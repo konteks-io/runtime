@@ -219,7 +219,7 @@ it("interruption stops local work before producing its exact queued receipt evid
   await f.addClaim();
   f.stop.mockImplementation(async () => { expect(f.outbox.depth).toBe(0); });
   await f.recovery.run();
-  expect(f.stop).toHaveBeenCalledWith("a", 1);
+  expect(f.stop).toHaveBeenCalledWith("a", 1, expect.any(Function));
   const report = f.reports.queuedTerminalReport("a", 1, "claim")!;
   expect(report.result).toMatchObject({ class: "interrupted", reason: "agent_session_lost" });
   expect(f.apply.mock.calls[0]?.[0].decisionResults).toEqual([{ assignmentId: "a", attempt: 1, disposition: "interrupted", terminalReportId: report.reportId, terminalEvidence: { kind: "queued", reportSequence: report.reportSequence, payloadDigest: report.payloadDigest, terminalResultHash: report.result!.terminalResultHash } }]);
@@ -283,7 +283,7 @@ it("known cancellation reports its actual cancelled disposition after stop", asy
   const f = await fixture([{ action: "cancel", assignmentId: "a", attempt: 1, reason: "removed" }]);
   await f.addClaim();
   await f.recovery.run();
-  expect(f.stop).toHaveBeenCalledWith("a", 1);
+  expect(f.stop).toHaveBeenCalledWith("a", 1, expect.any(Function));
   expect(f.reports.queuedTerminalReport("a", 1, "claim")?.result).toMatchObject({ class: "cancelled", reason: "removed" });
   expect(f.apply.mock.calls[0]?.[0].decisionResults[0]).toMatchObject({ disposition: "applied", terminalEvidence: { kind: "queued" } });
 });
@@ -304,7 +304,7 @@ it("restart disposition stops newAttempt minus one without running the proposed 
   const prior = f.journal.assignments.get("a:1")!;
   await f.journal.assignments.put({ ...prior, attempt: 3, claimId: "other" });
   await f.recovery.run();
-  expect(f.stop).toHaveBeenCalledWith("a", 1);
+  expect(f.stop).toHaveBeenCalledWith("a", 1, expect.any(Function));
   expect(f.journal.assignments.get("a:1")?.state).toBe("cancelled");
   expect(f.journal.assignments.get("a:3")?.state).toBe("running");
   expect(f.journal.latestAttempt("b")).toBeUndefined();

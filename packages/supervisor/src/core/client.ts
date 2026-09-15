@@ -318,7 +318,10 @@ export class CoreClient {
     return result;
   }
 
-  async reconnect(request: Omit<RemoteInstanceReconnectRequest, "proof">): Promise<{ lease: string; leaseExpiresAt: string; manifest: RemoteInstanceReconciliationManifest }> {
+  async reconnect(input: Omit<RemoteInstanceReconnectRequest, "proof">): Promise<{ lease: string; leaseExpiresAt: string; manifest: RemoteInstanceReconciliationManifest }> {
+    // Detach before I/O: every retry signs the same intent, and the response is
+    // compared against what was signed, never a caller object mutated meanwhile.
+    const request = structuredClone(input);
     const manifest = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.reconnect(request.instanceId),
       bodyFactory: () => RemoteInstanceReconnectRequestSchema.parse({ ...request, proof: this.proof("reconnect", request.instanceId, request as unknown as { [key: string]: JsonValue }) }), schema: RemoteInstanceReconciliationManifestSchema,
       idempotencyKey: `reconnect:${request.instanceId}:${request.reconnectIntentId}` });
@@ -345,9 +348,11 @@ export class CoreClient {
    * the completion gate; this method never changes dispositions or marks local
    * recovery complete. Each explicit retry gets a fresh transport proof.
    */
-  async applyReconciliation(request: Omit<RemoteReconciliationAppliedRequest, "proof">): Promise<RemoteReconciliationAppliedResult> {
+  async applyReconciliation(input: Omit<RemoteReconciliationAppliedRequest, "proof">): Promise<RemoteReconciliationAppliedResult> {
     // Parse to a detached strict snapshot before I/O: caller mutation while the
-    // response is pending cannot change the authority we compare against.
+    // response is pending cannot change the authority we compare against, and
+    // every retry re-signs the same detached receipt.
+    const request = structuredClone(input);
     const firstBody = RemoteReconciliationAppliedRequestSchema.parse({ ...request, proof: this.proof("reconciliation_applied", request.instanceId, request as unknown as { [key: string]: JsonValue }) });
     const digest = computeRemoteReconciliationReceiptDigest(firstBody);
     const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.reconciliationApplied(request.instanceId),

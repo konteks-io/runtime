@@ -1,3 +1,4 @@
+import { NATIVE_TRANSIENT_MAX_ATTEMPTS } from "../native/transient-retry.js";
 import { describe, expect, it, vi } from "vitest";
 import { FixedClock, generateInstanceKey, jcsDigest, verifyInstanceProof, RemoteInstanceErrorCodeSchema } from "@konteks/remote-common";
 import { CoreClient, CORE_AUDIENCE } from "../core/client.js";
@@ -126,19 +127,26 @@ describe("native applied receipt HTTPS boundary", () => {
 
   it.each([
     [409, "reconciliation_replay"], [409, "idempotency_conflict"], [422, "resume_deadline_expired"],
-    [422, "instance_revoked"], [503, "temporarily_unavailable"],
+    [422, "instance_revoked"],
   ])("surfaces HTTP %s %s without hidden retries or local completion", async (status, code) => {
     const f = fixture({ code, message: "denied" }, status as number);
     await expect(f.client.applyReconciliation(receipt)).rejects.toMatchObject({ status, code, wireCode: code });
     expect(f.fetchFn).toHaveBeenCalledTimes(1);
   });
 
+  it("retries HTTP 503 within the bounded transient budget, then surfaces it without local completion", async () => {
+    const f = fixture({ code: "temporarily_unavailable", message: "denied" }, 503);
+    await expect(f.client.applyReconciliation(receipt)).rejects.toMatchObject({ status: 503, code: "temporarily_unavailable", wireCode: "temporarily_unavailable" });
+    expect(f.fetchFn).toHaveBeenCalledTimes(NATIVE_TRANSIENT_MAX_ATTEMPTS);
+  });
+
   it("does not turn an uncertain delivery into success, and fresh caller retry preserves evidence", async () => {
     const f = fixture(accepted);
     f.fetchFn.mockRejectedValueOnce(new Error("connection interrupted"));
-    await expect(f.client.applyReconciliation(receipt)).rejects.toMatchObject({ code: "temporarily_unavailable", retryable: true });
-    expect(f.fetchFn).toHaveBeenCalledTimes(1);
+    // A transport failure is retried within the bounded budget; the retry
+    // re-signs the identical receipt rather than inventing a local outcome.
     await expect(f.client.applyReconciliation(receipt)).resolves.toEqual(accepted);
+    expect(f.fetchFn).toHaveBeenCalledTimes(2);
     const bodies = f.fetchFn.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
     expect(bodies[0].decisionResults).toEqual(bodies[1].decisionResults);
     expect(bodies[0].proof.nonce).not.toBe(bodies[1].proof.nonce);
