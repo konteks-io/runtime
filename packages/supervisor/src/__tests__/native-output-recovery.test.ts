@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { computeRemoteDeliveryOutputDigest, computeRemoteFileTreeDigest } from "@konteks/remote-common";
+import { RemoteInstanceError, computeRemoteDeliveryOutputDigest, computeRemoteFileTreeDigest } from "@konteks/remote-common";
 import { createRetainedDeliveryOutputRecovery } from "../native/output-recovery.js";
 import { NativeOutputStore } from "../native/output-store.js";
 
@@ -44,5 +44,28 @@ describe("retained native output recovery", () => {
     await expect(recover(admission, { acpSessionRef: "acp" })).resolves.toEqual({ acpSessionRef: "acp", receipt });
     expect(acceptRetained).toHaveBeenCalledWith(admission, candidate);
     expect(await store.read()).toEqual({ version: 1, state: "accepted", candidate, completion, receipt });
+  });
+  it("leaves the frozen candidate unrecovered when Core no longer knows its assignment", async () => {
+    const container = join(root, `worktree-${"b".repeat(64)}`); await mkdir(container, { mode: 0o700 });
+    const { candidate, completion } = fixture(); const store = new NativeOutputStore(container);
+    await store.savePending(candidate, completion);
+    const acceptRetained = vi.fn(async () => { throw new RemoteInstanceError("capability_unavailable", "gone", { diagnostic: "assignment_not_found" }); });
+    const pending = { acpSessionRef: "acp", id: "prompt", method: "session/prompt", direction: "received", closedAt: null,
+      authorization: { state: "completed", claims: { acpSessionRef: "acp", instanceId: "instance", workspaceId: "workspace",
+        assignmentId: "assignment", attempt: 1, claimId: "claim", agentId: "codex", sessionId: "execution-session",
+        deliveryIdentity: { invocationId: "invocation" } } } };
+    const warn = vi.fn();
+    const recover = createRetainedDeliveryOutputRecovery({ roots: [root], journal: { pendingRequests: { get: vi.fn(() => pending) } } as never,
+      client: () => ({ acceptRetained } as never), mutate: operation => operation(), logger: { warn } as never });
+    const admission = { instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "old", assignmentId: "assignment", attempt: 1,
+      claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: "2026-09-14T00:00:00Z" };
+
+    await expect(recover(admission, { acpSessionRef: "acp" })).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ assignmentId: "assignment", attempt: 1 }), expect.stringContaining("no longer knows"));
+    expect(await store.read()).toEqual({ version: 1, state: "pending", candidate, completion });
+    // any other refusal still surfaces, so a live assignment keeps retrying
+    const other = createRetainedDeliveryOutputRecovery({ roots: [root], journal: { pendingRequests: { get: vi.fn(() => pending) } } as never,
+      client: () => ({ acceptRetained: async () => { throw new RemoteInstanceError("capability_unavailable", "refused"); } } as never), mutate: operation => operation() });
+    await expect(other(admission, { acpSessionRef: "acp" })).rejects.toThrow("refused");
   });
 });

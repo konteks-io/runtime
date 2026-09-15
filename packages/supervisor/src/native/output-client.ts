@@ -22,6 +22,15 @@ import { NATIVE_TRANSIENT_MAX_ATTEMPTS, logNativeRetryExhausted, transientHttpCl
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 const unavailable = () => new RemoteInstanceError("capability_unavailable", "Generated delivery output was not durably accepted.");
+const ASSIGNMENT_NOT_FOUND = "assignment_not_found";
+const isNotFound = (error: unknown) => error instanceof RemoteInstanceError && error.diagnostic === "response_refused_404";
+/** Core answered "not found" to both the prepare and the status probe: the
+ * assignment itself is gone (its plan failed or was superseded while the
+ * output waited). No retry can ever accept this output. */
+const assignmentGone = () => new RemoteInstanceError("capability_unavailable",
+  "Core no longer knows the assignment this generated delivery output belongs to.", { diagnostic: ASSIGNMENT_NOT_FOUND });
+export const isAssignmentGone = (error: unknown): boolean =>
+  error instanceof RemoteInstanceError && error.diagnostic === ASSIGNMENT_NOT_FOUND;
 
 export class NativeOutputClient {
   private readonly origin: string;
@@ -70,8 +79,10 @@ export class NativeOutputClient {
         invocationRef: candidate.invocationRef, resultId: candidate.resultId, resultDigest: candidate.resultDigest });
       let prepared;
       try { prepared = RemoteDeliveryOutputPrepareResultSchema.parse(await this.request(owner, "prepare", prepareBody)); }
-      catch {
-        const reconciled = await this.status(owner, statusBody);
+      catch (error) {
+        let reconciled: Awaited<ReturnType<NativeOutputClient["status"]>> = null;
+        try { reconciled = await this.status(owner, statusBody); }
+        catch (statusError) { if (isNotFound(error) && isNotFound(statusError)) throw assignmentGone(); }
         if (reconciled?.state === "accepted" && reconciled.receipt) return this.verifyReceipt(reconciled.receipt, candidate);
         if (reconciled?.state === "rejected") throw unavailable();
         // Missing or staged: identical prepare is the only response that can
@@ -84,23 +95,23 @@ export class NativeOutputClient {
       try {
         return this.verifyReceipt(await this.request(owner, "commit", commitBody), candidate);
       } catch {
-        const status = await this.status(owner, statusBody);
+        const status = await this.status(owner, statusBody).catch(() => null);
         if (status?.state === "accepted" && status.receipt) return this.verifyReceipt(status.receipt, candidate);
         if (status?.state !== "staged") throw unavailable();
         try { return this.verifyReceipt(await this.request(owner, "commit", commitBody), candidate); }
         catch {
-          const final = await this.status(owner, statusBody);
+          const final = await this.status(owner, statusBody).catch(() => null);
           if (final?.state !== "accepted" || !final.receipt) throw unavailable();
           return this.verifyReceipt(final.receipt, candidate);
         }
       }
-    } catch { throw unavailable(); }
+    } catch (error) { throw isAssignmentGone(error) ? error : unavailable(); }
     finally { this.busy = false; }
   }
 
   private async status(owner: { instanceId: string; assignmentId: string; attempt: number }, body: ReturnType<typeof RemoteDeliveryOutputStatusRequestSchema.parse>) {
     try { return RemoteDeliveryOutputStatusResultSchema.parse(await this.request(owner, "status", body)); }
-    catch { return null; }
+    catch (error) { if (isNotFound(error)) throw error; return null; }
   }
 
   private verifyReceipt(value: unknown, candidate: RemoteDeliveryResultCandidate): RemoteDeliveryAcceptanceReceipt {

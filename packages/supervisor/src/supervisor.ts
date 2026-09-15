@@ -577,6 +577,7 @@ export class Supervisor {
         roots: this.options.native!.runners.map(config => config.RUNNER_WORKSPACE_DIR),
         journal: this.journal,
         mutate: this.stateMutations!.run,
+        logger: this.logger,
         client: () => new NativeOutputClient({
           baseUrl: this.config.SUPERVISOR_CORE_URL, clock: this.clock,
           credential: () => this.lease.mode() === "active" ? this.lease.current()?.lease ?? null : null,

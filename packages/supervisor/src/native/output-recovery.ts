@@ -1,10 +1,10 @@
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { RemoteInstanceError } from "@konteks/remote-common";
+import { RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import type { LocalAdmission } from "../state/local-admission.js";
 import type { SupervisorJournal } from "../state/journal.js";
 import type { StateMutation } from "../state/mutation-gate.js";
-import type { NativeOutputClient } from "./output-client.js";
+import { isAssignmentGone, type NativeOutputClient } from "./output-client.js";
 import { NativeOutputStore, type NativeOutputRecord } from "./output-store.js";
 
 const WORKSPACE = /^(?:assignment|worktree)-[a-f0-9]{64}$/;
@@ -17,6 +17,7 @@ export interface RetainedDeliveryOutputRecoveryOptions {
   journal: SupervisorJournal;
   client: () => NativeOutputClient;
   mutate: StateMutation;
+  logger?: Logger;
 }
 
 /** Locates only connector-owned assignment/worktree containers and retries the
@@ -50,9 +51,23 @@ export function createRetainedDeliveryOutputRecovery(options: RetainedDeliveryOu
       }
     }
     if (!found) return null;
-    const receipt = found.record.state === "accepted"
-      ? found.record.receipt
-      : await options.client().acceptRetained(admission, found.record.candidate);
+    let receipt;
+    if (found.record.state === "accepted") receipt = found.record.receipt;
+    else {
+      try { receipt = await options.client().acceptRetained(admission, found.record.candidate); }
+      catch (error) {
+        if (!isAssignmentGone(error)) throw error;
+        // The assignment no longer exists on Core (its plan failed or was
+        // superseded while this runtime was down), so nothing can ever accept
+        // the frozen output. Retrying it on every startup kept the whole
+        // runtime in startup recovery: no relay handshake, no new work. The
+        // record stays on disk for forensics; recovery reports nothing found
+        // and restart recovery classifies the attempt as interrupted.
+        options.logger?.warn({ assignmentId: admission.assignmentId, attempt: admission.attempt, claimId: admission.claimId },
+          "retained delivery output belongs to an assignment Core no longer knows; leaving it unrecovered");
+        return null;
+      }
+    }
     await options.mutate(() => found!.store.saveAccepted(found!.record.candidate, receipt));
     return { acpSessionRef: execution.acpSessionRef, receipt };
   };

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { FixedClock, computeRemoteDeliveryOutputDigest, computeRemoteFileTreeDigest, type RemoteWorkAssignment } from "@konteks/remote-common";
-import { NativeOutputClient } from "../native/output-client.js";
+import { NativeOutputClient, isAssignmentGone } from "../native/output-client.js";
 
 const assignment: RemoteWorkAssignment = {
   id: "assignment", instanceId: "instance", workspaceId: "tenant", attempt: 1, kind: "delivery", placementId: "placement", taskId: "task", correlationId: "invocation",
@@ -78,5 +78,22 @@ describe("native claim-scoped output client", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify(receipt), { headers: { "content-type": "application/json" } }));
     await expect(new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn, retrySleep: async () => undefined }).accept(assignment, candidate)).resolves.toEqual(receipt);
     expect(fetchFn.mock.calls[1]![1]?.body).toBe(fetchFn.mock.calls[6]![1]?.body);
+  });
+  it("names an assignment Core no longer knows instead of an ordinary refusal", async () => {
+    const notFound = () => new Response(JSON.stringify({ code: "not_found", message: "assignment not found" }), { status: 404, headers: { "content-type": "application/json" } });
+    const fetchFn = vi.fn(async () => notFound());
+    const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn, retrySleep: async () => undefined });
+    const failure = await client.acceptRetained({ instanceId: "instance", workspaceId: "tenant", assignmentId: "assignment", attempt: 1, claimId: "claim" }, candidate).catch((error: unknown) => error);
+    expect(isAssignmentGone(failure)).toBe(true);
+    // prepare then the status probe; a plain refusal on a live assignment stays "unavailable"
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    const refusedOnce = vi.fn()
+      .mockResolvedValueOnce(new Response("over limit", { status: 413, headers: { "content-type": "text/plain" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ state: "missing" }), { headers: { "content-type": "application/json" } }))
+      .mockResolvedValueOnce(new Response("over limit", { status: 413, headers: { "content-type": "text/plain" } }));
+    const plain = await new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn: refusedOnce, retrySleep: async () => undefined })
+      .acceptRetained({ instanceId: "instance", workspaceId: "tenant", assignmentId: "assignment", attempt: 1, claimId: "claim" }, candidate).catch((error: unknown) => error);
+    expect(isAssignmentGone(plain)).toBe(false);
+    expect(plain).toMatchObject({ code: "capability_unavailable" });
   });
 });
