@@ -980,7 +980,7 @@ export class Supervisor {
       // bb: every 5 minutes release sessions idle for 30 minutes.
       this.reaperTimer = setInterval(() => void this.work.reapIdleCompletedSessions(IDLE_SESSION_RELEASE_MS).catch(() => undefined), IDLE_SESSION_SWEEP_MS);
       this.reaperTimer.unref();
-      const update = this.options.native!.update;
+      const update = this.options.native?.update;
       if (update && !this.updates) {
         this.updates = new NativeUpdateCoordinator({
           ...update,

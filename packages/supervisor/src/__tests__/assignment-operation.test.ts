@@ -54,6 +54,8 @@ async function workFixture(f: Awaited<ReturnType<typeof fixture>>, draining = fa
     transport: { send: (message: typeof sent[number]) => sent.push(message) }, deploymentKind: "native_connector",
     clock: new FixedClock(Date.parse(at)), instanceId: () => "instance", workspaceId: () => "workspace",
     recoveryAuthority: () => f.authority.key, reportDeliveryAllowed: () => true,
+    // Core-signed cancellations are verified by the supervisor; this fixture accepts the test signature.
+    verifyCancellation: () => true,
     reconciliationComplete: () => true, lease: { canPullNewWork: () => true }, draining: () => draining,
     headroom: () => 0, maxPullItems: 1, acceptedKinds: () => ["delivery"], components: {},
   } as never);

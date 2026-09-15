@@ -27,7 +27,8 @@ describe("native authoritative execution readiness", () => {
   it("uses only the local accepted claim and persists Core's exact receipt before returning", async () => {
     const f = await fixture();
     await expect(f.register(work, binding, "acp")).resolves.toEqual(ready);
-    expect(f.registerExecutionReady).toHaveBeenCalledWith("instance", { assignmentId: "assignment", attempt: 1, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "process", agentId: "codex", acpSessionRef: "acp" });
+    // The local deadline travels with the request so Core's retry budget is bounded by the caller.
+    expect(f.registerExecutionReady).toHaveBeenCalledWith("instance", { assignmentId: "assignment", attempt: 1, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "process", agentId: "codex", acpSessionRef: "acp" }, expect.any(Number));
     const reopened = new SupervisorJournal(root); await reopened.load();
     expect(reopened.assignments.get("assignment:1")?.executionReady).toEqual(ready);
   });
