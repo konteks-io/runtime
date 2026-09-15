@@ -75,7 +75,8 @@ switch (command) {
       const path = join(args.dir, name);
       if (!existsSync(path) || createHash("sha256").update(readFileSync(path)).digest("hex") !== digest) fail(`checksum manifest entry ${name} does not match a present file`);
     }
-    for (const required of ["native-manifest.json", "SHA256SUMS", "SHA256SUMS.sig", "release-signing.pub", "install.sh", "install.ps1"]) if (!existsSync(join(args.dir, required))) fail(`release is missing ${required}`);
+    for (const required of ["native-manifest.json", "SHA256SUMS", "SHA256SUMS.sig", "release-signing.pub", "install.sh", "install.ps1", "onboarding.md"]) if (!existsSync(join(args.dir, required))) fail(`release is missing ${required}`);
+    if (!readFileSync(join(args.dir, "install.sh"), "utf8").match(/BAKED_EXECUTABLE_SUMS="[0-9a-f]{64}  konteks-remote-/)) fail("install.sh was not baked with this release's executable digests");
     console.log(`verified ${manifest.nativeArtifacts.length} manifest artifacts and ${sums.length} package checksums`);
     break;
   }

@@ -9,11 +9,18 @@
 #
 # `--user` installs the verified connector executable into the private user
 # root with no `sudo` and no package, because the person's coding agent has
-# neither a terminal to type a password at nor a reason to need one. The trust
-# root is the release signing key that signs SHA256SUMS — the same key the
-# connector already trusts for every update it applies after install. When
-# publisher packaging signatures exist, the package path keeps demanding them
-# and this path verifies both.
+# neither a terminal to type a password at nor a reason to need one. Its trust
+# anchor is this script itself: the release job bakes the digests of this
+# release's connector executables (and of the release signing key file) into
+# the copy of install.sh it publishes with the same immutable release, so a
+# script fetched from a tag installs only that tag's bytes. The Ed25519
+# signature over SHA256SUMS is verified as well wherever `openssl` can speak
+# Ed25519; macOS ships LibreSSL, which cannot, and a check that cannot run is
+# reported rather than faked. Once installed, the connector verifies the
+# Ed25519-signed native manifest with its own embedded roots before it stages
+# anything — that, not the bootstrap, is the trust root for everything after.
+# When publisher packaging signatures exist, the package path keeps demanding
+# them and this path verifies both.
 #
 # This script downloads the signed native launcher package for this platform,
 # verifies its checksum against the published, signed checksum manifest and
@@ -29,6 +36,10 @@ BOOTSTRAP_VERSION="1"
 RELEASE_BASE="${KONTEKS_RELEASE_BASE:-https://github.com/konteks-io/runtime/releases/latest/download}"
 EXPECTED_MACOS_TEAM_ID="${KONTEKS_MACOS_TEAM_ID:-KONTEKS0000}"
 EXPECTED_DEB_FINGERPRINT="${KONTEKS_DEB_KEY_FINGERPRINT:-0000000000000000000000000000000000000000}"
+# Filled in by scripts/bake-bootstrap.mjs in the release job; empty in the
+# repository copy, which then falls back to the fetched SHA256SUMS.
+BAKED_EXECUTABLE_SUMS=""
+BAKED_RELEASE_PUBKEY_SHA256=""
 
 activation_id=""
 user_install=0
@@ -83,35 +94,55 @@ fetch "${RELEASE_BASE}/SHA256SUMS" "$workdir/SHA256SUMS"
 fetch "${RELEASE_BASE}/SHA256SUMS.sig" "$workdir/SHA256SUMS.sig"
 fetch "${RELEASE_BASE}/release-signing.pub" "$workdir/release-signing.pub"
 
-# The checksum manifest is signed by the Konteks release key; its public key
-# is pinned by fingerprint inside this script so a swapped manifest fails.
-need openssl
-actual_fp="$(openssl pkey -pubin -in "$workdir/release-signing.pub" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')"
-if [ -n "${KONTEKS_RELEASE_PUBKEY_SHA256:-}" ] && [ "$actual_fp" != "$KONTEKS_RELEASE_PUBKEY_SHA256" ]; then
-  echo "error: release signing key fingerprint mismatch; refusing to install" >&2; exit 4
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+
+# The release signing key file is pinned by its digest: baked into this script
+# by the release job, or given explicitly. A swapped key fails before anything
+# it signed is believed.
+expected_pub="${KONTEKS_RELEASE_PUBKEY_SHA256:-$BAKED_RELEASE_PUBKEY_SHA256}"
+if [ -n "$expected_pub" ] && [ "$(sha256_of "$workdir/release-signing.pub")" != "$expected_pub" ]; then
+  echo "error: release signing key digest mismatch; refusing to install" >&2; exit 4
 fi
-openssl pkeyutl -verify -pubin -inkey "$workdir/release-signing.pub" -rawin -in "$workdir/SHA256SUMS" -sigfile "$workdir/SHA256SUMS.sig" >/dev/null 2>&1 \
-  || { echo "error: checksum manifest signature does not verify; refusing to install" >&2; exit 4; }
+# The checksum manifest is Ed25519-signed by that key. Verify it wherever the
+# local openssl can; LibreSSL (macOS) cannot load an Ed25519 key at all, and
+# that is reported, never silently skipped.
+need openssl
+sig_check="$(openssl pkeyutl -verify -pubin -inkey "$workdir/release-signing.pub" -rawin -in "$workdir/SHA256SUMS" -sigfile "$workdir/SHA256SUMS.sig" 2>&1)" && sig_ok=1 || sig_ok=0
+if [ "$sig_ok" -ne 1 ]; then
+  case "$sig_check" in
+    *"unsupported algorithm"*|*"unable to load Public Key"*)
+      echo "note: this openssl cannot verify Ed25519 (LibreSSL); relying on the digests pinned in this release's bootstrap" ;;
+    *) echo "error: checksum manifest signature does not verify; refusing to install" >&2; exit 4 ;;
+  esac
+fi
 
 # ── User-local install (no sudo, no package) ────────────────────────────────
-# The bare connector executable is published alongside the packages and its
-# digest is in the same signed SHA256SUMS verified above, so this path is not
-# less verified than the package path — it verifies a different artifact.
+# The bare connector executable is published alongside the packages. Its
+# digest comes from this release's bootstrap (baked by the release job) and,
+# as a second source, from the published SHA256SUMS; when the bootstrap is the
+# unbaked repository copy only SHA256SUMS is available. The two must agree.
 if [ "$user_install" -eq 1 ]; then
+  if [ "$sig_ok" -ne 1 ] && [ -z "$BAKED_EXECUTABLE_SUMS" ]; then
+    echo "error: neither an Ed25519-capable openssl nor a release-baked bootstrap is available; fetch install.sh from a published release" >&2; exit 4
+  fi
   case "$os" in
     Darwin) os_id="macos" ;;
     Linux) os_id="debian" ;;
-    *) echo "error: the user-local install supports macOS and Linux; use the activation install on Windows" >&2; exit 3 ;;
+    *) echo "error: the user-local install supports macOS and Linux for now; on Windows use the activation install (Settings → Connected runtimes)" >&2; exit 3 ;;
   esac
   connector="konteks-remote-${os_id}-${arch}"
   fetch "${RELEASE_BASE}/${connector}" "$workdir/$connector"
-  expected="$(grep " ${connector}\$" "$workdir/SHA256SUMS" | awk '{print $1}')"
-  if [ "$os" = "Darwin" ]; then
-    actual="$(shasum -a 256 "$workdir/$connector" | awk '{print $1}')"
-  else
-    actual="$(sha256sum "$workdir/$connector" | awk '{print $1}')"
+  published="$(grep " ${connector}\$" "$workdir/SHA256SUMS" | awk '{print $1}')"
+  baked="$(printf '%b\n' "$BAKED_EXECUTABLE_SUMS" | grep " ${connector}\$" | awk '{print $1}')"
+  expected="${baked:-$published}"
+  [ -n "$expected" ] || { echo "error: this release publishes no connector executable for ${os_id}/${arch}" >&2; exit 4; }
+  if [ -n "$baked" ] && [ -n "$published" ] && [ "$baked" != "$published" ]; then
+    echo "error: the published checksum manifest does not match this release's bootstrap; refusing to install" >&2; exit 4
   fi
-  [ -n "$expected" ] && [ "$expected" = "$actual" ] || { echo "error: connector checksum mismatch; refusing to install" >&2; exit 4; }
+  actual="$(sha256_of "$workdir/$connector")"
+  [ "$expected" = "$actual" ] || { echo "error: connector checksum mismatch; refusing to install" >&2; exit 4; }
 
   if [ "$os" = "Darwin" ]; then
     root="${KONTEKS_ROOT:-$HOME/Library/Application Support/konteks-remote}"
