@@ -58,13 +58,15 @@ describe("available memory on macOS", () => {
   it("counts reclaimable page classes, never active, wired or compressed pages", () => {
     // free + inactive + speculative + purgeable = 74545 pages of 16 KiB.
     expect(parseDarwinAvailableBytes(sample)).toBe(74545 * 16384);
-    expect(availableMemoryBytes(() => sample)).toBe(74545 * 16384);
+    expect(availableMemoryBytes(() => sample, "darwin")).toBe(74545 * 16384);
   });
 
   it("falls back to the wholly free figure rather than inventing headroom", () => {
     for (const broken of [null, "", "Pages free: not-a-number.", "(page size of 16384 bytes)\nPages active: 5."]) {
       expect(parseDarwinAvailableBytes(broken)).toBeNull();
     }
-    expect(availableMemoryBytes(() => null)).toBe(freemem());
+    // Two free-memory samples never agree exactly on a live host; the fallback must track it, not invent headroom.
+    expect(Math.abs(availableMemoryBytes(() => null, "darwin") - freemem())).toBeLessThan(512 * 1024 * 1024);
+    expect(Math.abs(availableMemoryBytes(() => "irrelevant", "linux") - freemem())).toBeLessThan(512 * 1024 * 1024);
   });
 });

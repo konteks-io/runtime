@@ -78,8 +78,8 @@ export class SignalSampler {
  * free pages, so a healthy Mac reports a few tens of megabytes and every
  * sample looks saturated; reclaimable page classes are available memory.
  */
-export function availableMemoryBytes(readVmStat: () => string | null = darwinVmStat): number {
-  if (process.platform === "darwin") {
+export function availableMemoryBytes(readVmStat: () => string | null = darwinVmStat, platform: NodeJS.Platform = process.platform): number {
+  if (platform === "darwin") {
     const parsed = parseDarwinAvailableBytes(readVmStat());
     if (parsed !== null) return parsed;
   }

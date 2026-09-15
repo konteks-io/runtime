@@ -15,7 +15,7 @@ const at = "2026-09-06T00:00:00.000Z";
 const scope = { instanceId: "instance", workspaceId: "workspace" };
 const pull = { instanceId: "instance", maxItems: 1, acceptedKinds: ["delivery"] };
 const assignment = { id: "assignment", kind: "delivery", placementId: "placement", ...scope, taskId: "task", correlationId: "correlation", attempt: 1,
-  expiresAt: "2026-09-07T00:00:00Z", requiredCapabilities: [], agentRoute: { requiredRole: "planner", agentId: "codex" },
+  expiresAt: "2026-09-07T00:00:00Z", requiredCapabilities: [], agentRoute: { requiredRole: "generator", agentId: "codex" },
   source: { kind: "harness_task_checkout", portability: "instance_bound", ownerInstanceId: "instance", workspaceRef: "ref" },
   policy: { maxDurationSeconds: 60, maxArtifactBytes: 1, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted", latestResumeAt: "2026-09-07T00:00:00Z", permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: true },
 };
@@ -51,7 +51,7 @@ async function fixture(claimOutcome: "denied" | "claimed" = "denied", overrides:
     transport: { send: (message: OutboundMessage) => sent.push(message) }, instanceId: () => "instance", workspaceId: () => "workspace",
     runnerIncarnation: () => "process", assertOwned: () => undefined, recoveryAuthority: () => authority.key,
     reportDeliveryAllowed: () => true, reconciliationComplete: () => true, lease: { canPullNewWork: () => true }, draining: () => false,
-    headroom: () => 2, maxPullItems: 1, acceptedKinds: () => ["delivery"], advertisedRoles: () => ["planner"], browserToolAvailable: () => false,
+    headroom: () => 2, maxPullItems: 1, acceptedKinds: () => ["delivery"], advertisedRoles: () => ["generator"], browserToolAvailable: () => false,
     agents: () => [{ agentId: "codex", readiness: "ready", connectionState: "ready" }], instanceEvidencePolicy: () => "structured_only", components: {},
     ...overrides,
   } as never);

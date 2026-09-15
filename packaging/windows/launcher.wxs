@@ -2,7 +2,7 @@
 <!-- konteks-remote MSI (WiX v3). Installs the single launcher executable
      under Program Files, adds it to the machine PATH, and records the
      publisher. Uninstall of the MSI never touches the restricted install root
-     (%ProgramData%\konteks-remote): `konteks-remote uninstall [--purge]` owns
+     (%ProgramData%\konteks-remote): `konteks-remote uninstall` (with purge) owns
      that lifecycle. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="Konteks Remote Instance launcher" Language="1033" Version="$(var.ProductVersion)" Manufacturer="Konteks" UpgradeCode="7d3b7f2e-6f0d-4d5b-9b52-0f3f9b1c2a01">
