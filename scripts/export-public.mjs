@@ -61,12 +61,16 @@ for (const entry of readdirSync(join(out, "packages"))) {
     for (const [name, spec] of Object.entries(manifest[section] ?? {})) {
       if (!name.startsWith("@konteks/") || name.startsWith("@konteks/remote-") || !String(spec).startsWith("file:")) continue;
       if (!vendored[name]) { console.error(`${entry} depends on ${name}, which is not vendored`); process.exit(1); }
-      manifest[section][name] = `file:../../vendor/${vendored[name].file}`;
+      // The tarball is declared once at the root (npm records `resolved` for a
+      // root-level file: dependency but not for ../ tarball paths inside
+      // workspaces); workspaces pin the exact version the root tree provides.
+      manifest[section][name] = vendored[name].version;
     }
   }
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 const rootManifest = JSON.parse(readFileSync(join(out, "package.json"), "utf8"));
+rootManifest.dependencies = { ...(rootManifest.dependencies ?? {}), ...Object.fromEntries(Object.entries(vendored).map(([name, entry]) => [name, `file:vendor/${entry.file}`])) };
 rootManifest.konteksContracts = Object.fromEntries(Object.entries(vendored).map(([name, entry]) => [name, entry.version]));
 writeFileSync(join(out, "package.json"), `${JSON.stringify(rootManifest, null, 2)}\n`);
 execFileSync("npm", ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund", "--legacy-peer-deps"], { cwd: out, stdio: "inherit" });

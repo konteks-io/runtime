@@ -26,7 +26,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
-    "@konteks/backstage-plugin-common": "file:../../vendor/konteks-backstage-plugin-common-6.0.0.tgz",
+    "@konteks/backstage-plugin-common": "6.0.0",
     "@konteks/remote-common": "*",
     "@konteks/remote-release": "*",
     "pino": "^9.5.0",
