@@ -4,6 +4,17 @@
 # Usage (copied verbatim from the Konteks App or MCP activation response):
 #   curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --activation-id <id>
 #
+# Agent-first onboarding (onboarding-simplified OS3, R10) instead:
+#   curl -fsSL .../install.sh | sh -s -- --user --enroll
+#
+# `--user` installs the verified connector executable into the private user
+# root with no `sudo` and no package, because the person's coding agent has
+# neither a terminal to type a password at nor a reason to need one. The trust
+# root is the release signing key that signs SHA256SUMS — the same key the
+# connector already trusts for every update it applies after install. When
+# publisher packaging signatures exist, the package path keeps demanding them
+# and this path verifies both.
+#
 # This script downloads the signed native launcher package for this platform,
 # verifies its checksum against the published, signed checksum manifest and
 # its signer identity, installs it, and invokes `konteks-remote install` with
@@ -20,6 +31,8 @@ EXPECTED_MACOS_TEAM_ID="${KONTEKS_MACOS_TEAM_ID:-KONTEKS0000}"
 EXPECTED_DEB_FINGERPRINT="${KONTEKS_DEB_KEY_FINGERPRINT:-0000000000000000000000000000000000000000}"
 
 activation_id=""
+user_install=0
+enroll=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --activation-id)
@@ -27,17 +40,25 @@ while [ $# -gt 0 ]; do
       activation_id="$2"; shift 2 ;;
     --activation-id=*)
       activation_id="${1#--activation-id=}"; shift ;;
+    --user)
+      user_install=1; shift ;;
+    --enroll)
+      enroll=1; user_install=1; shift ;;
     --version)
       echo "konteks-remote bootstrap v${BOOTSTRAP_VERSION}"; exit 0 ;;
     *)
       # No passthrough: anything else is refused rather than forwarded.
-      echo "error: unknown argument (this bootstrap accepts only --activation-id <id>)" >&2; exit 2 ;;
+      echo "error: unknown argument (this bootstrap accepts --activation-id <id>, --user, --enroll)" >&2; exit 2 ;;
   esac
 done
-case "$activation_id" in
-  "") echo "error: --activation-id <id> is required (copy the command from the Konteks App or MCP)" >&2; exit 2 ;;
-  *[!A-Za-z0-9._-]*) echo "error: activation id has an unexpected format" >&2; exit 2 ;;
-esac
+if [ "$enroll" -eq 0 ]; then
+  case "$activation_id" in
+    "") echo "error: --activation-id <id> is required (copy the command from the Konteks App or MCP)" >&2; exit 2 ;;
+    *[!A-Za-z0-9._-]*) echo "error: activation id has an unexpected format" >&2; exit 2 ;;
+  esac
+elif [ -n "$activation_id" ]; then
+  echo "error: --enroll and --activation-id are different doors; choose one" >&2; exit 2
+fi
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "error: $1 is required" >&2; exit 3; }; }
 need curl
@@ -71,6 +92,45 @@ if [ -n "${KONTEKS_RELEASE_PUBKEY_SHA256:-}" ] && [ "$actual_fp" != "$KONTEKS_RE
 fi
 openssl pkeyutl -verify -pubin -inkey "$workdir/release-signing.pub" -rawin -in "$workdir/SHA256SUMS" -sigfile "$workdir/SHA256SUMS.sig" >/dev/null 2>&1 \
   || { echo "error: checksum manifest signature does not verify; refusing to install" >&2; exit 4; }
+
+# ── User-local install (no sudo, no package) ────────────────────────────────
+# The bare connector executable is published alongside the packages and its
+# digest is in the same signed SHA256SUMS verified above, so this path is not
+# less verified than the package path — it verifies a different artifact.
+if [ "$user_install" -eq 1 ]; then
+  case "$os" in
+    Darwin) os_id="macos" ;;
+    Linux) os_id="debian" ;;
+    *) echo "error: the user-local install supports macOS and Linux; use the activation install on Windows" >&2; exit 3 ;;
+  esac
+  connector="konteks-remote-${os_id}-${arch}"
+  fetch "${RELEASE_BASE}/${connector}" "$workdir/$connector"
+  expected="$(grep " ${connector}\$" "$workdir/SHA256SUMS" | awk '{print $1}')"
+  if [ "$os" = "Darwin" ]; then
+    actual="$(shasum -a 256 "$workdir/$connector" | awk '{print $1}')"
+  else
+    actual="$(sha256sum "$workdir/$connector" | awk '{print $1}')"
+  fi
+  [ -n "$expected" ] && [ "$expected" = "$actual" ] || { echo "error: connector checksum mismatch; refusing to install" >&2; exit 4; }
+
+  if [ "$os" = "Darwin" ]; then
+    root="${KONTEKS_ROOT:-$HOME/Library/Application Support/konteks-remote}"
+  else
+    root="${KONTEKS_ROOT:-$HOME/.local/share/konteks-remote}"
+  fi
+  mkdir -p "$root/bin"
+  chmod 700 "$root"
+  install -m 0755 "$workdir/$connector" "$root/bin/konteks-remote"
+  echo "konteks-remote installed for this user at $root/bin/konteks-remote"
+  case ":$PATH:" in
+    *":$root/bin:"*) ;;
+    *) echo "add it to PATH for this shell:  export PATH=\"$root/bin:\$PATH\"" ;;
+  esac
+  if [ "$enroll" -eq 1 ]; then
+    exec "$root/bin/konteks-remote" install --enroll
+  fi
+  exec "$root/bin/konteks-remote" install --activation-id "$activation_id"
+fi
 
 case "$os" in
   Darwin)

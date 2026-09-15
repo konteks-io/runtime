@@ -6,7 +6,8 @@ import { createNativeService, loadNativeInstallation, verifyInstalledNativeConne
 import { RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, status, supportBundle } from "../commands/lifecycle.js";
 import { SupervisorControl } from "../control.js";
-import { addNativeAgent, installNative, readNativeRecord, restoreNativeRecord } from "./install.js";
+import { addNativeAgent, installNative, prepareNativeEnrollment, readNativeRecord, restoreNativeRecord } from "./install.js";
+import { onboardCoreUrl, runOnboardStep } from "./onboard.js";
 import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
 import { productionUpdateDeps, runNativeUpdate } from "./update-transaction.js";
@@ -42,7 +43,36 @@ async function start(input: NativeCommandContext): Promise<void> {
 }
 
 export const nativeCliActions: NativeCliActions = {
-  install: async input => { const record = await installNative(input); await start(input); input.output.result({ instanceId: record.instanceId, deploymentKind: record.deploymentKind, state: "installed" }); },
+  install: async input => {
+    if (input.enroll) {
+      // The enrollment install stops short of an identity, because there is no
+      // Workspace to have one in yet (onboarding-simplified OS3). It verifies
+      // the release, stages it, and leaves the machine ready for `onboard`.
+      const prepared = await prepareNativeEnrollment(input);
+      input.output.line("This machine is ready. Run `konteks-remote onboard --json` and follow the steps it prints.");
+      input.output.result({ state: "ready-to-onboard", agents: prepared.agents, bundleVersion: prepared.bundleVersion });
+      return;
+    }
+    const record = await installNative({ ...input, activationId: input.activationId! });
+    await start(input);
+    input.output.result({ instanceId: record.instanceId, deploymentKind: record.deploymentKind, state: "installed" });
+  },
+  onboard: async input => {
+    const step = await runOnboardStep({
+      root: input.root,
+      output: input.output,
+      ...(input.answer !== undefined ? { answer: input.answer } : {}),
+      ...(input.cwd ? { cwd: input.cwd } : {}),
+      ...((await onboardCoreUrl(input.root)) ? { coreUrl: (await onboardCoreUrl(input.root))! } : {}),
+    });
+    // One step per invocation, printed whole. In human mode the same step
+    // reads as a sentence so a person running this by hand is not left
+    // reading JSON.
+    input.output.result(step);
+    if (step.ask) input.output.line(`${step.note ? `${step.note}\n` : ""}${step.ask.question}`);
+    else if (step.done) input.output.line(`${step.done.summary}\n${step.done.links.site}`);
+    else if (step.note) input.output.line(step.note);
+  },
   addAgent: async input => {
     const previous = await readNativeRecord(input.root);
     if (previous.agents.includes(input.agent)) {

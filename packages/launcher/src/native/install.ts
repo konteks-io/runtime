@@ -104,6 +104,82 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
 }
 
 /**
+ * Prepare a machine for `konteks-remote onboard` (onboarding-simplified OS3).
+ *
+ * The activation install cannot serve the agent-first door: it consumes an
+ * activation that does not exist yet and prompts for a code at a terminal the
+ * person's coding agent does not have. This does everything that does not
+ * need an identity — verify the signed release against the embedded roots,
+ * stage it, install the agent bridges for the families this machine actually
+ * has — and stops. No runtime record is written, because there is no instance
+ * id to write; `onboard` binds and writes it.
+ *
+ * Agent families are detected rather than assumed (OS14). Someone who runs
+ * only Claude Code is not refused for not also having Codex.
+ */
+export async function prepareNativeEnrollment(options: {
+  root: string;
+  coreUrl: string;
+  relayUrl: string;
+  output: Output;
+  agents?: string[];
+  controlPort?: number;
+  deps?: NativeInstallOptions["deps"];
+}): Promise<{ agents: string[]; bundleVersion: string; releaseId: string }> {
+  const platform = options.deps?.platform ?? nativePlatform();
+  const roots = options.deps?.roots ?? EMBEDDED_RELEASE_ROOTS;
+  const root = resolve(options.root);
+  if (root === parse(root).root || root === resolve(homedir())) throw invalid();
+  await privateDirectory(root);
+  const installLockDir = join(root, "installer");
+  await privateDirectory(installLockDir);
+  const lock = acquireNativeRootLock(installLockDir);
+  try {
+    const detected: string[] = [];
+    if (options.agents && options.agents.length > 0) detected.push(...options.agents);
+    else {
+      if (await resolveNativeClaudeExecutable().then(() => true).catch(() => false)) detected.push("claude-code");
+      if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
+    }
+    if (detected.length === 0) {
+      throw new RemoteInstanceError("prerequisite_missing", "Konteks runs the coding agent you already have. Install Claude Code or Codex for this user, then run this again.");
+    }
+    const fetchFn = options.deps?.fetchFn ?? fetch;
+    const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
+    const release = verifyNativeRelease(payload, roots);
+    const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: detected });
+    if (artifacts.some(artifact => artifact.kind === "connector" ? artifact.format !== "executable" : artifact.format !== "offline_agent_tgz")) {
+      throw new RemoteInstanceError("bundle_untrusted", "Native agents require a complete signed offline package with official login tooling.");
+    }
+    for (const dir of ["releases", "credentials", "workspaces", "logs", "supervisor"]) await privateDirectory(join(root, dir));
+    const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: detected }, releasesDir: join(root, "releases"), fetchFn });
+    await privateDirectory(join(staged.directory, "agents"));
+    for (const agent of detected) {
+      const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
+      await installOfflineAgentPackage(staged.bridges[agent]!, join(staged.directory, "agents", agent), artifact);
+      await privateDirectory(join(root, "credentials", agent));
+      await privateDirectory(join(root, "workspaces", agent));
+    }
+    await writeSecretFile(join(staged.directory, "manifest.json"), JSON.stringify(release.manifest));
+    const releaseId = `release-${basename(staged.directory).replace(/^\.candidate-/, "")}`;
+    await rename(staged.directory, join(root, "releases", releaseId));
+    lock.assertOwned();
+    // The endpoints are remembered so `onboard` speaks to the same Core the
+    // person installed against, without asking them for a URL.
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1,
+      coreUrl: options.coreUrl,
+      relayUrl: options.relayUrl,
+      agents: detected,
+      releaseId,
+      bundleVersion: release.manifest.bundleVersion,
+      controlPort: options.controlPort ?? CONTROL_SOCKET_DEFAULT_PORT,
+    }));
+    return { agents: detected, bundleVersion: release.manifest.bundleVersion, releaseId };
+  } finally { lock.release(); }
+}
+
+/**
  * Add one agent to an existing identity without reactivation. A newer release
  * is fetched independently and verified by the executable's embedded roots;
  * the existing release is never edited. A complete successor is verified

@@ -4,7 +4,8 @@ import { createOutput, type Output } from "../output.js";
 
 export interface NativeCommandContext { root: string; output: Output }
 export interface NativeCliActions {
-  install(input: NativeCommandContext & { activationId: string; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
+  install(input: NativeCommandContext & { activationId?: string; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
+  onboard(input: NativeCommandContext & { answer?: string; cwd?: string }): Promise<void>;
   addAgent(input: NativeCommandContext & { agent: "claude-code" | "codex" | "opencode" | "pi" }): Promise<void>;
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
@@ -32,11 +33,23 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     return value as "claude-code" | "codex" | "opencode" | "pi";
   };
   program.command("install").description("activate, verify and install the native connector, then start its user service")
-    .requiredOption("--activation-id <id>", "non-secret activation id from App or MCP", id)
+    .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
+    // Agent-first onboarding (onboarding-simplified OS3): no activation, no
+    // prompt, no TTY. The install stops short of an identity; `onboard` binds.
+    .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://core.konteks.example")
     .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.example/relay/runtime")
     .option("--agents <ids>", "agent families (default: claude-code,codex)", value => value.split(",").map(part => agent(part.trim())))
-    .action(async (options: { activationId: string; coreUrl: string; relayUrl: string; agents?: string[] }) => actions.install({ ...context(), ...options }));
+    .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
+      if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");
+      if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
+      await actions.install({ ...context(), ...options });
+    });
+  // The conversation the person's own coding agent relays (OS2, OS16). One
+  // step per invocation; the agent runs what the step says and nothing else.
+  program.command("onboard").description("connect this machine to Konteks, one question at a time")
+    .option("--answer <text>", "the person's answer to the question the previous step asked")
+    .action(async (options: { answer?: string }) => actions.onboard({ ...context(), ...(options.answer !== undefined ? { answer: options.answer } : {}) }));
   program.command("serve").description("run the native connector in the foreground (used by the background service)").action(async () => actions.serve(context()));
   program.command("start").description("start the installed native user service").action(async () => actions.start(context()));
   program.command("stop").description("stop the native user service, preserving identity and local work").action(async () => actions.stop(context()));
