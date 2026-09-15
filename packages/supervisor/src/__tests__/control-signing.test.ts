@@ -1,19 +1,25 @@
 import { describe, expect, it } from "vitest";
 import { generateEd25519 } from "@konteks/remote-common";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
-// Workspace interoperability proof: actual Core producer, actual connector consumer.
-import { CoreControlSigningService } from "../../../../../core/plugins/remote-instance-backend/src/services/CoreControlSigningService";
+// Cross-repository interoperability proof: the actual Core producer beside the
+// actual connector consumer. It runs only next to a Core checkout; the public
+// repository ships without one, so the proof is skipped there, never faked.
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+const CORE_SIGNING_SERVICE = fileURLToPath(new URL("../../../../../core/plugins/remote-instance-backend/src/services/CoreControlSigningService.ts", import.meta.url));
+const coreSigning: { CoreControlSigningService: new (options: never) => { sign(payload: Record<string, unknown>): Promise<unknown> } } | null =
+  existsSync(CORE_SIGNING_SERVICE) ? await import(CORE_SIGNING_SERVICE) : null;
 
 const body = { type: "drain", instanceId: "instance", reason: "user", issuedAt: "2026-09-06T00:00:00Z" };
 function fixture(keyId = "control-1") {
   const key = generateEd25519();
   const descriptor = { keyId, publicKeyJwk: key.publicJwk };
   const stored = { keyId: descriptor.keyId, key: key.privateKey.export({ type: "pkcs8", format: "pem" }).toString() };
-  const signer = new CoreControlSigningService({ vault: { retrieveSecret: async () => ({ value: stored }) }, cluster: "local", key: descriptor });
+  const signer = new coreSigning!.CoreControlSigningService({ vault: { retrieveSecret: async () => ({ value: stored }) }, cluster: "local", key: descriptor } as never);
   const root = { keyId: "release", publicKeyJwk: generateEd25519().publicJwk, coreControlKeys: [descriptor] };
   return { signer, root, verifier: new CoreSignatureVerifier([root]) };
 }
-describe("Core/connector detached control signatures", () => {
+describe.skipIf(coreSigning === null)("Core/connector detached control signatures", () => {
   it("accepts real Core output and rejects body tampering, padded signatures and unknown commands", async () => {
     const f = fixture();
     const signature = await f.signer.sign(body);

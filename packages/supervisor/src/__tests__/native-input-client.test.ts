@@ -10,7 +10,14 @@ import {
   type RemoteWorkAssignment,
 } from "@konteks/remote-common";
 import { NativeInputClient } from "../native/input-client.js";
-import { CoreControlSigningService } from "../../../../../core/plugins/remote-instance-backend/src/services/CoreControlSigningService";
+// Cross-repository interoperability proof: the actual Core producer beside the
+// actual connector consumer. It runs only next to a Core checkout; the public
+// repository ships without one, so the proof is skipped there, never faked.
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+const CORE_SIGNING_SERVICE = fileURLToPath(new URL("../../../../../core/plugins/remote-instance-backend/src/services/CoreControlSigningService.ts", import.meta.url));
+const coreSigning: { CoreControlSigningService: new (options: never) => { sign(payload: Record<string, unknown>): Promise<unknown> } } | null =
+  existsSync(CORE_SIGNING_SERVICE) ? await import(CORE_SIGNING_SERVICE) : null;
 
 const now = Date.parse("2026-09-06T01:00:00Z");
 const binding = {
@@ -315,10 +322,10 @@ describe("native claim-scoped input client", () => {
     ).resolves.toMatchObject({ selection: { source: { revision: inputDigest } } });
   });
 
-  it("accepts an input envelope signed by the actual Core control producer", async () => {
+  it.skipIf(coreSigning === null)("accepts an input envelope signed by the actual Core control producer", async () => {
     const f = fixture();
     const key = { keyId: f.keys.keyId, publicKeyJwk: f.keys.root.publicKeyJwk };
-    const producer = new CoreControlSigningService({
+    const producer = new coreSigning!.CoreControlSigningService({
       cluster: "local-test",
       key,
       vault: {
