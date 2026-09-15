@@ -1,0 +1,106 @@
+import { basename, resolve } from "node:path";
+import { runCommand, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
+
+/**
+ * What the machine can see about the repository the person's agent is in
+ * (onboarding-simplified OS10).
+ *
+ * Deliberately shallow. It asks git four questions and looks at nothing else:
+ * no file bodies, no history, no scan of the tree. The first System is a
+ * proposal the person confirms, not a discovery run, so the only facts needed
+ * are what to call it and where, if anywhere, it already lives.
+ */
+
+export interface RepositoryFacts {
+  /** The repository root, or null when the directory is not a repository. */
+  path: string | null;
+  name: string;
+  remoteUrl: string | null;
+  /** Whether the machine's own git can actually reach that remote (OS11). */
+  remoteReachable: boolean;
+  currentBranch: string | null;
+  defaultBranch: string;
+}
+
+const env = () => sanitizeInheritedChildProcessEnv({ env: process.env });
+
+async function git(cwd: string, args: string[], timeoutMs = 10_000) {
+  return runCommand({ command: "git", args, cwd, env: env(), timeoutMs });
+}
+
+export async function inspectRepository(cwd: string): Promise<RepositoryFacts> {
+  const directory = resolve(cwd);
+  const top = await git(directory, ["rev-parse", "--show-toplevel"]).catch(() => null);
+  if (!top || top.code !== 0) {
+    return {
+      path: null,
+      name: basename(directory),
+      remoteUrl: null,
+      remoteReachable: false,
+      currentBranch: null,
+      defaultBranch: "main",
+    };
+  }
+  const path = top.stdout.trim();
+  const name = basename(path);
+
+  const remote = await git(path, ["remote", "get-url", "origin"]).catch(() => null);
+  const remoteUrl = remote && remote.code === 0 ? remote.stdout.trim() : null;
+
+  const branch = await git(path, ["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => null);
+  const currentBranch =
+    branch && branch.code === 0 && branch.stdout.trim() !== "HEAD" ? branch.stdout.trim() : null;
+
+  // Reachability is asked of git itself, with whatever credential this machine
+  // already has. A remote we cannot read is not a remote we can push to, and
+  // the person is offered managed git instead of a broken registration.
+  let remoteReachable = false;
+  if (remoteUrl) {
+    const probe = await git(path, ["ls-remote", "--exit-code", "--heads", remoteUrl], 20_000).catch(
+      () => null,
+    );
+    remoteReachable = probe !== null && probe.code === 0;
+  }
+
+  return {
+    path,
+    name,
+    remoteUrl,
+    remoteReachable,
+    currentBranch,
+    defaultBranch: currentBranch ?? "main",
+  };
+}
+
+/** Add the managed remote and push the current branch (OS11, R15). */
+export async function pushToManagedRemote(input: {
+  repositoryPath: string;
+  remoteUrl: string;
+  branch: string;
+}): Promise<{ pushed: boolean; message: string }> {
+  const existing = await git(input.repositoryPath, ["remote", "get-url", "konteks"]).catch(() => null);
+  if (!existing || existing.code !== 0) {
+    const added = await git(input.repositoryPath, ["remote", "add", "konteks", input.remoteUrl]);
+    if (added.code !== 0) {
+      return { pushed: false, message: "The konteks remote could not be added." };
+    }
+  } else if (existing.stdout.trim() !== input.remoteUrl) {
+    const updated = await git(input.repositoryPath, ["remote", "set-url", "konteks", input.remoteUrl]);
+    if (updated.code !== 0) {
+      return { pushed: false, message: "The konteks remote could not be repointed." };
+    }
+  }
+  // Only the branch the person is on (R15); the rest follow through ordinary
+  // git use, and pushing a whole history of branches is not what they agreed to.
+  const pushed = await git(
+    input.repositoryPath,
+    ["push", "--set-upstream", "konteks", input.branch],
+    120_000,
+  );
+  return pushed.code === 0
+    ? { pushed: true, message: `Pushed ${input.branch} to Konteks managed git.` }
+    : {
+        pushed: false,
+        message: `The push was refused. Run: git push --set-upstream konteks ${input.branch}`,
+      };
+}

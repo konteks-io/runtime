@@ -50,6 +50,7 @@ export * from "./runner-port.js";
 export * from "./native/runner.js";
 export * from "./native/inventory.js";
 export * from "./native/activation.js";
+export * from "./native/enrollment.js";
 export * from "./native/installation.js";
 export * from "./native/codex-home.js";
 export * from "./native/codex-app-server-owner.js";
