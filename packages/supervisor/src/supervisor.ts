@@ -87,6 +87,7 @@ import { PlanningTerminalDirectiveProcessor } from "./work/planning-terminal-dir
 import { ControllerDirectivePoller } from "./work/controller-directive-poller.js";
 import { DurableSearchAssignmentCarrier } from "./work/search-assignment-carrier.js";
 import { NativeUpdateCoordinator, type NativeUpdateCoordinatorOptions } from "./native/update.js";
+import { evaluateHeartbeatLiveness } from "./heartbeat/liveness.js";
 
 /**
  * The composition root: wires state, transport, heartbeat, control, work,
@@ -97,8 +98,14 @@ const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "prev
 /** bb releases sessions idle for 30 minutes, checked every 5 minutes. */
 const IDLE_SESSION_RELEASE_MS = 30 * 60_000;
 const IDLE_SESSION_SWEEP_MS = 5 * 60_000;
+const LIVENESS_CHECK_MS = 30_000;
+const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
 
 export interface SupervisorOptions {
+  /** Native only: called once when no heartbeat has been attempted for longer
+   * than the publisher's budget. The service wires it to a non-zero shutdown so
+   * the service manager replaces a silent process. */
+  onLivenessLost?: (detail: Record<string, unknown>) => void;
   native?: {
     /** Public trust provided by the verified native executable, never by writable install metadata. */
     trustedRoots: readonly EmbeddedReleaseRoot[];
@@ -200,6 +207,9 @@ export class Supervisor {
   private ordinaryHeartbeatStarted = false;
   private activeLoopStarting: Promise<void> | null = null;
   private recoveryRetryTimer: NodeJS.Timeout | null = null;
+  private livenessTimer: NodeJS.Timeout | null = null;
+  private livenessWatchingSince: number | null = null;
+  private livenessQuietWarned = false;
   private pendingHeartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeLogins = new Map<string, { agentId: string; emit: (event: ControlLoginEvent) => void }>();
 
@@ -930,6 +940,7 @@ export class Supervisor {
   private startActiveLoop(): Promise<void> {
     if (this.stopping || this.activeLoopStarted) return Promise.resolve();
     if (this.activeLoopStarting) return this.activeLoopStarting;
+    this.startLivenessWatchdog();
     if (this.recoveryRetryTimer) clearTimeout(this.recoveryRetryTimer);
     this.recoveryRetryTimer = null;
     const operation = this.startActiveLoopImpl().catch(error => {
@@ -944,6 +955,35 @@ export class Supervisor {
     }).finally(() => { this.activeLoopStarting = null; });
     this.activeLoopStarting = operation;
     return operation;
+  }
+
+  /** From the first recovery cycle on, some heartbeat (pending or ordinary) is
+   * always due. When none has even been attempted for longer than the
+   * publisher's budget, every loop is stuck behind one promise; say so with
+   * the gates that are pending, then hand the process to its service manager. */
+  private startLivenessWatchdog(): void {
+    if (!this.native || this.livenessTimer) return;
+    this.livenessWatchingSince = Date.now();
+    this.livenessTimer = setInterval(() => {
+      if (this.stopping || !this.livenessTimer) return;
+      const budgetMs = Math.max(LIVENESS_MIN_BUDGET_MS, this.heartbeat.livenessBudgetMs());
+      const liveness = this.heartbeat.liveness();
+      const verdict = evaluateHeartbeatLiveness({ now: Date.now(), watchingSince: this.livenessWatchingSince ?? Date.now(), liveness, budgetMs });
+      if (verdict.state === "live") { this.livenessQuietWarned = false; return; }
+      const detail = { ...verdict, budgetMs, heartbeat: liveness, activeLoopStarted: this.activeLoopStarted, activeLoopStarting: this.activeLoopStarting !== null,
+        recoveryRetryArmed: this.recoveryRetryTimer !== null, leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus,
+        activeResources: process.getActiveResourcesInfo().slice(0, 32) };
+      if (verdict.state === "quiet") {
+        if (!this.livenessQuietWarned) this.logger.warn(detail, "no heartbeat attempted for a while; the supervisor may be stuck");
+        this.livenessQuietWarned = true;
+        return;
+      }
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = null;
+      this.logger.error(detail, "supervisor liveness lost: no heartbeat attempted within the budget; asking the service to restart");
+      this.options.onLivenessLost?.(detail);
+    }, LIVENESS_CHECK_MS);
+    this.livenessTimer.unref();
   }
 
   private async startActiveLoopImpl(): Promise<void> {
@@ -1589,6 +1629,8 @@ export class Supervisor {
     await this.activeLoopStarting;
     if (this.pullTimer) clearInterval(this.pullTimer);
     if (this.reaperTimer) clearInterval(this.reaperTimer);
+    if (this.livenessTimer) clearInterval(this.livenessTimer);
+    this.livenessTimer = null;
     this.updates?.stop();
     if (this.muxTimer) clearInterval(this.muxTimer);
     if (this.cancellationTimer) clearInterval(this.cancellationTimer);

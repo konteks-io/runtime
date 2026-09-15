@@ -10,6 +10,12 @@ interface SignalSource {
   off(event: NodeJS.Signals, listener: () => void): void;
 }
 
+type ProcessFailureEvent = "uncaughtException" | "unhandledRejection";
+interface ProcessFailureSource {
+  on(event: ProcessFailureEvent, listener: (error: unknown) => void): void;
+  off(event: ProcessFailureEvent, listener: (error: unknown) => void): void;
+}
+
 export interface DaemonStep {
   name: string;
   run: () => Promise<void>;
@@ -20,6 +26,8 @@ export interface CreateDaemonOptions {
   onStart: () => Promise<void>;
   shutdownSteps: () => DaemonStep[];
   signalSource?: SignalSource;
+  /** Where uncaught exceptions and unhandled rejections arrive; defaults to the process. */
+  failureSource?: ProcessFailureSource;
   exitProcess?: (code: number) => void;
   shutdownExitGraceMs?: number;
   logger?: Logger;
@@ -32,12 +40,15 @@ export interface Daemon {
 }
 
 const TERMINATION_SIGNALS: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
+const PROCESS_FAILURE_EVENTS: ProcessFailureEvent[] = ["uncaughtException", "unhandledRejection"];
 const DEFAULT_SHUTDOWN_EXIT_GRACE_MS = 15_000;
 
 export function createDaemon(options: CreateDaemonOptions): Daemon {
   const logger = options.logger ?? createLogger({ name: options.name });
   const signalSource = options.signalSource ?? process;
+  const failureSource: ProcessFailureSource = options.failureSource ?? process;
   const listeners = new Map<NodeJS.Signals, () => void>();
+  const failureListeners = new Map<ProcessFailureEvent, (error: unknown) => void>();
   let stopPromise: Promise<void> | null = null;
   let stopFailure: Error | null = null;
   let startupFailed = false;
@@ -53,6 +64,8 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
   function unregister(): void {
     for (const [signal, listener] of listeners) signalSource.off(signal, listener);
     listeners.clear();
+    for (const [event, listener] of failureListeners) failureSource.off(event, listener);
+    failureListeners.clear();
   }
 
   async function stop(reason: string, exitCode: 0 | 1): Promise<void> {
@@ -107,6 +120,18 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
         };
         listeners.set(signal, listener);
         signalSource.on(signal, listener);
+      }
+      // Without these, an uncaught throw ends the process with only Node's
+      // stderr trace, and an unhandled rejection can leave a loop dead while
+      // the process lives on. Log both in the daemon's own log and shut down
+      // non-zero so the service manager restarts a known-bad process.
+      for (const event of PROCESS_FAILURE_EVENTS) {
+        const listener = (error: unknown): void => {
+          logger.error({ err: normalizeCaughtError(error), event }, "process-level failure; shutting down");
+          void stop(event, 1).catch(() => undefined);
+        };
+        failureListeners.set(event, listener);
+        failureSource.on(event, listener);
       }
       startPromise = (async () => {
         try {

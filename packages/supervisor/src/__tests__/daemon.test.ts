@@ -74,4 +74,18 @@ describe("bb-derived native daemon lifecycle", () => {
     await daemon.shutdown('repeat', 0);
     expect(release).toHaveBeenCalledTimes(1);
   });
+  it("logs a process-level failure and shuts down non-zero instead of dying silently", async () => {
+    const failureSource = new EventEmitter();
+    const exitProcess = vi.fn();
+    const steps: string[] = [];
+    const daemon = createDaemon({ name: 'test', onStart: async () => undefined, signalSource: new EventEmitter(), failureSource, exitProcess,
+      shutdownSteps: () => [{ name: 'release', run: async () => { steps.push('released'); } }] });
+    await daemon.start();
+    failureSource.emit('unhandledRejection', new Error('loop died'));
+    await daemon.waitUntilStopped();
+    expect(steps).toEqual(['released']);
+    expect(exitProcess).toHaveBeenCalledWith(1);
+    expect(failureSource.listenerCount('unhandledRejection')).toBe(0);
+    expect(failureSource.listenerCount('uncaughtException')).toBe(0);
+  });
 });

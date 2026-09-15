@@ -97,4 +97,21 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     // Let the filesystem work from the fired heartbeat settle before teardown.
     vi.useRealTimers(); await f.publisher.settle(); expect(f.heartbeat).not.toHaveBeenCalled();
   });
+  it("abandons a flight that never settles so shutdown and recovery are not held hostage", async () => {
+    const f = await fixture();
+    const publisher = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process", settleDeadlineMs: 40,
+      core: { heartbeat: () => new Promise<never>(() => undefined) } } as HeartbeatOptions);
+    publishers.push(publisher);
+    await publisher.start();
+    const failure = await publisher.publish().catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "temporarily_unavailable", retryable: true });
+    expect(String((failure as Error).message)).toMatch(/did not settle .*stage request/u);
+    const liveness = publisher.liveness();
+    expect(liveness.inFlightSince).toBeNull();
+    expect(liveness.lastAttemptAt).not.toBeNull();
+    expect(liveness.lastSettledAt).not.toBeNull();
+    // the abandoned flight no longer blocks settle()
+    publisher.stop();
+    await expect(publisher.settle()).resolves.toBeUndefined();
+  });
 });

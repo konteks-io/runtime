@@ -35,7 +35,22 @@ export interface HeartbeatOptions {
   intervalSeconds: () => number;
   renewalDelayMs: () => number;
   logger?: Logger;
+  /** Test override for the flight deadline; production derives it from the interval. */
+  settleDeadlineMs?: number;
 }
+
+export type HeartbeatStage = "collect" | "sequence" | "request" | "adopt";
+export interface HeartbeatLiveness {
+  running: boolean;
+  pendingFlight: boolean;
+  stage: HeartbeatStage | null;
+  inFlightSince: number | null;
+  lastAttemptAt: number | null;
+  lastSettledAt: number | null;
+}
+
+const MIN_SETTLE_DEADLINE_MS = 60_000;
+const MAX_SETTLE_DEADLINE_MS = 10 * 60_000;
 
 export class HeartbeatPublisher {
   private timer: NodeJS.Timeout | null = null;
@@ -46,6 +61,10 @@ export class HeartbeatPublisher {
   private started: Promise<void> | null = null;
   private inFlight: Promise<HeartbeatMessage> | null = null;
   private pendingFlight = false;
+  private stage: HeartbeatStage | null = null;
+  private inFlightSince: number | null = null;
+  private lastAttemptAt: number | null = null;
+  private lastSettledAt: number | null = null;
 
   constructor(private readonly options: HeartbeatOptions) {
     this.logger = options.logger ?? createLogger({ name: "heartbeat" });
@@ -80,6 +99,22 @@ export class HeartbeatPublisher {
 
   roles(): string[] {
     return [...this.lastRoles];
+  }
+
+  /** What a watchdog needs to tell a quiet publisher from a stuck one. */
+  liveness(): HeartbeatLiveness {
+    return { running: this.running, pendingFlight: this.pendingFlight, stage: this.stage, inFlightSince: this.inFlightSince,
+      lastAttemptAt: this.lastAttemptAt, lastSettledAt: this.lastSettledAt };
+  }
+
+  /** How long a healthy publisher can go without a new attempt: a few
+   * intervals plus one abandoned flight. */
+  livenessBudgetMs(): number {
+    return 4 * Math.max(1000, this.options.intervalSeconds() * 1000) + this.settleDeadlineMs();
+  }
+
+  private settleDeadlineMs(): number {
+    return this.options.settleDeadlineMs ?? Math.min(MAX_SETTLE_DEADLINE_MS, Math.max(MIN_SETTLE_DEADLINE_MS, 2 * this.options.intervalSeconds() * 1000));
   }
 
   private schedule(): void {
@@ -118,19 +153,45 @@ export class HeartbeatPublisher {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.pendingFlight = pending;
+    const startedAt = Date.now();
+    this.inFlightSince = startedAt;
+    this.lastAttemptAt = startedAt;
+    this.stage = null;
     const acquire = this.options.withLeaseAcquisition ?? (operation => operation());
-    this.inFlight = acquire(async () => {
+    const flight = acquire(async () => {
       try { return await this.publishImpl(pending); }
       catch (error) {
         if (!this.stopped && (pending || this.running)) await this.options.onFailure(error);
         throw error;
       }
-    }).finally(() => {
+    });
+    flight.catch(() => undefined);
+    // A flight that never settled once held the recovery cycle, shutdown and
+    // the lease lane hostage: the process stayed alive with no timers and no
+    // log line for an hour. The flight now loses to a deadline that names the
+    // stage it was in; the caller sees a retryable failure and the abandoned
+    // flight can no longer block anyone.
+    const deadlineMs = this.settleDeadlineMs();
+    let deadlineTimer: NodeJS.Timeout | null = null;
+    const deadline = new Promise<never>((_, reject) => {
+      deadlineTimer = setTimeout(() => {
+        this.logger.error({ pending, stage: this.stage ?? "lease", deadlineMs, elapsedMs: Date.now() - startedAt }, "heartbeat did not settle within its deadline; abandoning it");
+        reject(new RemoteInstanceError("temporarily_unavailable", `Heartbeat did not settle within ${deadlineMs} ms (stage ${this.stage ?? "lease"}).`, { retryable: true }));
+      }, deadlineMs);
+      deadlineTimer.unref();
+    });
+    const settled: Promise<HeartbeatMessage> = Promise.race([flight, deadline]).finally(() => {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      if (this.inFlight !== settled) return;
       this.inFlight = null;
       this.pendingFlight = false;
+      this.stage = null;
+      this.inFlightSince = null;
+      this.lastSettledAt = Date.now();
       if (!pending) this.schedule();
     });
-    return this.inFlight;
+    this.inFlight = settled;
+    return settled;
   }
 
   private async publishImpl(pending: boolean): Promise<HeartbeatMessage> {
@@ -143,6 +204,7 @@ export class HeartbeatPublisher {
       if (this.options.instanceId() !== instanceId || this.options.runnerIncarnation() !== runnerIncarnation) throw new RemoteInstanceError("recovery_required", "Heartbeat process identity changed.");
     };
     assertCurrent();
+    this.stage = "collect";
     const snapshot = await this.options.inventory.collect();
     assertCurrent();
     this.options.onInventory?.(snapshot.agents);
@@ -156,6 +218,7 @@ export class HeartbeatPublisher {
       ...(this.options.softMaxConcurrent() === undefined ? {} : { softMaxConcurrent: this.options.softMaxConcurrent() as number }),
       acceptingWork: !pending && this.options.acceptingWork() && requiredHealthy,
     });
+    this.stage = "sequence";
     const sequence = await this.options.store.allocateHeartbeatSequence();
     assertCurrent();
     const message: HeartbeatMessage = HeartbeatMessageSchema.parse({
@@ -182,11 +245,13 @@ export class HeartbeatPublisher {
       { method: "heartbeat", audience: REMOTE_INSTANCE_PROOF_AUDIENCE, subject: message.instanceId, body: message as unknown as { [key: string]: JsonValue } },
       `seq:${message.sequence}`,
     );
+    this.stage = "request";
     const result = await this.options.core.heartbeat({ ...message, signature });
     // Preserve ordinary shutdown's no-adoption behavior; a pending refresh must
     // reject rather than let its caller infer that recovery connectivity is ready.
     if (!pending && !this.running) return message;
     assertCurrent();
+    this.stage = "adopt";
     await this.options.onResult(result, assertCurrent);
     assertCurrent();
     return message;
