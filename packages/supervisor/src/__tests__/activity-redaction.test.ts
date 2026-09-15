@@ -60,6 +60,42 @@ describe("streamed activity redaction", () => {
     });
   });
 
+  it("promotes a Claude platform MCP tool label to the federated tool name", () => {
+    const canonical = canonicalizeAcpToolActivity({
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-ideation",
+      title: "mcp__konteks-1788413200202-4qlo2i__platform__builtin__ideation_system",
+      kind: "other",
+      status: "pending",
+      rawInput: { intent: "add todos" },
+    }, "claude-code");
+
+    expect(redactActivity(canonical, "/Users/me/work")).toEqual({
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-ideation",
+      title: "mcp__konteks-1788413200202-4qlo2i__platform__builtin__ideation_system",
+      name: "platform__builtin__ideation_system",
+      kind: "other",
+      status: "pending",
+    });
+    // A later update of the same call keeps the promoted identity.
+    expect(canonicalizeAcpToolActivity({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tool-ideation",
+      status: "completed",
+    }, "claude-code", { name: "platform__builtin__ideation_system", kind: "other" })).toMatchObject({
+      name: "platform__builtin__ideation_system",
+    });
+    // Anything outside the platform namespace stays an anonymous tool.
+    expect(canonicalizeAcpToolActivity({
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-other",
+      title: "mcp__some-server__delete_everything",
+      kind: "other",
+      status: "pending",
+    }, "claude-code")).not.toHaveProperty("name");
+  });
+
   it("does not mistake a catalog ref split at a chunk boundary for a local path", () => {
     const ref = '"component:default/konteks-component-system-595ee944" "vcsrepository:default/konteks-toopay-orders-api"';
     expect(redactStream(['"component:default', '/konteks-component-system-595ee944" "vcsrepository:defaul', 't/konteks-toopay-orders-api"'])).toBe(ref);

@@ -5,6 +5,14 @@ const ACP_TOOL_KINDS = new Set([
   "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "switch_mode", "other",
 ]);
 
+const PLATFORM_MCP_TOOL_NAME = /^mcp__[A-Za-z0-9_-]+?__(platform__[A-Za-z0-9_-]+)$/;
+
+/** The federated `platform__*` tool name behind a Claude `mcp__<server>__<tool>` label, if that is what it is. */
+export function platformMcpToolName(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return PLATFORM_MCP_TOOL_NAME.exec(value.trim())?.[1];
+}
+
 export interface CanonicalAcpToolIdentity {
   name?: string;
   kind?: string;
@@ -51,7 +59,15 @@ export function canonicalizeAcpToolActivity(
   const knownPublicName = currentName === "ToolSearch" || currentTitle === "ToolSearch"
     ? "ToolSearch"
     : undefined;
-  const identityName = metaName ?? prior?.name ?? knownPublicName;
+  // Claude names every MCP tool `mcp__<server>__<tool>` and the bridge echoes
+  // that name as the call's title with the generic `other` kind. For the
+  // platform facade the tool half is the federated `platform__*` name Core
+  // and the Assistant already key their policy, projection, and handoff
+  // watches on; without it the call reads as an anonymous "other" tool and
+  // the terminal ideation hand-off is never recognized. Only that closed
+  // namespace is promoted — an arbitrary title still never becomes a name.
+  const platformToolName = platformMcpToolName(currentName) ?? platformMcpToolName(currentTitle);
+  const identityName = metaName ?? prior?.name ?? knownPublicName ?? platformToolName;
   if (identityName === undefined && prior === undefined) return value;
   // Claude currently emits ToolSearch as ACP `other`; that one closed quirk is
   // normalized here. Other tools keep their protocol kind, including Agent.
