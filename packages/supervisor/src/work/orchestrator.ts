@@ -30,7 +30,7 @@ import {
 } from "@konteks/remote-common";
 import type { RunnerEvent } from "@konteks/remote-agent-runner";
 import type { LeaseState } from "../lease/lease.js";
-import { placedAgentReady, type RoleBinding } from "../inventory/roles.js";
+import { placedAgentReady, type RoleBinding, type RoleCapabilityInputs } from "../inventory/roles.js";
 import type { SupervisorJournal, JournalEntry } from "../state/journal.js";
 import type { LocalAdmission } from "../state/local-admission.js";
 import type { RetainedProcessOwner } from "@konteks/remote-common";
@@ -46,6 +46,7 @@ import { ReportSender } from "./report-sender.js";
 import type { AssignmentSender } from "./assignment-sender.js";
 import { coreChannelId } from "../relay/channel-ids.js";
 import { isSearchAssignment, type SearchControllerBoundary } from "./search-assignment-carrier.js";
+import { isOnboardWorkAssignment, onboardTerminalResult, type OnboardWorkAssignment, type OnboardWorkCarrier } from "../onboard/carrier.js";
 
 /**
  * Pull → claim → dispatch → report. Core owns admission and placement; the
@@ -86,6 +87,12 @@ export interface OrchestratorDeps {
   roleBindings: () => RoleBinding[];
   advertisedRoles: () => string[];
   browserToolAvailable: () => boolean;
+  /**
+   * Non-agent facts a role depends on (the browser tool, the machine's git).
+   * Optional: omitted, only the browser-tool fact is known, so a role that
+   * needs anything else is refused rather than claimed.
+   */
+  roleCapabilityInputs?: () => RoleCapabilityInputs;
   acceptedKinds: () => RemoteWorkKind[];
   instanceEvidencePolicy: () => "structured_only" | "selected_artifacts";
   draining: () => boolean;
@@ -118,6 +125,8 @@ export interface OrchestratorDeps {
   gatewayBind: (agentId: string, assignment: RemoteWorkAssignment) => Promise<void>;
   gatewayRelease: (agentId: string) => Promise<void>;
   searchController?: SearchControllerBoundary;
+  /** Present on a runtime tagged `onboard`; absent, both kinds are refused. */
+  onboardCarrier?: Pick<OnboardWorkCarrier, "execute">;
   logger?: Logger;
 }
 
@@ -229,6 +238,10 @@ export class WorkOrchestrator {
     const gate = this.canPull();
     if (gate !== null) return gate;
     if (isSearchAssignment(assignment) && !this.deps.searchController) return "unknown_kind";
+    // A runtime without the onboard lane composed cannot serve either onboard
+    // work kind, whatever Core placed. Refusing here is the same answer as
+    // never having advertised the role.
+    if (isOnboardWorkAssignment(assignment) && !this.deps.onboardCarrier) return "unknown_kind";
     if (this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) return "stale_attempt";
     if (this.deps.journal.execution.isCancelled(assignment.id, assignment.attempt)) return "stale_attempt";
     if (!this.deps.acceptedKinds().includes(assignment.kind)) return "unknown_kind";
@@ -240,8 +253,12 @@ export class WorkOrchestrator {
     if (parseRfc3339(assignment.expiresAt) <= this.deps.clock.coreNow()) return "expired";
     if (assignment.source.kind === "harness_task_checkout" && assignment.source.ownerInstanceId !== this.deps.instanceId()) return "checkout_owned_elsewhere";
     if (!this.deps.advertisedRoles().includes(assignment.agentRoute.requiredRole)) return "role_not_advertised";
-    if (!placedAgentReady(this.deps.agents(), assignment.agentRoute.agentId, assignment.agentRoute.requiredRole, { browserToolAvailable: this.deps.browserToolAvailable() })) return "agent_unavailable";
+    if (!placedAgentReady(this.deps.agents(), assignment.agentRoute.agentId, assignment.agentRoute.requiredRole, this.roleCapabilityInputs())) return "agent_unavailable";
     return null;
+  }
+
+  private roleCapabilityInputs(): RoleCapabilityInputs {
+    return this.deps.roleCapabilityInputs?.() ?? { browserToolAvailable: this.deps.browserToolAvailable() };
   }
 
   /** Inbound `assignment` channel bodies: work available, claim results, report acks, cancel directives. */
@@ -559,6 +576,14 @@ export class WorkOrchestrator {
       : componentForKind(assignment.kind);
     try {
       assertAuthority();
+      if (this.deps.onboardCarrier && isOnboardWorkAssignment(assignment)) {
+        // Evidence collection and the relocation mirror are deterministic local
+        // git work with no model in the loop, so they never open an ACP session
+        // and never bind the gateway. An onboarding SESSION turn carries the
+        // `conversation` source and does not land here (OB6 §2, §3).
+        await this.runOnboardWork(assignment, entry, assertAuthority);
+        return;
+      }
       if (this.deps.deploymentKind === "native_connector" || target === "agent_runner") {
         await this.startRelayedSession(assignment, entry, assertAuthority);
       } else {
@@ -607,6 +632,25 @@ export class WorkOrchestrator {
       ? { class: "interrupted" as const, reason: error.diagnostic === "agent_session_lost" ? "agent_session_lost" as const : "not_resumable" as const }
       : { class: "failed" as const, reason: error instanceof RemoteInstanceError && error.code === "agent_auth_required" ? "agent_auth_required" as const : "internal" as const };
     await this.reports.submit({ assignmentId: assignment.id, attempt: assignment.attempt, claimId: entry.claimId, draft: { terminal: true, result: { ...outcome, terminalResultHash: jcsDigest(outcome) } } });
+  }
+
+  /**
+   * Run an onboard assignment to a terminal report on this machine. The report
+   * is the whole outcome: there is no session to keep open afterwards, and a
+   * refusal the worker turned into an evidence gap is a SUCCESSFUL collection
+   * that found a gap, not a failed assignment.
+   */
+  private async runOnboardWork(assignment: OnboardWorkAssignment, entry: JournalEntry, assertAuthority: () => void): Promise<void> {
+    await this.deps.journal.assignments.put({ ...entry, state: "running", updatedAt: this.deps.clock.nowIso() });
+    assertAuthority();
+    const outcome = await this.deps.onboardCarrier!.execute(assignment, assertAuthority);
+    assertAuthority();
+    await this.reports.submit({
+      assignmentId: assignment.id,
+      attempt: assignment.attempt,
+      claimId: entry.claimId,
+      draft: { terminal: true, result: onboardTerminalResult(outcome) },
+    });
   }
 
   /**

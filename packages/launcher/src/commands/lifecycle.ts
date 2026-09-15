@@ -130,6 +130,42 @@ export async function authLogout(context: ControlContext, agentId: string): Prom
   context.output.line(`logged out ${agentId}; readiness ${String(value.readiness)}`);
 }
 
+/**
+ * `git key add [--title]` (ON16, OB6 §4): the runtime generates (or reuses) an
+ * ed25519 key, registers its PUBLIC half through Core, and writes an SSH config
+ * stanza for the managed host. The private half never leaves the machine, which
+ * is why this is a launcher command on the trusted machine and not a field in
+ * the App.
+ */
+export async function gitKeyAdd(context: ControlContext, title?: string): Promise<void> {
+  const value = await context.control.call(
+    { op: "git.key.add", ...(title ? { title } : {}) },
+    z.object({ keyRef: z.string(), title: z.string(), fingerprint: z.string(), host: z.string(), sshConfig: z.string() }).strict(),
+  );
+  context.output.result(value);
+  context.output.line(`registered ${value.fingerprint} as "${value.title}" for ${value.host}`);
+  context.output.line("the private key stays on this machine and is never shown, uploaded or backed up");
+  context.output.line(`to clone managed repositories by hand with the same key, add this line to ~/.ssh/config:\n  Include ${value.sshConfig}`);
+}
+
+export async function gitKeyList(context: ControlContext): Promise<void> {
+  const value = await context.control.call(
+    { op: "git.key.list" },
+    z.object({ keys: z.array(z.object({ keyRef: z.string(), title: z.string(), fingerprint: z.string(), createdAt: z.string(), revokedAt: z.string().optional() }).strict()) }).strict(),
+  );
+  context.output.result(value);
+  if (value.keys.length === 0) {
+    context.output.line("no managed git key is registered for this runtime; run `konteks-remote git key add`");
+    return;
+  }
+  for (const key of value.keys) context.output.line(`${key.keyRef}: ${key.fingerprint} "${key.title}" (added ${key.createdAt})${key.revokedAt ? ` — revoked ${key.revokedAt}` : ""}`);
+}
+
+export async function gitKeyRemove(context: ControlContext, keyRef: string): Promise<void> {
+  await context.control.call({ op: "git.key.remove", keyRef }, z.unknown());
+  context.output.line(`revoked ${keyRef}; managed repositories no longer accept this runtime's key. Removing the runtime revokes it too.`);
+}
+
 export async function gatewayKeySet(context: LifecycleContext, agentId: string): Promise<void> {
   const secret = context.promptSecret ?? ((label: string) => promptSecret({ label, minLength: 8, ...(context.input ? { input: context.input } : {}) }));
   const key = await secret(`Provider API key for ${agentId}`);

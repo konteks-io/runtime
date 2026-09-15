@@ -10,7 +10,7 @@ export interface NativeCliActions {
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
-  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "auth.status" | "auth.login" | "auth.logout"; agent?: string; organization?: boolean }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; title?: string; keyRef?: string }): Promise<void>;
 }
 
 /** One customer architecture. No appliance, provider-key or cloud-agent fallback switch. */
@@ -54,7 +54,17 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--check", "report the available release without installing anything", false)
     .option("--unattended", "launched by the connector itself; recorded as such in the update ledger", false)
     .action(async (options: { check: boolean; unattended: boolean }) => actions.update({ ...context(), ...options }));
-  // Rollback/uninstall must acquire the native lifecycle transaction; the old
-  // appliance implementations are deliberately not registered here.
+  // ON16: managed-git key registration is a command on the trusted machine,
+  // because the private half must never leave it. The App shows this command.
+  const git = program.command("git").description("managed Konteks git access for this runtime");
+  const key = git.command("key").description("the SSH key this runtime uses for managed repositories");
+  key.command("add").description("generate or reuse this runtime's key and register its public half")
+    .option("--title <title>", "how the key is labelled in Konteks")
+    .action(async (options: { title?: string }) => actions.control({ ...context(), operation: "git.key.add", ...(options.title ? { title: options.title } : {}) }));
+  key.command("list").description("keys registered for this runtime").action(async () => actions.control({ ...context(), operation: "git.key.list" }));
+  key.command("remove").description("revoke one registered key").argument("<keyRef>", "key reference from `git key list`")
+    .action(async (keyRef: string) => actions.control({ ...context(), operation: "git.key.remove", keyRef }));
+  // Update/rollback/uninstall must acquire the native lifecycle transaction;
+  // the old appliance implementations are deliberately not registered here.
   return program;
 }

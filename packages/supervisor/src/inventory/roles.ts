@@ -14,9 +14,16 @@ export interface RoleBinding {
 
 export interface RoleCapabilityInputs {
   browserToolAvailable: boolean;
+  /**
+   * The git version this machine reports, or `null` when git is not on PATH.
+   * The `onboard` role reads repositories and moves bytes with the machine's
+   * own git (onboarding-mode OB6 §1), so without it the runtime advertises
+   * neither onboard capability and Core reports it ineligible for both kinds.
+   */
+  gitVersion?: string | null;
 }
 
-export function agentSatisfiesRole(agent: ConnectedAgentView, role: RuntimeRole, _inputs: RoleCapabilityInputs): boolean {
+export function agentSatisfiesRole(agent: ConnectedAgentView, role: RuntimeRole, inputs: RoleCapabilityInputs): boolean {
   if (agent.readiness !== "ready" || agent.connectionState !== "ready") return false;
   switch (role) {
     case "planner":
@@ -33,7 +40,26 @@ export function agentSatisfiesRole(agent: ConnectedAgentView, role: RuntimeRole,
     case "ops":
       // The shared vocabulary is not proof of an installed operations carrier.
       return false;
+    case "onboard":
+      // Evidence collection and relocation are git work. A ready agent alone
+      // is not enough, and an absent probe is not a licence to claim it.
+      return typeof inputs.gitVersion === "string" && inputs.gitVersion.length > 0;
   }
+}
+
+/**
+ * What an `onboard` runtime advertises when git is present (OB6 §1). Both
+ * capabilities go together: one machine's git either reads repositories and
+ * pushes mirrors or it does neither, and Core places both work kinds on the
+ * same role. The git version rides along as its own advertised string so an
+ * eligibility refusal can say what was actually found.
+ */
+export const ONBOARD_EVIDENCE_CAPABILITY = "onboard.evidence";
+export const ONBOARD_RELOCATION_CAPABILITY = "onboard.relocation";
+
+export function onboardCapabilities(gitVersion: string | null | undefined): string[] {
+  if (typeof gitVersion !== "string" || gitVersion.length === 0) return [];
+  return [ONBOARD_EVIDENCE_CAPABILITY, ONBOARD_RELOCATION_CAPABILITY, `git:${gitVersion}`];
 }
 
 export function deriveAdvertisedRoles(bindings: readonly RoleBinding[], agents: readonly ConnectedAgentView[], inputs: RoleCapabilityInputs): RuntimeRole[] {

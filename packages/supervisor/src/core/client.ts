@@ -128,6 +128,14 @@ export const CORE_PATHS = Object.freeze({
   observations: (instanceId: string) => instancePath(instanceId, "observations"),
   permissionsDeferred: (instanceId: string) => instancePath(instanceId, "permissions/deferred"),
   capabilityTokenRedeem: (instanceId: string) => instancePath(instanceId, "capability-tokens/redeem"),
+  // CONTRACT-GAP: OB6 §4 names the App BFF route
+  // `POST /api/app/remote-instances/:id/git-keys`, but a runtime holds a lease,
+  // not a person's session, and cannot authenticate against an App route. The
+  // registration therefore sits on the supervisor-private table beside every
+  // other route the runtime calls; Core forwards it to managed-git with the
+  // instance id exactly as the contract describes.
+  gitKeys: (instanceId: string) => instancePath(instanceId, "git-keys"),
+  gitKey: (instanceId: string, keyRef: string) => instancePath(instanceId, `git-keys/${encodeURIComponent(keyRef)}`),
   // CONTRACT-GAP: `RemoteWorkAssignment` carries no delivery/validation/qa
   // definition, so the supervisor reads it for a CLAIMED assignment from
   // this lease-guarded route (added to Core with this seam) and serves it to
@@ -179,9 +187,37 @@ export interface CapabilityTokenIssue {
   mcpServer: { name: string; url: string; headers: Array<{ name: string; value: string }> };
   expiresAt: string;
 }
-const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "preview", "qa", "assistant_execution"]), workload: BoundedJsonValueSchema }).strict();
+const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "preview", "qa", "assistant_execution", "onboarding", "repository_relocation"]), workload: BoundedJsonValueSchema }).strict();
 export type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
 const TaskCheckoutMaterializedResultSchema = z.object({ workspaceRef: z.string().min(1) }).strict();
+
+/**
+ * Managed-git key registration (ON16). Core answers with the reference it
+ * minted, the fingerprint managed-git stored, and the SSH host this key opens —
+ * the runtime cannot know the managed host on its own, and guessing one would
+ * make the machine offer its key to whatever answered.
+ *
+ * CONTRACT-GAP: `ManagedGitKeyRegisterRequest` (OB1 §6) also carries
+ * `userEntityRef`. A runtime does not know which person it belongs to; Core
+ * derives it from the instance, which is also what binds the key to this
+ * runtime so removing the runtime revokes exactly this key.
+ */
+const GitKeyRegisterResultSchema = z.object({
+  keyRef: z.string().min(1).max(200),
+  fingerprint: z.string().min(1).max(256),
+  host: z.string().min(1).max(255),
+  user: z.string().min(1).max(64).optional(),
+  createdAt: z.string().min(1).max(64),
+}).strict();
+const GitKeyListResultSchema = z.object({
+  keys: z.array(z.object({
+    keyRef: z.string().min(1).max(200),
+    title: z.string().min(1).max(256),
+    fingerprint: z.string().min(1).max(256),
+    createdAt: z.string().min(1).max(64),
+    revokedAt: z.string().min(1).max(64).optional(),
+  }).strict()).max(64),
+}).strict();
 
 /** Core's `DeferredPermission` (CP3 `PendingPermissionService`): what the supervisor posts for a component-raised deferral. */
 export type DeferredPermissionBody =
@@ -537,6 +573,23 @@ export class CoreClient {
   /** The claimed assignment's work definition (see `CORE_PATHS.workload`); `not_found` when Core has none. */
   async fetchWorkload(instanceId: string, assignmentId: string): Promise<WorkloadRead> {
     return this.http.request({ method: "GET", path: CORE_PATHS.workload(instanceId, assignmentId), schema: WorkloadReadSchema });
+  }
+
+  /**
+   * Register this runtime's managed-git public key. Only the public half is
+   * ever sent; the private half stays on the machine that generated it.
+   */
+  async registerGitKey(instanceId: string, body: { publicKey: string; title: string }): Promise<z.infer<typeof GitKeyRegisterResultSchema>> {
+    return this.http.request({ method: "POST", path: CORE_PATHS.gitKeys(instanceId), body, schema: GitKeyRegisterResultSchema, idempotencyKey: `git-key:${instanceId}:${body.title}` });
+  }
+
+  async listGitKeys(instanceId: string): Promise<z.infer<typeof GitKeyListResultSchema>["keys"]> {
+    return (await this.http.request({ method: "GET", path: CORE_PATHS.gitKeys(instanceId), schema: GitKeyListResultSchema })).keys;
+  }
+
+  /** Revocation is Core's and managed-git's; the local half is dropped after. */
+  async revokeGitKey(instanceId: string, keyRef: string): Promise<void> {
+    await this.http.request({ method: "DELETE", path: CORE_PATHS.gitKey(instanceId, keyRef), schema: z.unknown() });
   }
 
   /** The Harness materialized a task checkout here; Core records the owner so exact-checkout work binds to this instance. */

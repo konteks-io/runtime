@@ -356,3 +356,34 @@ export {
   REMOTE_LEASE_AUDIENCE as REMOTE_INSTANCE_LEASE_AUDIENCE,
   RELAYED_ACP_METHODS,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
+
+/**
+ * Onboarding (onboarding-mode OB1). The `onboard` role reads repositories and
+ * moves them, so the runtime needs the discovery-run vocabulary, the evidence
+ * submission shape it is allowed to send (deliberately WITHOUT `collectedBy`,
+ * which Core stamps), and the two tool contracts OB1 published by name.
+ */
+export {
+  DiscoveryDepthSchema,
+  DiscoveryRunBoundsSchema,
+  DiscoveryInventoryItemSchema,
+  DiscoveryEvidenceFactsSchema,
+  DiscoveryEvidenceSubmissionSchema,
+  EnrichmentProgressInputSchema,
+  RepositoryRelocateReportInputSchema,
+  MANAGED_REPOSITORY_CREATE_TOOL,
+  REPOSITORY_RELOCATE_PROPOSE_TOOL,
+  REPOSITORY_RELOCATE_REPORT_TOOL,
+  REPOSITORY_RELOCATE_STATUS_TOOL,
+} from "@konteks/backstage-plugin-common";
+export type {
+  DiscoveryDepth,
+  DiscoveryRunBounds,
+  DiscoveryInventoryItem,
+  DiscoveryEvidenceFacts,
+  DiscoveryEvidenceSubmission,
+  EnrichmentProgressInput,
+  RepositoryRelocateReportInput,
+  CatalogLearningEvidence,
+  CatalogLearningEvidenceKind,
+} from "@konteks/backstage-plugin-common";

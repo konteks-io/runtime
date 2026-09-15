@@ -46,6 +46,12 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
     })
     .strict(),
   z.object({ op: z.literal("gateway.key.clear"), agentId: agentIdSchema }).strict(),
+  // Managed-git key registration (ON16). Nothing here carries key material:
+  // the private half is generated on the machine and never crosses this hop,
+  // not even to be shown to the person who ran the command.
+  z.object({ op: z.literal("git.key.add"), title: z.string().trim().min(1).max(256).optional() }).strict(),
+  z.object({ op: z.literal("git.key.list") }).strict(),
+  z.object({ op: z.literal("git.key.remove"), keyRef: z.string().trim().min(1).max(200) }).strict(),
   z.object({ op: z.literal("preview.enable"), port: z.number().int().min(1).max(65_535) }).strict(),
   z.object({ op: z.literal("preview.disable") }).strict(),
   z.object({ op: z.literal("drain"), reason: z.enum(["user", "update", "remove"]) }).strict(),

@@ -17,6 +17,7 @@ import {
   type InstanceKeyPair,
   type JsonValue,
   type Logger,
+  type RemoteWorkAssignment,
   type RemoteWorkKind,
   type RelayRuntimeHandshakeResult,
   type SupervisorStatus,
@@ -37,7 +38,13 @@ import { GatewayClient } from "./gateway-client.js";
 import { HeartbeatPublisher } from "./heartbeat/heartbeat.js";
 import { startInternalServer, type InternalServer } from "./internal/server.js";
 import { InventoryCollector, type InventorySnapshot } from "./inventory/collector.js";
-import { deriveAdvertisedRoles, type RoleBinding } from "./inventory/roles.js";
+import { deriveAdvertisedRoles, type RoleBinding, type RoleCapabilityInputs } from "./inventory/roles.js";
+import { LocalGit, OnboardScratch } from "./onboard/git.js";
+import { GitKeyStore, sshConfigPath } from "./onboard/git-keys.js";
+import { RawFileApi } from "./onboard/raw-file-api.js";
+import { createRemoteResolver, type ManagedGitBinding } from "./onboard/remotes.js";
+import { OnboardWorkCarrier, type OnboardWorkAssignment } from "./onboard/carrier.js";
+import type { PlatformMcpEntry } from "./work/components.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
 import { PreviewChannel } from "./preview/preview-channel.js";
@@ -137,6 +144,15 @@ export class Supervisor {
   private drainDeadline: string | null = null;
   private pendingRevocation = false;
   private lastSnapshot: InventorySnapshot | null = null;
+  /**
+   * The machine's own git (OB6 §5). It is a field rather than a dependency
+   * because every onboard lane — role advertisement, the evidence collector
+   * and the relocation worker — must use the SAME access, or a runtime could
+   * advertise a capability one path has and another does not.
+   */
+  private readonly git = new LocalGit();
+  /** Cached so every onboard lane resolves the same managed host and key. */
+  private managedGitBinding: ManagedGitBinding | null = null;
   private readonly logLines: string[] = [];
 
   core!: CoreClient;
@@ -298,6 +314,7 @@ export class Supervisor {
         this.runners.set(runner.agentId, runner);
       }
       this.inventory = new NativeInventoryCollector({ runners: this.runners, sampler: new SignalSampler(this.config.SUPERVISOR_DATA_DIR), bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
+        gitVersion: () => this.git.version(),
         executionPermitsReady: () => {
           // Native sessionDeps below always composes NativeExecutionGate.
           // Advertise only once that work owner exists and is still owned.
@@ -339,6 +356,7 @@ export class Supervisor {
       sysmonUrl: this.config.SUPERVISOR_SYSMON_URL,
       browserToolUrl: this.config.SUPERVISOR_BROWSER_TOOL_URL,
       runnerUrls: parseRunnerUrls(this.config.SUPERVISOR_RUNNER_URLS),
+      gitVersion: () => this.git.version(),
     });
     }
 
@@ -550,8 +568,9 @@ export class Supervisor {
       workspaceId: () => this.workspaceId,
       agents: () => this.lastSnapshot?.agents ?? [],
       roleBindings: () => this.roleBindings,
-      advertisedRoles: () => deriveAdvertisedRoles(this.roleBindings, this.lastSnapshot?.agents ?? [], { browserToolAvailable: this.lastSnapshot?.browserToolAvailable ?? false }),
+      advertisedRoles: () => deriveAdvertisedRoles(this.roleBindings, this.lastSnapshot?.agents ?? [], this.roleCapabilityInputs()),
       browserToolAvailable: () => this.lastSnapshot?.browserToolAvailable ?? false,
+      roleCapabilityInputs: () => this.roleCapabilityInputs(),
       acceptedKinds: () => ALL_KINDS,
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
       draining: () => this.draining,
@@ -571,15 +590,10 @@ export class Supervisor {
       maxPullItems: this.config.SUPERVISOR_PULL_MAX_ITEMS,
       components,
       searchController: new DurableSearchAssignmentCarrier(this.journal, this.clock),
+      onboardCarrier: this.onboardCarrier(),
       softMaxConcurrent: () => this.configuration.softMaxConcurrent,
       bridgeDigest: (agentId) => this.nativeRelease?.manifest.nativeArtifacts?.find(artifact => artifact.agentId === agentId)?.digest ?? this.release?.agentBridges.find((bridge) => bridge.agentId === agentId)?.digest,
-      redeemPlatformMcp: async (assignment) => {
-        const ref = assignment.agentRoute.mcpCapabilityTokenRef;
-        if (!ref) return undefined;
-        const deadlineAtMs = Date.now() + Math.max(0, Date.parse(assignment.expiresAt) - this.clock.coreNow());
-        const issued = await this.core.redeemCapabilityToken(this.instanceId ?? "", { assignmentId: assignment.id, attempt: assignment.attempt, mcpCapabilityTokenRef: ref }, deadlineAtMs);
-        return issued.mcpServer;
-      },
+      redeemPlatformMcp: (assignment) => this.redeemPlatformMcp(assignment),
       fetchWorkload: (assignment) => this.core.fetchWorkload(this.instanceId ?? "", assignment.id),
       runners: this.runners,
       sessionDeps: (assignment, runner) => ({
@@ -937,6 +951,10 @@ export class Supervisor {
 
   private async startActiveLoopImpl(): Promise<void> {
     if (this.stopping) return;
+    // Reload the managed-git binding before any onboard work can be claimed:
+    // the key survives a restart, and a lane that forgot it would fall back to
+    // the machine's ambient git on a host where only this key authenticates.
+    await this.reloadManagedGitBinding();
     if (this.native) {
       try { await this.reconciliation.run(); }
       finally {
@@ -1323,6 +1341,71 @@ export class Supervisor {
     return Math.max(0, Math.min(ceiling, readyAgents * 4) - active);
   }
 
+  /** Redeem the claim's capability token into the platform MCP entry. In memory and in the dispatch body only; never journaled. */
+  private async redeemPlatformMcp(assignment: RemoteWorkAssignment): Promise<PlatformMcpEntry | undefined> {
+    const ref = assignment.agentRoute.mcpCapabilityTokenRef;
+    if (!ref) return undefined;
+    // Bounded by the assignment's own expiry, so a redemption cannot outlive
+    // the work it was for. Shared by the ACP lane and the onboard facade.
+    const deadlineAtMs = Date.now() + Math.max(0, Date.parse(assignment.expiresAt) - this.clock.coreNow());
+    const issued = await this.core.redeemCapabilityToken(this.instanceId ?? "", { assignmentId: assignment.id, attempt: assignment.attempt, mcpCapabilityTokenRef: ref }, deadlineAtMs);
+    return issued.mcpServer;
+  }
+
+  /**
+   * The onboard lane, composed once. Everything it needs is local: the
+   * machine's own git, a scratch directory, and the capability token the
+   * orchestrator redeems per claim. No connector credential and no broker
+   * client appear here, and none may (invariant 3, A5).
+   */
+  private onboardCarrier(): OnboardWorkCarrier {
+    const scratch = new OnboardScratch(this.config.SUPERVISOR_ONBOARD_SCRATCH_ROOT);
+    const resolveRemote = createRemoteResolver(() => this.managedGitBinding);
+    return new OnboardWorkCarrier({
+      collector: {
+        git: this.git,
+        rawFiles: new RawFileApi({ git: this.git }),
+        scratch,
+        resolveRemote,
+        concurrency: this.config.SUPERVISOR_ONBOARD_MAX_CONCURRENT,
+      },
+      relocation: {
+        git: this.git,
+        scratch,
+        managedBinding: () => this.managedGitBinding,
+        now: () => this.clock.nowIso(),
+      },
+      redeemFacade: assignment => this.redeemPlatformMcp(assignment),
+      fetchWorkload: (assignment: OnboardWorkAssignment) => this.core.fetchWorkload(this.instanceId ?? "", assignment.id),
+    });
+  }
+
+  /** Re-read the registered key, if any. An unregistered runtime is normal. */
+  private async reloadManagedGitBinding(): Promise<void> {
+    if (!this.instanceId) return;
+    try { this.managedGitBinding = await this.gitKeys().binding(); }
+    catch (error) { this.logger.debug({ err: error }, "no managed git key is registered on this runtime"); }
+  }
+
+  /** The key store; the private half never leaves the directory it names. */
+  private gitKeys(): GitKeyStore {
+    const instanceId = this.instanceId;
+    if (!instanceId) throw new RemoteInstanceError("temporarily_unavailable", "This runtime is not activated yet; register a key after installation completes.");
+    return new GitKeyStore({
+      directory: this.config.SUPERVISOR_ONBOARD_GIT_KEY_DIR,
+      registrar: {
+        register: body => this.core.registerGitKey(instanceId, body),
+        list: () => this.core.listGitKeys(instanceId),
+        revoke: keyRef => this.core.revokeGitKey(instanceId, keyRef),
+      },
+    });
+  }
+
+  /** The non-agent facts a role may depend on; one source for every reader. */
+  private roleCapabilityInputs(): RoleCapabilityInputs {
+    return { browserToolAvailable: this.lastSnapshot?.browserToolAvailable ?? false, gitVersion: this.lastSnapshot?.gitVersion ?? null };
+  }
+
   // ── Status and control socket ─────────────────────────────────────────────
 
   status(): SupervisorStatus {
@@ -1388,6 +1471,21 @@ export class Supervisor {
           if (this.native) throw new RemoteInstanceError("capability_unavailable", "BYOK is not supported by a native connector.");
           await this.gateway.clearKey(request.agentId);
           return { agentId: request.agentId, keyed: false };
+        case "git.key.add": {
+          const store = this.gitKeys();
+          const key = await store.add(request.title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);
+          this.managedGitBinding = await store.binding();
+          // The reference, the fingerprint and the host; never the key.
+          return { keyRef: key.keyRef, title: key.title, fingerprint: key.fingerprint, host: key.host, sshConfig: sshConfigPath(this.config.SUPERVISOR_ONBOARD_GIT_KEY_DIR) };
+        }
+        case "git.key.list":
+          return { keys: await this.gitKeys().list() };
+        case "git.key.remove": {
+          const store = this.gitKeys();
+          await store.remove(request.keyRef);
+          this.managedGitBinding = await store.binding();
+          return { keyRef: request.keyRef, revoked: true };
+        }
         case "preview.enable":
           if (this.native) throw new RemoteInstanceError("capability_unavailable", "Native preview forwarding has not been configured.");
           this.preview.enable(request.port);
