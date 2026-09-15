@@ -1,0 +1,109 @@
+import { createServer, type Server } from "node:http";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { nullLogger } from "@konteks/remote-common";
+import { McpCapabilityFacade } from "../mcp/capability-facade.js";
+import type { CapabilityTokenIssue } from "../core/client.js";
+
+const servers: Server[] = [];
+const facades: McpCapabilityFacade[] = [];
+
+afterEach(async () => {
+  await Promise.all(facades.splice(0).map(facade => facade.close()));
+  await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+});
+
+async function upstream(handler: Parameters<typeof createServer>[0]): Promise<string> {
+  const server = createServer(handler);
+  servers.push(server);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("missing address");
+  return `http://127.0.0.1:${address.port}/mcp`;
+}
+
+function issue(url: string, token: string, expiresAt: number): CapabilityTokenIssue {
+  return { mcpServer: { name: "konteks-platform", url, headers: [{ name: "authorization", value: `Bearer ${token}` }] }, expiresAt: new Date(expiresAt).toISOString() };
+}
+
+async function started(options: Omit<ConstructorParameters<typeof McpCapabilityFacade>[0], "context"> & { context?: ConstructorParameters<typeof McpCapabilityFacade>[0]["context"] }) {
+  const facade = new McpCapabilityFacade({ ...options, context: options.context ?? { assignmentId: "assignment", attempt: 1, sessionId: "session" }, logger: nullLogger });
+  facades.push(facade);
+  return { facade, entry: await facade.start() };
+}
+
+function localHeaders(entry: Awaited<ReturnType<McpCapabilityFacade["start"]>>) {
+  return Object.fromEntries(entry.headers.map(header => [header.name, header.value]));
+}
+
+describe("native MCP capability facade", () => {
+  it("exposes only a loopback credential and forwards with the in-memory cloud bearer", async () => {
+    let seenAuthorization = "";
+    const url = await upstream((request, response) => {
+      seenAuthorization = request.headers.authorization ?? "";
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [] } }));
+    });
+    const { entry } = await started({ initial: issue(url, "cloud-secret", Date.now() + 300_000), renew: vi.fn() });
+    expect(entry.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+    expect(JSON.stringify(entry)).not.toContain("cloud-secret");
+    const response = await fetch(entry.url, { method: "POST", headers: { ...localHeaders(entry), "content-type": "application/json" }, body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' });
+    expect(response.status).toBe(200);
+    expect(seenAuthorization).toBe("Bearer cloud-secret");
+  });
+
+  it("renews once for concurrent requests near expiry and uses the replacement bearer", async () => {
+    let now = Date.now();
+    const seen: string[] = [];
+    const url = await upstream((request, response) => {
+      seen.push(request.headers.authorization ?? "");
+      response.end("ok");
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const renew = vi.fn(async () => {
+      await blocked;
+      return issue(url, "renewed", now + 300_000);
+    });
+    const firstExpiry = now + 120_000;
+    const { entry } = await started({ initial: issue(url, "initial", firstExpiry), renew, now: () => now });
+    now = firstExpiry - 10_000;
+    const request = () => fetch(entry.url, { method: "POST", headers: localHeaders(entry), body: "{}" });
+    const first = request();
+    const second = request();
+    await vi.waitFor(() => expect(renew).toHaveBeenCalledTimes(1));
+    release();
+    await Promise.all([first, second]);
+    expect(renew).toHaveBeenCalledTimes(1);
+    expect(seen).toEqual(["Bearer renewed", "Bearer renewed"]);
+  });
+
+  it("refreshes and replays exactly once after Core rejects authentication before dispatch", async () => {
+    const seen: string[] = [];
+    const url = await upstream((request, response) => {
+      const authorization = request.headers.authorization ?? "";
+      seen.push(authorization);
+      if (authorization === "Bearer expired") return void response.writeHead(401).end('{"error":"invalid_token"}');
+      response.end("accepted");
+    });
+    const renew = vi.fn(async () => issue(url, "fresh", Date.now() + 300_000));
+    const { entry } = await started({ initial: issue(url, "expired", Date.now() + 300_000), renew });
+    const response = await fetch(entry.url, { method: "POST", headers: localHeaders(entry), body: "{}" });
+    expect(await response.text()).toBe("accepted");
+    expect(seen).toEqual(["Bearer expired", "Bearer fresh"]);
+    expect(renew).toHaveBeenCalledTimes(1);
+  });
+
+  it("never replays an ambiguous non-authentication failure", async () => {
+    let calls = 0;
+    const url = await upstream((_request, response) => {
+      calls += 1;
+      response.writeHead(503).end("later");
+    });
+    const renew = vi.fn(async () => issue(url, "fresh", Date.now() + 300_000));
+    const { entry } = await started({ initial: issue(url, "current", Date.now() + 300_000), renew });
+    const response = await fetch(entry.url, { method: "POST", headers: localHeaders(entry), body: "{}" });
+    expect(response.status).toBe(503);
+    expect(calls).toBe(1);
+    expect(renew).not.toHaveBeenCalled();
+  });
+});

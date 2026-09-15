@@ -37,6 +37,8 @@ export type SessionContext = z.infer<typeof SessionContextSchema>;
 
 export interface CreateSessionArgs {
   context: SessionContext;
+  /** Absolute outer readiness deadline supplied by the claim owner. */
+  readinessDeadlineAt?: string;
   cwd: string;
   mcpServers: McpServer[];
   /** ACP session-config selections from the assignment (`agentRoute.sessionConfig`). */
@@ -169,7 +171,13 @@ export class SessionManager {
     operation: Promise<T>,
     bootstrapAttempt: number,
   ): Promise<T> {
-    const timeoutMs = this.bootstrapTimeoutMs;
+    const remainingMs = args.readinessDeadlineAt === undefined ? Number.POSITIVE_INFINITY : Date.parse(args.readinessDeadlineAt) - this.now().getTime();
+    if (Number.isNaN(remainingMs) || remainingMs <= 0) {
+      throw new RemoteInstanceError("agent_unavailable", "The outer execution readiness deadline expired.", {
+        retryable: true, recoveryActions: [{ kind: "retry" }], diagnostic: `acp_${stage}_deadline`,
+      });
+    }
+    const timeoutMs = Math.max(1, Math.min(this.bootstrapTimeoutMs, remainingMs));
     const deadlineMarker = Symbol(stage);
     let timer: NodeJS.Timeout | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
@@ -292,8 +300,10 @@ export class SessionManager {
             }, "ACP session bootstrap retry budget exhausted");
             throw error;
           }
+          const remainingMs = args.readinessDeadlineAt === undefined ? Number.POSITIVE_INFINITY : Date.parse(args.readinessDeadlineAt) - this.now().getTime();
+          if (Number.isNaN(remainingMs) || remainingMs <= 0) throw error;
           const exponentialMs = 500 * (2 ** (bootstrapAttempt - 1));
-          const delayMs = Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + (this.bootstrapRetryRandom() * 0.5)))));
+          const delayMs = Math.min(remainingMs, 2_000, Math.max(1, Math.round(exponentialMs * (0.75 + (this.bootstrapRetryRandom() * 0.5)))));
           this.logger.warn({
             assignmentId: args.context.assignmentId,
             attempt: args.context.attempt,

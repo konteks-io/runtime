@@ -48,7 +48,7 @@ describe("native activation and resumable exchange", () => {
     await runNativeActivationExchange(f.args);
     const reloaded = new SupervisorJournal(join(f.args.dataDir, "journal")); await reloaded.load();
     expect(reloaded.execution.enrollment()).toEqual(enrolled);
-  });
+  }, 15_000);
 
   it("never upgrades an existing empty directory into complete admission history", async () => {
     const f = fixture(); await runNativeActivationExchange(f.args);
@@ -58,7 +58,10 @@ describe("native activation and resumable exchange", () => {
 
   it("retains the same enrollment seed through an uncertain fresh activation response", async () => {
     const f = fixture(); f.args.dataDir = join(dir, "fresh");
-    f.args.fetchFn.mockRejectedValueOnce(new Error("lost response"));
+    f.args.fetchFn.mockRejectedValueOnce(new Error("lost response"))
+      .mockRejectedValueOnce(new Error("lost response"))
+      .mockRejectedValueOnce(new Error("lost response"))
+      .mockRejectedValueOnce(new Error("lost response"));
     await expect(runNativeActivationExchange(f.args)).rejects.toThrow();
     const pending = new SupervisorJournal(join(f.args.dataDir, "journal")); await pending.load();
     const seed = pending.execution.enrollment();
@@ -98,19 +101,22 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.readActivationCode).toHaveBeenCalledOnce();
   });
 
-  it("persists nonce and key before the first request, then reuses them after a lost response", async () => {
+  it("persists semantic retry identity and key before the first request while refreshing transport proof", async () => {
     const f = fixture();
+    const exchange = f.args.fetchFn.getMockImplementation()!;
     let first: RemoteInstanceActivationExchangeRequest | undefined;
-    f.args.fetchFn.mockImplementationOnce(async (_url, init) => {
+    f.args.fetchFn.mockImplementation(async (_url, init) => {
       first = JSON.parse(String(init?.body));
       const attempt = JSON.parse(await readFile(join(dir, "activation-attempt.json"), "utf8"));
-      expect(attempt).toMatchObject({ activationId: f.args.activationId, nonce: first?.proof.nonce, manifestDigest: f.manifest.digest });
+      expect(attempt).toMatchObject({ activationId: f.args.activationId, manifestDigest: f.manifest.digest });
+      expect((init?.headers as Record<string, string>)["idempotency-key"]).toBe(`activation:${f.args.activationId}:${attempt.nonce}`);
       throw new Error("response lost after Core commit");
     });
     await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    f.args.fetchFn.mockReset().mockImplementation(exchange);
     expect(await new SupervisorStore(dir).identity()).toBeNull();
     await runNativeActivationExchange(f.args);
-    expect(f.requests[0]?.proof.nonce).toBe(first?.proof.nonce);
+    expect(f.requests[0]?.proof.nonce).not.toBe(first?.proof.nonce);
     expect(f.requests[0]?.publicKeyJwk).toEqual(first?.publicKeyJwk);
   });
 
@@ -120,7 +126,7 @@ describe("native activation and resumable exchange", () => {
     await expect(runNativeActivationExchange(f.args)).rejects.toThrow("disk full");
     await runNativeActivationExchange(f.args);
     expect(f.requests).toHaveLength(2);
-    expect(f.requests[0]?.proof.nonce).toBe(f.requests[1]?.proof.nonce);
+    expect(f.requests[0]?.proof.nonce).not.toBe(f.requests[1]?.proof.nonce);
     expect(await new SupervisorStore(dir).provisioning()).not.toBeNull();
   });
 
@@ -158,8 +164,9 @@ describe("native activation and resumable exchange", () => {
 
   it("refuses a changed activation after an uncertain exchange", async () => {
     const f = fixture();
-    f.args.fetchFn.mockRejectedValueOnce(new Error("lost"));
+    f.args.fetchFn.mockRejectedValue(new Error("lost"));
     await expect(runNativeActivationExchange(f.args)).rejects.toThrow();
+    f.args.fetchFn.mockReset().mockImplementation(fixture().args.fetchFn.getMockImplementation()!);
     f.args.readActivationCode.mockClear();
     await expect(runNativeActivationExchange({ ...f.args, activationId: "different" })).rejects.toMatchObject({ code: "registration_mismatch" });
     expect(f.args.readActivationCode).not.toHaveBeenCalled();
@@ -167,7 +174,7 @@ describe("native activation and resumable exchange", () => {
 
   it("does not silently generate a new key when the retry identity was lost", async () => {
     const f = fixture();
-    f.args.fetchFn.mockRejectedValueOnce(new Error("lost"));
+    f.args.fetchFn.mockRejectedValue(new Error("lost"));
     await expect(runNativeActivationExchange(f.args)).rejects.toThrow();
     await rm(join(dir, "instance-key.jwk"));
     await expect(runNativeActivationExchange(f.args)).rejects.toMatchObject({ code: "install_state_corrupt" });

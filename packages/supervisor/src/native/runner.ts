@@ -8,6 +8,7 @@ import type { RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../
 const idSchema = z.string().min(1).max(128);
 const inputSchema = z.object({
   context: SessionContextSchema,
+  readinessDeadlineAt: z.string().datetime({ offset: true }),
   cwd: z.string().min(1).refine(isAbsolute).refine(value => !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)),
   mcpServers: z.array(z.object({
     type: z.enum(["http", "sse"]), name: z.string().min(1).max(256), url: z.string().url(),
@@ -109,8 +110,8 @@ export class NativeRunner implements RunnerPort {
     const parsed = inputSchema.safeParse(input);
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
-    const { context, cwd, mcpServers, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore } = parsed.data;
-    const args = { context, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
+    const { context, readinessDeadlineAt, cwd, mcpServers, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore } = parsed.data;
+    const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
       ...(freshProviderSessionOnRestore === undefined ? {} : { freshProviderSessionOnRestore }), lifecycle: {
       beforeCreate: async (ref: string) => { await lifecycle?.beforeCreate(ref); },
       recordProcessOwner: async (owner: RetainedProcessOwner) => { await lifecycle?.recordProcessOwner(owner); },

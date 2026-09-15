@@ -27,6 +27,46 @@ describe("request-specific Core transport deadline", () => {
     expect(delays).toEqual([25, 50, 100]);
   });
 
+  it.each([400, 401, 403, 404, 409])("never retries permanent HTTP %s even when an old server uses a transient wire code", async status => {
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({ code: "temporarily_unavailable", message: "generic" }), { status }));
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn, retrySleep: async () => undefined, logger: nullLogger });
+    await expect(client.request({ method: "GET", path: "/operation", schema: { parse: value => value } }))
+      .rejects.toMatchObject({ retryable: false, status });
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it("rebuilds proof-bearing bodies for each retry while retaining the idempotency identity", async () => {
+    const fetchFn = vi.fn()
+      .mockRejectedValueOnce(new Error("connection reset"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ accepted: true })));
+    let nonce = 0;
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn,
+      retrySleep: async () => undefined, logger: nullLogger });
+    await client.request({ method: "POST", path: "/signed", idempotencyKey: "semantic-operation",
+      bodyFactory: () => ({ operationId: "stable", proof: { nonce: `nonce-${++nonce}` } }),
+      schema: { parse: value => value } });
+    const bodies = fetchFn.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+    expect(bodies.map(body => body.operationId)).toEqual(["stable", "stable"]);
+    expect(bodies.map(body => body.proof.nonce)).toEqual(["nonce-1", "nonce-2"]);
+    expect(fetchFn.mock.calls.map(([, init]) => (init?.headers as Record<string, string>)["idempotency-key"]))
+      .toEqual(["semantic-operation", "semantic-operation"]);
+  });
+
+  it("clips retry backoff to the caller's absolute outer deadline", async () => {
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ accepted: true })));
+    const delays: number[] = [];
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const client = new JsonClient({ baseUrl: "https://core.example", fetchFn, retryBaseDelayMs: 100,
+        retrySleep: async delay => { delays.push(delay); }, retryRandom: () => 0.5, logger: nullLogger });
+      await client.request({ method: "POST", path: "/operation", idempotencyKey: "stable", body: {}, deadlineAtMs: 1_050,
+        schema: { parse: value => value } });
+      expect(delays).toEqual([50]);
+    } finally { now.mockRestore(); }
+  });
+
   it("does not replay an unsafe POST after an uncertain failure", async () => {
     const fetchFn = vi.fn(async () => { throw new Error("connection reset"); });
     const client = new JsonClient({ baseUrl: "https://core.example", fetchFn, retrySleep: async () => undefined, logger: nullLogger });

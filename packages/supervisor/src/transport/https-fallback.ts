@@ -33,7 +33,8 @@ export interface HttpsFallbackOptions {
 export class HttpsFallbackTransport implements ControlPlaneTransport {
   readonly kind = "https" as const;
   private handler: InboundHandler | null = null;
-  private timer: NodeJS.Timeout | null = null;
+  private pollTimer: NodeJS.Timeout | null = null;
+  private pollFlight: Promise<void> | null = null;
   private running = false;
   private readonly logger: Logger;
   private readonly pending: OutboundMessage[] = [];
@@ -68,8 +69,7 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
     this.startPreparedAssignments();
     this.running = true;
     void this.housekeepAssignments();
-    this.timer = setInterval(() => void this.poll(), this.options.pollIntervalMs);
-    this.timer.unref();
+    void this.runPollCycle();
   }
 
   stop(): void {
@@ -83,8 +83,8 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
 
   pauseOrdinaryPolling(): void {
     this.running = false;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
+    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.pollTimer = null;
   }
 
   send(message: OutboundMessage): void {
@@ -268,7 +268,29 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
     }
   }
 
-  private async poll(): Promise<void> {
+  /** Coalesces direct wakeups and scheduled polls onto one in-flight cycle. */
+  private poll(): Promise<void> {
+    if (this.pollFlight) return this.pollFlight;
+    const flight = this.pollOnce().finally(() => {
+      if (this.pollFlight === flight) this.pollFlight = null;
+    });
+    this.pollFlight = flight;
+    return flight;
+  }
+
+  private async runPollCycle(): Promise<void> {
+    await this.poll();
+    if (!this.running || this.pollTimer) return;
+    const configured = this.options.pollIntervalMs;
+    const delay = Number.isFinite(configured) ? Math.max(1, configured) : 5_000;
+    this.pollTimer = setTimeout(() => {
+      this.pollTimer = null;
+      void this.runPollCycle();
+    }, delay);
+    this.pollTimer.unref();
+  }
+
+  private async pollOnce(): Promise<void> {
     if (!this.running) return;
     await this.housekeepAssignments();
     const instanceId = this.options.instanceId();

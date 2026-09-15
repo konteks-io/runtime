@@ -2,6 +2,8 @@ import type { ConnectedAgentView, RetainedProcessOwner } from "@konteks/remote-c
 
 export interface RunnerSessionInput {
   context: { instanceId: string; assignmentId: string; attempt: number; agentId: string };
+  /** Absolute outer readiness deadline; every nested native retry clips to it. */
+  readinessDeadlineAt: string;
   cwd: string;
   mcpServers: Array<{ type: "http" | "sse"; name: string; url: string; headers: Array<{ name: string; value: string }> }>;
   sessionConfig?: Record<string, string>;

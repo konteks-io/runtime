@@ -11,7 +11,7 @@ export interface NativeUpdateCoordinatorOptions {
   trustedRoots: readonly EmbeddedReleaseRoot[];
   fetchManifest: () => Promise<unknown>;
   /** Starts the launcher transaction out of process; it drains, stops and restarts this service itself. */
-  launch: (target: { bundleVersion: string; manifestDigest: string; reason: NativeUpdateReason }) => Promise<{ pid: number | null }>;
+  launch: (target: { bundleVersion: string; manifestDigest: string; reason: NativeUpdateReason }) => Promise<{ pid: number | null; onExit?: (listener: (code: number | null) => void) => void }>;
   readLedger: () => Promise<NativeUpdateLedger>;
   /** Live veto from the owner: stopping, or a drain the update must not preempt. */
   canApply: () => { ok: true } | { ok: false; reason: string };
@@ -126,7 +126,16 @@ export class NativeUpdateCoordinator {
     if (backoff) return refuse(backoff);
     try {
       const launched = await this.options.launch({ ...available, reason });
-      this.inFlight = { startedAt: new Date(this.now()).toISOString(), bundleVersion: available.bundleVersion, manifestDigest: available.manifestDigest, reason, pid: launched.pid };
+      const inFlight = { startedAt: new Date(this.now()).toISOString(), bundleVersion: available.bundleVersion, manifestDigest: available.manifestDigest, reason, pid: launched.pid };
+      this.inFlight = inFlight;
+      // A transaction that exits while this service is still running did not
+      // replace it: clear the in-flight view so the next tick can try again.
+      launched.onExit?.(code => {
+        if (this.inFlight !== inFlight) return;
+        this.inFlight = null;
+        if (code !== 0) this.lastError = `update transaction exited with code ${code ?? "null"} before replacing this service`;
+        this.options.logger.warn({ code, bundleVersion: available.bundleVersion }, "native update transaction exited without replacing the service");
+      });
       this.options.logger.info({ bundleVersion: available.bundleVersion, reason, pid: launched.pid }, "native update transaction launched");
       return { started: true, reason: null, pid: launched.pid, status: this.status() };
     } catch (error) {

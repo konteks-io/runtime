@@ -32,7 +32,10 @@ export class CoreResponseError extends RemoteInstanceError {
     const parsed = RemoteInstanceErrorCodeSchema.safeParse(args.code);
     super(parsed.success ? parsed.data : "temporarily_unavailable", redactText(args.message), {
       recoveryActions: args.recoveryActions ?? [],
-      retryable: args.status >= 500 || args.status === 429 || args.status === 408,
+      // HTTP admission/auth/not-found/conflict responses are authoritative
+      // even when an older server emits the generic wire code. Retrying those
+      // multiplied load and delayed recovery without any chance of success.
+      retryable: args.status >= 500 || args.status === 429 || args.status === 425 || args.status === 408,
     });
     this.name = "CoreResponseError";
     this.status = args.status;
@@ -63,12 +66,16 @@ export interface JsonRequest<T> {
   method: "GET" | "POST" | "PUT" | "DELETE";
   path: string;
   body?: unknown;
+  /** Rebuilds authentication material immediately before each transport attempt. */
+  bodyFactory?: () => unknown;
   /** Structural: inferring through `z.ZodType<T>` is pathological on the piped contract schemas. */
   schema: SchemaParser<T>;
   headers?: Record<string, string>;
   idempotencyKey?: string;
   /** May shorten the client's deadline, never extend it. */
   timeoutMs?: number;
+  /** Absolute wall-clock deadline shared with the caller and nested retries. */
+  deadlineAtMs?: number;
 }
 
 /**
@@ -94,17 +101,33 @@ export class JsonClient {
   }
 
   async request<T>(request: JsonRequest<T>): Promise<T> {
+    if (request.body !== undefined && request.bodyFactory !== undefined) throw new Error("JsonRequest cannot provide both body and bodyFactory");
     const url = new URL(request.path, this.options.baseUrl);
+    const hasBody = request.body !== undefined || request.bodyFactory !== undefined;
     const headers: Record<string, string> = {
       accept: "application/json",
-      ...(request.body === undefined ? {} : { "content-type": "application/json" }),
+      ...(hasBody ? { "content-type": "application/json" } : {}),
       ...(request.idempotencyKey === undefined ? {} : { "idempotency-key": request.idempotencyKey }),
       ...(request.headers ?? {}),
     };
     const replaySafe = request.method === "GET" || request.idempotencyKey !== undefined;
-    // One initial request plus three retries for replay-safe operations.
     const maxAttempts = replaySafe ? 4 : 1;
+    const perAttemptTimeoutMs = Math.max(1, Math.floor(Math.min(this.timeoutMs, request.timeoutMs ?? this.timeoutMs)));
+    // `timeoutMs` is an attempt timeout. Only an explicit outer deadline may
+    // reduce the promised initial attempt plus three replay-safe retries.
+    const deadlineAtMs = request.deadlineAtMs ?? (Date.now() + perAttemptTimeoutMs * maxAttempts
+      + this.retryBaseDelayMs * (2 ** (maxAttempts - 1) - 1));
+    const requestStartedAt = Date.now();
+    let recoveredClassification: string | undefined;
+    let recoveredStatus: number | undefined;
+    let recoveredRequestId: string | undefined;
+    // One initial request plus three retries for replay-safe operations.
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const remainingMs = deadlineAtMs - Date.now();
+      if (remainingMs <= 0) {
+        if (replaySafe) this.logExhausted(request, Math.max(1, attempt - 1), maxAttempts, "timeout", requestStartedAt);
+        throw new RemoteInstanceError("temporarily_unavailable", "Core request deadline expired", { retryable: true });
+      }
       // A lease may rotate while a prior attempt is backing off. Resolve the
       // credential immediately before each replay rather than retaining a
       // bearer that Core has already fenced.
@@ -114,11 +137,12 @@ export class JsonClient {
       const startedAt = Date.now();
       let response: Response;
       try {
+        const body = request.bodyFactory?.() ?? request.body;
         response = await this.fetchFn(url, {
           method: request.method,
           headers,
-          ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
-          signal: AbortSignal.timeout(Math.max(1, Math.floor(Math.min(this.timeoutMs, request.timeoutMs ?? this.timeoutMs)))),
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          signal: AbortSignal.timeout(Math.max(1, Math.floor(Math.min(perAttemptTimeoutMs, remainingMs)))),
         });
       } catch (error) {
         const failure = new RemoteInstanceError("temporarily_unavailable", "Core request failed", {
@@ -127,10 +151,11 @@ export class JsonClient {
           recoveryActions: [{ kind: "retry" }],
         });
         if (attempt === maxAttempts) {
-          if (replaySafe) this.logExhausted(request, attempt, maxAttempts, "transport");
+          if (replaySafe) this.logExhausted(request, attempt, maxAttempts, "transport", requestStartedAt);
           throw failure;
         }
-        await this.backoff(request, attempt, maxAttempts, "transport");
+        recoveredClassification = "transport"; recoveredStatus = undefined; recoveredRequestId = undefined;
+        await this.backoff(request, attempt, maxAttempts, "transport", deadlineAtMs, requestStartedAt);
         continue;
       }
       const roundTripMs = Date.now() - startedAt;
@@ -157,15 +182,19 @@ export class JsonClient {
             return parsed.success ? [{ kind: parsed.data.kind } as RecoveryAction] : [];
           }),
         });
-        const classification = response.status === 408 ? "timeout" : response.status === 429 ? "rate_limited" : response.status >= 500 ? "upstream" : "permanent";
+        const classification = response.status === 408 || response.status === 425 ? "timeout" : response.status === 429 ? "rate_limited" : response.status >= 500 ? "upstream" : "permanent";
         if (!failure.retryable || attempt === maxAttempts) {
-          if (failure.retryable && replaySafe) this.logExhausted(request, attempt, maxAttempts, classification, response.status, failure.requestId);
+          if (failure.retryable && replaySafe) this.logExhausted(request, attempt, maxAttempts, classification, requestStartedAt, response.status, failure.requestId);
           throw failure;
         }
-        await this.backoff(request, attempt, maxAttempts, classification, response.status, failure.requestId);
+        recoveredClassification = classification; recoveredStatus = response.status; recoveredRequestId = failure.requestId;
+        await this.backoff(request, attempt, maxAttempts, classification, deadlineAtMs, requestStartedAt, response.status, failure.requestId);
         continue;
       }
-      if (response.status === 204) return request.schema.parse(undefined);
+      if (response.status === 204) {
+        if (attempt > 1) this.logRecovered(request, attempt, maxAttempts, requestStartedAt, recoveredClassification, recoveredStatus, recoveredRequestId);
+        return request.schema.parse(undefined);
+      }
       let payload: unknown;
       try { payload = await response.json(); }
       catch (error) {
@@ -174,30 +203,38 @@ export class JsonClient {
         const retryable = !(error instanceof SyntaxError);
         const failure = new RemoteInstanceError("temporarily_unavailable", "Core response could not be read", { retryable });
         if (!retryable || attempt === maxAttempts) {
-          if (retryable && replaySafe) this.logExhausted(request, attempt, maxAttempts, "response_body");
+          if (retryable && replaySafe) this.logExhausted(request, attempt, maxAttempts, "response_body", requestStartedAt);
           throw failure;
         }
-        await this.backoff(request, attempt, maxAttempts, "response_body");
+        recoveredClassification = "response_body"; recoveredStatus = response.status; recoveredRequestId = undefined;
+        await this.backoff(request, attempt, maxAttempts, "response_body", deadlineAtMs, requestStartedAt);
         continue;
       }
+      if (attempt > 1) this.logRecovered(request, attempt, maxAttempts, requestStartedAt, recoveredClassification, recoveredStatus, recoveredRequestId);
       return request.schema.parse(payload);
     }
     throw new RemoteInstanceError("temporarily_unavailable", "Core request retry exhausted", { retryable: true });
   }
 
-  private async backoff<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, status?: number, requestId?: string): Promise<void> {
+  private async backoff<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, deadlineAtMs: number, requestStartedAt: number, status?: number, requestId?: string): Promise<void> {
     const exponentialDelayMs = this.retryBaseDelayMs * 2 ** (attempt - 1);
     const entropy = Math.min(1, Math.max(0, this.retryRandom()));
-    const delayMs = Math.max(1, Math.floor(exponentialDelayMs * (0.75 + entropy * 0.5)));
-    this.logger.warn({ operation: `${request.method} ${request.path}`, attempt, retry: attempt, maxAttempts,
-      maxRetries: maxAttempts - 1, delayMs, classification,
+    const delayMs = Math.min(Math.max(0, deadlineAtMs - Date.now()), Math.max(1, Math.floor(exponentialDelayMs * (0.75 + entropy * 0.5))));
+    this.logger.warn({ event: "retry_scheduled", operation: `${request.method} ${request.path}`, attempt, retry: attempt, maxAttempts,
+      maxRetries: maxAttempts - 1, delayMs, elapsedMs: Date.now() - requestStartedAt, classification,
       ...(status === undefined ? {} : { status }), ...(requestId === undefined ? {} : { requestId }) }, "transient Core request failed; retrying");
-    await this.retrySleep(delayMs);
+    if (delayMs > 0) await this.retrySleep(delayMs);
   }
 
-  private logExhausted<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, status?: number, requestId?: string): void {
-    this.logger.error({ operation: `${request.method} ${request.path}`, attempt, retries: attempt - 1,
-      maxAttempts, maxRetries: maxAttempts - 1, classification,
+  private logExhausted<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, requestStartedAt: number, status?: number, requestId?: string): void {
+    this.logger.error({ event: "retry_exhausted", operation: `${request.method} ${request.path}`, attempt, retries: attempt - 1,
+      maxAttempts, maxRetries: maxAttempts - 1, elapsedMs: Date.now() - requestStartedAt, classification,
       ...(status === undefined ? {} : { status }), ...(requestId === undefined ? {} : { requestId }) }, "transient Core request retry exhausted");
+  }
+
+  private logRecovered<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, requestStartedAt: number, classification?: string, status?: number, requestId?: string): void {
+    this.logger.info({ event: "retry_recovered", operation: `${request.method} ${request.path}`, attempt, retries: attempt - 1,
+      maxAttempts, maxRetries: maxAttempts - 1, elapsedMs: Date.now() - requestStartedAt, classification: classification ?? "transport",
+      ...(status === undefined ? {} : { status }), ...(requestId === undefined ? {} : { requestId }) }, "transient Core request recovered");
   }
 }

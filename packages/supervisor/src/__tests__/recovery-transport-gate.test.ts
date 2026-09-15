@@ -90,7 +90,7 @@ describe("receipt-owned transport recovery gate", () => {
     await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
     mux.send("control:i", "control", {} as never);
     mux.send("heartbeat:i", "heartbeat", {} as never);
-    expect(emit.mock.calls.map(call => (call[0] as { channel: string }).channel)).toEqual(["control", "heartbeat"]);
+    await vi.waitFor(() => expect(emit.mock.calls.map(call => (call[0] as { channel: string }).channel)).toEqual(["control", "heartbeat"]));
   });
 
   it("does not let blocked work head-of-line block HTTPS control delivery before start", async () => {
@@ -148,6 +148,30 @@ describe("receipt-owned transport recovery gate", () => {
       expect(core.controlPoll).toHaveBeenCalledTimes(1);
       expect(core.sessionInbound).not.toHaveBeenCalled();
     } finally { transport.stop(); }
+  });
+
+  it("schedules the next HTTPS poll only after the current poll completes", async () => {
+    vi.useFakeTimers();
+    const first = Promise.withResolvers<ToRuntimeRelayFrame[]>();
+    const core = { controlPoll: vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValue([]), sessionInbound: vi.fn(async () => []) };
+    const transport = new HttpsFallbackTransport({ core: core as never, instanceId: () => "i", pollIntervalMs: 1000,
+      recoveryAuthority: () => "accepted" });
+    transport.start();
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(core.controlPoll).toHaveBeenCalledTimes(1);
+      first.resolve([]);
+      await (transport as unknown as { poll(): Promise<void> }).poll();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(core.controlPoll).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(core.controlPoll).toHaveBeenCalledTimes(2);
+    } finally {
+      transport.stop();
+      vi.useRealTimers();
+    }
   });
 
   it("does not deliver a session poll result under a replacement generation", async () => {

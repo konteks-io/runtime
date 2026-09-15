@@ -142,9 +142,49 @@ describe("native update transaction", () => {
     const h = harness({ previous });
     const outcome = await runNativeUpdate({ root: "/root", output: h.output }, h.deps);
     expect(outcome).toEqual({ state: "updated", from: "1.0.0", to: "1.1.0", releaseId: "release-next", previousReleaseId: "release-prev", restarted: true });
-    expect(h.calls).toEqual(["status", "control:doctor@release-prev", "control:drain@release-prev", "control:drain.status@release-prev", "stop", "commit", "start", "control:status@release-next", "control:agents@release-next", "control:doctor@release-next", "control:agents@release-next"]);
+    expect(h.calls).toEqual(["status", "control:doctor@release-prev", "control:drain@release-prev", "control:drain.status@release-prev", "stop", "status", "commit", "start", "control:status@release-next", "control:agents@release-next", "control:doctor@release-next", "control:agents@release-next"]);
     expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "applied"]);
     expect(h.currentRecord().releaseId).toBe("release-next");
+  });
+  it("waits for a slow-stopping service to exit and release the runtime directory before committing", async () => {
+    const h = harness({ previous });
+    // The stop command acknowledges immediately, but the old process lingers for two polls and holds the runtime lock for one more.
+    let lingering = 0, held = 1;
+    const execute = h.deps.execute;
+    h.deps.execute = async command => { if (command.command === "stop") { lingering = 2; return execute(command); } if (command.command === "status" && lingering > 0) { lingering -= 1; return 0; } return execute(command); };
+    const commit = h.deps.commit;
+    h.deps.commit = async options => { if (held > 0) { held -= 1; throw new RemoteInstanceError("temporarily_unavailable", "Another connector owns this native data directory."); } return commit(options); };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+    expect(h.calls.filter(call => call === "status").length).toBeGreaterThanOrEqual(2);
+    expect(h.calls.indexOf("commit")).toBeGreaterThan(h.calls.indexOf("stop"));
+  });
+  it("lets a connectivity doctor failure settle within the deadline instead of rolling back", async () => {
+    const h = harness({ previous, gate: "new_failure" });
+    // The successor's relay check fails on the first two doctor reads, then passes.
+    let reads = 0;
+    const control = h.deps.control;
+    h.deps.control = (root, record) => { const client = control(root, record); return { call: async (request: { op: string }, schema: never, options?: never) => { const value = await client.call(request as never, schema, options); if (request.op === "doctor" && record.releaseId === "release-next") { reads += 1; if (reads > 2) (value as { checks: Array<{ id: string }> }).checks = (value as { checks: Array<{ id: string }> }).checks.filter(check => check.id !== "runner_spawn"); } return value as never; } }; };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated" });
+    expect(h.calls.filter(call => call === "control:doctor@release-next").length).toBe(3);
+    expect(h.calls).not.toContain("restore:release-next");
+  });
+  it("waits for the failed successor to exit and release the runtime directory before restoring", async () => {
+    const h = harness({ previous, gate: "wrong_version" });
+    let held = 2;
+    const restore = h.deps.restore;
+    h.deps.restore = async (root, expected, prev) => { if (held > 0) { held -= 1; throw new RemoteInstanceError("temporarily_unavailable", "Another connector owns this native data directory."); } return restore(root, expected, prev); };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "update_required" });
+    expect(h.calls.slice(-2)).toEqual(["restore:release-next", "start"]);
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back" });
+  });
+  it("gives up when the old service never exits, leaving the record unchanged", async () => {
+    const h = harness({ previous });
+    const execute = h.deps.execute;
+    h.deps.execute = async command => (command.command === "stop" ? 0 : command.command === "status" ? 0 : execute(command));
+    h.deps.stopDeadlineMs = 3_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.calls).not.toContain("commit");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
   });
   it("does not drain or restart when the service is not running", async () => {
     const h = harness({ previous, running: false });
@@ -154,7 +194,7 @@ describe("native update transaction", () => {
   it.each(["no_answer", "wrong_version", "new_failure"] as const)("rolls back to the previous release and restarts it when the gate fails (%s)", async gate => {
     const h = harness({ previous, gate });
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: expect.stringMatching(/temporarily_unavailable|update_required/) });
-    expect(h.calls.slice(-3)).toEqual(["stop", "restore:release-next", "start"]);
+    expect(h.calls.slice(-4)).toEqual(["stop", "status", "restore:release-next", "start"]);
     expect(h.currentRecord().releaseId).toBe("release-prev");
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back", manifestDigest: "sha256:next", releaseId: "release-next" });
     expect((h.ledger.at(-1) as { detail: string }).detail).toMatch(/control socket|reports 1.0.0|doctor failure\(s\): runner_spawn/);
@@ -175,6 +215,15 @@ describe("native update transaction", () => {
     expect(h.calls).not.toContain("stop");
     expect(h.calls).not.toContain("commit");
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
+  });
+  it("records a failed attempt when the channel cannot even be read, so a launched transaction never looks in flight", async () => {
+    const h = harness({ previous });
+    h.deps.stage = async () => { throw new RemoteInstanceError("temporarily_unavailable", "The native release channel could not be read; the installed release is unchanged."); };
+    await expect(runNativeUpdate({ root: "/root", output: h.output, unattended: true }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.ledger).toHaveLength(1);
+    expect(h.ledger[0]).toMatchObject({ outcome: "failed", reason: "unattended", bundleVersion: "unknown", releaseId: null });
+    expect((h.ledger[0] as { detail: string }).detail).toMatch(/channel could not be read/);
+    expect(h.calls).toEqual([]);
   });
   it("writes the durable ledger the supervisor reads back", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-update-ledger-")); roots.push(root);

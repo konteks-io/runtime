@@ -8,7 +8,6 @@ import {
   HeartbeatResultSchema,
   RemoteAgentCapabilityRedeemRequestSchema,
   RemoteAgentCapabilityRedeemResultSchema,
-  CoreResponseError,
   DesiredConfigurationAckSchema,
   DesiredConfigurationEnvelopeSchema,
   DesiredConfigurationAckResultSchema,
@@ -226,26 +225,28 @@ export class CoreClient {
   }
 
   async activationExchange(request: Omit<RemoteInstanceActivationExchangeRequest, "proof">, nonce: string): Promise<RemoteInstanceActivationExchangeResult> {
-    const body = { ...request, proof: this.proof("activation_exchange", request.activationId, request as unknown as { [key: string]: JsonValue }, nonce) };
-    return this.http.request({ method: "POST", path: CORE_PATHS.activationExchange, body, schema: RemoteInstanceActivationExchangeResultSchema, idempotencyKey: `activation:${request.activationId}:${nonce}` });
+    return this.http.request({ method: "POST", path: CORE_PATHS.activationExchange,
+      bodyFactory: () => ({ ...request, proof: this.proof("activation_exchange", request.activationId, request as unknown as { [key: string]: JsonValue }) }),
+      schema: RemoteInstanceActivationExchangeResultSchema, idempotencyKey: `activation:${request.activationId}:${nonce}` });
   }
 
   async refreshProvisioningCredential(request: Omit<RemoteInstanceProvisioningCredentialRefreshRequest, "proof">): Promise<RemoteInstanceProvisioningCredentialRefreshResult> {
-    const body = { ...request, proof: this.proof("provisioning_refresh", request.instanceId, request as unknown as { [key: string]: JsonValue }) };
-    return this.http.request({ method: "POST", path: CORE_PATHS.provisioningCredential(request.instanceId), body, schema: RemoteInstanceProvisioningCredentialRefreshResultSchema,
+    return this.http.request({ method: "POST", path: CORE_PATHS.provisioningCredential(request.instanceId),
+      bodyFactory: () => ({ ...request, proof: this.proof("provisioning_refresh", request.instanceId, request as unknown as { [key: string]: JsonValue }) }), schema: RemoteInstanceProvisioningCredentialRefreshResultSchema,
       idempotencyKey: `provisioning-refresh:${request.instanceId}:${request.manifestDigest}` });
   }
 
   async submitReadiness(request: Omit<RemoteInstanceReadinessRequest, "proof">): Promise<z.infer<typeof ReadinessResultSchema>> {
-    const body = { ...request, proof: this.proof("readiness", request.instanceId, request as unknown as { [key: string]: JsonValue }) };
-    return this.http.request({ method: "POST", path: CORE_PATHS.readiness(request.instanceId), body, schema: ReadinessResultSchema,
+    return this.http.request({ method: "POST", path: CORE_PATHS.readiness(request.instanceId),
+      bodyFactory: () => ({ ...request, proof: this.proof("readiness", request.instanceId, request as unknown as { [key: string]: JsonValue }) }), schema: ReadinessResultSchema,
       idempotencyKey: `readiness:${request.instanceId}:${jcsDigest(request as unknown as JsonValue)}` });
   }
 
-  async registerExecutionReady(instanceId: string, request: Omit<RemoteExecutionReadyRequest, "proof">): Promise<RemoteExecutionReadyResult> {
-    const body = RemoteExecutionReadyRequestSchema.parse({ ...request, proof: this.proof("execution_ready", instanceId, request) });
-    const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionReady(instanceId), body, schema: RemoteExecutionReadyResultSchema,
-      idempotencyKey: `execution-ready:${request.assignmentId}:${request.attempt}:${request.claimId}:${request.recoveryEpoch}` });
+  async registerExecutionReady(instanceId: string, request: Omit<RemoteExecutionReadyRequest, "proof">, deadlineAtMs?: number): Promise<RemoteExecutionReadyResult> {
+    const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionReady(instanceId),
+      bodyFactory: () => RemoteExecutionReadyRequestSchema.parse({ ...request, proof: this.proof("execution_ready", instanceId, request) }), schema: RemoteExecutionReadyResultSchema,
+      idempotencyKey: `execution-ready:${request.assignmentId}:${request.attempt}:${request.claimId}:${request.recoveryEpoch}`,
+      ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
     if (result.instanceId !== instanceId || result.assignmentId !== request.assignmentId || result.attempt !== request.attempt || result.claimId !== request.claimId || result.recoveryEpoch !== request.recoveryEpoch ||
         result.runnerIncarnation !== request.runnerIncarnation || result.agentId !== request.agentId || result.acpSessionRef !== request.acpSessionRef) {
       throw new RemoteInstanceError("registration_mismatch", "Execution readiness response does not match the local claim.");
@@ -255,15 +256,15 @@ export class CoreClient {
 
   async consumeExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionConsumeRequest, "proof">) {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
-    const body = RemoteExecutionConsumeRequestSchema.parse({ ...request, proof: this.proof("execution_consume", subject, request) });
-    return this.http.request({ method: "POST", path: CORE_PATHS.executionConsume(instanceId, executionId), body, schema: RemoteExecutionConsumeResultSchema,
+    return this.http.request({ method: "POST", path: CORE_PATHS.executionConsume(instanceId, executionId),
+      bodyFactory: () => RemoteExecutionConsumeRequestSchema.parse({ ...request, proof: this.proof("execution_consume", subject, request) }), schema: RemoteExecutionConsumeResultSchema,
       idempotencyKey: `execution-consume:${executionId}:${request.permitId}:${request.operationId}` });
   }
 
   async checkExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">) {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
-    const body = RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) });
-    const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionCheck(instanceId, executionId), body, schema: RemoteExecutionCheckResultSchema,
+    const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionCheck(instanceId, executionId),
+      bodyFactory: () => RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) }), schema: RemoteExecutionCheckResultSchema,
       idempotencyKey: `execution-check:${executionId}:${request.executionRevision}` });
     if (result.executionId !== executionId || result.executionRevision !== request.executionRevision) {
       throw new RemoteInstanceError("execution_fenced", "Execution check response belongs to another execution.");
@@ -273,15 +274,15 @@ export class CoreClient {
 
   async consumeDeliveryExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionConsumeRequest, "proof">) {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
-    const body = RemoteExecutionConsumeRequestSchema.parse({ ...request, proof: this.proof("execution_consume", subject, request) });
-    return this.http.request({ method: "POST", path: CORE_PATHS.deliveryExecutionConsume(instanceId, executionId), body, schema: RemoteExecutionConsumeResultSchema,
+    return this.http.request({ method: "POST", path: CORE_PATHS.deliveryExecutionConsume(instanceId, executionId),
+      bodyFactory: () => RemoteExecutionConsumeRequestSchema.parse({ ...request, proof: this.proof("execution_consume", subject, request) }), schema: RemoteExecutionConsumeResultSchema,
       idempotencyKey: `delivery-execution-consume:${executionId}:${request.permitId}:${request.operationId}` });
   }
 
   async checkDeliveryExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">) {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
-    const body = RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) });
-    const result = await this.http.request({ method: "POST", path: CORE_PATHS.deliveryExecutionCheck(instanceId, executionId), body, schema: RemoteExecutionCheckResultSchema,
+    const result = await this.http.request({ method: "POST", path: CORE_PATHS.deliveryExecutionCheck(instanceId, executionId),
+      bodyFactory: () => RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) }), schema: RemoteExecutionCheckResultSchema,
       idempotencyKey: `delivery-execution-check:${executionId}:${request.executionRevision}` });
     if (result.executionId !== executionId || result.executionRevision !== request.executionRevision) {
       throw new RemoteInstanceError("execution_fenced", "Delivery check response belongs to another execution.");
@@ -318,11 +319,11 @@ export class CoreClient {
   }
 
   async reconnect(request: Omit<RemoteInstanceReconnectRequest, "proof">): Promise<{ lease: string; leaseExpiresAt: string; manifest: RemoteInstanceReconciliationManifest }> {
-    const body = RemoteInstanceReconnectRequestSchema.parse({ ...request, proof: this.proof("reconnect", request.instanceId, request as unknown as { [key: string]: JsonValue }) });
-    const manifest = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.reconnect(body.instanceId), body, schema: RemoteInstanceReconciliationManifestSchema,
-      idempotencyKey: `reconnect:${body.instanceId}:${body.reconnectIntentId}` });
-    if (manifest.instanceId !== body.instanceId || manifest.runnerIncarnation !== body.runnerIncarnation || manifest.reconnectIntentId !== body.reconnectIntentId) throw new RemoteInstanceError("registration_mismatch", "Reconnect response belongs to another recovery intent.");
-    const claims = decodeLeaseClaims(manifest.lease, { instanceId: body.instanceId, audience: LEASE_AUDIENCE });
+    const manifest = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.reconnect(request.instanceId),
+      bodyFactory: () => RemoteInstanceReconnectRequestSchema.parse({ ...request, proof: this.proof("reconnect", request.instanceId, request as unknown as { [key: string]: JsonValue }) }), schema: RemoteInstanceReconciliationManifestSchema,
+      idempotencyKey: `reconnect:${request.instanceId}:${request.reconnectIntentId}` });
+    if (manifest.instanceId !== request.instanceId || manifest.runnerIncarnation !== request.runnerIncarnation || manifest.reconnectIntentId !== request.reconnectIntentId) throw new RemoteInstanceError("registration_mismatch", "Reconnect response belongs to another recovery intent.");
+    const claims = decodeLeaseClaims(manifest.lease, { instanceId: request.instanceId, audience: LEASE_AUDIENCE });
     if (claims.exp * 1000 <= this.options.clock.coreNow()) throw new RemoteInstanceError("recovery_required", "Reconnect lease has expired.");
     // This is an internal scheduling projection, not an HTTP response wrapper.
     // Topology/workspace checks remain in Supervisor's fenced lease adoption.
@@ -332,10 +333,10 @@ export class CoreClient {
   /** Read-only owner projection; this neither establishes a process nor persists its CAS. */
   async resolveRuntimeOwner(instanceId: string): Promise<RemoteRuntimeOwnerResolveResult> {
     const unsigned = { instanceId };
-    const body = RemoteRuntimeOwnerResolveRequestSchema.parse({ ...unsigned, proof: this.proof("runtime_owner_resolve", instanceId, unsigned) });
-    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.runtimeOwnerResolve(body.instanceId), body, schema: RemoteRuntimeOwnerResolveResultSchema,
-      idempotencyKey: `runtime-owner-resolve:${body.instanceId}` });
-    if (result.instanceId !== body.instanceId) throw new RemoteInstanceError("registration_mismatch", "Runtime owner response belongs to another instance.");
+    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.runtimeOwnerResolve(instanceId),
+      bodyFactory: () => RemoteRuntimeOwnerResolveRequestSchema.parse({ ...unsigned, proof: this.proof("runtime_owner_resolve", instanceId, unsigned) }), schema: RemoteRuntimeOwnerResolveResultSchema,
+      idempotencyKey: `runtime-owner-resolve:${instanceId}` });
+    if (result.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Runtime owner response belongs to another instance.");
     return result;
   }
 
@@ -347,11 +348,12 @@ export class CoreClient {
   async applyReconciliation(request: Omit<RemoteReconciliationAppliedRequest, "proof">): Promise<RemoteReconciliationAppliedResult> {
     // Parse to a detached strict snapshot before I/O: caller mutation while the
     // response is pending cannot change the authority we compare against.
-    const body = RemoteReconciliationAppliedRequestSchema.parse({ ...request, proof: this.proof("reconciliation_applied", request.instanceId, request as unknown as { [key: string]: JsonValue }) });
-    const digest = computeRemoteReconciliationReceiptDigest(body);
-    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.reconciliationApplied(body.instanceId), body, schema: RemoteReconciliationAppliedResultSchema,
-      idempotencyKey: `reconciliation-applied:${body.instanceId}:${body.manifestId}:${digest}` });
-    if (result.instanceId !== body.instanceId || result.runnerIncarnation !== body.runnerIncarnation || result.manifestId !== body.manifestId || result.receiptDigest !== digest) {
+    const firstBody = RemoteReconciliationAppliedRequestSchema.parse({ ...request, proof: this.proof("reconciliation_applied", request.instanceId, request as unknown as { [key: string]: JsonValue }) });
+    const digest = computeRemoteReconciliationReceiptDigest(firstBody);
+    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.reconciliationApplied(request.instanceId),
+      bodyFactory: () => RemoteReconciliationAppliedRequestSchema.parse({ ...request, proof: this.proof("reconciliation_applied", request.instanceId, request as unknown as { [key: string]: JsonValue }) }), schema: RemoteReconciliationAppliedResultSchema,
+      idempotencyKey: `reconciliation-applied:${request.instanceId}:${request.manifestId}:${digest}` });
+    if (result.instanceId !== request.instanceId || result.runnerIncarnation !== request.runnerIncarnation || result.manifestId !== request.manifestId || result.receiptDigest !== digest) {
       throw new RemoteInstanceError("registration_mismatch", "Applied receipt response does not match the submitted recovery generation.");
     }
     return result;
@@ -376,11 +378,10 @@ export class CoreClient {
    * the work. The disposition is closed, so the caller never guesses.
    */
   async submitAssignment(instanceId: string, frame: LogicalAssignmentRequestFrame): Promise<NativeAssignmentResult> {
-    const body = NativeAssignmentRequestSchema.parse({
-      instanceId, frame,
-      proof: this.proof("assignment_request", instanceId, { instanceId, frame } as unknown as { [key: string]: JsonValue }),
-    });
-    return this.proofHttp.request({ method: "POST", path: CORE_PATHS.assignmentStream(instanceId), body, schema: NativeAssignmentResultSchema,
+    const semantic = { instanceId, frame };
+    return this.proofHttp.request({ method: "POST", path: CORE_PATHS.assignmentStream(instanceId),
+      bodyFactory: () => NativeAssignmentRequestSchema.parse({ ...semantic,
+        proof: this.proof("assignment_request", instanceId, semantic as unknown as { [key: string]: JsonValue }) }), schema: NativeAssignmentResultSchema,
       idempotencyKey: `assignment-stream:${instanceId}:${frame.channelId}:${frame.seq}` });
   }
 
@@ -391,13 +392,15 @@ export class CoreClient {
    */
   async acknowledgeAssignments(instanceId: string, cursors: { observedRequestAckSequence: number; consumedReplySequence: number }): Promise<NativeAssignmentAckResult> {
     const semantic = { instanceId, channelId: `assignment:${instanceId}`, ...cursors };
-    const body = NativeAssignmentAckRequestSchema.parse({
-      ...semantic,
-      proof: this.proof("assignment_ack", instanceId, semantic as unknown as { [key: string]: JsonValue }),
-    });
-    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.assignmentStreamAck(instanceId), body, schema: NativeAssignmentAckResultSchema,
+    const attemptedNonces = new Set<string>();
+    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.assignmentStreamAck(instanceId), bodyFactory: () => {
+      const body = NativeAssignmentAckRequestSchema.parse({ ...semantic,
+        proof: this.proof("assignment_ack", instanceId, semantic as unknown as { [key: string]: JsonValue }) });
+      attemptedNonces.add(body.proof.nonce);
+      return body;
+    }, schema: NativeAssignmentAckResultSchema,
       idempotencyKey: `assignment-ack:${instanceId}:${cursors.observedRequestAckSequence}:${cursors.consumedReplySequence}` });
-    if (result.instanceId !== body.instanceId || result.channelId !== body.channelId || result.requestNonce !== body.proof.nonce) {
+    if (result.instanceId !== semantic.instanceId || result.channelId !== semantic.channelId || !attemptedNonces.has(result.requestNonce)) {
       throw new RemoteInstanceError("registration_mismatch", "Acknowledgement response belongs to another stream or exchange.");
     }
     return result;
@@ -407,13 +410,15 @@ export class CoreClient {
    * inbox handled or an ACP process stopped. Each explicit retry signs afresh. */
   async acknowledgeCancellation(receipt: NativeCancellationReceipt): Promise<NativeCancellationReceiptResult> {
     const semantic = NativeCancellationReceiptSchema.parse(receipt);
-    const body = NativeCancellationReceiptRequestSchema.parse({ ...semantic,
-      proof: this.proof("cancellation_receipt", semantic.instanceId, semantic),
-    });
-    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.cancellationReceipt(body.instanceId),
-      body, schema: NativeCancellationReceiptResultSchema,
-      idempotencyKey: `cancellation-receipt:${body.instanceId}:${semantic.intentId}` });
-    if (result.requestNonce !== body.proof.nonce ||
+    const attemptedNonces = new Set<string>();
+    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.cancellationReceipt(semantic.instanceId),
+      bodyFactory: () => {
+        const body = NativeCancellationReceiptRequestSchema.parse({ ...semantic, proof: this.proof("cancellation_receipt", semantic.instanceId, semantic) });
+        attemptedNonces.add(body.proof.nonce);
+        return body;
+      }, schema: NativeCancellationReceiptResultSchema,
+      idempotencyKey: `cancellation-receipt:${semantic.instanceId}:${semantic.intentId}` });
+    if (!attemptedNonces.has(result.requestNonce) ||
         Object.entries(semantic).some(([field, value]) => result[field as keyof NativeCancellationReceipt] !== value)) {
       throw new RemoteInstanceError("registration_mismatch", "Cancellation receipt response belongs to another intent or exchange.");
     }
@@ -423,14 +428,11 @@ export class CoreClient {
   /** Long-poll Core's retained planning terminal intents for this native owner. */
   async pullControllerDirectives(instanceId: string, candidate: ControllerDirectivePullInput): Promise<PlanningControllerDirectivePullResult> {
     const input = ControllerDirectivePullInputSchema.parse(candidate);
-    const body = PlanningControllerDirectivePullRequestSchema.parse({
-      ...input,
-      proof: this.proof("controller_directives_pull", instanceId, input as unknown as { [key: string]: JsonValue }),
-    });
     const result = await this.http.request({
       method: "POST",
       path: CORE_PATHS.controllerDirectivesPull(instanceId),
-      body,
+      bodyFactory: () => PlanningControllerDirectivePullRequestSchema.parse({ ...input,
+        proof: this.proof("controller_directives_pull", instanceId, input as unknown as { [key: string]: JsonValue }) }),
       schema: PlanningControllerDirectivePullResultSchema,
       idempotencyKey: `controller-directives:${instanceId}:${input.runnerIncarnation}:${input.afterSequence}`,
     });
@@ -497,40 +499,34 @@ export class CoreClient {
   }
 
   /** Repeat delivery of one claim's capability; bearer lives only in ACP configuration. */
-  async redeemCapabilityToken(instanceId: string, args: { assignmentId: string; attempt: number; mcpCapabilityTokenRef: string }): Promise<CapabilityTokenIssue> {
+  async redeemCapabilityToken(instanceId: string, args: { assignmentId: string; attempt: number; mcpCapabilityTokenRef: string }, deadlineAtMs?: number): Promise<CapabilityTokenIssue> {
     const request = { instanceId, ...args };
     // Core restarts and cold local E2E stacks have repeatedly answered valid
     // claim reads in 7-15 seconds. Nine seconds made a healthy, resumable
     // native turn fail during a brief control-plane warm-up. Keep the retry
     // count bounded, but allow each authenticated attempt a useful interval.
-    const deadline = performance.now() + 30_000;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const remaining = deadline - performance.now();
-      if (remaining <= 0) break;
-      // Fresh proof each HTTP attempt, identical assignment/reference identity.
-      const body = RemoteAgentCapabilityRedeemRequestSchema.safeParse({ ...request, proof: this.proof("token_redeem", instanceId, request) });
-      if (!body.success) throw new RemoteInstanceError("capability_unavailable", "Capability request is invalid.");
-      try {
-        const issued = await this.http.request({ method: "POST", path: CORE_PATHS.capabilityTokenRedeem(instanceId), body: body.data, schema: RemoteAgentCapabilityRedeemResultSchema, timeoutMs: Math.min(10_000, remaining) });
-        if (performance.now() >= deadline || Date.parse(issued.expiresAt) <= this.options.clock.coreNow()) {
-          throw new RemoteInstanceError("capability_unavailable", "Capability delivery has expired.");
-        }
-        // /api/app/mcp is connection-management REST, not the MCP transport.
-        // The real /mcp owner still needs its capability admission integration.
-        const url = this.options.platformMcpUrl ?? new URL("/mcp", this.options.baseUrl).toString();
-        return { mcpServer: { name: "konteks-platform", url, headers: [{ name: "authorization", value: `Bearer ${issued.token}` }] }, expiresAt: issued.expiresAt };
-      } catch (error) {
-        const transient = error instanceof RemoteInstanceError && error.retryable && error.code === "temporarily_unavailable" &&
-          (!(error instanceof CoreResponseError) || error.wireCode === "temporarily_unavailable");
-        if (!transient || attempt === 2) {
-          // Schema/parser/server messages may contain secret-bearing input.
-          throw new RemoteInstanceError(error instanceof RemoteInstanceError ? error.code : "capability_unavailable", "Capability delivery was not accepted.", { retryable: transient });
-        }
-        const delay = Math.min(100 * 2 ** attempt, Math.max(0, deadline - performance.now()));
-        await new Promise(resolve => setTimeout(resolve, delay));
+    const validated = RemoteAgentCapabilityRedeemRequestSchema.safeParse({ ...request, proof: this.proof("token_redeem", instanceId, request) });
+    if (!validated.success) throw new RemoteInstanceError("capability_unavailable", "Capability request is invalid.");
+    // Preserve the caller's enclosing authority deadline, but otherwise let
+    // JsonClient budget all four 30-second attempts plus bounded backoff.
+    const deadline = deadlineAtMs;
+    try {
+      const issued = await this.http.request({ method: "POST", path: CORE_PATHS.capabilityTokenRedeem(instanceId),
+        bodyFactory: () => RemoteAgentCapabilityRedeemRequestSchema.parse({ ...request, proof: this.proof("token_redeem", instanceId, request) }),
+        schema: RemoteAgentCapabilityRedeemResultSchema, idempotencyKey: `capability-redeem:${instanceId}:${args.assignmentId}:${args.attempt}:${args.mcpCapabilityTokenRef}`,
+        timeoutMs: 30_000, ...(deadline === undefined ? {} : { deadlineAtMs: deadline }) });
+      if ((deadline !== undefined && Date.now() >= deadline) || Date.parse(issued.expiresAt) <= this.options.clock.coreNow()) {
+        throw new RemoteInstanceError("capability_unavailable", "Capability delivery has expired.");
       }
+      // /api/app/mcp is connection-management REST, not the MCP transport.
+      // The real /mcp owner still needs its capability admission integration.
+      const url = this.options.platformMcpUrl ?? new URL("/mcp", this.options.baseUrl).toString();
+      return { mcpServer: { name: "konteks-platform", url, headers: [{ name: "authorization", value: `Bearer ${issued.token}` }] }, expiresAt: issued.expiresAt };
+    } catch (error) {
+      const transient = error instanceof RemoteInstanceError && error.retryable;
+      // Schema/parser/server messages may contain secret-bearing input.
+      throw new RemoteInstanceError(error instanceof RemoteInstanceError ? error.code : "capability_unavailable", "Capability delivery was not accepted.", { retryable: transient });
     }
-    throw new RemoteInstanceError("temporarily_unavailable", "Capability delivery timed out.", { retryable: true });
   }
 
   /** The claimed assignment's work definition (see `CORE_PATHS.workload`); `not_found` when Core has none. */

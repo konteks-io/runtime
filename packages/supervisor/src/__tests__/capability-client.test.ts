@@ -28,13 +28,13 @@ describe("repeatable native capability delivery", () => {
     }
   });
 
-  it("bounds transport retries to three attempts", async () => {
+  it("bounds transport delivery to four total attempts", async () => {
     const f = fixture(async () => { throw new Error("offline"); });
     await expect(f.client.redeemCapabilityToken("instance", args)).rejects.toMatchObject({ code: "temporarily_unavailable" });
-    expect(f.fetchFn).toHaveBeenCalledTimes(3);
+    expect(f.fetchFn).toHaveBeenCalledTimes(4);
   });
 
-  it.each([403, 500])("does not retry explicit capability denial even at HTTP %s", async status => {
+  it.each([400, 403])("does not retry explicit capability denial at HTTP %s", async status => {
     const f = fixture(async () => new Response(JSON.stringify({ code: "capability_unavailable", message: "denied" }), { status }));
     await expect(f.client.redeemCapabilityToken("instance", args)).rejects.toMatchObject({ code: "capability_unavailable" });
     expect(f.fetchFn).toHaveBeenCalledTimes(1);
@@ -45,6 +45,14 @@ describe("repeatable native capability delivery", () => {
     await expect(f.client.redeemCapabilityToken("instance", args)).resolves.toHaveProperty("mcpServer");
     expect(f.fetchFn).toHaveBeenCalledTimes(3);
     for (const [, init] of f.fetchFn.mock.calls) expect(init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it.each([408, 425, 429, 500, 503])("retries the allowed transient HTTP status %s", async status => {
+    const f = fixture(async count => count === 1
+      ? new Response(JSON.stringify({ code: "temporarily_unavailable", message: "wait" }), { status })
+      : success());
+    await expect(f.client.redeemCapabilityToken("instance", args)).resolves.toHaveProperty("mcpServer");
+    expect(f.fetchFn).toHaveBeenCalledTimes(2);
   });
 
   it("retries when the response body is lost after headers arrive", async () => {
@@ -73,11 +81,11 @@ describe("repeatable native capability delivery", () => {
     expect(f.fetchFn).not.toHaveBeenCalled();
   });
 
-  it("rejects successful delivery arriving after the monotonic total budget", async () => {
+  it("rejects successful delivery arriving after the caller's enclosing deadline", async () => {
     const f = fixture(async () => success());
-    const clock = vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(30_001);
+    const clock = vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(30_001);
     try {
-      await expect(f.client.redeemCapabilityToken("instance", args)).rejects.toMatchObject({ code: "capability_unavailable" });
+      await expect(f.client.redeemCapabilityToken("instance", args, 30_000)).rejects.toMatchObject({ code: "capability_unavailable" });
       expect(f.fetchFn).toHaveBeenCalledTimes(1);
     } finally { clock.mockRestore(); }
   });
@@ -91,7 +99,7 @@ describe("repeatable native capability delivery", () => {
   });
 
   it("does not reinterpret an unknown server error as a transient authority decision", async () => {
-    const f = fixture(async () => new Response(JSON.stringify({ code: "unrecognized_authority_denial" }), { status: 500 }));
+    const f = fixture(async () => new Response(JSON.stringify({ code: "unrecognized_authority_denial" }), { status: 400 }));
     await expect(f.client.redeemCapabilityToken("instance", args)).rejects.toThrow();
     expect(f.fetchFn).toHaveBeenCalledTimes(1);
   });

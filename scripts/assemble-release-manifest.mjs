@@ -8,13 +8,17 @@ const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) =>
 const tag = args.tag, artifactsPath = args.artifacts, policyPath = args.policy ?? "release/release-policy.json";
 const out = args.out ?? "release/unsigned-native-manifest.json";
 if (!tag || !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(tag) || !artifactsPath) {
-  console.error("usage: assemble-release-manifest.mjs --tag vX.Y.Z --artifacts native-artifacts.json [--policy release/release-policy.json] --out path");
+  console.error("usage: assemble-release-manifest.mjs --tag vX.Y.Z --artifacts native-artifacts.json [--policy release/release-policy.json] [--targets os/arch,...] --out path");
   process.exit(2);
 }
 const bundleVersion = tag.slice(1), index = parseJson(artifactsPath), policy = parseJson(policyPath);
 exactKeys(index, ["schemaVersion", "artifacts"], "artifact index");
 if (index.schemaVersion !== 1 || !Array.isArray(index.artifacts)) fail("unsupported artifact index");
-const targets = [["macos", "amd64"], ["macos", "arm64"], ["windows", "amd64"], ["debian", "amd64"], ["debian", "arm64"]];
+const ALL_TARGETS = [["macos", "amd64"], ["macos", "arm64"], ["windows", "amd64"], ["debian", "amd64"], ["debian", "arm64"]];
+// A release ships the full matrix; a developer/e2e channel may name a subset (`--targets macos/arm64,debian/amd64`).
+const targets = args.targets
+  ? args.targets.split(",").map(pair => { const target = ALL_TARGETS.find(([os, architecture]) => `${os}/${architecture}` === pair.trim()); if (!target) fail(`unknown target ${pair}`); return target; })
+  : ALL_TARGETS;
 const agents = ["claude-code", "codex", "opencode"], ids = new Set(), coordinates = new Set();
 for (const artifact of index.artifacts) {
   const bridge = artifact.kind === "agent_bridge";

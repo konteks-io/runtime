@@ -64,8 +64,8 @@ export async function runActivationExchange(args: ActivationExchangeArgs): Promi
   if (existing && existing.administrativeStatus !== "provisioning") {
     throw new RemoteInstanceError("activation_consumed", "this runtime is already activated", { recoveryActions: [{ kind: "run_doctor" }] });
   }
-  // A retried exchange (interrupted install) reuses the same key AND nonce so
-  // Core returns the same result instead of creating a duplicate identity.
+  // A retried exchange reuses this semantic nonce in its idempotency key.
+  // The transport proof nonce is regenerated for every HTTP attempt.
   let nonce = existing?.exchangeNonce ?? newNonce();
   if (args.deploymentKind === "native_connector") {
     const independent = verifyNativeRelease(args.release.manifest, args.roots, args.clock.now());

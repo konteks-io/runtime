@@ -29,7 +29,8 @@ export function createNativeReadyRegistrar(options: NativeReadyOptions) {
     };
     const initial = checked(options.journal.assignments.get(key));
     const request = { assignmentId: assignment.id, attempt: assignment.attempt, claimId: initial.claimId, recoveryEpoch: initial.recoveryEpoch, runnerIncarnation: options.runnerIncarnation, agentId: assignment.agentRoute.agentId, acpSessionRef };
-    const result = RemoteExecutionReadyResultSchema.parse(await options.client.registerExecutionReady(options.instanceId, request));
+    const localDeadlineAtMs = Date.now() + Math.max(0, Date.parse(assignment.expiresAt) - options.clock.coreNow());
+    const result = RemoteExecutionReadyResultSchema.parse(await options.client.registerExecutionReady(options.instanceId, request, localDeadlineAtMs));
     if (Object.entries({ ...binding, ...request }).some(([field, value]) => result[field as keyof typeof result] !== value)) throw unavailable();
     await options.journal.assignments.update(key, current => {
       const entry = checked(current);

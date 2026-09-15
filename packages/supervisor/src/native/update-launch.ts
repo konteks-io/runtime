@@ -20,9 +20,20 @@ export interface NativeUpdateLaunchOptions {
  * alone, while a systemd user service kills its whole cgroup, so there the
  * updater runs as its own transient unit.
  */
-export async function launchNativeUpdater(options: NativeUpdateLaunchOptions): Promise<{ pid: number | null; command: string; args: string[] }> {
+/** Network trust and channel settings the service itself was started with; the transaction needs the same ones. */
+const UPDATER_ENV_ALLOWLIST = ["NODE_EXTRA_CA_CERTS", "KONTEKS_RELEASE_MANIFEST_URL", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy"] as const;
+
+export interface NativeUpdateLaunch {
+  pid: number | null;
+  command: string;
+  args: string[];
+  /** Fires when the spawned transaction exits while this service is still alive (a refusal or early failure); a successful update stops this service first. */
+  onExit: (listener: (code: number | null) => void) => void;
+}
+
+export async function launchNativeUpdater(options: NativeUpdateLaunchOptions): Promise<NativeUpdateLaunch> {
   if (!isAbsolute(options.root) || !isAbsolute(options.executable)) throw new Error("native update launch paths must be absolute");
-  const env = sanitizeInheritedChildProcessEnv({ env: process.env });
+  const env = sanitizeInheritedChildProcessEnv({ env: process.env, allow: UPDATER_ENV_ALLOWLIST });
   const updateArgs = ["--root", options.root, "--json", "update", "--unattended"];
   const spawnFn = options.spawnFn ?? spawn;
   if (options.os === "debian") {
@@ -30,14 +41,14 @@ export async function launchNativeUpdater(options: NativeUpdateLaunchOptions): P
     const args = ["--user", "--collect", "--quiet", `--unit=${unit}`, "--property=KillMode=process", options.executable, ...updateArgs];
     const child = spawnFn("systemd-run", args, { env, stdio: "ignore", detached: true });
     child.unref();
-    return { pid: child.pid ?? null, command: "systemd-run", args };
+    return { pid: child.pid ?? null, command: "systemd-run", args, onExit: listener => child.once("exit", code => listener(code)) };
   }
   const logPath = options.logPath ?? join(options.root, "logs", "update.log");
   const log = await open(logPath, "a", 0o600);
   try {
     const child = spawnFn(options.executable, updateArgs, { env, stdio: ["ignore", log.fd, log.fd], detached: true, windowsHide: true });
     child.unref();
-    return { pid: child.pid ?? null, command: options.executable, args: updateArgs };
+    return { pid: child.pid ?? null, command: options.executable, args: updateArgs, onExit: listener => child.once("exit", code => listener(code)) };
   } finally {
     await log.close();
   }

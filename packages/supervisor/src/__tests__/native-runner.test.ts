@@ -30,7 +30,7 @@ function fixture(options: { loggedOut?: boolean; startGate?: Promise<void> } = {
   const runner = new NativeRunner({ instanceId: "instance", config, onEvent: event => events.push(event), runtimeOptions: { spawn, probe: async () => options.loggedOut ? { kind: "logged_out" } : { kind: "signal", fingerprint: "opaque-identity-fingerprint" } } });
   const port: RunnerPort = runner;
   runners.push(runner);
-  const input = { context: { instanceId: "instance", assignmentId: "assignment", attempt: 1, agentId: "codex" }, cwd: join(root, "work"), mcpServers: [] };
+  const input = { context: { instanceId: "instance", assignmentId: "assignment", attempt: 1, agentId: "codex" }, readinessDeadlineAt: "2099-01-01T00:00:00.000Z", cwd: join(root, "work"), mcpServers: [] };
   return { runner, port, input, config, connection, bridge, spawn, events, handlers: () => handlers };
 }
 

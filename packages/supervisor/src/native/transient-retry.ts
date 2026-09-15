@@ -8,6 +8,7 @@ export type NativeTransientClassification = "transport" | "timeout" | "rate_limi
 
 export function transientHttpClassification(status: number): NativeTransientClassification | null {
   if (status === 408) return "timeout";
+  if (status === 425) return "timeout";
   if (status === 429) return "rate_limited";
   if (status >= 500) return "upstream";
   return null;

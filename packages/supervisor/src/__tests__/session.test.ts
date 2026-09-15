@@ -144,7 +144,7 @@ describe("relayed session (D98/D113/D114)", () => {
       policy: new EvaluatorPolicyResponder(null, () => true),
       broker,
       instanceId: "inst",
-      redeemCapabilityToken: async () => ({ name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }),
+      redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" }),
       browserToolUrl: null,
       workspaceRoot: "/workspace",
       ...(overrides.deploymentKind === "native_connector" ? { registerReady: async (target: RemoteWorkAssignment, binding: { sessionId: string }, acpSessionRef: string) => ({ workspaceId: target.workspaceId, instanceId: target.instanceId, sessionId: binding.sessionId, channelId: `session:${binding.sessionId}`, assignmentId: target.id, attempt: target.attempt, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner-process", agentId: target.agentRoute.agentId, acpSessionRef, readyRevision: 1, registeredAt: clock.nowIso() }) } : {}),
@@ -214,7 +214,7 @@ describe("relayed session (D98/D113/D114)", () => {
       },
       redeemCapabilityToken: async () => {
         order.push("capability");
-        return { name: "konteks", url: "https://mcp.example", headers: [] };
+        return { mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" };
       },
       reserveChannel: () => () => undefined,
       activateExecution,

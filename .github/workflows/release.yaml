@@ -1,0 +1,100 @@
+name: release
+# One tag push produces one immutable GitHub Release holding every native
+# artifact, the Ed25519-signed native manifest, the checksum manifest and the
+# bootstrap scripts. Installed connectors follow `releases/latest/download/
+# native-manifest.json`; every artifact they fetch is pinned by digest inside
+# that signed document, so the release host itself is not trusted.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runner: macos-15, os: macos, architecture: arm64, node_arch: arm64, package: konteks-remote-arm64.pkg, executable: konteks-remote }
+          - { runner: macos-15, os: macos, architecture: amd64, node_arch: x64, package: konteks-remote-amd64.pkg, executable: konteks-remote }
+          - { runner: windows-2022, os: windows, architecture: amd64, node_arch: x64, package: konteks-remote-x64.msi, executable: konteks-remote.exe }
+          - { runner: ubuntu-24.04, os: debian, architecture: amd64, node_arch: x64, package: konteks-remote_amd64.deb, executable: konteks-remote }
+          - { runner: ubuntu-24.04-arm, os: debian, architecture: arm64, node_arch: arm64, package: konteks-remote_arm64.deb, executable: konteks-remote }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+          architecture: ${{ matrix.node_arch }}
+      - name: Install (shared contracts are vendored under vendor/)
+        run: npm ci --ignore-scripts --legacy-peer-deps
+      - name: Build the connector executable and its installer package
+        shell: bash
+        env:
+          KONTEKS_RELEASE_ROOTS_JSON: ${{ vars.KONTEKS_RELEASE_ROOTS_JSON }}
+          KONTEKS_LAUNCHER_VERSION: ${{ github.ref_name }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          WINDOWS_AUTHENTICODE_PFX: ${{ secrets.WINDOWS_AUTHENTICODE_PFX }}
+          DEB_SIGNING_KEY: ${{ secrets.DEB_SIGNING_KEY }}
+        run: |
+          test -n "$KONTEKS_RELEASE_ROOTS_JSON" || { echo "KONTEKS_RELEASE_ROOTS_JSON variable is required: a connector without embedded roots verifies nothing"; exit 1; }
+          node scripts/build-launcher.mjs --os "${{ matrix.os }}" --out "dist/${{ matrix.package }}"
+          node scripts/sign-launcher.mjs --os "${{ matrix.os }}" --architecture "${{ matrix.architecture }}" --artifact "dist/${{ matrix.package }}"
+      - name: Build complete offline agent packages and describe every artifact
+        shell: bash
+        env:
+          REDISTRIBUTION_APPROVAL_REF: ${{ vars.KONTEKS_AGENT_REDISTRIBUTION_APPROVAL_REF }}
+        run: |
+          test -n "$REDISTRIBUTION_APPROVAL_REF" || { echo "KONTEKS_AGENT_REDISTRIBUTION_APPROVAL_REF variable is required"; exit 1; }
+          node scripts/release-assets.mjs stage --os "${{ matrix.os }}" --architecture "${{ matrix.architecture }}" --tag "${{ github.ref_name }}" --repository "${{ github.repository }}" --executable "dist/launcher-build/${{ matrix.executable }}" --package "dist/${{ matrix.package }}" --approval "$REDISTRIBUTION_APPROVAL_REF"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.os }}-${{ matrix.architecture }}
+          path: dist/release
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - name: Install (shared contracts are vendored under vendor/)
+        run: npm ci --ignore-scripts --legacy-peer-deps
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+      - name: Assemble, sign and verify the native manifest and the checksum manifest
+        env:
+          RELEASE_SIGNING_KEY_JWK: ${{ secrets.RELEASE_SIGNING_KEY_JWK }}
+          RELEASE_KEY_ID: ${{ vars.RELEASE_KEY_ID }}
+          KONTEKS_RELEASE_ROOTS_JSON: ${{ vars.KONTEKS_RELEASE_ROOTS_JSON }}
+          DEB_SIGNING_PUBLIC_KEY: ${{ vars.DEB_SIGNING_PUBLIC_KEY }}
+        run: |
+          test -n "$RELEASE_SIGNING_KEY_JWK" || { echo "RELEASE_SIGNING_KEY_JWK secret is required"; exit 1; }
+          test -n "$RELEASE_KEY_ID" || { echo "RELEASE_KEY_ID variable is required"; exit 1; }
+          node scripts/release-assets.mjs collect --artifacts dist/artifacts --out dist/release --descriptors dist/descriptors
+          node scripts/native-artifact-index.mjs --directory dist/descriptors --out dist/native-artifacts.json
+          node scripts/assemble-release-manifest.mjs --tag "${{ github.ref_name }}" --artifacts dist/native-artifacts.json --out dist/unsigned-native-manifest.json
+          printf '%s' "$KONTEKS_RELEASE_ROOTS_JSON" > dist/roots.json
+          umask 077
+          printf '%s' "$RELEASE_SIGNING_KEY_JWK" > "$RUNNER_TEMP/release.key.json"
+          npx tsx packages/release/src/cli.ts sign-native --manifest dist/unsigned-native-manifest.json --key "$RUNNER_TEMP/release.key.json" --key-id "$RELEASE_KEY_ID" --out dist/release/native-manifest.json
+          npx tsx packages/release/src/cli.ts verify-native --manifest dist/release/native-manifest.json --roots dist/roots.json
+          node scripts/launcher-checksums.mjs dist/release dist/release
+          node scripts/sign-checksums.mjs --key "$RUNNER_TEMP/release.key.json" --in dist/release/SHA256SUMS --out dist/release/SHA256SUMS.sig --pub dist/release/release-signing.pub
+          rm -f "$RUNNER_TEMP/release.key.json"
+          if [ -n "$DEB_SIGNING_PUBLIC_KEY" ]; then printf '%s\n' "$DEB_SIGNING_PUBLIC_KEY" > dist/release/deb-signing.asc; fi
+          cp bootstrap/install.sh bootstrap/install.ps1 dist/release/
+          node scripts/release-assets.mjs verify --manifest dist/release/native-manifest.json --dir dist/release
+      - name: Publish the GitHub Release (assets are immutable per tag; latest is the stable channel)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/release/* --repo "${{ github.repository }}" --title "konteks-remote ${{ github.ref_name }}" --notes-file <(node scripts/release-assets.mjs notes --manifest dist/release/native-manifest.json --tag "${{ github.ref_name }}")

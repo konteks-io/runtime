@@ -28,6 +28,8 @@ export interface NativeUpdateTransactionDeps {
   now: () => number;
   drainDeadlineMs?: number;
   healthDeadlineMs?: number;
+  /** How long the old service may take to exit and release the runtime directory after its stop command returned. */
+  stopDeadlineMs?: number;
   pollMs?: number;
 }
 
@@ -68,7 +70,16 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
  */
 export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps): Promise<NativeUpdateOutcome> {
   const previous = await deps.readRecord(input.root);
-  const staged = await deps.stage({ root: input.root, output: input.output, ...(input.deps ? { deps: input.deps } : {}) });
+  let staged: NativeUpdateStage;
+  try {
+    staged = await deps.stage({ root: input.root, output: input.output, ...(input.deps ? { deps: input.deps } : {}) });
+  } catch (error) {
+    // Nothing was changed, but the operator and the supervisor's ledger view
+    // must still see that a launched transaction ended here.
+    const startedAt = new Date(deps.now()).toISOString();
+    await deps.recordAttempt(input.root, { id: `update-${randomUUID()}`, bundleVersion: "unknown", manifestDigest: "unknown", releaseId: null, reason: input.unattended ? "unattended" : "operator", startedAt, finishedAt: startedAt, outcome: "failed", detail: (error instanceof Error ? error.message : String(error)).slice(0, 1_024) }).catch(() => undefined);
+    throw error;
+  }
   if (staged.status === "current") {
     input.output.line(`Installed release ${staged.bundleVersion} is current; nothing was changed.`);
     const outcome: NativeUpdateOutcome = { state: "current", bundleVersion: staged.bundleVersion };
@@ -97,8 +108,12 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
         throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
       }
       stopped = true;
+      // launchd and Task Scheduler acknowledge a stop before the process has
+      // finished its graceful shutdown; the record may only move once the old
+      // service is gone and has released the runtime directory.
+      await waitForServiceExit(input, definition, deps);
     }
-    successor = await deps.commit({ root: input.root, releaseId: staged.releaseId, output: input.output });
+    successor = await commitOnceReleased(input, staged.releaseId, deps);
     if (wasRunning) {
       await deps.start(input);
       await healthGate(input, deps.control(input.root, successor), successor, failingBefore, deps);
@@ -113,8 +128,8 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     if (successor) {
       input.output.line(`Update to ${successor.bundleVersion} failed its health gate; rolling back to ${previous.releaseId}.`);
       try {
-        await deps.execute(definition.stop).catch(() => null);
-        await deps.restore(input.root, successor.releaseId, previous);
+        if (await deps.execute(definition.stop).catch(() => null) === 0) await waitForServiceExit(input, definition, deps);
+        await restoreOnceReleased(input, successor.releaseId, previous, deps);
         if (wasRunning) await deps.start(input);
         await finish("rolled_back", detail);
       } catch (rollbackError) {
@@ -126,6 +141,36 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       await finish("failed", detail);
     }
     throw error;
+  }
+}
+
+async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
+  const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+  while (await deps.execute(definition.status) === 0) {
+    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
+    input.output.line("waiting for the running connector to exit…");
+    await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
+  }
+}
+
+/** The previous process releases the runtime directory only at the very end of its shutdown. */
+function commitOnceReleased(input: NativeUpdateInput, releaseId: string, deps: NativeUpdateTransactionDeps): Promise<NativeRuntimeRecord> {
+  return onceReleased(input, deps, () => deps.commit({ root: input.root, releaseId, output: input.output }));
+}
+function restoreOnceReleased(input: NativeUpdateInput, expectedReleaseId: string, previous: NativeRuntimeRecord, deps: NativeUpdateTransactionDeps): Promise<void> {
+  return onceReleased(input, deps, () => deps.restore(input.root, expectedReleaseId, previous));
+}
+async function onceReleased<T>(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, operation: () => Promise<T>): Promise<T> {
+  const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+  for (;;) {
+    try {
+      return await operation();
+    } catch (error) {
+      const owned = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message);
+      if (!owned || deps.now() >= deadline) throw error;
+      input.output.line("waiting for the previous connector to release the runtime directory…");
+      await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
+    }
   }
 }
 
@@ -163,8 +208,10 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
   for (;;) {
     try {
       const status = await control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 });
-      if (status.version.bundle !== successor.bundleVersion) throw new RemoteInstanceError("update_required", `the service answering reports ${status.version.bundle}, not ${successor.bundleVersion}`);
       answered = true;
+      // The old process has already exited before the commit, so a different
+      // version answering here is the wrong executable, not a transition.
+      if (status.version.bundle !== successor.bundleVersion) throw new RemoteInstanceError("update_required", `the service answering reports ${status.version.bundle}, not ${successor.bundleVersion}`);
       const probed = await control.call({ op: "agents" }, AgentsSchema, { timeoutMs: 5_000 });
       const settled = successor.agents.every(agentId => probed.agents.some(agent => agent.agentId === agentId && agent.readiness !== "unknown" && agent.readiness !== "probing"));
       if (settled) break;
@@ -174,9 +221,16 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", answered ? "The updated connector did not finish probing its agents in time." : "The updated connector did not answer on its control socket in time.");
     await deps.sleep(poll);
   }
-  const failingAfter = await failingDoctorChecks(control);
-  const introduced = [...failingAfter].filter(id => !failingBefore.has(id));
-  if (introduced.length > 0) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector introduced doctor failure(s): ${introduced.join(", ")}.`);
+  // Connectivity checks (relay, lease) settle seconds after start; a failure
+  // counts against the update only if it is still there when the deadline passes.
+  for (;;) {
+    const failingAfter = await failingDoctorChecks(control);
+    const introduced = [...failingAfter].filter(id => !failingBefore.has(id));
+    if (introduced.length === 0) break;
+    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector introduced doctor failure(s): ${introduced.join(", ")}.`);
+    input.output.line(`waiting for the updated connector to clear doctor failure(s): ${introduced.join(", ")}…`);
+    await deps.sleep(poll);
+  }
   for (const agent of (await control.call({ op: "agents" }, AgentsSchema)).agents) {
     if (agent.readiness === "reconnect_required") input.output.line(`agent ${agent.agentId} needs a fresh login after this update: run \`konteks-remote auth login ${agent.agentId}\`.`);
   }

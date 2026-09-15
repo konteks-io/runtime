@@ -28,9 +28,10 @@ import type { RunnerPort } from "../runner-port.js";
 import type { SupervisorJournal } from "../state/journal.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest, type PendingHumanRequest, type SanitizedElicitation, type SanitizedPermission } from "./permissions.js";
-import type { DeferredPermissionBody } from "../core/client.js";
+import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
 import type { PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
+import { McpCapabilityFacade } from "../mcp/capability-facade.js";
 import {
   canonicalizeAcpToolActivity,
   continuesAtBoundary,
@@ -65,8 +66,8 @@ export interface RelayedSessionDeps {
    */
   registerDeferral?: (body: DeferredPermissionBody) => Promise<PendingPermissionView>;
   instanceId: string;
-  /** Redeems `mcpCapabilityTokenRef` into the in-memory `mcpServers` entry. */
-  redeemCapabilityToken: (assignment: RemoteWorkAssignment) => Promise<{ name: string; url: string; headers: Array<{ name: string; value: string }> }>;
+  /** Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory. */
+  redeemCapabilityToken: (assignment: RemoteWorkAssignment) => Promise<CapabilityTokenIssue>;
   browserToolUrl: string | null;
   workspaceRoot: string;
   /** Legacy appliance callers may omit this during migration. Native cannot. */
@@ -141,6 +142,7 @@ export class RelayedSession {
   private readonly executionGate: NativeExecutionGate | null;
   private lastPromptCompletion: { usage: AgentTurnUsageObservation | null } = { usage: null };
   private deliveryAcceptance: RemoteDeliveryAcceptanceReceipt | null = null;
+  private mcpFacade: McpCapabilityFacade | null = null;
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
 
   constructor(readonly assignment: RemoteWorkAssignment, private readonly deps: RelayedSessionDeps) {
@@ -157,7 +159,13 @@ export class RelayedSession {
 
   /** D98 bootstrap: initialize is runner-local; token → mcpServers; load/resume when proven; else session/new. */
   bootstrap(): Promise<{ acpSessionRef: string; resumed: boolean }> {
-    return this.track(() => this.bootstrapImpl());
+    return this.track(async () => {
+      try { return await this.bootstrapImpl(); }
+      catch (error) {
+        await this.closeMcpFacade();
+        throw error;
+      }
+    });
   }
 
   private track<T>(operation: () => Promise<T>): Promise<T> {
@@ -193,9 +201,25 @@ export class RelayedSession {
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     const mcpServers: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }> = [];
     if (this.assignment.agentRoute.mcpCapabilityTokenRef) {
-      const entry = await this.deps.redeemCapabilityToken(this.assignment);
+      const issue = await this.deps.redeemCapabilityToken(this.assignment);
       this.deps.assertExecutionOwned?.();
-      mcpServers.push({ type: "http", ...entry });
+      if (this.deps.deploymentKind === "native_connector") {
+        const facade = new McpCapabilityFacade({
+          initial: issue,
+          renew: () => this.deps.redeemCapabilityToken(this.assignment),
+          context: {
+            assignmentId: this.assignment.id,
+            attempt: this.assignment.attempt,
+            sessionId: this.preparedInputs?.binding.sessionId ?? this.assignment.id,
+          },
+          logger: this.logger,
+          now: () => this.deps.clock.coreNow(),
+        });
+        this.mcpFacade = facade;
+        mcpServers.push({ type: "http", ...await facade.start() });
+      } else {
+        mcpServers.push({ type: "http", ...issue.mcpServer });
+      }
     }
     if (this.assignment.agentRoute.requiredRole === "qa" && this.deps.browserToolUrl) {
       mcpServers.push({ type: "http", name: "konteks-browser-tool", url: this.deps.browserToolUrl, headers: [] });
@@ -247,6 +271,7 @@ export class RelayedSession {
     } : undefined;
     const created = await this.deps.runner.createSession({
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
+      readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
       cwd: this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
       mcpServers,
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
@@ -782,6 +807,7 @@ export class RelayedSession {
     if (this.recoveryStopTask) return this.recoveryStopTask;
     this.fenceForRecovery();
     this.recoveryStopTask = (async () => {
+      await this.closeMcpFacade();
       const initialRef = this.creationReturned ? this.acpSessionRef : null;
       const stop = async (ref: string): Promise<void> => {
         const stopRunner = this.deps.runner.stopForRecovery;
@@ -821,6 +847,7 @@ export class RelayedSession {
     }
     this.closed = true;
     try {
+      await this.closeMcpFacade();
       if (this.acpSessionRef !== null) {
         await this.deps.runner.cancel(this.acpSessionRef).catch(() => undefined);
         this.deps.assertExecutionOwned?.();
@@ -887,6 +914,7 @@ export class RelayedSession {
       if (nativeCompletion) this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "completed_turn_settlement", outcome: settlementRecorded ? "report_failed" : "unconfirmed", code: "recovery_required" }, "native completed closure remains unconfirmed");
       throw error;
     } finally {
+      await this.closeMcpFacade();
       this.completedSettlementInProgress = false;
       // The completed receipt is not qualified handoff. Keep the channel's
       // retry owner even after its terminal report has been persisted.
@@ -896,6 +924,12 @@ export class RelayedSession {
         this.releaseChannel = null;
       }
     }
+  }
+
+  private async closeMcpFacade(): Promise<void> {
+    const facade = this.mcpFacade;
+    this.mcpFacade = null;
+    await facade?.close();
   }
 
   get isClosed(): boolean {

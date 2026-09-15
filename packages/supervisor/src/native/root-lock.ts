@@ -19,7 +19,7 @@ export interface NativeRootLock {
 export function acquireNativeRootLock(dataDir: string, options: { onLost?: () => void; checkIntervalMs?: number } = {}): NativeRootLock {
   if (!isAbsolute(dataDir)) throw new RemoteInstanceError("install_state_corrupt", "Native state requires an absolute private directory.");
   let sqlite: typeof import("node:sqlite");
-  try { sqlite = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite"); }
+  try { sqlite = loadSqlite(); }
   catch { throw new RemoteInstanceError("prerequisite_missing", "Native ownership requires the bundled Node runtime with SQLite support."); }
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const directory = lstatSync(dataDir);
@@ -79,4 +79,16 @@ function restricted(stat: Stats): boolean {
 }
 function unsafe(): RemoteInstanceError {
   return new RemoteInstanceError("install_state_corrupt", "Native state ownership is unavailable or unsafe; stop the connector and check its private data directory and supported runtime.");
+}
+
+/**
+ * `process.getBuiltinModule` resolves builtins the same way in ESM, in the
+ * bundled CommonJS of the single-executable connector and under vitest;
+ * `createRequire(import.meta.url)` has no URL inside that executable, which
+ * once made every native command fail with prerequisite_missing.
+ */
+function loadSqlite(): typeof import("node:sqlite") {
+  const builtin = (process as { getBuiltinModule?: (id: string) => unknown }).getBuiltinModule?.("node:sqlite");
+  if (builtin) return builtin as typeof import("node:sqlite");
+  return createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 }

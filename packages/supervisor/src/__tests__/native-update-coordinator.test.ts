@@ -10,7 +10,7 @@ import { readNativeUpdateLedger, recordNativeUpdateAttempt, type NativeUpdateAtt
 import { launchNativeUpdater } from "../native/update-launch.js";
 
 const roots: string[] = [];
-afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
 function manifests() {
   const keys = buildReleaseFixture();
@@ -92,6 +92,17 @@ describe("native update coordinator", () => {
     await expect(broken.c.apply("operator")).rejects.toMatchObject({ code: "temporarily_unavailable" });
     expect(broken.c.status().lastError).toBe("spawn EACCES");
   });
+  it("clears its in-flight view when the launched transaction exits without replacing this process", async () => {
+    let exit: ((code: number | null) => void) | undefined;
+    const { c, launch } = coordinator({});
+    launch.mockImplementationOnce(async () => ({ pid: 99, onExit: (listener: (code: number | null) => void) => { exit = listener; } }));
+    await c.apply("periodic");
+    expect(c.status().inFlight?.pid).toBe(99);
+    exit!(1);
+    expect(c.status().inFlight).toBeNull();
+    expect(c.status().lastError).toMatch(/exited with code 1/);
+    expect(await c.apply("periodic")).toMatchObject({ started: true });
+  });
   it("clears its in-flight view once the ledger shows the transaction ended without replacing this process", async () => {
     let ledger: NativeUpdateLedger = { schemaVersion: 1, attempts: [] };
     const { c, launch, m } = coordinator({ ledger });
@@ -123,10 +134,14 @@ describe("native updater launch", () => {
   it("runs the installer transaction detached from the service process group, as a transient unit on systemd", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-update-launch-")); roots.push(root);
     const children: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
-    const spawnFn = ((command: string, args: string[], options: Record<string, unknown>) => { children.push({ command, args, options }); return { pid: 77, unref: () => {} }; }) as never;
+    vi.stubEnv("NODE_EXTRA_CA_CERTS", "/corp/ca.pem");
+    vi.stubEnv("KONTEKS_RELEASE_MANIFEST_URL", "https://channel.example/latest/native-manifest.json");
+    const spawnFn = ((command: string, args: string[], options: Record<string, unknown>) => { children.push({ command, args, options }); return { pid: 77, unref: () => {}, once: () => {} }; }) as never;
     await launchNativeUpdater({ root, executable: join(root, "releases", "release-a", "connector"), os: "macos", logPath: join(root, "update.log"), spawnFn });
     expect(children[0]).toMatchObject({ command: join(root, "releases", "release-a", "connector"), args: ["--root", root, "--json", "update", "--unattended"], options: { detached: true } });
     expect((children[0]!.options.env as Record<string, string>)).not.toHaveProperty("KONTEKS_ACTIVATION_CODE");
+    expect((children[0]!.options.env as Record<string, string>).NODE_EXTRA_CA_CERTS).toBe("/corp/ca.pem");
+    expect((children[0]!.options.env as Record<string, string>).KONTEKS_RELEASE_MANIFEST_URL).toBe("https://channel.example/latest/native-manifest.json");
     await launchNativeUpdater({ root, executable: join(root, "releases", "release-a", "connector"), os: "debian", spawnFn });
     expect(children[1]!.command).toBe("systemd-run");
     expect(children[1]!.args).toEqual(expect.arrayContaining(["--user", "--collect", "--property=KillMode=process", join(root, "releases", "release-a", "connector"), "update", "--unattended"]));
