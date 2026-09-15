@@ -1,6 +1,7 @@
 {
   "name": "@konteks/remote-preview-forwarder",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "Loopback-only preview forwarder mapping a configured local port onto the governed preview channel under the D124/D125 policy.",

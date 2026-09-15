@@ -1,6 +1,7 @@
 {
   "name": "@konteks/remote-release",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "Signed release manifest schema, verification against the embedded release root, and the release tooling stub.",

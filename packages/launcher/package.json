@@ -1,6 +1,7 @@
 {
   "name": "@konteks/remote-launcher",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "konteks-remote: native BYOA agent connector installation, user service lifecycle, status, and official agent authentication.",

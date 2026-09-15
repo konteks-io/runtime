@@ -1,6 +1,7 @@
 {
   "name": "@konteks/remote-browser-tool",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "Headless Chromium/Playwright exposed as an MCP tool to qa-role agents; no provider access.",

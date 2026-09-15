@@ -1,6 +1,7 @@
 {
   "name": "@konteks/remote-gateway",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "description": "Runtime-local egress gateway: per-dialect provider egress, in-memory key stamping, signed allowlist, three-stage cap enforcement, GatewayCallObservation.",

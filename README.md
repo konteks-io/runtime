@@ -74,5 +74,6 @@ inputs.
 
 ## License
 
-Copyright © Konteks. Third-party components are listed in
+Copyright 2026 Konteks. Licensed under the Apache License, Version 2.0; see
+`LICENSE`. Third-party components and adapted code are listed in
 `THIRD_PARTY_NOTICES.md`.
