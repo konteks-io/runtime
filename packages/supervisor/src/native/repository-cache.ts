@@ -179,7 +179,14 @@ async function withRepositoryLock<T>(root: string, digest: string, operation: ()
         const current = (await readJson(join(lock, "owner.json"))) as { pid?: unknown };
         stale = !(await ownerAlive(current.pid));
       } catch {
-        const stat = await lstat(lock);
+        let stat;
+        try {
+          stat = await lstat(lock);
+        } catch (statError) {
+          // The holder released between our EEXIST and this read: contend again.
+          if (statError && typeof statError === "object" && "code" in statError && statError.code === "ENOENT") continue;
+          throw unavailable();
+        }
         stale = Date.now() - stat.mtimeMs > LOCK_DEADLINE_MS;
       }
       if (stale) {
