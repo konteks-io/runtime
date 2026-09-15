@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { SchemaParser } from "@konteks/remote-common";
 import { ConnectedAgentViewSchema, createLogger, type ConnectedAgentView, type Logger, type RemoteInstanceView } from "@konteks/remote-common";
 import { UtilizationSignalsSchema, hostPressureRatio } from "@konteks/remote-sysmon";
+import { onboardCapabilities } from "./roles.js";
 
 /**
  * Collects the sanitized inventory the heartbeat carries: component health
@@ -22,6 +23,8 @@ export interface InventorySources {
   browserToolUrl: string;
   runnerUrls: Map<string, string>;
   fetchFn?: typeof fetch;
+  /** The machine's git probe (OB6 §1); omitted, the runtime is not `onboard`. */
+  gitVersion?: () => Promise<string | null>;
   now?: () => Date;
   logger?: Logger;
 }
@@ -37,6 +40,11 @@ export interface InventorySnapshot {
   activeSessions: number;
   activeTurns: number;
   browserToolAvailable: boolean;
+  /**
+   * The machine's git version, or `null` when git is not on PATH. The `onboard`
+   * role is derived from it (OB6 §1); nothing else reads it.
+   */
+  gitVersion: string | null;
   gatewayRollupIncompleteSince: string | null;
   diskFreeBytes: number;
 }
@@ -98,6 +106,7 @@ export class InventoryCollector {
 
   async collect(): Promise<InventorySnapshot> {
     const at = this.now().toISOString();
+    const gitVersion = await (this.sources.gitVersion?.().catch(() => null) ?? Promise.resolve(null));
     const [harness, validation, gateway, sysmon, browser] = await Promise.all([
       this.probeJson(new URL("/health", this.sources.harnessUrl).toString(), ComponentHealthSchema),
       this.probeJson(new URL("/health", this.sources.validationUrl).toString(), ComponentHealthSchema),
@@ -125,7 +134,7 @@ export class InventoryCollector {
     const components: ComponentInventory[] = [
       this.freshPush("harness") ?? { kind: "harness", version: harness?.version ?? "unknown", healthStatus: harness ? healthFrom(harness.status) : "unhealthy", capabilities: harness?.capabilities ?? [], lastProbeAt: at },
       this.freshPush("validation_runtime") ?? { kind: "validation_runtime", version: validation?.version ?? "unknown", healthStatus: validation ? healthFrom(validation.status) : "unhealthy", capabilities: validation?.capabilities ?? [], lastProbeAt: at },
-      { kind: "agent_runner", version: "bundle", healthStatus: anyRunnerHealthy ? "healthy" : "unhealthy", capabilities: agents.filter((agent) => agent.readiness === "ready").map((agent) => `agent:${agent.agentId}`), lastProbeAt: at },
+      { kind: "agent_runner", version: "bundle", healthStatus: anyRunnerHealthy ? "healthy" : "unhealthy", capabilities: [...agents.filter((agent) => agent.readiness === "ready").map((agent) => `agent:${agent.agentId}`), ...onboardCapabilities(gitVersion)], lastProbeAt: at },
       {
         kind: "gateway",
         version: gateway?.version ?? "unknown",
@@ -142,6 +151,7 @@ export class InventoryCollector {
       activeSessions,
       activeTurns,
       browserToolAvailable: browser?.ok === true,
+      gitVersion,
       gatewayRollupIncompleteSince: gateway?.rollupIncompleteSince ?? null,
       diskFreeBytes: sysmon?.diskFreeBytes ?? 0,
     };

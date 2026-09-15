@@ -36,6 +36,12 @@ export const SupervisorConfigSchema = z
     SUPERVISOR_VALIDATION_DISPATCH_SECRET_FILE: z.string().min(1).default("/run/secrets/validation_dispatch_secret"),
     /** The Harness container's task-checkout root; the Validation Runtime mounts the same tree read-only as its projection root. */
     SUPERVISOR_HARNESS_TASK_CHECKOUT_ROOT: z.string().min(1).default("/data/checkouts"),
+    /** The onboard lane's scratch: `clones/` for deep reads and relocation mirrors, `archives/` for single-file tars (OB6 §2). */
+    SUPERVISOR_ONBOARD_SCRATCH_ROOT: z.string().min(1).default("/data/onboard"),
+    /** Where this runtime's managed-git key lives. Private half, never backed up, never sent (ON16). */
+    SUPERVISOR_ONBOARD_GIT_KEY_DIR: z.string().min(1).default("/data/git-keys"),
+    /** Repositories in flight during an evidence pass; the host is somebody's laptop. */
+    SUPERVISOR_ONBOARD_MAX_CONCURRENT: z.coerce.number().int().min(1).max(16).default(4),
     /** The platform MCP endpoint handed to agents inside `mcpServers` (Core's redeem answers a bearer token, not a URL). */
     SUPERVISOR_PLATFORM_MCP_URL: z.string().url().optional(),
     SUPERVISOR_BROWSER_TOOL_URL: z.string().url().default("http://browser-tool:41850/mcp"),

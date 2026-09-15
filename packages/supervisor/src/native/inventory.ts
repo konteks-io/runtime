@@ -3,6 +3,7 @@ import { ConnectedAgentViewSchema, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMO
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
 import type { InventorySnapshot } from "../inventory/collector.js";
 import type { RunnerPort } from "../runner-port.js";
+import { onboardCapabilities } from "../inventory/roles.js";
 
 const readinessSchema = z.object({
   agent: ConnectedAgentViewSchema,
@@ -19,6 +20,8 @@ export interface NativeInventoryOptions {
   deliveryExecutionPermitsReady?: () => boolean;
   /** Cancellation remains available independently of agent sign-in/readiness. */
   cancellationDeliveryReady?: () => boolean;
+  /** The machine's git probe (OB6 §1); omitted, the runtime is not `onboard`. */
+  gitVersion?: () => Promise<string | null>;
   now?: () => Date;
 }
 
@@ -42,6 +45,7 @@ export class NativeInventoryCollector {
 
   async collect(): Promise<InventorySnapshot> {
     const at = this.now().toISOString();
+    const gitVersion = await (this.options.gitVersion?.().catch(() => null) ?? Promise.resolve(null));
     const [signals, results] = await Promise.all([
       this.options.sampler.sample(this.now).then(value => UtilizationSignalsSchema.safeParse(value)).catch(() => null),
       Promise.all([...this.options.runners].map(async ([agentId, runner]) => {
@@ -75,6 +79,10 @@ export class NativeInventoryCollector {
     if (agents.some(agent => agent.readiness === 'ready' && agent.connectionState === 'ready') &&
       this.options.deliveryExecutionPermitsReady?.()) capabilities.push(REMOTE_DELIVERY_PERMITS_CAPABILITY);
     if (this.options.cancellationDeliveryReady?.()) capabilities.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
+    // The onboard role is git on THIS machine, not a signed-in agent: the
+    // capabilities are advertised whenever git answers, and withheld the moment
+    // it does not (OB6 §1).
+    capabilities.push(...onboardCapabilities(gitVersion));
     return {
       components: [{ kind: "agent_runner", version: this.options.bundleVersion,
         healthStatus: healthyRunners === 0 ? "unhealthy" : healthyRunners === results.length ? "healthy" : "degraded",
@@ -86,6 +94,7 @@ export class NativeInventoryCollector {
       // Local QA/browser capabilities need a proven native capability source;
       // a configured appliance URL is not evidence they exist on this host.
       browserToolAvailable: false,
+      gitVersion,
       gatewayRollupIncompleteSince: null,
       diskFreeBytes: metrics?.diskFreeBytes ?? 0,
     };

@@ -4,7 +4,7 @@ import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS } from "@konteks/remote-release";
 import { createNativeService, loadNativeInstallation, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
 import { RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
-import { agents, authLogin, authLogout, authStatus, doctor, status, supportBundle } from "../commands/lifecycle.js";
+import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, status, supportBundle } from "../commands/lifecycle.js";
 import { SupervisorControl } from "../control.js";
 import { addNativeAgent, installNative, readNativeRecord, restoreNativeRecord } from "./install.js";
 import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
@@ -113,6 +113,9 @@ export const nativeCliActions: NativeCliActions = {
       case "auth.status": return authStatus(context, input.agent);
       case "auth.login": return authLogin(context, input.agent!, input.organization ?? false);
       case "auth.logout": return authLogout(context, input.agent!);
+      case "git.key.add": return gitKeyAdd(context, input.title);
+      case "git.key.list": return gitKeyList(context);
+      case "git.key.remove": return gitKeyRemove(context, input.keyRef!);
     }
   },
 };

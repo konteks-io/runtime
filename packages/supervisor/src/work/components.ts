@@ -237,6 +237,11 @@ export function componentForKind(kind: RemoteWorkAssignment["kind"]): ComponentK
       throw new Error("search generation requires its dedicated carrier owner");
     case "operations":
       throw new Error("operations requires its dedicated carrier owner");
+    case "onboarding":
+    case "repository_relocation":
+      // The onboard lane is not a domain component: evidence collection and the
+      // relocation mirror run in the supervisor itself (onboarding-mode OB6).
+      throw new Error("onboard work requires its dedicated carrier owner");
   }
 }
 
