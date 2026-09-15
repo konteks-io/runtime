@@ -7,6 +7,9 @@
  * the executable and the package skeleton.
  */
 import { execFileSync } from "node:child_process";
+// npm/npx are .cmd shims on Windows and need a shell to spawn.
+const shell = process.platform === "win32";
+const npx = shell ? "npx.cmd" : "npx";
 import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -24,7 +27,7 @@ if (!roots) {
 }
 JSON.parse(roots); // must be valid
 
-execFileSync("npx", ["tsc", "--build", "packages/launcher"], { stdio: "inherit" });
+execFileSync(npx, ["tsc", "--build", "packages/launcher"], { stdio: "inherit", shell });
 const work = join("dist", "launcher-build");
 mkdirSync(work, { recursive: true });
 // Embed the roots and version as build-time constants: the SEA reads them
@@ -34,12 +37,12 @@ writeFileSync(
   entry,
   `process.env.KONTEKS_RELEASE_ROOTS_JSON = ${JSON.stringify(roots)};\nprocess.env.KONTEKS_LAUNCHER_VERSION = ${JSON.stringify(process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0")};\nimport("../../packages/launcher/dist/cli.js");\n`,
 );
-execFileSync("npx", ["esbuild", entry, "--bundle", "--platform=node", "--target=node22", "--format=cjs", `--outfile=${join(work, "launcher.bundle.cjs")}`], { stdio: "inherit" });
+execFileSync(npx, ["esbuild", entry, "--bundle", "--platform=node", "--target=node22", "--format=cjs", `--outfile=${join(work, "launcher.bundle.cjs")}`], { stdio: "inherit", shell });
 writeFileSync(join(work, "sea-config.json"), JSON.stringify({ main: join(work, "launcher.bundle.cjs"), output: join(work, "launcher.blob"), disableExperimentalSEAWarning: true }));
 execFileSync(process.execPath, ["--experimental-sea-config", join(work, "sea-config.json")], { stdio: "inherit" });
 const executable = join(work, os === "windows" ? "konteks-remote.exe" : "konteks-remote");
 copyFileSync(process.execPath, executable);
-execFileSync("npx", ["postject", executable, "NODE_SEA_BLOB", join(work, "launcher.blob"), "--sentinel-fuse", "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2", ...(os === "macos" ? ["--macho-segment-name", "NODE_SEA"] : [])], { stdio: "inherit" });
+execFileSync(npx, ["postject", executable, "NODE_SEA_BLOB", join(work, "launcher.blob"), "--sentinel-fuse", "NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2", ...(os === "macos" ? ["--macho-segment-name", "NODE_SEA"] : [])], { stdio: "inherit", shell });
 // Injection invalidates the Mach-O signature; an unsigned arm64 binary will not
 // launch at all. Ad-hoc sign here so the artifact runs; sign-launcher.mjs
 // replaces this with the Developer ID signature when one is configured.

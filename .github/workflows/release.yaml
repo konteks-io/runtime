@@ -14,7 +14,7 @@ permissions:
 jobs:
   build:
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - { runner: macos-15, os: macos, architecture: arm64, node_arch: arm64, package: konteks-remote-arm64.pkg, executable: konteks-remote }

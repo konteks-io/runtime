@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 /** Build a complete, immutable agent+ACP package; runtime install never invokes npm. */
 import { execFileSync } from "node:child_process";
+// npm is a .cmd shim on Windows and needs a shell to spawn.
+const shell = process.platform === "win32";
+const npm = shell ? "npm.cmd" : "npm";
 import { Buffer } from "node:buffer";
 import process from "node:process";
 import { chmodSync, cpSync, createReadStream, createWriteStream, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -27,7 +30,7 @@ try {
   if (sharedCodex) packages.push("ws@8.21.3");
   // Personal-profile agents (Claude Code) run the operator's installed CLI, so
   // their platform-native optional binaries are deliberately not vendored.
-  execFileSync("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--omit=dev", ...(selected.tooling.personalProfile ? ["--omit=optional"] : []), "--prefix", root, ...packages], { stdio: "inherit" });
+  execFileSync(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--omit=dev", ...(selected.tooling.personalProfile ? ["--omit=optional"] : []), "--prefix", root, ...packages], { stdio: "inherit" , shell });
   const runtimeName = args.os === "windows" ? "node.exe" : "node";
   mkdirSync(join(root, "bin"), { recursive: true, mode: 0o700 });
   cpSync(process.execPath, join(root, "bin", runtimeName));
