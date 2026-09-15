@@ -49,7 +49,8 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   // step per invocation; the agent runs what the step says and nothing else.
   program.command("onboard").description("connect this machine to Konteks, one question at a time")
     .option("--answer <text>", "the person's answer to the question the previous step asked")
-    .action(async (options: { answer?: string }) => actions.onboard({ ...context(), ...(options.answer !== undefined ? { answer: options.answer } : {}) }));
+    .option("--repo <path>", "the repository to register as the first System (default: the working directory)")
+    .action(async (options: { answer?: string; repo?: string }) => actions.onboard({ ...context(), ...(options.answer !== undefined ? { answer: options.answer } : {}), ...(options.repo ? { cwd: options.repo } : {}) }));
   program.command("serve").description("run the native connector in the foreground (used by the background service)").action(async () => actions.serve(context()));
   program.command("start").description("start the installed native user service").action(async () => actions.start(context()));
   program.command("stop").description("stop the native user service, preserving identity and local work").action(async () => actions.stop(context()));

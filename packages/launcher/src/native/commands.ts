@@ -58,12 +58,13 @@ export const nativeCliActions: NativeCliActions = {
     input.output.result({ instanceId: record.instanceId, deploymentKind: record.deploymentKind, state: "installed" });
   },
   onboard: async input => {
+    const coreUrl = await onboardCoreUrl(input.root);
     const step = await runOnboardStep({
       root: input.root,
       output: input.output,
       ...(input.answer !== undefined ? { answer: input.answer } : {}),
       ...(input.cwd ? { cwd: input.cwd } : {}),
-      ...((await onboardCoreUrl(input.root)) ? { coreUrl: (await onboardCoreUrl(input.root))! } : {}),
+      ...(coreUrl ? { coreUrl } : {}),
     });
     // One step per invocation, printed whole. In human mode the same step
     // reads as a sentence so a person running this by hand is not left

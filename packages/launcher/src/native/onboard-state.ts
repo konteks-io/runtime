@@ -44,6 +44,10 @@ export const OnboardStateSchema = z
     proposedTenantId: z.string().optional(),
     tenantId: z.string().optional(),
     instanceId: z.string().optional(),
+    /** Code attempts left on the live challenge, for the re-ask. */
+    attemptsRemaining: z.number().int().min(0).optional(),
+    /** Roles the service advertised at the first heartbeat, if it was seen. */
+    advertisedRoles: z.array(z.string()).optional(),
     /** The repository captured at the first inspect; later runs use it. */
     repositoryPath: z.string().optional(),
     repositoryName: z.string().optional(),

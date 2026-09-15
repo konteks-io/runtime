@@ -132,7 +132,7 @@ export class SupervisorStore {
       await mkdir(this.dataDir, { recursive: true, mode: 0o700 });
       await mkdir(this.path("journal"), { recursive: true, mode: 0o700 });
       await mkdir(this.path("outbox"), { recursive: true, mode: 0o700 });
-      for (const secret of ["instance-key.jwk", "lease.json", "provisioning.json", CONTROL_TOKEN_FILE_NAME]) {
+      for (const secret of ["instance-key.jwk", "lease.json", "provisioning.json", "owner-token.json", CONTROL_TOKEN_FILE_NAME]) {
         try {
           await assertRestrictedMode(this.path(secret));
         } catch (error) {

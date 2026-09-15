@@ -5,6 +5,7 @@ import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { z } from "zod";
 import type { Output } from "../output.js";
 import { promptSecret } from "../prompt.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
@@ -141,8 +142,12 @@ export async function prepareNativeEnrollment(options: {
       if (await resolveNativeClaudeExecutable().then(() => true).catch(() => false)) detected.push("claude-code");
       if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
     }
-    if (detected.length === 0) {
-      throw new RemoteInstanceError("prerequisite_missing", "Konteks runs the coding agent you already have. Install Claude Code or Codex for this user, then run this again.");
+    // None is required (OS14): a machine with no detectable family still
+    // enrolls, and the closing summary says how to add one.
+    const prepared = await readNativeEnrollment(root).catch(() => null);
+    if (prepared && await lstat(join(root, "releases", prepared.releaseId, "manifest.json")).then(info => info.isFile()).catch(() => false)) {
+      lock.assertOwned();
+      return { agents: prepared.agents, bundleVersion: prepared.bundleVersion, releaseId: prepared.releaseId };
     }
     const fetchFn = options.deps?.fetchFn ?? fetch;
     const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
@@ -166,16 +171,83 @@ export async function prepareNativeEnrollment(options: {
     lock.assertOwned();
     // The endpoints are remembered so `onboard` speaks to the same Core the
     // person installed against, without asking them for a URL.
-    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify(NativeEnrollmentRecordSchema.parse({
       schemaVersion: 1,
       coreUrl: options.coreUrl,
       relayUrl: options.relayUrl,
       agents: detected,
       releaseId,
       bundleVersion: release.manifest.bundleVersion,
+      manifestDigest: release.manifest.digest,
       controlPort: options.controlPort ?? CONTROL_SOCKET_DEFAULT_PORT,
-    }));
+    })));
     return { agents: detected, bundleVersion: release.manifest.bundleVersion, releaseId };
+  } finally { lock.release(); }
+}
+
+/** What `install --enroll` remembered for `onboard`: endpoints, families, the staged release. */
+export const NativeEnrollmentRecordSchema = z.object({
+  schemaVersion: z.literal(1),
+  coreUrl: z.string().min(1),
+  relayUrl: z.string().min(1),
+  agents: z.array(z.string().min(1)),
+  releaseId: z.string().min(1),
+  bundleVersion: z.string().min(1),
+  manifestDigest: z.string().min(1),
+  controlPort: z.number().int().positive(),
+}).strict();
+export type NativeEnrollmentRecord = z.infer<typeof NativeEnrollmentRecordSchema>;
+
+export async function readNativeEnrollment(root: string): Promise<NativeEnrollmentRecord> {
+  const path = join(resolve(root), "native-enrollment.json");
+  const info = await lstat(path);
+  if (!info.isFile() || info.nlink !== 1 || info.size > 1024 * 1024 || (process.platform !== "win32" && (info.mode & 0o077) !== 0)) throw invalid();
+  return NativeEnrollmentRecordSchema.parse(JSON.parse(await readFile(path, "utf8")));
+}
+
+/**
+ * Finish an enrollment install once `onboard` has bound the machine (OS3).
+ *
+ * `bind` persisted the identity, provisioning state and manifest record under
+ * `supervisor/`; this writes the runtime record that `start`, `status` and
+ * every later command load, from the staged release `install --enroll` left
+ * and the identity Core answered with. It ends by loading the installation
+ * the way the service will, so a record that would not start is never written.
+ */
+export async function completeNativeEnrollment(root: string, identity: { instanceId: string; workspaceId: string }, deps: NativeInstallOptions["deps"] = {}): Promise<NativeRuntimeRecord> {
+  const platform = deps.platform ?? nativePlatform();
+  const roots = deps.roots ?? EMBEDDED_RELEASE_ROOTS;
+  root = resolve(root);
+  const installLockDir = join(root, "installer");
+  await privateDirectory(installLockDir);
+  const lock = acquireNativeRootLock(installLockDir);
+  try {
+    const existing = await lstat(join(root, "native-runtime.json")).catch(error => { if (error.code === "ENOENT") return null; throw error; });
+    if (existing) {
+      const installation = await loadNativeInstallation(root, { roots, platform });
+      if (installation.record.instanceId !== identity.instanceId) throw invalid();
+      return installation.record;
+    }
+    const prepared = await readNativeEnrollment(root);
+    const stored = await new SupervisorStore(join(root, "supervisor")).identity();
+    if (!stored || stored.instanceId !== identity.instanceId || stored.workspaceId !== identity.workspaceId) throw invalid();
+    const release = verifyNativeRelease(JSON.parse(await readFile(join(root, "releases", prepared.releaseId, "manifest.json"), "utf8")), roots);
+    if (release.manifest.digest !== prepared.manifestDigest) throw invalid();
+    const codexHome = prepared.agents.includes("codex") ? await resolveNativeCodexHome().catch(() => undefined) : undefined;
+    const claudeExecutable = prepared.agents.includes("claude-code") ? await resolveNativeClaudeExecutable().catch(() => undefined) : undefined;
+    const agents = prepared.agents.filter(agent => (agent === "codex" ? codexHome !== undefined : agent === "claude-code" ? claudeExecutable !== undefined : true));
+    const git = deps.git === undefined ? await discoverGit() : deps.git;
+    const record = NativeRuntimeRecordSchema.parse({
+      schemaVersion: 1, deploymentKind: "native_connector",
+      instanceId: identity.instanceId, workspaceId: identity.workspaceId,
+      releaseId: prepared.releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest,
+      coreUrl: prepared.coreUrl, relayUrl: prepared.relayUrl, agents, controlPort: prepared.controlPort,
+      ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...(git ? { git: await verifyNativeGitTool(git) } : {}),
+    });
+    lock.assertOwned();
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
+    await loadNativeInstallation(root, { roots, platform });
+    return record;
   } finally { lock.release(); }
 }
 

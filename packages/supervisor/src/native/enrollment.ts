@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { mkdir } from "node:fs/promises";
 import {
   isFsErrorWithCode,
+  jcsDigest,
   JsonClient,
   RemoteInstanceError,
   signInstanceProof,
@@ -9,8 +11,10 @@ import {
   type FetchFn,
   type JsonValue,
 } from "@konteks/remote-common";
+import { EMBEDDED_RELEASE_ROOTS, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { z } from "zod";
 import { SupervisorStore } from "../state/store.js";
+import { SupervisorJournal } from "../state/journal.js";
 import { StateMutationGate } from "../state/mutation-gate.js";
 import { acquireNativeRootLock } from "./root-lock.js";
 
@@ -76,6 +80,8 @@ const OwnerTokenSchema = z
 const BoundSchema = z
   .object({
     identity: z.object({ instanceId: z.string().min(1), workspaceId: z.string().min(1) }).strict(),
+    /** The activation Core minted and consumed for this bind; the identity's lineage. */
+    activationId: z.string().min(1).optional(),
     provisioningCredential: z.string().min(1),
     provisioningCredentialExpiresAt: z.string().min(1),
     provisioningWindowExpiresAt: z.string().min(1),
@@ -96,6 +102,8 @@ export interface NativeEnrollmentOptions {
   coreUrl: string;
   clock: Clock;
   fetchFn?: FetchFn;
+  /** Release roots the bound bundle manifest must verify against; the executable's own by default. */
+  roots?: readonly EmbeddedReleaseRoot[];
 }
 
 /**
@@ -142,17 +150,66 @@ export class NativeEnrollment {
     );
   }
 
-  async bind(intentRef: string, input: { email: string; tenantId?: string }): Promise<EnrollmentBound> {
-    return this.withKey(key =>
-      this.post(
+  /**
+   * Bind, then persist what the activation exchange would have persisted
+   * (onboarding-simplified OS3, OS9).
+   *
+   * Core answers with the identity, the provisioning credential and the
+   * signed bundle manifest. Before any of it is believed, the manifest is
+   * verified against this executable's embedded roots and must be the very
+   * release `install --enroll` staged. Then identity, provisioning state and
+   * the manifest record are written and the journal's enrollment lineage is
+   * seeded and bound — the same files, in the same shape, that a machine
+   * activated through the operator door has, so `start`, `status`, doctor
+   * and reconnect cannot tell the two doors apart afterwards.
+   */
+  async bind(
+    intentRef: string,
+    input: { email: string; tenantId?: string; expectedManifestDigest: string },
+  ): Promise<EnrollmentBound> {
+    return this.withKey(async (key, store, mutations) => {
+      const bound = await this.post(
         ENROLLMENT_PATHS.bind(intentRef),
         { email: input.email, ...(input.tenantId ? { tenantId: input.tenantId } : {}) },
         key,
         "enrollment_bind",
         intentRef,
         BoundSchema,
-      ),
-    );
+      );
+      const release = verifyNativeRelease(bound.bundleManifest, this.options.roots ?? EMBEDDED_RELEASE_ROOTS, this.options.clock.now());
+      if (release.manifest.digest !== input.expectedManifestDigest) {
+        throw new RemoteInstanceError("bundle_untrusted", "The bound bundle differs from the independently verified release this machine staged.");
+      }
+      const activationId = bound.activationId ?? `enrollment:${intentRef}`;
+      const exchangeNonce = randomUUID();
+      await store.saveIdentity({
+        instanceId: bound.identity.instanceId,
+        workspaceId: bound.identity.workspaceId,
+        activationId,
+        activatedAt: this.options.clock.nowIso(),
+        administrativeStatus: "provisioning",
+        exchangeNonce,
+      });
+      await store.saveProvisioning({
+        provisioningCredential: bound.provisioningCredential,
+        provisioningCredentialExpiresAt: bound.provisioningCredentialExpiresAt,
+        provisioningWindowExpiresAt: bound.provisioningWindowExpiresAt,
+        manifestDigest: release.manifest.digest,
+        lastRefreshAt: null,
+      });
+      await store.saveManifest(release.manifest, release.manifest.digest);
+      const journal = new SupervisorJournal(store.path("journal"), mutations.run);
+      await journal.load();
+      const keyDigest = jcsDigest(key.publicKeyJwk as never);
+      if (!journal.execution.enrollment()) {
+        await journal.execution.seedEnrollment({ enrollmentId: randomUUID(), activationId, keyDigest, createdAt: this.options.clock.nowIso() });
+      }
+      const seed = journal.execution.enrollment();
+      if (seed && !("instanceId" in seed)) {
+        await journal.execution.bindEnrollment({ ...seed, instanceId: bound.identity.instanceId, workspaceId: bound.identity.workspaceId, exchangeNonce });
+      }
+      return bound;
+    });
   }
 
   async refreshOwnerToken(instanceId: string): Promise<OwnerTokenGrant> {
@@ -190,7 +247,9 @@ export class NativeEnrollment {
    * The key is created on the first call and never again: it is the machine's
    * identity from here on, and the intent Core holds is bound to it.
    */
-  private async withKey<T>(run: (key: { privateKey: unknown; publicKeyJwk: unknown }) => Promise<T>): Promise<T> {
+  private async withKey<T>(
+    run: (key: { privateKey: unknown; publicKeyJwk: unknown }, store: SupervisorStore, mutations: StateMutationGate) => Promise<T>,
+  ): Promise<T> {
     try {
       await mkdir(this.options.dataDir, { mode: 0o700, recursive: true });
     } catch (error) {
@@ -202,8 +261,9 @@ export class NativeEnrollment {
       const store = new SupervisorStore(this.options.dataDir, mutations.run);
       await store.init();
       const key = await store.loadOrCreateInstanceKey();
-      return await run(key as never);
+      return await run(key as never, store, mutations);
     } finally {
+      await mutations.close();
       owner.release();
     }
   }

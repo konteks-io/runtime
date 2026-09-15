@@ -90,11 +90,14 @@ describe("onboard", () => {
       defaultBranch: "main",
       remoteUrl: "https://github.com/acme/shop",
     } as never);
-    const question = await step({});
+    const here = {
+      inspect: async () => ({ path: "/tmp/acme-shop", name: "acme-shop", remoteUrl: "https://github.com/acme/shop", remoteReachable: true, currentBranch: "main", defaultBranch: "main" }),
+    };
+    const question = await step(here);
     expect(question.ask).toMatchObject({ kind: "confirm" });
     expect(question.ask?.question).toContain("acme-shop");
 
-    const declined = await step({}, "no");
+    const declined = await step(here, "no");
     expect(declined.note).toContain("Leaving the catalog");
     expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
   });
@@ -252,5 +255,83 @@ describe("onboard", () => {
     const raw = await readFile(join(root, "onboard-state.json"), "utf8");
     expect(raw).not.toContain("owner-token");
     expect(raw).not.toMatch(/\b\d{6}\b/);
+  });
+
+  it("asks which repository is meant when a later run comes from a different one", async () => {
+    await writeOnboardState(root, {
+      step: "system",
+      repositoryName: "acme-shop",
+      repositoryKind: "existing",
+      repositoryPath: "/tmp/acme-shop",
+      defaultBranch: "main",
+    } as never);
+    const elsewhere = {
+      inspect: async () => ({ path: "/tmp/other", name: "other", remoteUrl: null, remoteReachable: false, currentBranch: "main", defaultBranch: "main" }),
+    };
+    const question = await step(elsewhere);
+    expect(question.ask).toMatchObject({ kind: "choice", choices: ["acme-shop", "other"] });
+    const switched = await step(elsewhere, "other");
+    expect(switched.note).toContain("Switching to other");
+    expect(await readOnboardState(root)).toMatchObject({ step: "inspect" });
+  });
+
+  it("binds, persists the installation and hands the agent the start command", async () => {
+    await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "create" } as never);
+    const { writeSecretFile } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: ["claude-code"], releaseId: "release-1", bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const bind = vi.fn(async () => ({
+      identity: { instanceId: "instance-9", workspaceId: "acme" },
+      activationId: "activation-9",
+      provisioningCredential: "kxrp_x", provisioningCredentialExpiresAt: "2030-01-01T00:00:00Z", provisioningWindowExpiresAt: "2030-01-01T00:00:00Z",
+      bundleManifest: {},
+      ownerToken: { token: "user-token", expiresAt: new Date(Date.now() + 3600_000).toISOString(), userRef: "user:default/ada", tenantId: "acme" },
+      workspaceCreated: true,
+    }));
+    const complete = vi.fn(async () => ({}) as never);
+    const result = await step({ enrollment: { bind } as never, complete });
+    expect(bind).toHaveBeenCalledWith("intent-1", { email: "ada@acme.test", expectedManifestDigest: "digest-1" });
+    expect(complete).toHaveBeenCalledWith(root, { instanceId: "instance-9", workspaceId: "acme" });
+    expect(result.run?.argv).toEqual(["konteks-remote", "start"]);
+    const state = await readOnboardState(root);
+    expect(state).toMatchObject({ step: "inspect", instanceId: "instance-9", tenantId: "acme" });
+    expect(state?.email).toBeUndefined();
+    expect(JSON.parse(await readFile(join(root, "supervisor", "owner-token.json"), "utf8"))).toMatchObject({ token: "user-token", instanceId: "instance-9" });
+  });
+
+  it("stops with the plan-limit remedy instead of retrying the bind on every run", async () => {
+    await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "join" } as never);
+    const { writeSecretFile, CoreResponseError } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: [], releaseId: "release-1", bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const bind = vi.fn(async () => { throw new CoreResponseError({ status: 402, code: "limit_exceeded", message: "The plan limit on connected runtimes is reached" }); });
+    const result = await step({ enrollment: { bind } as never });
+    expect(result.done?.summary).toContain("Revoke the existing runtime in Settings");
+    expect(result.done?.links.site).toContain("/settings/runtimes");
+    expect(await readOnboardState(root)).toMatchObject({ step: "done" });
+  });
+
+  it("re-asks for the code with the attempts left, and starts over once the code can no longer be used", async () => {
+    await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "ada@acme.test", emailMasked: "a••@acme.test", attemptsRemaining: 3 } as never);
+    const { CoreResponseError } = await import("@konteks/remote-common");
+    const verifyCode = vi
+      .fn()
+      .mockRejectedValueOnce(new CoreResponseError({ status: 400, code: "code_invalid", message: "no" }))
+      .mockRejectedValueOnce(new CoreResponseError({ status: 401, code: "enrollment_invalid", message: "no" }));
+    const first = await step({ enrollment: { verifyCode } as never }, "000000");
+    expect(first.ask).toMatchObject({ kind: "code" });
+    expect(first.note).toContain("2 attempts left");
+    const second = await step({ enrollment: { verifyCode } as never }, "000001");
+    expect(second.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+    expect(await readOnboardState(root)).toMatchObject({ step: "email" });
+  });
+
+  it("ends the flow on an empty answer to the first task, not only on whitespace", async () => {
+    await writeOnboardState(root, { step: "first_task", systemId: "sys-1", instanceId: "instance-1" } as never);
+    const result = await step({}, "");
+    expect(result.note).toBe("Ending here.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "done" });
   });
 });
