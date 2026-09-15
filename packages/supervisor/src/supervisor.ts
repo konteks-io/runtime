@@ -32,6 +32,7 @@ import { PermissionAnswerReceiver } from "./control/permission-answer-receiver.j
 import { CancellationReplay } from "./control/cancellation-replay.js";
 import { ControlHandlers, compareSemver } from "./control/handlers.js";
 import { ConfigurationAckDelivery } from "./control/configuration-ack-delivery.js";
+import { ObservationDelivery } from "./control/observation-delivery.js";
 import { GatewayClient } from "./gateway-client.js";
 import { HeartbeatPublisher } from "./heartbeat/heartbeat.js";
 import { startInternalServer, type InternalServer } from "./internal/server.js";
@@ -147,6 +148,7 @@ export class Supervisor {
   heartbeat!: HeartbeatPublisher;
   control!: ControlHandlers;
   private configurationAcks!: ConfigurationAckDelivery;
+  private observations!: ObservationDelivery;
   work!: WorkOrchestrator;
   private planningTerminal!: PlanningTerminalDirectiveProcessor;
   private planningDirectivePoller: ControllerDirectivePoller | null = null;
@@ -179,6 +181,7 @@ export class Supervisor {
   private cancellationTimer: NodeJS.Timeout | null = null;
   private cancellationReplay: CancellationReplay | null = null;
   private configurationTimer: NodeJS.Timeout | null = null;
+  private observationTimer: NodeJS.Timeout | null = null;
   private configurationRefresh: Promise<void> | null = null;
   private activeLoopStarted = false;
   private ordinaryHeartbeatStarted = false;
@@ -279,6 +282,7 @@ export class Supervisor {
       credential: () => this.lease.current()?.lease ?? this.provisioningCredential,
     });
     this.configurationAcks = new ConfigurationAckDelivery({ outbox: this.outbox, core: this.core, instanceId: () => this.instanceId ?? "", clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId) });
+    this.observations = new ObservationDelivery({ outbox: this.outbox, core: this.core, instanceId: () => this.instanceId ?? "", clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId) });
     if (this.native) {
       const sharedCodex = this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === "codex" && config.RUNNER_NATIVE_CODEX_SOCKET !== undefined);
       if (sharedCodex) this.nativeCodexOwner = new NativeCodexAppServerOwner({
@@ -992,6 +996,11 @@ export class Supervisor {
         this.updates.start();
       }
     }
+    if (!this.observationTimer) {
+      this.observationTimer = setInterval(() => void this.observations.flush().catch(error => this.logger.warn({ err: error }, "observation delivery retry retained")), 5_000);
+      this.observationTimer.unref();
+    }
+    await this.observations.flush();
     await this.work.reports.flushAll();
   }
 
@@ -1001,6 +1010,7 @@ export class Supervisor {
       if (this.native) this.validateRelayHandshake(result);
       else await this.reconciliation.run();
       this.transport.resumeAfterRecovery();
+      await this.observations.flush();
       await this.work.reports.flushAll();
     } catch (error) {
       this.logger.warn({ err: error }, "reconciliation failed after relay connect; retrying on next handshake");
@@ -1232,13 +1242,12 @@ export class Supervisor {
   }
 
   private async sendGatewayObservation(observation: GatewayCallObservation, signature: string): Promise<void> {
-    await this.outbox.enqueue({ id: randomUUID(), channel: "observation", key: `gateway:${observation.assignmentId}:${observation.observedAt}:${observation.agentId}`, group: "observation", order: this.clock.now(), body: observation, createdAt: this.clock.nowIso() });
-    this.transport.send({ channel: "observation", channelId: coreChannelId("observation", this.instanceId ?? ""), body: observation, signature });
+    void signature;
+    await this.observations.submit(`gateway:${observation.assignmentId}:${observation.observedAt}:${observation.agentId}`, observation);
   }
 
   private async sendUsageObservation(observation: AgentTurnUsageObservation): Promise<void> {
-    await this.outbox.enqueue({ id: randomUUID(), channel: "observation", key: `usage:${observation.assignmentId}:${observation.observedAt}`, group: "observation", order: this.clock.now(), body: observation, createdAt: this.clock.nowIso() });
-    this.transport.send({ channel: "observation", channelId: coreChannelId("observation", this.instanceId ?? ""), body: observation, signature: signBody(this.key, observation as unknown as { [key: string]: JsonValue }) });
+    await this.observations.submit(`usage:${observation.assignmentId}:${observation.observedAt}`, observation);
   }
 
   // ── Drain / erase ──────────────────────────────────────────────────────────
@@ -1495,8 +1504,10 @@ export class Supervisor {
     if (this.cancellationTimer) clearInterval(this.cancellationTimer);
     await this.cancellationReplay?.stop();
     if (this.configurationTimer) clearInterval(this.configurationTimer);
+    if (this.observationTimer) clearInterval(this.observationTimer);
     await this.configurationRefresh;
     await this.configurationAcks?.settle();
+    await this.observations?.settle();
     await this.planningDirectivePoller?.stop();
     this.heartbeat?.stop();
     await this.heartbeat?.settle();

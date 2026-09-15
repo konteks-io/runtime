@@ -233,7 +233,7 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
           return true;
         }
         case "observation":
-          await this.options.core.observations(instanceId, [message.body]);
+          await this.options.core.observation(instanceId, message.body);
           assertRecovery();
           return true;
         case "control":

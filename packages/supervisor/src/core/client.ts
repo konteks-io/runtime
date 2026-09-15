@@ -158,7 +158,7 @@ export const LEASE_AUDIENCE: string = REMOTE_INSTANCE_LEASE_AUDIENCE;
 const ReadinessResultSchema = z.object({ instanceId: z.string(), administrativeStatus: z.literal("active"), lease: z.string().min(1), leaseExpiresAt: z.string(), leaseMode: RemoteLeaseModeSchema, heartbeatIntervalSeconds: z.number().int().positive() }).strict();
 export type { HeartbeatResult } from "@konteks/remote-common";
 const ControlPollSchema = z.object({ frames: z.array(ToRuntimeRelayFrameSchema).max(64) }).strict();
-const ObservationsResultSchema = z.object({ accepted: z.number().int().nonnegative() }).strict();
+const ObservationResultSchema = z.object({ stored: z.boolean() }).strict();
 const AckResultSchema = z.object({ accepted: z.boolean() }).strict();
 const ControllerDirectivePullInputSchema = z.object({
   version: PlanningControllerDirectivePullRequestSchema.shape.version,
@@ -463,11 +463,11 @@ export class CoreClient {
     return this.http.request({ method: "POST", path: CORE_PATHS.report(instanceId), body: report, schema: ReportAckSchema, idempotencyKey: `report:${report.reportId}` });
   }
 
-  async observations(instanceId: string, observations: unknown[]): Promise<number> {
-    const body = { observations };
-    const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId), body, schema: ObservationsResultSchema,
-      idempotencyKey: `observations:${instanceId}:${jcsDigest(body as unknown as JsonValue)}` });
-    return result.accepted;
+  async observation(instanceId: string, observation: unknown): Promise<boolean> {
+    const body = observation as { [key: string]: JsonValue };
+    const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId), body, schema: ObservationResultSchema,
+      idempotencyKey: `observation:${instanceId}:${jcsDigest(body)}` });
+    return result.stored;
   }
 
   async controlAck(instanceId: string, ack: unknown): Promise<boolean | Extract<ReturnType<typeof DesiredConfigurationAckResultSchema.parse>, { status: "superseded" }>> {
