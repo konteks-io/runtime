@@ -35,7 +35,11 @@ mkdirSync(work, { recursive: true });
 const entry = join(work, "entry.cjs");
 writeFileSync(
   entry,
-  `process.env.KONTEKS_RELEASE_ROOTS_JSON = ${JSON.stringify(roots)};\nprocess.env.KONTEKS_LAUNCHER_VERSION = ${JSON.stringify(process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0")};\nimport("../../packages/launcher/dist/cli.js");\n`,
+  // The Core and relay endpoints are baked too: the onboarding block passes
+  // no URL, so a release must know which Konteks it belongs to. An explicit
+  // KONTEKS_CORE_URL / KONTEKS_RELAY_URL in the environment still wins at run
+  // time (the e2e stack relies on that).
+  `process.env.KONTEKS_RELEASE_ROOTS_JSON = ${JSON.stringify(roots)};\nprocess.env.KONTEKS_LAUNCHER_VERSION = ${JSON.stringify(process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0")};\nprocess.env.KONTEKS_CORE_URL ??= ${JSON.stringify(process.env.KONTEKS_DEFAULT_CORE_URL ?? "https://api.konteks.io")};\nprocess.env.KONTEKS_RELAY_URL ??= ${JSON.stringify(process.env.KONTEKS_DEFAULT_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")};\nimport("../../packages/launcher/dist/cli.js");\n`,
 );
 execFileSync(npx, ["esbuild", entry, "--bundle", "--platform=node", "--target=node22", "--format=cjs", `--outfile=${join(work, "launcher.bundle.cjs")}`], { stdio: "inherit", shell });
 writeFileSync(join(work, "sea-config.json"), JSON.stringify({ main: join(work, "launcher.bundle.cjs"), output: join(work, "launcher.blob"), disableExperimentalSEAWarning: true }));

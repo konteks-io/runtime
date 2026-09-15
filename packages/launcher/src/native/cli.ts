@@ -37,8 +37,8 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     // Agent-first onboarding (onboarding-simplified OS3): no activation, no
     // prompt, no TTY. The install stops short of an identity; `onboard` binds.
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
-    .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://core.konteks.example")
-    .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.example/relay/runtime")
+    .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
+    .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")
     .option("--agents <ids>", "agent families (default: claude-code,codex)", value => value.split(",").map(part => agent(part.trim())))
     .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
       if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");

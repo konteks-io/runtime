@@ -11,7 +11,7 @@ import { completeNativeEnrollment, readNativeEnrollment, readNativeRecord } from
 import { nativePlatform } from "./service.js";
 import { inspectRepository, pushToManagedRemote } from "./repository-inspect.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
-import { OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
+import { deleteOwnerToken, OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
 
 /**
  * The conversation the person's own coding agent relays
@@ -127,7 +127,7 @@ async function waitForServiceReady(root: string): Promise<{ administrativeStatus
 export async function runOnboardStep(context: OnboardContext): Promise<OnboardStep> {
   const supervisorData = join(context.root, "supervisor");
   const clock = new SystemClock();
-  const coreUrl = context.coreUrl ?? process.env.KONTEKS_CORE_URL ?? "https://core.konteks.example";
+  const coreUrl = context.coreUrl ?? process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io";
   const siteUrl = (context.siteUrl ?? process.env.KONTEKS_SITE_URL ?? "https://app.konteks.io").replace(/\/+$/, "");
   const enrollment =
     context.deps?.enrollment ??
@@ -524,7 +524,17 @@ async function ownerApi(
   }
   let token = stored.token;
   if (Date.parse(stored.expiresAt) - Date.now() < TOKEN_REFRESH_MARGIN_MS) {
-    const refreshed = await enrollment.refreshOwnerToken(stored.instanceId);
+    let refreshed;
+    try {
+      refreshed = await enrollment.refreshOwnerToken(stored.instanceId);
+    } catch (error) {
+      if (wireCode(error) === "enrollment_invalid") {
+        // Revoked in Settings, or the lease lapsed: the token is gone for good.
+        await deleteOwnerToken(supervisorData);
+        throw new RemoteInstanceError("permission_denied", "This machine's Konteks access for you was revoked; sign in on the site or enroll again.");
+      }
+      throw error;
+    }
     await writeOwnerToken(supervisorData, { ...refreshed, instanceId: stored.instanceId });
     token = refreshed.token;
   }

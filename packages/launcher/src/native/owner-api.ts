@@ -41,6 +41,11 @@ export async function readOwnerToken(supervisorData: string): Promise<StoredOwne
   return parsed.success ? parsed.data : null;
 }
 
+export async function deleteOwnerToken(supervisorData: string): Promise<void> {
+  const { rm } = await import("node:fs/promises");
+  await rm(ownerTokenPath(supervisorData), { force: true });
+}
+
 export async function writeOwnerToken(
   supervisorData: string,
   token: Omit<StoredOwnerToken, "schemaVersion">,

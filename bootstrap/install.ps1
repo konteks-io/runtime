@@ -12,10 +12,25 @@ general command passthrough exists; an unverified package is refused.
 #>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)]
+  # Agent-first onboarding (onboarding-simplified R17): the user-local install
+  # arrives for Windows in a later release. Until then these switches say so
+  # instead of failing on a missing activation id.
+  [switch]$User,
+  [switch]$Enroll,
+  [Parameter(Mandatory = $false)]
   [ValidatePattern('^[A-Za-z0-9._-]{8,128}$')]
   [string]$ActivationId
 )
+
+if ($User -or $Enroll) {
+  Write-Host "The user-local (agent-first) install is not available on Windows yet; it arrives in a later release."
+  Write-Host "For now, create an activation in Konteks (Settings -> Connected runtimes) and run this script with -ActivationId <id>."
+  exit 3
+}
+if (-not $ActivationId) {
+  Write-Error "-ActivationId <id> is required (copy the command from the Konteks App or MCP)"
+  exit 2
+}
 $ErrorActionPreference = 'Stop'
 $BootstrapVersion = '1'
 $ReleaseBase = if ($env:KONTEKS_RELEASE_BASE) { $env:KONTEKS_RELEASE_BASE } else { 'https://github.com/konteks-io/runtime/releases/latest/download' }

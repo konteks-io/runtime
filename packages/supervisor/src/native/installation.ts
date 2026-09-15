@@ -28,7 +28,9 @@ export const NativeRuntimeRecordSchema = z.object({
   manifestDigest: z.string().min(1).max(128), bundleVersion: z.string().min(1).max(128),
   coreUrl: endpoint("https:"), relayUrl: endpoint("wss:"),
   controlPort: z.number().int().min(1).max(65_535),
-  agents: z.array(z.enum(["claude-code", "codex", "opencode", "pi"])).min(1).max(4)
+  // Zero agents is a machine enrolled from an agent door with nothing
+  // detectable yet (OS14); it advertises no roles until one is added.
+  agents: z.array(z.enum(["claude-code", "codex", "opencode", "pi"])).max(4)
     .refine(agents => new Set(agents).size === agents.length),
   git: NativeGitToolSchema.optional(),
   /** Local installer-owned profile binding, never a cloud-provided path. */

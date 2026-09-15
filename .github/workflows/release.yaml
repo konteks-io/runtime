@@ -36,6 +36,8 @@ jobs:
         env:
           KONTEKS_RELEASE_ROOTS_JSON: ${{ vars.KONTEKS_RELEASE_ROOTS_JSON }}
           KONTEKS_LAUNCHER_VERSION: ${{ github.ref_name }}
+          KONTEKS_DEFAULT_CORE_URL: ${{ vars.KONTEKS_DEFAULT_CORE_URL || 'https://api.konteks.io' }}
+          KONTEKS_DEFAULT_RELAY_URL: ${{ vars.KONTEKS_DEFAULT_RELAY_URL || 'wss://relay.konteks.io/relay/runtime' }}
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
           MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
           WINDOWS_AUTHENTICODE_PFX: ${{ secrets.WINDOWS_AUTHENTICODE_PFX }}
