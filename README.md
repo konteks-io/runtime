@@ -1,5 +1,10 @@
 # konteks-remote
 
+This `konteks-io/runtime` repository is the canonical implementation source for
+the native BYOA runtime, including local E2E builds and repairs. The former
+`remote-instance` repository retains architecture and proof history only; do
+not build or deploy the connector from that checkout.
+
 `konteks-remote` is the Konteks native runtime connector. It installs on a
 developer's or team's own machine, runs the coding agents that are already
 installed there (Claude Code, Codex, OpenCode) under their own subscriptions,
