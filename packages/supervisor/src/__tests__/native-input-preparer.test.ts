@@ -184,7 +184,7 @@ describe("native authorized input composition", () => {
     const target: RemoteWorkAssignment = {
       ...assignment,
       kind: "delivery",
-      agentRoute: { agentId: "codex", requiredRole: "planner" },
+      agentRoute: { agentId: "codex", requiredRole: "generator" },
       source: {
         kind: "repository_snapshot",
         portability: "portable_before_claim",
@@ -216,7 +216,7 @@ describe("native authorized input composition", () => {
     const target: RemoteWorkAssignment = {
       ...assignment,
       kind: "delivery",
-      agentRoute: { agentId: "codex", requiredRole: "planner" },
+      agentRoute: { agentId: "codex", requiredRole: "generator" },
       source: {
         kind: "repository_snapshot",
         portability: "portable_before_claim",

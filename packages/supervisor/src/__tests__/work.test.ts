@@ -390,7 +390,7 @@ describe("work orchestrator claim validation", () => {
     attempt: 1,
     expiresAt: "2026-09-06T01:00:00Z",
     requiredCapabilities: [],
-    agentRoute: { requiredRole: "planner", agentId: "codex" },
+    agentRoute: { requiredRole: "generator", agentId: "codex" },
     source: { kind: "harness_task_checkout", portability: "instance_bound", ownerInstanceId: "inst-1", workspaceRef: "ref" },
     policy: { maxDurationSeconds: 60, maxArtifactBytes: 1, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted", latestResumeAt: "2026-09-06T02:00:00Z", permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: true },
   };
@@ -415,8 +415,8 @@ describe("work orchestrator claim validation", () => {
       assertOwned: () => undefined,
       workspaceId: () => "ws-1",
       agents: () => [readyAgent],
-      roleBindings: () => [{ role: "planner", agentPreference: ["codex"] }],
-      advertisedRoles: () => ["planner"],
+      roleBindings: () => [{ role: "generator", agentPreference: ["codex"] }],
+      advertisedRoles: () => ["generator"],
       browserToolAvailable: () => false,
       acceptedKinds: () => ["delivery", "validation", "preview", "qa", "assistant_execution"],
       instanceEvidencePolicy: () => "structured_only",
@@ -760,7 +760,7 @@ describe("work orchestrator claim validation", () => {
     const gatewayBind = vi.fn(async () => undefined);
     const fetchWorkload = vi.fn(async () => { throw new Error("legacy component workload owner unavailable"); });
     const runner = { createSession: vi.fn(async (_input: RunnerSessionInput, lifecycle?: RunnerSessionLifecycle) => { await lifecycle?.beforeCreate("native-acp"); lifecycle?.assertCurrent(); return { acpSessionRef: "native-acp", resumed: false, capabilities: { forkSession: false, sessionResume: false } }; }), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined) } as unknown as RunnerPort;
-    const role = kind === "delivery" ? "planner" : kind === "assistant_execution" ? "assistant" : "qa";
+    const role = kind === "delivery" ? "generator" : kind === "assistant_execution" ? "assistant" : "qa";
     const f = await orchestrator({ deploymentKind: "native_connector", components: {}, runners: new Map([["codex", runner]]), gatewayBind, fetchWorkload, advertisedRoles: () => [role], browserToolAvailable: () => true,
       sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => { throw new Error("not needed"); }, browserToolUrl: null, workspaceRoot: "/native", deploymentKind: "native_connector", prepareInputs: async () => ({ binding: { workspaceId: target.workspaceId, assignmentId: target.id, attempt: target.attempt, instanceId: target.instanceId, sessionId: "cloud-session" }, cwd: "/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
         registerReady: createNativeReadyRegistrar({ clock, journal: f.journal, instanceId: target.instanceId, workspaceId: target.workspaceId, runnerIncarnation: "process", assertActive: () => undefined,
@@ -830,8 +830,8 @@ describe("work orchestrator claim validation", () => {
       prompt: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined),
     } as unknown as RunnerPort;
     const f = await orchestrator({ deploymentKind: "native_connector", recoveryAuthority, components: {}, runners: new Map([["codex", runner]]),
-      advertisedRoles: () => ["planner", "assistant"],
-      roleBindings: () => [{ role: "planner", agentPreference: ["codex"] }, { role: "assistant", agentPreference: ["codex"] }],
+      advertisedRoles: () => ["generator", "assistant"],
+      roleBindings: () => [{ role: "generator", agentPreference: ["codex"] }, { role: "assistant", agentPreference: ["codex"] }],
       sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => { throw new Error("not needed"); }, browserToolUrl: null, workspaceRoot: "/native", deploymentKind: "native_connector",
         prepareInputs: async () => ({ binding: { workspaceId: target.workspaceId, assignmentId: target.id, attempt: target.attempt, instanceId: target.instanceId, sessionId: "cloud-session" }, cwd: "/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
         registerReady: async (_assignment, binding, acpSessionRef) => {
@@ -1072,8 +1072,8 @@ describe("work orchestrator claim validation", () => {
     ["workspace_mismatch", { workspaceId: "ws-9" }],
     ["checkout_owned_elsewhere", { source: { kind: "harness_task_checkout", portability: "instance_bound", ownerInstanceId: "inst-9", workspaceRef: "ref" } }],
     ["expired", { expiresAt: "2026-09-05T00:00:00Z" }],
-    ["role_not_advertised", { agentRoute: { requiredRole: "qa", agentId: "codex" } }],
-    ["agent_unavailable", { agentRoute: { requiredRole: "planner", agentId: "claude-code" } }],
+    ["role_not_advertised", { kind: "qa", agentRoute: { requiredRole: "qa", agentId: "codex" } }],
+    ["agent_unavailable", { agentRoute: { requiredRole: "generator", agentId: "claude-code" } }],
     ["unknown_kind", { kind: "mystery" }],
   ])("rejects %s", async (rejection, patch) => {
     const { work, sent } = await orchestrator();
