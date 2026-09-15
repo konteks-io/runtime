@@ -194,10 +194,23 @@ describe("relayed session (D98/D113/D114)", () => {
     await expect(missing.session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable" });
     expect(missing.runner.createSession).not.toHaveBeenCalled();
     expect(missing.sent).toEqual([]);
-    const failed = await build({ deploymentKind: "native_connector", prepareInputs: async () => { throw new Error("input delivery failed"); } });
+    const warn = vi.fn();
+    const failed = await build({
+      deploymentKind: "native_connector",
+      prepareInputs: async () => { throw new Error("input delivery failed secret-body"); },
+      logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
+    });
     await expect(failed.session.bootstrap()).rejects.toThrow();
     expect(failed.runner.createSession).not.toHaveBeenCalled();
     expect(failed.sent).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      assignmentId: "asg",
+      attempt: 1,
+      stage: "input_preparation",
+      code: "unexpected_error",
+      retryable: false,
+    }), "native session bootstrap stage failed");
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("secret-body");
   });
 
   it("finishes fallible cloud preparation before activating local execution ownership", async () => {

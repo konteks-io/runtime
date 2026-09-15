@@ -175,6 +175,29 @@ export class RelayedSession {
     return task;
   }
 
+  /**
+   * Keep bootstrap failures diagnosable without copying provider/Core error
+   * messages into logs. Stage, stable code and retryability are sufficient to
+   * locate the failing boundary; raw messages may contain private response or
+   * workspace data and are deliberately excluded.
+   */
+  private async bootstrapStage<T>(stage: string, operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      const known = error instanceof RemoteInstanceError;
+      this.logger.warn({
+        assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt,
+        stage,
+        code: known ? error.code : "unexpected_error",
+        retryable: known ? error.retryable : false,
+        ...(known && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+      }, "native session bootstrap stage failed");
+      throw error;
+    }
+  }
+
   private async bootstrapImpl(): Promise<{ acpSessionRef: string; resumed: boolean }> {
     this.deps.assertExecutionOwned?.();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
@@ -183,7 +206,7 @@ export class RelayedSession {
     }
     if (this.deps.prepareInputs) {
       let prepared: PreparedSessionInputs;
-      try { prepared = await this.deps.prepareInputs(this.assignment); }
+      try { prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs!(this.assignment)); }
       catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
       this.deps.assertExecutionOwned?.();
       const parsedBinding = RemoteTransferBindingSchema.safeParse(prepared.binding);
@@ -201,7 +224,7 @@ export class RelayedSession {
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     const mcpServers: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }> = [];
     if (this.assignment.agentRoute.mcpCapabilityTokenRef) {
-      const issue = await this.deps.redeemCapabilityToken(this.assignment);
+      const issue = await this.bootstrapStage("mcp_capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
       this.deps.assertExecutionOwned?.();
       if (this.deps.deploymentKind === "native_connector") {
         const facade = new McpCapabilityFacade({
@@ -216,7 +239,7 @@ export class RelayedSession {
           now: () => this.deps.clock.coreNow(),
         });
         this.mcpFacade = facade;
-        mcpServers.push({ type: "http", ...await facade.start() });
+        mcpServers.push({ type: "http", ...await this.bootstrapStage("mcp_facade_start", () => facade.start()) });
       } else {
         mcpServers.push({ type: "http", ...issue.mcpServer });
       }
@@ -227,7 +250,9 @@ export class RelayedSession {
     // Keep every fallible cloud/file input ahead of the local ownership
     // commit. Once activation succeeds, only local channel reservation and
     // runner adoption stand between the old and new ACP generations.
-    const activation = this.deps.activateExecution ? await this.deps.activateExecution() : undefined;
+    const activation = this.deps.activateExecution
+      ? await this.bootstrapStage("execution_activation", () => this.deps.activateExecution!())
+      : undefined;
     this.deps.assertExecutionOwned?.();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     if (this.boundChannelId !== null && this.deps.reserveChannel) {
@@ -269,7 +294,7 @@ export class RelayedSession {
         this.deps.assertExecutionOwned?.();
       },
     } : undefined;
-    const created = await this.deps.runner.createSession({
+    const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession({
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
       cwd: this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
@@ -278,7 +303,7 @@ export class RelayedSession {
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
       ...(restoreRef ? { restoreAcpSessionRef: restoreRef } : {}),
       ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
-    }, lifecycle);
+    }, lifecycle));
     this.creationReturned = true;
     if (lifecycle && reservedRef !== created.acpSessionRef) throw new RemoteInstanceError("recovery_required", "Runner did not preserve durable reference ownership.");
     this.acpSessionRef = created.acpSessionRef;
@@ -296,7 +321,8 @@ export class RelayedSession {
     if (this.deps.deploymentKind === "native_connector") {
       try {
         const binding = this.preparedInputs!.binding;
-        const ready = RemoteExecutionReadyResultSchema.parse(await this.deps.registerReady!(this.assignment, binding, created.acpSessionRef));
+        const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("core_readiness_registration", () =>
+          this.deps.registerReady!(this.assignment, binding, created.acpSessionRef)));
         this.deps.assertExecutionOwned?.();
         if (ready.workspaceId !== binding.workspaceId || ready.instanceId !== binding.instanceId || ready.sessionId !== binding.sessionId || ready.assignmentId !== binding.assignmentId || ready.attempt !== binding.attempt ||
             ready.agentId !== this.assignment.agentRoute.agentId || ready.acpSessionRef !== created.acpSessionRef || ready.channelId !== this.boundChannelId) {
