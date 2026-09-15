@@ -779,14 +779,12 @@ export class RelayedSession {
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
     if (decision.kind === "allow") return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
-    if (decision.kind !== "allow") {
-      // A refused tool ends the agent's turn on Claude Code; the log named
-      // nothing about it, so a turn that stopped at a build command read as
-      // a hung agent. Bounded, sanitized title only.
-      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId,
-        title: sanitizePermissionRequest(params).params.title, decision: decision.kind,
-        humanDeferralAllowed: this.assignment.policy.humanDeferralAllowed }, "tool permission not allowed by policy");
-    }
+    // A refused tool ends the agent's turn on Claude Code; the log named
+    // nothing about it, so a turn that stopped at a build command read as a
+    // hung agent. Bounded, sanitized title only.
+    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId,
+      title: sanitizePermissionRequest(params).params.title, decision: decision.kind,
+      humanDeferralAllowed: this.assignment.policy.humanDeferralAllowed }, "tool permission not allowed by policy");
     if (decision.kind === "deny") {
       return void (await this.deps.runner.answer(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
     }
