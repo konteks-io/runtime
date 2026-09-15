@@ -31,6 +31,9 @@ function fixture() {
   vi.spyOn(supervisor.store, "provisioning").mockResolvedValue(null);
   internal.nativeOwnership = { assertOwned: vi.fn() };
   internal.openCoreChannels = vi.fn();
+  // The managed-git binding reload reads the key store from disk; under fake
+  // timers that real I/O would never settle before a retry is asserted.
+  internal.reloadManagedGitBinding = vi.fn(async () => undefined);
   internal.refreshConfiguration = vi.fn(async () => { events.push("configuration"); });
   const run = vi.fn(async () => { events.push("recovery"); complete = true; });
   supervisor.reconciliation = { run, get isComplete() { return complete; } } as never;
