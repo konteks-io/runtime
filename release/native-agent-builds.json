@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "nodeVersion": "22.23.2",
+  "agents": {
+    "claude-code": {
+      "bridge": { "package": "@agentclientprotocol/claude-agent-acp", "version": "0.75.1", "bin": "claude-agent-acp" },
+      "tooling": { "package": "@anthropic-ai/claude-code", "version": "2.1.263", "bin": "claude", "personalProfile": true }
+    },
+    "codex": {
+      "bridge": { "package": "@agentclientprotocol/codex-acp", "version": "1.10.0", "bin": "codex-acp" },
+      "tooling": { "package": "@openai/codex", "version": "0.153.4", "bin": "codex" }
+    },
+    "opencode": {
+      "bridge": { "package": "opencode-ai", "version": "1.2.0", "bin": "opencode" },
+      "tooling": { "package": "opencode-ai", "version": "1.2.0", "bin": "opencode" }
+    }
+  }
+}

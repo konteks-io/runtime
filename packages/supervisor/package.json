@@ -1,0 +1,43 @@
+{
+  "name": "@konteks/remote-supervisor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Remote Instance supervisor: instance key, activation exchange, readiness, lease, relay client and channel mux, durable journal/outbox, pull/claim/report, ACP session bootstrap, control protocol, loopback control socket.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
+    "typecheck": "tsc --build --noEmit",
+    "test": "vitest run --root ../.. --project unit -- packages/supervisor"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@konteks/agent-core": "file:../../vendor/konteks-agent-core-6.0.0.tgz",
+    "@konteks/backstage-plugin-common": "file:../../vendor/konteks-backstage-plugin-common-6.0.0.tgz",
+    "@konteks/remote-agent-runner": "*",
+    "@konteks/remote-common": "*",
+    "@konteks/remote-preview-forwarder": "*",
+    "@konteks/remote-release": "*",
+    "@konteks/remote-sysmon": "*",
+    "pino": "^9.5.0",
+    "ws": "^8.18.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}

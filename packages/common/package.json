@@ -1,0 +1,32 @@
+{
+  "name": "@konteks/remote-common",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared local utilities for the Konteks Remote Instance toolkit: contract boundary, redaction, secret files, process lifecycle, proofs, preview policy, control socket.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
+    "typecheck": "tsc --build --noEmit",
+    "test": "vitest run --root ../.. --project unit -- packages/common"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@konteks/backstage-plugin-common": "file:../../vendor/konteks-backstage-plugin-common-6.0.0.tgz",
+    "pino": "^9.5.0",
+    "zod": "^4.0.0"
+  }
+}

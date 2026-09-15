@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- konteks-remote MSI (WiX v3). Installs the single launcher executable
+     under Program Files, adds it to the machine PATH, and records the
+     publisher. Uninstall of the MSI never touches the restricted install root
+     (%ProgramData%\konteks-remote): `konteks-remote uninstall [--purge]` owns
+     that lifecycle. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="Konteks Remote Instance launcher" Language="1033" Version="$(var.ProductVersion)" Manufacturer="Konteks" UpgradeCode="7d3b7f2e-6f0d-4d5b-9b52-0f3f9b1c2a01">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" Description="konteks-remote launcher" />
+    <MajorUpgrade DowngradeErrorMessage="A newer konteks-remote is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="konteks-remote">
+          <Component Id="Launcher" Guid="3c5d2a1e-1b7f-4e0a-8a3c-9c1e6a2d4b10" Win64="yes">
+            <File Id="LauncherExe" Source="dist\launcher-build\konteks-remote.exe" KeyPath="yes" />
+            <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+    <Feature Id="Main" Level="1">
+      <ComponentRef Id="Launcher" />
+    </Feature>
+  </Product>
+</Wix>

@@ -1,0 +1,36 @@
+{
+  "name": "@konteks/remote-preview-forwarder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Loopback-only preview forwarder mapping a configured local port onto the governed preview channel under the D124/D125 policy.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
+    "typecheck": "tsc --build --noEmit",
+    "test": "vitest run --root ../.. --project unit -- packages/preview-forwarder"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@konteks/backstage-plugin-common": "file:../../vendor/konteks-backstage-plugin-common-6.0.0.tgz",
+    "@konteks/remote-common": "*",
+    "ws": "^8.18.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}

@@ -1,0 +1,149 @@
+import { constants, type Stats } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { isAbsolute, join, parse, resolve } from "node:path";
+import { z } from "zod";
+import { RemoteInstanceError } from "@konteks/remote-common";
+import { RunnerConfigSchema } from "@konteks/remote-agent-runner";
+import { EmbeddedReleaseRootSchema, selectNativeArtifacts, verifyNativeRelease, verifyOfflineAgentPackage, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { SupervisorConfigSchema } from "../config.js";
+import { IdentitySchema, ManifestRecordSchema } from "../state/store.js";
+import { verifyInstalledNativeBridges } from "./installed.js";
+import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
+import { resolveNativeCodexHome } from "./codex-home.js";
+import { resolveNativeClaudeExecutable } from "./claude-executable.js";
+
+const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
+function endpoint(protocol: "https:" | "wss:") {
+  return z.string().max(2048).url().refine(value => {
+    const url = new URL(value);
+    return url.protocol === protocol && !url.username && !url.password && !url.search && !url.hash;
+  });
+}
+
+/** Installer-owned metadata, not an environment file or arbitrary process configuration. */
+export const NativeRuntimeRecordSchema = z.object({
+  schemaVersion: z.literal(1), deploymentKind: z.literal("native_connector"),
+  instanceId: identifier, workspaceId: identifier, releaseId: identifier,
+  manifestDigest: z.string().min(1).max(128), bundleVersion: z.string().min(1).max(128),
+  coreUrl: endpoint("https:"), relayUrl: endpoint("wss:"),
+  controlPort: z.number().int().min(1).max(65_535),
+  agents: z.array(z.enum(["claude-code", "codex", "opencode", "pi"])).min(1).max(4)
+    .refine(agents => new Set(agents).size === agents.length),
+  git: NativeGitToolSchema.optional(),
+  /** Local installer-owned profile binding, never a cloud-provided path. */
+  codexHome: z.string().min(1).max(4096).optional(),
+  codexSocket: z.string().min(1).max(4096).optional(),
+  /** The operator's own installed Claude Code CLI, located at install time. */
+  claudeExecutable: z.string().min(1).max(4096).optional(),
+}).strict();
+export type NativeRuntimeRecord = z.infer<typeof NativeRuntimeRecordSchema>;
+
+export interface NativeInstallationOptions {
+  /** Supplied by the verified executable, never discovered in the writable installation. */
+  roots: readonly EmbeddedReleaseRoot[];
+  platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" };
+  nowMs?: number;
+}
+
+/** Read-only preflight. The supervisor must still acquire ownership and reverify before spawning. */
+export async function loadNativeInstallation(root: string, options: NativeInstallationOptions) {
+  if (!isAbsolute(root) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(root)) throw invalid();
+  root = resolve(root);
+  if (root === parse(root).root || root === resolve(homedir())) throw invalid();
+  const directories = new Map<string, Stats>();
+  const directory = async (path: string) => {
+    const info = await lstat(path);
+    if (!info.isDirectory() || !privateOwner(info)) throw invalid();
+    directories.set(path, info);
+  };
+  try {
+    await directory(root);
+    // Canonicalize ancestors (e.g. macOS /var -> /private/var), but never accept a linked root.
+    root = await realpath(root);
+    const record = NativeRuntimeRecordSchema.parse(await readPrivateJson(join(root, "native-runtime.json")));
+    if (record.git) await verifyNativeGitTool(record.git);
+    const roots = z.array(EmbeddedReleaseRootSchema).parse(options.roots);
+    const dataDir = join(root, "supervisor");
+    const releaseDir = join(root, "releases", record.releaseId);
+    for (const path of [dataDir, join(root, "releases"), releaseDir, join(releaseDir, "agents"), join(root, "credentials"), join(root, "workspaces")]) await directory(path);
+    const identity = IdentitySchema.parse(await readPrivateJson(join(dataDir, "identity.json")));
+    if (identity.instanceId !== record.instanceId || identity.workspaceId !== record.workspaceId) throw invalid();
+    const release = verifyNativeRelease(await readPrivateJson(join(releaseDir, "manifest.json")), roots, options.nowMs);
+    const exchangeRecord = ManifestRecordSchema.parse(await readPrivateJson(join(dataDir, "manifest.json")));
+    const exchange = verifyNativeRelease(exchangeRecord.manifest, roots, options.nowMs);
+    // Activation provenance remains immutable. A later installed release may
+    // differ, but both manifests must independently verify against the roots
+    // embedded in the connector executable.
+    if (release.manifest.digest !== record.manifestDigest) throw invalid();
+    if (exchangeRecord.manifestDigest !== exchange.manifest.digest) throw invalid();
+    if (release.manifest.bundleVersion !== record.bundleVersion) throw invalid();
+    const runners = [];
+    const artifacts = selectNativeArtifacts(release, { ...options.platform, agentIds: record.agents });
+    for (const agent of record.agents) {
+      const prefix = join(releaseDir, "agents", agent);
+      const credentials = join(root, "credentials", agent);
+      const workspace = join(root, "workspaces", agent);
+      for (const path of [prefix, credentials, workspace]) await directory(path);
+      const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
+      const profile = await verifyOfflineAgentPackage(prefix, artifact);
+      const codexHome = agent === "codex" ? await resolveNativeCodexHome(record.codexHome === undefined ? process.env : { CODEX_HOME: record.codexHome }) : undefined;
+      const claudeExecutable = agent === "claude-code" ? await resolveNativeClaudeExecutable(record.claudeExecutable === undefined ? process.env : { CLAUDE_CODE_EXECUTABLE: record.claudeExecutable }) : undefined;
+      runners.push(RunnerConfigSchema.parse({
+        RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
+        RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
+        ...(codexHome ? { RUNNER_NATIVE_CODEX_HOME: codexHome } : {}),
+        ...(claudeExecutable ? { RUNNER_NATIVE_CLAUDE_EXECUTABLE: claudeExecutable } : {}),
+        // The supervisor owns this shared service lifecycle. The path remains
+        // under the operator's local profile and is never cloud supplied.
+        ...(codexHome && profile.codexLocalProxy ? { RUNNER_NATIVE_CODEX_SOCKET: record.codexSocket ?? join(codexHome, "app-server-control", "app-server-control.sock") } : {}),
+        RUNNER_BRIDGE_PREFIX: prefix, RUNNER_BRIDGE_VERSION: profile.bridge.version,
+        RUNNER_NATIVE_PACKAGE_PROFILE: profile, RUNNER_NATIVE_PACKAGE_ARTIFACT: artifact,
+      }));
+    }
+    await verifyInstalledNativeBridges(release, runners, options.platform);
+    for (const [path, before] of directories) {
+      const after = await lstat(path);
+      if (!after.isDirectory() || !privateOwner(after) || !sameFile(before, after)) throw invalid();
+    }
+    const config = SupervisorConfigSchema.parse({
+      SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: dataDir,
+      SUPERVISOR_CORE_URL: record.coreUrl, SUPERVISOR_RELAY_URL: record.relayUrl,
+      SUPERVISOR_CONTROL_PORT: record.controlPort, SUPERVISOR_BUNDLE_VERSION: record.bundleVersion,
+      SUPERVISOR_PLATFORM_OS: options.platform.os, SUPERVISOR_PLATFORM_ARCH: options.platform.architecture,
+      SUPERVISOR_RELEASE_MANIFEST_FILE: join(releaseDir, "manifest.json"), SUPERVISOR_RUNNER_URLS: "",
+    });
+    return { record, config, runners, roots, release };
+  } catch (error) {
+    if (error instanceof RemoteInstanceError) throw error;
+    throw invalid();
+  }
+}
+
+function privateOwner(info: Stats): boolean {
+  return process.platform === "win32" || ((info.mode & 0o077) === 0 && info.uid === process.getuid?.());
+}
+function sameFile(a: Stats, b: Stats): boolean { return a.ino === b.ino && a.dev === b.dev; }
+function invalid() { return new RemoteInstanceError("install_state_corrupt", "Native installation metadata or private paths are invalid; repair the installation before starting."); }
+
+async function readPrivateJson(path: string): Promise<unknown> {
+  const before = await lstat(path);
+  const limit = 1024 * 1024;
+  if (!before.isFile() || before.nlink !== 1 || !privateOwner(before) || before.size > limit) throw invalid();
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat();
+    if (!sameFile(before, opened) || opened.size !== before.size) throw invalid();
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      size += chunk.length;
+      if (size > limit || size > before.size) throw invalid();
+      chunks.push(chunk);
+    }
+    const after = await handle.stat();
+    const named = await lstat(path);
+    if (size !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || !sameFile(before, named) || named.nlink !== 1 || !privateOwner(named)) throw invalid();
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } finally { await handle.close(); }
+}

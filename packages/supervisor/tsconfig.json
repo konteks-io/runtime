@@ -1,0 +1,34 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/**/*.test.ts",
+    "src/__tests__/**",
+    "src/__characterization__/**"
+  ],
+  "references": [
+    {
+      "path": "../common"
+    },
+    {
+      "path": "../release"
+    },
+    {
+      "path": "../sysmon"
+    },
+    {
+      "path": "../agent-runner"
+    },
+    {
+      "path": "../preview-forwarder"
+    }
+  ]
+}

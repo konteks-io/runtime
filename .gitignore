@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+!.env.example
+coverage/
+tmp/
+.runtime/
+# Local install roots created while developing the launcher on this machine.
+.konteks-remote/

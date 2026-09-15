@@ -1,0 +1,13 @@
+Package: konteks-remote
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: ca-certificates
+Maintainer: Konteks <support@konteks.example>
+Homepage: https://docs.konteks.example/remote-instance
+Description: Konteks native BYOA connector
+ konteks-remote installs and operates one user-owned native connector with
+ signed offline ACP agent packages. Harness, Validation Runtime, Assistant,
+ ai-manager, databases, gateways, Docker, Compose and WSL remain absent from
+ this machine. Connector-owned state is removed only by an explicit purge.

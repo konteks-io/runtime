@@ -1,0 +1,35 @@
+{
+  "name": "@konteks/remote-release",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Signed release manifest schema, verification against the embedded release root, and the release tooling stub.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "konteks-release": "./dist/cli.js"
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
+    "typecheck": "tsc --build --noEmit",
+    "test": "vitest run --root ../.. --project unit -- packages/release"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@konteks/remote-common": "*",
+    "commander": "^13.0.0",
+    "zod": "^4.0.0"
+  }
+}

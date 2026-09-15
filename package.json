@@ -1,0 +1,54 @@
+{
+  "name": "konteks-remote-instance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Konteks native BYOA connector, signed host distribution, offline ACP agent packages, and cloud relay client.",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "workspaces": [
+    "packages/common",
+    "packages/release",
+    "packages/sysmon",
+    "packages/gateway",
+    "packages/agent-runner",
+    "packages/browser-tool",
+    "packages/preview-forwarder",
+    "packages/supervisor",
+    "packages/launcher"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "tsc --build --clean && rm -rf packages/*/dist",
+    "typecheck": "tsc --build",
+    "lint": "eslint packages/*/src",
+    "format": "prettier --write \"packages/*/src/**/*.ts\" \"scripts/**/*.mjs\"",
+    "format:check": "prettier --check \"packages/*/src/**/*.ts\" \"scripts/**/*.mjs\"",
+    "test": "node --test scripts/offline-agent-files.test.mjs scripts/codex-acp-live-user-patch.test.mjs && vitest run",
+    "test:watch": "vitest",
+    "test:characterization": "REMOTE_INSTANCE_CHARACTERIZE=1 vitest run --project characterization",
+    "release:manifest": "tsx packages/release/src/cli.ts",
+    "ci:check": "npm run lint && npm run typecheck && npm test && npm run check:agpl && npm run check:secret-canary",
+    "check:agpl": "node scripts/check-agpl.mjs",
+    "check:secret-canary": "node scripts/check-secret-canary.mjs",
+    "image:deps": "node scripts/pin-registry-deps.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^22.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^4.1.8"
+  },
+  "overrides": {
+    "zod": "4.4.3"
+  },
+  "konteksContracts": {
+    "@konteks/agent-core": "6.0.0",
+    "@konteks/backstage-plugin-common": "6.0.0"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "claude-code": {
+    "displayName": "Claude Code",
+    "acpProtocol": { "min": 1, "max": 1 },
+    "command": ["claude-agent-acp"],
+    "tooling": { "login": ["claude", "auth", "login"], "logout": ["claude", "auth", "logout"], "identitySignal": ["claude", "auth", "status", "--json"] },
+    "egress": { "baseUrlEnv": "ANTHROPIC_BASE_URL", "providers": ["anthropic"] }
+  },
+  "codex": {
+    "displayName": "Codex",
+    "acpProtocol": { "min": 1, "max": 1 },
+    "command": ["codex-acp"],
+    "tooling": {
+      "login": ["codex", "login", "--device-auth"],
+      "logout": ["codex", "logout"],
+      "identitySignal": ["codex", "login", "status"],
+      "hostCacheImport": { "relativePath": ".codex/auth.json", "documentedBy": "https://github.com/openai/codex/blob/main/docs/authentication.md" }
+    },
+    "egress": { "baseUrlEnv": "OPENAI_BASE_URL", "providers": ["openai"] }
+  },
+  "opencode": {
+    "displayName": "OpenCode",
+    "acpProtocol": { "min": 1, "max": 1 },
+    "command": ["opencode", "acp"],
+    "tooling": { "login": ["opencode", "auth", "login"], "logout": ["opencode", "auth", "logout"], "identitySignal": ["opencode", "auth", "list"] },
+    "egress": { "providers": ["anthropic", "openai", "google", "deepseek"] }
+  },
+  "pi": {
+    "displayName": "Pi",
+    "acpProtocol": { "min": 1, "max": 1 },
+    "command": ["pi-acp"],
+    "tooling": { "login": ["pi", "login"], "logout": ["pi", "logout"] },
+    "egress": { "providers": ["anthropic", "openai", "google", "deepseek"] }
+  }
+}

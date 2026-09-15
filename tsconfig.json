@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/common" },
+    { "path": "packages/release" },
+    { "path": "packages/sysmon" },
+    { "path": "packages/gateway" },
+    { "path": "packages/agent-runner" },
+    { "path": "packages/browser-tool" },
+    { "path": "packages/preview-forwarder" },
+    { "path": "packages/supervisor" },
+    { "path": "packages/launcher" }
+  ]
+}
