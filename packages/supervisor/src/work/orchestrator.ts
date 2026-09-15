@@ -693,12 +693,24 @@ export class WorkOrchestrator {
     let reference: string | undefined;
     let takeover: { reference: string; mode: "live" | "restore" } | undefined;
     let executionActivated = this.deps.deploymentKind !== "native_connector";
+    const admissionOwned = () => admission !== undefined && this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`)?.claimId === entry.claimId && admission.claimId === entry.claimId && admission.runnerIncarnation === this.deps.runnerIncarnation?.() && admission.instanceId === this.deps.instanceId() && admission.workspaceId === this.deps.workspaceId() && admission.agentId === assignment.agentRoute.agentId;
+    const noCurrentAdmission = () => new RemoteInstanceError("recovery_required", "Native execution has no current durable admission.");
     const assertAdmissionCurrent = () => {
       if (this.deps.deploymentKind !== "native_connector") return;
       assertAuthority();
       this.requireNativeOwner();
-      if (!admission || this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`)?.claimId !== entry.claimId || admission.claimId !== entry.claimId || admission.runnerIncarnation !== this.deps.runnerIncarnation?.() || admission.instanceId !== this.deps.instanceId() || admission.workspaceId !== this.deps.workspaceId() || admission.agentId !== assignment.agentRoute.agentId || this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) throw new RemoteInstanceError("recovery_required", "Native execution has no current durable admission.");
-      this.deps.journal.execution.assertAdmission(admission);
+      if (!admissionOwned() || this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) throw noCurrentAdmission();
+      this.deps.journal.execution.assertAdmission(admission!);
+    };
+    // The session's own recovery stop: the recovery fence is that stop's mark
+    // and the accepted generation it dispatched under may already have moved
+    // on (a new recovery epoch is usually why it is being stopped), so neither
+    // is a refusal here. Ownership of the exact admission still is.
+    const assertRecoveryOwned = () => {
+      if (this.deps.deploymentKind !== "native_connector") return;
+      this.requireNativeOwner();
+      if (!admissionOwned()) throw noCurrentAdmission();
+      this.deps.journal.execution.assertAdmission(admission!);
     };
     assertAdmissionCurrent();
     const assertExecutionOwned = () => {
@@ -714,6 +726,7 @@ export class WorkOrchestrator {
     const session = new RelayedSession(assignment, {
       ...this.deps.sessionDeps(assignment, runner),
       assertExecutionOwned,
+      assertRecoveryOwned,
       ...(assignment.kind === "planning" ? {
         beforeSendToCore: async (message) => {
           assertExecutionOwned();

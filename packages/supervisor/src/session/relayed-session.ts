@@ -85,6 +85,14 @@ export interface RelayedSessionDeps {
   reserveChannel?: (channelId: string, session: RelayedSession) => () => void;
   /** Actual WorkOrchestrator retained-admission fence, not a permission grant. */
   assertExecutionOwned?: () => void;
+  /**
+   * Admission-scoped ownership for the recovery stop this session drives
+   * itself. That stop has already fenced the session and moved the execution
+   * out of `opened`, so `assertExecutionOwned` refuses by construction; what
+   * must still hold while the runner settles ACP is that the admission is
+   * exactly this runtime's. Absent, `assertExecutionOwned` is used.
+   */
+  assertRecoveryOwned?: () => void;
   executionAuthority?: Pick<NativeExecutionGateOptions, "client" | "runnerIncarnation">;
   onExecutionAuthorityLost?: () => Promise<void>;
   reserveExecutionReference?: (opaqueRef: string) => Promise<void>;
@@ -131,6 +139,13 @@ export class RelayedSession {
    * closures still fence it immediately.
    */
   private completedSettlementInProgress = false;
+  /**
+   * The recovery counterpart: `stopForRecovery` fences this session before it
+   * asks the runner to settle ACP, and the runner re-asserts the lifecycle
+   * fence before it will stop anything. For exactly that runner call the fence
+   * must answer with admission ownership instead of refusing its own stop.
+   */
+  private recoverySettlementInProgress = false;
   private channelOpened = false;
   private releaseChannel: (() => void) | null = null;
   /** Last streamed text per chunk kind, so redaction can tell a mid-token chunk start. */
@@ -288,6 +303,10 @@ export class RelayedSession {
         await this.deps.replaceExecutionProcessOwner(previous, replacement);
       },
       assertCurrent: () => {
+        // The runner's recovery stop asserts this fence first. The fence is
+        // this session's own recovery mark, not a stale owner, so answer with
+        // admission ownership for that one settlement operation only.
+        if (this.recoverySettlementInProgress) return void this.assertRecoveryOwned();
         if (this.closed && !this.completedSettlementInProgress) {
           throw new RemoteInstanceError("recovery_required", "Session generation is fenced.", { diagnostic: "session_generation_fenced" });
         }
@@ -839,7 +858,9 @@ export class RelayedSession {
         const stopRunner = this.deps.runner.stopForRecovery;
         if (!stopRunner) throw new RemoteInstanceError("recovery_required", "Runner cannot prove a per-session recovery stop.");
         this.deps.broker.cancelSession(ref);
-        await stopRunner.call(this.deps.runner, ref);
+        this.recoverySettlementInProgress = true;
+        try { await stopRunner.call(this.deps.runner, ref); }
+        finally { this.recoverySettlementInProgress = false; }
       };
       // Request cancellation before awaiting a handler that may itself be
       // waiting for that agent. Late bootstrap is handled after it settles.
@@ -854,11 +875,17 @@ export class RelayedSession {
       if (initialStop) await initialStop;
       else if (this.acpSessionRef !== null) await stop(this.acpSessionRef);
       else throw new RemoteInstanceError("recovery_required", "Bridge session creation has an unknown outcome; recovery stop is unproven.");
-      this.deps.assertExecutionOwned?.();
+      // The execution is already `stopping` under this session's own recovery
+      // fence; only admission ownership can still be current here.
+      this.assertRecoveryOwned();
       // Stage one only. ACP settlement never releases the final live/channel
       // owner or qualifies background tool quiescence.
     })();
     return this.recoveryStopTask;
+  }
+
+  private assertRecoveryOwned(): void {
+    (this.deps.assertRecoveryOwned ?? this.deps.assertExecutionOwned)?.();
   }
 
   /** Dispatch owns the failure report; disposal must not invent a user cancellation. */
