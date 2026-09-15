@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import {
+  REMOTE_FILE_TREE_LIMITS,
   RemoteDeliveryResultCandidateSchema,
   RemoteFileTreeSchema,
   RemoteInstanceError,
@@ -16,6 +17,29 @@ import {
 const MAX_GIT_OUTPUT = 16 * 1024 * 1024;
 const oidPattern = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
 const unavailable = () => new RemoteInstanceError("capability_unavailable", "Generated delivery output is unavailable or changed during capture.");
+
+/**
+ * Package-manager caches are never part of a delivered change: an agent that
+ * runs `npm install` inside the worktree would otherwise hand the platform a
+ * tree of tens of thousands of vendored files, far past the contract's
+ * 1000-file / 10 MiB envelope. Ignored *generated* files elsewhere stay
+ * captured on purpose (a build output the change relies on).
+ */
+const DEPENDENCY_CACHE_EXCLUSIONS = [
+  ":(exclude,glob)**/node_modules/**",
+  ":(exclude,glob)**/.venv/**",
+  ":(exclude,glob)**/__pycache__/**",
+  ":(exclude,glob)**/.pnpm-store/**",
+];
+
+/** The captured tree against the transfer contract, before any bytes leave the runtime. */
+export function checkOutputTreeLimits(entries: ReadonlyArray<{ sizeBytes: number }>): void {
+  const totalBytes = entries.reduce((sum, entry) => sum + entry.sizeBytes, 0);
+  if (entries.length <= REMOTE_FILE_TREE_LIMITS.files && totalBytes <= REMOTE_FILE_TREE_LIMITS.bytes) return;
+  throw new RemoteInstanceError("capability_unavailable",
+    `Generated delivery output exceeds the transfer contract (${entries.length} files, ${totalBytes} bytes; limits ${REMOTE_FILE_TREE_LIMITS.files} files, ${REMOTE_FILE_TREE_LIMITS.bytes} bytes).`,
+    { diagnostic: "output_exceeds_limits" });
+}
 
 async function checkedDirectory(value: string): Promise<string> {
   if (!isAbsolute(value) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)) throw unavailable();
@@ -52,7 +76,7 @@ async function captureIndex(executable: string, cwd: string, baselineCommit: str
   // A private index and object directory capture tracked, untracked and ignored
   // generated files without mutating the connector baseline or following paths
   // after discovery. Git metadata remains excluded by Git itself.
-  await runGit(executable, cwd, ["add", "--no-renormalize", "-A", "-f", "--", "."], env);
+  await runGit(executable, cwd, ["add", "--no-renormalize", "-A", "-f", "--", ".", ...DEPENDENCY_CACHE_EXCLUSIONS], env);
   const tree = (await runGit(executable, cwd, ["write-tree"], env)).toString("ascii").trim();
   if (!oidPattern.test(tree)) throw unavailable();
   return tree;
@@ -123,6 +147,7 @@ export async function captureNativeDeliveryOutput(options: {
       return { path: value.path, mode: value.item!.mode, sizeBytes: bytes.length,
         digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, contentBase64: bytes.toString("base64") };
     });
+    checkOutputTreeLimits(entries);
     const files = RemoteFileTreeSchema.parse({ format: "konteks-file-tree-v1", entries, treeDigest: computeRemoteFileTreeDigest(entries) });
     const identity = { binding: options.binding, claimId: options.claimId, invocationRef: options.invocationRef,
       inputSelectionDigest: options.inputSelectionDigest, baseRevision: options.baseRevision, files, deletions };

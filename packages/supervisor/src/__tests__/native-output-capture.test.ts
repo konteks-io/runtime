@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { computeRemoteDeliveryOutputDigest } from "@konteks/remote-common";
-import { captureNativeDeliveryOutput } from "../native/output-capture.js";
+import { captureNativeDeliveryOutput, checkOutputTreeLimits } from "../native/output-capture.js";
 
 let dir = "";
 let linked = "";
@@ -43,6 +43,25 @@ describe("native delivery output capture", () => {
     ]);
     const { resultDigest: _, ...digestBody } = result;
     expect(result.resultDigest).toBe(computeRemoteDeliveryOutputDigest(digestBody));
+  });
+
+  it("never captures a package-manager cache, even when nothing ignores it", async () => {
+    await mkdir(join(dir, "node_modules", "left-pad"), { recursive: true });
+    await writeFile(join(dir, "node_modules", "left-pad", "index.js"), "module.exports = 1;\n");
+    await mkdir(join(dir, "src"));
+    await writeFile(join(dir, "src", "app.js"), "// app\n");
+    const { stdout } = await run("git", ["-C", dir, "rev-parse", "HEAD"]);
+    const result = await captureNativeDeliveryOutput({ cwd: dir, gitExecutable: "/usr/bin/git", baselineCommit: stdout.trim(),
+      binding: { workspaceId: "tenant", sessionId: "session", assignmentId: "assignment", attempt: 1, instanceId: "instance" },
+      claimId: "claim", invocationRef: "invocation", inputSelectionDigest: `sha256:${"a".repeat(64)}`, baseRevision: stdout.trim() });
+    expect(result.files.entries.map(entry => entry.path)).toEqual(["src/app.js"]);
+  });
+
+  it("refuses a tree past the transfer contract before it leaves the runtime", () => {
+    expect(() => checkOutputTreeLimits(Array.from({ length: 1001 }, () => ({ sizeBytes: 1 }))))
+      .toThrow(/exceeds the transfer contract \(1001 files/);
+    expect(() => checkOutputTreeLimits([{ sizeBytes: 10 * 1024 * 1024 + 1 }])).toThrow(/exceeds the transfer contract/);
+    expect(() => checkOutputTreeLimits([{ sizeBytes: 10 }])).not.toThrow();
   });
 
   it("fails closed if the pinned base moved", async () => {

@@ -151,7 +151,17 @@ export class NativeOutputClient {
             sleep: this.options.retrySleep, baseDelayMs: this.options.retryBaseDelayMs });
           continue;
         }
-        if (!response.ok || response.redirected || response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json" || !response.body) throw unavailable();
+        if (!response.ok || response.redirected || response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json" || !response.body) {
+          // A non-retryable refusal (413 over the body limit, 422 rejected
+          // candidate) was previously indistinguishable from any other
+          // "unavailable": record the status and a bounded, secret-free body.
+          const body = await response.text().then(text => text.replace(/\s+/gu, " ").slice(0, 300)).catch(() => "");
+          this.logger.warn({ event: "native.output.refused", operation: `output.${operation}`, status: response.status,
+            redirected: response.redirected, contentType: response.headers.get("content-type") ?? null,
+            requestBytes: Buffer.byteLength(encoded), body }, "native delivery output request refused");
+          throw new RemoteInstanceError("capability_unavailable", "Generated delivery output was not durably accepted.",
+            { diagnostic: `response_refused_${response.status}` });
+        }
         reader = response.body.getReader();
         const chunks: Uint8Array[] = []; let size = 0;
         while (true) {
