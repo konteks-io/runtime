@@ -397,7 +397,8 @@ export class Supervisor {
         ? { assignmentCursors: () => this.assignmentSender?.relayCursors() ?? null }
         : {}),
       onStall: (channelId) => this.relay?.rehandshake(`stall:${channelId}`),
-      onReset: (channelId) => void this.onChannelReset(channelId),
+      onReset: (channelId) => void this.onChannelReset(channelId)
+        .catch(error => this.logger.error({ err: error, channelId }, "channel reset handling failed")),
       persistCursors: (cursors) => this.store.saveCursors(cursors),
       persistRelayState: (state) => this.store.saveRelayState(state),
     });

@@ -289,6 +289,28 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(runner.createSession).not.toHaveBeenCalled();
   });
 
+  it("closes a native turn that ends without end_turn as an agent exit so a terminal reaches Core", async () => {
+    const { session, closed, runner, journal, sent } = await build({
+      deploymentKind: "native_connector",
+      reserveChannel: () => vi.fn(),
+      reserveExecutionReference: async () => undefined,
+      recordExecutionProcessOwner: async () => undefined,
+      prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
+    });
+    vi.mocked(runner.createSession).mockImplementation(async (_input, lifecycle) => {
+      await lifecycle!.beforeCreate("acp-1");
+      lifecycle!.assertCurrent();
+      return { acpSessionRef: "acp-1", resumed: false, capabilities: { forkSession: false, sessionResume: true } };
+    });
+    await session.bootstrap();
+    await journal.pendingRequests.put({ acpSessionRef: "acp-1", id: "p1", method: "session/prompt", direction: "received", openedAt: clock.nowIso(), closedAt: null, deadlineAt: null, requestDigest: null });
+    // A rejected tool interrupts Claude Code's turn as `cancelled`; the turn is over either way.
+    await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "cancelled" } });
+    expect(closed).toEqual(["agent_exited"]);
+    expect(runner.closeSession).toHaveBeenCalledWith("acp-1");
+    expect(sent.at(-1)?.body).toMatchObject({ kind: "session_closed", assignmentId: "asg", reason: "agent_exited" });
+  });
+
   it("uses the verified logical session channel across native assignment attempts and retains replay on close", async () => {
     for (const attempt of [1, 2]) {
       const work = { ...assignment, id: `asg-${attempt}`, attempt };

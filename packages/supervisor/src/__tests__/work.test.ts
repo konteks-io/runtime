@@ -484,6 +484,32 @@ describe("work orchestrator claim validation", () => {
     expect(f.sent).toEqual([]);
   });
 
+  it("keeps a native harness turn alive on a relay replay gap but still closes an appliance session", async () => {
+    const fake = (kind: string, source: string) => ({
+      channelId: "session:live", isClosed: false, close: vi.fn(async () => undefined),
+      assignment: { id: "live", attempt: 1, kind, source: { kind: source } },
+    });
+    const native = await orchestrator({ deploymentKind: "native_connector" });
+    const nativeSession = fake("delivery", "harness_delivery");
+    (native.work as unknown as { sessions: Map<string, unknown> }).sessions.set("live:1", nativeSession);
+    const nativeClose = vi.spyOn(native.transport, "closeChannel");
+    await native.work.onChannelReset("session:live");
+    expect(nativeSession.close).not.toHaveBeenCalled();
+    expect(nativeClose).not.toHaveBeenCalled();
+
+    const appliance = await orchestrator();
+    const applianceSession = fake("delivery", "harness_delivery");
+    (appliance.work as unknown as { sessions: Map<string, unknown> }).sessions.set("live:1", applianceSession);
+    await appliance.work.onChannelReset("session:live");
+    expect(applianceSession.close).toHaveBeenCalledExactlyOnceWith("relay_replay_gap");
+
+    // a close that throws is logged and does not abort the reset handler
+    const failing = await orchestrator();
+    const failingSession = { ...fake("delivery", "harness_delivery"), close: vi.fn(async () => { throw new Error("cancel failed"); }) };
+    (failing.work as unknown as { sessions: Map<string, unknown> }).sessions.set("live:1", failingSession);
+    await expect(failing.work.onChannelReset("session:live")).resolves.toBeUndefined();
+  });
+
   it("retires an ownerless terminal session channel after reset but preserves an ownerless live recovery channel", async () => {
     const f = await orchestrator({ deploymentKind: "native_connector" });
     const close = vi.spyOn(f.transport, "closeChannel");

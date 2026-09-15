@@ -724,9 +724,21 @@ export class RelayedSession {
         // native Codex thread does not exit when its turn ends, so waiting for
         // session_exited leaks a claimed assignment and blocks the next turn.
         // Close this assignment, not the shared native server or its history.
-        if (accepted && this.deps.deploymentKind === "native_connector" &&
-          (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery") &&
-          (event.result as { stopReason?: string })?.stopReason === "end_turn") await this.close("completed");
+        const stopReason = (event.result as { stopReason?: string })?.stopReason;
+        const nativeTurn = accepted && this.deps.deploymentKind === "native_connector" &&
+          (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery");
+        if (nativeTurn && stopReason === "end_turn") await this.close("completed");
+        else if (nativeTurn && typeof stopReason === "string" && !this.closed) {
+          // A turn that ends any other way has still ENDED: a rejected tool
+          // interrupts Claude Code's turn as `cancelled`, a refusal or token
+          // cap ends it likewise. Left open, the claimed assignment kept
+          // heartbeating until the harness deadline (2026-09-15, 27 minutes
+          // for a turn that had stopped at minute ten). Close it so a
+          // terminal reaches Core now.
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stopReason },
+            "native turn ended without end_turn; closing the assignment as an agent exit");
+          await this.close("agent_exited");
+        }
         return;
       }
       case "set_mode_result":
@@ -767,6 +779,14 @@ export class RelayedSession {
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
     if (decision.kind === "allow") return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
+    if (decision.kind !== "allow") {
+      // A refused tool ends the agent's turn on Claude Code; the log named
+      // nothing about it, so a turn that stopped at a build command read as
+      // a hung agent. Bounded, sanitized title only.
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId,
+        title: sanitizePermissionRequest(params).params.title, decision: decision.kind,
+        humanDeferralAllowed: this.assignment.policy.humanDeferralAllowed }, "tool permission not allowed by policy");
+    }
     if (decision.kind === "deny") {
       return void (await this.deps.runner.answer(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
     }
