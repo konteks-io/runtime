@@ -11,7 +11,6 @@ import {
   RemoteInstanceError,
   type DiscoveryEvidenceSubmission,
   type DiscoveryRunBounds,
-  type DiscoveryDepth,
   type EnrichmentProgressInput,
   type FetchFn,
   type RepositoryRelocateReportInput,

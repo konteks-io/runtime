@@ -102,7 +102,7 @@ function parseManifest(path: string, text: string): { kind: string; name?: strin
     }
     case "pyproject.toml": {
       const name = /^\s*name\s*=\s*["']([^"']{1,256})["']/m.exec(text)?.[1];
-      const dependencies = [...text.matchAll(/^\s*["']([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:[<>=!~\[][^"']*)?["']\s*,?\s*$/gm)].map(match => match[1]!);
+      const dependencies = [...text.matchAll(/^\s*["']([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:[<>=!~[][^"']*)?["']\s*,?\s*$/gm)].map(match => match[1]!);
       return { kind: "python", ...(name ? { name } : {}), ...(dependencies.length ? { dependencies: dependencies.slice(0, MAX_DEPENDENCIES) } : {}) };
     }
     case "go.mod": {
