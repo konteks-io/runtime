@@ -187,7 +187,9 @@ it("does not fence or duplicate a live claim handoff when maintenance runs durin
     const settled = vi.fn(); void delivery.then(settled);
     await vi.waitFor(() => expect(settled).toHaveBeenCalledOnce());
     const admission = f.journal.execution.start("assignment", 1)!.admission;
-    expect(f.journal.execution.execution(admission)?.phase).toBe("opened");
+    // The execution opens only after input preparation and capability
+    // redemption, so a slow bootstrap holds it unopened without any fence.
+    expect(f.journal.execution.execution(admission)?.phase).toBeUndefined();
     expect((f.work as unknown as { pendingClaims: Map<string, unknown> }).pendingClaims.size).toBe(0);
     expect(f.journal.execution.start("assignment", 1)?.claimEffect?.state).toBe("applied");
     const count = f.sent.filter(message => message.assignmentRequest?.requestSequence === ref.requestSequence).length;

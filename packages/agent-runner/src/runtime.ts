@@ -382,8 +382,11 @@ export class AgentRuntime {
     try {
       await this.persistProcessOwner(idle.durable, lifecycle);
     } catch (error) {
-      // Mirror the spawn path: an unrecorded owner is never left running.
+      // Mirror the spawn path: an unrecorded owner is never left running. The
+      // stop is settled here, so the bootstrap failure path must not stop the
+      // same process a second time or demand a further exit observation.
       await idle.durable.stop();
+      record.process = null;
       throw error;
     }
     if (this.stopping || record.stopping || idle.bridge.exited) {

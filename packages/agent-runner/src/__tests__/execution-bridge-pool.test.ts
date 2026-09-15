@@ -46,7 +46,8 @@ async function fixture(options: { limit?: number; ttlMs?: number } = {}) {
         cancel: vi.fn(async () => undefined),
         closeSession: vi.fn(async () => ({})),
       } as never,
-      stop: vi.fn(async () => undefined),
+      // A real stop handle resolves only once the process is observed exited.
+      stop: vi.fn(async () => { Object.defineProperty(bridge, "exited", { value: true }); }),
     };
     // The real spawn hands the exact stop handle over before ACP initialize.
     await input.onProcessOwner?.(bridge);
@@ -196,11 +197,17 @@ it("stops a resident process whose durable owner cannot be recorded for the new 
   const first = await f.runtime.sessions.create(f.input);
   await completeAndRelease(f, first.acpSessionRef);
   const failing = { ...f.input, lifecycle: { ...f.input.lifecycle, recordProcessOwner: vi.fn(async () => { throw new Error("journal unavailable"); }) } };
+  const spawnsBefore = f.spawn.mock.calls.length;
   await expect(f.runtime.sessions.create(failing)).rejects.toThrow("journal unavailable");
   expect(f.execution().bridge.stop).toHaveBeenCalledOnce();
   expect(f.execution().bridge.connection.newSession).toHaveBeenCalledTimes(1);
-  // A rejected bootstrap retains its slot exactly as a rejected spawn does.
-  await expect(f.runtime.sessions.create(f.input)).rejects.toThrow();
+  // The resident is stopped once; the remaining bootstrap attempts spawn
+  // fresh processes, each stopped in turn, and every failed owner is finalized.
+  expect(f.spawn.mock.calls.length).toBe(spawnsBefore + 3);
+  for (const owner of f.owners.slice(spawnsBefore)) expect(owner.bridge.stop).toHaveBeenCalledOnce();
+  // An exhausted bootstrap releases its slot rather than holding it forever.
+  const recovered = await f.runtime.sessions.create(f.input);
+  expect(recovered.acpSessionRef).toBeTruthy();
 });
 
 it("answers the model capability probe from the resident process and keeps it resident", async () => {
