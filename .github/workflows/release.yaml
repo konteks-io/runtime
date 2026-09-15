@@ -93,7 +93,7 @@ jobs:
           node scripts/sign-checksums.mjs --key "$RUNNER_TEMP/release.key.json" --in dist/release/SHA256SUMS --out dist/release/SHA256SUMS.sig --pub dist/release/release-signing.pub
           rm -f "$RUNNER_TEMP/release.key.json"
           if [ -n "$DEB_SIGNING_PUBLIC_KEY" ]; then printf '%s\n' "$DEB_SIGNING_PUBLIC_KEY" > dist/release/deb-signing.asc; fi
-          cp bootstrap/install.sh bootstrap/install.ps1 dist/release/
+          cp bootstrap/install.sh bootstrap/install.ps1 bootstrap/onboarding.md dist/release/
           node scripts/release-assets.mjs verify --manifest dist/release/native-manifest.json --dir dist/release
       - name: Publish the GitHub Release (assets are immutable per tag; latest is the stable channel)
         env:

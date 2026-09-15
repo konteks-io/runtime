@@ -13,6 +13,29 @@ channel. No Docker, no local databases, no provider API keys on the host.
 
 ## Install
 
+There are two doors, and they lead to the same place.
+
+### From your own coding agent
+
+If you already work in Claude Code or Codex, you never have to open the app.
+Paste [the onboarding block](bootstrap/onboarding.md) into your agent, inside
+a repository you care about. It installs the connector into your own user
+directory — no `sudo`, no package — then asks you for an email and the
+six-digit code Konteks sends back. That is the whole of it before the machine
+is connected; from there your agent offers to make the repository you are in
+your first System, and to open a first session.
+
+```sh
+curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --user --enroll
+konteks-remote onboard --json
+```
+
+macOS and Linux. The connector executable is verified against the same signed
+checksum manifest the packages are, so this path is verified differently from
+the package path, not less.
+
+### From the Konteks app
+
 Create a runtime in the Konteks App (Settings → Runtimes → Connect) and copy
 the command it shows. It carries only a non-secret activation id; the
 activation code is prompted without echo.
