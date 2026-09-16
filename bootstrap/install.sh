@@ -191,10 +191,11 @@ case "$os" in
     echo "installing ${pkg} (administrator password may be requested by the installer)"
     sudo installer -pkg "$workdir/$pkg" -target / ;;
   Linux)
-    [ -r /etc/os-release ] && . /etc/os-release
+    os_release_file="${KONTEKS_OS_RELEASE_FILE:-/etc/os-release}"
+    [ -r "$os_release_file" ] && . "$os_release_file"
     case "${ID:-}" in
-      debian) ;;
-      *) echo "error: unsupported Linux distribution '${ID:-unknown}' (Debian 12/13 is supported); see the documentation for a manual, verified install" >&2; exit 3 ;;
+      debian|ubuntu) ;;
+      *) echo "error: unsupported Linux distribution '${ID:-unknown}' (Debian 12/13 and Ubuntu 22.04/24.04 are supported); see the documentation for a manual, verified install" >&2; exit 3 ;;
     esac
     need dpkg
     need gpg
