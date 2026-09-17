@@ -195,10 +195,12 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
     }
 
     case "email": {
-      if (context.answer === undefined || !context.answer.trim()) {
+      // After a lost bind the address is already known; asking for it again
+      // would make the person repeat themselves for our failure.
+      const email = context.answer?.trim() || state.resendTo;
+      if (!email) {
         return { step: "email", ask: { question: "What email address should this machine belong to?", kind: "email" } };
       }
-      const email = context.answer.trim();
       let intentRef = state.intentRef;
       if (!intentRef) {
         const platform = nativePlatform();
@@ -222,7 +224,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         intentRef = opened.intentRef;
       }
       const sent = await enrollment.sendChallenge(intentRef, email);
-      await save({ step: "code", intentRef, email, emailMasked: sent.sentToMasked, attemptsRemaining: sent.attemptsRemaining });
+      await save({ step: "code", intentRef, email, emailMasked: sent.sentToMasked, attemptsRemaining: sent.attemptsRemaining, resendTo: undefined } as never);
       return { step: "email", note: `A six-digit code is on its way to ${sent.sentToMasked}.`, run: AGAIN };
     }
 
@@ -312,6 +314,17 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
             expectedManifestDigest: prepared.manifestDigest,
           });
         } catch (error) {
+          if (wireCode(error) === "enrollment_invalid" && state.email) {
+            // The bind finished on Konteks but its answer never arrived, so
+            // this intent is spent. A new code for the same address joins the
+            // machine to the workspace that bind made (WS1-014).
+            await save({ step: "email", intentRef: undefined, emailMasked: undefined, decision: undefined, attemptsRemaining: undefined, resendTo: state.email } as never);
+            return {
+              step: "start",
+              note: "This machine did not hear back from Konteks in time, though your workspace may already be set up. Konteks will send a new code to finish connecting this machine.",
+              run: AGAIN,
+            };
+          }
           if (["limit_exceeded", "limit_reached"].includes(wireCode(error))) {
             // R18: the plan allows one connected runtime. Say so, say how to
             // move it, and stop here rather than retrying on every run.

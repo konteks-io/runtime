@@ -106,6 +106,9 @@ export interface NativeEnrollmentOptions {
   roots?: readonly EmbeddedReleaseRoot[];
 }
 
+/** Longer than Core's own bound on creating a workspace. */
+const BIND_TIMEOUT_MS = 150_000;
+
 /**
  * One enrollment conversation, held open across separate `onboard` processes.
  *
@@ -175,6 +178,10 @@ export class NativeEnrollment {
         "enrollment_bind",
         intentRef,
         BoundSchema,
+        // Binding a new address creates its workspace, which takes tens of
+        // seconds; Core allows two minutes for it, so this waits longer still
+        // rather than give up on a bind that is about to succeed (WS1-014).
+        BIND_TIMEOUT_MS,
       );
       const release = verifyNativeRelease(bound.bundleManifest, this.options.roots ?? EMBEDDED_RELEASE_ROOTS, this.options.clock.now());
       if (release.manifest.digest !== input.expectedManifestDigest) {
@@ -225,9 +232,11 @@ export class NativeEnrollment {
     method: string,
     subject: string,
     schema: z.ZodType<T>,
+    timeoutMs?: number,
   ): Promise<T> {
     const client = new JsonClient({
       baseUrl: this.options.coreUrl,
+      ...(timeoutMs ? { timeoutMs } : {}),
       ...(this.options.fetchFn ? { fetchFn: this.options.fetchFn } : {}),
     });
     return client.request({

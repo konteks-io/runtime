@@ -522,6 +522,25 @@ describe("onboard", () => {
     vi.restoreAllMocks();
   });
 
+  it("recovers from a bind whose answer was lost by sending a new code to the same address", async () => {
+    await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "hello@konteks.io", decision: "create" } as never);
+    const { writeSecretFile, RemoteInstanceError: Refusal } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: [], bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const bind = vi.fn(async () => { throw new Refusal("enrollment_invalid" as never, "This enrollment was not accepted"); });
+    const lost = await step({ enrollment: { bind } as never });
+    expect(lost.note).toContain("did not hear back");
+    expect(lost.ask).toBeUndefined();
+    const openIntent = vi.fn(async () => ({ intentRef: "intent-2" }));
+    const sendChallenge = vi.fn(async () => ({ sentToMasked: "h••••@konteks.io", attemptsRemaining: 5 }));
+    const resent = await step({ enrollment: { openIntent, sendChallenge } as never });
+    expect(sendChallenge).toHaveBeenCalledWith("intent-2", "hello@konteks.io");
+    expect(resent.note).toContain("h••••@konteks.io");
+    expect(await readOnboardState(root)).toMatchObject({ step: "code", intentRef: "intent-2" });
+    expect((await readOnboardState(root))?.resendTo).toBeUndefined();
+  });
+
   it("stops with the plan-limit remedy instead of retrying the bind on every run", async () => {
     await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "join" } as never);
     const { writeSecretFile, CoreResponseError } = await import("@konteks/remote-common");
