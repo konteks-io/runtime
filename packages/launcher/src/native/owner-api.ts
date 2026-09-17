@@ -75,6 +75,15 @@ const FirstSystemSchema = z
 
 export type FirstSystemRegistered = z.infer<typeof FirstSystemSchema>;
 
+/** One agent this machine advertises for a role, as the capabilities read names it. */
+interface MachineAgentOption {
+  optionId: string;
+  runtimeId?: string;
+  providerId?: string;
+  modelId: string;
+  availability?: string;
+}
+
 export class OwnerApiClient {
   constructor(
     private readonly options: {
@@ -100,59 +109,55 @@ export class OwnerApiClient {
   }
 
   /**
-   * What this workspace's agents are set to, if anything (W1-A6).
+   * Whether this workspace can already run work (W1-A6).
    *
    * A workspace made from a coding agent has never been through the setup the
-   * site offers, so its first session has no profile to run with and every
-   * turn is refused. Onboarding reads this and, when nothing is configured,
-   * chooses what the machine itself advertises.
+   * site offers, so it has no execution profile and its first session is
+   * refused for want of one. Any profile at all means somebody has chosen.
    */
-  async agentSetupReadiness(): Promise<string> {
-    const body = (await this.call("GET", "/api/app/agent-setup/status")) as { readiness?: unknown };
-    return typeof body.readiness === "string" ? body.readiness : "never_configured";
+  async hasExecutionProfile(): Promise<boolean> {
+    const body = (await this.call("GET", "/api/app/execution-profiles")) as { profiles?: unknown };
+    return Array.isArray(body.profiles) && body.profiles.length > 0;
   }
 
   /**
-   * Set the workspace's agents up from what this machine advertises: the
-   * recommended option for every role the setup requires. It is the person's
-   * own machine and their own agent login, so there is nothing to ask.
+   * Make this machine's own agents the workspace's default execution profile:
+   * the recommended option for the planner and the executor, which are the
+   * person's own agent logins on their own machine, so there is nothing to ask.
+   * Answers false when the machine advertises nothing that can carry the work.
    */
-  async setUpAgentsFromThisMachine(): Promise<{ operationId: string } | null> {
+  async setUpAgentsFromThisMachine(name: string): Promise<boolean> {
     const capabilities = (await this.call("GET", "/api/app/agent-setup/capabilities")) as {
-      contractVersion?: unknown;
-      setupVersion?: unknown;
-      presetRevision?: unknown;
-      roles?: Record<string, { required?: boolean; recommendedOptionId?: string; preferredOptionId?: string; options?: Array<{ optionId: string; availability?: string }> }>;
+      roles?: Record<string, { recommendedOptionId?: string; preferredOptionId?: string; options?: MachineAgentOption[] }>;
     };
     const roles = capabilities.roles ?? {};
-    const selections: Record<string, { optionId: string }> = {};
-    for (const [role, offer] of Object.entries(roles)) {
-      const optionId =
-        offer.recommendedOptionId ??
-        offer.preferredOptionId ??
-        offer.options?.find(option => option.availability === "available")?.optionId;
-      if (optionId) selections[role] = { optionId };
-      else if (offer.required) return null;
-    }
-    if (!selections.planner || !selections.executor || !selections.assistant || !selections.search) return null;
-    const body = (await this.call(
-      "PUT",
-      "/api/app/agent-setup",
-      {
-        contractVersion: capabilities.contractVersion,
-        setupVersion: capabilities.setupVersion,
-        presetRevision: capabilities.presetRevision,
-        selections,
-      },
-      { "Idempotency-Key": `onboarding-setup:${String(capabilities.setupVersion)}` },
-    )) as { operationId?: unknown };
-    return typeof body.operationId === "string" ? { operationId: body.operationId } : null;
-  }
-
-  /** How far the setup has got, for the person to be told honestly. */
-  async agentSetupOperation(operationId: string): Promise<{ state: string }> {
-    const body = (await this.call("GET", `/api/app/agent-setup/${encodeURIComponent(operationId)}`)) as { state?: unknown };
-    return { state: typeof body.state === "string" ? body.state : "validating" };
+    const pick = (role: string): MachineAgentOption | undefined => {
+      const offer = roles[role];
+      if (!offer) return undefined;
+      const wanted = offer.recommendedOptionId ?? offer.preferredOptionId;
+      const options = offer.options ?? [];
+      return options.find(option => option.optionId === wanted) ?? options.find(option => option.availability === "available");
+    };
+    const planner = pick("planner") ?? pick("assistant");
+    const executor = pick("executor") ?? planner;
+    if (!planner || !executor) return false;
+    const role = (option: MachineAgentOption) => ({
+      ...(option.runtimeId ? { runtimeId: option.runtimeId, agentId: option.runtimeId } : {}),
+      ...(option.providerId ? { provider: option.providerId } : {}),
+      model: option.modelId,
+      authMode: "managed_local_auth" as const,
+    });
+    const created = (await this.call("POST", "/api/app/execution-profiles", {
+      name,
+      description: "Set up from this machine when it was connected.",
+    })) as { profile?: { id?: unknown } };
+    const profileId = typeof created.profile?.id === "string" ? created.profile.id : "";
+    if (!profileId) throw new RemoteInstanceError("temporarily_unavailable", "Konteks did not answer with a profile.");
+    await this.call("POST", `/api/app/execution-profiles/${encodeURIComponent(profileId)}/revisions`, {
+      configuration: { planner: role(planner), executor: role(executor) },
+      makeDefault: true,
+    });
+    return true;
   }
 
   /**

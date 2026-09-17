@@ -335,45 +335,60 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "push" });
   });
 
-  it("sets the workspace's agents up from what this machine advertises before the first initiative", async () => {
+  it("makes this machine's agents the workspace's default before the first initiative", async () => {
     await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
-    const calls: Array<{ method: string; url: string; body?: unknown; headers?: Record<string, string> }> = [];
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
     const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
-      calls.push({ method: String(init.method), url, ...(init.body ? { body: JSON.parse(String(init.body)) } : {}), headers: init.headers as Record<string, string> });
-      if (url.endsWith("/agent-setup/status")) return new Response(JSON.stringify({ readiness: "never_configured" }), { status: 200, headers: { "content-type": "application/json" } });
+      calls.push({ method: String(init.method), url, ...(init.body ? { body: JSON.parse(String(init.body)) } : {}) });
+      if (url.endsWith("/execution-profiles") && init.method === "GET") {
+        return new Response(JSON.stringify({ profiles: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
       if (url.endsWith("/agent-setup/capabilities")) {
         return new Response(JSON.stringify({
-          contractVersion: "1", setupVersion: "v1", presetRevision: 3,
           roles: {
-            planner: { required: true, recommendedOptionId: "native_a" },
-            executor: { required: true, recommendedOptionId: "native_b" },
-            assistant: { required: true, recommendedOptionId: "native_c" },
-            search: { required: true, options: [{ optionId: "native_d", availability: "available" }] },
+            planner: { recommendedOptionId: "native_a", options: [{ optionId: "native_a", runtimeId: "claude-code", providerId: "anthropic", modelId: "claude-sonnet-5", availability: "available" }] },
+            executor: { recommendedOptionId: "native_b", options: [{ optionId: "native_b", runtimeId: "claude-code", providerId: "anthropic", modelId: "claude-opus-5", availability: "available" }] },
           },
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
-      return new Response(JSON.stringify({ operationId: "op-1", state: "staging" }), { status: 202, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/execution-profiles") && init.method === "POST") {
+        return new Response(JSON.stringify({ profile: { id: "profile-1" } }), { status: 201, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ revision: { revision: 1 } }), { status: 201, headers: { "content-type": "application/json" } });
     });
-    const started = await step({ fetchFn: fetchFn as never });
-    const put = calls.find(call => call.method === "PUT")!;
-    expect(put.url).toBe("https://core.test/api/app/agent-setup");
-    expect(put.headers?.["Idempotency-Key"]).toBe("onboarding-setup:v1");
-    expect(put.body).toMatchObject({ setupVersion: "v1", presetRevision: 3, selections: { planner: { optionId: "native_a" }, search: { optionId: "native_d" } } });
-    expect(started.note).toContain("agents ready");
-    expect(await readOnboardState(root)).toMatchObject({ step: "agents", setupOperationId: "op-1" });
 
-    const ready = vi.fn(async () => new Response(JSON.stringify({ readiness: "in_progress", state: "ready" }), { status: 200, headers: { "content-type": "application/json" } }));
-    const done = await step({ fetchFn: ready as never });
-    expect(done.note).toContain("agents are ready");
+    const result = await step({ fetchFn: fetchFn as never });
+
+    const revision = calls.find(call => call.url.endsWith("/revisions"))!;
+    expect(revision.body).toEqual({
+      configuration: {
+        planner: { runtimeId: "claude-code", agentId: "claude-code", provider: "anthropic", model: "claude-sonnet-5", authMode: "managed_local_auth" },
+        executor: { runtimeId: "claude-code", agentId: "claude-code", provider: "anthropic", model: "claude-opus-5", authMode: "managed_local_auth" },
+      },
+      makeDefault: true,
+    });
+    expect(result.note).toContain("agents will run the work");
+    expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
+  });
+
+  it("leaves a workspace that already chose its agents alone", async () => {
+    await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
+    const urls: string[] = [];
+    const fetchFn = vi.fn(async (url: string) => {
+      urls.push(url);
+      return new Response(JSON.stringify({ profiles: [{ id: "profile-9" }] }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    await step({ fetchFn: fetchFn as never });
+    expect(urls).toEqual(["https://core.test/api/app/execution-profiles"]);
     expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
   });
 
   it("goes on to the initiative when this machine advertises no agent to set up", async () => {
     await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
     const fetchFn = vi.fn(async (url: string) =>
-      url.endsWith("/agent-setup/status")
-        ? new Response(JSON.stringify({ readiness: "never_configured" }), { status: 200, headers: { "content-type": "application/json" } })
-        : new Response(JSON.stringify({ contractVersion: "1", setupVersion: "v1", presetRevision: 1, roles: { planner: { required: true, options: [] }, executor: { required: true }, assistant: { required: true }, search: { required: true } } }), { status: 200, headers: { "content-type": "application/json" } }),
+      url.endsWith("/execution-profiles")
+        ? new Response(JSON.stringify({ profiles: [] }), { status: 200, headers: { "content-type": "application/json" } })
+        : new Response(JSON.stringify({ roles: { planner: { options: [] }, executor: { options: [] } } }), { status: 200, headers: { "content-type": "application/json" } }),
     );
     const result = await step({ fetchFn: fetchFn as never });
     expect(result.note).toContain("no agent Konteks can run work with yet");
