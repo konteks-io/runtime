@@ -22,8 +22,8 @@ export interface NativeServiceOptions extends NativeInstallationOptions {
 export function createNativeService(options: NativeServiceOptions): Daemon {
   let supervisor: Supervisor | undefined;
   let control: ControlSocketServer | undefined;
-  let daemon: Daemon | undefined;
-  daemon = createDaemon({
+  // The liveness callback reads `daemon` only after createDaemon has returned.
+  const daemon: Daemon = createDaemon({
     name: "native-connector",
     ...(options.signalSource ? { signalSource: options.signalSource } : {}),
     ...(options.exitProcess ? { exitProcess: options.exitProcess } : {}),
@@ -37,7 +37,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         ...(options.update ?? {}),
       };
       supervisor = new Supervisor(installation.config, {
-        onLivenessLost: () => { void daemon?.shutdown("liveness-lost", 1).catch(() => undefined); },
+        onLivenessLost: () => { void daemon.shutdown("liveness-lost", 1).catch(() => undefined); },
         native: {
           trustedRoots: installation.roots, runners: installation.runners,
           repositoryCacheRoot: join(options.root, "repositories"),
