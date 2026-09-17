@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -7,7 +7,9 @@ import { resolveNativeCodexHome } from "../native/codex-home.js";
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "native-codex-home-")); roots.push(root);
+  // realpath: on macOS tmpdir() is /var/..., a symlink to /private/var/..., and
+  // the resolver reports resolved paths.
+  const root = await mkdtemp(join(await realpath(tmpdir()), "native-codex-home-")); roots.push(root);
   const profile = join(root, ".codex"); await mkdir(profile, { mode: 0o755 });
   return { root, profile };
 }

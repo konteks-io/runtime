@@ -41,7 +41,13 @@ function fixture() {
   vi.spyOn(supervisor.lease, "isValid").mockReturnValue(true);
   vi.spyOn(supervisor.lease, "mode").mockReturnValue("active");
   const heartbeatStart = vi.fn(async () => { events.push("heartbeat"); });
-  supervisor.heartbeat = { start: heartbeatStart, settle: vi.fn(async () => undefined), stop: vi.fn() } as never;
+  supervisor.heartbeat = {
+    start: heartbeatStart, settle: vi.fn(async () => undefined), stop: vi.fn(),
+    // The native liveness watchdog reads these on every tick; a publisher that
+    // just attempted is live, so the watchdog never interrupts the ordering.
+    liveness: () => ({ running: true, pendingFlight: false, stage: null, inFlightSince: null, lastAttemptAt: Date.now(), lastSettledAt: Date.now() }),
+    livenessBudgetMs: () => 60_000,
+  } as never;
   const transportStart = vi.fn(() => { events.push("transport"); });
   supervisor.transport = { start: transportStart, resumeAfterRecovery: vi.fn(() => { events.push("replay"); }) } as never;
   const flushAll = vi.fn(async () => { events.push("reports"); });
