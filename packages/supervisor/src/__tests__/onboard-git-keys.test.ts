@@ -51,6 +51,22 @@ describe("git key add", () => {
     expect(await readFile(store.privateKeyPath, "utf8")).toContain("PRIVATE-KEY-MATERIAL");
   });
 
+  it("registers a key whose answer names no host, and writes no ssh stanza for it", async () => {
+    const dir = await directory();
+    const registry = registrar();
+    registry.register.mockImplementation(async () => ({ keyRef: "key-1", fingerprint: "SHA256:deadbeef", createdAt: "2026-09-14T00:00:00.000Z" }) as never);
+    const store = new GitKeyStore({ directory: dir, registrar: registry, run: keygen(dir) as never });
+
+    const key = await store.add("laptop");
+
+    expect(key).toMatchObject({ keyRef: "key-1", title: "laptop" });
+    expect(key.host).toBeUndefined();
+    await expect(readFile(join(dir, "ssh-config"), "utf8")).rejects.toThrow();
+    // The push uses the repository's own SSH URL with this key.
+    expect(store.privateKeyPath.startsWith(dir)).toBe(true);
+    expect(await store.binding()).toBeNull();
+  });
+
   it("reuses the key it already generated rather than minting a second one", async () => {
     const dir = await directory();
     const registry = registrar();

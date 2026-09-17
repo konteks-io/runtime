@@ -23,8 +23,13 @@ export const RegisteredGitKeySchema = z
     keyRef: z.string().min(1).max(200),
     title: z.string().min(1).max(256),
     fingerprint: z.string().min(1).max(256),
-    /** The managed git host this key opens, as Core named it at registration. */
-    host: z.string().min(1).max(255),
+    /**
+     * The managed git host this key opens, where the registration named one.
+     * Managed git registers a key for the person, not for one host, so the
+     * answer may carry none; the repository's own SSH URL is then what a push
+     * uses (WS1-026), and the host-matching resolver simply has no binding.
+     */
+    host: z.string().min(1).max(255).optional(),
     user: z.string().min(1).max(64).optional(),
     createdAt: z.string().min(1).max(64),
   })
@@ -40,7 +45,7 @@ const KeyFileSchema = z.object({ keys: z.array(RegisteredGitKeySchema).max(16) }
  * are different types.
  */
 export interface GitKeyRegistrar {
-  register(input: { publicKey: string; title: string }): Promise<{ keyRef: string; fingerprint: string; host: string; user?: string | undefined; createdAt: string }>;
+  register(input: { publicKey: string; title: string }): Promise<{ keyRef: string; fingerprint: string; host?: string | undefined; user?: string | undefined; createdAt?: string | undefined }>;
   list(): Promise<Array<{ keyRef: string; title: string; fingerprint: string; createdAt: string; revokedAt?: string | undefined }>>;
   revoke(keyRef: string): Promise<void>;
 }
@@ -83,13 +88,13 @@ export class GitKeyStore {
       keyRef: registered.keyRef,
       title,
       fingerprint: registered.fingerprint,
-      host: registered.host,
-      createdAt: registered.createdAt,
+      ...(registered.host ? { host: registered.host } : {}),
+      createdAt: registered.createdAt ?? new Date().toISOString(),
       ...(registered.user ? { user: registered.user } : {}),
     });
     const current = await this.records();
     await this.save([...current.filter(entry => entry.keyRef !== key.keyRef), key]);
-    await this.writeSshConfig(key);
+    if (key.host !== undefined) await this.writeSshConfig({ ...key, host: key.host });
     this.logger.info({ keyRef: key.keyRef, host: key.host }, "registered a managed git key for this runtime");
     return key;
   }
@@ -114,7 +119,7 @@ export class GitKeyStore {
   /** The binding the collector and the relocation worker resolve remotes with. */
   async binding(): Promise<ManagedGitBinding | null> {
     const [key] = await this.records();
-    if (!key) return null;
+    if (!key?.host) return null;
     return { host: key.host, identityFile: this.privateKeyPath, ...(key.user ? { user: key.user } : {}) };
   }
 
@@ -145,7 +150,7 @@ export class GitKeyStore {
    * they also want to clone by hand — the runtime itself needs no include,
    * because it passes the identity file to ssh directly.
    */
-  private async writeSshConfig(key: RegisteredGitKey): Promise<void> {
+  private async writeSshConfig(key: RegisteredGitKey & { host: string }): Promise<void> {
     const stanza = [
       `# Written by konteks-remote git key add. Include it from ~/.ssh/config to`,
       `# clone managed Konteks repositories by hand with the same key.`,

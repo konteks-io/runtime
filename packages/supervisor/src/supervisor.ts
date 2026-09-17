@@ -1522,7 +1522,10 @@ export class Supervisor {
           return {
             keyRef: key.keyRef, title: key.title, fingerprint: key.fingerprint, host: key.host,
             sshConfig: sshConfigPath(this.config.SUPERVISOR_ONBOARD_GIT_KEY_DIR),
-            ...(this.managedGitBinding ? { identityFile: this.managedGitBinding.identityFile, user: this.managedGitBinding.user ?? "git" } : {}),
+            // The key file, wherever the person's push needs it: the binding
+            // exists only when the registration named a host (WS1-026).
+            identityFile: store.privateKeyPath,
+            user: this.managedGitBinding?.user ?? "git",
           };
         }
         case "git.key.list":
