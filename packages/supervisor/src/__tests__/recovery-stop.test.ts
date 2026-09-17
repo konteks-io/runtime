@@ -421,6 +421,31 @@ describe("proven per-session recovery stop", () => {
     expect(restarted.execution.execution(admission)?.interruptedAt).toBe(interruptedAt);
   });
 
+  it("reports a retained execution interrupted after a predecessor already settled its ACP turn", async () => {
+    const f = await sessionFixture();
+    const retainedStop = vi.fn(async () => undefined);
+    const admission = { instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "predecessor", assignmentId: "assignment", attempt: 1, claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: clock.nowIso() };
+    await f.journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution", placementId: "placement", workspaceId: "workspace", agentId: "codex", state: "running", acpSessionRef: "prior-process-ref", recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only", expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() });
+    await f.journal.execution.admit(admission, () => undefined);
+    await f.journal.execution.open(admission, () => undefined, clock.nowIso());
+    await f.journal.execution.bindReference(admission, "prior-process-ref", () => undefined);
+    const owner = { version: 1 as const, platform: "darwin" as const, pid: 123, processGroupId: 123, startToken: "start", commandDigest: "A".repeat(43) };
+    await f.journal.execution.bindProcessOwner(admission, owner, () => undefined);
+    // The predecessor's live recovery settled ACP, then refused to certify quiescence and died.
+    await f.journal.execution.markStopping(admission, clock.nowIso(), () => undefined);
+    await f.journal.execution.markAcpSettled(admission, "prior-process-ref", clock.nowIso(), () => undefined);
+    const restarted = new SupervisorJournal(dir); await restarted.load();
+    const acpSettledAt = restarted.execution.execution(admission)?.acpSettledAt;
+    const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal: restarted, outbox: f.outbox, transport: f.transport, clock,
+      runners: new Map([["codex", { ...f.runner, stopRetainedExecution: retainedStop }]]), sessionDeps: () => f.deps, onUsage: async () => undefined,
+      instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "successor", assertOwned: () => undefined,
+      recoveryAuthority: () => "accepted-successor", reportDeliveryAllowed: () => false } as never);
+    await expect(work.stopForRecovery("assignment", 1, () => undefined)).resolves.toBeUndefined();
+    expect(retainedStop).toHaveBeenCalledWith(owner);
+    expect(restarted.execution.execution(admission)).toMatchObject({ phase: "interrupted_unqualified", acpSettledAt });
+    expect(() => restarted.execution.assertQuiescent(admission)).toThrow("not qualified execution quiescence");
+  });
+
   it("replays frozen native delivery output before a retained process is reported interrupted", async () => {
     const f = await sessionFixture();
     const events: string[] = [];

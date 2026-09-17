@@ -70,9 +70,11 @@ const ExecutionSchema = z.object({ schemaVersion: z.literal(1), admission: Admis
       (value.phase === "opened" && (value.stoppingAt !== null || value.acpSettledAt !== null)) ||
       (value.phase !== "opened" && value.phase !== "continued" && value.stoppingAt === null) ||
       (value.phase === "stopping" && (value.processStoppedAt !== undefined || value.acpSettledAt !== null)) ||
-      (value.phase === "process_stopped" && (value.processStoppedAt === undefined || value.acpSettledAt !== null)) ||
+      // A retained process may be proven gone after its ACP session already settled;
+      // the settled instant stays on the record rather than being erased.
+      (value.phase === "process_stopped" && value.processStoppedAt === undefined) ||
       (value.phase === "acp_settled" && (value.acpSessionRef === null || value.acpSettledAt === null)) ||
-      (value.phase === "interrupted_unqualified" && (value.processStoppedAt === undefined || value.interruptedAt === undefined || value.acpSettledAt !== null)) ||
+      (value.phase === "interrupted_unqualified" && (value.processStoppedAt === undefined || value.interruptedAt === undefined)) ||
       (value.interruptedAt !== undefined && value.phase !== "interrupted_unqualified") ||
       (value.phase === "continued" && (value.acpSessionRef === null || value.referenceFence !== null || !value.processOwner || !value.completedTurnSettledAt || !value.continuedToGeneration || !value.continuedAt || value.stoppingAt !== null || value.acpSettledAt !== null)) ||
       (value.phase !== "continued" && (value.continuedToGeneration !== undefined || value.continuedAt !== undefined)) ||
@@ -429,7 +431,10 @@ export class LocalExecutionJournal {
 
   async markProcessStopped(admission: LocalAdmission, at: string, assertCurrent: () => void): Promise<void> {
     await this.transition(admission, assertCurrent, existing => {
-      if (!existing || (existing.phase !== "stopping" && existing.phase !== "process_stopped") || !existing.processOwner) throw conflict();
+      // `acp_settled` is a predecessor's live recovery that settled the ACP turn but
+      // could not certify quiescence. After restart only the retained process can
+      // still be proven gone; refusing it here left startup recovery wedged forever.
+      if (!existing || (existing.phase !== "stopping" && existing.phase !== "acp_settled" && existing.phase !== "process_stopped") || !existing.processOwner) throw conflict();
       return existing.phase === "process_stopped" ? existing : { ...existing, phase: "process_stopped", processStoppedAt: at };
     });
   }
