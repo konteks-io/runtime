@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { lstat, mkdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { isFsErrorWithCode, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
+import { isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
 import { z } from "zod";
 
 /**
@@ -111,7 +111,10 @@ export async function spawnEnrollmentStaging(root: string): Promise<number | und
       {
         detached: true,
         stdio: ["ignore", log, log],
-        env: sanitizeInheritedChildProcessEnv({ env: process.env }),
+        // The same connector finishing its own install, not a bridge or a
+        // tool: it keeps the environment it was installed with, including the
+        // release roots and endpoints that a child sanitizer would strip.
+        env: process.env,
       },
     );
     child.unref();
