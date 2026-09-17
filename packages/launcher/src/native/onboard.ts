@@ -575,15 +575,27 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         }
       }
       if (state.repositoryNeedsInit) {
+        const remoteUrl = sshCommand ? state.managedSshUrl : state.managedRemoteUrl;
         const initialized = await (context.deps?.initialize ?? initializeRepository)({
           path: state.repositoryPath!,
           branch: state.defaultBranch!,
           authorName: (state.ownerEmail ?? "Konteks").split("@")[0]!,
           authorEmail: state.ownerEmail ?? "onboarding@konteks.invalid",
+          ...(remoteUrl ? { remote: { url: remoteUrl, ...(sshCommand ? { sshCommand } : {}) } } : {}),
         });
         if (!initialized.ok) {
           await save({ step: "push" });
           return { step: "pushing", note: `${initialized.message} Nothing was pushed.`, ask: { question: "Try the push again?", kind: "confirm" } };
+        }
+        if (initialized.adopted) {
+          // The Konteks repository already had its first commit, so there is
+          // nothing of the person's to push: the folder is on it now.
+          await save({ step: "first_task" });
+          return {
+            step: "pushing",
+            note: `${initialized.message} Your code lives on Konteks managed git, on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}. Push your work with git as usual (remote "konteks").`,
+            run: AGAIN,
+          };
         }
       }
       const result = await (context.deps?.push ?? pushToManagedRemote)({

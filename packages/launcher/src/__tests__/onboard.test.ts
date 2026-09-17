@@ -242,12 +242,12 @@ describe("onboard", () => {
     await step({ initialize, push: push as never }, "yes");
     expect(initialize).not.toHaveBeenCalled();
     const pushed = await step({ initialize, push: push as never });
-    expect(initialize).toHaveBeenCalledWith({
+    expect(initialize).toHaveBeenCalledWith(expect.objectContaining({
       path: "/tmp/projects/konteks-onboard-app",
       branch: "main",
       authorName: "hello",
       authorEmail: "hello@konteks.io",
-    });
+    }));
     expect(push).toHaveBeenCalledTimes(1);
     expect(pushed.note).toContain("https://app.test/systems/sys-1");
   });
@@ -292,6 +292,31 @@ describe("onboard", () => {
     expect(result.note).toContain("not running");
     expect(result.ask).toMatchObject({ kind: "confirm" });
     expect(await readOnboardState(root)).toMatchObject({ step: "push" });
+  });
+
+  it("joins the Konteks repository's own first commit instead of pushing an unrelated one", async () => {
+    await writeOnboardState(root, {
+      step: "pushing",
+      repositoryName: "konteks-onboard-app",
+      repositoryPath: "/tmp/projects/konteks-onboard-app",
+      repositoryNeedsInit: true,
+      repositoryKind: "managed",
+      managedRemoteUrl: "https://git.konteks.test/konteks-2/konteks-onboard-app",
+      managedSshUrl: "ssh://git@git.konteks.test:2222/konteks-2/konteks-onboard-app.git",
+      defaultBranch: "main",
+      systemId: "sys-1",
+    } as never);
+    const registerGitKey = vi.fn(async () => ({ identityFile: "/keys/id_ed25519" }));
+    const initialize = vi.fn(async () => ({ ok: true, adopted: true, message: "konteks-onboard-app is now a git repository on main, tracking the Konteks repository, which already had its first commit." }));
+    const push = vi.fn();
+    const result = await step({ registerGitKey, initialize, push: push as never });
+    expect(initialize).toHaveBeenCalledWith(expect.objectContaining({
+      remote: { url: "ssh://git@git.konteks.test:2222/konteks-2/konteks-onboard-app.git", sshCommand: expect.stringContaining("/keys/id_ed25519") },
+    }));
+    expect(push).not.toHaveBeenCalled();
+    expect(result.note).toContain("tracking the Konteks repository");
+    expect(result.note).toContain("https://app.test/systems/sys-1");
+    expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
   });
 
   it("re-asks the push in plain words when it does not go through", async () => {

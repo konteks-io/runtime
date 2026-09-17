@@ -85,7 +85,14 @@ export async function initializeRepository(input: {
   branch: string;
   authorName: string;
   authorEmail: string;
-}): Promise<{ ok: boolean; message: string }> {
+  /**
+   * The managed repository to join, when there is one. Konteks creates it with
+   * its own first commit, so an unrelated commit pushed from here could never
+   * fast-forward (WS1-028): the folder joins that history instead, which is
+   * what the person asked for and costs them nothing in an empty folder.
+   */
+  remote?: { url: string; sshCommand?: string };
+}): Promise<{ ok: boolean; message: string; adopted?: boolean }> {
   const top = await git(input.path, ["rev-parse", "--show-toplevel"]).catch(() => null);
   if (!top || top.code !== 0) {
     const created = await git(input.path, ["init", "--initial-branch", input.branch]).catch(() => null);
@@ -95,6 +102,22 @@ export async function initializeRepository(input: {
   }
   const head = await git(input.path, ["rev-parse", "--verify", "--quiet", "HEAD"]).catch(() => null);
   if (head && head.code === 0) return { ok: true, message: "" };
+  if (input.remote) {
+    const attached = await attachManagedRemote(input.path, input.remote);
+    if (attached) return { ok: false, message: attached };
+    const fetched = await git(input.path, ["fetch", "--quiet", "konteks", input.branch], 120_000).catch(() => null);
+    if (fetched && fetched.code === 0) {
+      const checkedOut = await git(input.path, ["checkout", "-B", input.branch, "--track", `konteks/${input.branch}`]);
+      if (checkedOut.code !== 0) {
+        return { ok: false, message: `This folder could not be put on ${input.branch}${reason(checkedOut)}.` };
+      }
+      return {
+        ok: true,
+        adopted: true,
+        message: `${basename(resolve(input.path))} is now a git repository on ${input.branch}, tracking the Konteks repository, which already had its first commit.`,
+      };
+    }
+  }
   // The laptop may have no git identity yet; the commit is the person's own,
   // so it carries their name and address for this one commit only.
   const committed = await git(input.path, [
@@ -113,6 +136,34 @@ function reason(result: { stderr?: string } | null): string {
   return line ? ` (git said: ${line})` : "";
 }
 
+/**
+ * Point `konteks` at the managed repository, and keep the key this runtime
+ * pushes with in the repository's own config so the person's later pushes work
+ * too. Answers a message when something went wrong, nothing when it is set.
+ */
+async function attachManagedRemote(
+  repositoryPath: string,
+  remote: { url: string; sshCommand?: string },
+): Promise<string | null> {
+  if (remote.sshCommand) {
+    const configured = await git(repositoryPath, ["config", "core.sshCommand", remote.sshCommand]);
+    if (configured.code !== 0) {
+      return `The repository could not be set up for Konteks managed git${reason(configured)}.`;
+    }
+  }
+  const existing = await git(repositoryPath, ["remote", "get-url", "konteks"]).catch(() => null);
+  if (!existing || existing.code !== 0) {
+    const added = await git(repositoryPath, ["remote", "add", "konteks", remote.url]);
+    if (added.code !== 0) return "The konteks remote could not be added.";
+    return null;
+  }
+  if (existing.stdout.trim() !== remote.url) {
+    const updated = await git(repositoryPath, ["remote", "set-url", "konteks", remote.url]);
+    if (updated.code !== 0) return "The konteks remote could not be repointed.";
+  }
+  return null;
+}
+
 /** Add the managed remote and push the current branch (OS11, R15). */
 export async function pushToManagedRemote(input: {
   repositoryPath: string;
@@ -121,26 +172,13 @@ export async function pushToManagedRemote(input: {
   /** How git reaches managed git with the runtime's key; kept in the repository's own config. */
   sshCommand?: string;
 }): Promise<{ pushed: boolean; message: string }> {
-  if (input.sshCommand) {
-    // Only this repository: the person's later pushes use the same key, and
-    // nothing outside the folder they agreed to is touched.
-    const configured = await git(input.repositoryPath, ["config", "core.sshCommand", input.sshCommand]);
-    if (configured.code !== 0) {
-      return { pushed: false, message: `The repository could not be set up for Konteks managed git${reason(configured)}.` };
-    }
-  }
-  const existing = await git(input.repositoryPath, ["remote", "get-url", "konteks"]).catch(() => null);
-  if (!existing || existing.code !== 0) {
-    const added = await git(input.repositoryPath, ["remote", "add", "konteks", input.remoteUrl]);
-    if (added.code !== 0) {
-      return { pushed: false, message: "The konteks remote could not be added." };
-    }
-  } else if (existing.stdout.trim() !== input.remoteUrl) {
-    const updated = await git(input.repositoryPath, ["remote", "set-url", "konteks", input.remoteUrl]);
-    if (updated.code !== 0) {
-      return { pushed: false, message: "The konteks remote could not be repointed." };
-    }
-  }
+  // Only this repository: the person's later pushes use the same key, and
+  // nothing outside the folder they agreed to is touched.
+  const attached = await attachManagedRemote(input.repositoryPath, {
+    url: input.remoteUrl,
+    ...(input.sshCommand ? { sshCommand: input.sshCommand } : {}),
+  });
+  if (attached) return { pushed: false, message: attached };
   // Only the branch the person is on (R15); the rest follow through ordinary
   // git use, and pushing a whole history of branches is not what they agreed to.
   const pushed = await git(
