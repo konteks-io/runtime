@@ -440,6 +440,16 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "inspect" });
   });
 
+  it("promises no workspace id before the workspace exists, and says the wait is coming", async () => {
+    await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "hello@konteks.io", emailMasked: "h••••@konteks.io" } as never);
+    const verifyCode = vi.fn(async () => ({ decision: "create", proposedTenantId: "konteks" }));
+    const result = await step({ enrollment: { verifyCode } as never }, "022667");
+    expect(result.note).toContain("creating your workspace");
+    expect(result.note).toContain("up to a minute");
+    expect(result.note).not.toContain("konteks");
+    expect(result.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+  });
+
   it("binds, persists the installation and hands the agent the start command", async () => {
     await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "create" } as never);
     const { writeSecretFile } = await import("@konteks/remote-common");
@@ -459,6 +469,8 @@ describe("onboard", () => {
     expect(bind).toHaveBeenCalledWith("intent-1", { email: "ada@acme.test", expectedManifestDigest: "digest-1" });
     expect(complete).toHaveBeenCalledWith(root, { instanceId: "instance-9", workspaceId: "acme" });
     expect(result.run?.argv).toEqual(["konteks-remote", "start"]);
+    expect(result.note).toContain("Your workspace is ready: acme");
+    expect(result.note).toContain("rename it in Settings");
     const state = await readOnboardState(root);
     expect(state).toMatchObject({ step: "inspect", instanceId: "instance-9", tenantId: "acme" });
     expect(state?.email).toBeUndefined();

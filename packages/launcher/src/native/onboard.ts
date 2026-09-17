@@ -258,7 +258,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         step: "code",
         note:
           verified.decision === "create"
-            ? `A workspace will be created: ${verified.proposedTenantId}. You can rename it later in Settings.`
+            ? // The id is only settled when the workspace is made (a taken one
+              // gets a suffix), so none is promised here; the next step names it.
+              "Your address is confirmed. Konteks is creating your workspace and connecting this machine to it; this can take up to a minute."
             : `This machine will join ${verified.workspaces?.[0]?.displayName ?? "your workspace"}.`,
         run: AGAIN,
       };
@@ -336,7 +338,10 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       } as never);
       return {
         step: "start",
-        note: `This machine is now ${identity.workspaceId}'s runtime.`,
+        note:
+          state.decision === "create"
+            ? `Your workspace is ready: ${identity.workspaceId}. You can rename it in Settings. This machine is now its runtime; starting it next.`
+            : `This machine is now ${identity.workspaceId}'s runtime; starting it next.`,
         // Registering and starting the service is the launcher's own command,
         // so the agent runs it rather than this process forking a service.
         run: { argv: ["konteks-remote", "start"] },
