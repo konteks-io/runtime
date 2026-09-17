@@ -46,7 +46,7 @@ const KeyFileSchema = z.object({ keys: z.array(RegisteredGitKeySchema).max(16) }
  */
 export interface GitKeyRegistrar {
   register(input: { publicKey: string; title: string }): Promise<{ keyRef: string; fingerprint: string; host?: string | undefined; user?: string | undefined; createdAt?: string | undefined }>;
-  list(): Promise<Array<{ keyRef: string; title: string; fingerprint: string; createdAt: string; revokedAt?: string | undefined }>>;
+  list(): Promise<Array<{ keyRef: string; title: string; fingerprint: string; createdAt?: string | undefined; revokedAt?: string | undefined }>>;
   revoke(keyRef: string): Promise<void>;
 }
 
@@ -100,7 +100,7 @@ export class GitKeyStore {
   }
 
   /** `git key list`. Core is the authority; the local record is a convenience. */
-  async list(): Promise<Array<{ keyRef: string; title: string; fingerprint: string; createdAt: string; revokedAt?: string | undefined }>> {
+  async list(): Promise<Array<{ keyRef: string; title: string; fingerprint: string; createdAt?: string | undefined; revokedAt?: string | undefined }>> {
     return this.options.registrar.list();
   }
 

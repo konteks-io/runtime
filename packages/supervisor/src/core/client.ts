@@ -202,21 +202,33 @@ const TaskCheckoutMaterializedResultSchema = z.object({ workspaceRef: z.string()
  * derives it from the instance, which is also what binds the key to this
  * runtime so removing the runtime revokes exactly this key.
  */
+/**
+ * What Core answers with. Managed git registers a key for the PERSON, so its
+ * record names them and the instance and carries no host; a runtime reads the
+ * parts it needs and ignores the rest, rather than refusing its own
+ * registration as malformed (WS1-026).
+ */
 const GitKeyRegisterResultSchema = z.object({
   keyRef: z.string().min(1).max(200),
   fingerprint: z.string().min(1).max(256),
-  host: z.string().min(1).max(255),
+  title: z.string().min(1).max(256).optional(),
+  userEntityRef: z.string().min(1).max(512).optional(),
+  instanceId: z.string().min(1).max(200).optional(),
+  host: z.string().min(1).max(255).optional(),
   user: z.string().min(1).max(64).optional(),
-  createdAt: z.string().min(1).max(64),
-}).strict();
+  createdAt: z.string().min(1).max(64).optional(),
+  revokedAt: z.string().min(1).max(64).optional(),
+});
 const GitKeyListResultSchema = z.object({
   keys: z.array(z.object({
     keyRef: z.string().min(1).max(200),
     title: z.string().min(1).max(256),
     fingerprint: z.string().min(1).max(256),
-    createdAt: z.string().min(1).max(64),
+    userEntityRef: z.string().min(1).max(512).optional(),
+    instanceId: z.string().min(1).max(200).optional(),
+    createdAt: z.string().min(1).max(64).optional(),
     revokedAt: z.string().min(1).max(64).optional(),
-  }).strict()).max(64),
+  })).max(64),
 }).strict();
 
 /** Core's `DeferredPermission` (CP3 `PendingPermissionService`): what the supervisor posts for a component-raised deferral. */
