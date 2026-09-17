@@ -65,6 +65,7 @@ import type { NativeGitTool } from "./native/git-workspace.js";
 import { verifyInstalledNativeBridges } from "./native/installed.js";
 import { acquireNativeRootLock, type NativeRootLock } from "./native/root-lock.js";
 import { NativeCodexAppServerOwner, type NativeCodexAppServerOwnerOptions } from "./native/codex-app-server-owner.js";
+import { startNativeAgents } from "./native/start-native-agents.js";
 import { StateMutationGate } from "./state/mutation-gate.js";
 import type { RelayedSessionDeps } from "./session/relayed-session.js";
 import { PermissionBroker } from "./session/permissions.js";
@@ -821,12 +822,19 @@ export class Supervisor {
     });
 
     for (const runner of this.runners.values()) runner.startEvents();
-    await this.nativeCodexOwner?.start();
-    try {
-      for (const runner of this.nativeRunners) await runner.start();
-    } catch (error) {
-      await this.nativeCodexOwner?.stop();
-      throw error;
+    const agents = await startNativeAgents({
+      codexOwner: this.nativeCodexOwner,
+      runners: this.nativeRunners,
+      onUnavailable: (agentId, error) => this.logger.error({ err: error, agentId }, "agent could not start; the runtime continues without it"),
+    });
+    if (this.nativeCodexOwner && !agents.codexOwnerStarted) {
+      // Codex is left out rather than taking every other agent down with it:
+      // it is not advertised, so no work is placed on it.
+      this.nativeCodexOwner = null;
+      for (const runner of this.nativeRunners.filter(candidate => candidate.agentId === "codex")) this.runners.delete(runner.agentId);
+      for (let index = this.nativeRunners.length - 1; index >= 0; index -= 1) {
+        if (this.nativeRunners[index]!.agentId === "codex") this.nativeRunners.splice(index, 1);
+      }
     }
     if (this.native) this.lastSnapshot = await this.inventory.collect();
     if (this.stopping) return;

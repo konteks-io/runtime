@@ -41,6 +41,16 @@ describe("onboard", () => {
       deps: extra,
     });
 
+  it("asks for the email in its very first response on a machine that is not connected", async () => {
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue(null as never);
+    const first = await step({});
+    expect(first.run).toBeUndefined();
+    expect(first.ask).toMatchObject({ kind: "email" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "email" });
+    vi.restoreAllMocks();
+  });
+
   it("asks only for the repository once a machine is already connected", async () => {
     await writeOnboardState(root, {
       step: "inspect",

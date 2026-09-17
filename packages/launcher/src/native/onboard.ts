@@ -76,7 +76,7 @@ const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
 /** How long one `start` invocation waits on the unpacking before saying how far it got. */
 const STAGING_WAIT_MS = 25_000;
 /** How long `inspect` waits for the freshly started service before moving on without it. */
-const READY_WAIT_MS = 45_000;
+const READY_WAIT_MS = 20_000;
 /** The owner token is refreshed this long before it expires (OS15). */
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60_000;
 
@@ -190,8 +190,14 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           run: AGAIN,
         };
       }
+      // Not connected yet: the first response is the first question, not a
+      // bare "run again" the agent has to explain (WS1-017).
       await save({ step: "email" });
-      return { step: "identity", note: "This machine is not connected to Konteks yet.", run: AGAIN };
+      return {
+        step: "identity",
+        note: "This machine is not connected to Konteks yet.",
+        ask: { question: "What email address should this machine belong to?", kind: "email" },
+      };
     }
 
     case "email": {
