@@ -19,11 +19,12 @@ There are two doors, and they lead to the same place.
 
 If you already work in Claude Code or Codex, you never have to open the app.
 Paste [the onboarding block](bootstrap/onboarding.md) into your agent, inside
-a repository you care about. It installs the connector into your own user
+a repository you care about, or a new, empty project folder. It installs the connector into your own user
 directory — no `sudo`, no package — then asks you for an email and the
 six-digit code Konteks sends back. That is the whole of it before the machine
-is connected; from there your agent offers to make the repository you are in
-your first System, and to open a first session.
+is connected; from there your agent offers to make the folder you are in your
+first System (on Konteks managed git if it has no remote yet), and turns what
+you want to build first into your first initiative.
 
 ```sh
 curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --user --enroll

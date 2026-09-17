@@ -7,7 +7,7 @@ import { RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writ
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, status, supportBundle } from "../commands/lifecycle.js";
 import { SupervisorControl } from "../control.js";
 import { addNativeAgent, installNative, prepareNativeEnrollment, readNativeRecord, restoreNativeRecord } from "./install.js";
-import { onboardCoreUrl, runOnboardStep } from "./onboard.js";
+import { onboardCoreUrl, onboardFailureStep, runOnboardStep, type OnboardStep } from "./onboard.js";
 import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
 import { productionUpdateDeps, runNativeUpdate } from "./update-transaction.js";
@@ -59,13 +59,20 @@ export const nativeCliActions: NativeCliActions = {
   },
   onboard: async input => {
     const coreUrl = await onboardCoreUrl(input.root);
-    const step = await runOnboardStep({
+    const context = {
       root: input.root,
       output: input.output,
       ...(input.answer !== undefined ? { answer: input.answer } : {}),
       ...(input.cwd ? { cwd: input.cwd } : {}),
       ...(coreUrl ? { coreUrl } : {}),
-    });
+    };
+    let step: OnboardStep;
+    try {
+      step = await runOnboardStep(context);
+    } catch (error) {
+      // Never leave the protocol the agent was taught: a failure is a step too.
+      step = await onboardFailureStep(context, error);
+    }
     // One step per invocation, printed whole. In human mode the same step
     // reads as a sentence so a person running this by hand is not left
     // reading JSON.

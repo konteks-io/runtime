@@ -27,11 +27,15 @@ Konteks yourself. Everything you need is in the next step.
 3. You paste the code. That is the last question before the machine is
    connected. If the address already belongs to a workspace, this machine
    joins it; otherwise a workspace is created for you.
-4. Your agent reports the repository you are in and asks whether to make it
-   your first System. A repository with no remote this machine can push to is
-   offered a Konteks managed one instead.
-5. You are asked what you want to build first. Your answer opens a
-   project-management session with that sentence as its first turn.
+4. Your agent reports the folder you are in and asks whether to make it your
+   first System. A repository with no remote this machine can push to, or a
+   folder that is not a git repository yet, is offered a Konteks managed one
+   instead. Nothing is pushed until you say yes; a plain folder becomes a git
+   repository with one empty first commit, and no file is added or changed.
+5. You are asked what you want to build first. Your answer becomes your first
+   initiative on that System, and its planning session starts on this machine
+   with your sentence as its first message. Your agent gives you the
+   initiative's link.
 
 Answering nothing at the last question ends the flow. Running
 `konteks-remote onboard --json` again on a connected machine reports who it is

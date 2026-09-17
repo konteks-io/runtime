@@ -97,6 +97,42 @@ export class OwnerApiClient {
     return parsed.data;
   }
 
+  /**
+   * The person's first initiative on that System (W1-A6).
+   *
+   * Core's initiative setup creates the initiative and opens its planning
+   * session under this same token, exactly as New initiative does on the site.
+   */
+  async createInitiative(input: { systemId: string; title: string }): Promise<{
+    initiativeId: string;
+    title: string;
+    pmSessionId?: string;
+    setupFailure?: string;
+  }> {
+    const body = (await this.call("POST", "/api/collaboration/initiatives", {
+      systemId: input.systemId,
+      title: input.title,
+    })) as Record<string, unknown>;
+    const initiative = (body.initiative ?? {}) as Record<string, unknown>;
+    const initiativeId = typeof initiative.id === "string" ? initiative.id : "";
+    if (!initiativeId) {
+      throw new RemoteInstanceError("temporarily_unavailable", "Konteks did not answer with an initiative.");
+    }
+    const pmSessionId =
+      typeof body.pmSessionId === "string" && body.pmSessionId
+        ? body.pmSessionId
+        : typeof initiative.pmSessionId === "string" && initiative.pmSessionId
+          ? initiative.pmSessionId
+          : undefined;
+    const failure = body.spawnFailure as { message?: unknown } | undefined;
+    return {
+      initiativeId,
+      title: typeof initiative.title === "string" ? initiative.title : input.title,
+      ...(pmSessionId ? { pmSessionId } : {}),
+      ...(failure && typeof failure.message === "string" ? { setupFailure: failure.message } : {}),
+    };
+  }
+
   /** A project-management session scoped to that System (OS13). */
   async createProjectManagementSession(input: {
     systemId: string;

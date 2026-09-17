@@ -31,7 +31,11 @@ export const OnboardStateSchema = z
       "inspect",
       "system",
       "push",
+      /** The person said yes to the push; the next run performs it, so the agent can say it is under way. */
+      "pushing",
       "first_task",
+      /** The person answered the first task; the next run creates the initiative. */
+      "initiative",
       "done",
     ]),
     intentRef: z.string().min(1).optional(),
@@ -54,10 +58,24 @@ export const OnboardStateSchema = z
     remoteUrl: z.string().optional(),
     defaultBranch: z.string().optional(),
     repositoryKind: z.enum(["existing", "managed"]).optional(),
+    /** The folder is not a git repository yet; the push makes it one (W1-A5). */
+    repositoryNeedsInit: z.boolean().optional(),
+    /** Who authors the first commit of a folder the push turns into a repository. */
+    ownerEmail: z.string().min(1).optional(),
     systemId: z.string().optional(),
     systemEntityRef: z.string().optional(),
     managedRemoteUrl: z.string().optional(),
+    /** Kept readable for state files written before initiatives; never offered as a link. */
     sessionUrl: z.string().optional(),
+    /** The person's answer to "what do you want to build first?", until it is the first turn. */
+    firstTask: z.string().optional(),
+    initiativeId: z.string().optional(),
+    initiativeTitle: z.string().optional(),
+    initiativeUrl: z.string().optional(),
+    pmSessionId: z.string().optional(),
+    firstTurnSent: z.boolean().optional(),
+    /** The planning session could not be opened; the initiative page offers Retry setup. */
+    setupFailure: z.string().optional(),
     updatedAt: z.string().min(1),
   })
   .strict();

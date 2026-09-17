@@ -72,6 +72,47 @@ export async function inspectRepository(cwd: string): Promise<RepositoryFacts> {
   };
 }
 
+/**
+ * Make a plain project folder a git repository the push can carry (W1-A5).
+ *
+ * The person agreed to this folder becoming their first System, so it gets
+ * exactly what a push needs and nothing more: `git init` on the branch they
+ * were told about, and one empty first commit. No file is added, changed or
+ * staged. A folder that is already a repository with a commit is left as it is.
+ */
+export async function initializeRepository(input: {
+  path: string;
+  branch: string;
+  authorName: string;
+  authorEmail: string;
+}): Promise<{ ok: boolean; message: string }> {
+  const top = await git(input.path, ["rev-parse", "--show-toplevel"]).catch(() => null);
+  if (!top || top.code !== 0) {
+    const created = await git(input.path, ["init", "--initial-branch", input.branch]).catch(() => null);
+    if (!created || created.code !== 0) {
+      return { ok: false, message: `This folder could not be made a git repository${reason(created)}.` };
+    }
+  }
+  const head = await git(input.path, ["rev-parse", "--verify", "--quiet", "HEAD"]).catch(() => null);
+  if (head && head.code === 0) return { ok: true, message: "" };
+  // The laptop may have no git identity yet; the commit is the person's own,
+  // so it carries their name and address for this one commit only.
+  const committed = await git(input.path, [
+    "-c", `user.name=${input.authorName}`,
+    "-c", `user.email=${input.authorEmail}`,
+    "commit", "--allow-empty", "--quiet", "-m", "Start on Konteks",
+  ]).catch(() => null);
+  if (!committed || committed.code !== 0) {
+    return { ok: false, message: `The first commit could not be made${reason(committed)}.` };
+  }
+  return { ok: true, message: `${basename(resolve(input.path))} is now a git repository on ${input.branch}.` };
+}
+
+function reason(result: { stderr?: string } | null): string {
+  const line = result?.stderr?.trim().split("\n").filter(Boolean).pop();
+  return line ? ` (git said: ${line})` : "";
+}
+
 /** Add the managed remote and push the current branch (OS11, R15). */
 export async function pushToManagedRemote(input: {
   repositoryPath: string;
@@ -101,6 +142,6 @@ export async function pushToManagedRemote(input: {
     ? { pushed: true, message: `Pushed ${input.branch} to Konteks managed git.` }
     : {
         pushed: false,
-        message: `The push was refused. Run: git push --set-upstream konteks ${input.branch}`,
+        message: `The push to Konteks managed git did not go through${reason(pushed)}.`,
       };
 }

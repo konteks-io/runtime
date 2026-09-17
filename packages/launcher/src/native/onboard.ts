@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, NATIVE_MANIFEST_URL, verifyNativeRelease } from "@konteks/remote-release";
 import { z } from "zod";
 import { CoreResponseError, RemoteInstanceError, SupervisorStatusSchema, SystemClock } from "@konteks/remote-common";
@@ -9,7 +9,7 @@ import type { Output } from "../output.js";
 import { SupervisorControl } from "../control.js";
 import { completeNativeEnrollment, readNativeEnrollment, readNativeRecord } from "./install.js";
 import { nativePlatform } from "./service.js";
-import { inspectRepository, pushToManagedRemote } from "./repository-inspect.js";
+import { initializeRepository, inspectRepository, pushToManagedRemote } from "./repository-inspect.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
 import { deleteOwnerToken, OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
 
@@ -34,7 +34,7 @@ export interface OnboardStep {
   run?: { argv: string[] };
   done?: {
     summary: string;
-    links: { site: string; system?: string; session?: string };
+    links: { site: string; system?: string; initiative?: string };
     agents?: string[];
     remedies?: string[];
   };
@@ -53,6 +53,7 @@ export interface OnboardContext {
     fetchFn?: typeof fetch;
     inspect?: typeof inspectRepository;
     push?: typeof pushToManagedRemote;
+    initialize?: typeof initializeRepository;
     enrollment?: Pick<NativeEnrollment, "openIntent" | "sendChallenge" | "verifyCode" | "bind" | "refreshOwnerToken">;
     complete?: typeof completeNativeEnrollment;
     families?: () => Promise<string[]>;
@@ -148,7 +149,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
   const links = () => ({
     site: siteUrl,
     ...(state.systemId ? { system: `${siteUrl}/systems/${state.systemId}` } : {}),
-    ...(state.sessionUrl ? { session: state.sessionUrl } : {}),
+    ...(state.initiativeUrl ? { initiative: state.initiativeUrl } : {}),
   });
 
   switch (state.step) {
@@ -326,7 +327,13 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         identity = bound.identity;
       }
       await (context.deps?.complete ?? completeNativeEnrollment)(context.root, identity);
-      await save({ step: "inspect", instanceId: identity.instanceId, tenantId: identity.workspaceId, email: undefined } as never);
+      await save({
+        step: "inspect",
+        instanceId: identity.instanceId,
+        tenantId: identity.workspaceId,
+        email: undefined,
+        ...(state.email ? { ownerEmail: state.email } : {}),
+      } as never);
       return {
         step: "start",
         note: `This machine is now ${identity.workspaceId}'s runtime.`,
@@ -344,8 +351,34 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const notReady = ready && ready.administrativeStatus !== "active" ? "The runtime service is still coming up; it will finish in the background. " : "";
       const facts = await (context.deps?.inspect ?? inspectRepository)(context.cwd ?? process.cwd());
       if (!facts.path) {
-        await save({ step: "first_task", ...(ready ? { advertisedRoles: ready.roles } : {}) });
-        return { step: "inspect", note: `${notReady}This directory is not a git repository, so there is no first System to make here.`, run: AGAIN };
+        const directory = resolve(context.cwd ?? process.cwd());
+        if (directory === resolve(homedir()) || directory === resolve("/")) {
+          // A home or root directory is not a project; making it a repository
+          // would sweep in everything the person owns.
+          await save({ step: "first_task", ...(ready ? { advertisedRoles: ready.roles } : {}) });
+          return {
+            step: "inspect",
+            note: `${notReady}This is your ${directory === resolve("/") ? "root" : "home"} folder, not a project, so no System is made here. Run onboard again from inside a project folder to add one.`,
+            run: AGAIN,
+          };
+        }
+        // An ordinary folder that is not a repository yet (W1-A5): offer it
+        // as the first System on managed git. Nothing happens to it until the
+        // person has said yes twice.
+        await save({
+          step: "system",
+          repositoryPath: directory,
+          repositoryName: basename(directory),
+          defaultBranch: "main",
+          repositoryKind: "managed",
+          repositoryNeedsInit: true,
+          ...(ready ? { advertisedRoles: ready.roles } : {}),
+        });
+        return {
+          step: "inspect",
+          note: `${notReady}You are in ${basename(directory)}, a folder that is not a git repository yet. Konteks can make it one and keep it on Konteks managed git.`,
+          run: AGAIN,
+        };
       }
       const kind = facts.remoteUrl && facts.remoteReachable ? "existing" : "managed";
       await save({
@@ -368,7 +401,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const question =
         state.repositoryKind === "existing"
           ? `Make ${state.repositoryName} your first System in Konteks?`
-          : `Make ${state.repositoryName} your first System, on Konteks managed git?`;
+          : state.repositoryNeedsInit
+            ? `Make ${state.repositoryName} your first System, kept on Konteks managed git? Nothing is pushed until you say so.`
+            : `Make ${state.repositoryName} your first System, on Konteks managed git?`;
       if (context.answer === undefined) {
         // The repository is the one captured at the first inspect. A run from
         // somewhere else while this is pending asks which of the two is meant,
@@ -416,17 +451,36 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         systemEntityRef: registered.systemEntityRef,
         ...(registered.repository.remoteUrl ? { managedRemoteUrl: registered.repository.remoteUrl } : {}),
       });
-      return { step: "system", note: `${state.repositoryName} is now a System in Konteks.`, run: AGAIN };
+      return {
+        step: "system",
+        note:
+          state.repositoryKind === "managed"
+            ? `${state.repositoryName} is now a System in Konteks, with a managed git repository ready for it.`
+            : `${state.repositoryName} is now a System in Konteks.`,
+        run: AGAIN,
+      };
     }
 
     case "push": {
+      const question = state.repositoryNeedsInit
+        ? `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch} with one empty first commit; no files are added or changed.`
+        : `Push ${state.defaultBranch} to the Konteks repository now?`;
       if (context.answer === undefined) {
-        return { step: "push", ask: { question: `Push ${state.defaultBranch} to the Konteks repository now?`, kind: "confirm" } };
+        return { step: "push", ask: { question, kind: "confirm" } };
       }
       if (!isYes(context.answer)) {
         await save({ step: "first_task" });
         return { step: "push", note: "Nothing was pushed; the Konteks remote is recorded on the System and can be pushed to later.", run: AGAIN };
       }
+      await save({ step: "pushing" });
+      return {
+        step: "push",
+        note: `Pushing ${state.defaultBranch} to Konteks managed git. This usually takes a few seconds.`,
+        run: AGAIN,
+      };
+    }
+
+    case "pushing": {
       // The managed-git key is registered before the push, since managed git
       // accepts only a key this runtime registered (OS11). `git key add` is
       // idempotent for a key that already exists.
@@ -435,13 +489,33 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         const control = new SupervisorControl({ supervisorData }, record.controlPort);
         await control.call({ op: "git.key.add" }, z.unknown(), { timeoutMs: 30_000 }).catch(() => undefined);
       }
+      if (state.repositoryNeedsInit) {
+        const initialized = await (context.deps?.initialize ?? initializeRepository)({
+          path: state.repositoryPath!,
+          branch: state.defaultBranch!,
+          authorName: (state.ownerEmail ?? "Konteks").split("@")[0]!,
+          authorEmail: state.ownerEmail ?? "onboarding@konteks.invalid",
+        });
+        if (!initialized.ok) {
+          await save({ step: "push" });
+          return { step: "pushing", note: `${initialized.message} Nothing was pushed.`, ask: { question: "Try the push again?", kind: "confirm" } };
+        }
+      }
       const result = await (context.deps?.push ?? pushToManagedRemote)({
         repositoryPath: state.repositoryPath!,
         remoteUrl: state.managedRemoteUrl!,
         branch: state.defaultBranch!,
       });
+      if (!result.pushed) {
+        await save({ step: "push" });
+        return { step: "pushing", note: `${result.message} Your folder is unchanged apart from git's own files.`, ask: { question: "Try the push again?", kind: "confirm" } };
+      }
       await save({ step: "first_task" });
-      return { step: "push", note: result.message, run: AGAIN };
+      return {
+        step: "pushing",
+        note: `${result.message} Your code now lives on Konteks managed git, on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}. This folder's ${state.defaultBranch} branch tracks it (remote "konteks").`,
+        run: AGAIN,
+      };
     }
 
     case "first_task": {
@@ -458,17 +532,62 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       }
       if (!state.systemId) {
         await save({ step: "done" });
-        return { step: "first_task", note: "There is no System to open a session on; start one from the site.", run: AGAIN };
+        return {
+          step: "first_task",
+          note: "An initiative needs a System, and none was made here. Start it from the site with New initiative once you have a System.",
+          run: AGAIN,
+        };
       }
+      const title = initiativeTitle(wanted);
+      await save({ step: "initiative", firstTask: wanted, initiativeTitle: title });
+      return {
+        step: "first_task",
+        note: `Setting up your first initiative, "${title}", on ${state.repositoryName ?? "your System"}. Konteks is opening its planning session on this machine; this takes a few seconds.`,
+        run: AGAIN,
+      };
+    }
+
+    case "initiative": {
       const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
-      const session = await api.createProjectManagementSession({
-        systemId: state.systemId,
-        instanceId: state.instanceId!,
-        title: wanted.slice(0, 80),
-      });
-      await api.postFirstTurn(session.sessionId, wanted);
-      await save({ step: "done", sessionUrl: `${siteUrl}/sessions/${session.sessionId}` });
-      return { step: "first_task", note: "Your first session is open.", run: AGAIN };
+      const wanted = state.firstTask ?? "";
+      let initiativeId = state.initiativeId;
+      let title = state.initiativeTitle ?? initiativeTitle(wanted);
+      let pmSessionId = state.pmSessionId;
+      let setupFailure = state.setupFailure;
+      if (!initiativeId) {
+        const created = await api.createInitiative({ systemId: state.systemId!, title });
+        initiativeId = created.initiativeId;
+        title = created.title;
+        pmSessionId = created.pmSessionId;
+        setupFailure = created.setupFailure;
+        // Recorded before the first turn, so a retry never makes a second initiative.
+        await save({
+          initiativeId,
+          initiativeTitle: title,
+          initiativeUrl: `${siteUrl}/work/${encodeURIComponent(initiativeId)}`,
+          ...(pmSessionId ? { pmSessionId } : {}),
+          ...(setupFailure ? { setupFailure } : {}),
+        });
+        Object.assign(state, { initiativeId, initiativeTitle: title, pmSessionId, setupFailure });
+      }
+      const url = `${siteUrl}/work/${encodeURIComponent(initiativeId)}`;
+      if (pmSessionId && !state.firstTurnSent) {
+        await api.postFirstTurn(pmSessionId, wanted);
+        await save({ firstTurnSent: true });
+      }
+      await save({ step: "done", initiativeUrl: url, firstTask: undefined } as never);
+      if (!pmSessionId) {
+        return {
+          step: "initiative",
+          note: `Your first initiative, "${title}", is created, but its planning session could not be opened${setupFailure ? `: ${setupFailure}` : ""}. Open the initiative and choose Retry setup: ${url}`,
+          run: AGAIN,
+        };
+      }
+      return {
+        step: "initiative",
+        note: `Your first initiative, "${title}", is ready. Its planning session on this machine has your words as its first message and is replying now; follow it and answer it from the initiative: ${url}`,
+        run: AGAIN,
+      };
     }
 
     case "done":
@@ -492,8 +611,13 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         step: "done",
         done: {
           summary: [
-            `This machine is connected to ${state.tenantId ?? "your workspace"}.`,
-            state.systemEntityRef ? `${state.repositoryName} is a System in Konteks.` : null,
+            `This machine is connected to your workspace ${state.tenantId ?? ""}`.trim() + " (you can rename it in Settings).",
+            state.systemEntityRef
+              ? `${state.repositoryName} is your first System${state.repositoryKind === "managed" ? ", kept on Konteks managed git" : ""}.`
+              : null,
+            state.initiativeId
+              ? `Your first initiative is "${state.initiativeTitle}"${state.setupFailure ? "; its planning session still needs Retry setup on the initiative page" : ", and its planning session is working on it here"}.`
+              : null,
             agentsLine,
           ]
             .filter(Boolean)
@@ -505,6 +629,45 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       };
     }
   }
+}
+
+/**
+ * An initiative name from the person's sentence: its first sentence, without
+ * the closing stop, kept to a title's length at a word boundary. The whole
+ * sentence still becomes the planning session's first turn.
+ */
+export function initiativeTitle(sentence: string): string {
+  const first = sentence.trim().split(/(?<=[.!?])\s+/)[0]!.replace(/[.!?]+$/, "").trim();
+  if (first.length <= 80) return first;
+  const cut = first.slice(0, 80);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > 40 ? cut.slice(0, space) : cut).trim()}…`;
+}
+
+/**
+ * The step to show when a step could not finish (WS1-003).
+ *
+ * The block teaches the agent three shapes and nothing else, so a failure is
+ * said inside the protocol: what did not work, in plain words, and the same
+ * question again, or an offer to try the step again. Revoked access is final
+ * and ends the flow with where to go instead.
+ */
+export async function onboardFailureStep(context: OnboardContext, error: unknown): Promise<OnboardStep> {
+  const state = await readOnboardState(context.root).catch(() => null);
+  const step = state?.step ?? "identity";
+  const message = error instanceof Error ? error.message.trim() : "";
+  const said = message ? (/[.!?]$/.test(message) ? message : `${message}.`) : "Something unexpected went wrong.";
+  const siteUrl = (context.siteUrl ?? process.env.KONTEKS_SITE_URL ?? "https://app.konteks.io").replace(/\/+$/, "");
+  if (error instanceof RemoteInstanceError && error.code === "permission_denied") {
+    return { step, done: { summary: `Konteks stopped this setup: ${said} Sign in on the site to see this machine and your workspace.`, links: { site: siteUrl } } };
+  }
+  const note = `Konteks could not finish that step: ${said} Nothing you answered was lost.`;
+  if (step === "email" || step === "code" || step === "workspace" || step === "first_task") {
+    const { answer: _answer, ...unanswered } = context;
+    const again = await runOnboardStep(unanswered).catch(() => null);
+    if (again?.ask) return { step, note: `${note} Answer again when you are ready.`, ask: again.ask };
+  }
+  return { step, note, ask: { question: "Try that step again now?", kind: "confirm" } };
 }
 
 function hostLabel(): string {
