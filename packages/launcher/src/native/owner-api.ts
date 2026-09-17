@@ -100,6 +100,62 @@ export class OwnerApiClient {
   }
 
   /**
+   * What this workspace's agents are set to, if anything (W1-A6).
+   *
+   * A workspace made from a coding agent has never been through the setup the
+   * site offers, so its first session has no profile to run with and every
+   * turn is refused. Onboarding reads this and, when nothing is configured,
+   * chooses what the machine itself advertises.
+   */
+  async agentSetupReadiness(): Promise<string> {
+    const body = (await this.call("GET", "/api/app/agent-setup/status")) as { readiness?: unknown };
+    return typeof body.readiness === "string" ? body.readiness : "never_configured";
+  }
+
+  /**
+   * Set the workspace's agents up from what this machine advertises: the
+   * recommended option for every role the setup requires. It is the person's
+   * own machine and their own agent login, so there is nothing to ask.
+   */
+  async setUpAgentsFromThisMachine(): Promise<{ operationId: string } | null> {
+    const capabilities = (await this.call("GET", "/api/app/agent-setup/capabilities")) as {
+      contractVersion?: unknown;
+      setupVersion?: unknown;
+      presetRevision?: unknown;
+      roles?: Record<string, { required?: boolean; recommendedOptionId?: string; preferredOptionId?: string; options?: Array<{ optionId: string; availability?: string }> }>;
+    };
+    const roles = capabilities.roles ?? {};
+    const selections: Record<string, { optionId: string }> = {};
+    for (const [role, offer] of Object.entries(roles)) {
+      const optionId =
+        offer.recommendedOptionId ??
+        offer.preferredOptionId ??
+        offer.options?.find(option => option.availability === "available")?.optionId;
+      if (optionId) selections[role] = { optionId };
+      else if (offer.required) return null;
+    }
+    if (!selections.planner || !selections.executor || !selections.assistant || !selections.search) return null;
+    const body = (await this.call(
+      "PUT",
+      "/api/app/agent-setup",
+      {
+        contractVersion: capabilities.contractVersion,
+        setupVersion: capabilities.setupVersion,
+        presetRevision: capabilities.presetRevision,
+        selections,
+      },
+      { "Idempotency-Key": `onboarding-setup:${String(capabilities.setupVersion)}` },
+    )) as { operationId?: unknown };
+    return typeof body.operationId === "string" ? { operationId: body.operationId } : null;
+  }
+
+  /** How far the setup has got, for the person to be told honestly. */
+  async agentSetupOperation(operationId: string): Promise<{ state: string }> {
+    const body = (await this.call("GET", `/api/app/agent-setup/${encodeURIComponent(operationId)}`)) as { state?: unknown };
+    return { state: typeof body.state === "string" ? body.state : "validating" };
+  }
+
+  /**
    * The person's first initiative on that System (W1-A6).
    *
    * Core's initiative setup creates the initiative and opens its planning
@@ -163,17 +219,18 @@ export class OwnerApiClient {
     });
   }
 
-  private async call(method: string, path: string, body: unknown): Promise<unknown> {
+  private async call(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<unknown> {
     const doFetch = this.options.fetchFn ?? fetch;
     let response: Response;
     try {
       response = await doFetch(`${this.options.coreUrl.replace(/\/+$/, "")}${path}`, {
         method,
         headers: {
-          "Content-Type": "application/json",
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
           Authorization: `Bearer ${this.options.token}`,
+          ...headers,
         },
-        body: JSON.stringify(body),
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: AbortSignal.timeout(this.options.timeoutMs ?? 60_000),
       });
     } catch {

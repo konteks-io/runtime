@@ -637,12 +637,56 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         };
       }
       const title = initiativeTitle(wanted);
-      await save({ step: "initiative", firstTask: wanted, initiativeTitle: title });
+      await save({ step: "agents", firstTask: wanted, initiativeTitle: title });
       return {
         step: "first_task",
-        note: `Setting up your first initiative, "${title}", on ${state.repositoryName ?? "your System"}. Konteks is opening its planning session on this machine; this takes a few seconds.`,
+        note: `Setting up your first initiative, "${title}", on ${state.repositoryName ?? "your System"}. Konteks is getting this machine's agents ready and opening the initiative's planning session; this takes up to a minute.`,
         run: AGAIN,
       };
+    }
+
+    case "agents": {
+      // A workspace made from a coding agent has never been through the setup
+      // the site offers, so its first session would have no agent to run with
+      // and every turn would be refused (W1-A6). The machine's own agents are
+      // what it advertises, and they are the person's own logins.
+      const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
+      const readiness = await api.agentSetupReadiness();
+      if (readiness === "ready" || readiness === "ready_legacy") {
+        await save({ step: "initiative" });
+        return { step: "agents", note: "This machine's agents are ready.", run: AGAIN };
+      }
+      let operationId = state.setupOperationId;
+      if (!operationId && readiness !== "in_progress") {
+        const started = await api.setUpAgentsFromThisMachine();
+        if (!started) {
+          // Nothing this machine advertises can carry the work yet.
+          await save({ step: "initiative" });
+          return {
+            step: "agents",
+            note: "This machine has no agent Konteks can run work with yet; its first initiative is still being created, and you can choose an agent in Settings.",
+            run: AGAIN,
+          };
+        }
+        operationId = started.operationId;
+        await save({ setupOperationId: operationId });
+      }
+      if (operationId) {
+        const operation = await api.agentSetupOperation(operationId).catch(() => ({ state: "validating" }));
+        if (operation.state === "ready" || operation.state === "partial") {
+          await save({ step: "initiative", setupOperationId: undefined } as never);
+          return { step: "agents", note: "This machine's agents are ready.", run: AGAIN };
+        }
+        if (operation.state === "failed" || operation.state === "superseded") {
+          await save({ step: "initiative", setupOperationId: undefined } as never);
+          return {
+            step: "agents",
+            note: "Konteks could not finish setting this machine's agents up; your initiative is still being created, and Settings shows what to choose.",
+            run: AGAIN,
+          };
+        }
+      }
+      return { step: "agents", note: "Still getting this machine's agents ready for your workspace.", run: AGAIN };
     }
 
     case "initiative": {

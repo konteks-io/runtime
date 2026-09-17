@@ -34,6 +34,8 @@ export const OnboardStateSchema = z
       /** The person said yes to the push; the next run performs it, so the agent can say it is under way. */
       "pushing",
       "first_task",
+      /** The workspace's agents are being set up from what this machine advertises. */
+      "agents",
       /** The person answered the first task; the next run creates the initiative. */
       "initiative",
       "done",
@@ -73,6 +75,8 @@ export const OnboardStateSchema = z
     managedSshUrl: z.string().optional(),
     /** Kept readable for state files written before initiatives; never offered as a link. */
     sessionUrl: z.string().optional(),
+    /** The workspace agent setup this machine started, until it is ready (W1-A6). */
+    setupOperationId: z.string().optional(),
     /** The person's answer to "what do you want to build first?", until it is the first turn. */
     firstTask: z.string().optional(),
     initiativeId: z.string().optional(),

@@ -335,6 +335,51 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "push" });
   });
 
+  it("sets the workspace's agents up from what this machine advertises before the first initiative", async () => {
+    await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
+    const calls: Array<{ method: string; url: string; body?: unknown; headers?: Record<string, string> }> = [];
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      calls.push({ method: String(init.method), url, ...(init.body ? { body: JSON.parse(String(init.body)) } : {}), headers: init.headers as Record<string, string> });
+      if (url.endsWith("/agent-setup/status")) return new Response(JSON.stringify({ readiness: "never_configured" }), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/agent-setup/capabilities")) {
+        return new Response(JSON.stringify({
+          contractVersion: "1", setupVersion: "v1", presetRevision: 3,
+          roles: {
+            planner: { required: true, recommendedOptionId: "native_a" },
+            executor: { required: true, recommendedOptionId: "native_b" },
+            assistant: { required: true, recommendedOptionId: "native_c" },
+            search: { required: true, options: [{ optionId: "native_d", availability: "available" }] },
+          },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ operationId: "op-1", state: "staging" }), { status: 202, headers: { "content-type": "application/json" } });
+    });
+    const started = await step({ fetchFn: fetchFn as never });
+    const put = calls.find(call => call.method === "PUT")!;
+    expect(put.url).toBe("https://core.test/api/app/agent-setup");
+    expect(put.headers?.["Idempotency-Key"]).toBe("onboarding-setup:v1");
+    expect(put.body).toMatchObject({ setupVersion: "v1", presetRevision: 3, selections: { planner: { optionId: "native_a" }, search: { optionId: "native_d" } } });
+    expect(started.note).toContain("agents ready");
+    expect(await readOnboardState(root)).toMatchObject({ step: "agents", setupOperationId: "op-1" });
+
+    const ready = vi.fn(async () => new Response(JSON.stringify({ readiness: "in_progress", state: "ready" }), { status: 200, headers: { "content-type": "application/json" } }));
+    const done = await step({ fetchFn: ready as never });
+    expect(done.note).toContain("agents are ready");
+    expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
+  });
+
+  it("goes on to the initiative when this machine advertises no agent to set up", async () => {
+    await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
+    const fetchFn = vi.fn(async (url: string) =>
+      url.endsWith("/agent-setup/status")
+        ? new Response(JSON.stringify({ readiness: "never_configured" }), { status: 200, headers: { "content-type": "application/json" } })
+        : new Response(JSON.stringify({ contractVersion: "1", setupVersion: "v1", presetRevision: 1, roles: { planner: { required: true, options: [] }, executor: { required: true }, assistant: { required: true }, search: { required: true } } }), { status: 200, headers: { "content-type": "application/json" } }),
+    );
+    const result = await step({ fetchFn: fetchFn as never });
+    expect(result.note).toContain("no agent Konteks can run work with yet");
+    expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
+  });
+
   it("creates the first initiative from the person's sentence and sends it as the planning session's first turn", async () => {
     await writeOnboardState(root, {
       step: "first_task",
@@ -349,6 +394,9 @@ describe("onboard", () => {
     expect(fetchFn).not.toHaveBeenCalled();
     expect(announced.note).toContain("Setting up your first initiative");
     expect(announced.note).toContain("A simple site where people book a table at our restaurant");
+    expect(await readOnboardState(root)).toMatchObject({ step: "agents" });
+    // The workspace's agents are set up first; this covers the initiative itself.
+    await writeOnboardState(root, { ...(await readOnboardState(root))!, step: "initiative" } as never);
 
     const calls: Array<{ url: string; body: unknown }> = [];
     const created = vi.fn(async (url: string, init: RequestInit) => {
