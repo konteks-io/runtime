@@ -55,6 +55,8 @@ export interface OnboardContext {
     inspect?: typeof inspectRepository;
     push?: typeof pushToManagedRemote;
     initialize?: typeof initializeRepository;
+    /** Register this runtime's managed-git key through the local service; answers where the key lives. */
+    registerGitKey?: (root: string) => Promise<{ identityFile?: string; user?: string }>;
     enrollment?: Pick<NativeEnrollment, "openIntent" | "sendChallenge" | "verifyCode" | "bind" | "refreshOwnerToken">;
     complete?: typeof completeNativeEnrollment;
     families?: () => Promise<string[]>;
@@ -518,6 +520,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         systemId: registered.systemId,
         systemEntityRef: registered.systemEntityRef,
         ...(registered.repository.remoteUrl ? { managedRemoteUrl: registered.repository.remoteUrl } : {}),
+        ...(registered.repository.sshUrl ? { managedSshUrl: registered.repository.sshUrl } : {}),
       });
       return {
         step: "system",
@@ -549,13 +552,27 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
     }
 
     case "pushing": {
-      // The managed-git key is registered before the push, since managed git
-      // accepts only a key this runtime registered (OS11). `git key add` is
-      // idempotent for a key that already exists.
-      const record = await readNativeRecord(context.root).catch(() => null);
-      if (record) {
-        const control = new SupervisorControl({ supervisorData }, record.controlPort);
-        await control.call({ op: "git.key.add" }, z.unknown(), { timeoutMs: 30_000 }).catch(() => undefined);
+      // Managed git accepts only a key this runtime registered (OS11), over
+      // SSH (WS1-021). `git key add` is idempotent for a key that exists. A
+      // key that cannot be registered is said plainly, not swallowed into a
+      // push that then fails for a reason the person cannot see.
+      let sshCommand: string | undefined;
+      if (state.managedSshUrl) {
+        let key: { identityFile?: string; user?: string };
+        try {
+          key = await (context.deps?.registerGitKey ?? registerGitKey)(context.root);
+        } catch (error) {
+          await save({ step: "push" });
+          const why = error instanceof Error && error.message ? ` (${error.message.replace(/[.]$/, "")})` : "";
+          return {
+            step: "pushing",
+            note: `This machine could not register its key with Konteks managed git${why}. Nothing was pushed.`,
+            ask: { question: "Try the push again?", kind: "confirm" },
+          };
+        }
+        if (key.identityFile) {
+          sshCommand = `ssh -i '${key.identityFile.replace(/'/g, "'\\''")}' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`;
+        }
       }
       if (state.repositoryNeedsInit) {
         const initialized = await (context.deps?.initialize ?? initializeRepository)({
@@ -571,8 +588,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       }
       const result = await (context.deps?.push ?? pushToManagedRemote)({
         repositoryPath: state.repositoryPath!,
-        remoteUrl: state.managedRemoteUrl!,
+        remoteUrl: sshCommand ? state.managedSshUrl! : state.managedRemoteUrl!,
         branch: state.defaultBranch!,
+        ...(sshCommand ? { sshCommand } : {}),
       });
       if (!result.pushed) {
         await save({ step: "push" });
@@ -736,6 +754,21 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
     if (again?.ask) return { step, note: `${note} Answer again when you are ready.`, ask: again.ask };
   }
   return { step, note, ask: { question: "Try that step again now?", kind: "confirm" } };
+}
+
+async function registerGitKey(root: string): Promise<{ identityFile?: string; user?: string }> {
+  const record = await readNativeRecord(root).catch(() => null);
+  if (!record) throw new RemoteInstanceError("temporarily_unavailable", "The Konteks service on this machine is not installed yet");
+  const control = new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort);
+  const answer = await control.call(
+    { op: "git.key.add" },
+    z.object({ identityFile: z.string().optional(), user: z.string().optional() }).passthrough(),
+    { timeoutMs: 30_000 },
+  );
+  return {
+    ...(answer.identityFile ? { identityFile: answer.identityFile } : {}),
+    ...(answer.user ? { user: answer.user } : {}),
+  };
 }
 
 function hostLabel(): string {

@@ -142,6 +142,9 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
           logger.info("started");
         } catch (error) {
           startupFailed = true;
+          // Say why before shutting down: shutdown can take a while, and the
+          // error is otherwise only printed once it has finished.
+          logger.error({ err: normalizeCaughtError(error) }, "startup failed");
           settleStartup();
           await stop("startup-failed", 1).catch(() => undefined);
           throw error;

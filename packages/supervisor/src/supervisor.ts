@@ -1517,7 +1517,13 @@ export class Supervisor {
           const key = await store.add(request.title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);
           this.managedGitBinding = await store.binding();
           // The reference, the fingerprint and the host; never the key.
-          return { keyRef: key.keyRef, title: key.title, fingerprint: key.fingerprint, host: key.host, sshConfig: sshConfigPath(this.config.SUPERVISOR_ONBOARD_GIT_KEY_DIR) };
+          // The key file's PATH lets the person's own git use the key for the
+          // repository onboarding pushes (WS1-021); the key itself never leaves.
+          return {
+            keyRef: key.keyRef, title: key.title, fingerprint: key.fingerprint, host: key.host,
+            sshConfig: sshConfigPath(this.config.SUPERVISOR_ONBOARD_GIT_KEY_DIR),
+            ...(this.managedGitBinding ? { identityFile: this.managedGitBinding.identityFile, user: this.managedGitBinding.user ?? "git" } : {}),
+          };
         }
         case "git.key.list":
           return { keys: await this.gitKeys().list() };

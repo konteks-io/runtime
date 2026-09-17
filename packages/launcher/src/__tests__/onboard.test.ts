@@ -252,6 +252,48 @@ describe("onboard", () => {
     expect(pushed.note).toContain("https://app.test/systems/sys-1");
   });
 
+  it("pushes to managed git over SSH with the runtime's own registered key", async () => {
+    await writeOnboardState(root, {
+      step: "pushing",
+      repositoryName: "konteks-onboard-app",
+      repositoryPath: "/tmp/projects/konteks-onboard-app",
+      managedRemoteUrl: "https://git.konteks.test/konteks-2/konteks-onboard-app",
+      managedSshUrl: "ssh://git@git.konteks.test:2222/konteks-2/konteks-onboard-app.git",
+      defaultBranch: "main",
+      systemId: "sys-1",
+    } as never);
+    const registerGitKey = vi.fn(async () => ({ identityFile: "/home/me/Library/Application Support/konteks-remote/git/id_ed25519", user: "git" }));
+    const push = vi.fn(async () => ({ pushed: true, message: "Pushed main to Konteks managed git." }));
+    const result = await step({ registerGitKey, push: push as never });
+    expect(registerGitKey).toHaveBeenCalledWith(root);
+    expect(push).toHaveBeenCalledWith({
+      repositoryPath: "/tmp/projects/konteks-onboard-app",
+      remoteUrl: "ssh://git@git.konteks.test:2222/konteks-2/konteks-onboard-app.git",
+      branch: "main",
+      sshCommand: "ssh -i '/home/me/Library/Application Support/konteks-remote/git/id_ed25519' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+    });
+    expect(result.note).toContain("now lives on Konteks managed git");
+  });
+
+  it("says plainly when the runtime cannot register its git key, and pushes nothing", async () => {
+    await writeOnboardState(root, {
+      step: "pushing",
+      repositoryName: "solo",
+      repositoryPath: "/tmp/solo",
+      managedRemoteUrl: "https://git.konteks.test/acme/solo",
+      managedSshUrl: "ssh://git@git.konteks.test:2222/acme/solo.git",
+      defaultBranch: "main",
+    } as never);
+    const push = vi.fn();
+    const registerGitKey = vi.fn(async () => { throw new Error("The Konteks service on this machine is not running."); });
+    const result = await step({ registerGitKey, push: push as never });
+    expect(push).not.toHaveBeenCalled();
+    expect(result.note).toContain("could not register its key");
+    expect(result.note).toContain("not running");
+    expect(result.ask).toMatchObject({ kind: "confirm" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "push" });
+  });
+
   it("re-asks the push in plain words when it does not go through", async () => {
     await writeOnboardState(root, {
       step: "pushing",

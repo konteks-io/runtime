@@ -118,7 +118,17 @@ export async function pushToManagedRemote(input: {
   repositoryPath: string;
   remoteUrl: string;
   branch: string;
+  /** How git reaches managed git with the runtime's key; kept in the repository's own config. */
+  sshCommand?: string;
 }): Promise<{ pushed: boolean; message: string }> {
+  if (input.sshCommand) {
+    // Only this repository: the person's later pushes use the same key, and
+    // nothing outside the folder they agreed to is touched.
+    const configured = await git(input.repositoryPath, ["config", "core.sshCommand", input.sshCommand]);
+    if (configured.code !== 0) {
+      return { pushed: false, message: `The repository could not be set up for Konteks managed git${reason(configured)}.` };
+    }
+  }
   const existing = await git(input.repositoryPath, ["remote", "get-url", "konteks"]).catch(() => null);
   if (!existing || existing.code !== 0) {
     const added = await git(input.repositoryPath, ["remote", "add", "konteks", input.remoteUrl]);

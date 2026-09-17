@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createServer } from "node:net";
 import { chmod, lstat, mkdir, readFile, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
@@ -135,6 +136,26 @@ export async function prepareNativeEnrollment(options: {
 const ENROLLMENT_MANIFEST = "enrollment-manifest.json";
 
 /**
+ * The control port a new enrollment records (WS1-020): the default when it is
+ * free, otherwise one the system hands out. A machine that already runs another
+ * Konteks connector would otherwise get a runtime that activates and then dies
+ * on `EADDRINUSE`.
+ */
+export async function chooseControlPort(preferred = CONTROL_SOCKET_DEFAULT_PORT): Promise<number> {
+  const tryListen = (port: number) =>
+    new Promise<number | null>(resolveListen => {
+      const server = createServer();
+      server.once("error", () => resolveListen(null));
+      server.listen(port, "127.0.0.1", () => {
+        const address = server.address();
+        const chosen = typeof address === "object" && address ? address.port : null;
+        server.close(() => resolveListen(chosen));
+      });
+    });
+  return (await tryListen(preferred)) ?? (await tryListen(0)) ?? preferred;
+}
+
+/**
  * The fast half of an enrollment install (WS1-012): detect the families,
  * fetch and verify the signed release, and remember it. Enough for `onboard`
  * to ask the first question; nothing is unpacked. The signed payload is kept
@@ -189,7 +210,7 @@ export async function recordNativeEnrollment(options: {
       agents: detected,
       bundleVersion: release.manifest.bundleVersion,
       manifestDigest: release.manifest.digest,
-      controlPort: options.controlPort ?? CONTROL_SOCKET_DEFAULT_PORT,
+      controlPort: options.controlPort ?? await chooseControlPort(),
     })));
     return { agents: detected, bundleVersion: release.manifest.bundleVersion, staged: false };
   } finally { lock.release(); }

@@ -69,6 +69,8 @@ export const OnboardStateSchema = z
     systemId: z.string().optional(),
     systemEntityRef: z.string().optional(),
     managedRemoteUrl: z.string().optional(),
+    /** The managed repository's SSH URL, pushed to with the runtime's key (WS1-021). */
+    managedSshUrl: z.string().optional(),
     /** Kept readable for state files written before initiatives; never offered as a link. */
     sessionUrl: z.string().optional(),
     /** The person's answer to "what do you want to build first?", until it is the first turn. */

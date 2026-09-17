@@ -65,6 +65,8 @@ const FirstSystemSchema = z
       .object({
         kind: z.enum(["existing", "managed"]),
         remoteUrl: z.string().optional(),
+        /** Where the runtime pushes with its own key (managed only). */
+        sshUrl: z.string().optional(),
         defaultBranch: z.string(),
       })
       .strict(),
