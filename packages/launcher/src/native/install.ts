@@ -9,6 +9,7 @@ import { z } from "zod";
 import type { Output } from "../output.js";
 import { promptSecret } from "../prompt.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
+import { releaseStaged, writeStagingProgress } from "./enrollment-staging.js";
 
 export { NATIVE_MANIFEST_URL };
 export interface NativeInstallOptions {
@@ -127,6 +128,26 @@ export async function prepareNativeEnrollment(options: {
   controlPort?: number;
   deps?: NativeInstallOptions["deps"];
 }): Promise<{ agents: string[]; bundleVersion: string; releaseId: string }> {
+  await recordNativeEnrollment(options);
+  return stageNativeEnrollment({ root: options.root, ...(options.deps ? { deps: options.deps } : {}) });
+}
+
+const ENROLLMENT_MANIFEST = "enrollment-manifest.json";
+
+/**
+ * The fast half of an enrollment install (WS1-012): detect the families,
+ * fetch and verify the signed release, and remember it. Enough for `onboard`
+ * to ask the first question; nothing is unpacked. The signed payload is kept
+ * so the unpacking verifies exactly what was recorded, without a second fetch.
+ */
+export async function recordNativeEnrollment(options: {
+  root: string;
+  coreUrl: string;
+  relayUrl: string;
+  agents?: string[];
+  controlPort?: number;
+  deps?: NativeInstallOptions["deps"];
+}): Promise<{ agents: string[]; bundleVersion: string; staged: boolean }> {
   const platform = options.deps?.platform ?? nativePlatform();
   const roots = options.deps?.roots ?? EMBEDDED_RELEASE_ROOTS;
   const root = resolve(options.root);
@@ -136,6 +157,11 @@ export async function prepareNativeEnrollment(options: {
   await privateDirectory(installLockDir);
   const lock = acquireNativeRootLock(installLockDir);
   try {
+    const prepared = await readNativeEnrollment(root).catch(() => null);
+    if (prepared) {
+      lock.assertOwned();
+      return { agents: prepared.agents, bundleVersion: prepared.bundleVersion, staged: await releaseStaged(root, prepared.releaseId) };
+    }
     const detected: string[] = [];
     if (options.agents && options.agents.length > 0) detected.push(...options.agents);
     else {
@@ -144,11 +170,6 @@ export async function prepareNativeEnrollment(options: {
     }
     // None is required (OS14): a machine with no detectable family still
     // enrolls, and the closing summary says how to add one.
-    const prepared = await readNativeEnrollment(root).catch(() => null);
-    if (prepared && await lstat(join(root, "releases", prepared.releaseId, "manifest.json")).then(info => info.isFile()).catch(() => false)) {
-      lock.assertOwned();
-      return { agents: prepared.agents, bundleVersion: prepared.bundleVersion, releaseId: prepared.releaseId };
-    }
     const fetchFn = options.deps?.fetchFn ?? fetch;
     const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
     const release = verifyNativeRelease(payload, roots);
@@ -157,18 +178,8 @@ export async function prepareNativeEnrollment(options: {
       throw new RemoteInstanceError("bundle_untrusted", "Native agents require a complete signed offline package with official login tooling.");
     }
     for (const dir of ["releases", "credentials", "workspaces", "logs", "supervisor"]) await privateDirectory(join(root, dir));
-    const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: detected }, releasesDir: join(root, "releases"), fetchFn });
-    await privateDirectory(join(staged.directory, "agents"));
-    for (const agent of detected) {
-      const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
-      await installOfflineAgentPackage(staged.bridges[agent]!, join(staged.directory, "agents", agent), artifact);
-      await privateDirectory(join(root, "credentials", agent));
-      await privateDirectory(join(root, "workspaces", agent));
-    }
-    await writeSecretFile(join(staged.directory, "manifest.json"), JSON.stringify(release.manifest));
-    const releaseId = `release-${basename(staged.directory).replace(/^\.candidate-/, "")}`;
-    await rename(staged.directory, join(root, "releases", releaseId));
     lock.assertOwned();
+    await writeSecretFile(join(installLockDir, ENROLLMENT_MANIFEST), JSON.stringify(payload));
     // The endpoints are remembered so `onboard` speaks to the same Core the
     // person installed against, without asking them for a URL.
     await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify(NativeEnrollmentRecordSchema.parse({
@@ -176,12 +187,72 @@ export async function prepareNativeEnrollment(options: {
       coreUrl: options.coreUrl,
       relayUrl: options.relayUrl,
       agents: detected,
-      releaseId,
       bundleVersion: release.manifest.bundleVersion,
       manifestDigest: release.manifest.digest,
       controlPort: options.controlPort ?? CONTROL_SOCKET_DEFAULT_PORT,
     })));
-    return { agents: detected, bundleVersion: release.manifest.bundleVersion, releaseId };
+    return { agents: detected, bundleVersion: release.manifest.bundleVersion, staged: false };
+  } finally { lock.release(); }
+}
+
+/**
+ * The slow half: unpack the recorded release and its agent packages, report
+ * progress for `onboard` to show, and name the staged release in the record.
+ * Idempotent: a release already staged is returned as it is.
+ */
+export async function stageNativeEnrollment(options: {
+  root: string;
+  deps?: NativeInstallOptions["deps"];
+}): Promise<{ agents: string[]; bundleVersion: string; releaseId: string }> {
+  const platform = options.deps?.platform ?? nativePlatform();
+  const roots = options.deps?.roots ?? EMBEDDED_RELEASE_ROOTS;
+  const root = resolve(options.root);
+  const installLockDir = join(root, "installer");
+  await privateDirectory(installLockDir);
+  const lock = acquireNativeRootLock(installLockDir);
+  try {
+    const prepared = await readNativeEnrollment(root);
+    if (prepared.releaseId && await releaseStaged(root, prepared.releaseId)) {
+      await writeStagingProgress(root, { state: "done", done: prepared.agents.length, total: prepared.agents.length });
+      return { agents: prepared.agents, bundleVersion: prepared.bundleVersion, releaseId: prepared.releaseId };
+    }
+    const total = prepared.agents.length;
+    const progress = (done: number, agent?: string) =>
+      writeStagingProgress(root, { state: "running", pid: process.pid, done, total, ...(agent ? { agent } : {}) });
+    try {
+      await progress(0);
+      const payload = options.deps?.manifest ?? JSON.parse(await readFile(join(installLockDir, ENROLLMENT_MANIFEST), "utf8"));
+      const release = verifyNativeRelease(payload, roots);
+      if (release.manifest.digest !== prepared.manifestDigest) throw invalid();
+      const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: prepared.agents });
+      const fetchFn = options.deps?.fetchFn ?? fetch;
+      const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: prepared.agents }, releasesDir: join(root, "releases"), fetchFn });
+      await privateDirectory(join(staged.directory, "agents"));
+      let done = 0;
+      for (const agent of prepared.agents) {
+        await progress(done, agent);
+        const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
+        await installOfflineAgentPackage(staged.bridges[agent]!, join(staged.directory, "agents", agent), artifact);
+        await privateDirectory(join(root, "credentials", agent));
+        await privateDirectory(join(root, "workspaces", agent));
+        done += 1;
+      }
+      await writeSecretFile(join(staged.directory, "manifest.json"), JSON.stringify(release.manifest));
+      const releaseId = `release-${basename(staged.directory).replace(/^\.candidate-/, "")}`;
+      await rename(staged.directory, join(root, "releases", releaseId));
+      lock.assertOwned();
+      await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify(NativeEnrollmentRecordSchema.parse({ ...prepared, releaseId })));
+      await writeStagingProgress(root, { state: "done", done: total, total });
+      return { agents: prepared.agents, bundleVersion: release.manifest.bundleVersion, releaseId };
+    } catch (error) {
+      await writeStagingProgress(root, {
+        state: "failed",
+        done: 0,
+        total,
+        message: error instanceof Error ? error.message : "Unpacking the agent packages failed.",
+      }).catch(() => undefined);
+      throw error;
+    }
   } finally { lock.release(); }
 }
 
@@ -191,7 +262,8 @@ export const NativeEnrollmentRecordSchema = z.object({
   coreUrl: z.string().min(1),
   relayUrl: z.string().min(1),
   agents: z.array(z.string().min(1)),
-  releaseId: z.string().min(1),
+  /** Absent until the agent packages are unpacked (WS1-012). */
+  releaseId: z.string().min(1).optional(),
   bundleVersion: z.string().min(1),
   manifestDigest: z.string().min(1),
   controlPort: z.number().int().positive(),
@@ -229,6 +301,9 @@ export async function completeNativeEnrollment(root: string, identity: { instanc
       return installation.record;
     }
     const prepared = await readNativeEnrollment(root);
+    if (!prepared.releaseId) {
+      throw new RemoteInstanceError("temporarily_unavailable", "The agent packages are still unpacking on this machine.");
+    }
     const stored = await new SupervisorStore(join(root, "supervisor")).identity();
     if (!stored || stored.instanceId !== identity.instanceId || stored.workspaceId !== identity.workspaceId) throw invalid();
     const release = verifyNativeRelease(JSON.parse(await readFile(join(root, "releases", prepared.releaseId, "manifest.json"), "utf8")), roots);

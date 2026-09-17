@@ -6,7 +6,8 @@ import { createNativeService, loadNativeInstallation, verifyInstalledNativeConne
 import { RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, status, supportBundle } from "../commands/lifecycle.js";
 import { SupervisorControl } from "../control.js";
-import { addNativeAgent, installNative, prepareNativeEnrollment, readNativeRecord, restoreNativeRecord } from "./install.js";
+import { addNativeAgent, installNative, readNativeRecord, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
+import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboardStep, type OnboardStep } from "./onboard.js";
 import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
@@ -47,15 +48,34 @@ export const nativeCliActions: NativeCliActions = {
     if (input.enroll) {
       // The enrollment install stops short of an identity, because there is no
       // Workspace to have one in yet (onboarding-simplified OS3). It verifies
-      // the release, stages it, and leaves the machine ready for `onboard`.
-      const prepared = await prepareNativeEnrollment(input);
-      input.output.line("This machine is ready. Run `konteks-remote onboard --json` and follow the steps it prints.");
-      input.output.result({ state: "ready-to-onboard", agents: prepared.agents, bundleVersion: prepared.bundleVersion });
+      // and records the release, and unpacks the agent packages in the
+      // background so the person's first question does not wait on them
+      // (WS1-012); `onboard` waits for the unpacking where it is needed.
+      const prepared = await recordNativeEnrollment(input);
+      let unpacking = "done";
+      if (!prepared.staged) {
+        const pid = await spawnEnrollmentStaging(input.root).catch(() => undefined);
+        if (pid === undefined) {
+          await stageNativeEnrollment({ root: input.root });
+        } else {
+          unpacking = "background";
+        }
+      }
+      input.output.line(
+        unpacking === "background"
+          ? "This machine is ready. Its agent packages keep unpacking in the background. Run `konteks-remote onboard --json` and follow the steps it prints."
+          : "This machine is ready. Run `konteks-remote onboard --json` and follow the steps it prints.",
+      );
+      input.output.result({ state: "ready-to-onboard", agents: prepared.agents, bundleVersion: prepared.bundleVersion, unpacking });
       return;
     }
     const record = await installNative({ ...input, activationId: input.activationId! });
     await start(input);
     input.output.result({ instanceId: record.instanceId, deploymentKind: record.deploymentKind, state: "installed" });
+  },
+  stageEnrollment: async input => {
+    const staged = await stageNativeEnrollment({ root: input.root });
+    input.output.result({ state: "staged", releaseId: staged.releaseId, agents: staged.agents });
   },
   onboard: async input => {
     const coreUrl = await onboardCoreUrl(input.root);

@@ -465,7 +465,7 @@ describe("onboard", () => {
       workspaceCreated: true,
     }));
     const complete = vi.fn(async () => ({}) as never);
-    const result = await step({ enrollment: { bind } as never, complete });
+    const result = await step({ enrollment: { bind } as never, complete, staging: { status: async () => ({ state: "done" }), spawn: vi.fn() } });
     expect(bind).toHaveBeenCalledWith("intent-1", { email: "ada@acme.test", expectedManifestDigest: "digest-1" });
     expect(complete).toHaveBeenCalledWith(root, { instanceId: "instance-9", workspaceId: "acme" });
     expect(result.run?.argv).toEqual(["konteks-remote", "start"]);
@@ -475,6 +475,51 @@ describe("onboard", () => {
     expect(state).toMatchObject({ step: "inspect", instanceId: "instance-9", tenantId: "acme" });
     expect(state?.email).toBeUndefined();
     expect(JSON.parse(await readFile(join(root, "supervisor", "owner-token.json"), "utf8"))).toMatchObject({ token: "user-token", instanceId: "instance-9" });
+  });
+
+  it("says how far the agent packages have unpacked instead of waiting silently, and names the workspace once", async () => {
+    await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "create" } as never);
+    const { writeSecretFile } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: ["claude-code", "codex"], bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const bind = vi.fn(async () => ({
+      identity: { instanceId: "instance-9", workspaceId: "acme" },
+      ownerToken: { token: "user-token", expiresAt: new Date(Date.now() + 3600_000).toISOString(), userRef: "user:default/ada", tenantId: "acme" },
+    }));
+    const complete = vi.fn(async () => ({}) as never);
+    let status: { state: "running"; agent: string; done: number; total: number } | { state: "done" } = { state: "running", agent: "codex", done: 1, total: 2 };
+    const staging = { status: vi.fn(async () => status), spawn: vi.fn(), waitMs: 5 };
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue(null as never);
+
+    const first = await step({ enrollment: { bind } as never, complete, staging });
+    expect(first.note).toContain("Your workspace is ready: acme");
+    expect(first.note).toContain("Codex, 2 of 2");
+    expect(first.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+    expect(complete).not.toHaveBeenCalled();
+    expect(staging.spawn).not.toHaveBeenCalled();
+
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-9", workspaceId: "acme" } as never);
+    status = { state: "done" };
+    const second = await step({ enrollment: { bind } as never, complete, staging });
+    expect(bind).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(second.note).not.toContain("Your workspace is ready");
+    expect(second.run?.argv).toEqual(["konteks-remote", "start"]);
+    vi.restoreAllMocks();
+  });
+
+  it("starts the unpacking again when it stopped, and says so", async () => {
+    await writeOnboardState(root, { step: "start", decision: "join", workspaceAnnounced: true } as never);
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-9", workspaceId: "acme" } as never);
+    const staging = { status: vi.fn(async () => ({ state: "failed" as const, message: "Unpacking the agent packages stopped before it finished." })), spawn: vi.fn(async () => 123), waitMs: 5 };
+    const result = await step({ staging, complete: vi.fn() as never });
+    expect(staging.spawn).toHaveBeenCalledWith(root);
+    expect(result.note).toContain("started again");
+    expect(result.note).not.toContain("joining");
+    vi.restoreAllMocks();
   });
 
   it("stops with the plan-limit remedy instead of retrying the bind on every run", async () => {

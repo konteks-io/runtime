@@ -47,6 +47,8 @@ export const OnboardStateSchema = z
     workspaces: z.array(z.object({ tenantId: z.string(), displayName: z.string() }).strict()).optional(),
     proposedTenantId: z.string().optional(),
     tenantId: z.string().optional(),
+    /** The workspace was named to the person once already (W1-A4). */
+    workspaceAnnounced: z.boolean().optional(),
     instanceId: z.string().optional(),
     /** Code attempts left on the live challenge, for the re-ask. */
     attemptsRemaining: z.number().int().min(0).optional(),

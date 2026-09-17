@@ -10,6 +10,7 @@ import { SupervisorControl } from "../control.js";
 import { completeNativeEnrollment, readNativeEnrollment, readNativeRecord } from "./install.js";
 import { nativePlatform } from "./service.js";
 import { initializeRepository, inspectRepository, pushToManagedRemote } from "./repository-inspect.js";
+import { enrollmentStagingStatus, releaseStaged, spawnEnrollmentStaging, type StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
 import { deleteOwnerToken, OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
 
@@ -59,12 +60,21 @@ export interface OnboardContext {
     families?: () => Promise<string[]>;
     /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
     waitForReady?: (root: string) => Promise<{ administrativeStatus: string; roles: string[] } | null>;
+    /** The background unpacking of the agent packages (WS1-012). */
+    staging?: {
+      status: (root: string) => Promise<StagingStatus>;
+      spawn: (root: string) => Promise<number | undefined>;
+      /** How long one `start` invocation waits for it before reporting progress. */
+      waitMs?: number;
+    };
   };
 }
 
 const AFFIRMATIVE = new Set(["y", "yes", "yeah", "yep", "ok", "okay", "sure", "do it", "please"]);
 const NEGATIVE = new Set(["n", "no", "nope", "not now", "skip", "later"]);
 const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
+/** How long one `start` invocation waits on the unpacking before saying how far it got. */
+const STAGING_WAIT_MS = 25_000;
 /** How long `inspect` waits for the freshly started service before moving on without it. */
 const READY_WAIT_MS = 45_000;
 /** The owner token is refreshed this long before it expires (OS15). */
@@ -328,6 +338,43 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         });
         identity = bound.identity;
       }
+      const workspaceNote =
+        state.decision === "create"
+          ? `Your workspace is ready: ${identity.workspaceId}. You can rename it in Settings.`
+          : `This machine is joining ${identity.workspaceId}.`;
+      const announce = state.workspaceAnnounced ? "" : `${workspaceNote} `;
+      // The agent packages unpack in the background from `install --enroll`
+      // (WS1-012). Wait a while for them here, and if they are still going,
+      // say how far they have got and come back, rather than sit silent.
+      const staging = context.deps?.staging ?? {
+        status: (root: string) =>
+          enrollmentStagingStatus(root, async r => releaseStaged(r, (await readNativeEnrollment(r).catch(() => null))?.releaseId)),
+        spawn: spawnEnrollmentStaging,
+      };
+      const deadline = Date.now() + (staging.waitMs ?? STAGING_WAIT_MS);
+      let unpacked = await staging.status(context.root);
+      while (unpacked.state === "running" && Date.now() < deadline) {
+        await new Promise(resolveWait => setTimeout(resolveWait, Math.min(2_000, staging.waitMs ?? 2_000)));
+        unpacked = await staging.status(context.root);
+      }
+      if (unpacked.state !== "done") {
+        let progress: string;
+        if (unpacked.state === "running") {
+          const names = { "claude-code": "Claude Code", codex: "Codex" } as Record<string, string>;
+          progress =
+            unpacked.total > 0
+              ? `This machine is still unpacking its agent packages: ${unpacked.agent ? `${names[unpacked.agent] ?? unpacked.agent}, ` : ""}${Math.min(unpacked.done + 1, unpacked.total)} of ${unpacked.total}. This usually finishes within two minutes of the install.`
+              : "This machine is still unpacking its agent packages. This usually finishes within two minutes of the install.";
+        } else {
+          await staging.spawn(context.root);
+          progress =
+            unpacked.state === "failed"
+              ? `Unpacking the agent packages stopped (${unpacked.message.replace(/[.]$/, "")}), so it has been started again.`
+              : "Unpacking the agent packages has started.";
+        }
+        await save({ step: "start", workspaceAnnounced: true });
+        return { step: "start", note: `${announce}${progress}`, run: AGAIN };
+      }
       await (context.deps?.complete ?? completeNativeEnrollment)(context.root, identity);
       await save({
         step: "inspect",
@@ -338,10 +385,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       } as never);
       return {
         step: "start",
-        note:
-          state.decision === "create"
-            ? `Your workspace is ready: ${identity.workspaceId}. You can rename it in Settings. This machine is now its runtime; starting it next.`
-            : `This machine is now ${identity.workspaceId}'s runtime; starting it next.`,
+        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${identity.workspaceId}'s`} runtime; starting it next.`,
         // Registering and starting the service is the launcher's own command,
         // so the agent runs it rather than this process forking a service.
         run: { argv: ["konteks-remote", "start"] },

@@ -6,6 +6,7 @@ export interface NativeCommandContext { root: string; output: Output }
 export interface NativeCliActions {
   install(input: NativeCommandContext & { activationId?: string; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
   onboard(input: NativeCommandContext & { answer?: string; cwd?: string }): Promise<void>;
+  stageEnrollment(input: NativeCommandContext): Promise<void>;
   addAgent(input: NativeCommandContext & { agent: "claude-code" | "codex" | "opencode" | "pi" }): Promise<void>;
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
@@ -51,6 +52,9 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--answer <text>", "the person's answer to the question the previous step asked")
     .option("--repo <path>", "the repository to register as the first System (default: the working directory)")
     .action(async (options: { answer?: string; repo?: string }) => actions.onboard({ ...context(), ...(options.answer !== undefined ? { answer: options.answer } : {}), ...(options.repo ? { cwd: options.repo } : {}) }));
+  // The background half of `install --enroll`; `onboard` waits for it.
+  program.command("stage-enrollment", { hidden: true }).description("unpack the agent packages an enrollment install recorded")
+    .action(async () => actions.stageEnrollment(context()));
   program.command("serve").description("run the native connector in the foreground (used by the background service)").action(async () => actions.serve(context()));
   program.command("start").description("start the installed native user service").action(async () => actions.start(context()));
   program.command("stop").description("stop the native user service, preserving identity and local work").action(async () => actions.stop(context()));
