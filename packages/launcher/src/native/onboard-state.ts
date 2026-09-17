@@ -75,6 +75,8 @@ export const OnboardStateSchema = z
     managedSshUrl: z.string().optional(),
     /** Kept readable for state files written before initiatives; never offered as a link. */
     sessionUrl: z.string().optional(),
+    /** How many times this run has waited for the machine's agents to be advertised. */
+    agentsWaited: z.number().int().min(0).optional(),
     /** The workspace agent setup this machine started, until it is ready (W1-A6). */
     setupOperationId: z.string().optional(),
     /** The person's answer to "what do you want to build first?", until it is the first turn. */

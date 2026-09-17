@@ -383,15 +383,20 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
   });
 
-  it("goes on to the initiative when this machine advertises no agent to set up", async () => {
+  it("waits for the machine to say what its agents can run, then goes on without it", async () => {
     await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
     const fetchFn = vi.fn(async (url: string) =>
       url.endsWith("/execution-profiles")
         ? new Response(JSON.stringify({ profiles: [] }), { status: 200, headers: { "content-type": "application/json" } })
         : new Response(JSON.stringify({ roles: { planner: { options: [] }, executor: { options: [] } } }), { status: 200, headers: { "content-type": "application/json" } }),
     );
-    const result = await step({ fetchFn: fetchFn as never });
-    expect(result.note).toContain("no agent Konteks can run work with yet");
+    const waiting = await step({ fetchFn: fetchFn as never, agentsWaitMs: 1 });
+    expect(waiting.note).toContain("still learning what this machine's agents can do");
+    expect(await readOnboardState(root)).toMatchObject({ step: "agents", agentsWaited: 1 });
+
+    await writeOnboardState(root, { ...(await readOnboardState(root))!, agentsWaited: 9 } as never);
+    const givenUp = await step({ fetchFn: fetchFn as never, agentsWaitMs: 1 });
+    expect(givenUp.note).toContain("has not told Konteks what its agents can run yet");
     expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
   });
 

@@ -55,6 +55,8 @@ export interface OnboardContext {
     inspect?: typeof inspectRepository;
     push?: typeof pushToManagedRemote;
     initialize?: typeof initializeRepository;
+    /** How long the agents step pauses between asks; tests make it instant. */
+    agentsWaitMs?: number;
     /** Register this runtime's managed-git key through the local service; answers where the key lives. */
     registerGitKey?: (root: string) => Promise<{ identityFile?: string; user?: string }>;
     enrollment?: Pick<NativeEnrollment, "openIntent" | "sendChallenge" | "verifyCode" | "bind" | "refreshOwnerToken">;
@@ -75,6 +77,9 @@ export interface OnboardContext {
 const AFFIRMATIVE = new Set(["y", "yes", "yeah", "yep", "ok", "okay", "sure", "do it", "please"]);
 const NEGATIVE = new Set(["n", "no", "nope", "not now", "skip", "later"]);
 const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
+/** How long, and how often, the agents step waits for the machine to advertise what it can run. */
+const AGENTS_WAIT_MS = 10_000;
+const AGENTS_WAIT_ATTEMPTS = 9;
 /** How long one `start` invocation waits on the unpacking before saying how far it got. */
 const STAGING_WAIT_MS = 25_000;
 /** How long `inspect` waits for the freshly started service before moving on without it. */
@@ -654,14 +659,28 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       if (!(await api.hasExecutionProfile())) {
         const ready = await api.setUpAgentsFromThisMachine(hostLabel());
         if (!ready) {
-          await save({ step: "initiative" });
+          // What the machine can run is discovered by the runtime and accepted
+          // on a later heartbeat, a minute or so after it starts, so an empty
+          // answer this early means "not yet", not "never" (W1-A6).
+          const waited = (state.agentsWaited ?? 0) + 1;
+          if (waited <= AGENTS_WAIT_ATTEMPTS) {
+            await save({ agentsWaited: waited });
+            await new Promise(resolveWait => setTimeout(resolveWait, context.deps?.agentsWaitMs ?? AGENTS_WAIT_MS));
+            return {
+              step: "agents",
+              note: "Konteks is still learning what this machine's agents can do; this finishes about a minute after the machine starts.",
+              run: AGAIN,
+            };
+          }
+          await save({ step: "initiative", agentsWaited: undefined } as never);
           return {
             step: "agents",
-            note: "This machine has no agent Konteks can run work with yet; your initiative is still being created, and you can choose one in Settings.",
+            note: "This machine has not told Konteks what its agents can run yet; your initiative is still being created, and you can choose an agent in Settings once it has.",
             run: AGAIN,
           };
         }
       }
+      await save({ agentsWaited: undefined } as never);
       await save({ step: "initiative" });
       return { step: "agents", note: "This machine's agents will run the work in this workspace.", run: AGAIN };
     }
