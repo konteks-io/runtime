@@ -362,7 +362,7 @@ describe("onboard", () => {
     expect(calls[0]!.url).toBe("https://core.test/api/collaboration/initiatives");
     expect(calls[0]!.body).toEqual({ systemId: "sys-1", title: "A simple site where people book a table at our restaurant" });
     expect(calls[1]!.url).toBe("https://core.test/api/app/sessions/session-9/messages");
-    expect(calls[1]!.body).toMatchObject({ content: sentence });
+    expect(calls[1]!.body).toEqual({ message: sentence });
     expect(calls).toHaveLength(2);
     expect(result.note).toContain("https://app.test/work/init-7");
     expect(result.note).not.toContain("/sessions/");

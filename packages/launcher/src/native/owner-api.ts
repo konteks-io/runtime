@@ -156,9 +156,10 @@ export class OwnerApiClient {
 
   /** The person's first sentence becomes the session's first turn. */
   async postFirstTurn(sessionId: string, content: string): Promise<void> {
+    // The session message API takes `message`; `content`/`role` is refused as
+    // a malformed body, which left the planning session with nothing to answer.
     await this.call("POST", `/api/app/sessions/${encodeURIComponent(sessionId)}/messages`, {
-      content,
-      role: "user",
+      message: content,
     });
   }
 
