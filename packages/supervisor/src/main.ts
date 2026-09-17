@@ -14,6 +14,7 @@ const daemon = createDaemon({
       token: await supervisor.store.controlToken(),
       port: supervisor.config.SUPERVISOR_CONTROL_PORT,
       handler: supervisor.controlHandler(),
+      onUnexpectedError: (error, operation) => supervisor.logger.error({ err: error, operation }, "control operation failed"),
     });
   },
   shutdownSteps: () => [

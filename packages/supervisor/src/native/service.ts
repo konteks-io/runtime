@@ -52,6 +52,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         token: await supervisor.store.controlToken(),
         port: installation.config.SUPERVISOR_CONTROL_PORT,
         handler: supervisor.controlHandler(),
+        onUnexpectedError: (error, operation) => supervisor?.logger.error({ err: error, operation }, "control operation failed"),
       });
     },
     shutdownSteps: () => [

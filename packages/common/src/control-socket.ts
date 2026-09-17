@@ -157,6 +157,11 @@ export interface ControlSocketServerOptions {
   token: string;
   port: number;
   handler: ControlHandler;
+  /**
+   * Told about an unexpected failure the caller only sees as "control
+   * operation failed", so its real cause is in the runtime's log.
+   */
+  onUnexpectedError?: (error: unknown, operation: string) => void;
 }
 
 export interface ControlSocketServer {
@@ -249,6 +254,7 @@ function handleConnection(socket: Socket, options: ControlSocketServerOptions): 
             recoveryActions: error.recoveryActions,
           });
         } else {
+          options.onUnexpectedError?.(error, String((request as { op?: unknown }).op ?? "unknown"));
           send({
             kind: "error",
             id,
