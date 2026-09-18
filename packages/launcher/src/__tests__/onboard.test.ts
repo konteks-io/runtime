@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { initiativeTitle, onboardFailureStep, runOnboardStep } from "../native/onboard.js";
+import { initiativeTitle, isNo, isYes, onboardFailureStep, runOnboardStep } from "../native/onboard.js";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { readOnboardState, writeOnboardState } from "../native/onboard-state.js";
 import { writeOwnerToken } from "../native/owner-api.js";
@@ -93,6 +93,23 @@ describe("onboard", () => {
       }),
     });
     expect(await readOnboardState(root)).toMatchObject({ repositoryKind: "managed" });
+  });
+
+  it("takes a yes or a no the way people actually write them", () => {
+    // Passes 20 and 21 refused "Yes.", "Yes, please." and "Yes, try it
+    // again." — the agent had to rewrite the person's answer to get through.
+    for (const said of ["yes", "Yes.", "Yes, please.", "yes, try it again", "Sure!", "OK", "go ahead", "Yep - push it"]) {
+      expect(isYes(said), said).toBe(true);
+    }
+    for (const said of ["no", "No.", "No thanks", "not now", "Nope, later"]) {
+      expect(isNo(said), said).toBe(true);
+      expect(isYes(said), said).toBe(false);
+    }
+    // A yes that takes itself back is not a yes, and an answer that is
+    // neither is asked again rather than guessed.
+    for (const said of ["yes, but not now", "please don't", "maybe", "acme-shop"]) {
+      expect(isYes(said), said).toBe(false);
+    }
   });
 
   it("asks a yes/no about the first System and accepts no without registering", async () => {

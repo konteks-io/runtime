@@ -74,8 +74,10 @@ export interface OnboardContext {
   };
 }
 
-const AFFIRMATIVE = new Set(["y", "yes", "yeah", "yep", "ok", "okay", "sure", "do it", "please"]);
-const NEGATIVE = new Set(["n", "no", "nope", "not now", "skip", "later"]);
+const AFFIRMATIVE = new Set(["y", "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "do it", "please", "go ahead", "go for it", "absolutely", "of course", "sounds good"]);
+const NEGATIVE = new Set(["n", "no", "nope", "not now", "skip", "later", "cancel", "stop"]);
+/** Words that turn an otherwise agreeable answer into a refusal ("please don't"). */
+const NEGATION = /\b(no|not|don'?t|do not|never|cancel|stop|wait)\b/;
 const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
 /** How long, and how often, the agents step waits for the machine to advertise what it can run. */
 const AGENTS_WAIT_MS = 10_000;
@@ -93,11 +95,26 @@ function wireCode(error: unknown): string {
   return error instanceof RemoteInstanceError ? error.code : "";
 }
 
-function isYes(answer: string): boolean {
-  return AFFIRMATIVE.has(answer.trim().toLowerCase());
+// People answer in words, and an agent that relays them faithfully passes the
+// words on: "Yes.", "Yes, please.", "yes, try it again". Matching only the
+// bare word refused all three and made the agent rewrite the person's answer.
+// An answer counts when it starts with a yes or a no, ignoring punctuation.
+function normalizeAnswer(answer: string): string {
+  return answer.toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, " ").replace(/\s+/g, " ").trim();
 }
-function isNo(answer: string): boolean {
-  return NEGATIVE.has(answer.trim().toLowerCase());
+function leadsWith(words: Set<string>, answer: string): boolean {
+  if (words.has(answer)) return true;
+  for (const word of words) if (answer.startsWith(`${word} `)) return true;
+  return false;
+}
+export function isYes(answer: string): boolean {
+  const said = normalizeAnswer(answer);
+  if (!leadsWith(AFFIRMATIVE, said)) return false;
+  // "yes, but not now" and "please don't" are not a yes.
+  return !NEGATION.test(said.replace(/^\S+\s?/, ""));
+}
+export function isNo(answer: string): boolean {
+  return leadsWith(NEGATIVE, normalizeAnswer(answer));
 }
 
 /** Every family whose local tooling this machine actually has (OS14). */
