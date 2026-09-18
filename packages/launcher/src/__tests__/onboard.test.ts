@@ -552,6 +552,14 @@ describe("onboard", () => {
     expect(result.note).toContain("about a minute");
     expect(result.run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
     expect(result.ask).toBeUndefined();
+
+    // A bare gateway status while Core restarts is the same situation.
+    const gateway = await onboardFailureStep(
+      { root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" },
+      new Error("HTTP 502"),
+    );
+    expect(gateway.note).toContain("still setting up your workspace");
+    expect(gateway.ask).toBeUndefined();
   });
 
   it("offers to try a step that asks nothing again, and ends plainly when access was revoked", async () => {

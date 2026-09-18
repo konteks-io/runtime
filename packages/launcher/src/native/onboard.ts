@@ -829,12 +829,13 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
   // could not be completed" about a step that will simply work shortly sends
   // the person looking for a fault that is not there — say what is happening
   // and carry on with the answer they already gave.
-  // Only the nameless envelope — an error Core itself could not name — is read
-  // this way. A refusal that says what it is keeps its own words.
+  // Only a nameless answer is read this way — Core's own unnamed envelope, or
+  // a bare gateway status while Core is restarting (pass 19 met "HTTP 502"
+  // here, and Core was back within a minute). A refusal that says what it is
+  // keeps its own words.
   const stillBeingMade =
     (step === "code" || step === "start" || step === "workspace") &&
-    error instanceof RemoteInstanceError &&
-    /the request could not be completed/i.test(message);
+    (/the request could not be completed/i.test(message) || /^HTTP 50[234]$/.test(message));
   if (stillBeingMade) {
     return {
       step,
