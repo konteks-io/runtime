@@ -31,6 +31,9 @@ describe("onboard", () => {
   });
   afterEach(() => rm(root, { recursive: true, force: true }));
 
+  // A connected machine's service answers; the tests that care about it say so
+  // themselves, and the rest should not have to stand up a supervisor.
+  const readyService = async () => ({ administrativeStatus: "active", roles: ["assistant", "onboard"] });
   const step = (extra: Parameters<typeof runOnboardStep>[0]["deps"] = {}, answer?: string) =>
     runOnboardStep({
       root,
@@ -38,7 +41,7 @@ describe("onboard", () => {
       coreUrl: "https://core.test",
       siteUrl: "https://app.test",
       ...(answer !== undefined ? { answer } : {}),
-      deps: extra,
+      deps: { waitForReady: readyService, ...extra },
     });
 
   it("asks for the email in its very first response on a machine that is not connected", async () => {
@@ -214,12 +217,38 @@ describe("onboard", () => {
       siteUrl: "https://app.test",
       cwd: homedir(),
       deps: {
-        waitForReady: async () => null,
+        waitForReady: async () => ({ administrativeStatus: "active", roles: ["assistant", "onboard"] }),
         inspect: async () => ({ path: null, name: "me", remoteUrl: null, remoteReachable: false, currentBranch: null, defaultBranch: "main" }),
       },
     });
     expect(result.note).toContain("home folder");
     expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
+  });
+
+  it("asks again for the step that was skipped instead of going on without the service", async () => {
+    // The step before this one told the agent to run `konteks-remote start`.
+    // When nothing answers, that did not happen, and going on regardless is
+    // how the omission surfaced two questions later, during the push.
+    await writeOnboardState(root, { step: "inspect" } as never);
+    let inspected = false;
+    const result = await runOnboardStep({
+      root,
+      output: output(),
+      coreUrl: "https://core.test",
+      siteUrl: "https://app.test",
+      cwd: "/tmp/projects/konteks-onboard-app",
+      deps: {
+        waitForReady: async () => null,
+        inspect: async () => {
+          inspected = true;
+          return { path: null, name: "konteks-onboard-app", remoteUrl: null, remoteReachable: false, currentBranch: null, defaultBranch: "main" };
+        },
+      },
+    });
+    expect(result.run).toEqual({ argv: ["konteks-remote", "start"] });
+    expect(result.note).toContain("not running yet");
+    expect(inspected).toBe(false);
+    expect(await readOnboardState(root)).toMatchObject({ step: "inspect" });
   });
 
   it("makes a plain folder a repository with one empty commit before pushing, and only after a yes", async () => {
@@ -484,6 +513,21 @@ describe("onboard", () => {
     expect(result.note).toContain("Nothing you answered was lost");
     expect(result.ask).toMatchObject({ kind: "code" });
     expect(result.ask?.question).toContain("h••••@konteks.io");
+  });
+
+  it("reads the nameless server error during workspace creation as what it is", async () => {
+    // A call that lands while the workspace is still being made comes back as
+    // Core's unnamed 500. "The request could not be completed" sends the
+    // person hunting for a fault that is not there.
+    await writeOnboardState(root, { step: "code", intentRef: "intent-1", emailMasked: "h••••@konteks.io" } as never);
+    const result = await onboardFailureStep(
+      { root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" },
+      new RemoteInstanceError("temporarily_unavailable", "The request could not be completed"),
+    );
+    expect(result.note).toContain("still setting up your workspace");
+    expect(result.note).toContain("about a minute");
+    expect(result.run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
+    expect(result.ask).toBeUndefined();
   });
 
   it("offers to try a step that asks nothing again, and ends plainly when access was revoked", async () => {

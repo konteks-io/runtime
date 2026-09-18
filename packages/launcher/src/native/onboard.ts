@@ -423,14 +423,26 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       // anything is said about what runs here (OS14). A machine that was
       // already connected answers at once.
       const ready = await (context.deps?.waitForReady ?? waitForServiceReady)(context.root).catch(() => null);
-      const notReady = ready && ready.administrativeStatus !== "active" ? "The runtime service is still coming up; it will finish in the background. " : "";
+      // The previous step asked for `konteks-remote start`. If nothing answers
+      // here, that step did not happen — and carrying on regardless is how a
+      // missed start surfaced two questions later as "the supervisor has not
+      // started yet", about a folder the person had already agreed to push.
+      // Ask for it again, in the same words, and stay on this step.
+      if (!ready) {
+        return {
+          step: "inspect",
+          note: "This machine's Konteks service is not running yet, so nothing can be set up here. Starting it is the step before this one.",
+          run: { argv: ["konteks-remote", "start"] },
+        };
+      }
+      const notReady = ready.administrativeStatus !== "active" ? "The runtime service is still coming up; it will finish in the background. " : "";
       const facts = await (context.deps?.inspect ?? inspectRepository)(context.cwd ?? process.cwd());
       if (!facts.path) {
         const directory = resolve(context.cwd ?? process.cwd());
         if (directory === resolve(homedir()) || directory === resolve("/")) {
           // A home or root directory is not a project; making it a repository
           // would sweep in everything the person owns.
-          await save({ step: "first_task", ...(ready ? { advertisedRoles: ready.roles } : {}) });
+          await save({ step: "first_task", advertisedRoles: ready.roles });
           return {
             step: "inspect",
             note: `${notReady}This is your ${directory === resolve("/") ? "root" : "home"} folder, not a project, so no System is made here. Run onboard again from inside a project folder to add one.`,
@@ -447,7 +459,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           defaultBranch: "main",
           repositoryKind: "managed",
           repositoryNeedsInit: true,
-          ...(ready ? { advertisedRoles: ready.roles } : {}),
+          advertisedRoles: ready.roles,
         });
         return {
           step: "inspect",
@@ -463,7 +475,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         defaultBranch: facts.defaultBranch,
         repositoryKind: kind,
         ...(facts.remoteUrl ? { remoteUrl: facts.remoteUrl } : {}),
-        ...(ready ? { advertisedRoles: ready.roles } : {}),
+        advertisedRoles: ready.roles,
       });
       return {
         step: "inspect",
@@ -798,6 +810,24 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
   const siteUrl = (context.siteUrl ?? process.env.KONTEKS_SITE_URL ?? "https://app.konteks.io").replace(/\/+$/, "");
   if (error instanceof RemoteInstanceError && error.code === "permission_denied") {
     return { step, done: { summary: `Konteks stopped this setup: ${said} Sign in on the site to see this machine and your workspace.`, links: { site: siteUrl } } };
+  }
+  // A workspace takes about a minute to make, and a call that arrives while it
+  // is still being made comes back as a bare server error. Saying "the request
+  // could not be completed" about a step that will simply work shortly sends
+  // the person looking for a fault that is not there — say what is happening
+  // and carry on with the answer they already gave.
+  // Only the nameless envelope — an error Core itself could not name — is read
+  // this way. A refusal that says what it is keeps its own words.
+  const stillBeingMade =
+    (step === "code" || step === "start" || step === "workspace") &&
+    error instanceof RemoteInstanceError &&
+    /the request could not be completed/i.test(message);
+  if (stillBeingMade) {
+    return {
+      step,
+      note: "Konteks is still setting up your workspace. That takes about a minute; nothing you answered was lost and it will be used as soon as it is ready.",
+      run: AGAIN,
+    };
   }
   const note = `Konteks could not finish that step: ${said} Nothing you answered was lost.`;
   if (step === "email" || step === "code" || step === "workspace" || step === "first_task") {
