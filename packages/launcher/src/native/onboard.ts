@@ -429,10 +429,23 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       // started yet", about a folder the person had already agreed to push.
       // Ask for it again, in the same words, and stay on this step.
       if (!ready) {
+        // Two different situations, and telling them apart is the whole point:
+        // a machine with no service record never ran the start step, and one
+        // that has a record is starting — its control port simply is not open
+        // yet, and asking for `start` again would loop on a service that is
+        // already coming up (it takes about a minute after a fresh install).
+        const started = await readNativeRecord(context.root).catch(() => null);
+        if (!started) {
+          return {
+            step: "inspect",
+            note: "This machine's Konteks service is not running yet, so nothing can be set up here. Starting it is the step before this one.",
+            run: { argv: ["konteks-remote", "start"] },
+          };
+        }
         return {
           step: "inspect",
-          note: "This machine's Konteks service is not running yet, so nothing can be set up here. Starting it is the step before this one.",
-          run: { argv: ["konteks-remote", "start"] },
+          note: "The Konteks service on this machine is still starting; it opens for work about a minute after a fresh install. Nothing else is needed — ask again in a moment.",
+          run: AGAIN,
         };
       }
       const notReady = ready.administrativeStatus !== "active" ? "The runtime service is still coming up; it will finish in the background. " : "";

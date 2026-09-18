@@ -40,7 +40,11 @@ async function start(input: NativeCommandContext): Promise<void> {
     if (await execute(command) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native user service could not start; installed identity and credentials were preserved.");
   }
   if (definition.requiresLinger) input.output.line("This Linux user service needs user lingering to remain available after logout. Configure it explicitly if required.");
-  input.output.line("Native user service started. Agent login and cloud readiness are reported separately by status.");
+  // Starting the process is not the same as being open for work: the service
+  // finishes unpacking and opens its control port about a minute later. Saying
+  // only "started" invited a second and third `start` against a service that
+  // was already coming up.
+  input.output.line("Native user service started. It takes about a minute after a fresh install before it is ready for work; agent login and cloud readiness are reported separately by status.");
 }
 
 export const nativeCliActions: NativeCliActions = {

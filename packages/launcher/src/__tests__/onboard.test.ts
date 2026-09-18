@@ -251,6 +251,30 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "inspect" });
   });
 
+  it("says a service that is still starting is starting, rather than asking for start again", async () => {
+    // `konteks-remote start` returns as soon as the process is up, but the
+    // service opens for work about a minute later. Asking for `start` again in
+    // that window is a loop on something that is already coming up.
+    const { writeFile, chmod } = await import("node:fs/promises");
+    await writeFile(
+      join(root, "native-runtime.json"),
+      JSON.stringify({ schemaVersion: 1, deploymentKind: "native_connector", instanceId: "instance-1", workspaceId: "konteks-2", releaseId: "release-1", manifestDigest: "d", bundleVersion: "0.4.1", coreUrl: "https://core.test", relayUrl: "wss://core.test/relay", agents: ["claude-code"], controlPort: 41800 }),
+    );
+    await chmod(join(root, "native-runtime.json"), 0o600);
+    await writeOnboardState(root, { step: "inspect" } as never);
+    const result = await runOnboardStep({
+      root,
+      output: output(),
+      coreUrl: "https://core.test",
+      siteUrl: "https://app.test",
+      cwd: "/tmp/projects/konteks-onboard-app",
+      deps: { waitForReady: async () => null, inspect: async () => { throw new Error("must not inspect"); } },
+    });
+    expect(result.run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
+    expect(result.note).toContain("still starting");
+    expect(await readOnboardState(root)).toMatchObject({ step: "inspect" });
+  });
+
   it("makes a plain folder a repository with one empty commit before pushing, and only after a yes", async () => {
     await writeOnboardState(root, {
       step: "push",
