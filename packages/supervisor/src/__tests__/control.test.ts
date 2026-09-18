@@ -227,6 +227,12 @@ describe("roles and utilization", () => {
     expect(deriveAdvertisedRoles([{ role: "ops", agentPreference: [ready.agentId] }], [ready], { browserToolAvailable: true })).toEqual([]);
     expect(deriveAdvertisedRoles(bindings, [ready], { browserToolAvailable: true })).toEqual(["planner", "generator", "qa"]);
     expect(deriveAdvertisedRoles(bindings, [{ ...ready, readiness: "not_configured" }], { browserToolAvailable: true })).toEqual([]);
+    // Enrollment binds a machine's roles before it has said what it has, so
+    // the preference is empty. Reading that as "no candidate" made the machine
+    // refuse its own workspace's first assignment as role_not_advertised.
+    expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: [] }], [ready], { browserToolAvailable: true })).toEqual(["assistant"]);
+    expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: [] }], [{ ...ready, readiness: "not_configured" }], { browserToolAvailable: true })).toEqual([]);
+    expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: [] }], [], { browserToolAvailable: true })).toEqual([]);
     expect(placedAgentReady([ready], "codex", "planner", { browserToolAvailable: false })).toBe(true);
     expect(placedAgentReady([ready], "codex", "generator", { browserToolAvailable: false })).toBe(true);
     expect(placedAgentReady([ready], "claude-code", "planner", { browserToolAvailable: false })).toBe(false);

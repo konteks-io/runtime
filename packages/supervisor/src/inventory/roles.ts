@@ -6,6 +6,12 @@ import type { ConnectedAgentView, RuntimeRole, RuntimeUtilization } from "@konte
  * its preference list is ready and capable of the work kind that role maps
  * to. Core strips anything it disagrees with; the supervisor never claims a
  * role it cannot serve.
+ *
+ * A binding with an empty preference is a role the person never narrowed, not
+ * a role with no candidates — enrollment writes exactly that, before the
+ * machine has said what it has. Reading it the other way is how a machine
+ * that had just reported a ready Claude Code refused its own workspace's
+ * first assignment, `role_not_advertised`, every five seconds.
  */
 export interface RoleBinding {
   role: RuntimeRole;
@@ -66,7 +72,8 @@ export function deriveAdvertisedRoles(bindings: readonly RoleBinding[], agents: 
   const byId = new Map(agents.map((agent) => [agent.agentId, agent]));
   const roles: RuntimeRole[] = [];
   for (const binding of bindings) {
-    const capable = binding.agentPreference.some((agentId) => {
+    const candidates = binding.agentPreference.length > 0 ? binding.agentPreference : agents.map((agent) => agent.agentId);
+    const capable = candidates.some((agentId) => {
       const agent = byId.get(agentId);
       return agent !== undefined && agentSatisfiesRole(agent, binding.role, inputs);
     });
