@@ -186,6 +186,9 @@ export async function runOnboard(context: OnboardContext, maxChained = 4): Promi
       if (notes.length === 0) return result;
       return { ...result, note: [...notes, result.note].filter(Boolean).join(" ") };
     }
+    // Keep only the newest note: successive steps restate progress on the
+    // same thing ("will join… is joining… is now…", pass 27).
+    notes.length = 0;
     if (result.note) notes.push(result.note);
     const { answer: _answered, ...next } = current;
     current = next;
@@ -649,6 +652,17 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       }
       const answer = context.answer.trim();
       if (isNo(answer)) {
+        // A first initiative needs a System. With none, asking what to build
+        // first only leads to "an initiative needs a System" (pass 27): close
+        // instead, and say how to come back to it.
+        if (!state.systemId) {
+          await save({ step: "done", closing: true });
+          return {
+            step: "system",
+            note: "Leaving the catalog as it is; nothing was registered or pushed. To make this folder a System later, run onboard here again. A first initiative needs a System, so that waits too.",
+            run: AGAIN,
+          };
+        }
         await save({ step: "first_task" });
         return { step: "system", note: "Leaving the catalog as it is.", run: AGAIN };
       }

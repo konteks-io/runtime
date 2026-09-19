@@ -189,7 +189,9 @@ describe("onboard", () => {
 
     const declined = await step(here, "no");
     expect(declined.note).toContain("Leaving the catalog");
-    expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
+    // No System, so no first initiative to ask about: this conversation closes (pass 27).
+    expect(declined.note).toContain("run onboard here again");
+    expect(await readOnboardState(root)).toMatchObject({ step: "done", closing: true });
   });
 
   it("registers the first System and moves to the push step for managed git", async () => {
