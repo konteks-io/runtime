@@ -34,9 +34,10 @@ export interface AuthorizedNativeOperation {
 const fenced = () => new RemoteInstanceError("execution_fenced", "Native execution authority is no longer current.");
 const unavailable = () => new RemoteInstanceError("execution_authority_unavailable", "Fresh execution authority is unavailable.");
 /** How long a running turn outlives its check lease while Core is only slow or
- * unreachable. A definitive refusal still stops it at once, and no new
- * operation is admitted without a fresh check. */
-export const NATIVE_CHECK_GRACE_MS = 90_000;
+ * unreachable. Long enough to ride out a Core restart (~2.5 min observed); a
+ * definitive refusal still stops it at once, and no new operation is admitted
+ * without a fresh check. */
+export const NATIVE_CHECK_GRACE_MS = 300_000;
 /** Only Core saying no, or the local claim no longer matching, ends a turn.
  * A late, failed or unreadable renewal is not evidence that authority moved. */
 const transientLoss = (error: unknown): boolean =>

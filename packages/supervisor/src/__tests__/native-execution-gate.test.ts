@@ -452,7 +452,7 @@ describe("independent native live execution gate", () => {
     const step = async (seconds: number) => {
       for (let second = 0; second < seconds; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
     };
-    await step(110);
+    await step(320); // 30s lease + most of the grace: a Core restart fits
     expect(f.onAuthorityLost).not.toHaveBeenCalled();
     await step(15);
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
