@@ -663,7 +663,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
 
     case "push": {
       const question = state.repositoryNeedsInit
-        ? `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch} with one empty first commit; no files are added or changed.`
+        ? `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it; none of your files are added or changed.`
         : `Push ${state.defaultBranch} to the Konteks repository now?`;
       if (context.answer === undefined) {
         return { step: "push", ask: { question, kind: "confirm" } };

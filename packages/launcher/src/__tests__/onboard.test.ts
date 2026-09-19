@@ -396,8 +396,9 @@ describe("onboard", () => {
     const initialize = vi.fn(async () => ({ ok: true, message: "konteks-onboard-app is now a git repository on main." }));
     const push = vi.fn(async () => ({ pushed: true, message: "Pushed main to Konteks managed git." }));
     const question = await step({ initialize, push: push as never });
-    expect(question.ask?.question).toContain("empty first commit");
-    expect(question.ask?.question).toContain("no files are added");
+    expect(question.ask?.question).toContain("joined to the repository Konteks made for it; none of your files are added or changed");
+    expect(question.ask?.question).not.toContain("empty first commit"); // WS1-031: the repository usually has its own
+    expect(question.ask?.question).toContain("none of your files are added");
     await step({ initialize, push: push as never }, "yes");
     expect(initialize).not.toHaveBeenCalled();
     const pushed = await step({ initialize, push: push as never });
