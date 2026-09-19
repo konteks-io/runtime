@@ -33,6 +33,15 @@ export interface AuthorizedNativeOperation {
 }
 const fenced = () => new RemoteInstanceError("execution_fenced", "Native execution authority is no longer current.");
 const unavailable = () => new RemoteInstanceError("execution_authority_unavailable", "Fresh execution authority is unavailable.");
+/** How long a running turn outlives its check lease while Core is only slow or
+ * unreachable. A definitive refusal still stops it at once, and no new
+ * operation is admitted without a fresh check. */
+export const NATIVE_CHECK_GRACE_MS = 90_000;
+/** Only Core saying no, or the local claim no longer matching, ends a turn.
+ * A late, failed or unreadable renewal is not evidence that authority moved. */
+const transientLoss = (error: unknown): boolean =>
+  error instanceof RemoteInstanceError &&
+  (error.code === "execution_authority_unavailable" || error.code === "temporarily_unavailable" || error.retryable);
 
 /** Native's independent admission boundary, required by native Assistant and delivery
  * sessions. Legacy appliance and planning-controller protocols remain separate. */
@@ -220,13 +229,27 @@ export class NativeExecutionGate {
   private async tick(): Promise<void> {
     if (this.stopped || !this.authority) return;
     try {
-      this.assertDispatchCurrent(this.authority);
-      if (this.monotonic() >= this.refreshAfter) await this.refresh();
-    } catch {
+      let current = true;
+      try { this.assertDispatchCurrent(this.authority); } catch (error) {
+        if (!this.withinGrace(error)) throw error;
+        current = false;
+      }
+      if (!current || this.monotonic() >= this.refreshAfter) await this.refresh();
+    } catch (error) {
       if (this.stopped) return;
+      // A renewal that is merely late (Core answered checks in ~16s under
+      // load, past a 30s lease renewed every 10s) used to kill a finished
+      // turn whose result was about to be reported. It keeps renewing through
+      // a bounded grace instead; begin() stays strict meanwhile, and a
+      // definitive refusal still stops the turn at once.
+      if (this.withinGrace(error)) return;
       this.stop();
       this.authorityStop = Promise.resolve().then(() => this.options.onAuthorityLost());
       await this.authorityStop.catch(() => undefined); // Retained for owner teardown.
     }
+  }
+
+  private withinGrace(error: unknown): boolean {
+    return transientLoss(error) && this.monotonic() < this.monotonicDeadline + NATIVE_CHECK_GRACE_MS;
   }
 }

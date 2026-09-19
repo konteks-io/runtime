@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.js";
 import { SupervisorJournal } from "../state/journal.js";
@@ -352,6 +352,8 @@ describe("native session dispatch uses genuine execution admission", () => {
     const f = await sessionFixture(); vi.useFakeTimers();
     await f.session.onToRuntime(f.envelope);
     f.runner.stopForRecovery.mockRejectedValueOnce(new Error("stop unproven"));
+    // A lapsed lease alone is renewed through the grace; Core refusing is what stops it.
+    f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("execution_fenced", "moved"));
     f.clock.advance(31_000); await vi.advanceTimersByTimeAsync(1000);
     await expect(f.session.waitForAuthorityStop()).rejects.toThrow("stop unproven");
     expect(f.runner.stopForRecovery).toHaveBeenCalledWith("acp");
@@ -419,7 +421,40 @@ describe("independent native live execution gate", () => {
   it("does not extend authority when wall-clock time moves backward", async () => {
     const f = await fixture(); vi.useFakeTimers();
     const operation = await f.gate.admit(f.envelope); await f.gate.begin(operation);
+    // The old lease is not trusted again: only a fresh Core check could
+    // extend it, and Core refuses this one.
+    f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("execution_fenced", "moved"));
     f.advance(31_000); f.clock.advance(-40_000); await vi.advanceTimersByTimeAsync(1000);
+    expect(f.client.checkExecution).toHaveBeenCalledTimes(2);
+    expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a running turn while a slow check is still on its way (WS2-047)", async () => {
+    const f = await fixture(); vi.useFakeTimers();
+    const operation = await f.gate.admit(f.envelope); await f.gate.begin(operation);
+    const answerNow = f.client.checkExecution.getMockImplementation()!;
+    let answer!: () => void;
+    f.client.checkExecution.mockImplementationOnce(() => new Promise((resolve) => { answer = () => resolve(answerNow()); }));
+    const step = async (seconds: number) => {
+      for (let second = 0; second < seconds; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
+    };
+    await step(40); // the renewal left at 10s; the 30s lease lapsed while it waited
+    expect(f.onAuthorityLost).not.toHaveBeenCalled();
+    answer(); await step(60);
+    expect(f.onAuthorityLost).not.toHaveBeenCalled();
+    expect(f.client.checkExecution.mock.calls.length).toBeGreaterThan(2);
+  });
+
+  it("stops a turn once Core has stayed unreachable past the grace", async () => {
+    const f = await fixture(); vi.useFakeTimers();
+    const operation = await f.gate.admit(f.envelope); await f.gate.begin(operation);
+    f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));
+    const step = async (seconds: number) => {
+      for (let second = 0; second < seconds; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
+    };
+    await step(110);
+    expect(f.onAuthorityLost).not.toHaveBeenCalled();
+    await step(15);
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
   });
 });
