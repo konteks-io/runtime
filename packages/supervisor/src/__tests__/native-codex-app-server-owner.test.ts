@@ -44,6 +44,21 @@ function fixture() {
 }
 
 describe("native shared Codex app-server owner", () => {
+  it("ends its app-server group if the process exits after a stop was asked for, and only then (WS1-042)", async () => {
+    const f = fixture();
+    await f.owner.start();
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    process.emit("exit", 0);
+    expect(kill).not.toHaveBeenCalled(); // a crash leaves it for the next start to adopt
+    f.owner.shutdownRequested();
+    process.emit("exit", 0);
+    expect(kill).toHaveBeenCalledWith(-42, "SIGKILL");
+    kill.mockClear();
+    await f.owner.stop();
+    process.emit("exit", 0);
+    expect(kill).not.toHaveBeenCalled(); // a finished stop removes the hook
+    kill.mockRestore();
+  });
   it("starts the signed installed Codex server before clients and stops it as one shared owner", async () => {
     const f = fixture();
     await f.owner.start();

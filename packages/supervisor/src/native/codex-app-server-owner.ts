@@ -54,13 +54,33 @@ export class NativeCodexAppServerOwner {
     }
   }
 
+  private exitReaper: (() => void) | null = null;
+
   start(): Promise<void> {
     if (this.stopping) return Promise.reject(unavailable("The shared Codex owner is stopping."));
     this.startPromise ??= this.spawnAndAwaitReady();
     return this.startPromise;
   }
 
+  /**
+   * A stop was asked for (WS1-042). The app-server runs in its own process
+   * group and listens on a socket, so it deliberately outlives a connector
+   * crash for the next start to adopt; but once the connector is being
+   * stopped, a shutdown that ends the process before reaching `stop()` — the
+   * daemon's exit watchdog — must not leave it running with nobody to own it.
+   */
+  shutdownRequested(): void {
+    if (this.exitReaper) return;
+    this.exitReaper = () => {
+      const pid = this.child?.pid;
+      if (!pid) return;
+      try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+    };
+    process.once("exit", this.exitReaper);
+  }
+
   async stop(): Promise<void> {
+    this.shutdownRequested();
     this.stopping = true;
     this.generation++;
     if (this.restartTimer) clearTimeout(this.restartTimer);
@@ -74,6 +94,8 @@ export class NativeCodexAppServerOwner {
     this.child = null;
     if (child) await (this.options.stop ?? stopProcessGroupLeaderFirst)({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
     await (this.options.cleanupSocket ?? cleanupCodexSocket)(this.options.config.RUNNER_NATIVE_CODEX_SOCKET!);
+    if (this.exitReaper) process.removeListener("exit", this.exitReaper);
+    this.exitReaper = null;
   }
 
   private async spawnAndAwaitReady(): Promise<void> {

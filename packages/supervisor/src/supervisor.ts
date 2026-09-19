@@ -1653,6 +1653,8 @@ export class Supervisor {
   stop(): Promise<void> {
     this.leaseAuthorityEpoch++;
     this.stopping = true;
+    // Before anything that can outlast the daemon's exit watchdog (WS1-042).
+    this.nativeCodexOwner?.shutdownRequested();
     this.draining = true;
     this.heartbeat?.stop();
     this.stopPendingHeartbeat();
