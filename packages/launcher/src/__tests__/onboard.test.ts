@@ -209,6 +209,30 @@ describe("onboard", () => {
     });
   });
 
+  it("waits while Konteks is still setting up managed git, instead of asking to retry (WS1-048)", async () => {
+    await writeOnboardState(root, {
+      step: "system", repositoryName: "solo", repositoryKind: "managed", repositoryPath: "/tmp/solo", defaultBranch: "trunk", instanceId: "instance-1",
+    } as never);
+    const settingUp = () => new Response(JSON.stringify({ error: "managed_git_setting_up", message: "Konteks is still setting up managed git for this workspace. It takes about a minute; nothing you answered was lost." }), { status: 503, headers: { "content-type": "application/json" } });
+    const registered = () => new Response(JSON.stringify({
+      systemId: "sys-1", systemEntityRef: "system:default/acme-solo", componentEntityRef: "component:default/acme-solo",
+      repository: { kind: "managed", remoteUrl: "https://git.konteks.test/acme/solo", defaultBranch: "trunk" },
+    }), { status: 201, headers: { "content-type": "application/json" } });
+    const fetchFn = vi.fn().mockResolvedValueOnce(settingUp()).mockResolvedValueOnce(settingUp()).mockResolvedValueOnce(registered());
+    const result = await step({ fetchFn: fetchFn as never, managedGitPollMs: 1 }, "yes");
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(result.note).toContain("is now a System");
+
+    // Past the wait it says what is happening, once, and offers to try again.
+    await writeOnboardState(root, {
+      step: "system", repositoryName: "solo", repositoryKind: "managed", repositoryPath: "/tmp/solo", defaultBranch: "trunk", instanceId: "instance-1",
+    } as never);
+    const always = vi.fn(async () => settingUp());
+    const error = await step({ fetchFn: always as never, managedGitPollMs: 1, managedGitWaitMs: 0 }, "yes").catch((e: unknown) => e);
+    const failed = await onboardFailureStep({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" }, error);
+    expect(failed.note).toBe("Konteks could not finish that step: Konteks is still setting up managed git for this workspace. It takes about a minute; nothing you answered was lost.");
+  });
+
   it("stops at the next step with why, once this machine's access was revoked in Settings (W1-X3)", async () => {
     await writeOnboardState(root, {
       step: "system",

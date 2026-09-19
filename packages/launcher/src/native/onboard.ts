@@ -61,6 +61,9 @@ export interface OnboardContext {
     registerGitKey?: (root: string) => Promise<{ identityFile?: string; user?: string }>;
     enrollment?: Pick<NativeEnrollment, "openIntent" | "sendChallenge" | "verifyCode" | "bind" | "refreshOwnerToken">;
     complete?: typeof completeNativeEnrollment;
+    /** How long the System step waits for managed git still being set up, and how often it asks (WS1-048). */
+    managedGitWaitMs?: number;
+    managedGitPollMs?: number;
     families?: () => Promise<string[]>;
     /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
     waitForReady?: (root: string) => Promise<{ administrativeStatus: string; roles: string[] } | null>;
@@ -617,7 +620,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         return { step: "system", note: "A yes or no is what this step needs.", ask: { question, kind: "confirm" } };
       }
       const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
-      const registered = await api.registerFirstSystem({
+      const register = () => api.registerFirstSystem({
         name: state.repositoryName!,
         hostLabel: hostLabel(),
         repository: {
@@ -626,6 +629,21 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           defaultBranch: state.defaultBranch!,
         },
       });
+      // A new workspace's managed git can still be on its way, and Konteks
+      // has just asked for it again (WS1-048). That is a wait, not a failure:
+      // wait here, briefly, rather than hand the person a "retry".
+      const settingUpUntil = Date.now() + (context.deps?.managedGitWaitMs ?? 90_000);
+      let registered: Awaited<ReturnType<typeof register>>;
+      for (;;) {
+        try {
+          registered = await register();
+          break;
+        } catch (error) {
+          const settingUp = error instanceof RemoteInstanceError && /still setting up managed git/i.test(error.message);
+          if (!settingUp || Date.now() >= settingUpUntil) throw error;
+          await new Promise(done => setTimeout(done, context.deps?.managedGitPollMs ?? 10_000));
+        }
+      }
       await save({
         step: state.repositoryKind === "managed" ? "push" : "first_task",
         systemId: registered.systemId,
@@ -942,7 +960,9 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
       run: AGAIN,
     };
   }
-  const note = `Konteks could not finish that step: ${said} Nothing you answered was lost.`;
+  const note = /nothing you answered was lost/i.test(said)
+    ? `Konteks could not finish that step: ${said}`
+    : `Konteks could not finish that step: ${said} Nothing you answered was lost.`;
   if (step === "email" || step === "code" || step === "workspace" || step === "first_task") {
     const { answer: _answer, ...unanswered } = context;
     const again = await runOnboardStep(unanswered).catch(() => null);
