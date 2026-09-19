@@ -94,7 +94,11 @@ import { evaluateHeartbeatLiveness } from "./heartbeat/liveness.js";
  * The composition root: wires state, transport, heartbeat, control, work,
  * sessions, preview, and the loopback control socket into one supervisor.
  */
-const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "preview", "qa", "assistant_execution", "search_generation"];
+// The onboard lane (evidence collector and relocation worker) is always
+// composed below, so its two kinds are accepted too. Leaving them out meant
+// Core never offered a discovery run's evidence work, and grouping evidence
+// was never read.
+const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "preview", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation"];
 
 /** bb releases sessions idle for 30 minutes, checked every 5 minutes. */
 const IDLE_SESSION_RELEASE_MS = 30 * 60_000;
