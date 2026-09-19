@@ -27,9 +27,12 @@ first System (on Konteks managed git if it has no remote yet), and turns what
 you want to build first into your first initiative.
 
 ```sh
-curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --user --enroll
+curl -fsSL -o "${TMPDIR:-/tmp}/konteks-install.sh" https://github.com/konteks-io/runtime/releases/latest/download/install.sh && sh "${TMPDIR:-/tmp}/konteks-install.sh" --user --enroll
 konteks-remote onboard --json
 ```
+
+The installer is downloaded to a file your agent can read before it runs,
+rather than piped into `sh`.
 
 macOS and Linux. The connector executable is verified against the same signed
 checksum manifest the packages are, so this path is verified differently from
@@ -66,7 +69,15 @@ konteks-remote doctor
 konteks-remote update --check  # what the stable channel offers
 konteks-remote update          # stage, drain, swap, verify; rolls back on failure
 konteks-remote stop | start
+konteks-remote uninstall       # finish running work, remove this runtime from its workspace, delete the connector
 ```
+
+`uninstall` lets running work finish (up to 15 minutes), has Konteks drain,
+revoke and tombstone this runtime, stops and unregisters the service and
+deletes the connector's folder. Your repositories and your coding agents'
+logins are not touched. A machine that lost its key stops and says so;
+running `konteks-remote onboard` again connects it as a runtime that replaces
+its old one.
 
 The connector runs as a user service (launchd, user systemd, or Task
 Scheduler). It checks the stable channel on its own and applies updates
