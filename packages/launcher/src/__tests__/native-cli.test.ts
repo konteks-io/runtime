@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { createNativeProgram } from "../native/cli.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createNativeProgram, installedReleaseVersion } from "../native/cli.js";
 
 function fixture() {
   const actions = { install: vi.fn(async () => {}), addAgent: vi.fn(async () => {}), serve: vi.fn(async () => {}), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), update: vi.fn(async () => {}), uninstall: vi.fn(async () => {}), control: vi.fn(async () => {}) };
@@ -41,6 +44,16 @@ describe("native customer entry point", () => {
     const { program, actions } = fixture();
     await program.parseAsync(["auth", "login", "codex", "--organization"], { from: "user" });
     expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.login", agent: "codex", organization: true }));
+  });
+  it("reports the installed release as its version, so it matches status after an update (W1-L4)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-version-"));
+    try {
+      expect(installedReleaseVersion(root)).toBeNull();
+      await writeFile(join(root, "native-runtime.json"), JSON.stringify({ releaseId: "release-next", bundleVersion: "0.5.1" }));
+      expect(installedReleaseVersion(root)).toBe("0.5.1");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
   it("exposes update as a native transaction with check-only and unattended forms", async () => {
     const { program, actions } = fixture();

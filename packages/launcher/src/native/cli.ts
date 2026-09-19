@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { nativePaths, nativePlatform } from "./service.js";
 import { createOutput, type Output } from "../output.js";
@@ -19,9 +21,18 @@ export interface NativeCliActions {
 /** One customer architecture. No appliance, provider-key or cloud-agent fallback switch. */
 export function createNativeProgram(actions: NativeCliActions): Command {
   const program = new Command("konteks-remote").description("Konteks native agent connector")
-    .version(process.env.KONTEKS_LAUNCHER_VERSION ?? "0.1.0")
     .option("--root <path>", "private user-scoped installation root")
-    .option("--json", "machine-readable output", false);
+    .option("--json", "machine-readable output", false)
+    .option("-V, --version", "print the release installed on this machine");
+  // The release this machine runs, not the launcher package: after an update
+  // the person checks this number, and it must match `status` and the site.
+  program.on("option:version", () => {
+    const argv = process.argv;
+    const at = argv.indexOf("--root");
+    const root = at >= 0 && argv[at + 1] ? argv[at + 1]! : nativePaths({ os: nativePlatform().os }).root;
+    process.stdout.write(`${installedReleaseVersion(root) ?? process.env.KONTEKS_LAUNCHER_VERSION ?? "0.1.0"}\n`);
+    process.exit(0);
+  });
   const context = (): NativeCommandContext => {
     const options = program.opts<{ root?: string; json: boolean }>();
     return { root: options.root ?? nativePaths({ os: nativePlatform().os }).root, output: createOutput({ json: options.json }) };
@@ -90,4 +101,14 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   // Update/rollback must acquire the native lifecycle transaction; the old
   // appliance implementations are deliberately not registered here.
   return program;
+}
+
+/** The bundle version of the release this root's runtime record points at, if one is installed. */
+export function installedReleaseVersion(root: string): string | null {
+  try {
+    const record = JSON.parse(readFileSync(join(root, "native-runtime.json"), "utf8")) as { bundleVersion?: unknown };
+    return typeof record.bundleVersion === "string" && record.bundleVersion ? record.bundleVersion : null;
+  } catch {
+    return null;
+  }
 }

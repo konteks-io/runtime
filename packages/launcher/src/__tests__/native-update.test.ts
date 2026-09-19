@@ -158,6 +158,23 @@ describe("native update transaction", () => {
     expect(h.calls.filter(call => call === "status").length).toBeGreaterThanOrEqual(2);
     expect(h.calls.indexOf("commit")).toBeGreaterThan(h.calls.indexOf("stop"));
   });
+  it("tells the person once what a long stop is doing, then only every ten seconds, instead of a line per poll", async () => {
+    const h = harness({ previous });
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    // The old process lingers for 25 polls (one second each on the harness clock).
+    let lingering = 0;
+    const execute = h.deps.execute;
+    h.deps.execute = async command => { if (command.command === "stop") { lingering = 25; return execute(command); } if (command.command === "status" && lingering > 0) { lingering -= 1; return 0; } return execute(command); };
+    h.deps.healthDeadlineMs = 180_000;
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).resolves.toMatchObject({ state: "updated" });
+    const stopping = lines.filter(line => /stopping the connector/i.test(line));
+    expect(stopping[0]).toMatch(/^Stopping the connector: .*usually takes under a minute/);
+    // The harness clock moves a second per reading (two per poll): about 50 s, so one line then one per ten seconds, not 25.
+    expect(stopping.length).toBeLessThanOrEqual(6);
+    expect(stopping.slice(1).every(line => /still stopping the connector \(\d+ s so far\)/.test(line))).toBe(true);
+    expect(lines).toContain("Starting 1.1.0 and checking it is healthy before keeping it (up to 3 min)…");
+  });
   it("lets a connectivity doctor failure settle within the deadline instead of rolling back", async () => {
     const h = harness({ previous, gate: "new_failure" });
     // The successor's relay check fails on the first two doctor reads, then passes.

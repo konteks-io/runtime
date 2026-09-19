@@ -115,6 +115,7 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     }
     successor = await commitOnceReleased(input, staged.releaseId, deps);
     if (wasRunning) {
+      input.output.line(`Starting ${successor.bundleVersion} and checking it is healthy before keeping it (up to ${spoken(deps.healthDeadlineMs ?? 180_000)})…`);
       await deps.start(input);
       await healthGate(input, deps.control(input.root, successor), successor, failingBefore, deps);
     }
@@ -146,11 +147,32 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
 
 async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
   const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+  const progress = progressLines(input, deps, "Stopping the connector: it closes its agent sessions and relay first, which usually takes under a minute…", "still stopping the connector");
   while (await deps.execute(definition.status) === 0) {
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
-    input.output.line("waiting for the running connector to exit…");
+    progress();
     await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
   }
+}
+
+function spoken(ms: number): string {
+  return ms >= 120_000 ? `${Math.round(ms / 60_000)} min` : `${Math.round(ms / 1_000)} s`;
+}
+
+/**
+ * A wait the person watches: say once what is happening and roughly how long
+ * it takes, then only every ten seconds how long it has been, so a normal wait
+ * never reads as a loop.
+ */
+function progressLines(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, first: string, again: string): () => void {
+  const started = deps.now();
+  let said = -1;
+  return () => {
+    const tens = Math.floor((deps.now() - started) / 10_000);
+    if (tens === said) return;
+    input.output.line(said < 0 ? first : `${again} (${tens * 10} s so far)…`);
+    said = tens;
+  };
 }
 
 /** The previous process releases the runtime directory only at the very end of its shutdown. */
@@ -162,13 +184,14 @@ function restoreOnceReleased(input: NativeUpdateInput, expectedReleaseId: string
 }
 async function onceReleased<T>(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, operation: () => Promise<T>): Promise<T> {
   const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+  const progress = progressLines(input, deps, "Waiting for the stopped connector to let go of its files…", "still waiting for the stopped connector to let go of its files");
   for (;;) {
     try {
       return await operation();
     } catch (error) {
       const owned = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message);
       if (!owned || deps.now() >= deadline) throw error;
-      input.output.line("waiting for the previous connector to release the runtime directory…");
+      progress();
       await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
     }
   }
