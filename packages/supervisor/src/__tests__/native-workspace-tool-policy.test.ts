@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
-import { blockedCommandPattern, createWorkspaceToolPolicy, isWithinWorkspace } from "../session/workspace-tool-policy.js";
+import { DEFAULT_BASH_BLOCKLIST, blockedCommandPattern, createWorkspaceToolPolicy, isWithinWorkspace } from "../session/workspace-tool-policy.js";
 
 const options = [
   { optionId: "allow", name: "Allow", kind: "allow_once" },
@@ -48,3 +48,16 @@ describe("native workspace tool policy", () => {
     expect(isWithinWorkspace("src/new-file.ts", root)).toBe(true);
   });
 });
+
+describe("the connector's command blocklist", () => {
+  it("lets ordinary output discards and project paths through, and still blocks the real thing", () => {
+    expect(blockedCommandPattern("ls context 2>/dev/null", DEFAULT_BASH_BLOCKLIST)).toBeNull();
+    expect(blockedCommandPattern("npm test > /dev/null 2>&1 &", DEFAULT_BASH_BLOCKLIST)).toBeNull();
+    expect(blockedCommandPattern("rm -rf /tmp/work/node_modules", DEFAULT_BASH_BLOCKLIST)).toBeNull();
+
+    expect(blockedCommandPattern("echo x > /dev/sda", DEFAULT_BASH_BLOCKLIST)).toBe("/dev/");
+    expect(blockedCommandPattern("rm -rf /", DEFAULT_BASH_BLOCKLIST)).toBe("rm -rf /");
+    expect(blockedCommandPattern("cd x && rm -rf /*", DEFAULT_BASH_BLOCKLIST)).toBe("rm -rf /");
+  });
+});
+

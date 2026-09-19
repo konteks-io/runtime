@@ -25,15 +25,27 @@ export const DEFAULT_BASH_BLOCKLIST: readonly string[] = [
 const FILE_CHANGE_KINDS = new Set(["edit", "delete", "move"]);
 const PATH_KEYS = ["file_path", "filePath", "path", "notebook_path", "target_file", "destination"] as const;
 
+/** Device paths an ordinary command writes to (`2>/dev/null`) — never a device write. */
+const HARMLESS_DEVICES = /\/dev\/(null|stdout|stderr|stdin|tty|fd\/\d+)(?![a-z0-9_/-])/g;
+
 /** Same token/substring rule as the adapters' `isBashCommandBlocked`. */
 export function blockedCommandPattern(command: string, blocklist: readonly string[]): string | null {
-  const lower = command.toLowerCase();
+  // `2>/dev/null` and friends are how commands discard output; only a real
+  // device path should still meet the `/dev/` entry.
+  const lower = command.toLowerCase().replace(HARMLESS_DEVICES, "<device>");
   for (const blocked of blocklist) {
     const normalized = blocked.trim().toLowerCase();
     if (!normalized) continue;
     if (/^[a-z0-9_.-]+$/i.test(normalized)) {
       const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       if (new RegExp(`(^|[\\s;&|()])${escaped}(?=$|[\\s;&|()])`, "i").test(lower)) return blocked;
+      continue;
+    }
+    // "rm -rf /" must not refuse `rm -rf /abs/project/node_modules`: an entry
+    // aimed at the filesystem root matches only when its target IS the root.
+    if (normalized.endsWith(" /")) {
+      const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`(^|[\\s;&|()])${escaped}\\*?(?=$|[\\s;&|()])`, "i").test(lower)) return blocked;
       continue;
     }
     if (lower.includes(normalized)) return blocked;
