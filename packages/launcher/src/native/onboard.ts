@@ -467,6 +467,31 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       }
       const notReady = ready.administrativeStatus !== "active" ? "The runtime service is still coming up; it will finish in the background. " : "";
       const facts = await (context.deps?.inspect ?? inspectRepository)(context.cwd ?? process.cwd());
+      // A new conversation in the folder that is already this machine's
+      // System: there is nothing to register again. Say so, and where the
+      // work is, instead of offering to make it a System a second time.
+      if (
+        state.revisit &&
+        state.systemEntityRef &&
+        state.repositoryPath &&
+        resolve(facts.path ?? context.cwd ?? process.cwd()) === resolve(state.repositoryPath)
+      ) {
+        await save({ step: "done", revisit: false });
+        return {
+          step: "inspect",
+          done: {
+            summary: [
+              `This machine is connected to ${state.tenantId ?? "your workspace"}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}.`,
+              `${state.repositoryName ?? "This folder"} is already your System${state.repositoryKind === "managed" ? " on Konteks managed git" : ""}; nothing here needs setting up again.`,
+              state.initiativeId ? `Your first initiative "${state.initiativeTitle}" and its planning session are on the site.` : null,
+              "Run onboard from another project folder to add it as a System.",
+            ]
+              .filter(Boolean)
+              .join(" "),
+            links: links(),
+          },
+        };
+      }
       if (!facts.path) {
         const directory = resolve(context.cwd ?? process.cwd());
         if (directory === resolve(homedir()) || directory === resolve("/")) {
@@ -772,6 +797,24 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
 
     case "done":
     default: {
+      // W1-A8: the person pasted the block into a new conversation on a
+      // machine that already finished onboarding. Replaying the old closing
+      // summary made the new agent suspicious ("it was already set up before I
+      // asked a single question — if you didn't choose those, check them") and
+      // said a planning session "is working on it here" hours later. Say who
+      // and where this machine is connected, then look at the folder it is in.
+      if (state.step === "done" && context.answer === undefined) {
+        const identity = await new SupervisorStore(supervisorData).identity().catch(() => null);
+        if (identity?.instanceId && identity.instanceId !== "pending") {
+          await save({ step: "inspect", revisit: true });
+          const where = state.tenantId ?? identity.workspaceId ?? "your workspace";
+          return {
+            step: "identity",
+            note: `This machine is already connected to ${where}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}; no sign-in is needed. Looking at this folder next.`,
+            run: AGAIN,
+          };
+        }
+      }
       const present = await families();
       const remedies: string[] = [];
       for (const family of ["claude-code", "codex"]) {

@@ -95,6 +95,42 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ repositoryKind: "managed" });
   });
 
+  it("greets a new conversation on a finished machine instead of replaying the old summary", async () => {
+    // W1-A8: the person pastes the block into a new agent in the same folder.
+    // The old closing summary came back as if setup had just happened, and the
+    // new agent told the person to check what "they" had chosen.
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "konteks-2" } as never);
+    await writeOnboardState(root, {
+      step: "done",
+      tenantId: "konteks-2",
+      ownerEmail: "hello@konteks.io",
+      repositoryName: "konteks-onboard-app",
+      repositoryPath: "/tmp/projects/konteks-onboard-app",
+      repositoryKind: "managed",
+      systemEntityRef: "system:default/konteks-2-onboard-app",
+      initiativeId: "init-1",
+      initiativeTitle: "A simple site where people can book a table at my restaurant",
+    } as never);
+    const greeting = await step({});
+    expect(greeting.ask).toBeUndefined();
+    expect(greeting.note).toContain("already connected to konteks-2 as hello@konteks.io");
+    expect(greeting.run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
+
+    const here = {
+      inspect: async () => ({ path: "/tmp/projects/konteks-onboard-app", name: "konteks-onboard-app", remoteUrl: "ssh://git@git.test/konteks-2/konteks-onboard-app.git", remoteReachable: true, currentBranch: "main", defaultBranch: "main" }),
+    };
+    const settled = await step(here);
+    expect(settled.done?.summary).toContain("already your System");
+    expect(settled.done?.summary).not.toContain("is working on it here");
+    expect(await readOnboardState(root)).toMatchObject({ step: "done" });
+
+    // And the next new conversation is greeted the same way.
+    const again = await step({});
+    expect(again.note).toContain("already connected");
+    vi.restoreAllMocks();
+  });
+
   it("takes a yes or a no the way people actually write them", () => {
     // Passes 20 and 21 refused "Yes.", "Yes, please." and "Yes, try it
     // again." — the agent had to rewrite the person's answer to get through.

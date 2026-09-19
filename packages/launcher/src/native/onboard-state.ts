@@ -68,6 +68,8 @@ export const OnboardStateSchema = z
     repositoryNeedsInit: z.boolean().optional(),
     /** Who authors the first commit of a folder the push turns into a repository. */
     ownerEmail: z.string().min(1).optional(),
+    /** A new conversation on a machine that finished onboarding (W1-A8). */
+    revisit: z.boolean().optional(),
     systemId: z.string().optional(),
     systemEntityRef: z.string().optional(),
     managedRemoteUrl: z.string().optional(),
