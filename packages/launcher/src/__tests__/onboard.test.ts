@@ -815,17 +815,22 @@ describe("onboard", () => {
     expect((await readOnboardState(root))?.resendTo).toBeUndefined();
   });
 
-  it("stops with the plan-limit remedy instead of retrying the bind on every run", async () => {
+  it("stops with the plan-limit remedy, naming the machine that holds it, and can try again later", async () => {
     await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "join" } as never);
     const { writeSecretFile, CoreResponseError } = await import("@konteks/remote-common");
     await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
       schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: [], releaseId: "release-1", bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
     }));
-    const bind = vi.fn(async () => { throw new CoreResponseError({ status: 402, code: "limit_exceeded", message: "The plan limit on connected runtimes is reached" }); });
+    const bind = vi.fn(async () => {
+      throw new CoreResponseError({ status: 402, code: "limit_exceeded", message: "This workspace's plan allows one connected runtime, and \"ada's Mac\" already holds it" });
+    });
     const result = await step({ enrollment: { bind } as never });
-    expect(result.done?.summary).toContain("Revoke the existing runtime in Settings");
+    // W1-A10: the refusal names the machine to revoke, and says how to move.
+    expect(result.done?.summary).toContain("\"ada's Mac\" already holds it.");
+    expect(result.done?.summary).toContain("revoke that runtime in Settings → Connected runtimes, then run onboard again here");
     expect(result.done?.links.site).toContain("/settings/runtimes");
-    expect(await readOnboardState(root)).toMatchObject({ step: "done" });
+    // "Run onboard again" must actually try again: a fresh code, not a replayed summary.
+    expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
   });
 
   it("re-asks for the code with the attempts left, and starts over once the code can no longer be used", async () => {

@@ -355,17 +355,30 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               run: AGAIN,
             };
           }
-          if (["limit_exceeded", "limit_reached"].includes(wireCode(error))) {
-            // R18: the plan allows one connected runtime. Say so, say how to
-            // move it, and stop here rather than retrying on every run.
+          if (wireCode(error) === "limit_exceeded") {
+            // R18 / W1-A10: the plan allows one connected runtime. Konteks
+            // names the machine that holds it, so the person knows which one
+            // to revoke. Stop here, but leave onboarding ready to try again:
+            // "run onboard again" used to find a finished machine and replay
+            // a summary instead of connecting. The next run sends a new code.
+            await save({ step: "email", intentRef: undefined, emailMasked: undefined, decision: undefined, attemptsRemaining: undefined, resendTo: state.email } as never);
+            const said = error instanceof Error && /plan allows/i.test(error.message)
+              ? error.message.trim().replace(/([^.!?])$/, "$1.")
+              : "This workspace's plan allows one connected runtime, and it is in use.";
+            return {
+              step: "start",
+              done: {
+                summary: `${said} To move Konteks to this laptop, revoke that runtime in Settings → Connected runtimes, then run onboard again here; a new code will be sent to ${state.emailMasked ?? "your address"}.`,
+                links: { site: `${siteUrl}/settings/runtimes` },
+              },
+            };
+          }
+          if (wireCode(error) === "limit_reached") {
             await save({ step: "done" });
             return {
               step: "start",
               done: {
-                summary:
-                  wireCode(error) === "limit_exceeded"
-                    ? "This workspace's plan allows one connected runtime, and it already has one. Revoke the existing runtime in Settings → Connected runtimes, then run onboard again on this machine."
-                    : "No new workspace can be created right now. Sign in on the site or try again later.",
+                summary: "No new workspace can be created right now. Sign in on the site or try again later.",
                 links: { site: `${siteUrl}/settings/runtimes` },
               },
             };
