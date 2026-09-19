@@ -102,6 +102,22 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ repositoryKind: "managed" });
   });
 
+  it("closes the conversation that just finished with its summary, not a revisit (pass 25)", async () => {
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "konteks-2" } as never);
+    await writeOnboardState(root, {
+      step: "done", closing: true, tenantId: "konteks-2", ownerEmail: "hello@konteks.io",
+      systemEntityRef: "system:default/konteks-2-onboard-app", systemId: "sys-1",
+    } as never);
+    const closing = await step({ families: async () => ["claude-code", "codex"] });
+    expect(closing.done?.summary).toContain("connected to your workspace konteks-2");
+    expect(closing.note ?? "").not.toContain("already connected");
+    // A later conversation is a revisit again.
+    expect(await readOnboardState(root)).toMatchObject({ step: "done", closing: false });
+    const later = await step({});
+    expect(later.note).toContain("already connected to konteks-2");
+  });
+
   it("greets a new conversation on a finished machine instead of replaying the old summary", async () => {
     // W1-A8: the person pastes the block into a new agent in the same folder.
     // The old closing summary came back as if setup had just happened, and the

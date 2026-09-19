@@ -754,11 +754,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       }
       const wanted = context.answer.trim();
       if (!wanted) {
-        await save({ step: "done" });
+        await save({ step: "done", closing: true });
         return { step: "first_task", note: "Ending here.", run: AGAIN };
       }
       if (!state.systemId) {
-        await save({ step: "done" });
+        await save({ step: "done", closing: true });
         return {
           step: "first_task",
           note: "An initiative needs a System, and none was made here. Start it from the site with New initiative once you have a System.",
@@ -837,7 +837,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         await api.postFirstTurn(pmSessionId, wanted);
         await save({ firstTurnSent: true });
       }
-      await save({ step: "done", initiativeUrl: url, firstTask: undefined } as never);
+      await save({ step: "done", closing: true, initiativeUrl: url, firstTask: undefined } as never);
       if (!pmSessionId) {
         return {
           step: "initiative",
@@ -860,7 +860,10 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       // asked a single question — if you didn't choose those, check them") and
       // said a planning session "is working on it here" hours later. Say who
       // and where this machine is connected, then look at the folder it is in.
-      if (state.step === "done" && context.answer === undefined) {
+      // The run right after the last step is this conversation closing, not
+      // a new one; only a later run is a revisit.
+      if (state.closing) await save({ closing: false });
+      if (state.step === "done" && context.answer === undefined && !state.closing) {
         const identity = await new SupervisorStore(supervisorData).identity().catch(() => null);
         if (identity?.instanceId && identity.instanceId !== "pending") {
           await save({ step: "inspect", revisit: true });
