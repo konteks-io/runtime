@@ -118,6 +118,9 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
       // container default `/data/git-keys`, which a laptop does not have: key
       // registration failed there and onboarding could never push (WS1-024).
       SUPERVISOR_ONBOARD_GIT_KEY_DIR: join(dataDir, "git-keys"),
+      // Same for the evidence collector's scratch: `/data/onboard` does not
+      // exist on a laptop, so every grouping read failed with ENOENT.
+      SUPERVISOR_ONBOARD_SCRATCH_ROOT: join(dataDir, "onboard"),
     });
     return { record, config, runners, roots, release };
   } catch (error) {

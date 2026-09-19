@@ -130,7 +130,7 @@ describe("closed native runtime installation", () => {
     vi.stubEnv("SUPERVISOR_CORE_URL", "https://wrong.example");
     const loaded = await loadNativeInstallation(root, f.options);
     expect(loaded.runners[0]?.RUNNER_NATIVE_CODEX_HOME).toBe(join(root, "operator-codex"));
-    expect(loaded.config).toMatchObject({ SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: join(root, "supervisor"), SUPERVISOR_ONBOARD_GIT_KEY_DIR: join(root, "supervisor", "git-keys"), SUPERVISOR_CORE_URL: "https://core.example", SUPERVISOR_BUNDLE_VERSION: "1.0.0", SUPERVISOR_RUNNER_URLS: "" });
+    expect(loaded.config).toMatchObject({ SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: join(root, "supervisor"), SUPERVISOR_ONBOARD_GIT_KEY_DIR: join(root, "supervisor", "git-keys"), SUPERVISOR_ONBOARD_SCRATCH_ROOT: join(root, "supervisor", "onboard"), SUPERVISOR_CORE_URL: "https://core.example", SUPERVISOR_BUNDLE_VERSION: "1.0.0", SUPERVISOR_RUNNER_URLS: "" });
     expect(loaded.runners).toHaveLength(1);
     expect(loaded.runners[0]).toMatchObject({ RUNNER_AGENT_ID: "codex", RUNNER_AUTH_MODE: "agent_local_subscription", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "codex"), RUNNER_WORKSPACE_DIR: join(root, "workspaces", "codex"), RUNNER_BRIDGE_PREFIX: join(f.releaseDir, "agents", "codex") });
     expect(loaded.runners[0]).not.toHaveProperty("RUNNER_GATEWAY_BASE_URL");
