@@ -5,8 +5,11 @@ about. Your agent will run two commands and then relay a few short questions.
 
 ```
 Run these two commands and then follow the JSON the second one prints.
+The first downloads the installer to a file you can read, then runs it: it
+checks the connector against the release's published checksums and installs
+into your user directory only, with no sudo.
 
-  curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --user --enroll
+  curl -fsSL -o "${TMPDIR:-/tmp}/konteks-install.sh" https://github.com/konteks-io/runtime/releases/latest/download/install.sh && sh "${TMPDIR:-/tmp}/konteks-install.sh" --user --enroll
   konteks-remote onboard --json
 
 Each response has one of three shapes:
@@ -31,7 +34,8 @@ Konteks yourself. Everything you need is in the next step.
    first System. A repository with no remote this machine can push to, or a
    folder that is not a git repository yet, is offered a Konteks managed one
    instead. Nothing is pushed until you say yes; a plain folder becomes a git
-   repository with one empty first commit, and no file is added or changed.
+   repository joined to the one Konteks made for it, and none of your files is
+   added or changed.
 5. You are asked what you want to build first. Your answer becomes your first
    initiative on that System, and its planning session starts on this machine
    with your sentence as its first message. Your agent gives you the

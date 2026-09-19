@@ -5,7 +5,7 @@
 #   curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --activation-id <id>
 #
 # Agent-first onboarding (onboarding-simplified OS3, R10) instead:
-#   curl -fsSL .../install.sh | sh -s -- --user --enroll
+#   curl -fsSL -o "${TMPDIR:-/tmp}/konteks-install.sh" .../install.sh && sh "${TMPDIR:-/tmp}/konteks-install.sh" --user --enroll
 #
 # `--user` installs the verified connector executable into the private user
 # root with no `sudo` and no package, because the person's coding agent has
