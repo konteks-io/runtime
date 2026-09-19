@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initiativeTitle, isNo, isYes, onboardFailureStep, runOnboardStep } from "../native/onboard.js";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { readOnboardState, writeOnboardState } from "../native/onboard-state.js";
-import { writeOwnerToken } from "../native/owner-api.js";
+import { OWNER_ACCESS_REVOKED, writeOwnerToken } from "../native/owner-api.js";
 import { createOutput } from "../output.js";
 
 /**
@@ -200,6 +200,28 @@ describe("onboard", () => {
       systemId: "sys-1",
       managedRemoteUrl: "https://git.konteks.test/acme/solo",
     });
+  });
+
+  it("stops at the next step with why, once this machine's access was revoked in Settings (W1-X3)", async () => {
+    await writeOnboardState(root, {
+      step: "system",
+      repositoryName: "solo",
+      repositoryKind: "managed",
+      repositoryPath: "/tmp/solo",
+      defaultBranch: "trunk",
+      instanceId: "instance-1",
+    } as never);
+    const refusal = (body: object) =>
+      vi.fn(async () => new Response(JSON.stringify(body), { status: 401, headers: { "content-type": "application/json" } }));
+    const error = await step({ fetchFn: refusal({ code: "enrollment_invalid", message: "revoked" }) as never }, "yes").catch((e: unknown) => e);
+    expect((error as Error).message).toBe(OWNER_ACCESS_REVOKED);
+    const stopped = await onboardFailureStep({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" }, error);
+    expect(stopped.done?.summary).toContain("revoked in Settings");
+    expect(stopped.ask).toBeUndefined();
+    expect(await readOnboardState(root)).toMatchObject({ step: "system" });
+
+    const other = await step({ fetchFn: refusal({ error: { name: "AuthenticationError" } }) as never }, "yes").catch((e: unknown) => e);
+    expect((other as Error).message).toBe("This machine's Konteks access was refused.");
   });
 
   it("pushes only the branch the person is on, and only after a yes", async () => {
@@ -620,7 +642,7 @@ describe("onboard", () => {
     const context = { root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" };
     const retry = await onboardFailureStep(context, new RemoteInstanceError("temporarily_unavailable", "Konteks could not be reached."));
     expect(retry.ask).toMatchObject({ kind: "confirm" });
-    const revoked = await onboardFailureStep(context, new RemoteInstanceError("permission_denied", "This machine's Konteks access for you was revoked; sign in on the site or enroll again."));
+    const revoked = await onboardFailureStep(context, new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED));
     expect(revoked.done?.summary).toContain("revoked");
     expect(revoked.done?.links.site).toBe("https://app.test");
   });

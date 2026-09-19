@@ -12,7 +12,7 @@ import { nativePlatform } from "./service.js";
 import { initializeRepository, inspectRepository, pushToManagedRemote } from "./repository-inspect.js";
 import { enrollmentStagingStatus, releaseStaged, spawnEnrollmentStaging, type StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
-import { deleteOwnerToken, OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
+import { deleteOwnerToken, OWNER_ACCESS_REVOKED, OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
 
 /**
  * The conversation the person's own coding agent relays
@@ -967,7 +967,7 @@ async function ownerApi(
       if (wireCode(error) === "enrollment_invalid") {
         // Revoked in Settings, or the lease lapsed: the token is gone for good.
         await deleteOwnerToken(supervisorData);
-        throw new RemoteInstanceError("permission_denied", "This machine's Konteks access for you was revoked; sign in on the site or enroll again.");
+        throw new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED);
       }
       throw error;
     }
