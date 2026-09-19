@@ -70,6 +70,8 @@ export const OnboardStateSchema = z
     ownerEmail: z.string().min(1).optional(),
     /** A new conversation on a machine that finished onboarding (W1-A8). */
     revisit: z.boolean().optional(),
+    /** The runtime this machine was before it lost its key; the next bind replaces it (W1-L1). */
+    replaces: z.string().min(1).optional(),
     systemId: z.string().optional(),
     systemEntityRef: z.string().optional(),
     managedRemoteUrl: z.string().optional(),

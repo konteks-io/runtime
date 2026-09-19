@@ -20,6 +20,10 @@ const output = () => createOutput({ json: true, stdout: { write: () => true } as
 describe("onboard", () => {
   let root: string;
   beforeEach(async () => {
+    // Every machine these tests describe can still prove itself; the lost-key
+    // test (W1-L1) says otherwise for itself.
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "loadInstanceKey").mockResolvedValue({} as never);
     root = await mkdtemp(join(tmpdir(), "konteks-onboard-"));
     await writeOwnerToken(join(root, "supervisor"), {
       token: "owner-token",
@@ -29,7 +33,10 @@ describe("onboard", () => {
       instanceId: "instance-1",
     }).catch(() => undefined);
   });
-  afterEach(() => rm(root, { recursive: true, force: true }));
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(root, { recursive: true, force: true });
+  });
 
   // A connected machine's service answers; the tests that care about it say so
   // themselves, and the rest should not have to stand up a supervisor.
@@ -744,6 +751,38 @@ describe("onboard", () => {
     expect(result.note).toContain("up to a minute");
     expect(result.note).not.toContain("konteks");
     expect(result.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+  });
+
+  it("connects a machine that lost its key again, as a replacement for the runtime it was (W1-L1)", async () => {
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    await new SupervisorStore(join(root, "supervisor")).saveIdentity({
+      instanceId: "instance-old", workspaceId: "acme", activationId: "act-1", activatedAt: new Date().toISOString(), administrativeStatus: "active", exchangeNonce: "n-1",
+    });
+    vi.spyOn(SupervisorStore.prototype, "loadInstanceKey").mockResolvedValue(null);
+    await writeOnboardState(root, { step: "done", email: "ada@acme.test", tenantId: "acme", instanceId: "instance-old" } as never);
+
+    const result = await step({});
+    expect(result.note).toContain("lost its Konteks key");
+    expect(result.note).toContain("takes the old one's place");
+    expect(result.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+    expect(await readOnboardState(root)).toMatchObject({ step: "email", replaces: "instance-old", resendTo: "ada@acme.test" });
+    // The old identity is set aside, not deleted, and the machine starts empty.
+    const { readdir } = await import("node:fs/promises");
+    const [aside] = await readdir(join(root, "retired"));
+    expect(aside).toMatch(/^instance-old-/);
+    expect(await readdir(join(root, "retired", aside!, "supervisor"))).toContain("identity.json");
+    expect(await new SupervisorStore(join(root, "supervisor")).identity()).toBeNull();
+  });
+
+  it("names the runtime a bind replaces", async () => {
+    await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "join", tenantId: "acme", replaces: "instance-old" } as never);
+    const { writeSecretFile } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: ["claude-code"], releaseId: "release-1", bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const bind = vi.fn(async () => { throw new Error("stop here"); });
+    await step({ enrollment: { bind } as never, staging: { status: async () => ({ state: "done" }), spawn: vi.fn() } }).catch(() => undefined);
+    expect(bind).toHaveBeenCalledWith("intent-1", { email: "ada@acme.test", tenantId: "acme", replacesInstanceId: "instance-old", expectedManifestDigest: "digest-1" });
   });
 
   it("binds, persists the installation and hands the agent the start command", async () => {

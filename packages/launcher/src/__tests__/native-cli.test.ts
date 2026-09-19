@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createNativeProgram } from "../native/cli.js";
 
 function fixture() {
-  const actions = { install: vi.fn(async () => {}), addAgent: vi.fn(async () => {}), serve: vi.fn(async () => {}), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), update: vi.fn(async () => {}), control: vi.fn(async () => {}) };
+  const actions = { install: vi.fn(async () => {}), addAgent: vi.fn(async () => {}), serve: vi.fn(async () => {}), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), update: vi.fn(async () => {}), uninstall: vi.fn(async () => {}), control: vi.fn(async () => {}) };
   const program = createNativeProgram(actions).exitOverride().configureOutput({ writeOut: () => {}, writeErr: () => {} });
   return { program, actions };
 }
@@ -13,6 +13,12 @@ describe("native customer entry point", () => {
     expect(program.commands.map(command => command.name())).toEqual(expect.arrayContaining(["install", "serve", "start", "stop", "status", "agents", "auth"]));
     expect(program.commands.map(command => command.name())).not.toContain("gateway");
     expect(program.helpInformation()).not.toMatch(/Docker|Compose|gateway-keyed/);
+  });
+  it("offers an uninstall an agent can find in --help (W1-L2)", async () => {
+    const { program, actions } = fixture();
+    expect(program.helpInformation()).toMatch(/uninstall\s+remove Konteks from this machine/);
+    await program.parseAsync(["--json", "uninstall"], { from: "user" });
+    expect(actions.uninstall).toHaveBeenCalledWith(expect.objectContaining({ root: expect.any(String) }));
   });
   it("runs the native service command used by all OS service definitions", async () => {
     const { program, actions } = fixture();

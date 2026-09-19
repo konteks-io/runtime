@@ -12,6 +12,7 @@ export interface NativeCliActions {
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
+  uninstall(input: NativeCommandContext): Promise<void>;
   control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; title?: string; keyRef?: string }): Promise<void>;
 }
 
@@ -82,7 +83,11 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   key.command("list").description("keys registered for this runtime").action(async () => actions.control({ ...context(), operation: "git.key.list" }));
   key.command("remove").description("revoke one registered key").argument("<keyRef>", "key reference from `git key list`")
     .action(async (keyRef: string) => actions.control({ ...context(), operation: "git.key.remove", keyRef }));
-  // Update/rollback/uninstall must acquire the native lifecycle transaction;
-  // the old appliance implementations are deliberately not registered here.
+  // W1-L2: a person asks their agent to remove Konteks, in plain words; the
+  // description is what the agent finds in `--help`.
+  program.command("uninstall").description("remove Konteks from this machine: finish running work, remove this runtime from your workspace, stop the background service and delete the connector's folder; your repositories and your coding agents' logins are left untouched")
+    .action(async () => actions.uninstall(context()));
+  // Update/rollback must acquire the native lifecycle transaction; the old
+  // appliance implementations are deliberately not registered here.
   return program;
 }

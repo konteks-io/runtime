@@ -12,6 +12,7 @@ import { onboardCoreUrl, onboardFailureStep, runOnboardStep, type OnboardStep } 
 import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
 import { productionUpdateDeps, runNativeUpdate } from "./update-transaction.js";
+import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 
 const environment = () => sanitizeInheritedChildProcessEnv({ env: process.env });
@@ -158,6 +159,10 @@ export const nativeCliActions: NativeCliActions = {
       return;
     }
     await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start }));
+  },
+  uninstall: async input => {
+    const result = await uninstallNative(input, productionUninstallDeps({ root: input.root, serviceDefinition, execute }));
+    input.output.result(result);
   },
   stop: async input => {
     const definition = await serviceDefinition(input.root);

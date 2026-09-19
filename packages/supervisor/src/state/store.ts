@@ -38,6 +38,10 @@ import type { RelayDurableState } from "../relay/channel-mux.js";
  * Nothing under this root is ever a checkpoint payload, agent stdio, a
  * provider key, or a capability token.
  */
+/** Said when a machine with an identity has lost its key (W1-L1). */
+export const MACHINE_KEY_LOST =
+  "This machine's Konteks key is missing, so it can no longer prove which runtime it is. Run `konteks-remote onboard` to connect it again; it will replace its old runtime.";
+
 export const IdentitySchema = z
   .object({
     instanceId: z.string().min(1),
@@ -153,6 +157,12 @@ export class SupervisorStore {
 
   private async writeJson(name: string, value: unknown): Promise<void> {
     await this.mutate(() => writeSecretFile(this.path(name), `${JSON.stringify(value)}\n`));
+  }
+
+  /** The machine key, or null when there is none on disk. */
+  async loadInstanceKey(): Promise<InstanceKeyPair | null> {
+    const existing = await this.readJson("instance-key.jwk", z.record(z.string(), z.unknown()));
+    return existing ? instanceKeyFromPrivateJwk(existing as JsonWebKey) : null;
   }
 
   async loadOrCreateInstanceKey(): Promise<InstanceKeyPair> {

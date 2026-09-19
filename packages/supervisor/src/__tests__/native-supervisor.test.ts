@@ -49,6 +49,8 @@ async function fixture() {
   await writeSecretFile(config.SUPERVISOR_RELEASE_ROOTS_FILE, JSON.stringify({ roots: [{ ...signing.root, coreControlKeys: [{ keyId: signing.keyId, publicKeyJwk: signing.root.publicKeyJwk }] }] }));
   const store = new SupervisorStore(config.SUPERVISOR_DATA_DIR);
   await store.init();
+  // An activated machine has its key; enrollment writes it before the identity.
+  await store.loadOrCreateInstanceKey();
   await store.saveIdentity({ instanceId: "instance", workspaceId: "tenant", activationId: "activation", activatedAt: new Date().toISOString(), administrativeStatus: "provisioning", exchangeNonce: "exchange" });
   await store.saveManifest(manifest as never, manifest.digest);
   const archive = join(root, "agent.tgz"); await writeFile(archive, agent.archive, { mode: 0o600 });
@@ -69,6 +71,15 @@ describe("native Supervisor composition", () => {
     await f.store.saveLease({ ...record, [field]: field === "mode" ? "drain_only" : new Date(Date.now() + 3600000).toISOString() });
     const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);
     await expect(supervisor.start()).rejects.toMatchObject({ code: "registration_mismatch" });
+    expect(f.spawn).not.toHaveBeenCalled();
+  });
+  it("stops and says so when its key is gone, instead of making a new one Core would refuse (W1-L1)", async () => {
+    const f = await fixture();
+    const { rm } = await import("node:fs/promises");
+    await rm(join(f.config.SUPERVISOR_DATA_DIR, "instance-key.jwk"));
+    const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);
+    await expect(supervisor.start()).rejects.toMatchObject({ code: "install_state_corrupt", message: expect.stringContaining("key is missing") });
+    expect(await f.store.loadInstanceKey()).toBeNull();
     expect(f.spawn).not.toHaveBeenCalled();
   });
   it("keeps bounded suspended heartbeats and restores only the new Core lease", async () => {

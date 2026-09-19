@@ -168,12 +168,17 @@ export class NativeEnrollment {
    */
   async bind(
     intentRef: string,
-    input: { email: string; tenantId?: string; expectedManifestDigest: string },
+    input: { email: string; tenantId?: string; replacesInstanceId?: string; expectedManifestDigest: string },
   ): Promise<EnrollmentBound> {
     return this.withKey(async (key, store, mutations) => {
       const bound = await this.post(
         ENROLLMENT_PATHS.bind(intentRef),
-        { email: input.email, ...(input.tenantId ? { tenantId: input.tenantId } : {}) },
+        {
+          email: input.email,
+          ...(input.tenantId ? { tenantId: input.tenantId } : {}),
+          // The runtime this machine was before it lost its key (W1-L1).
+          ...(input.replacesInstanceId ? { replacesInstanceId: input.replacesInstanceId } : {}),
+        },
         key,
         "enrollment_bind",
         intentRef,

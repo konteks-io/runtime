@@ -135,6 +135,8 @@ export const CORE_PATHS = Object.freeze({
   // other route the runtime calls; Core forwards it to managed-git with the
   // instance id exactly as the contract describes.
   gitKeys: (instanceId: string) => instancePath(instanceId, "git-keys"),
+  // Uninstall: the runtime removes itself (W1-L2), lease-authenticated like the rest.
+  retire: (instanceId: string) => instancePath(instanceId, "retire"),
   gitKey: (instanceId: string, keyRef: string) => instancePath(instanceId, `git-keys/${encodeURIComponent(keyRef)}`),
   // CONTRACT-GAP: `RemoteWorkAssignment` carries no delivery/validation/qa
   // definition, so the supervisor reads it for a CLAIMED assignment from
@@ -600,6 +602,16 @@ export class CoreClient {
   }
 
   /** Revocation is Core's and managed-git's; the local half is dropped after. */
+  /** Remove this runtime from its workspace: `draining` while its work finishes, then `removed`. */
+  async retire(instanceId: string): Promise<{ outcome: "removed" | "draining" | "already_removed"; activeAssignments: number }> {
+    return this.http.request({
+      method: "POST",
+      path: CORE_PATHS.retire(instanceId),
+      body: {},
+      schema: z.object({ outcome: z.enum(["removed", "draining", "already_removed"]), activeAssignments: z.number().int().min(0) }).strict(),
+    });
+  }
+
   async revokeGitKey(instanceId: string, keyRef: string): Promise<void> {
     await this.http.request({ method: "DELETE", path: CORE_PATHS.gitKey(instanceId, keyRef), schema: z.unknown() });
   }

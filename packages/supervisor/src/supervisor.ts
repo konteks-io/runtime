@@ -73,7 +73,7 @@ import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "./session/workspace-tool-policy.js";
 import { SupervisorJournal } from "./state/journal.js";
 import { DurableOutbox } from "./state/outbox.js";
-import { DEFAULT_CONFIG, SupervisorStore, type ConfigRecord } from "./state/store.js";
+import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord } from "./state/store.js";
 import { buildSupportBundle } from "./support/bundle.js";
 import { runDoctor } from "./support/doctor.js";
 import { HttpsFallbackTransport } from "./transport/https-fallback.js";
@@ -250,7 +250,16 @@ export class Supervisor {
     await this.store.init();
     await this.journal.load();
     await this.outbox.load();
-    this.key = await this.store.loadOrCreateInstanceKey();
+    // A native machine that has an identity but no key has lost the only
+    // proof of who it is. A fresh key would be refused by Core on every call
+    // while the process looked alive (W1-L1), so it stops and says so;
+    // `konteks-remote onboard` connects the machine again as a new runtime.
+    const knownIdentity = this.native ? await this.store.identity().catch(() => null) : null;
+    const existingKey = knownIdentity ? await this.store.loadInstanceKey() : null;
+    if (knownIdentity && !existingKey) {
+      throw new RemoteInstanceError("install_state_corrupt", MACHINE_KEY_LOST);
+    }
+    this.key = existingKey ?? await this.store.loadOrCreateInstanceKey();
     this.roots = this.native
       ? (this.options.native!.trustedRoots ?? []).map(root => EmbeddedReleaseRootSchema.parse(root))
       : await loadReleaseRootsFile(this.config.SUPERVISOR_RELEASE_ROOTS_FILE).catch(() => []);
@@ -1588,6 +1597,18 @@ export class Supervisor {
         case "revoke.pending":
           this.pendingRevocation = true;
           return { pendingRevocation: true };
+        case "instance.retire": {
+          if (!this.instanceId) throw new RemoteInstanceError("temporarily_unavailable", "This runtime is not activated, so there is nothing to remove from Konteks.");
+          const result = await this.core.retire(this.instanceId);
+          if (result.outcome !== "draining") {
+            // Removed from its workspace, a runtime has nothing left to do:
+            // it stops once this answer is sent, so uninstall never deletes a
+            // folder out from under a process still running in it.
+            this.administrativeStatus = "removed";
+            setTimeout(() => { void this.stop().catch(() => undefined); }, 500).unref?.();
+          }
+          return result;
+        }
       }
     };
   }

@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rename } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, NATIVE_MANIFEST_URL, verifyNativeRelease } from "@konteks/remote-release";
@@ -186,6 +186,28 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
     ...(state.initiativeUrl ? { initiative: state.initiativeUrl } : {}),
   });
 
+  // A machine that lost its key cannot be the runtime it was: every call it
+  // signs is refused, and its service will not start (W1-L1). Whatever step
+  // this conversation was on, it connects the machine again, as a runtime
+  // that takes the old one's place.
+  const lost = await lostMachineKey(supervisorData);
+  if (lost) {
+    await setAsideLostIdentity(context.root, lost.instanceId);
+    const email = state.email ?? state.resendTo;
+    await writeOnboardState(context.root, {
+      schemaVersion: 1,
+      step: "email",
+      updatedAt: new Date().toISOString(),
+      replaces: lost.instanceId,
+      ...(email ? { resendTo: email } : {}),
+    } as never);
+    const note =
+      "This machine lost its Konteks key, so it can no longer connect as the runtime it was. It will connect again as a new runtime that takes the old one's place; your repository and your coding agents' logins are not affected.";
+    return email
+      ? { step: "identity", note: `${note} A code will be sent to the address it belonged to.`, run: AGAIN }
+      : { step: "identity", note, ask: { question: "What email address should this machine belong to?", kind: "email" } };
+  }
+
   switch (state.step) {
     case "identity": {
       // A machine that already has an identity is not enrolling again; it is
@@ -344,6 +366,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           bound = await enrollment.bind(state.intentRef!, {
             email: state.email!,
             ...(state.tenantId ? { tenantId: state.tenantId } : {}),
+            ...(state.replaces ? { replacesInstanceId: state.replaces } : {}),
             expectedManifestDigest: prepared.manifestDigest,
           });
         } catch (error) {
@@ -945,6 +968,30 @@ async function registerGitKey(root: string): Promise<{ identityFile?: string; us
 
 function hostLabel(): string {
   return `${homedir().split("/").pop() ?? "user"}@${nativePlatform().os}`;
+}
+
+/** The identity on disk when its key is gone; null for a machine that can still prove itself. */
+async function lostMachineKey(supervisorData: string): Promise<{ instanceId: string } | null> {
+  const store = new SupervisorStore(supervisorData);
+  const identity = await store.identity().catch(() => null);
+  if (!identity?.instanceId || identity.instanceId === "pending") return null;
+  const key = await store.loadInstanceKey().catch(() => null);
+  return key ? null : { instanceId: identity.instanceId };
+}
+
+/**
+ * Keep a lost identity's state beside the install, never delete it: it is
+ * the record of what that runtime was, and it holds nothing that could act
+ * for it any more. The machine then enrolls from an empty supervisor.
+ */
+async function setAsideLostIdentity(root: string, instanceId: string): Promise<void> {
+  const aside = join(root, "retired", `${instanceId}-${Date.now()}`);
+  await mkdir(aside, { recursive: true, mode: 0o700 });
+  await rename(join(root, "supervisor"), join(aside, "supervisor"));
+  await rename(join(root, "native-runtime.json"), join(aside, "native-runtime.json")).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error;
+  });
+  await mkdir(join(root, "supervisor"), { mode: 0o700 });
 }
 
 /** The person's token, refreshed rather than kept long (OS15). */
