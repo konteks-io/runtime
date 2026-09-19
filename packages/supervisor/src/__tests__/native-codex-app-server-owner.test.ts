@@ -44,6 +44,15 @@ function fixture() {
 }
 
 describe("native shared Codex app-server owner", () => {
+  it("can be started again after a start that failed (WS1-018)", async () => {
+    const f = fixture();
+    f.waitUntilReady.mockRejectedValueOnce(new Error("socket never came up"));
+    await expect(f.owner.start()).rejects.toThrow("socket never came up");
+    await f.owner.start();
+    expect(f.spawn).toHaveBeenCalledTimes(2);
+    await f.owner.stop();
+  });
+
   it("ends its app-server group if the process exits after a stop was asked for, and only then (WS1-042)", async () => {
     const f = fixture();
     await f.owner.start();

@@ -82,6 +82,28 @@ describe("native Supervisor composition", () => {
     expect(await f.store.loadInstanceKey()).toBeNull();
     expect(f.spawn).not.toHaveBeenCalled();
   });
+  it("asks Konteks to remove it on uninstall, then ends the whole process once removed (W1-L2)", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const f = await fixture();
+      const onRetired = vi.fn();
+      const supervisor = new Supervisor(f.config, { ...f.options, onRetired }); supervisors.push(supervisor);
+      await supervisor.start();
+      const retire = vi.spyOn(supervisor.core, "retire")
+        .mockResolvedValueOnce({ outcome: "draining", activeAssignments: 1 })
+        .mockResolvedValueOnce({ outcome: "removed", activeAssignments: 0 });
+      const handle = supervisor.controlHandler();
+      expect(await handle({ op: "instance.retire" }, { event: () => undefined } as never)).toEqual({ outcome: "draining", activeAssignments: 1 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(onRetired).not.toHaveBeenCalled();
+      expect(await handle({ op: "instance.retire" }, { event: () => undefined } as never)).toEqual({ outcome: "removed", activeAssignments: 0 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(onRetired).toHaveBeenCalledOnce();
+      expect(retire).toHaveBeenCalledWith("instance");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it("keeps bounded suspended heartbeats and restores only the new Core lease", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
     const heartbeat = vi.spyOn(supervisor.core, "heartbeat").mockRejectedValueOnce(new RemoteInstanceError("instance_suspended", "suspended")).mockResolvedValue(heartbeatLease());

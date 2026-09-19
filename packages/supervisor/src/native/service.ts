@@ -38,6 +38,9 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
       };
       supervisor = new Supervisor(installation.config, {
         onLivenessLost: () => { void daemon.shutdown("liveness-lost", 1).catch(() => undefined); },
+        // Uninstalled (W1-L2): nothing is left for this process to do, and its
+        // folder is about to be deleted — end it, whatever runs it.
+        onRetired: () => { void daemon.shutdown("retired", 0).catch(() => undefined); },
         native: {
           trustedRoots: installation.roots, runners: installation.runners,
           repositoryCacheRoot: join(options.root, "repositories"),

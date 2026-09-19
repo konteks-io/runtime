@@ -58,7 +58,12 @@ export class NativeCodexAppServerOwner {
 
   start(): Promise<void> {
     if (this.stopping) return Promise.reject(unavailable("The shared Codex owner is stopping."));
-    this.startPromise ??= this.spawnAndAwaitReady();
+    // A failed start is not remembered: the supervisor tries a Codex that
+    // could not start again later (WS1-018), and that try must spawn afresh.
+    this.startPromise ??= this.spawnAndAwaitReady().catch(error => {
+      this.startPromise = null;
+      throw error;
+    });
     return this.startPromise;
   }
 

@@ -107,6 +107,8 @@ export interface SupervisorOptions {
    * than the publisher's budget. The service wires it to a non-zero shutdown so
    * the service manager replaces a silent process. */
   onLivenessLost?: (detail: Record<string, unknown>) => void;
+  /** This runtime was removed from its workspace (uninstall): end the whole process, not only the supervisor. */
+  onRetired?: () => void;
   native?: {
     /** Public trust provided by the verified native executable, never by writable install metadata. */
     trustedRoots: readonly EmbeddedReleaseRoot[];
@@ -838,7 +840,11 @@ export class Supervisor {
     });
     if (this.nativeCodexOwner && !agents.codexOwnerStarted) {
       // Codex is left out rather than taking every other agent down with it:
-      // it is not advertised, so no work is placed on it.
+      // it is not advertised, so no work is placed on it. It is tried again
+      // in the background (WS1-018), so a passing failure does not leave it
+      // out until the service happens to restart.
+      this.parkedCodex = { owner: this.nativeCodexOwner, runners: this.nativeRunners.filter(candidate => candidate.agentId === "codex") };
+      this.scheduleCodexRetry();
       this.nativeCodexOwner = null;
       for (const runner of this.nativeRunners.filter(candidate => candidate.agentId === "codex")) this.runners.delete(runner.agentId);
       for (let index = this.nativeRunners.length - 1; index >= 0; index -= 1) {
@@ -861,6 +867,43 @@ export class Supervisor {
       this.cancellationTimer = setInterval(() => this.cancellationReplay?.tick(), 5_000);
       this.cancellationTimer.unref();
     }
+  }
+
+  private parkedCodex: { owner: NativeCodexAppServerOwner; runners: NativeRunner[] } | null = null;
+  private codexRetryTimer: NodeJS.Timeout | null = null;
+  private codexRetryAttempt = 0;
+
+  /** Try a Codex that could not start again: a minute, then doubling, at most ten times. */
+  private scheduleCodexRetry(): void {
+    if (this.stopping || !this.parkedCodex || this.codexRetryAttempt >= 10) return;
+    const delay = Math.min(60_000 * 2 ** this.codexRetryAttempt, 15 * 60_000);
+    this.codexRetryTimer = setTimeout(() => { void this.retryCodex(); }, delay);
+    this.codexRetryTimer.unref?.();
+  }
+
+  private async retryCodex(): Promise<void> {
+    this.codexRetryTimer = null;
+    const parked = this.parkedCodex;
+    if (this.stopping || !parked) return;
+    try {
+      await parked.owner.start();
+      for (const runner of parked.runners) await runner.start();
+    } catch (error) {
+      this.codexRetryAttempt += 1;
+      this.logger.warn({ err: error, attempt: this.codexRetryAttempt }, "codex still could not start; trying again later");
+      this.scheduleCodexRetry();
+      return;
+    }
+    if (this.stopping) return;
+    this.parkedCodex = null;
+    this.nativeCodexOwner = parked.owner;
+    for (const runner of parked.runners) {
+      this.nativeRunners.push(runner);
+      this.runners.set(runner.agentId, runner);
+    }
+    // The next heartbeat advertises it; nothing waits for this.
+    if (this.native) this.lastSnapshot = await this.inventory.collect().catch(() => this.lastSnapshot);
+    this.logger.info("codex started on a later try; it is advertised again");
   }
 
   private provisioningCredential: string | null = null;
@@ -1605,7 +1648,10 @@ export class Supervisor {
             // it stops once this answer is sent, so uninstall never deletes a
             // folder out from under a process still running in it.
             this.administrativeStatus = "removed";
-            setTimeout(() => { void this.stop().catch(() => undefined); }, 500).unref?.();
+            setTimeout(() => {
+              if (this.options.onRetired) this.options.onRetired();
+              else void this.stop().catch(() => undefined);
+            }, 500).unref?.();
           }
           return result;
         }
@@ -1688,6 +1734,9 @@ export class Supervisor {
     await this.work?.drainSessions("drain");
     for (const runner of this.nativeRunners) await runner.stop();
     await this.nativeCodexOwner?.stop();
+    if (this.codexRetryTimer) clearTimeout(this.codexRetryTimer);
+    this.codexRetryTimer = null;
+    this.parkedCodex = null;
     for (const runner of this.runners.values()) runner.stopEvents();
     this.transport?.stop();
     await this.internal?.close().catch(() => undefined);
