@@ -281,7 +281,10 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         if (["enrollment_invalid", "challenge_expired"].includes(wireCode(error))) {
           // Attempts spent or the intent expired: start the enrollment again
           // with the same key. It costs the person one more email (OS9).
-          await save({ step: "email", intentRef: undefined, emailMasked: undefined, attemptsRemaining: undefined } as never);
+          // Keep the address: the note promises a new code, and the email
+          // step sends one to it rather than asking the person for their
+          // address again (W1-X1; passes 19 and X1 were asked again).
+          await save({ step: "email", intentRef: undefined, emailMasked: undefined, attemptsRemaining: undefined, ...(state.email ? { resendTo: state.email } : {}) } as never);
           return { step: "code", note: "That code can no longer be used; a new one will be sent.", run: AGAIN };
         }
         throw error;

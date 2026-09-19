@@ -844,8 +844,10 @@ describe("onboard", () => {
     expect(first.ask).toMatchObject({ kind: "code" });
     expect(first.note).toContain("2 attempts left");
     const second = await step({ enrollment: { verifyCode } as never }, "000001");
+    expect(second.note).toContain("a new one will be sent");
     expect(second.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
-    expect(await readOnboardState(root)).toMatchObject({ step: "email" });
+    // The promise holds: the email step sends to the same address instead of asking for it.
+    expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
   });
 
   it("ends the flow on an empty answer to the first task, not only on whitespace", async () => {
