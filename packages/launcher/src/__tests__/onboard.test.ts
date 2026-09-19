@@ -789,6 +789,16 @@ describe("onboard", () => {
     expect(result.done?.summary).toContain('Your first initiative is "Book a table"');
   });
 
+  it("names only the agents that are logged in as running work, and says how to log in the other (pass 28)", async () => {
+    await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
+    const result = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "login_required" }) });
+    expect(result.done?.summary).toContain("Your claude-code login will run Konteks work here.");
+    expect(result.done?.summary).not.toContain("claude-code and codex");
+    expect(result.done?.remedies).toContain("codex is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login codex");
+    // A service still probing is not evidence of a missing login.
+    const probing = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "probing" }) });
+    expect(probing.done?.summary).toContain("Your claude-code and codex login will run Konteks work here.");
+  });
   it("never asks the relaying agent to run anything but konteks-remote", async () => {
     for (const state of ["inspect", "system", "push", "first_task"] as const) {
       await writeOnboardState(root, {

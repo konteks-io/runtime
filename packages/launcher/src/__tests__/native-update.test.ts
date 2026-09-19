@@ -8,7 +8,7 @@ import { buildReleaseFixture } from "@konteks/remote-release";
 import { loadNativeInstallation, readNativeUpdateLedger, SupervisorStore, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
-import { runNativeUpdate, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
+import { earlierFailure, earlierFailureNote, runNativeUpdate, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { createOutput } from "../output.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 
@@ -185,13 +185,31 @@ describe("native update transaction", () => {
     expect(h.calls.filter(call => call === "control:doctor@release-next").length).toBe(3);
     expect(h.calls).not.toContain("restore:release-next");
   });
+  it("remembers a release that already rolled back here, so it is not offered as if new (W1-L4)", () => {
+    const attempt = (outcome: "applied" | "rolled_back" | "failed" | "in_progress", digest: string, finishedAt = "2026-09-19T11:58:31.000Z") => ({ id: `u-${outcome}-${digest}`, bundleVersion: "0.5.2", manifestDigest: digest, releaseId: "release-x", reason: "operator", startedAt: "2026-09-19T11:54:53.000Z", finishedAt, outcome, detail: outcome === "rolled_back" ? "The updated connector did not answer on its control socket in time." : null });
+    expect(earlierFailure([attempt("applied", "sha256:a")], "sha256:b")).toBeNull();
+    const failed = earlierFailure([attempt("rolled_back", "sha256:b"), attempt("applied", "sha256:a")], "sha256:b");
+    expect(failed?.outcome).toBe("rolled_back");
+    expect(earlierFailureNote(failed!)).toBe("0.5.2 already failed its health check here and was rolled back (2026-09-19T11:58:31.000Z: The updated connector did not answer on its control socket in time.). Installing it again installs the same release; it is usually better to wait for a newer one.");
+    // A later success with the same bytes clears it.
+    expect(earlierFailure([attempt("rolled_back", "sha256:b"), attempt("applied", "sha256:b")], "sha256:b")).toBeNull();
+  });
+  it("after a rollback, says the previous release answers again before returning (W1-L4)", async () => {
+    const h = harness({ previous, gate: "no_answer" });
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(lines).toContain("Waiting for 1.1.0 to answer…");
+    expect(lines).toContain("Rolled back: 1.0.0 is running and answering again. 1.1.0 was not kept.");
+    expect(h.calls.at(-1)).toBe("control:status@release-prev");
+  });
   it("waits for the failed successor to exit and release the runtime directory before restoring", async () => {
     const h = harness({ previous, gate: "wrong_version" });
     let held = 2;
     const restore = h.deps.restore;
     h.deps.restore = async (root, expected, prev) => { if (held > 0) { held -= 1; throw new RemoteInstanceError("temporarily_unavailable", "Another connector owns this native data directory."); } return restore(root, expected, prev); };
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "update_required" });
-    expect(h.calls.slice(-2)).toEqual(["restore:release-next", "start"]);
+    expect(h.calls.slice(-3)).toEqual(["restore:release-next", "start", "control:status@release-prev"]);
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back" });
   });
   it("gives up when the old service never exits, leaving the record unchanged", async () => {
@@ -211,7 +229,7 @@ describe("native update transaction", () => {
   it.each(["no_answer", "wrong_version", "new_failure"] as const)("rolls back to the previous release and restarts it when the gate fails (%s)", async gate => {
     const h = harness({ previous, gate });
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: expect.stringMatching(/temporarily_unavailable|update_required/) });
-    expect(h.calls.slice(-4)).toEqual(["stop", "status", "restore:release-next", "start"]);
+    expect(h.calls.slice(-5)).toEqual(["stop", "status", "restore:release-next", "start", "control:status@release-prev"]);
     expect(h.currentRecord().releaseId).toBe("release-prev");
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back", manifestDigest: "sha256:next", releaseId: "release-next" });
     expect((h.ledger.at(-1) as { detail: string }).detail).toMatch(/control socket|reports 1.0.0|doctor failure\(s\): runner_spawn/);

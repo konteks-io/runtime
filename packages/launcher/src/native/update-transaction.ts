@@ -131,7 +131,14 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       try {
         if (await deps.execute(definition.stop).catch(() => null) === 0) await waitForServiceExit(input, definition, deps);
         await restoreOnceReleased(input, successor.releaseId, previous, deps);
-        if (wasRunning) await deps.start(input);
+        if (wasRunning) {
+          await deps.start(input);
+          // The person checks right after; say only once the old release answers again.
+          const back = await answersAgain(input, deps.control(input.root, previous), previous, deps);
+          input.output.line(back
+            ? `Rolled back: ${previous.bundleVersion} is running and answering again. ${successor.bundleVersion} was not kept.`
+            : `Rolled back to ${previous.bundleVersion} and started it; it has not answered yet. Run \`konteks-remote status\` in a minute.`);
+        }
         await finish("rolled_back", detail);
       } catch (rollbackError) {
         await finish("failed", `rollback failed after: ${detail}`);
@@ -152,6 +159,19 @@ async function waitForServiceExit(input: NativeUpdateInput, definition: NativeSe
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
     progress();
     await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
+  }
+}
+
+/** Whether the restored release answers on its control socket within the stop deadline. */
+async function answersAgain(input: NativeUpdateInput, control: UpdateControlClient, record: NativeRuntimeRecord, deps: NativeUpdateTransactionDeps): Promise<boolean> {
+  const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+  const progress = progressLines(input, deps, `Waiting for ${record.bundleVersion} to answer again…`, `still waiting for ${record.bundleVersion} to answer`);
+  for (;;) {
+    progress();
+    const status = await control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 }).catch(() => null);
+    if (status) return true;
+    if (deps.now() >= deadline) return false;
+    await deps.sleep(Math.min(deps.pollMs ?? 3_000, 3_000));
   }
 }
 
@@ -228,7 +248,9 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
   const deadline = deps.now() + (deps.healthDeadlineMs ?? 180_000);
   const poll = deps.pollMs ?? 3_000;
   let answered = false;
+  const progress = progressLines(input, deps, `Waiting for ${successor.bundleVersion} to answer…`, `still waiting for ${successor.bundleVersion} to answer`);
   for (;;) {
+    progress();
     try {
       const status = await control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 });
       answered = true;
@@ -257,4 +279,20 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
   for (const agent of (await control.call({ op: "agents" }, AgentsSchema)).agents) {
     if (agent.readiness === "reconnect_required") input.output.line(`agent ${agent.agentId} needs a fresh login after this update: run \`konteks-remote auth login ${agent.agentId}\`.`);
   }
+}
+
+/**
+ * The last attempt on this machine that could not keep this exact release, if
+ * any. A release that already rolled back here is the same bytes next time,
+ * so the person hears that before being offered it again.
+ */
+export function earlierFailure(attempts: readonly NativeUpdateAttempt[], manifestDigest: string): NativeUpdateAttempt | null {
+  const last = [...attempts].reverse().find(attempt => attempt.manifestDigest === manifestDigest && attempt.outcome !== "in_progress");
+  return last && (last.outcome === "rolled_back" || last.outcome === "failed") ? last : null;
+}
+
+export function earlierFailureNote(attempt: NativeUpdateAttempt): string {
+  const when = attempt.finishedAt ?? attempt.startedAt;
+  const how = attempt.outcome === "rolled_back" ? "failed its health check here and was rolled back" : "failed here";
+  return `${attempt.bundleVersion} already ${how} (${when}${attempt.detail ? `: ${attempt.detail}` : ""}). Installing it again installs the same release; it is usually better to wait for a newer one.`;
 }

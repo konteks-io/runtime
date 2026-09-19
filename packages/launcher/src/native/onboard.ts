@@ -65,6 +65,8 @@ export interface OnboardContext {
     managedGitWaitMs?: number;
     managedGitPollMs?: number;
     families?: () => Promise<string[]>;
+    /** Each installed agent's readiness as the running service reports it, or null when it cannot say. */
+    agentReadiness?: (root: string) => Promise<Record<string, string> | null>;
     /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
     waitForReady?: (root: string) => Promise<{ administrativeStatus: string; roles: string[] } | null>;
     /** The background unpacking of the agent packages (WS1-012). */
@@ -134,6 +136,19 @@ export async function detectAgentFamilies(): Promise<string[]> {
   }
   return families;
 }
+
+/** Readiness per agent from the running service; a tooling check alone cannot tell a login apart from an install. */
+async function readAgentReadiness(root: string): Promise<Record<string, string> | null> {
+  const record = await readNativeRecord(root).catch(() => null);
+  if (!record) return null;
+  const control = new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort);
+  const schema = z.object({ agents: z.array(z.object({ agentId: z.string(), readiness: z.string() }).passthrough()) }).passthrough();
+  const report = await control.call({ op: "agents" }, schema, { timeoutMs: 5_000 }).catch(() => null);
+  return report ? Object.fromEntries(report.agents.map(agent => [agent.agentId, agent.readiness])) : null;
+}
+
+/** Still being probed, or never reported: not evidence that the login is missing. */
+const UNSETTLED_READINESS = new Set(["ready", "probing", "unknown"]);
 
 /**
  * Poll the control socket until the service reports itself active, or give up.
@@ -948,10 +963,15 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           };
         }
       }
-      const present = await families();
+      const installed = await families();
+      // Installed is not logged in: name only the agents that can run work (pass 28).
+      const readiness = await (context.deps?.agentReadiness ?? readAgentReadiness)(context.root).catch(() => null);
+      const notLoggedIn = installed.filter(family => readiness?.[family] !== undefined && !UNSETTLED_READINESS.has(readiness[family]!));
+      const present = installed.filter(family => !notLoggedIn.includes(family));
       const remedies: string[] = [];
       for (const family of ["claude-code", "codex"]) {
-        if (!present.includes(family)) remedies.push(`To also run ${family} work here: konteks-remote auth login ${family}`);
+        if (notLoggedIn.includes(family)) remedies.push(`${family} is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login ${family}`);
+        else if (!present.includes(family)) remedies.push(`To also run ${family} work here: konteks-remote auth login ${family}`);
       }
       if (nativePlatform().os === "debian") {
         remedies.push("To keep the runtime available after logout: loginctl enable-linger $USER");
@@ -959,7 +979,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const advertised = state.advertisedRoles;
       const agentsLine =
         present.length === 0
-          ? "No coding agent was found on this machine; install Claude Code or Codex and run konteks-remote auth login."
+          ? installed.length > 0
+            ? `No coding agent is logged in here yet, so no Konteks work can run on this machine until one is (see below).`
+            : "No coding agent was found on this machine; install Claude Code or Codex and run konteks-remote auth login."
           : advertised && advertised.length === 0
             ? `Your ${present.join(" and ")} login is set up; the runtime will advertise it once its first heartbeat lands.`
             : `Your ${present.join(" and ")} login will run Konteks work here.`;

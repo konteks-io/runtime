@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS } from "@konteks/remote-release";
-import { createNativeService, loadNativeInstallation, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
+import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
 import { RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, status, supportBundle } from "../commands/lifecycle.js";
 import { SupervisorControl } from "../control.js";
@@ -11,7 +11,7 @@ import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
 import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
-import { productionUpdateDeps, runNativeUpdate } from "./update-transaction.js";
+import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 
@@ -154,9 +154,17 @@ export const nativeCliActions: NativeCliActions = {
     if (input.check) {
       const check = await checkNativeUpdate({ root: input.root });
       if (check.status === "current") input.output.line(`Installed release ${check.bundleVersion} is current.`);
-      else input.output.line(`Release ${check.release.manifest.bundleVersion} is available (installed: ${check.current.bundleVersion}); run \`konteks-remote update\` to install it.`);
-      input.output.result(check.status === "current" ? { state: "current", bundleVersion: check.bundleVersion } : { state: "available", installed: check.current.bundleVersion, available: check.release.manifest.bundleVersion, manifestDigest: check.release.manifest.digest });
+      const failed = check.status === "current" ? null : earlierFailure((await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts, check.release.manifest.digest);
+      if (check.status !== "current") input.output.line(failed
+        ? `Release ${check.release.manifest.bundleVersion} is available (installed: ${check.current.bundleVersion}), but ${earlierFailureNote(failed)}`
+        : `Release ${check.release.manifest.bundleVersion} is available (installed: ${check.current.bundleVersion}); run \`konteks-remote update\` to install it.`);
+      input.output.result(check.status === "current" ? { state: "current", bundleVersion: check.bundleVersion } : { state: "available", installed: check.current.bundleVersion, available: check.release.manifest.bundleVersion, manifestDigest: check.release.manifest.digest, ...(failed ? { failedHere: { outcome: failed.outcome, at: failed.finishedAt ?? failed.startedAt, detail: failed.detail } } : {}) });
       return;
+    }
+    if (!input.unattended) {
+      const check = await checkNativeUpdate({ root: input.root }).catch(() => null);
+      const failed = check && check.status !== "current" ? earlierFailure((await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts, check.release.manifest.digest) : null;
+      if (failed) input.output.line(`Trying again as asked: ${earlierFailureNote(failed)}`);
     }
     await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start }));
   },
