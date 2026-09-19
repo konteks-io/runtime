@@ -8,7 +8,7 @@ import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyLis
 import { SupervisorControl } from "../control.js";
 import { addNativeAgent, installNative, readNativeRecord, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
-import { onboardCoreUrl, onboardFailureStep, runOnboardStep, type OnboardStep } from "./onboard.js";
+import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
 import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
 import { productionUpdateDeps, runNativeUpdate } from "./update-transaction.js";
@@ -93,7 +93,7 @@ export const nativeCliActions: NativeCliActions = {
     };
     let step: OnboardStep;
     try {
-      step = await runOnboardStep(context);
+      step = await runOnboard(context);
     } catch (error) {
       // Never leave the protocol the agent was taught: a failure is a step too.
       step = await onboardFailureStep(context, error);

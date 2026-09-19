@@ -70,6 +70,8 @@ export const OnboardStateSchema = z
     ownerEmail: z.string().min(1).optional(),
     /** A new conversation on a machine that finished onboarding (W1-A8). */
     revisit: z.boolean().optional(),
+    /** How many times inspect has found the service still starting (WS1-036). */
+    startWaits: z.number().int().min(0).optional(),
     /** The last step just finished: the next run closes this conversation instead of starting a revisit. */
     closing: z.boolean().optional(),
     /** The runtime this machine was before it lost its key; the next bind replaces it (W1-L1). */

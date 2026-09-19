@@ -252,7 +252,11 @@ export class OwnerApiClient {
       if (response.status === 401 && detail.code === "enrollment_invalid") {
         throw new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED);
       }
-      throw new RemoteInstanceError("permission_denied", "This machine's Konteks access was refused.");
+      // Say what Konteks said (WS1-049): "access was refused" alone sent the
+      // person looking at this machine for a refusal that was about something
+      // else, such as a proof the Assistant would not accept.
+      const said = typeof detail.message === "string" && detail.message.trim() ? detail.message.trim().replace(/([^.!?])$/, "$1.") : "";
+      throw new RemoteInstanceError("permission_denied", said ? `Konteks refused that request: ${said}` : "This machine's Konteks access was refused.");
     }
     if (response.status === 402) {
       throw new RemoteInstanceError("limit_exceeded", "This workspace has no Story Points left for a first turn.");

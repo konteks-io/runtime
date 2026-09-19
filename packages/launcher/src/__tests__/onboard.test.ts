@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { initiativeTitle, isNo, isYes, onboardFailureStep, runOnboardStep } from "../native/onboard.js";
+import { initiativeTitle, isNo, isYes, onboardFailureStep, runOnboard, runOnboardStep } from "../native/onboard.js";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { readOnboardState, writeOnboardState } from "../native/onboard-state.js";
 import { OWNER_ACCESS_REVOKED, writeOwnerToken } from "../native/owner-api.js";
@@ -269,6 +269,38 @@ describe("onboard", () => {
 
     const other = await step({ fetchFn: refusal({ error: { name: "AuthenticationError" } }) as never }, "yes").catch((e: unknown) => e);
     expect((other as Error).message).toBe("This machine's Konteks access was refused.");
+    // WS1-049: a refusal that says why keeps its words.
+    const named = await step({ fetchFn: refusal({ code: "access_denied", message: "The session proof was not accepted" }) as never }, "yes").catch((e: unknown) => e);
+    expect((named as Error).message).toBe("Konteks refused that request: The session proof was not accepted.");
+  });
+
+  it("hands the agent the next question with the note, instead of a bare run-again hop (WS1-032)", async () => {
+    await writeOnboardState(root, {
+      step: "system", repositoryName: "solo", repositoryKind: "managed", repositoryPath: "/tmp/solo", repositoryNeedsInit: true, defaultBranch: "trunk", instanceId: "instance-1",
+    } as never);
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({
+        systemId: "sys-1", systemEntityRef: "system:default/acme-solo", componentEntityRef: "component:default/acme-solo",
+        repository: { kind: "managed", remoteUrl: "https://git.konteks.test/acme/solo", defaultBranch: "trunk" },
+      }), { status: 201, headers: { "content-type": "application/json" } }),
+    );
+    const result = await runOnboard({
+      root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "yes",
+      deps: { waitForReady: readyService, fetchFn: fetchFn as never },
+    });
+    expect(result.note).toContain("is now a System");
+    expect(result.ask?.question).toContain("Push solo to Konteks managed git now?");
+    expect(result.run).toBeUndefined();
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+
+    // A step that did not move on (still starting) goes back to the agent as it is.
+    await writeOnboardState(root, { step: "inspect" } as never);
+    const { writeFile, chmod } = await import("node:fs/promises");
+    await writeFile(join(root, "native-runtime.json"), JSON.stringify({ schemaVersion: 1, deploymentKind: "native_connector", instanceId: "instance-1", workspaceId: "konteks-2", releaseId: "release-1", manifestDigest: "d", bundleVersion: "0.4.1", coreUrl: "https://core.test", relayUrl: "wss://core.test/relay", agents: ["claude-code"], controlPort: 41800 }));
+    await chmod(join(root, "native-runtime.json"), 0o600);
+    const waiting = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", deps: { waitForReady: async () => null } });
+    expect(waiting.run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
+    expect(waiting.note).toContain("still starting");
   });
 
   it("pushes only the branch the person is on, and only after a yes", async () => {
@@ -394,7 +426,19 @@ describe("onboard", () => {
     });
     expect(result.run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
     expect(result.note).toContain("still starting");
-    expect(await readOnboardState(root)).toMatchObject({ step: "inspect" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "inspect", startWaits: 1 });
+
+    // WS1-036: the record exists before `start` is ever run, so "starting"
+    // must not be said for ever. The third wait hands out start again.
+    const again = () => runOnboardStep({
+      root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", cwd: "/tmp/projects/konteks-onboard-app",
+      deps: { waitForReady: async () => null, inspect: async () => { throw new Error("must not inspect"); } },
+    });
+    expect((await again()).run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
+    const third = await again();
+    expect(third.run).toEqual({ argv: ["konteks-remote", "start"] });
+    expect(third.note).toContain("safe if it is already running");
+    expect(await readOnboardState(root)).toMatchObject({ step: "inspect", startWaits: 0 });
   });
 
   it("makes a plain folder a repository with one empty commit before pushing, and only after a yes", async () => {
@@ -468,6 +512,21 @@ describe("onboard", () => {
     expect(result.note).toContain("not running");
     expect(result.ask).toMatchObject({ kind: "confirm" });
     expect(await readOnboardState(root)).toMatchObject({ step: "push" });
+  });
+
+  it("starts a stopped service instead of asking to retry the push, and keeps the person's yes (WS1-027)", async () => {
+    await writeOnboardState(root, {
+      step: "pushing", repositoryName: "solo", repositoryPath: "/tmp/solo",
+      managedRemoteUrl: "https://git.konteks.test/acme/solo", managedSshUrl: "ssh://git@git.konteks.test:2222/acme/solo.git", defaultBranch: "main",
+    } as never);
+    const push = vi.fn();
+    const registerGitKey = vi.fn(async () => { throw new RemoteInstanceError("control_socket_unavailable", "cannot reach the supervisor control socket"); });
+    const result = await step({ registerGitKey, push: push as never });
+    expect(push).not.toHaveBeenCalled();
+    expect(result.note).toContain("service on this machine is not running");
+    expect(result.run).toEqual({ argv: ["konteks-remote", "start"] });
+    expect(result.ask).toBeUndefined();
+    expect(await readOnboardState(root)).toMatchObject({ step: "pushing" });
   });
 
   it("joins the Konteks repository's own first commit instead of pushing an unrelated one", async () => {

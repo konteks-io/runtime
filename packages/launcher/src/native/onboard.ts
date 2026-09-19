@@ -162,6 +162,36 @@ async function waitForServiceReady(root: string): Promise<{ administrativeStatus
   return last;
 }
 
+const isAgain = (run: OnboardStep["run"]) =>
+  Boolean(run && run.argv.length === AGAIN.argv.length && run.argv.every((part, index) => part === AGAIN.argv[index]));
+
+/**
+ * One invocation as the agent sees it (WS1-032). A step that moved onboarding
+ * on and only says "run onboard again" costs the person a whole agent turn —
+ * passes 23–25 spent most of each two-minute gate on those hops, not in
+ * Konteks. When a step advanced and has nothing to ask or run, the next one
+ * runs here, and the agent gets the notes and the next question together. A
+ * step that did not advance (something is still starting) is handed back as
+ * it is, so waiting still happens between the agent's runs.
+ */
+export async function runOnboard(context: OnboardContext, maxChained = 4): Promise<OnboardStep> {
+  const notes: string[] = [];
+  let current = context;
+  for (let hop = 0; ; hop += 1) {
+    const before = (await readOnboardState(current.root).catch(() => null))?.step;
+    const result = await runOnboardStep(current);
+    const after = (await readOnboardState(current.root).catch(() => null))?.step;
+    const advanced = after !== undefined && after !== before;
+    if (!isAgain(result.run) || result.ask || result.done || !advanced || hop >= maxChained) {
+      if (notes.length === 0) return result;
+      return { ...result, note: [...notes, result.note].filter(Boolean).join(" ") };
+    }
+    if (result.note) notes.push(result.note);
+    const { answer: _answered, ...next } = current;
+    current = next;
+  }
+}
+
 export async function runOnboardStep(context: OnboardContext): Promise<OnboardStep> {
   const supervisorData = join(context.root, "supervisor");
   const clock = new SystemClock();
@@ -501,12 +531,27 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
             run: { argv: ["konteks-remote", "start"] },
           };
         }
+        // A record is also written before `start` is ever run, so "starting"
+        // cannot wait for ever (WS1-036): after three waits (about a minute)
+        // hand out `start` again — it is harmless for a service that is
+        // already up, and it is the step that was missed if it is not.
+        const waits = (state.startWaits ?? 0) + 1;
+        if (waits >= 3) {
+          await save({ startWaits: 0 });
+          return {
+            step: "inspect",
+            note: "The Konteks service on this machine has not answered for about a minute. Starting it again; that is safe if it is already running.",
+            run: { argv: ["konteks-remote", "start"] },
+          };
+        }
+        await save({ startWaits: waits });
         return {
           step: "inspect",
           note: "The Konteks service on this machine is still starting; it opens for work about a minute after a fresh install. Nothing else is needed — ask again in a moment.",
           run: AGAIN,
         };
       }
+      if (state.startWaits) await save({ startWaits: 0 });
       const notReady = ready.administrativeStatus !== "active" ? "The runtime service is still coming up; it will finish in the background. " : "";
       const facts = await (context.deps?.inspect ?? inspectRepository)(context.cwd ?? process.cwd());
       // A new conversation in the folder that is already this machine's
@@ -689,8 +734,22 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       if (state.managedSshUrl) {
         let key: { identityFile?: string; user?: string };
         try {
+          // A service that was just (re)started answers within the wait; one
+          // that is up answers at once.
+          await (context.deps?.waitForReady ?? waitForServiceReady)(context.root).catch(() => null);
           key = await (context.deps?.registerGitKey ?? registerGitKey)(context.root);
         } catch (error) {
+          // The service on this machine is not running (WS1-027): say that,
+          // and start it, instead of a control-socket error and "try again".
+          // The person already said yes; the push goes on once it answers.
+          if (error instanceof RemoteInstanceError && error.code === "control_socket_unavailable") {
+            await save({ step: "pushing" });
+            return {
+              step: "pushing",
+              note: "The Konteks service on this machine is not running, so nothing was pushed yet. Starting it; the push goes on once it answers.",
+              run: { argv: ["konteks-remote", "start"] },
+            };
+          }
           await save({ step: "push" });
           const why = error instanceof Error && error.message ? ` (${error.message.replace(/[.]$/, "")})` : "";
           return {
