@@ -11,6 +11,7 @@ import {
   type RemoteNativeArtifact,
 } from "@konteks/remote-common";
 import { installOfflineAgentPackage, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
+import type { RemoteSignedBundleManifest } from "@konteks/remote-common";
 
 export interface E2ESmokeReleaseOptions {
   gate: string | undefined;
@@ -145,6 +146,31 @@ async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directo
   await writeFile(join(options.directory, "release-roots.json"), JSON.stringify({ roots: [root] }), { mode: 0o600 });
   await writeFile(join(options.directory, "native-manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
   return { root, manifest, artifactFiles: { connector: connectorPath, agent: agentFiles[agentArtifacts[0]!.agentId!]!, agents: agentFiles } };
+}
+
+/**
+ * Re-sign the local release at another version (W1-L4), keeping its agent
+ * packages and model mappings, and optionally replacing the connector with a
+ * runnable one so the connector can run as a real OS service. The update path
+ * — stage, drain, swap, health gate, roll back — only runs for a connector the
+ * OS service manager owns. E2E-only: signed by the stack's own local key.
+ */
+export async function reissueE2ERelease(options: { directory: string; bundleVersion: string; connectorPath?: string }) {
+  const manifestPath = join(options.directory, "native-manifest.json");
+  const current = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown> & { nativeArtifacts: RemoteNativeArtifact[] };
+  const { digest: _digest, signature: _signature, ...unsigned } = current;
+  let nativeArtifacts = current.nativeArtifacts;
+  if (options.connectorPath) {
+    const connector = await readFile(options.connectorPath);
+    await writeFile(join(options.directory, "connector"), connector, { mode: 0o700 });
+    nativeArtifacts = nativeArtifacts.map(artifact => artifact.kind === "connector" ? { ...artifact, digest: sha(connector), sizeBytes: connector.length } : artifact);
+  }
+  const manifest = signNativeReleaseManifest(
+    { ...(unsigned as Omit<RemoteSignedBundleManifest, "digest" | "signature">), bundleVersion: options.bundleVersion, nativeArtifacts },
+    { keyId: "e2e-local-native-release-1", privateKey: await e2eSigningKey(options.directory) },
+  );
+  await writeFile(manifestPath, JSON.stringify(manifest), { mode: 0o600 });
+  return manifest;
 }
 
 /** Stable private test authority lives outside the directory served by TLS. */

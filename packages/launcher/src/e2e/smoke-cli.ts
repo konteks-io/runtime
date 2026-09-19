@@ -7,7 +7,7 @@ import { createOutput } from "../output.js";
 import { addNativeAgent, installNative, readNativeRecord } from "../native/install.js";
 import { nativePlatform } from "../native/service.js";
 import { loadE2EInstallAuthority } from "./authority.js";
-import { prepareE2ERealRelease, prepareE2ESmokeRelease } from "./smoke-release.js";
+import { prepareE2ERealRelease, prepareE2ESmokeRelease, reissueE2ERelease } from "./smoke-release.js";
 
 const program = new Command("konteks-remote-e2e-smoke").description("E2E-only signed native connector smoke preparation");
 const gated = () => {
@@ -25,6 +25,16 @@ program.command("prepare")
     if (platform.os === "windows") throw new InvalidArgumentError("the source-driven E2E smoke currently runs on macOS or Debian; Windows uses the signed matrix proof");
     const prepared = await prepareE2ESmokeRelease({ gate: process.env.KONTEKS_E2E_NATIVE_CONNECTOR, directory: resolve(directory), origin, platform: { os: platform.os, architecture: platform.architecture } });
     createOutput({ json: true }).result({ manifestDigest: prepared.manifest.digest, signer: prepared.root.keyId, directory: resolve(directory) });
+  });
+program.command("reissue")
+  .description("re-sign the local release at another version, optionally with a runnable connector (W1-L4)")
+  .requiredOption("--directory <path>", "controller-owned .runtime/native-cloud directory")
+  .requiredOption("--bundle-version <version>", "the version to publish")
+  .option("--connector <path>", "a runnable connector to publish in place of the placeholder")
+  .action(async (options: { directory: string; bundleVersion: string; connector?: string }) => {
+    gated();
+    const manifest = await reissueE2ERelease({ directory: resolve(options.directory), bundleVersion: options.bundleVersion, ...(options.connector ? { connectorPath: resolve(options.connector) } : {}) });
+    createOutput({ json: true }).result({ bundleVersion: manifest.bundleVersion, manifestDigest: manifest.digest });
   });
 program.command("prepare-real")
   .requiredOption("--directory <path>", "controller-owned .runtime/native-cloud directory")
