@@ -70,6 +70,22 @@ describe("uninstall", () => {
     expect(await readdir(repository)).toEqual([".git"]);
     expect(lines.join("")).toContain("runtime is removed from your workspace");
     expect(lines.join("")).toContain(`Your repository at ${repository}`);
+    expect(lines.join("")).toContain("One piece of work is still running on this machine");
+  });
+
+  it("says what the wait is for once, then only a line a minute", async () => {
+    let now = 0;
+    const running = { draining: true, reason: "remove", activeAssignments: 1, openSessions: 0 };
+    const d = deps([], {
+      "drain.status": [...Array.from({ length: 30 }, () => running), { ...running, activeAssignments: 0 }],
+      "instance.retire": [{ outcome: "removed", activeAssignments: 0 }],
+    });
+    d.now = () => now;
+    d.sleep = async () => { now += 5_000; };
+    await uninstallNative({ root, output: output() }, d);
+    const said = lines.join("").split("\n").filter(Boolean);
+    expect(said.filter(line => line.includes("still running on this machine"))).toHaveLength(1);
+    expect(said.filter(line => line.startsWith("Still waiting"))).toHaveLength(2);
   });
 
   it("still cleans up the machine, and says what is left on the site, when Konteks cannot be told", async () => {

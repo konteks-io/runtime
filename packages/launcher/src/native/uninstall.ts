@@ -62,14 +62,24 @@ export async function uninstallNative(input: { root: string; output: Output }, d
     // Finish what is running before anything is revoked: a removal must never
     // cut an agent off mid-turn.
     await control.call({ op: "drain", reason: "remove" }, z.unknown());
-    const drainUntil = deps.now() + DRAIN_LIMIT_MS;
+    const drainStarted = deps.now();
+    const drainUntil = drainStarted + DRAIN_LIMIT_MS;
+    let lastSaid = -Infinity;
     for (;;) {
       const state = await control.call({ op: "drain.status" }, DrainStatusSchema);
       if (state.activeAssignments === 0) break;
       if (deps.now() >= drainUntil) {
         throw new RemoteInstanceError("active_work", "Konteks waited 15 minutes for work still running on this machine, so nothing was removed. The runtime is drained and takes no new work; try again once it finishes.");
       }
-      input.output.line(`Waiting for ${state.activeAssignments} running task(s) to finish before removing Konteks…`);
+      // Say what the wait is for once, then a short line a minute — the same
+      // line every five seconds read as if nothing were happening (pass 26).
+      if (lastSaid === -Infinity) {
+        input.output.line(`${state.activeAssignments === 1 ? "One piece of work is" : `${state.activeAssignments} pieces of work are`} still running on this machine (a planning session, for example). Konteks lets it finish before removing anything; this can take a few minutes, at most 15. No new work starts here meanwhile.`);
+        lastSaid = deps.now();
+      } else if (deps.now() - lastSaid >= 60_000) {
+        input.output.line(`Still waiting for ${state.activeAssignments} running task(s) to finish (${Math.round((deps.now() - drainStarted) / 60_000)} min so far)…`);
+        lastSaid = deps.now();
+      }
       await deps.sleep(POLL_MS);
     }
     const retireUntil = deps.now() + DRAIN_LIMIT_MS;
