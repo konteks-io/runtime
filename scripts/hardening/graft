@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+workspace_root=$(CDPATH= cd -- "$(dirname -- "$repo_root")" && pwd)
+cd "$repo_root"
+exec "$workspace_root/acp-improvement/tools/graft/run" --dir "$repo_root/graft" "$@"

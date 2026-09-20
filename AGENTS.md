@@ -23,3 +23,9 @@ observe its failure or baseline. Run focused tests serially; do not start
 multiple Vitest processes or a whole suite during local proof work unless the
 user explicitly requests it. Preserve unrelated worktree changes and commit
 coherent verified checkpoints.
+
+## C00 hardening
+
+Read and follow [HARDENING.md](HARDENING.md) before maintenance work. Its
+pinned Graft workflow and complexity, documentation, deletion-proof, and
+verification requirements are mandatory.
