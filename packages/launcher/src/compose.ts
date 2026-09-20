@@ -37,7 +37,11 @@ export interface ComposeRenderInputs {
 }
 
 export function composeTemplatePath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "compose", "compose.template.yaml");
+  // esbuild maps import.meta.url to __filename in the native CommonJS bundle.
+  // Repository ESM builds retain a file URL. Accept both representations so
+  // this helper remains valid outside the embedded-template release path.
+  const modulePath = import.meta.url.startsWith("file:") ? fileURLToPath(import.meta.url) : import.meta.url;
+  return join(dirname(modulePath), "..", "..", "..", "compose", "compose.template.yaml");
 }
 
 export function imageRef(release: ReleaseManifest, component: ReleaseManifest["images"][number]["component"]): string {
