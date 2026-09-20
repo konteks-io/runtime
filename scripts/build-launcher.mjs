@@ -49,8 +49,11 @@ execFileSync(npx, [
   "--platform=node",
   "--target=node22",
   "--format=cjs",
-  "--banner:js=const __konteks_import_meta_url = require(\"node:url\").pathToFileURL(__filename).href;",
-  "--define:import.meta.url=__konteks_import_meta_url",
+  // npx.cmd is spawned through cmd.exe on Windows. Keep every argument free
+  // of shell syntax so cmd cannot split one option into extra input files.
+  // createRequire accepts __filename, and composeTemplatePath handles either
+  // that path or the file URL used by repository ESM builds.
+  "--define:import.meta.url=__filename",
   `--outfile=${join(work, "launcher.bundle.cjs")}`,
 ], { stdio: "inherit", shell });
 writeFileSync(join(work, "sea-config.json"), JSON.stringify({ main: join(work, "launcher.bundle.cjs"), output: join(work, "launcher.blob"), disableExperimentalSEAWarning: true }));
