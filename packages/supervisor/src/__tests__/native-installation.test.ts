@@ -36,6 +36,7 @@ async function fixture() {
   const record = { schemaVersion: 1, deploymentKind: "native_connector", instanceId: "instance", workspaceId: "tenant", releaseId: "release-1", manifestDigest: manifest.digest, bundleVersion: "1.0.0", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", controlPort: 41800, agents: ["codex"] };
   const releaseDir = join(root, "releases", record.releaseId);
   for (const directory of [join(root, "supervisor"), join(root, "credentials", "codex"), join(root, "workspaces", "codex"), join(releaseDir, "agents")]) await mkdir(directory, { recursive: true, mode: 0o700 });
+  await new SupervisorStore(join(root, "supervisor")).loadOrCreateInstanceKey();
   await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
   await writeSecretFile(join(root, "supervisor", "identity.json"), JSON.stringify({ instanceId: "instance", workspaceId: "tenant", activationId: "activation", activatedAt: "2026-09-06T00:00:00Z", administrativeStatus: "provisioning", exchangeNonce: "nonce" }));
   await writeSecretFile(join(root, "supervisor", "manifest.json"), JSON.stringify({ manifest, manifestDigest: manifest.digest }));
