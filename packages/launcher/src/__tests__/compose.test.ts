@@ -12,6 +12,7 @@ beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "kr-compose-"));
 });
 afterEach(async () => {
+  delete process.env.KONTEKS_EMBEDDED_COMPOSE_TEMPLATE;
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -80,6 +81,14 @@ describe("compose rendering", () => {
     await writeFile(tampered, `${await readFile(composeTemplatePath(), "utf8")}\n# tampered\n`);
     const paths = installPaths(join(dir, "root"));
     await expect(renderCompose({ release: manifest, paths, coreUrl: "https://core.example", relayUrl: null, agents: [], platform, bundleVersion: manifest.bundleVersion }, tampered)).rejects.toMatchObject({ code: "bundle_untrusted" });
+  });
+
+  it("loads the template embedded by the native release without filesystem access", async () => {
+    process.env.KONTEKS_EMBEDDED_COMPOSE_TEMPLATE = "services:\n  supervisor: {}\n";
+
+    await expect(loadComposeTemplate()).resolves.toMatchObject({
+      template: "services:\n  supervisor: {}\n",
+    });
   });
 
   it("writes the verified template, a 0600 .env, and unique store credentials", async () => {

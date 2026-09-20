@@ -113,8 +113,12 @@ export async function ensureStoreCredentials(paths: InstallPaths): Promise<void>
   await readOrCreateSecretFile({ bytes: 24, dataDir: paths.stores, encoding: "base64url", fileName: "valkey.password" });
 }
 
-export async function loadComposeTemplate(path: string = composeTemplatePath()): Promise<{ template: string; digest: string }> {
-  const template = await readFile(path, "utf8");
+export async function loadComposeTemplate(path?: string): Promise<{ template: string; digest: string }> {
+  // Native releases carry the exact template inside the signed launcher.
+  // Repository builds still read it from disk, which keeps local development
+  // and digest tests pointed at the canonical source file.
+  const embedded = path === undefined ? process.env.KONTEKS_EMBEDDED_COMPOSE_TEMPLATE : undefined;
+  const template = embedded ?? (await readFile(path ?? composeTemplatePath(), "utf8"));
   return { template, digest: `sha256:${sha256Hex(template)}` };
 }
 

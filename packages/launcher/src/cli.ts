@@ -11,13 +11,26 @@ process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
   (emitWarning as (...args: unknown[]) => void)(warning, ...rest);
 }) as typeof process.emitWarning;
 
-const { createNativeProgram } = await import("./native/cli.js");
-const { nativeCliActions } = await import("./native/commands.js");
-const { createOutput } = await import("./output.js");
-
 /** The customer executable has one architecture: a native BYOA connector. */
 export const LAUNCHER_VERSION = process.env.KONTEKS_LAUNCHER_VERSION ?? "0.1.0";
-createNativeProgram(nativeCliActions).parseAsync(process.argv).catch((error: unknown) => {
-  createOutput({ json: process.argv.includes("--json") }).error(error);
-  process.exitCode = 1;
-});
+
+async function main(): Promise<void> {
+  // Keep these imports after the warning filter above without introducing
+  // top-level await. The release launcher is bundled as CommonJS because
+  // Node's single-executable application entry point is a CommonJS script.
+  const [{ createNativeProgram }, { nativeCliActions }, { createOutput }] =
+    await Promise.all([
+      import("./native/cli.js"),
+      import("./native/commands.js"),
+      import("./output.js"),
+    ]);
+
+  await createNativeProgram(nativeCliActions).parseAsync(process.argv).catch(
+    (error: unknown) => {
+      createOutput({ json: process.argv.includes("--json") }).error(error);
+      process.exitCode = 1;
+    },
+  );
+}
+
+void main();
