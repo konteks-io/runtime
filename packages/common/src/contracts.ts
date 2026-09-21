@@ -367,6 +367,15 @@ export {
   // The ordered D125 verdict table as a pure function: the supervisor applies
   // it to component-minted reports exactly as Core applies it to its own.
   decideReportVerdict,
+  DiagnosticCarrierCompanionSchema,
+  DiagnosticCarrierCompanionDeliveryRequestSchema,
+  DiagnosticCarrierCompanionDeliveryResultSchema,
+  diagnosticCarrierCompanionSigningBytes,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
+export type {
+  DiagnosticCarrierCompanion,
+  DiagnosticCarrierCompanionDeliveryRequest,
+  DiagnosticCarrierCompanionDeliveryResult,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
 
 /**

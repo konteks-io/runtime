@@ -5,10 +5,12 @@ import {
   RelayAckSchema,
   RelayReplayRequestSchema,
   RuntimeCancellationDeliveryRequestSchema,
+  DiagnosticCarrierCompanionDeliveryRequestSchema,
   RemoteExecutionRevisionControlDeliveryRequestSchema,
   RuntimePermissionAnswerDeliveryRequestSchema,
   type RemoteExecutionRevisionControlDeliveryRequest,
   type RuntimePermissionAnswerDeliveryRequest,
+  type DiagnosticCarrierCompanionDeliveryRequest,
   RemoteInstanceError,
   AssignmentReplyFrameSchema,
   ToRuntimeRelayFrameSchema,
@@ -79,6 +81,11 @@ export interface RelayClientOptions {
   }) => Promise<void>;
   /** Dedicated C02 safety-control intake; never a mux cursor or receipt ACK. */
   onExecutionRevisionControl?: (request: RemoteExecutionRevisionControlDeliveryRequest, connection: {
+    connectionEpoch: number;
+    assertCurrent(): void;
+  }) => Promise<void>;
+  /** C01 diagnostic-only sidecar; its failure must not interrupt work transport. */
+  onDiagnosticCompanion?: (request: DiagnosticCarrierCompanionDeliveryRequest, connection: {
     connectionEpoch: number;
     assertCurrent(): void;
   }) => Promise<void>;
@@ -325,6 +332,30 @@ export class RelayClient {
         if (!this.options.onCancellation) throw new RemoteInstanceError("recovery_required", "Cancellation receiver is unavailable");
         await this.options.onCancellation(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
         assertCurrent();
+        return;
+      }
+      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_diagnostic_carrier_companion_delivery") {
+        // Diagnostics are deliberately best effort: malformed, stale, or
+        // unavailable sidecars become a coverage signal, never a work outage.
+        try {
+          const request = DiagnosticCarrierCompanionDeliveryRequestSchema.parse(value);
+          const epoch = validatedEpoch;
+          const assertCurrent = () => {
+            if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
+              validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
+              throw new RemoteInstanceError("recovery_required", "Diagnostic companion socket ownership is not current");
+            }
+          };
+          assertCurrent();
+          if (!this.options.onDiagnosticCompanion) {
+            this.logger.warn({ deliveryId: request.companion.deliveryId }, "diagnostic companion coverage is incomplete");
+            return;
+          }
+          await this.options.onDiagnosticCompanion(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
+          assertCurrent();
+        } catch (error) {
+          this.logger.warn({ err: error }, "diagnostic companion delivery was not retained");
+        }
         return;
       }
       if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_execution_revision_control_delivery") {

@@ -30,6 +30,7 @@ import { CoreClient, LEASE_AUDIENCE } from "./core/client.js";
 import { CoreSignatureVerifier } from "./control/core-signature.js";
 import { CancellationReceiver } from "./control/cancellation-receiver.js";
 import { ExecutionRevisionControlReceiver } from "./control/execution-revision-control-receiver.js";
+import { DiagnosticCompanionReceiver } from "./control/diagnostic-companion-receiver.js";
 import { PermissionAnswerReceiver } from "./control/permission-answer-receiver.js";
 import { CancellationReplay } from "./control/cancellation-replay.js";
 import { ControlHandlers, compareSemver } from "./control/handlers.js";
@@ -495,6 +496,37 @@ export class Supervisor {
                       this.instanceId !== instanceId || this.workspaceId !== workspaceId ||
                       this.runnerIncarnation !== runnerIncarnation) {
                     throw new RemoteInstanceError("recovery_required", "Cancellation native ownership is not current");
+                  }
+                  ownership.assertOwned();
+                },
+              } : null,
+            });
+            await receiver.receive(request);
+          },
+          onDiagnosticCompanion: async (request, connection) => {
+            const lease = this.lease.current();
+            const instanceId = this.instanceId;
+            const workspaceId = this.workspaceId;
+            const runnerIncarnation = this.runnerIncarnation;
+            const ownership = this.nativeOwnership;
+            const receiver = new DiagnosticCompanionReceiver({
+              verifier,
+              inbox: this.journal.diagnosticCompanions,
+              now: () => this.clock.coreNow(),
+              captureConnection: () => lease && instanceId && workspaceId && ownership ? {
+                instanceId,
+                workspaceId,
+                runnerIncarnation,
+                nodeId: request.nodeId,
+                connectionRef: request.connectionRef,
+                connectionEpoch: connection.connectionEpoch,
+                assertCurrent: () => {
+                  connection.assertCurrent();
+                  if (this.stopping || this.nativeOwnership !== ownership ||
+                    this.lease.current() !== lease || this.instanceId !== instanceId ||
+                    this.workspaceId !== workspaceId ||
+                    this.runnerIncarnation !== runnerIncarnation) {
+                    throw new RemoteInstanceError("recovery_required", "Diagnostic companion ownership is not current");
                   }
                   ownership.assertOwned();
                 },

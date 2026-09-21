@@ -17,6 +17,11 @@ import {
   ExecutionRevisionFenceInboxRecordSchema,
   type ExecutionRevisionFenceInboxRecord,
 } from "./execution-revision-fence-inbox.js";
+import {
+  DiagnosticCompanionInbox,
+  DiagnosticCompanionInboxRecordSchema,
+  type DiagnosticCompanionInboxRecord,
+} from "./diagnostic-companion-inbox.js";
 
 /**
  * The bounded assignment recovery journal. Contains only IDs, attempt, claim,
@@ -433,6 +438,9 @@ export class SupervisorJournal {
   /** C02 pre-fence evidence; not a provider-stop or terminal result. */
   readonly executionRevisionFences: ExecutionRevisionFenceInbox;
   private readonly executionRevisionFenceLog: AppendLog<ExecutionRevisionFenceInboxRecord>;
+  /** C01 diagnostic-only evidence; it never changes delivery or authority. */
+  readonly diagnosticCompanions: DiagnosticCompanionInbox;
+  private readonly diagnosticCompanionLog: AppendLog<DiagnosticCompanionInboxRecord>;
 
   constructor(dir: string, mutate: StateMutation = unrestrictedStateMutation) {
     this.cancellationLog = new AppendLog(dir, { name: "cancellation-inbox", schema: CancellationInboxRecordSchema,
@@ -444,6 +452,12 @@ export class SupervisorJournal {
       key: record => record.intent.intentId,
     }, MAX_JOURNAL_ENTRIES, mutate);
     this.executionRevisionFences = new ExecutionRevisionFenceInbox(this.executionRevisionFenceLog);
+    this.diagnosticCompanionLog = new AppendLog(dir, {
+      name: "diagnostic-companion-inbox",
+      schema: DiagnosticCompanionInboxRecordSchema,
+      key: record => record.companion.deliveryId,
+    }, MAX_JOURNAL_ENTRIES, mutate);
+    this.diagnosticCompanions = new DiagnosticCompanionInbox(this.diagnosticCompanionLog);
     this.executionLog = new AppendLog(dir, { name: "local-execution", schema: LocalExecutionRecordSchema, key: localExecutionKey, atomicBatches: true }, 50_000, mutate);
     this.execution = new LocalExecutionJournal(this.executionLog);
     this.assignmentStream = new AssignmentStreamJournal(this.executionLog, this.execution);
@@ -460,7 +474,7 @@ export class SupervisorJournal {
   }
 
   async load(): Promise<void> {
-    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryEvidence.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load(), this.executionRevisionFenceLog.load()]);
+    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryEvidence.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load(), this.executionRevisionFenceLog.load(), this.diagnosticCompanionLog.load()]);
   }
 
   /** Bounded pruning: completed/cancelled entries beyond the bound go first, oldest first. */

@@ -2,6 +2,8 @@ import type { KeyObject } from "node:crypto";
 import { PlanningControllerTerminalDirectiveSchema, RemoteControlSigningKeySchema, planningControllerTerminalDirectiveSigningBytes, remoteControlSigningBytes, ed25519PublicKeyFromJwk, ed25519Verify, type JsonValue, type PlanningControllerTerminalDirective } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "@konteks/remote-release";
 import {
+  diagnosticCarrierCompanionSigningBytes,
+  DiagnosticCarrierCompanionDeliveryRequestSchema,
   executionRevisionControlSigningBytes,
   RemoteExecutionRevisionControlDeliveryRequestSchema,
   RuntimeCancellationDeliveryRequestSchema,
@@ -87,6 +89,20 @@ export class CoreSignatureVerifier {
     } catch {
       return false;
     }
+  }
+
+  /** C01 uses detached diagnostic-only signing bytes so it cannot be
+   * confused with authority, work, or cancellation control. */
+  verifyDiagnosticCarrierCompanionDelivery(candidate: unknown): boolean {
+    const parsed = DiagnosticCarrierCompanionDeliveryRequestSchema.safeParse(candidate);
+    if (!parsed.success) return false;
+    const request = parsed.data;
+    const key = this.keys.get(request.keyId);
+    if (!key || !/^[A-Za-z0-9_-]{86}$/.test(request.signature) ||
+      Buffer.from(request.signature, "base64url").toString("base64url") !== request.signature) return false;
+    try {
+      return ed25519Verify(key, diagnosticCarrierCompanionSigningBytes(request), request.signature);
+    } catch { return false; }
   }
 
   verify(body: { [key: string]: JsonValue }, signature: string): boolean {
