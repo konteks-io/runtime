@@ -22,6 +22,19 @@ function globalRoot() {
   } catch { return null; /* npm unavailable */ }
 }
 
+// The dist/claude dir beside the `graft` binary on PATH. The CLI, the MCP server
+// and scripts/hardening/graft already resolve Graft this way, so the hooks agree
+// with them whichever Node happens to run the hook (an app-launched session can
+// put an older Node first on PATH than the one Graft was installed under).
+function fromPathBinary() {
+  try {
+    const finder = process.platform === 'win32' ? 'where' : 'which';
+    const bin = execFileSync(finder, ['graft'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split(/\r?\n/)[0].trim();
+    if (!bin) return null;
+    return path.join(path.dirname(fs.realpathSync(bin)), 'claude'); // dist/cli.js -> dist/claude
+  } catch { return null; /* graft not on PATH */ }
+}
+
 // The version of the package a dist/claude dir belongs to, or null if unreadable.
 function versionOf(distClaude) {
   try {
@@ -58,6 +71,8 @@ function entry(name) {
   const cheap = [BAKED, fromPkg(dir), fromPkg(path.join(path.dirname(process.execPath), '..', 'lib'))];
   const hit = best(cheap, name);
   if (hit) return path.join(hit, name);
+  const onPath = fromPathBinary();
+  if (onPath && fs.existsSync(path.join(onPath, name))) return path.join(onPath, name);
   const gr = globalRoot();
   const global = gr && path.join(gr, '@nanonets', 'graft', 'dist', 'claude');
   if (global && fs.existsSync(path.join(global, name))) return path.join(global, name);
