@@ -30,11 +30,11 @@ you want to build first into your first initiative.
 
 ```sh
 curl -fsSL -o "${TMPDIR:-/tmp}/konteks-install.sh" https://github.com/konteks-io/runtime/releases/latest/download/install.sh && sh "${TMPDIR:-/tmp}/konteks-install.sh" --user --enroll
-konteks-remote onboard --json
 ```
 
 The installer is downloaded to a file your agent can read before it runs,
-rather than piped into `sh`.
+rather than piped into `sh`. It ends by printing the first onboarding step as
+JSON; each later step comes from `konteks-remote onboard --json`.
 
 macOS and Linux. The connector executable is verified against the same signed
 checksum manifest the packages are, so this path is verified differently from
