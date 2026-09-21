@@ -1,8 +1,11 @@
 #!/usr/bin/env sh
 set -eu
 export DO_NOT_TRACK=1
-# Query-time rebuilds remain explicitly scheduled.
 export GRAFT_NO_REFRESH=1
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
-exec "$HOME/.local/share/graft/node_modules/.bin/graft" --dir "$repo_root/graft" "$@"
+graft_bin=$(command -v graft) || {
+  echo "Graft is not on PATH; install @nanonets/graft and restart the agent." >&2
+  exit 127
+}
+exec "$graft_bin" --dir "$repo_root/graft" "$@"
