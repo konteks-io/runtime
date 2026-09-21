@@ -20,6 +20,11 @@ export interface NativeExecutionGateOptions {
     Partial<Pick<CoreClient, "consumeDeliveryExecution" | "checkDeliveryExecution">>;
   assertOwned: () => void;
   onAuthorityLost: () => Promise<void>;
+  /** Present only when the live native relay owner can prove its exact socket. */
+  currentRevisionFenceConnection?: () => {
+    connectionRef: string;
+    connectionEpoch: number;
+  } | null;
   monotonicNow?: () => number;
 }
 type Authority = RemoteExecutionAuthorityView | RemoteDeliveryExecutionAuthorityView;
@@ -111,6 +116,10 @@ export class NativeExecutionGate {
   async begin(operation: AuthorizedNativeOperation): Promise<boolean> {
     if (operation.replay) return false;
     try {
+      if (this.hasDurableRevisionFence(operation.authority)) {
+        await this.fenceAuthority();
+        throw fenced();
+      }
       await this.refresh();
       const started = await this.operations.begin(operation.key, () => this.assertDispatchCurrent(operation.authority));
       this.assertDispatchCurrent(operation.authority);
@@ -190,6 +199,28 @@ export class NativeExecutionGate {
     this.localAuthority(authority);
     if (this.authority?.executionId !== authority.executionId || this.authority.executionRevision !== authority.executionRevision ||
       this.monotonicDeadline <= this.monotonic()) throw unavailable();
+  }
+
+  /**
+   * The receiver verified the Core signature and exact live socket before
+   * persisting this record. The gate still requires the same current local
+   * runner and socket before it suppresses work, so a retained old-socket fact
+   * cannot fence a replacement execution.
+   */
+  private hasDurableRevisionFence(authority: Authority): boolean {
+    const connection = this.options.currentRevisionFenceConnection?.();
+    if (!connection) return false;
+    return this.options.journal.executionRevisionFences.pending().some(
+      (record) =>
+        record.runnerIncarnation === authority.runnerIncarnation &&
+        record.connectionRef === connection.connectionRef &&
+        record.connectionEpoch === connection.connectionEpoch &&
+        record.intent.instanceId === authority.instanceId &&
+        record.intent.executionId === authority.executionId &&
+        record.intent.executionRevision === authority.executionRevision &&
+        record.intent.connectionRef === connection.connectionRef &&
+        record.intent.connectionEpoch === connection.connectionEpoch,
+    );
   }
 
   private refresh(): Promise<void> {

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, RemoteInstanceError, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeExecutionRevisionControlIntentDigest, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.js";
 import { SupervisorJournal } from "../state/journal.js";
@@ -58,7 +58,7 @@ async function fixture() {
   const assertOwned = vi.fn();
   const onAuthorityLost = vi.fn(async () => undefined);
   const makeGate = () => { const gate = new NativeExecutionGate({ assignment, journal, clock, runnerIncarnation: "runner", client,
-    assertOwned, onAuthorityLost, monotonicNow: () => monotonic }); gates.push(gate); return gate; };
+    assertOwned, onAuthorityLost, currentRevisionFenceConnection: () => ({ connectionRef: "connection", connectionEpoch: 2 }), monotonicNow: () => monotonic }); gates.push(gate); return gate; };
   return { journal, clock, ready, claims, client, envelope, gate: makeGate(), makeGate, onAuthorityLost, assertOwned,
     advance: (milliseconds: number) => { monotonic += milliseconds; clock.advance(milliseconds); } };
 }
@@ -365,6 +365,67 @@ describe("native session dispatch uses genuine execution admission", () => {
 });
 
 describe("independent native live execution gate", () => {
+  it("fences before dispatch when durable verified control names this exact execution revision", async () => {
+    const f = await fixture();
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      executionRevision: 1,
+      checkId: "check",
+      policyRevision: null,
+      connectionRef: "connection",
+      connectionEpoch: 2,
+      reason: "authority_revoked" as const,
+      issuedAt: f.clock.nowIso(),
+      deadlineAt: new Date(f.clock.coreNow() + 2_000).toISOString(),
+    };
+    await f.journal.executionRevisionFences.receiveVerified({
+      intent,
+      intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      runnerIncarnation: "runner",
+      connectionRef: "connection",
+      connectionEpoch: 2,
+    }, f.clock.nowIso(), () => {});
+    const operation = await f.gate.admit(f.envelope);
+    await expect(f.gate.begin(operation)).rejects.toMatchObject({
+      code: "execution_fenced",
+    });
+    expect(f.client.checkExecution).not.toHaveBeenCalled();
+  });
+
+  it("does not fence a different execution revision or connection record", async () => {
+    const f = await fixture();
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "other-intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      executionRevision: 2,
+      checkId: "other-check",
+      policyRevision: null,
+      connectionRef: "other-connection",
+      connectionEpoch: 3,
+      reason: "authority_revoked" as const,
+      issuedAt: f.clock.nowIso(),
+      deadlineAt: new Date(f.clock.coreNow() + 2_000).toISOString(),
+    };
+    await f.journal.executionRevisionFences.receiveVerified({
+      intent,
+      intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      runnerIncarnation: "runner",
+      connectionRef: "other-connection",
+      connectionEpoch: 3,
+    }, f.clock.nowIso(), () => {});
+    const operation = await f.gate.admit(f.envelope);
+    await expect(f.gate.begin(operation)).resolves.toBe(true);
+  });
+
   it("requires genuine signatures, exact local readiness, consumption and a check before start", async () => {
     const f = await fixture(); const operation = await f.gate.admit(f.envelope);
     expect(f.journal.pendingRequests.get(operation.key)?.authorization?.state).toBe("admitted");

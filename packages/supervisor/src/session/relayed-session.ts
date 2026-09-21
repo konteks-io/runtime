@@ -93,7 +93,10 @@ export interface RelayedSessionDeps {
    * exactly this runtime's. Absent, `assertExecutionOwned` is used.
    */
   assertRecoveryOwned?: () => void;
-  executionAuthority?: Pick<NativeExecutionGateOptions, "client" | "runnerIncarnation">;
+  executionAuthority?: Pick<
+    NativeExecutionGateOptions,
+    "client" | "runnerIncarnation" | "currentRevisionFenceConnection"
+  >;
   onExecutionAuthorityLost?: () => Promise<void>;
   reserveExecutionReference?: (opaqueRef: string) => Promise<void>;
   /**
