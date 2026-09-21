@@ -93,6 +93,8 @@ const AFFIRMATIVE = new Set(["y", "yes", "yeah", "yep", "yup", "ok", "okay", "su
 const NEGATIVE = new Set(["n", "no", "nope", "not now", "skip", "later", "cancel", "stop"]);
 /** Words that turn an otherwise agreeable answer into a refusal ("please don't"). */
 const NEGATION = /\b(no|not|don'?t|do not|never|cancel|stop|wait)\b/;
+/** "send a new code", "resend", "I didn't get it", "another code please". */
+const ASKS_NEW_CODE = /\b(new code|another code|resend|send (it |a code )?again|didn'?t (get|receive|arrive)|did not (get|receive|arrive)|no (code|email) (came|arrived))\b/i;
 const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
 /** How long, and how often, the agents step waits for the machine to advertise what it can run. */
 const AGENTS_WAIT_MS = 10_000;
@@ -353,16 +355,34 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         intentRef = opened.intentRef;
       }
       const sent = await enrollment.sendChallenge(intentRef, email);
-      await save({ step: "code", intentRef, email, emailMasked: sent.sentToMasked, attemptsRemaining: sent.attemptsRemaining, resendTo: undefined } as never);
-      return { step: "email", note: `A six-digit code is on its way to ${sent.sentToMasked}.`, run: AGAIN };
+      await save({ step: "code", intentRef, email, emailMasked: sent.sentToMasked, attemptsRemaining: sent.attemptsRemaining, resendTo: undefined, resendReason: undefined } as never);
+      return {
+        step: "email",
+        note: `${state.resendReason ? `${state.resendReason} ` : ""}A ${state.resendReason ? "new " : ""}six-digit code is on its way to ${sent.sentToMasked}. If it does not arrive within a minute or two, say "send a new code".`,
+        run: AGAIN,
+      };
     }
 
     case "code": {
+      const codeQuestion = { question: `Paste the six-digit code sent to ${state.emailMasked ?? "your email"}.`, kind: "code" as const };
       if (context.answer === undefined || !context.answer.trim()) {
-        return {
-          step: "code",
-          ask: { question: `Paste the six-digit code sent to ${state.emailMasked ?? "your email"}.`, kind: "code" },
-        };
+        return { step: "code", ask: codeQuestion };
+      }
+      // No mail, or a code lost: the person asks for another one (WS1-088).
+      if (ASKS_NEW_CODE.test(context.answer)) {
+        try {
+          const sent = await enrollment.sendChallenge(state.intentRef!, state.email!);
+          await save({ emailMasked: sent.sentToMasked, attemptsRemaining: sent.attemptsRemaining });
+          return { step: "code", note: `A new code is on its way to ${sent.sentToMasked}; the one before it no longer works.`, ask: codeQuestion };
+        } catch (error) {
+          if (wireCode(error) === "challenge_active") {
+            return { step: "code", note: `The last code was sent less than a minute ago and is probably still on its way. If it has not arrived in a minute, say "send a new code" again.`, ask: codeQuestion };
+          }
+          if (wireCode(error) === "rate_limited") {
+            return { step: "code", note: "Too many codes were sent to this address in the last hour, so no new one can be sent yet. The last code still works until it expires.", ask: codeQuestion };
+          }
+          throw error;
+        }
       }
       let verified;
       try {
@@ -373,8 +393,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           await save({ attemptsRemaining: left });
           return {
             step: "code",
-            note: `That code was not accepted${left > 0 ? `; ${left} attempt${left === 1 ? "" : "s"} left` : ""}.`,
-            ask: { question: `Paste the six-digit code sent to ${state.emailMasked ?? "your email"}.`, kind: "code" },
+            note: `That code was not accepted${left > 0 ? `; ${left} attempt${left === 1 ? "" : "s"} left` : ""}. If the email did not arrive or the code is lost, say "send a new code".`,
+            ask: codeQuestion,
           };
         }
         if (["enrollment_invalid", "challenge_expired"].includes(wireCode(error))) {
@@ -383,8 +403,15 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           // Keep the address: the note promises a new code, and the email
           // step sends one to it rather than asking the person for their
           // address again (W1-X1; passes 19 and X1 were asked again).
-          await save({ step: "email", intentRef: undefined, emailMasked: undefined, attemptsRemaining: undefined, ...(state.email ? { resendTo: state.email } : {}) } as never);
-          return { step: "code", note: "That code can no longer be used; a new one will be sent.", run: AGAIN };
+          // Say why before the new code goes out; the email step, which the
+          // chain ends on, carries the reason (Z2: the fifth wrong code was
+          // otherwise reported only as "a code is on its way").
+          const resendReason =
+            wireCode(error) === "challenge_expired"
+              ? "That code has expired; codes last ten minutes."
+              : "That code was not accepted either, and after five wrong codes a code stops working, to keep your account safe.";
+          await save({ step: "email", intentRef: undefined, emailMasked: undefined, attemptsRemaining: undefined, resendReason, ...(state.email ? { resendTo: state.email } : {}) } as never);
+          return { step: "code", note: `${resendReason} A new one will be sent.`, run: AGAIN };
         }
         throw error;
       }

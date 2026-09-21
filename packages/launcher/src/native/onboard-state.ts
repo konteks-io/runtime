@@ -49,6 +49,8 @@ export const OnboardStateSchema = z
     emailMasked: z.string().min(1).optional(),
     /** An address to send a fresh code to without asking again, after a lost bind. */
     resendTo: z.string().min(1).optional(),
+    /** Why a fresh code is being sent, said with it (W1-Z2). */
+    resendReason: z.string().min(1).optional(),
     /** The address the person gave, needed once more at bind (OS6). */
     email: z.string().min(1).optional(),
     decision: z.enum(["join", "choose", "create"]).optional(),

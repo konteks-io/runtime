@@ -1159,11 +1159,48 @@ describe("onboard", () => {
     const first = await step({ enrollment: { verifyCode } as never }, "000000");
     expect(first.ask).toMatchObject({ kind: "code" });
     expect(first.note).toContain("2 attempts left");
+    expect(first.note).toContain('say "send a new code"');
     const second = await step({ enrollment: { verifyCode } as never }, "000001");
-    expect(second.note).toContain("a new one will be sent");
+    expect(second.note).toBe("That code was not accepted either, and after five wrong codes a code stops working, to keep your account safe. A new one will be sent.");
     expect(second.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
     // The promise holds: the email step sends to the same address instead of asking for it.
     expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
+  });
+
+  it("says why a new code comes after the fifth wrong one, in the same reply as the new code (W1-Z2)", async () => {
+    await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "ada@acme.test", emailMasked: "a••@acme.test", attemptsRemaining: 1 } as never);
+    const { CoreResponseError } = await import("@konteks/remote-common");
+    const enrollment = {
+      verifyCode: vi.fn().mockRejectedValueOnce(new CoreResponseError({ status: 401, code: "enrollment_invalid", message: "no" })),
+      openIntent: vi.fn(async () => ({ intentRef: "intent-2" })),
+      sendChallenge: vi.fn(async () => ({ sentToMasked: "a••@acme.test", attemptsRemaining: 5 })),
+    };
+    const { writeSecretFile } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: [], bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "428913", deps: { waitForReady: readyService, enrollment: enrollment as never, fetchFn: (async () => { throw new Error("no fetch"); }) as never } });
+    expect(result.note).toContain("after five wrong codes a code stops working, to keep your account safe.");
+    expect(result.note).toContain("A new six-digit code is on its way to a••@acme.test.");
+    expect(result.ask).toMatchObject({ kind: "code" });
+    expect(enrollment.sendChallenge).toHaveBeenCalledWith("intent-2", "ada@acme.test");
+    expect((await readOnboardState(root))?.resendReason).toBeUndefined();
+  });
+
+  it("sends a new code when the person asks for one, and says when it is too soon (WS1-088)", async () => {
+    await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "ada@acme.test", emailMasked: "a••@acme.test", attemptsRemaining: 5 } as never);
+    const { CoreResponseError } = await import("@konteks/remote-common");
+    const sendChallenge = vi
+      .fn()
+      .mockRejectedValueOnce(new CoreResponseError({ status: 409, code: "challenge_active", message: "wait" }))
+      .mockResolvedValueOnce({ sentToMasked: "a••@acme.test", attemptsRemaining: 5 });
+    const verifyCode = vi.fn();
+    const soon = await step({ enrollment: { sendChallenge, verifyCode } as never }, "I didn't get it");
+    expect(soon.note).toContain("less than a minute ago");
+    expect(soon.ask).toMatchObject({ kind: "code" });
+    const again = await step({ enrollment: { sendChallenge, verifyCode } as never }, "send a new code");
+    expect(again.note).toBe("A new code is on its way to a••@acme.test; the one before it no longer works.");
+    expect(verifyCode).not.toHaveBeenCalled();
   });
 
   it("ends the flow on an empty answer to the first task, not only on whitespace", async () => {
