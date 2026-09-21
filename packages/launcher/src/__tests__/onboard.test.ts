@@ -1241,6 +1241,13 @@ describe("onboard", () => {
     expect((await readOnboardState(root))?.email).toBeUndefined();
   });
 
+  it("takes \"nothing for now\" as no first initiative, not as its title", async () => {
+    await writeOnboardState(root, { step: "first_task", systemId: "sys-1", instanceId: "instance-1" } as never);
+    const result = await step({}, "nothing for now, thanks");
+    expect(result.note).toBe("No initiative was started; start one from the site with New initiative whenever you like.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "done" });
+  });
+
   it("ends the flow on an empty answer to the first task, not only on whitespace", async () => {
     await writeOnboardState(root, { step: "first_task", systemId: "sys-1", instanceId: "instance-1" } as never);
     const result = await step({}, "");

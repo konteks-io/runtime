@@ -1021,9 +1021,10 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         };
       }
       const wanted = context.answer.trim();
-      if (!wanted) {
+      // "nothing for now", "skip", "no thanks": a refusal, not an initiative's title.
+      if (!wanted || isNo(wanted) || /^(nothing|none|not now|skip|later|maybe later)\b/i.test(wanted)) {
         await save({ step: "done", closing: true });
-        return { step: "first_task", note: "Ending here.", run: AGAIN };
+        return { step: "first_task", note: wanted ? "No initiative was started; start one from the site with New initiative whenever you like." : "Ending here.", run: AGAIN };
       }
       if (!state.systemId) {
         await save({ step: "done", closing: true });
