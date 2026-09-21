@@ -79,6 +79,20 @@ describe("native claim-scoped output client", () => {
     await expect(new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn, retrySleep: async () => undefined }).accept(assignment, candidate)).resolves.toEqual(receipt);
     expect(fetchFn.mock.calls[1]![1]?.body).toBe(fetchFn.mock.calls[6]![1]?.body);
   });
+
+  it("does not let repeated output retries outlive one logical transfer budget", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const fetchFn = vi.fn(async () => new Response(null, { status: 503 }));
+      const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn,
+        retrySleep: async () => { now.mockReturnValue(32_001); } });
+
+      await expect(client.accept(assignment, candidate)).rejects.toMatchObject({ code: "capability_unavailable" });
+      expect(fetchFn).toHaveBeenCalledOnce();
+    } finally {
+      now.mockRestore();
+    }
+  });
   it("names an assignment Core no longer knows instead of an ordinary refusal", async () => {
     const notFound = () => new Response(JSON.stringify({ code: "not_found", message: "assignment not found" }), { status: 404, headers: { "content-type": "application/json" } });
     const fetchFn = vi.fn(async () => notFound());
