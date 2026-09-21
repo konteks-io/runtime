@@ -907,6 +907,29 @@ describe("onboard", () => {
     expect((state as { intentRef?: string }).intentRef).toBeUndefined();
   });
 
+  it("shows what a folder with files would commit, and what it leaves out, then commits exactly that and pushes (W1-B2)", async () => {
+    await writeOnboardState(root, {
+      step: "push", repositoryPath: "/tmp/cafe", repositoryName: "cafe", repositoryNeedsInit: true, defaultBranch: "main",
+      managedRemoteUrl: "https://git.konteks.test/acme/cafe", systemId: "sys-1", ownerEmail: "hello@konteks.io",
+    } as never);
+    const plan = { include: ["README.md", "package.json", "src/app.js"], leftOut: [{ path: ".env", why: "it can hold secrets" }, { path: "node_modules/", why: "installed packages" }] };
+    const planCommit = vi.fn(async () => plan);
+    const asked = await step({ planCommit });
+    expect(asked.ask?.question).toBe("Push cafe to Konteks managed git now? The folder becomes a git repository on main, joined to the repository Konteks made for it, with one commit of your 3 files.");
+    expect(asked.note).toBe("The commit would hold README.md, package.json and src/app.js. Left out: .env (it can hold secrets) and node_modules/ (installed packages). A .gitignore listing them is added so they stay out.");
+
+    await step({ planCommit }, "yes");
+    const initialize = vi.fn(async () => ({ ok: true, adopted: true, message: "cafe is now a git repository on main." }));
+    const commitFiles = vi.fn(async () => ({ ok: true, message: 'Committed 3 files as "Add cafe".' }));
+    const push = vi.fn(async () => ({ pushed: true, message: "Pushed main to Konteks managed git." }));
+    const pushed = await step({ planCommit, initialize: initialize as never, commitFiles, push: push as never });
+    expect(initialize).toHaveBeenCalledWith(expect.objectContaining({ keepFiles: true }));
+    expect(commitFiles).toHaveBeenCalledWith({ path: "/tmp/cafe", plan, authorName: "hello", authorEmail: "hello@konteks.io", message: "Add cafe" });
+    expect(push).toHaveBeenCalled();
+    expect(pushed.note).toContain("Pushed main to Konteks managed git.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "graft" });
+  });
+
   describe("Graft (W1-G1..G3, WS1-081)", () => {
     const plan = async () => ({ agents: ["claude", "agents"], adds: ["graft/", ".claude/", ".mcp.json", "AGENTS.md"], tracked: [] as string[], files: 3 });
     const graftDeps = (extra: Record<string, unknown> = {}) => ({

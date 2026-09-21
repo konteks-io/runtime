@@ -1,4 +1,5 @@
-import { basename, resolve } from "node:path";
+import { readdir, readFile, writeFile } from "node:fs/promises";
+import { basename, join, relative, resolve } from "node:path";
 import { runCommand, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
 
 /**
@@ -92,6 +93,13 @@ export async function initializeRepository(input: {
    * what the person asked for and costs them nothing in an empty folder.
    */
   remote?: { url: string; sshCommand?: string };
+  /**
+   * The folder already has the person's files (W1-B2). Joining Konteks's
+   * history then must not touch them: a checkout would refuse over a file
+   * both have, so the branch is moved onto that history with the working tree
+   * left as it is.
+   */
+  keepFiles?: boolean;
 }): Promise<{ ok: boolean; message: string; adopted?: boolean }> {
   const top = await git(input.path, ["rev-parse", "--show-toplevel"]).catch(() => null);
   if (!top || top.code !== 0) {
@@ -106,6 +114,20 @@ export async function initializeRepository(input: {
     const attached = await attachManagedRemote(input.path, input.remote);
     if (attached) return { ok: false, message: attached };
     const fetched = await git(input.path, ["fetch", "--quiet", "konteks", input.branch], 120_000).catch(() => null);
+    if (fetched && fetched.code === 0 && input.keepFiles) {
+      const moved = await git(input.path, ["reset", "--quiet", `konteks/${input.branch}`]);
+      if (moved.code !== 0) return { ok: false, message: `This folder could not be joined to the Konteks repository${reason(moved)}.` };
+      await git(input.path, ["branch", "--set-upstream-to", `konteks/${input.branch}`]);
+      // A file Konteks's first commit has and the folder does not (its
+      // README) is restored; the person's own files win everywhere else.
+      const tracked = (await git(input.path, ["ls-files", "--deleted"])).stdout.split("\n").filter(Boolean);
+      if (tracked.length > 0) await git(input.path, ["checkout", "HEAD", "--", ...tracked]);
+      return {
+        ok: true,
+        adopted: true,
+        message: `${basename(resolve(input.path))} is now a git repository on ${input.branch}, joined to the Konteks repository's first commit.`,
+      };
+    }
     if (fetched && fetched.code === 0) {
       const checkedOut = await git(input.path, ["checkout", "-B", input.branch, "--track", `konteks/${input.branch}`]);
       if (checkedOut.code !== 0) {
@@ -192,4 +214,76 @@ export async function pushToManagedRemote(input: {
         pushed: false,
         message: `The push to Konteks managed git did not go through${reason(pushed)}.`,
       };
+}
+
+/** Why a file is left out of the first commit unless the person asks for it. */
+const LEFT_OUT: Array<{ test: (name: string, isDirectory: boolean) => boolean; why: string }> = [
+  { test: (name, dir) => dir && name === "node_modules", why: "installed packages" },
+  { test: (name, dir) => !dir && /^\.env(\..+)?$/.test(name) && !/\.(example|sample|template)$/.test(name), why: "it can hold secrets" },
+  { test: (name, dir) => !dir && (/\.(pem|key|p12|pfx)$/.test(name) || /^id_(rsa|ed25519|ecdsa)(\.pub)?$/.test(name)), why: "a key file" },
+  { test: (name, dir) => !dir && name === ".DS_Store", why: "a Finder file" },
+];
+
+export interface FirstCommitPlan {
+  /** Paths relative to the folder, committed on a yes. */
+  include: string[];
+  /** What is left out, and why, as the person is told. */
+  leftOut: Array<{ path: string; why: string }>;
+}
+
+/**
+ * What a folder that is not a repository yet would put in its first commit
+ * (W1-B2): everything but secrets, installed packages and keys, which are
+ * left out by default and named so the person knows.
+ */
+export async function planFirstCommit(folder: string): Promise<FirstCommitPlan> {
+  const root = resolve(folder);
+  const include: string[] = [];
+  const leftOut: Array<{ path: string; why: string }> = [];
+  const walk = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name === ".git") continue;
+      const path = join(directory, entry.name);
+      const isDirectory = entry.isDirectory();
+      const rule = LEFT_OUT.find(candidate => candidate.test(entry.name, isDirectory));
+      const shown = relative(root, path) + (isDirectory ? "/" : "");
+      if (rule) leftOut.push({ path: shown, why: rule.why });
+      else if (isDirectory) await walk(path);
+      else if (entry.isFile()) include.push(relative(root, path));
+    }
+  };
+  await walk(root);
+  return { include, leftOut };
+}
+
+/**
+ * Commit exactly the planned files as the person's first commit, with a
+ * .gitignore that keeps what was left out out of later commits too.
+ */
+export async function commitFirstFiles(input: {
+  path: string;
+  plan: FirstCommitPlan;
+  authorName: string;
+  authorEmail: string;
+  message: string;
+}): Promise<{ ok: boolean; message: string }> {
+  const ignore = join(input.path, ".gitignore");
+  const current = await readFile(ignore, "utf8").catch(() => "");
+  const listed = new Set(current.split("\n").map(line => line.trim()));
+  const missing = input.plan.leftOut.map(entry => `/${entry.path}`).filter(line => !listed.has(line) && !listed.has(line.slice(1)));
+  if (missing.length > 0) {
+    const block = ["# Left out of the first commit by Konteks onboarding", ...missing].join("\n");
+    await writeFile(ignore, `${current}${current && !current.endsWith("\n") ? "\n" : ""}${block}\n`);
+  }
+  const paths = [...new Set([...input.plan.include, ".gitignore"])];
+  const added = await git(input.path, ["add", "--", ...paths], 60_000);
+  if (added.code !== 0) return { ok: false, message: `Your files could not be added${reason(added)}.` };
+  const committed = await git(input.path, [
+    "-c", `user.name=${input.authorName}`,
+    "-c", `user.email=${input.authorEmail}`,
+    "commit", "--quiet", "-m", input.message,
+  ]);
+  if (committed.code !== 0) return { ok: false, message: `The first commit could not be made${reason(committed)}.` };
+  return { ok: true, message: `Committed ${input.plan.include.length} file${input.plan.include.length === 1 ? "" : "s"} as "${input.message}".` };
 }

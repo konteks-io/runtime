@@ -9,7 +9,7 @@ import type { Output } from "../output.js";
 import { SupervisorControl } from "../control.js";
 import { completeNativeEnrollment, readNativeEnrollment, readNativeRecord } from "./install.js";
 import { nativePlatform } from "./service.js";
-import { initializeRepository, inspectRepository, pushToManagedRemote } from "./repository-inspect.js";
+import { commitFirstFiles, initializeRepository, inspectRepository, planFirstCommit, pushToManagedRemote, type FirstCommitPlan } from "./repository-inspect.js";
 import { enrollmentStagingStatus, releaseStaged, spawnEnrollmentStaging, type StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
 import { ensureGraft, graftBuildSeconds, planGraft, readGraftRecord, wireGraft, type GraftTool } from "./graft.js";
@@ -56,6 +56,8 @@ export interface OnboardContext {
     inspect?: typeof inspectRepository;
     push?: typeof pushToManagedRemote;
     initialize?: typeof initializeRepository;
+    planCommit?: typeof planFirstCommit;
+    commitFiles?: typeof commitFirstFiles;
     /** How long the agents step pauses between asks; tests make it instant. */
     agentsWaitMs?: number;
     /** Register this runtime's managed-git key through the local service; answers where the key lives. */
@@ -760,11 +762,29 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
     }
 
     case "push": {
-      const question = state.repositoryNeedsInit
-        ? `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it; none of your files are added or changed.`
-        : `Push ${state.defaultBranch} to the Konteks repository now?`;
+      // A folder with the person's files in it gets them committed, and is
+      // shown exactly which, and what stays out, before anything happens (W1-B2).
+      const plan: FirstCommitPlan = state.repositoryNeedsInit
+        ? await (context.deps?.planCommit ?? planFirstCommit)(state.repositoryPath!)
+        : { include: [], leftOut: [] };
+      const withFiles = plan.include.length > 0;
+      const question = !state.repositoryNeedsInit
+        ? `Push ${state.defaultBranch} to the Konteks repository now?`
+        : withFiles
+          ? `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it, with one commit of your ${plan.include.length} file${plan.include.length === 1 ? "" : "s"}.`
+          : `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it; none of your files are added or changed.`;
       if (context.answer === undefined) {
-        return { step: "push", ask: { question, kind: "confirm" } };
+        if (!withFiles) return { step: "push", ask: { question, kind: "confirm" } };
+        const shown = plan.include.slice(0, 8);
+        const more = plan.include.length - shown.length;
+        const left = plan.leftOut.length > 0
+          ? ` Left out: ${listed(plan.leftOut.map(entry => `${entry.path} (${entry.why})`))}. A .gitignore listing ${plan.leftOut.length === 1 ? "it" : "them"} is added so ${plan.leftOut.length === 1 ? "it stays" : "they stay"} out.`
+          : "";
+        return {
+          step: "push",
+          note: `The commit would hold ${listed(more > 0 ? [...shown, `${more} more`] : shown)}.${left}`,
+          ask: { question, kind: "confirm" },
+        };
       }
       if (!isYes(context.answer)) {
         await save({ step: "first_task" });
@@ -817,18 +837,32 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       }
       if (state.repositoryNeedsInit) {
         const remoteUrl = sshCommand ? state.managedSshUrl : state.managedRemoteUrl;
+        const plan = await (context.deps?.planCommit ?? planFirstCommit)(state.repositoryPath!);
+        const author = { authorName: (state.ownerEmail ?? "Konteks").split("@")[0]!, authorEmail: state.ownerEmail ?? "onboarding@konteks.invalid" };
         const initialized = await (context.deps?.initialize ?? initializeRepository)({
           path: state.repositoryPath!,
           branch: state.defaultBranch!,
-          authorName: (state.ownerEmail ?? "Konteks").split("@")[0]!,
-          authorEmail: state.ownerEmail ?? "onboarding@konteks.invalid",
+          ...author,
           ...(remoteUrl ? { remote: { url: remoteUrl, ...(sshCommand ? { sshCommand } : {}) } } : {}),
+          ...(plan.include.length > 0 ? { keepFiles: true } : {}),
         });
         if (!initialized.ok) {
           await save({ step: "push" });
           return { step: "pushing", note: `${initialized.message} Nothing was pushed.`, ask: { question: "Try the push again?", kind: "confirm" } };
         }
-        if (initialized.adopted) {
+        if (plan.include.length > 0) {
+          const committed = await (context.deps?.commitFiles ?? commitFirstFiles)({
+            path: state.repositoryPath!,
+            plan,
+            ...author,
+            message: `Add ${state.repositoryName}`,
+          });
+          if (!committed.ok) {
+            await save({ step: "push" });
+            return { step: "pushing", note: `${committed.message} Nothing was pushed.`, ask: { question: "Try the push again?", kind: "confirm" } };
+          }
+          // Falls through to the push below, with the person's files on it.
+        } else if (initialized.adopted) {
           // The Konteks repository already had its first commit, so there is
           // nothing of the person's to push: the folder is on it now.
           await save({ step: "graft" });
