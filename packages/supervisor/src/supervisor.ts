@@ -600,6 +600,15 @@ export class Supervisor {
       reconciliationComplete: () => this.reconciliation.isComplete,
       recoveryAuthority: () => this.recoveryAuthority(),
       reportDeliveryAllowed: () => this.recoveryAuthority() !== null,
+      ...(this.native ? {
+        recoveryEvidence: { submit: (input: Parameters<CoreClient["submitRecoveryEvidence"]>[0]) => this.core.submitRecoveryEvidence(input) },
+        recoveryEvidenceConnection: () => ({ kind: "https" as const }),
+        canSubmitRecoveryEvidence: () => {
+          if (this.stopping || !this.nativeOwnership || this.recoveryAuthority() === null) return false;
+          try { this.nativeOwnership.assertOwned(); return true; }
+          catch { return false; }
+        },
+      } : {}),
       ...(this.native ? { recoverPendingDeliveryOutput: createRetainedDeliveryOutputRecovery({
         roots: this.options.native!.runners.map(config => config.RUNNER_WORKSPACE_DIR),
         journal: this.journal,

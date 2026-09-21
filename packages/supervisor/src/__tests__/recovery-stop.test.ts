@@ -6,7 +6,7 @@ import { FixedClock, RemoteInstanceError, type RemoteWorkAssignment } from "@kon
 import { SessionManager, InMemorySessionRefStore } from "../../../agent-runner/src/sessions/manager.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
-import { SupervisorJournal } from "../state/journal.js";
+import { recoveryEvidenceRecordKey, SupervisorJournal } from "../state/journal.js";
 import { DurableOutbox } from "../state/outbox.js";
 import { WorkOrchestrator } from "../work/orchestrator.js";
 import { PermissionBroker } from "../session/permissions.js";
@@ -54,7 +54,15 @@ async function realOwnedWork() {
   f.deps.registerReady = async (_assignment, binding, ref) => ({ ...binding, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "process", channelId: "session:cloud-session", agentId: "codex", acpSessionRef: ref, readyRevision: 1, registeredAt: clock.nowIso() });
   (f.runner.createSession as unknown as ReturnType<typeof vi.fn>).mockImplementation((input, lifecycle) => m.manager.create({ ...input, lifecycle }));
   f.runner.stopForRecovery.mockImplementation(ref => m.manager.stopForRecovery(ref));
+  let evidenceAtSubmission: unknown;
+  const recoveryEvidence = {
+    submit: vi.fn(async () => {
+      evidenceAtSubmission = (f.journal as unknown as { recoveryEvidence?: { all(): unknown[] } }).recoveryEvidence?.all();
+      return { outcome: "accepted" as const, acceptedAt: clock.nowIso() };
+    }),
+  };
   const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
+    recoveryEvidence,
     runners: new Map([["codex", f.runner]]), sessionDeps: () => f.deps, onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process", assertOwned: () => undefined, recoveryAuthority: () => "accepted-A", reportDeliveryAllowed: () => false } as never);
   const entry = { assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution" as const, placementId: "placement", workspaceId: "workspace", agentId: "codex", state: "claimed" as const, recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only" as const, expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() };
   await f.journal.assignments.put(entry);
@@ -63,7 +71,7 @@ async function realOwnedWork() {
   const internal = work as unknown as { captureNativeAuthority(id: string, attempt: number): () => void; dispatch(a: RemoteWorkAssignment, e: typeof entry, check: () => void): Promise<void> };
   const originalAuthority = internal.captureNativeAuthority(assignment.id, assignment.attempt);
   const dispatch = () => internal.dispatch(assignment, entry, originalAuthority);
-  return { ...f, ...m, work, dispatch, admission, failWrites: (value: boolean) => { failWrite = value; } };
+  return { ...f, ...m, work, dispatch, admission, recoveryEvidence, evidenceAtSubmission: () => evidenceAtSubmission, failWrites: (value: boolean) => { failWrite = value; } };
 }
 
 describe("proven per-session recovery stop", () => {
@@ -143,6 +151,47 @@ describe("proven per-session recovery stop", () => {
     expect(f.journal.execution.execution(f.admission)?.phase).toBe("acp_settled");
     expect(f.outbox.depth).toBe(0);
     expect(f.transport.closeChannel).not.toHaveBeenCalled();
+  });
+
+  it("durably records a turn-settled stop observation before submitting the immutable Core evidence", async () => {
+    const f = await realOwnedWork(); await f.dispatch();
+    await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+
+    await expect(f.work.stopForRecovery("assignment", 1)).rejects.toThrow("quiescence");
+
+    const records = (f.journal as unknown as { recoveryEvidence?: { all(): Array<{ evidence: unknown }> } }).recoveryEvidence?.all();
+    expect(records).toHaveLength(1);
+    expect(records?.[0]?.evidence).toMatchObject({
+      instanceId: "instance", assignmentId: "assignment", attempt: 1, claimId: "claim",
+      runnerIncarnation: "process", recoveryEpoch: 0, evidenceKind: "stop_observation",
+      schemaVersion: "remote-recovery-evidence-v1", stopClass: "turn_settled",
+      terminalDisposition: "not_terminal", quiescenceAssertion: "not_asserted_by_recovery_evidence",
+    });
+    expect(f.recoveryEvidence.submit).toHaveBeenCalledTimes(1);
+    expect(f.evidenceAtSubmission()).toMatchObject([{ evidence: records?.[0]?.evidence, delivery: "pending" }]);
+    expect(f.outbox.depth).toBe(0);
+  });
+
+  it("keeps failed stop evidence pending and replays the same immutable bytes", async () => {
+    const f = await realOwnedWork(); await f.dispatch();
+    await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+    f.recoveryEvidence.submit.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "Core unavailable"));
+
+    await expect(f.work.stopForRecovery("assignment", 1)).rejects.toThrow("quiescence");
+
+    const pending = (f.journal as unknown as { recoveryEvidence: { all(): Array<{ evidence: unknown; delivery: string; lastFailureCode: string | null; nextAttemptAt: string }> } }).recoveryEvidence.all();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({ delivery: "pending", lastFailureCode: "temporarily_unavailable" });
+    const pendingRecord = pending[0]!;
+    await (f.journal as unknown as { recoveryEvidence: { update(key: string, derive: (record: typeof pendingRecord) => typeof pendingRecord): Promise<void> } }).recoveryEvidence.update(
+      recoveryEvidenceRecordKey(pendingRecord as never),
+      record => ({ ...record, nextAttemptAt: clock.nowIso() }),
+    );
+    await f.work.retryRecoveryEvidence();
+    expect(f.recoveryEvidence.submit).toHaveBeenCalledTimes(2);
+    expect(f.recoveryEvidence.submit.mock.calls[0]?.[0]?.evidence).toEqual(f.recoveryEvidence.submit.mock.calls[1]?.[0]?.evidence);
+    expect((f.journal as unknown as { recoveryEvidence: { all(): Array<{ delivery: string }> } }).recoveryEvidence.all()).toMatchObject([{ delivery: "accepted" }]);
+    expect(f.outbox.depth).toBe(0);
   });
 
   it("settles the real late-created owner without treating the reserved reference as creation proof", async () => {

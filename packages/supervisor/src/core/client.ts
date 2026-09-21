@@ -44,6 +44,9 @@ import {
   RemoteReconciliationAppliedRequestSchema,
   RemoteReconciliationAppliedResultSchema,
   computeRemoteReconciliationReceiptDigest,
+  RemoteRecoveryEvidenceSchema,
+  RemoteReconciliationConnectionSchema,
+  remoteRecoveryEvidenceIdentityKey,
   ReportAckSchema,
   ToRuntimeRelayFrameSchema,
   WorkAvailableSchema,
@@ -79,6 +82,8 @@ import {
   type RemoteRuntimeOwnerResolveResult,
   type RemoteReconciliationAppliedRequest,
   type RemoteReconciliationAppliedResult,
+  type RemoteRecoveryEvidence,
+  type RemoteReconciliationConnection,
   type ReportAck,
   type ToRuntimeRelayFrame,
   type WorkAvailable,
@@ -117,6 +122,7 @@ export const CORE_PATHS = Object.freeze({
   reconnect: (instanceId: string) => instancePath(instanceId, "reconnect"),
   runtimeOwnerResolve: (instanceId: string) => instancePath(instanceId, "runtime-owner/resolve"),
   reconciliationApplied: (instanceId: string) => instancePath(instanceId, "reconciliation/applied"),
+  recoveryEvidence: (instanceId: string) => instancePath(instanceId, "recovery-evidence"),
   heartbeat: (instanceId: string) => instancePath(instanceId, "heartbeat"),
   assignmentStream: (instanceId: string) => instancePath(instanceId, "assignments/stream"),
   assignmentStreamAck: (instanceId: string) => instancePath(instanceId, "assignments/stream/ack"),
@@ -248,6 +254,18 @@ export interface CoreClientOptions {
   /** The platform MCP endpoint agents reach through `mcpServers`; defaults to Core's root MCP surface. */
   platformMcpUrl?: string;
 }
+
+const RecoveryEvidenceIngressResultSchema = z.object({
+  instanceId: z.string().min(1),
+  assignmentId: z.string().min(1),
+  attempt: z.number().int().positive(),
+  claimId: z.string().min(1),
+  recoveryEpoch: z.number().int().nonnegative(),
+  evidenceDigest: z.string().min(1),
+  acceptedAt: z.string().datetime(),
+  outcome: z.enum(["accepted", "duplicate"]),
+}).strict();
+export type RecoveryEvidenceIngressResult = z.infer<typeof RecoveryEvidenceIngressResultSchema>;
 
 export class CoreClient {
   private readonly http: JsonClient;
@@ -413,6 +431,26 @@ export class CoreClient {
       idempotencyKey: `reconciliation-applied:${request.instanceId}:${request.manifestId}:${digest}` });
     if (result.instanceId !== request.instanceId || result.runnerIncarnation !== request.runnerIncarnation || result.manifestId !== request.manifestId || result.receiptDigest !== digest) {
       throw new RemoteInstanceError("registration_mismatch", "Applied receipt response does not match the submitted recovery generation.");
+    }
+    return result;
+  }
+
+  /**
+   * Submit an already-durable C03 stop observation. This route is a private,
+   * machine-proof boundary; its acknowledgement records only acceptance of
+   * observation bytes and never a terminal result or quiescence decision.
+   */
+  async submitRecoveryEvidence(input: { evidence: RemoteRecoveryEvidence; connection: RemoteReconciliationConnection }): Promise<RecoveryEvidenceIngressResult> {
+    const evidence = RemoteRecoveryEvidenceSchema.parse(structuredClone(input.evidence));
+    const connection = RemoteReconciliationConnectionSchema.parse(structuredClone(input.connection));
+    const request = { evidence, connection };
+    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.recoveryEvidence(evidence.instanceId),
+      bodyFactory: () => ({ ...request, proof: this.proof("recovery_evidence", evidence.instanceId, request as unknown as { [key: string]: JsonValue }) }),
+      schema: RecoveryEvidenceIngressResultSchema,
+      idempotencyKey: `recovery-evidence:${remoteRecoveryEvidenceIdentityKey(evidence)}:${evidence.evidenceDigest}` });
+    if (result.instanceId !== evidence.instanceId || result.assignmentId !== evidence.assignmentId || result.attempt !== evidence.attempt ||
+        result.claimId !== evidence.claimId || result.recoveryEpoch !== evidence.recoveryEpoch || result.evidenceDigest !== evidence.evidenceDigest) {
+      throw new RemoteInstanceError("registration_mismatch", "Recovery evidence response does not match the submitted observation.");
     }
     return result;
   }

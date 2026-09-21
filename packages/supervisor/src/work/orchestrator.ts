@@ -10,6 +10,7 @@ import {
   CancelDirectiveSchema,
   createLogger,
   createRuntimeAdmissionObservabilityContext,
+  computeRemoteRecoveryEvidenceDigest,
   jcsDigest,
   computeRemoteReconciliationManifestDigest,
   parseRfc3339,
@@ -26,13 +27,15 @@ import {
   type RemoteWorkAssignment,
   type RemoteWorkKind,
   type RemoteInstanceReconciliationManifest,
+  type RemoteReconciliationConnection,
+  type RemoteRecoveryEvidence,
   type RemoteDeliveryAcceptanceReceipt,
   type RecoveryDecision,
 } from "@konteks/remote-common";
 import type { RunnerEvent } from "@konteks/remote-agent-runner";
 import type { LeaseState } from "../lease/lease.js";
 import { placedAgentReady, type RoleBinding, type RoleCapabilityInputs } from "../inventory/roles.js";
-import type { SupervisorJournal, JournalEntry } from "../state/journal.js";
+import { recoveryEvidenceRecordKey, type SupervisorJournal, type JournalEntry, type RecoveryEvidenceRecord } from "../state/journal.js";
 import type { LocalAdmission } from "../state/local-admission.js";
 import type { RetainedProcessOwner } from "@konteks/remote-common";
 import type { DurableOutbox } from "../state/outbox.js";
@@ -102,6 +105,14 @@ export interface OrchestratorDeps {
   recoveryAuthority?: () => string | null;
   /** Native delivery requires current receipt authority; omission fails closed. */
   reportDeliveryAllowed?: () => boolean;
+  /** C03 private Core boundary; submission cannot select a terminal winner. */
+  recoveryEvidence?: {
+    submit(input: { evidence: RemoteRecoveryEvidence; connection: RemoteReconciliationConnection }): Promise<{ outcome: "accepted" | "duplicate"; acceptedAt: string }>;
+  };
+  /** Machine-proof transport topology, never embedded in the immutable evidence. */
+  recoveryEvidenceConnection?: () => RemoteReconciliationConnection;
+  /** A former owner retains bytes but must not submit them as a current runtime. */
+  canSubmitRecoveryEvidence?: () => boolean;
   /** Recover an already-frozen delivery result before restart recovery can
    * classify the now-gone bridge process as interrupted. The callback must
    * prove the exact admission, retained execution and candidate itself. */
@@ -143,6 +154,7 @@ export class WorkOrchestrator {
   private readonly bootstrapping = new Map<string, Promise<void>>();
   private readonly recoveryStops = new Map<string, Promise<void>>();
   private readonly recoveryFences = new Set<string>();
+  private recoveryEvidenceRetry: Promise<void> | null = null;
   private readonly logger: Logger;
   private pullTask: Promise<void> | null = null;
   readonly counters: Record<ClaimRejection, number> = { unknown_kind: 0, stale_attempt: 0, workspace_mismatch: 0, instance_mismatch: 0, checkout_owned_elsewhere: 0, role_not_advertised: 0, agent_unavailable: 0, expired: 0, draining: 0, lease_invalid: 0, reconciliation_pending: 0, no_headroom: 0 };
@@ -204,6 +216,7 @@ export class WorkOrchestrator {
     // while draining or at capacity. It is not a global admission lock: Core
     // orders successors within their lineage, while unrelated work continues.
     void this.reports.retryDue().catch(error => this.logger.warn({ err: error }, "durable assignment report retry failed"));
+    void this.retryRecoveryEvidence().catch(error => this.logger.warn({ err: error }, "durable recovery evidence retry failed"));
     // Existing timer also services retained stream intents during drain/capacity
     // loss. Replaying a request does not authorize admission of returned work.
     if (this.deps.assignmentSender) {
@@ -1301,6 +1314,9 @@ export class WorkOrchestrator {
       const owner = late ?? session;
       if (!owner?.acpSessionRef) throw new RemoteInstanceError("recovery_required", "No confirmed ACP session settlement is available.");
       await this.deps.journal.execution.markAcpSettled(admission!, owner.acpSessionRef, this.deps.clock.nowIso(), assertCurrent);
+      // C03 observes the already-durable `acp_settled` boundary. It is neither
+      // a terminal report nor proof that background tools have stopped.
+      await this.recordTurnSettledRecoveryEvidence(admission!, assertCurrent);
       // Finalization and D139 require a pinned qualified lifecycle profile.
       // None exists yet. Keep the fenced owner for write retries, never report
       // interrupted/cancelled work merely because ACP has settled.
@@ -1309,6 +1325,106 @@ export class WorkOrchestrator {
     this.recoveryStops.set(key, task);
     void task.catch(() => { if (this.recoveryStops.get(key) === task) this.recoveryStops.delete(key); });
     return task;
+  }
+
+  /** Retry only the exact bytes that were first fsynced with the observation. */
+  async retryRecoveryEvidence(maxItems = 4): Promise<void> {
+    if (!this.deps.recoveryEvidence || this.deps.canSubmitRecoveryEvidence?.() === false) return;
+    if (this.recoveryEvidenceRetry) return this.recoveryEvidenceRetry;
+    const task = (async () => {
+      const now = this.deps.clock.coreNow();
+      const due = this.deps.journal.recoveryEvidence.all()
+        .filter(record => record.delivery === "pending" && Date.parse(record.nextAttemptAt) <= now)
+        .sort((left, right) => left.nextAttemptAt.localeCompare(right.nextAttemptAt))
+        .slice(0, maxItems);
+      for (const record of due) await this.deliverRecoveryEvidence(record);
+    })();
+    this.recoveryEvidenceRetry = task;
+    void task.finally(() => { if (this.recoveryEvidenceRetry === task) this.recoveryEvidenceRetry = null; }).catch(() => undefined);
+    return task;
+  }
+
+  private async recordTurnSettledRecoveryEvidence(admission: LocalAdmission, assertCurrent: () => void): Promise<void> {
+    const execution = this.deps.journal.execution.execution(admission);
+    const entry = this.deps.journal.assignments.get(`${admission.assignmentId}:${admission.attempt}`);
+    if (!execution || execution.phase !== "acp_settled" || !execution.acpSettledAt || !entry || entry.claimId !== admission.claimId) {
+      throw new RemoteInstanceError("recovery_required", "Durable ACP settlement does not match the current claim.");
+    }
+    const recordedAt = this.deps.clock.nowIso();
+    const observedAt = execution.acpSettledAt;
+    const observedMs = Date.parse(observedAt);
+    const ageMs = Number.isFinite(observedMs) ? Math.max(0, this.deps.clock.coreNow() - observedMs) : 0;
+    const semantic = {
+      instanceId: admission.instanceId,
+      assignmentId: admission.assignmentId,
+      attempt: admission.attempt,
+      claimId: admission.claimId,
+      runnerIncarnation: admission.runnerIncarnation,
+      recoveryEpoch: entry.recoveryEpoch,
+      evidenceKind: "stop_observation" as const,
+      schemaVersion: "remote-recovery-evidence-v1" as const,
+      stopClass: "turn_settled" as const,
+      reason: "ownership_scope_lost" as const,
+      observedAt,
+      recordedAt,
+      ageMs,
+      nextRetryAt: new Date(this.deps.clock.coreNow() + 5_000).toISOString(),
+      safeAction: { kind: "retry_later" as const, instanceId: admission.instanceId, agentId: admission.agentId },
+      terminalDisposition: "not_terminal" as const,
+      quiescenceAssertion: "not_asserted_by_recovery_evidence" as const,
+    };
+    const evidence = {
+      ...semantic,
+      evidenceDigest: computeRemoteRecoveryEvidenceDigest(semantic),
+    } as RemoteRecoveryEvidence;
+    const key = recoveryEvidenceRecordKey(evidence);
+    const existing = this.deps.journal.recoveryEvidence.get(key);
+    if (!existing) {
+      await this.deps.journal.recoveryEvidence.put({
+        evidence,
+        delivery: "pending",
+        attempts: 0,
+        lastAttemptAt: null,
+        nextAttemptAt: recordedAt,
+        acceptedAt: null,
+        lastFailureCode: null,
+        updatedAt: recordedAt,
+      });
+    }
+    assertCurrent();
+    // A retry reaches the same identity after time has passed. Reuse the
+    // first fsynced bytes rather than recalculating recorded time/age/digest.
+    const record = existing ?? this.deps.journal.recoveryEvidence.get(key);
+    if (record) await this.deliverRecoveryEvidence(record, assertCurrent);
+  }
+
+  private async deliverRecoveryEvidence(record: RecoveryEvidenceRecord, assertCurrent?: () => void): Promise<void> {
+    const client = this.deps.recoveryEvidence;
+    if (!client || this.deps.canSubmitRecoveryEvidence?.() === false || record.delivery !== "pending") return;
+    const key = recoveryEvidenceRecordKey(record);
+    const attemptedAt = this.deps.clock.nowIso();
+    await this.deps.journal.recoveryEvidence.update(key, current => {
+      if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", "Recovery evidence record changed before delivery.");
+      return { ...current, attempts: current.attempts + 1, lastAttemptAt: attemptedAt, updatedAt: attemptedAt };
+    });
+    try {
+      const result = await client.submit({ evidence: structuredClone(record.evidence), connection: this.deps.recoveryEvidenceConnection?.() ?? { kind: "https" } });
+      assertCurrent?.();
+      const acceptedAt = result.acceptedAt;
+      await this.deps.journal.recoveryEvidence.update(key, current => {
+        if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", "Recovery evidence record changed after delivery.");
+        return { ...current, delivery: result.outcome, acceptedAt, lastFailureCode: null, updatedAt: this.deps.clock.nowIso() };
+      });
+      this.logger.info({ assignmentId: record.evidence.assignmentId, attempt: record.evidence.attempt, evidenceDigest: record.evidence.evidenceDigest, outcome: result.outcome }, "recovery stop observation accepted by Core");
+    } catch (error) {
+      const failureCode = recoveryEvidenceFailureCode(error);
+      const nextAttemptAt = new Date(this.deps.clock.coreNow() + 5_000).toISOString();
+      await this.deps.journal.recoveryEvidence.update(key, current => {
+        if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", "Recovery evidence record changed after delivery failure.");
+        return { ...current, nextAttemptAt, lastFailureCode: failureCode, updatedAt: this.deps.clock.nowIso() };
+      });
+      this.logger.warn({ assignmentId: record.evidence.assignmentId, attempt: record.evidence.attempt, evidenceDigest: record.evidence.evidenceDigest, outcome: "pending", failureCode }, "recovery stop observation remains pending Core acknowledgement");
+    }
   }
 
   /** D141: the same retained log serializes admission and exact absence. */
@@ -1401,4 +1517,9 @@ export function dispatchErrorIdentity(error: unknown): { errorName?: string; err
   const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
   if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(code)) identity.errorCode = code;
   return identity;
+}
+
+function recoveryEvidenceFailureCode(error: unknown): string {
+  if (error instanceof RemoteInstanceError) return error.code.slice(0, 128);
+  return "temporarily_unavailable";
 }

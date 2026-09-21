@@ -4,7 +4,8 @@ import type { SchemaParser } from "@konteks/remote-common";
 import { join } from "node:path";
 import { z } from "zod";
 import { AssignmentReportSchema, canonicalize, isFsErrorWithCode, RemoteExecutionReadyResultSchema, RemoteReconciliationReceiptSnapshotSchema, ReportAckSchema,
-  RemoteExecutionAdmissionClaimsSchema, RemoteDeliveryAdmissionClaimsSchema, SessionToCoreMessageSchema, RemoteWorkKindSchema } from "@konteks/remote-common";
+  RemoteExecutionAdmissionClaimsSchema, RemoteDeliveryAdmissionClaimsSchema, SessionToCoreMessageSchema, RemoteWorkKindSchema, RemoteRecoveryEvidenceSchema,
+  remoteRecoveryEvidenceIdentityKey, type RemoteRecoveryEvidence } from "@konteks/remote-common";
 import { unrestrictedStateMutation, type StateMutation } from "./mutation-gate.js";
 import { RuntimeRecoveryJournal, RuntimeRecoveryRecordSchema, recoveryRecordKey, type RuntimeRecoveryRecord } from "./runtime-recovery.js";
 import { LocalExecutionJournal, LocalExecutionRecordSchema, localExecutionKey, type LocalExecutionRecord } from "./local-execution.js";
@@ -146,6 +147,29 @@ export const EraseRecordSchema = z
   .object({ directiveId: z.string().min(1), scope: z.enum(["assignment_data", "all_konteks_data"]), status: z.enum(["pending", "completed", "partially_completed", "failed"]), receiptSent: z.boolean(), updatedAt: z.string() })
   .strict();
 export type EraseRecord = z.infer<typeof EraseRecordSchema>;
+
+/**
+ * An immutable C03 observation and its local delivery watermark. This is
+ * intentionally separate from terminal reports: accepting it cannot settle
+ * work, assert quiescence, or release a workspace owner.
+ */
+export const RecoveryEvidenceRecordSchema = z.object({
+  evidence: RemoteRecoveryEvidenceSchema,
+  delivery: z.enum(["pending", "accepted", "duplicate"]),
+  attempts: z.number().int().nonnegative(),
+  lastAttemptAt: z.string().nullable(),
+  nextAttemptAt: z.string(),
+  acceptedAt: z.string().nullable(),
+  lastFailureCode: z.string().min(1).max(128).nullable(),
+  updatedAt: z.string(),
+}).strict().superRefine((record, ctx) => {
+  if ((record.delivery === "accepted" || record.delivery === "duplicate") !== (record.acceptedAt !== null)) {
+    ctx.addIssue({ code: "custom", path: ["acceptedAt"], message: "Accepted recovery evidence requires its immutable acceptance timestamp" });
+  }
+});
+export type RecoveryEvidenceRecord = z.infer<typeof RecoveryEvidenceRecordSchema>;
+export const recoveryEvidenceRecordKey = (record: Pick<RecoveryEvidenceRecord, "evidence"> | RemoteRecoveryEvidence): string =>
+  remoteRecoveryEvidenceIdentityKey("evidence" in record ? record.evidence : record);
 
 const MAX_JOURNAL_ENTRIES = 2_000;
 const COMPACT_EVERY_APPENDS = 500;
@@ -395,6 +419,8 @@ export class SupervisorJournal {
   readonly decisions: AppendLog<DecisionRecord>;
   readonly manifests: AppendLog<ReconciliationManifestRecord>;
   readonly erase: AppendLog<EraseRecord>;
+  /** C03 local durable evidence. Never use this table as a terminal owner. */
+  readonly recoveryEvidence: AppendLog<RecoveryEvidenceRecord>;
   readonly planning: PlanningTerminalJournal;
   private readonly planningLog: AppendLog<PlanningTerminalRecord>;
   readonly cancellations: CancellationInbox;
@@ -414,12 +440,13 @@ export class SupervisorJournal {
     this.decisions = new AppendLog(dir, { name: "decisions", schema: DecisionRecordSchema, key: (entry) => `${entry.manifestId}:${entry.assignmentId}:${entry.attempt}` }, MAX_JOURNAL_ENTRIES, mutate);
     this.manifests = new AppendLog(dir, { name: "reconciliation-manifests", schema: ReconciliationManifestRecordSchema, key: entry => entry.manifestId }, MAX_JOURNAL_ENTRIES, mutate);
     this.erase = new AppendLog(dir, { name: "erase", schema: EraseRecordSchema, key: (entry) => entry.directiveId }, 500, mutate);
+    this.recoveryEvidence = new AppendLog(dir, { name: "recovery-evidence", schema: RecoveryEvidenceRecordSchema, key: recoveryEvidenceRecordKey }, MAX_JOURNAL_ENTRIES, mutate);
     this.planningLog = new AppendLog(dir, { name: "planning-terminal", schema: PlanningTerminalRecordSchema, key: planningTerminalRecordKey, atomicBatches: true }, MAX_JOURNAL_ENTRIES * 4, mutate);
     this.planning = new PlanningTerminalJournal(this.planningLog);
   }
 
   async load(): Promise<void> {
-    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load()]);
+    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryEvidence.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load()]);
   }
 
   /** Bounded pruning: completed/cancelled entries beyond the bound go first, oldest first. */
