@@ -11,7 +11,7 @@ import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
 import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
-import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate } from "./update-transaction.js";
+import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 
@@ -161,8 +161,9 @@ export const nativeCliActions: NativeCliActions = {
   update: async input => {
     if (input.check) {
       const check = await checkNativeUpdate({ root: input.root });
-      if (check.status === "current") input.output.line(`Installed release ${check.bundleVersion} is current.`);
-      const failed = check.status === "current" ? null : earlierFailure((await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts, check.release.manifest.digest);
+      const attempts = (await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts;
+      if (check.status === "current") input.output.line([`Installed release ${check.bundleVersion} is current.`, selfUpdateNote(attempts, check.bundleVersion)].filter(Boolean).join(" "));
+      const failed = check.status === "current" ? null : earlierFailure(attempts, check.release.manifest.digest);
       if (check.status !== "current") input.output.line(failed
         ? `Release ${check.release.manifest.bundleVersion} is available (installed: ${check.current.bundleVersion}), but ${earlierFailureNote(failed)}`
         : `Release ${check.release.manifest.bundleVersion} is available (installed: ${check.current.bundleVersion}); run \`konteks-remote update\` to install it.`);
@@ -171,8 +172,11 @@ export const nativeCliActions: NativeCliActions = {
     }
     if (!input.unattended) {
       const check = await checkNativeUpdate({ root: input.root }).catch(() => null);
-      const failed = check && check.status !== "current" ? earlierFailure((await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts, check.release.manifest.digest) : null;
+      const attempts = (await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts;
+      const failed = check && check.status !== "current" ? earlierFailure(attempts, check.release.manifest.digest) : null;
       if (failed) input.output.line(`Trying again as asked: ${earlierFailureNote(failed)}`);
+      const selfUpdated = check?.status === "current" ? selfUpdateNote(attempts, check.bundleVersion) : null;
+      if (selfUpdated) input.output.line(selfUpdated);
     }
     await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start }));
   },

@@ -291,6 +291,15 @@ export function earlierFailure(attempts: readonly NativeUpdateAttempt[], manifes
   return last && (last.outcome === "rolled_back" || last.outcome === "failed") ? last : null;
 }
 
+/**
+ * When the installed release is one the connector updated itself to, the
+ * person hears that, instead of a bare "current" after being offered it.
+ */
+export function selfUpdateNote(attempts: readonly NativeUpdateAttempt[], bundleVersion: string): string | null {
+  const last = [...attempts].reverse().find(attempt => attempt.bundleVersion === bundleVersion && attempt.outcome !== "in_progress");
+  return last && last.outcome === "applied" && last.reason === "unattended" ? `Konteks updated itself to ${bundleVersion} at ${last.finishedAt ?? last.startedAt}.` : null;
+}
+
 export function earlierFailureNote(attempt: NativeUpdateAttempt): string {
   const when = attempt.finishedAt ?? attempt.startedAt;
   const how = attempt.outcome === "rolled_back" ? "failed its health check here and was rolled back" : "failed here";
