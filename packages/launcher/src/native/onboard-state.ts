@@ -86,6 +86,8 @@ export const OnboardStateSchema = z
     graftDecision: z.enum(["accepted", "declined", "unavailable", "failed"]).optional(),
     graftRepository: z.string().optional(),
     systemId: z.string().optional(),
+    /** The System already existed in the workspace; this machine joined it (WS1-089). */
+    systemExisting: z.boolean().optional(),
     systemEntityRef: z.string().optional(),
     managedRemoteUrl: z.string().optional(),
     /** The managed repository's SSH URL, pushed to with the runtime's key (WS1-021). */

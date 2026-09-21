@@ -12,7 +12,7 @@ import { nativePlatform } from "./service.js";
 import { commitFirstFiles, initializeRepository, inspectRepository, planFirstCommit, pushToManagedRemote, type FirstCommitPlan } from "./repository-inspect.js";
 import { enrollmentStagingStatus, releaseStaged, spawnEnrollmentStaging, type StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
-import { ensureGraft, graftBuildSeconds, planGraft, readGraftRecord, wireGraft, type GraftTool } from "./graft.js";
+import { ensureGraft, graftAlreadyWired, graftBuildSeconds, planGraft, readGraftRecord, wireGraft, type GraftTool } from "./graft.js";
 import { deleteOwnerToken, OWNER_ACCESS_REVOKED, OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
 
 /**
@@ -75,6 +75,7 @@ export interface OnboardContext {
     /** Graft, injectable for tests (W1-G1). */
     graft?: {
       available?: (root: string) => Promise<boolean>;
+      wired?: (repo: string) => Promise<boolean>;
       plan?: typeof planGraft;
       ensure?: (root: string) => Promise<GraftTool>;
       wire?: typeof wireGraft;
@@ -780,6 +781,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       }
       await save({
         step: state.repositoryKind === "managed" ? "push" : "graft",
+        ...(registered.existing ? { systemExisting: true } : {}),
         systemId: registered.systemId,
         systemEntityRef: registered.systemEntityRef,
         ...(registered.repository.remoteUrl ? { managedRemoteUrl: registered.repository.remoteUrl } : {}),
@@ -937,6 +939,12 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         await save({ step: "first_task", ...(!repo || decided ? {} : { graftDecision: "unavailable", graftRepository: repo }) });
         return { step: "graft", run: AGAIN };
       }
+      // A machine that reconnected in a folder it already wired (a lost key
+      // resets onboarding) is not asked again (WS1-090).
+      if (await (context.deps?.graft?.wired ?? graftAlreadyWired)(repo).catch(() => false)) {
+        await save({ step: "first_task", graftDecision: "accepted", graftRepository: repo });
+        return { step: "graft", note: `Graft is already set up in ${state.repositoryName ?? "this repository"}.`, run: AGAIN };
+      }
       const plan = await (context.deps?.graft?.plan ?? planGraft)(repo, await families());
       if (plan.agents.length === 0) {
         await save({ step: "first_task", graftDecision: "unavailable", graftRepository: repo });
@@ -994,6 +1002,18 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
     }
 
     case "first_task": {
+      // A machine back in a System the workspace already had (a lost key)
+      // is not asked for a first initiative it already has (WS1-090).
+      if (context.answer === undefined && state.systemExisting && state.systemId && !state.initiativeId) {
+        const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
+        const existing = (await api.listInitiatives(state.systemId).catch(() => []))[0];
+        if (existing) {
+          const url = `${siteUrl}/work/${encodeURIComponent(existing.id)}`;
+          await save({ step: "done", closing: true, initiativeId: existing.id, initiativeTitle: existing.title, initiativeUrl: url } as never);
+          Object.assign(state, { initiativeId: existing.id, initiativeTitle: existing.title, initiativeUrl: url });
+          return { step: "first_task", note: `${state.repositoryName ?? "This System"} already has an initiative, "${existing.title}", so no new one is started: ${url}`, run: AGAIN };
+        }
+      }
       if (context.answer === undefined) {
         return {
           step: "first_task",

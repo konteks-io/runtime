@@ -202,6 +202,15 @@ export class OwnerApiClient {
     };
   }
 
+  /** The initiatives a System already has, newest first as Konteks lists them (WS1-090). */
+  async listInitiatives(systemId: string): Promise<Array<{ id: string; title: string }>> {
+    const body = (await this.call("GET", `/api/collaboration/initiatives?systemId=${encodeURIComponent(systemId)}`)) as Record<string, unknown>;
+    const list = Array.isArray(body.initiatives) ? (body.initiatives as Array<Record<string, unknown>>) : [];
+    return list
+      .filter(entry => typeof entry.id === "string" && entry.id)
+      .map(entry => ({ id: entry.id as string, title: typeof entry.title === "string" ? entry.title : "" }));
+  }
+
   /** A project-management session scoped to that System (OS13). */
   async createProjectManagementSession(input: {
     systemId: string;

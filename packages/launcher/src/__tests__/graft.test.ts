@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ensureGraft, planGraft, wireGraft, writeGraftRecord, type GraftTool } from "../native/graft.js";
+import { ensureGraft, graftAlreadyWired, planGraft, wireGraft, writeGraftRecord, type GraftTool } from "../native/graft.js";
 
 /**
  * Graft in the person's repository (W1-G1..G3, WS1-081). A stand-in Graft
@@ -63,6 +63,7 @@ describe("graft", () => {
   });
 
   it("names the files it adds for this machine's agents, and the ones git already tracks", async () => {
+    expect(await graftAlreadyWired(repo)).toBe(false);
     const plain = await planGraft(repo, ["claude-code", "codex"]);
     expect(plain.agents).toEqual(["claude", "agents"]);
     expect(plain.adds).toEqual(["graft/", ".claude/", ".mcp.json", "AGENTS.md"]);
@@ -107,6 +108,8 @@ describe("graft", () => {
     // Graft's own npm update check is answered in ~/.graft, so it never runs.
     const check = JSON.parse(await readFile(join(home, ".graft", "update-check.json"), "utf8")) as { checkedAt: number };
     expect(check.checkedAt).toBeGreaterThan(Date.now() + 1e12);
+
+    expect(await graftAlreadyWired(repo)).toBe(true);
 
     // Wiring again adds no second exclude block.
     await wireGraft(root, repo, ["claude-code", "codex"], tool);

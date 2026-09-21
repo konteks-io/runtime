@@ -194,6 +194,19 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "done", closing: true });
   });
 
+  it("names the initiative a rejoined System already has instead of asking for a first one (WS1-090)", async () => {
+    await writeOnboardState(root, { step: "first_task", systemExisting: true, systemId: "sys-existing", repositoryName: "hello-world", instanceId: "instance-1" } as never);
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({ initiatives: [{ id: "init_1", title: "Turn this into a tiny page that greets visitors by the time of day" }] }), { status: 200, headers: { "content-type": "application/json" } }));
+    const result = await step({ fetchFn: fetchFn as never });
+    expect(result.ask).toBeUndefined();
+    expect(result.note).toBe('hello-world already has an initiative, "Turn this into a tiny page that greets visitors by the time of day", so no new one is started: https://app.test/work/init_1');
+    expect(await readOnboardState(root)).toMatchObject({ step: "done", initiativeId: "init_1" });
+    // A System with none still gets the question.
+    await writeOnboardState(root, { step: "first_task", systemExisting: true, systemId: "sys-existing", repositoryName: "hello-world", instanceId: "instance-1" } as never);
+    const empty = vi.fn(async () => new Response(JSON.stringify({ initiatives: [] }), { status: 200, headers: { "content-type": "application/json" } }));
+    expect((await step({ fetchFn: empty as never })).ask?.kind).toBe("text");
+  });
+
   it("says so when the folder was already the workspace's System, instead of failing (WS1-089)", async () => {
     await writeOnboardState(root, { step: "system", repositoryName: "hello-world", repositoryKind: "existing", repositoryPath: "/tmp/hello-world", remoteUrl: "https://github.com/octocat/Hello-World.git", defaultBranch: "master", instanceId: "instance-1" } as never);
     const fetchFn = vi.fn(async () => new Response(JSON.stringify({
@@ -945,7 +958,7 @@ describe("onboard", () => {
     const plan = async () => ({ agents: ["claude", "agents"], adds: ["graft/", ".claude/", ".mcp.json", "AGENTS.md"], tracked: [] as string[], files: 3 });
     const graftDeps = (extra: Record<string, unknown> = {}) => ({
       families: async () => ["claude-code", "codex"],
-      graft: { available: async () => true, plan, ...extra } as never,
+      graft: { available: async () => true, wired: async () => false, plan, ...extra } as never,
     });
     const atGraft = () => writeOnboardState(root, { step: "graft", repositoryPath: "/tmp/table-booking", repositoryName: "table-booking", systemId: "sys-1" } as never);
 
@@ -1001,6 +1014,14 @@ describe("onboard", () => {
       const again = await step(graftDeps());
       expect(again.ask).toBeUndefined();
       expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
+    });
+
+    it("does not offer Graft again in a folder it already wired (WS1-090)", async () => {
+      await atGraft();
+      const result = await step(graftDeps({ wired: async () => true }));
+      expect(result.ask).toBeUndefined();
+      expect(result.note).toBe("Graft is already set up in table-booking.");
+      expect(await readOnboardState(root)).toMatchObject({ step: "first_task", graftDecision: "accepted" });
     });
 
     it("goes straight on when the release has no Graft", async () => {

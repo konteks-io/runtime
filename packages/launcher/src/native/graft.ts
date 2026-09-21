@@ -184,6 +184,14 @@ async function git(repo: string, args: string[]): Promise<string> {
   return (await run("git", ["-C", repo, ...args], { maxBuffer: 16 * 1024 * 1024 })).stdout;
 }
 
+/** Whether this repository already has the Graft wiring onboarding sets up (WS1-090). */
+export async function graftAlreadyWired(repo: string): Promise<boolean> {
+  const gitDir = (await git(repo, ["rev-parse", "--absolute-git-dir"]).catch(() => "")).trim();
+  if (!gitDir) return false;
+  const exclude = await readFile(join(gitDir, "info", "exclude"), "utf8").catch(() => "");
+  return exclude.includes(EXCLUDE_MARK) && (await stat(join(repo, "graft")).then(() => true, () => false));
+}
+
 /** What the offer says: the files Graft adds, and any the repository already tracks. */
 export async function planGraft(repo: string, families: string[]): Promise<{ agents: string[]; adds: string[]; tracked: string[]; files: number }> {
   const agents = families.map(family => GRAFT_AGENT_IDS[family]).filter((id): id is string => Boolean(id));
