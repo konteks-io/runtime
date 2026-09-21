@@ -961,7 +961,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           note:
             `Graft maps this repository's code so ${names} can find their way around it before they search. ` +
             "It runs only on this machine, sends nothing to a paid model, and its usage statistics stay off. " +
-            `Outside this folder it writes only its own settings in ~/.graft and installs itself in Konteks's folder on this machine.${tracked}`,
+            `Outside this folder it writes only in ~/.graft: its settings and its own copy of Graft, which keeps working if Konteks is ever removed.${tracked}`,
           ask: { question, kind: "confirm" },
         };
       }

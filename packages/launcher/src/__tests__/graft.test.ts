@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureGraft, graftAlreadyWired, planGraft, wireGraft, writeGraftRecord, type GraftTool } from "../native/graft.js";
 
@@ -133,13 +133,18 @@ describe("graft", () => {
     const bytes = await readFile(archive);
     const digest = createHash("sha256").update(bytes).digest("hex");
     const served = (body: Buffer) => (async () => new Response(new Uint8Array(body), { status: 200 })) as unknown as typeof fetch;
-    const node = async () => process.execPath;
+    const stagedNode = join(dir, "staged-node");
+    await writeFile(stagedNode, "#!/bin/sh\n", { mode: 0o755 });
+    const node = async () => stagedNode;
 
     await writeGraftRecord(root, { name: "konteks-graft-macos-arm64.tgz", digest, base: "https://release.test/download" });
     await expect(ensureGraft(root, { fetchFn: served(Buffer.from("tampered")), node })).rejects.toThrow(/does not match this release's checksum/);
 
     const installed = await ensureGraft(root, { fetchFn: served(bytes), node });
-    expect(installed.node).toBe(process.execPath);
+    // It lives in ~/.graft with its own Node, so it outlives Konteks (WS1-091).
+    expect(installed.cli.startsWith(join(home, ".graft", "konteks"))).toBe(true);
+    expect(installed.node).toBe(join(dirname(dirname(dirname(dirname(dirname(installed.cli))))), "bin", "node"));
+    expect(await readFile(installed.node, "utf8")).toBe("#!/bin/sh\n");
     expect(await readFile(installed.cli, "utf8")).toBe("// graft\n");
     // Once unpacked it is not downloaded again.
     const again = await ensureGraft(root, { fetchFn: (async () => { throw new Error("must not download"); }) as unknown as typeof fetch, node });

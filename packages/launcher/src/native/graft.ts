@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -89,9 +89,14 @@ export async function graftNode(root: string): Promise<string | null> {
   return null;
 }
 
-/** The unpacked package for this record, if it is already here. */
-function toolDirectory(root: string, record: GraftRecord): string {
-  return join(resolve(root), "tools", `graft-${record.digest.slice(0, 16)}`);
+/**
+ * Where Graft lives on this machine: in ~/.graft, the one place outside the
+ * repository the offer names, with its own copy of Node. The person keeps
+ * Graft's files in their repository if Konteks is ever removed, and they
+ * keep working (WS1-091): inside Konteks's folder they broke with it.
+ */
+function toolDirectory(record: GraftRecord): string {
+  return join(process.env.HOME ?? homedir(), ".graft", "konteks", `graft-${record.digest.slice(0, 16)}`);
 }
 
 const cliOf = (directory: string) => join(directory, "node_modules", "@nanonets", "graft", "dist", "cli.js");
@@ -108,8 +113,9 @@ export async function ensureGraft(
   if (!record) throw new Error("this connector release does not include Graft");
   const node = await (deps.node ?? graftNode)(root);
   if (!node) throw new Error("the agent packages Graft runs on are not unpacked yet");
-  const directory = toolDirectory(root, record);
-  if (await stat(cliOf(directory)).then(() => true, () => false)) return { node, cli: cliOf(directory) };
+  const directory = toolDirectory(record);
+  const ownNode = join(directory, "bin", "node");
+  if ((await stat(cliOf(directory)).then(() => true, () => false)) && (await executable(ownNode))) return { node: ownNode, cli: cliOf(directory) };
 
   const response = await (deps.fetchFn ?? fetch)(`${record.base.replace(/\/+$/, "")}/${record.name}`);
   if (!response.ok) throw new Error(`Graft could not be downloaded (HTTP ${response.status})`);
@@ -126,13 +132,16 @@ export async function ensureGraft(
     await mkdir(unpacked, { mode: 0o700 });
     await run("tar", ["-xzf", archive, "-C", unpacked]);
     if (!(await stat(cliOf(unpacked)).then(() => true, () => false))) throw new Error("the Graft package has no command in it");
+    await mkdir(join(unpacked, "bin"), { recursive: true, mode: 0o700 });
+    await copyFile(node, join(unpacked, "bin", "node"));
+    await chmod(join(unpacked, "bin", "node"), 0o755);
     await mkdir(dirname(directory), { recursive: true, mode: 0o700 });
     await rm(directory, { recursive: true, force: true });
     await rename(unpacked, directory);
   } finally {
     await rm(work, { recursive: true, force: true });
   }
-  return { node, cli: cliOf(directory) };
+  return { node: ownNode, cli: cliOf(directory) };
 }
 
 /** Every Graft run: statistics off, and its own .gitignore edit off (we exclude locally). */

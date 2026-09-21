@@ -969,7 +969,7 @@ describe("onboard", () => {
       expect(offer.ask?.question).toBe("Set up Graft in table-booking? It adds graft/, .claude/, .mcp.json and AGENTS.md here, kept out of your commits.");
       expect(offer.note).toContain("so Claude Code and Codex can find their way around it");
       expect(offer.note).toContain("sends nothing to a paid model, and its usage statistics stay off");
-      expect(offer.note).toContain("Outside this folder it writes only its own settings in ~/.graft");
+      expect(offer.note).toContain("Outside this folder it writes only in ~/.graft: its settings and its own copy of Graft, which keeps working if Konteks is ever removed.");
     });
 
     it("says a tracked file Graft would change will show in git", async () => {
