@@ -42,6 +42,19 @@ describe("native execution admission HTTPS proofs", () => {
     await expect(f.client.checkExecution("instance", "../other", request)).rejects.toThrow();
   });
 
+  it("carries a caller renewal deadline to the JSON request budget", async () => {
+    const response = { executionId: "execution", executionRevision: 1, expiresAt: "2026-09-10T00:00:30Z", lease: "a.b.c" };
+    const f = fixture(response);
+    const request = { executionRevision: 1, readyRevision: 1, runnerIncarnation: "runner" };
+    const http = (f.client as unknown as { http: { request: ReturnType<typeof vi.fn> } }).http;
+    const requestSpy = vi.spyOn(http, "request");
+
+    const deadlineAtMs = Date.now() + 5_000;
+    await (f.client.checkExecution as (...args: unknown[]) => Promise<unknown>)("instance", "execution", request, deadlineAtMs);
+
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({ deadlineAtMs }));
+  });
+
   it("accepts only bounded public RSA trust from configured Core, without sending a credential", async () => {
     const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const key = { ...pair.publicKey.export({ format: "jwk" }), kid: "core", alg: "RS256", use: "sig" };

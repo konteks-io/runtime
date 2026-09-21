@@ -33,13 +33,9 @@ export interface AuthorizedNativeOperation {
 }
 const fenced = () => new RemoteInstanceError("execution_fenced", "Native execution authority is no longer current.");
 const unavailable = () => new RemoteInstanceError("execution_authority_unavailable", "Fresh execution authority is unavailable.");
-/** How long a running turn outlives its check lease while Core is only slow or
- * unreachable. Long enough to ride out a Core restart (~2.5 min observed); a
- * definitive refusal still stops it at once, and no new operation is admitted
- * without a fresh check. */
-export const NATIVE_CHECK_GRACE_MS = 300_000;
-/** Only Core saying no, or the local claim no longer matching, ends a turn.
- * A late, failed or unreadable renewal is not evidence that authority moved. */
+/** The whole trust fetch and signed check exchange share this one budget. */
+export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 5_000;
+const RENEWAL_RETRY_DELAY_MS = 1_000;
 const transientLoss = (error: unknown): boolean =>
   error instanceof RemoteInstanceError &&
   (error.code === "execution_authority_unavailable" || error.code === "temporarily_unavailable" || error.retryable);
@@ -50,7 +46,6 @@ export class NativeExecutionGate {
   private readonly operations: OperationAdmissionJournal;
   private keys: ReadonlyMap<string, KeyObject> | null = null;
   private authority: Authority | null = null;
-  private checkDeadline = 0;
   private monotonicDeadline = 0;
   private refreshAfter = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -194,7 +189,7 @@ export class NativeExecutionGate {
   private assertDispatchCurrent(authority: Authority): void {
     this.localAuthority(authority);
     if (this.authority?.executionId !== authority.executionId || this.authority.executionRevision !== authority.executionRevision ||
-      this.checkDeadline <= this.options.clock.coreNow() || this.monotonicDeadline <= this.monotonic()) throw unavailable();
+      this.monotonicDeadline <= this.monotonic()) throw unavailable();
   }
 
   private refresh(): Promise<void> {
@@ -209,48 +204,50 @@ export class NativeExecutionGate {
     const authority = this.authority;
     if (!authority || !this.keys) throw unavailable();
     this.localAuthority(authority);
-    const keys = await this.options.client.executionSigningKeys();
+    const deadlineAtMs = Date.now() + NATIVE_EXECUTION_RENEWAL_BUDGET_MS;
+    const keys = await this.options.client.executionSigningKeys(deadlineAtMs);
     this.localAuthority(authority);
     const check = delivery(authority) ? this.options.client.checkDeliveryExecution : this.options.client.checkExecution;
     if (!check) throw unavailable();
     const result = await check.call(this.options.client, authority.instanceId, authority.executionId, {
       executionRevision: authority.executionRevision, readyRevision: authority.readyRevision, runnerIncarnation: authority.runnerIncarnation,
-    });
+    }, deadlineAtMs);
     this.localAuthority(authority);
     const checkInput = { lease: result.lease, trustedKeys: keys, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000) };
     const claims = delivery(authority) ? verifyRemoteDeliveryCheckLease({ ...checkInput, currentAuthority: authority })
       : verifyRemoteExecutionCheckLease({ ...checkInput, currentAuthority: authority });
     if (result.executionId !== authority.executionId || result.executionRevision !== authority.executionRevision || Date.parse(result.expiresAt) !== claims.exp * 1000) throw fenced();
     this.keys = keys;
-    this.checkDeadline = claims.exp * 1000;
-    this.monotonicDeadline = this.monotonic() + Math.max(0, this.checkDeadline - this.options.clock.coreNow());
-    this.refreshAfter = this.monotonic() + 10_000;
+    const remainingMs = Math.max(0, claims.exp * 1000 - this.options.clock.coreNow());
+    this.monotonicDeadline = this.monotonic() + remainingMs;
+    this.refreshAfter = Math.max(this.monotonic(), this.monotonicDeadline - NATIVE_EXECUTION_RENEWAL_BUDGET_MS);
   }
 
   private async tick(): Promise<void> {
     if (this.stopped || !this.authority) return;
     try {
-      let current = true;
-      try { this.assertDispatchCurrent(this.authority); } catch (error) {
-        if (!this.withinGrace(error)) throw error;
-        current = false;
-      }
-      if (!current || this.monotonic() >= this.refreshAfter) await this.refresh();
+      this.assertDispatchCurrent(this.authority);
+      if (this.monotonic() >= this.refreshAfter) await this.refresh();
     } catch (error) {
       if (this.stopped) return;
-      // A renewal that is merely late (Core answered checks in ~16s under
-      // load, past a 30s lease renewed every 10s) used to kill a finished
-      // turn whose result was about to be reported. It keeps renewing through
-      // a bounded grace instead; begin() stays strict meanwhile, and a
-      // definitive refusal still stops the turn at once.
-      if (this.withinGrace(error)) return;
-      this.stop();
-      this.authorityStop = Promise.resolve().then(() => this.options.onAuthorityLost());
-      await this.authorityStop.catch(() => undefined); // Retained for owner teardown.
+      if (this.canRetryRenewal(error)) {
+        this.refreshAfter = Math.min(this.monotonicDeadline, this.monotonic() + RENEWAL_RETRY_DELAY_MS);
+        return;
+      }
+      await this.fenceAuthority();
     }
   }
 
-  private withinGrace(error: unknown): boolean {
-    return transientLoss(error) && this.monotonic() < this.monotonicDeadline + NATIVE_CHECK_GRACE_MS;
+  private canRetryRenewal(error: unknown): boolean {
+    // Optional continuationPolicy claims are intentionally not a local grant
+    // yet: runtime has not qualified the exact operation/provider-side-effect
+    // fence. A transient failure may retry only within the verified lease.
+    return transientLoss(error) && this.monotonic() < this.monotonicDeadline;
+  }
+
+  private async fenceAuthority(): Promise<void> {
+    this.stop();
+    this.authorityStop = Promise.resolve().then(() => this.options.onAuthorityLost());
+    await this.authorityStop.catch(() => undefined); // Retained for owner teardown.
   }
 }

@@ -311,11 +311,12 @@ export class CoreClient {
       idempotencyKey: `execution-consume:${executionId}:${request.permitId}:${request.operationId}` });
   }
 
-  async checkExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">) {
+  async checkExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">, deadlineAtMs?: number) {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionCheck(instanceId, executionId),
       bodyFactory: () => RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) }), schema: RemoteExecutionCheckResultSchema,
-      idempotencyKey: `execution-check:${executionId}:${request.executionRevision}` });
+      idempotencyKey: `execution-check:${executionId}:${request.executionRevision}`,
+      ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
     if (result.executionId !== executionId || result.executionRevision !== request.executionRevision) {
       throw new RemoteInstanceError("execution_fenced", "Execution check response belongs to another execution.");
     }
@@ -329,11 +330,12 @@ export class CoreClient {
       idempotencyKey: `delivery-execution-consume:${executionId}:${request.permitId}:${request.operationId}` });
   }
 
-  async checkDeliveryExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">) {
+  async checkDeliveryExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">, deadlineAtMs?: number) {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.deliveryExecutionCheck(instanceId, executionId),
       bodyFactory: () => RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) }), schema: RemoteExecutionCheckResultSchema,
-      idempotencyKey: `delivery-execution-check:${executionId}:${request.executionRevision}` });
+      idempotencyKey: `delivery-execution-check:${executionId}:${request.executionRevision}`,
+      ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
     if (result.executionId !== executionId || result.executionRevision !== request.executionRevision) {
       throw new RemoteInstanceError("execution_fenced", "Delivery check response belongs to another execution.");
     }
@@ -341,14 +343,15 @@ export class CoreClient {
   }
 
   /** Trust comes only from the configured Core origin, never a token URL/header. */
-  async executionSigningKeys(): Promise<ReadonlyMap<string, KeyObject>> {
+  async executionSigningKeys(deadlineAtMs?: number): Promise<ReadonlyMap<string, KeyObject>> {
     const keySchema = z.object({ kty: z.literal("RSA"), kid: z.string().min(1).max(256),
       alg: z.literal("RS256").optional(), use: z.literal("sig").optional(),
       n: z.string().min(1).max(2048).regex(/^[A-Za-z0-9_-]+$/), e: z.string().min(1).max(16).regex(/^[A-Za-z0-9_-]+$/),
     }).strict();
     try {
       const result = await this.proofHttp.request({ method: "GET", path: CORE_PATHS.jwks,
-        schema: z.object({ keys: z.array(keySchema).min(1).max(32) }).strict() });
+        schema: z.object({ keys: z.array(keySchema).min(1).max(32) }).strict(),
+        ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
       const keys = new Map<string, KeyObject>();
       for (const jwk of result.keys) {
         if (keys.has(jwk.kid)) throw new Error("Duplicate signing key");
