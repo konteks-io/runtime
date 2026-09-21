@@ -50,10 +50,10 @@
   },
   "dependencies": {
     "@konteks/agent-core": "file:vendor/konteks-agent-core-6.0.0.tgz",
-    "@konteks/backstage-plugin-common": "file:vendor/konteks-backstage-plugin-common-6.0.0.tgz"
+    "@konteks/backstage-plugin-common": "file:vendor/konteks-backstage-plugin-common-6.2.0.tgz"
   },
   "konteksContracts": {
     "@konteks/agent-core": "6.0.0",
-    "@konteks/backstage-plugin-common": "6.0.0"
+    "@konteks/backstage-plugin-common": "6.2.0"
   }
 }
