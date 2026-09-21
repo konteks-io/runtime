@@ -63,6 +63,8 @@ export async function writeOwnerToken(
 const FirstSystemSchema = z
   .object({
     systemId: z.string().min(1),
+    /** The workspace already had this System; this machine now works on it (WS1-089). */
+    existing: z.boolean().optional(),
     systemEntityRef: z.string().min(1),
     componentEntityRef: z.string().min(1),
     repository: z

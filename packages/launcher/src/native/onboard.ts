@@ -787,8 +787,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       });
       return {
         step: "system",
-        note:
-          state.repositoryKind === "managed"
+        note: registered.existing
+          ? `${state.repositoryName} was already a System in your workspace, so this machine works on that one; nothing was made twice.`
+          : state.repositoryKind === "managed"
             ? `${state.repositoryName} is now a System in Konteks, with a managed git repository ready for it.`
             : `${state.repositoryName} is now a System in Konteks.`,
         run: AGAIN,

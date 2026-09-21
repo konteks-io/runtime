@@ -194,6 +194,17 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "done", closing: true });
   });
 
+  it("says so when the folder was already the workspace's System, instead of failing (WS1-089)", async () => {
+    await writeOnboardState(root, { step: "system", repositoryName: "hello-world", repositoryKind: "existing", repositoryPath: "/tmp/hello-world", remoteUrl: "https://github.com/octocat/Hello-World.git", defaultBranch: "master", instanceId: "instance-1" } as never);
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({
+      systemId: "sys-existing", existing: true, systemEntityRef: "system:default/konteks-2-hello-world", componentEntityRef: "component:default/octocat-hello-world",
+      repository: { kind: "existing", remoteUrl: "https://github.com/octocat/Hello-World.git", defaultBranch: "master" },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    const result = await step({ fetchFn: fetchFn as never }, "yes");
+    expect(result.note).toBe("hello-world was already a System in your workspace, so this machine works on that one; nothing was made twice.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "graft", systemId: "sys-existing" });
+  });
+
   it("registers the first System and moves to the push step for managed git", async () => {
     await writeOnboardState(root, {
       step: "system",
