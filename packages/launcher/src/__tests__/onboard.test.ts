@@ -1201,6 +1201,12 @@ describe("onboard", () => {
     const again = await step({ enrollment: { sendChallenge, verifyCode } as never }, "send a new code");
     expect(again.note).toBe("A new code is on its way to a••@acme.test; the one before it no longer works.");
     expect(verifyCode).not.toHaveBeenCalled();
+
+    // A mistyped address goes back to the email question.
+    const other = await step({ enrollment: { sendChallenge, verifyCode } as never }, "oops, use a different email");
+    expect(other.ask).toMatchObject({ kind: "email" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "email" });
+    expect((await readOnboardState(root))?.email).toBeUndefined();
   });
 
   it("ends the flow on an empty answer to the first task, not only on whitespace", async () => {

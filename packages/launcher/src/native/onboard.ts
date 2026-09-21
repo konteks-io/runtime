@@ -94,6 +94,8 @@ const NEGATIVE = new Set(["n", "no", "nope", "not now", "skip", "later", "cancel
 /** Words that turn an otherwise agreeable answer into a refusal ("please don't"). */
 const NEGATION = /\b(no|not|don'?t|do not|never|cancel|stop|wait)\b/;
 /** "send a new code", "resend", "I didn't get it", "another code please". */
+/** "use a different email", "wrong address", "change the email". */
+const ASKS_OTHER_EMAIL = /\b(different|another|other|wrong|change( the)?) (e-?mail|address)\b/i;
 const ASKS_NEW_CODE = /\b(new code|another code|resend|send (it |a code )?again|didn'?t (get|receive|arrive)|did not (get|receive|arrive)|no (code|email) (came|arrived))\b/i;
 const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
 /** How long, and how often, the agents step waits for the machine to advertise what it can run. */
@@ -358,7 +360,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "code", intentRef, email, emailMasked: sent.sentToMasked, attemptsRemaining: sent.attemptsRemaining, resendTo: undefined, resendReason: undefined } as never);
       return {
         step: "email",
-        note: `${state.resendReason ? `${state.resendReason} ` : ""}A ${state.resendReason ? "new " : ""}six-digit code is on its way to ${sent.sentToMasked}. If it does not arrive within a minute or two, say "send a new code".`,
+        note: `${state.resendReason ? `${state.resendReason} ` : ""}A ${state.resendReason ? "new " : ""}six-digit code is on its way to ${sent.sentToMasked}. If it does not arrive within a minute or two, say "send a new code"; for another address, say "use a different email".`,
         run: AGAIN,
       };
     }
@@ -367,6 +369,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const codeQuestion = { question: `Paste the six-digit code sent to ${state.emailMasked ?? "your email"}.`, kind: "code" as const };
       if (context.answer === undefined || !context.answer.trim()) {
         return { step: "code", ask: codeQuestion };
+      }
+      // A mistyped address: go back and ask for it (WS1-088).
+      if (ASKS_OTHER_EMAIL.test(context.answer)) {
+        await save({ step: "email", intentRef: undefined, email: undefined, emailMasked: undefined, attemptsRemaining: undefined, resendTo: undefined, resendReason: undefined } as never);
+        return { step: "code", note: "The code sent before will not be used.", ask: { question: "What email address should this machine belong to?", kind: "email" } };
       }
       // No mail, or a code lost: the person asks for another one (WS1-088).
       if (ASKS_NEW_CODE.test(context.answer)) {
