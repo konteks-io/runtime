@@ -9,6 +9,7 @@ import {
   WorkAvailableSchema,
   CancelDirectiveSchema,
   createLogger,
+  createRuntimeAdmissionObservabilityContext,
   jcsDigest,
   computeRemoteReconciliationManifestDigest,
   parseRfc3339,
@@ -338,6 +339,14 @@ export class WorkOrchestrator {
           await this.reconstructAdmissionProjectionsOwned(assignment.id, assignment.attempt, assertCurrent);
           assertCurrent();
           const start = this.deps.journal.execution.start(assignment.id, assignment.attempt)!;
+          const observability = createRuntimeAdmissionObservabilityContext({
+            runtimeIncarnationId: start.admission.runnerIncarnation,
+            assignmentId: start.admission.assignmentId,
+            attempt: start.admission.attempt,
+            claimId: start.admission.claimId,
+            executionId: start.admission.executionGeneration,
+          });
+          this.logger.info({ event: "runtime.admission.durable", observability }, "native claim admission persisted");
           const initial = this.journalEntry(assignment, claim.claimId, "claimed", start.projectionCreatedAt, start.evidenceUpload);
           const assertPrepared = () => {
             assertCurrent();

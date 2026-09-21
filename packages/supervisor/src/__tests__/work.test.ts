@@ -543,6 +543,35 @@ describe("work orchestrator claim validation", () => {
     expect(f.journal.execution.start("asg-1", 1)?.delivery).toBe("unallocated");
   });
 
+  it("emits causal diagnostics only after native admission is durable", async () => {
+    let admissionPersisted = false;
+    const info = vi.fn((fields: Record<string, unknown>) => {
+      if (fields.event === "runtime.admission.durable") {
+        expect(admissionPersisted).toBe(true);
+      }
+    });
+    const logger = { info, warn: vi.fn(), error: vi.fn() } as unknown as Logger;
+    const f = await orchestrator({ deploymentKind: "native_connector", logger });
+    const begin = f.journal.execution.beginAdmission.bind(f.journal.execution);
+    vi.spyOn(f.journal.execution, "beginAdmission").mockImplementation(async (candidate, check) => {
+      await begin(candidate, check);
+      admissionPersisted = true;
+    });
+
+    await f.work.onAssignmentMessage({ assignments: [assignment] });
+
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({
+      event: "runtime.admission.durable",
+      observability: expect.objectContaining({
+        schemaVersion: "observability-context-v1",
+        assignmentId: "asg-1",
+        attempt: 1,
+        executionId: expect.any(String),
+        runtimeIncarnationId: "process",
+      }),
+    }), "native claim admission persisted");
+  });
+
   it("claim ACK completion cannot adopt newer authority or invent a terminal", async () => {
     let generation: string | null = "accepted-A";
     const f = await orchestrator({ deploymentKind: "native_connector", recoveryAuthority: () => generation });
