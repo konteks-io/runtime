@@ -1,9 +1,10 @@
 {
   "mcpServers": {
     "graft": {
-      "command": "./scripts/hardening/graft",
+      "command": "sh",
       "args": [
-        "mcp"
+        "-c",
+        "exec \"$HOME/.local/share/graft/node_modules/.bin/graft\" mcp"
       ],
       "env": {
         "DO_NOT_TRACK": "1",
