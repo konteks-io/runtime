@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { FixedClock, generateInstanceKey, logicalAssignmentRequestDigest, verifyInstanceProof, type RelayRuntimeHandshakeResult } from "@konteks/remote-common";
+import { FixedClock, computeExecutionRevisionControlIntentDigest, generateInstanceKey, logicalAssignmentRequestDigest, verifyInstanceProof, type RelayRuntimeHandshakeResult } from "@konteks/remote-common";
 import { RelayClient, type RelayClientOptions } from "../relay/relay-client.js";
 import { ChannelMux } from "../relay/channel-mux.js";
 import { CORE_AUDIENCE } from "../core/client.js";
@@ -120,6 +120,52 @@ describe("native runtime relay handshake validation boundary", () => {
       expect(onCancellation.mock.calls[0]?.[1].connectionEpoch).toBe(7);
       expect(f.mux.receive).not.toHaveBeenCalled(); expect(f.socket.send).not.toHaveBeenCalled();
       expect(f.socket.close).not.toHaveBeenCalled();
+    } finally { f.client.stop(); }
+  });
+
+  it("routes C02 revision control only to its current dedicated receiver", async () => {
+    const onExecutionRevisionControl = vi.fn(async (_request, connection) => connection.assertCurrent());
+    const f = fixture({ onExecutionRevisionControl } as never);
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      executionRevision: 1,
+      checkId: "check",
+      policyRevision: null,
+      connectionRef: "connection",
+      connectionEpoch: 7,
+      reason: "authority_revoked" as const,
+      issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+      deadlineAt: "2026-09-06T00:00:02.000Z",
+    };
+    const request = {
+      type: "runtime_execution_revision_control_delivery",
+      method: "POST",
+      path: { instanceId: "instance" },
+      nodeId: "node",
+      connectionRef: "connection",
+      connectionEpoch: 7,
+      intent,
+      intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      keyId: "control",
+      nonce: "N".repeat(22),
+      issuedAt: intent.issuedAt,
+      expiresAt: intent.deadlineAt,
+      signature: "A".repeat(86),
+    };
+    try {
+      f.socket.message(confirmed); await flush(); f.socket.send.mockClear();
+      f.socket.message(request); await flush();
+      expect(onExecutionRevisionControl).toHaveBeenCalledOnce();
+      expect(f.mux.receive).not.toHaveBeenCalled();
+      expect(f.socket.send).not.toHaveBeenCalled();
+      const guard = onExecutionRevisionControl.mock.calls[0]![1].assertCurrent;
+      f.client.rehandshake("replacement");
+      expect(guard).toThrow("Revision-control socket ownership is not current");
     } finally { f.client.stop(); }
   });
 

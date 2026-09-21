@@ -29,6 +29,7 @@ import { loadSupervisorConfig, parseRunnerUrls, type SupervisorConfig } from "./
 import { CoreClient, LEASE_AUDIENCE } from "./core/client.js";
 import { CoreSignatureVerifier } from "./control/core-signature.js";
 import { CancellationReceiver } from "./control/cancellation-receiver.js";
+import { ExecutionRevisionControlReceiver } from "./control/execution-revision-control-receiver.js";
 import { PermissionAnswerReceiver } from "./control/permission-answer-receiver.js";
 import { CancellationReplay } from "./control/cancellation-replay.js";
 import { ControlHandlers, compareSemver } from "./control/handlers.js";
@@ -208,6 +209,13 @@ export class Supervisor {
   private muxTimer: NodeJS.Timeout | null = null;
   private cancellationTimer: NodeJS.Timeout | null = null;
   private cancellationReplay: CancellationReplay | null = null;
+  /** Cleared on every relay generation change; gates may use it only while its
+   * captured socket assertion still proves the same signed delivery path. */
+  private revisionFenceConnection: {
+    connectionRef: string;
+    connectionEpoch: number;
+    assertCurrent(): void;
+  } | null = null;
   private configurationTimer: NodeJS.Timeout | null = null;
   private configurationRefresh: Promise<void> | null = null;
   private activeLoopStarted = false;
@@ -437,7 +445,10 @@ export class Supervisor {
           outboundHighWaterBytes: Math.max(64 * 1024, Math.floor(this.config.SUPERVISOR_REPLAY_BUFFER_BYTES / 2)),
           outboundLowWaterBytes: Math.max(32 * 1024, Math.floor(this.config.SUPERVISOR_REPLAY_BUFFER_BYTES / 4)),
           outboundMaxBytes: this.config.SUPERVISOR_REPLAY_BUFFER_BYTES,
-          onStateChange: () => this.transport.evaluate(),
+          onStateChange: (state) => {
+            if (state !== "connected") this.revisionFenceConnection = null;
+            this.transport.evaluate();
+          },
           validateHandshake: result => this.validateRelayHandshake(result),
           onConnected: result => this.onRelayConnected(result),
           onPermissionAnswer: async (request, connection) => {
@@ -490,6 +501,46 @@ export class Supervisor {
               } : null,
             });
             await receiver.receive(request);
+          },
+          onExecutionRevisionControl: async (request, connection) => {
+            const lease = this.lease.current();
+            const instanceId = this.instanceId;
+            const workspaceId = this.workspaceId;
+            const runnerIncarnation = this.runnerIncarnation;
+            const ownership = this.nativeOwnership;
+            const accepted = this.recoveryAuthority();
+            const assertCurrent = () => {
+              connection.assertCurrent();
+              if (this.stopping || !lease || !instanceId || !workspaceId || !ownership ||
+                  this.nativeOwnership !== ownership || this.lease.current() !== lease ||
+                  this.instanceId !== instanceId || this.workspaceId !== workspaceId ||
+                  this.runnerIncarnation !== runnerIncarnation || this.recoveryAuthority() !== accepted) {
+                throw new RemoteInstanceError("recovery_required", "Revision-control native ownership is not current");
+              }
+              ownership.assertOwned();
+            };
+            const receiver = new ExecutionRevisionControlReceiver({
+              verifier,
+              inbox: this.journal.executionRevisionFences,
+              now: () => this.clock.coreNow(),
+              monotonicNow: () => performance.now(),
+              captureConnection: () => lease && instanceId && workspaceId && ownership && accepted ? {
+                instanceId,
+                workspaceId,
+                runnerIncarnation,
+                nodeId: request.nodeId,
+                connectionRef: request.connectionRef,
+                connectionEpoch: connection.connectionEpoch,
+                assertCurrent,
+              } : null,
+            });
+            await receiver.receive(request);
+            assertCurrent();
+            this.revisionFenceConnection = {
+              connectionRef: request.connectionRef,
+              connectionEpoch: connection.connectionEpoch,
+              assertCurrent,
+            };
           },
         })
       : null;
@@ -646,7 +697,19 @@ export class Supervisor {
         workspaceRoot: this.native ? this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR : "/workspace",
         ...(this.native ? {
           deploymentKind: "native_connector" as const,
-          executionAuthority: { client: this.core, runnerIncarnation: this.runnerIncarnation },
+          executionAuthority: {
+            client: this.core,
+            runnerIncarnation: this.runnerIncarnation,
+            currentRevisionFenceConnection: () => {
+              const connection = this.revisionFenceConnection;
+              if (!connection) return null;
+              connection.assertCurrent();
+              return {
+                connectionRef: connection.connectionRef,
+                connectionEpoch: connection.connectionEpoch,
+              };
+            },
+          },
           registerReady: createNativeReadyRegistrar({
             clock: this.clock, journal: this.journal, client: this.core,
             instanceId: this.instanceId ?? "", workspaceId: this.workspaceId ?? "", runnerIncarnation: this.runnerIncarnation,
