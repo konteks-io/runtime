@@ -38,6 +38,8 @@ describe("graft", () => {
   let repo: string;
   let root: string;
   let tool: GraftTool;
+  let home: string;
+  let savedHome: string | undefined;
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "konteks-graft-"));
     repo = join(dir, "table-booking");
@@ -50,9 +52,13 @@ describe("graft", () => {
     await writeFile(cli, FAKE_GRAFT);
     tool = { node: process.execPath, cli };
     process.env.GRAFT_TEST_LOG = join(dir, "graft.log");
+    home = join(dir, "home");
+    savedHome = process.env.HOME;
+    process.env.HOME = home;
   });
   afterEach(async () => {
     delete process.env.GRAFT_TEST_LOG;
+    process.env.HOME = savedHome;
     await rm(dir, { recursive: true, force: true });
   });
 
@@ -93,10 +99,14 @@ describe("graft", () => {
     expect(settings.hooks.Stop[0]!.hooks[0]!.command).toBe(`${JSON.stringify(process.execPath)} "\${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/graft-hooks.cjs" stop`);
     expect(settings.permissions).toEqual({ allow: ["Bash(graft:*)"] });
     const mcp = JSON.parse(await readFile(join(repo, ".mcp.json"), "utf8")) as { mcpServers: { graft: { command: string; args: string[]; env: Record<string, string> } } };
-    expect(mcp.mcpServers.graft).toEqual({ command: process.execPath, args: [tool.cli, "mcp"], env: { DO_NOT_TRACK: "1" } });
+    expect(mcp.mcpServers.graft).toEqual({ command: process.execPath, args: [tool.cli, "mcp"], env: { DO_NOT_TRACK: "1", NO_UPDATE_NOTIFIER: "1" } });
     const shim = await readFile(join(root, "bin", "graft"), "utf8");
     expect(shim).toContain("DO_NOT_TRACK=1");
     expect(shim).toContain(tool.cli);
+
+    // Graft's own npm update check is answered in ~/.graft, so it never runs.
+    const check = JSON.parse(await readFile(join(home, ".graft", "update-check.json"), "utf8")) as { checkedAt: number };
+    expect(check.checkedAt).toBeGreaterThan(Date.now() + 1e12);
 
     // Wiring again adds no second exclude block.
     await wireGraft(root, repo, ["claude-code", "codex"], tool);

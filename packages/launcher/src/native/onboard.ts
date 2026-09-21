@@ -1083,7 +1083,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           const where = state.tenantId ?? identity.workspaceId ?? "your workspace";
           return {
             step: "identity",
-            note: `This machine is already connected to ${where}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}; no sign-in is needed. Looking at this folder next.`,
+            note: `This machine is already connected to ${where}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}; no sign-in is needed.`,
             run: AGAIN,
           };
         }

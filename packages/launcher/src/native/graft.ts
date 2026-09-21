@@ -2,7 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
@@ -137,7 +137,20 @@ export async function ensureGraft(
 
 /** Every Graft run: statistics off, and its own .gitignore edit off (we exclude locally). */
 function graftEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, DO_NOT_TRACK: "1", GRAFT_NO_GITIGNORE: "1" };
+  return { ...process.env, DO_NOT_TRACK: "1", GRAFT_NO_GITIGNORE: "1", NO_UPDATE_NOTIFIER: "1" };
+}
+
+/**
+ * Graft checks npm for a newer version of itself in the background (`npm
+ * view`), which writes npm's own files in the home folder and calls the
+ * registry: nothing the person was told about (WS1-081). The release pins
+ * Graft's version, so its self-update check is answered here, once, in
+ * ~/.graft, the one place outside the repository the offer names.
+ */
+export async function quietGraftUpdateCheck(home: string): Promise<void> {
+  const file = join(home, ".graft", "update-check.json");
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  await writeFile(file, `${JSON.stringify({ latest: null, checkedAt: 8_640_000_000_000_000 })}\n`, { mode: 0o600 });
 }
 
 export async function runGraft(tool: GraftTool, args: string[], cwd: string, timeoutMs = 10 * 60_000): Promise<string> {
@@ -199,6 +212,7 @@ export async function wireGraft(
 ): Promise<{ added: string[]; changedTracked: string[]; mappedFiles: number | null }> {
   const { agents } = await planGraft(repo, families);
   const before = new Set((await git(repo, ["status", "--porcelain=v1", "--untracked-files=all"])).split("\n").filter(Boolean));
+  await quietGraftUpdateCheck(process.env.HOME ?? homedir());
   await runGraft(tool, ["telemetry", "disable"], repo, 60_000);
   const output = await runGraft(tool, ["init", repo, "--agents", ...agents, "--no-global", "-y"], repo);
   await pointWiringAtTool(repo, tool);
@@ -258,7 +272,7 @@ async function pointWiringAtTool(repo: string, tool: GraftTool): Promise<void> {
   if (mcp !== null) {
     const parsed = JSON.parse(mcp) as { mcpServers?: Record<string, unknown> };
     if (parsed.mcpServers?.graft) {
-      parsed.mcpServers.graft = { command: tool.node, args: [tool.cli, "mcp"], env: { DO_NOT_TRACK: "1" } };
+      parsed.mcpServers.graft = { command: tool.node, args: [tool.cli, "mcp"], env: { DO_NOT_TRACK: "1", NO_UPDATE_NOTIFIER: "1" } };
       await writeFile(mcpPath, `${JSON.stringify(parsed, null, 2)}\n`);
     }
   }
@@ -269,7 +283,7 @@ export async function installGraftShim(root: string, tool: GraftTool): Promise<s
   const bin = join(resolve(root), "bin");
   await mkdir(bin, { recursive: true, mode: 0o700 });
   const shim = join(bin, "graft");
-  await writeFile(shim, `#!/bin/sh\n# Graft, as konteks-remote installed it; usage statistics stay off.\nDO_NOT_TRACK=1 GRAFT_NO_GITIGNORE=1 exec ${JSON.stringify(tool.node)} ${JSON.stringify(tool.cli)} "$@"\n`);
+  await writeFile(shim, `#!/bin/sh\n# Graft, as konteks-remote installed it; usage statistics stay off.\nDO_NOT_TRACK=1 GRAFT_NO_GITIGNORE=1 NO_UPDATE_NOTIFIER=1 exec ${JSON.stringify(tool.node)} ${JSON.stringify(tool.cli)} "$@"\n`);
   await chmod(shim, 0o755);
   return shim;
 }
