@@ -701,7 +701,13 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       });
       return {
         step: "inspect",
-        note: `${notReady}${kind === "existing" ? `You are in ${facts.name}, with remote ${facts.remoteUrl}.` : `You are in ${facts.name}, which has no remote this machine can push to.`}`,
+        note: `${notReady}${
+          kind === "existing"
+            ? `You are in ${facts.name}, with remote ${facts.remoteUrl}.`
+            : facts.onManagedGit
+              ? `You are in ${facts.name}, which is already on Konteks managed git (remote "konteks").`
+              : `You are in ${facts.name}, which has no remote this machine can push to.`
+        }`,
         run: AGAIN,
       };
     }

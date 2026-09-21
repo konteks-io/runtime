@@ -21,6 +21,8 @@ export interface RepositoryFacts {
   remoteReachable: boolean;
   currentBranch: string | null;
   defaultBranch: string;
+  /** The repository already has Konteks managed git as its "konteks" remote. */
+  onManagedGit?: boolean;
 }
 
 const env = () => sanitizeInheritedChildProcessEnv({ env: process.env });
@@ -63,6 +65,7 @@ export async function inspectRepository(cwd: string): Promise<RepositoryFacts> {
     remoteReachable = probe !== null && probe.code === 0;
   }
 
+  const konteks = await git(path, ["remote", "get-url", "konteks"]).catch(() => null);
   return {
     path,
     name,
@@ -70,6 +73,7 @@ export async function inspectRepository(cwd: string): Promise<RepositoryFacts> {
     remoteReachable,
     currentBranch,
     defaultBranch: currentBranch ?? "main",
+    ...(konteks && konteks.code === 0 ? { onManagedGit: true } : {}),
   };
 }
 

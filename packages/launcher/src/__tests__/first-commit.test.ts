@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { commitFirstFiles, initializeRepository, planFirstCommit, pushToManagedRemote } from "../native/repository-inspect.js";
+import { commitFirstFiles, initializeRepository, inspectRepository, planFirstCommit, pushToManagedRemote } from "../native/repository-inspect.js";
 
 /**
  * A folder with files but no git becomes a repository on managed git with
@@ -82,5 +82,7 @@ describe("first commit of a folder with files", () => {
     // What was left out is still there, and still not tracked.
     expect(await readFile(join(folder, ".env"), "utf8")).toContain("sk_test_fake");
     expect(git(folder, "status", "--porcelain")).toBe("");
+    // A later look at the folder knows it is on Konteks managed git (pass 6).
+    expect(await inspectRepository(folder)).toMatchObject({ onManagedGit: true, remoteUrl: null });
   });
 });
