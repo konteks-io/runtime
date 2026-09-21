@@ -9,7 +9,7 @@ import { SupervisorControl } from "../control.js";
 import { addNativeAgent, installNative, readNativeRecord, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
-import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
+import { nativePlatform, nativeServiceDefinition, parseServiceExits, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
 import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
@@ -19,6 +19,11 @@ const environment = () => sanitizeInheritedChildProcessEnv({ env: process.env })
 async function execute(command: NativeServiceCommand): Promise<number | null> {
   const result = await runCommand({ ...command, env: environment(), timeoutMs: 30_000 });
   return result.code;
+}
+async function serviceExits(definition: NativeServiceDefinition) {
+  if (!definition.exits) return null;
+  const result = await runCommand({ ...definition.exits, env: environment(), timeoutMs: 10_000 });
+  return result.code === 0 ? parseServiceExits(nativePlatform().os, result.stdout) : null;
 }
 async function serviceDefinition(root: string) {
   const platform = nativePlatform();
@@ -178,7 +183,7 @@ export const nativeCliActions: NativeCliActions = {
       const selfUpdated = check?.status === "current" ? selfUpdateNote(attempts, check.bundleVersion) : null;
       if (selfUpdated) input.output.line(selfUpdated);
     }
-    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start }));
+    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start, serviceExits }));
   },
   uninstall: async input => {
     const result = await uninstallNative(input, productionUninstallDeps({ root: input.root, serviceDefinition, execute }));

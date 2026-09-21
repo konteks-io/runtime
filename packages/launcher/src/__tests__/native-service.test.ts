@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { nativePlatform, nativePaths, nativeServiceDefinition } from "../native/service.js";
+import { nativePlatform, nativePaths, nativeServiceDefinition, parseServiceExits } from "../native/service.js";
 
 describe("native install layout", () => {
   it.each([['darwin', 'macos'], ['win32', 'windows'], ['linux', 'debian']] as const)("supports %s x64 and arm64 without a container backend", (os, expected) => {
@@ -69,5 +69,19 @@ describe("native background service definitions", () => {
     const input = { os: 'debian' as const, home: '/home/a', root: '/home/a/remote', executable: '/home/a/remote/bin/remote' };
     expect(() => nativeServiceDefinition({ ...input, executable: 'relative' })).toThrow(/absolute/);
     expect(() => nativeServiceDefinition({ ...input, root: '/home/a/remote\nExecStart=evil' })).toThrow();
+  });
+});
+
+describe("service exits (W1-Z7)", () => {
+  it("reads launchd's run count and last exit code", () => {
+    const print = (runs: number, last: string) => `gui/501/dev.konteks.remote.x = {\n\tactive count = 1\n\tstate = running\n\truns = ${runs}\n\tpid = 81413\n\tlast exit code = ${last}\n\tendpoints = {\n\t\tstate = active\n\t}\n}\n`;
+    expect(parseServiceExits("macos", print(1, "(never exited)"))).toEqual({ runs: 1, lastExitCode: null });
+    expect(parseServiceExits("macos", print(4, "1"))).toEqual({ runs: 4, lastExitCode: 1 });
+    expect(parseServiceExits("macos", "Could not find service")).toBeNull();
+  });
+  it("reads systemd's restarts and main exit status", () => {
+    expect(parseServiceExits("debian", "NRestarts=2\nExecMainStatus=1\n")).toEqual({ runs: 3, lastExitCode: 1 });
+    expect(parseServiceExits("debian", "NRestarts=0\nExecMainStatus=0\n")).toEqual({ runs: 1, lastExitCode: null });
+    expect(parseServiceExits("windows", "anything")).toBeNull();
   });
 });
