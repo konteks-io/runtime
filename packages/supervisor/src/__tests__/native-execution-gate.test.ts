@@ -21,10 +21,10 @@ beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "native-gate-")); }
 afterEach(async () => { for (const session of sessions.splice(0)) session.fenceForRecovery(); for (const gate of gates.splice(0)) gate.stop(); vi.useRealTimers(); await rm(root, { recursive: true, force: true }); });
 const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const keys = new Map([["core", pair.publicKey]]);
-function signed(value: unknown) {
+function signed(value: unknown, signingKey = pair.privateKey, kid = "core") {
   const encoded = (part: unknown) => Buffer.from(JSON.stringify(part)).toString("base64url");
-  const body = `${encoded({ alg: "RS256", kid: "core" })}.${encoded(value)}`;
-  return `${body}.${sign("RSA-SHA256", Buffer.from(body), pair.privateKey).toString("base64url")}`;
+  const body = `${encoded({ alg: "RS256", kid })}.${encoded(value)}`;
+  return `${body}.${sign("RSA-SHA256", Buffer.from(body), signingKey).toString("base64url")}`;
 }
 const expiresAt = "2026-09-10T01:00:00Z";
 const assignment: RemoteWorkAssignment = { id: "assignment", attempt: 1, workspaceId: "tenant", instanceId: "instance", placementId: "placement", kind: "assistant_execution", taskId: "turn", correlationId: "correlation", expiresAt, requiredCapabilities: [], agentRoute: { agentId: "codex", requiredRole: "assistant" }, source: { kind: "conversation", portability: "portable_before_claim", sessionId: "session", turnRef: "turn" }, policy: { maxDurationSeconds: 60, maxArtifactBytes: 1, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted", latestResumeAt: expiresAt, permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: false } };
@@ -100,6 +100,20 @@ async function deliveryFixture() {
   return { ...f, gate: makeGate(), makeGate, client, claims, assigned,
     envelope: { ...f.envelope, permit: signed(claims) } };
 }
+
+it("passes an operation key identifier to the configured-origin trust cache", async () => {
+  const f = await fixture();
+  const rotated = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const rotatedKeys = new Map([["rotated", rotated.publicKey]]);
+  const receipt = signed({ ...f.claims, aud: "konteks:remote-execution-admission", admissionId: "admission",
+    admittedAt: f.clock.nowIso(), checkExpiresAt: "2026-09-10T00:00:30Z" }, rotated.privateKey, "rotated");
+  f.client.executionSigningKeys.mockResolvedValue(rotatedKeys);
+  f.client.consumeExecution.mockResolvedValue({ outcome: "admitted", admissionId: "admission", receipt });
+
+  await f.gate.admit({ ...f.envelope, permit: signed(f.claims, rotated.privateKey, "rotated") });
+
+  expect(f.client.executionSigningKeys).toHaveBeenCalledWith(undefined, "rotated");
+});
 
 it("dispatches delivery exactly once through dedicated consumption and check routes", async () => {
   const f = await deliveryFixture(); const operation = await f.gate.admit(f.envelope);

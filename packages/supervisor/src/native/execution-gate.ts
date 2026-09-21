@@ -38,6 +38,16 @@ export interface AuthorizedNativeOperation {
 }
 const fenced = () => new RemoteInstanceError("execution_fenced", "Native execution authority is no longer current.");
 const unavailable = () => new RemoteInstanceError("execution_authority_unavailable", "Fresh execution authority is unavailable.");
+const signedOperationKeyId = (permit: string): string | undefined => {
+  try {
+    const header = JSON.parse(Buffer.from(permit.split(".", 1)[0] ?? "", "base64url").toString("utf8"));
+    return typeof header.kid === "string" && header.kid.length > 0 && header.kid.length <= 256
+      ? header.kid
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
 /** The whole trust fetch and signed check exchange share this one budget. */
 export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 5_000;
 const RENEWAL_RETRY_DELAY_MS = 1_000;
@@ -73,7 +83,7 @@ export class NativeExecutionGate {
     this.options.assertOwned();
     if (this.stopped) throw fenced();
     // Fetch only the configured Core trust. No token header may select a URL.
-    const keys = await this.options.client.executionSigningKeys();
+    const keys = await this.options.client.executionSigningKeys(undefined, signedOperationKeyId(envelope.permit));
     this.options.assertOwned();
     const ref = this.options.journal.assignments.get(`${this.options.assignment.id}:${this.options.assignment.attempt}`)?.executionReady?.acpSessionRef;
     const message = envelope.message;

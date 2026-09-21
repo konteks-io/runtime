@@ -89,6 +89,27 @@ describe("native execution admission HTTPS proofs", () => {
     expect(f.fetchFn).toHaveBeenCalledOnce();
   });
 
+  it("coalesces one configured-origin refresh when a cached keyset lacks an operation key", async () => {
+    const oldPair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const rotatedPair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const oldKey = { ...oldPair.publicKey.export({ format: "jwk" }), kid: "old", alg: "RS256", use: "sig" };
+    const rotatedKey = { ...rotatedPair.publicKey.export({ format: "jwk" }), kid: "rotated", alg: "RS256", use: "sig" };
+    const responses = [{ keys: [oldKey] }, { keys: [rotatedKey] }];
+    const key = generateInstanceKey();
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify(responses.shift()), { status: 200 }));
+    const client = new CoreClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-10T00:00:00Z")),
+      key: () => key, credential: () => "test-native-lease", fetchFn });
+
+    await client.executionSigningKeys();
+    const results = await Promise.all(Array.from({ length: 40 }, () =>
+      (client.executionSigningKeys as (deadlineAtMs?: number, expectedKid?: string) => Promise<ReadonlyMap<string, unknown>>)(undefined, "rotated")));
+
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(results.every(keys => keys.has("rotated"))).toBe(true);
+    await client.executionSigningKeys(undefined, "another-unknown-kid");
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
   it("refreshes configured-origin signing keys after the 60-second cache bound", async () => {
     const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const key = { ...pair.publicKey.export({ format: "jwk" }), kid: "core", alg: "RS256", use: "sig" };

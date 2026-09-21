@@ -272,7 +272,11 @@ export class CoreClient {
   /** Recovery is authenticated by a machine proof, independent of a predecessor bearer. */
   private readonly proofHttp: JsonClient;
   /** Trusted keys are scoped to this client’s configured Core origin. */
-  private signingKeyCache: { keys: ReadonlyMap<string, KeyObject>; expiresAtMs: number } | null = null;
+  private signingKeyCache: {
+    keys: ReadonlyMap<string, KeyObject>;
+    expiresAtMs: number;
+    unknownKidRefreshUsed: boolean;
+  } | null = null;
   private signingKeyRefresh: Promise<ReadonlyMap<string, KeyObject>> | null = null;
 
   constructor(private readonly options: CoreClientOptions) {
@@ -367,14 +371,25 @@ export class CoreClient {
   }
 
   /** Trust comes only from the configured Core origin, never a token URL/header. */
-  async executionSigningKeys(deadlineAtMs?: number): Promise<ReadonlyMap<string, KeyObject>> {
+  async executionSigningKeys(deadlineAtMs?: number, expectedKid?: string): Promise<ReadonlyMap<string, KeyObject>> {
     const cached = this.signingKeyCache;
-    if (cached && cached.expiresAtMs > Date.now()) return cached.keys;
+    let refreshUnknownKid = false;
+    if (cached && cached.expiresAtMs > Date.now()) {
+      refreshUnknownKid = Boolean(expectedKid && !cached.keys.has(expectedKid) && !cached.unknownKidRefreshUsed);
+      if (!refreshUnknownKid) return cached.keys;
+    }
     if (!this.signingKeyRefresh) {
       this.signingKeyRefresh = this.fetchExecutionSigningKeys().then(keys => {
         // Core currently does not publish a shorter keyset max-age. Keep the
         // configured-origin cache below the C05 60-second upper bound.
-        this.signingKeyCache = { keys, expiresAtMs: Date.now() + 60_000 };
+        this.signingKeyCache = {
+          keys,
+          expiresAtMs: Date.now() + 60_000,
+          // A signed-operation header can request one refresh of a still-valid
+          // configured-origin epoch. Further unknown identifiers fail closed
+          // until normal expiry, preventing attacker-controlled fetch loops.
+          unknownKidRefreshUsed: refreshUnknownKid,
+        };
         return keys;
       }).finally(() => { this.signingKeyRefresh = null; });
     }
