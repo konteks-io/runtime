@@ -350,7 +350,7 @@ export class CoreClient {
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionCheck(instanceId, executionId),
       bodyFactory: () => RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) }), schema: RemoteExecutionCheckResultSchema,
       idempotencyKey: `execution-check:${executionId}:${request.executionRevision}`,
-      operationPolicy: "progressRead",
+      operationPolicy: "executionCheck",
       ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
     if (result.executionId !== executionId || result.executionRevision !== request.executionRevision) {
       throw new RemoteInstanceError("execution_fenced", "Execution check response belongs to another execution.");
@@ -370,7 +370,7 @@ export class CoreClient {
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.deliveryExecutionCheck(instanceId, executionId),
       bodyFactory: () => RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) }), schema: RemoteExecutionCheckResultSchema,
       idempotencyKey: `delivery-execution-check:${executionId}:${request.executionRevision}`,
-      operationPolicy: "progressRead",
+      operationPolicy: "executionCheck",
       ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
     if (result.executionId !== executionId || result.executionRevision !== request.executionRevision) {
       throw new RemoteInstanceError("execution_fenced", "Delivery check response belongs to another execution.");

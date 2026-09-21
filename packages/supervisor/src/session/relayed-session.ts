@@ -643,19 +643,18 @@ export class RelayedSession {
       const completion: SessionToCoreMessage | undefined = message.kind === "acp" && "id" in message
         ? { kind: "acp_error", id: message.id, method: message.method, error: classify(error) } : undefined;
       await gate.denyBeforeDispatch(operation.key, completion);
-      const terminalDeliveryFailure =
-        this.assignment.source.kind === "harness_delivery" &&
+      const terminalTurnFailure =
+        (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery") &&
         message.kind === "acp" &&
         message.method === "session/prompt" &&
-        completion?.kind === "acp_error" &&
-        completion.error.retryable === false;
+        completion?.kind === "acp_error";
       try {
         if (completion && !this.closed) await this.sendToCore(completion);
       } finally {
         // No runner prompt exists to produce a later terminal event. Close the
-        // failed delivery locally so its durable assignment report and capacity
+        // failed turn locally so its durable assignment report and capacity
         // release do not depend on a best-effort cloud cancellation round trip.
-        if (terminalDeliveryFailure) await this.close("agent_exited");
+        if (terminalTurnFailure && !this.closed) await this.close("agent_exited");
       }
       return;
     }
@@ -750,9 +749,14 @@ export class RelayedSession {
       case "set_config_option_result":
         await this.completeReceived(event.requestId, "session/set_config_option", { kind: "acp_result", id: event.requestId, method: "session/set_config_option", result: event.result as never });
         return;
-      case "request_error":
-        await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
+      case "request_error": {
+        const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
+        if (accepted && event.method === "session/prompt" && this.deps.deploymentKind === "native_connector" &&
+            (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery")) {
+          await this.close("agent_exited");
+        }
         return;
+      }
       case "usage_observation":
         this.lastPromptCompletion = { usage: event.observation };
         await this.deps.onUsage(event.observation);

@@ -336,6 +336,33 @@ describe("native session dispatch uses genuine execution admission", () => {
     await f.session.onToRuntime(f.envelope); expect(f.beforePrompt).toHaveBeenCalledTimes(1);
   });
 
+  it("closes a native turn after a retryable check refusal before dispatch", async () => {
+    const f = await sessionFixture();
+    f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));
+    await f.session.onToRuntime(f.envelope);
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("denied");
+    expect(f.runner.closeSession).toHaveBeenCalledOnce();
+    expect(f.session.isClosed).toBe(true);
+    expect(f.send.mock.calls.map(call => call[0].body)).toEqual([
+      expect.objectContaining({ kind: "acp_error", id: "request" }),
+      { kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" },
+    ]);
+  });
+
+  it("closes a native turn on a matched agent prompt error, ignoring unrelated errors", async () => {
+    const f = await sessionFixture();
+    await f.session.onToRuntime(f.envelope);
+    const error = { kind: "request_error", acpSessionRef: "acp", requestId: "unknown", method: "session/prompt",
+      code: -32603, class: "internal", message: "failed", retryable: true };
+    await f.session.onRunnerEvent(error as never);
+    expect(f.session.isClosed).toBe(false);
+    await f.session.onRunnerEvent({ ...error, requestId: "request" } as never);
+    expect(f.session.isClosed).toBe(true);
+    expect(f.runner.closeSession).toHaveBeenCalledOnce();
+    expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" });
+  });
+
   it("terminalizes a delivery whose local inputs fail before agent dispatch", async () => {
     const delivery = await deliveryFixture();
     const f = await sessionFixture(delivery.assigned);

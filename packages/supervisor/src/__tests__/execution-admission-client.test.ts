@@ -52,7 +52,23 @@ describe("native execution admission HTTPS proofs", () => {
     const deadlineAtMs = Date.now() + 5_000;
     await (f.client.checkExecution as (...args: unknown[]) => Promise<unknown>)("instance", "execution", request, deadlineAtMs);
 
-    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({ deadlineAtMs, operationPolicy: "progressRead" }));
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({ deadlineAtMs, operationPolicy: "executionCheck" }));
+  });
+
+  it.each(["checkExecution", "checkDeliveryExecution"] as const)("%s reads a slow response within the existing five-second lease budget", async method => {
+    const response = { executionId: "execution", executionRevision: 1, expiresAt: "2026-09-10T00:00:30Z", lease: "a.b.c" };
+    const f = fixture(response);
+    f.fetchFn.mockImplementation(async (_url, init) => {
+      const result = new Response(JSON.stringify(response));
+      result.json = () => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { init?.signal?.removeEventListener("abort", abort); resolve(response); }, 2_100);
+        const abort = () => { clearTimeout(timer); reject(init?.signal?.reason); };
+        init?.signal?.addEventListener("abort", abort, { once: true });
+      });
+      return result;
+    });
+    await expect(f.client[method]("instance", "execution", { executionRevision: 1, readyRevision: 1, runnerIncarnation: "runner" }, Date.now() + 5_000)).resolves.toEqual(response);
+    expect(f.fetchFn).toHaveBeenCalledOnce();
   });
 
   it("assigns the bounded renewal policy to credential refresh", async () => {

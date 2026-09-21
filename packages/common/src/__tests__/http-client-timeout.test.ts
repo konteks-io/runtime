@@ -3,6 +3,41 @@ import { nullLogger } from "../logger.js";
 import { JsonClient } from "../http-client.js";
 
 describe("request-specific Core transport deadline", () => {
+  it("does not let a caller's later deadline extend the policy budget", async () => {
+    let now = 1_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fetchFn = vi.fn(async () => { now += 5_000; return new Response(null, { status: 503 }); });
+    try {
+      const client = new JsonClient({ baseUrl: "https://core.example", fetchFn, logger: nullLogger, retrySleep: async () => undefined });
+      await expect(client.request({ method: "GET", path: "/check", deadlineAtMs: 61_000,
+        operationPolicy: "progressRead", schema: { parse: value => value } })).rejects.toMatchObject({ retryable: true });
+      expect(fetchFn).toHaveBeenCalledOnce();
+    } finally { clock.mockRestore(); }
+  });
+  it("does not retry or mislabel a local request preparation failure as transport", async () => {
+    const fetchFn = vi.fn();
+    const bodyFactory = vi.fn(() => { throw new Error("private proof details"); });
+    const error = vi.fn();
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn,
+      retrySleep: async () => undefined, logger: { ...nullLogger, error } as typeof nullLogger });
+    await expect(client.request({ method: "POST", path: "/check", idempotencyKey: "stable", bodyFactory,
+      schema: { parse: value => value } })).rejects.toMatchObject({ retryable: false, diagnostic: "request_preparation_failed" });
+    expect(bodyFactory).toHaveBeenCalledOnce();
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ classification: "request_preparation", event: "request_failed" }), expect.any(String));
+    expect(JSON.stringify(error.mock.calls)).not.toContain("private proof details");
+  });
+
+  it("records safe transport cause codes without persisting raw error messages", async () => {
+    const fetchFn = vi.fn(async () => { throw new TypeError("secret URL", { cause: Object.assign(new Error("secret host"), { code: "ECONNRESET" }) }); });
+    const error = vi.fn();
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn,
+      retrySleep: async () => undefined, logger: { ...nullLogger, error } as typeof nullLogger });
+    await expect(client.request({ method: "GET", path: "/check", schema: { parse: value => value } })).rejects.toMatchObject({ retryable: true });
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ classification: "transport", transportCode: "ECONNRESET" }), expect.any(String));
+    expect(JSON.stringify(error.mock.calls)).not.toContain("secret");
+  });
+
   it("bounds the fetch by the shorter request budget", async () => {
     const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => { init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true }); }));
     const client = new JsonClient({ baseUrl: "https://core.example", timeoutMs: 1000, fetchFn, retrySleep: async () => undefined, logger: nullLogger });

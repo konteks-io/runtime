@@ -54,6 +54,9 @@ export type FetchFn = (input: string | URL, init?: RequestInit) => Promise<Respo
 export const JsonOperationPolicies = {
   renewal: { totalTimeoutMs: 5_000, perAttemptTimeoutMs: 2_000, maxAttempts: 2, retryBaseDelayMs: 100, retryAfterMaxMs: 1_000, requiresIdempotencyKey: true },
   admissionPreparation: { totalTimeoutMs: 30_000, perAttemptTimeoutMs: 10_000, maxAttempts: 3, retryBaseDelayMs: 100, retryAfterMaxMs: 5_000, requiresIdempotencyKey: true },
+  // A signed execution lease must finish reading within the same five-second gate budget.
+  // Do not abort a healthy response at two seconds merely to start it again.
+  executionCheck: { totalTimeoutMs: 5_000, perAttemptTimeoutMs: 5_000, maxAttempts: 2, retryBaseDelayMs: 100, retryAfterMaxMs: 1_000, requiresIdempotencyKey: true },
   progressRead: { totalTimeoutMs: 5_000, perAttemptTimeoutMs: 2_000, maxAttempts: 2, retryBaseDelayMs: 100, retryAfterMaxMs: 1_000, requiresIdempotencyKey: false },
   outputTransfer: { totalTimeoutMs: 120_000, perAttemptTimeoutMs: 30_000, maxAttempts: 4, retryBaseDelayMs: 250, retryAfterMaxMs: 30_000, requiresIdempotencyKey: true },
 } as const;
@@ -156,7 +159,7 @@ export class JsonClient {
     // `timeoutMs` is an attempt timeout. An explicit outer deadline or named
     // operation policy can reduce the total retry budget; neither can extend it.
     const policyBudgetMs = policy?.totalTimeoutMs;
-    const deadlineAtMs = request.deadlineAtMs ?? (Date.now() + Math.min(policyBudgetMs ?? Number.POSITIVE_INFINITY,
+    const deadlineAtMs = Math.min(request.deadlineAtMs ?? Number.POSITIVE_INFINITY, Date.now() + Math.min(policyBudgetMs ?? Number.POSITIVE_INFINITY,
       perAttemptTimeoutMs * maxAttempts + (policy?.retryBaseDelayMs ?? this.retryBaseDelayMs) * (2 ** (maxAttempts - 1) - 1)));
     const requestStartedAt = Date.now();
     let recoveredClassification: string | undefined;
@@ -178,15 +181,27 @@ export class JsonClient {
       else delete headers.authorization;
       const startedAt = Date.now();
       let response: Response;
+      let init: RequestInit;
       try {
         const body = request.bodyFactory?.() ?? request.body;
         const timeout = AbortSignal.timeout(Math.max(1, Math.floor(Math.min(perAttemptTimeoutMs, remainingMs))));
-        response = await this.fetchFn(url, {
+        init = {
           method: request.method,
           headers,
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           signal: request.signal ? AbortSignal.any([request.signal, timeout]) : timeout,
+        };
+      } catch (error) {
+        this.logger.error({ event: "request_failed", operation: `${request.method} ${request.path}`,
+          classification: "request_preparation", attempt, elapsedMs: Date.now() - requestStartedAt,
+          ...(request.operationPolicy === undefined ? {} : { operationPolicy: request.operationPolicy }) }, "Core request could not be prepared");
+        if (error instanceof RemoteInstanceError) throw error;
+        throw new RemoteInstanceError("schema_invalid", "Core request could not be prepared", {
+          cause: error, diagnostic: "request_preparation_failed",
         });
+      }
+      try {
+        response = await this.fetchFn(url, init);
       } catch (error) {
         if (request.signal?.aborted) throw this.cancelled(request.signal.reason);
         const failure = new RemoteInstanceError("temporarily_unavailable", "Core request failed", {
@@ -195,7 +210,7 @@ export class JsonClient {
           recoveryActions: [{ kind: "retry" }],
         });
         if (attempt === maxAttempts) {
-          if (replaySafe) this.logExhausted(request, attempt, maxAttempts, "transport", requestStartedAt);
+          if (replaySafe) this.logExhausted(request, attempt, maxAttempts, "transport", requestStartedAt, undefined, undefined, transportCode(error));
           throw failure;
         }
         recoveredClassification = "transport"; recoveredStatus = undefined; recoveredRequestId = undefined;
@@ -247,9 +262,9 @@ export class JsonClient {
         // An interrupted body is uncertain delivery and can be replayed only
         // when the request identity is stable. Invalid JSON is permanent.
         const retryable = !(error instanceof SyntaxError);
-        const failure = new RemoteInstanceError("temporarily_unavailable", "Core response could not be read", { retryable });
+        const failure = new RemoteInstanceError("temporarily_unavailable", "Core response could not be read", { retryable, cause: error });
         if (!retryable || attempt === maxAttempts) {
-          if (retryable && replaySafe) this.logExhausted(request, attempt, maxAttempts, "response_body", requestStartedAt);
+          if (retryable && replaySafe) this.logExhausted(request, attempt, maxAttempts, "response_body", requestStartedAt, response.status, undefined, transportCode(error));
           throw failure;
         }
         recoveredClassification = "response_body"; recoveredStatus = response.status; recoveredRequestId = undefined;
@@ -303,9 +318,10 @@ export class JsonClient {
     return new RemoteInstanceError("operation_interrupted", "Core request was cancelled by its caller", { cause });
   }
 
-  private logExhausted<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, requestStartedAt: number, status?: number, requestId?: string): void {
+  private logExhausted<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, requestStartedAt: number, status?: number, requestId?: string, transportCode?: string): void {
     this.logger.error({ event: "retry_exhausted", operation: `${request.method} ${request.path}`, attempt, retries: attempt - 1,
       maxAttempts, maxRetries: maxAttempts - 1, elapsedMs: Date.now() - requestStartedAt, classification,
+      ...(transportCode === undefined ? {} : { transportCode }),
       ...(request.operationPolicy === undefined ? {} : { operationPolicy: request.operationPolicy }),
       ...(status === undefined ? {} : { status }), ...(requestId === undefined ? {} : { requestId }) }, "transient Core request retry exhausted");
   }
@@ -316,4 +332,20 @@ export class JsonClient {
       ...(request.operationPolicy === undefined ? {} : { operationPolicy: request.operationPolicy }),
       ...(status === undefined ? {} : { status }), ...(requestId === undefined ? {} : { requestId }) }, "transient Core request recovered");
   }
+}
+
+// Never persist raw exception messages, URLs, hostnames, or arbitrary codes.
+function transportCode(error: unknown): string {
+  const allowed = new Set(["ECONNRESET", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "EPIPE",
+    "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_SOCKET",
+    "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "UNABLE_TO_VERIFY_LEAF_SIGNATURE"]);
+  let current = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
+    if (current.name === "TimeoutError") return "timeout";
+    if (current.name === "AbortError") return "aborted";
+    const code = (current as NodeJS.ErrnoException).code;
+    if (code && allowed.has(code)) return code;
+    current = current.cause;
+  }
+  return "unknown";
 }
