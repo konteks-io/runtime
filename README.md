@@ -19,7 +19,9 @@ There are two doors, and they lead to the same place.
 
 If you already work in Claude Code or Codex, you never have to open the app.
 Paste [the onboarding block](bootstrap/onboarding.md) into your agent, inside
-a repository you care about, or a new, empty project folder. It installs the connector into your own user
+a repository you care about, or a new, empty project folder. Every release also
+ships [the same steps written for the agent itself](bootstrap/connect.md), so a
+single sentence with a link to that file is enough. It installs the connector into your own user
 directory — no `sudo`, no package — then asks you for an email and the
 six-digit code Konteks sends back. That is the whole of it before the machine
 is connected; from there your agent offers to make the folder you are in your
