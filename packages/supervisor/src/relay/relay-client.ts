@@ -348,7 +348,12 @@ export class RelayClient {
           };
           assertCurrent();
           if (!this.options.onDiagnosticCompanion) {
-            this.logger.warn({ deliveryId: request.companion.deliveryId }, "diagnostic companion coverage is incomplete");
+            this.logger.warn({
+              event: "runtime.diagnostic_companion.coverage_incomplete",
+              outcome: "unknown",
+              reason: "receiver_unavailable",
+              deliveryId: request.companion.deliveryId,
+            }, "diagnostic companion coverage is incomplete");
             return;
           }
           await this.options.onDiagnosticCompanion(request, { connectionEpoch: request.connectionEpoch, assertCurrent });

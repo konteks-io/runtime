@@ -216,6 +216,23 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); }
   });
 
+  it("records an explicit C01 coverage gap when a legacy runtime lacks the diagnostic receiver", async () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const f = fixture({ logger: logger as never });
+    try {
+      f.socket.message(confirmed); await flush();
+      f.socket.message(diagnosticCompanion()); await flush();
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+        event: "runtime.diagnostic_companion.coverage_incomplete",
+        outcome: "unknown",
+        reason: "receiver_unavailable",
+        deliveryId: "diagnostic-delivery",
+      }), "diagnostic companion coverage is incomplete");
+      expect(f.mux.receive).not.toHaveBeenCalled();
+      expect(f.socket.close).not.toHaveBeenCalled();
+    } finally { f.client.stop(); }
+  });
+
   it("buffers cancellation through cursor fsync and captures authority only after adoption", async () => {
     const onCancellation = vi.fn<NonNullable<RelayClientOptions["onCancellation"]>>(async (_request, connection) => connection.assertCurrent());
     const f = delayedAdoption({ onCancellation });

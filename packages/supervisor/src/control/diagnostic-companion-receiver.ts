@@ -33,6 +33,8 @@ export class DiagnosticCompanionReceiver {
       >;
       inbox: Pick<DiagnosticCompanionInbox, "receiveVerified">;
       captureConnection: () => CapturedDiagnosticCompanionConnection | null;
+      /** Best-effort observability after durable retention; never business control. */
+      onAccepted?: (record: DiagnosticCompanionInboxRecord) => void | Promise<void>;
       now: () => number;
     },
   ) {}
@@ -68,6 +70,14 @@ export class DiagnosticCompanionReceiver {
       new Date(this.deps.now()).toISOString(),
       assertCurrent,
     );
+    assertCurrent();
+    // Export or logging trouble must not make a signed diagnostic sidecar an
+    // execution dependency. The retained record remains queryable either way.
+    try {
+      await this.deps.onAccepted?.(record);
+    } catch {
+      // C01 observation failure is explicitly non-fatal to work transport.
+    }
     assertCurrent();
     return record;
   }
