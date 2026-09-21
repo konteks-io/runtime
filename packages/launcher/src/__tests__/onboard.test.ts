@@ -194,6 +194,14 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "done", closing: true });
   });
 
+  it("says every chained step's news, not only the last (pass 6)", async () => {
+    await writeOnboardState(root, { step: "graft", repositoryPath: "/tmp/booking-site", repositoryName: "booking-site", systemId: "sys-1", systemExisting: true, instanceId: "instance-1" } as never);
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({ initiatives: [{ id: "init_1", title: "Tables" }] }), { status: 200, headers: { "content-type": "application/json" } }));
+    const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", deps: { waitForReady: readyService, fetchFn: fetchFn as never, families: async () => ["claude-code"], graft: { available: async () => true, wired: async () => true } as never } });
+    expect(result.note).toContain("Graft is already set up in booking-site.");
+    expect(result.note).toContain('booking-site already has an initiative, "Tables"');
+  });
+
   it("names the initiative a rejoined System already has instead of asking for a first one (WS1-090)", async () => {
     await writeOnboardState(root, { step: "first_task", systemExisting: true, systemId: "sys-existing", repositoryName: "hello-world", instanceId: "instance-1" } as never);
     const fetchFn = vi.fn(async () => new Response(JSON.stringify({ initiatives: [{ id: "init_1", title: "Turn this into a tiny page that greets visitors by the time of day" }] }), { status: 200, headers: { "content-type": "application/json" } }));

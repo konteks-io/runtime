@@ -232,10 +232,11 @@ export async function runOnboard(context: OnboardContext, maxChained = 4): Promi
       if (notes.length === 0) return result;
       return { ...result, note: [...notes, result.note].filter(Boolean).join(" ") };
     }
-    // Keep only the newest note: successive steps restate progress on the
-    // same thing ("will join… is joining… is now…", pass 27).
-    notes.length = 0;
-    if (result.note) notes.push(result.note);
+    // Every step's news reaches the person: the push that went through, the
+    // Graft already there (pass 6 lost both behind the closing). The steps that
+    // restated one wait ("will join… is joining… is now…", pass 27) no longer
+    // chain, since the slow start is never entered in the same call.
+    if (result.note && !notes.includes(result.note)) notes.push(result.note);
     const { answer: _answered, ...next } = current;
     current = next;
   }
