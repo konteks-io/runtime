@@ -242,7 +242,13 @@ export class NativeExecutionGate {
     const authority = this.authority;
     if (!authority || !this.keys) throw unavailable();
     this.localAuthority(authority);
-    const deadlineAtMs = Date.now() + NATIVE_EXECUTION_RENEWAL_BUDGET_MS;
+    // The first check establishes a lease. Every later renewal is bounded by
+    // both its five-second I/O policy and the last verified monotonic lease;
+    // a slow renewal must not obtain authority after that lease expires.
+    const remainingLeaseMs = this.monotonicDeadline > 0
+      ? Math.max(0, this.monotonicDeadline - this.monotonic())
+      : NATIVE_EXECUTION_RENEWAL_BUDGET_MS;
+    const deadlineAtMs = Date.now() + Math.min(NATIVE_EXECUTION_RENEWAL_BUDGET_MS, remainingLeaseMs);
     const keys = await this.options.client.executionSigningKeys(deadlineAtMs);
     this.localAuthority(authority);
     const check = delivery(authority) ? this.options.client.checkDeliveryExecution : this.options.client.checkExecution;

@@ -112,6 +112,19 @@ it("dispatches delivery exactly once through dedicated consumption and check rou
   expect(f.journal.pendingRequests.get(operation.key)?.authorization?.claims).toMatchObject({ workloadKind: "harness_delivery" });
 });
 
+it("does not give renewal I/O more time than the verified monotonic lease has left", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+
+  f.advance(29_999);
+  await vi.advanceTimersByTimeAsync(1_000);
+
+  const renewalDeadline = f.client.executionSigningKeys.mock.calls.at(-1)?.[0] as number;
+  expect(renewalDeadline).toBeLessThanOrEqual(Date.now() + 1);
+});
+
 it("does not redispatch recovered ambiguous delivery work", async () => {
   const f = await deliveryFixture(); const operation = await f.gate.admit(f.envelope);
   await f.gate.begin(operation); f.gate.stop();
