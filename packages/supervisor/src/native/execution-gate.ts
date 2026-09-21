@@ -51,6 +51,8 @@ export class NativeExecutionGate {
   private readonly operations: OperationAdmissionJournal;
   private keys: ReadonlyMap<string, KeyObject> | null = null;
   private authority: Authority | null = null;
+  /** The fresh, signed Core check that the next revision fence must name. */
+  private checkId: string | null = null;
   private monotonicDeadline = 0;
   private refreshAfter = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -116,11 +118,13 @@ export class NativeExecutionGate {
   async begin(operation: AuthorizedNativeOperation): Promise<boolean> {
     if (operation.replay) return false;
     try {
+      // A fence is scoped to one signed check, so establish that check before
+      // deciding whether the durable control record applies to this dispatch.
+      await this.refresh();
       if (this.hasDurableRevisionFence(operation.authority)) {
         await this.fenceAuthority();
         throw fenced();
       }
-      await this.refresh();
       const started = await this.operations.begin(operation.key, () => this.assertDispatchCurrent(operation.authority));
       this.assertDispatchCurrent(operation.authority);
       if (started && !this.timer) {
@@ -199,6 +203,7 @@ export class NativeExecutionGate {
     this.localAuthority(authority);
     if (this.authority?.executionId !== authority.executionId || this.authority.executionRevision !== authority.executionRevision ||
       this.monotonicDeadline <= this.monotonic()) throw unavailable();
+    if (this.hasDurableRevisionFence(authority)) throw fenced();
   }
 
   /**
@@ -209,7 +214,8 @@ export class NativeExecutionGate {
    */
   private hasDurableRevisionFence(authority: Authority): boolean {
     const connection = this.options.currentRevisionFenceConnection?.();
-    if (!connection) return false;
+    const checkId = this.checkId;
+    if (!connection || !checkId) return false;
     return this.options.journal.executionRevisionFences.pending().some(
       (record) =>
         record.runnerIncarnation === authority.runnerIncarnation &&
@@ -218,6 +224,7 @@ export class NativeExecutionGate {
         record.intent.instanceId === authority.instanceId &&
         record.intent.executionId === authority.executionId &&
         record.intent.executionRevision === authority.executionRevision &&
+        record.intent.checkId === checkId &&
         record.intent.connectionRef === connection.connectionRef &&
         record.intent.connectionEpoch === connection.connectionEpoch,
     );
@@ -249,6 +256,7 @@ export class NativeExecutionGate {
       : verifyRemoteExecutionCheckLease({ ...checkInput, currentAuthority: authority });
     if (result.executionId !== authority.executionId || result.executionRevision !== authority.executionRevision || Date.parse(result.expiresAt) !== claims.exp * 1000) throw fenced();
     this.keys = keys;
+    this.checkId = claims.checkId;
     const remainingMs = Math.max(0, claims.exp * 1000 - this.options.clock.coreNow());
     this.monotonicDeadline = this.monotonic() + remainingMs;
     this.refreshAfter = Math.max(this.monotonic(), this.monotonicDeadline - NATIVE_EXECUTION_RENEWAL_BUDGET_MS);

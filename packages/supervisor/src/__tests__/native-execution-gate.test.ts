@@ -365,7 +365,7 @@ describe("native session dispatch uses genuine execution admission", () => {
 });
 
 describe("independent native live execution gate", () => {
-  it("fences before dispatch when durable verified control names this exact execution revision", async () => {
+  it("fences before dispatch when durable verified control names the fresh exact execution check", async () => {
     const f = await fixture();
     const intent = {
       schemaVersion: "remote-execution-revision-control-v1" as const,
@@ -394,7 +394,7 @@ describe("independent native live execution gate", () => {
     await expect(f.gate.begin(operation)).rejects.toMatchObject({
       code: "execution_fenced",
     });
-    expect(f.client.checkExecution).not.toHaveBeenCalled();
+    expect(f.client.checkExecution).toHaveBeenCalledOnce();
   });
 
   it("does not fence a different execution revision or connection record", async () => {
@@ -422,6 +422,36 @@ describe("independent native live execution gate", () => {
       connectionRef: "other-connection",
       connectionEpoch: 3,
     }, f.clock.nowIso(), () => {});
+    const operation = await f.gate.admit(f.envelope);
+    await expect(f.gate.begin(operation)).resolves.toBe(true);
+  });
+
+  it("does not fence a control for the same revision when its verified check differs", async () => {
+    const f = await fixture();
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "other-check-intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      executionRevision: 1,
+      checkId: "other-check",
+      policyRevision: null,
+      connectionRef: "connection",
+      connectionEpoch: 2,
+      reason: "authority_revoked" as const,
+      issuedAt: f.clock.nowIso(),
+      deadlineAt: new Date(f.clock.coreNow() + 2_000).toISOString(),
+    };
+    await f.journal.executionRevisionFences.receiveVerified({
+      intent,
+      intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      runnerIncarnation: "runner",
+      connectionRef: "connection",
+      connectionEpoch: 2,
+    }, f.clock.nowIso(), () => {});
+
     const operation = await f.gate.admit(f.envelope);
     await expect(f.gate.begin(operation)).resolves.toBe(true);
   });
