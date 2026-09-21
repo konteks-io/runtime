@@ -169,6 +169,53 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); }
   });
 
+  const diagnosticCompanion = () => ({
+    schemaVersion: "diagnostic-carrier-companion-delivery-v1",
+    type: "runtime_diagnostic_carrier_companion_delivery",
+    method: "POST",
+    path: { instanceId: "instance" },
+    nodeId: "node",
+    connectionRef: "connection",
+    connectionEpoch: 7,
+    companion: {
+      schemaVersion: "diagnostic-carrier-companion-v1",
+      deliveryId: "diagnostic-delivery",
+      match: { assignmentId: "assignment", attempt: 1, executionSessionId: "session", invocationId: "invocation", dispatchGeneration: 2 },
+      capabilityOffer: { schemaVersion: "diagnostic-carrier-capability-offer-v1", capabilities: ["diagnostic-carrier-v1"] },
+      carrier: {
+        schemaVersion: "diagnostic-carrier-v1",
+        context: {
+          schemaVersion: "observability-context-v1",
+          traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+          tenantId: "tenant",
+          assignmentId: "assignment",
+          attempt: 1,
+          invocationId: "invocation",
+        },
+        build: { service: "core", component: "admission", sourceRevision: "a".repeat(40) },
+        protocol: { remoteInstanceProtocolVersion: "2.0" },
+      },
+    },
+    keyId: "control",
+    nonce: "N".repeat(22),
+    issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+    expiresAt: "2026-09-06T00:00:30.000Z",
+    signature: "A".repeat(86),
+  });
+
+  it("isolates C01 diagnostic sidecar failure from mux and work transport", async () => {
+    const onDiagnosticCompanion = vi.fn(async () => { throw new Error("diagnostic journal unavailable"); });
+    const f = fixture({ onDiagnosticCompanion } as never);
+    try {
+      f.socket.message(confirmed); await flush(); f.socket.send.mockClear();
+      f.socket.message(diagnosticCompanion()); await flush();
+      expect(onDiagnosticCompanion).toHaveBeenCalledOnce();
+      expect(f.mux.receive).not.toHaveBeenCalled();
+      expect(f.socket.send).not.toHaveBeenCalled();
+      expect(f.socket.close).not.toHaveBeenCalled();
+    } finally { f.client.stop(); }
+  });
+
   it("buffers cancellation through cursor fsync and captures authority only after adoption", async () => {
     const onCancellation = vi.fn<NonNullable<RelayClientOptions["onCancellation"]>>(async (_request, connection) => connection.assertCurrent());
     const f = delayedAdoption({ onCancellation });
