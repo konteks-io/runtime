@@ -36,6 +36,15 @@ The installer is downloaded to a file your agent can read before it runs,
 rather than piped into `sh`. It ends by printing the first onboarding step as
 JSON; each later step comes from `konteks-remote onboard --json`.
 
+Once the folder is a repository, onboarding offers Graft, a map of the code
+that Claude Code and Codex read before they search. On a yes the connector
+downloads the release's Graft package, checks it against the digest the
+installer recorded from the signed checksums, and unpacks it in `~/.graft`
+with its own copy of Node, so it needs no Node on the laptop and keeps working
+if Konteks is removed. Its usage statistics are off, nothing goes to a paid
+model, and its files stay out of your commits through the repository's local
+`.git/info/exclude`.
+
 macOS and Linux. The connector executable is verified against the same signed
 checksum manifest the packages are, so this path is verified differently from
 the package path, not less.
