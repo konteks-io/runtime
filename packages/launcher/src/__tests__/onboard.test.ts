@@ -865,6 +865,37 @@ describe("onboard", () => {
     expect(result.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
   });
 
+  it("tells the person the workspace is being made before the long bind starts, never chaining into it (WS1-076)", async () => {
+    await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "hello@konteks.io", emailMasked: "h••••@konteks.io" } as never);
+    const verifyCode = vi.fn(async () => ({ decision: "create", proposedTenantId: "konteks" }));
+    const bind = vi.fn(async () => { throw new Error("the bind must wait for the next invocation"); });
+    const result = await runOnboard({
+      root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "022667",
+      deps: { waitForReady: readyService, enrollment: { verifyCode, bind } as never },
+    });
+    expect(result.note).toContain("creating your workspace");
+    expect(result.note).toContain("up to a minute");
+    expect(result.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+    expect(bind).not.toHaveBeenCalled();
+    expect(await readOnboardState(root)).toMatchObject({ step: "start" });
+  });
+
+  it("stops with Konteks's own words when it does not connect this machine's release, instead of asking the email again (WS1-077)", async () => {
+    await writeOnboardState(root, { step: "email", email: "hello@konteks.io" } as never);
+    const said = "This machine installed connector release 0.1.0-e2e, but Konteks connects release 0.4.1-e2e right now, so nothing was set up and no code was sent. Run the install command again to get the current release, then carry on";
+    const result = await onboardFailureStep(
+      { root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "hello@konteks.io" },
+      new RemoteInstanceError("update_required", said),
+    );
+    expect(result.ask).toBeUndefined();
+    expect(result.done?.summary).toBe(`${said}.`);
+    expect(result.done?.links.site).toBe("https://app.test");
+    // A fresh install starts the conversation again from the first question.
+    const state = await readOnboardState(root);
+    expect(state).toMatchObject({ step: "identity" });
+    expect((state as { intentRef?: string }).intentRef).toBeUndefined();
+  });
+
   it("connects a machine that lost its key again, as a replacement for the runtime it was (W1-L1)", async () => {
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
     await new SupervisorStore(join(root, "supervisor")).saveIdentity({

@@ -48,6 +48,24 @@ async function start(input: NativeCommandContext): Promise<void> {
   input.output.line("Native user service started. It takes about a minute after a fresh install before it is ready for work; agent login and cloud readiness are reported separately by status.");
 }
 
+/** One onboarding step, with a failure said as a step too, never a crash. */
+async function onboardStep(input: { root: string; output: NativeCommandContext["output"]; answer?: string; cwd?: string }): Promise<OnboardStep> {
+  const coreUrl = await onboardCoreUrl(input.root);
+  const context = {
+    root: input.root,
+    output: input.output,
+    ...(input.answer !== undefined ? { answer: input.answer } : {}),
+    ...(input.cwd ? { cwd: input.cwd } : {}),
+    ...(coreUrl ? { coreUrl } : {}),
+  };
+  try {
+    return await runOnboard(context);
+  } catch (error) {
+    // Never leave the protocol the agent was taught: a failure is a step too.
+    return await onboardFailureStep(context, error);
+  }
+}
+
 export const nativeCliActions: NativeCliActions = {
   install: async input => {
     if (input.enroll) {
@@ -66,12 +84,16 @@ export const nativeCliActions: NativeCliActions = {
           unpacking = "background";
         }
       }
+      // The install starts onboarding itself (W1-C2, WS1-078): the agent that
+      // ran the one install command reads the first question here, instead of
+      // being told to run a second command to get it.
+      const first = await onboardStep({ root: input.root, output: input.output });
       input.output.line(
-        unpacking === "background"
-          ? "This machine is ready. Its agent packages keep unpacking in the background. Run `konteks-remote onboard --json` and follow the steps it prints."
-          : "This machine is ready. Run `konteks-remote onboard --json` and follow the steps it prints.",
+        `${unpacking === "background" ? "This machine is ready. Its agent packages keep unpacking in the background." : "This machine is ready."} ` +
+          "Onboarding has started. Its first step is the JSON object below; for each step after it, run `konteks-remote onboard --json` (with `--answer \"<the person's answer>\"` when the step asked something).",
       );
-      input.output.result({ state: "ready-to-onboard", agents: prepared.agents, bundleVersion: prepared.bundleVersion, unpacking });
+      input.output.line(JSON.stringify(first, null, 2));
+      input.output.result({ state: "ready-to-onboard", agents: prepared.agents, bundleVersion: prepared.bundleVersion, unpacking, firstStep: first });
       return;
     }
     const record = await installNative({ ...input, activationId: input.activationId! });
@@ -83,21 +105,7 @@ export const nativeCliActions: NativeCliActions = {
     input.output.result({ state: "staged", releaseId: staged.releaseId, agents: staged.agents });
   },
   onboard: async input => {
-    const coreUrl = await onboardCoreUrl(input.root);
-    const context = {
-      root: input.root,
-      output: input.output,
-      ...(input.answer !== undefined ? { answer: input.answer } : {}),
-      ...(input.cwd ? { cwd: input.cwd } : {}),
-      ...(coreUrl ? { coreUrl } : {}),
-    };
-    let step: OnboardStep;
-    try {
-      step = await runOnboard(context);
-    } catch (error) {
-      // Never leave the protocol the agent was taught: a failure is a step too.
-      step = await onboardFailureStep(context, error);
-    }
+    const step = await onboardStep(input);
     // One step per invocation, printed whole. In human mode the same step
     // reads as a sentence so a person running this by hand is not left
     // reading JSON.

@@ -177,6 +177,9 @@ async function waitForServiceReady(root: string): Promise<{ administrativeStatus
   return last;
 }
 
+/** Steps that can take tens of seconds; never entered without saying so first. */
+const SLOW_STEPS: ReadonlySet<string> = new Set(["start"]);
+
 const isAgain = (run: OnboardStep["run"]) =>
   Boolean(run && run.argv.length === AGAIN.argv.length && run.argv.every((part, index) => part === AGAIN.argv[index]));
 
@@ -197,7 +200,12 @@ export async function runOnboard(context: OnboardContext, maxChained = 4): Promi
     const result = await runOnboardStep(current);
     const after = (await readOnboardState(current.root).catch(() => null))?.step;
     const advanced = after !== undefined && after !== before;
-    if (!isAgain(result.run) || result.ask || result.done || !advanced || hop >= maxChained) {
+    // The bind that follows a confirmed code makes the workspace and waits for
+    // the agent packages, up to a minute or two. Chaining into it swallowed the
+    // note that says so, and the person sat 51 s with nothing (WS1-076), so
+    // that note always reaches the person before the long step starts.
+    const slowNext = after !== undefined && SLOW_STEPS.has(after);
+    if (!isAgain(result.run) || result.ask || result.done || !advanced || slowNext || hop >= maxChained) {
       if (notes.length === 0) return result;
       return { ...result, note: [...notes, result.note].filter(Boolean).join(" ") };
     }
@@ -1036,6 +1044,17 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
   const message = error instanceof Error ? error.message.trim() : "";
   const said = message ? (/[.!?]$/.test(message) ? message : `${message}.`) : "Something unexpected went wrong.";
   const siteUrl = (context.siteUrl ?? process.env.KONTEKS_SITE_URL ?? "https://app.konteks.io").replace(/\/+$/, "");
+  // Konteks does not connect the release this machine installed (WS1-077).
+  // Asking the email again would only meet the same refusal, so the flow stops
+  // with Konteks's own words, which say what to do.
+  if (wireCode(error) === "update_required") {
+    await writeOnboardState(context.root, {
+      ...(state ?? { schemaVersion: 1 as const, updatedAt: new Date().toISOString() }),
+      step: "identity",
+      intentRef: undefined,
+    } as never).catch(() => undefined);
+    return { step, done: { summary: said, links: { site: siteUrl } } };
+  }
   if (error instanceof RemoteInstanceError && error.code === "permission_denied") {
     return { step, done: { summary: `Konteks stopped this setup: ${said} Sign in on the site to see this machine and your workspace.`, links: { site: siteUrl } } };
   }
