@@ -46,6 +46,20 @@ export class CoreResponseError extends RemoteInstanceError {
 
 export type FetchFn = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
+/**
+ * Bounded retry ownership for the native calls that can affect an ACP
+ * operation. Callers retain their immutable idempotency key and may always
+ * provide a shorter deadline; a policy never extends that caller budget.
+ */
+export const JsonOperationPolicies = {
+  renewal: { totalTimeoutMs: 5_000, perAttemptTimeoutMs: 2_000, maxAttempts: 2, retryBaseDelayMs: 100, retryAfterMaxMs: 1_000, requiresIdempotencyKey: true },
+  admissionPreparation: { totalTimeoutMs: 30_000, perAttemptTimeoutMs: 10_000, maxAttempts: 3, retryBaseDelayMs: 100, retryAfterMaxMs: 5_000, requiresIdempotencyKey: true },
+  progressRead: { totalTimeoutMs: 5_000, perAttemptTimeoutMs: 2_000, maxAttempts: 2, retryBaseDelayMs: 100, retryAfterMaxMs: 1_000, requiresIdempotencyKey: false },
+  outputTransfer: { totalTimeoutMs: 120_000, perAttemptTimeoutMs: 30_000, maxAttempts: 4, retryBaseDelayMs: 250, retryAfterMaxMs: 30_000, requiresIdempotencyKey: true },
+} as const;
+
+export type JsonOperationPolicyName = keyof typeof JsonOperationPolicies;
+
 export interface JsonClientOptions {
   baseUrl: string;
   fetchFn?: FetchFn;
@@ -74,6 +88,8 @@ export interface JsonRequest<T> {
   schema: SchemaParser<T>;
   headers?: Record<string, string>;
   idempotencyKey?: string;
+  /** Selects a bounded retry policy for a named ACP operation. */
+  operationPolicy?: JsonOperationPolicyName;
   /** Cancels this logical operation and prevents further transport retries. */
   signal?: AbortSignal;
   /** May shorten the client's deadline, never extend it. */
@@ -130,13 +146,18 @@ export class JsonClient {
       ...(request.idempotencyKey === undefined ? {} : { "idempotency-key": request.idempotencyKey }),
       ...(request.headers ?? {}),
     };
+    const policy = request.operationPolicy === undefined ? undefined : JsonOperationPolicies[request.operationPolicy];
+    if (policy?.requiresIdempotencyKey && request.idempotencyKey === undefined) {
+      throw new RemoteInstanceError("idempotency_conflict", `${request.operationPolicy} requires an immutable idempotency key`);
+    }
     const replaySafe = request.method === "GET" || request.idempotencyKey !== undefined;
-    const maxAttempts = replaySafe ? 4 : 1;
-    const perAttemptTimeoutMs = Math.max(1, Math.floor(Math.min(this.timeoutMs, request.timeoutMs ?? this.timeoutMs)));
-    // `timeoutMs` is an attempt timeout. Only an explicit outer deadline may
-    // reduce the promised initial attempt plus three replay-safe retries.
-    const deadlineAtMs = request.deadlineAtMs ?? (Date.now() + perAttemptTimeoutMs * maxAttempts
-      + this.retryBaseDelayMs * (2 ** (maxAttempts - 1) - 1));
+    const maxAttempts = replaySafe ? Math.min(4, policy?.maxAttempts ?? 4) : 1;
+    const perAttemptTimeoutMs = Math.max(1, Math.floor(Math.min(this.timeoutMs, request.timeoutMs ?? this.timeoutMs, policy?.perAttemptTimeoutMs ?? Number.POSITIVE_INFINITY)));
+    // `timeoutMs` is an attempt timeout. An explicit outer deadline or named
+    // operation policy can reduce the total retry budget; neither can extend it.
+    const policyBudgetMs = policy?.totalTimeoutMs;
+    const deadlineAtMs = request.deadlineAtMs ?? (Date.now() + Math.min(policyBudgetMs ?? Number.POSITIVE_INFINITY,
+      perAttemptTimeoutMs * maxAttempts + (policy?.retryBaseDelayMs ?? this.retryBaseDelayMs) * (2 ** (maxAttempts - 1) - 1)));
     const requestStartedAt = Date.now();
     let recoveredClassification: string | undefined;
     let recoveredStatus: number | undefined;
@@ -178,7 +199,8 @@ export class JsonClient {
           throw failure;
         }
         recoveredClassification = "transport"; recoveredStatus = undefined; recoveredRequestId = undefined;
-        await this.backoff(request, attempt, maxAttempts, "transport", deadlineAtMs, requestStartedAt);
+        await this.backoff(request, attempt, maxAttempts, "transport", deadlineAtMs, requestStartedAt,
+          undefined, undefined, undefined, policy?.retryBaseDelayMs, policy?.retryAfterMaxMs);
         continue;
       }
       const roundTripMs = Date.now() - startedAt;
@@ -211,7 +233,8 @@ export class JsonClient {
           throw failure;
         }
         recoveredClassification = classification; recoveredStatus = response.status; recoveredRequestId = failure.requestId;
-        await this.backoff(request, attempt, maxAttempts, classification, deadlineAtMs, requestStartedAt, response.status, failure.requestId, response.headers.get("retry-after"));
+        await this.backoff(request, attempt, maxAttempts, classification, deadlineAtMs, requestStartedAt,
+          response.status, failure.requestId, response.headers.get("retry-after"), policy?.retryBaseDelayMs, policy?.retryAfterMaxMs);
         continue;
       }
       if (response.status === 204) {
@@ -230,7 +253,8 @@ export class JsonClient {
           throw failure;
         }
         recoveredClassification = "response_body"; recoveredStatus = response.status; recoveredRequestId = undefined;
-        await this.backoff(request, attempt, maxAttempts, "response_body", deadlineAtMs, requestStartedAt);
+        await this.backoff(request, attempt, maxAttempts, "response_body", deadlineAtMs, requestStartedAt,
+          undefined, undefined, undefined, policy?.retryBaseDelayMs, policy?.retryAfterMaxMs);
         continue;
       }
       if (attempt > 1) this.logRecovered(request, attempt, maxAttempts, requestStartedAt, recoveredClassification, recoveredStatus, recoveredRequestId);
@@ -239,14 +263,15 @@ export class JsonClient {
     throw new RemoteInstanceError("temporarily_unavailable", "Core request retry exhausted", { retryable: true });
   }
 
-  private async backoff<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, deadlineAtMs: number, requestStartedAt: number, status?: number, requestId?: string, retryAfter?: string | null): Promise<void> {
-    const exponentialDelayMs = this.retryBaseDelayMs * 2 ** (attempt - 1);
+  private async backoff<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, deadlineAtMs: number, requestStartedAt: number, status?: number, requestId?: string, retryAfter?: string | null, retryBaseDelayMs = this.retryBaseDelayMs, retryAfterMaxMs = this.retryAfterMaxMs): Promise<void> {
+    const exponentialDelayMs = retryBaseDelayMs * 2 ** (attempt - 1);
     const entropy = Math.min(1, Math.max(0, this.retryRandom()));
-    const retryAfterMs = this.retryAfterDelayMs(retryAfter);
+    const retryAfterMs = this.retryAfterDelayMs(retryAfter, retryAfterMaxMs);
     const requestedDelayMs = retryAfterMs ?? Math.max(1, Math.floor(exponentialDelayMs * (0.75 + entropy * 0.5)));
     const delayMs = Math.min(Math.max(0, deadlineAtMs - Date.now()), requestedDelayMs);
     this.logger.warn({ event: "retry_scheduled", operation: `${request.method} ${request.path}`, attempt, retry: attempt, maxAttempts,
       maxRetries: maxAttempts - 1, delayMs, elapsedMs: Date.now() - requestStartedAt, classification,
+      ...(request.operationPolicy === undefined ? {} : { operationPolicy: request.operationPolicy }),
       ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
       ...(status === undefined ? {} : { status }), ...(requestId === undefined ? {} : { requestId }) }, "transient Core request failed; retrying");
     this.assertNotCancelled(request.signal);
@@ -261,13 +286,13 @@ export class JsonClient {
     this.assertNotCancelled(request.signal);
   }
 
-  private retryAfterDelayMs(value: string | null | undefined): number | undefined {
+  private retryAfterDelayMs(value: string | null | undefined, maxDelayMs = this.retryAfterMaxMs): number | undefined {
     if (!value) return undefined;
     const seconds = Number(value);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(this.retryAfterMaxMs, Math.floor(seconds * 1_000));
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(maxDelayMs, Math.floor(seconds * 1_000));
     const dateMs = Date.parse(value);
     if (!Number.isFinite(dateMs)) return undefined;
-    return Math.min(this.retryAfterMaxMs, Math.max(0, dateMs - Date.now()));
+    return Math.min(maxDelayMs, Math.max(0, dateMs - Date.now()));
   }
 
   private assertNotCancelled(signal: AbortSignal | undefined): void {
@@ -281,12 +306,14 @@ export class JsonClient {
   private logExhausted<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, requestStartedAt: number, status?: number, requestId?: string): void {
     this.logger.error({ event: "retry_exhausted", operation: `${request.method} ${request.path}`, attempt, retries: attempt - 1,
       maxAttempts, maxRetries: maxAttempts - 1, elapsedMs: Date.now() - requestStartedAt, classification,
+      ...(request.operationPolicy === undefined ? {} : { operationPolicy: request.operationPolicy }),
       ...(status === undefined ? {} : { status }), ...(requestId === undefined ? {} : { requestId }) }, "transient Core request retry exhausted");
   }
 
   private logRecovered<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, requestStartedAt: number, classification?: string, status?: number, requestId?: string): void {
     this.logger.info({ event: "retry_recovered", operation: `${request.method} ${request.path}`, attempt, retries: attempt - 1,
       maxAttempts, maxRetries: maxAttempts - 1, elapsedMs: Date.now() - requestStartedAt, classification: classification ?? "transport",
+      ...(request.operationPolicy === undefined ? {} : { operationPolicy: request.operationPolicy }),
       ...(status === undefined ? {} : { status }), ...(requestId === undefined ? {} : { requestId }) }, "transient Core request recovered");
   }
 }

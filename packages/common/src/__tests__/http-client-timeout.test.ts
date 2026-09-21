@@ -118,4 +118,13 @@ describe("request-specific Core transport deadline", () => {
       schema: { parse: value => value } })).resolves.toEqual({ accepted: true });
     expect(delays).toEqual([75]);
   });
+
+  it("applies the five-second renewal retry budget only when the caller selects that policy", async () => {
+    const fetchFn = vi.fn(async () => new Response(null, { status: 503 }));
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn, retrySleep: async () => undefined, logger: nullLogger });
+
+    await expect(client.request({ method: "POST", path: "/renew", idempotencyKey: "stable", body: {}, operationPolicy: "renewal",
+      schema: { parse: value => value } })).rejects.toMatchObject({ retryable: true });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
 });

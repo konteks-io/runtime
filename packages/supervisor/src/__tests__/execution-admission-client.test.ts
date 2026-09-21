@@ -52,7 +52,18 @@ describe("native execution admission HTTPS proofs", () => {
     const deadlineAtMs = Date.now() + 5_000;
     await (f.client.checkExecution as (...args: unknown[]) => Promise<unknown>)("instance", "execution", request, deadlineAtMs);
 
-    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({ deadlineAtMs }));
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({ deadlineAtMs, operationPolicy: "progressRead" }));
+  });
+
+  it("assigns the bounded renewal policy to credential refresh", async () => {
+    const f = fixture({});
+    const http = (f.client as unknown as { http: { request: ReturnType<typeof vi.fn> } }).http;
+    const requestSpy = vi.spyOn(http, "request").mockResolvedValue({} as never);
+
+    await f.client.refreshProvisioningCredential({ instanceId: "instance", manifestDigest: "a".repeat(43) });
+
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({ operationPolicy: "renewal",
+      idempotencyKey: `provisioning-refresh:instance:${"a".repeat(43)}` }));
   });
 
   it("accepts only bounded public RSA trust from configured Core, without sending a credential", async () => {
