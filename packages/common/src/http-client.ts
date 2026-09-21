@@ -56,9 +56,11 @@ export interface JsonClientOptions {
   /** Base delay for replay-safe transient retries. Defaults to 100 ms. */
   retryBaseDelayMs?: number;
   /** Injectable sleep used by focused tests and embedders. */
-  retrySleep?: (delayMs: number) => Promise<void>;
+  retrySleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   /** Injectable entropy for bounded retry jitter. */
   retryRandom?: () => number;
+  /** Upper bound for a server-directed Retry-After delay. Defaults to 30 seconds. */
+  retryAfterMaxMs?: number;
   logger?: Logger;
 }
 
@@ -72,6 +74,8 @@ export interface JsonRequest<T> {
   schema: SchemaParser<T>;
   headers?: Record<string, string>;
   idempotencyKey?: string;
+  /** Cancels this logical operation and prevents further transport retries. */
+  signal?: AbortSignal;
   /** May shorten the client's deadline, never extend it. */
   timeoutMs?: number;
   /** Absolute wall-clock deadline shared with the caller and nested retries. */
@@ -87,16 +91,32 @@ export class JsonClient {
   private readonly fetchFn: FetchFn;
   private readonly timeoutMs: number;
   private readonly retryBaseDelayMs: number;
-  private readonly retrySleep: (delayMs: number) => Promise<void>;
+  private readonly retrySleep: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   private readonly retryRandom: () => number;
+  private readonly retryAfterMaxMs: number;
   private readonly logger: Logger;
 
   constructor(private readonly options: JsonClientOptions) {
     this.fetchFn = options.fetchFn ?? ((input, init) => fetch(input, init));
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.retryBaseDelayMs = Math.max(1, Math.floor(options.retryBaseDelayMs ?? 100));
-    this.retrySleep = options.retrySleep ?? (delayMs => new Promise(resolve => setTimeout(resolve, delayMs)));
+    this.retrySleep = options.retrySleep ?? ((delayMs: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+      const complete = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", cancelled);
+        resolve();
+      };
+      const cancelled = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", cancelled);
+        reject(signal?.reason);
+      };
+      const timer = setTimeout(complete, delayMs);
+      if (signal?.aborted) cancelled();
+      else signal?.addEventListener("abort", cancelled, { once: true });
+    }));
     this.retryRandom = options.retryRandom ?? Math.random;
+    this.retryAfterMaxMs = Math.max(0, Math.floor(options.retryAfterMaxMs ?? 30_000));
     this.logger = options.logger ?? createLogger({ name: "core-http" });
   }
 
@@ -123,6 +143,7 @@ export class JsonClient {
     let recoveredRequestId: string | undefined;
     // One initial request plus three retries for replay-safe operations.
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      this.assertNotCancelled(request.signal);
       const remainingMs = deadlineAtMs - Date.now();
       if (remainingMs <= 0) {
         if (replaySafe) this.logExhausted(request, Math.max(1, attempt - 1), maxAttempts, "timeout", requestStartedAt);
@@ -138,13 +159,15 @@ export class JsonClient {
       let response: Response;
       try {
         const body = request.bodyFactory?.() ?? request.body;
+        const timeout = AbortSignal.timeout(Math.max(1, Math.floor(Math.min(perAttemptTimeoutMs, remainingMs))));
         response = await this.fetchFn(url, {
           method: request.method,
           headers,
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-          signal: AbortSignal.timeout(Math.max(1, Math.floor(Math.min(perAttemptTimeoutMs, remainingMs)))),
+          signal: request.signal ? AbortSignal.any([request.signal, timeout]) : timeout,
         });
       } catch (error) {
+        if (request.signal?.aborted) throw this.cancelled(request.signal.reason);
         const failure = new RemoteInstanceError("temporarily_unavailable", "Core request failed", {
           cause: error,
           retryable: true,
@@ -188,7 +211,7 @@ export class JsonClient {
           throw failure;
         }
         recoveredClassification = classification; recoveredStatus = response.status; recoveredRequestId = failure.requestId;
-        await this.backoff(request, attempt, maxAttempts, classification, deadlineAtMs, requestStartedAt, response.status, failure.requestId);
+        await this.backoff(request, attempt, maxAttempts, classification, deadlineAtMs, requestStartedAt, response.status, failure.requestId, response.headers.get("retry-after"));
         continue;
       }
       if (response.status === 204) {
@@ -216,14 +239,43 @@ export class JsonClient {
     throw new RemoteInstanceError("temporarily_unavailable", "Core request retry exhausted", { retryable: true });
   }
 
-  private async backoff<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, deadlineAtMs: number, requestStartedAt: number, status?: number, requestId?: string): Promise<void> {
+  private async backoff<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, deadlineAtMs: number, requestStartedAt: number, status?: number, requestId?: string, retryAfter?: string | null): Promise<void> {
     const exponentialDelayMs = this.retryBaseDelayMs * 2 ** (attempt - 1);
     const entropy = Math.min(1, Math.max(0, this.retryRandom()));
-    const delayMs = Math.min(Math.max(0, deadlineAtMs - Date.now()), Math.max(1, Math.floor(exponentialDelayMs * (0.75 + entropy * 0.5))));
+    const retryAfterMs = this.retryAfterDelayMs(retryAfter);
+    const requestedDelayMs = retryAfterMs ?? Math.max(1, Math.floor(exponentialDelayMs * (0.75 + entropy * 0.5)));
+    const delayMs = Math.min(Math.max(0, deadlineAtMs - Date.now()), requestedDelayMs);
     this.logger.warn({ event: "retry_scheduled", operation: `${request.method} ${request.path}`, attempt, retry: attempt, maxAttempts,
       maxRetries: maxAttempts - 1, delayMs, elapsedMs: Date.now() - requestStartedAt, classification,
+      ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
       ...(status === undefined ? {} : { status }), ...(requestId === undefined ? {} : { requestId }) }, "transient Core request failed; retrying");
-    if (delayMs > 0) await this.retrySleep(delayMs);
+    this.assertNotCancelled(request.signal);
+    if (delayMs > 0) {
+      try {
+        await this.retrySleep(delayMs, request.signal);
+      } catch (error) {
+        if (request.signal?.aborted) throw this.cancelled(error);
+        throw error;
+      }
+    }
+    this.assertNotCancelled(request.signal);
+  }
+
+  private retryAfterDelayMs(value: string | null | undefined): number | undefined {
+    if (!value) return undefined;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(this.retryAfterMaxMs, Math.floor(seconds * 1_000));
+    const dateMs = Date.parse(value);
+    if (!Number.isFinite(dateMs)) return undefined;
+    return Math.min(this.retryAfterMaxMs, Math.max(0, dateMs - Date.now()));
+  }
+
+  private assertNotCancelled(signal: AbortSignal | undefined): void {
+    if (signal?.aborted) throw this.cancelled(signal.reason);
+  }
+
+  private cancelled(cause: unknown): RemoteInstanceError {
+    return new RemoteInstanceError("operation_interrupted", "Core request was cancelled by its caller", { cause });
   }
 
   private logExhausted<T>(request: JsonRequest<T>, attempt: number, maxAttempts: number, classification: string, requestStartedAt: number, status?: number, requestId?: string): void {

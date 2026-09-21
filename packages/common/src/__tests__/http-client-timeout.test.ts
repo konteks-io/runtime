@@ -73,4 +73,49 @@ describe("request-specific Core transport deadline", () => {
     await expect(client.request({ method: "POST", path: "/unsafe", body: {}, schema: { parse: value => value } })).rejects.toMatchObject({ retryable: true });
     expect(fetchFn).toHaveBeenCalledOnce();
   });
+
+  it("stops a replay-safe request when its caller cancels the shared operation", async () => {
+    const controller = new AbortController();
+    const fetchFn = vi.fn(async () => {
+      controller.abort();
+      throw controller.signal.reason;
+    });
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn, retrySleep: async () => undefined, logger: nullLogger });
+
+    await expect(client.request({ method: "POST", path: "/operation", idempotencyKey: "stable", body: {},
+      schema: { parse: value => value }, signal: controller.signal })).rejects.toMatchObject({ code: "operation_interrupted", retryable: false });
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a scheduled retry instead of retaining a sleeping operation", async () => {
+    const controller = new AbortController();
+    const fetchFn = vi.fn(async () => new Response(null, { status: 503 }));
+    let retryStarted!: () => void;
+    const retryStartedPromise = new Promise<void>(resolve => { retryStarted = resolve; });
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn, logger: nullLogger,
+      retrySleep: async (_delay, signal) => new Promise<void>((_resolve, reject) => {
+        retryStarted();
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }) });
+    const request = client.request({ method: "POST", path: "/operation", idempotencyKey: "stable", body: {},
+      schema: { parse: value => value }, signal: controller.signal });
+
+    await retryStartedPromise;
+    controller.abort();
+    await expect(request).rejects.toMatchObject({ code: "operation_interrupted", retryable: false });
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it("honors a bounded Retry-After before replaying a stable operation", async () => {
+    const fetchFn = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 429, headers: { "retry-after": "1" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ accepted: true })));
+    const delays: number[] = [];
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn, retryBaseDelayMs: 25, retryAfterMaxMs: 75,
+      retrySleep: async delay => { delays.push(delay); }, retryRandom: () => 0.5, logger: nullLogger });
+
+    await expect(client.request({ method: "POST", path: "/operation", idempotencyKey: "stable", body: {},
+      schema: { parse: value => value } })).resolves.toEqual({ accepted: true });
+    expect(delays).toEqual([75]);
+  });
 });
