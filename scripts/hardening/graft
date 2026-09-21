@@ -1,5 +1,8 @@
 #!/usr/bin/env sh
 set -eu
+export DO_NOT_TRACK=1
+# Automatic query rebuilds must not bypass verification scheduling.
+export GRAFT_NO_REFRESH=1
 
 repo_root=$(git rev-parse --show-toplevel)
 workspace_root=$(CDPATH= cd -- "$(dirname -- "$repo_root")" && pwd)
