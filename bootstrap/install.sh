@@ -153,6 +153,20 @@ if [ "$user_install" -eq 1 ]; then
   chmod 700 "$root"
   install -m 0755 "$workdir/$connector" "$root/bin/konteks-remote"
   echo "konteks-remote installed for this user at $root/bin/konteks-remote"
+  # Graft (W1-G1) is offered later, and downloaded only after a yes. Record
+  # the digest the verified checksums give its package now, so the connector
+  # installs exactly this release's bytes then, and nothing else.
+  graft="konteks-graft-${os_id}-${arch}.tgz"
+  graft_baked="$(printf '%b\n' "$BAKED_EXECUTABLE_SUMS" | grep " ${graft}\$" | awk '{print $1}')"
+  graft_published="$(grep " ${graft}\$" "$workdir/SHA256SUMS" | awk '{print $1}')"
+  # Published sums count only where their signature was verified here.
+  [ "$sig_ok" -eq 1 ] || graft_published=""
+  graft_digest="${graft_baked:-$graft_published}"
+  if [ -n "$graft_digest" ] && { [ -z "$graft_baked" ] || [ -z "$graft_published" ] || [ "$graft_baked" = "$graft_published" ]; }; then
+    mkdir -p "$root/installer"
+    chmod 700 "$root/installer"
+    printf '{"name":"%s","digest":"%s","base":"%s"}\n' "$graft" "$graft_digest" "$RELEASE_BASE" > "$root/installer/graft.json"
+  fi
   case ":$PATH:" in
     *":$root/bin:"*) ;;
     *) echo "add it to PATH for this shell:  export PATH=\"$root/bin:\$PATH\"" ;;

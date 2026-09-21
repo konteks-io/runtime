@@ -12,6 +12,7 @@ import { nativePlatform } from "./service.js";
 import { initializeRepository, inspectRepository, pushToManagedRemote } from "./repository-inspect.js";
 import { enrollmentStagingStatus, releaseStaged, spawnEnrollmentStaging, type StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
+import { ensureGraft, graftBuildSeconds, planGraft, readGraftRecord, wireGraft, type GraftTool } from "./graft.js";
 import { deleteOwnerToken, OWNER_ACCESS_REVOKED, OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
 
 /**
@@ -69,6 +70,13 @@ export interface OnboardContext {
     agentReadiness?: (root: string) => Promise<Record<string, string> | null>;
     /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
     waitForReady?: (root: string) => Promise<{ administrativeStatus: string; roles: string[] } | null>;
+    /** Graft, injectable for tests (W1-G1). */
+    graft?: {
+      available?: (root: string) => Promise<boolean>;
+      plan?: typeof planGraft;
+      ensure?: (root: string) => Promise<GraftTool>;
+      wire?: typeof wireGraft;
+    };
     /** The background unpacking of the agent packages (WS1-012). */
     staging?: {
       status: (root: string) => Promise<StagingStatus>;
@@ -90,7 +98,10 @@ const AGENTS_WAIT_ATTEMPTS = 9;
 /** How long one `start` invocation waits on the unpacking before saying how far it got. */
 const STAGING_WAIT_MS = 25_000;
 /** How long `inspect` waits for the freshly started service before moving on without it. */
-const READY_WAIT_MS = 20_000;
+// A fresh service opens for work about a minute after the install; one
+// invocation waits that long, so the agent is not handed "ask again" twice
+// and left to write its own polling loop around onboard (WS1-079).
+const READY_WAIT_MS = 75_000;
 /** The owner token is refreshed this long before it expires (OS15). */
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60_000;
 
@@ -178,7 +189,12 @@ async function waitForServiceReady(root: string): Promise<{ administrativeStatus
 }
 
 /** Steps that can take tens of seconds; never entered without saying so first. */
-const SLOW_STEPS: ReadonlySet<string> = new Set(["start"]);
+const SLOW_STEPS: ReadonlySet<string> = new Set(["start", "graft_setup"]);
+
+/** "a", "a and b", "a, b and c". */
+function listed(items: string[]): string {
+  return items.length <= 1 ? (items[0] ?? "nothing") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+}
 
 const isAgain = (run: OnboardStep["run"]) =>
   Boolean(run && run.argv.length === AGAIN.argv.length && run.argv.every((part, index) => part === AGAIN.argv[index]));
@@ -558,22 +574,22 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           };
         }
         // A record is also written before `start` is ever run, so "starting"
-        // cannot wait for ever (WS1-036): after three waits (about a minute)
+        // cannot wait for ever (WS1-036): after two waits (over two minutes)
         // hand out `start` again — it is harmless for a service that is
         // already up, and it is the step that was missed if it is not.
         const waits = (state.startWaits ?? 0) + 1;
-        if (waits >= 3) {
+        if (waits >= 2) {
           await save({ startWaits: 0 });
           return {
             step: "inspect",
-            note: "The Konteks service on this machine has not answered for about a minute. Starting it again; that is safe if it is already running.",
+            note: "The Konteks service on this machine has not answered for over two minutes. Starting it again; that is safe if it is already running.",
             run: { argv: ["konteks-remote", "start"] },
           };
         }
         await save({ startWaits: waits });
         return {
           step: "inspect",
-          note: "The Konteks service on this machine is still starting; it opens for work about a minute after a fresh install. Nothing else is needed — ask again in a moment.",
+          note: "The Konteks service on this machine is still starting. It usually opens for work about a minute after a fresh install; the next step waits for it again.",
           run: AGAIN,
         };
       }
@@ -727,7 +743,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         }
       }
       await save({
-        step: state.repositoryKind === "managed" ? "push" : "first_task",
+        step: state.repositoryKind === "managed" ? "push" : "graft",
         systemId: registered.systemId,
         systemEntityRef: registered.systemEntityRef,
         ...(registered.repository.remoteUrl ? { managedRemoteUrl: registered.repository.remoteUrl } : {}),
@@ -815,7 +831,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         if (initialized.adopted) {
           // The Konteks repository already had its first commit, so there is
           // nothing of the person's to push: the folder is on it now.
-          await save({ step: "first_task" });
+          await save({ step: "graft" });
           return {
             step: "pushing",
             note: `${initialized.message} Your code lives on Konteks managed git, on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}. Push your work with git as usual (remote "konteks").`,
@@ -833,12 +849,79 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         await save({ step: "push" });
         return { step: "pushing", note: `${result.message} Your folder is unchanged apart from git's own files.`, ask: { question: "Try the push again?", kind: "confirm" } };
       }
-      await save({ step: "first_task" });
+      await save({ step: "graft" });
       return {
         step: "pushing",
         note: `${result.message} Your code now lives on Konteks managed git, on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}. This folder's ${state.defaultBranch} branch tracks it (remote "konteks").`,
         run: AGAIN,
       };
+    }
+
+    case "graft": {
+      // Graft is offered once the folder is a repository, once per repository
+      // (W1-G1, W1-G2). A release without it, or a repository that already
+      // decided, goes straight on.
+      const repo = state.repositoryPath;
+      const decided = state.graftDecision !== undefined && state.graftRepository === repo;
+      const available = await (context.deps?.graft?.available ?? (async (root: string) => (await readGraftRecord(root)) !== null))(context.root).catch(() => false);
+      if (!repo || decided || !available) {
+        await save({ step: "first_task", ...(!repo || decided ? {} : { graftDecision: "unavailable", graftRepository: repo }) });
+        return { step: "graft", run: AGAIN };
+      }
+      const plan = await (context.deps?.graft?.plan ?? planGraft)(repo, await families());
+      if (plan.agents.length === 0) {
+        await save({ step: "first_task", graftDecision: "unavailable", graftRepository: repo });
+        return { step: "graft", run: AGAIN };
+      }
+      const names = plan.agents.map(id => (id === "claude" ? "Claude Code" : "Codex")).join(" and ");
+      const question = `Set up Graft in ${state.repositoryName ?? "this repository"}? It adds ${listed(plan.adds)} here, kept out of your commits.`;
+      if (context.answer === undefined) {
+        const tracked = plan.tracked.length > 0
+          ? ` ${listed(plan.tracked)} ${plan.tracked.length === 1 ? "is" : "are"} already tracked by git, so Graft's section there will show as a change until you commit or drop it.`
+          : "";
+        return {
+          step: "graft",
+          note:
+            `Graft maps this repository's code so ${names} can find their way around it before they search. ` +
+            "It runs only on this machine, sends nothing to a paid model, and its usage statistics stay off. " +
+            `Outside this folder it writes only its own settings in ~/.graft and installs itself in Konteks's folder on this machine.${tracked}`,
+          ask: { question, kind: "confirm" },
+        };
+      }
+      if (isNo(context.answer)) {
+        await save({ step: "first_task", graftDecision: "declined", graftRepository: repo });
+        return { step: "graft", note: "Graft was not set up; nothing was added, and it will not be offered again for this folder.", run: AGAIN };
+      }
+      if (!isYes(context.answer)) {
+        return { step: "graft", note: "A yes or no is what this step needs.", ask: { question, kind: "confirm" } };
+      }
+      await save({ step: "graft_setup", graftDecision: "accepted", graftRepository: repo });
+      return {
+        step: "graft",
+        note: `Setting up Graft: downloading it, then building its map of ${state.repositoryName ?? "this repository"} (${plan.files} file${plan.files === 1 ? "" : "s"}). That usually takes under ${graftBuildSeconds(plan.files) + 30} seconds.`,
+        run: AGAIN,
+      };
+    }
+
+    case "graft_setup": {
+      const repo = state.repositoryPath!;
+      try {
+        const tool = await (context.deps?.graft?.ensure ?? ((root: string) => ensureGraft(root, context.deps?.fetchFn ? { fetchFn: context.deps.fetchFn } : {})))(context.root);
+        const wired = await (context.deps?.graft?.wire ?? wireGraft)(context.root, repo, await families(), tool);
+        await save({ step: "first_task" });
+        const changed = wired.changedTracked.length > 0 ? ` It also changed ${listed(wired.changedTracked)}, which git tracks.` : "";
+        return {
+          step: "graft_setup",
+          note:
+            `Graft is set up in ${state.repositoryName ?? "this repository"}${wired.mappedFiles !== null ? `: its map covers ${wired.mappedFiles} file${wired.mappedFiles === 1 ? "" : "s"}` : ""}. ` +
+            `It added ${listed(wired.added)}, which git leaves out of your commits on this machine.${changed} A graft command sits next to konteks-remote for your agents.`,
+          run: AGAIN,
+        };
+      } catch (error) {
+        await save({ step: "first_task", graftDecision: "failed", graftRepository: repo });
+        const why = error instanceof Error ? error.message.replace(/[.]$/, "") : "it stopped unexpectedly";
+        return { step: "graft_setup", note: `Graft could not be set up (${why}). Nothing else changed, and onboarding carries on.`, run: AGAIN };
+      }
     }
 
     case "first_task": {
@@ -978,9 +1061,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const present = installed.filter(family => !notLoggedIn.includes(family));
       const remedies: string[] = [];
       for (const family of ["claude-code", "codex"]) {
-        if (notLoggedIn.includes(family)) remedies.push(`${family} is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login ${family}`);
-        else if (!present.includes(family)) remedies.push(`To also run ${family} work here: konteks-remote auth login ${family}`);
+        if (notLoggedIn.includes(family)) remedies.push(`${agentName(family)} is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login ${family}`);
+        else if (!present.includes(family)) remedies.push(`To also run ${agentName(family)} work here: konteks-remote auth login ${family}`);
       }
+      // People know their agents by name, not by id (WS1-083).
+      const presentNames = present.map(agentName);
       if (nativePlatform().os === "debian") {
         remedies.push("To keep the runtime available after logout: loginctl enable-linger $USER");
       }
@@ -991,8 +1076,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
             ? `No coding agent is logged in here yet, so no Konteks work can run on this machine until one is (see below).`
             : "No coding agent was found on this machine; install Claude Code or Codex and run konteks-remote auth login."
           : advertised && advertised.length === 0
-            ? `Your ${present.join(" and ")} login is set up; the runtime will advertise it once its first heartbeat lands.`
-            : `Your ${present.join(" and ")} login will run Konteks work here.`;
+            ? `Your ${presentNames.join(" and ")} login is set up; the runtime will advertise it once its first heartbeat lands.`
+            : `Your ${presentNames.join(" and ")} login will run Konteks work here.`;
       return {
         step: "done",
         done: {
@@ -1025,9 +1110,23 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
 export function initiativeTitle(sentence: string): string {
   const first = sentence.trim().split(/(?<=[.!?])\s+/)[0]!.replace(/[.!?]+$/, "").trim();
   if (first.length <= 80) return first;
+  // A long sentence reads best cut where a phrase ends ("…for a date and
+  // time, and I get an email" becomes "…for a date and time"), not after a
+  // dangling "and" (WS1-083). Only when no phrase ends in reach, cut at a word.
+  const phrase = /,\s|;\s|\s(?:and|so|but|which|because|where|with)\s/g;
+  let end = -1;
+  for (let match = phrase.exec(first); match && match.index <= 90; match = phrase.exec(first)) {
+    if (match.index >= 30) end = match.index;
+  }
+  if (end > 0) return first.slice(0, end).replace(/[,;]$/, "").trim();
   const cut = first.slice(0, 80);
   const space = cut.lastIndexOf(" ");
   return `${(space > 40 ? cut.slice(0, space) : cut).trim()}…`;
+}
+
+/** An agent family as people name it. */
+export function agentName(family: string): string {
+  return ({ "claude-code": "Claude Code", codex: "Codex", opencode: "OpenCode", pi: "Pi" } as Record<string, string>)[family] ?? family;
 }
 
 /**

@@ -17,8 +17,13 @@ const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) =>
 for (const key of ["sums", "pub", "in", "out"]) if (!args[key]) throw new Error("usage: bake-bootstrap.mjs --sums SHA256SUMS --pub release-signing.pub --in bootstrap/install.sh --out dist/release/install.sh");
 
 const EXECUTABLE = /^konteks-remote-(?:macos|debian|windows)-(?:amd64|arm64)(?:\.exe)?$/;
-const lines = readFileSync(args.sums, "utf8").trim().split("\n").map(line => line.trim().split(/\s+/)).filter(([, name]) => EXECUTABLE.test(name ?? ""));
-if (lines.length !== 5) throw new Error(`expected five connector executables in ${args.sums}, found ${lines.length}`);
+// The Graft package is baked too: on macOS the bootstrap cannot verify the
+// signed SHA256SUMS, and the baked digest is what it records for Graft.
+const GRAFT = /^konteks-graft-(?:macos|debian)-(?:amd64|arm64)\.tgz$/;
+const all = readFileSync(args.sums, "utf8").trim().split("\n").map(line => line.trim().split(/\s+/));
+const executables = all.filter(([, name]) => EXECUTABLE.test(name ?? ""));
+if (executables.length !== 5) throw new Error(`expected five connector executables in ${args.sums}, found ${executables.length}`);
+const lines = [...executables, ...all.filter(([, name]) => GRAFT.test(name ?? ""))];
 for (const [digest] of lines) if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("malformed digest in SHA256SUMS");
 const pubDigest = createHash("sha256").update(readFileSync(args.pub)).digest("hex");
 

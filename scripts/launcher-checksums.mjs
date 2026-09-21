@@ -13,7 +13,9 @@ const out = process.argv[2];
 if (!out) throw new Error("usage: launcher-checksums.mjs <output-directory> [search-root]");
 const PACKAGE = /^konteks-remote(?:-|_).+\.(?:pkg|msi|deb)$/;
 const EXECUTABLE = /^konteks-remote-(?:macos|debian|windows)-(?:amd64|arm64)(?:\.exe)?$/;
-const files = walk(process.argv[3] ?? "dist").filter(path => PACKAGE.test(basename(path)) || EXECUTABLE.test(basename(path))).sort();
+// The Graft package the bootstrap records for the connector (W1-G1).
+const TOOL = /^konteks-graft-(?:macos|debian)-(?:amd64|arm64)\.tgz$/;
+const files = walk(process.argv[3] ?? "dist").filter(path => PACKAGE.test(basename(path)) || EXECUTABLE.test(basename(path)) || TOOL.test(basename(path))).sort();
 const packages = files.filter(path => PACKAGE.test(basename(path))), executables = files.filter(path => EXECUTABLE.test(basename(path)));
 if (packages.length !== 5 || new Set(packages.map(path => basename(path))).size !== 5) throw new Error("the signed launcher platform matrix is incomplete");
 if (executables.length !== 5 || new Set(executables.map(path => basename(path))).size !== 5) throw new Error("the connector executable matrix is incomplete");
