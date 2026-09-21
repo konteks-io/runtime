@@ -77,4 +77,32 @@ describe("native execution admission HTTPS proofs", () => {
       await expect(fixture({ keys }).client.executionSigningKeys()).rejects.toMatchObject({ code: "execution_authority_unavailable" });
     }
   });
+
+  it("coalesces concurrent signing-key reads from active execution gates", async () => {
+    const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const key = { ...pair.publicKey.export({ format: "jwk" }), kid: "core", alg: "RS256", use: "sig" };
+    const f = fixture({ keys: [key] });
+
+    const results = await Promise.all(Array.from({ length: 40 }, () => f.client.executionSigningKeys()));
+
+    expect(results.every(keys => keys.get("core")?.type === "public")).toBe(true);
+    expect(f.fetchFn).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes configured-origin signing keys after the 60-second cache bound", async () => {
+    const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const key = { ...pair.publicKey.export({ format: "jwk" }), kid: "core", alg: "RS256", use: "sig" };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const f = fixture({ keys: [key] });
+      await f.client.executionSigningKeys();
+      now.mockReturnValue(60_999);
+      await f.client.executionSigningKeys();
+      now.mockReturnValue(61_000);
+      await f.client.executionSigningKeys();
+      expect(f.fetchFn).toHaveBeenCalledTimes(2);
+    } finally {
+      now.mockRestore();
+    }
+  });
 });

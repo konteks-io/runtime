@@ -271,6 +271,9 @@ export class CoreClient {
   private readonly http: JsonClient;
   /** Recovery is authenticated by a machine proof, independent of a predecessor bearer. */
   private readonly proofHttp: JsonClient;
+  /** Trusted keys are scoped to this client’s configured Core origin. */
+  private signingKeyCache: { keys: ReadonlyMap<string, KeyObject>; expiresAtMs: number } | null = null;
+  private signingKeyRefresh: Promise<ReadonlyMap<string, KeyObject>> | null = null;
 
   constructor(private readonly options: CoreClientOptions) {
     const transport = {
@@ -365,15 +368,27 @@ export class CoreClient {
 
   /** Trust comes only from the configured Core origin, never a token URL/header. */
   async executionSigningKeys(deadlineAtMs?: number): Promise<ReadonlyMap<string, KeyObject>> {
+    const cached = this.signingKeyCache;
+    if (cached && cached.expiresAtMs > Date.now()) return cached.keys;
+    if (!this.signingKeyRefresh) {
+      this.signingKeyRefresh = this.fetchExecutionSigningKeys().then(keys => {
+        // Core currently does not publish a shorter keyset max-age. Keep the
+        // configured-origin cache below the C05 60-second upper bound.
+        this.signingKeyCache = { keys, expiresAtMs: Date.now() + 60_000 };
+        return keys;
+      }).finally(() => { this.signingKeyRefresh = null; });
+    }
+    return this.waitForSigningKeys(this.signingKeyRefresh, deadlineAtMs);
+  }
+
+  private async fetchExecutionSigningKeys(): Promise<ReadonlyMap<string, KeyObject>> {
     const keySchema = z.object({ kty: z.literal("RSA"), kid: z.string().min(1).max(256),
       alg: z.literal("RS256").optional(), use: z.literal("sig").optional(),
       n: z.string().min(1).max(2048).regex(/^[A-Za-z0-9_-]+$/), e: z.string().min(1).max(16).regex(/^[A-Za-z0-9_-]+$/),
     }).strict();
     try {
       const result = await this.proofHttp.request({ method: "GET", path: CORE_PATHS.jwks,
-        schema: z.object({ keys: z.array(keySchema).min(1).max(32) }).strict(),
-        operationPolicy: "progressRead",
-        ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
+        schema: z.object({ keys: z.array(keySchema).min(1).max(32) }).strict(), operationPolicy: "progressRead" });
       const keys = new Map<string, KeyObject>();
       for (const jwk of result.keys) {
         if (keys.has(jwk.kid)) throw new Error("Duplicate signing key");
@@ -384,6 +399,23 @@ export class CoreClient {
       return keys;
     } catch {
       throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.");
+    }
+  }
+
+  private async waitForSigningKeys(refresh: Promise<ReadonlyMap<string, KeyObject>>, deadlineAtMs?: number): Promise<ReadonlyMap<string, KeyObject>> {
+    if (deadlineAtMs === undefined) return refresh;
+    const remainingMs = deadlineAtMs - Date.now();
+    if (remainingMs <= 0) throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        refresh,
+        new Promise<ReadonlyMap<string, KeyObject>>((_, reject) => {
+          timer = setTimeout(() => reject(new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.")), remainingMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
