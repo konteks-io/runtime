@@ -19,7 +19,9 @@ const MAX_RECORD_BYTES = 16 * 1024 * 1024;
 const RecordSchema = z.discriminatedUnion("state", [
   z.object({ version: z.literal(1), state: z.literal("pending"), candidate: RemoteDeliveryResultCandidateSchema, completion: SessionToCoreMessageSchema }).strict(),
   z.object({ version: z.literal(1), state: z.literal("accepted"), candidate: RemoteDeliveryResultCandidateSchema, completion: SessionToCoreMessageSchema, receipt: RemoteDeliveryAcceptanceReceiptSchema }).strict(),
-]).refine(record => record.completion.kind === "acp_result" && record.completion.method === "session/prompt", "Output completion must be a successful ACP prompt result");
+])
+  .refine(record => record.completion.kind === "acp_result" && record.completion.method === "session/prompt", "Output completion must be a successful ACP prompt result")
+  .refine(record => record.state !== "accepted" || receiptMatches(record.receipt, record.candidate), "Output acceptance must match the frozen candidate");
 export type NativeOutputRecord = z.infer<typeof RecordSchema>;
 const TurnIdentitySchema = z.object({ sessionId: z.string().min(1).max(256), invocationId: z.string().min(1).max(256), claimId: z.string().min(1).max(256) }).strict();
 const SessionHeadSchema = z.object({ version: z.literal(1), latest: TurnIdentitySchema.optional(),

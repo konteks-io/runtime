@@ -37,6 +37,19 @@ describe("durable native output state", () => {
     await expect(new NativeOutputStore(dir).read()).rejects.toThrow();
   });
 
+  it("rejects an accepted record whose receipt belongs to another frozen result", async () => {
+    const { candidate, receipt, completion } = fixture();
+    await writeFile(join(dir, "delivery-output.json"), JSON.stringify({
+      version: 1,
+      state: "accepted",
+      candidate,
+      completion,
+      receipt: { ...receipt, resultId: "another-result" },
+    }), { mode: 0o600 });
+
+    await expect(new NativeOutputStore(dir).read()).rejects.toThrow();
+  });
+
   it("never overwrites a frozen pending candidate with different bytes", async () => {
     const { candidate, completion } = fixture(); const store = new NativeOutputStore(dir);
     await store.savePending(candidate, completion);
