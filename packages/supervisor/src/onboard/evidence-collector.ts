@@ -1,7 +1,7 @@
 import { createLogger, sha256Hex, type CatalogLearningEvidence, type DiscoveryEvidenceSubmission, type DiscoveryInventoryItem, type DiscoveryRunBounds, type Logger } from "@konteks/remote-common";
 import { evidenceCandidates, type EvidenceCandidate } from "./evidence-paths.js";
 import { extractFacts, type ReadFile } from "./facts.js";
-import type { OnboardFacade, OnboardRunView } from "./facade.js";
+import type { OnboardEvidenceSubmission, OnboardFacade, OnboardRunView } from "./facade.js";
 import { MAX_EVIDENCE_FILE_BYTES, type EvidenceReadPath, type RawFileApi } from "./raw-file-api.js";
 import type { GitAccess, GitGap, GitRemote, OnboardScratch } from "./git.js";
 
@@ -99,11 +99,15 @@ export class OnboardEvidenceCollector {
       for (const batch of chunk(outstanding, this.batchSize)) {
         assertCurrent();
         const results = await mapWithConcurrency(batch, this.concurrency, item => this.readRepository(item, run.bounds));
-        const submissions: DiscoveryEvidenceSubmission[] = [];
+        const submissions: OnboardEvidenceSubmission[] = [];
         for (const result of results) {
           if (result.submission.refs.length === 0 && result.gaps.length > 0) {
-            // Nothing readable: the gap IS the evidence for this repository.
-            outcome.unreadable.push({ canonicalKey: result.submission.canonicalKey, gap: result.gaps[0]! });
+            // Nothing readable: the gap IS the evidence for this repository,
+            // and it travels with it so the person sees why and what to do.
+            const gap = result.gaps[0]!;
+            outcome.unreadable.push({ canonicalKey: result.submission.canonicalKey, gap });
+            submissions.push({ ...result.submission, gap });
+            continue;
           }
           submissions.push(result.submission);
         }
