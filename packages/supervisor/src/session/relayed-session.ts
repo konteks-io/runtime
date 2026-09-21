@@ -95,7 +95,7 @@ export interface RelayedSessionDeps {
   assertRecoveryOwned?: () => void;
   executionAuthority?: Pick<
     NativeExecutionGateOptions,
-    "client" | "runnerIncarnation" | "currentRevisionFenceConnection"
+    "client" | "runnerIncarnation" | "currentRevisionFenceConnection" | "onFenceApplied"
   >;
   onExecutionAuthorityLost?: () => Promise<void>;
   reserveExecutionReference?: (opaqueRef: string) => Promise<void>;

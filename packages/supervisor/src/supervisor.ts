@@ -30,6 +30,7 @@ import { CoreClient, LEASE_AUDIENCE } from "./core/client.js";
 import { CoreSignatureVerifier } from "./control/core-signature.js";
 import { CancellationReceiver } from "./control/cancellation-receiver.js";
 import { ExecutionRevisionControlReceiver } from "./control/execution-revision-control-receiver.js";
+import { ExecutionRevisionFenceReceiptDelivery } from "./control/execution-revision-fence-receipt-delivery.js";
 import { DiagnosticCompanionReceiver } from "./control/diagnostic-companion-receiver.js";
 import { diagnosticCompanionOperationalObservation } from "./control/diagnostic-companion-observability.js";
 import { PermissionAnswerReceiver } from "./control/permission-answer-receiver.js";
@@ -180,6 +181,7 @@ export class Supervisor {
   heartbeat!: HeartbeatPublisher;
   control!: ControlHandlers;
   private configurationAcks!: ConfigurationAckDelivery;
+  private executionRevisionFenceReceipts!: ExecutionRevisionFenceReceiptDelivery;
   work!: WorkOrchestrator;
   private planningTerminal!: PlanningTerminalDirectiveProcessor;
   private planningDirectivePoller: ControllerDirectivePoller | null = null;
@@ -331,6 +333,7 @@ export class Supervisor {
       credential: () => this.lease.current()?.lease ?? this.provisioningCredential,
     });
     this.configurationAcks = new ConfigurationAckDelivery({ outbox: this.outbox, core: this.core, instanceId: () => this.instanceId ?? "", clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId) });
+    this.executionRevisionFenceReceipts = new ExecutionRevisionFenceReceiptDelivery({ outbox: this.outbox, core: this.core, clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId), logger: this.logger });
     if (this.native) {
       const sharedCodex = this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === "codex" && config.RUNNER_NATIVE_CODEX_SOCKET !== undefined);
       if (sharedCodex) this.nativeCodexOwner = new NativeCodexAppServerOwner({
@@ -755,6 +758,7 @@ export class Supervisor {
           executionAuthority: {
             client: this.core,
             runnerIncarnation: this.runnerIncarnation,
+            onFenceApplied: receipt => this.executionRevisionFenceReceipts.submit(receipt),
             currentRevisionFenceConnection: () => {
               const connection = this.revisionFenceConnection;
               if (!connection) return null;
@@ -1046,6 +1050,7 @@ export class Supervisor {
     this.configurationRefresh ??= (async () => {
       try {
         await this.configurationAcks.flush();
+        await this.executionRevisionFenceReceipts.flush();
         if (this.stopping) return;
         const desired = await this.core.fetchDesiredConfiguration(this.instanceId!);
         if (!this.stopping) await this.control.handle(desired);
@@ -1856,6 +1861,7 @@ export class Supervisor {
     if (this.configurationTimer) clearInterval(this.configurationTimer);
     await this.configurationRefresh;
     await this.configurationAcks?.settle();
+    await this.executionRevisionFenceReceipts?.settle();
     await this.planningDirectivePoller?.stop();
     this.heartbeat?.stop();
     await this.heartbeat?.settle();

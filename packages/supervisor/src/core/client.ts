@@ -39,8 +39,14 @@ import {
   NativeCancellationReceiptSchema,
   NativeCancellationReceiptRequestSchema,
   NativeCancellationReceiptResultSchema,
+  NativeExecutionRevisionFenceReceiptSchema,
+  NativeExecutionRevisionFenceReceiptRequestSchema,
+  NativeExecutionRevisionFenceReceiptResultSchema,
   type NativeCancellationReceipt,
   type NativeCancellationReceiptResult,
+  type NativeExecutionRevisionFenceReceipt,
+  type NativeExecutionRevisionFenceReceiptRequest,
+  type NativeExecutionRevisionFenceReceiptResult,
   RemoteReconciliationAppliedRequestSchema,
   RemoteReconciliationAppliedResultSchema,
   computeRemoteReconciliationReceiptDigest,
@@ -97,6 +103,7 @@ import { decodeLeaseClaims } from "../lease/lease.js";
  * `:id/provisioning-credential`, `:id/desired-configuration[/ack]`,
  * `:id/readiness`, `:id/heartbeat`, `:id/reconnect`,
  * `:id/runtime-owner/resolve`, `:id/reconciliation/applied`,
+ * `:id/execution-revision-controls/receipt`,
  * `:id/assignments/{pull,claim,report}`, `:id/observations`,
  * `:id/permissions/deferred`, and `:id/capability-tokens/redeem`. Every
  * HTTPS-fallback message carries the same schema and idempotency key as its
@@ -123,6 +130,7 @@ export const CORE_PATHS = Object.freeze({
   runtimeOwnerResolve: (instanceId: string) => instancePath(instanceId, "runtime-owner/resolve"),
   reconciliationApplied: (instanceId: string) => instancePath(instanceId, "reconciliation/applied"),
   recoveryEvidence: (instanceId: string) => instancePath(instanceId, "recovery-evidence"),
+  executionRevisionControlReceipt: (instanceId: string) => instancePath(instanceId, "execution-revision-controls/receipt"),
   heartbeat: (instanceId: string) => instancePath(instanceId, "heartbeat"),
   assignmentStream: (instanceId: string) => instancePath(instanceId, "assignments/stream"),
   assignmentStreamAck: (instanceId: string) => instancePath(instanceId, "assignments/stream/ack"),
@@ -502,6 +510,35 @@ export class CoreClient {
     if (result.instanceId !== evidence.instanceId || result.assignmentId !== evidence.assignmentId || result.attempt !== evidence.attempt ||
         result.claimId !== evidence.claimId || result.recoveryEpoch !== evidence.recoveryEpoch || result.evidenceDigest !== evidence.evidenceDigest) {
       throw new RemoteInstanceError("registration_mismatch", "Recovery evidence response does not match the submitted observation.");
+    }
+    return result;
+  }
+
+  /** Creates one proof-bearing receipt that a durable sender can replay byte-for-byte. */
+  createExecutionRevisionFenceReceiptRequest(receipt: NativeExecutionRevisionFenceReceipt): NativeExecutionRevisionFenceReceiptRequest {
+    const parsed = NativeExecutionRevisionFenceReceiptSchema.parse(structuredClone(receipt));
+    return NativeExecutionRevisionFenceReceiptRequestSchema.parse({
+      ...parsed,
+      proof: this.proof("execution_revision_fence_receipt", parsed.intent.instanceId, parsed as unknown as { [key: string]: JsonValue }),
+    });
+  }
+
+  /** Submit an exact, previously durable fence receipt; this never asserts a stop or terminal outcome. */
+  async submitExecutionRevisionFenceReceipt(request: NativeExecutionRevisionFenceReceiptRequest): Promise<NativeExecutionRevisionFenceReceiptResult> {
+    const parsed = NativeExecutionRevisionFenceReceiptRequestSchema.parse(structuredClone(request));
+    const result = await this.proofHttp.request({
+      method: "POST",
+      path: CORE_PATHS.executionRevisionControlReceipt(parsed.intent.instanceId),
+      bodyFactory: () => parsed,
+      schema: NativeExecutionRevisionFenceReceiptResultSchema,
+      idempotencyKey: `execution-revision-fence-receipt:${parsed.intentDigest}:${parsed.runnerIncarnation}:${parsed.connectionRef}:${parsed.connectionEpoch}`,
+    });
+    if (result.kind !== parsed.kind || result.intentDigest !== parsed.intentDigest ||
+        result.runnerIncarnation !== parsed.runnerIncarnation || result.connectionRef !== parsed.connectionRef ||
+        result.connectionEpoch !== parsed.connectionEpoch || result.fencedAt !== parsed.fencedAt ||
+        result.requestNonce !== parsed.proof.nonce ||
+        jcsDigest(result.intent) !== jcsDigest(parsed.intent)) {
+      throw new RemoteInstanceError("registration_mismatch", "Execution revision fence receipt does not match the submitted fence.");
     }
     return result;
   }

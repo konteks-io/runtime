@@ -57,8 +57,8 @@ async function fixture() {
   let monotonic = 0;
   const assertOwned = vi.fn();
   const onAuthorityLost = vi.fn(async () => undefined);
-  const makeGate = () => { const gate = new NativeExecutionGate({ assignment, journal, clock, runnerIncarnation: "runner", client,
-    assertOwned, onAuthorityLost, currentRevisionFenceConnection: () => ({ connectionRef: "connection", connectionEpoch: 2 }), monotonicNow: () => monotonic }); gates.push(gate); return gate; };
+  const makeGate = (overrides: Record<string, unknown> = {}) => { const gate = new NativeExecutionGate({ assignment, journal, clock, runnerIncarnation: "runner", client,
+    assertOwned, onAuthorityLost, currentRevisionFenceConnection: () => ({ connectionRef: "connection", connectionEpoch: 2 }), monotonicNow: () => monotonic, ...overrides } as never); gates.push(gate); return gate; };
   return { journal, clock, ready, claims, client, envelope, gate: makeGate(), makeGate, onAuthorityLost, assertOwned,
     advance: (milliseconds: number) => { monotonic += milliseconds; clock.advance(milliseconds); } };
 }
@@ -422,6 +422,29 @@ describe("independent native live execution gate", () => {
       code: "execution_fenced",
     });
     expect(f.client.checkExecution).toHaveBeenCalledOnce();
+  });
+
+  it("creates a nonterminal receipt only after applying the exact current native fence", async () => {
+    const f = await fixture();
+    const onFenceApplied = vi.fn(async () => undefined);
+    const gate = f.makeGate({ onFenceApplied });
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "receipt-intent", tenantId: "tenant", instanceId: "instance", executionId: "execution", executionRevision: 1,
+      checkId: "check", policyRevision: null, connectionRef: "connection", connectionEpoch: 2,
+      reason: "authority_revoked" as const, issuedAt: f.clock.nowIso(), deadlineAt: new Date(f.clock.coreNow() + 2_000).toISOString(),
+    };
+    await f.journal.executionRevisionFences.receiveVerified({
+      intent, intentDigest: computeExecutionRevisionControlIntentDigest(intent), runnerIncarnation: "runner", connectionRef: "connection", connectionEpoch: 2,
+    }, f.clock.nowIso(), () => {});
+
+    const operation = await gate.admit(f.envelope);
+    await expect(gate.begin(operation)).rejects.toMatchObject({ code: "execution_fenced" });
+    await vi.waitFor(() => expect(onFenceApplied).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "execution_revision_fenced", intent, intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      runnerIncarnation: "runner", connectionRef: "connection", connectionEpoch: 2,
+    })));
   });
 
   it("does not fence a different execution revision or connection record", async () => {

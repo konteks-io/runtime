@@ -6,6 +6,8 @@ import {
   canonicalize, type JsonValue, type RemoteDeliveryExecutionAuthorityView, type RemoteDeliveryOperationPermitClaims,
   type RemoteAuthorizedOperation, type RemoteExecutionAuthorityView, type RemoteExecutionOperationPermitClaims,
   type Clock, type RemoteWorkAssignment, type SessionToCoreMessage,
+  NativeExecutionRevisionFenceReceiptSchema,
+  type NativeExecutionRevisionFenceReceipt,
 } from "@konteks/remote-common";
 import type { CoreClient } from "../core/client.js";
 import type { SupervisorJournal } from "../state/journal.js";
@@ -25,6 +27,8 @@ export interface NativeExecutionGateOptions {
     connectionRef: string;
     connectionEpoch: number;
   } | null;
+  /** Durable C02 receipt delivery; failure cannot alter local fence behavior. */
+  onFenceApplied?: (receipt: NativeExecutionRevisionFenceReceipt) => Promise<void>;
   monotonicNow?: () => number;
 }
 type Authority = RemoteExecutionAuthorityView | RemoteDeliveryExecutionAuthorityView;
@@ -131,8 +135,10 @@ export class NativeExecutionGate {
       // A fence is scoped to one signed check, so establish that check before
       // deciding whether the durable control record applies to this dispatch.
       await this.refresh();
-      if (this.hasDurableRevisionFence(operation.authority)) {
+      const fence = this.durableRevisionFence(operation.authority);
+      if (fence) {
         await this.fenceAuthority();
+        this.recordAppliedFence(fence);
         throw fenced();
       }
       const started = await this.operations.begin(operation.key, () => this.assertDispatchCurrent(operation.authority));
@@ -223,10 +229,14 @@ export class NativeExecutionGate {
    * cannot fence a replacement execution.
    */
   private hasDurableRevisionFence(authority: Authority): boolean {
+    return this.durableRevisionFence(authority) !== null;
+  }
+
+  private durableRevisionFence(authority: Authority) {
     const connection = this.options.currentRevisionFenceConnection?.();
     const checkId = this.checkId;
-    if (!connection || !checkId) return false;
-    return this.options.journal.executionRevisionFences.pending().some(
+    if (!connection || !checkId) return null;
+    return this.options.journal.executionRevisionFences.pending().find(
       (record) =>
         record.runnerIncarnation === authority.runnerIncarnation &&
         record.connectionRef === connection.connectionRef &&
@@ -237,7 +247,21 @@ export class NativeExecutionGate {
         record.intent.checkId === checkId &&
         record.intent.connectionRef === connection.connectionRef &&
         record.intent.connectionEpoch === connection.connectionEpoch,
-    );
+    ) ?? null;
+  }
+
+  private recordAppliedFence(record: ReturnType<NativeExecutionGate["durableRevisionFence"]>): void {
+    if (!record || !this.options.onFenceApplied) return;
+    const receipt = NativeExecutionRevisionFenceReceiptSchema.parse({
+      kind: "execution_revision_fenced",
+      intent: record.intent,
+      intentDigest: record.intentDigest,
+      runnerIncarnation: record.runnerIncarnation,
+      connectionRef: record.connectionRef,
+      connectionEpoch: record.connectionEpoch,
+      fencedAt: this.options.clock.nowIso(),
+    });
+    void this.options.onFenceApplied(receipt).catch(() => undefined);
   }
 
   private refresh(): Promise<void> {
