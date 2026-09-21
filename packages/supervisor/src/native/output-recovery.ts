@@ -25,6 +25,7 @@ export interface RetainedDeliveryOutputRecoveryOptions {
  * authorization must independently name every candidate identity. */
 export function createRetainedDeliveryOutputRecovery(options: RetainedDeliveryOutputRecoveryOptions) {
   return async (admission: LocalAdmission, execution: { acpSessionRef: string | null }) => {
+    const startedAt = Date.now();
     if (!execution.acpSessionRef) return null;
     let found: { store: NativeOutputStore; record: NativeOutputRecord } | null = null;
     for (const root of options.roots) {
@@ -51,6 +52,7 @@ export function createRetainedDeliveryOutputRecovery(options: RetainedDeliveryOu
       }
     }
     if (!found) return null;
+    const cacheOutcome = found.record.state === "accepted" ? "accepted_record" : "pending_record";
     let receipt;
     if (found.record.state === "accepted") receipt = found.record.receipt;
     else {
@@ -69,6 +71,9 @@ export function createRetainedDeliveryOutputRecovery(options: RetainedDeliveryOu
       }
     }
     await options.mutate(() => found!.store.saveAccepted(found!.record.candidate, receipt));
+    options.logger?.info({ event: "native.output.recovery_completed", correlationId: found.record.candidate.invocationRef, stage: "recovery",
+      outcome: "accepted", cacheOutcome, resultDigest: found.record.candidate.resultDigest, durationMs: Date.now() - startedAt },
+    "retained native delivery output recovery completed");
     return { acpSessionRef: execution.acpSessionRef, receipt };
   };
 }

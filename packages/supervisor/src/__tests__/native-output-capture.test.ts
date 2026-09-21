@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { computeRemoteDeliveryOutputDigest } from "@konteks/remote-common";
 import { captureNativeDeliveryOutput, checkOutputTreeLimits } from "../native/output-capture.js";
 
@@ -43,6 +43,20 @@ describe("native delivery output capture", () => {
     ]);
     const { resultDigest: _, ...digestBody } = result;
     expect(result.resultDigest).toBe(computeRemoteDeliveryOutputDigest(digestBody));
+  });
+
+  it("emits bounded C01-correlated capture telemetry without output content or paths", async () => {
+    await writeFile(join(dir, "secret-path.txt"), "payload-canary-secret\n");
+    const { stdout } = await run("git", ["-C", dir, "rev-parse", "HEAD"]);
+    const info = vi.fn();
+    const result = await captureNativeDeliveryOutput({ cwd: dir, gitExecutable: "/usr/bin/git", baselineCommit: stdout.trim(),
+      binding: { workspaceId: "tenant", sessionId: "session", assignmentId: "assignment", attempt: 1, instanceId: "instance" },
+      claimId: "claim", invocationRef: "c01-correlation", inputSelectionDigest: `sha256:${"a".repeat(64)}`, baseRevision: "revision",
+      logger: { info } as never });
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({ event: "native.output.capture_completed", correlationId: "c01-correlation",
+      stage: "capture", outcome: "success", bytes: result.files.entries[0]?.sizeBytes, resultDigest: result.resultDigest, durationMs: expect.any(Number) }), expect.any(String));
+    expect(JSON.stringify(info.mock.calls)).not.toContain("payload-canary-secret");
+    expect(JSON.stringify(info.mock.calls)).not.toContain("secret-path.txt");
   });
 
   it("never captures a package-manager cache, even when nothing ignores it", async () => {

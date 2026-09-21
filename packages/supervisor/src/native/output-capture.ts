@@ -10,6 +10,8 @@ import {
   canonicalize,
   computeRemoteDeliveryOutputDigest,
   computeRemoteFileTreeDigest,
+  createLogger,
+  type Logger,
   type RemoteDeliveryResultCandidate,
   type RemoteTransferBinding,
 } from "@konteks/remote-common";
@@ -117,7 +119,10 @@ async function readBlobs(executable: string, cwd: string, env: NodeJS.ProcessEnv
 export async function captureNativeDeliveryOutput(options: {
   cwd: string; gitExecutable: string; baselineCommit: string; binding: RemoteTransferBinding; claimId: string;
   invocationRef: string; inputSelectionDigest: string; baseRevision: string;
+  logger?: Logger;
 }): Promise<RemoteDeliveryResultCandidate> {
+  const startedAt = Date.now();
+  const logger = options.logger ?? createLogger({ name: "native-output-capture" });
   let temporary: string | undefined;
   try {
     const root = await checkedDirectory(options.cwd);
@@ -152,7 +157,11 @@ export async function captureNativeDeliveryOutput(options: {
     const identity = { binding: options.binding, claimId: options.claimId, invocationRef: options.invocationRef,
       inputSelectionDigest: options.inputSelectionDigest, baseRevision: options.baseRevision, files, deletions };
     const body = { ...identity, resultId: `result-${createHash("sha256").update("konteks-native-output-id-v1\0").update(canonicalize(identity as never)).digest("hex")}` };
-    return RemoteDeliveryResultCandidateSchema.parse({ ...body, resultDigest: computeRemoteDeliveryOutputDigest(body) });
+    const result = RemoteDeliveryResultCandidateSchema.parse({ ...body, resultDigest: computeRemoteDeliveryOutputDigest(body) });
+    logger.info({ event: "native.output.capture_completed", correlationId: result.invocationRef, stage: "capture", outcome: "success",
+      files: entries.length, bytes: entries.reduce((total, entry) => total + entry.sizeBytes, 0), treeDigest: result.files.treeDigest,
+      resultDigest: result.resultDigest, durationMs: Date.now() - startedAt }, "native delivery output capture completed");
+    return result;
   } catch { throw unavailable(); }
   finally { if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined); }
 }

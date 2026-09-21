@@ -80,6 +80,10 @@ export class NativeOutputClient {
     candidate: RemoteDeliveryResultCandidate): Promise<RemoteDeliveryAcceptanceReceipt> {
     if (this.busy) throw unavailable();
     this.busy = true;
+    const startedAt = Date.now();
+    const telemetry = { correlationId: candidate.invocationRef, resultDigest: candidate.resultDigest,
+      bytes: candidate.files.entries.reduce((total, entry) => total + entry.sizeBytes, 0) };
+    let cacheOutcome = "miss";
     try {
       const deadlineAtMs = Date.now() + outputTransferBudgetMs(candidate);
       const prepareBody = RemoteDeliveryOutputPrepareRequestSchema.parse({ attempt: owner.attempt, claimId: candidate.claimId,
@@ -88,39 +92,59 @@ export class NativeOutputClient {
       const statusBody = RemoteDeliveryOutputStatusRequestSchema.parse({ attempt: owner.attempt, claimId: candidate.claimId,
         invocationRef: candidate.invocationRef, resultId: candidate.resultId, resultDigest: candidate.resultDigest });
       let prepared;
-      try { prepared = RemoteDeliveryOutputPrepareResultSchema.parse(await this.request(owner, "prepare", prepareBody, deadlineAtMs)); }
+      try { prepared = RemoteDeliveryOutputPrepareResultSchema.parse(await this.request(owner, "prepare", prepareBody, deadlineAtMs, telemetry)); }
       catch (error) {
         let reconciled: Awaited<ReturnType<NativeOutputClient["status"]>> = null;
-        try { reconciled = await this.status(owner, statusBody, deadlineAtMs); }
+        try { reconciled = await this.status(owner, statusBody, deadlineAtMs, telemetry); }
         catch (statusError) { if (isNotFound(error) && isNotFound(statusError)) throw assignmentGone(); }
-        if (reconciled?.state === "accepted" && reconciled.receipt) return this.verifyReceipt(reconciled.receipt, candidate);
+        if (reconciled?.state === "accepted" && reconciled.receipt) {
+          cacheOutcome = "prepare_status_hit";
+          return this.accepted(candidate, reconciled.receipt, telemetry, cacheOutcome, startedAt);
+        }
         if (reconciled?.state === "rejected") throw unavailable();
         // Missing or staged: identical prepare is the only response that can
         // recover the owner-issued stagedReceiptId without widening status.
-        prepared = RemoteDeliveryOutputPrepareResultSchema.parse(await this.request(owner, "prepare", prepareBody, deadlineAtMs));
+        cacheOutcome = "prepare_retried";
+        prepared = RemoteDeliveryOutputPrepareResultSchema.parse(await this.request(owner, "prepare", prepareBody, deadlineAtMs, telemetry));
       }
       if (prepared.resultId !== candidate.resultId || prepared.resultDigest !== candidate.resultDigest || Date.parse(prepared.expiresAt) <= this.options.clock.coreNow()) throw unavailable();
       const commitBody = RemoteDeliveryOutputCommitRequestSchema.parse({ attempt: owner.attempt, claimId: candidate.claimId,
         invocationRef: candidate.invocationRef, resultId: candidate.resultId, resultDigest: candidate.resultDigest, stagedReceiptId: prepared.stagedReceiptId });
       try {
-        return this.verifyReceipt(await this.request(owner, "commit", commitBody, deadlineAtMs), candidate);
+        return this.accepted(candidate, await this.request(owner, "commit", commitBody, deadlineAtMs, telemetry), telemetry, cacheOutcome, startedAt);
       } catch {
-        const status = await this.status(owner, statusBody, deadlineAtMs).catch(() => null);
-        if (status?.state === "accepted" && status.receipt) return this.verifyReceipt(status.receipt, candidate);
+        const status = await this.status(owner, statusBody, deadlineAtMs, telemetry).catch(() => null);
+        if (status?.state === "accepted" && status.receipt) {
+          cacheOutcome = "commit_status_hit";
+          return this.accepted(candidate, status.receipt, telemetry, cacheOutcome, startedAt);
+        }
         if (status?.state !== "staged") throw unavailable();
-        try { return this.verifyReceipt(await this.request(owner, "commit", commitBody, deadlineAtMs), candidate); }
+        try {
+          cacheOutcome = "commit_retried";
+          return this.accepted(candidate, await this.request(owner, "commit", commitBody, deadlineAtMs, telemetry), telemetry, cacheOutcome, startedAt);
+        }
         catch {
-          const final = await this.status(owner, statusBody, deadlineAtMs).catch(() => null);
+          const final = await this.status(owner, statusBody, deadlineAtMs, telemetry).catch(() => null);
           if (final?.state !== "accepted" || !final.receipt) throw unavailable();
-          return this.verifyReceipt(final.receipt, candidate);
+          cacheOutcome = "commit_status_hit";
+          return this.accepted(candidate, final.receipt, telemetry, cacheOutcome, startedAt);
         }
       }
     } catch (error) { throw isAssignmentGone(error) ? error : unavailable(); }
     finally { this.busy = false; }
   }
 
-  private async status(owner: { instanceId: string; assignmentId: string; attempt: number }, body: ReturnType<typeof RemoteDeliveryOutputStatusRequestSchema.parse>, deadlineAtMs: number) {
-    try { return RemoteDeliveryOutputStatusResultSchema.parse(await this.request(owner, "status", body, deadlineAtMs)); }
+  private accepted(candidate: RemoteDeliveryResultCandidate, value: unknown, telemetry: { correlationId: string; resultDigest: string; bytes: number },
+    cacheOutcome: string, startedAt: number): RemoteDeliveryAcceptanceReceipt {
+    const receipt = this.verifyReceipt(value, candidate);
+    this.logger.info({ event: "native.output.accept_completed", ...telemetry, stage: "accept", outcome: "success", cacheOutcome,
+      durationMs: Date.now() - startedAt }, "native delivery output accepted");
+    return receipt;
+  }
+
+  private async status(owner: { instanceId: string; assignmentId: string; attempt: number }, body: ReturnType<typeof RemoteDeliveryOutputStatusRequestSchema.parse>,
+    deadlineAtMs: number, telemetry: { correlationId: string; resultDigest: string; bytes: number }) {
+    try { return RemoteDeliveryOutputStatusResultSchema.parse(await this.request(owner, "status", body, deadlineAtMs, telemetry)); }
     catch (error) { if (isNotFound(error)) throw error; return null; }
   }
 
@@ -132,7 +156,9 @@ export class NativeOutputClient {
     return receipt;
   }
 
-  private async request(owner: { instanceId: string; assignmentId: string; attempt: number }, operation: "prepare" | "commit" | "status", body: unknown, deadlineAtMs: number): Promise<unknown> {
+  private async request(owner: { instanceId: string; assignmentId: string; attempt: number }, operation: "prepare" | "commit" | "status", body: unknown,
+    deadlineAtMs: number, telemetry: { correlationId: string; resultDigest: string; bytes: number }): Promise<unknown> {
+    const startedAt = Date.now();
     const encoded = JSON.stringify(body);
     if (Buffer.byteLength(encoded) > MAX_REQUEST_BYTES) throw unavailable();
     const url = `${this.origin}/api/remote-instances/internal/remote-instances/${encodeURIComponent(owner.instanceId)}/assignments/${encodeURIComponent(owner.assignmentId)}/outputs/${operation}`;
@@ -177,11 +203,12 @@ export class NativeOutputClient {
         if (!response.ok || response.redirected || response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json" || !response.body) {
           // A non-retryable refusal (413 over the body limit, 422 rejected
           // candidate) was previously indistinguishable from any other
-          // "unavailable": record the status and a bounded, secret-free body.
-          const body = await response.text().then(text => text.replace(/\s+/gu, " ").slice(0, 300)).catch(() => "");
-          this.logger.warn({ event: "native.output.refused", operation: `output.${operation}`, status: response.status,
+          // "unavailable": record only bounded protocol metadata. A Core body
+          // can contain operator text and must never become output telemetry.
+          void response.body?.cancel().catch(() => undefined);
+          this.logger.warn({ event: "native.output.refused", ...telemetry, stage: operation, outcome: "refused", status: response.status,
             redirected: response.redirected, contentType: response.headers.get("content-type") ?? null,
-            requestBytes: Buffer.byteLength(encoded), body }, "native delivery output request refused");
+            requestBytes: Buffer.byteLength(encoded), durationMs: Date.now() - startedAt }, "native delivery output request refused");
           throw new RemoteInstanceError("capability_unavailable", "Generated delivery output was not durably accepted.",
             { diagnostic: `response_refused_${response.status}` });
         }
@@ -196,7 +223,12 @@ export class NativeOutputClient {
               sleep: this.options.retrySleep, baseDelayMs: this.options.retryBaseDelayMs });
             break;
           }
-          if (chunk.done) return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
+          if (chunk.done) {
+            const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
+            this.logger.info({ event: "native.output.request_completed", ...telemetry, stage: operation, outcome: "success", attempt,
+              requestBytes: Buffer.byteLength(encoded), responseBytes: size, durationMs: Date.now() - startedAt }, "native delivery output request completed");
+            return value;
+          }
           size += chunk.value.byteLength; if (size > MAX_RESPONSE_BYTES) throw unavailable(); chunks.push(chunk.value);
         }
       } finally { clearTimeout(timer); abort.abort(); if (reader) void reader.cancel().catch(() => undefined); }
