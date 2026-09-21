@@ -94,7 +94,10 @@ The connector runs as a user service (launchd, user systemd, or Task
 Scheduler). It checks the stable channel on its own and applies updates
 transactionally: the new release is staged beside the running one, work is
 drained, the service is swapped and health-gated, and the previous release is
-restored if the gate fails.
+restored if the gate fails. A new release whose service exits as it starts is
+rolled back after three failed starts, within seconds, rather than at the
+gate's three-minute deadline. `update` and `update --check` say when the
+connector updated itself, and when a release already failed here.
 
 ## How releases are trusted
 
