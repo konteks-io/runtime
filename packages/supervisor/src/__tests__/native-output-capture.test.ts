@@ -39,10 +39,23 @@ describe("native delivery output capture", () => {
       claimId: "claim", invocationRef: "invocation", inputSelectionDigest: `sha256:${"a".repeat(64)}`, baseRevision: "revision" });
     expect(result.deletions).toEqual(["deleted.txt"]);
     expect(result.files.entries.map(entry => [entry.path, Buffer.from(entry.contentBase64, "base64").toString(), entry.mode])).toEqual([
-      ["generated/ignored.txt", "ignored but required\n", 0o600], ["kept.txt", "after\n", 0o600], ["new.sh", "#!/bin/sh\nexit 0\n", 0o700],
+      ["kept.txt", "after\n", 0o600], ["new.sh", "#!/bin/sh\nexit 0\n", 0o700],
     ]);
     const { resultDigest: _, ...digestBody } = result;
     expect(result.resultDigest).toBe(computeRemoteDeliveryOutputDigest(digestBody));
+  });
+
+  it("honors connector exclude rules without suppressing tracked project changes", async () => {
+    await writeFile(join(dir, ".git", "info", "exclude"), "graft/\n.mcp.json\nkept.txt\n");
+    await mkdir(join(dir, "graft"));
+    await writeFile(join(dir, "graft", "INDEX.md"), "connector metadata");
+    await writeFile(join(dir, ".mcp.json"), "connector config");
+    await writeFile(join(dir, "kept.txt"), "project change");
+    const { stdout } = await run("git", ["-C", dir, "rev-parse", "HEAD"]);
+    const result = await captureNativeDeliveryOutput({ cwd: dir, gitExecutable: "/usr/bin/git", baselineCommit: stdout.trim(),
+      binding: { workspaceId: "tenant", sessionId: "session", assignmentId: "assignment", attempt: 1, instanceId: "instance" },
+      claimId: "claim", invocationRef: "invocation", inputSelectionDigest: `sha256:${"a".repeat(64)}`, baseRevision: stdout.trim() });
+    expect(result.files.entries.map(entry => entry.path)).toEqual(["kept.txt"]);
   });
 
   it("emits bounded C01-correlated capture telemetry without output content or paths", async () => {

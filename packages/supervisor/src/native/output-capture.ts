@@ -24,8 +24,8 @@ const unavailable = () => new RemoteInstanceError("capability_unavailable", "Gen
  * Package-manager caches are never part of a delivered change: an agent that
  * runs `npm install` inside the worktree would otherwise hand the platform a
  * tree of tens of thousands of vendored files, far past the contract's
- * 1000-file / 10 MiB envelope. Ignored *generated* files elsewhere stay
- * captured on purpose (a build output the change relies on).
+ * 1000-file / 10 MiB envelope. Repository and connector ignore rules remain authoritative for untracked
+ * files. Already tracked files are still captured even if later ignored.
  */
 const DEPENDENCY_CACHE_EXCLUSIONS = [
   ":(exclude,glob)**/node_modules/**",
@@ -75,10 +75,9 @@ function decodePaths(value: Buffer): string[] {
 
 async function captureIndex(executable: string, cwd: string, baselineCommit: string, env: NodeJS.ProcessEnv): Promise<string> {
   await runGit(executable, cwd, ["read-tree", "--reset", baselineCommit], env);
-  // A private index and object directory capture tracked, untracked and ignored
-  // generated files without mutating the connector baseline or following paths
-  // after discovery. Git metadata remains excluded by Git itself.
-  await runGit(executable, cwd, ["add", "--no-renormalize", "-A", "-f", "--", ".", ...DEPENDENCY_CACHE_EXCLUSIONS], env);
+  // A private index captures tracked changes and non-ignored new files.
+  // Forcing addition bypasses connector excludes and publishes local tooling.
+  await runGit(executable, cwd, ["add", "--no-renormalize", "-A", "--", ".", ...DEPENDENCY_CACHE_EXCLUSIONS], env);
   const tree = (await runGit(executable, cwd, ["write-tree"], env)).toString("ascii").trim();
   if (!oidPattern.test(tree)) throw unavailable();
   return tree;
@@ -162,6 +161,12 @@ export async function captureNativeDeliveryOutput(options: {
       files: entries.length, bytes: entries.reduce((total, entry) => total + entry.sizeBytes, 0), treeDigest: result.files.treeDigest,
       resultDigest: result.resultDigest, durationMs: Date.now() - startedAt }, "native delivery output capture completed");
     return result;
-  } catch { throw unavailable(); }
+  } catch (error) {
+    logger.warn({ event: "native.output.capture_failed", correlationId: options.invocationRef,
+      assignmentId: options.binding.assignmentId, stage: "capture", outcome: "failed",
+      errorClass: error instanceof Error ? error.name : "UnknownError", durationMs: Date.now() - startedAt },
+      "native delivery output capture failed");
+    throw unavailable();
+  }
   finally { if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined); }
 }
