@@ -1,3 +1,4 @@
+import { AgentTurnUsageObservationSchema, GatewayCallObservationSchema } from "@konteks/remote-common";
 import { z } from "zod";
 import { createPublicKey, type KeyObject } from "node:crypto";
 import {
@@ -182,7 +183,7 @@ export const LEASE_AUDIENCE: string = REMOTE_INSTANCE_LEASE_AUDIENCE;
 const ReadinessResultSchema = z.object({ instanceId: z.string(), administrativeStatus: z.literal("active"), lease: z.string().min(1), leaseExpiresAt: z.string(), leaseMode: RemoteLeaseModeSchema, heartbeatIntervalSeconds: z.number().int().positive() }).strict();
 export type { HeartbeatResult } from "@konteks/remote-common";
 const ControlPollSchema = z.object({ frames: z.array(ToRuntimeRelayFrameSchema).max(64) }).strict();
-const ObservationsResultSchema = z.object({ accepted: z.number().int().nonnegative() }).strict();
+const ObservationReceiptSchema = z.object({ stored: z.boolean(), observationId: z.string().min(1), observationDigest: z.string().length(43) }).strict();
 const AckResultSchema = z.object({ accepted: z.boolean() }).strict();
 const ControllerDirectivePullInputSchema = z.object({
   version: PlanningControllerDirectivePullRequestSchema.shape.version,
@@ -642,11 +643,23 @@ export class CoreClient {
     return this.http.request({ method: "POST", path: CORE_PATHS.report(instanceId), body: report, schema: ReportAckSchema, idempotencyKey: `report:${report.reportId}` });
   }
 
+  /** The mounted Core route accepts one body, and replies only after commit. */
+  async submitObservation(instanceId: string, body: unknown): Promise<void> {
+    const parsed = AgentTurnUsageObservationSchema.safeParse(body);
+    const observation = parsed.success ? parsed.data : GatewayCallObservationSchema.parse(body);
+    if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Observation instance mismatch");
+    const digest = jcsDigest(observation as unknown as JsonValue);
+    const kind = observation.moneyBasis === "gateway_priced" ? "gw" : "turn";
+    const expectedId = `ri:${kind}:${instanceId}:${observation.assignmentId}:${observation.attempt}:${digest.slice(0, 24)}`;
+    const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId), body: observation,
+      schema: ObservationReceiptSchema, idempotencyKey: `observation:${expectedId}`, operationPolicy: "progressRead" });
+    if (result.observationId !== expectedId || result.observationDigest !== digest)
+      throw new RemoteInstanceError("registration_mismatch", "Observation receipt does not match submitted bytes");
+  }
+
   async observations(instanceId: string, observations: unknown[]): Promise<number> {
-    const body = { observations };
-    const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId), body, schema: ObservationsResultSchema,
-      idempotencyKey: `observations:${instanceId}:${jcsDigest(body as unknown as JsonValue)}` });
-    return result.accepted;
+    for (const observation of observations) await this.submitObservation(instanceId, observation);
+    return observations.length;
   }
 
   async controlAck(instanceId: string, ack: unknown): Promise<boolean | Extract<ReturnType<typeof DesiredConfigurationAckResultSchema.parse>, { status: "superseded" }>> {

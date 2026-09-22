@@ -55,14 +55,14 @@ const signedOperationKeyId = (permit: string): string | undefined => {
   }
 };
 /** The whole trust fetch and signed check exchange share this one budget. */
-export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 5_000;
+export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 12_000;
 const RENEWAL_RETRY_DELAY_MS = 1_000;
 // Begin while a full busy-host event-loop pause can still elapse before the
 // verified lease expires. A collaboration/Core restart has produced a 19 s
-// pause in practice; five exchange budgets leave 25 s without lengthening the
+// pause in practice; a 25 s renewal lead avoids lengthening the
 // authority Core issued. Retries remain fenced by the original monotonic
 // deadline, so this changes availability rather than trust semantics.
-const RENEWAL_LEAD_MS = 5 * NATIVE_EXECUTION_RENEWAL_BUDGET_MS;
+const RENEWAL_LEAD_MS = 25_000;
 const transientLoss = (error: unknown): boolean =>
   error instanceof RemoteInstanceError &&
   (error.code === "execution_authority_unavailable" || error.code === "temporarily_unavailable" || error.retryable);
@@ -323,7 +323,7 @@ export class NativeExecutionGate {
     if (!authority || !this.keys) throw unavailable();
     this.localAuthority(authority);
     // The first check establishes a lease. Every later renewal is bounded by
-    // both its five-second I/O policy and the last verified monotonic lease;
+    // both its bounded I/O policy and the last verified monotonic lease;
     // a slow renewal must not obtain authority after that lease expires.
     const remainingLeaseMs = this.monotonicDeadline > 0
       ? Math.max(0, this.monotonicDeadline - this.monotonic())

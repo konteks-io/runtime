@@ -3,6 +3,22 @@ import { nullLogger } from "../logger.js";
 import { JsonClient } from "../http-client.js";
 
 describe("request-specific Core transport deadline", () => {
+  it("accepts an eight-second authority response without aborting and duplicating its work", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchFn = vi.fn(async (_url: unknown, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => resolve(new Response(JSON.stringify({ accepted: true }))), 8_600);
+        init?.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(init.signal?.reason); }, { once: true });
+      }));
+      const client = new JsonClient({ baseUrl: "https://core.example", fetchFn, logger: nullLogger });
+      const pending = client.request({ method: "POST", path: "/check", body: {}, idempotencyKey: "check",
+        operationPolicy: "executionCheck", deadlineAtMs: Date.now() + 25_000, schema: { parse: value => value } });
+      const result = expect(pending).resolves.toEqual({ accepted: true });
+      await vi.advanceTimersByTimeAsync(8_600);
+      await result;
+      expect(fetchFn).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
   it("does not let a caller's later deadline extend the policy budget", async () => {
     let now = 1_000;
     const clock = vi.spyOn(Date, "now").mockImplementation(() => now);

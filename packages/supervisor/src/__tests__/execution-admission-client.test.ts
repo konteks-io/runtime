@@ -1,6 +1,6 @@
 import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { FixedClock, generateInstanceKey, verifyInstanceProof, remoteExecutionInstanceProofSubject } from "@konteks/remote-common";
+import { FixedClock, jcsDigest, generateInstanceKey, verifyInstanceProof, remoteExecutionInstanceProofSubject } from "@konteks/remote-common";
 import { CoreClient, CORE_AUDIENCE } from "../core/client.js";
 
 function fixture(response: object) {
@@ -10,6 +10,22 @@ function fixture(response: object) {
     key: () => key, credential: () => "test-native-lease", fetchFn });
   return { client, fetchFn, key };
 }
+
+describe("observation HTTPS receipts", () => {
+  const usage = { instanceId: "instance", assignmentId: "a", agentId: "codex", attempt: 1,
+    moneyBasis: "unavailable_local_subscription", observedAt: "2026-09-22T00:00:00Z" };
+  const digest = jcsDigest(usage);
+  const receipt = { stored: false, observationId: `ri:turn:instance:a:1:${digest.slice(0,24)}`, observationDigest: digest };
+  it("posts the single observation and accepts a committed duplicate", async () => {
+    const f = fixture(receipt);
+    await expect(f.client.submitObservation("instance", usage)).resolves.toBeUndefined();
+    expect(JSON.parse(f.fetchFn.mock.calls[0]![1]!.body as string)).toEqual(usage);
+  });
+  it.each([{ observationDigest: "x".repeat(43) }, { observationId: "other" }, { accepted: 1 }])("rejects an unbound receipt", async patch => {
+    const f = fixture({ ...receipt, ...patch });
+    await expect(f.client.submitObservation("instance", usage)).rejects.toBeDefined();
+  });
+});
 
 describe("native execution admission HTTPS proofs", () => {
   it("binds consume proofs to both path identities and fresh retry nonces", async () => {

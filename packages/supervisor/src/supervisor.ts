@@ -1,3 +1,4 @@
+import { ObservationDelivery } from "./control/observation-delivery.js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import {
@@ -181,6 +182,7 @@ export class Supervisor {
   inventory!: InventoryCollector | NativeInventoryCollector;
   heartbeat!: HeartbeatPublisher;
   control!: ControlHandlers;
+  private observationDelivery!: ObservationDelivery;
   private configurationAcks!: ConfigurationAckDelivery;
   private executionRevisionFenceReceipts!: ExecutionRevisionFenceReceiptDelivery;
   work!: WorkOrchestrator;
@@ -333,6 +335,10 @@ export class Supervisor {
       key: () => this.key,
       credential: () => this.lease.current()?.lease ?? this.provisioningCredential,
     });
+    this.observationDelivery = new ObservationDelivery({ outbox: this.outbox, core: this.core,
+      instanceId: () => this.instanceId ?? "", clock: this.clock, logger: this.logger,
+      canSend: () => !this.stopping && Boolean(this.instanceId) && Boolean(this.lease.current()) && (!this.native || this.recoveryAuthority() !== null) });
+    this.observationDelivery.start();
     this.configurationAcks = new ConfigurationAckDelivery({ outbox: this.outbox, core: this.core, instanceId: () => this.instanceId ?? "", clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId) });
     this.executionRevisionFenceReceipts = new ExecutionRevisionFenceReceiptDelivery({ outbox: this.outbox, core: this.core, clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId), logger: this.logger });
     if (this.native) {
@@ -1492,14 +1498,12 @@ export class Supervisor {
     }
   }
 
-  private async sendGatewayObservation(observation: GatewayCallObservation, signature: string): Promise<void> {
-    await this.outbox.enqueue({ id: randomUUID(), channel: "observation", key: `gateway:${observation.assignmentId}:${observation.observedAt}:${observation.agentId}`, group: "observation", order: this.clock.now(), body: observation, createdAt: this.clock.nowIso() });
-    this.transport.send({ channel: "observation", channelId: coreChannelId("observation", this.instanceId ?? ""), body: observation, signature });
+  private async sendGatewayObservation(observation: GatewayCallObservation, _signature: string): Promise<void> {
+    await this.observationDelivery.submit(observation);
   }
 
   private async sendUsageObservation(observation: AgentTurnUsageObservation): Promise<void> {
-    await this.outbox.enqueue({ id: randomUUID(), channel: "observation", key: `usage:${observation.assignmentId}:${observation.observedAt}`, group: "observation", order: this.clock.now(), body: observation, createdAt: this.clock.nowIso() });
-    this.transport.send({ channel: "observation", channelId: coreChannelId("observation", this.instanceId ?? ""), body: observation, signature: signBody(this.key, observation as unknown as { [key: string]: JsonValue }) });
+    await this.observationDelivery.submit(observation);
   }
 
   // ── Drain / erase ──────────────────────────────────────────────────────────
@@ -1865,6 +1869,7 @@ export class Supervisor {
     await this.cancellationReplay?.stop();
     if (this.configurationTimer) clearInterval(this.configurationTimer);
     await this.configurationRefresh;
+    await this.observationDelivery?.stop();
     await this.configurationAcks?.settle();
     await this.executionRevisionFenceReceipts?.settle();
     await this.planningDirectivePoller?.stop();

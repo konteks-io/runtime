@@ -54,9 +54,9 @@ export type FetchFn = (input: string | URL, init?: RequestInit) => Promise<Respo
 export const JsonOperationPolicies = {
   renewal: { totalTimeoutMs: 5_000, perAttemptTimeoutMs: 2_000, maxAttempts: 2, retryBaseDelayMs: 100, retryAfterMaxMs: 1_000, requiresIdempotencyKey: true },
   admissionPreparation: { totalTimeoutMs: 30_000, perAttemptTimeoutMs: 10_000, maxAttempts: 3, retryBaseDelayMs: 100, retryAfterMaxMs: 5_000, requiresIdempotencyKey: true },
-  // A signed execution lease must finish reading within the same five-second gate budget.
-  // Do not abort a healthy response at two seconds merely to start it again.
-  executionCheck: { totalTimeoutMs: 5_000, perAttemptTimeoutMs: 5_000, maxAttempts: 2, retryBaseDelayMs: 100, retryAfterMaxMs: 1_000, requiresIdempotencyKey: true },
+  // One exchange may span a busy-host pause. The gate supplies the shorter
+  // remaining verified lease; it owns retries rather than overlapping HTTP work.
+  executionCheck: { totalTimeoutMs: 12_000, perAttemptTimeoutMs: 12_000, maxAttempts: 1, retryBaseDelayMs: 100, retryAfterMaxMs: 1_000, requiresIdempotencyKey: true },
   progressRead: { totalTimeoutMs: 5_000, perAttemptTimeoutMs: 2_000, maxAttempts: 2, retryBaseDelayMs: 100, retryAfterMaxMs: 1_000, requiresIdempotencyKey: false },
   outputTransfer: { totalTimeoutMs: 120_000, perAttemptTimeoutMs: 30_000, maxAttempts: 4, retryBaseDelayMs: 250, retryAfterMaxMs: 30_000, requiresIdempotencyKey: true },
 } as const;
