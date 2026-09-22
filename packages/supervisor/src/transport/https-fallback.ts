@@ -23,6 +23,8 @@ export interface HttpsFallbackOptions {
    * cutover is a composition choice, never a heuristic on the reply shape.
    */
   sender?: AssignmentSender;
+  /** Native sessions use durable relay replay; Core has no legacy session polling routes. */
+  relayOnlySessions?: boolean;
   instanceId: () => string;
   pollIntervalMs: number;
   /** A heartbeat response may carry the renewed lease (CP3 has no separate renewal route). */
@@ -88,6 +90,9 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
   }
 
   send(message: OutboundMessage): void {
+    if (this.options.relayOnlySessions && message.channel === "session") {
+      throw new RemoteInstanceError("protocol_incompatible", "Native session frames require durable relay replay.");
+    }
     const reference = message.assignmentRequest;
     if (reference && this.pending.some(existing => existing.channelId === message.channelId &&
       existing.assignmentRequest?.requestSequence === reference.requestSequence &&
@@ -293,6 +298,7 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
   private async pollOnce(): Promise<void> {
     if (!this.running) return;
     await this.housekeepAssignments();
+    if (this.options.relayOnlySessions) return;
     const instanceId = this.options.instanceId();
     try {
       const frames = await this.options.core.controlPoll(instanceId);

@@ -413,7 +413,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     await expect(f.session.waitForAuthorityStop()).rejects.toThrow("stop unproven");
     expect(f.runner.stopForRecovery).toHaveBeenCalledWith("acp");
     expect(f.runner.closeSession).not.toHaveBeenCalled();
-    expect(f.send).not.toHaveBeenCalled();
+    expect(f.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ body: { kind: "session_closed", assignmentId: "assignment", reason: "lease_lost" } }));
     expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("dispatch_started");
   });
 });
@@ -614,4 +614,47 @@ describe("independent native live execution gate", () => {
     await step(1);
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
   });
+});
+
+
+it('retains a genuine admission that expires in transit as non-dispatch evidence', async () => {
+  const f = await fixture();
+  const consume = f.client.consumeExecution.getMockImplementation()!;
+  f.client.consumeExecution.mockImplementationOnce(async (...args) => {
+    const response = await consume(...args); f.clock.advance(31_000); return response;
+  });
+  const operation = await f.gate.admit(f.envelope);
+  await expect(f.gate.begin(operation)).rejects.toMatchObject({ code: 'operation_expired' });
+  expect(f.journal.pendingRequests.get(operation.key)?.authorization?.state).toBe('denied');
+  expect(f.client.checkExecution).not.toHaveBeenCalled();
+});
+
+it('accepts an admission and fresh check at an HTTP Date second boundary', async () => {
+  const f = await fixture();
+  const freshCheck = await f.client.checkExecution();
+  f.client.checkExecution.mockResolvedValue(freshCheck);
+  f.clock.advance(-550);
+  const op = await f.gate.admit(f.envelope);
+  expect(await f.gate.begin(op)).toBe(true);
+});
+
+
+it('refuses a new permit for an already admitted ACP request before consuming again', async () => {
+  const f = await fixture(); await f.gate.admit(f.envelope);
+  const changed = { ...f.claims, operationId: 'second-operation', permitId: 'second-permit' };
+  await expect(f.gate.admit({ ...f.envelope, operationId: changed.operationId, permit: signed(changed) })).rejects.toMatchObject({ code: 'operation_conflict' });
+  expect(f.client.consumeExecution).toHaveBeenCalledTimes(1);
+});
+
+it("notifies the holder of authority loss before recovery suppresses session traffic", async () => {
+  const f = await sessionFixture();
+  await f.session.onToRuntime(f.envelope);
+  const gate = (f.session as unknown as { executionGate: { fenceAuthority(): Promise<void> } }).executionGate;
+  await gate.fenceAuthority();
+  expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({
+    kind: "session_closed", assignmentId: assignment.id, reason: "lease_lost",
+  });
+  expect(f.runner.stopForRecovery).toHaveBeenCalledExactlyOnceWith("acp");
+  expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("dispatch_started");
+  expect(f.session.isClosed).toBe(true);
 });

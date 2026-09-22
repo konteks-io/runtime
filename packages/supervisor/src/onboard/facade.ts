@@ -1,4 +1,3 @@
-import type { GitGap } from "./git.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
@@ -21,7 +20,7 @@ import {
  * What the runtime sends for one repository: the shared submission, plus why
  * the repository read nothing when it did (W2-O3).
  */
-export type OnboardEvidenceSubmission = DiscoveryEvidenceSubmission & { gap?: GitGap };
+export type OnboardEvidenceSubmission = DiscoveryEvidenceSubmission;
 
 /**
  * The onboard MCP facade as this runtime sees it (OB6 §2, §3; OB2 §5).

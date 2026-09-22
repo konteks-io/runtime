@@ -625,6 +625,7 @@ export class Supervisor {
     const https = new HttpsFallbackTransport({
       core: this.core, instanceId: () => this.instanceId ?? "",
       pollIntervalMs: this.config.SUPERVISOR_HTTPS_FALLBACK_POLL_MS,
+      relayOnlySessions: this.native,
       recoveryAuthority: () => this.recoveryAuthority(),
       ...(this.assignmentSender ? { sender: this.assignmentSender } : {}),
     });

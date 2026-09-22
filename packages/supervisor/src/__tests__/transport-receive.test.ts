@@ -80,3 +80,31 @@ describe("awaitable transport receipt", () => {
     } finally { client.stop(); }
   });
 });
+
+
+it('keeps session frames on durable relay replay when ordinary traffic falls back to HTTPS', async () => {
+  const { TransportManager } = await import('../transport/relay-transport.js');
+  const relay = { kind: 'relay', available: false, send: vi.fn(), start: vi.fn(), stop: vi.fn(), resumeAfterRecovery: vi.fn() };
+  const https = { kind: 'https', available: true, send: vi.fn(), start: vi.fn(), stop: vi.fn(), resumeAfterRecovery: vi.fn() };
+  const manager = new TransportManager(relay as never, https as never, 3, () => ({ connected: false, consecutiveFailures: 3 }));
+  manager.evaluate();
+  const frame = { channel: 'session', channelId: 'session:s', body: { kind: 'session_closed', reason: 'agent_exited' } };
+  manager.send(frame as never);
+  expect(relay.send).toHaveBeenCalledWith(frame);
+  expect(https.send).not.toHaveBeenCalled();
+  manager.resumeAfterRecovery();
+  expect(relay.resumeAfterRecovery).toHaveBeenCalled();
+});
+
+
+it('never polls unmounted legacy endpoints for native HTTPS fallback', async () => {
+  const core = { controlPoll: vi.fn(), sessionInbound: vi.fn(), sessionOutbound: vi.fn() };
+  const transport = new HttpsFallbackTransport({ core: core as never, instanceId: () => 'i', pollIntervalMs: 1000, relayOnlySessions: true });
+  transport.start();
+  try {
+    await Promise.resolve(); await Promise.resolve();
+    expect(core.controlPoll).not.toHaveBeenCalled(); expect(core.sessionInbound).not.toHaveBeenCalled();
+    expect(() => transport.send({ channel: 'session', channelId: 'session:s', body: {} } as never)).toThrow('durable relay replay');
+    expect(core.sessionOutbound).not.toHaveBeenCalled();
+  } finally { transport.stop(); }
+});

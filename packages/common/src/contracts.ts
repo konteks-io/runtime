@@ -164,7 +164,7 @@ export type {
 // D143 logical assignment identities. Authentication and accepting owners remain separate.
 export {
   RemoteDeliveryExecutionAuthorityViewSchema, RemoteDeliveryAdmissionClaimsSchema,
-  verifyRemoteDeliveryOperationSignature, verifyRemoteDeliveryAdmission, verifyRemoteDeliveryCheckLease,
+  verifyRemoteDeliveryOperationSignature, verifyRemoteDeliveryAdmission, verifyRemoteDeliveryAdmissionEvidence, verifyRemoteDeliveryCheckLease,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
 export type {
   RemoteDeliveryExecutionAuthorityView, RemoteDeliveryAdmissionClaims, RemoteDeliveryOperationPermitClaims,
@@ -202,7 +202,7 @@ export {
   RemoteAuthorizedOperationSchema,
   verifyRemoteExecutionOperationSignature,
   verifyRemoteExecutionOperationPermit,
-  verifyRemoteExecutionAdmission,
+  verifyRemoteExecutionAdmission, verifyRemoteExecutionAdmissionEvidence,
   verifyRemoteExecutionCheckLease,
   remoteExecutionInstanceProofSubject,
   REMOTE_EXECUTION_PERMITS_CAPABILITY,

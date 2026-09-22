@@ -168,11 +168,33 @@ export class RelayedSession {
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
     this.executionGate = deps.deploymentKind === "native_connector" &&
       (assignment.kind === "assistant_execution" || assignment.source.kind === "harness_delivery") && deps.executionAuthority
-      ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, journal: deps.journal, clock: deps.clock,
+      ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, logger: this.logger, journal: deps.journal, clock: deps.clock,
         assertOwned: () => {
           if (!deps.assertExecutionOwned) throw new RemoteInstanceError("execution_fenced", "Execution ownership is unavailable.");
           deps.assertExecutionOwned();
-        }, onAuthorityLost: () => deps.onExecutionAuthorityLost ? deps.onExecutionAuthorityLost() : this.stopForRecovery() }) : null;
+        }, onAuthorityLost: () => this.onExecutionAuthorityLost() }) : null;
+  }
+
+  private async onExecutionAuthorityLost(): Promise<void> {
+    this.logger.warn({ event: "execution.authority_lost", workspaceId: this.assignment.workspaceId,
+      assignmentId: this.assignment.id, attempt: this.assignment.attempt, acpSessionRef: this.acpSessionRef,
+      outcome: "recovery_required" }, "Native execution fenced; notifying the session holder");
+    try {
+      // Notify while the admission still owns its channel, before recovery
+      // suppresses normal traffic. This is failure visibility, not a claim of
+      // operation settlement or background-tool quiescence.
+      await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason: "lease_lost" });
+    } catch {
+      this.logger.warn({ event: "execution.authority_loss_notice_failed", assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt }, "Execution fenced without a current delivery owner");
+    }
+    try { await (this.deps.onExecutionAuthorityLost?.() ?? this.stopForRecovery()); }
+    catch (error) {
+      this.logger.warn({ event: "execution.recovery_stop_unconfirmed", assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "recovery_required" },
+      "Execution remains fenced; recovery settlement is unconfirmed");
+      throw error;
+    }
   }
 
   /** D98 bootstrap: initialize is runner-local; token → mcpServers; load/resume when proven; else session/new. */
@@ -247,7 +269,12 @@ export class RelayedSession {
       if (this.deps.deploymentKind === "native_connector") {
         const facade = new McpCapabilityFacade({
           initial: issue,
-          renew: () => this.deps.redeemCapabilityToken(this.assignment),
+          renew: () => {
+            this.deps.assertExecutionOwned?.();
+            if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
+            return this.deps.redeemCapabilityToken(this.assignment);
+          },
+          onUnavailable: () => this.close("agent_exited"),
           context: {
             assignmentId: this.assignment.id,
             attempt: this.assignment.attempt,
