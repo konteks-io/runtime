@@ -1,3 +1,4 @@
+import { AgentTurnUsageObservationSchema, GatewayCallObservationSchema } from "@konteks/remote-common";
 import { z } from "zod";
 import { createPublicKey, type KeyObject } from "node:crypto";
 import {
@@ -39,11 +40,20 @@ import {
   NativeCancellationReceiptSchema,
   NativeCancellationReceiptRequestSchema,
   NativeCancellationReceiptResultSchema,
+  NativeExecutionRevisionFenceReceiptSchema,
+  NativeExecutionRevisionFenceReceiptRequestSchema,
+  NativeExecutionRevisionFenceReceiptResultSchema,
   type NativeCancellationReceipt,
   type NativeCancellationReceiptResult,
+  type NativeExecutionRevisionFenceReceipt,
+  type NativeExecutionRevisionFenceReceiptRequest,
+  type NativeExecutionRevisionFenceReceiptResult,
   RemoteReconciliationAppliedRequestSchema,
   RemoteReconciliationAppliedResultSchema,
   computeRemoteReconciliationReceiptDigest,
+  RemoteRecoveryEvidenceSchema,
+  RemoteReconciliationConnectionSchema,
+  remoteRecoveryEvidenceIdentityKey,
   ReportAckSchema,
   ToRuntimeRelayFrameSchema,
   WorkAvailableSchema,
@@ -79,6 +89,8 @@ import {
   type RemoteRuntimeOwnerResolveResult,
   type RemoteReconciliationAppliedRequest,
   type RemoteReconciliationAppliedResult,
+  type RemoteRecoveryEvidence,
+  type RemoteReconciliationConnection,
   type ReportAck,
   type ToRuntimeRelayFrame,
   type WorkAvailable,
@@ -92,6 +104,7 @@ import { decodeLeaseClaims } from "../lease/lease.js";
  * `:id/provisioning-credential`, `:id/desired-configuration[/ack]`,
  * `:id/readiness`, `:id/heartbeat`, `:id/reconnect`,
  * `:id/runtime-owner/resolve`, `:id/reconciliation/applied`,
+ * `:id/execution-revision-controls/receipt`,
  * `:id/assignments/{pull,claim,report}`, `:id/observations`,
  * `:id/permissions/deferred`, and `:id/capability-tokens/redeem`. Every
  * HTTPS-fallback message carries the same schema and idempotency key as its
@@ -117,6 +130,8 @@ export const CORE_PATHS = Object.freeze({
   reconnect: (instanceId: string) => instancePath(instanceId, "reconnect"),
   runtimeOwnerResolve: (instanceId: string) => instancePath(instanceId, "runtime-owner/resolve"),
   reconciliationApplied: (instanceId: string) => instancePath(instanceId, "reconciliation/applied"),
+  recoveryEvidence: (instanceId: string) => instancePath(instanceId, "recovery-evidence"),
+  executionRevisionControlReceipt: (instanceId: string) => instancePath(instanceId, "execution-revision-controls/receipt"),
   heartbeat: (instanceId: string) => instancePath(instanceId, "heartbeat"),
   assignmentStream: (instanceId: string) => instancePath(instanceId, "assignments/stream"),
   assignmentStreamAck: (instanceId: string) => instancePath(instanceId, "assignments/stream/ack"),
@@ -168,7 +183,7 @@ export const LEASE_AUDIENCE: string = REMOTE_INSTANCE_LEASE_AUDIENCE;
 const ReadinessResultSchema = z.object({ instanceId: z.string(), administrativeStatus: z.literal("active"), lease: z.string().min(1), leaseExpiresAt: z.string(), leaseMode: RemoteLeaseModeSchema, heartbeatIntervalSeconds: z.number().int().positive() }).strict();
 export type { HeartbeatResult } from "@konteks/remote-common";
 const ControlPollSchema = z.object({ frames: z.array(ToRuntimeRelayFrameSchema).max(64) }).strict();
-const ObservationsResultSchema = z.object({ accepted: z.number().int().nonnegative() }).strict();
+const ObservationReceiptSchema = z.object({ stored: z.boolean(), observationId: z.string().min(1), observationDigest: z.string().length(43) }).strict();
 const AckResultSchema = z.object({ accepted: z.boolean() }).strict();
 const ControllerDirectivePullInputSchema = z.object({
   version: PlanningControllerDirectivePullRequestSchema.shape.version,
@@ -249,10 +264,29 @@ export interface CoreClientOptions {
   platformMcpUrl?: string;
 }
 
+const RecoveryEvidenceIngressResultSchema = z.object({
+  instanceId: z.string().min(1),
+  assignmentId: z.string().min(1),
+  attempt: z.number().int().positive(),
+  claimId: z.string().min(1),
+  recoveryEpoch: z.number().int().nonnegative(),
+  evidenceDigest: z.string().min(1),
+  acceptedAt: z.string().datetime(),
+  outcome: z.enum(["accepted", "duplicate"]),
+}).strict();
+export type RecoveryEvidenceIngressResult = z.infer<typeof RecoveryEvidenceIngressResultSchema>;
+
 export class CoreClient {
   private readonly http: JsonClient;
   /** Recovery is authenticated by a machine proof, independent of a predecessor bearer. */
   private readonly proofHttp: JsonClient;
+  /** Trusted keys are scoped to this client’s configured Core origin. */
+  private signingKeyCache: {
+    keys: ReadonlyMap<string, KeyObject>;
+    expiresAtMs: number;
+    unknownKidRefreshUsed: boolean;
+  } | null = null;
+  private signingKeyRefresh: Promise<ReadonlyMap<string, KeyObject>> | null = null;
 
   constructor(private readonly options: CoreClientOptions) {
     const transport = {
@@ -283,7 +317,7 @@ export class CoreClient {
   async refreshProvisioningCredential(request: Omit<RemoteInstanceProvisioningCredentialRefreshRequest, "proof">): Promise<RemoteInstanceProvisioningCredentialRefreshResult> {
     return this.http.request({ method: "POST", path: CORE_PATHS.provisioningCredential(request.instanceId),
       bodyFactory: () => ({ ...request, proof: this.proof("provisioning_refresh", request.instanceId, request as unknown as { [key: string]: JsonValue }) }), schema: RemoteInstanceProvisioningCredentialRefreshResultSchema,
-      idempotencyKey: `provisioning-refresh:${request.instanceId}:${request.manifestDigest}` });
+      idempotencyKey: `provisioning-refresh:${request.instanceId}:${request.manifestDigest}`, operationPolicy: "renewal" });
   }
 
   async submitReadiness(request: Omit<RemoteInstanceReadinessRequest, "proof">): Promise<z.infer<typeof ReadinessResultSchema>> {
@@ -296,6 +330,7 @@ export class CoreClient {
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionReady(instanceId),
       bodyFactory: () => RemoteExecutionReadyRequestSchema.parse({ ...request, proof: this.proof("execution_ready", instanceId, request) }), schema: RemoteExecutionReadyResultSchema,
       idempotencyKey: `execution-ready:${request.assignmentId}:${request.attempt}:${request.claimId}:${request.recoveryEpoch}`,
+      operationPolicy: "admissionPreparation",
       ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
     if (result.instanceId !== instanceId || result.assignmentId !== request.assignmentId || result.attempt !== request.attempt || result.claimId !== request.claimId || result.recoveryEpoch !== request.recoveryEpoch ||
         result.runnerIncarnation !== request.runnerIncarnation || result.agentId !== request.agentId || result.acpSessionRef !== request.acpSessionRef) {
@@ -308,14 +343,16 @@ export class CoreClient {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
     return this.http.request({ method: "POST", path: CORE_PATHS.executionConsume(instanceId, executionId),
       bodyFactory: () => RemoteExecutionConsumeRequestSchema.parse({ ...request, proof: this.proof("execution_consume", subject, request) }), schema: RemoteExecutionConsumeResultSchema,
-      idempotencyKey: `execution-consume:${executionId}:${request.permitId}:${request.operationId}` });
+      idempotencyKey: `execution-consume:${executionId}:${request.permitId}:${request.operationId}`, operationPolicy: "admissionPreparation" });
   }
 
-  async checkExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">) {
+  async checkExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">, deadlineAtMs?: number) {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionCheck(instanceId, executionId),
       bodyFactory: () => RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) }), schema: RemoteExecutionCheckResultSchema,
-      idempotencyKey: `execution-check:${executionId}:${request.executionRevision}` });
+      idempotencyKey: `execution-check:${executionId}:${request.executionRevision}`,
+      operationPolicy: "executionCheck",
+      ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
     if (result.executionId !== executionId || result.executionRevision !== request.executionRevision) {
       throw new RemoteInstanceError("execution_fenced", "Execution check response belongs to another execution.");
     }
@@ -326,14 +363,16 @@ export class CoreClient {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
     return this.http.request({ method: "POST", path: CORE_PATHS.deliveryExecutionConsume(instanceId, executionId),
       bodyFactory: () => RemoteExecutionConsumeRequestSchema.parse({ ...request, proof: this.proof("execution_consume", subject, request) }), schema: RemoteExecutionConsumeResultSchema,
-      idempotencyKey: `delivery-execution-consume:${executionId}:${request.permitId}:${request.operationId}` });
+      idempotencyKey: `delivery-execution-consume:${executionId}:${request.permitId}:${request.operationId}`, operationPolicy: "admissionPreparation" });
   }
 
-  async checkDeliveryExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">) {
+  async checkDeliveryExecution(instanceId: string, executionId: string, request: Omit<RemoteExecutionCheckRequest, "proof">, deadlineAtMs?: number) {
     const subject = remoteExecutionInstanceProofSubject(instanceId, executionId);
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.deliveryExecutionCheck(instanceId, executionId),
       bodyFactory: () => RemoteExecutionCheckRequestSchema.parse({ ...request, proof: this.proof("execution_check", subject, request) }), schema: RemoteExecutionCheckResultSchema,
-      idempotencyKey: `delivery-execution-check:${executionId}:${request.executionRevision}` });
+      idempotencyKey: `delivery-execution-check:${executionId}:${request.executionRevision}`,
+      operationPolicy: "executionCheck",
+      ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
     if (result.executionId !== executionId || result.executionRevision !== request.executionRevision) {
       throw new RemoteInstanceError("execution_fenced", "Delivery check response belongs to another execution.");
     }
@@ -341,14 +380,39 @@ export class CoreClient {
   }
 
   /** Trust comes only from the configured Core origin, never a token URL/header. */
-  async executionSigningKeys(): Promise<ReadonlyMap<string, KeyObject>> {
+  async executionSigningKeys(deadlineAtMs?: number, expectedKid?: string): Promise<ReadonlyMap<string, KeyObject>> {
+    const cached = this.signingKeyCache;
+    let refreshUnknownKid = false;
+    if (cached && cached.expiresAtMs > Date.now()) {
+      refreshUnknownKid = Boolean(expectedKid && !cached.keys.has(expectedKid) && !cached.unknownKidRefreshUsed);
+      if (!refreshUnknownKid) return cached.keys;
+    }
+    if (!this.signingKeyRefresh) {
+      this.signingKeyRefresh = this.fetchExecutionSigningKeys().then(keys => {
+        // Core currently does not publish a shorter keyset max-age. Keep the
+        // configured-origin cache below the C05 60-second upper bound.
+        this.signingKeyCache = {
+          keys,
+          expiresAtMs: Date.now() + 60_000,
+          // A signed-operation header can request one refresh of a still-valid
+          // configured-origin epoch. Further unknown identifiers fail closed
+          // until normal expiry, preventing attacker-controlled fetch loops.
+          unknownKidRefreshUsed: refreshUnknownKid,
+        };
+        return keys;
+      }).finally(() => { this.signingKeyRefresh = null; });
+    }
+    return this.waitForSigningKeys(this.signingKeyRefresh, deadlineAtMs);
+  }
+
+  private async fetchExecutionSigningKeys(): Promise<ReadonlyMap<string, KeyObject>> {
     const keySchema = z.object({ kty: z.literal("RSA"), kid: z.string().min(1).max(256),
       alg: z.literal("RS256").optional(), use: z.literal("sig").optional(),
       n: z.string().min(1).max(2048).regex(/^[A-Za-z0-9_-]+$/), e: z.string().min(1).max(16).regex(/^[A-Za-z0-9_-]+$/),
     }).strict();
     try {
       const result = await this.proofHttp.request({ method: "GET", path: CORE_PATHS.jwks,
-        schema: z.object({ keys: z.array(keySchema).min(1).max(32) }).strict() });
+        schema: z.object({ keys: z.array(keySchema).min(1).max(32) }).strict(), operationPolicy: "progressRead" });
       const keys = new Map<string, KeyObject>();
       for (const jwk of result.keys) {
         if (keys.has(jwk.kid)) throw new Error("Duplicate signing key");
@@ -359,6 +423,23 @@ export class CoreClient {
       return keys;
     } catch {
       throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.");
+    }
+  }
+
+  private async waitForSigningKeys(refresh: Promise<ReadonlyMap<string, KeyObject>>, deadlineAtMs?: number): Promise<ReadonlyMap<string, KeyObject>> {
+    if (deadlineAtMs === undefined) return refresh;
+    const remainingMs = deadlineAtMs - Date.now();
+    if (remainingMs <= 0) throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        refresh,
+        new Promise<ReadonlyMap<string, KeyObject>>((_, reject) => {
+          timer = setTimeout(() => reject(new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.")), remainingMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -410,6 +491,55 @@ export class CoreClient {
       idempotencyKey: `reconciliation-applied:${request.instanceId}:${request.manifestId}:${digest}` });
     if (result.instanceId !== request.instanceId || result.runnerIncarnation !== request.runnerIncarnation || result.manifestId !== request.manifestId || result.receiptDigest !== digest) {
       throw new RemoteInstanceError("registration_mismatch", "Applied receipt response does not match the submitted recovery generation.");
+    }
+    return result;
+  }
+
+  /**
+   * Submit an already-durable C03 stop observation. This route is a private,
+   * machine-proof boundary; its acknowledgement records only acceptance of
+   * observation bytes and never a terminal result or quiescence decision.
+   */
+  async submitRecoveryEvidence(input: { evidence: RemoteRecoveryEvidence; connection: RemoteReconciliationConnection }): Promise<RecoveryEvidenceIngressResult> {
+    const evidence = RemoteRecoveryEvidenceSchema.parse(structuredClone(input.evidence));
+    const connection = RemoteReconciliationConnectionSchema.parse(structuredClone(input.connection));
+    const request = { evidence, connection };
+    const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.recoveryEvidence(evidence.instanceId),
+      bodyFactory: () => ({ ...request, proof: this.proof("recovery_evidence", evidence.instanceId, request as unknown as { [key: string]: JsonValue }) }),
+      schema: RecoveryEvidenceIngressResultSchema,
+      idempotencyKey: `recovery-evidence:${remoteRecoveryEvidenceIdentityKey(evidence)}:${evidence.evidenceDigest}` });
+    if (result.instanceId !== evidence.instanceId || result.assignmentId !== evidence.assignmentId || result.attempt !== evidence.attempt ||
+        result.claimId !== evidence.claimId || result.recoveryEpoch !== evidence.recoveryEpoch || result.evidenceDigest !== evidence.evidenceDigest) {
+      throw new RemoteInstanceError("registration_mismatch", "Recovery evidence response does not match the submitted observation.");
+    }
+    return result;
+  }
+
+  /** Creates one proof-bearing receipt that a durable sender can replay byte-for-byte. */
+  createExecutionRevisionFenceReceiptRequest(receipt: NativeExecutionRevisionFenceReceipt): NativeExecutionRevisionFenceReceiptRequest {
+    const parsed = NativeExecutionRevisionFenceReceiptSchema.parse(structuredClone(receipt));
+    return NativeExecutionRevisionFenceReceiptRequestSchema.parse({
+      ...parsed,
+      proof: this.proof("execution_revision_fence_receipt", parsed.intent.instanceId, parsed as unknown as { [key: string]: JsonValue }),
+    });
+  }
+
+  /** Submit an exact, previously durable fence receipt; this never asserts a stop or terminal outcome. */
+  async submitExecutionRevisionFenceReceipt(request: NativeExecutionRevisionFenceReceiptRequest): Promise<NativeExecutionRevisionFenceReceiptResult> {
+    const parsed = NativeExecutionRevisionFenceReceiptRequestSchema.parse(structuredClone(request));
+    const result = await this.proofHttp.request({
+      method: "POST",
+      path: CORE_PATHS.executionRevisionControlReceipt(parsed.intent.instanceId),
+      bodyFactory: () => parsed,
+      schema: NativeExecutionRevisionFenceReceiptResultSchema,
+      idempotencyKey: `execution-revision-fence-receipt:${parsed.intentDigest}:${parsed.runnerIncarnation}:${parsed.connectionRef}:${parsed.connectionEpoch}`,
+    });
+    if (result.kind !== parsed.kind || result.intentDigest !== parsed.intentDigest ||
+        result.runnerIncarnation !== parsed.runnerIncarnation || result.connectionRef !== parsed.connectionRef ||
+        result.connectionEpoch !== parsed.connectionEpoch || result.fencedAt !== parsed.fencedAt ||
+        result.requestNonce !== parsed.proof.nonce ||
+        jcsDigest(result.intent) !== jcsDigest(parsed.intent)) {
+      throw new RemoteInstanceError("registration_mismatch", "Execution revision fence receipt does not match the submitted fence.");
     }
     return result;
   }
@@ -513,11 +643,23 @@ export class CoreClient {
     return this.http.request({ method: "POST", path: CORE_PATHS.report(instanceId), body: report, schema: ReportAckSchema, idempotencyKey: `report:${report.reportId}` });
   }
 
+  /** The mounted Core route accepts one body, and replies only after commit. */
+  async submitObservation(instanceId: string, body: unknown): Promise<void> {
+    const parsed = AgentTurnUsageObservationSchema.safeParse(body);
+    const observation = parsed.success ? parsed.data : GatewayCallObservationSchema.parse(body);
+    if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Observation instance mismatch");
+    const digest = jcsDigest(observation as unknown as JsonValue);
+    const kind = observation.moneyBasis === "gateway_priced" ? "gw" : "turn";
+    const expectedId = `ri:${kind}:${instanceId}:${observation.assignmentId}:${observation.attempt}:${digest.slice(0, 24)}`;
+    const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId), body: observation,
+      schema: ObservationReceiptSchema, idempotencyKey: `observation:${expectedId}`, operationPolicy: "progressRead" });
+    if (result.observationId !== expectedId || result.observationDigest !== digest)
+      throw new RemoteInstanceError("registration_mismatch", "Observation receipt does not match submitted bytes");
+  }
+
   async observations(instanceId: string, observations: unknown[]): Promise<number> {
-    const body = { observations };
-    const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId), body, schema: ObservationsResultSchema,
-      idempotencyKey: `observations:${instanceId}:${jcsDigest(body as unknown as JsonValue)}` });
-    return result.accepted;
+    for (const observation of observations) await this.submitObservation(instanceId, observation);
+    return observations.length;
   }
 
   async controlAck(instanceId: string, ack: unknown): Promise<boolean | Extract<ReturnType<typeof DesiredConfigurationAckResultSchema.parse>, { status: "superseded" }>> {

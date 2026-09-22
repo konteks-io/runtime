@@ -187,7 +187,11 @@ export class ChannelMux {
       state = {
         channel,
         nextSeq: 1,
-        buffer: new ReplayBuffer<ToCoreRelayFrame>({ maxBytes: this.options.replayBufferBytes, maxAgeMs: this.options.replayBufferAgeMs }),
+        // Logical sessions survive idle time between assignments. Expiring an
+        // unacknowledged final frame here would poison the next ready frame.
+        // Keep endpoint-ACK ownership and the byte bound, including on restore.
+        buffer: new ReplayBuffer<ToCoreRelayFrame>({ maxBytes: this.options.replayBufferBytes,
+          maxAgeMs: channel === "session" ? Number.POSITIVE_INFINITY : this.options.replayBufferAgeMs }),
         receivedCursor: 0,
         ackedByEndpoint: 0,
         lastAckAt: this.options.clock.now(),
@@ -402,6 +406,13 @@ export class ChannelMux {
     const sendGeneration = this.generation;
     void this.serialize(async () => {
       await this.persist(this.durableState());
+      if (channel === "session" && (body as { kind?: string }).kind === "session_ready") {
+        this.logger.info({ event: "relay.session_ready.persisted", channelId, seq, connectionEpoch: this.epoch,
+          connected: this.connected, stalled: state.stalled, recoveryPermitted: this.recovery.permits(channel),
+          generationChanged: this.generation !== sendGeneration,
+          persistenceMs: Math.max(0, this.options.clock.now() - Date.parse(frame.issuedAt)) },
+          "session readiness retained for endpoint delivery");
+      }
       if (this.generation !== sendGeneration || this.channels.get(channelId) !== state ||
           !state.buffer.snapshot().some(entry => entry.seq === seq)) return;
       if (this.connected && !state.stalled && this.recovery.permits(channel)) this.options.emit({ ...frame, connectionEpoch: this.epoch });
@@ -665,6 +676,9 @@ export class ChannelMux {
     this.logger.warn({ event: "relay.channel.reset", channelId, channel: state.channel, connectionEpoch: this.epoch,
       reason, nextSeq: state.nextSeq, ackedByEndpoint: state.ackedByEndpoint, receivedCursor: state.receivedCursor,
       unackedCount: state.buffer.unackedCount, unackedBytes: state.buffer.unackedBytes,
+      oldestUnackedAgeMs: state.buffer.snapshot()[0] ? Math.max(0, this.options.clock.now() - state.buffer.snapshot()[0]!.enqueuedAt) : null,
+      replayMaxBytes: this.options.replayBufferBytes,
+      replayRetention: state.channel === "session" ? "endpoint_ack_or_byte_limit" : "age_or_byte_limit",
       ...peer }, "channel replay reset");
   }
 

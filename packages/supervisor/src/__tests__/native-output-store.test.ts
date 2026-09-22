@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { computeRemoteDeliveryOutputDigest, computeRemoteFileTreeDigest } from "@konteks/remote-common";
 import { NativeOutputSessionHeadStore, NativeOutputStore } from "../native/output-store.js";
 
@@ -32,8 +32,35 @@ describe("durable native output state", () => {
     expect(await new NativeOutputStore(dir).read()).toEqual({ version: 1, state: "accepted", candidate, completion, receipt });
   });
 
+  it("emits bounded durable-write and fsync telemetry without record paths or payload bytes", async () => {
+    const { candidate, receipt, completion } = fixture("c01-correlation", "claim-secret");
+    const info = vi.fn();
+    const store = new NativeOutputStore(dir, undefined, undefined, { logger: { info } as never });
+    await store.savePending(candidate, completion);
+    await store.saveAccepted(candidate, receipt);
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({ event: "native.output.persisted", correlationId: "c01-correlation",
+      stage: "store", outcome: "pending", bytes: expect.any(Number), fsyncDurationMs: expect.any(Number), durationMs: expect.any(Number) }), expect.any(String));
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({ event: "native.output.persisted", correlationId: "c01-correlation",
+      stage: "store", outcome: "accepted", resultDigest: candidate.resultDigest }), expect.any(String));
+    expect(JSON.stringify(info.mock.calls)).not.toContain("generated\\n");
+    expect(JSON.stringify(info.mock.calls)).not.toContain("delivery-output");
+  });
+
   it("fails closed on a corrupt or overly permissive record", async () => {
     await writeFile(join(dir, "delivery-output.json"), "{}\n", { mode: 0o644 });
+    await expect(new NativeOutputStore(dir).read()).rejects.toThrow();
+  });
+
+  it("rejects an accepted record whose receipt belongs to another frozen result", async () => {
+    const { candidate, receipt, completion } = fixture();
+    await writeFile(join(dir, "delivery-output.json"), JSON.stringify({
+      version: 1,
+      state: "accepted",
+      candidate,
+      completion,
+      receipt: { ...receipt, resultId: "another-result" },
+    }), { mode: 0o600 });
+
     await expect(new NativeOutputStore(dir).read()).rejects.toThrow();
   });
 

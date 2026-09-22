@@ -33,6 +33,10 @@ export const OnboardStateSchema = z
       "push",
       /** The person said yes to the push; the next run performs it, so the agent can say it is under way. */
       "pushing",
+      /** Graft is offered for the repository (W1-G1). */
+      "graft",
+      /** The person said yes to Graft; the next run sets it up, so the agent can say it is under way. */
+      "graft_setup",
       "first_task",
       /** The workspace's agents are being set up from what this machine advertises. */
       "agents",
@@ -45,6 +49,8 @@ export const OnboardStateSchema = z
     emailMasked: z.string().min(1).optional(),
     /** An address to send a fresh code to without asking again, after a lost bind. */
     resendTo: z.string().min(1).optional(),
+    /** Why a fresh code is being sent, said with it (W1-Z2). */
+    resendReason: z.string().min(1).optional(),
     /** The address the person gave, needed once more at bind (OS6). */
     email: z.string().min(1).optional(),
     decision: z.enum(["join", "choose", "create"]).optional(),
@@ -76,7 +82,12 @@ export const OnboardStateSchema = z
     closing: z.boolean().optional(),
     /** The runtime this machine was before it lost its key; the next bind replaces it (W1-L1). */
     replaces: z.string().min(1).optional(),
+    /** What happened to Graft, and for which repository; it is never offered twice (W1-G2). */
+    graftDecision: z.enum(["accepted", "declined", "unavailable", "failed"]).optional(),
+    graftRepository: z.string().optional(),
     systemId: z.string().optional(),
+    /** The System already existed in the workspace; this machine joined it (WS1-089). */
+    systemExisting: z.boolean().optional(),
     systemEntityRef: z.string().optional(),
     managedRemoteUrl: z.string().optional(),
     /** The managed repository's SSH URL, pushed to with the runtime's key (WS1-021). */

@@ -1,11 +1,13 @@
 import type { KeyObject } from "node:crypto";
 import {
   RemoteAuthorizedOperationSchema, RemoteExecutionAuthorityViewSchema, RemoteInstanceError,
-  verifyRemoteExecutionOperationSignature, verifyRemoteExecutionAdmission, verifyRemoteExecutionCheckLease,
-  RemoteDeliveryExecutionAuthorityViewSchema, verifyRemoteDeliveryOperationSignature, verifyRemoteDeliveryAdmission, verifyRemoteDeliveryCheckLease,
+  verifyRemoteExecutionOperationSignature, verifyRemoteExecutionAdmission, verifyRemoteExecutionAdmissionEvidence, verifyRemoteExecutionCheckLease,
+  RemoteDeliveryExecutionAuthorityViewSchema, verifyRemoteDeliveryOperationSignature, verifyRemoteDeliveryAdmission, verifyRemoteDeliveryAdmissionEvidence, verifyRemoteDeliveryCheckLease,
   canonicalize, type JsonValue, type RemoteDeliveryExecutionAuthorityView, type RemoteDeliveryOperationPermitClaims,
   type RemoteAuthorizedOperation, type RemoteExecutionAuthorityView, type RemoteExecutionOperationPermitClaims,
-  type Clock, type RemoteWorkAssignment, type SessionToCoreMessage,
+  createLogger, type Logger, type Clock, type RemoteWorkAssignment, type SessionToCoreMessage,
+  NativeExecutionRevisionFenceReceiptSchema,
+  type NativeExecutionRevisionFenceReceipt,
 } from "@konteks/remote-common";
 import type { CoreClient } from "../core/client.js";
 import type { SupervisorJournal } from "../state/journal.js";
@@ -20,7 +22,15 @@ export interface NativeExecutionGateOptions {
     Partial<Pick<CoreClient, "consumeDeliveryExecution" | "checkDeliveryExecution">>;
   assertOwned: () => void;
   onAuthorityLost: () => Promise<void>;
+  /** Present only when the live native relay owner can prove its exact socket. */
+  currentRevisionFenceConnection?: () => {
+    connectionRef: string;
+    connectionEpoch: number;
+  } | null;
+  /** Durable C02 receipt delivery; failure cannot alter local fence behavior. */
+  onFenceApplied?: (receipt: NativeExecutionRevisionFenceReceipt) => Promise<void>;
   monotonicNow?: () => number;
+  logger?: Logger;
 }
 type Authority = RemoteExecutionAuthorityView | RemoteDeliveryExecutionAuthorityView;
 const delivery = (value: Authority): value is RemoteDeliveryExecutionAuthorityView => "workloadKind" in value;
@@ -30,16 +40,29 @@ export interface AuthorizedNativeOperation {
   authority: Authority;
   replayCompletion?: SessionToCoreMessage;
   replay: boolean;
+  admissionFailure?: RemoteInstanceError;
 }
 const fenced = () => new RemoteInstanceError("execution_fenced", "Native execution authority is no longer current.");
 const unavailable = () => new RemoteInstanceError("execution_authority_unavailable", "Fresh execution authority is unavailable.");
-/** How long a running turn outlives its check lease while Core is only slow or
- * unreachable. Long enough to ride out a Core restart (~2.5 min observed); a
- * definitive refusal still stops it at once, and no new operation is admitted
- * without a fresh check. */
-export const NATIVE_CHECK_GRACE_MS = 300_000;
-/** Only Core saying no, or the local claim no longer matching, ends a turn.
- * A late, failed or unreadable renewal is not evidence that authority moved. */
+const signedOperationKeyId = (permit: string): string | undefined => {
+  try {
+    const header = JSON.parse(Buffer.from(permit.split(".", 1)[0] ?? "", "base64url").toString("utf8"));
+    return typeof header.kid === "string" && header.kid.length > 0 && header.kid.length <= 256
+      ? header.kid
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+/** The whole trust fetch and signed check exchange share this one budget. */
+export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 12_000;
+const RENEWAL_RETRY_DELAY_MS = 1_000;
+// Begin while a full busy-host event-loop pause can still elapse before the
+// verified lease expires. A collaboration/Core restart has produced a 19 s
+// pause in practice; a 25 s renewal lead avoids lengthening the
+// authority Core issued. Retries remain fenced by the original monotonic
+// deadline, so this changes availability rather than trust semantics.
+const RENEWAL_LEAD_MS = 25_000;
 const transientLoss = (error: unknown): boolean =>
   error instanceof RemoteInstanceError &&
   (error.code === "execution_authority_unavailable" || error.code === "temporarily_unavailable" || error.retryable);
@@ -50,7 +73,8 @@ export class NativeExecutionGate {
   private readonly operations: OperationAdmissionJournal;
   private keys: ReadonlyMap<string, KeyObject> | null = null;
   private authority: Authority | null = null;
-  private checkDeadline = 0;
+  /** The fresh, signed Core check that the next revision fence must name. */
+  private checkId: string | null = null;
   private monotonicDeadline = 0;
   private refreshAfter = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -58,20 +82,31 @@ export class NativeExecutionGate {
   private stopped = false;
   private authorityStop: Promise<void> | null = null;
   private readonly monotonic: () => number;
+  private readonly logger: Logger;
 
   constructor(private readonly options: NativeExecutionGateOptions) {
+    this.logger = options.logger ?? createLogger({ name: "native-execution-gate" });
     this.operations = new OperationAdmissionJournal(options.journal, options.clock);
     this.monotonic = options.monotonicNow ?? (() => performance.now());
   }
 
   async admit(raw: unknown): Promise<AuthorizedNativeOperation> {
+    try { return await this.admitImpl(raw); }
+    catch (error) {
+      this.logger.warn({ event: "execution.admission_refused", assignmentId: this.options.assignment.id,
+        attempt: this.options.assignment.attempt, diagnostic: error instanceof RemoteInstanceError ? error.diagnostic ?? error.code : verificationReason(error) }, "Native operation admission refused");
+      throw error;
+    }
+  }
+
+  private async admitImpl(raw: unknown): Promise<AuthorizedNativeOperation> {
     const parsed = RemoteAuthorizedOperationSchema.safeParse(raw);
     if (!parsed.success) throw new RemoteInstanceError("operation_permit_required", "A signed execution operation is required.");
     const envelope = parsed.data;
     this.options.assertOwned();
     if (this.stopped) throw fenced();
     // Fetch only the configured Core trust. No token header may select a URL.
-    const keys = await this.options.client.executionSigningKeys();
+    const keys = await this.options.client.executionSigningKeys(undefined, signedOperationKeyId(envelope.permit));
     this.options.assertOwned();
     const ref = this.options.journal.assignments.get(`${this.options.assignment.id}:${this.options.assignment.attempt}`)?.executionReady?.acpSessionRef;
     const message = envelope.message;
@@ -82,7 +117,15 @@ export class NativeExecutionGate {
     const replay = prior?.state === "completed" || prior?.state === "denied";
     const verifier = this.options.assignment.source.kind === "harness_delivery" ? verifyRemoteDeliveryOperationSignature : verifyRemoteExecutionOperationSignature;
     const claims = verifier({ operation: envelope, trustedKeys: keys,
+      issuedAtToleranceSeconds: 1,
       nowSeconds: replay ? prior.claims.iat : Math.floor(this.options.clock.coreNow() / 1000) });
+    // A retry may not consume a second operation for the same durable ACP
+    // request. Refuse before Core consumption can create another orphan.
+    if (prior && (prior.claims.permitId !== claims.permitId || prior.claims.operationId !== claims.operationId ||
+      prior.claims.payloadDigest !== claims.payloadDigest || prior.claims.executionId !== claims.executionId ||
+      prior.claims.executionRevision !== claims.executionRevision)) {
+      throw new RemoteInstanceError("operation_conflict", "The ACP request already has a different durable admission.");
+    }
     const authority = this.localAuthority(claims, replay);
     if (replay) {
       if (prior.claims.permitId !== claims.permitId || prior.claims.operationId !== claims.operationId ||
@@ -102,21 +145,48 @@ export class NativeExecutionGate {
     this.localAuthority(claims);
     const receiptInput = { operation: envelope, receipt: consumed.receipt,
       admissionId: consumed.admissionId, trustedKeys: keys,
-      authenticatedProducer: claims.sender.principal, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000) };
-    const receipt = delivery(authority)
-      ? verifyRemoteDeliveryAdmission({ ...receiptInput, currentAuthority: authority })
-      : verifyRemoteExecutionAdmission({ ...receiptInput, currentAuthority: authority });
+      authenticatedProducer: claims.sender.principal, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000), issuedAtToleranceSeconds: 1 };
+    let receipt;
+    let admissionFailure: RemoteInstanceError | undefined;
+    try {
+      receipt = delivery(authority)
+        ? verifyRemoteDeliveryAdmission({ ...receiptInput, currentAuthority: authority })
+        : verifyRemoteExecutionAdmission({ ...receiptInput, currentAuthority: authority });
+    } catch (error) {
+      // Consumption has already committed in Core. A genuine receipt that
+      // arrived too late is retained for a non-dispatch disposition; it must
+      // never disappear merely because it no longer grants current authority.
+      receipt = delivery(authority)
+        ? verifyRemoteDeliveryAdmissionEvidence({ ...receiptInput, currentAuthority: authority })
+        : verifyRemoteExecutionAdmissionEvidence({ ...receiptInput, currentAuthority: authority });
+      const reason = verificationReason(error);
+      admissionFailure = new RemoteInstanceError(reason === "expired" ? "operation_expired" : "operation_permit_invalid",
+        "The operation admission is not currently valid.", { diagnostic: reason });
+    }
     await this.operations.admit(receipt, consumed.receipt, () => { this.localAuthority(claims); });
+    this.logger.info({ event: "execution.admission_retained", assignmentId: claims.assignmentId, attempt: claims.attempt,
+      claimId: claims.claimId, executionId: claims.executionId, operationId: claims.operationId, permitId: claims.permitId,
+      admissionId: receipt.admissionId, outcome: admissionFailure ? "refused_before_dispatch" : "admitted",
+      ...(admissionFailure ? { diagnostic: admissionFailure.diagnostic } : {}) }, "Native operation admission retained");
     this.keys = keys;
     this.authority = authority;
-    return { key: admittedOperationKey(receipt), envelope, authority, replay: false };
+    return { key: admittedOperationKey(receipt), envelope, authority, replay: false, ...(admissionFailure ? { admissionFailure } : {}) };
   }
 
   /** Called immediately before the bridge call, after any local preparation IO. */
   async begin(operation: AuthorizedNativeOperation): Promise<boolean> {
     if (operation.replay) return false;
     try {
+      if (operation.admissionFailure) throw operation.admissionFailure;
+      // A fence is scoped to one signed check, so establish that check before
+      // deciding whether the durable control record applies to this dispatch.
       await this.refresh();
+      const fence = this.durableRevisionFence(operation.authority);
+      if (fence) {
+        await this.fenceAuthority();
+        this.recordAppliedFence(fence);
+        throw fenced();
+      }
       const started = await this.operations.begin(operation.key, () => this.assertDispatchCurrent(operation.authority));
       this.assertDispatchCurrent(operation.authority);
       if (started && !this.timer) {
@@ -194,7 +264,50 @@ export class NativeExecutionGate {
   private assertDispatchCurrent(authority: Authority): void {
     this.localAuthority(authority);
     if (this.authority?.executionId !== authority.executionId || this.authority.executionRevision !== authority.executionRevision ||
-      this.checkDeadline <= this.options.clock.coreNow() || this.monotonicDeadline <= this.monotonic()) throw unavailable();
+      this.monotonicDeadline <= this.monotonic()) throw unavailable();
+    if (this.hasDurableRevisionFence(authority)) throw fenced();
+  }
+
+  /**
+   * The receiver verified the Core signature and exact live socket before
+   * persisting this record. The gate still requires the same current local
+   * runner and socket before it suppresses work, so a retained old-socket fact
+   * cannot fence a replacement execution.
+   */
+  private hasDurableRevisionFence(authority: Authority): boolean {
+    return this.durableRevisionFence(authority) !== null;
+  }
+
+  private durableRevisionFence(authority: Authority) {
+    const connection = this.options.currentRevisionFenceConnection?.();
+    const checkId = this.checkId;
+    if (!connection || !checkId) return null;
+    return this.options.journal.executionRevisionFences.pending().find(
+      (record) =>
+        record.runnerIncarnation === authority.runnerIncarnation &&
+        record.connectionRef === connection.connectionRef &&
+        record.connectionEpoch === connection.connectionEpoch &&
+        record.intent.instanceId === authority.instanceId &&
+        record.intent.executionId === authority.executionId &&
+        record.intent.executionRevision === authority.executionRevision &&
+        record.intent.checkId === checkId &&
+        record.intent.connectionRef === connection.connectionRef &&
+        record.intent.connectionEpoch === connection.connectionEpoch,
+    ) ?? null;
+  }
+
+  private recordAppliedFence(record: ReturnType<NativeExecutionGate["durableRevisionFence"]>): void {
+    if (!record || !this.options.onFenceApplied) return;
+    const receipt = NativeExecutionRevisionFenceReceiptSchema.parse({
+      kind: "execution_revision_fenced",
+      intent: record.intent,
+      intentDigest: record.intentDigest,
+      runnerIncarnation: record.runnerIncarnation,
+      connectionRef: record.connectionRef,
+      connectionEpoch: record.connectionEpoch,
+      fencedAt: this.options.clock.nowIso(),
+    });
+    void this.options.onFenceApplied(receipt).catch(() => undefined);
   }
 
   private refresh(): Promise<void> {
@@ -209,48 +322,101 @@ export class NativeExecutionGate {
     const authority = this.authority;
     if (!authority || !this.keys) throw unavailable();
     this.localAuthority(authority);
-    const keys = await this.options.client.executionSigningKeys();
-    this.localAuthority(authority);
-    const check = delivery(authority) ? this.options.client.checkDeliveryExecution : this.options.client.checkExecution;
-    if (!check) throw unavailable();
-    const result = await check.call(this.options.client, authority.instanceId, authority.executionId, {
-      executionRevision: authority.executionRevision, readyRevision: authority.readyRevision, runnerIncarnation: authority.runnerIncarnation,
-    });
-    this.localAuthority(authority);
-    const checkInput = { lease: result.lease, trustedKeys: keys, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000) };
-    const claims = delivery(authority) ? verifyRemoteDeliveryCheckLease({ ...checkInput, currentAuthority: authority })
-      : verifyRemoteExecutionCheckLease({ ...checkInput, currentAuthority: authority });
-    if (result.executionId !== authority.executionId || result.executionRevision !== authority.executionRevision || Date.parse(result.expiresAt) !== claims.exp * 1000) throw fenced();
-    this.keys = keys;
-    this.checkDeadline = claims.exp * 1000;
-    this.monotonicDeadline = this.monotonic() + Math.max(0, this.checkDeadline - this.options.clock.coreNow());
-    this.refreshAfter = this.monotonic() + 10_000;
+    // The first check establishes a lease. Every later renewal is bounded by
+    // both its bounded I/O policy and the last verified monotonic lease;
+    // a slow renewal must not obtain authority after that lease expires.
+    const remainingLeaseMs = this.monotonicDeadline > 0
+      ? Math.max(0, this.monotonicDeadline - this.monotonic())
+      : NATIVE_EXECUTION_RENEWAL_BUDGET_MS;
+    const deadlineAtMs = Date.now() + Math.min(NATIVE_EXECUTION_RENEWAL_BUDGET_MS, remainingLeaseMs);
+    const startedAt = this.monotonic();
+    let stage = "signing_keys";
+    let keysElapsedMs = 0;
+    const context = { assignmentId: authority.assignmentId, attempt: authority.attempt,
+      claimId: authority.claimId, executionId: authority.executionId, executionRevision: authority.executionRevision };
+    try {
+      const keys = await this.options.client.executionSigningKeys(deadlineAtMs);
+      keysElapsedMs = this.monotonic() - startedAt;
+      stage = "check";
+      this.localAuthority(authority);
+      const check = delivery(authority) ? this.options.client.checkDeliveryExecution : this.options.client.checkExecution;
+      if (!check) throw unavailable();
+      const result = await check.call(this.options.client, authority.instanceId, authority.executionId, {
+        executionRevision: authority.executionRevision, readyRevision: authority.readyRevision, runnerIncarnation: authority.runnerIncarnation,
+      }, deadlineAtMs);
+      this.localAuthority(authority);
+      stage = "verification";
+      if (this.monotonicDeadline > 0 && this.monotonic() >= this.monotonicDeadline) throw fenced();
+      const checkInput = { lease: result.lease, trustedKeys: keys, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000), issuedAtToleranceSeconds: 1 };
+      let claims;
+      try {
+        claims = delivery(authority) ? verifyRemoteDeliveryCheckLease({ ...checkInput, currentAuthority: authority })
+          : verifyRemoteExecutionCheckLease({ ...checkInput, currentAuthority: authority });
+      } catch (error) {
+        this.logger.warn({ event: "execution.check_refused", assignmentId: authority.assignmentId, attempt: authority.attempt,
+          claimId: authority.claimId, executionId: authority.executionId, executionRevision: authority.executionRevision,
+          diagnostic: verificationReason(error), skewMs: this.options.clock.skewMs(), issuedAtToleranceSeconds: 1 }, "Native execution check refused");
+        throw new RemoteInstanceError("execution_fenced", "Invalid execution check lease", { diagnostic: verificationReason(error) });
+      }
+      if (result.executionId !== authority.executionId || result.executionRevision !== authority.executionRevision || Date.parse(result.expiresAt) !== claims.exp * 1000) throw fenced();
+      this.keys = keys;
+      this.checkId = claims.checkId;
+      const remainingMs = Math.max(0, claims.exp * 1000 - this.options.clock.coreNow());
+      this.monotonicDeadline = this.monotonic() + remainingMs;
+      this.refreshAfter = Math.max(this.monotonic(), this.monotonicDeadline - Math.min(RENEWAL_LEAD_MS, remainingMs));
+      this.logger.info({ event: "execution.renewal_completed", ...context,
+        elapsedMs: this.monotonic() - startedAt, keysElapsedMs,
+        remainingLeaseMs: remainingMs, nextRenewalInMs: Math.max(0, this.refreshAfter - this.monotonic()),
+        skewMs: this.options.clock.skewMs() }, "Native execution lease verified");
+    } catch (error) {
+      this.logger.warn({ event: "execution.renewal_failed", ...context, stage,
+        elapsedMs: this.monotonic() - startedAt, keysElapsedMs,
+        budgetMs: Math.min(NATIVE_EXECUTION_RENEWAL_BUDGET_MS, remainingLeaseMs),
+        remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
+        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
+        retryable: transientLoss(error), skewMs: this.options.clock.skewMs() }, "Native execution renewal failed");
+      throw error;
+    }
   }
 
   private async tick(): Promise<void> {
     if (this.stopped || !this.authority) return;
     try {
-      let current = true;
-      try { this.assertDispatchCurrent(this.authority); } catch (error) {
-        if (!this.withinGrace(error)) throw error;
-        current = false;
-      }
-      if (!current || this.monotonic() >= this.refreshAfter) await this.refresh();
+      this.assertDispatchCurrent(this.authority);
+      if (!this.refreshing && this.monotonic() >= this.refreshAfter) await this.refresh();
     } catch (error) {
       if (this.stopped) return;
-      // A renewal that is merely late (Core answered checks in ~16s under
-      // load, past a 30s lease renewed every 10s) used to kill a finished
-      // turn whose result was about to be reported. It keeps renewing through
-      // a bounded grace instead; begin() stays strict meanwhile, and a
-      // definitive refusal still stops the turn at once.
-      if (this.withinGrace(error)) return;
-      this.stop();
-      this.authorityStop = Promise.resolve().then(() => this.options.onAuthorityLost());
-      await this.authorityStop.catch(() => undefined); // Retained for owner teardown.
+      if (this.canRetryRenewal(error)) {
+        this.refreshAfter = Math.min(this.monotonicDeadline, this.monotonic() + RENEWAL_RETRY_DELAY_MS);
+        this.logger.warn({ event: "execution.renewal_retry_scheduled", executionId: this.authority?.executionId,
+          remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
+          retryInMs: Math.max(0, this.refreshAfter - this.monotonic()) }, "Retrying within the verified execution lease");
+        return;
+      }
+      this.logger.warn({ event: "execution.renewal_fenced", executionId: this.authority?.executionId,
+        remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
+        renewalInFlight: this.refreshing !== null,
+        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" }, "Execution authority can no longer renew safely");
+      await this.fenceAuthority();
     }
   }
 
-  private withinGrace(error: unknown): boolean {
-    return transientLoss(error) && this.monotonic() < this.monotonicDeadline + NATIVE_CHECK_GRACE_MS;
+  private canRetryRenewal(error: unknown): boolean {
+    // Optional continuationPolicy claims are intentionally not a local grant
+    // yet: runtime has not qualified the exact operation/provider-side-effect
+    // fence. A transient failure may retry only within the verified lease.
+    return transientLoss(error) && this.monotonic() < this.monotonicDeadline;
   }
+
+  private async fenceAuthority(): Promise<void> {
+    this.stop();
+    this.authorityStop = Promise.resolve().then(() => this.options.onAuthorityLost());
+    await this.authorityStop.catch(() => undefined); // Retained for owner teardown.
+  }
+}
+
+function verificationReason(error: unknown): string {
+  const reason = error && typeof error === "object" && "verificationReason" in error ? error.verificationReason : undefined;
+  return typeof reason === "string" && ["signature_or_encoding", "schema", "not_yet_valid", "expired", "authority_mismatch", "operation_mismatch", "invalid_clock"].includes(reason)
+    ? reason : "execution_verification_failed";
 }

@@ -163,6 +163,19 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(JSON.stringify(journal.assignments.all())).not.toContain("cap-token");
   });
 
+  it("reports native interruption even when the broken relay cannot carry session_closed", async () => {
+    const f = await build({ deploymentKind: "native_connector",
+      prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
+    });
+    await f.session.bootstrap();
+    vi.spyOn(f.transport, "send").mockImplementation(() => { throw new RemoteInstanceError("recovery_required", "replay gap"); });
+    await expect(f.session.close("relay_replay_gap")).resolves.toBeUndefined();
+    expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
+    expect(f.closed).toEqual(["relay_replay_gap"]);
+    await f.session.close("relay_replay_gap");
+    expect(f.closed).toHaveLength(1);
+  });
+
   it("relays actual runner message/tool updates with the opaque session reference, never hidden thoughts", async () => {
     const events = new RunnerEventBus();
     const bridge = { exited: false, initializeResult: { protocolVersion: 1 }, connection: { newSession: async () => ({ sessionId: "private-bridge-session" }) } } as unknown as BridgeProcess;

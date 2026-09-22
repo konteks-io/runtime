@@ -1,7 +1,14 @@
 import type { KeyObject } from "node:crypto";
 import { PlanningControllerTerminalDirectiveSchema, RemoteControlSigningKeySchema, planningControllerTerminalDirectiveSigningBytes, remoteControlSigningBytes, ed25519PublicKeyFromJwk, ed25519Verify, type JsonValue, type PlanningControllerTerminalDirective } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { RuntimeCancellationDeliveryRequestSchema, RuntimePermissionAnswerDeliveryRequestSchema } from "@konteks/remote-common";
+import {
+  diagnosticCarrierCompanionSigningBytes,
+  DiagnosticCarrierCompanionDeliveryRequestSchema,
+  executionRevisionControlSigningBytes,
+  RemoteExecutionRevisionControlDeliveryRequestSchema,
+  RuntimeCancellationDeliveryRequestSchema,
+  RuntimePermissionAnswerDeliveryRequestSchema,
+} from "@konteks/remote-common";
 
 /**
  * Verification of Core-signed `to_runtime` control bodies (desired
@@ -54,6 +61,47 @@ export class CoreSignatureVerifier {
     try {
       return ed25519Verify(key, remoteControlSigningBytes(request), request.signature)
         && this.verify(request.intent.directive, request.intent.directive.signature);
+    } catch { return false; }
+  }
+
+  /** C02 is a distinct signed control carrier. Its canonical bytes are not
+   * interchangeable with legacy cancellation control bytes. */
+  verifyExecutionRevisionControlDelivery(candidate: unknown): boolean {
+    const parsed =
+      RemoteExecutionRevisionControlDeliveryRequestSchema.safeParse(candidate);
+    if (!parsed.success) return false;
+    const request = parsed.data;
+    const key = this.keys.get(request.keyId);
+    if (
+      !key ||
+      !/^[A-Za-z0-9_-]{86}$/.test(request.signature) ||
+      Buffer.from(request.signature, "base64url").toString("base64url") !==
+        request.signature
+    ) {
+      return false;
+    }
+    try {
+      return ed25519Verify(
+        key,
+        executionRevisionControlSigningBytes(request),
+        request.signature,
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /** C01 uses detached diagnostic-only signing bytes so it cannot be
+   * confused with authority, work, or cancellation control. */
+  verifyDiagnosticCarrierCompanionDelivery(candidate: unknown): boolean {
+    const parsed = DiagnosticCarrierCompanionDeliveryRequestSchema.safeParse(candidate);
+    if (!parsed.success) return false;
+    const request = parsed.data;
+    const key = this.keys.get(request.keyId);
+    if (!key || !/^[A-Za-z0-9_-]{86}$/.test(request.signature) ||
+      Buffer.from(request.signature, "base64url").toString("base64url") !== request.signature) return false;
+    try {
+      return ed25519Verify(key, diagnosticCarrierCompanionSigningBytes(request), request.signature);
     } catch { return false; }
   }
 

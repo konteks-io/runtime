@@ -26,6 +26,8 @@ export interface NativeUpdateTransactionDeps {
   recordAttempt: (root: string, attempt: NativeUpdateAttempt) => Promise<unknown>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  /** How often the OS has started the service and its last exit code; null where it cannot say. */
+  serviceExits?: (definition: NativeServiceDefinition) => Promise<{ runs: number; lastExitCode: number | null } | null>;
   drainDeadlineMs?: number;
   healthDeadlineMs?: number;
   /** How long the old service may take to exit and release the runtime directory after its stop command returned. */
@@ -46,7 +48,7 @@ export type NativeUpdateOutcome =
 const DrainStatusSchema = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
 const AgentsSchema = z.object({ agents: z.array(z.object({ agentId: z.string(), readiness: z.string() }).passthrough()) }).passthrough();
 
-export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTransactionDeps["serviceDefinition"]; execute: NativeUpdateTransactionDeps["execute"]; start: NativeUpdateTransactionDeps["start"] }): NativeUpdateTransactionDeps {
+export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTransactionDeps["serviceDefinition"]; execute: NativeUpdateTransactionDeps["execute"]; start: NativeUpdateTransactionDeps["start"]; serviceExits: NonNullable<NativeUpdateTransactionDeps["serviceExits"]> }): NativeUpdateTransactionDeps {
   return {
     ...input,
     readRecord: readNativeRecord,
@@ -117,7 +119,7 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     if (wasRunning) {
       input.output.line(`Starting ${successor.bundleVersion} and checking it is healthy before keeping it (up to ${spoken(deps.healthDeadlineMs ?? 180_000)})…`);
       await deps.start(input);
-      await healthGate(input, deps.control(input.root, successor), successor, failingBefore, deps);
+      await healthGate(input, deps.control(input.root, successor), successor, failingBefore, deps, definition);
     }
     await finish("applied", null);
     const outcome: NativeUpdateOutcome = { state: "updated", from: previous.bundleVersion, to: successor.bundleVersion, releaseId: successor.releaseId, previousReleaseId: previous.releaseId, restarted: wasRunning };
@@ -244,7 +246,7 @@ async function failingDoctorChecks(control: UpdateControlClient): Promise<Set<st
  * every installed agent, and introduce no doctor failure that was not already
  * present; a pre-existing failure (an agent awaiting login) is not the update's.
  */
-async function healthGate(input: NativeUpdateInput, control: UpdateControlClient, successor: NativeRuntimeRecord, failingBefore: Set<string>, deps: NativeUpdateTransactionDeps): Promise<void> {
+async function healthGate(input: NativeUpdateInput, control: UpdateControlClient, successor: NativeRuntimeRecord, failingBefore: Set<string>, deps: NativeUpdateTransactionDeps, definition: NativeServiceDefinition): Promise<void> {
   const deadline = deps.now() + (deps.healthDeadlineMs ?? 180_000);
   const poll = deps.pollMs ?? 3_000;
   let answered = false;
@@ -263,6 +265,10 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
     } catch (error) {
       if (answered && error instanceof RemoteInstanceError && error.code === "update_required") throw error;
     }
+    // A build that exits as it starts is restarted by the OS every few
+    // seconds and will never answer: say so now rather than at the deadline.
+    const exits = answered ? null : await deps.serviceExits?.(definition).catch(() => null);
+    if (exits && exits.runs >= 3 && exits.lastExitCode) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector stopped as soon as it started, ${exits.runs} times (exit code ${exits.lastExitCode}).`);
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", answered ? "The updated connector did not finish probing its agents in time." : "The updated connector did not answer on its control socket in time.");
     await deps.sleep(poll);
   }
@@ -289,6 +295,15 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
 export function earlierFailure(attempts: readonly NativeUpdateAttempt[], manifestDigest: string): NativeUpdateAttempt | null {
   const last = [...attempts].reverse().find(attempt => attempt.manifestDigest === manifestDigest && attempt.outcome !== "in_progress");
   return last && (last.outcome === "rolled_back" || last.outcome === "failed") ? last : null;
+}
+
+/**
+ * When the installed release is one the connector updated itself to, the
+ * person hears that, instead of a bare "current" after being offered it.
+ */
+export function selfUpdateNote(attempts: readonly NativeUpdateAttempt[], bundleVersion: string): string | null {
+  const last = [...attempts].reverse().find(attempt => attempt.bundleVersion === bundleVersion && attempt.outcome !== "in_progress");
+  return last && last.outcome === "applied" && last.reason === "unattended" ? `Konteks updated itself to ${bundleVersion} at ${last.finishedAt ?? last.startedAt}.` : null;
 }
 
 export function earlierFailureNote(attempt: NativeUpdateAttempt): string {

@@ -10,7 +10,8 @@ export function konteksSessionMetadata(title: string, agentId?: string) {
   return {
     konteksSession: { version: 1, title: nativeTitle },
     // Pinned claude-agent-acp forwards these to the SDK's native new-session
-    // title option. No permission, auth, model, or resume options are supplied.
-    ...(agentId === "claude-code" ? { claudeCode: { options: { title: nativeTitle } } } : {}),
+    // title and settings-source options. Login stays in the official profile,
+    // but personal instructions/settings/hooks must not steer managed work.
+    ...(agentId === "claude-code" ? { claudeCode: { options: { title: nativeTitle, settingSources: ["project"] } } } : {}),
   };
 }

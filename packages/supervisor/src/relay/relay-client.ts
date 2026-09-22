@@ -5,8 +5,12 @@ import {
   RelayAckSchema,
   RelayReplayRequestSchema,
   RuntimeCancellationDeliveryRequestSchema,
+  DiagnosticCarrierCompanionDeliveryRequestSchema,
+  RemoteExecutionRevisionControlDeliveryRequestSchema,
   RuntimePermissionAnswerDeliveryRequestSchema,
+  type RemoteExecutionRevisionControlDeliveryRequest,
   type RuntimePermissionAnswerDeliveryRequest,
+  type DiagnosticCarrierCompanionDeliveryRequest,
   RemoteInstanceError,
   AssignmentReplyFrameSchema,
   ToRuntimeRelayFrameSchema,
@@ -72,6 +76,16 @@ export interface RelayClientOptions {
     assertCurrent(): void;
   }) => Promise<void>;
   onPermissionAnswer?: (request: RuntimePermissionAnswerDeliveryRequest, connection: {
+    connectionEpoch: number;
+    assertCurrent(): void;
+  }) => Promise<void>;
+  /** Dedicated C02 safety-control intake; never a mux cursor or receipt ACK. */
+  onExecutionRevisionControl?: (request: RemoteExecutionRevisionControlDeliveryRequest, connection: {
+    connectionEpoch: number;
+    assertCurrent(): void;
+  }) => Promise<void>;
+  /** C01 diagnostic-only sidecar; its failure must not interrupt work transport. */
+  onDiagnosticCompanion?: (request: DiagnosticCarrierCompanionDeliveryRequest, connection: {
     connectionEpoch: number;
     assertCurrent(): void;
   }) => Promise<void>;
@@ -254,7 +268,7 @@ export class RelayClient {
     let handshook = false;
     let handshakeProcessing = false;
     let validatedEpoch: number | null = null;
-    const pending: Array<ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest | RuntimePermissionAnswerDeliveryRequest> = [];
+    const pending: Array<ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest> = [];
     let pendingBytes = 0;
     const discardPending = () => { pending.length = 0; pendingBytes = 0; };
     this.discardHandshakeBuffer = discardPending;
@@ -320,6 +334,50 @@ export class RelayClient {
         assertCurrent();
         return;
       }
+      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_diagnostic_carrier_companion_delivery") {
+        // Diagnostics are deliberately best effort: malformed, stale, or
+        // unavailable sidecars become a coverage signal, never a work outage.
+        try {
+          const request = DiagnosticCarrierCompanionDeliveryRequestSchema.parse(value);
+          const epoch = validatedEpoch;
+          const assertCurrent = () => {
+            if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
+              validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
+              throw new RemoteInstanceError("recovery_required", "Diagnostic companion socket ownership is not current");
+            }
+          };
+          assertCurrent();
+          if (!this.options.onDiagnosticCompanion) {
+            this.logger.warn({
+              event: "runtime.diagnostic_companion.coverage_incomplete",
+              outcome: "unknown",
+              reason: "receiver_unavailable",
+              deliveryId: request.companion.deliveryId,
+            }, "diagnostic companion coverage is incomplete");
+            return;
+          }
+          await this.options.onDiagnosticCompanion(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
+          assertCurrent();
+        } catch (error) {
+          this.logger.warn({ err: error }, "diagnostic companion delivery was not retained");
+        }
+        return;
+      }
+      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_execution_revision_control_delivery") {
+        const request = RemoteExecutionRevisionControlDeliveryRequestSchema.parse(value);
+        const epoch = validatedEpoch;
+        const assertCurrent = () => {
+          if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
+              validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
+            throw new RemoteInstanceError("recovery_required", "Revision-control socket ownership is not current");
+          }
+        };
+        assertCurrent();
+        if (!this.options.onExecutionRevisionControl) throw new RemoteInstanceError("recovery_required", "Revision-control receiver is unavailable");
+        await this.options.onExecutionRevisionControl(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
+        assertCurrent();
+        return;
+      }
       await this.options.mux.receive(value);
     };
     const handshakeTimer = setTimeout(() => {
@@ -374,9 +432,10 @@ export class RelayClient {
         const ack = RelayAckSchema.safeParse(parsed);
         const assignment = ack.success ? null : AssignmentReplyFrameSchema.safeParse(parsed);
         const cancellation = RuntimeCancellationDeliveryRequestSchema.safeParse(parsed);
+        const revisionControl = RemoteExecutionRevisionControlDeliveryRequestSchema.safeParse(parsed);
         const answer = RuntimePermissionAnswerDeliveryRequestSchema.safeParse(parsed);
         const replay = RelayReplayRequestSchema.safeParse(parsed);
-        const frame = answer.success ? answer : cancellation.success ? cancellation : replay.success ? replay : ack.success ? ack : assignment?.success ? assignment : ToRuntimeRelayFrameSchema.safeParse(parsed);
+        const frame = answer.success ? answer : cancellation.success ? cancellation : revisionControl.success ? revisionControl : replay.success ? replay : ack.success ? ack : assignment?.success ? assignment : ToRuntimeRelayFrameSchema.safeParse(parsed);
         if (!frame.success || frame.data.connectionEpoch !== validatedEpoch) {
           rejectProtocol("protocol", "relay sent an invalid post-handshake envelope");
           return;

@@ -41,6 +41,9 @@ switch (command) {
       node("scripts/build-offline-agent.mjs", ["--agent", agent, "--os", args.os, "--architecture", args.architecture, "--approval", args.approval, "--out", join(out, name), "--profile", profile]);
       node("scripts/native-artifact-index.mjs", ["--file", join(out, name), "--profile", profile, "--id", `${agent}-${args.os}-${args.architecture}`, "--kind", "agent_bridge", "--format", "offline_agent_tgz", "--agent", agent, "--os", args.os, "--architecture", args.architecture, "--url", url(name), "--out", join(out, `${agent}-${args.os}-${args.architecture}.artifact.json`)]);
     }
+    // Graft rides next to the connector, listed in SHA256SUMS (W1-G1). It is
+    // a local tool Core never hands out, so it is not a manifest artifact.
+    if (args.os !== "windows") node("scripts/build-offline-tool.mjs", ["--tool", "graft", "--out", join(out, `konteks-graft-${args.os}-${args.architecture}.tgz`)]);
     copyFileSync(args.package, join(out, basename(args.package)));
     if (existsSync(`${args.package}.asc`)) copyFileSync(`${args.package}.asc`, join(out, `${basename(args.package)}.asc`));
     console.log(`staged ${readdirSync(out).length} release assets for ${args.os}/${args.architecture} in ${out}`);
@@ -75,7 +78,7 @@ switch (command) {
       const path = join(args.dir, name);
       if (!existsSync(path) || createHash("sha256").update(readFileSync(path)).digest("hex") !== digest) fail(`checksum manifest entry ${name} does not match a present file`);
     }
-    for (const required of ["native-manifest.json", "SHA256SUMS", "SHA256SUMS.sig", "release-signing.pub", "install.sh", "install.ps1", "onboarding.md"]) if (!existsSync(join(args.dir, required))) fail(`release is missing ${required}`);
+    for (const required of ["native-manifest.json", "SHA256SUMS", "SHA256SUMS.sig", "release-signing.pub", "install.sh", "install.ps1", "onboarding.md", "connect.md"]) if (!existsSync(join(args.dir, required))) fail(`release is missing ${required}`);
     if (!readFileSync(join(args.dir, "install.sh"), "utf8").match(/BAKED_EXECUTABLE_SUMS="[0-9a-f]{64}  konteks-remote-/)) fail("install.sh was not baked with this release's executable digests");
     console.log(`verified ${manifest.nativeArtifacts.length} manifest artifacts and ${sums.length} package checksums`);
     break;

@@ -19,6 +19,13 @@ export type {
   RuntimeCancellationIntent,
   RuntimeCancellationDeliveryRequest,
   RuntimeCancellationDeliveryResult,
+  ExecutionRevisionControlReason,
+  RemoteExecutionRevisionControlIntent,
+  RemoteExecutionRevisionControlDeliveryRequest,
+  RemoteExecutionRevisionControlDeliveryResult,
+  NativeExecutionRevisionFenceReceipt,
+  NativeExecutionRevisionFenceReceiptRequest,
+  NativeExecutionRevisionFenceReceiptResult,
   RemoteExecutionOperationDisposition,
   RemoteExecutionAuthorityView,
   RemoteExecutionOperationPermitClaims,
@@ -79,6 +86,7 @@ export type {
   RemoteReconciliationConnection,
   RemoteReconciliationAppliedRequest,
   RemoteReconciliationAppliedResult,
+  RemoteRecoveryEvidence,
   RemoteReconciliationDecisionResult,
   RemoteReconciliationTerminalEvidence,
   RemoteReconnectIntentSnapshot,
@@ -156,7 +164,7 @@ export type {
 // D143 logical assignment identities. Authentication and accepting owners remain separate.
 export {
   RemoteDeliveryExecutionAuthorityViewSchema, RemoteDeliveryAdmissionClaimsSchema,
-  verifyRemoteDeliveryOperationSignature, verifyRemoteDeliveryAdmission, verifyRemoteDeliveryCheckLease,
+  verifyRemoteDeliveryOperationSignature, verifyRemoteDeliveryAdmission, verifyRemoteDeliveryAdmissionEvidence, verifyRemoteDeliveryCheckLease,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
 export type {
   RemoteDeliveryExecutionAuthorityView, RemoteDeliveryAdmissionClaims, RemoteDeliveryOperationPermitClaims,
@@ -172,6 +180,18 @@ export {
   runtimeCancellationIntentDigest,
   RuntimeCancellationDeliveryRequestSchema,
   REMOTE_CANCELLATION_DELIVERY_CAPABILITY,
+  EXECUTION_REVISION_CONTROL_SCHEMA_VERSION,
+  EXECUTION_REVISION_CONTROL_CAPABILITY,
+  EXECUTION_REVISION_CONTROL_MAX_DELIVERY_MS,
+  ExecutionRevisionControlReasonSchema,
+  RemoteExecutionRevisionControlIntentSchema,
+  computeExecutionRevisionControlIntentDigest,
+  RemoteExecutionRevisionControlDeliveryRequestSchema,
+  executionRevisionControlSigningBytes,
+  RemoteExecutionRevisionControlDeliveryResultSchema,
+  NativeExecutionRevisionFenceReceiptSchema,
+  NativeExecutionRevisionFenceReceiptRequestSchema,
+  NativeExecutionRevisionFenceReceiptResultSchema,
   RemoteExecutionAuthorityViewSchema,
   RemoteExecutionOperationPermitClaimsSchema,
   RemoteExecutionAdmissionClaimsSchema,
@@ -182,7 +202,7 @@ export {
   RemoteAuthorizedOperationSchema,
   verifyRemoteExecutionOperationSignature,
   verifyRemoteExecutionOperationPermit,
-  verifyRemoteExecutionAdmission,
+  verifyRemoteExecutionAdmission, verifyRemoteExecutionAdmissionEvidence,
   verifyRemoteExecutionCheckLease,
   remoteExecutionInstanceProofSubject,
   REMOTE_EXECUTION_PERMITS_CAPABILITY,
@@ -281,7 +301,11 @@ export {
   RemoteRuntimeOwnerResolveRequestSchema,
   RemoteRuntimeOwnerResolveResultSchema,
   RemoteReconciliationAppliedRequestSchema,
+  RemoteReconciliationConnectionSchema,
   RemoteReconciliationAppliedResultSchema,
+  RemoteRecoveryEvidenceSchema,
+  computeRemoteRecoveryEvidenceDigest,
+  remoteRecoveryEvidenceIdentityKey,
   RemoteReconnectIntentSnapshotSchema,
   RemoteReconciliationReceiptSnapshotSchema,
   computeRemoteReconnectIntentDigest,
@@ -343,6 +367,15 @@ export {
   // The ordered D125 verdict table as a pure function: the supervisor applies
   // it to component-minted reports exactly as Core applies it to its own.
   decideReportVerdict,
+  DiagnosticCarrierCompanionSchema,
+  DiagnosticCarrierCompanionDeliveryRequestSchema,
+  DiagnosticCarrierCompanionDeliveryResultSchema,
+  diagnosticCarrierCompanionSigningBytes,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
+export type {
+  DiagnosticCarrierCompanion,
+  DiagnosticCarrierCompanionDeliveryRequest,
+  DiagnosticCarrierCompanionDeliveryResult,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
 
 /**

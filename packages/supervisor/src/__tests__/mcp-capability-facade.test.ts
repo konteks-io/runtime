@@ -1,6 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { nullLogger } from "@konteks/remote-common";
+import { nullLogger, RemoteInstanceError } from "@konteks/remote-common";
 import { McpCapabilityFacade } from "../mcp/capability-facade.js";
 import type { CapabilityTokenIssue } from "../core/client.js";
 
@@ -106,4 +106,58 @@ describe("native MCP capability facade", () => {
     expect(calls).toBe(1);
     expect(renew).not.toHaveBeenCalled();
   });
+});
+
+
+it('stops renewing and notifies its owner once on a permanent refusal', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  const renew = vi.fn(async () => { throw new RemoteInstanceError('capability_unavailable', 'No longer owned'); });
+  const onUnavailable = vi.fn();
+  try {
+    const { facade } = await started({ initial: issue('http://127.0.0.1:1/mcp', 'secret', Date.now() + 60_000), renew, onUnavailable });
+    await vi.advanceTimersByTimeAsync(31_000);
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(renew).toHaveBeenCalledTimes(1);
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
+    await facade.close();
+  } finally { vi.useRealTimers(); }
+});
+
+
+it('bounds transient renewal to the existing capability expiry and stops the owner once', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  const renew = vi.fn(async () => { throw new RemoteInstanceError('temporarily_unavailable', 'Offline', { retryable: true }); });
+  const onUnavailable = vi.fn();
+  try {
+    const { facade } = await started({ initial: issue('http://127.0.0.1:1/mcp', 'secret', Date.now() + 60_000), renew, onUnavailable });
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
+    const calls = renew.mock.calls.length;
+    expect(calls).toBeGreaterThan(1); expect(calls).toBeLessThan(20);
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(renew).toHaveBeenCalledTimes(calls);
+    await facade.close();
+  } finally { vi.useRealTimers(); }
+});
+
+
+it('handles a synchronous ownership refusal through the same cleanup path', async () => {
+  const onUnavailable = vi.fn();
+  const { facade } = await started({ initial: issue('http://127.0.0.1:1/mcp', 'secret', Date.now() + 60_000),
+    renew: () => { throw new RemoteInstanceError('execution_fenced', 'Owner lost'); }, onUnavailable });
+  const refresh = () => (facade as unknown as { refresh(force: boolean, reason: string): Promise<unknown> }).refresh(true, 'timer');
+  await expect(async () => refresh()).rejects.toThrow('Owner lost');
+  expect(onUnavailable).toHaveBeenCalledTimes(1);
+});
+
+it("never forwards a still-unexpired bearer after renewal closes the owner", async () => {
+  let now = Date.now();
+  const calls = vi.fn((_request, response) => response.end("unexpected"));
+  const url = await upstream(calls);
+  const { facade } = await started({ initial: issue(url, "old", now + 120_000), now: () => now,
+    renew: async () => { throw new RemoteInstanceError("execution_fenced", "Owner lost"); } });
+  now += 115_000;
+  const forward = facade as unknown as { forward(request: { headers: Record<string, never>; url: string }, body: Buffer, refreshed: boolean): Promise<unknown> };
+  await expect(forward.forward({ headers: {}, url: "/mcp" }, Buffer.from("{}"), false)).rejects.toThrow("Owner lost");
+  expect(calls).not.toHaveBeenCalled();
 });

@@ -4,13 +4,24 @@ import type { SchemaParser } from "@konteks/remote-common";
 import { join } from "node:path";
 import { z } from "zod";
 import { AssignmentReportSchema, canonicalize, isFsErrorWithCode, RemoteExecutionReadyResultSchema, RemoteReconciliationReceiptSnapshotSchema, ReportAckSchema,
-  RemoteExecutionAdmissionClaimsSchema, RemoteDeliveryAdmissionClaimsSchema, SessionToCoreMessageSchema, RemoteWorkKindSchema } from "@konteks/remote-common";
+  RemoteExecutionAdmissionClaimsSchema, RemoteDeliveryAdmissionClaimsSchema, SessionToCoreMessageSchema, RemoteWorkKindSchema, RemoteRecoveryEvidenceSchema,
+  remoteRecoveryEvidenceIdentityKey, type RemoteRecoveryEvidence } from "@konteks/remote-common";
 import { unrestrictedStateMutation, type StateMutation } from "./mutation-gate.js";
 import { RuntimeRecoveryJournal, RuntimeRecoveryRecordSchema, recoveryRecordKey, type RuntimeRecoveryRecord } from "./runtime-recovery.js";
 import { LocalExecutionJournal, LocalExecutionRecordSchema, localExecutionKey, type LocalExecutionRecord } from "./local-execution.js";
 import { AssignmentStreamJournal } from "./assignment-stream.js";
 import { PlanningTerminalJournal, PlanningTerminalRecordSchema, planningTerminalRecordKey, type PlanningTerminalRecord } from "./planning-terminal.js";
 import { CancellationInbox, CancellationInboxRecordSchema, type CancellationInboxRecord } from "./cancellation-inbox.js";
+import {
+  ExecutionRevisionFenceInbox,
+  ExecutionRevisionFenceInboxRecordSchema,
+  type ExecutionRevisionFenceInboxRecord,
+} from "./execution-revision-fence-inbox.js";
+import {
+  DiagnosticCompanionInbox,
+  DiagnosticCompanionInboxRecordSchema,
+  type DiagnosticCompanionInboxRecord,
+} from "./diagnostic-companion-inbox.js";
 
 /**
  * The bounded assignment recovery journal. Contains only IDs, attempt, claim,
@@ -146,6 +157,29 @@ export const EraseRecordSchema = z
   .object({ directiveId: z.string().min(1), scope: z.enum(["assignment_data", "all_konteks_data"]), status: z.enum(["pending", "completed", "partially_completed", "failed"]), receiptSent: z.boolean(), updatedAt: z.string() })
   .strict();
 export type EraseRecord = z.infer<typeof EraseRecordSchema>;
+
+/**
+ * An immutable C03 observation and its local delivery watermark. This is
+ * intentionally separate from terminal reports: accepting it cannot settle
+ * work, assert quiescence, or release a workspace owner.
+ */
+export const RecoveryEvidenceRecordSchema = z.object({
+  evidence: RemoteRecoveryEvidenceSchema,
+  delivery: z.enum(["pending", "accepted", "duplicate"]),
+  attempts: z.number().int().nonnegative(),
+  lastAttemptAt: z.string().nullable(),
+  nextAttemptAt: z.string(),
+  acceptedAt: z.string().nullable(),
+  lastFailureCode: z.string().min(1).max(128).nullable(),
+  updatedAt: z.string(),
+}).strict().superRefine((record, ctx) => {
+  if ((record.delivery === "accepted" || record.delivery === "duplicate") !== (record.acceptedAt !== null)) {
+    ctx.addIssue({ code: "custom", path: ["acceptedAt"], message: "Accepted recovery evidence requires its immutable acceptance timestamp" });
+  }
+});
+export type RecoveryEvidenceRecord = z.infer<typeof RecoveryEvidenceRecordSchema>;
+export const recoveryEvidenceRecordKey = (record: Pick<RecoveryEvidenceRecord, "evidence"> | RemoteRecoveryEvidence): string =>
+  remoteRecoveryEvidenceIdentityKey("evidence" in record ? record.evidence : record);
 
 const MAX_JOURNAL_ENTRIES = 2_000;
 const COMPACT_EVERY_APPENDS = 500;
@@ -395,15 +429,35 @@ export class SupervisorJournal {
   readonly decisions: AppendLog<DecisionRecord>;
   readonly manifests: AppendLog<ReconciliationManifestRecord>;
   readonly erase: AppendLog<EraseRecord>;
+  /** C03 local durable evidence. Never use this table as a terminal owner. */
+  readonly recoveryEvidence: AppendLog<RecoveryEvidenceRecord>;
   readonly planning: PlanningTerminalJournal;
   private readonly planningLog: AppendLog<PlanningTerminalRecord>;
   readonly cancellations: CancellationInbox;
   private readonly cancellationLog: AppendLog<CancellationInboxRecord>;
+  /** C02 pre-fence evidence; not a provider-stop or terminal result. */
+  readonly executionRevisionFences: ExecutionRevisionFenceInbox;
+  private readonly executionRevisionFenceLog: AppendLog<ExecutionRevisionFenceInboxRecord>;
+  /** C01 diagnostic-only evidence; it never changes delivery or authority. */
+  readonly diagnosticCompanions: DiagnosticCompanionInbox;
+  private readonly diagnosticCompanionLog: AppendLog<DiagnosticCompanionInboxRecord>;
 
   constructor(dir: string, mutate: StateMutation = unrestrictedStateMutation) {
     this.cancellationLog = new AppendLog(dir, { name: "cancellation-inbox", schema: CancellationInboxRecordSchema,
       key: record => record.intent.intentId }, MAX_JOURNAL_ENTRIES, mutate);
     this.cancellations = new CancellationInbox(this.cancellationLog);
+    this.executionRevisionFenceLog = new AppendLog(dir, {
+      name: "execution-revision-fence-inbox",
+      schema: ExecutionRevisionFenceInboxRecordSchema,
+      key: record => record.intent.intentId,
+    }, MAX_JOURNAL_ENTRIES, mutate);
+    this.executionRevisionFences = new ExecutionRevisionFenceInbox(this.executionRevisionFenceLog);
+    this.diagnosticCompanionLog = new AppendLog(dir, {
+      name: "diagnostic-companion-inbox",
+      schema: DiagnosticCompanionInboxRecordSchema,
+      key: record => record.companion.deliveryId,
+    }, MAX_JOURNAL_ENTRIES, mutate);
+    this.diagnosticCompanions = new DiagnosticCompanionInbox(this.diagnosticCompanionLog);
     this.executionLog = new AppendLog(dir, { name: "local-execution", schema: LocalExecutionRecordSchema, key: localExecutionKey, atomicBatches: true }, 50_000, mutate);
     this.execution = new LocalExecutionJournal(this.executionLog);
     this.assignmentStream = new AssignmentStreamJournal(this.executionLog, this.execution);
@@ -414,12 +468,13 @@ export class SupervisorJournal {
     this.decisions = new AppendLog(dir, { name: "decisions", schema: DecisionRecordSchema, key: (entry) => `${entry.manifestId}:${entry.assignmentId}:${entry.attempt}` }, MAX_JOURNAL_ENTRIES, mutate);
     this.manifests = new AppendLog(dir, { name: "reconciliation-manifests", schema: ReconciliationManifestRecordSchema, key: entry => entry.manifestId }, MAX_JOURNAL_ENTRIES, mutate);
     this.erase = new AppendLog(dir, { name: "erase", schema: EraseRecordSchema, key: (entry) => entry.directiveId }, 500, mutate);
+    this.recoveryEvidence = new AppendLog(dir, { name: "recovery-evidence", schema: RecoveryEvidenceRecordSchema, key: recoveryEvidenceRecordKey }, MAX_JOURNAL_ENTRIES, mutate);
     this.planningLog = new AppendLog(dir, { name: "planning-terminal", schema: PlanningTerminalRecordSchema, key: planningTerminalRecordKey, atomicBatches: true }, MAX_JOURNAL_ENTRIES * 4, mutate);
     this.planning = new PlanningTerminalJournal(this.planningLog);
   }
 
   async load(): Promise<void> {
-    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load()]);
+    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryEvidence.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load(), this.executionRevisionFenceLog.load(), this.diagnosticCompanionLog.load()]);
   }
 
   /** Bounded pruning: completed/cancelled entries beyond the bound go first, oldest first. */

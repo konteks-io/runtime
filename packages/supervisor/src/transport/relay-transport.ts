@@ -124,12 +124,20 @@ export class TransportManager {
       this.https.send(message);
       return;
     }
+    // Session frames have one durable sequence/replay owner. Core has no
+    // native session HTTPS ingress; switching here stranded terminal results.
+    if (message.channel === "session") {
+      if (!this.relay) throw new RemoteInstanceError("protocol_incompatible", "Session delivery requires the configured relay.");
+      this.relay.send(message);
+      return;
+    }
     this.active.send(message);
   }
 
   resumeAfterRecovery(): void {
-    // Only the selected transport transmits; switching never creates authority.
+    // Resume the selected carrier and the session relay; neither creates authority.
     this.active.resumeAfterRecovery?.();
+    if (this.active !== this.relay) this.relay?.resumeAfterRecovery();
     if (this.active !== this.https) this.https.resumePreparedAssignments?.();
   }
 

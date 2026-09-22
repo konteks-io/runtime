@@ -9,7 +9,9 @@ import {
   RemoteInstanceError,
   SessionToCoreMessageSchema,
   canonicalize,
+  createLogger,
   sha256Hex,
+  type Logger,
   type RemoteDeliveryAcceptanceReceipt,
   type RemoteDeliveryResultCandidate,
   type SessionToCoreMessage,
@@ -19,7 +21,9 @@ const MAX_RECORD_BYTES = 16 * 1024 * 1024;
 const RecordSchema = z.discriminatedUnion("state", [
   z.object({ version: z.literal(1), state: z.literal("pending"), candidate: RemoteDeliveryResultCandidateSchema, completion: SessionToCoreMessageSchema }).strict(),
   z.object({ version: z.literal(1), state: z.literal("accepted"), candidate: RemoteDeliveryResultCandidateSchema, completion: SessionToCoreMessageSchema, receipt: RemoteDeliveryAcceptanceReceiptSchema }).strict(),
-]).refine(record => record.completion.kind === "acp_result" && record.completion.method === "session/prompt", "Output completion must be a successful ACP prompt result");
+])
+  .refine(record => record.completion.kind === "acp_result" && record.completion.method === "session/prompt", "Output completion must be a successful ACP prompt result")
+  .refine(record => record.state !== "accepted" || receiptMatches(record.receipt, record.candidate), "Output acceptance must match the frozen candidate");
 export type NativeOutputRecord = z.infer<typeof RecordSchema>;
 const TurnIdentitySchema = z.object({ sessionId: z.string().min(1).max(256), invocationId: z.string().min(1).max(256), claimId: z.string().min(1).max(256) }).strict();
 const SessionHeadSchema = z.object({ version: z.literal(1), latest: TurnIdentitySchema.optional(),
@@ -35,11 +39,13 @@ const unavailable = () => new RemoteInstanceError("capability_unavailable", "Dur
 export class NativeOutputStore {
   private readonly path: string;
   private readonly turn: TurnIdentity | undefined;
-  constructor(container: string, turn?: { sessionId: string; invocationId: string; claimId: string }, exactPath?: string) {
+  private readonly logger: Logger;
+  constructor(container: string, turn?: { sessionId: string; invocationId: string; claimId: string }, exactPath?: string, options: { logger?: Logger } = {}) {
     this.turn = turn ? TurnIdentitySchema.parse(turn) : undefined;
     this.path = exactPath ?? join(container, this.turn
       ? `.delivery-output-${sha256Hex(canonicalize(this.turn))}.json`
       : "delivery-output.json");
+    this.logger = options.logger ?? createLogger({ name: "native-output-store" });
   }
 
   static retained(path: string): NativeOutputStore {
@@ -109,15 +115,20 @@ export class NativeOutputStore {
   }
 
   private async write(record: NativeOutputRecord): Promise<void> {
+    const startedAt = Date.now();
     const bytes = Buffer.from(JSON.stringify(RecordSchema.parse(record)) + "\n");
     if (bytes.byteLength > MAX_RECORD_BYTES) throw unavailable();
     const temporary = join(dirname(this.path), `.delivery-output-${randomUUID()}.tmp`);
+    let fsyncStartedAt = 0;
     try {
       const handle = await open(temporary, "wx", 0o600);
-      try { await handle.writeFile(bytes); await handle.chmod(0o600); await handle.sync(); }
+      try { await handle.writeFile(bytes); await handle.chmod(0o600); fsyncStartedAt = Date.now(); await handle.sync(); }
       finally { await handle.close(); }
       await rename(temporary, this.path);
       if (process.platform !== "win32") { const directory = await open(dirname(this.path), "r"); try { await directory.sync(); } finally { await directory.close(); } }
+      this.logger.info({ event: "native.output.persisted", correlationId: record.candidate.invocationRef, stage: "store", outcome: record.state,
+        bytes: bytes.byteLength, resultDigest: record.candidate.resultDigest, fsyncDurationMs: Date.now() - fsyncStartedAt,
+        durationMs: Date.now() - startedAt }, "native delivery output persisted");
     } catch { throw unavailable(); }
     finally { await rm(temporary, { force: true }).catch(() => undefined); }
   }

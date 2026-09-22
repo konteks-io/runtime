@@ -19,7 +19,9 @@ There are two doors, and they lead to the same place.
 
 If you already work in Claude Code or Codex, you never have to open the app.
 Paste [the onboarding block](bootstrap/onboarding.md) into your agent, inside
-a repository you care about, or a new, empty project folder. It installs the connector into your own user
+a repository you care about, or a new, empty project folder. Every release also
+ships [the same steps written for the agent itself](bootstrap/connect.md), so a
+single sentence with a link to that file is enough. It installs the connector into your own user
 directory — no `sudo`, no package — then asks you for an email and the
 six-digit code Konteks sends back. That is the whole of it before the machine
 is connected; from there your agent offers to make the folder you are in your
@@ -28,11 +30,20 @@ you want to build first into your first initiative.
 
 ```sh
 curl -fsSL -o "${TMPDIR:-/tmp}/konteks-install.sh" https://github.com/konteks-io/runtime/releases/latest/download/install.sh && sh "${TMPDIR:-/tmp}/konteks-install.sh" --user --enroll
-konteks-remote onboard --json
 ```
 
 The installer is downloaded to a file your agent can read before it runs,
-rather than piped into `sh`.
+rather than piped into `sh`. It ends by printing the first onboarding step as
+JSON; each later step comes from `konteks-remote onboard --json`.
+
+Once the folder is a repository, onboarding offers Graft, a map of the code
+that Claude Code and Codex read before they search. On a yes the connector
+downloads the release's Graft package, checks it against the digest the
+installer recorded from the signed checksums, and unpacks it in `~/.graft`
+with its own copy of Node, so it needs no Node on the laptop and keeps working
+if Konteks is removed. Its usage statistics are off, nothing goes to a paid
+model, and its files stay out of your commits through the repository's local
+`.git/info/exclude`.
 
 macOS and Linux. The connector executable is verified against the same signed
 checksum manifest the packages are, so this path is verified differently from
@@ -83,7 +94,10 @@ The connector runs as a user service (launchd, user systemd, or Task
 Scheduler). It checks the stable channel on its own and applies updates
 transactionally: the new release is staged beside the running one, work is
 drained, the service is swapped and health-gated, and the previous release is
-restored if the gate fails.
+restored if the gate fails. A new release whose service exits as it starts is
+rolled back after three failed starts, within seconds, rather than at the
+gate's three-minute deadline. `update` and `update --check` say when the
+connector updated itself, and when a release already failed here.
 
 ## How releases are trusted
 

@@ -16,3 +16,4 @@ export * from "./backoff.js";
 export * from "./http-client.js";
 export * from "./preview-policy.js";
 export * from "./control-socket.js";
+export * from "./observability.js";

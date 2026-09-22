@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { FixedClock, generateInstanceKey, logicalAssignmentRequestDigest, verifyInstanceProof, type RelayRuntimeHandshakeResult } from "@konteks/remote-common";
+import { FixedClock, computeExecutionRevisionControlIntentDigest, generateInstanceKey, logicalAssignmentRequestDigest, verifyInstanceProof, type RelayRuntimeHandshakeResult } from "@konteks/remote-common";
 import { RelayClient, type RelayClientOptions } from "../relay/relay-client.js";
 import { ChannelMux } from "../relay/channel-mux.js";
 import { CORE_AUDIENCE } from "../core/client.js";
@@ -119,6 +119,116 @@ describe("native runtime relay handshake validation boundary", () => {
       expect(onCancellation).toHaveBeenCalledOnce();
       expect(onCancellation.mock.calls[0]?.[1].connectionEpoch).toBe(7);
       expect(f.mux.receive).not.toHaveBeenCalled(); expect(f.socket.send).not.toHaveBeenCalled();
+      expect(f.socket.close).not.toHaveBeenCalled();
+    } finally { f.client.stop(); }
+  });
+
+  it("routes C02 revision control only to its current dedicated receiver", async () => {
+    const onExecutionRevisionControl = vi.fn(async (_request, connection) => connection.assertCurrent());
+    const f = fixture({ onExecutionRevisionControl } as never);
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      executionRevision: 1,
+      checkId: "check",
+      policyRevision: null,
+      connectionRef: "connection",
+      connectionEpoch: 7,
+      reason: "authority_revoked" as const,
+      issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+      deadlineAt: "2026-09-06T00:00:02.000Z",
+    };
+    const request = {
+      type: "runtime_execution_revision_control_delivery",
+      method: "POST",
+      path: { instanceId: "instance" },
+      nodeId: "node",
+      connectionRef: "connection",
+      connectionEpoch: 7,
+      intent,
+      intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      keyId: "control",
+      nonce: "N".repeat(22),
+      issuedAt: intent.issuedAt,
+      expiresAt: intent.deadlineAt,
+      signature: "A".repeat(86),
+    };
+    try {
+      f.socket.message(confirmed); await flush(); f.socket.send.mockClear();
+      f.socket.message(request); await flush();
+      expect(onExecutionRevisionControl).toHaveBeenCalledOnce();
+      expect(f.mux.receive).not.toHaveBeenCalled();
+      expect(f.socket.send).not.toHaveBeenCalled();
+      const guard = onExecutionRevisionControl.mock.calls[0]![1].assertCurrent;
+      f.client.rehandshake("replacement");
+      expect(guard).toThrow("Revision-control socket ownership is not current");
+    } finally { f.client.stop(); }
+  });
+
+  const diagnosticCompanion = () => ({
+    schemaVersion: "diagnostic-carrier-companion-delivery-v1",
+    type: "runtime_diagnostic_carrier_companion_delivery",
+    method: "POST",
+    path: { instanceId: "instance" },
+    nodeId: "node",
+    connectionRef: "connection",
+    connectionEpoch: 7,
+    companion: {
+      schemaVersion: "diagnostic-carrier-companion-v1",
+      deliveryId: "diagnostic-delivery",
+      match: { assignmentId: "assignment", attempt: 1, executionSessionId: "session", invocationId: "invocation", dispatchGeneration: 2 },
+      capabilityOffer: { schemaVersion: "diagnostic-carrier-capability-offer-v1", capabilities: ["diagnostic-carrier-v1"] },
+      carrier: {
+        schemaVersion: "diagnostic-carrier-v1",
+        context: {
+          schemaVersion: "observability-context-v1",
+          traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+          tenantId: "tenant",
+          assignmentId: "assignment",
+          attempt: 1,
+          invocationId: "invocation",
+        },
+        build: { service: "core", component: "admission", sourceRevision: "a".repeat(40) },
+        protocol: { remoteInstanceProtocolVersion: "2.0" },
+      },
+    },
+    keyId: "control",
+    nonce: "N".repeat(22),
+    issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+    expiresAt: "2026-09-06T00:00:30.000Z",
+    signature: "A".repeat(86),
+  });
+
+  it("isolates C01 diagnostic sidecar failure from mux and work transport", async () => {
+    const onDiagnosticCompanion = vi.fn(async () => { throw new Error("diagnostic journal unavailable"); });
+    const f = fixture({ onDiagnosticCompanion } as never);
+    try {
+      f.socket.message(confirmed); await flush(); f.socket.send.mockClear();
+      f.socket.message(diagnosticCompanion()); await flush();
+      expect(onDiagnosticCompanion).toHaveBeenCalledOnce();
+      expect(f.mux.receive).not.toHaveBeenCalled();
+      expect(f.socket.send).not.toHaveBeenCalled();
+      expect(f.socket.close).not.toHaveBeenCalled();
+    } finally { f.client.stop(); }
+  });
+
+  it("records an explicit C01 coverage gap when a legacy runtime lacks the diagnostic receiver", async () => {
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const f = fixture({ logger: logger as never });
+    try {
+      f.socket.message(confirmed); await flush();
+      f.socket.message(diagnosticCompanion()); await flush();
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+        event: "runtime.diagnostic_companion.coverage_incomplete",
+        outcome: "unknown",
+        reason: "receiver_unavailable",
+        deliveryId: "diagnostic-delivery",
+      }), "diagnostic companion coverage is incomplete");
+      expect(f.mux.receive).not.toHaveBeenCalled();
       expect(f.socket.close).not.toHaveBeenCalled();
     } finally { f.client.stop(); }
   });

@@ -6,6 +6,7 @@ import { EMBEDDED_RELEASE_ROOTS } from "@konteks/remote-release";
 import { createOutput } from "../output.js";
 import { addNativeAgent, installNative, readNativeRecord } from "../native/install.js";
 import { nativePlatform } from "../native/service.js";
+import { prepareDeliveryGraft } from "../native/graft.js";
 import { loadE2EInstallAuthority } from "./authority.js";
 import { prepareE2ERealRelease, prepareE2ESmokeRelease, reissueE2ERelease } from "./smoke-release.js";
 
@@ -129,7 +130,9 @@ program.command("serve")
     }) || runtimeRoots.some(root => !(root.coreControlKeys?.length))) {
       throw new InvalidArgumentError("E2E runtime control authority is unavailable or does not match the verified release root");
     }
-    const service = createNativeService({ root, roots: runtimeRoots, platform: nativePlatform(), exitProcess: code => process.exit(code) });
+    const service = createNativeService({ root, roots: runtimeRoots, platform: nativePlatform(),
+      prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(root, cwd, agentId),
+      exitProcess: code => process.exit(code) });
     await service.start();
     await service.waitUntilStopped();
   });

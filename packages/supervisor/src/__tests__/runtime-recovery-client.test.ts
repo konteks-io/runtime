@@ -1,6 +1,6 @@
 import { NATIVE_TRANSIENT_MAX_ATTEMPTS } from "../native/transient-retry.js";
 import { describe, expect, it, vi } from "vitest";
-import { FixedClock, generateInstanceKey, jcsDigest, verifyInstanceProof, RemoteInstanceErrorCodeSchema } from "@konteks/remote-common";
+import { FixedClock, computeRemoteRecoveryEvidenceDigest, generateInstanceKey, jcsDigest, verifyInstanceProof, RemoteInstanceErrorCodeSchema } from "@konteks/remote-common";
 import { CoreClient, CORE_AUDIENCE } from "../core/client.js";
 
 const at = "2026-09-06T00:00:00.000Z";
@@ -9,6 +9,20 @@ const owner = { instanceId: "instance", ownerRevision: 1, currentIncarnation: "p
 const semanticReceipt = { instanceId: "instance", runnerIncarnation: "process", manifestId: "manifest", decisionResults: [{ assignmentId: "assignment", attempt: 1, disposition: "interrupted" as const, terminalReportId: "report", terminalEvidence: { kind: "queued" as const, reportSequence: 1, payloadDigest: hash, terminalResultHash: hash } }], pendingClaimResults: [] };
 const receipt = { ...semanticReceipt, connection: { kind: "https" as const } };
 const accepted = { instanceId: "instance", runnerIncarnation: "process", manifestId: "manifest", receiptDigest: jcsDigest(semanticReceipt), acceptedAt: at, outcome: "accepted" };
+const recoveryEvidenceBody = {
+  instanceId: "instance", assignmentId: "assignment", attempt: 1, claimId: "claim", runnerIncarnation: "process", recoveryEpoch: 0,
+  evidenceKind: "stop_observation" as const, schemaVersion: "remote-recovery-evidence-v1" as const,
+  stopClass: "turn_settled" as const, reason: "ownership_scope_lost" as const,
+  observedAt: at, recordedAt: at, ageMs: 0, nextRetryAt: "2026-09-06T00:00:05.000Z",
+  safeAction: { kind: "retry_later" as const, instanceId: "instance", agentId: "codex" },
+  terminalDisposition: "not_terminal" as const, quiescenceAssertion: "not_asserted_by_recovery_evidence" as const,
+};
+const recoveryEvidence = { ...recoveryEvidenceBody, evidenceDigest: computeRemoteRecoveryEvidenceDigest(recoveryEvidenceBody) };
+const recoveryEvidenceRequest = { evidence: recoveryEvidence, connection: { kind: "https" as const } };
+const recoveryEvidenceAccepted = {
+  instanceId: "instance", assignmentId: "assignment", attempt: 1, claimId: "claim", recoveryEpoch: 0,
+  evidenceDigest: recoveryEvidence.evidenceDigest, acceptedAt: at, outcome: "accepted" as const,
+};
 
 function fixture(response: object = owner, status = 200) {
   const key = generateInstanceKey();
@@ -161,6 +175,30 @@ describe("native applied receipt HTTPS boundary", () => {
     expect(String(error)).not.toContain(secret);
     expect(JSON.stringify(error)).not.toContain(secret);
     expect(f.credential).not.toHaveBeenCalled();
+  });
+});
+
+describe("native recovery evidence HTTPS boundary", () => {
+  it("binds the immutable observation and current connection with a fresh machine proof", async () => {
+    const f = fixture(recoveryEvidenceAccepted);
+    await expect(f.client.submitRecoveryEvidence(recoveryEvidenceRequest)).resolves.toEqual(recoveryEvidenceAccepted);
+    await f.client.submitRecoveryEvidence({ ...recoveryEvidenceRequest, connection: { kind: "relay", connectionEpoch: 2 } });
+    const [url, init] = f.fetchFn.mock.calls[0]!;
+    expect(String(url)).toBe("https://core.example/api/remote-instances/internal/remote-instances/instance/recovery-evidence");
+    expect(init?.headers).not.toHaveProperty("authorization");
+    const { proof, ...body } = JSON.parse(String(init?.body));
+    expect(body).toEqual(recoveryEvidenceRequest);
+    expect(verifyInstanceProof(f.key.publicKey, { method: "recovery_evidence", audience: CORE_AUDIENCE, subject: "instance", body }, proof)).toBe(true);
+    expect(verifyInstanceProof(f.key.publicKey, { method: "reconciliation_applied", audience: CORE_AUDIENCE, subject: "instance", body }, proof)).toBe(false);
+    const [first, second] = f.fetchFn.mock.calls.map(([, request]) => JSON.parse(String(request?.body)));
+    expect(first.proof.nonce).not.toBe(second.proof.nonce);
+    expect(first.evidence).toEqual(second.evidence);
+    expect(f.credential).not.toHaveBeenCalled();
+  });
+
+  it("does not turn a mismatched Core receipt into accepted recovery evidence", async () => {
+    const f = fixture({ ...recoveryEvidenceAccepted, evidenceDigest: hash });
+    await expect(f.client.submitRecoveryEvidence(recoveryEvidenceRequest)).rejects.toMatchObject({ code: "registration_mismatch" });
   });
 });
 

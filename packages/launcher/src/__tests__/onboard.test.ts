@@ -194,6 +194,38 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "done", closing: true });
   });
 
+  it("says every chained step's news, not only the last (pass 6)", async () => {
+    await writeOnboardState(root, { step: "graft", repositoryPath: "/tmp/booking-site", repositoryName: "booking-site", systemId: "sys-1", systemExisting: true, instanceId: "instance-1" } as never);
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({ initiatives: [{ id: "init_1", title: "Tables" }] }), { status: 200, headers: { "content-type": "application/json" } }));
+    const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", deps: { waitForReady: readyService, fetchFn: fetchFn as never, families: async () => ["claude-code"], graft: { available: async () => true, wired: async () => true } as never } });
+    expect(result.note).toContain("Graft is already set up in booking-site.");
+    expect(result.note).toContain('booking-site already has an initiative, "Tables"');
+  });
+
+  it("names the initiative a rejoined System already has instead of asking for a first one (WS1-090)", async () => {
+    await writeOnboardState(root, { step: "first_task", systemExisting: true, systemId: "sys-existing", repositoryName: "hello-world", instanceId: "instance-1" } as never);
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({ initiatives: [{ id: "init_1", title: "Turn this into a tiny page that greets visitors by the time of day" }] }), { status: 200, headers: { "content-type": "application/json" } }));
+    const result = await step({ fetchFn: fetchFn as never });
+    expect(result.ask).toBeUndefined();
+    expect(result.note).toBe('hello-world already has an initiative, "Turn this into a tiny page that greets visitors by the time of day", so no new one is started: https://app.test/work/init_1');
+    expect(await readOnboardState(root)).toMatchObject({ step: "done", initiativeId: "init_1" });
+    // A System with none still gets the question.
+    await writeOnboardState(root, { step: "first_task", systemExisting: true, systemId: "sys-existing", repositoryName: "hello-world", instanceId: "instance-1" } as never);
+    const empty = vi.fn(async () => new Response(JSON.stringify({ initiatives: [] }), { status: 200, headers: { "content-type": "application/json" } }));
+    expect((await step({ fetchFn: empty as never })).ask?.kind).toBe("text");
+  });
+
+  it("says so when the folder was already the workspace's System, instead of failing (WS1-089)", async () => {
+    await writeOnboardState(root, { step: "system", repositoryName: "hello-world", repositoryKind: "existing", repositoryPath: "/tmp/hello-world", remoteUrl: "https://github.com/octocat/Hello-World.git", defaultBranch: "master", instanceId: "instance-1" } as never);
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({
+      systemId: "sys-existing", existing: true, systemEntityRef: "system:default/konteks-2-hello-world", componentEntityRef: "component:default/octocat-hello-world",
+      repository: { kind: "existing", remoteUrl: "https://github.com/octocat/Hello-World.git", defaultBranch: "master" },
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    const result = await step({ fetchFn: fetchFn as never }, "yes");
+    expect(result.note).toBe("hello-world was already a System in your workspace, so this machine works on that one; nothing was made twice.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "graft", systemId: "sys-existing" });
+  });
+
   it("registers the first System and moves to the push step for managed git", async () => {
     await writeOnboardState(root, {
       step: "system",
@@ -335,7 +367,7 @@ describe("onboard", () => {
     });
     expect(accepted.note).toContain("Pushed trunk");
     expect(accepted.note).toContain("now lives on Konteks managed git");
-    expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "graft" }); // Graft is offered next (W1-G1).
   });
 
   it("offers a plain project folder as the first System on managed git", async () => {
@@ -428,18 +460,21 @@ describe("onboard", () => {
     });
     expect(result.run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
     expect(result.note).toContain("still starting");
+    // WS1-079: never "ask again in a moment", which read as an invitation to
+    // poll; the run already says what comes next.
+    expect(result.note).not.toMatch(/ask again/i);
     expect(await readOnboardState(root)).toMatchObject({ step: "inspect", startWaits: 1 });
 
     // WS1-036: the record exists before `start` is ever run, so "starting"
-    // must not be said for ever. The third wait hands out start again.
+    // must not be said for ever. The second wait (each is over a minute)
+    // hands out start again.
     const again = () => runOnboardStep({
       root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", cwd: "/tmp/projects/konteks-onboard-app",
       deps: { waitForReady: async () => null, inspect: async () => { throw new Error("must not inspect"); } },
     });
-    expect((await again()).run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
-    const third = await again();
-    expect(third.run).toEqual({ argv: ["konteks-remote", "start"] });
-    expect(third.note).toContain("safe if it is already running");
+    const second = await again();
+    expect(second.run).toEqual({ argv: ["konteks-remote", "start"] });
+    expect(second.note).toContain("safe if it is already running");
     expect(await readOnboardState(root)).toMatchObject({ step: "inspect", startWaits: 0 });
   });
 
@@ -553,7 +588,7 @@ describe("onboard", () => {
     expect(push).not.toHaveBeenCalled();
     expect(result.note).toContain("tracking the Konteks repository");
     expect(result.note).toContain("https://app.test/systems/sys-1");
-    expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "graft" });
   });
 
   it("re-asks the push in plain words when it does not go through", async () => {
@@ -706,7 +741,19 @@ describe("onboard", () => {
 
   it("names an initiative from the first sentence, at a title's length", () => {
     expect(initiativeTitle("Add a coupon code to checkout.")).toBe("Add a coupon code to checkout");
-    const long = initiativeTitle("I want a very small booking site for my cafe where regulars can reserve the window table and get a reminder the day before.");
+    // WS1-083: a long sentence is cut where a phrase ends, not mid-phrase.
+    expect(initiativeTitle("I want a very small booking site for my cafe where regulars can reserve the window table and get a reminder the day before.")).toBe(
+      "I want a very small booking site for my cafe where regulars can reserve the window table",
+    );
+    expect(initiativeTitle("A simple site where people can book a table at my restaurant for a date and time, and I get an email for each booking.")).toBe(
+      "A simple site where people can book a table at my restaurant for a date and time",
+    );
+    // A sentence a title can hold stays whole: a cut at "date and party size" left "…for a date" (pass 8).
+    expect(initiativeTitle("A simple site where people book a table at my restaurant for a date and party size.")).toBe(
+      "A simple site where people book a table at my restaurant for a date and party size",
+    );
+    // With no phrase end in reach it still cuts at a word, marked as cut.
+    const long = initiativeTitle("Build a reservation calendar synchronisation dashboard integrating multiple restaurant locations' availability feeds automatically nightly.");
     expect(long.length).toBeLessThanOrEqual(81);
     expect(long.endsWith("…")).toBe(true);
   });
@@ -792,12 +839,12 @@ describe("onboard", () => {
   it("names only the agents that are logged in as running work, and says how to log in the other (pass 28)", async () => {
     await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
     const result = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "login_required" }) });
-    expect(result.done?.summary).toContain("Your claude-code login will run Konteks work here.");
+    expect(result.done?.summary).toContain("Your Claude Code login will run Konteks work here.");
     expect(result.done?.summary).not.toContain("claude-code and codex");
-    expect(result.done?.remedies).toContain("codex is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login codex");
+    expect(result.done?.remedies).toContain("Codex is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login codex");
     // A service still probing is not evidence of a missing login.
     const probing = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "probing" }) });
-    expect(probing.done?.summary).toContain("Your claude-code and codex login will run Konteks work here.");
+    expect(probing.done?.summary).toContain("Your Claude Code and Codex login will run Konteks work here.");
   });
   it("never asks the relaying agent to run anything but konteks-remote", async () => {
     for (const state of ["inspect", "system", "push", "first_task"] as const) {
@@ -863,6 +910,146 @@ describe("onboard", () => {
     expect(result.note).toContain("up to a minute");
     expect(result.note).not.toContain("konteks");
     expect(result.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+  });
+
+  it("tells the person the workspace is being made before the long bind starts, never chaining into it (WS1-076)", async () => {
+    await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "hello@konteks.io", emailMasked: "h••••@konteks.io" } as never);
+    const verifyCode = vi.fn(async () => ({ decision: "create", proposedTenantId: "konteks" }));
+    const bind = vi.fn(async () => { throw new Error("the bind must wait for the next invocation"); });
+    const result = await runOnboard({
+      root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "022667",
+      deps: { waitForReady: readyService, enrollment: { verifyCode, bind } as never },
+    });
+    expect(result.note).toContain("creating your workspace");
+    expect(result.note).toContain("up to a minute");
+    expect(result.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+    expect(bind).not.toHaveBeenCalled();
+    expect(await readOnboardState(root)).toMatchObject({ step: "start" });
+  });
+
+  it("stops with Konteks's own words when it does not connect this machine's release, instead of asking the email again (WS1-077)", async () => {
+    await writeOnboardState(root, { step: "email", email: "hello@konteks.io" } as never);
+    const said = "This machine installed connector release 0.1.0-e2e, but Konteks connects release 0.4.1-e2e right now, so nothing was set up and no code was sent. Run the install command again to get the current release, then carry on";
+    const result = await onboardFailureStep(
+      { root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "hello@konteks.io" },
+      new RemoteInstanceError("update_required", said),
+    );
+    expect(result.ask).toBeUndefined();
+    expect(result.done?.summary).toBe(`${said}.`);
+    expect(result.done?.links.site).toBe("https://app.test");
+    // A fresh install starts the conversation again from the first question.
+    const state = await readOnboardState(root);
+    expect(state).toMatchObject({ step: "identity" });
+    expect((state as { intentRef?: string }).intentRef).toBeUndefined();
+  });
+
+  it("shows what a folder with files would commit, and what it leaves out, then commits exactly that and pushes (W1-B2)", async () => {
+    await writeOnboardState(root, {
+      step: "push", repositoryPath: "/tmp/cafe", repositoryName: "cafe", repositoryNeedsInit: true, defaultBranch: "main",
+      managedRemoteUrl: "https://git.konteks.test/acme/cafe", systemId: "sys-1", ownerEmail: "hello@konteks.io",
+    } as never);
+    const plan = { include: ["README.md", "package.json", "src/app.js"], leftOut: [{ path: ".env", why: "it can hold secrets" }, { path: "node_modules/", why: "installed packages" }] };
+    const planCommit = vi.fn(async () => plan);
+    const asked = await step({ planCommit });
+    expect(asked.ask?.question).toBe("Push cafe to Konteks managed git now? The folder becomes a git repository on main, joined to the repository Konteks made for it, with one commit of your 3 files.");
+    expect(asked.note).toBe("The commit would hold README.md, package.json and src/app.js. Left out: .env (it can hold secrets) and node_modules/ (installed packages). A .gitignore listing them is added so they stay out.");
+
+    await step({ planCommit }, "yes");
+    const initialize = vi.fn(async () => ({ ok: true, adopted: true, message: "cafe is now a git repository on main." }));
+    const commitFiles = vi.fn(async () => ({ ok: true, message: 'Committed 3 files as "Add cafe".' }));
+    const push = vi.fn(async () => ({ pushed: true, message: "Pushed main to Konteks managed git." }));
+    const pushed = await step({ planCommit, initialize: initialize as never, commitFiles, push: push as never });
+    expect(initialize).toHaveBeenCalledWith(expect.objectContaining({ keepFiles: true }));
+    expect(commitFiles).toHaveBeenCalledWith({ path: "/tmp/cafe", plan, authorName: "hello", authorEmail: "hello@konteks.io", message: "Add cafe" });
+    expect(push).toHaveBeenCalled();
+    expect(pushed.note).toContain("Pushed main to Konteks managed git.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "graft" });
+  });
+
+  describe("Graft (W1-G1..G3, WS1-081)", () => {
+    const plan = async () => ({ agents: ["claude", "agents"], adds: ["graft/", ".claude/", ".mcp.json", "AGENTS.md"], tracked: [] as string[], files: 3 });
+    const graftDeps = (extra: Record<string, unknown> = {}) => ({
+      families: async () => ["claude-code", "codex"],
+      graft: { available: async () => true, wired: async () => false, plan, ...extra } as never,
+    });
+    const atGraft = () => writeOnboardState(root, { step: "graft", repositoryPath: "/tmp/table-booking", repositoryName: "table-booking", systemId: "sys-1" } as never);
+
+    it("offers Graft once the folder is a repository, naming what it adds and what it never does", async () => {
+      await atGraft();
+      const offer = await step(graftDeps());
+      expect(offer.ask).toMatchObject({ kind: "confirm" });
+      expect(offer.ask?.question).toBe("Set up Graft in table-booking? It adds graft/, .claude/, .mcp.json and AGENTS.md here, kept out of your commits.");
+      expect(offer.note).toContain("so Claude Code and Codex can find their way around it");
+      expect(offer.note).toContain("sends nothing to a paid model, and its usage statistics stay off");
+      expect(offer.note).toContain("Outside this folder it writes only in ~/.graft: its settings and its own copy of Graft, which keeps working if Konteks is ever removed.");
+    });
+
+    it("says a tracked file Graft would change will show in git", async () => {
+      await atGraft();
+      const offer = await step(graftDeps({ plan: async () => ({ ...(await plan()), tracked: ["AGENTS.md"] }) }));
+      expect(offer.note).toContain("AGENTS.md is already tracked by git, so Graft's section there will show as a change");
+    });
+
+    it("sets it up after a yes, saying first how long it takes, then carries on to the first task", async () => {
+      await atGraft();
+      const ensure = vi.fn(async () => ({ node: "/n", cli: "/c" }));
+      const wire = vi.fn(async () => ({ added: [".claude/settings.json", ".mcp.json", "AGENTS.md", "graft/"], changedTracked: [] as string[], mappedFiles: 3 }));
+      const yes = await step(graftDeps({ ensure, wire }), "yes");
+      expect(yes.note).toMatch(/^Setting up Graft: downloading it, then building its map of table-booking \(3 files\)\. That usually takes under \d+ seconds\.$/);
+      expect(ensure).not.toHaveBeenCalled();
+      expect(await readOnboardState(root)).toMatchObject({ step: "graft_setup", graftDecision: "accepted" });
+
+      const done = await step(graftDeps({ ensure, wire }));
+      expect(wire).toHaveBeenCalledWith(root, "/tmp/table-booking", ["claude-code", "codex"], { node: "/n", cli: "/c" });
+      expect(done.note).toContain("Graft is set up in table-booking: its map covers 3 files.");
+      expect(done.note).toContain("which git leaves out of your commits on this machine");
+      expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
+    });
+
+    it("never enters the setup in the same invocation as the yes", async () => {
+      await atGraft();
+      const wire = vi.fn();
+      const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "yes", deps: { waitForReady: readyService, ...graftDeps({ wire }) } });
+      expect(result.note).toContain("Setting up Graft");
+      expect(wire).not.toHaveBeenCalled();
+    });
+
+    it("adds nothing on a no, and never asks again for that folder (W1-G2)", async () => {
+      await atGraft();
+      const wire = vi.fn();
+      const no = await step(graftDeps({ wire }), "no thanks");
+      expect(no.note).toBe("Graft was not set up; nothing was added, and it will not be offered again for this folder.");
+      expect(wire).not.toHaveBeenCalled();
+      expect(await readOnboardState(root)).toMatchObject({ step: "first_task", graftDecision: "declined", graftRepository: "/tmp/table-booking" });
+
+      await writeOnboardState(root, { ...(await readOnboardState(root))!, step: "graft" } as never);
+      const again = await step(graftDeps());
+      expect(again.ask).toBeUndefined();
+      expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
+    });
+
+    it("does not offer Graft again in a folder it already wired (WS1-090)", async () => {
+      await atGraft();
+      const result = await step(graftDeps({ wired: async () => true }));
+      expect(result.ask).toBeUndefined();
+      expect(result.note).toBe("Graft is already set up in table-booking.");
+      expect(await readOnboardState(root)).toMatchObject({ step: "first_task", graftDecision: "accepted" });
+    });
+
+    it("goes straight on when the release has no Graft", async () => {
+      await atGraft();
+      const result = await step({ families: async () => ["claude-code"], graft: { available: async () => false } as never });
+      expect(result.ask).toBeUndefined();
+      expect(result.note).toBeUndefined();
+      expect(await readOnboardState(root)).toMatchObject({ step: "first_task", graftDecision: "unavailable" });
+    });
+
+    it("says plainly when the setup failed and carries on", async () => {
+      await writeOnboardState(root, { step: "graft_setup", repositoryPath: "/tmp/table-booking", repositoryName: "table-booking" } as never);
+      const failed = await step(graftDeps({ ensure: async () => { throw new Error("the downloaded Graft package does not match this release's checksum, so it was not installed."); } }));
+      expect(failed.note).toBe("Graft could not be set up (the downloaded Graft package does not match this release's checksum, so it was not installed). Nothing else changed, and onboarding carries on.");
+      expect(await readOnboardState(root)).toMatchObject({ step: "first_task", graftDecision: "failed" });
+    });
   });
 
   it("connects a machine that lost its key again, as a replacement for the runtime it was (W1-L1)", async () => {
@@ -1016,11 +1203,61 @@ describe("onboard", () => {
     const first = await step({ enrollment: { verifyCode } as never }, "000000");
     expect(first.ask).toMatchObject({ kind: "code" });
     expect(first.note).toContain("2 attempts left");
+    expect(first.note).toContain('say "send a new code"');
     const second = await step({ enrollment: { verifyCode } as never }, "000001");
-    expect(second.note).toContain("a new one will be sent");
+    expect(second.note).toBe("That code was not accepted either, and after five wrong codes a code stops working, to keep your account safe. A new one will be sent.");
     expect(second.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
     // The promise holds: the email step sends to the same address instead of asking for it.
     expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
+  });
+
+  it("says why a new code comes after the fifth wrong one, in the same reply as the new code (W1-Z2)", async () => {
+    await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "ada@acme.test", emailMasked: "a••@acme.test", attemptsRemaining: 1 } as never);
+    const { CoreResponseError } = await import("@konteks/remote-common");
+    const enrollment = {
+      verifyCode: vi.fn().mockRejectedValueOnce(new CoreResponseError({ status: 401, code: "enrollment_invalid", message: "no" })),
+      openIntent: vi.fn(async () => ({ intentRef: "intent-2" })),
+      sendChallenge: vi.fn(async () => ({ sentToMasked: "a••@acme.test", attemptsRemaining: 5 })),
+    };
+    const { writeSecretFile } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: [], bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "428913", deps: { waitForReady: readyService, enrollment: enrollment as never, fetchFn: (async () => { throw new Error("no fetch"); }) as never } });
+    expect(result.note).toContain("after five wrong codes a code stops working, to keep your account safe.");
+    expect(result.note).toContain("A new six-digit code is on its way to a••@acme.test.");
+    expect(result.ask).toMatchObject({ kind: "code" });
+    expect(enrollment.sendChallenge).toHaveBeenCalledWith("intent-2", "ada@acme.test");
+    expect((await readOnboardState(root))?.resendReason).toBeUndefined();
+  });
+
+  it("sends a new code when the person asks for one, and says when it is too soon (WS1-088)", async () => {
+    await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "ada@acme.test", emailMasked: "a••@acme.test", attemptsRemaining: 5 } as never);
+    const { CoreResponseError } = await import("@konteks/remote-common");
+    const sendChallenge = vi
+      .fn()
+      .mockRejectedValueOnce(new CoreResponseError({ status: 409, code: "challenge_active", message: "wait" }))
+      .mockResolvedValueOnce({ sentToMasked: "a••@acme.test", attemptsRemaining: 5 });
+    const verifyCode = vi.fn();
+    const soon = await step({ enrollment: { sendChallenge, verifyCode } as never }, "I didn't get it");
+    expect(soon.note).toContain("less than a minute ago");
+    expect(soon.ask).toMatchObject({ kind: "code" });
+    const again = await step({ enrollment: { sendChallenge, verifyCode } as never }, "send a new code");
+    expect(again.note).toBe("A new code is on its way to a••@acme.test; the one before it no longer works.");
+    expect(verifyCode).not.toHaveBeenCalled();
+
+    // A mistyped address goes back to the email question.
+    const other = await step({ enrollment: { sendChallenge, verifyCode } as never }, "oops, use a different email");
+    expect(other.ask).toMatchObject({ kind: "email" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "email" });
+    expect((await readOnboardState(root))?.email).toBeUndefined();
+  });
+
+  it("takes \"nothing for now\" as no first initiative, not as its title", async () => {
+    await writeOnboardState(root, { step: "first_task", systemId: "sys-1", instanceId: "instance-1" } as never);
+    const result = await step({}, "nothing for now, thanks");
+    expect(result.note).toBe("No initiative was started; start one from the site with New initiative whenever you like.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "done" });
   });
 
   it("ends the flow on an empty answer to the first task, not only on whitespace", async () => {

@@ -27,6 +27,7 @@ export interface McpCapabilityFacadeOptions {
   context: { assignmentId: string; attempt: number; sessionId: string };
   logger?: Logger;
   now?: () => number;
+  onUnavailable?: () => void | Promise<void>;
 }
 
 /**
@@ -47,6 +48,8 @@ export class McpCapabilityFacade {
   private refreshTask: Promise<CapabilityTokenIssue> | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
   private closed = false;
+  private refreshFailures = 0;
+  private renewalDeadline: number | null = null;
 
   constructor(private readonly options: McpCapabilityFacadeOptions) {
     this.issue = options.initial;
@@ -141,7 +144,7 @@ export class McpCapabilityFacade {
       // A proactive renewal outage must not discard a bearer that Core still
       // accepts. The request may use it once; a 401 then follows the safe
       // pre-dispatch forced-refresh path below.
-      if (Date.parse(this.issue.expiresAt) <= this.now()) throw error;
+      if (this.closed || Date.parse(this.issue.expiresAt) <= this.now()) throw error;
       issue = this.issue;
       this.logger.warn({ event: "mcp_capability.refresh_deferred", ...this.options.context, expiresAt: issue.expiresAt }, "MCP request is using the still-live capability after refresh exhaustion");
     }
@@ -193,13 +196,16 @@ export class McpCapabilityFacade {
     const previousExpiry = this.issue.expiresAt;
     const startedAt = this.now();
     this.logger.info({ event: "mcp_capability.refresh_started", ...this.options.context, reason, previousExpiry }, "MCP capability refresh started");
-    this.refreshTask = this.options.renew().then(issue => {
+    this.refreshTask = Promise.resolve().then(() => this.options.renew()).then(issue => {
       this.assertIssue(issue);
+      if (this.closed) throw new RemoteInstanceError("capability_unavailable", "The local MCP facade is closed.");
       this.issue = issue;
+      this.refreshFailures = 0;
+      this.renewalDeadline = null;
       this.logger.info({ event: "mcp_capability.refresh_recovered", ...this.options.context, reason, expiresAt: issue.expiresAt, durationMs: this.now() - startedAt }, "MCP capability refresh succeeded");
       this.scheduleRefresh(this.refreshDue() ? REFRESH_RETRY_DELAY_MS : undefined);
       return issue;
-    }, error => {
+    }).catch(async error => {
       this.logger.warn({
         event: "mcp_capability.refresh_exhausted",
         ...this.options.context,
@@ -207,7 +213,22 @@ export class McpCapabilityFacade {
         durationMs: this.now() - startedAt,
         code: error instanceof RemoteInstanceError ? error.code : "temporarily_unavailable",
       }, "MCP capability refresh exhausted its bounded retries");
-      this.scheduleRefresh(REFRESH_RETRY_DELAY_MS);
+      if (!this.closed) {
+        this.refreshFailures++;
+        this.renewalDeadline ??= Math.min(Date.parse(this.issue.expiresAt), this.now() + 60_000);
+        const remaining = this.renewalDeadline - this.now();
+        const retryable = error instanceof RemoteInstanceError && (error.retryable || error.code === "temporarily_unavailable");
+        if (retryable && remaining > 0) {
+          const delay = Math.min(remaining, 30_000, REFRESH_RETRY_DELAY_MS * 2 ** Math.min(this.refreshFailures - 1, 3));
+          this.scheduleRefresh(Math.min(remaining, delay * (0.8 + Math.random() * 0.2)));
+        } else {
+          this.logger.warn({ event: "mcp_capability.owner_unavailable", ...this.options.context,
+            attempts: this.refreshFailures, reason: retryable ? "renewal_deadline" : "permanent_refusal" }, "MCP capability owner must stop");
+          await this.close();
+          try { await this.options.onUnavailable?.(); }
+          catch { this.logger.error({ event: "mcp_capability.owner_stop_failed", ...this.options.context }, "MCP capability owner stop failed"); }
+        }
+      }
       throw error;
     }).finally(() => { this.refreshTask = null; });
     return this.refreshTask;

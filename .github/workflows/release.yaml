@@ -95,7 +95,7 @@ jobs:
           node scripts/sign-checksums.mjs --key "$RUNNER_TEMP/release.key.json" --in dist/release/SHA256SUMS --out dist/release/SHA256SUMS.sig --pub dist/release/release-signing.pub
           rm -f "$RUNNER_TEMP/release.key.json"
           if [ -n "$DEB_SIGNING_PUBLIC_KEY" ]; then printf '%s\n' "$DEB_SIGNING_PUBLIC_KEY" > dist/release/deb-signing.asc; fi
-          cp bootstrap/install.ps1 bootstrap/onboarding.md dist/release/
+          cp bootstrap/install.ps1 bootstrap/onboarding.md bootstrap/connect.md dist/release/
           node scripts/bake-bootstrap.mjs --sums dist/release/SHA256SUMS --pub dist/release/release-signing.pub --in bootstrap/install.sh --out dist/release/install.sh
           sh -n dist/release/install.sh
           node scripts/release-assets.mjs verify --manifest dist/release/native-manifest.json --dir dist/release

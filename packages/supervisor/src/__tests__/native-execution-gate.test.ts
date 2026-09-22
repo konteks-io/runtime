@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, RemoteInstanceError, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, generateEd25519, ed25519Sign, remoteControlSigningBytes, computeExecutionRevisionControlIntentDigest, computeRemoteExecutionOperationDigest, type RemoteDeliveryAcceptanceReceipt, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.js";
 import { SupervisorJournal } from "../state/journal.js";
@@ -21,10 +21,10 @@ beforeEach(async () => { root = await mkdtemp(join(tmpdir(), "native-gate-")); }
 afterEach(async () => { for (const session of sessions.splice(0)) session.fenceForRecovery(); for (const gate of gates.splice(0)) gate.stop(); vi.useRealTimers(); await rm(root, { recursive: true, force: true }); });
 const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const keys = new Map([["core", pair.publicKey]]);
-function signed(value: unknown) {
+function signed(value: unknown, signingKey = pair.privateKey, kid = "core") {
   const encoded = (part: unknown) => Buffer.from(JSON.stringify(part)).toString("base64url");
-  const body = `${encoded({ alg: "RS256", kid: "core" })}.${encoded(value)}`;
-  return `${body}.${sign("RSA-SHA256", Buffer.from(body), pair.privateKey).toString("base64url")}`;
+  const body = `${encoded({ alg: "RS256", kid })}.${encoded(value)}`;
+  return `${body}.${sign("RSA-SHA256", Buffer.from(body), signingKey).toString("base64url")}`;
 }
 const expiresAt = "2026-09-10T01:00:00Z";
 const assignment: RemoteWorkAssignment = { id: "assignment", attempt: 1, workspaceId: "tenant", instanceId: "instance", placementId: "placement", kind: "assistant_execution", taskId: "turn", correlationId: "correlation", expiresAt, requiredCapabilities: [], agentRoute: { agentId: "codex", requiredRole: "assistant" }, source: { kind: "conversation", portability: "portable_before_claim", sessionId: "session", turnRef: "turn" }, policy: { maxDurationSeconds: 60, maxArtifactBytes: 1, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted", latestResumeAt: expiresAt, permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: false } };
@@ -57,8 +57,8 @@ async function fixture() {
   let monotonic = 0;
   const assertOwned = vi.fn();
   const onAuthorityLost = vi.fn(async () => undefined);
-  const makeGate = () => { const gate = new NativeExecutionGate({ assignment, journal, clock, runnerIncarnation: "runner", client,
-    assertOwned, onAuthorityLost, monotonicNow: () => monotonic }); gates.push(gate); return gate; };
+  const makeGate = (overrides: Record<string, unknown> = {}) => { const gate = new NativeExecutionGate({ assignment, journal, clock, runnerIncarnation: "runner", client,
+    assertOwned, onAuthorityLost, currentRevisionFenceConnection: () => ({ connectionRef: "connection", connectionEpoch: 2 }), monotonicNow: () => monotonic, ...overrides } as never); gates.push(gate); return gate; };
   return { journal, clock, ready, claims, client, envelope, gate: makeGate(), makeGate, onAuthorityLost, assertOwned,
     advance: (milliseconds: number) => { monotonic += milliseconds; clock.advance(milliseconds); } };
 }
@@ -101,6 +101,20 @@ async function deliveryFixture() {
     envelope: { ...f.envelope, permit: signed(claims) } };
 }
 
+it("passes an operation key identifier to the configured-origin trust cache", async () => {
+  const f = await fixture();
+  const rotated = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const rotatedKeys = new Map([["rotated", rotated.publicKey]]);
+  const receipt = signed({ ...f.claims, aud: "konteks:remote-execution-admission", admissionId: "admission",
+    admittedAt: f.clock.nowIso(), checkExpiresAt: "2026-09-10T00:00:30Z" }, rotated.privateKey, "rotated");
+  f.client.executionSigningKeys.mockResolvedValue(rotatedKeys);
+  f.client.consumeExecution.mockResolvedValue({ outcome: "admitted", admissionId: "admission", receipt });
+
+  await f.gate.admit({ ...f.envelope, permit: signed(f.claims, rotated.privateKey, "rotated") });
+
+  expect(f.client.executionSigningKeys).toHaveBeenCalledWith(undefined, "rotated");
+});
+
 it("dispatches delivery exactly once through dedicated consumption and check routes", async () => {
   const f = await deliveryFixture(); const operation = await f.gate.admit(f.envelope);
   expect(await f.gate.begin(operation)).toBe(true);
@@ -110,6 +124,71 @@ it("dispatches delivery exactly once through dedicated consumption and check rou
   expect(f.client.consumeExecution).not.toHaveBeenCalled();
   expect(f.client.checkExecution).not.toHaveBeenCalled();
   expect(f.journal.pendingRequests.get(operation.key)?.authorization?.claims).toMatchObject({ workloadKind: "harness_delivery" });
+});
+
+it("does not give renewal I/O more time than the verified monotonic lease has left", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+
+  f.advance(29_999);
+  await vi.advanceTimersByTimeAsync(1_000);
+
+  const renewalDeadline = f.client.executionSigningKeys.mock.calls.at(-1)?.[0] as number;
+  expect(renewalDeadline).toBeLessThanOrEqual(Date.now() + 1);
+});
+
+it("renews early enough to recover from a 19 second busy-host pause without extending the old lease", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+  f.client.checkExecution.mockImplementationOnce(async () => {
+    f.advance(19_000);
+    throw new RemoteInstanceError("temporarily_unavailable", "check timed out", { retryable: true });
+  });
+  f.advance(5_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(f.client.checkExecution).toHaveBeenCalledTimes(2);
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  f.advance(1_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(f.client.checkExecution).toHaveBeenCalledTimes(3);
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  f.advance(3_000);
+  expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
+});
+
+it("refuses a successful renewal response received after the old monotonic lease expired", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+  const normalCheck = f.client.checkExecution.getMockImplementation()!;
+  f.client.checkExecution.mockImplementationOnce(async () => {
+    f.advance(26_000);
+    return normalCheck();
+  });
+  f.advance(5_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(f.onAuthorityLost).toHaveBeenCalledOnce();
+  expect(() => f.gate.assertDispatchCurrent(operation.authority)).toThrow();
+});
+
+it("records renewal stage and remaining authority without logging signed material", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: vi.fn() };
+  const gate = f.makeGate({ logger });
+  const operation = await gate.admit(f.envelope);
+  await gate.begin(operation);
+  f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "secret upstream message", { retryable: true }));
+  f.advance(5_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "execution.renewal_failed", stage: "check", executionId: "execution", remainingLeaseMs: 25_000 }), expect.any(String));
+  expect(JSON.stringify(logger.warn.mock.calls)).not.toContain("secret upstream message");
+  expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(f.envelope.permit);
 });
 
 it("does not redispatch recovered ambiguous delivery work", async () => {
@@ -309,6 +388,33 @@ describe("native session dispatch uses genuine execution admission", () => {
     await f.session.onToRuntime(f.envelope); expect(f.beforePrompt).toHaveBeenCalledTimes(1);
   });
 
+  it("closes a native turn after a retryable check refusal before dispatch", async () => {
+    const f = await sessionFixture();
+    f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));
+    await f.session.onToRuntime(f.envelope);
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("denied");
+    expect(f.runner.closeSession).toHaveBeenCalledOnce();
+    expect(f.session.isClosed).toBe(true);
+    expect(f.send.mock.calls.map(call => call[0].body)).toEqual([
+      expect.objectContaining({ kind: "acp_error", id: "request" }),
+      { kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" },
+    ]);
+  });
+
+  it("closes a native turn on a matched agent prompt error, ignoring unrelated errors", async () => {
+    const f = await sessionFixture();
+    await f.session.onToRuntime(f.envelope);
+    const error = { kind: "request_error", acpSessionRef: "acp", requestId: "unknown", method: "session/prompt",
+      code: -32603, class: "internal", message: "failed", retryable: true };
+    await f.session.onRunnerEvent(error as never);
+    expect(f.session.isClosed).toBe(false);
+    await f.session.onRunnerEvent({ ...error, requestId: "request" } as never);
+    expect(f.session.isClosed).toBe(true);
+    expect(f.runner.closeSession).toHaveBeenCalledOnce();
+    expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "agent_exited" });
+  });
+
   it("terminalizes a delivery whose local inputs fail before agent dispatch", async () => {
     const delivery = await deliveryFixture();
     const f = await sessionFixture(delivery.assigned);
@@ -352,18 +458,133 @@ describe("native session dispatch uses genuine execution admission", () => {
     const f = await sessionFixture(); vi.useFakeTimers();
     await f.session.onToRuntime(f.envelope);
     f.runner.stopForRecovery.mockRejectedValueOnce(new Error("stop unproven"));
-    // A lapsed lease alone is renewed through the grace; Core refusing is what stops it.
+    // The verified lease schedules renewal while 25 seconds remain; a
+    // definitive refusal must stop without claiming the stop succeeded.
     f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("execution_fenced", "moved"));
-    f.clock.advance(31_000); await vi.advanceTimersByTimeAsync(1000);
+    f.clock.advance(25_000); await vi.advanceTimersByTimeAsync(25_000);
     await expect(f.session.waitForAuthorityStop()).rejects.toThrow("stop unproven");
     expect(f.runner.stopForRecovery).toHaveBeenCalledWith("acp");
     expect(f.runner.closeSession).not.toHaveBeenCalled();
-    expect(f.send).not.toHaveBeenCalled();
+    expect(f.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ body: { kind: "session_closed", assignmentId: "assignment", reason: "lease_lost" } }));
     expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("dispatch_started");
   });
 });
 
 describe("independent native live execution gate", () => {
+  it("fences before dispatch when durable verified control names the fresh exact execution check", async () => {
+    const f = await fixture();
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      executionRevision: 1,
+      checkId: "check",
+      policyRevision: null,
+      connectionRef: "connection",
+      connectionEpoch: 2,
+      reason: "authority_revoked" as const,
+      issuedAt: f.clock.nowIso(),
+      deadlineAt: new Date(f.clock.coreNow() + 2_000).toISOString(),
+    };
+    await f.journal.executionRevisionFences.receiveVerified({
+      intent,
+      intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      runnerIncarnation: "runner",
+      connectionRef: "connection",
+      connectionEpoch: 2,
+    }, f.clock.nowIso(), () => {});
+    const operation = await f.gate.admit(f.envelope);
+    await expect(f.gate.begin(operation)).rejects.toMatchObject({
+      code: "execution_fenced",
+    });
+    expect(f.client.checkExecution).toHaveBeenCalledOnce();
+  });
+
+  it("creates a nonterminal receipt only after applying the exact current native fence", async () => {
+    const f = await fixture();
+    const onFenceApplied = vi.fn(async () => undefined);
+    const gate = f.makeGate({ onFenceApplied });
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "receipt-intent", tenantId: "tenant", instanceId: "instance", executionId: "execution", executionRevision: 1,
+      checkId: "check", policyRevision: null, connectionRef: "connection", connectionEpoch: 2,
+      reason: "authority_revoked" as const, issuedAt: f.clock.nowIso(), deadlineAt: new Date(f.clock.coreNow() + 2_000).toISOString(),
+    };
+    await f.journal.executionRevisionFences.receiveVerified({
+      intent, intentDigest: computeExecutionRevisionControlIntentDigest(intent), runnerIncarnation: "runner", connectionRef: "connection", connectionEpoch: 2,
+    }, f.clock.nowIso(), () => {});
+
+    const operation = await gate.admit(f.envelope);
+    await expect(gate.begin(operation)).rejects.toMatchObject({ code: "execution_fenced" });
+    await vi.waitFor(() => expect(onFenceApplied).toHaveBeenCalledWith(expect.objectContaining({
+      kind: "execution_revision_fenced", intent, intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      runnerIncarnation: "runner", connectionRef: "connection", connectionEpoch: 2,
+    })));
+  });
+
+  it("does not fence a different execution revision or connection record", async () => {
+    const f = await fixture();
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "other-intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      executionRevision: 2,
+      checkId: "other-check",
+      policyRevision: null,
+      connectionRef: "other-connection",
+      connectionEpoch: 3,
+      reason: "authority_revoked" as const,
+      issuedAt: f.clock.nowIso(),
+      deadlineAt: new Date(f.clock.coreNow() + 2_000).toISOString(),
+    };
+    await f.journal.executionRevisionFences.receiveVerified({
+      intent,
+      intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      runnerIncarnation: "runner",
+      connectionRef: "other-connection",
+      connectionEpoch: 3,
+    }, f.clock.nowIso(), () => {});
+    const operation = await f.gate.admit(f.envelope);
+    await expect(f.gate.begin(operation)).resolves.toBe(true);
+  });
+
+  it("does not fence a control for the same revision when its verified check differs", async () => {
+    const f = await fixture();
+    const intent = {
+      schemaVersion: "remote-execution-revision-control-v1" as const,
+      negotiatedCapability: "execution-revision-control-v1" as const,
+      intentId: "other-check-intent",
+      tenantId: "tenant",
+      instanceId: "instance",
+      executionId: "execution",
+      executionRevision: 1,
+      checkId: "other-check",
+      policyRevision: null,
+      connectionRef: "connection",
+      connectionEpoch: 2,
+      reason: "authority_revoked" as const,
+      issuedAt: f.clock.nowIso(),
+      deadlineAt: new Date(f.clock.coreNow() + 2_000).toISOString(),
+    };
+    await f.journal.executionRevisionFences.receiveVerified({
+      intent,
+      intentDigest: computeExecutionRevisionControlIntentDigest(intent),
+      runnerIncarnation: "runner",
+      connectionRef: "connection",
+      connectionEpoch: 2,
+    }, f.clock.nowIso(), () => {});
+
+    const operation = await f.gate.admit(f.envelope);
+    await expect(f.gate.begin(operation)).resolves.toBe(true);
+  });
+
   it("requires genuine signatures, exact local readiness, consumption and a check before start", async () => {
     const f = await fixture(); const operation = await f.gate.admit(f.envelope);
     expect(f.journal.pendingRequests.get(operation.key)?.authorization?.state).toBe("admitted");
@@ -413,7 +634,9 @@ describe("independent native live execution gate", () => {
     const f = await fixture(); vi.useFakeTimers();
     const operation = await f.gate.admit(f.envelope); await f.gate.begin(operation);
     f.client.checkExecution.mockRejectedValueOnce(new Error("policy revoked"));
-    f.advance(10_000); await vi.advanceTimersByTimeAsync(1000);
+    f.advance(4_000); await vi.advanceTimersByTimeAsync(4_000);
+    expect(f.onAuthorityLost).not.toHaveBeenCalled();
+    f.advance(1_000); await vi.advanceTimersByTimeAsync(1_000);
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(10_000); expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
   });
@@ -425,36 +648,65 @@ describe("independent native live execution gate", () => {
     // extend it, and Core refuses this one.
     f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("execution_fenced", "moved"));
     f.advance(31_000); f.clock.advance(-40_000); await vi.advanceTimersByTimeAsync(1000);
-    expect(f.client.checkExecution).toHaveBeenCalledTimes(2);
+    // A backward wall-clock jump cannot manufacture time before the local
+    // monotonic expiry; the old check is never retried or extended.
+    expect(f.client.checkExecution).toHaveBeenCalledOnce();
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps a running turn while a slow check is still on its way (WS2-047)", async () => {
-    const f = await fixture(); vi.useFakeTimers();
-    const operation = await f.gate.admit(f.envelope); await f.gate.begin(operation);
-    const answerNow = f.client.checkExecution.getMockImplementation()!;
-    let answer!: () => void;
-    f.client.checkExecution.mockImplementationOnce(() => new Promise((resolve) => { answer = () => resolve(answerNow()); }));
-    const step = async (seconds: number) => {
-      for (let second = 0; second < seconds; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
-    };
-    await step(40); // the renewal left at 10s; the 30s lease lapsed while it waited
-    expect(f.onAuthorityLost).not.toHaveBeenCalled();
-    answer(); await step(60);
-    expect(f.onAuthorityLost).not.toHaveBeenCalled();
-    expect(f.client.checkExecution.mock.calls.length).toBeGreaterThan(2);
-  });
-
-  it("stops a turn once Core has stayed unreachable past the grace", async () => {
+  it("fences at the monotonic projection of the last verified expiry when a renewal is unavailable", async () => {
     const f = await fixture(); vi.useFakeTimers();
     const operation = await f.gate.admit(f.envelope); await f.gate.begin(operation);
     f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));
     const step = async (seconds: number) => {
       for (let second = 0; second < seconds; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
     };
-    await step(320); // 30s lease + most of the grace: a Core restart fits
+    await step(29);
     expect(f.onAuthorityLost).not.toHaveBeenCalled();
-    await step(15);
+    await step(1);
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
   });
+});
+
+
+it('retains a genuine admission that expires in transit as non-dispatch evidence', async () => {
+  const f = await fixture();
+  const consume = f.client.consumeExecution.getMockImplementation()!;
+  f.client.consumeExecution.mockImplementationOnce(async (...args) => {
+    const response = await consume(...args); f.clock.advance(31_000); return response;
+  });
+  const operation = await f.gate.admit(f.envelope);
+  await expect(f.gate.begin(operation)).rejects.toMatchObject({ code: 'operation_expired' });
+  expect(f.journal.pendingRequests.get(operation.key)?.authorization?.state).toBe('denied');
+  expect(f.client.checkExecution).not.toHaveBeenCalled();
+});
+
+it('accepts an admission and fresh check at an HTTP Date second boundary', async () => {
+  const f = await fixture();
+  const freshCheck = await f.client.checkExecution();
+  f.client.checkExecution.mockResolvedValue(freshCheck);
+  f.clock.advance(-550);
+  const op = await f.gate.admit(f.envelope);
+  expect(await f.gate.begin(op)).toBe(true);
+});
+
+
+it('refuses a new permit for an already admitted ACP request before consuming again', async () => {
+  const f = await fixture(); await f.gate.admit(f.envelope);
+  const changed = { ...f.claims, operationId: 'second-operation', permitId: 'second-permit' };
+  await expect(f.gate.admit({ ...f.envelope, operationId: changed.operationId, permit: signed(changed) })).rejects.toMatchObject({ code: 'operation_conflict' });
+  expect(f.client.consumeExecution).toHaveBeenCalledTimes(1);
+});
+
+it("notifies the holder of authority loss before recovery suppresses session traffic", async () => {
+  const f = await sessionFixture();
+  await f.session.onToRuntime(f.envelope);
+  const gate = (f.session as unknown as { executionGate: { fenceAuthority(): Promise<void> } }).executionGate;
+  await gate.fenceAuthority();
+  expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({
+    kind: "session_closed", assignmentId: assignment.id, reason: "lease_lost",
+  });
+  expect(f.runner.stopForRecovery).toHaveBeenCalledExactlyOnceWith("acp");
+  expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("dispatch_started");
+  expect(f.session.isClosed).toBe(true);
 });

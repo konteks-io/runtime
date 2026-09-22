@@ -63,6 +63,8 @@ export async function writeOwnerToken(
 const FirstSystemSchema = z
   .object({
     systemId: z.string().min(1),
+    /** The workspace already had this System; this machine now works on it (WS1-089). */
+    existing: z.boolean().optional(),
     systemEntityRef: z.string().min(1),
     componentEntityRef: z.string().min(1),
     repository: z
@@ -198,6 +200,15 @@ export class OwnerApiClient {
       ...(pmSessionId ? { pmSessionId } : {}),
       ...(failure && typeof failure.message === "string" ? { setupFailure: failure.message } : {}),
     };
+  }
+
+  /** The initiatives a System already has, newest first as Konteks lists them (WS1-090). */
+  async listInitiatives(systemId: string): Promise<Array<{ id: string; title: string }>> {
+    const body = (await this.call("GET", `/api/collaboration/initiatives?systemId=${encodeURIComponent(systemId)}`)) as Record<string, unknown>;
+    const list = Array.isArray(body.initiatives) ? (body.initiatives as Array<Record<string, unknown>>) : [];
+    return list
+      .filter(entry => typeof entry.id === "string" && entry.id)
+      .map(entry => ({ id: entry.id as string, title: typeof entry.title === "string" ? entry.title : "" }));
   }
 
   /** A project-management session scoped to that System (OS13). */

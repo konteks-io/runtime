@@ -47,6 +47,9 @@ interface NativeInputPreparerOptions {
   git?: NativeGitTool;
   /** Connector-wide object cache; agent worktrees remain below `root`. */
   repositoryCacheRoot?: string;
+  /** Optional local developer tool wiring for a newly materialized private
+   * worktree. Failure is observable but never withholds delivery inputs. */
+  prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void>;
   outputClient?: () => NativeOutputClient;
   logger?: Pick<Logger, "warn">;
 }
@@ -337,8 +340,16 @@ export function createNativeInputPreparer(
               // repository cache.
               worktreeId: selection.binding.sessionId,
               ...(repositoryWorkspace ? { mode: repositoryWorkspace.mode } : {}),
-            }).then(worktree => ({ cwd: worktree.cwd, container: worktree.cwd,
-              baselineCommit: worktree.baselineCommit, verify: worktree.verify }))
+            }).then(async worktree => {
+              if (options.prepareRepositoryWorktree) {
+                await options.prepareRepositoryWorktree(worktree.cwd, current.agentRoute.agentId).catch(error =>
+                  options.logger?.warn({ event: "repository_worktree.tool_wiring_failed", repositoryId: selectedRepository.repositoryId,
+                    agentId: current.agentRoute.agentId, errorClass: error instanceof Error ? error.name : "unknown" },
+                  "optional repository tool wiring failed; delivery continues"));
+              }
+              return { cwd: worktree.cwd, container: worktree.cwd,
+                baselineCommit: worktree.baselineCommit, verify: worktree.verify };
+            })
           : await sourceWorkspace(
               root,
               envelope,

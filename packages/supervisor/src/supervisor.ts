@@ -1,3 +1,4 @@
+import { ObservationDelivery } from "./control/observation-delivery.js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import {
@@ -29,6 +30,10 @@ import { loadSupervisorConfig, parseRunnerUrls, type SupervisorConfig } from "./
 import { CoreClient, LEASE_AUDIENCE } from "./core/client.js";
 import { CoreSignatureVerifier } from "./control/core-signature.js";
 import { CancellationReceiver } from "./control/cancellation-receiver.js";
+import { ExecutionRevisionControlReceiver } from "./control/execution-revision-control-receiver.js";
+import { ExecutionRevisionFenceReceiptDelivery } from "./control/execution-revision-fence-receipt-delivery.js";
+import { DiagnosticCompanionReceiver } from "./control/diagnostic-companion-receiver.js";
+import { diagnosticCompanionOperationalObservation } from "./control/diagnostic-companion-observability.js";
 import { PermissionAnswerReceiver } from "./control/permission-answer-receiver.js";
 import { CancellationReplay } from "./control/cancellation-replay.js";
 import { ControlHandlers, compareSemver } from "./control/handlers.js";
@@ -122,6 +127,7 @@ export interface SupervisorOptions {
     git?: NativeGitTool;
     /** Shared object cache across every configured local agent. */
     repositoryCacheRoot?: string;
+    prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void>;
     runtimeOptions?: NativeRunnerOptions["runtimeOptions"];
     /** Test/embedding seam for the independently supervised shared Codex owner. */
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;
@@ -176,7 +182,9 @@ export class Supervisor {
   inventory!: InventoryCollector | NativeInventoryCollector;
   heartbeat!: HeartbeatPublisher;
   control!: ControlHandlers;
+  private observationDelivery!: ObservationDelivery;
   private configurationAcks!: ConfigurationAckDelivery;
+  private executionRevisionFenceReceipts!: ExecutionRevisionFenceReceiptDelivery;
   work!: WorkOrchestrator;
   private planningTerminal!: PlanningTerminalDirectiveProcessor;
   private planningDirectivePoller: ControllerDirectivePoller | null = null;
@@ -208,6 +216,13 @@ export class Supervisor {
   private muxTimer: NodeJS.Timeout | null = null;
   private cancellationTimer: NodeJS.Timeout | null = null;
   private cancellationReplay: CancellationReplay | null = null;
+  /** Cleared on every relay generation change; gates may use it only while its
+   * captured socket assertion still proves the same signed delivery path. */
+  private revisionFenceConnection: {
+    connectionRef: string;
+    connectionEpoch: number;
+    assertCurrent(): void;
+  } | null = null;
   private configurationTimer: NodeJS.Timeout | null = null;
   private configurationRefresh: Promise<void> | null = null;
   private activeLoopStarted = false;
@@ -320,7 +335,12 @@ export class Supervisor {
       key: () => this.key,
       credential: () => this.lease.current()?.lease ?? this.provisioningCredential,
     });
+    this.observationDelivery = new ObservationDelivery({ outbox: this.outbox, core: this.core,
+      instanceId: () => this.instanceId ?? "", clock: this.clock, logger: this.logger,
+      canSend: () => !this.stopping && Boolean(this.instanceId) && Boolean(this.lease.current()) && (!this.native || this.recoveryAuthority() !== null) });
+    this.observationDelivery.start();
     this.configurationAcks = new ConfigurationAckDelivery({ outbox: this.outbox, core: this.core, instanceId: () => this.instanceId ?? "", clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId) });
+    this.executionRevisionFenceReceipts = new ExecutionRevisionFenceReceiptDelivery({ outbox: this.outbox, core: this.core, clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId), logger: this.logger });
     if (this.native) {
       const sharedCodex = this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === "codex" && config.RUNNER_NATIVE_CODEX_SOCKET !== undefined);
       if (sharedCodex) this.nativeCodexOwner = new NativeCodexAppServerOwner({
@@ -437,7 +457,10 @@ export class Supervisor {
           outboundHighWaterBytes: Math.max(64 * 1024, Math.floor(this.config.SUPERVISOR_REPLAY_BUFFER_BYTES / 2)),
           outboundLowWaterBytes: Math.max(32 * 1024, Math.floor(this.config.SUPERVISOR_REPLAY_BUFFER_BYTES / 4)),
           outboundMaxBytes: this.config.SUPERVISOR_REPLAY_BUFFER_BYTES,
-          onStateChange: () => this.transport.evaluate(),
+          onStateChange: (state) => {
+            if (state !== "connected") this.revisionFenceConnection = null;
+            this.transport.evaluate();
+          },
           validateHandshake: result => this.validateRelayHandshake(result),
           onConnected: result => this.onRelayConnected(result),
           onPermissionAnswer: async (request, connection) => {
@@ -491,6 +514,99 @@ export class Supervisor {
             });
             await receiver.receive(request);
           },
+          onDiagnosticCompanion: async (request, connection) => {
+            const lease = this.lease.current();
+            const instanceId = this.instanceId;
+            const workspaceId = this.workspaceId;
+            const runnerIncarnation = this.runnerIncarnation;
+            const ownership = this.nativeOwnership;
+            const receiver = new DiagnosticCompanionReceiver({
+              verifier,
+              inbox: this.journal.diagnosticCompanions,
+              now: () => this.clock.coreNow(),
+              onAccepted: record => {
+                const match = record.companion.match;
+                const active = this.journal.activeAssignments().find(entry =>
+                  entry.assignmentId === match.assignmentId && entry.attempt === match.attempt,
+                );
+                const retained = active ? this.journal.execution.start(match.assignmentId, match.attempt) : undefined;
+                const operation = active && retained && active.claimId === retained.admission.claimId
+                  ? {
+                      assignmentId: active.assignmentId,
+                      attempt: active.attempt,
+                      claimId: retained.admission.claimId,
+                      executionId: retained.admission.executionGeneration,
+                      runtimeIncarnationId: retained.admission.runnerIncarnation,
+                    }
+                  : null;
+                const observation = diagnosticCompanionOperationalObservation(record, operation);
+                if (observation.event === "runtime.diagnostic_companion.coverage_incomplete") {
+                  this.logger.warn(observation, "diagnostic companion coverage is incomplete");
+                } else {
+                  this.logger.info(observation, "diagnostic companion persisted for active operation");
+                }
+              },
+              captureConnection: () => lease && instanceId && workspaceId && ownership ? {
+                instanceId,
+                workspaceId,
+                runnerIncarnation,
+                nodeId: request.nodeId,
+                connectionRef: request.connectionRef,
+                connectionEpoch: connection.connectionEpoch,
+                assertCurrent: () => {
+                  connection.assertCurrent();
+                  if (this.stopping || this.nativeOwnership !== ownership ||
+                    this.lease.current() !== lease || this.instanceId !== instanceId ||
+                    this.workspaceId !== workspaceId ||
+                    this.runnerIncarnation !== runnerIncarnation) {
+                    throw new RemoteInstanceError("recovery_required", "Diagnostic companion ownership is not current");
+                  }
+                  ownership.assertOwned();
+                },
+              } : null,
+            });
+            await receiver.receive(request);
+          },
+          onExecutionRevisionControl: async (request, connection) => {
+            const lease = this.lease.current();
+            const instanceId = this.instanceId;
+            const workspaceId = this.workspaceId;
+            const runnerIncarnation = this.runnerIncarnation;
+            const ownership = this.nativeOwnership;
+            const accepted = this.recoveryAuthority();
+            const assertCurrent = () => {
+              connection.assertCurrent();
+              if (this.stopping || !lease || !instanceId || !workspaceId || !ownership ||
+                  this.nativeOwnership !== ownership || this.lease.current() !== lease ||
+                  this.instanceId !== instanceId || this.workspaceId !== workspaceId ||
+                  this.runnerIncarnation !== runnerIncarnation || this.recoveryAuthority() !== accepted) {
+                throw new RemoteInstanceError("recovery_required", "Revision-control native ownership is not current");
+              }
+              ownership.assertOwned();
+            };
+            const receiver = new ExecutionRevisionControlReceiver({
+              verifier,
+              inbox: this.journal.executionRevisionFences,
+              now: () => this.clock.coreNow(),
+              monotonicNow: () => performance.now(),
+              captureConnection: () => lease && instanceId && workspaceId && ownership && accepted ? {
+                instanceId,
+                workspaceId,
+                runnerIncarnation,
+                nodeId: request.nodeId,
+                connectionRef: request.connectionRef,
+                connectionEpoch: connection.connectionEpoch,
+                assertCurrent,
+              } : null,
+            });
+            await receiver.receive(request);
+            assertCurrent();
+            this.revisionFenceConnection = {
+              connectionRef: request.connectionRef,
+              connectionEpoch: connection.connectionEpoch,
+              assertCurrent,
+            };
+          },
         })
       : null;
     // The D143 cutover is decided by the protocol this build speaks, not by
@@ -516,6 +632,7 @@ export class Supervisor {
     const https = new HttpsFallbackTransport({
       core: this.core, instanceId: () => this.instanceId ?? "",
       pollIntervalMs: this.config.SUPERVISOR_HTTPS_FALLBACK_POLL_MS,
+      relayOnlySessions: this.native,
       recoveryAuthority: () => this.recoveryAuthority(),
       ...(this.assignmentSender ? { sender: this.assignmentSender } : {}),
     });
@@ -600,6 +717,15 @@ export class Supervisor {
       reconciliationComplete: () => this.reconciliation.isComplete,
       recoveryAuthority: () => this.recoveryAuthority(),
       reportDeliveryAllowed: () => this.recoveryAuthority() !== null,
+      ...(this.native ? {
+        recoveryEvidence: { submit: (input: Parameters<CoreClient["submitRecoveryEvidence"]>[0]) => this.core.submitRecoveryEvidence(input) },
+        recoveryEvidenceConnection: () => ({ kind: "https" as const }),
+        canSubmitRecoveryEvidence: () => {
+          if (this.stopping || !this.nativeOwnership || this.recoveryAuthority() === null) return false;
+          try { this.nativeOwnership.assertOwned(); return true; }
+          catch { return false; }
+        },
+      } : {}),
       ...(this.native ? { recoverPendingDeliveryOutput: createRetainedDeliveryOutputRecovery({
         roots: this.options.native!.runners.map(config => config.RUNNER_WORKSPACE_DIR),
         journal: this.journal,
@@ -637,7 +763,20 @@ export class Supervisor {
         workspaceRoot: this.native ? this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR : "/workspace",
         ...(this.native ? {
           deploymentKind: "native_connector" as const,
-          executionAuthority: { client: this.core, runnerIncarnation: this.runnerIncarnation },
+          executionAuthority: {
+            client: this.core,
+            runnerIncarnation: this.runnerIncarnation,
+            onFenceApplied: receipt => this.executionRevisionFenceReceipts.submit(receipt),
+            currentRevisionFenceConnection: () => {
+              const connection = this.revisionFenceConnection;
+              if (!connection) return null;
+              connection.assertCurrent();
+              return {
+                connectionRef: connection.connectionRef,
+                connectionEpoch: connection.connectionEpoch,
+              };
+            },
+          },
           registerReady: createNativeReadyRegistrar({
             clock: this.clock, journal: this.journal, client: this.core,
             instanceId: this.instanceId ?? "", workspaceId: this.workspaceId ?? "", runnerIncarnation: this.runnerIncarnation,
@@ -654,6 +793,9 @@ export class Supervisor {
             ...(this.options.native!.git ? { git: this.options.native!.git } : {}),
             ...(this.options.native!.repositoryCacheRoot
               ? { repositoryCacheRoot: this.options.native!.repositoryCacheRoot }
+              : {}),
+            ...(this.options.native!.prepareRepositoryWorktree
+              ? { prepareRepositoryWorktree: this.options.native!.prepareRepositoryWorktree }
               : {}),
             client: () => new NativeInputClient({
               baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots, clock: this.clock,
@@ -919,6 +1061,7 @@ export class Supervisor {
     this.configurationRefresh ??= (async () => {
       try {
         await this.configurationAcks.flush();
+        await this.executionRevisionFenceReceipts.flush();
         if (this.stopping) return;
         const desired = await this.core.fetchDesiredConfiguration(this.instanceId!);
         if (!this.stopping) await this.control.handle(desired);
@@ -1355,14 +1498,12 @@ export class Supervisor {
     }
   }
 
-  private async sendGatewayObservation(observation: GatewayCallObservation, signature: string): Promise<void> {
-    await this.outbox.enqueue({ id: randomUUID(), channel: "observation", key: `gateway:${observation.assignmentId}:${observation.observedAt}:${observation.agentId}`, group: "observation", order: this.clock.now(), body: observation, createdAt: this.clock.nowIso() });
-    this.transport.send({ channel: "observation", channelId: coreChannelId("observation", this.instanceId ?? ""), body: observation, signature });
+  private async sendGatewayObservation(observation: GatewayCallObservation, _signature: string): Promise<void> {
+    await this.observationDelivery.submit(observation);
   }
 
   private async sendUsageObservation(observation: AgentTurnUsageObservation): Promise<void> {
-    await this.outbox.enqueue({ id: randomUUID(), channel: "observation", key: `usage:${observation.assignmentId}:${observation.observedAt}`, group: "observation", order: this.clock.now(), body: observation, createdAt: this.clock.nowIso() });
-    this.transport.send({ channel: "observation", channelId: coreChannelId("observation", this.instanceId ?? ""), body: observation, signature: signBody(this.key, observation as unknown as { [key: string]: JsonValue }) });
+    await this.observationDelivery.submit(observation);
   }
 
   // ── Drain / erase ──────────────────────────────────────────────────────────
@@ -1728,7 +1869,9 @@ export class Supervisor {
     await this.cancellationReplay?.stop();
     if (this.configurationTimer) clearInterval(this.configurationTimer);
     await this.configurationRefresh;
+    await this.observationDelivery?.stop();
     await this.configurationAcks?.settle();
+    await this.executionRevisionFenceReceipts?.settle();
     await this.planningDirectivePoller?.stop();
     this.heartbeat?.stop();
     await this.heartbeat?.settle();

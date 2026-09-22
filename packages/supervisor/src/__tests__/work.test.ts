@@ -484,7 +484,7 @@ describe("work orchestrator claim validation", () => {
     expect(f.sent).toEqual([]);
   });
 
-  it("keeps a native harness turn alive on a relay replay gap but still closes an appliance session", async () => {
+  it("closes native and appliance work on an unrecoverable relay replay gap", async () => {
     const fake = (kind: string, source: string) => ({
       channelId: "session:live", isClosed: false, close: vi.fn(async () => undefined),
       assignment: { id: "live", attempt: 1, kind, source: { kind: source } },
@@ -494,7 +494,7 @@ describe("work orchestrator claim validation", () => {
     (native.work as unknown as { sessions: Map<string, unknown> }).sessions.set("live:1", nativeSession);
     const nativeClose = vi.spyOn(native.transport, "closeChannel");
     await native.work.onChannelReset("session:live");
-    expect(nativeSession.close).not.toHaveBeenCalled();
+    expect(nativeSession.close).toHaveBeenCalledExactlyOnceWith("relay_replay_gap");
     expect(nativeClose).not.toHaveBeenCalled();
 
     const appliance = await orchestrator();
@@ -541,6 +541,35 @@ describe("work orchestrator claim validation", () => {
     expect(f.sent).toEqual([]);
     expect(f.outbox.depth).toBe(0);
     expect(f.journal.execution.start("asg-1", 1)?.delivery).toBe("unallocated");
+  });
+
+  it("emits causal diagnostics only after native admission is durable", async () => {
+    let admissionPersisted = false;
+    const info = vi.fn((fields: Record<string, unknown>) => {
+      if (fields.event === "runtime.admission.durable") {
+        expect(admissionPersisted).toBe(true);
+      }
+    });
+    const logger = { info, warn: vi.fn(), error: vi.fn() } as unknown as Logger;
+    const f = await orchestrator({ deploymentKind: "native_connector", logger });
+    const begin = f.journal.execution.beginAdmission.bind(f.journal.execution);
+    vi.spyOn(f.journal.execution, "beginAdmission").mockImplementation(async (candidate, check) => {
+      await begin(candidate, check);
+      admissionPersisted = true;
+    });
+
+    await f.work.onAssignmentMessage({ assignments: [assignment] });
+
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({
+      event: "runtime.admission.durable",
+      observability: expect.objectContaining({
+        schemaVersion: "observability-context-v1",
+        assignmentId: "asg-1",
+        attempt: 1,
+        executionId: expect.any(String),
+        runtimeIncarnationId: "process",
+      }),
+    }), "native claim admission persisted");
   });
 
   it("claim ACK completion cannot adopt newer authority or invent a terminal", async () => {

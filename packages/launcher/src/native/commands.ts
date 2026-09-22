@@ -9,9 +9,10 @@ import { SupervisorControl } from "../control.js";
 import { addNativeAgent, installNative, readNativeRecord, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
-import { nativePlatform, nativeServiceDefinition, type NativeServiceCommand } from "./service.js";
+import { nativePlatform, nativeServiceDefinition, parseServiceExits, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
-import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate } from "./update-transaction.js";
+import { prepareDeliveryGraft } from "./graft.js";
+import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 
@@ -19,6 +20,11 @@ const environment = () => sanitizeInheritedChildProcessEnv({ env: process.env })
 async function execute(command: NativeServiceCommand): Promise<number | null> {
   const result = await runCommand({ ...command, env: environment(), timeoutMs: 30_000 });
   return result.code;
+}
+async function serviceExits(definition: NativeServiceDefinition) {
+  if (!definition.exits) return null;
+  const result = await runCommand({ ...definition.exits, env: environment(), timeoutMs: 10_000 });
+  return result.code === 0 ? parseServiceExits(nativePlatform().os, result.stdout) : null;
 }
 async function serviceDefinition(root: string) {
   const platform = nativePlatform();
@@ -48,6 +54,24 @@ async function start(input: NativeCommandContext): Promise<void> {
   input.output.line("Native user service started. It takes about a minute after a fresh install before it is ready for work; agent login and cloud readiness are reported separately by status.");
 }
 
+/** One onboarding step, with a failure said as a step too, never a crash. */
+async function onboardStep(input: { root: string; output: NativeCommandContext["output"]; answer?: string; cwd?: string }): Promise<OnboardStep> {
+  const coreUrl = await onboardCoreUrl(input.root);
+  const context = {
+    root: input.root,
+    output: input.output,
+    ...(input.answer !== undefined ? { answer: input.answer } : {}),
+    ...(input.cwd ? { cwd: input.cwd } : {}),
+    ...(coreUrl ? { coreUrl } : {}),
+  };
+  try {
+    return await runOnboard(context);
+  } catch (error) {
+    // Never leave the protocol the agent was taught: a failure is a step too.
+    return await onboardFailureStep(context, error);
+  }
+}
+
 export const nativeCliActions: NativeCliActions = {
   install: async input => {
     if (input.enroll) {
@@ -66,12 +90,16 @@ export const nativeCliActions: NativeCliActions = {
           unpacking = "background";
         }
       }
+      // The install starts onboarding itself (W1-C2, WS1-078): the agent that
+      // ran the one install command reads the first question here, instead of
+      // being told to run a second command to get it.
+      const first = await onboardStep({ root: input.root, output: input.output });
       input.output.line(
-        unpacking === "background"
-          ? "This machine is ready. Its agent packages keep unpacking in the background. Run `konteks-remote onboard --json` and follow the steps it prints."
-          : "This machine is ready. Run `konteks-remote onboard --json` and follow the steps it prints.",
+        `${unpacking === "background" ? "This machine is ready. Its agent packages keep unpacking in the background." : "This machine is ready."} ` +
+          "Onboarding has started. Its first step is the JSON object below; for each step after it, run `konteks-remote onboard --json` (with `--answer \"<the person's answer>\"` when the step asked something).",
       );
-      input.output.result({ state: "ready-to-onboard", agents: prepared.agents, bundleVersion: prepared.bundleVersion, unpacking });
+      input.output.line(JSON.stringify(first, null, 2));
+      input.output.result({ state: "ready-to-onboard", agents: prepared.agents, bundleVersion: prepared.bundleVersion, unpacking, firstStep: first });
       return;
     }
     const record = await installNative({ ...input, activationId: input.activationId! });
@@ -83,21 +111,7 @@ export const nativeCliActions: NativeCliActions = {
     input.output.result({ state: "staged", releaseId: staged.releaseId, agents: staged.agents });
   },
   onboard: async input => {
-    const coreUrl = await onboardCoreUrl(input.root);
-    const context = {
-      root: input.root,
-      output: input.output,
-      ...(input.answer !== undefined ? { answer: input.answer } : {}),
-      ...(input.cwd ? { cwd: input.cwd } : {}),
-      ...(coreUrl ? { coreUrl } : {}),
-    };
-    let step: OnboardStep;
-    try {
-      step = await runOnboard(context);
-    } catch (error) {
-      // Never leave the protocol the agent was taught: a failure is a step too.
-      step = await onboardFailureStep(context, error);
-    }
+    const step = await onboardStep(input);
     // One step per invocation, printed whole. In human mode the same step
     // reads as a sentence so a person running this by hand is not left
     // reading JSON.
@@ -145,7 +159,9 @@ export const nativeCliActions: NativeCliActions = {
     }
   },
   serve: async input => {
-    const service = createNativeService({ root: input.root, roots: EMBEDDED_RELEASE_ROOTS, platform: nativePlatform(), exitProcess: code => process.exit(code) });
+    const service = createNativeService({ root: input.root, roots: EMBEDDED_RELEASE_ROOTS, platform: nativePlatform(),
+      prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(input.root, cwd, agentId),
+      exitProcess: code => process.exit(code) });
     await service.start();
     await service.waitUntilStopped();
   },
@@ -153,8 +169,9 @@ export const nativeCliActions: NativeCliActions = {
   update: async input => {
     if (input.check) {
       const check = await checkNativeUpdate({ root: input.root });
-      if (check.status === "current") input.output.line(`Installed release ${check.bundleVersion} is current.`);
-      const failed = check.status === "current" ? null : earlierFailure((await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts, check.release.manifest.digest);
+      const attempts = (await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts;
+      if (check.status === "current") input.output.line([`Installed release ${check.bundleVersion} is current.`, selfUpdateNote(attempts, check.bundleVersion)].filter(Boolean).join(" "));
+      const failed = check.status === "current" ? null : earlierFailure(attempts, check.release.manifest.digest);
       if (check.status !== "current") input.output.line(failed
         ? `Release ${check.release.manifest.bundleVersion} is available (installed: ${check.current.bundleVersion}), but ${earlierFailureNote(failed)}`
         : `Release ${check.release.manifest.bundleVersion} is available (installed: ${check.current.bundleVersion}); run \`konteks-remote update\` to install it.`);
@@ -163,10 +180,13 @@ export const nativeCliActions: NativeCliActions = {
     }
     if (!input.unattended) {
       const check = await checkNativeUpdate({ root: input.root }).catch(() => null);
-      const failed = check && check.status !== "current" ? earlierFailure((await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts, check.release.manifest.digest) : null;
+      const attempts = (await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts;
+      const failed = check && check.status !== "current" ? earlierFailure(attempts, check.release.manifest.digest) : null;
       if (failed) input.output.line(`Trying again as asked: ${earlierFailureNote(failed)}`);
+      const selfUpdated = check?.status === "current" ? selfUpdateNote(attempts, check.bundleVersion) : null;
+      if (selfUpdated) input.output.line(selfUpdated);
     }
-    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start }));
+    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start, serviceExits }));
   },
   uninstall: async input => {
     const result = await uninstallNative(input, productionUninstallDeps({ root: input.root, serviceDefinition, execute }));

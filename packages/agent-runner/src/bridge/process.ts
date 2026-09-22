@@ -22,6 +22,7 @@ import {
   type PipedChildProcess,
   type RetainedProcessOwner,
 } from "@konteks/remote-common";
+import { instructionScopeObserver } from "./instruction-scope-observer.js";
 import type { BridgeSpawnSpec } from "./spec.js";
 
 /**
@@ -86,8 +87,12 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
     });
   }
   const stderrLines: string[] = [];
+  const observeInstructionScope = instructionScopeObserver(scope => {
+    logger.info({ event: "agent.instruction_scope", agentId: options.spec.family.agentId, bridgePid: child.pid, source: "bridge_report", ...scope }, "agent instruction scope applied");
+  });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {
+    if (options.spec.family.agentId === "claude-code") observeInstructionScope(chunk);
     for (const line of chunk.split(/\r?\n/)) {
       if (!line) continue;
       stderrLines.push(line.slice(0, 512));

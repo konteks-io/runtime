@@ -17,6 +17,12 @@ import {
 } from "@konteks/remote-common";
 
 /**
+ * What the runtime sends for one repository: the shared submission, plus why
+ * the repository read nothing when it did (W2-O3).
+ */
+export type OnboardEvidenceSubmission = DiscoveryEvidenceSubmission;
+
+/**
  * The onboard MCP facade as this runtime sees it (OB6 §2, §3; OB2 §5).
  *
  * The runtime holds exactly one credential for Core's onboard surface: the
@@ -124,7 +130,7 @@ export function requireBounds(run: z.infer<typeof OnboardRunViewSchema>): Onboar
 export interface OnboardFacade {
   runGet(runRef: string): Promise<OnboardRunView>;
   inventoryList(runRef: string, cursor?: string): Promise<OnboardInventoryPage>;
-  evidenceSubmit(runRef: string, evidence: readonly DiscoveryEvidenceSubmission[]): Promise<void>;
+  evidenceSubmit(runRef: string, evidence: readonly OnboardEvidenceSubmission[]): Promise<void>;
   enrichmentProgress(runRef: string, progress: EnrichmentProgressInput): Promise<void>;
   enrichmentSubmit(runRef: string, systemRef: string, evidence: readonly DiscoveryEvidenceSubmission[]): Promise<void>;
   relocationStatus(relocationRef: string): Promise<RelocationPlan>;
@@ -162,10 +168,15 @@ export class McpOnboardFacade implements OnboardFacade {
     return OnboardInventoryPageSchema.parse(await this.call(DISCOVERY_RUN_INVENTORY_LIST_TOOL, { runRef, ...(cursor ? { cursor } : {}) }));
   }
 
-  async evidenceSubmit(runRef: string, evidence: readonly DiscoveryEvidenceSubmission[]): Promise<void> {
+  async evidenceSubmit(runRef: string, evidence: readonly OnboardEvidenceSubmission[]): Promise<void> {
     // Parsing our own submission before it leaves is not ceremony: it is what
-    // stops a fact extractor from ever putting a file body on the wire.
-    const body = evidence.map(entry => DiscoveryEvidenceSubmissionSchema.parse(entry));
+    // stops a fact extractor from ever putting a file body on the wire. The
+    // gap is checked here and re-attached, because the vendored shared schema
+    // predates it (Core checks it the same way on arrival).
+    const body = evidence.map(({ gap, ...entry }) => ({
+      ...DiscoveryEvidenceSubmissionSchema.parse(entry),
+      ...(gap ? { gap: { code: gap.code, remedy: gap.remedy.slice(0, 500) } } : {}),
+    }));
     await this.call(DISCOVERY_RUN_EVIDENCE_SUBMIT_TOOL, { runRef, evidence: body });
   }
 

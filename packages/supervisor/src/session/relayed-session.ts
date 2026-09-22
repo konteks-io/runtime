@@ -93,7 +93,10 @@ export interface RelayedSessionDeps {
    * exactly this runtime's. Absent, `assertExecutionOwned` is used.
    */
   assertRecoveryOwned?: () => void;
-  executionAuthority?: Pick<NativeExecutionGateOptions, "client" | "runnerIncarnation">;
+  executionAuthority?: Pick<
+    NativeExecutionGateOptions,
+    "client" | "runnerIncarnation" | "currentRevisionFenceConnection" | "onFenceApplied"
+  >;
   onExecutionAuthorityLost?: () => Promise<void>;
   reserveExecutionReference?: (opaqueRef: string) => Promise<void>;
   /**
@@ -165,11 +168,33 @@ export class RelayedSession {
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
     this.executionGate = deps.deploymentKind === "native_connector" &&
       (assignment.kind === "assistant_execution" || assignment.source.kind === "harness_delivery") && deps.executionAuthority
-      ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, journal: deps.journal, clock: deps.clock,
+      ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, logger: this.logger, journal: deps.journal, clock: deps.clock,
         assertOwned: () => {
           if (!deps.assertExecutionOwned) throw new RemoteInstanceError("execution_fenced", "Execution ownership is unavailable.");
           deps.assertExecutionOwned();
-        }, onAuthorityLost: () => deps.onExecutionAuthorityLost ? deps.onExecutionAuthorityLost() : this.stopForRecovery() }) : null;
+        }, onAuthorityLost: () => this.onExecutionAuthorityLost() }) : null;
+  }
+
+  private async onExecutionAuthorityLost(): Promise<void> {
+    this.logger.warn({ event: "execution.authority_lost", workspaceId: this.assignment.workspaceId,
+      assignmentId: this.assignment.id, attempt: this.assignment.attempt, acpSessionRef: this.acpSessionRef,
+      outcome: "recovery_required" }, "Native execution fenced; notifying the session holder");
+    try {
+      // Notify while the admission still owns its channel, before recovery
+      // suppresses normal traffic. This is failure visibility, not a claim of
+      // operation settlement or background-tool quiescence.
+      await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason: "lease_lost" });
+    } catch {
+      this.logger.warn({ event: "execution.authority_loss_notice_failed", assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt }, "Execution fenced without a current delivery owner");
+    }
+    try { await (this.deps.onExecutionAuthorityLost?.() ?? this.stopForRecovery()); }
+    catch (error) {
+      this.logger.warn({ event: "execution.recovery_stop_unconfirmed", assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "recovery_required" },
+      "Execution remains fenced; recovery settlement is unconfirmed");
+      throw error;
+    }
   }
 
   /** D98 bootstrap: initialize is runner-local; token → mcpServers; load/resume when proven; else session/new. */
@@ -244,7 +269,12 @@ export class RelayedSession {
       if (this.deps.deploymentKind === "native_connector") {
         const facade = new McpCapabilityFacade({
           initial: issue,
-          renew: () => this.deps.redeemCapabilityToken(this.assignment),
+          renew: () => {
+            this.deps.assertExecutionOwned?.();
+            if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
+            return this.deps.redeemCapabilityToken(this.assignment);
+          },
+          onUnavailable: () => this.close("agent_exited"),
           context: {
             assignmentId: this.assignment.id,
             attempt: this.assignment.attempt,
@@ -640,19 +670,18 @@ export class RelayedSession {
       const completion: SessionToCoreMessage | undefined = message.kind === "acp" && "id" in message
         ? { kind: "acp_error", id: message.id, method: message.method, error: classify(error) } : undefined;
       await gate.denyBeforeDispatch(operation.key, completion);
-      const terminalDeliveryFailure =
-        this.assignment.source.kind === "harness_delivery" &&
+      const terminalTurnFailure =
+        (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery") &&
         message.kind === "acp" &&
         message.method === "session/prompt" &&
-        completion?.kind === "acp_error" &&
-        completion.error.retryable === false;
+        completion?.kind === "acp_error";
       try {
         if (completion && !this.closed) await this.sendToCore(completion);
       } finally {
         // No runner prompt exists to produce a later terminal event. Close the
-        // failed delivery locally so its durable assignment report and capacity
+        // failed turn locally so its durable assignment report and capacity
         // release do not depend on a best-effort cloud cancellation round trip.
-        if (terminalDeliveryFailure) await this.close("agent_exited");
+        if (terminalTurnFailure && !this.closed) await this.close("agent_exited");
       }
       return;
     }
@@ -747,9 +776,14 @@ export class RelayedSession {
       case "set_config_option_result":
         await this.completeReceived(event.requestId, "session/set_config_option", { kind: "acp_result", id: event.requestId, method: "session/set_config_option", result: event.result as never });
         return;
-      case "request_error":
-        await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
+      case "request_error": {
+        const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
+        if (accepted && event.method === "session/prompt" && this.deps.deploymentKind === "native_connector" &&
+            (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery")) {
+          await this.close("agent_exited");
+        }
         return;
+      }
       case "usage_observation":
         this.lastPromptCompletion = { usage: event.observation };
         await this.deps.onUsage(event.observation);
@@ -975,7 +1009,18 @@ export class RelayedSession {
         } else await this.deps.runner.closeSession(this.acpSessionRef).catch(() => undefined);
         this.deps.assertExecutionOwned?.();
       }
-      await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason });
+      try {
+        await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason });
+      } catch (error) {
+        // A broken transcript channel must not suppress the independent durable
+        // terminal report. Ownership and native completion checks still apply.
+        if (this.deps.deploymentKind !== "native_connector") throw error;
+        this.deps.assertExecutionOwned?.();
+        this.logger.warn({ event: "session.close.relay_unavailable", assignmentId: this.assignment.id,
+          attempt: this.assignment.attempt, channelId: this.boundChannelId, reason,
+          stage: "terminal_report", code: error instanceof RemoteInstanceError ? error.code : "transport_failed" },
+          "session closure could not use relay; continuing durable terminal reporting");
+      }
       // Native assignment closure is not logical-session channel retirement.
       // Retain its final frame, replay buffer and sequence space for the next turn.
       if (this.deps.deploymentKind !== "native_connector" && this.boundChannelId !== null) this.deps.transport.closeChannel(this.boundChannelId);

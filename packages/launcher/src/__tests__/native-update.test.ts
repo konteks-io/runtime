@@ -8,7 +8,7 @@ import { buildReleaseFixture } from "@konteks/remote-release";
 import { loadNativeInstallation, readNativeUpdateLedger, SupervisorStore, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
-import { earlierFailure, earlierFailureNote, runNativeUpdate, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
+import { earlierFailure, earlierFailureNote, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { createOutput } from "../output.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 
@@ -193,6 +193,32 @@ describe("native update transaction", () => {
     expect(earlierFailureNote(failed!)).toBe("0.5.2 already failed its health check here and was rolled back (2026-09-19T11:58:31.000Z: The updated connector did not answer on its control socket in time.). Installing it again installs the same release; it is usually better to wait for a newer one.");
     // A later success with the same bytes clears it.
     expect(earlierFailure([attempt("rolled_back", "sha256:b"), attempt("applied", "sha256:b")], "sha256:b")).toBeNull();
+  });
+  it("rolls back within seconds when the new release keeps exiting as it starts, instead of waiting out the deadline (W1-Z7)", async () => {
+    const h = harness({ previous, gate: "no_answer" });
+    h.deps.healthDeadlineMs = 180_000;
+    let reads = 0;
+    h.deps.serviceExits = async () => { reads += 1; return { runs: reads, lastExitCode: 1 }; };
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).rejects.toThrow("The updated connector stopped as soon as it started, 3 times (exit code 1).");
+    expect(reads).toBe(3);
+    expect(h.calls).toContain("restore:release-next");
+    expect(lines).toContain("Rolled back: 1.0.0 is running and answering again. 1.1.0 was not kept.");
+    expect((h.ledger.at(-1) as { outcome: string; detail: string }).detail).toMatch(/stopped as soon as it started/);
+  });
+  it("does not count a service that is still starting as a crash", async () => {
+    const h = harness({ previous, gate: "no_answer" });
+    h.deps.serviceExits = async () => ({ runs: 1, lastExitCode: null });
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow("did not answer on its control socket in time");
+  });
+  it("says when the installed release came from Konteks updating itself (W1-Z7)", () => {
+    const attempt = (reason: "unattended" | "operator", outcome: "applied" | "rolled_back", bundleVersion = "0.5.1") => ({ id: `u-${reason}-${outcome}`, bundleVersion, manifestDigest: "sha256:a", releaseId: "release-x", reason, startedAt: "2026-09-21T23:10:09.083Z", finishedAt: "2026-09-21T23:11:27.626Z", outcome, detail: null });
+    expect(selfUpdateNote([attempt("unattended", "rolled_back"), attempt("unattended", "applied")], "0.5.1")).toBe("Konteks updated itself to 0.5.1 at 2026-09-21T23:11:27.626Z.");
+    // Installed by hand, or not this release: nothing to add.
+    expect(selfUpdateNote([attempt("operator", "applied")], "0.5.1")).toBeNull();
+    expect(selfUpdateNote([attempt("unattended", "applied", "0.5.0")], "0.5.1")).toBeNull();
+    expect(selfUpdateNote([attempt("unattended", "rolled_back")], "0.5.1")).toBeNull();
   });
   it("after a rollback, says the previous release answers again before returning (W1-L4)", async () => {
     const h = harness({ previous, gate: "no_answer" });

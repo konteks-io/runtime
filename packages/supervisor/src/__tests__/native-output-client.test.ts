@@ -38,6 +38,21 @@ describe("native claim-scoped output client", () => {
     expect(JSON.parse(String(fetchFn.mock.calls[1]![1]?.body))).toMatchObject({ attempt: 1, claimId: "claim", resultId: "result", stagedReceiptId: "staged" });
   });
 
+  it("emits correlated prepare, commit, and acceptance timing without payloads or credentials", async () => {
+    const info = vi.fn();
+    const fetchFn = vi.fn(async (url: string | URL) => new Response(JSON.stringify(String(url).endsWith("/prepare")
+      ? { resultId: "result", resultDigest: candidate.resultDigest, stagedReceiptId: "staged", expiresAt: "2026-09-11T01:05:00Z" }
+      : receipt), { headers: { "content-type": "application/json" } }));
+    await expect(new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "credential-canary", fetchFn,
+      logger: { info } as never }).accept(assignment, candidate)).resolves.toEqual(receipt);
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({ event: "native.output.request_completed", correlationId: "invocation",
+      stage: "prepare", outcome: "success", durationMs: expect.any(Number), requestBytes: expect.any(Number) }), expect.any(String));
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({ event: "native.output.accept_completed", correlationId: "invocation",
+      stage: "accept", outcome: "success", cacheOutcome: "miss", durationMs: expect.any(Number), bytes: 6 }), expect.any(String));
+    expect(JSON.stringify(info.mock.calls)).not.toContain("after\\n");
+    expect(JSON.stringify(info.mock.calls)).not.toContain("credential-canary");
+  });
+
   it("resolves a lost commit response through status without uploading bytes again", async () => {
     const fetchFn = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ resultId: "result", resultDigest: candidate.resultDigest, stagedReceiptId: "staged", expiresAt: "2026-09-11T01:05:00Z" }), { headers: { "content-type": "application/json" } }))
@@ -78,6 +93,20 @@ describe("native claim-scoped output client", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify(receipt), { headers: { "content-type": "application/json" } }));
     await expect(new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn, retrySleep: async () => undefined }).accept(assignment, candidate)).resolves.toEqual(receipt);
     expect(fetchFn.mock.calls[1]![1]?.body).toBe(fetchFn.mock.calls[6]![1]?.body);
+  });
+
+  it("does not let repeated output retries outlive one logical transfer budget", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const fetchFn = vi.fn(async () => new Response(null, { status: 503 }));
+      const client = new NativeOutputClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-11T01:00:00Z")), credential: () => "lease", fetchFn,
+        retrySleep: async () => { now.mockReturnValue(32_001); } });
+
+      await expect(client.accept(assignment, candidate)).rejects.toMatchObject({ code: "capability_unavailable" });
+      expect(fetchFn).toHaveBeenCalledOnce();
+    } finally {
+      now.mockRestore();
+    }
   });
   it("names an assignment Core no longer knows instead of an ordinary refusal", async () => {
     const notFound = () => new Response(JSON.stringify({ code: "not_found", message: "assignment not found" }), { status: 404, headers: { "content-type": "application/json" } });

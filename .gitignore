@@ -10,3 +10,6 @@ tmp/
 .runtime/
 # Local install roots created while developing the launcher on this machine.
 .konteks-remote/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

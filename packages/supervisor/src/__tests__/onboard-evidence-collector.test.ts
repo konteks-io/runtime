@@ -199,8 +199,10 @@ describe("grouping depth", () => {
     // One refusal answers for the whole repository; the run does not retry the
     // same credential five more times.
     expect(archiveFile).toHaveBeenCalledTimes(1);
-    // The repository still has a row: an unreadable repository is a fact.
+    // The repository still has a row: an unreadable repository is a fact,
+    // and it says why and what a person does about it (W2-O3).
     expect(recorded.submitted[0]!.refs).toEqual([]);
+    expect(recorded.submitted[0]).toMatchObject({ gap: { code: "credential_unavailable", remedy: "sign in to this provider" } });
   });
 
   it("refuses a run whose bounds are absent rather than choosing its own", () => {

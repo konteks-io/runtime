@@ -51,6 +51,8 @@ export interface NativeServiceDefinition {
   stop: NativeServiceCommand;
   remove: NativeServiceCommand[];
   status: NativeServiceCommand;
+  /** Reads how often the OS has started the service and how it last exited (`parseServiceExits`); absent where the OS does not say. */
+  exits?: NativeServiceCommand;
   /** User services on Linux need linger to survive logout/reboot without a login. */
   requiresLinger: boolean;
 }
@@ -76,6 +78,7 @@ export function nativeServiceDefinition(input: {
       stop: { command: "launchctl", args: ["bootout", `${domain}/${label}`] },
       remove: [],
       status: { command: "launchctl", args: ["print", `${domain}/${label}`] },
+      exits: { command: "launchctl", args: ["print", `${domain}/${label}`] },
     };
   }
   if (input.os === "debian") {
@@ -88,6 +91,7 @@ export function nativeServiceDefinition(input: {
       stop: { command: "systemctl", args: ["--user", "stop", unit] },
       remove: [{ command: "systemctl", args: ["--user", "disable", "--now", unit] }],
       status: { command: "systemctl", args: ["--user", "is-active", unit] },
+      exits: { command: "systemctl", args: ["--user", "show", unit, "-p", "NRestarts", "-p", "ExecMainStatus"] },
     };
   }
   if (!input.userId || !/^S-1-\d+(?:-\d+)+$/.test(input.userId)) throw new Error("the current Windows user SID is required");
@@ -121,4 +125,26 @@ function systemdArg(value: string): string {
 function windowsArg(value: string): string {
   if (!/[\s"]/.test(value)) return value;
   return `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1')}"`;
+}
+
+/**
+ * How often the OS service manager has started the service since it was
+ * loaded, and the exit code of its last run (null while it has never exited),
+ * from `exits`' output: launchd's `runs` / `last exit code`, systemd's
+ * `NRestarts` / `ExecMainStatus`.
+ */
+export function parseServiceExits(os: HostOs, stdout: string): { runs: number; lastExitCode: number | null } | null {
+  if (os === "macos") {
+    const runs = stdout.match(/^\s*runs = (\d+)$/m);
+    if (!runs) return null;
+    const code = stdout.match(/^\s*last exit code = (\d+)/m);
+    return { runs: Number(runs[1]), lastExitCode: code ? Number(code[1]) : null };
+  }
+  if (os === "debian") {
+    const restarts = stdout.match(/^NRestarts=(\d+)$/m);
+    const status = stdout.match(/^ExecMainStatus=(\d+)$/m);
+    if (!restarts) return null;
+    return { runs: Number(restarts[1]) + 1, lastExitCode: status && Number(status[1]) !== 0 ? Number(status[1]) : null };
+  }
+  return null;
 }

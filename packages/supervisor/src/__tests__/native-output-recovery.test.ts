@@ -36,14 +36,19 @@ describe("retained native output recovery", () => {
       authorization: { state: "dispatch_started", claims: { acpSessionRef: "acp", instanceId: "instance", workspaceId: "workspace",
         assignmentId: "assignment", attempt: 1, claimId: "claim", agentId: "codex", sessionId: "execution-session",
         deliveryIdentity: { invocationId: "invocation" } } } };
+    const info = vi.fn();
     const recover = createRetainedDeliveryOutputRecovery({ roots: [root], journal: { pendingRequests: { get: vi.fn(() => pending) } } as never,
-      client: () => ({ acceptRetained } as never), mutate: operation => operation() });
+      client: () => ({ acceptRetained } as never), mutate: operation => operation(), logger: { info } as never });
     const admission = { instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "old", assignmentId: "assignment", attempt: 1,
       claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: "2026-09-14T00:00:00Z" };
 
     await expect(recover(admission, { acpSessionRef: "acp" })).resolves.toEqual({ acpSessionRef: "acp", receipt });
     expect(acceptRetained).toHaveBeenCalledWith(admission, candidate);
     expect(await store.read()).toEqual({ version: 1, state: "accepted", candidate, completion, receipt });
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({ event: "native.output.recovery_completed", correlationId: "invocation",
+      stage: "recovery", outcome: "accepted", cacheOutcome: "pending_record", durationMs: expect.any(Number) }), expect.any(String));
+    expect(JSON.stringify(info.mock.calls)).not.toContain("generated\\n");
+    expect(JSON.stringify(info.mock.calls)).not.toContain(container);
   });
   it("leaves the frozen candidate unrecovered when Core no longer knows its assignment", async () => {
     const container = join(root, `worktree-${"b".repeat(64)}`); await mkdir(container, { mode: 0o700 });
