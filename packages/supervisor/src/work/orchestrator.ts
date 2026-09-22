@@ -740,6 +740,7 @@ export class WorkOrchestrator {
       if (this.deps.deploymentKind === "native_connector" && executionActivated) this.deps.journal.execution.assertExecutable(admission!, reference);
     };
     assertExecutionOwned();
+    if (this.deps.deploymentKind === "native_connector") this.assertNoRecoveringPredecessor(assignment);
     const key = `${assignment.id}:${assignment.attempt}`;
     if (this.sessions.has(key)) throw new Error("the assignment already has a local session owner");
     const runner = this.deps.runners.get(assignment.agentRoute.agentId);
@@ -798,7 +799,7 @@ export class WorkOrchestrator {
         };
       },
       onUsage: this.deps.onUsage,
-      onExecutionAuthorityLost: () => this.stopForRecovery(assignment.id, assignment.attempt),
+      onExecutionAuthorityLost: () => this.recoverLostExecutionAuthority(assignment.id, assignment.attempt),
       onClosed: async (closed, reason) => this.onSessionClosed(closed, reason, assertAuthority),
     });
     this.sessions.set(key, session);
@@ -811,6 +812,29 @@ export class WorkOrchestrator {
       .finally(() => { if (this.bootstrapping.get(key) === bootstrap) this.bootstrapping.delete(key); });
   }
 
+  /** Refuse before input preparation, then recheck at activation to close races. */
+  private assertNoRecoveringPredecessor(assignment: RemoteWorkAssignment): void {
+    const source = assignment.source;
+    if (source.kind !== "conversation" && source.kind !== "harness_delivery") return;
+    const sessionId = source.kind === "conversation" ? source.sessionId : source.executionSessionId;
+    const predecessor = this.channelOwners.get(`session:${sessionId}`);
+    if (!predecessor) return;
+    const prior = this.deps.journal.execution.admission(predecessor.assignment.id, predecessor.assignment.attempt);
+    const execution = prior && this.deps.journal.execution.execution(prior);
+    if (!execution || execution.phase === "opened") return;
+    const priorEntry = this.deps.journal.assignments.get(`${predecessor.assignment.id}:${predecessor.assignment.attempt}`);
+    this.logger.warn({ event: "execution.successor_blocked", assignmentId: assignment.id, attempt: assignment.attempt,
+      sessionId, predecessorAssignmentId: predecessor.assignment.id, predecessorAttempt: predecessor.assignment.attempt,
+      predecessorClaimId: prior?.claimId, phase: execution.phase, acpSessionRef: execution.acpSessionRef,
+      terminalSequence: priorEntry?.reports.terminalSequence ?? null,
+      lifecycleProfileDigest: execution.lifecycleProfileDigest ?? null,
+      executionProfileDigest: execution.executionProfileDigest ?? null,
+      diagnostic: "predecessor_recovery_unqualified" }, "Previous execution requires recovery before this session can run again");
+    throw new RemoteInstanceError("recovery_required",
+      "The previous execution stopped unexpectedly and its background work could not be confirmed stopped. This session requires recovery before retrying.",
+      { diagnostic: "predecessor_recovery_unqualified" });
+  }
+
   /**
    * Hand a logical session channel from its retained completed turn to the
    * next admitted turn. The exact prior reference continues the
@@ -821,6 +845,7 @@ export class WorkOrchestrator {
    * reference, if any.
    */
   private async takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined> {
+    this.assertNoRecoveringPredecessor(assignment);
     const source = assignment.source;
     if (source.kind !== "conversation" && source.kind !== "harness_delivery") return undefined;
     const logicalSessionId = source.kind === "conversation" ? source.sessionId : source.executionSessionId;
@@ -1224,6 +1249,35 @@ export class WorkOrchestrator {
     await this.sessions.get(`${assignmentId}:${attempt}`)?.close("cancelled");
   }
 
+  /** Report the interruption only after independent exact-process proof. */
+  private async recoverLostExecutionAuthority(assignmentId: string, attempt: number): Promise<void> {
+    await this.stopForRecovery(assignmentId, attempt);
+    const admission = this.deps.journal.execution.admission(assignmentId, attempt);
+    const entry = this.deps.journal.assignments.get(`${assignmentId}:${attempt}`);
+    this.requireNativeOwner();
+    if (!admission || !entry || entry.claimId !== admission.claimId ||
+        admission.instanceId !== this.deps.instanceId() || admission.workspaceId !== this.deps.workspaceId() ||
+        admission.runnerIncarnation !== this.deps.runnerIncarnation?.() ||
+        this.deps.journal.execution.execution(admission)?.phase !== "interrupted_unqualified") {
+      throw new RemoteInstanceError("recovery_required", "Stopped execution evidence is unavailable.");
+    }
+    this.deps.journal.execution.assertAdmission(admission);
+    if (entry.reports.terminalSequence !== undefined) {
+      if (!this.reports.hasDurableTerminalReport(assignmentId, attempt, entry.claimId)) {
+        throw new RemoteInstanceError("recovery_required", "The interrupted report is not yet durable.");
+      }
+      return;
+    }
+    const result = { class: "interrupted" as const, reason: "agent_session_lost" as const };
+    await this.reports.submit({ assignmentId, attempt, claimId: entry.claimId, draft: {
+      terminal: true, acpSessionRef: entry.acpSessionRef,
+      result: { ...result, terminalResultHash: jcsDigest(result) },
+    } });
+    this.logger.warn({ event: "execution.interruption_reported", assignmentId, attempt, claimId: entry.claimId,
+      phase: "interrupted_unqualified", quiescenceQualified: false, capacityReleased: false },
+    "Execution interruption is durable; uncertain operations and background work remain fenced");
+  }
+
   /** Stop/fence the exact local attempt without choosing its terminal result.
    * This is not evidence of absence and writes no absence tombstone.
    */
@@ -1317,9 +1371,38 @@ export class WorkOrchestrator {
       // C03 observes the already-durable `acp_settled` boundary. It is neither
       // a terminal report nor proof that background tools have stopped.
       await this.recordTurnSettledRecoveryEvidence(admission!, assertCurrent);
-      // Finalization and D139 require a pinned qualified lifecycle profile.
-      // None exists yet. Keep the fenced owner for write retries, never report
-      // interrupted/cancelled work merely because ACP has settled.
+      const stopped = this.deps.journal.execution.execution(admission!);
+      const runner = this.deps.runners.get(admission!.agentId);
+      if (stopped?.processOwner && runner?.stopRetainedExecution) {
+        // Apply the same exact-process proof as restart recovery. This only
+        // proves interruption, never background-tool quiescence or safe reuse.
+        const stopStartedAt = performance.now();
+        try { await runner.stopRetainedExecution(stopped.processOwner); }
+        catch (error) {
+          this.logger.warn({ event: "execution.process_stop_unconfirmed", assignmentId, attempt,
+            claimId: admission!.claimId, acpSessionRef: owner.acpSessionRef, phase: stopped.phase,
+            elapsedMs: Math.round(performance.now() - stopStartedAt),
+            code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" },
+          "Exact process stop is unconfirmed; no interruption report or capacity release is authorized");
+          throw error;
+        }
+        assertCurrent();
+        await this.deps.journal.execution.markProcessStopped(admission!, this.deps.clock.nowIso(), assertCurrent);
+        await this.deps.journal.execution.markInterruptedWithoutQuiescence(admission!, this.deps.clock.nowIso(), assertCurrent);
+        this.logger.warn({ event: "execution.recovery_interrupted", assignmentId, attempt, claimId: admission!.claimId,
+          acpSessionRef: owner.acpSessionRef, phase: "interrupted_unqualified", quiescenceQualified: false,
+          capacityReleased: false }, "Exact execution process stopped; background work remains unqualified");
+        return;
+      }
+      // Without independent process proof, ACP settlement alone cannot even
+      // qualify the interrupted report. Keep the owner for evidence retries.
+      this.logger.warn({ event: "execution.recovery_blocked", assignmentId, attempt, claimId: admission!.claimId,
+        acpSessionRef: owner.acpSessionRef, phase: stopped?.phase,
+        stoppingAt: stopped?.stoppingAt, acpSettledAt: stopped?.acpSettledAt,
+        lifecycleProfileDigest: stopped?.lifecycleProfileDigest ?? null,
+        executionProfileDigest: stopped?.executionProfileDigest ?? null,
+        diagnostic: "lifecycle_quiescence_unqualified", terminalReported: false, capacityReleased: false },
+      "ACP turn settled; background work remains unqualified and the execution stays fenced");
       this.deps.journal.execution.assertQuiescent(admission!);
     });
     this.recoveryStops.set(key, task);

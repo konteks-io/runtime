@@ -270,3 +270,15 @@ it("releases a completed session idle past the reaper window and keeps a recent 
   expect(f.journal.execution.execution(prior)).toMatchObject({ phase: "acp_settled" });
   expect(f.internal.channelOwners.has("session:session")).toBe(false);
 });
+
+it("explains an unqualified stopped predecessor and preserves its fence", async () => {
+  const f = await fixture({ terminal: false });
+  await f.journal.execution.markStopping(prior, clock.nowIso(), current);
+  await f.journal.execution.markAcpSettled(prior, "ref", clock.nowIso(), current);
+  await expect(f.internal.takeOverCompletedChannel(work(next), next, current)).rejects.toMatchObject({
+    code: "recovery_required", diagnostic: "predecessor_recovery_unqualified",
+  });
+  expect(f.internal.channelOwners.has("session:session")).toBe(true);
+  expect(f.journal.execution.execution(next)).toBeUndefined();
+  expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
+});

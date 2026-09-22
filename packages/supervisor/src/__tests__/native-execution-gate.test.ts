@@ -139,6 +139,58 @@ it("does not give renewal I/O more time than the verified monotonic lease has le
   expect(renewalDeadline).toBeLessThanOrEqual(Date.now() + 1);
 });
 
+it("renews early enough to recover from a full slow exchange without extending the old lease", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+  f.client.checkExecution.mockImplementationOnce(async () => {
+    f.advance(5_000);
+    throw new RemoteInstanceError("temporarily_unavailable", "check timed out", { retryable: true });
+  });
+  f.advance(18_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(f.client.checkExecution).toHaveBeenCalledTimes(2);
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  f.advance(1_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(f.client.checkExecution).toHaveBeenCalledTimes(3);
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  f.advance(7_000);
+  expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
+});
+
+it("refuses a successful renewal response received after the old monotonic lease expired", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+  const normalCheck = f.client.checkExecution.getMockImplementation()!;
+  f.client.checkExecution.mockImplementationOnce(async () => {
+    f.advance(12_000);
+    return normalCheck();
+  });
+  f.advance(18_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(f.onAuthorityLost).toHaveBeenCalledOnce();
+  expect(() => f.gate.assertDispatchCurrent(operation.authority)).toThrow();
+});
+
+it("records renewal stage and remaining authority without logging signed material", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: vi.fn() };
+  const gate = f.makeGate({ logger });
+  const operation = await gate.admit(f.envelope);
+  await gate.begin(operation);
+  f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "secret upstream message", { retryable: true }));
+  f.advance(18_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "execution.renewal_failed", stage: "check", executionId: "execution", remainingLeaseMs: 12_000 }), expect.any(String));
+  expect(JSON.stringify(logger.warn.mock.calls)).not.toContain("secret upstream message");
+  expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(f.envelope.permit);
+});
+
 it("does not redispatch recovered ambiguous delivery work", async () => {
   const f = await deliveryFixture(); const operation = await f.gate.admit(f.envelope);
   await f.gate.begin(operation); f.gate.stop();
@@ -582,7 +634,7 @@ describe("independent native live execution gate", () => {
     const f = await fixture(); vi.useFakeTimers();
     const operation = await f.gate.admit(f.envelope); await f.gate.begin(operation);
     f.client.checkExecution.mockRejectedValueOnce(new Error("policy revoked"));
-    f.advance(24_000); await vi.advanceTimersByTimeAsync(24_000);
+    f.advance(17_000); await vi.advanceTimersByTimeAsync(17_000);
     expect(f.onAuthorityLost).not.toHaveBeenCalled();
     f.advance(1_000); await vi.advanceTimersByTimeAsync(1_000);
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);

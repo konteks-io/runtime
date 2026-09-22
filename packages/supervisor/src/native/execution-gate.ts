@@ -57,6 +57,8 @@ const signedOperationKeyId = (permit: string): string | undefined => {
 /** The whole trust fetch and signed check exchange share this one budget. */
 export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 5_000;
 const RENEWAL_RETRY_DELAY_MS = 1_000;
+// Two complete exchanges, retry delay, and one scheduler tick before expiry.
+const RENEWAL_LEAD_MS = 2 * NATIVE_EXECUTION_RENEWAL_BUDGET_MS + RENEWAL_RETRY_DELAY_MS + 1_000;
 const transientLoss = (error: unknown): boolean =>
   error instanceof RemoteInstanceError &&
   (error.code === "execution_authority_unavailable" || error.code === "temporarily_unavailable" || error.retryable);
@@ -323,44 +325,74 @@ export class NativeExecutionGate {
       ? Math.max(0, this.monotonicDeadline - this.monotonic())
       : NATIVE_EXECUTION_RENEWAL_BUDGET_MS;
     const deadlineAtMs = Date.now() + Math.min(NATIVE_EXECUTION_RENEWAL_BUDGET_MS, remainingLeaseMs);
-    const keys = await this.options.client.executionSigningKeys(deadlineAtMs);
-    this.localAuthority(authority);
-    const check = delivery(authority) ? this.options.client.checkDeliveryExecution : this.options.client.checkExecution;
-    if (!check) throw unavailable();
-    const result = await check.call(this.options.client, authority.instanceId, authority.executionId, {
-      executionRevision: authority.executionRevision, readyRevision: authority.readyRevision, runnerIncarnation: authority.runnerIncarnation,
-    }, deadlineAtMs);
-    this.localAuthority(authority);
-    const checkInput = { lease: result.lease, trustedKeys: keys, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000), issuedAtToleranceSeconds: 1 };
-    let claims;
+    const startedAt = this.monotonic();
+    let stage = "signing_keys";
+    let keysElapsedMs = 0;
+    const context = { assignmentId: authority.assignmentId, attempt: authority.attempt,
+      claimId: authority.claimId, executionId: authority.executionId, executionRevision: authority.executionRevision };
     try {
-      claims = delivery(authority) ? verifyRemoteDeliveryCheckLease({ ...checkInput, currentAuthority: authority })
-        : verifyRemoteExecutionCheckLease({ ...checkInput, currentAuthority: authority });
+      const keys = await this.options.client.executionSigningKeys(deadlineAtMs);
+      keysElapsedMs = this.monotonic() - startedAt;
+      stage = "check";
+      this.localAuthority(authority);
+      const check = delivery(authority) ? this.options.client.checkDeliveryExecution : this.options.client.checkExecution;
+      if (!check) throw unavailable();
+      const result = await check.call(this.options.client, authority.instanceId, authority.executionId, {
+        executionRevision: authority.executionRevision, readyRevision: authority.readyRevision, runnerIncarnation: authority.runnerIncarnation,
+      }, deadlineAtMs);
+      this.localAuthority(authority);
+      stage = "verification";
+      if (this.monotonicDeadline > 0 && this.monotonic() >= this.monotonicDeadline) throw fenced();
+      const checkInput = { lease: result.lease, trustedKeys: keys, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000), issuedAtToleranceSeconds: 1 };
+      let claims;
+      try {
+        claims = delivery(authority) ? verifyRemoteDeliveryCheckLease({ ...checkInput, currentAuthority: authority })
+          : verifyRemoteExecutionCheckLease({ ...checkInput, currentAuthority: authority });
+      } catch (error) {
+        this.logger.warn({ event: "execution.check_refused", assignmentId: authority.assignmentId, attempt: authority.attempt,
+          claimId: authority.claimId, executionId: authority.executionId, executionRevision: authority.executionRevision,
+          diagnostic: verificationReason(error), skewMs: this.options.clock.skewMs(), issuedAtToleranceSeconds: 1 }, "Native execution check refused");
+        throw new RemoteInstanceError("execution_fenced", "Invalid execution check lease", { diagnostic: verificationReason(error) });
+      }
+      if (result.executionId !== authority.executionId || result.executionRevision !== authority.executionRevision || Date.parse(result.expiresAt) !== claims.exp * 1000) throw fenced();
+      this.keys = keys;
+      this.checkId = claims.checkId;
+      const remainingMs = Math.max(0, claims.exp * 1000 - this.options.clock.coreNow());
+      this.monotonicDeadline = this.monotonic() + remainingMs;
+      this.refreshAfter = Math.max(this.monotonic(), this.monotonicDeadline - Math.min(RENEWAL_LEAD_MS, remainingMs / 2));
+      this.logger.info({ event: "execution.renewal_completed", ...context,
+        elapsedMs: this.monotonic() - startedAt, keysElapsedMs,
+        remainingLeaseMs: remainingMs, nextRenewalInMs: Math.max(0, this.refreshAfter - this.monotonic()),
+        skewMs: this.options.clock.skewMs() }, "Native execution lease verified");
     } catch (error) {
-      this.logger.warn({ event: "execution.check_refused", assignmentId: authority.assignmentId, attempt: authority.attempt,
-        claimId: authority.claimId, executionId: authority.executionId, executionRevision: authority.executionRevision,
-        diagnostic: verificationReason(error), skewMs: this.options.clock.skewMs(), issuedAtToleranceSeconds: 1 }, "Native execution check refused");
-      throw new RemoteInstanceError("execution_fenced", "Invalid execution check lease", { diagnostic: verificationReason(error) });
+      this.logger.warn({ event: "execution.renewal_failed", ...context, stage,
+        elapsedMs: this.monotonic() - startedAt, keysElapsedMs,
+        budgetMs: Math.min(NATIVE_EXECUTION_RENEWAL_BUDGET_MS, remainingLeaseMs),
+        remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
+        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
+        retryable: transientLoss(error), skewMs: this.options.clock.skewMs() }, "Native execution renewal failed");
+      throw error;
     }
-    if (result.executionId !== authority.executionId || result.executionRevision !== authority.executionRevision || Date.parse(result.expiresAt) !== claims.exp * 1000) throw fenced();
-    this.keys = keys;
-    this.checkId = claims.checkId;
-    const remainingMs = Math.max(0, claims.exp * 1000 - this.options.clock.coreNow());
-    this.monotonicDeadline = this.monotonic() + remainingMs;
-    this.refreshAfter = Math.max(this.monotonic(), this.monotonicDeadline - NATIVE_EXECUTION_RENEWAL_BUDGET_MS);
   }
 
   private async tick(): Promise<void> {
     if (this.stopped || !this.authority) return;
     try {
       this.assertDispatchCurrent(this.authority);
-      if (this.monotonic() >= this.refreshAfter) await this.refresh();
+      if (!this.refreshing && this.monotonic() >= this.refreshAfter) await this.refresh();
     } catch (error) {
       if (this.stopped) return;
       if (this.canRetryRenewal(error)) {
         this.refreshAfter = Math.min(this.monotonicDeadline, this.monotonic() + RENEWAL_RETRY_DELAY_MS);
+        this.logger.warn({ event: "execution.renewal_retry_scheduled", executionId: this.authority?.executionId,
+          remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
+          retryInMs: Math.max(0, this.refreshAfter - this.monotonic()) }, "Retrying within the verified execution lease");
         return;
       }
+      this.logger.warn({ event: "execution.renewal_fenced", executionId: this.authority?.executionId,
+        remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
+        renewalInFlight: this.refreshing !== null,
+        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" }, "Execution authority can no longer renew safely");
       await this.fenceAuthority();
     }
   }

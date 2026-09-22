@@ -539,3 +539,28 @@ describe("proven per-session recovery stop", () => {
     });
   });
 });
+
+it.each([true, false])("reports live authority loss only after exact process stop proof: %s", async confirmed => {
+  const f = await realOwnedWork(); await f.dispatch();
+  await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+  const owner = { version: 1 as const, platform: "darwin" as const, pid: 123, processGroupId: 123, startToken: "start", commandDigest: "A".repeat(43) };
+  await f.journal.execution.bindProcessOwner(f.admission, owner, () => undefined);
+  const stop = vi.fn(async () => { if (!confirmed) throw new RemoteInstanceError("recovery_required", "process identity is uncertain"); });
+  Object.assign(f.runner, { stopRetainedExecution: stop });
+  const recover = () => (f.work as unknown as { recoverLostExecutionAuthority(id: string, attempt: number): Promise<void> }).recoverLostExecutionAuthority("assignment", 1);
+  if (confirmed) {
+    await recover();
+    await recover();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledWith(owner);
+    expect(f.journal.execution.execution(f.admission)?.phase).toBe("interrupted_unqualified");
+    expect(f.journal.assignments.get("assignment:1")?.reports.terminalSequence).toBeDefined();
+    expect(f.outbox.depth).toBe(1);
+  } else {
+    await expect(recover()).rejects.toMatchObject({ code: "recovery_required" });
+    expect(f.outbox.depth).toBe(0);
+    expect(f.journal.execution.execution(f.admission)?.phase).toBe("acp_settled");
+  }
+  expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
+  expect(f.transport.closeChannel).not.toHaveBeenCalled();
+});
