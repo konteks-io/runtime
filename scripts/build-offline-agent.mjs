@@ -39,6 +39,7 @@ try {
   const toolingEntry = packageBin(root, selected.tooling.package, selected.tooling.bin);
   if (args.agent === "claude-code") {
     mkdirSync(join(root, "konteks"), { recursive: true, mode: 0o700 });
+    cpSync(new URL("./claude-instruction-scope.mjs", import.meta.url), join(root, "node_modules", "@agentclientprotocol", "claude-agent-acp", "dist", "konteks-instruction-scope.mjs"));
     const provenance = [];
     for (const file of ["acp-agent.js", "settings.js"]) {
       const path = join(root, "node_modules", "@agentclientprotocol", "claude-agent-acp", "dist", file);

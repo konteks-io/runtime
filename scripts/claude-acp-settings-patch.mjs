@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 // Build-time only: installed release bytes remain immutable and signed.
 export const claudeAcpSettingsPatch = {
-  id: "konteks-claude-project-settings-v1",
+  id: "konteks-claude-project-settings-v2",
   version: "0.75.1",
   hashes: {
     "acp-agent.js": "c22424c297429378166524b59ee6bed239c999a420ad0dd06571b768efa7525b",
@@ -20,11 +20,13 @@ export function patchClaudeSettings(source, file, version) {
     source = source.replace(before, after);
   };
   if (file === "acp-agent.js") {
+    source = 'import { isolateClaudeInstructions } from "./konteks-instruction-scope.mjs";\n' + source;
+    replace('        const env = {\n            ...process.env,', '        settings = await isolateClaudeInstructions(settings, params.cwd, CLAUDE_CONFIG_DIR);\n        this.logger.log(`[konteks] instruction_scope version=2 settings=project ancestors=excluded user=excluded local=excluded auto_memory=excluded auth=official_profile exclusions=${settings.claudeMdExcludes.length}`);\n        const env = {\n            ...process.env,');
     replace('settingSources: ["user", "project", "local"],', 'settingSources: ["project"],');
     // Apply after the optional client options too, including session/load and
     // resume. SettingsManager and query must see the same effective scope.
     replace('            ...userProvidedOptions,\n', '            ...userProvidedOptions,\n            settingSources: ["project"],\n');
-    replace('        timing.phase("settings");', '        timing.phase("settings");\n        this.logger.log("[konteks] instruction_scope version=1 settings=project user=excluded local=excluded auth=official_profile");');
+
   } else {
     replace('resolveSettings({ cwd: this.cwd })', 'resolveSettings({ cwd: this.cwd, settingSources: ["project"] })');
     replace('            path.join(CLAUDE_CONFIG_DIR, "settings.json"),\n', '');

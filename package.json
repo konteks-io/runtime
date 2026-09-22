@@ -26,7 +26,7 @@
     "lint": "eslint packages/*/src",
     "format": "prettier --write \"packages/*/src/**/*.ts\" \"scripts/**/*.mjs\"",
     "format:check": "prettier --check \"packages/*/src/**/*.ts\" \"scripts/**/*.mjs\"",
-    "test": "node --test scripts/offline-agent-files.test.mjs scripts/codex-acp-live-user-patch.test.mjs scripts/claude-acp-settings-patch.test.mjs && vitest run",
+    "test": "node --test scripts/offline-agent-files.test.mjs scripts/codex-acp-live-user-patch.test.mjs scripts/claude-acp-settings-patch.test.mjs scripts/claude-instruction-scope.test.mjs scripts/claude-instruction-scope.integration.test.mjs && vitest run",
     "test:watch": "vitest",
     "test:characterization": "REMOTE_INSTANCE_CHARACTERIZE=1 vitest run --project characterization",
     "release:manifest": "tsx packages/release/src/cli.ts",

@@ -19,5 +19,6 @@ test("reviewed bridge uses project settings in both SDK resolution and query", {
   assert.doesNotMatch(settings, /path.join\(CLAUDE_CONFIG_DIR, "settings.json"\)/);
   const agent = load("acp-agent.js");
   assert.match(agent, /\.\.\.userProvidedOptions,\s+settingSources: \["project"\]/);
-  assert.match(agent, /instruction_scope version=1/);
+  assert.match(agent, /instruction_scope version=2/);
+  assert.match(agent, /settings = await isolateClaudeInstructions\(settings, params.cwd, CLAUDE_CONFIG_DIR\)/);
 });
