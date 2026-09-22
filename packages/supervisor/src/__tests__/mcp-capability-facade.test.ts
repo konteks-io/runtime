@@ -157,7 +157,7 @@ it("never forwards a still-unexpired bearer after renewal closes the owner", asy
   const { facade } = await started({ initial: issue(url, "old", now + 120_000), now: () => now,
     renew: async () => { throw new RemoteInstanceError("execution_fenced", "Owner lost"); } });
   now += 115_000;
-  const forward = facade as unknown as { forward(request: { headers: {}; url: string }, body: Buffer, refreshed: boolean): Promise<unknown> };
+  const forward = facade as unknown as { forward(request: { headers: Record<string, never>; url: string }, body: Buffer, refreshed: boolean): Promise<unknown> };
   await expect(forward.forward({ headers: {}, url: "/mcp" }, Buffer.from("{}"), false)).rejects.toThrow("Owner lost");
   expect(calls).not.toHaveBeenCalled();
 });

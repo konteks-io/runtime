@@ -182,9 +182,10 @@ export async function runGraft(tool: GraftTool, args: string[], cwd: string, tim
 }
 
 function lastLine(text: string): string | undefined {
+  const ansiColor = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
   return text
     .split(/\r?\n/)
-    .map(line => line.replace(/\u001b\[[0-9;]*m/g, "").trim())
+    .map(line => line.replace(ansiColor, "").trim())
     .filter(Boolean)
     .at(-1);
 }

@@ -7,7 +7,7 @@ import { McpOnboardFacade } from "../onboard/facade.js";
  */
 describe("McpOnboardFacade.evidenceSubmit", () => {
   it("sends why a repository was not read, with the remedy bounded", async () => {
-    const fetchFn = vi.fn(async (_url: string, init?: RequestInit) => new Response(
+    const fetchFn = vi.fn(async (_url: string, _init?: RequestInit) => new Response(
       JSON.stringify({ jsonrpc: "2.0", id: "1", result: { content: [{ type: "text", text: "{}" }], structuredContent: {} } }),
       { status: 200, headers: { "content-type": "application/json" } },
     ));
