@@ -31,6 +31,9 @@ function walk(dir) {
     if (SKIP_DIRS.has(entry)) continue;
     const path = join(dir, entry);
     const info = statSync(path);
+    // The git-ignored graph mirrors allowlisted redaction fixtures in JSON.
+    // It is a local index, not a release input; scan the original sources.
+    if (path === join(root, "graft") && info.isDirectory()) continue;
     if (info.isDirectory()) {
       walk(path);
       continue;
