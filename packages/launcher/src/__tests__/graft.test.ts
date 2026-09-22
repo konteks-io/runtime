@@ -138,6 +138,22 @@ describe("graft", () => {
     expect(await readFile(join(repo, "graft", "INDEX.md"), "utf8")).toContain("index");
   });
 
+  it("keeps Graft out of git in a linked worktree, the way delivery copies are made", async () => {
+    git(repo, "add", "index.ts");
+    git(repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base");
+    const copy = join(dir, "delivery-copy");
+    git(repo, "worktree", "add", "-q", "--detach", copy);
+    await prepareDeliveryGraft(root, copy, "claude-code", {
+      available: async () => true,
+      ensure: async () => tool,
+      wire: wireGraft,
+    });
+    // A worktree's own info/exclude is never read by git: the rules must land
+    // where they apply, or every Graft file is an untracked change to publish.
+    expect(git(copy, "status", "--porcelain", "--untracked-files=all").trim()).toBe("");
+    expect(await graftAlreadyWired(copy)).toBe(true);
+  });
+
   it("installs only a package whose checksum is the one the installer recorded", async () => {
     const packaged = join(dir, "pkg");
     await mkdir(join(packaged, "node_modules", "@nanonets", "graft", "dist"), { recursive: true });

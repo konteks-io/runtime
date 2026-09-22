@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { access, chmod, copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import { isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
@@ -195,9 +195,9 @@ async function git(repo: string, args: string[]): Promise<string> {
 
 /** Whether this repository already has the Graft wiring onboarding sets up (WS1-090). */
 export async function graftAlreadyWired(repo: string): Promise<boolean> {
-  const gitDir = (await git(repo, ["rev-parse", "--absolute-git-dir"]).catch(() => "")).trim();
-  if (!gitDir) return false;
-  const exclude = await readFile(join(gitDir, "info", "exclude"), "utf8").catch(() => "");
+  const file = await excludeFile(repo).catch(() => "");
+  if (!file) return false;
+  const exclude = await readFile(file, "utf8").catch(() => "");
   return exclude.includes(EXCLUDE_MARK) && (await stat(join(repo, "graft")).then(() => true, () => false));
 }
 
@@ -269,10 +269,20 @@ function collapse(paths: string[]): string[] {
   return [...out].sort();
 }
 
+/**
+ * The exclude file git actually reads. In a linked worktree (every delivery
+ * copy) `--absolute-git-dir` is `…/worktrees/<name>`, whose `info/exclude`
+ * git never consults; `--git-path` resolves to the shared one.
+ */
+async function excludeFile(repo: string): Promise<string> {
+  const path = (await git(repo, ["rev-parse", "--git-path", "info/exclude"])).trim();
+  if (!path) throw new Error("git did not name its exclude file");
+  return isAbsolute(path) ? path : resolve(repo, path);
+}
+
 async function excludeLocally(repo: string, paths: string[]): Promise<void> {
   if (paths.length === 0) return;
-  const gitDir = (await git(repo, ["rev-parse", "--absolute-git-dir"])).trim();
-  const file = join(gitDir, "info", "exclude");
+  const file = await excludeFile(repo);
   const current = await readFile(file, "utf8").catch(() => "");
   const known = new Set(current.split("\n").map(line => line.trim()));
   const missing = paths.map(path => `/${path}`).filter(line => !known.has(line));
