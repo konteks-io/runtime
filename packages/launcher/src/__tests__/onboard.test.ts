@@ -748,6 +748,10 @@ describe("onboard", () => {
     expect(initiativeTitle("A simple site where people can book a table at my restaurant for a date and time, and I get an email for each booking.")).toBe(
       "A simple site where people can book a table at my restaurant for a date and time",
     );
+    // A sentence a title can hold stays whole: a cut at "date and party size" left "…for a date" (pass 8).
+    expect(initiativeTitle("A simple site where people book a table at my restaurant for a date and party size.")).toBe(
+      "A simple site where people book a table at my restaurant for a date and party size",
+    );
     // With no phrase end in reach it still cuts at a word, marked as cut.
     const long = initiativeTitle("Build a reservation calendar synchronisation dashboard integrating multiple restaurant locations' availability feeds automatically nightly.");
     expect(long.length).toBeLessThanOrEqual(81);

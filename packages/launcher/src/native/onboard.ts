@@ -1206,7 +1206,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
  */
 export function initiativeTitle(sentence: string): string {
   const first = sentence.trim().split(/(?<=[.!?])\s+/)[0]!.replace(/[.!?]+$/, "").trim();
-  if (first.length <= 80) return first;
+  // Up to 100 characters the person's own sentence is the title: any cut
+  // inside it loses part of what they asked for.
+  if (first.length <= 100) return first;
   // A long sentence reads best cut where a phrase ends ("…for a date and
   // time, and I get an email" becomes "…for a date and time"), not after a
   // dangling "and" (WS1-083). Only when no phrase ends in reach, cut at a word.
