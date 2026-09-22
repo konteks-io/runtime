@@ -1009,7 +1009,18 @@ export class RelayedSession {
         } else await this.deps.runner.closeSession(this.acpSessionRef).catch(() => undefined);
         this.deps.assertExecutionOwned?.();
       }
-      await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason });
+      try {
+        await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason });
+      } catch (error) {
+        // A broken transcript channel must not suppress the independent durable
+        // terminal report. Ownership and native completion checks still apply.
+        if (this.deps.deploymentKind !== "native_connector") throw error;
+        this.deps.assertExecutionOwned?.();
+        this.logger.warn({ event: "session.close.relay_unavailable", assignmentId: this.assignment.id,
+          attempt: this.assignment.attempt, channelId: this.boundChannelId, reason,
+          stage: "terminal_report", code: error instanceof RemoteInstanceError ? error.code : "transport_failed" },
+          "session closure could not use relay; continuing durable terminal reporting");
+      }
       // Native assignment closure is not logical-session channel retirement.
       // Retain its final frame, replay buffer and sequence space for the next turn.
       if (this.deps.deploymentKind !== "native_connector" && this.boundChannelId !== null) this.deps.transport.closeChannel(this.boundChannelId);

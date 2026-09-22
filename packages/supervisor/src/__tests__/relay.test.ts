@@ -80,6 +80,32 @@ describe("replay buffer (D99)", () => {
 });
 
 describe("channel mux", () => {
+  it("still bounds retained session frames by bytes", async () => {
+    const f = buildMux({ replayBufferBytes: 1 });
+    await f.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+    f.mux.send("session:s", "session", { kind: "session_closed", assignmentId: "a", reason: "completed" });
+    expect(f.resets).toContain("session:s");
+    expect(() => f.mux.send("session:s", "session", { kind: "session_closed", assignmentId: "b", reason: "completed" })).toThrow();
+  });
+  it("retains unacknowledged session readiness across an idle handoff and restart", async () => {
+    let durable: import('../relay/channel-mux.js').RelayDurableState | undefined;
+    const first = buildMux({ persistRelayState: async state => { durable = structuredClone(state); } });
+    await first.mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+    first.mux.send("session:s", "session", { kind: "session_closed", assignmentId: "old", reason: "completed" });
+    await vi.waitFor(() => expect(durable?.outbound['session:s']).toHaveLength(1));
+    first.clock.advance(20 * 60_000);
+    first.mux.send("session:s", "session", { kind: "session_ready", assignmentId: "new", acpSessionRef: "acp", agentId: "claude-code", resumed: true, capabilities: { forkSession: false, sessionUsage: false } } as never);
+    await vi.waitFor(() => expect(durable?.outbound['session:s']).toHaveLength(2));
+    expect(first.resets).toEqual([]);
+    const second = buildMux();
+    second.clock.advance(40 * 60_000);
+    second.mux.restoreDurableState(durable!, () => "session");
+    await second.mux.applyHandshake({ connectionEpoch: 2, resume: { 'session:s': { to_core: 0, to_runtime: 0 } }, reset: [] });
+    expect(second.emitted.filter(frame => 'seq' in frame).map(frame => (frame as ToCoreRelayFrame).seq)).toEqual([1, 2]);
+    expect(second.mux.handshakeCursors()['session:s']?.to_core).toBe(0);
+    expect(second.resets).toEqual([]);
+  });
+
   it("replays a fresh holder's channel immediately without advancing durable acknowledgement", async () => {
     const { mux, emitted } = buildMux();
     await mux.applyHandshake({ connectionEpoch: 7, resume: {}, reset: [] });

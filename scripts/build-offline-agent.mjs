@@ -15,6 +15,7 @@ import { basename, dirname, join, relative, sep } from "node:path";
 import { createGzip } from "node:zlib";
 import { inventoryOfflineFiles } from "./offline-agent-files.mjs";
 import { patchCodexAcpLiveUsers } from "./codex-acp-live-user-patch.mjs";
+import { patchClaudeSettings } from "./claude-acp-settings-patch.mjs";
 
 const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) => value.startsWith("--") ? [value.slice(2), all[index + 1]] : []).filter(pair => pair.length === 2));
 if (!args.agent || !args.os || !args.architecture || !args.out || !args.profile || !args.approval || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{7,255}$/.test(args.approval)) throw new Error("offline agent packaging requires an explicit redistribution approval reference");
@@ -36,6 +37,17 @@ try {
   cpSync(process.execPath, join(root, "bin", runtimeName));
   const bridgeEntry = packageBin(root, selected.bridge.package, selected.bridge.bin);
   const toolingEntry = packageBin(root, selected.tooling.package, selected.tooling.bin);
+  if (args.agent === "claude-code") {
+    mkdirSync(join(root, "konteks"), { recursive: true, mode: 0o700 });
+    const provenance = [];
+    for (const file of ["acp-agent.js", "settings.js"]) {
+      const path = join(root, "node_modules", "@agentclientprotocol", "claude-agent-acp", "dist", file);
+      const patched = patchClaudeSettings(readFileSync(path, "utf8"), file, selected.bridge.version);
+      writeFileSync(path, patched.source);
+      provenance.push(patched.provenance);
+    }
+    writeFileSync(join(root, "konteks", "claude-acp-provenance.json"), JSON.stringify(provenance));
+  }
   if (sharedCodex) {
     mkdirSync(join(root, "konteks"), { mode: 0o700 });
     const bridgePath = join(root, bridgeEntry);

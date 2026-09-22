@@ -1195,19 +1195,9 @@ export class WorkOrchestrator {
     for (const session of this.sessions.values()) {
       if (session.channelId !== channelId || session.isClosed) continue;
       liveOwner = true;
-      if (this.deps.deploymentKind === "native_connector" &&
-        (session.assignment.source.kind === "harness_delivery" || session.assignment.kind === "assistant_execution")) {
-        // A native turn runs locally: the relay channel only carries its
-        // transcript to Core, while its accepted output and terminal report
-        // travel over HTTPS. Closing it here on a replay gap killed a green
-        // generator turn ten minutes in (2026-09-15): the close cancelled the
-        // tool permission in flight, which Claude Code reads as a rejection
-        // and ends its turn. Keep the turn; the mux fences the channel until
-        // a later handshake rebuilds it.
-        this.logger.warn({ assignmentId: session.assignment.id, attempt: session.assignment.attempt, channelId },
-          "relay replay gap on a native session channel; the local turn continues and its terminal travels over HTTPS");
-        continue;
-      }
+      this.logger.warn({ event: "session.replay_gap.interrupt", assignmentId: session.assignment.id,
+        attempt: session.assignment.attempt, channelId, stage: "relay_recovery", reason: "relay_replay_gap" },
+        "unrecoverable session replay gap; stopping local work and reporting interruption");
       try { await session.close("relay_replay_gap"); }
       catch (error) {
         this.logger.error({ err: error, assignmentId: session.assignment.id, attempt: session.assignment.attempt, channelId },

@@ -484,7 +484,7 @@ describe("work orchestrator claim validation", () => {
     expect(f.sent).toEqual([]);
   });
 
-  it("keeps a native harness turn alive on a relay replay gap but still closes an appliance session", async () => {
+  it("closes native and appliance work on an unrecoverable relay replay gap", async () => {
     const fake = (kind: string, source: string) => ({
       channelId: "session:live", isClosed: false, close: vi.fn(async () => undefined),
       assignment: { id: "live", attempt: 1, kind, source: { kind: source } },
@@ -494,7 +494,7 @@ describe("work orchestrator claim validation", () => {
     (native.work as unknown as { sessions: Map<string, unknown> }).sessions.set("live:1", nativeSession);
     const nativeClose = vi.spyOn(native.transport, "closeChannel");
     await native.work.onChannelReset("session:live");
-    expect(nativeSession.close).not.toHaveBeenCalled();
+    expect(nativeSession.close).toHaveBeenCalledExactlyOnceWith("relay_replay_gap");
     expect(nativeClose).not.toHaveBeenCalled();
 
     const appliance = await orchestrator();

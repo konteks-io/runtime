@@ -11,10 +11,10 @@ describe("native session provenance title", () => {
   it("carries display metadata rather than a prompt or identity claim", () => {
     expect(konteksSessionMetadata("Review")).toEqual({ konteksSession: { version: 1, title: "[konteks] Review" } });
   });
-  it("uses only the native title option for Claude", () => {
+  it("limits managed Claude sessions to repository settings while preserving the title", () => {
     expect(konteksSessionMetadata("Review", "claude-code")).toEqual({
       konteksSession: { version: 1, title: "[konteks] Review" },
-      claudeCode: { options: { title: "[konteks] Review" } },
+      claudeCode: { options: { title: "[konteks] Review", settingSources: ["project"] } },
     });
     expect(konteksSessionMetadata("Review", "opencode")).not.toHaveProperty("claudeCode");
   });
