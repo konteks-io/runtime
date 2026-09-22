@@ -217,6 +217,7 @@ it("answers the model capability probe from the resident process and keeps it re
   const first = await f.runtime.sessions.create(f.input);
   await completeAndRelease(f, first.acpSessionRef);
   await expect(f.runtime.discoverModelCapability("model")).resolves.toEqual({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
+  await expect(f.runtime.discoverModelCapability("model")).resolves.toEqual({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
   expect(f.spawn).toHaveBeenCalledTimes(2);
   const process = f.execution().bridge;
   expect(process.connection.newSession).toHaveBeenCalledTimes(2);

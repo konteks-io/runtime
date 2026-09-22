@@ -11,6 +11,7 @@ export interface NativeServiceOptions extends NativeInstallationOptions {
   root: string;
   /** Test/embedding override; production defaults to the claim-bound native preparer. */
   prepareInputs?: NonNullable<SupervisorOptions["native"]>["prepareInputs"];
+  prepareRepositoryWorktree?: NonNullable<SupervisorOptions["native"]>["prepareRepositoryWorktree"];
   runtimeOptions?: NonNullable<SupervisorOptions["native"]>["runtimeOptions"];
   signalSource?: CreateDaemonOptions["signalSource"];
   exitProcess?: CreateDaemonOptions["exitProcess"];
@@ -47,6 +48,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
           ...(update ? { update } : {}),
           ...(installation.record.git ? { git: installation.record.git } : {}),
           ...(options.prepareInputs ? { prepareInputs: options.prepareInputs } : {}),
+          ...(options.prepareRepositoryWorktree ? { prepareRepositoryWorktree: options.prepareRepositoryWorktree } : {}),
           ...(options.runtimeOptions ? { runtimeOptions: options.runtimeOptions } : {}),
         },
       });

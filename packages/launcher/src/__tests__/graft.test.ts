@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ensureGraft, graftAlreadyWired, planGraft, wireGraft, writeGraftRecord, type GraftTool } from "../native/graft.js";
+import { ensureGraft, graftAlreadyWired, planGraft, prepareDeliveryGraft, wireGraft, writeGraftRecord, type GraftTool } from "../native/graft.js";
 
 /**
  * Graft in the person's repository (W1-G1..G3, WS1-081). A stand-in Graft
@@ -122,6 +122,20 @@ describe("graft", () => {
     const wired = await wireGraft(root, repo, ["codex"], tool);
     expect(wired.changedTracked).toEqual(["AGENTS.md"]);
     expect(wired.added).not.toContain("AGENTS.md");
+  });
+
+  it("keeps tracked Graft annotations local in a generated delivery worktree", async () => {
+    await writeFile(join(repo, "AGENTS.md"), "# rules\n");
+    git(repo, "add", "AGENTS.md", "index.ts");
+    git(repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base");
+    await prepareDeliveryGraft(root, repo, "codex", {
+      available: async () => true,
+      ensure: async () => tool,
+      wire: wireGraft,
+    });
+    expect(git(repo, "status", "--porcelain", "--untracked-files=all").trim()).toBe("");
+    expect(git(repo, "ls-files", "-v", "AGENTS.md")).toMatch(/^S /);
+    expect(await readFile(join(repo, "graft", "INDEX.md"), "utf8")).toContain("index");
   });
 
   it("installs only a package whose checksum is the one the installer recorded", async () => {

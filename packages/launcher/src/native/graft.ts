@@ -244,6 +244,23 @@ export async function wireGraft(
   return { added, changedTracked, mappedFiles: mapped ? Number(mapped[1]) : null };
 }
 
+/** Wire Graft into a connector-owned delivery copy without allowing its
+ * local tracked-file annotations to enter the delivered change. The signed
+ * installer record remains the only authority to locate/download Graft. */
+export async function prepareDeliveryGraft(root: string, repo: string, family: string, deps: {
+  available?: (root: string) => Promise<boolean>;
+  ensure?: (root: string) => Promise<GraftTool>;
+  wire?: typeof wireGraft;
+} = {}): Promise<void> {
+  const available = deps.available ?? (async value => (await readGraftRecord(value)) !== null);
+  if (!(await available(root))) return;
+  const tool = await (deps.ensure ?? ensureGraft)(root);
+  const wired = await (deps.wire ?? wireGraft)(root, repo, [family], tool);
+  if (wired.changedTracked.length > 0) {
+    await git(repo, ["update-index", "--skip-worktree", "--", ...wired.changedTracked]);
+  }
+}
+
 /** `graft/a.md`, `graft/b.md` → `graft/`: exclude whole directories Graft owns. */
 function collapse(paths: string[]): string[] {
   const owned = ["graft/", ".claude/helpers/", ".claude/skills/graft/"];

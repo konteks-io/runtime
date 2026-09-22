@@ -126,6 +126,10 @@ export class AgentRuntime {
   private scope: AgentScopeState = { accountScope: "personal", authIdentityFingerprint: null, scopeAttestedAt: null, lastLoginAt: null };
   private lastProbeAt: string | null = null;
   private activeLogin: LoginFlow | null = null;
+  /** ACP exposes model choices only through session/new. Cache the immutable
+   * capability by authenticated identity for this runtime lifetime so status
+   * polling cannot create a visible Codex thread on every refresh. */
+  private readonly modelCapabilities = new Map<string, Promise<DiscoveredBridgeModelCapability>>();
   private stopping = false;
 
   constructor(private readonly options: AgentRuntimeOptions) {
@@ -568,6 +572,13 @@ export class AgentRuntime {
     if (view.readiness !== "ready" || view.connectionState !== "ready" || view.authIdentityFingerprint === undefined) {
       throw new RemoteInstanceError("agent_auth_required", "Model capability discovery requires the current authenticated agent identity.");
     }
+    const cacheKey = `${view.authIdentityFingerprint}\u0000${this.options.config.RUNNER_BRIDGE_VERSION}\u0000${configId}`;
+    const cached = this.modelCapabilities.get(cacheKey);
+    if (cached) {
+      this.logger.debug({ event: "model_capability.cache_hit", agentId: this.family.agentId, configId },
+        "reusing authenticated ACP model capability");
+      return structuredClone(await cached);
+    }
     await verifyNativeRunnerPackage(this.options.config);
     const discovery = {
       configId,
@@ -585,20 +596,36 @@ export class AgentRuntime {
     // process. An idle resident bridge answers the same `session/new` without
     // that cost; it is checked out for the probe so no session can adopt it
     // meanwhile, and returned only when the probe succeeded on it.
-    const idle = this.takeIdleExecutionBridge();
-    if (!idle) return discoverBridgeModelCapability(discovery);
-    let succeeded = false;
-    try {
-      const result = await discoverBridgeModelCapability({ ...discovery, bridge: idle.bridge });
-      succeeded = true;
-      return result;
-    } finally {
-      if (!succeeded || !this.parkIdle(idle.bridge, idle.durable)) {
-        await idle.bridge.stop().catch(error => this.logger.warn({
-          errorClass: classifyBridgeError(error).class,
-          errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_stop_failed",
-        }, "idle execution bridge could not be stopped after model capability discovery"));
+    const pending = (async () => {
+      this.logger.info({ event: "model_capability.cache_miss", agentId: this.family.agentId, configId },
+        "discovering authenticated ACP model capability once");
+      const idle = this.takeIdleExecutionBridge();
+      if (!idle) return discoverBridgeModelCapability(discovery);
+      let succeeded = false;
+      try {
+        const result = await discoverBridgeModelCapability({ ...discovery, bridge: idle.bridge });
+        succeeded = true;
+        return result;
+      } finally {
+        if (!succeeded || !this.parkIdle(idle.bridge, idle.durable)) {
+          await idle.bridge.stop().catch(error => this.logger.warn({
+            errorClass: classifyBridgeError(error).class,
+            errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_stop_failed",
+          }, "idle execution bridge could not be stopped after model capability discovery"));
+        }
       }
+    })();
+    // The control plane supplies a reviewed config id, but keep the cache
+    // bounded if that contract regresses. Oldest insertion is safe to evict.
+    if (this.modelCapabilities.size >= 16) {
+      const oldest = this.modelCapabilities.keys().next().value as string | undefined;
+      if (oldest) this.modelCapabilities.delete(oldest);
+    }
+    this.modelCapabilities.set(cacheKey, pending);
+    try { return structuredClone(await pending); }
+    catch (error) {
+      if (this.modelCapabilities.get(cacheKey) === pending) this.modelCapabilities.delete(cacheKey);
+      throw error;
     }
   }
 

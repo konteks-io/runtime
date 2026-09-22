@@ -139,16 +139,16 @@ it("does not give renewal I/O more time than the verified monotonic lease has le
   expect(renewalDeadline).toBeLessThanOrEqual(Date.now() + 1);
 });
 
-it("renews early enough to recover from a full slow exchange without extending the old lease", async () => {
+it("renews early enough to recover from a 19 second busy-host pause without extending the old lease", async () => {
   vi.useFakeTimers();
   const f = await fixture();
   const operation = await f.gate.admit(f.envelope);
   await f.gate.begin(operation);
   f.client.checkExecution.mockImplementationOnce(async () => {
-    f.advance(5_000);
+    f.advance(19_000);
     throw new RemoteInstanceError("temporarily_unavailable", "check timed out", { retryable: true });
   });
-  f.advance(18_000);
+  f.advance(5_000);
   await vi.advanceTimersByTimeAsync(1_000);
   expect(f.client.checkExecution).toHaveBeenCalledTimes(2);
   expect(f.onAuthorityLost).not.toHaveBeenCalled();
@@ -156,7 +156,7 @@ it("renews early enough to recover from a full slow exchange without extending t
   await vi.advanceTimersByTimeAsync(1_000);
   expect(f.client.checkExecution).toHaveBeenCalledTimes(3);
   expect(f.onAuthorityLost).not.toHaveBeenCalled();
-  f.advance(7_000);
+  f.advance(3_000);
   expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
 });
 
@@ -167,10 +167,10 @@ it("refuses a successful renewal response received after the old monotonic lease
   await f.gate.begin(operation);
   const normalCheck = f.client.checkExecution.getMockImplementation()!;
   f.client.checkExecution.mockImplementationOnce(async () => {
-    f.advance(12_000);
+    f.advance(26_000);
     return normalCheck();
   });
-  f.advance(18_000);
+  f.advance(5_000);
   await vi.advanceTimersByTimeAsync(1_000);
   expect(f.onAuthorityLost).toHaveBeenCalledOnce();
   expect(() => f.gate.assertDispatchCurrent(operation.authority)).toThrow();
@@ -184,9 +184,9 @@ it("records renewal stage and remaining authority without logging signed materia
   const operation = await gate.admit(f.envelope);
   await gate.begin(operation);
   f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "secret upstream message", { retryable: true }));
-  f.advance(18_000);
+  f.advance(5_000);
   await vi.advanceTimersByTimeAsync(1_000);
-  expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "execution.renewal_failed", stage: "check", executionId: "execution", remainingLeaseMs: 12_000 }), expect.any(String));
+  expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "execution.renewal_failed", stage: "check", executionId: "execution", remainingLeaseMs: 25_000 }), expect.any(String));
   expect(JSON.stringify(logger.warn.mock.calls)).not.toContain("secret upstream message");
   expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(f.envelope.permit);
 });
@@ -458,7 +458,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     const f = await sessionFixture(); vi.useFakeTimers();
     await f.session.onToRuntime(f.envelope);
     f.runner.stopForRecovery.mockRejectedValueOnce(new Error("stop unproven"));
-    // The verified lease schedules renewal five seconds before expiry; a
+    // The verified lease schedules renewal while 25 seconds remain; a
     // definitive refusal must stop without claiming the stop succeeded.
     f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("execution_fenced", "moved"));
     f.clock.advance(25_000); await vi.advanceTimersByTimeAsync(25_000);
@@ -634,7 +634,7 @@ describe("independent native live execution gate", () => {
     const f = await fixture(); vi.useFakeTimers();
     const operation = await f.gate.admit(f.envelope); await f.gate.begin(operation);
     f.client.checkExecution.mockRejectedValueOnce(new Error("policy revoked"));
-    f.advance(17_000); await vi.advanceTimersByTimeAsync(17_000);
+    f.advance(4_000); await vi.advanceTimersByTimeAsync(4_000);
     expect(f.onAuthorityLost).not.toHaveBeenCalled();
     f.advance(1_000); await vi.advanceTimersByTimeAsync(1_000);
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);

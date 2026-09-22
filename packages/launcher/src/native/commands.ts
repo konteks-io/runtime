@@ -11,6 +11,7 @@ import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
 import { nativePlatform, nativeServiceDefinition, parseServiceExits, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
+import { prepareDeliveryGraft } from "./graft.js";
 import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
@@ -158,7 +159,9 @@ export const nativeCliActions: NativeCliActions = {
     }
   },
   serve: async input => {
-    const service = createNativeService({ root: input.root, roots: EMBEDDED_RELEASE_ROOTS, platform: nativePlatform(), exitProcess: code => process.exit(code) });
+    const service = createNativeService({ root: input.root, roots: EMBEDDED_RELEASE_ROOTS, platform: nativePlatform(),
+      prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(input.root, cwd, agentId),
+      exitProcess: code => process.exit(code) });
     await service.start();
     await service.waitUntilStopped();
   },

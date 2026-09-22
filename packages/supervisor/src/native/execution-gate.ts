@@ -57,8 +57,12 @@ const signedOperationKeyId = (permit: string): string | undefined => {
 /** The whole trust fetch and signed check exchange share this one budget. */
 export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 5_000;
 const RENEWAL_RETRY_DELAY_MS = 1_000;
-// Two complete exchanges, retry delay, and one scheduler tick before expiry.
-const RENEWAL_LEAD_MS = 2 * NATIVE_EXECUTION_RENEWAL_BUDGET_MS + RENEWAL_RETRY_DELAY_MS + 1_000;
+// Begin while a full busy-host event-loop pause can still elapse before the
+// verified lease expires. A collaboration/Core restart has produced a 19 s
+// pause in practice; five exchange budgets leave 25 s without lengthening the
+// authority Core issued. Retries remain fenced by the original monotonic
+// deadline, so this changes availability rather than trust semantics.
+const RENEWAL_LEAD_MS = 5 * NATIVE_EXECUTION_RENEWAL_BUDGET_MS;
 const transientLoss = (error: unknown): boolean =>
   error instanceof RemoteInstanceError &&
   (error.code === "execution_authority_unavailable" || error.code === "temporarily_unavailable" || error.retryable);
@@ -359,7 +363,7 @@ export class NativeExecutionGate {
       this.checkId = claims.checkId;
       const remainingMs = Math.max(0, claims.exp * 1000 - this.options.clock.coreNow());
       this.monotonicDeadline = this.monotonic() + remainingMs;
-      this.refreshAfter = Math.max(this.monotonic(), this.monotonicDeadline - Math.min(RENEWAL_LEAD_MS, remainingMs / 2));
+      this.refreshAfter = Math.max(this.monotonic(), this.monotonicDeadline - Math.min(RENEWAL_LEAD_MS, remainingMs));
       this.logger.info({ event: "execution.renewal_completed", ...context,
         elapsedMs: this.monotonic() - startedAt, keysElapsedMs,
         remainingLeaseMs: remainingMs, nextRenewalInMs: Math.max(0, this.refreshAfter - this.monotonic()),

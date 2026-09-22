@@ -126,6 +126,7 @@ export interface SupervisorOptions {
     git?: NativeGitTool;
     /** Shared object cache across every configured local agent. */
     repositoryCacheRoot?: string;
+    prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void>;
     runtimeOptions?: NativeRunnerOptions["runtimeOptions"];
     /** Test/embedding seam for the independently supervised shared Codex owner. */
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;
@@ -786,6 +787,9 @@ export class Supervisor {
             ...(this.options.native!.git ? { git: this.options.native!.git } : {}),
             ...(this.options.native!.repositoryCacheRoot
               ? { repositoryCacheRoot: this.options.native!.repositoryCacheRoot }
+              : {}),
+            ...(this.options.native!.prepareRepositoryWorktree
+              ? { prepareRepositoryWorktree: this.options.native!.prepareRepositoryWorktree }
               : {}),
             client: () => new NativeInputClient({
               baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots, clock: this.clock,
