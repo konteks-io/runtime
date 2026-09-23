@@ -1144,7 +1144,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         const identity = await new SupervisorStore(supervisorData).identity().catch(() => null);
         if (identity?.instanceId && identity.instanceId !== "pending") {
           await save({ step: "inspect", revisit: true });
-          const where = state.tenantId ?? identity.workspaceId ?? "your workspace";
+          const tenant = state.tenantId ?? identity.workspaceId;
+          const where = tenant ? workspaceName(state, tenant) : "your workspace";
           return {
             step: "identity",
             note: `This machine is already connected to ${where}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}; no sign-in is needed.`,

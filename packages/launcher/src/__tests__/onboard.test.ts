@@ -1084,6 +1084,17 @@ describe("onboard", () => {
     expect(bind).toHaveBeenCalledWith("intent-1", { email: "ada@acme.test", tenantId: "acme", replacesInstanceId: "instance-old", expectedManifestDigest: "digest-1" });
   });
 
+  it("greets a new conversation with the name of the workspace it joined (W1-E1)", async () => {
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "konteks-onboard" } as never);
+    await writeOnboardState(root, {
+      step: "done", decision: "join", tenantId: "konteks-onboard", ownerEmail: "hello@konteks.io",
+      workspaces: [{ tenantId: "konteks-onboard", displayName: "Konteks-Onboard" }],
+    } as never);
+    const greeting = await step({});
+    expect(greeting.note).toContain("already connected to Konteks-Onboard as hello@konteks.io");
+  });
+
   it("names a workspace it joined by the name its owner gave it, and offers no rename (W1-E1)", async () => {
     await writeOnboardState(root, {
       step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "join",
