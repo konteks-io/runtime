@@ -507,8 +507,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
             return {
               step: "start",
               done: {
-                summary: `${said} To move Konteks to this laptop, revoke that runtime in Settings → Connected runtimes, then run onboard again here; a new code will be sent to ${state.emailMasked ?? "your address"}.`,
-                links: { site: `${siteUrl}/settings/runtimes` },
+                summary: `${said} To move Konteks to this laptop, revoke that runtime in Customize → Runtimes, then run onboard again here; a new code will be sent to ${state.emailMasked ?? "your address"}. To keep both, move the workspace to a plan with more runtimes in Settings → Plan.`,
+                links: { site: `${siteUrl}/customize/connected-runtimes` },
               },
             };
           }
@@ -518,7 +518,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               step: "start",
               done: {
                 summary: "No new workspace can be created right now. Sign in on the site or try again later.",
-                links: { site: `${siteUrl}/settings/runtimes` },
+                links: { site: siteUrl },
               },
             };
           }
@@ -533,10 +533,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         });
         identity = bound.identity;
       }
+      const joinedName = workspaceName(state, identity.workspaceId);
       const workspaceNote =
         state.decision === "create"
           ? `Your workspace is ready: ${identity.workspaceId}. You can rename it in Settings.`
-          : `This machine is joining ${identity.workspaceId}.`;
+          : `This machine is joining ${joinedName}.`;
       const announce = state.workspaceAnnounced ? "" : `${workspaceNote} `;
       // The agent packages unpack in the background from `install --enroll`
       // (WS1-012). Wait a while for them here, and if they are still going,
@@ -580,7 +581,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       } as never);
       return {
         step: "start",
-        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${identity.workspaceId}'s`} runtime; starting it next.`,
+        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next.`,
         // Registering and starting the service is the launcher's own command,
         // so the agent runs it rather than this process forking a service.
         run: { argv: ["konteks-remote", "start"] },
@@ -1179,7 +1180,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         step: "done",
         done: {
           summary: [
-            `This machine is connected to your workspace ${state.tenantId ?? ""}`.trim() + " (you can rename it in Settings).",
+            joinedWorkspace(state)
+              ? `This machine is connected to your workspace ${workspaceName(state, state.tenantId ?? "")}.`
+              : `This machine is connected to your workspace ${state.tenantId ?? ""}`.trim() + " (you can rename it in Settings).",
             state.systemEntityRef
               ? `${state.repositoryName} is your first System${state.repositoryKind === "managed" ? ", kept on Konteks managed git" : ""}.`
               : null,
@@ -1221,6 +1224,18 @@ export function initiativeTitle(sentence: string): string {
   const cut = first.slice(0, 80);
   const space = cut.lastIndexOf(" ");
   return `${(space > 40 ? cut.slice(0, space) : cut).trim()}…`;
+}
+
+/**
+ * A workspace this machine joined is named the way its owner named it (W1-E1);
+ * only one it made has just its derived id, with the note that it can be renamed.
+ */
+function joinedWorkspace(state: { decision?: string | undefined }): boolean {
+  return state.decision === "join" || state.decision === "choose";
+}
+
+function workspaceName(state: { workspaces?: Array<{ tenantId: string; displayName: string }> | undefined }, tenantId: string): string {
+  return state.workspaces?.find(entry => entry.tenantId === tenantId)?.displayName ?? tenantId;
 }
 
 /** An agent family as people name it. */

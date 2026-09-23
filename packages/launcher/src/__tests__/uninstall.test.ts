@@ -94,7 +94,7 @@ describe("uninstall", () => {
     const result = await uninstallNative({ root, output: output() }, d);
     expect(result.runtime).toBe("not_told");
     await expect(stat(root)).rejects.toThrow();
-    expect(lines.join("")).toContain("Settings → Runtimes");
+    expect(lines.join("")).toContain("Customize → Runtimes");
   });
 
   it("removes nothing while work is still running after the wait", async () => {

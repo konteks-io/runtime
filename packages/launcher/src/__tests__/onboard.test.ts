@@ -1084,6 +1084,34 @@ describe("onboard", () => {
     expect(bind).toHaveBeenCalledWith("intent-1", { email: "ada@acme.test", tenantId: "acme", replacesInstanceId: "instance-old", expectedManifestDigest: "digest-1" });
   });
 
+  it("names a workspace it joined by the name its owner gave it, and offers no rename (W1-E1)", async () => {
+    await writeOnboardState(root, {
+      step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "join",
+      workspaces: [{ tenantId: "acme-kitchen", displayName: "Acme Kitchen" }], workspaceAnnounced: false,
+    } as never);
+    const { writeSecretFile } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: ["claude-code"], releaseId: "release-1", bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const bind = vi.fn(async () => ({
+      identity: { instanceId: "instance-9", workspaceId: "acme-kitchen" },
+      activationId: "activation-9",
+      provisioningCredential: "kxrp_x", provisioningCredentialExpiresAt: "2030-01-01T00:00:00Z", provisioningWindowExpiresAt: "2030-01-01T00:00:00Z",
+      bundleManifest: {},
+      ownerToken: { token: "user-token", expiresAt: new Date(Date.now() + 3600_000).toISOString(), userRef: "user:default/ada", tenantId: "acme-kitchen" },
+      workspaceCreated: false,
+    }));
+    const started = await step({ enrollment: { bind } as never, complete: vi.fn(async () => ({}) as never), staging: { status: async () => ({ state: "done" }), spawn: vi.fn() } });
+    expect(started.note).toContain("This machine is joining Acme Kitchen.");
+    expect(started.note).toContain("This machine is now Acme Kitchen's runtime");
+    expect(started.note).not.toContain("acme-kitchen");
+
+    await writeOnboardState(root, { ...(await readOnboardState(root)), step: "done" } as never);
+    const done = await step({});
+    expect(done.done?.summary).toContain("This machine is connected to your workspace Acme Kitchen.");
+    expect(done.done?.summary).not.toContain("rename it in Settings");
+  });
+
   it("binds, persists the installation and hands the agent the start command", async () => {
     await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "create" } as never);
     const { writeSecretFile } = await import("@konteks/remote-common");
@@ -1187,8 +1215,11 @@ describe("onboard", () => {
     const result = await step({ enrollment: { bind } as never });
     // W1-A10: the refusal names the machine to revoke, and says how to move.
     expect(result.done?.summary).toContain("\"ada's Mac\" already holds it.");
-    expect(result.done?.summary).toContain("revoke that runtime in Settings → Connected runtimes, then run onboard again here");
-    expect(result.done?.links.site).toContain("/settings/runtimes");
+    // W1-E5: runtimes moved to Customize on 09-21, and the link must open
+    // that page; another slot comes from a larger plan.
+    expect(result.done?.summary).toContain("revoke that runtime in Customize → Runtimes, then run onboard again here");
+    expect(result.done?.summary).toContain("move the workspace to a plan with more runtimes in Settings → Plan");
+    expect(result.done?.links.site).toBe("https://app.test/customize/connected-runtimes");
     // "Run onboard again" must actually try again: a fresh code, not a replayed summary.
     expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
   });

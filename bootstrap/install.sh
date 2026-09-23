@@ -130,7 +130,7 @@ if [ "$user_install" -eq 1 ]; then
   case "$os" in
     Darwin) os_id="macos" ;;
     Linux) os_id="debian" ;;
-    *) echo "error: the user-local install supports macOS and Linux for now; on Windows use the activation install (Settings → Connected runtimes)" >&2; exit 3 ;;
+    *) echo "error: the user-local install supports macOS and Linux for now; on Windows use the activation install (Customize → Runtimes)" >&2; exit 3 ;;
   esac
   connector="konteks-remote-${os_id}-${arch}"
   fetch "${RELEASE_BASE}/${connector}" "$workdir/$connector"
