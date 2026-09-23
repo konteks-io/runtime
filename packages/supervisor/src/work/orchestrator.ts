@@ -1241,6 +1241,31 @@ export class WorkOrchestrator {
 
   /** Report the interruption only after independent exact-process proof. */
   private async recoverLostExecutionAuthority(assignmentId: string, attempt: number): Promise<void> {
+    const observedAdmission = this.deps.journal.execution.admission(assignmentId, attempt);
+    if (observedAdmission) {
+      const assertCurrent = () => {
+        this.requireNativeOwner();
+        if (observedAdmission.runnerIncarnation !== this.deps.runnerIncarnation?.() ||
+            observedAdmission.instanceId !== this.deps.instanceId() || observedAdmission.workspaceId !== this.deps.workspaceId()) {
+          throw new RemoteInstanceError("recovery_required", "Recovery observer no longer owns this execution.");
+        }
+        this.deps.journal.execution.assertAdmission(observedAdmission);
+      };
+      assertCurrent();
+      // The negative observation must survive even when cancellation never
+      // returns. It is not terminal authority and cannot release resources.
+      try {
+        await this.recordTurnSettledRecoveryEvidence(observedAdmission, assertCurrent, "stop_unconfirmed", false);
+        void this.retryRecoveryEvidence().catch(error => {
+          this.logger.warn({ assignmentId, attempt, code: recoveryEvidenceFailureCode(error) }, "Recovery evidence delivery remains pending");
+        });
+      } catch (error) {
+        // Diagnostic durability must never suppress the independent stop path.
+        this.logger.error({ event: "execution.recovery_observation_persist_failed", assignmentId, attempt,
+          code: recoveryEvidenceFailureCode(error), stopClass: "stop_unconfirmed", capacityReleased: false },
+        "Recovery observation could not be persisted; cancellation will still be attempted");
+      }
+    }
     await this.stopForRecovery(assignmentId, attempt);
     const admission = this.deps.journal.execution.admission(assignmentId, attempt);
     const entry = this.deps.journal.assignments.get(`${assignmentId}:${attempt}`);
@@ -1417,14 +1442,15 @@ export class WorkOrchestrator {
     return task;
   }
 
-  private async recordTurnSettledRecoveryEvidence(admission: LocalAdmission, assertCurrent: () => void): Promise<void> {
+  private async recordTurnSettledRecoveryEvidence(admission: LocalAdmission, assertCurrent: () => void,
+    stopClass: "turn_settled" | "stop_unconfirmed" = "turn_settled", deliver = true): Promise<void> {
     const execution = this.deps.journal.execution.execution(admission);
     const entry = this.deps.journal.assignments.get(`${admission.assignmentId}:${admission.attempt}`);
-    if (!execution || execution.phase !== "acp_settled" || !execution.acpSettledAt || !entry || entry.claimId !== admission.claimId) {
+    if (!execution || (stopClass === "turn_settled" && (execution.phase !== "acp_settled" || !execution.acpSettledAt)) || !entry || entry.claimId !== admission.claimId) {
       throw new RemoteInstanceError("recovery_required", "Durable ACP settlement does not match the current claim.");
     }
     const recordedAt = this.deps.clock.nowIso();
-    const observedAt = execution.acpSettledAt;
+    const observedAt = stopClass === "turn_settled" ? execution.acpSettledAt! : this.deps.clock.nowIso();
     const observedMs = Date.parse(observedAt);
     const ageMs = Number.isFinite(observedMs) ? Math.max(0, this.deps.clock.coreNow() - observedMs) : 0;
     const semantic = {
@@ -1436,7 +1462,7 @@ export class WorkOrchestrator {
       recoveryEpoch: entry.recoveryEpoch,
       evidenceKind: "stop_observation" as const,
       schemaVersion: "remote-recovery-evidence-v1" as const,
-      stopClass: "turn_settled" as const,
+      stopClass,
       reason: "ownership_scope_lost" as const,
       observedAt,
       recordedAt,
@@ -1468,7 +1494,7 @@ export class WorkOrchestrator {
     // A retry reaches the same identity after time has passed. Reuse the
     // first fsynced bytes rather than recalculating recorded time/age/digest.
     const record = existing ?? this.deps.journal.recoveryEvidence.get(key);
-    if (record) await this.deliverRecoveryEvidence(record, assertCurrent);
+    if (record && deliver) await this.deliverRecoveryEvidence(record, assertCurrent);
   }
 
   private async deliverRecoveryEvidence(record: RecoveryEvidenceRecord, assertCurrent?: () => void): Promise<void> {
