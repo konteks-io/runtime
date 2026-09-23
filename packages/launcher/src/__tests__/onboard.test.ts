@@ -1214,6 +1214,27 @@ describe("onboard", () => {
     expect((await readOnboardState(root))?.resendTo).toBeUndefined();
   });
 
+  it("after a full workspace, offers the other workspaces again without a new code (W1-E2, WS1-104)", async () => {
+    const workspaces = [{ tenantId: "konteks-onboard", displayName: "Konteks-Onboard" }, { tenantId: "side-project", displayName: "Side Project" }];
+    await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "choose", tenantId: "konteks-onboard", workspaces } as never);
+    const { writeSecretFile, CoreResponseError } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: [], releaseId: "release-1", bundleVersion: "0.5.0", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const bind = vi.fn(async () => {
+      throw new CoreResponseError({ status: 402, code: "limit_exceeded", message: "This workspace's plan allows one connected runtime, and \"ada's Mac\" already holds it" });
+    });
+    const result = await step({ enrollment: { bind } as never });
+    // The address was proved a minute ago and Core still holds that proof.
+    expect(result.step).toBe("workspace");
+    expect(result.note).toContain("Konteks-Onboard has no room for this machine");
+    expect(result.note).toContain("\"ada's Mac\" already holds it.");
+    expect(result.note).toContain("Customize → Runtimes");
+    expect(result.ask).toEqual({ question: "Which workspace should this machine join?", kind: "choice", choices: ["Konteks-Onboard", "Side Project"] });
+    expect(await readOnboardState(root)).toMatchObject({ step: "workspace", intentRef: "intent-1", decision: "choose" });
+    expect((await readOnboardState(root))?.resendTo).toBeUndefined();
+  });
+
   it("stops with the plan-limit remedy, naming the machine that holds it, and can try again later", async () => {
     await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "join" } as never);
     const { writeSecretFile, CoreResponseError } = await import("@konteks/remote-common");

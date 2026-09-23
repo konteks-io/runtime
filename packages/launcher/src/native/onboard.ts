@@ -500,10 +500,21 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
             // to revoke. Stop here, but leave onboarding ready to try again:
             // "run onboard again" used to find a finished machine and replay
             // a summary instead of connecting. The next run sends a new code.
-            await save({ step: "email", intentRef: undefined, emailMasked: undefined, decision: undefined, attemptsRemaining: undefined, resendTo: state.email } as never);
             const said = error instanceof Error && /plan allows/i.test(error.message)
               ? error.message.trim().replace(/([^.!?])$/, "$1.")
               : "This workspace's plan allows one connected runtime, and it is in use.";
+            // With other workspaces on offer, the address this run proved is
+            // still good for them: ask again instead of sending a new code
+            // (W1-E2, WS1-104). Core only rolled the refused bind back.
+            if (state.decision === "choose" && (state.workspaces?.length ?? 0) > 1) {
+              await save({ step: "workspace", tenantId: undefined } as never);
+              return {
+                step: "workspace",
+                note: `${workspaceName(state, state.tenantId ?? "")} has no room for this machine. ${said} To use it here, revoke that runtime in Customize → Runtimes or move the workspace to a plan with more runtimes in Settings → Plan. Or choose another workspace.`,
+                ask: { question: "Which workspace should this machine join?", kind: "choice", choices: (state.workspaces ?? []).map(entry => entry.displayName) },
+              };
+            }
+            await save({ step: "email", intentRef: undefined, emailMasked: undefined, decision: undefined, attemptsRemaining: undefined, resendTo: state.email } as never);
             return {
               step: "start",
               done: {
