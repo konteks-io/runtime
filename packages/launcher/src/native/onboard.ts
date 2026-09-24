@@ -932,7 +932,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "pushing" });
       return {
         step: "push",
-        note: `Pushing ${state.defaultBranch} to Konteks managed git. This usually takes a few seconds.`,
+        // An empty folder has nothing of the person's to push; it only joins
+        // the repository Konteks made (WS1-124).
+        note: state.repositoryNeedsInit && !withFiles
+          ? `Joining ${state.repositoryName} to its Konteks repository. This usually takes a few seconds.`
+          : `Pushing ${state.defaultBranch} to Konteks managed git. This usually takes a few seconds.`,
         run: AGAIN,
       };
     }
@@ -1007,7 +1011,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           await save({ step: "graft" });
           return {
             step: "pushing",
-            note: `${initialized.message} Your code lives on Konteks managed git, on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}. Push your work with git as usual (remote "konteks").`,
+            note: `${initialized.message} It is on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}; push your work with git as usual (remote "konteks").`,
             run: AGAIN,
           };
         }

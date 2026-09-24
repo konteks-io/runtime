@@ -537,7 +537,9 @@ describe("onboard", () => {
     expect(question.ask?.question).toContain("It becomes a git repository on main; none of your files are added or changed");
     expect(question.ask?.question).not.toContain("empty first commit"); // WS1-031: the repository usually has its own
     expect(question.ask?.question).toContain("none of your files are added");
-    await step({ initialize, push: push as never }, "yes");
+    const joining = await step({ initialize, push: push as never }, "yes");
+    // Nothing of the person's is pushed from an empty folder (WS1-124).
+    expect(joining.note).toBe("Joining konteks-onboard-app to its Konteks repository. This usually takes a few seconds.");
     expect(initialize).not.toHaveBeenCalled();
     const pushed = await step({ initialize, push: push as never });
     expect(initialize).toHaveBeenCalledWith(expect.objectContaining({
