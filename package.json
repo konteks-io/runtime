@@ -49,11 +49,11 @@
     "zod": "4.4.3"
   },
   "dependencies": {
-    "@konteks/agent-core": "file:vendor/konteks-agent-core-6.2.0.tgz",
-    "@konteks/backstage-plugin-common": "file:vendor/konteks-backstage-plugin-common-6.2.0.tgz"
+    "@konteks/agent-core": "file:vendor/konteks-agent-core-6.3.0.tgz",
+    "@konteks/backstage-plugin-common": "file:vendor/konteks-backstage-plugin-common-6.3.0.tgz"
   },
   "konteksContracts": {
-    "@konteks/agent-core": "6.2.0",
-    "@konteks/backstage-plugin-common": "6.2.0"
+    "@konteks/agent-core": "6.3.0",
+    "@konteks/backstage-plugin-common": "6.3.0"
   }
 }

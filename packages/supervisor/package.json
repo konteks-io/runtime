@@ -27,8 +27,8 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
-    "@konteks/agent-core": "6.2.0",
-    "@konteks/backstage-plugin-common": "6.2.0",
+    "@konteks/agent-core": "6.3.0",
+    "@konteks/backstage-plugin-common": "6.3.0",
     "@konteks/remote-agent-runner": "*",
     "@konteks/remote-common": "*",
     "@konteks/remote-preview-forwarder": "*",
