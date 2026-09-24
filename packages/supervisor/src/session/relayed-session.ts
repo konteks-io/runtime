@@ -191,7 +191,7 @@ export class RelayedSession {
     try { await (this.deps.onExecutionAuthorityLost?.() ?? this.stopForRecovery()); }
     catch (error) {
       this.logger.warn({ event: "execution.recovery_stop_unconfirmed", assignmentId: this.assignment.id,
-        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "recovery_required" },
+        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "recovery_required", err: error },
       "Execution remains fenced; recovery settlement is unconfirmed");
       throw error;
     }

@@ -1262,7 +1262,7 @@ export class WorkOrchestrator {
       } catch (error) {
         // Diagnostic durability must never suppress the independent stop path.
         this.logger.error({ event: "execution.recovery_observation_persist_failed", assignmentId, attempt,
-          code: recoveryEvidenceFailureCode(error), stopClass: "stop_unconfirmed", capacityReleased: false },
+          code: recoveryEvidenceFailureCode(error), stopClass: "stop_unconfirmed", capacityReleased: false, err: error },
         "Recovery observation could not be persisted; cancellation will still be attempted");
       }
     }
@@ -1449,10 +1449,16 @@ export class WorkOrchestrator {
     if (!execution || (stopClass === "turn_settled" && (execution.phase !== "acp_settled" || !execution.acpSettledAt)) || !entry || entry.claimId !== admission.claimId) {
       throw new RemoteInstanceError("recovery_required", "Durable ACP settlement does not match the current claim.");
     }
-    const recordedAt = this.deps.clock.nowIso();
-    const observedAt = stopClass === "turn_settled" ? execution.acpSettledAt! : this.deps.clock.nowIso();
-    const observedMs = Date.parse(observedAt);
-    const ageMs = Number.isFinite(observedMs) ? Math.max(0, this.deps.clock.coreNow() - observedMs) : 0;
+    // One clock for the whole record. The schema requires ageMs to equal
+    // recordedAt minus observedAt exactly, and acpSettledAt is host time;
+    // mixing in Core's fractional skew estimate made every live stop fail
+    // to parse, so a lost lease held its claim until the next restart.
+    const recordedMs = this.deps.clock.now();
+    const settledMs = stopClass === "turn_settled" ? Date.parse(execution.acpSettledAt!) : recordedMs;
+    const observedMs = Number.isFinite(settledMs) ? Math.min(settledMs, recordedMs) : recordedMs;
+    const recordedAt = new Date(recordedMs).toISOString();
+    const observedAt = new Date(observedMs).toISOString();
+    const ageMs = recordedMs - observedMs;
     const semantic = {
       instanceId: admission.instanceId,
       assignmentId: admission.assignmentId,
@@ -1467,7 +1473,7 @@ export class WorkOrchestrator {
       observedAt,
       recordedAt,
       ageMs,
-      nextRetryAt: new Date(this.deps.clock.coreNow() + 5_000).toISOString(),
+      nextRetryAt: new Date(recordedMs + 5_000).toISOString(),
       safeAction: { kind: "retry_later" as const, instanceId: admission.instanceId, agentId: admission.agentId },
       terminalDisposition: "not_terminal" as const,
       quiescenceAssertion: "not_asserted_by_recovery_evidence" as const,

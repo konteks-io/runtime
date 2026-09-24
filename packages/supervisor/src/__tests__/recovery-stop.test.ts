@@ -172,6 +172,21 @@ describe("proven per-session recovery stop", () => {
     expect(f.outbox.depth).toBe(0);
   });
 
+  it("records stop evidence on a host whose clock is not Core's", async () => {
+    // A live connector estimates a fractional skew from Core responses (-1.6 s on 09-24).
+    clock.observeCoreTime(clock.now() + 1_597.73, 0);
+    try {
+      const f = await realOwnedWork(); await f.dispatch();
+      await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+
+      await expect(f.work.stopForRecovery("assignment", 1)).rejects.toThrow("quiescence");
+
+      const [record] = f.journal.recoveryEvidence.all();
+      expect(record?.evidence).toMatchObject({ stopClass: "turn_settled", ageMs: 0 });
+      expect(f.recoveryEvidence.submit).toHaveBeenCalledTimes(1);
+    } finally { clock.observeCoreTime(clock.now(), 0); }
+  });
+
   it("keeps failed stop evidence pending and replays the same immutable bytes", async () => {
     const f = await realOwnedWork(); await f.dispatch();
     await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
@@ -588,6 +603,19 @@ it("persists authority-loss uncertainty before cancellation fails and replays th
   expect(f.recoveryEvidence.submit.mock.calls[1]?.[0]?.evidence).toEqual(first?.evidence);
   expect(f.journal.recoveryEvidence.all()[0]?.delivery).toBe("accepted");
   expect(f.transport.closeChannel).not.toHaveBeenCalled();
+});
+
+it("persists authority-loss uncertainty on a host whose clock is not Core's", async () => {
+  clock.observeCoreTime(clock.now() + 1_597.73, 0);
+  try {
+    const f = await realOwnedWork(); await f.dispatch();
+    await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+    f.connection.cancel.mockRejectedValue(new Error("cancel response lost"));
+    await expect((f.work as unknown as { recoverLostExecutionAuthority(id: string, attempt: number): Promise<void> })
+      .recoverLostExecutionAuthority("assignment", 1)).rejects.toThrow();
+    expect(f.journal.recoveryEvidence.all().map(record => record.evidence)).toContainEqual(
+      expect.objectContaining({ stopClass: "stop_unconfirmed", ageMs: 0 }));
+  } finally { clock.observeCoreTime(clock.now(), 0); }
 });
 
 it("still attempts cancellation when persisting the uncertainty observation fails", async () => {
