@@ -77,7 +77,12 @@ interface SessionRecord {
   recoveryStop: Promise<void> | null;
   completedClose?: Promise<void>;
   assertCurrent?: () => void;
+  /** Native turns started by a connector-sent prompt (bounded, oldest evicted). */
+  connectorTurns?: Set<string>;
 }
+
+const MAX_CONNECTOR_TURNS = 256;
+type AcpNativeObservation = z.infer<typeof AcpNativeObservationSchema>;
 
 export interface SessionManagerOptions {
   bridge: () => BridgeProcess | null;
@@ -731,10 +736,34 @@ export class SessionManager {
     const { nativeObservation: _untrusted, ...update } = params.update as typeof params.update & { nativeObservation?: unknown };
     const native = AcpNativeObservationSchema.safeParse(update._meta?.konteksNativeObservation);
     const messageChunk = update.sessionUpdate === "user_message_chunk" || update.sessionUpdate === "agent_message_chunk";
+    const observation = messageChunk && native.success ? this.attributeNativeTurn(record, update.sessionUpdate, native.data) : undefined;
     this.options.events.publish({ kind: "session_update", acpSessionRef: record.acpSessionRef, params: {
       ...withoutBridgeSessionId(params), sessionId: record.acpSessionRef,
-      update: { ...update, ...(messageChunk && native.success ? { nativeObservation: native.data } : {}) },
+      update: { ...update, ...(observation ? { nativeObservation: observation } : {}) },
     } });
+  }
+
+  /**
+   * The Codex bridge marks every agent chunk "unclassified" and leaves the
+   * join to its turn: only the user message that opened the turn says whether
+   * the connector sent it. Join here, under the session owner, so the reply to
+   * a Konteks prompt is the Konteks turn's output. Before this, every Codex
+   * reply to a Konteks prompt was treated as someone else's local turn and
+   * dropped, so a Codex QA could never return a verdict (WS2-158). A turn the
+   * connector did not open stays unclassified.
+   */
+  private attributeNativeTurn(record: SessionRecord, sessionUpdate: string, observation: AcpNativeObservation): AcpNativeObservation {
+    if (sessionUpdate === "user_message_chunk") {
+      if (observation.origin === "connector") {
+        const turns = record.connectorTurns ??= new Set();
+        turns.add(observation.turnId);
+        if (turns.size > MAX_CONNECTOR_TURNS) turns.delete(turns.values().next().value!);
+      }
+      return observation;
+    }
+    return observation.origin === "unclassified" && record.connectorTurns?.has(observation.turnId)
+      ? { ...observation, origin: "connector" }
+      : observation;
   }
 
   /**

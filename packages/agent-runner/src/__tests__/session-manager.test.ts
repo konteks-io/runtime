@@ -334,6 +334,25 @@ describe("session manager (D98 bootstrap)", () => {
     expect((seen[1] as { params: { update: unknown } }).params.update).not.toHaveProperty("nativeObservation");
   });
 
+  it("attributes a Codex reply to the turn the connector opened, and only that turn (WS2-158)", async () => {
+    const events = new RunnerEventBus(), seen: RunnerEvent[] = [];
+    events.subscribe(event => seen.push(event));
+    const { bridge } = fakeBridge();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+    await manager.create({ context, cwd: "/w", mcpServers: [] });
+    seen.length = 0;
+    const observed = (origin: string, turnId: string) => ({ version: 1, origin, turnId, itemId: `${turnId}-item` });
+    const send = (sessionUpdate: string, origin: string, turnId: string) => manager.onSessionUpdate({ sessionId: "bridge-s1", update: {
+      sessionUpdate, content: { type: "text", text: "x" }, _meta: { konteksNativeObservation: observed(origin, turnId) },
+    } } as never);
+    send("user_message_chunk", "connector", "konteks-turn");
+    send("agent_message_chunk", "unclassified", "konteks-turn");
+    send("user_message_chunk", "unclassified", "local-turn");
+    send("agent_message_chunk", "unclassified", "local-turn");
+    const origins = seen.map(event => (event as { params: { update: { nativeObservation?: { origin: string } } } }).params.update.nativeObservation?.origin);
+    expect(origins).toEqual(["connector", "connector", "unclassified", "unclassified"]);
+  });
+
   it("ignores foreign bridge callbacks and exit even when its private ID matches", async () => {
     const first = fakeBridge(), foreign = fakeBridge();
     const events = new RunnerEventBus(), seen: RunnerEvent[] = [];
