@@ -203,6 +203,16 @@ export class OwnerApiClient {
   }
 
   /** The initiatives a System already has, newest first as Konteks lists them (WS1-090). */
+  /** The workspace's name as people see it on the site, or undefined when Core does not say. */
+  async workspaceDisplayName(tenantId: string): Promise<string | undefined> {
+    const body = await this.call("GET", "/api/platform/tenants");
+    const match = (Array.isArray(body) ? body : []).find(
+      (entry: unknown): entry is { displayName?: unknown } =>
+        typeof entry === "object" && entry !== null && (entry as { name?: unknown }).name === tenantId,
+    );
+    return typeof match?.displayName === "string" && match.displayName.trim() ? match.displayName.trim() : undefined;
+  }
+
   async listInitiatives(systemId: string): Promise<Array<{ id: string; title: string }>> {
     const body = (await this.call("GET", `/api/collaboration/initiatives?systemId=${encodeURIComponent(systemId)}`)) as Record<string, unknown>;
     const list = Array.isArray(body.initiatives) ? (body.initiatives as Array<Record<string, unknown>>) : [];

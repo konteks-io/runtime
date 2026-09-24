@@ -255,6 +255,19 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       clock,
       ...(context.deps?.fetchFn ? { fetchFn: context.deps.fetchFn } : {}),
     });
+  // The workspace's name as the site shows it now: the person may have renamed
+  // it since this machine was told its id (WS1-108). Revoked access still
+  // speaks; anything else falls back to what this machine was told.
+  const currentWorkspaceName = async (tenantId: string): Promise<string | undefined> => {
+    if (!tenantId || !(await readOwnerToken(supervisorData).catch(() => null))) return undefined;
+    try {
+      const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
+      return await api.workspaceDisplayName(tenantId);
+    } catch (error) {
+      if (error instanceof RemoteInstanceError && error.message === OWNER_ACCESS_REVOKED) throw error;
+      return undefined;
+    }
+  };
   const families = context.deps?.families ?? detectAgentFamilies;
   const state = (await readOnboardState(context.root)) ?? {
     schemaVersion: 1 as const,
@@ -324,7 +337,6 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "email" });
       return {
         step: "identity",
-        note: "This machine is not connected to Konteks yet.",
         ask: { question: "What email address should this machine belong to?", kind: "email" },
       };
     }
@@ -592,7 +604,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       } as never);
       return {
         step: "start",
-        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next.`,
+        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next; this takes about a minute.`,
         // Registering and starting the service is the launcher's own command,
         // so the agent runs it rather than this process forking a service.
         run: { argv: ["konteks-remote", "start"] },
@@ -660,7 +672,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           step: "inspect",
           done: {
             summary: [
-              `This machine is connected to ${state.tenantId ?? "your workspace"}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}.`,
+              // The greeting just said who and where this machine is connected.
               `${state.repositoryName ?? "This folder"} is already your System${state.repositoryKind === "managed" ? " on Konteks managed git" : ""}; nothing here needs setting up again.`,
               state.initiativeId ? `Your first initiative "${state.initiativeTitle}" and its planning session are on the site.` : null,
               "Run onboard from another project folder to add it as a System.",
@@ -697,7 +709,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         });
         return {
           step: "inspect",
-          note: `${notReady}You are in ${basename(directory)}, a folder that is not a git repository yet. Konteks can make it one and keep it on Konteks managed git.`,
+          note: `${notReady}${basename(directory)} isn\u2019t a git repository yet.`,
           run: AGAIN,
         };
       }
@@ -1036,7 +1048,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       if (context.answer === undefined) {
         return {
           step: "first_task",
-          ask: { question: "What do you want to build first? (this first turn uses your starter grant)", kind: "text" },
+          ask: { question: "What do you want to build first? Your first planning turn is included.", kind: "text" },
         };
       }
       const wanted = context.answer.trim();
@@ -1156,7 +1168,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         if (identity?.instanceId && identity.instanceId !== "pending") {
           await save({ step: "inspect", revisit: true });
           const tenant = state.tenantId ?? identity.workspaceId;
-          const where = tenant ? workspaceName(state, tenant) : "your workspace";
+          const where = tenant ? ((await currentWorkspaceName(tenant)) ?? workspaceName(state, tenant)) : "your workspace";
           return {
             step: "identity",
             note: `This machine is already connected to ${where}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}; no sign-in is needed.`,
@@ -1180,6 +1192,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         remedies.push("To keep the runtime available after logout: loginctl enable-linger $USER");
       }
       const advertised = state.advertisedRoles;
+      const currentName = await currentWorkspaceName(state.tenantId ?? "");
       const agentsLine =
         present.length === 0
           ? installed.length > 0
@@ -1192,8 +1205,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         step: "done",
         done: {
           summary: [
-            joinedWorkspace(state)
-              ? `This machine is connected to your workspace ${workspaceName(state, state.tenantId ?? "")}.`
+            joinedWorkspace(state) || (currentName !== undefined && currentName !== state.tenantId)
+              ? `This machine is connected to your workspace ${currentName ?? workspaceName(state, state.tenantId ?? "")}.`
               : `This machine is connected to your workspace ${state.tenantId ?? ""}`.trim() + " (you can rename it in Settings).",
             state.systemEntityRef
               ? `${state.repositoryName} is your first System${state.repositoryKind === "managed" ? ", kept on Konteks managed git" : ""}.`

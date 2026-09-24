@@ -41,6 +41,9 @@ describe("onboard", () => {
   // A connected machine's service answers; the tests that care about it say so
   // themselves, and the rest should not have to stand up a supervisor.
   const readyService = async () => ({ administrativeStatus: "active", roles: ["assistant", "onboard"] });
+  const offline = async () => {
+    throw new TypeError("fetch failed (offline test)");
+  };
   const step = (extra: Parameters<typeof runOnboardStep>[0]["deps"] = {}, answer?: string) =>
     runOnboardStep({
       root,
@@ -48,7 +51,8 @@ describe("onboard", () => {
       coreUrl: "https://core.test",
       siteUrl: "https://app.test",
       ...(answer !== undefined ? { answer } : {}),
-      deps: { waitForReady: readyService, ...extra },
+      // No test reaches a real Core: a lookup nobody stubbed fails fast.
+      deps: { waitForReady: readyService, fetchFn: offline as never, ...extra },
     });
 
   it("asks for the email in its very first response on a machine that is not connected", async () => {
@@ -383,7 +387,7 @@ describe("onboard", () => {
         inspect: async () => ({ path: null, name: "konteks-onboard-app", remoteUrl: null, remoteReachable: false, currentBranch: null, defaultBranch: "main" }),
       },
     });
-    expect(result.note).toContain("not a git repository yet");
+    expect(result.note).toBe("konteks-onboard-app isn\u2019t a git repository yet.");
     expect(result.note).not.toContain("no first System");
     expect(await readOnboardState(root)).toMatchObject({
       step: "system",
@@ -803,6 +807,12 @@ describe("onboard", () => {
     expect(revoked.done?.links.site).toBe("https://app.test");
   });
 
+  it("asks what to build first in plain words, without billing terms (WS1-109)", async () => {
+    await writeOnboardState(root, { step: "first_task", systemId: "sys-1" } as never);
+    const ask = await step({});
+    expect(ask.ask?.question).toBe("What do you want to build first? Your first planning turn is included.");
+  });
+
   it("ends without a session when the person answers nothing", async () => {
     await writeOnboardState(root, { step: "first_task", systemId: "sys-1" } as never);
     const fetchFn = vi.fn();
@@ -824,7 +834,9 @@ describe("onboard", () => {
       initiativeUrl: "https://app.test/work/init-7",
       sessionUrl: "https://app.test/sessions/session-9",
     } as never);
-    const result = await step({});
+    // Core still names the workspace by its id: the rename is still on offer.
+    const tenants = vi.fn(async () => new Response(JSON.stringify([{ name: "acme", displayName: "acme" }]), { status: 200, headers: { "content-type": "application/json" } }));
+    const result = await step({ fetchFn: tenants as never });
     expect(result.done?.links).toEqual({
       site: "https://app.test",
       system: "https://app.test/systems/sys-1",
@@ -834,6 +846,40 @@ describe("onboard", () => {
     expect(result.done?.summary).toContain("rename it in Settings");
     expect(result.done?.summary).toContain("solo is your first System, kept on Konteks managed git");
     expect(result.done?.summary).toContain('Your first initiative is "Book a table"');
+  });
+
+  it("names a workspace renamed on the site by its new name in the closing and the next conversation (WS1-108)", async () => {
+    await writeOnboardState(root, {
+      step: "done", decision: "create", tenantId: "acme", ownerEmail: "ada@acme.test",
+      systemId: "sys-1", systemEntityRef: "system:default/acme-solo", repositoryName: "solo", repositoryKind: "managed",
+    } as never);
+    const tenants = vi.fn(async (url: unknown) => {
+      expect(String(url)).toBe("https://core.test/api/platform/tenants");
+      return new Response(JSON.stringify([{ name: "acme", displayName: "Acme Kitchen", isDefault: true }]), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const done = await step({ fetchFn: tenants as never });
+    expect(done.done?.summary).toContain("This machine is connected to your workspace Acme Kitchen.");
+    expect(done.done?.summary).not.toContain("rename it in Settings");
+
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
+    const greeting = await step({ fetchFn: tenants as never });
+    expect(greeting.note).toBe("This machine is already connected to Acme Kitchen as ada@acme.test; no sign-in is needed.");
+  });
+
+  it("still closes, naming the id, when Core cannot say the workspace's name (WS1-108)", async () => {
+    await writeOnboardState(root, { step: "done", decision: "create", tenantId: "acme" } as never);
+    const down = vi.fn(async () => new Response("unavailable", { status: 503 }));
+    const done = await step({ fetchFn: down as never });
+    expect(done.done?.summary).toContain("This machine is connected to your workspace acme (you can rename it in Settings).");
+  });
+
+  it("asks for the email without a note saying the machine is not connected (WS1-109)", async () => {
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue(null as never);
+    const first = await step({});
+    expect(first.note).toBeUndefined();
+    expect(first.ask?.question).toBe("What email address should this machine belong to?");
   });
 
   it("names only the agents that are logged in as running work, and says how to log in the other (pass 28)", async () => {
@@ -1144,6 +1190,7 @@ describe("onboard", () => {
     expect(result.run?.argv).toEqual(["konteks-remote", "start"]);
     expect(result.note).toContain("Your workspace is ready: acme");
     expect(result.note).toContain("rename it in Settings");
+    expect(result.note).toContain("starting it next; this takes about a minute.");
     const state = await readOnboardState(root);
     expect(state).toMatchObject({ step: "inspect", instanceId: "instance-9", tenantId: "acme" });
     expect(state?.email).toBeUndefined();
