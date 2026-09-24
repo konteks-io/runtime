@@ -970,6 +970,18 @@ describe("onboard", () => {
     expect((await readOnboardState(root))?.retryAsked).toBe(true);
   });
 
+  it("takes the one offered workspace a sentence names, and asks again when it names none or both (pass 5)", async () => {
+    const workspaces = [{ tenantId: "konteks-2", displayName: "konteks-2" }, { tenantId: "recipe-club", displayName: "Recipe Club" }];
+    for (const [answer, tenantId] of [["konteks-2 again please", "konteks-2"], ["the Recipe Club one", "recipe-club"], ["recipe-club", "recipe-club"]] as const) {
+      await writeOnboardState(root, { step: "workspace", decision: "choose", workspaces } as never);
+      const joined = await step({}, answer);
+      expect(joined.note, answer).toBe(`Joining ${workspaces.find(entry => entry.tenantId === tenantId)!.displayName}.`);
+      expect(await readOnboardState(root)).toMatchObject({ step: "start", tenantId });
+    }
+    await writeOnboardState(root, { step: "workspace", decision: "choose", workspaces } as never);
+    expect((await step({}, "konteks-2 or Recipe Club?")).note).toBe("That is not one of the workspaces on offer.");
+  });
+
   it("asks what to build first in plain words, without billing terms (WS1-109)", async () => {
     await writeOnboardState(root, { step: "first_task", systemId: "sys-1" } as never);
     const ask = await step({});

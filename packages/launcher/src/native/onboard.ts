@@ -510,9 +510,14 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         return { step: "workspace", ask: { question: "Which workspace should this machine join?", kind: "choice", choices } };
       }
       const wanted = context.answer.trim().toLowerCase();
-      const chosen = (state.workspaces ?? []).find(
-        entry => entry.displayName.toLowerCase() === wanted || entry.tenantId.toLowerCase() === wanted,
-      );
+      const offered = state.workspaces ?? [];
+      // A person answers in a sentence ("konteks-2 again please"): take the one
+      // offered name it mentions, and ask again only when it names none or two.
+      const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const mentions = (name: string) => new RegExp(`(^|[^\\p{L}\\p{N}-])${escape(name.toLowerCase())}($|[^\\p{L}\\p{N}-])`, "u").test(wanted);
+      const named = offered.filter(entry => mentions(entry.displayName) || mentions(entry.tenantId));
+      const chosen = offered.find(entry => entry.displayName.toLowerCase() === wanted || entry.tenantId.toLowerCase() === wanted) ??
+        (named.length === 1 ? named[0] : undefined);
       if (!chosen) {
         return {
           step: "workspace",
