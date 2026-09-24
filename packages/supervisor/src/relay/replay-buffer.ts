@@ -63,6 +63,11 @@ export class ReplayBuffer<T> {
     this.evict(now);
   }
 
+  /** Whether the frame with this sequence is still held (unacknowledged). */
+  holds(seq: number): boolean {
+    return this.frames.some(entry => entry.seq === seq);
+  }
+
   snapshot(): BufferedFrame<T>[] {
     return this.frames.map(entry => ({ ...entry }));
   }

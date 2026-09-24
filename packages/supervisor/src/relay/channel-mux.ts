@@ -91,6 +91,15 @@ interface ChannelState {
   lastInboundAt: number;
 }
 
+interface PendingSend {
+  channelId: string;
+  channel: RelayChannel;
+  state: ChannelState;
+  frame: ToCoreRelayFrame;
+  seq: number;
+  generation: number;
+}
+
 export interface MuxCounters {
   epochStale: number;
   invalidFrames: number;
@@ -107,6 +116,12 @@ export class ChannelMux {
   private readonly receiveLanes = new Map<string, Promise<void>>();
   /** Only cursor snapshot/persist/publish holds this shared mutation lane. */
   private pending: Promise<void> = Promise.resolve();
+  /**
+   * Sent frames waiting for the durability write that has not started yet
+   * (group commit, WS2-157). Every frame queued while an earlier write runs
+   * joins this one batch; the batch closes when its own write starts.
+   */
+  private openSendBatch: PendingSend[] | null = null;
   private readonly logger: Logger;
   private readonly recovery: RecoveryAuthority;
   readonly counters: MuxCounters = { epochStale: 0, invalidFrames: 0, duplicates: 0, resets: 0, stalls: 0 };
@@ -403,24 +418,48 @@ export class ChannelMux {
     // them. A crash before this write emits nothing; a crash after it replays.
     // A handshake that races this durability write owns replay on its new
     // epoch; the original send continuation must not emit the same frame too.
-    const sendGeneration = this.generation;
-    void this.serialize(async () => {
-      await this.persist(this.durableState());
-      if (channel === "session" && (body as { kind?: string }).kind === "session_ready") {
-        this.logger.info({ event: "relay.session_ready.persisted", channelId, seq, connectionEpoch: this.epoch,
-          connected: this.connected, stalled: state.stalled, recoveryPermitted: this.recovery.permits(channel),
-          generationChanged: this.generation !== sendGeneration,
-          persistenceMs: Math.max(0, this.options.clock.now() - Date.parse(frame.issuedAt)) },
-          "session readiness retained for endpoint delivery");
-      }
-      if (this.generation !== sendGeneration || this.channels.get(channelId) !== state ||
-          !state.buffer.snapshot().some(entry => entry.seq === seq)) return;
-      if (this.connected && !state.stalled && this.recovery.permits(channel)) this.options.emit({ ...frame, connectionEpoch: this.epoch });
-    }).catch(error => {
-      this.logger.warn({ err: error, channelId, seq }, "relay outbound durability failed; retaining the frame without emitting");
-      this.options.onStall(channelId);
-    });
+    this.commitSend({ channelId, channel, state, frame, seq, generation: this.generation });
     return seq;
+  }
+
+  /**
+   * Group commit (WS2-157): one durability write covers every frame sent
+   * while the previous write ran, instead of one full relay-state write per
+   * frame. Each frame is still emitted only after a write that contains it.
+   */
+  private commitSend(send: PendingSend): void {
+    if (this.openSendBatch) {
+      this.openSendBatch.push(send);
+      return;
+    }
+    const batch = [send];
+    this.openSendBatch = batch;
+    void this.serialize(async () => {
+      // Close the batch as its write starts: the snapshot below holds every
+      // frame in it, and later frames wait for the next write.
+      if (this.openSendBatch === batch) this.openSendBatch = null;
+      const startedAt = this.options.clock.now();
+      await this.persist(this.durableState());
+      const persistenceMs = Math.max(0, this.options.clock.now() - startedAt);
+      for (const { channelId, channel, state, frame, seq, generation } of batch) {
+        if (channel === "session" && (frame.body as { kind?: string }).kind === "session_ready") {
+          this.logger.info({ event: "relay.session_ready.persisted", channelId, seq, connectionEpoch: this.epoch,
+            connected: this.connected, stalled: state.stalled, recoveryPermitted: this.recovery.permits(channel),
+            generationChanged: this.generation !== generation, persistenceMs, batchFrames: batch.length },
+          "session readiness retained for endpoint delivery");
+        }
+        if (this.generation !== generation || this.channels.get(channelId) !== state ||
+            !state.buffer.holds(seq)) continue;
+        if (this.connected && !state.stalled && this.recovery.permits(channel)) this.options.emit({ ...frame, connectionEpoch: this.epoch });
+      }
+    }).catch(error => {
+      if (this.openSendBatch === batch) this.openSendBatch = null;
+      const stalled = new Set<string>();
+      for (const { channelId, seq } of batch) {
+        this.logger.warn({ err: error, channelId, seq }, "relay outbound durability failed; retaining the frame without emitting");
+        if (!stalled.has(channelId)) { stalled.add(channelId); this.options.onStall(channelId); }
+      }
+    });
   }
 
   /** Emit the journal-owned assignment identity with only this socket's epoch added. */

@@ -118,6 +118,8 @@ export class RelayClient {
   private readonly backoff = new ReconnectBackoff();
   private readonly logger: Logger;
   private connectedAt = 0;
+  /** Why this runtime closed a socket itself; a close without one came from the peer or the network. */
+  private readonly localCloseReasons = new WeakMap<object, string>();
   private lastConnectedAt: string | null = null;
   private consecutiveFailures = 0;
   private readonly outboundQueue: Array<{ socket: NodeWebSocket; payload: string; bytes: number }> = [];
@@ -166,6 +168,7 @@ export class RelayClient {
     this.discardHandshakeBuffer = null;
     if (!this.stopped) this.setState("reconnecting");
     this.options.mux.disconnected();
+    if (this.socket) this.localCloseReasons.set(this.socket, `rehandshake:${reason}`);
     this.socket?.close(1012, reason);
   }
 
@@ -289,6 +292,7 @@ export class RelayClient {
       this.lastError = message;
       this.options.mux.disconnected();
       this.setState("reconnecting");
+      this.localCloseReasons.set(socket, `protocol:${reason}`);
       socket.close(1002, reason);
     };
     const failReceive = (error: unknown) => {
@@ -300,6 +304,7 @@ export class RelayClient {
       this.logger.warn({ err: error }, "relay durable receive failed; retaining replay for reconnect");
       this.options.mux.disconnected();
       this.setState("reconnecting");
+      this.localCloseReasons.set(socket, "durable_receive_failed");
       socket.close(1011, "durable_receive_failed");
     };
     const receive = async (value: unknown) => {
@@ -415,6 +420,7 @@ export class RelayClient {
         this.lastError = "relay handshake timed out";
         this.options.mux.disconnected();
         this.setState("reconnecting");
+        this.localCloseReasons.set(socket, "handshake_timeout");
         socket.terminate();
       }
     }, this.options.handshakeTimeoutMs ?? 15_000);
@@ -526,6 +532,7 @@ export class RelayClient {
     socket.on("unexpected-response", (_request, response) => {
       this.lastError = `relay rejected the connection: HTTP ${response.statusCode ?? 0}`;
       response.resume();
+      this.localCloseReasons.set(socket, `http_${response.statusCode ?? 0}`);
       socket.terminate();
     });
     socket.on("error", (error: Error) => {
@@ -545,6 +552,13 @@ export class RelayClient {
         this.setState("offline");
         return;
       }
+      // Say who closed it and why, every time (WS2-157): a close with no
+      // local reason came from the relay or the network (1006: no close frame).
+      const localReason = this.localCloseReasons.get(socket) ?? null;
+      this.logger.warn({ event: "relay.socket.closed", code, reason: reason.toString("utf8").slice(0, 120),
+        closedBy: localReason ? "runtime" : "peer_or_network", localReason, handshook,
+        connectedForMs: handshook ? Date.now() - this.connectedAt : null, lastError: this.lastError,
+        connectionEpoch: this.options.mux.connectionEpoch }, "relay socket closed");
       if (this.lastError === null) this.lastError = `relay socket closed (code ${code}${reason.length > 0 ? `, ${reason.toString()}` : ""})`;
       this.consecutiveFailures += handshook ? 0 : 1;
       this.setState("reconnecting");

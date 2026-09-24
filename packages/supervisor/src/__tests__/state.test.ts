@@ -53,6 +53,27 @@ describe("supervisor store", () => {
     expect((await stat(store.path("instance-key.jwk"))).mode & 0o777).toBe(0o600);
   });
 
+  it("writes relay state exactly as before while checking each buffered frame only once (WS2-157)", async () => {
+    const store = new SupervisorStore(dir);
+    await store.init();
+    const frame = (seq: number, reason = "completed") => ({ channel: "session", direction: "to_core", channelId: "s", connectionEpoch: 1, seq,
+      issuedAt: "2026-09-06T00:00:00.000Z", body: { kind: "session_closed", assignmentId: `asg-${seq}`, reason } }) as never;
+    const first = frame(1), second = frame(2);
+    const state = (entries: unknown[]) => ({ cursors: { s: { to_core: 0, to_runtime: 0, allocated: entries.length } },
+      outbound: { s: entries.map((entry, index) => ({ frame: entry, bytes: 10 + index, enqueuedAt: 1_000 + index })) } }) as never;
+
+    await store.saveRelayState(state([first]));
+    await store.saveRelayState(state([first, second]));
+    expect(await readFile(store.path("relay-state.json"), "utf8")).toBe(`${JSON.stringify(state([first, second]))}\n`);
+    expect(await new SupervisorStore(dir).relayState()).toEqual(JSON.parse(JSON.stringify(state([first, second]))));
+
+    // A new frame that does not validate is still refused, and nothing is written.
+    expect(() => store.saveRelayState(state([first, second, frame(3, "not-a-reason")]))).toThrow();
+    const bad = { cursors: {}, outbound: { s: [{ frame: first, bytes: -1, enqueuedAt: 0 }] } } as never;
+    expect(() => store.saveRelayState(bad)).toThrow();
+    expect(await new SupervisorStore(dir).relayState()).toEqual(JSON.parse(JSON.stringify(state([first, second]))));
+  });
+
   it("persists identity, provisioning, lease, manifest, cursors, heartbeat, and erases konteks data without the key", async () => {
     const store = new SupervisorStore(dir);
     await store.init();
