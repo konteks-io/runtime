@@ -823,6 +823,19 @@ describe("onboard", () => {
     expect((await readdir(join(root, "retired"))).some(entry => entry.startsWith("instance-1-"))).toBe(true);
   });
 
+  it("does not tell a revoked machine that nothing needs setting up, even mid-revisit (W1-Z4)", async () => {
+    await writeOnboardState(root, {
+      step: "inspect", revisit: true, tenantId: "acme", systemEntityRef: "system:default/acme-solo",
+      repositoryName: "solo", repositoryKind: "managed", repositoryPath: "/tmp/solo",
+    } as never);
+    const revoked = vi.fn(async () => new Response(JSON.stringify({ code: "enrollment_invalid", message: "revoked" }), { status: 401, headers: { "content-type": "application/json" } }));
+    const error = await step({
+      fetchFn: revoked as never,
+      inspect: async () => ({ path: "/tmp/solo", name: "solo", remoteUrl: null, remoteReachable: false, currentBranch: "main", defaultBranch: "main" }),
+    }).catch((e: unknown) => e);
+    expect((error as Error).message).toBe(OWNER_ACCESS_REVOKED);
+  });
+
   it("leaves a revoked machine disconnected when the person says no (W1-Z4)", async () => {
     await writeOnboardState(root, { step: "reconnect", tenantId: "acme" } as never);
     const no = await step({}, "no");

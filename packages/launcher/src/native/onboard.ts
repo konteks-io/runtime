@@ -691,6 +691,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         state.repositoryPath &&
         resolve(facts.path ?? context.cwd ?? process.cwd()) === resolve(state.repositoryPath)
       ) {
+        // "Nothing needs setting up" is only true while Core still accepts
+        // this machine; a revoked one is asked to connect again instead.
+        await currentWorkspaceName(state.tenantId ?? "");
         await save({ step: "done", revisit: false });
         return {
           step: "inspect",
@@ -1190,9 +1193,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       if (state.step === "done" && context.answer === undefined && !state.closing) {
         const identity = await new SupervisorStore(supervisorData).identity().catch(() => null);
         if (identity?.instanceId && identity.instanceId !== "pending") {
-          await save({ step: "inspect", revisit: true });
+          // Named before anything is saved: a revoked machine stops here, and
+          // the next paste meets the same question instead of a false "all set".
           const tenant = state.tenantId ?? identity.workspaceId;
           const where = tenant ? ((await currentWorkspaceName(tenant)) ?? workspaceName(state, tenant)) : "your workspace";
+          await save({ step: "inspect", revisit: true });
           return {
             step: "identity",
             note: `This machine is already connected to ${where}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}; no sign-in is needed.`,
