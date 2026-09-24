@@ -374,6 +374,26 @@ describe("report sender (D125 sender-side state machine)", () => {
     expect(outbox.depth).toBe(0);
   });
 
+  it("heals a claim halted over a refused terminal before this fix existed, once per process (WS2-153)", async () => {
+    const confirmStopped = vi.fn(async () => undefined);
+    const { sender, sent, journal, outbox } = await senderHarness(() => true, { confirmStopped, sleep: async () => undefined });
+    await journal.assignments.update("a:1", current => ({ ...current!, state: "recovery_required", recoveryReason: "assignment_conflict",
+      acpSessionRef: "acp", reports: { nextSequence: 2, durableWatermark: 0, terminalSequence: 1 } }));
+    await sender.healHaltedConflicts();
+    await Promise.all(sender.pendingResubmissions());
+    const resubmitted = reports(sent).at(-1)!;
+    expect(resubmitted).toMatchObject({ terminal: true, reportSequence: 1, acpSessionRef: "acp",
+      result: { class: "interrupted", reason: "not_resumable" } });
+    expect(journal.assignments.get("a:1")?.state).toBe("terminal_pending_report");
+    // Refused again as a genuine conflict: the claim halts and is not retried in this process.
+    await sender.onAck({ assignmentId: "a", attempt: 1, claimId: "c", acknowledged: { reportId: resubmitted.reportId, reportSequence: 1 }, durableWatermark: 0, outcome: "payload_conflict" });
+    expect(journal.assignments.get("a:1")).toMatchObject({ state: "recovery_required", recoveryReason: "assignment_conflict" });
+    const before = sent.length;
+    await sender.healHaltedConflicts();
+    expect(sent.length).toBe(before);
+    expect(outbox.depth).toBe(0);
+  });
+
   it("operation_conflict on a report already stop-confirmed halts the claim instead of looping", async () => {
     const confirmStopped = vi.fn(async () => undefined);
     const { sender, journal, conflicts, outbox } = await senderHarness(() => true, { confirmStopped });

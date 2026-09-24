@@ -58,6 +58,8 @@ export class ReportSender {
   private readonly logger: Logger;
   private retryFlight: Promise<void> | null = null;
   private readonly resubmits = new Map<string, Promise<void>>();
+  /** Halted claims this process already tried to heal; never twice per process. */
+  private readonly healed = new Set<string>();
 
   constructor(private readonly options: ReportSenderOptions) {
     this.logger = options.logger ?? createLogger({ name: "report-sender" });
@@ -311,6 +313,38 @@ export class ReportSender {
     }
   }
 
+  /**
+   * A claim halted into recovery_required(assignment_conflict) whose terminal
+   * report Core never made durable (halted before stop-confirmed resubmission
+   * existed, or by a crash mid-resubmission) heals on the maintenance cadence:
+   * once per process its refused terminal is taken back and the claim reports
+   * interrupted(not_resumable) once its session is stopped, with backoff. Core
+   * stored nothing for an operation_conflict refusal; for a genuine integrity
+   * conflict it refuses again and the claim halts as before (WS2-153).
+   */
+  async healHaltedConflicts(): Promise<void> {
+    if (!this.options.confirmStopped || !this.options.canSend()) return;
+    for (const entry of this.options.journal.assignments.all()) {
+      const key = `${entry.assignmentId}:${entry.attempt}`;
+      const terminalSequence = entry.reports.terminalSequence;
+      if (entry.state !== "recovery_required" || entry.recoveryReason !== "assignment_conflict" || entry.kind === "planning" ||
+        terminalSequence === undefined || entry.reports.durableWatermark >= terminalSequence ||
+        this.healed.has(key) || this.resubmits.has(key)) continue;
+      this.healed.add(key);
+      await this.options.outbox.removeGroup(reportGroup(entry.assignmentId, entry.attempt, entry.claimId));
+      await this.options.journal.assignments.update(key, current => {
+        if (!current || current.claimId !== entry.claimId || current.state !== "recovery_required") throw new Error("Halted claim changed before healing");
+        const { terminalSequence: _sequence, terminalResult: _result, ...reports } = current.reports;
+        const { terminalResultHash: _hash, ...rest } = current;
+        return { ...rest, reports: { ...reports, nextSequence: terminalSequence }, updatedAt: this.options.clock.nowIso() };
+      });
+      this.logger.warn({ assignmentId: entry.assignmentId, attempt: entry.attempt, reportSequence: terminalSequence },
+        "healing a claim halted over a refused terminal report; reporting interrupted once the session is stopped");
+      this.resubmitStopConfirmed(entry.assignmentId, entry.attempt, entry.claimId,
+        entry.acpSessionRef ? { acpSessionRef: entry.acpSessionRef } : {});
+    }
+  }
+
   /** In-flight stop-confirmed resubmissions (tests and shutdown observe them). */
   pendingResubmissions(): Promise<void>[] {
     return [...this.resubmits.values()];
@@ -344,7 +378,8 @@ export class ReportSender {
     return true;
   }
 
-  private resubmitStopConfirmed(assignmentId: string, attempt: number, claimId: string, rejected: AssignmentReport): void {
+  private resubmitStopConfirmed(assignmentId: string, attempt: number, claimId: string,
+    rejected: Pick<AssignmentReport, "usage" | "acpSessionRef">): void {
     const key = `${assignmentId}:${attempt}`;
     if (this.resubmits.has(key)) return;
     const sleep = this.options.sleep ?? ((ms: number) => new Promise<void>(resolve => { const timer = setTimeout(resolve, ms); timer.unref?.(); }));

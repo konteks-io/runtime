@@ -217,6 +217,7 @@ export class WorkOrchestrator {
     // while draining or at capacity. It is not a global admission lock: Core
     // orders successors within their lineage, while unrelated work continues.
     void this.reports.retryDue().catch(error => this.logger.warn({ err: error }, "durable assignment report retry failed"));
+    void this.reports.healHaltedConflicts().catch(error => this.logger.warn({ err: error }, "halted claim healing failed"));
     void this.retryRecoveryEvidence().catch(error => this.logger.warn({ err: error }, "durable recovery evidence retry failed"));
     // Existing timer also services retained stream intents during drain/capacity
     // loss. Replaying a request does not authorize admission of returned work.
