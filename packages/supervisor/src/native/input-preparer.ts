@@ -498,7 +498,12 @@ export function createNativeInputPreparer(
                 // After local verification, so a local failure costs no call.
                 await authorize();
                 await source.verify();
-              } catch {
+              } catch (error) {
+                // The turn fails as unavailable either way; keep why (WS2-145).
+                options.logger?.warn({ event: "native.inputs.recheck_failed", assignmentId: assignment.id,
+                  attempt: assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "local_verification_failed",
+                  ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}) },
+                "Inputs could not be rechecked before the prompt");
                 throw unavailable();
               } finally {
                 prompting = false;
