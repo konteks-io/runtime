@@ -1263,6 +1263,11 @@ export class Supervisor {
           trustedRoots: this.options.native!.trustedRoots,
           logger: this.logger,
           canApply: () => this.stopping ? { ok: false, reason: "supervisor is stopping" } : this.draining && this.drainReason !== "update" ? { ok: false, reason: `draining (${this.drainReason ?? "unknown"})` } : { ok: true },
+          // Only a release Core accepts is installed unattended (WS1-093).
+          acceptedRelease: async () => {
+            if (!this.instanceId) throw new Error("no instance identity yet");
+            return this.core.acceptedRelease(this.instanceId);
+          },
         });
         this.updates.start();
       }

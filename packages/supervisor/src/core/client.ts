@@ -155,6 +155,7 @@ export const CORE_PATHS = Object.freeze({
   gitKeys: (instanceId: string) => instancePath(instanceId, "git-keys"),
   // A coding agent login the person started from the site (WS1-115).
   agentLoginReport: (instanceId: string) => instancePath(instanceId, "agent-logins/report"),
+  acceptedRelease: (instanceId: string) => instancePath(instanceId, "accepted-release"),
   // Uninstall: the runtime removes itself (W1-L2), lease-authenticated like the rest.
   retire: (instanceId: string) => instancePath(instanceId, "retire"),
   gitKey: (instanceId: string, keyRef: string) => instancePath(instanceId, `git-keys/${encodeURIComponent(keyRef)}`),
@@ -748,6 +749,24 @@ export class CoreClient {
       schema: z.object({ accepted: z.boolean() }).strict(),
       idempotencyKey: `agent-login:${body.loginId}:${body.state}:${body.userCode ?? ""}:${body.verificationUrl ? createHash("sha256").update(body.verificationUrl).digest("base64url").slice(0, 16) : ""}`,
     });
+  }
+
+  /**
+   * The release this Core accepts right now (WS1-093). An update to anything
+   * else would be refused by Core and leave the machine offline until it
+   * rolls back. Null from a Core that does not say.
+   */
+  async acceptedRelease(instanceId: string): Promise<{ bundleVersion: string; manifestDigest: string } | null> {
+    try {
+      return await this.http.request({
+        method: "GET", path: CORE_PATHS.acceptedRelease(instanceId),
+        schema: z.object({ bundleVersion: z.string().min(1).max(64), manifestDigest: z.string().min(1).max(256) }).strict(),
+      });
+    } catch (error) {
+      if (error instanceof RemoteInstanceError && "status" in error && (error as { status: number }).status === 404) return null;
+      if (error instanceof RemoteInstanceError && error.code === "capability_unavailable") return null;
+      throw error;
+    }
   }
 
   async registerGitKey(instanceId: string, body: { publicKey: string; title: string }): Promise<z.infer<typeof GitKeyRegisterResultSchema>> {
