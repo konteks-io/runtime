@@ -407,7 +407,7 @@ describe("onboard", () => {
       branch: "trunk",
     });
     expect(accepted.note).toContain("Pushed trunk");
-    expect(accepted.note).toContain("now lives on Konteks managed git");
+    expect(accepted.note).toContain("branch tracks it"); expect(accepted.note.match(/Konteks managed git/g)).toHaveLength(1);
     expect(await readOnboardState(root)).toMatchObject({ step: "graft" }); // Graft is offered next (W1-G1).
   });
 
@@ -570,7 +570,7 @@ describe("onboard", () => {
       branch: "main",
       sshCommand: "ssh -i '/home/me/Library/Application Support/konteks-remote/git/id_ed25519' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
     });
-    expect(result.note).toContain("now lives on Konteks managed git");
+    expect(result.note).toContain("branch tracks it (remote \"konteks\")");
   });
 
   it("says plainly when the runtime cannot register its git key, and pushes nothing", async () => {
@@ -1334,7 +1334,7 @@ describe("onboard", () => {
     }));
     const started = await step({ enrollment: { bind } as never, complete: vi.fn(async () => ({}) as never), staging: { status: async () => ({ state: "done" }), spawn: vi.fn() } });
     // The join was already said; the step says it once (pass 5).
-    expect(started.note).toBe("This machine is now Acme Kitchen's runtime; starting it next.");
+    expect(started.note).toBe("This machine is now Acme Kitchen's runtime; starting it next, which takes about half a minute.");
     expect(started.note).not.toContain("acme-kitchen");
 
     await writeOnboardState(root, { ...(await readOnboardState(root)), step: "done" } as never);
@@ -1364,9 +1364,9 @@ describe("onboard", () => {
     expect(result.run?.argv).toEqual(["konteks-remote", "start"]);
     expect(result.note).toContain("Your workspace is ready: acme");
     expect(result.note).toContain("rename it in Settings");
-    // The start is seconds, not a minute: the note claims no duration (WS1-109).
-    expect(result.note).toContain("starting it next.");
-    expect(result.note).not.toContain("minute");
+    // The start took 32 to 39 s on pass 6 with nothing said in between
+    // (WS1-124), so the note gives the person the wait to expect.
+    expect(result.note).toContain("starting it next, which takes about half a minute.");
     const state = await readOnboardState(root);
     expect(state).toMatchObject({ step: "inspect", instanceId: "instance-9", tenantId: "acme" });
     expect(state?.email).toBeUndefined();
