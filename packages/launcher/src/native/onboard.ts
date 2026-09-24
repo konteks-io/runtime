@@ -99,6 +99,7 @@ const NEGATION = /\b(no|not|don'?t|do not|never|cancel|stop|wait)\b/;
 const ASKS_OTHER_EMAIL = /\b(different|another|other|wrong|change( the)?) (e-?mail|address)\b/i;
 const ASKS_NEW_CODE = /\b(new code|another code|resend|send (it |a code )?again|didn'?t (get|receive|arrive)|did not (get|receive|arrive)|no (code|email) (came|arrived))\b/i;
 const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
+const RECONNECT_ASK = { question: "Connect this machine again? It starts over with your email and a new code.", kind: "confirm" } as const;
 /** How long, and how often, the agents step waits for the machine to advertise what it can run. */
 const AGENTS_WAIT_MS = 10_000;
 const AGENTS_WAIT_ATTEMPTS = 9;
@@ -305,6 +306,29 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
   }
 
   switch (state.step) {
+    case "reconnect": {
+      if (context.answer === undefined || (!isYes(context.answer) && !isNo(context.answer))) {
+        return { step: "identity", note: OWNER_ACCESS_REVOKED, ask: RECONNECT_ASK };
+      }
+      if (isNo(context.answer)) {
+        await save({ step: "done", closing: true });
+        return { step: "identity", done: { summary: "This machine stays disconnected from Konteks.", links: { site: siteUrl } } };
+      }
+      // The revoked runtime can never act again; keep its record beside the
+      // install and enroll this machine afresh, as a new runtime.
+      const revoked = await new SupervisorStore(supervisorData).identity().catch(() => null);
+      if (revoked?.instanceId && revoked.instanceId !== "pending") await setAsideLostIdentity(context.root, revoked.instanceId);
+      const address = state.ownerEmail ?? state.email;
+      await writeOnboardState(context.root, {
+        schemaVersion: 1,
+        step: "email",
+        updatedAt: new Date().toISOString(),
+        ...(address ? { resendTo: address } : {}),
+      } as never);
+      return address
+        ? { step: "identity", note: `A new code will be sent to ${address}.`, run: AGAIN }
+        : { step: "identity", ask: { question: "What email address should this machine belong to?", kind: "email" } };
+    }
     case "identity": {
       // A machine that already has an identity is not enrolling again; it is
       // being asked what it is (OS9).
@@ -1273,8 +1297,8 @@ export function agentName(family: string): string {
  *
  * The block teaches the agent three shapes and nothing else, so a failure is
  * said inside the protocol: what did not work, in plain words, and the same
- * question again, or an offer to try the step again. Revoked access is final
- * and ends the flow with where to go instead.
+ * question again, or an offer to try the step again. Revoked access ends that
+ * runtime, and the person is asked whether to connect the machine again.
  */
 export async function onboardFailureStep(context: OnboardContext, error: unknown): Promise<OnboardStep> {
   const state = await readOnboardState(context.root).catch(() => null);
@@ -1292,6 +1316,15 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
       intentRef: undefined,
     } as never).catch(() => undefined);
     return { step, done: { summary: said, links: { site: siteUrl } } };
+  }
+  // Revoked is final for that runtime, not for the machine: offer to connect
+  // it again rather than end on a refusal the next paste would only repeat.
+  if (error instanceof RemoteInstanceError && error.code === "permission_denied" && message === OWNER_ACCESS_REVOKED) {
+    await writeOnboardState(context.root, {
+      ...(state ?? { schemaVersion: 1 as const, updatedAt: new Date().toISOString() }),
+      step: "reconnect",
+    } as never).catch(() => undefined);
+    return { step: "identity", note: OWNER_ACCESS_REVOKED, ask: RECONNECT_ASK };
   }
   if (error instanceof RemoteInstanceError && error.code === "permission_denied") {
     return { step, done: { summary: `Konteks stopped this setup: ${said} Sign in on the site to see this machine and your workspace.`, links: { site: siteUrl } } };

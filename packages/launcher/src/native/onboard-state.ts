@@ -43,6 +43,8 @@ export const OnboardStateSchema = z
       /** The person answered the first task; the next run creates the initiative. */
       "initiative",
       "done",
+      /** This machine's access was revoked; the person is asked whether to connect it again (W1-Z4). */
+      "reconnect",
     ]),
     intentRef: z.string().min(1).optional(),
     /** Masked, for re-asking without holding the address. */

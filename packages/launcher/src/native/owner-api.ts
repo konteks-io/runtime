@@ -3,9 +3,8 @@ import { join } from "node:path";
 import { z } from "zod";
 import { isFsErrorWithCode, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 
-/** What the person hears once their access on this machine was revoked in Settings. */
-export const OWNER_ACCESS_REVOKED =
-  "Your Konteks access on this machine was revoked in Settings, so nothing more can be done as you from here.";
+/** What the person hears once their access on this machine was revoked in Customize → Runtimes. */
+export const OWNER_ACCESS_REVOKED = "This machine's Konteks access was revoked in Customize → Runtimes.";
 
 /**
  * The person's own credential, and the three calls the onboarding flow makes
@@ -267,7 +266,7 @@ export class OwnerApiClient {
       throw new RemoteInstanceError("temporarily_unavailable", "Konteks could not be reached.");
     }
     if (response.status === 401 || response.status === 403) {
-      // Core refuses a token revoked in Settings at its next use with the code
+      // Core refuses a token revoked in Customize → Runtimes at its next use with the code
       // a revoked refresh gets, so the person hears why rather than "refused".
       const detail = (await response.json().catch(() => ({}))) as Record<string, unknown>;
       if (response.status === 401 && detail.code === "enrollment_invalid") {

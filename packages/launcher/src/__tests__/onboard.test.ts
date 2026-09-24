@@ -287,7 +287,7 @@ describe("onboard", () => {
     expect(failed.note).toBe("Konteks could not finish that step: Konteks is still setting up managed git for this workspace. It takes about a minute; nothing you answered was lost.");
   });
 
-  it("stops at the next step with why, once this machine's access was revoked in Settings (W1-X3)", async () => {
+  it("stops at the next step with why, once this machine's access was revoked, and offers to connect again (W1-X3, W1-Z4)", async () => {
     await writeOnboardState(root, {
       step: "system",
       repositoryName: "solo",
@@ -301,9 +301,10 @@ describe("onboard", () => {
     const error = await step({ fetchFn: refusal({ code: "enrollment_invalid", message: "revoked" }) as never }, "yes").catch((e: unknown) => e);
     expect((error as Error).message).toBe(OWNER_ACCESS_REVOKED);
     const stopped = await onboardFailureStep({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" }, error);
-    expect(stopped.done?.summary).toContain("revoked in Settings");
-    expect(stopped.ask).toBeUndefined();
-    expect(await readOnboardState(root)).toMatchObject({ step: "system" });
+    expect(stopped.note).toBe("This machine's Konteks access was revoked in Customize → Runtimes.");
+    expect(stopped.ask).toMatchObject({ question: "Connect this machine again? It starts over with your email and a new code.", kind: "confirm" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "reconnect" });
+    await writeOnboardState(root, { ...(await readOnboardState(root)), step: "system" } as never);
 
     const other = await step({ fetchFn: refusal({ error: { name: "AuthenticationError" } }) as never }, "yes").catch((e: unknown) => e);
     expect((other as Error).message).toBe("This machine's Konteks access was refused.");
@@ -803,8 +804,30 @@ describe("onboard", () => {
     const retry = await onboardFailureStep(context, new RemoteInstanceError("temporarily_unavailable", "Konteks could not be reached."));
     expect(retry.ask).toMatchObject({ kind: "confirm" });
     const revoked = await onboardFailureStep(context, new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED));
-    expect(revoked.done?.summary).toContain("revoked");
-    expect(revoked.done?.links.site).toBe("https://app.test");
+    expect(revoked.note).toContain("revoked in Customize → Runtimes");
+    expect(revoked.ask?.kind).toBe("confirm");
+    const refused = await onboardFailureStep(context, new RemoteInstanceError("permission_denied", "This machine's Konteks access was refused."));
+    expect(refused.done?.summary).toContain("was refused");
+    expect(refused.done?.links.site).toBe("https://app.test");
+  });
+
+  it("connects a revoked machine again as a new runtime, with a new code to the same address, when the person says yes (W1-Z4)", async () => {
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
+    await writeOnboardState(root, { step: "reconnect", tenantId: "acme", ownerEmail: "ada@acme.test" } as never);
+    const again = await step({}, "yes");
+    expect(again.note).toBe("A new code will be sent to ada@acme.test.");
+    expect(again.run).toBeDefined();
+    expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
+    const { readdir } = await import("node:fs/promises");
+    expect((await readdir(join(root, "retired"))).some(entry => entry.startsWith("instance-1-"))).toBe(true);
+  });
+
+  it("leaves a revoked machine disconnected when the person says no (W1-Z4)", async () => {
+    await writeOnboardState(root, { step: "reconnect", tenantId: "acme" } as never);
+    const no = await step({}, "no");
+    expect(no.done?.summary).toBe("This machine stays disconnected from Konteks.");
+    expect(no.done?.links.site).toBe("https://app.test");
   });
 
   it("asks what to build first in plain words, without billing terms (WS1-109)", async () => {
