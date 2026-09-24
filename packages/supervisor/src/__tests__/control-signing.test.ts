@@ -42,3 +42,21 @@ describe.skipIf(coreSigning === null)("Core/connector detached control signature
     expect(() => new CoreSignatureVerifier([{ ...old.root, coreControlKeys: [old.root.coreControlKeys[0]!, { ...next.root.coreControlKeys[0]!, keyId: "control-1" }] }])).toThrow();
   });
 });
+describe.skipIf(coreSigning === null)("site-started agent login delivery (WS1-115)", () => {
+  const unsigned = {
+    type: "runtime_agent_login_delivery", method: "POST", path: { instanceId: "instance" }, nodeId: "node-1",
+    connectionRef: "conn-1", connectionEpoch: 3, keyId: "control-1", nonce: "A".repeat(22),
+    intent: { loginId: "login-1", tenantId: "tenant", instanceId: "instance", agentId: "codex", action: "start" },
+    issuedAt: "2026-09-24T05:00:00.000Z", expiresAt: "2026-09-24T05:00:10.000Z",
+  };
+  it("accepts Core's signed start and rejects a changed login, agent or key", async () => {
+    const f = fixture();
+    const signature = await f.signer.sign(unsigned) as string;
+    expect(f.verifier.verifyAgentLoginDelivery({ ...unsigned, signature })).toBe(true);
+    expect(f.verifier.verifyAgentLoginDelivery({ ...unsigned, intent: { ...unsigned.intent, loginId: "login-2" }, signature })).toBe(false);
+    expect(f.verifier.verifyAgentLoginDelivery({ ...unsigned, intent: { ...unsigned.intent, action: "cancel" }, signature })).toBe(false);
+    expect(f.verifier.verifyAgentLoginDelivery({ ...unsigned, intent: { ...unsigned.intent, agentId: "claude-code" }, signature })).toBe(false);
+    expect(f.verifier.verifyAgentLoginDelivery({ ...unsigned, keyId: "control-2", signature })).toBe(false);
+    expect(f.verifier.verifyAgentLoginDelivery({ ...unsigned, signature: `${signature}==` })).toBe(false);
+  });
+});

@@ -8,6 +8,8 @@ import {
   DiagnosticCarrierCompanionDeliveryRequestSchema,
   RemoteExecutionRevisionControlDeliveryRequestSchema,
   RuntimePermissionAnswerDeliveryRequestSchema,
+  RuntimeAgentLoginDeliveryRequestSchema,
+  type RuntimeAgentLoginDeliveryRequest,
   type RemoteExecutionRevisionControlDeliveryRequest,
   type RuntimePermissionAnswerDeliveryRequest,
   type DiagnosticCarrierCompanionDeliveryRequest,
@@ -76,6 +78,11 @@ export interface RelayClientOptions {
     assertCurrent(): void;
   }) => Promise<void>;
   onPermissionAnswer?: (request: RuntimePermissionAnswerDeliveryRequest, connection: {
+    connectionEpoch: number;
+    assertCurrent(): void;
+  }) => Promise<void>;
+  /** A coding agent login the person started from the site (WS1-115). */
+  onAgentLogin?: (request: RuntimeAgentLoginDeliveryRequest, connection: {
     connectionEpoch: number;
     assertCurrent(): void;
   }) => Promise<void>;
@@ -268,7 +275,7 @@ export class RelayClient {
     let handshook = false;
     let handshakeProcessing = false;
     let validatedEpoch: number | null = null;
-    const pending: Array<ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest> = [];
+    const pending: Array<ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest> = [];
     let pendingBytes = 0;
     const discardPending = () => { pending.length = 0; pendingBytes = 0; };
     this.discardHandshakeBuffer = discardPending;
@@ -317,6 +324,26 @@ export class RelayClient {
         if (!this.options.onPermissionAnswer) throw new RemoteInstanceError("recovery_required", "Permission answer receiver is unavailable");
         await this.options.onPermissionAnswer(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
         assertCurrent();
+        return;
+      }
+      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_agent_login_delivery") {
+        // A login is the person's convenience, never work transport: whatever
+        // goes wrong with it is logged and dropped, and the socket stays up.
+        try {
+          const request = RuntimeAgentLoginDeliveryRequestSchema.parse(value);
+          const epoch = validatedEpoch;
+          const assertCurrent = () => {
+            if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
+              validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
+              throw new RemoteInstanceError("recovery_required", "Login socket ownership is not current");
+            }
+          };
+          assertCurrent();
+          if (!this.options.onAgentLogin) throw new RemoteInstanceError("recovery_required", "Agent login receiver is unavailable");
+          await this.options.onAgentLogin(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
+        } catch (error) {
+          this.logger.warn({ err: error }, "agent login delivery dropped");
+        }
         return;
       }
       if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_cancellation_delivery") {
@@ -434,8 +461,9 @@ export class RelayClient {
         const cancellation = RuntimeCancellationDeliveryRequestSchema.safeParse(parsed);
         const revisionControl = RemoteExecutionRevisionControlDeliveryRequestSchema.safeParse(parsed);
         const answer = RuntimePermissionAnswerDeliveryRequestSchema.safeParse(parsed);
+        const login = RuntimeAgentLoginDeliveryRequestSchema.safeParse(parsed);
         const replay = RelayReplayRequestSchema.safeParse(parsed);
-        const frame = answer.success ? answer : cancellation.success ? cancellation : revisionControl.success ? revisionControl : replay.success ? replay : ack.success ? ack : assignment?.success ? assignment : ToRuntimeRelayFrameSchema.safeParse(parsed);
+        const frame = answer.success ? answer : login.success ? login : cancellation.success ? cancellation : revisionControl.success ? revisionControl : replay.success ? replay : ack.success ? ack : assignment?.success ? assignment : ToRuntimeRelayFrameSchema.safeParse(parsed);
         if (!frame.success || frame.data.connectionEpoch !== validatedEpoch) {
           rejectProtocol("protocol", "relay sent an invalid post-handshake envelope");
           return;

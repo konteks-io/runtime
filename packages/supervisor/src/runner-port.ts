@@ -52,7 +52,8 @@ export interface RunnerPort {
   setMode(ref: string, id: string, params: unknown): Promise<unknown>;
   setConfigOption(ref: string, id: string, params: unknown): Promise<unknown>;
   answer(ref: string, id: string, response: unknown): Promise<{ delivered: boolean }>;
-  login(organization: boolean, loginId: string): Promise<{ loginId: string }>;
+  /** `personal`: the person asked for their own device login on this machine (WS1-115). */
+  login(organization: boolean, loginId: string, personal?: boolean): Promise<{ loginId: string }>;
   loginInput(loginId: string, text: string): Promise<unknown>;
   loginCancel(loginId: string): Promise<unknown>;
   logout(): Promise<ConnectedAgentView>;

@@ -214,12 +214,12 @@ export class NativeRunner implements RunnerPort {
     return { delivered: this.runtime.sessions.answer(ref, id, response) };
   }
 
-  async login(organization: boolean, loginId: string) {
+  async login(organization: boolean, loginId: string, personal = false) {
     this.requireStarted();
-    if (typeof organization !== "boolean" || !idSchema.safeParse(loginId).success) throw invalid();
+    if (typeof organization !== "boolean" || typeof personal !== "boolean" || !idSchema.safeParse(loginId).success) throw invalid();
     await verifyNativeRunnerPackage(this.options.config);
     this.requireStarted();
-    return { loginId: this.runtime.startLogin({ organization, loginId }).loginId };
+    return { loginId: this.runtime.startLogin({ organization, loginId, personal }).loginId };
   }
 
   async loginInput(loginId: string, text: string) {

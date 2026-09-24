@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ConnectedAgentView } from "@konteks/remote-common";
-import { NativeInventoryCollector } from "../native/inventory.js";
+import { NativeInventoryCollector, machineHasDesktop } from "../native/inventory.js";
 import { deriveAdvertisedRoles } from "../inventory/roles.js";
 
 const agent: ConnectedAgentView = { agentId: "codex", displayName: "Codex", connectionState: "ready", authMode: "agent_local_subscription", accountScope: "personal", readiness: "ready", moneyObservable: false, tokenUsageObservable: true, acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" } };
@@ -36,6 +36,19 @@ describe("native host inventory (A4 D133)", () => {
     owned = true;
     f.readiness.mockResolvedValue({ agent: { ...agent, readiness: 'not_configured' }, utilization: { activeSessions: 0, activeTurns: 0 } });
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual([]);
+  });
+  it("offers a login from the site even while the agent is signed out, and Claude Code's only with a desktop (WS1-115)", async () => {
+    let browser = true;
+    const readiness = vi.fn(async () => ({ agent: { ...agent, readiness: "not_configured" as const }, utilization: { activeSessions: 0, activeTurns: 0 } }));
+    const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0",
+      agentLoginReady: () => true, agentLoginBrowserReady: () => browser });
+    expect((await inventory.collect()).components[0]?.capabilities).toEqual(["agent-login-v1", "agent-login-browser-v1"]);
+    browser = false;
+    expect((await inventory.collect()).components[0]?.capabilities).toEqual(["agent-login-v1"]);
+    expect(machineHasDesktop("darwin", {})).toBe(true);
+    expect(machineHasDesktop("darwin", { SSH_CONNECTION: "10.0.0.1 22 10.0.0.2 22" })).toBe(false);
+    expect(machineHasDesktop("linux", {})).toBe(false);
+    expect(machineHasDesktop("linux", { WAYLAND_DISPLAY: "wayland-0" })).toBe(true);
   });
   it("advertises the composed cancellation owner independently of agent sign-in", async () => {
     let owned = true;

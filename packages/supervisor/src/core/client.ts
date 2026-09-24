@@ -1,6 +1,7 @@
-import { AgentTurnUsageObservationSchema, GatewayCallObservationSchema } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, GatewayCallObservationSchema, RuntimeAgentLoginReportSchema } from "@konteks/remote-common";
+
 import { z } from "zod";
-import { createPublicKey, type KeyObject } from "node:crypto";
+import { createHash, createPublicKey, type KeyObject } from "node:crypto";
 import {
   BoundedJsonValueSchema,
   ClaimResultSchema,
@@ -97,6 +98,8 @@ import {
 } from "@konteks/remote-common";
 import { decodeLeaseClaims } from "../lease/lease.js";
 
+type RuntimeAgentLoginReport = ReturnType<typeof RuntimeAgentLoginReportSchema.parse>;
+
 /**
  * Core's private supervisor endpoints over TLS. CP3 mounts the
  * `remote-instance-backend` plugin at `/api/remote-instances`; its
@@ -150,6 +153,8 @@ export const CORE_PATHS = Object.freeze({
   // other route the runtime calls; Core forwards it to managed-git with the
   // instance id exactly as the contract describes.
   gitKeys: (instanceId: string) => instancePath(instanceId, "git-keys"),
+  // A coding agent login the person started from the site (WS1-115).
+  agentLoginReport: (instanceId: string) => instancePath(instanceId, "agent-logins/report"),
   // Uninstall: the runtime removes itself (W1-L2), lease-authenticated like the rest.
   retire: (instanceId: string) => instancePath(instanceId, "retire"),
   gitKey: (instanceId: string, keyRef: string) => instancePath(instanceId, `git-keys/${encodeURIComponent(keyRef)}`),
@@ -735,6 +740,16 @@ export class CoreClient {
    * Register this runtime's managed-git public key. Only the public half is
    * ever sent; the private half stays on the machine that generated it.
    */
+  /** Only the login's state, the provider link and the device code: never output, never input. */
+  async reportAgentLogin(instanceId: string, report: RuntimeAgentLoginReport): Promise<{ accepted: boolean }> {
+    const body = RuntimeAgentLoginReportSchema.parse(report);
+    return this.http.request({
+      method: "POST", path: CORE_PATHS.agentLoginReport(instanceId), body,
+      schema: z.object({ accepted: z.boolean() }).strict(),
+      idempotencyKey: `agent-login:${body.loginId}:${body.state}:${body.userCode ?? ""}:${body.verificationUrl ? createHash("sha256").update(body.verificationUrl).digest("base64url").slice(0, 16) : ""}`,
+    });
+  }
+
   async registerGitKey(instanceId: string, body: { publicKey: string; title: string }): Promise<z.infer<typeof GitKeyRegisterResultSchema>> {
     return this.http.request({ method: "POST", path: CORE_PATHS.gitKeys(instanceId), body, schema: GitKeyRegisterResultSchema, idempotencyKey: `git-key:${instanceId}:${body.title}` });
   }
