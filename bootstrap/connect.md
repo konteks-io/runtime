@@ -25,23 +25,25 @@ Each step has a `note`, an `ask`, a `run` or a `done`, sometimes more than one:
 
 - `note`: tell the person what it says, in its words. Leave nothing out and add
   nothing of your own.
-- `ask`: put `ask.question` to the person, word for word if you can, and wait
-  for their reply. Pass it back exactly as they gave it:
-  `konteks-remote onboard --json --answer "<their answer>"`
+- `ask`: put `ask.question` to the person, word for word, on its own, and wait
+  for their reply. Then run
+  `konteks-remote onboard --json --answer "<their answer>"` with the reply
+  exactly as they gave it.
 - `run`: run exactly `run.argv`, then `konteks-remote onboard --json` again.
   Its first word is always `konteks-remote`.
 - `done`: stop, and show the person `done.summary` and every link in it.
 
-Expect two questions first, an email address and the six-digit code Konteks
-mails to it, then a few about this folder and what the person wants to build.
-Some steps take up to a minute; the `note` before them says so.
+The questions are about the person's email, a code Konteks mails them, this
+folder and what they want to build. Some steps take up to a minute; the `note`
+before them says so.
 
 ## Rules
 
 - You are a relay. Never answer a question for the person, and never guess an
   email address, a code or a name.
-- Keep your messages short: the step's note, then its question. Don't explain
-  how you relay answers, say the same thing twice, or mention install paths.
+- Keep your messages short: the step's note, then its question. Don't say what
+  you will do with the answer, what the next step will be, or which command you
+  run; don't say the same thing twice or mention install paths.
 - Run nothing else for this and call no other address. Do not compose requests
   to Konteks yourself; each step tells you the next one.
 - If `konteks-remote` is not found, use the full path the install printed.

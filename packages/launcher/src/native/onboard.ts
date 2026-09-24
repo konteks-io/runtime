@@ -71,7 +71,7 @@ export interface OnboardContext {
     /** Each installed agent's readiness as the running service reports it, or null when it cannot say. */
     agentReadiness?: (root: string) => Promise<Record<string, string> | null>;
     /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
-    waitForReady?: (root: string) => Promise<{ administrativeStatus: string; roles: string[] } | null>;
+    waitForReady?: (root: string, until?: "ready" | "answering") => Promise<{ administrativeStatus: string; roles: string[] } | null>;
     /** Graft, injectable for tests (W1-G1). */
     graft?: {
       available?: (root: string) => Promise<boolean>;
@@ -176,7 +176,7 @@ const UNSETTLED_READINESS = new Set(["ready", "probing", "unknown"]);
  * the summary that says "your Claude Code login will run Konteks work here"
  * waits for that heartbeat rather than claiming it early (OS14).
  */
-async function waitForServiceReady(root: string): Promise<{ administrativeStatus: string; roles: string[] } | null> {
+async function waitForServiceReady(root: string, until: "ready" | "answering" = "ready"): Promise<{ administrativeStatus: string; roles: string[] } | null> {
   const record = await readNativeRecord(root).catch(() => null);
   if (!record) return null;
   const control = new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort);
@@ -186,6 +186,7 @@ async function waitForServiceReady(root: string): Promise<{ administrativeStatus
     try {
       const status = await control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 });
       last = { administrativeStatus: status.administrativeStatus, roles: status.roles };
+      if (until === "answering") return last;
       if (status.administrativeStatus === "active" && status.connectivity.reconciliationComplete) return last;
     } catch (error) {
       // No control token yet means the service has not come up; keep waiting.
@@ -638,10 +639,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
     }
 
     case "inspect": {
-      // The service was just started; give it the first heartbeat before
-      // anything is said about what runs here (OS14). A machine that was
-      // already connected answers at once.
-      const ready = await (context.deps?.waitForReady ?? waitForServiceReady)(context.root).catch(() => null);
+      // The service was just started. The folder questions need only that it
+      // answers: its agents keep starting while the person reads and replies,
+      // and the agents step waits for the first heartbeat before anything is
+      // said about what runs here (OS14, WS1-116).
+      const ready = await (context.deps?.waitForReady ?? waitForServiceReady)(context.root, "answering").catch(() => null);
       // The previous step asked for `konteks-remote start`. If nothing answers
       // here, that step did not happen — and carrying on regardless is how a
       // missed start surfaced two questions later as "the supervisor has not
@@ -682,7 +684,6 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         };
       }
       if (state.startWaits) await save({ startWaits: 0 });
-      const notReady = ready.administrativeStatus !== "active" ? "The runtime service is still coming up; it will finish in the background. " : "";
       const facts = await (context.deps?.inspect ?? inspectRepository)(context.cwd ?? process.cwd());
       // A new conversation in the folder that is already this machine's
       // System: there is nothing to register again. Say so, and where the
@@ -720,7 +721,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           await save({ step: "first_task", advertisedRoles: ready.roles });
           return {
             step: "inspect",
-            note: `${notReady}This is your ${directory === resolve("/") ? "root" : "home"} folder, not a project, so no System is made here. Run onboard again from inside a project folder to add one.`,
+            note: `This is your ${directory === resolve("/") ? "root" : "home"} folder, not a project, so no System is made here. Run onboard again from inside a project folder to add one.`,
             run: AGAIN,
           };
         }
@@ -738,7 +739,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         });
         return {
           step: "inspect",
-          note: `${notReady}${basename(directory)} isn\u2019t a git repository yet.`,
+          note: `${basename(directory)} isn\u2019t a git repository yet.`,
           run: AGAIN,
         };
       }
@@ -767,7 +768,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               : `You are in ${facts.name}, which has no remote this machine can push to.`;
       return {
         step: "inspect",
-        ...(`${notReady}${where}` ? { note: `${notReady}${where}` } : {}),
+        ...(where ? { note: where } : {}),
         run: AGAIN,
       };
     }
@@ -1124,6 +1125,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       // work, so its first planning session would be refused for want of a
       // profile (W1-A6). This machine's own agents are the answer, and they
       // are the person's own logins: nothing to ask, nothing to configure.
+      // The first heartbeat, which the folder questions did not wait for.
+      const service = await (context.deps?.waitForReady ?? waitForServiceReady)(context.root).catch(() => null);
+      if (service?.administrativeStatus === "active") await save({ advertisedRoles: service.roles });
       const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
       if (!(await api.hasExecutionProfile())) {
         const ready = await api.setUpAgentsFromThisMachine(hostLabel());

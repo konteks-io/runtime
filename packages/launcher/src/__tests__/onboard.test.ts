@@ -91,6 +91,19 @@ describe("onboard", () => {
     });
   });
 
+  it("asks about the folder once the service answers, and waits for its first heartbeat only before agents run (WS1-116)", async () => {
+    await writeOnboardState(root, { step: "inspect", instanceId: "instance-1", tenantId: "acme" } as never);
+    const waits: Array<string | undefined> = [];
+    const waitForReady = async (_root: string, until?: "ready" | "answering") => { waits.push(until); return { administrativeStatus: "provisioning", roles: [] }; };
+    const result = await step({
+      waitForReady,
+      inspect: async () => ({ path: "/tmp/acme-shop", name: "acme-shop", remoteUrl: "https://github.com/acme/shop", remoteReachable: true, currentBranch: "main", defaultBranch: "main" }),
+    });
+    expect(waits).toEqual(["answering"]);
+    expect(result.note).toBe("You are in acme-shop, with remote https://github.com/acme/shop.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "system" });
+  });
+
   it("offers managed git when the remote cannot be reached", async () => {
     await writeOnboardState(root, { step: "inspect" } as never);
     await step({
