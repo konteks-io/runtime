@@ -72,6 +72,59 @@ export async function verifyOfflineAgentPackage(directory: string, artifact: Rem
   } catch { throw offlinePackageInvalid(); }
 }
 
+/**
+ * A cheap stat fingerprint of an unpacked package: entry count, total file
+ * bytes, the newest mtime or ctime of any entry (root included) and the
+ * root's identity. Any write, rename, chmod, added or removed file moves at
+ * least one of these; ctime cannot be set back by the owning user.
+ */
+export async function offlineAgentPackageFingerprint(directory: string): Promise<string> {
+  const root = await lstat(directory, { bigint: true });
+  if (!root.isDirectory()) throw offlinePackageInvalid();
+  let entries = 0n, bytes = 0n, newest = root.mtimeNs > root.ctimeNs ? root.mtimeNs : root.ctimeNs;
+  const pending = [directory];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    for (const name of await readdir(current)) {
+      const path = join(current, name);
+      const info = await lstat(path, { bigint: true });
+      entries += 1n;
+      if (info.isFile()) bytes += info.size;
+      if (info.mtimeNs > newest) newest = info.mtimeNs;
+      if (info.ctimeNs > newest) newest = info.ctimeNs;
+      if (info.isDirectory()) pending.push(path);
+    }
+  }
+  return `${root.dev}:${root.ino}:${entries}:${bytes}:${newest}`;
+}
+
+/** Successful full verifications this process has made, per package and digest. */
+const verifiedPackages = new Map<string, { fingerprint: string; profile: NativeAgentPackageProfile }>();
+
+/**
+ * Full integrity check on first use, then only while the package is unchanged
+ * a stat fingerprint (WS2-156): rehashing a 400 MB agent every turn cost ~12 s.
+ * A changed fingerprint, another artifact (digest) or another path verifies in
+ * full again; a failure is never remembered.
+ */
+export async function verifyOfflineAgentPackageOnce(directory: string, artifact: RemoteNativeArtifact): Promise<{ profile: NativeAgentPackageProfile; cached: boolean }> {
+  const key = JSON.stringify([directory, artifact]);
+  const known = verifiedPackages.get(key);
+  let before: string;
+  try { before = await offlineAgentPackageFingerprint(directory); }
+  catch { verifiedPackages.delete(key); throw offlinePackageInvalid(); }
+  if (known && known.fingerprint === before) return { profile: structuredClone(known.profile), cached: true };
+  verifiedPackages.delete(key);
+  const profile = await verifyOfflineAgentPackage(directory, artifact);
+  // Remember only a package that did not move while it was being hashed.
+  const after = await offlineAgentPackageFingerprint(directory).catch(() => null);
+  if (after === before) verifiedPackages.set(key, { fingerprint: after, profile: structuredClone(profile) });
+  return { profile, cached: false };
+}
+
+/** Test seam: forget every remembered verification. */
+export function forgetVerifiedOfflineAgentPackages(): void { verifiedPackages.clear(); }
+
 async function walk(root: string, relative: string, expected: Set<string>, directories: Set<string>): Promise<void> {
   const directory = relative ? join(root, ...relative.split("/")) : root;
   await privateDirectory(directory);

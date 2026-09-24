@@ -154,6 +154,36 @@ describe("graft", () => {
     expect(await graftAlreadyWired(copy)).toBe(true);
   });
 
+  it("wires a delivery worktree once and leaves it as it is on later turns (WS2-156)", async () => {
+    await writeFile(join(repo, "AGENTS.md"), "# rules\n");
+    git(repo, "add", "AGENTS.md", "index.ts");
+    git(repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base");
+    const copy = join(dir, "delivery-copy");
+    git(repo, "worktree", "add", "-q", "--detach", copy);
+    let wires = 0;
+    const deps = { available: async () => true, ensure: async () => tool,
+      wire: async (...args: Parameters<typeof wireGraft>) => { wires += 1; return wireGraft(...args); } };
+
+    expect(await prepareDeliveryGraft(root, copy, "codex", deps)).toBe("wired");
+    expect(await prepareDeliveryGraft(root, copy, "codex", deps)).toBe("skipped");
+    expect(wires).toBe(1);
+    // The record of it stays out of the delivered tree.
+    expect(git(copy, "status", "--porcelain", "--untracked-files=all").trim()).toBe("");
+
+    // Another agent family, or another Graft, wires again.
+    expect(await prepareDeliveryGraft(root, copy, "claude-code", deps)).toBe("wired");
+    expect(await prepareDeliveryGraft(root, copy, "claude-code", deps)).toBe("skipped");
+    const moved = join(dir, "graft-next.cjs");
+    await writeFile(moved, await readFile(tool.cli, "utf8"));
+    expect(await prepareDeliveryGraft(root, copy, "claude-code", { ...deps, ensure: async () => ({ ...tool, cli: moved }) })).toBe("wired");
+
+    // A reset to a new revision cleans graft/, so the next turn wires again.
+    git(copy, "clean", "-ffdxq");
+    expect(await prepareDeliveryGraft(root, copy, "claude-code", { ...deps, ensure: async () => ({ ...tool, cli: moved }) })).toBe("wired");
+    expect(wires).toBe(4);
+    expect(await prepareDeliveryGraft(root, copy, "codex", { ...deps, available: async () => false })).toBe("unavailable");
+  });
+
   it("installs only a package whose checksum is the one the installer recorded", async () => {
     const packaged = join(dir, "pkg");
     await mkdir(join(packaged, "node_modules", "@nanonets", "graft", "dist"), { recursive: true });

@@ -131,7 +131,7 @@ export interface SupervisorOptions {
     git?: NativeGitTool;
     /** Shared object cache across every configured local agent. */
     repositoryCacheRoot?: string;
-    prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void>;
+    prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void | "unavailable" | "skipped" | "wired">;
     runtimeOptions?: NativeRunnerOptions["runtimeOptions"];
     /** Test/embedding seam for the independently supervised shared Codex owner. */
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;

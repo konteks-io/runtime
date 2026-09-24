@@ -253,6 +253,48 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(vi.mocked(runner.createSession).mock.calls[0]?.[0]).toEqual(expect.objectContaining({ acpSessionRef: "continued-ref" }));
   });
 
+  it("runs tool wiring alongside redemption, settles it before activation and the agent, and logs every stage (WS2-156)", async () => {
+    const order: string[] = [];
+    let finishWiring!: () => void;
+    const toolWiring = new Promise<void>(resolve => { finishWiring = resolve; });
+    const info = vi.fn();
+    const { session, runner } = await build({
+      deploymentKind: "native_connector",
+      logger: { warn: vi.fn(), info, error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
+      prepareInputs: async () => {
+        order.push("inputs");
+        return { binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout",
+          skillInstructions: "", beforePrompt: async () => undefined, toolWiring: toolWiring.then(() => void order.push("wired")) };
+      },
+      redeemCapabilityToken: async () => {
+        order.push("capability");
+        return { mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" };
+      },
+      reserveChannel: () => () => undefined,
+      activateExecution: async () => { order.push("activate"); return {}; },
+    });
+    vi.mocked(runner.createSession).mockImplementation(async () => {
+      order.push("acp");
+      return { acpSessionRef: "acp-1", resumed: false, capabilities: { forkSession: false, sessionResume: true } } as never;
+    });
+
+    const booting = session.bootstrap();
+    await vi.waitFor(() => expect(order).toContain("capability"));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    // Redemption did not wait for the wiring, and nothing past it started.
+    expect(order).toEqual(["inputs", "capability"]);
+    expect(runner.createSession).not.toHaveBeenCalled();
+    finishWiring();
+    await booting;
+
+    expect(order).toEqual(["inputs", "capability", "wired", "activate", "acp"]);
+    const stages = info.mock.calls.filter(call => (call[0] as { event?: string }).event === "native.bootstrap.stage")
+      .map(call => call[0] as { stage: string; durationMs: number });
+    expect(stages.map(stage => stage.stage)).toEqual(["input_preparation", "capability_redemption", "facade", "tool_wiring_wait",
+      "activation", "acp_session_bootstrap", "readiness"]);
+    for (const stage of stages) expect(stage.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
   it("prefers a live continuation over the restart-only restore fallback", async () => {
     const { session, runner } = await build({
       deploymentKind: "native_connector",

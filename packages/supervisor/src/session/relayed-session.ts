@@ -224,8 +224,13 @@ export class RelayedSession {
    * workspace data and are deliberately excluded.
    */
   private async bootstrapStage<T>(stage: string, operation: () => Promise<T>): Promise<T> {
+    const startedAt = Date.now();
     try {
-      return await operation();
+      const result = await operation();
+      // One line per finished stage, so a slow bootstrap says where (WS2-156).
+      this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+        stage, durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
+      return result;
     } catch (error) {
       const known = error instanceof RemoteInstanceError;
       this.logger.warn({
@@ -266,7 +271,7 @@ export class RelayedSession {
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     const mcpServers: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }> = [];
     if (this.assignment.agentRoute.mcpCapabilityTokenRef) {
-      const issue = await this.bootstrapStage("mcp_capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
+      const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
       this.deps.assertExecutionOwned?.();
       if (this.deps.deploymentKind === "native_connector") {
         const facade = new McpCapabilityFacade({
@@ -286,7 +291,7 @@ export class RelayedSession {
           now: () => this.deps.clock.coreNow(),
         });
         this.mcpFacade = facade;
-        mcpServers.push({ type: "http", ...await this.bootstrapStage("mcp_facade_start", () => facade.start()) });
+        mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
       } else {
         mcpServers.push({ type: "http", ...issue.mcpServer });
       }
@@ -294,11 +299,20 @@ export class RelayedSession {
     if (this.assignment.agentRoute.requiredRole === "qa" && this.deps.browserToolUrl) {
       mcpServers.push({ type: "http", name: "konteks-browser-tool", url: this.deps.browserToolUrl, headers: [] });
     }
+    // Optional tool wiring (Graft) ran alongside redemption and the facade.
+    // The agent must find it in place, and the ownership commit below must
+    // stay a short step from runner adoption, so settle it here. It never
+    // rejects: a failed wiring is logged and the delivery continues.
+    if (this.preparedInputs?.toolWiring) {
+      await this.bootstrapStage("tool_wiring_wait", () => this.preparedInputs!.toolWiring!);
+      this.deps.assertExecutionOwned?.();
+      if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+    }
     // Keep every fallible cloud/file input ahead of the local ownership
     // commit. Once activation succeeds, only local channel reservation and
     // runner adoption stand between the old and new ACP generations.
     const activation = this.deps.activateExecution
-      ? await this.bootstrapStage("execution_activation", () => this.deps.activateExecution!())
+      ? await this.bootstrapStage("activation", () => this.deps.activateExecution!())
       : undefined;
     this.deps.assertExecutionOwned?.();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
@@ -372,7 +386,7 @@ export class RelayedSession {
     if (this.deps.deploymentKind === "native_connector") {
       try {
         const binding = this.preparedInputs!.binding;
-        const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("core_readiness_registration", () =>
+        const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("readiness", () =>
           this.deps.registerReady!(this.assignment, binding, created.acpSessionRef)));
         this.deps.assertExecutionOwned?.();
         if (ready.workspaceId !== binding.workspaceId || ready.instanceId !== binding.instanceId || ready.sessionId !== binding.sessionId || ready.assignmentId !== binding.assignmentId || ready.attempt !== binding.attempt ||

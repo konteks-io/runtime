@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
-import { installOfflineAgentPackage, verifyOfflineAgentPackage } from "../offline-agent.js";
+import { forgetVerifiedOfflineAgentPackages, installOfflineAgentPackage, verifyOfflineAgentPackage, verifyOfflineAgentPackageOnce } from "../offline-agent.js";
 
 const hash = (bytes: Buffer | string) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 const folders: string[] = [];
@@ -33,6 +33,32 @@ describe("complete signed offline agent profile", () => {
     await expect(verifyOfflineAgentPackage(destination, fixture.artifact as never)).resolves.toEqual(profile);
     await writeFile(join(destination, "bridge/node_modules/example/package.json"), "modified");
     await expect(verifyOfflineAgentPackage(destination, fixture.artifact as never)).rejects.toThrow();
+  });
+  it("hashes the package once per process and again only when its files change (WS2-156)", async () => {
+    forgetVerifiedOfflineAgentPackages();
+    const fixture = offlineFixture();
+    const root = await mkdtemp(join(tmpdir(), "offline-agent-")); folders.push(root);
+    const archive = join(root, "package.tgz"), destination = join(root, "agent");
+    await writeFile(archive, fixture.archive, { mode: 0o600 });
+    await installOfflineAgentPackage(archive, destination, fixture.artifact as never);
+
+    await expect(verifyOfflineAgentPackageOnce(destination, fixture.artifact as never)).resolves.toEqual({ profile: fixture.profile, cached: false });
+    await expect(verifyOfflineAgentPackageOnce(destination, fixture.artifact as never)).resolves.toEqual({ profile: fixture.profile, cached: true });
+    // Another artifact is its own authority, verified in full.
+    const other = { ...fixture.artifact, id: "codex-offline-other" };
+    await expect(verifyOfflineAgentPackageOnce(destination, other as never)).resolves.toMatchObject({ cached: false });
+
+    // Same size, different bytes: the stat fingerprint moves, the full check fails.
+    const dependency = join(destination, "bridge/node_modules/example/package.json");
+    await writeFile(dependency, '{"name":"exampl3"}');
+    await expect(verifyOfflineAgentPackageOnce(destination, fixture.artifact as never)).rejects.toThrow();
+    // A failure is never remembered: restoring the bytes verifies in full again.
+    await writeFile(dependency, '{"name":"example"}');
+    await expect(verifyOfflineAgentPackageOnce(destination, fixture.artifact as never)).resolves.toMatchObject({ cached: false });
+    await expect(verifyOfflineAgentPackageOnce(destination, fixture.artifact as never)).resolves.toMatchObject({ cached: true });
+    // An added file is caught too.
+    await writeFile(join(destination, "bridge/extra.js"), "", { mode: 0o600 });
+    await expect(verifyOfflineAgentPackageOnce(destination, fixture.artifact as never)).rejects.toThrow();
   });
   it("rejects a re-signed-looking local receipt with a different dependency tree", async () => {
     const fixture = offlineFixture();

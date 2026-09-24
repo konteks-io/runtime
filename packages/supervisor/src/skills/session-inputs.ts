@@ -13,6 +13,11 @@ export interface PreparedSessionInputs {
   acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string; completion: SessionToCoreMessage }) => Promise<RemoteDeliveryAcceptanceReceipt>;
   /** Restart/reconnect path: never captures new bytes without the original runner completion. */
   resumeDeliveryOutput?: (authority: { claimId: string; invocationRef: string }) => Promise<{ receipt: RemoteDeliveryAcceptanceReceipt; completion: SessionToCoreMessage } | null>;
+  /**
+   * Optional developer-tool wiring (Graft) still running in the worktree.
+   * Never rejects. Bootstrap awaits it before the agent is given the worktree.
+   */
+  toolWiring?: Promise<void>;
 }
 
 /** Adapted from bb provider-bridge-acp's skill-root instruction construction. */

@@ -185,7 +185,7 @@ export class AgentRuntime {
       return Promise.reject(new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization."));
     }
     const bridge = Promise.resolve().then(async () => {
-      await verifyNativeRunnerPackage(this.options.config);
+      await verifyNativeRunnerPackage(this.options.config, this.logger);
       if (this.stopping || this.executionBridges.get(ref)!.stopping) throw new RemoteInstanceError("agent_unavailable", "Native execution owner is stopping.");
       // A resident process costs this reference one `session/new`; only when
       // none is idle does it pay the spawn plus ACP `initialize`.
@@ -651,7 +651,7 @@ export class AgentRuntime {
       let exitedDuringStart = false;
       const initializeStartedAt = Date.now();
       try {
-        await verifyNativeRunnerPackage(this.options.config);
+        await verifyNativeRunnerPackage(this.options.config, this.logger);
         if (this.stopping) return;
         const candidate = await (this.options.spawn ?? spawnBridge)({
           spec: this.spec,

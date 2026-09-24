@@ -1,5 +1,5 @@
 import { createHash, sign } from "node:crypto";
-import { mkdtemp, readFile, writeFile, rm, symlink, rename, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, rm, symlink, rename, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -328,6 +328,85 @@ describe("native authorized input composition", () => {
     await expect(prepared.beforePrompt()).rejects.toThrow();
     await expect(createNativeInputPreparer(f.options)(assignment)).rejects.toThrow();
     expect(await readFile(receipt, "utf8")).toBe("{}");
+  });
+  it("wires repository tools alongside the rest of bootstrap, once per worktree, and logs every stage (WS2-156)", async () => {
+    const f = await fixture(),
+      git = await testGitTool();
+    // A real repository, served as the signed bundle Core sends.
+    const seed = join(f.root, "seed");
+    await mkdir(seed, { mode: 0o700 });
+    await testGitCommand(git, seed, ["init", "-q"]);
+    await writeFile(join(seed, "app.txt"), "one\n");
+    await testGitCommand(git, seed, ["add", "app.txt"]);
+    await testGitCommand(git, seed, ["-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "one"]);
+    const revision = (await testGitCommand(git, seed, ["rev-parse", "HEAD"])).trim();
+    await testGitCommand(git, seed, ["update-ref", "refs/konteks/source", revision]);
+    await testGitCommand(git, seed, ["bundle", "create", join(f.root, "source.bundle"), "refs/konteks/source"]);
+    const bundle = await readFile(join(f.root, "source.bundle"));
+    await rm(seed, { recursive: true, force: true });
+    await rm(join(f.root, "source.bundle"));
+    f.selection.source.revision = revision;
+    Object.assign(f.selection, {
+      repository: { version: 1, transport: "core_git_bundle_v1", repositoryId: "https://gitea.example/acme/online-store",
+        revision, capabilityId: "repository-fetch", expiresAt: "2026-09-06T02:00:00Z" },
+      repositoryWorkspace: { mode: "preserve" },
+    });
+    const served = f.fetchFn.getMockImplementation()!;
+    f.fetchFn.mockImplementation(async (url, init) => String(url).endsWith("/fetch-repository")
+      ? new Response(new Uint8Array(bundle), { headers: { "content-type": "application/x-git-bundle", "x-konteks-revision": revision } })
+      : served(url, init));
+    const target: RemoteWorkAssignment = {
+      ...assignment,
+      kind: "delivery",
+      agentRoute: { agentId: "codex", requiredRole: "generator" },
+      source: { kind: "repository_snapshot", portability: "portable_before_claim", repositoryRef: "repository", revision },
+    };
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const outcomes: Array<"skipped" | "wired"> = ["wired", "skipped"];
+    const wire = vi.fn(async (_cwd: string, _agentId: string) => {
+      await held;
+      const outcome = outcomes.shift();
+      if (!outcome) throw new Error("graft broke");
+      return outcome;
+    });
+    const info = vi.fn(), warn = vi.fn();
+    const prepare = createNativeInputPreparer({ ...f.options, git, repositoryCacheRoot: join(f.root, "cache"),
+      prepareRepositoryWorktree: wire, logger: { info, warn } as never });
+    const stages = () => info.mock.calls.map(call => call[0] as { stage: string; cacheHit?: boolean; bytes?: number; outcome?: string });
+
+    // Preparation finishes while the (slow) wiring is still running.
+    const first = await prepare(target);
+    expect(wire).toHaveBeenCalledOnce();
+    expect(wire).toHaveBeenCalledWith(first.cwd, "codex");
+    expect(first.toolWiring).toBeInstanceOf(Promise);
+    expect(stages().map(stage => stage.stage)).toEqual(["selection", "repository_fetch", "worktree", "skills", "verify"]);
+    expect(stages()[1]).toMatchObject({ cacheHit: false, bytes: bundle.length });
+    expect(info.mock.calls.every(call => (call[0] as { event: string }).event === "native.bootstrap.stage")).toBe(true);
+
+    // A retried bootstrap on the same worktree joins the running wiring.
+    info.mockClear();
+    const retried = await prepare(target);
+    expect(retried.cwd).toBe(first.cwd);
+    expect(wire).toHaveBeenCalledOnce();
+    expect(stages()[1]).toMatchObject({ stage: "repository_fetch", cacheHit: true, bytes: 0 });
+
+    release();
+    await first.toolWiring;
+    await retried.toolWiring;
+    expect(stages().find(stage => stage.stage === "graft_wiring")).toMatchObject({ outcome: "wired" });
+
+    // The next turn asks again; the wiring itself decides it has nothing to do.
+    info.mockClear();
+    await (await prepare(target)).toolWiring;
+    expect(wire).toHaveBeenCalledTimes(2);
+    expect(stages().find(stage => stage.stage === "graft_wiring")).toMatchObject({ outcome: "skipped" });
+
+    // A broken wiring never fails the delivery.
+    const broken = await prepare(target);
+    await expect(broken.toolWiring).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "repository_worktree.tool_wiring_failed" }), expect.any(String));
+    await broken.beforePrompt();
   });
   it("fences preparation and before-prompt writes after native ownership shutdown", async () => {
     const f = await fixture();
