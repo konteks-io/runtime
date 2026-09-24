@@ -1470,6 +1470,8 @@ describe("onboard", () => {
     const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "428913", deps: { waitForReady: readyService, enrollment: enrollment as never, fetchFn: (async () => { throw new Error("no fetch"); }) as never } });
     expect(result.note).toContain("after five wrong codes a code stops working, to keep your account safe.");
     expect(result.note).toContain("A new six-digit code is on its way to a••@acme.test.");
+    // Said once, not once per chained step (pass 5).
+    expect(result.note!.split("after five wrong codes").length).toBe(2);
     expect(result.ask).toMatchObject({ kind: "code" });
     expect(enrollment.sendChallenge).toHaveBeenCalledWith("intent-2", "ada@acme.test");
     expect((await readOnboardState(root))?.resendReason).toBeUndefined();

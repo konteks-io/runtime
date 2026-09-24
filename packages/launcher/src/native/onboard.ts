@@ -464,7 +464,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               ? "That code has expired; codes last ten minutes."
               : "That code was not accepted either, and after five wrong codes a code stops working, to keep your account safe.";
           await save({ step: "email", intentRef: undefined, emailMasked: undefined, attemptsRemaining: undefined, resendReason, ...(state.email ? { resendTo: state.email } : {}) } as never);
-          return { step: "code", note: `${resendReason} A new one will be sent.`, run: AGAIN };
+          // The email step the chain ends on says the reason again (Z2, pass 5).
+          return { step: "code", note: `${resendReason} A new one will be sent.`, run: AGAIN, passing: true };
         }
         throw error;
       }
