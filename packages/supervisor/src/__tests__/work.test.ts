@@ -34,7 +34,7 @@ function fakeTransport(): { sent: OutboundMessage[]; transport: TransportManager
   return { sent, transport };
 }
 
-async function senderHarness(canSend = () => true) {
+async function senderHarness(canSend = () => true, extra: Partial<ConstructorParameters<typeof ReportSender>[0]> = {}) {
   const journal = new SupervisorJournal(dir);
   await journal.load();
   const outbox = new DurableOutbox(dir);
@@ -44,7 +44,7 @@ async function senderHarness(canSend = () => true) {
   const conflicts: string[] = [];
   const terminals: string[] = [];
   await journal.assignments.put({ assignmentId: "a", attempt: 1, claimId: "c", kind: "delivery", placementId: "p", workspaceId: "w", agentId: "codex", state: "running", recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only", expiresAt: "2026-09-07T00:00:00Z", latestResumeAt: "2026-09-07T00:00:00Z", updatedAt: "2026-09-06T00:00:00Z" });
-  const sender = new ReportSender({ journal, outbox, transport, clock, canSend, instanceId: () => "inst-1", onConflict: async (id) => void conflicts.push(id), onTerminalDurable: async (id) => void terminals.push(id) });
+  const sender = new ReportSender({ journal, outbox, transport, clock, canSend, instanceId: () => "inst-1", onConflict: async (id) => void conflicts.push(id), onTerminalDurable: async (id) => void terminals.push(id), ...extra });
   return { journal, outbox, sender, sent, conflicts, terminals, clock };
 }
 
@@ -347,7 +347,47 @@ describe("report sender (D125 sender-side state machine)", () => {
     expect(reports(sent).map((report) => report.reportSequence)).toEqual([2, 3]);
   });
 
-  it.each(["payload_conflict", "report_id_reused", "operation_conflict"] as const)("%s halts the claim into recovery_required(assignment_conflict)", async outcome => {
+  it("operation_conflict on a terminal report resubmits it as interrupted(not_resumable) once the session is stopped, backing off, and frees the claim (WS2-153)", async () => {
+    const delays: number[] = [];
+    const confirmStopped = vi.fn()
+      .mockRejectedValueOnce(new RemoteInstanceError("recovery_required", "The session is still open."))
+      .mockRejectedValueOnce(new RemoteInstanceError("recovery_required", "The session is still open."))
+      .mockResolvedValue(undefined);
+    const { sender, sent, journal, conflicts, terminals, outbox } = await senderHarness(() => true,
+      { confirmStopped, sleep: async ms => void delays.push(ms) });
+    const refused = await sender.submit({ assignmentId: "a", attempt: 1, claimId: "c", draft: {
+      terminal: true, acpSessionRef: "acp", result: { class: "succeeded", terminalResultHash: "h".repeat(43) },
+    } });
+    await sender.onAck({ assignmentId: "a", attempt: 1, claimId: "c", acknowledged: { reportId: refused.reportId, reportSequence: 1 }, durableWatermark: 0, outcome: "operation_conflict" });
+    await Promise.all(sender.pendingResubmissions());
+    expect(conflicts).toEqual([]);
+    expect(confirmStopped).toHaveBeenCalledTimes(3);
+    expect(delays).toEqual([500, 1000]);
+    const resubmitted = reports(sent).at(-1)!;
+    expect(resubmitted).toMatchObject({ terminal: true, reportSequence: 1, acpSessionRef: "acp",
+      result: { class: "interrupted", reason: "not_resumable" } });
+    expect(resubmitted.reportId).not.toBe(refused.reportId);
+    expect(outbox.depth).toBe(1);
+    await sender.onAck({ assignmentId: "a", attempt: 1, claimId: "c", acknowledged: { reportId: resubmitted.reportId, reportSequence: 1 }, durableWatermark: 1, terminalSequence: 1, outcome: "accepted" });
+    expect(journal.assignments.get("a:1")?.state).toBe("completed");
+    expect(terminals).toEqual(["a"]);
+    expect(outbox.depth).toBe(0);
+  });
+
+  it("operation_conflict on a report already stop-confirmed halts the claim instead of looping", async () => {
+    const confirmStopped = vi.fn(async () => undefined);
+    const { sender, journal, conflicts, outbox } = await senderHarness(() => true, { confirmStopped });
+    const report = await sender.submit({ assignmentId: "a", attempt: 1, claimId: "c", draft: {
+      terminal: true, result: { class: "interrupted", reason: "not_resumable", terminalResultHash: "h".repeat(43) },
+    } });
+    await sender.onAck({ assignmentId: "a", attempt: 1, claimId: "c", acknowledged: { reportId: report.reportId, reportSequence: 1 }, durableWatermark: 0, outcome: "operation_conflict" });
+    expect(confirmStopped).not.toHaveBeenCalled();
+    expect(journal.assignments.get("a:1")).toMatchObject({ state: "recovery_required", recoveryReason: "assignment_conflict" });
+    expect(conflicts).toEqual(["a"]);
+    expect(outbox.depth).toBe(0);
+  });
+
+  it.each(["payload_conflict", "report_id_reused"] as const)("%s halts the claim into recovery_required(assignment_conflict)", async outcome => {
     const { sender, journal, conflicts, outbox } = await senderHarness();
     await sender.submit({ assignmentId: "a", attempt: 1, claimId: "c", draft: {
       terminal: true, result: { class: "succeeded", terminalResultHash: "h".repeat(43) },

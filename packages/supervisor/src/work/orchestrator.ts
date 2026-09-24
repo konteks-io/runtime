@@ -171,6 +171,7 @@ export class WorkOrchestrator {
       canSend: () => deps.deploymentKind !== "native_connector" || deps.reportDeliveryAllowed?.() === true,
       onConflict: async (assignmentId, attempt) => this.abandon(assignmentId, attempt, "assignment_conflict"),
       onTerminalDurable: async (assignmentId, attempt) => this.finish(assignmentId, attempt),
+      confirmStopped: async (assignmentId, attempt) => this.confirmSessionStopped(assignmentId, attempt),
     });
   }
 
@@ -1562,6 +1563,16 @@ export class WorkOrchestrator {
     const session = this.sessions.get(`${assignmentId}:${attempt}`);
     if (session) await session.close("cancelled");
     this.logger.error({ assignmentId, attempt, reason }, "claim halted into recovery_required");
+  }
+
+  /**
+   * Before a claim reports itself stop-confirmed, its session must be closed
+   * and the agent told to stop any prompt still running on it. No session in
+   * this process means nothing of this claim runs here.
+   */
+  private async confirmSessionStopped(assignmentId: string, attempt: number): Promise<void> {
+    const session = this.sessions.get(`${assignmentId}:${attempt}`);
+    if (session) await session.confirmStopped();
   }
 
   private async finish(assignmentId: string, attempt: number): Promise<void> {

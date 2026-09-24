@@ -660,6 +660,13 @@ export class SessionManager {
   prompt(acpSessionRef: string, requestId: string, params: Omit<PromptRequest, "sessionId">): void {
     const record = this.require(acpSessionRef);
     const bridge = this.requireBridge(record);
+    // One ACP session runs one turn at a time. A second prompt would share the
+    // agent's context with the first and one of them would end `interrupted`
+    // with no one having asked for it. Refuse it before it reaches the bridge;
+    // the supervisor settles it as a known pre-dispatch denial.
+    if (record.activeTurns > 0) {
+      throw new RemoteInstanceError("operation_conflict", "Another prompt is already running on this session.");
+    }
     record.completedTurn = false;
     record.activeTurns += 1;
     const operation = bridge.connection

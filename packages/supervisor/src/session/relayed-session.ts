@@ -158,6 +158,8 @@ export class RelayedSession {
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
   private readonly executionGate: NativeExecutionGate | null;
+  /** Durable key of the last prompt admitted on this session (see promptBusy). */
+  private promptReservation: string | null = null;
   private lastPromptCompletion: { usage: AgentTurnUsageObservation | null } = { usage: null };
   private deliveryAcceptance: RemoteDeliveryAcceptanceReceipt | null = null;
   private mcpFacade: McpCapabilityFacade | null = null;
@@ -649,6 +651,15 @@ export class RelayedSession {
     }
     const message = operation.envelope.message;
     const ref = this.acpSessionRef!;
+    if (message.kind === "acp" && message.method === "session/prompt") {
+      // Check and reserve with no await between them: exactly one prompt may
+      // be admitted or running on this ACP session at a time.
+      if (this.promptBusy(operation.key)) {
+        await this.refuseConcurrentPrompt(gate, operation.key, message.id);
+        return;
+      }
+      this.promptReservation = operation.key;
+    }
     let params = message.kind === "acp" ? message.params : null;
     try {
       if (message.kind === "acp" && message.method === "session/prompt") {
@@ -687,7 +698,20 @@ export class RelayedSession {
     }
     // Do not convert a bridge transport exception into proof of completion.
     if (message.kind === "acp") {
-      if (message.method === "session/prompt") await this.deps.runner.prompt(ref, message.id, params);
+      if (message.method === "session/prompt") {
+        try { await this.deps.runner.prompt(ref, message.id, params); }
+        catch (error) {
+          // The runner's backstop: it refused because a prompt already runs
+          // on this session. Nothing reached the agent, so this is a known
+          // denial and the running turn is left alone.
+          if (!(error instanceof RemoteInstanceError) || error.code !== "operation_conflict") throw error;
+          const completion = concurrentPromptError(message.id);
+          await gate.refuseAtDispatch(operation.key, completion);
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "prompt_dispatch",
+            outcome: "denied_concurrent_prompt", source: "runner" }, "runner refused a second prompt on a busy session");
+          if (!this.closed) await this.sendToCore(completion);
+        }
+      }
       else if (message.method === "session/set_mode") await this.deps.runner.setMode(ref, message.id, params);
       else if (message.method === "session/set_config_option") await this.deps.runner.setConfigOption(ref, message.id, params);
       else {
@@ -711,6 +735,29 @@ export class RelayedSession {
     const delivered = await this.deps.runner.answer(ref, message.id, answer);
     if (!delivered.delivered) throw new RemoteInstanceError("operation_interrupted", "Answer delivery is unproven.");
     await gate.complete(operation.key);
+  }
+
+  /**
+   * Whether another prompt on this session is admitted or running. The
+   * reservation names the last prompt that passed this check; it holds only
+   * while that prompt is admitted, or started in this process and unsettled
+   * (a started row recovered from a crashed process never blocks a new turn).
+   */
+  private promptBusy(key: string): boolean {
+    const reserved = this.promptReservation;
+    if (reserved === null || reserved === key) return false;
+    const state = this.deps.journal.pendingRequests.get(reserved)?.authorization?.state;
+    return state === "admitted" || (state === "dispatch_started" && this.executionGate?.isDispatching(reserved) === true);
+  }
+
+  /** Deny before dispatch: a known outcome with an ACP error that never reaches the runner. */
+  private async refuseConcurrentPrompt(gate: NativeExecutionGate, key: string, id: string): Promise<void> {
+    const completion = concurrentPromptError(id);
+    await gate.denyBeforeDispatch(key, completion);
+    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "prompt_dispatch",
+      outcome: "denied_concurrent_prompt", source: "supervisor" }, "refused a second prompt while one is running on this session");
+    // The running turn keeps the session; do not close it for this refusal.
+    if (!this.closed) await this.sendToCore(completion);
   }
 
   private async completeReceived(id: string, method: "session/prompt" | "session/set_mode" | "session/set_config_option", completion: SessionToCoreMessage): Promise<boolean> {
@@ -944,6 +991,19 @@ export class RelayedSession {
     (this.deps.assertRecoveryOwned ?? this.deps.assertExecutionOwned)?.();
   }
 
+  /**
+   * Resolves once this session is closed and every prompt on it was asked to
+   * stop. A session still open has not reached its own terminal, so it throws
+   * and the caller retries later. Used before a claim reports itself
+   * `interrupted(not_resumable)`.
+   */
+  async confirmStopped(): Promise<void> {
+    if (!this.closed) throw new RemoteInstanceError("recovery_required", "The session is still open.");
+    if (this.closeTask) await Promise.allSettled([this.closeTask]);
+    if (this.acpSessionRef !== null) await this.deps.runner.cancel(this.acpSessionRef).catch(() => undefined);
+    await Promise.allSettled([...this.activities]);
+  }
+
   /** Dispatch owns the failure report; disposal must not invent a user cancellation. */
   async disposeFailedBootstrap(): Promise<void> {
     this.executionGate?.stop();
@@ -1075,6 +1135,11 @@ export class RelayedSession {
 
 function malformed(): AcpJsonRpcError {
   return { code: -32603, class: "malformed_response", message: "bridge response failed schema validation", retryable: false };
+}
+
+function concurrentPromptError(id: string): SessionToCoreMessage {
+  return { kind: "acp_error", id, method: "session/prompt",
+    error: { code: -32600, class: "invalid_params", message: "Another prompt is already running on this session.", retryable: false } };
 }
 
 function classify(error: unknown): AcpJsonRpcError {

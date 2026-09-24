@@ -159,6 +159,7 @@ function statusFor(error: RemoteInstanceError): number {
     case "gateway_unavailable":
       return 503;
     case "recovery_required":
+    case "operation_conflict":
       return 409;
     default:
       return 400;

@@ -209,6 +209,16 @@ export class NativeExecutionGate {
     return this.operations.denyBeforeDispatch(key, completion);
   }
 
+  /** The runner refused a begun operation before it reached the agent. */
+  refuseAtDispatch(key: string, completion: SessionToCoreMessage): Promise<void> {
+    return this.operations.refuseAtDispatch(key, completion);
+  }
+
+  /** Whether this process began the operation and has not settled it yet. */
+  isDispatching(key: string): boolean {
+    return this.operations.isDispatching(key);
+  }
+
   stop(): void {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);

@@ -568,6 +568,31 @@ describe("session manager (D98 bootstrap)", () => {
     expect(JSON.stringify(await usage)).not.toMatch(/"model"|amount|currency/);
   });
 
+  it("refuses a second prompt while one runs on the session, before it reaches the bridge (WS2-153)", async () => {
+    let finish!: (value: { stopReason: "end_turn" }) => void;
+    const prompt = vi.fn(() => new Promise<{ stopReason: "end_turn" }>((resolve) => { finish = resolve; }));
+    const { bridge } = fakeBridge({ prompt });
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+    const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    const published: RunnerEvent[] = [];
+    events.subscribe((event) => void published.push(event));
+    manager.prompt(acpSessionRef, "first", { prompt: [] });
+    let refused: unknown;
+    try { manager.prompt(acpSessionRef, "second", { prompt: [] }); } catch (error) { refused = error; }
+    expect(refused).toBeInstanceOf(RemoteInstanceError);
+    expect(refused).toMatchObject({ code: "operation_conflict" });
+    expect(prompt).toHaveBeenCalledOnce();
+    const result = nextEvent(events, "prompt_result");
+    finish({ stopReason: "end_turn" });
+    expect(await result).toMatchObject({ requestId: "first" });
+    expect(published.some((event) => event.kind === "request_error")).toBe(false);
+    // The session takes its next turn once the first has ended.
+    await new Promise((resolve) => setImmediate(resolve));
+    manager.prompt(acpSessionRef, "third", { prompt: [] });
+    expect(prompt).toHaveBeenCalledTimes(2);
+  });
+
   it("classifies bridge failures into the closed AcpJsonRpcError classes", async () => {
     const { bridge } = fakeBridge({ prompt: vi.fn(async () => { throw new RequestError(-32000, "authentication required"); }) });
     const events = new RunnerEventBus();
