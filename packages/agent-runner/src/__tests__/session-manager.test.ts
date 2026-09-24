@@ -69,6 +69,26 @@ describe("session manager (D98 bootstrap)", () => {
     expect(manager.activeSessions).toBe(1);
   });
 
+  it("refuses and cancels work the agent starts on its own after a turn, so the next turn still continues (WS2-130)", async () => {
+    const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+    const first = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    // A background timer from the last turn fires; Claude Code starts a turn
+    // nobody asked for and wants a tool permission.
+    await expect(manager.onRequestPermission({ sessionId: "bridge-s1", toolCall: { toolCallId: "t9", title: "discovery_run_inventory_list" }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] }))
+      .resolves.toEqual({ outcome: { outcome: "cancelled" } });
+    await expect(manager.onCreateElicitation({ sessionId: "bridge-s1", message: "?", requestedSchema: { type: "object" } } as never)).resolves.toEqual({ action: "cancel" });
+    expect(calls.cancel).toEqual([{ sessionId: "bridge-s1" }, { sessionId: "bridge-s1" }]);
+    const continued = await manager.continueLive({ context: { ...context, assignmentId: "asg-2" }, cwd: "/w", mcpServers: [], acpSessionRef: first.acpSessionRef,
+      lifecycle: { beforeCreate: async () => undefined, recordProcessOwner: async () => undefined, assertCurrent: () => undefined } });
+    expect(continued).toMatchObject({ acpSessionRef: first.acpSessionRef, resumed: true });
+  });
+
   it("continues a sealed session whose closed predecessor owner now rejects its own fence", async () => {
     // The live shape: the first turn's RelayedSession installed a fence that
     // rejects once that turn has closed and settled. Continuation belongs to

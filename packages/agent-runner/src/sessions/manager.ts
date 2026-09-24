@@ -738,6 +738,7 @@ export class SessionManager {
   onRequestPermission(params: RequestPermissionRequest, bridge = this.options.bridge()): Promise<RequestPermissionResponse> {
     const record = this.byBridgeId.get(params.sessionId);
     if (!record || record.bridge !== bridge || bridge.exited || record.recoveryStopping) return Promise.resolve({ outcome: { outcome: "cancelled" } });
+    if (record.continuationSealed) return this.refuseUnownedWork(record, { outcome: { outcome: "cancelled" } });
     const requestId = `perm-${randomUUID()}`;
     return this.awaitAnswer<RequestPermissionResponse>(record, requestId, () =>
       this.options.events.publish({ kind: "permission_request", acpSessionRef: record.acpSessionRef, requestId, params: withoutBridgeSessionId(params) }),
@@ -748,10 +749,26 @@ export class SessionManager {
     const sessionId = (params as { sessionId?: string }).sessionId;
     const record = sessionId ? this.byBridgeId.get(sessionId) : undefined;
     if (!record || record.bridge !== bridge || bridge.exited || record.recoveryStopping) return Promise.resolve({ action: "cancel" });
+    if (record.continuationSealed) return this.refuseUnownedWork(record, { action: "cancel" } as CreateElicitationResponse);
     const requestId = `elic-${randomUUID()}`;
     return this.awaitAnswer<CreateElicitationResponse>(record, requestId, () =>
       this.options.events.publish({ kind: "elicitation_request", acpSessionRef: record.acpSessionRef, requestId, params: withoutBridgeSessionId(params as unknown as Record<string, unknown>) }),
     );
+  }
+
+  /**
+   * A sealed session has no turn: its last one ended and no assignment owns it
+   * until the next adopts it. Work the agent starts on its own in between (a
+   * background timer from the last turn firing) has nobody to answer it. A
+   * request parked here was never answered and made the next turn refuse the
+   * session as busy (WS2-130). Refuse it at once and cancel that stray turn.
+   */
+  private refuseUnownedWork<T>(record: SessionRecord, refusal: T): Promise<T> {
+    const bridge = record.bridge;
+    if (bridge && !bridge.exited && record.bridgeSessionId) {
+      void bridge.connection.cancel({ sessionId: record.bridgeSessionId }).catch(() => undefined);
+    }
+    return Promise.resolve(refusal);
   }
 
   /** Supervisor → bridge: the single authorized answer for a pending request. */
