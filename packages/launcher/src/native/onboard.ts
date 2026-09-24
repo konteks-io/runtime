@@ -742,7 +742,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           run: AGAIN,
         };
       }
-      const kind = facts.remoteUrl && facts.remoteReachable ? "existing" : "managed";
+      // A remote only this machine can open (a folder, a file:// URL) is not
+      // one Konteks can register; the folder is offered managed git instead.
+      const kind = facts.remoteUrl && facts.remoteReachable && !facts.remoteLocal ? "existing" : "managed";
       await save({
         step: "system",
         repositoryPath: facts.path,
@@ -760,7 +762,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           ? `You are in ${facts.name}, with remote ${facts.remoteUrl}.`
           : facts.onManagedGit
             ? ""
-            : `You are in ${facts.name}, which has no remote this machine can push to.`;
+            : facts.remoteLocal
+              ? `You are in ${facts.name}. Its remote is a folder on this machine, which Konteks can\u2019t reach.`
+              : `You are in ${facts.name}, which has no remote this machine can push to.`;
       return {
         step: "inspect",
         ...(`${notReady}${where}` ? { note: `${notReady}${where}` } : {}),

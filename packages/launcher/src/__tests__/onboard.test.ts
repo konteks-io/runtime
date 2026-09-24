@@ -106,6 +106,29 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ repositoryKind: "managed" });
   });
 
+  it("offers managed git, and says why, when the remote is a folder on this machine (W1-B1 pass 4)", async () => {
+    await writeOnboardState(root, { step: "inspect" } as never);
+    const result = await step({
+      inspect: async () => ({
+        path: "/tmp/recipe-box",
+        name: "recipe-box",
+        remoteUrl: "/Users/me/remotes/recipe-box.git",
+        remoteReachable: true,
+        remoteLocal: true,
+        currentBranch: "main",
+        defaultBranch: "main",
+      }),
+    });
+    expect(result.note).toContain("Its remote is a folder on this machine, which Konteks can\u2019t reach.");
+    expect(await readOnboardState(root)).toMatchObject({ repositoryKind: "managed" });
+  });
+
+  it("tells a network remote from a folder only this machine can open", async () => {
+    const { remoteIsLocal } = await import("../native/repository-inspect.js");
+    for (const url of ["https://github.com/acme/shop.git", "ssh://git@git.test/a/b.git", "git@github.com:acme/shop.git", "git://example.org/x.git"]) expect(remoteIsLocal(url), url).toBe(false);
+    for (const url of ["/Users/me/remotes/recipe-box.git", "../recipe-box.git", "file:///srv/git/recipe-box.git", "C:\\git\\recipe-box.git"]) expect(remoteIsLocal(url), url).toBe(true);
+  });
+
   it("closes the conversation that just finished with its summary, not a revisit (pass 25)", async () => {
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
     vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "konteks-2" } as never);
