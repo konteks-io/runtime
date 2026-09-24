@@ -849,6 +849,13 @@ describe("onboard", () => {
     expect(gateway.ask).toBeUndefined();
   });
 
+  it("says Konteks could not be reached instead of a bare gateway status on any other step (pass 5)", async () => {
+    await writeOnboardState(root, { step: "initiative", systemId: "sys-1" } as never);
+    const failed = await onboardFailureStep({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" }, new Error("HTTP 502"));
+    expect(failed.note).toBe("Konteks could not be reached just now; it may be restarting. Nothing you answered was lost.");
+    expect(failed.note).not.toContain("502");
+  });
+
   it("offers to try a step that asks nothing again, and ends plainly when access was revoked", async () => {
     await writeOnboardState(root, { step: "initiative", systemId: "sys-1" } as never);
     const context = { root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" };

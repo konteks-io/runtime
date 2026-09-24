@@ -1396,9 +1396,15 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
       run: AGAIN,
     };
   }
-  const note = /nothing you answered was lost/i.test(said)
-    ? `Konteks could not finish that step: ${said}`
-    : `Konteks could not finish that step: ${said} Nothing you answered was lost.`;
+  // A bare gateway status or a dropped connection anywhere else is Konteks
+  // being unreachable for a moment (a restart, a deploy), not a code for the
+  // person to read ("HTTP 502", pass 5).
+  const unreachable = /^HTTP 50[234]$/.test(message) || /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(message);
+  const note = unreachable
+    ? "Konteks could not be reached just now; it may be restarting. Nothing you answered was lost."
+    : /nothing you answered was lost/i.test(said)
+      ? `Konteks could not finish that step: ${said}`
+      : `Konteks could not finish that step: ${said} Nothing you answered was lost.`;
   if (step === "email" || step === "code" || step === "workspace" || step === "first_task") {
     const { answer: _answer, ...unanswered } = context;
     const again = await runOnboardStep(unanswered).catch(() => null);
