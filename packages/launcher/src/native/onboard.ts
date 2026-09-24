@@ -290,13 +290,14 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
   const lost = await lostMachineKey(supervisorData);
   if (lost) {
     await setAsideLostIdentity(context.root, lost.instanceId);
-    const email = state.email ?? state.resendTo;
+    const email = state.email ?? state.resendTo ?? state.ownerEmail;
     await writeOnboardState(context.root, {
       schemaVersion: 1,
       step: "email",
       updatedAt: new Date().toISOString(),
       replaces: lost.instanceId,
       ...(email ? { resendTo: email } : {}),
+      ...keptAnswers(state),
     } as never);
     const note =
       "This machine lost its Konteks key, so it can no longer connect as the runtime it was. It will connect again as a new runtime that takes the old one's place; your repository and your coding agents' logins are not affected.";
@@ -324,6 +325,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         step: "email",
         updatedAt: new Date().toISOString(),
         ...(address ? { resendTo: address } : {}),
+        ...keptAnswers(state),
       } as never);
       return address
         ? { step: "identity", note: "Starting over as a new runtime.", run: AGAIN }
@@ -1300,6 +1302,17 @@ export function initiativeTitle(sentence: string): string {
  */
 function joinedWorkspace(state: { decision?: string | undefined }): boolean {
   return state.decision === "join" || state.decision === "choose";
+}
+
+/**
+ * What the person already answered about this machine and folder, kept when the
+ * machine connects again as a new runtime: they are not asked twice (W1-G2).
+ */
+function keptAnswers(state: { ownerEmail?: string | undefined; graftDecision?: string | undefined; graftRepository?: string | undefined }): Record<string, string> {
+  return {
+    ...(state.ownerEmail ? { ownerEmail: state.ownerEmail } : {}),
+    ...(state.graftDecision && state.graftRepository ? { graftDecision: state.graftDecision, graftRepository: state.graftRepository } : {}),
+  };
 }
 
 function workspaceName(state: { workspaces?: Array<{ tenantId: string; displayName: string }> | undefined }, tenantId: string): string {

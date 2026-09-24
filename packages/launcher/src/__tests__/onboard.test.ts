@@ -868,6 +868,19 @@ describe("onboard", () => {
     expect(asked.ask?.question).toBe("Use solo as your System here? It is already on Konteks managed git, so if your workspace has it, nothing is made twice.");
   });
 
+  it("keeps the person's address and Graft answer when a machine that lost its key connects again (W1-Z5, W1-G2)", async () => {
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
+    vi.spyOn(SupervisorStore.prototype, "loadInstanceKey").mockResolvedValue(null as never);
+    await writeOnboardState(root, { step: "done", tenantId: "acme", ownerEmail: "ada@acme.test", graftDecision: "declined", graftRepository: "/tmp/solo" } as never);
+    const again = await step({});
+    expect(again.run).toBeDefined();
+    expect(await readOnboardState(root)).toMatchObject({
+      step: "email", resendTo: "ada@acme.test", replaces: "instance-1",
+      ownerEmail: "ada@acme.test", graftDecision: "declined", graftRepository: "/tmp/solo",
+    });
+  });
+
   it("leaves a revoked machine disconnected when the person says no (W1-Z4)", async () => {
     await writeOnboardState(root, { step: "reconnect", tenantId: "acme" } as never);
     const no = await step({}, "no");
