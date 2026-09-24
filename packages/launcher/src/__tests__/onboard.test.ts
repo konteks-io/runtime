@@ -750,6 +750,21 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "done", initiativeId: "init-7", initiativeUrl: "https://app.test/work/init-7" });
   });
 
+  it("closes once: no stale wait and no initiative said three times (pass 5)", async () => {
+    await writeOnboardState(root, { step: "agents", systemId: "sys-1", repositoryName: "recipe-box", firstTask: "Recipes", initiativeTitle: "Recipes", instanceId: "instance-1", tenantId: "acme" } as never);
+    const fetchFn = vi.fn(async (url: string) => {
+      const body = url.endsWith("/execution-profiles") ? { profiles: [{ id: "p1" }] }
+        : url.endsWith("/initiatives") ? { initiative: { id: "init-7", title: "Recipes", setup: { state: "ready" } }, reconciliation: "recorded", pmSessionId: "session-9", retrySetup: false }
+        : url.includes("/messages") ? { id: "turn-1" } : {};
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", deps: { waitForReady: readyService, fetchFn: fetchFn as never, families: async () => ["claude-code"] } });
+    expect(result.done?.summary).toContain('Your first initiative is "Recipes". Its planning session is replying now; answer it from the initiative.');
+    expect(result.note ?? "").not.toContain("will run the work in this workspace");
+    expect(result.note ?? "").not.toContain("is ready");
+    expect(result).not.toHaveProperty("passing");
+  });
+
   it("never creates a second initiative when the first turn has to be retried", async () => {
     await writeOnboardState(root, {
       step: "initiative",
@@ -1144,7 +1159,7 @@ describe("onboard", () => {
       expect(offer.ask?.question).toBe("Set up Graft in table-booking? It adds graft/, .claude/, .mcp.json and AGENTS.md here, kept out of your commits.");
       expect(offer.note).toContain("so Claude Code and Codex can find their way around it");
       expect(offer.note).toContain("sends nothing to a paid model, and its usage statistics stay off");
-      expect(offer.note).toContain("Outside this folder it writes only in ~/.graft: its settings and its own copy of Graft, which keeps working if Konteks is ever removed.");
+      expect(offer.note).toContain("Outside this folder it writes only its settings and its own copy in ~/.graft.");
     });
 
     it("says a tracked file Graft would change will show in git", async () => {

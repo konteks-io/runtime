@@ -32,6 +32,8 @@ import { deleteOwnerToken, OWNER_ACCESS_REVOKED, OwnerApiClient, readOwnerToken,
 export interface OnboardStep {
   step: OnboardState["step"];
   note?: string;
+  /** Internal: news a later step in the same call says again, or a wait that is already over. Dropped when chained past. */
+  passing?: true;
   ask?: { question: string; kind: "email" | "code" | "choice" | "confirm" | "text"; choices?: string[] };
   run?: { argv: string[] };
   done?: {
@@ -231,14 +233,17 @@ export async function runOnboard(context: OnboardContext, maxChained = 4): Promi
     // that note always reaches the person before the long step starts.
     const slowNext = after !== undefined && SLOW_STEPS.has(after);
     if (!isAgain(result.run) || result.ask || result.done || !advanced || slowNext || hop >= maxChained) {
-      if (notes.length === 0) return result;
-      return { ...result, note: [...notes, result.note].filter(Boolean).join(" ") };
+      const { passing: _passing, ...shown } = result;
+      if (notes.length === 0) return shown;
+      return { ...shown, note: [...notes, shown.note].filter(Boolean).join(" ") };
     }
     // Every step's news reaches the person: the push that went through, the
     // Graft already there (pass 6 lost both behind the closing). The steps that
     // restated one wait ("will join… is joining… is now…", pass 27) no longer
     // chain, since the slow start is never entered in the same call.
-    if (result.note && !notes.includes(result.note)) notes.push(result.note);
+    // A wait already over, or news the next step says again, is not repeated
+    // (pass 5 read the initiative three times in one closing).
+    if (result.note && !result.passing && !notes.includes(result.note)) notes.push(result.note);
     const { answer: _answered, ...next } = current;
     current = next;
   }
@@ -1038,7 +1043,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           note:
             `Graft maps this repository's code so ${names} can find their way around it before they search. ` +
             "It runs only on this machine, sends nothing to a paid model, and its usage statistics stay off. " +
-            `Outside this folder it writes only in ~/.graft: its settings and its own copy of Graft, which keeps working if Konteks is ever removed.${tracked}`,
+            `Outside this folder it writes only its settings and its own copy in ~/.graft.${tracked}`,
           ask: { question, kind: "confirm" },
         };
       }
@@ -1116,6 +1121,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       return {
         step: "first_task",
         note: `Setting up your first initiative, "${title}", on ${state.repositoryName ?? "your System"}. Konteks is getting this machine's agents ready and opening the initiative's planning session; this takes up to a minute.`,
+        passing: true,
         run: AGAIN,
       };
     }
@@ -1155,7 +1161,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       }
       await save({ agentsWaited: undefined } as never);
       await save({ step: "initiative" });
-      return { step: "agents", note: "This machine's agents will run the work in this workspace.", run: AGAIN };
+      return { step: "agents", note: "This machine's agents will run the work in this workspace.", run: AGAIN, passing: true };
     }
 
     case "initiative": {
@@ -1197,6 +1203,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       return {
         step: "initiative",
         note: `Your first initiative, "${title}", is ready. Its planning session on this machine has your words as its first message and is replying now; follow it and answer it from the initiative: ${url}`,
+        passing: true,
         run: AGAIN,
       };
     }
@@ -1265,7 +1272,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
             state.initiativeId
               ? state.systemExisting
                 ? `Your first initiative "${state.initiativeTitle}" and its planning session are on the site.`
-                : `Your first initiative is "${state.initiativeTitle}"${state.setupFailure ? "; its planning session still needs Retry setup on the initiative page" : ", and its planning session is working on it here"}.`
+                : `Your first initiative is "${state.initiativeTitle}"${state.setupFailure ? "; its planning session still needs Retry setup on the initiative page" : ". Its planning session is replying now; answer it from the initiative"}.`
               : null,
             agentsLine,
           ]
