@@ -83,6 +83,6 @@ describe("first commit of a folder with files", () => {
     expect(await readFile(join(folder, ".env"), "utf8")).toContain("sk_test_fake");
     expect(git(folder, "status", "--porcelain")).toBe("");
     // A later look at the folder knows it is on Konteks managed git (pass 6).
-    expect(await inspectRepository(folder)).toMatchObject({ onManagedGit: true, remoteUrl: null });
+    expect(await inspectRepository(folder)).toMatchObject({ onManagedGit: true, remoteUrl: null, unpushedCommits: 0 });
   });
 });

@@ -23,6 +23,8 @@ export interface RepositoryFacts {
   defaultBranch: string;
   /** The repository already has Konteks managed git as its "konteks" remote. */
   onManagedGit?: boolean;
+  /** Commits on the current branch that its "konteks" remote does not have yet, when it tracks one. */
+  unpushedCommits?: number;
 }
 
 const env = () => sanitizeInheritedChildProcessEnv({ env: process.env });
@@ -66,6 +68,12 @@ export async function inspectRepository(cwd: string): Promise<RepositoryFacts> {
   }
 
   const konteks = await git(path, ["remote", "get-url", "konteks"]).catch(() => null);
+  let unpushedCommits: number | undefined;
+  if (konteks && konteks.code === 0 && currentBranch) {
+    const ahead = await git(path, ["rev-list", "--count", `konteks/${currentBranch}..HEAD`]).catch(() => null);
+    const count = ahead && ahead.code === 0 ? Number.parseInt(ahead.stdout.trim(), 10) : Number.NaN;
+    if (Number.isFinite(count)) unpushedCommits = count;
+  }
   return {
     path,
     name,
@@ -74,6 +82,7 @@ export async function inspectRepository(cwd: string): Promise<RepositoryFacts> {
     currentBranch,
     defaultBranch: currentBranch ?? "main",
     ...(konteks && konteks.code === 0 ? { onManagedGit: true } : {}),
+    ...(unpushedCommits !== undefined ? { unpushedCommits } : {}),
   };
 }
 

@@ -816,7 +816,8 @@ describe("onboard", () => {
     vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
     await writeOnboardState(root, { step: "reconnect", tenantId: "acme", ownerEmail: "ada@acme.test" } as never);
     const again = await step({}, "yes");
-    expect(again.note).toBe("A new code will be sent to ada@acme.test.");
+    // The code step says where the code went, masked; this note must not unmask it.
+    expect(again.note).toBe("Starting over as a new runtime.");
     expect(again.run).toBeDefined();
     expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
     const { readdir } = await import("node:fs/promises");
@@ -834,6 +835,37 @@ describe("onboard", () => {
       inspect: async () => ({ path: "/tmp/solo", name: "solo", remoteUrl: null, remoteReachable: false, currentBranch: "main", defaultBranch: "main" }),
     }).catch((e: unknown) => e);
     expect((error as Error).message).toBe(OWNER_ACCESS_REVOKED);
+  });
+
+  it("rejoins a System whose branch Konteks already has without asking to push, and closes without claiming new work (WS1-112)", async () => {
+    await writeOnboardState(root, {
+      step: "push", systemExisting: true, systemId: "sys-1", repositoryName: "solo", repositoryKind: "managed",
+      repositoryOnManagedGit: true, repositoryUnpushed: 0, defaultBranch: "main", repositoryPath: "/tmp/solo",
+    } as never);
+    const joined = await step({});
+    expect(joined.ask).toBeUndefined();
+    expect(joined.note).toBe("Konteks already has main; joining this machine to the repository.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "pushing" });
+
+    await writeOnboardState(root, {
+      step: "push", systemExisting: true, systemId: "sys-1", repositoryName: "solo", repositoryKind: "managed",
+      repositoryOnManagedGit: true, repositoryUnpushed: 2, defaultBranch: "main", repositoryPath: "/tmp/solo",
+    } as never);
+    expect((await step({})).ask?.question).toBe("Push main to the Konteks repository now?");
+
+    await writeOnboardState(root, {
+      step: "done", tenantId: "acme", systemExisting: true, systemEntityRef: "system:default/acme-solo", repositoryName: "solo",
+      repositoryKind: "managed", initiativeId: "init-7", initiativeTitle: "Book a table",
+    } as never);
+    const done = await step({});
+    expect(done.done?.summary).toContain('Your first initiative "Book a table" and its planning session are on the site.');
+    expect(done.done?.summary).not.toContain("working on it here");
+  });
+
+  it("asks about a folder already on Konteks managed git in words that say nothing is made twice (WS1-112)", async () => {
+    await writeOnboardState(root, { step: "system", repositoryName: "solo", repositoryKind: "managed", repositoryOnManagedGit: true, repositoryPath: "/tmp/solo", defaultBranch: "main" } as never);
+    const asked = await step({ inspect: async () => ({ path: "/tmp/solo", name: "solo", remoteUrl: null, remoteReachable: false, currentBranch: "main", defaultBranch: "main", onManagedGit: true }) });
+    expect(asked.ask?.question).toBe("Use solo as your System here? It is already on Konteks managed git, so if your workspace has it, nothing is made twice.");
   });
 
   it("leaves a revoked machine disconnected when the person says no (W1-Z4)", async () => {

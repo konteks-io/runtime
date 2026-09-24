@@ -326,7 +326,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         ...(address ? { resendTo: address } : {}),
       } as never);
       return address
-        ? { step: "identity", note: `A new code will be sent to ${address}.`, run: AGAIN }
+        ? { step: "identity", note: "Starting over as a new runtime.", run: AGAIN }
         : { step: "identity", ask: { question: "What email address should this machine belong to?", kind: "email" } };
     }
     case "identity": {
@@ -748,17 +748,20 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         defaultBranch: facts.defaultBranch,
         repositoryKind: kind,
         ...(facts.remoteUrl ? { remoteUrl: facts.remoteUrl } : {}),
+        ...(facts.onManagedGit ? { repositoryOnManagedGit: true } : {}),
+        ...(facts.unpushedCommits !== undefined ? { repositoryUnpushed: facts.unpushedCommits } : {}),
         advertisedRoles: ready.roles,
       });
+      // A folder already on Konteks managed git says so in its question.
+      const where =
+        kind === "existing"
+          ? `You are in ${facts.name}, with remote ${facts.remoteUrl}.`
+          : facts.onManagedGit
+            ? ""
+            : `You are in ${facts.name}, which has no remote this machine can push to.`;
       return {
         step: "inspect",
-        note: `${notReady}${
-          kind === "existing"
-            ? `You are in ${facts.name}, with remote ${facts.remoteUrl}.`
-            : facts.onManagedGit
-              ? `You are in ${facts.name}, which is already on Konteks managed git (remote "konteks").`
-              : `You are in ${facts.name}, which has no remote this machine can push to.`
-        }`,
+        ...(`${notReady}${where}` ? { note: `${notReady}${where}` } : {}),
         run: AGAIN,
       };
     }
@@ -769,7 +772,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           ? `Make ${state.repositoryName} your first System in Konteks?`
           : state.repositoryNeedsInit
             ? `Make ${state.repositoryName} your first System, kept on Konteks managed git? Nothing is pushed until you say so.`
-            : `Make ${state.repositoryName} your first System, on Konteks managed git?`;
+            : state.repositoryOnManagedGit
+              ? `Use ${state.repositoryName} as your System here? It is already on Konteks managed git, so if your workspace has it, nothing is made twice.`
+              : `Make ${state.repositoryName} your first System, on Konteks managed git?`;
       if (context.answer === undefined) {
         // The repository is the one captured at the first inspect. A run from
         // somewhere else while this is pending asks which of the two is meant,
@@ -869,6 +874,13 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           ? `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it, with one commit of your ${plan.include.length} file${plan.include.length === 1 ? "" : "s"}.`
           : `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it; none of your files are added or changed.`;
       if (context.answer === undefined) {
+        // A System this machine rejoined, whose branch Konteks already has:
+        // there is nothing to agree to. The push only registers this machine's
+        // key and changes nothing on the repository.
+        if (state.systemExisting && state.repositoryOnManagedGit && state.repositoryUnpushed === 0) {
+          await save({ step: "pushing" });
+          return { step: "push", note: `Konteks already has ${state.defaultBranch}; joining this machine to the repository.`, run: AGAIN };
+        }
         if (!withFiles) return { step: "push", ask: { question, kind: "confirm" } };
         const shown = plan.include.slice(0, 8);
         const more = plan.include.length - shown.length;
@@ -1241,7 +1253,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               ? `${state.repositoryName} is your first System${state.repositoryKind === "managed" ? ", kept on Konteks managed git" : ""}.`
               : null,
             state.initiativeId
-              ? `Your first initiative is "${state.initiativeTitle}"${state.setupFailure ? "; its planning session still needs Retry setup on the initiative page" : ", and its planning session is working on it here"}.`
+              ? state.systemExisting
+                ? `Your first initiative "${state.initiativeTitle}" and its planning session are on the site.`
+                : `Your first initiative is "${state.initiativeTitle}"${state.setupFailure ? "; its planning session still needs Retry setup on the initiative page" : ", and its planning session is working on it here"}.`
               : null,
             agentsLine,
           ]

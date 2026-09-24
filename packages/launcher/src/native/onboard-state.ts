@@ -74,6 +74,10 @@ export const OnboardStateSchema = z
     repositoryKind: z.enum(["existing", "managed"]).optional(),
     /** The folder is not a git repository yet; the push makes it one (W1-A5). */
     repositoryNeedsInit: z.boolean().optional(),
+    /** The folder already has Konteks managed git as its "konteks" remote. */
+    repositoryOnManagedGit: z.boolean().optional(),
+    /** Commits the "konteks" remote does not have yet, when known. */
+    repositoryUnpushed: z.number().int().nonnegative().optional(),
     /** Who authors the first commit of a folder the push turns into a repository. */
     ownerEmail: z.string().min(1).optional(),
     /** A new conversation on a machine that finished onboarding (W1-A8). */
