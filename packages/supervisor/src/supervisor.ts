@@ -1889,6 +1889,8 @@ export class Supervisor {
           finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "login_failed" });
         } else if (event.kind === "completed") {
           finish({ loginId: intent.loginId, agentId: intent.agentId, state: "succeeded" });
+          // Ready shows on the site now, not at the next heartbeat.
+          if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed"));
         } else if (event.kind === "failed") {
           finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "login_failed" });
         }
