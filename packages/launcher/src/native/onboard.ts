@@ -568,7 +568,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               await save({ step: "workspace", tenantId: undefined } as never);
               return {
                 step: "workspace",
-                note: `${workspaceName(state, state.tenantId ?? "")} has no room for this machine. ${said} To use it here, revoke that runtime in Customize → Runtimes or move the workspace to a plan with more runtimes in Settings → Plan. Or choose another workspace.`,
+                note: `${workspaceName(state, state.tenantId ?? "")} has no room for this machine. ${said} To use it here, revoke that runtime in Customize → Runtimes (${siteUrl}/customize/connected-runtimes) or move the workspace to a plan with more runtimes in Settings → Plan. Or choose another workspace.`,
                 ask: { question: "Which workspace should this machine join?", kind: "choice", choices: (state.workspaces ?? []).map(entry => entry.displayName) },
               };
             }

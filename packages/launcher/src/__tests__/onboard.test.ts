@@ -1440,6 +1440,8 @@ describe("onboard", () => {
     // The address was proved a minute ago and Core still holds that proof.
     expect(result.step).toBe("workspace");
     expect(result.note).toContain("Konteks-Onboard has no room for this machine");
+    // W1-E5: a link that opens the page where runtimes are managed.
+    expect(result.note).toContain("(https://app.test/customize/connected-runtimes)");
     expect(result.note).toContain("\"ada's Mac\" already holds it.");
     expect(result.note).toContain("Customize → Runtimes");
     expect(result.ask).toEqual({ question: "Which workspace should this machine join?", kind: "choice", choices: ["Konteks-Onboard", "Side Project"] });
