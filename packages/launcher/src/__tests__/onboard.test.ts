@@ -1334,8 +1334,8 @@ describe("onboard", () => {
       workspaceCreated: false,
     }));
     const started = await step({ enrollment: { bind } as never, complete: vi.fn(async () => ({}) as never), staging: { status: async () => ({ state: "done" }), spawn: vi.fn() } });
-    expect(started.note).toContain("This machine is joining Acme Kitchen.");
-    expect(started.note).toContain("This machine is now Acme Kitchen's runtime");
+    // The join was already said; the step says it once (pass 5).
+    expect(started.note).toBe("This machine is now Acme Kitchen's runtime; starting it next.");
     expect(started.note).not.toContain("acme-kitchen");
 
     await writeOnboardState(root, { ...(await readOnboardState(root)), step: "done" } as never);

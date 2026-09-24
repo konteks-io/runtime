@@ -608,11 +608,12 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         identity = bound.identity;
       }
       const joinedName = workspaceName(state, identity.workspaceId);
-      const workspaceNote =
-        state.decision === "create"
-          ? `Your workspace is ready: ${identity.workspaceId}. You can rename it in Settings.`
-          : `This machine is joining ${joinedName}.`;
-      const announce = state.workspaceAnnounced ? "" : `${workspaceNote} `;
+      // A join was already said ("This machine will join X.", "Joining X.")
+      // and "is now X's runtime" below says it once more; only a new
+      // workspace has news here (pass 5 read the join three times).
+      const announce = state.workspaceAnnounced || state.decision !== "create"
+        ? ""
+        : `Your workspace is ready: ${identity.workspaceId}. You can rename it in Settings. `;
       // The agent packages unpack in the background from `install --enroll`
       // (WS1-012). Wait a while for them here, and if they are still going,
       // say how far they have got and come back, rather than sit silent.
