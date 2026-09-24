@@ -23,7 +23,8 @@ later step comes from running, in the same folder:
 
 Each step has a `note`, an `ask`, a `run` or a `done`, sometimes more than one:
 
-- `note`: tell the person, in one short sentence, what it says is happening.
+- `note`: tell the person what it says, in its words. Leave nothing out and add
+  nothing of your own.
 - `ask`: put `ask.question` to the person, word for word if you can, and wait
   for their reply. Pass it back exactly as they gave it:
   `konteks-remote onboard --json --answer "<their answer>"`
@@ -39,8 +40,8 @@ Some steps take up to a minute; the `note` before them says so.
 
 - You are a relay. Never answer a question for the person, and never guess an
   email address, a code or a name.
-- Keep your messages short: what happened, then the question. Don't explain
-  how you relay answers, repeat a step's note, or mention install paths.
+- Keep your messages short: the step's note, then its question. Don't explain
+  how you relay answers, say the same thing twice, or mention install paths.
 - Run nothing else for this and call no other address. Do not compose requests
   to Konteks yourself; each step tells you the next one.
 - If `konteks-remote` is not found, use the full path the install printed.

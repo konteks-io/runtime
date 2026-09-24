@@ -1258,7 +1258,9 @@ describe("onboard", () => {
     expect(result.run?.argv).toEqual(["konteks-remote", "start"]);
     expect(result.note).toContain("Your workspace is ready: acme");
     expect(result.note).toContain("rename it in Settings");
-    expect(result.note).toContain("starting it next; this takes about a minute.");
+    // The start is seconds, not a minute: the note claims no duration (WS1-109).
+    expect(result.note).toContain("starting it next.");
+    expect(result.note).not.toContain("minute");
     const state = await readOnboardState(root);
     expect(state).toMatchObject({ step: "inspect", instanceId: "instance-9", tenantId: "acme" });
     expect(state?.email).toBeUndefined();

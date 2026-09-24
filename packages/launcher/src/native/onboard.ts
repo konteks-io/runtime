@@ -628,7 +628,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       } as never);
       return {
         step: "start",
-        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next; this takes about a minute.`,
+        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next.`,
         // Registering and starting the service is the launcher's own command,
         // so the agent runs it rather than this process forking a service.
         run: { argv: ["konteks-remote", "start"] },
