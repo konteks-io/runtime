@@ -780,6 +780,10 @@ export class RelayedSession {
         const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
         if (accepted && event.method === "session/prompt" && this.deps.deploymentKind === "native_connector" &&
             (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery")) {
+          // Say why before the close: its SIGTERM on the bridge was the only
+          // trace of a Codex sign-in that could not refresh (WS2-141).
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable },
+            "native turn failed with a request error; closing the assignment as an agent exit");
           await this.close("agent_exited");
         }
         return;

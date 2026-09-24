@@ -107,6 +107,43 @@ describe("native shared Codex app-server owner", () => {
     await f.owner.stop();
   });
 
+  it("replaces a live server left by an older release of this connector instead of adopting it (WS2-141)", async () => {
+    const releases = "/operator/connector/releases/";
+    const f = fixture();
+    const stopHolder = vi.fn(async () => undefined);
+    const onStaleReplaced = vi.fn();
+    const owner = new NativeCodexAppServerOwner({
+      config: { ...config, RUNNER_BRIDGE_PREFIX: `${releases}release-new/agents/codex` } as RunnerConfig,
+      spawn: f.spawn, stop: f.stop, prepareSocket: vi.fn(async () => "adopt" as const), waitUntilReady: f.waitUntilReady,
+      cleanupSocket: f.cleanupSocket, verifyPackage: f.verifyPackage, restartDelaysMs: [5, 10],
+      socketHolder: vi.fn(async () => ({ pid: 4411, command: `${releases}release-old/agents/codex/node_modules/@openai/codex/bin/codex app-server --listen unix:///s` })),
+      stopHolder, onStaleReplaced,
+    });
+    await owner.start();
+    expect(stopHolder).toHaveBeenCalledWith(4411);
+    expect(f.spawn).toHaveBeenCalledOnce();
+    expect(onStaleReplaced).toHaveBeenCalledWith(expect.objectContaining({ staleRelease: "release-old", currentRelease: "release-new" }));
+    await owner.stop();
+  });
+
+  it("still adopts its own release's server, and never stops a holder it cannot place", async () => {
+    const releases = "/operator/connector/releases/";
+    for (const command of [`${releases}release-new/agents/codex/bin/codex app-server`, "/Applications/Codex.app/Contents/Resources/codex app-server"]) {
+      const f = fixture();
+      const stopHolder = vi.fn(async () => undefined);
+      const owner = new NativeCodexAppServerOwner({
+        config: { ...config, RUNNER_BRIDGE_PREFIX: `${releases}release-new/agents/codex` } as RunnerConfig,
+        spawn: f.spawn, stop: f.stop, prepareSocket: vi.fn(async () => "adopt" as const), waitUntilReady: f.waitUntilReady,
+        cleanupSocket: f.cleanupSocket, verifyPackage: f.verifyPackage, restartDelaysMs: [5, 10],
+        socketHolder: vi.fn(async () => ({ pid: 4411, command })), stopHolder,
+      });
+      await owner.start();
+      expect(stopHolder).not.toHaveBeenCalled();
+      expect(f.spawn).not.toHaveBeenCalled();
+      await owner.stop();
+    }
+  });
+
   it("fails startup cleanly when the socket never becomes ready", async () => {
     const f = fixture();
     f.waitUntilReady.mockRejectedValueOnce(new Error("not ready"));
