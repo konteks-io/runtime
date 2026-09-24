@@ -84,6 +84,8 @@ export const OnboardStateSchema = z
     revisit: z.boolean().optional(),
     /** How many times inspect has found the service still starting (WS1-036). */
     startWaits: z.number().int().min(0).optional(),
+    /** The last reply asked "Try that step again now?": its answer is not the step's own. */
+    retryAsked: z.boolean().optional(),
     /** The last step just finished: the next run closes this conversation instead of starting a revisit. */
     closing: z.boolean().optional(),
     /** The runtime this machine was before it lost its key; the next bind replaces it (W1-L1). */

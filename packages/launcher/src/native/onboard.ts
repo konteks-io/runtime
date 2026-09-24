@@ -283,6 +283,19 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
   };
   const save = (next: Partial<OnboardState>) =>
     writeOnboardState(context.root, { ...state, ...next } as never);
+  // The last reply was "Try that step again now?". Its yes or no answers that
+  // question, never the step's own: pass 5's "yes" went on as an email address
+  // and was refused, again and again.
+  if (state.retryAsked) {
+    await save({ retryAsked: undefined } as never);
+    if (context.answer !== undefined) {
+      if (isNo(context.answer.trim())) {
+        return { step: state.step, note: "Stopped here; nothing you answered was lost. Paste the line again whenever you want to carry on." };
+      }
+      const { answer: _retry, ...again } = context;
+      return runOnboardStep(again);
+    }
+  }
   const links = () => ({
     site: siteUrl,
     ...(state.systemId ? { system: `${siteUrl}/systems/${state.systemId}` } : {}),
@@ -1410,6 +1423,7 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
     const again = await runOnboardStep(unanswered).catch(() => null);
     if (again?.ask) return { step, note: `${note} Answer again when you are ready.`, ask: again.ask };
   }
+  if (state) await writeOnboardState(context.root, { ...state, retryAsked: true } as never).catch(() => undefined);
   return { step, note, ask: { question: "Try that step again now?", kind: "confirm" } };
 }
 

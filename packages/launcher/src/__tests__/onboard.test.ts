@@ -946,6 +946,30 @@ describe("onboard", () => {
     expect(no.done?.links.site).toBe("https://app.test");
   });
 
+  it("reads a yes to 'Try that step again now?' as a retry, never as the step's own answer (pass 5)", async () => {
+    await writeOnboardState(root, { step: "first_task", systemId: "sys-1", retryAsked: true } as never);
+    const fetchFn = vi.fn();
+    const retried = await step({ fetchFn: fetchFn as never }, "yes");
+    expect(retried.ask?.question).toBe("What do you want to build first? Your first planning turn is included.");
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect((await readOnboardState(root))?.retryAsked).toBeUndefined();
+
+    await writeOnboardState(root, { step: "first_task", systemId: "sys-1", retryAsked: true } as never);
+    expect((await step({}, "no")).note).toContain("Stopped here");
+
+    // A new conversation that asks nothing yet clears it, so its first real answer counts.
+    await writeOnboardState(root, { step: "first_task", systemId: "sys-1", retryAsked: true } as never);
+    await step({});
+    expect((await readOnboardState(root))?.retryAsked).toBeUndefined();
+  });
+
+  it("marks the retry question so the next answer is read as a retry", async () => {
+    await writeOnboardState(root, { step: "initiative", systemId: "sys-1" } as never);
+    const failed = await onboardFailureStep({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" }, new RemoteInstanceError("temporarily_unavailable", "Konteks could not be reached."));
+    expect(failed.ask?.question).toBe("Try that step again now?");
+    expect((await readOnboardState(root))?.retryAsked).toBe(true);
+  });
+
   it("asks what to build first in plain words, without billing terms (WS1-109)", async () => {
     await writeOnboardState(root, { step: "first_task", systemId: "sys-1" } as never);
     const ask = await step({});
