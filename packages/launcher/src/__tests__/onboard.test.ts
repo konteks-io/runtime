@@ -534,7 +534,7 @@ describe("onboard", () => {
     const initialize = vi.fn(async () => ({ ok: true, message: "konteks-onboard-app is now a git repository on main." }));
     const push = vi.fn(async () => ({ pushed: true, message: "Pushed main to Konteks managed git." }));
     const question = await step({ initialize, push: push as never });
-    expect(question.ask?.question).toContain("joined to the repository Konteks made for it; none of your files are added or changed");
+    expect(question.ask?.question).toContain("It becomes a git repository on main; none of your files are added or changed");
     expect(question.ask?.question).not.toContain("empty first commit"); // WS1-031: the repository usually has its own
     expect(question.ask?.question).toContain("none of your files are added");
     await step({ initialize, push: push as never }, "yes");
@@ -1172,8 +1172,8 @@ describe("onboard", () => {
     const plan = { include: ["README.md", "package.json", "src/app.js"], leftOut: [{ path: ".env", why: "it can hold secrets" }, { path: "node_modules/", why: "installed packages" }] };
     const planCommit = vi.fn(async () => plan);
     const asked = await step({ planCommit });
-    expect(asked.ask?.question).toBe("Push cafe to Konteks managed git now? The folder becomes a git repository on main, joined to the repository Konteks made for it, with one commit of your 3 files.");
-    expect(asked.note).toBe("The commit would hold README.md, package.json and src/app.js. Left out: .env (it can hold secrets) and node_modules/ (installed packages). A .gitignore listing them is added so they stay out.");
+    expect(asked.ask?.question).toBe("Push cafe to Konteks managed git now? It becomes a git repository on main with one commit of the files above.");
+    expect(asked.note).toBe("The commit would hold README.md, package.json and src/app.js. Left out: .env (it can hold secrets) and node_modules/ (installed packages); a new .gitignore in the commit keeps them out.");
 
     await step({ planCommit }, "yes");
     const initialize = vi.fn(async () => ({ ok: true, adopted: true, message: "cafe is now a git repository on main." }));
@@ -1216,14 +1216,13 @@ describe("onboard", () => {
       const ensure = vi.fn(async () => ({ node: "/n", cli: "/c" }));
       const wire = vi.fn(async () => ({ added: [".claude/settings.json", ".mcp.json", "AGENTS.md", "graft/"], changedTracked: [] as string[], mappedFiles: 3 }));
       const yes = await step(graftDeps({ ensure, wire }), "yes");
-      expect(yes.note).toMatch(/^Setting up Graft: downloading it, then building its map of table-booking \(3 files\)\. That usually takes under \d+ seconds\.$/);
+      expect(yes.note).toMatch(/^Setting up Graft: downloading it, then mapping table-booking\. That usually takes under \d+ seconds\.$/);
       expect(ensure).not.toHaveBeenCalled();
       expect(await readOnboardState(root)).toMatchObject({ step: "graft_setup", graftDecision: "accepted" });
 
       const done = await step(graftDeps({ ensure, wire }));
       expect(wire).toHaveBeenCalledWith(root, "/tmp/table-booking", ["claude-code", "codex"], { node: "/n", cli: "/c" });
-      expect(done.note).toContain("Graft is set up in table-booking: its map covers 3 files.");
-      expect(done.note).toContain("which git leaves out of your commits on this machine");
+      expect(done.note).toBe("Graft is set up in table-booking and kept out of your commits.");
       expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
     });
 
@@ -1433,8 +1432,8 @@ describe("onboard", () => {
     const sendChallenge = vi.fn(async () => ({ sentToMasked: "h••••@konteks.io", attemptsRemaining: 5 }));
     const resent = await step({ enrollment: { openIntent, sendChallenge } as never });
     expect(sendChallenge).toHaveBeenCalledWith("intent-2", "hello@konteks.io");
-    expect(resent.note).toContain("h••••@konteks.io");
-    expect(await readOnboardState(root)).toMatchObject({ step: "code", intentRef: "intent-2" });
+    expect(resent.note).toContain("A six-digit code is on its way.");
+    expect(await readOnboardState(root)).toMatchObject({ step: "code", intentRef: "intent-2", emailMasked: "h••••@konteks.io" });
     expect((await readOnboardState(root))?.resendTo).toBeUndefined();
   });
 
@@ -1514,7 +1513,7 @@ describe("onboard", () => {
     }));
     const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "428913", deps: { waitForReady: readyService, enrollment: enrollment as never, fetchFn: (async () => { throw new Error("no fetch"); }) as never } });
     expect(result.note).toContain("after five wrong codes a code stops working, to keep your account safe.");
-    expect(result.note).toContain("A new six-digit code is on its way to a••@acme.test.");
+    expect(result.note).toContain("A new six-digit code is on its way."); expect(result.ask?.question).toContain("a••@acme.test");
     // Said once, not once per chained step (pass 5).
     expect(result.note!.split("after five wrong codes").length).toBe(2);
     expect(result.ask).toMatchObject({ kind: "code" });

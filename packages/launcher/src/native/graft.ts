@@ -205,7 +205,7 @@ export async function graftAlreadyWired(repo: string): Promise<boolean> {
 /** What the offer says: the files Graft adds, and any the repository already tracks. */
 export async function planGraft(repo: string, families: string[]): Promise<{ agents: string[]; adds: string[]; tracked: string[]; files: number }> {
   const agents = families.map(family => GRAFT_AGENT_IDS[family]).filter((id): id is string => Boolean(id));
-  const adds = ["graft/", ...agents.flatMap(id => GRAFT_FILES[id] ?? [])];
+  const adds = ["graft/", ...agents.flatMap(id => GRAFT_FILES[id] ?? []), ".ignore"];
   const listed = (await git(repo, ["ls-files", "--", ...TRACKABLE]).catch(() => "")).split("\n").filter(Boolean);
   const files = (await git(repo, ["ls-files", "--cached", "--others", "--exclude-standard"]).catch(() => "")).split("\n").filter(Boolean).length;
   return { agents, adds, tracked: listed.filter(path => agents.some(id => (GRAFT_FILES[id] ?? []).some(add => path.startsWith(add.replace(/\/$/, ""))))), files };

@@ -66,7 +66,7 @@ describe("graft", () => {
     expect(await graftAlreadyWired(repo)).toBe(false);
     const plain = await planGraft(repo, ["claude-code", "codex"]);
     expect(plain.agents).toEqual(["claude", "agents"]);
-    expect(plain.adds).toEqual(["graft/", ".claude/", ".mcp.json", "AGENTS.md"]);
+    expect(plain.adds).toEqual(["graft/", ".claude/", ".mcp.json", "AGENTS.md", ".ignore"]);
     expect(plain.tracked).toEqual([]);
     expect(plain.files).toBe(1);
 

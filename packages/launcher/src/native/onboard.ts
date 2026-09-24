@@ -419,7 +419,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "code", intentRef, email, emailMasked: sent.sentToMasked, attemptsRemaining: sent.attemptsRemaining, resendTo: undefined, resendReason: undefined } as never);
       return {
         step: "email",
-        note: `${state.resendReason ? `${state.resendReason} ` : ""}A ${state.resendReason ? "new " : ""}six-digit code is on its way to ${sent.sentToMasked}. If it does not arrive within a minute or two, say "send a new code"; for another address, say "use a different email".`,
+        note: `${state.resendReason ? `${state.resendReason} ` : ""}A ${state.resendReason ? "new " : ""}six-digit code is on its way. If it does not arrive in a minute or two, say "send a new code", or "use a different email".`,
         run: AGAIN,
       };
     }
@@ -903,8 +903,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const question = !state.repositoryNeedsInit
         ? `Push ${state.defaultBranch} to the Konteks repository now?`
         : withFiles
-          ? `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it, with one commit of your ${plan.include.length} file${plan.include.length === 1 ? "" : "s"}.`
-          : `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it; none of your files are added or changed.`;
+          ? `Push ${state.repositoryName} to Konteks managed git now? It becomes a git repository on ${state.defaultBranch} with one commit of the files above.`
+          : `Push ${state.repositoryName} to Konteks managed git now? It becomes a git repository on ${state.defaultBranch}; none of your files are added or changed.`;
       if (context.answer === undefined) {
         // A System this machine rejoined, whose branch Konteks already has:
         // there is nothing to agree to. The push only registers this machine's
@@ -917,7 +917,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         const shown = plan.include.slice(0, 8);
         const more = plan.include.length - shown.length;
         const left = plan.leftOut.length > 0
-          ? ` Left out: ${listed(plan.leftOut.map(entry => `${entry.path} (${entry.why})`))}. A .gitignore listing ${plan.leftOut.length === 1 ? "it" : "them"} is added so ${plan.leftOut.length === 1 ? "it stays" : "they stay"} out.`
+          ? ` Left out: ${listed(plan.leftOut.map(entry => `${entry.path} (${entry.why})`))}; a new .gitignore in the commit keeps ${plan.leftOut.length === 1 ? "it" : "them"} out.`
           : "";
         return {
           step: "push",
@@ -1077,7 +1077,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "graft_setup", graftDecision: "accepted", graftRepository: repo });
       return {
         step: "graft",
-        note: `Setting up Graft: downloading it, then building its map of ${state.repositoryName ?? "this repository"} (${plan.files} file${plan.files === 1 ? "" : "s"}). That usually takes under ${graftBuildSeconds(plan.files) + 30} seconds.`,
+        note: `Setting up Graft: downloading it, then mapping ${state.repositoryName ?? "this repository"}. That usually takes under ${graftBuildSeconds(plan.files) + 30} seconds.`,
         run: AGAIN,
       };
     }
@@ -1092,8 +1092,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         return {
           step: "graft_setup",
           note:
-            `Graft is set up in ${state.repositoryName ?? "this repository"}${wired.mappedFiles !== null ? `: its map covers ${wired.mappedFiles} file${wired.mappedFiles === 1 ? "" : "s"}` : ""}. ` +
-            `It added ${listed(wired.added)}, which git leaves out of your commits on this machine.${changed} A graft command sits next to konteks-remote for your agents.`,
+`Graft is set up in ${state.repositoryName ?? "this repository"} and kept out of your commits.${changed}`,
           run: AGAIN,
         };
       } catch (error) {
