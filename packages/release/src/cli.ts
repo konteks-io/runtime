@@ -2,7 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { Command } from "commander";
 import { ed25519PrivateKeyFromJwk, generateEd25519 } from "@konteks/remote-common";
-import { signNativeReleaseManifest, verifyNativeRelease } from "./native.js";
+import { signNativeProductionReleaseManifest, verifyNativeRelease } from "./native.js";
 import { loadReleaseRootsFile } from "./roots.js";
 
 /**
@@ -24,7 +24,10 @@ program
     delete unsigned.digest;
     delete unsigned.signature;
     const privateKey = ed25519PrivateKeyFromJwk(JSON.parse(await readFile(options.key, "utf8")));
-    const signed = signNativeReleaseManifest(unsigned as never, { keyId: options.keyId, privateKey });
+    const signed = signNativeProductionReleaseManifest(
+      unsigned as never,
+      { keyId: options.keyId, privateKey },
+    );
     await writeFile(options.out, `${JSON.stringify(signed, null, 2)}\n`);
     process.stdout.write(`signed native connector ${options.manifest} -> ${options.out} (digest ${signed.digest})\n`);
   });
