@@ -1776,6 +1776,11 @@ export class Supervisor {
           return this.requireUpdates().apply("operator");
         case "update.status":
           return this.requireUpdates().status();
+        case "release.accepted": {
+          if (!this.instanceId) return { bundleVersion: null };
+          const accepted = await this.core.acceptedRelease(this.instanceId);
+          return { bundleVersion: accepted?.bundleVersion ?? null };
+        }
         case "doctor":
           return this.doctor();
         case "logs":
