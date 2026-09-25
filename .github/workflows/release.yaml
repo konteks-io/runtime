@@ -44,6 +44,7 @@ jobs:
           DEB_SIGNING_KEY: ${{ secrets.DEB_SIGNING_KEY }}
         run: |
           test -n "$KONTEKS_RELEASE_ROOTS_JSON" || { echo "KONTEKS_RELEASE_ROOTS_JSON variable is required: a connector without embedded roots verifies nothing"; exit 1; }
+          node -e 'const value = JSON.parse(process.env.KONTEKS_RELEASE_ROOTS_JSON); if (!Array.isArray(value.roots) || !value.roots.some(root => Array.isArray(root.coreControlKeys) && root.coreControlKeys.length > 0)) { throw new Error("KONTEKS_RELEASE_ROOTS_JSON must certify at least one Core control key; otherwise every production directive is rejected") }'
           node scripts/build-launcher.mjs --os "${{ matrix.os }}" --out "dist/${{ matrix.package }}"
           node scripts/sign-launcher.mjs --os "${{ matrix.os }}" --architecture "${{ matrix.architecture }}" --artifact "dist/${{ matrix.package }}"
       - name: Build complete offline agent packages and describe every artifact
