@@ -295,6 +295,16 @@ describe("relayed session (D98/D113/D114)", () => {
     for (const stage of stages) expect(stage.durationMs).toBeGreaterThanOrEqual(0);
   });
 
+  it("passes Core's display label to the runner so the provider session is named after the work", async () => {
+    const sessionLabel = { system: "Todo List", kind: "initiative", title: "[v3] Stand up the todo list API" };
+    const { session, runner } = await build({}, { ...assignment, sessionLabel });
+    await session.bootstrap();
+    expect(vi.mocked(runner.createSession).mock.calls[0]?.[0]).toMatchObject({ sessionLabel });
+    const unlabelled = await build();
+    await unlabelled.session.bootstrap();
+    expect(vi.mocked(unlabelled.runner.createSession).mock.calls[0]?.[0]).not.toHaveProperty("sessionLabel");
+  });
+
   it("prefers a live continuation over the restart-only restore fallback", async () => {
     const { session, runner } = await build({
       deploymentKind: "native_connector",

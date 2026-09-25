@@ -323,7 +323,7 @@ export class WorkOrchestrator {
       }
       const retained = this.deps.deploymentKind === "native_connector" ? this.deps.journal.execution.start(assignment.id, assignment.attempt) : undefined;
       if (retained) {
-        if (jcsDigest(retained.assignment as JsonValue) !== jcsDigest(assignment as JsonValue)) throw new RemoteInstanceError("recovery_required", "Retained admission assignment changed.");
+        if (jcsDigest(withoutDisplayLabel(retained.assignment) as JsonValue) !== jcsDigest(withoutDisplayLabel(assignment) as JsonValue)) throw new RemoteInstanceError("recovery_required", "Retained admission assignment changed.");
         await this.reconstructAdmissionProjections(assignment.id, assignment.attempt);
         continue; // Repair is never transport or execution authority.
       }
@@ -1784,4 +1784,10 @@ function recoveryEvidenceRetryDelayMs(attemptsBefore: number): number {
 function recoveryEvidenceFailureCode(error: unknown): string {
   if (error instanceof RemoteInstanceError) return error.code.slice(0, 128);
   return "temporarily_unavailable";
+}
+
+/** The session label is display-only and Core may rename it between pulls; it is never admission identity. */
+function withoutDisplayLabel(assignment: RemoteWorkAssignment): Omit<RemoteWorkAssignment, "sessionLabel"> {
+  const { sessionLabel: _label, ...identity } = assignment;
+  return identity;
 }

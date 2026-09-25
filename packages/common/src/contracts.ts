@@ -143,6 +143,7 @@ export type {
   EraseReceipt,
   // Work protocol
   RemoteWorkAssignment,
+  RemoteSessionLabel,
   // Permissions (D102)
   PendingPermissionView,
   PermissionAnswerRequest,
@@ -330,6 +331,8 @@ export {
   RelayRuntimeHandshakeResultSchema,
   RelayReplayRequestSchema,
   RemoteWorkAssignmentSchema,
+  REMOTE_SESSION_LABEL_CAPABILITY,
+  RemoteSessionLabelSchema,
   WorkAvailableSchema,
   ClaimResultSchema,
   ReportAckSchema,

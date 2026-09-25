@@ -210,6 +210,14 @@ describe("session manager (D98 bootstrap)", () => {
     expect(calls.loadSession?.[0]).not.toHaveProperty("_meta");
     expect(calls.newSession).toHaveLength(1);
   });
+  it("names a new session from Core's display label", async () => {
+    const { bridge, calls } = fakeBridge();
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });
+    const created = await manager.create({ context: { ...context, agentId: "claude-code" }, cwd: "/w", mcpServers: [],
+      sessionLabel: { system: "Todo List", kind: "initiative", title: "[v3] Stand up the todo list API" } });
+    const title = `[konteks/Todo List/initiative] [v3] Stand up the todo list API ${created.acpSessionRef.slice(-8)}`;
+    expect(calls.newSession?.[0]).toMatchObject({ _meta: { konteksSession: { version: 1, title }, claudeCode: { options: { title } } } });
+  });
   it("refuses a later setting that resets an already confirmed model", async () => {
     const option = (id: string, currentValue: string) => ({ id, type: "select", name: id, currentValue, options: [{ value: currentValue, name: currentValue }] });
     const setSessionConfigOption = vi.fn(async ({ configId }: { configId: string }) => ({ configOptions:

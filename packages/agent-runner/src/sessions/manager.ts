@@ -16,7 +16,7 @@ import { AcpNativeObservationSchema, RemoteInstanceError, type AgentTurnUsageObs
 import type { BridgeProcess } from "../bridge/process.js";
 import { classifyBridgeError } from "../bridge/process.js";
 import type { RunnerEventBus } from "../events.js";
-import { konteksSessionMetadata } from "./title.js";
+import { konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
 
 /**
  * ACP sessions inside this runner. The supervisor creates them as a
@@ -47,6 +47,8 @@ export interface CreateSessionArgs {
   acpSessionRef?: string;
   /** Restart recovery whose durable context was staged outside the provider transcript. */
   freshProviderSessionOnRestore?: boolean;
+  /** Display-only naming for the provider session list; never authority. */
+  sessionLabel?: KonteksSessionLabel;
   /** Native in-process owner; opaque connector ref, never the bridge session ID. */
   lifecycle?: {
     beforeCreate(opaqueRef: string): Promise<void>;
@@ -395,7 +397,7 @@ export class SessionManager {
       let created: { sessionId: string };
       try {
         created = await this.boundedBootstrap("session_new", args, bridge,
-          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: konteksSessionMetadata(`Coding session ${acpSessionRef.slice(-8)}`, args.context.agentId) }), bootstrapAttempt);
+          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId) }), bootstrapAttempt);
       } catch (error) {
         if (error instanceof RemoteInstanceError && error.retryable) throw error;
         const classified = classifyBridgeError(error);

@@ -368,6 +368,7 @@ export class RelayedSession {
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
       ...(restoreRef ? { restoreAcpSessionRef: restoreRef } : {}),
       ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
+      ...(this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
     }, lifecycle));
     this.creationReturned = true;
     if (lifecycle && reservedRef !== created.acpSessionRef) throw new RemoteInstanceError("recovery_required", "Runner did not preserve durable reference ownership.");

@@ -22,7 +22,7 @@ describe("native host inventory (A4 D133)", () => {
     const inventory = new NativeInventoryCollector({ runners, sampler: { sample: async () => signals }, bundleVersion: "1.0.0" });
     const snapshot = await inventory.collect();
     expect(snapshot.agents).toEqual([agent, claude]);
-    expect(snapshot.components[0]).toMatchObject({ healthStatus: "healthy", capabilities: ["agent:codex"] });
+    expect(snapshot.components[0]).toMatchObject({ healthStatus: "healthy", capabilities: ["agent:codex", "session-label-v1"] });
     expect(runners.get("codex")!.readiness).toHaveBeenCalledOnce();
     expect(runners.get("claude-code")!.readiness).toHaveBeenCalledOnce();
   });
@@ -30,7 +30,7 @@ describe("native host inventory (A4 D133)", () => {
   it('advertises delivery separately and removes it when ownership or local-agent readiness is lost', async () => {
     let owned = true;
     const f = fixture(() => true, undefined, () => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(['agent:codex', 'execution-permits-v1', 'delivery-execution-permits-v1']);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(['agent:codex', 'execution-permits-v1', 'delivery-execution-permits-v1', 'session-label-v1']);
     owned = false;
     expect((await f.inventory.collect()).components[0]?.capabilities).not.toContain('delivery-execution-permits-v1');
     owned = true;
@@ -53,7 +53,7 @@ describe("native host inventory (A4 D133)", () => {
   it("advertises the composed cancellation owner independently of agent sign-in", async () => {
     let owned = true;
     const f = fixture(undefined, () => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "cancellation-delivery-v1"]);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "cancellation-delivery-v1", "session-label-v1"]);
     f.readiness.mockResolvedValue({ agent: { ...agent, readiness: "not_configured" }, utilization: { activeSessions: 0, activeTurns: 0 } });
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["cancellation-delivery-v1"]);
     owned = false;
@@ -62,9 +62,9 @@ describe("native host inventory (A4 D133)", () => {
   it("advertises permit admission only while a live owner and ready agent exist", async () => {
     let owned = true;
     const f = fixture(() => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "execution-permits-v1"]);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "execution-permits-v1", "session-label-v1"]);
     owned = false;
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex"]);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "session-label-v1"]);
     owned = true;
     f.readiness.mockRejectedValue(new Error("runner unavailable"));
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual([]);
@@ -72,7 +72,7 @@ describe("native host inventory (A4 D133)", () => {
   it("reports only the actual in-process runner and host pressure, never appliance components", async () => {
     const f = fixture();
     const snapshot = await f.inventory.collect();
-    expect(snapshot.components).toEqual([{ kind: "agent_runner", version: "1.0.0", healthStatus: "healthy", capabilities: ["agent:codex"], lastProbeAt: signals.observedAt }]);
+    expect(snapshot.components).toEqual([{ kind: "agent_runner", version: "1.0.0", healthStatus: "healthy", capabilities: ["agent:codex", "session-label-v1"], lastProbeAt: signals.observedAt }]);
     expect(snapshot).toMatchObject({ agents: [agent], hostPressure: 0.3, activeSessions: 2, activeTurns: 1, browserToolAvailable: false, gatewayRollupIncompleteSince: null, diskFreeBytes: 100 });
     expect(deriveAdvertisedRoles([
       { role: "generator", agentPreference: ["codex"] },
