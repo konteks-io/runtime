@@ -3,11 +3,13 @@ import { chmod, mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import {
   RemoteInstanceError, RemoteSignedBundleManifestSchema, bundleManifestSigningBytes,
-  agentModelCapabilityMappingSigningBytes, computeBundleManifestDigest, ed25519Sign, ed25519Verify,
+  agentModelCapabilityMappingSigningBytes, computeAgentModelCapabilityMappingDigest,
+  computeBundleManifestDigest, ed25519Sign, ed25519Verify,
   parseRfc3339, verifyBundleManifestTrust,
   type AgentModelCapabilityMapping, type RemoteNativeArtifact, type RemoteSignedBundleManifest,
 } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "./manifest.js";
+import { reviewedNativeModelIdentities } from "./reviewed-model-capabilities.js";
 
 const verified = Symbol("verified-native-release");
 export interface VerifiedNativeRelease {
@@ -26,6 +28,57 @@ export function signNativeReleaseManifest(
     ...withDigest,
     signature: { algorithm: "Ed25519", keyId: key.keyId, value: ed25519Sign(key.privateKey, bundleManifestSigningBytes(withDigest)) },
   });
+}
+
+/**
+ * Production release signer. Every reviewed selector mapping is bound to one
+ * exact bridge artifact and signed independently before the surrounding
+ * manifest is signed. The runtime can therefore publish only model authority
+ * that travelled with the installed, verified artifact.
+ */
+export function signNativeProductionReleaseManifest(
+  unsigned: Omit<RemoteSignedBundleManifest, "digest" | "signature">,
+  key: { keyId: string; privateKey: KeyObject },
+  now = new Date(),
+): RemoteSignedBundleManifest {
+  const issuedAt = now.toISOString();
+  const mappings = (unsigned.nativeArtifacts ?? []).flatMap(artifact => {
+    if (artifact.kind !== "agent_bridge" || !artifact.agentId) return [];
+    const modelIdentities = reviewedNativeModelIdentities(artifact.agentId);
+    if (!modelIdentities) return [];
+    const body = {
+      version: 1 as const,
+      mappingId: `${artifact.id}-models`,
+      mappingRevision: 1,
+      bridgeProfileRef: artifact.id,
+      bridgeArtifactDigest: artifact.digest,
+      configId: "model",
+      optionType: "select" as const,
+      modelIdentities: modelIdentities.map(identity => ({ ...identity })),
+      issuedAt,
+      expiresAt: unsigned.expiresAt,
+    };
+    const withDigest = {
+      ...body,
+      mappingDigest: computeAgentModelCapabilityMappingDigest(body),
+    };
+    const placeholder: AgentModelCapabilityMapping = {
+      ...withDigest,
+      signature: { algorithm: "Ed25519", keyId: key.keyId, value: "AA" },
+    };
+    return [{
+      ...withDigest,
+      signature: {
+        algorithm: "Ed25519" as const,
+        keyId: key.keyId,
+        value: ed25519Sign(
+          key.privateKey,
+          agentModelCapabilityMappingSigningBytes(placeholder),
+        ),
+      },
+    }];
+  });
+  return signNativeReleaseManifest({ ...unsigned, modelCapabilityMappings: mappings }, key);
 }
 
 /** Adapted from bb's host-only update pipeline; Konteks additionally requires release-root signatures. */

@@ -5,7 +5,10 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RemoteSignedBundleManifestSchema } from "@konteks/remote-common";
 import { buildReleaseFixture } from "../fixtures.js";
-import { signNativeReleaseManifest, verifyNativeRelease } from "../native.js";
+import {
+  signNativeProductionReleaseManifest,
+  verifyNativeRelease,
+} from "../native.js";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -32,12 +35,31 @@ describe("native release pipeline", () => {
     execFileSync(process.execPath, [resolve("scripts/assemble-release-manifest.mjs"), "--tag", "v1.2.3", "--artifacts", index, "--policy", resolve("release/release-policy.json"), "--out", out], { cwd: resolve(".") });
     const manifest = JSON.parse(await readFile(out, "utf8"));
     const fixture = buildReleaseFixture();
-    const signed = signNativeReleaseManifest(manifest, { keyId: fixture.keyId, privateKey: fixture.privateKey });
+    const signed = signNativeProductionReleaseManifest(
+      manifest,
+      { keyId: fixture.keyId, privateKey: fixture.privateKey },
+      new Date("2026-09-26T00:00:00Z"),
+    );
     expect(RemoteSignedBundleManifestSchema.safeParse(signed).success).toBe(true);
     expect(manifest).toMatchObject({ bundleVersion: "1.2.3", deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [] });
     expect(manifest.nativeArtifacts).toHaveLength(20);
     expect(JSON.stringify(manifest)).not.toMatch(/harness|validation.runtime|gateway|compose|docker|postgres|valkey/i);
-    expect(verifyNativeRelease(signed, [fixture.root], Date.now()).manifest.nativeArtifacts).toHaveLength(20);
+    const verified = verifyNativeRelease(
+      signed,
+      [fixture.root],
+      Date.parse("2026-09-26T00:00:00Z"),
+    ).manifest;
+    expect(verified.nativeArtifacts).toHaveLength(20);
+    expect(verified.modelCapabilityMappings).toHaveLength(10);
+    expect(verified.modelCapabilityMappings?.map(mapping => mapping.bridgeProfileRef).sort()).toEqual(
+      artifacts
+        .filter(artifact => artifact.kind === "agent_bridge" && artifact.agentId !== "opencode")
+        .map(artifact => artifact.id)
+        .sort(),
+    );
+    expect(verified.modelCapabilityMappings?.every(mapping =>
+      mapping.signature.keyId === fixture.keyId && mapping.signature.value !== "AA",
+    )).toBe(true);
   });
 
   it("rejects an incomplete platform or agent matrix before producing a manifest", async () => {
