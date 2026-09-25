@@ -40,6 +40,7 @@ import {
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
+import { DshToolGovernance } from "./dsh-tool-governance.js";
 
 /**
  * One relayed ACP session (D98/D113/D114): bootstrapped by the supervisor as a
@@ -155,6 +156,8 @@ export class RelayedSession {
   private readonly lastChunkText = new Map<string, { text: string; inPath: boolean }>();
   /** Safe tool identity carried from `tool_call` to sparse terminal updates. */
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
+  /** Rebuilds DeepSeek Harness permission requests and trips on an unasked tool (dsh-tool-governance.ts). */
+  private readonly dshGovernance: DshToolGovernance | null;
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
   private readonly executionGate: NativeExecutionGate | null;
@@ -166,6 +169,7 @@ export class RelayedSession {
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
 
   constructor(readonly assignment: RemoteWorkAssignment, private readonly deps: RelayedSessionDeps) {
+    this.dshGovernance = assignment.agentRoute.agentId === "dsh" ? new DshToolGovernance() : null;
     this.boundChannelId = deps.deploymentKind === "native_connector" ? null : `session:${assignment.id}:${assignment.attempt}:${randomUUID().slice(0, 8)}`;
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
     this.executionGate = deps.deploymentKind === "native_connector" &&
@@ -798,9 +802,12 @@ export class RelayedSession {
     if (this.closed || this.acpSessionRef === null || !("acpSessionRef" in event) || event.acpSessionRef !== this.acpSessionRef) return;
     this.deps.assertExecutionOwned?.();
     switch (event.kind) {
-      case "session_update":
+      case "session_update": {
+        const bypass = this.dshGovernance?.observe((event.params as { update?: unknown } | null)?.update) ?? null;
         await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
+        if (bypass) await this.onDshGovernanceBypass(bypass);
         return;
+      }
       case "prompt_result": {
         if (this.deps.deploymentKind === "native_connector" && this.assignment.kind === "delivery" &&
             this.assignment.source.kind === "harness_delivery") {
@@ -875,6 +882,21 @@ export class RelayedSession {
   private async onPermissionRequest(requestId: string, params: RequestPermissionRequest): Promise<void> {
     const ref = this.acpSessionRef;
     if (ref === null) return;
+    if (this.dshGovernance) {
+      // dsh asks with only a tool call id; judge the call it names, or refuse.
+      const verdict = this.dshGovernance.decide(params, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`);
+      if (verdict.kind !== "evaluate") {
+        if (this.closed) return;
+        this.deps.assertExecutionOwned?.();
+        const kind = verdict.kind === "allow" ? "allow_once" : "reject_once";
+        const optionId = params.options.find(option => option.kind === kind)?.optionId;
+        if (verdict.kind === "deny") {
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId, reason: verdict.reason }, "DeepSeek Harness tool call refused by policy");
+        }
+        return void (await this.deps.runner.answer(ref, requestId, optionId === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
+      }
+      params = verdict.request;
+    }
     const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.deps.workspaceRoot });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
@@ -893,6 +915,21 @@ export class RelayedSession {
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "cancelled" } }));
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: params.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
+  }
+
+  /**
+   * The Konteks ask hook did not run for a gated dsh tool that has now
+   * completed: stop the turn and take dsh out of service until the connector
+   * restarts, so at most one call ever runs unjudged.
+   */
+  private async onDshGovernanceBypass(bypass: { toolCallId: string; title: string }): Promise<void> {
+    const ref = this.acpSessionRef;
+    this.logger.error({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: bypass.toolCallId, tool: bypass.title.slice(0, 128), diagnostic: "dsh_tool_governance_bypassed" },
+      "DeepSeek Harness ran a gated tool without asking; stopping the turn and taking it out of service");
+    if (ref !== null) await this.deps.runner.cancel(ref).catch(error => this.logger.warn({ err: error }, "cancel after a governance bypass failed"));
+    await this.deps.runner.quarantine?.("DeepSeek Harness ran a tool without asking Konteks first. Update or reinstall DeepSeek Harness, then restart the connector.")
+      .catch(error => this.logger.warn({ err: error }, "quarantine after a governance bypass failed"));
+    await this.close("agent_exited");
   }
 
   private async onElicitationRequest(requestId: string, params: CreateElicitationRequest): Promise<void> {

@@ -133,6 +133,8 @@ export class AgentRuntime {
    * polling cannot create a visible Codex thread on every refresh. */
   private readonly modelCapabilities = new Map<string, Promise<DiscoveredBridgeModelCapability>>();
   private stopping = false;
+  /** Set when the agent broke a governance guarantee; no bridge starts again in this process. */
+  private quarantined: string | null = null;
 
   constructor(private readonly options: AgentRuntimeOptions) {
     this.events = options.events ?? new RunnerEventBus();
@@ -157,9 +159,6 @@ export class AgentRuntime {
     await mkdir(this.options.config.RUNNER_CREDENTIAL_DIR, { recursive: true, mode: 0o700 });
     await mkdir(this.options.config.RUNNER_WORKSPACE_DIR, { recursive: true });
     this.scope = await this.scopeStore.read();
-    // The person's own DeepSeek Harness reads the Konteks overlay from files
-    // its spawn arguments name; write them before its first start.
-    if (this.family.hostInstall !== undefined) await writeDshKonteksProfile(dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).konteksDir);
     await this.ensureBridge();
     await this.probe(false);
   }
@@ -190,7 +189,8 @@ export class AgentRuntime {
       return Promise.reject(new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization."));
     }
     const bridge = Promise.resolve().then(async () => {
-      await verifyNativeRunnerPackage(this.options.config, this.logger);
+      this.assertNotQuarantined();
+      await this.prepareToSpawn(this.logger);
       if (this.stopping || this.executionBridges.get(ref)!.stopping) throw new RemoteInstanceError("agent_unavailable", "Native execution owner is stopping.");
       // A resident process costs this reference one `session/new`; only when
       // none is idle does it pay the spawn plus ACP `initialize`.
@@ -584,7 +584,7 @@ export class AgentRuntime {
         "reusing authenticated ACP model capability");
       return structuredClone(await cached);
     }
-    await verifyNativeRunnerPackage(this.options.config);
+    await this.prepareToSpawn();
     const discovery = {
       configId,
       workspaceRoot: this.options.config.RUNNER_WORKSPACE_DIR,
@@ -635,7 +635,43 @@ export class AgentRuntime {
   }
 
   /** (Re)spawns the bridge and performs the runner-local `initialize`. */
+  /**
+   * Take this agent out of service for the life of the process: stop every
+   * bridge, refuse new ones and read as unavailable. Used when DeepSeek
+   * Harness ran a gated tool without asking (dsh-tool-governance.ts).
+   */
+  async quarantine(reason: string): Promise<void> {
+    this.quarantined = reason;
+    this.logger.error({ event: "agent.quarantined", agentId: this.family.agentId }, "agent taken out of service");
+    this.connectionState = "failed";
+    this.publishReadiness();
+    const errors: unknown[] = [];
+    for (const ref of this.executionBridges.keys()) {
+      try { await this.stopExecutionBridge(ref); } catch (error) { errors.push(error); }
+    }
+    try { await this.discardIdleExecutionBridge("runtime_stop"); } catch (error) { errors.push(error); }
+    await this.bridge?.stop();
+    this.bridge = null;
+    if (errors.length) this.logger.warn({ errors: errors.length }, "some bridges did not stop cleanly during quarantine");
+  }
+
+  /**
+   * Before any bridge process starts: re-verify a bundled package, or rewrite
+   * the Konteks overlay a host-installed DeepSeek Harness boots from. Every
+   * dsh process reads those files at boot, so a changed copy heals on the next
+   * spawn instead of leaving it unguarded (CP3 live proof, phase 2).
+   */
+  private async prepareToSpawn(logger?: Pick<Logger, "info">): Promise<void> {
+    await verifyNativeRunnerPackage(this.options.config, logger);
+    if (this.family.hostInstall !== undefined) await writeDshKonteksProfile(dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).konteksDir);
+  }
+
+  private assertNotQuarantined(): void {
+    if (this.quarantined !== null) throw new RemoteInstanceError("agent_unavailable", this.quarantined);
+  }
+
   async ensureBridge(): Promise<void> {
+    this.assertNotQuarantined();
     if (this.stopping) return;
     if (this.bridgeStart) return this.bridgeStart;
     if (this.bridge && !this.bridge.exited) return;
@@ -656,7 +692,7 @@ export class AgentRuntime {
       let exitedDuringStart = false;
       const initializeStartedAt = Date.now();
       try {
-        await verifyNativeRunnerPackage(this.options.config, this.logger);
+        await this.prepareToSpawn(this.logger);
         if (this.stopping) return;
         const candidate = await (this.options.spawn ?? spawnBridge)({
           spec: this.spec,
@@ -732,7 +768,7 @@ export class AgentRuntime {
   async probe(isLogin: boolean, organizationAttested = false): Promise<ConnectedAgentView> {
     let result: IdentityProbe;
     try {
-      await verifyNativeRunnerPackage(this.options.config);
+      await this.prepareToSpawn();
       result = await (this.options.probe ?? probeIdentity)(this.options.config, this.family, this.spec.env);
     } catch (error) {
       this.logger.warn({ err: error }, "identity probe failed");

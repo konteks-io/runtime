@@ -59,6 +59,8 @@ export interface RunnerPort {
   loginInput(loginId: string, text: string): Promise<unknown>;
   loginCancel(loginId: string): Promise<unknown>;
   logout(): Promise<ConnectedAgentView>;
+  /** Take the agent out of service until the connector restarts (a governance bypass). */
+  quarantine?(reason: string): Promise<void>;
   probe(): Promise<ConnectedAgentView>;
   startEvents(): void;
   stopEvents(): void;

@@ -1,4 +1,5 @@
 import { isSecretKey, redactText } from "@konteks/remote-common";
+import { DSH_TOOL_KINDS } from "./dsh-tool-governance.js";
 
 const TOOL_TITLE_PLACEHOLDER = /^(?:other|tool|unknown[ _-]?tool)$/i;
 const ACP_TOOL_KINDS = new Set([
@@ -35,6 +36,7 @@ export function canonicalizeAcpToolActivity(
   if (candidate.sessionUpdate !== "tool_call" && candidate.sessionUpdate !== "tool_call_update") {
     return value;
   }
+  if (dialectId === "dsh") return canonicalizeDshToolActivity(candidate, prior);
   if (dialectId !== "claude-code") return value;
   const meta = candidate._meta;
   const rawTool = meta !== null && typeof meta === "object" && !Array.isArray(meta)
@@ -85,6 +87,25 @@ export function canonicalizeAcpToolActivity(
     ...(titleFallback !== undefined && (currentTitle === undefined || TOOL_TITLE_PLACEHOLDER.test(currentTitle.trim()))
       ? { title: titleFallback }
       : {}),
+  };
+}
+
+/**
+ * DeepSeek Harness reports every tool call as ACP `other`, titled with its own
+ * tool name from a closed set. Give those their ACP kind for activity, and
+ * promote the federated `platform__*` name behind an MCP title as for Claude.
+ * An arbitrary title still never becomes a name.
+ */
+function canonicalizeDshToolActivity(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+  const title = typeof candidate.title === "string" ? candidate.title : undefined;
+  const name = platformMcpToolName(title) ?? prior?.name;
+  const kind = (title !== undefined ? DSH_TOOL_KINDS[title] : undefined) ?? prior?.kind;
+  const currentKind = typeof candidate.kind === "string" ? candidate.kind : undefined;
+  if (name === undefined && kind === undefined) return candidate;
+  return {
+    ...candidate,
+    ...(name !== undefined && typeof candidate.name !== "string" ? { name } : {}),
+    ...(kind !== undefined && (currentKind === undefined || currentKind === "other") ? { kind } : {}),
   };
 }
 

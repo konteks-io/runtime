@@ -97,6 +97,10 @@ export class NativeRunner implements RunnerPort {
     return this.stopPromise;
   }
 
+  async quarantine(reason: string): Promise<void> {
+    await this.runtime.quarantine(reason);
+  }
+
   startEvents(): void {
     if (!this.stopping) this.unsubscribe ??= this.runtime.events.subscribe(this.options.onEvent);
   }

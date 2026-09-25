@@ -8,6 +8,7 @@ import { SupervisorJournal } from "../state/journal.js";
 import { PermissionBroker, answerIsValid, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest } from "../session/permissions.js";
 import type { DeferredPermissionBody } from "../core/client.js";
 import { EvaluatorPolicyResponder, isSignInElicitation } from "../session/policy-responder.js";
+import { createWorkspaceToolPolicy } from "../session/workspace-tool-policy.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
 import type { RunnerClient } from "../runner-client.js";
 import type { TransportManager } from "../transport/relay-transport.js";
@@ -174,6 +175,60 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(f.closed).toEqual(["relay_replay_gap"]);
     await f.session.close("relay_replay_gap");
     expect(f.closed).toHaveLength(1);
+  });
+
+  describe("DeepSeek Harness tool governance (dsh-runtime-support CP3)", () => {
+    const dshWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "dsh" } };
+    const options = [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }, { optionId: "reject-once", name: "Reject", kind: "reject_once" }];
+    async function dshSession() {
+      const quarantine = vi.fn(async () => undefined);
+      const f = await build({ policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) }, dshWork);
+      (f.runner as unknown as { quarantine: typeof quarantine }).quarantine = quarantine;
+      await f.session.bootstrap();
+      const toolCall = (toolCallId: string, title: string, rawInput: Record<string, unknown>) =>
+        f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "tool_call", toolCallId, title, kind: "other", status: "in_progress", rawInput } } });
+      const finished = (toolCallId: string) =>
+        f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "tool_call_update", toolCallId, status: "completed", content: [] } } });
+      const ask = (requestId: string, toolCallId: string) =>
+        f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId }, options } });
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
+      return { ...f, quarantine, toolCall, finished, ask, answer };
+    }
+
+    it("judges the real command and path behind each dsh request with the native policy", async () => {
+      const f = await dshSession();
+      await f.toolCall("t-echo", "bash", { command: "echo hello" }); await f.ask("p-echo", "t-echo");
+      await f.toolCall("t-push", "bash", { command: "git push origin main" }); await f.ask("p-push", "t-push");
+      await f.toolCall("t-sudo", "bash", { command: "sudo rm -rf /tmp/x" }); await f.ask("p-sudo", "t-sudo");
+      await f.toolCall("t-in", "write", { file_path: "notes.txt", content: "hi" }); await f.ask("p-in", "t-in");
+      await f.toolCall("t-out", "write", { file_path: "/etc/outside.txt", content: "no" }); await f.ask("p-out", "t-out");
+      await f.toolCall("t-mcp", "mcp__konteks-platform__platform__builtin__echo", { text: "ping" }); await f.ask("p-mcp", "t-mcp");
+      await f.toolCall("t-esc", "bash", { command: "ls", sandbox_permissions: "danger-full-access", justification: "x" }); await f.ask("p-esc", "t-esc");
+      await f.ask("p-ghost", "t-never-seen");
+      expect({ echo: f.answer("p-echo"), push: f.answer("p-push"), sudo: f.answer("p-sudo"), inside: f.answer("p-in"), outside: f.answer("p-out"), mcp: f.answer("p-mcp"), escalation: f.answer("p-esc"), ghost: f.answer("p-ghost") })
+        .toEqual({ echo: "allow-once", push: "reject-once", sudo: "reject-once", inside: "allow-once", outside: "reject-once", mcp: "allow-once", escalation: "reject-once", ghost: "reject-once" });
+      expect(f.quarantine).not.toHaveBeenCalled();
+    });
+
+    it("gives dsh tool calls their ACP kind and the platform tool name in relayed activity", async () => {
+      const f = await dshSession();
+      await f.toolCall("t-1", "bash", { command: "ls" });
+      await f.toolCall("t-2", "mcp__konteks-platform__platform__builtin__echo", { text: "ping" });
+      const updates = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } }).filter(body => body.method === "session/update").map(body => body.params!.update!);
+      expect(updates[0]).toMatchObject({ toolCallId: "t-1", kind: "execute", title: "bash" });
+      expect(updates[1]).toMatchObject({ toolCallId: "t-2", name: "platform__builtin__echo" });
+    });
+
+    it("stops the turn and takes dsh out of service when a gated tool ran without asking", async () => {
+      const f = await dshSession();
+      await f.toolCall("t-ok", "bash", { command: "ls" }); await f.ask("p-ok", "t-ok"); await f.finished("t-ok");
+      await f.toolCall("t-read", "read", { file_path: "a" }); await f.finished("t-read");
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.toolCall("t-bypass", "bash", { command: "curl https://example.com" }); await f.finished("t-bypass");
+      expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
+      expect(f.quarantine).toHaveBeenCalledWith(expect.stringMatching(/without asking/));
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
   });
 
   it("relays actual runner message/tool updates with the opaque session reference, never hidden thoughts", async () => {
