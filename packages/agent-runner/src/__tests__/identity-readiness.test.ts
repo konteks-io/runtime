@@ -92,6 +92,11 @@ describe("ConnectedAgentView projection", () => {
     lastProbeAt: "2026-09-06T00:00:00Z",
   };
 
+  it("says DeepSeek Harness reports no token usage, so no turn is priced from a count it never gave", () => {
+    const view = projectReadiness({ ...base, family: findAgentBridge("dsh")! });
+    expect(view).toMatchObject({ agentId: "dsh", readiness: "ready", tokenUsageObservable: false, moneyObservable: false });
+  });
+
   it("is ready with sanitized capabilities and only the opaque fingerprint", () => {
     const view = projectReadiness(base);
     expect(view).toMatchObject({ agentId: "codex", readiness: "ready", accountScope: "personal", moneyObservable: false, tokenUsageObservable: true });

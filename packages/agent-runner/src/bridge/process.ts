@@ -197,6 +197,14 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
  */
 const DSH_KEY_MISSING = /llm-deepseek: (?:no API key for provider route|the API key resolved from \S+ contains characters no HTTP header can carry)/;
 
+/**
+ * DeepSeek Harness's own adapter wording for a provider it could not reach
+ * or that sent nothing (dsh 0.1.7-rc.2 llm-deepseek/src/adapter.ts). The ACP
+ * error drops dsh's stable failure code, so these fixed messages are all a
+ * client can route on until dsh forwards the code.
+ */
+const DSH_PROVIDER_FAILURE = /turn failed: DeepSeek Messages (?:stream idle timeout|transport failed|returned no response body)$/;
+
 function signInLapsed(data: unknown): boolean {
   if (data === undefined || data === null) return false;
   let text: string;
@@ -216,6 +224,9 @@ export function classifyBridgeError(error: unknown): {
     if (error.code === -32000 || /auth/i.test(message) || signInLapsed(error.data) || DSH_KEY_MISSING.test(message)) {
       return { code: error.code, class: "agent_auth_required", message: "agent authentication required", retryable: false };
     }
+    // dsh already retried these five times; a turn is not idempotent, so name
+    // the provider and let the person decide, never retry the whole turn.
+    if (DSH_PROVIDER_FAILURE.test(message)) return { code: error.code, class: "provider_failure", message, retryable: false };
     if (error.code === -32602) return { code: error.code, class: "invalid_params", message, retryable: false };
     if (error.code === -32601) return { code: error.code, class: "unknown_request", message, retryable: false };
     if (error.code === -32603) return { code: error.code, class: "internal", message, retryable: false };

@@ -40,7 +40,9 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
     accountScope: inputs.scope.accountScope,
     readiness,
     moneyObservable: inputs.authMode === "gateway_keyed",
-    tokenUsageObservable: true,
+    // DeepSeek Harness returns no usage with a turn; its usage_update is
+    // context occupancy, not billing tokens (dsh-runtime-support D4).
+    tokenUsageObservable: inputs.family.agentId !== "dsh",
     acpCapabilities: {
       sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
       forkSession: caps?.sessionCapabilities?.fork != null,

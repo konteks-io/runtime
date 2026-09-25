@@ -28,3 +28,15 @@ describe("a DeepSeek Harness turn without a usable API key (dsh-runtime-support 
     expect(classifyBridgeError(new RequestError(-32603, "Internal error: turn failed: llm-deepseek: upstream returned 500"))).toMatchObject({ class: "internal" });
   });
 });
+
+describe("a DeepSeek Harness turn that failed on the provider after dsh's own retries", () => {
+  // dsh retries RATE_LIMIT/SERVER/TIMEOUT/TRANSPORT five times before failing the
+  // turn, and a turn is not idempotent: name the provider, never retry the turn.
+  it.each([
+    "Internal error: turn failed: DeepSeek Messages stream idle timeout",
+    "Internal error: turn failed: DeepSeek Messages transport failed",
+    "Internal error: turn failed: DeepSeek Messages returned no response body",
+  ])("reads as a provider failure, not retried: %s", message => {
+    expect(classifyBridgeError(new RequestError(-32603, message))).toMatchObject({ class: "provider_failure", retryable: false });
+  });
+});
