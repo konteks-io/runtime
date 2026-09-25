@@ -1531,7 +1531,12 @@ export class WorkOrchestrator {
       this.recoveryEvidenceRetryRequested = true;
       return this.recoveryEvidenceRetry;
     }
-    const task = (async () => {
+    // Defer the sweep by one microtask so the single-flight slot is installed
+    // before any synchronous journal snapshot or immediately-settling submit
+    // can complete. Without this, a fast failed submit can leave a settled
+    // promise in the slot until its cleanup callback runs; a retry in that
+    // window joins work that can no longer observe retryRequested.
+    const task = Promise.resolve().then(async () => {
       do {
         this.recoveryEvidenceRetryRequested = false;
         const now = this.deps.clock.coreNow();
@@ -1541,7 +1546,7 @@ export class WorkOrchestrator {
           .slice(0, maxItems);
         for (const record of due) await this.deliverRecoveryEvidence(record);
       } while (this.recoveryEvidenceRetryRequested);
-    })();
+    });
     this.recoveryEvidenceRetry = task;
     void task.finally(() => { if (this.recoveryEvidenceRetry === task) this.recoveryEvidenceRetry = null; }).catch(() => undefined);
     return task;
