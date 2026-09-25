@@ -155,6 +155,7 @@ export class WorkOrchestrator {
   private readonly recoveryStops = new Map<string, Promise<void>>();
   private readonly recoveryFences = new Set<string>();
   private recoveryEvidenceRetry: Promise<void> | null = null;
+  private recoveryEvidenceRetryRequested = false;
   private readonly logger: Logger;
   private pullTask: Promise<void> | null = null;
   readonly counters: Record<ClaimRejection, number> = { unknown_kind: 0, stale_attempt: 0, workspace_mismatch: 0, instance_mismatch: 0, checkout_owned_elsewhere: 0, role_not_advertised: 0, agent_unavailable: 0, expired: 0, draining: 0, lease_invalid: 0, reconciliation_pending: 0, no_headroom: 0 };
@@ -1523,15 +1524,29 @@ export class WorkOrchestrator {
   /** Retry only the exact bytes that were first fsynced with the observation. */
   async retryRecoveryEvidence(maxItems = 4): Promise<void> {
     if (!this.deps.recoveryEvidence || this.deps.canSubmitRecoveryEvidence?.() === false) return;
-    if (this.recoveryEvidenceRetry) return this.recoveryEvidenceRetry;
-    const task = (async () => {
-      const now = this.deps.clock.coreNow();
-      const due = this.deps.journal.recoveryEvidence.all()
-        .filter(record => record.delivery === "pending" && Date.parse(record.nextAttemptAt) <= now)
-        .sort((left, right) => left.nextAttemptAt.localeCompare(right.nextAttemptAt))
-        .slice(0, maxItems);
-      for (const record of due) await this.deliverRecoveryEvidence(record);
-    })();
+    if (this.recoveryEvidenceRetry) {
+      // Do not lose a retry request that arrives while the current sweep is
+      // between its due-record snapshot and single-flight cleanup. The active
+      // owner performs one more fresh snapshot before releasing the lock.
+      this.recoveryEvidenceRetryRequested = true;
+      return this.recoveryEvidenceRetry;
+    }
+    // Defer the sweep by one microtask so the single-flight slot is installed
+    // before any synchronous journal snapshot or immediately-settling submit
+    // can complete. Without this, a fast failed submit can leave a settled
+    // promise in the slot until its cleanup callback runs; a retry in that
+    // window joins work that can no longer observe retryRequested.
+    const task = Promise.resolve().then(async () => {
+      do {
+        this.recoveryEvidenceRetryRequested = false;
+        const now = this.deps.clock.coreNow();
+        const due = this.deps.journal.recoveryEvidence.all()
+          .filter(record => record.delivery === "pending" && Date.parse(record.nextAttemptAt) <= now)
+          .sort((left, right) => left.nextAttemptAt.localeCompare(right.nextAttemptAt))
+          .slice(0, maxItems);
+        for (const record of due) await this.deliverRecoveryEvidence(record);
+      } while (this.recoveryEvidenceRetryRequested);
+    });
     this.recoveryEvidenceRetry = task;
     void task.finally(() => { if (this.recoveryEvidenceRetry === task) this.recoveryEvidenceRetry = null; }).catch(() => undefined);
     return task;
