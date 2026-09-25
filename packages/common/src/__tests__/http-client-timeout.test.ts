@@ -54,6 +54,16 @@ describe("request-specific Core transport deadline", () => {
     expect(JSON.stringify(error.mock.calls)).not.toContain("secret");
   });
 
+  it("names an unlisted local failure by its error classes, never its message (WS2-159)", async () => {
+    const fetchFn = vi.fn(async () => { throw new TypeError("secret URL", { cause: Object.assign(new Error("secret host"), { name: "InvalidArgumentError", code: "UND_ERR_INVALID_ARG" }) }); });
+    const error = vi.fn();
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn,
+      retrySleep: async () => undefined, logger: { ...nullLogger, error } as typeof nullLogger });
+    await expect(client.request({ method: "GET", path: "/check", schema: { parse: value => value } })).rejects.toMatchObject({ retryable: true });
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ classification: "transport", transportCode: "unknown:TypeError>UND_ERR_INVALID_ARG" }), expect.any(String));
+    expect(JSON.stringify(error.mock.calls)).not.toContain("secret");
+  });
+
   it("bounds the fetch by the shorter request budget", async () => {
     const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => { init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true }); }));
     const client = new JsonClient({ baseUrl: "https://core.example", timeoutMs: 1000, fetchFn, retrySleep: async () => undefined, logger: nullLogger });

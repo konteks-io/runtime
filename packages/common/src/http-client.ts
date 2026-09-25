@@ -340,12 +340,18 @@ function transportCode(error: unknown): string {
     "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_SOCKET",
     "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "UNABLE_TO_VERIFY_LEAF_SIGNATURE"]);
   let current = error;
+  const names: string[] = [];
   for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
     if (current.name === "TimeoutError") return "timeout";
     if (current.name === "AbortError") return "aborted";
     const code = (current as NodeJS.ErrnoException).code;
     if (code && allowed.has(code)) return code;
+    // An error class name (or an undici UND_ERR_* code) is not sensitive and
+    // tells a local failure from a network one; a bare "unknown" hid why a
+    // request that never reached Core kept being retried (WS2-159).
+    const token = typeof code === "string" && /^UND_ERR_[A-Z_]{1,40}$/u.test(code) ? code : current.name;
+    if (/^[A-Za-z_][A-Za-z0-9_]{0,60}$/u.test(token)) names.push(token);
     current = current.cause;
   }
-  return "unknown";
+  return names.length ? `unknown:${names.join(">")}` : "unknown";
 }
