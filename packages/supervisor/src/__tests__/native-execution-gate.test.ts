@@ -8,6 +8,7 @@ import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.js";
 import { SupervisorJournal } from "../state/journal.js";
 import { NativeExecutionGate } from "../native/execution-gate.js";
+import { terminalOperationDispositions } from "../state/operation-dispositions.js";
 import { RelayedSession } from "../session/relayed-session.js";
 import { PermissionBroker } from "../session/permissions.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
@@ -378,6 +379,39 @@ describe("native session dispatch uses genuine execution admission", () => {
     f.advance(31_000); await f.session.onToRuntime(f.envelope);
     expect(f.runner.prompt).toHaveBeenCalledTimes(1);
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "completed" });
+  });
+
+  it("denies a second prompt on a busy session before dispatch and leaves the running turn alone (WS2-153)", async () => {
+    const f = await sessionFixture();
+    const second = { kind: "acp" as const, method: "session/prompt" as const, id: "request-2", params: { sessionId: "acp", prompt: [{ type: "text" as const, text: "hello again" }] } };
+    const claims = { ...f.claims, operationId: "operation-2", permitId: "permit-2", requestId: "request-2", payloadDigest: computeRemoteExecutionOperationDigest(second) };
+    await f.session.onToRuntime(f.envelope);
+    f.client.consumeExecution.mockResolvedValueOnce({ outcome: "admitted", admissionId: "admission-2",
+      receipt: signed({ ...claims, aud: "konteks:remote-execution-admission", admissionId: "admission-2", admittedAt: f.clock.nowIso(), checkExpiresAt: "2026-09-10T00:00:30Z" }) });
+    await f.session.onToRuntime({ kind: "authorized_operation", operationId: "operation-2", permit: signed(claims), message: second });
+    expect(f.runner.prompt).toHaveBeenCalledOnce();
+    expect(f.runner.prompt).toHaveBeenCalledWith("acp", "request", expect.anything());
+    expect(f.journal.pendingRequests.get("acp:received:request-2")?.authorization).toMatchObject({ state: "denied",
+      completion: { kind: "acp_error", id: "request-2", error: { class: "invalid_params", retryable: false } } });
+    expect(f.session.isClosed).toBe(false);
+    expect(f.runner.cancel).not.toHaveBeenCalled();
+    expect(f.send.mock.calls.map(call => call[0].body)).toEqual([expect.objectContaining({ kind: "acp_error", id: "request-2" })]);
+    // The first turn ends normally: the claim's report settles both operations,
+    // one completed and one denied, and none interrupted.
+    await f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp", requestId: "request", result: { stopReason: "end_turn" } } as never);
+    expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "completed" });
+    const dispositions = await terminalOperationDispositions(f.journal, "assignment", 1, "claim");
+    expect(dispositions.map(item => [item.operationId, item.state]).sort()).toEqual([["operation", "completed"], ["operation-2", "denied"]]);
+  });
+
+  it("settles a prompt the runner refused as busy as a denial without closing the session", async () => {
+    const f = await sessionFixture();
+    f.runner.prompt.mockRejectedValueOnce(new RemoteInstanceError("operation_conflict", "Another prompt is already running on this session."));
+    await f.session.onToRuntime(f.envelope);
+    expect(f.journal.pendingRequests.get("acp:received:request")?.authorization).toMatchObject({ state: "denied",
+      completion: { kind: "acp_error", id: "request", error: { class: "invalid_params" } } });
+    expect(f.session.isClosed).toBe(false);
+    expect(f.send.mock.calls.map(call => call[0].body)).toEqual([expect.objectContaining({ kind: "acp_error", id: "request" })]);
   });
 
   it("persists preparation rejection before replying", async () => {

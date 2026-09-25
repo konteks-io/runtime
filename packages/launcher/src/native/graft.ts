@@ -205,7 +205,7 @@ export async function graftAlreadyWired(repo: string): Promise<boolean> {
 /** What the offer says: the files Graft adds, and any the repository already tracks. */
 export async function planGraft(repo: string, families: string[]): Promise<{ agents: string[]; adds: string[]; tracked: string[]; files: number }> {
   const agents = families.map(family => GRAFT_AGENT_IDS[family]).filter((id): id is string => Boolean(id));
-  const adds = ["graft/", ...agents.flatMap(id => GRAFT_FILES[id] ?? [])];
+  const adds = ["graft/", ...agents.flatMap(id => GRAFT_FILES[id] ?? []), ".ignore"];
   const listed = (await git(repo, ["ls-files", "--", ...TRACKABLE]).catch(() => "")).split("\n").filter(Boolean);
   const files = (await git(repo, ["ls-files", "--cached", "--others", "--exclude-standard"]).catch(() => "")).split("\n").filter(Boolean).length;
   return { agents, adds, tracked: listed.filter(path => agents.some(id => (GRAFT_FILES[id] ?? []).some(add => path.startsWith(add.replace(/\/$/, ""))))), files };
@@ -245,21 +245,50 @@ export async function wireGraft(
   return { added, changedTracked, mappedFiles: mapped ? Number(mapped[1]) : null };
 }
 
+/** What delivery wiring did: nothing to wire, already wired, or wired now. */
+export type DeliveryGraftOutcome = "unavailable" | "skipped" | "wired";
+
+/** Per-worktree record of a finished wiring, kept in that worktree's own git dir. */
+const WIRED_STAMP = "konteks-graft-wired.json";
+
+/**
+ * The stamp lives beside the worktree's own index (`worktrees/<name>` for a
+ * linked delivery copy), so it is never a change in the delivered tree, and
+ * a removed or re-created worktree takes it with it.
+ */
+async function wiredStampPath(repo: string): Promise<string> {
+  const dir = (await git(repo, ["rev-parse", "--absolute-git-dir"])).trim();
+  if (!isAbsolute(dir)) throw new Error("git did not name its directory");
+  return join(dir, WIRED_STAMP);
+}
+
 /** Wire Graft into a connector-owned delivery copy without allowing its
  * local tracked-file annotations to enter the delivered change. The signed
- * installer record remains the only authority to locate/download Graft. */
+ * installer record remains the only authority to locate/download Graft.
+ *
+ * A worktree already wired by this Graft for this agent family is left as
+ * it is (WS2-156): rewiring rebuilt the whole index every turn. Graft keeps
+ * its own index current between turns; a revision reset cleans `graft/`,
+ * which makes the next turn wire again. */
 export async function prepareDeliveryGraft(root: string, repo: string, family: string, deps: {
   available?: (root: string) => Promise<boolean>;
   ensure?: (root: string) => Promise<GraftTool>;
   wire?: typeof wireGraft;
-} = {}): Promise<void> {
+} = {}): Promise<DeliveryGraftOutcome> {
   const available = deps.available ?? (async value => (await readGraftRecord(value)) !== null);
-  if (!(await available(root))) return;
+  if (!(await available(root))) return "unavailable";
   const tool = await (deps.ensure ?? ensureGraft)(root);
+  const stampPath = await wiredStampPath(repo);
+  const stamp = `${JSON.stringify({ version: 1, family, node: tool.node, cli: tool.cli })}\n`;
+  if ((await graftAlreadyWired(repo)) && (await readFile(stampPath, "utf8").catch(() => null)) === stamp) return "skipped";
+  // An interrupted wiring must never read as finished.
+  await rm(stampPath, { force: true });
   const wired = await (deps.wire ?? wireGraft)(root, repo, [family], tool);
   if (wired.changedTracked.length > 0) {
     await git(repo, ["update-index", "--skip-worktree", "--", ...wired.changedTracked]);
   }
+  await writeFile(stampPath, stamp, { mode: 0o600 });
+  return "wired";
 }
 
 /** `graft/a.md`, `graft/b.md` → `graft/`: exclude whole directories Graft owns. */

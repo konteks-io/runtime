@@ -24,7 +24,7 @@ param(
 
 if ($User -or $Enroll) {
   Write-Host "The user-local (agent-first) install is not available on Windows yet; it arrives in a later release."
-  Write-Host "For now, create an activation in Konteks (Settings -> Connected runtimes) and run this script with -ActivationId <id>."
+  Write-Host "For now, create an activation in Konteks (Customize -> Runtimes) and run this script with -ActivationId <id>."
   exit 3
 }
 if (-not $ActivationId) {

@@ -109,7 +109,7 @@ export async function uninstallNative(input: { root: string; output: Output }, d
   if (runtime === "removed" || runtime === "already_removed") {
     input.output.line(`Konteks is removed from this machine, and this machine's runtime is removed from your workspace.${kept}`);
   } else if (runtime === "not_told") {
-    input.output.line(`Konteks is removed from this machine, but Konteks could not be told: remove this machine in Settings → Runtimes on the site so it stops counting as connected.${kept}`);
+    input.output.line(`Konteks is removed from this machine, but Konteks could not be told: remove this machine in Customize → Runtimes on the site so it stops counting as connected.${kept}`);
   } else {
     input.output.line(`Konteks is removed from this machine.${kept}`);
   }

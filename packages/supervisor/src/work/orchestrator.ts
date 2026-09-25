@@ -171,6 +171,7 @@ export class WorkOrchestrator {
       canSend: () => deps.deploymentKind !== "native_connector" || deps.reportDeliveryAllowed?.() === true,
       onConflict: async (assignmentId, attempt) => this.abandon(assignmentId, attempt, "assignment_conflict"),
       onTerminalDurable: async (assignmentId, attempt) => this.finish(assignmentId, attempt),
+      confirmStopped: async (assignmentId, attempt) => this.confirmSessionStopped(assignmentId, attempt),
     });
   }
 
@@ -216,6 +217,7 @@ export class WorkOrchestrator {
     // while draining or at capacity. It is not a global admission lock: Core
     // orders successors within their lineage, while unrelated work continues.
     void this.reports.retryDue().catch(error => this.logger.warn({ err: error }, "durable assignment report retry failed"));
+    void this.reports.healHaltedConflicts().catch(error => this.logger.warn({ err: error }, "halted claim healing failed"));
     void this.retryRecoveryEvidence().catch(error => this.logger.warn({ err: error }, "durable recovery evidence retry failed"));
     // Existing timer also services retained stream intents during drain/capacity
     // loss. Replaying a request does not authorize admission of returned work.
@@ -321,7 +323,7 @@ export class WorkOrchestrator {
       }
       const retained = this.deps.deploymentKind === "native_connector" ? this.deps.journal.execution.start(assignment.id, assignment.attempt) : undefined;
       if (retained) {
-        if (jcsDigest(retained.assignment as JsonValue) !== jcsDigest(assignment as JsonValue)) throw new RemoteInstanceError("recovery_required", "Retained admission assignment changed.");
+        if (jcsDigest(withoutDisplayLabel(retained.assignment) as JsonValue) !== jcsDigest(withoutDisplayLabel(assignment) as JsonValue)) throw new RemoteInstanceError("recovery_required", "Retained admission assignment changed.");
         await this.reconstructAdmissionProjections(assignment.id, assignment.attempt);
         continue; // Repair is never transport or execution authority.
       }
@@ -740,7 +742,14 @@ export class WorkOrchestrator {
       if (this.deps.deploymentKind === "native_connector" && executionActivated) this.deps.journal.execution.assertExecutable(admission!, reference);
     };
     assertExecutionOwned();
-    if (this.deps.deploymentKind === "native_connector") this.assertNoRecoveringPredecessor(assignment);
+    if (this.deps.deploymentKind === "native_connector") {
+      const pendingEvidence = this.recoveringPredecessors(assignment).flatMap(prior => this.pendingRecoveryEvidence(prior));
+      if (pendingEvidence.length > 0) {
+        await this.settleRecoveryEvidence(pendingEvidence);
+        assertExecutionOwned();
+      }
+      this.assertNoRecoveringPredecessor(assignment);
+    }
     const key = `${assignment.id}:${assignment.attempt}`;
     if (this.sessions.has(key)) throw new Error("the assignment already has a local session owner");
     const runner = this.deps.runners.get(assignment.agentRoute.agentId);
@@ -817,22 +826,100 @@ export class WorkOrchestrator {
     const source = assignment.source;
     if (source.kind !== "conversation" && source.kind !== "harness_delivery") return;
     const sessionId = source.kind === "conversation" ? source.sessionId : source.executionSessionId;
-    const predecessor = this.channelOwners.get(`session:${sessionId}`);
+    const channelId = `session:${sessionId}`;
+    const predecessor = this.channelOwners.get(channelId);
     if (!predecessor) return;
     const prior = this.deps.journal.execution.admission(predecessor.assignment.id, predecessor.assignment.attempt);
     const execution = prior && this.deps.journal.execution.execution(prior);
     if (!execution || execution.phase === "opened") return;
+    if (this.releaseRecoveredPredecessor(channelId, predecessor, prior, assignment)) return;
     const priorEntry = this.deps.journal.assignments.get(`${predecessor.assignment.id}:${predecessor.assignment.attempt}`);
     this.logger.warn({ event: "execution.successor_blocked", assignmentId: assignment.id, attempt: assignment.attempt,
       sessionId, predecessorAssignmentId: predecessor.assignment.id, predecessorAttempt: predecessor.assignment.attempt,
       predecessorClaimId: prior?.claimId, phase: execution.phase, acpSessionRef: execution.acpSessionRef,
       terminalSequence: priorEntry?.reports.terminalSequence ?? null,
+      // What is still missing before this session can start fresh: a proven
+      // process stop, Core's settlement of the claim, Core's answer to the stop observation.
+      processStopped: execution.processStoppedAt !== undefined,
+      terminalAcknowledged: prior ? this.reports.acknowledgedTerminalReport(prior.assignmentId, prior.attempt, prior.claimId) !== undefined : false,
+      pendingRecoveryEvidence: prior ? this.pendingRecoveryEvidence(prior).length : 0,
       lifecycleProfileDigest: execution.lifecycleProfileDigest ?? null,
       executionProfileDigest: execution.executionProfileDigest ?? null,
       diagnostic: "predecessor_recovery_unqualified" }, "Previous execution requires recovery before this session can run again");
     throw new RemoteInstanceError("recovery_required",
       "The previous execution stopped unexpectedly and its background work could not be confirmed stopped. This session requires recovery before retrying.",
       { diagnostic: "predecessor_recovery_unqualified" });
+  }
+
+  /**
+   * A fenced execution is finished with, and its logical session may start a
+   * fresh ACP session, once three facts hold (WS2-159): its exact process
+   * group is proven gone (`interrupted_unqualified` is written only after that
+   * proof), Core acknowledged the claim's terminal report (Core settled the
+   * work), and no stop observation for it still awaits Core (accepted, or
+   * superseded because Core can never take it). The fenced ACP reference is
+   * never resumed and its journal fence stays. Demanding more left the
+   * session refusing every later turn until the connector restarted.
+   */
+  private recoveredExecutionSettled(prior: LocalAdmission): boolean {
+    const execution = this.deps.journal.execution.execution(prior);
+    return execution?.phase === "interrupted_unqualified" && execution.processStoppedAt !== undefined &&
+      this.reports.acknowledgedTerminalReport(prior.assignmentId, prior.attempt, prior.claimId) !== undefined &&
+      this.pendingRecoveryEvidence(prior).length === 0;
+  }
+
+  private pendingRecoveryEvidence(prior: LocalAdmission): RecoveryEvidenceRecord[] {
+    return this.deps.journal.recoveryEvidence.all().filter(record => record.delivery === "pending" &&
+      record.evidence.instanceId === prior.instanceId && record.evidence.assignmentId === prior.assignmentId &&
+      record.evidence.attempt === prior.attempt && record.evidence.claimId === prior.claimId);
+  }
+
+  /** Hand a settled fenced owner's channel to the next turn; false keeps the gate. */
+  private releaseRecoveredPredecessor(channelId: string, predecessor: RelayedSession, prior: LocalAdmission | undefined,
+    successor: RemoteWorkAssignment): boolean {
+    if (!prior || !this.recoveredExecutionSettled(prior)) return false;
+    try { predecessor.releaseRecoveredChannel(); }
+    catch { return false; }
+    const key = `${prior.assignmentId}:${prior.attempt}`;
+    if (this.channelOwners.get(channelId) === predecessor) this.channelOwners.delete(channelId);
+    if (this.sessions.get(key) === predecessor) this.sessions.delete(key);
+    this.logger.info({ event: "execution.recovered_predecessor_released", assignmentId: successor.id, attempt: successor.attempt,
+      predecessorAssignmentId: prior.assignmentId, predecessorAttempt: prior.attempt, predecessorClaimId: prior.claimId,
+      stage: "channel_handoff", outcome: "fresh_session" },
+    "the previous execution was stopped and Core settled it; starting a fresh ACP session");
+    return true;
+  }
+
+  /** The fenced executions a turn of this logical session would wait on. */
+  private recoveringPredecessors(assignment: RemoteWorkAssignment): LocalAdmission[] {
+    const source = assignment.source;
+    if (source.kind !== "conversation" && source.kind !== "harness_delivery") return [];
+    const sessionId = source.kind === "conversation" ? source.sessionId : source.executionSessionId;
+    const owner = this.channelOwners.get(`session:${sessionId}`);
+    const candidates = [
+      owner && this.deps.journal.execution.admission(owner.assignment.id, owner.assignment.attempt),
+      source.kind === "harness_delivery" ? this.deps.journal.execution.headContinuationTip(assignment) : undefined,
+    ];
+    return candidates.filter((value): value is LocalAdmission => value !== undefined &&
+      this.deps.journal.execution.execution(value)?.phase === "interrupted_unqualified");
+  }
+
+  /**
+   * Let Core answer a fenced predecessor's stop observation now rather than at
+   * its next backed-off maintenance retry, so the gate below sees Core's answer.
+   * Delivery failures stay on the durable record; the gate decides.
+   */
+  private async settleRecoveryEvidence(pending: RecoveryEvidenceRecord[]): Promise<void> {
+    if (this.recoveryEvidenceRetry) await this.recoveryEvidenceRetry.catch(() => undefined);
+    for (const record of pending) {
+      const latest = this.deps.journal.recoveryEvidence.get(recoveryEvidenceRecordKey(record));
+      if (latest?.delivery !== "pending") continue;
+      try { await this.deliverRecoveryEvidence(latest); }
+      catch (error) {
+        this.logger.warn({ assignmentId: record.evidence.assignmentId, attempt: record.evidence.attempt,
+          code: recoveryEvidenceFailureCode(error) }, "Recovery evidence delivery remains pending");
+      }
+    }
   }
 
   /**
@@ -866,7 +953,8 @@ export class WorkOrchestrator {
           retained = this.deps.journal.execution.liveContinuation(assignment);
         } catch (error) {
           if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required" ||
-              !this.canStartFreshAfterUnresumableHarnessPredecessor(assignment)) throw error;
+              (!this.canStartFreshAfterUnresumableHarnessPredecessor(assignment) &&
+               !this.canStartFreshAfterRecoveredHarnessContinuation(assignment))) throw error;
           // The exact predecessor has already durably reported that it cannot
           // resume, and no qualified session head exists to transfer. Its old
           // generation/reference remain fenced in the execution journal; do
@@ -999,16 +1087,7 @@ export class WorkOrchestrator {
     const matches = this.deps.journal.assignments.all().filter(entry => {
       const predecessor = this.deps.journal.execution.start(entry.assignmentId, entry.attempt)?.assignment;
       if (!predecessor || predecessor.source.kind !== "harness_delivery") return false;
-      return predecessor.instanceId === successor.instanceId &&
-        predecessor.workspaceId === successor.workspaceId &&
-        predecessor.taskId === successor.taskId &&
-        predecessor.agentRoute.requiredRole === successor.agentRoute.requiredRole &&
-        predecessor.agentRoute.agentId === successor.agentRoute.agentId &&
-        predecessor.agentRoute.sessionConfig?.model === successor.agentRoute.sessionConfig?.model &&
-        predecessor.source.ownerInstanceId === successorSource.ownerInstanceId &&
-        predecessor.source.executionSessionId === successorSource.executionSessionId &&
-        predecessor.source.repositoryId === successorSource.repositoryId &&
-        jcsDigest(predecessor.source.modelBinding as JsonValue) === jcsDigest(successorSource.modelBinding as JsonValue) &&
+      return sameHarnessRoleSession(predecessor, successor) &&
         jcsDigest(predecessor.source.turn as JsonValue) === jcsDigest(expectedTurn as JsonValue);
     });
     // Retries of one logical predecessor retain the assignment id and advance
@@ -1020,6 +1099,22 @@ export class WorkOrchestrator {
     return latest.reports.terminalSequence !== undefined &&
       latest.reports.terminalResult?.class === "interrupted" &&
       latest.reports.terminalResult.reason === "not_resumable";
+  }
+
+  /**
+   * The repository role's completed head was continued by a turn that was then
+   * fenced, stopped and settled by Core (WS2-159). That session is spent: its
+   * head cannot be transferred again and the fenced reference is never
+   * resumed. The next turn of the same role session starts a fresh ACP
+   * session under the same exact boundaries instead of refusing forever.
+   */
+  private canStartFreshAfterRecoveredHarnessContinuation(successor: RemoteWorkAssignment): boolean {
+    if (successor.source.kind !== "harness_delivery" || !successor.source.turn.predecessor) return false;
+    const tip = this.deps.journal.execution.headContinuationTip(successor);
+    const fenced = tip && this.deps.journal.execution.start(tip.assignmentId, tip.attempt)?.assignment;
+    if (!tip || !fenced || fenced.source.kind !== "harness_delivery" || !sameHarnessRoleSession(fenced, successor) ||
+        jcsDigest((fenced.source.turn.predecessor ?? null) as JsonValue) !== jcsDigest(successor.source.turn.predecessor as JsonValue)) return false;
+    return this.recoveredExecutionSettled(tip);
   }
 
   /** Release an idle sealed completion, then journal its proven stop. */
@@ -1241,6 +1336,31 @@ export class WorkOrchestrator {
 
   /** Report the interruption only after independent exact-process proof. */
   private async recoverLostExecutionAuthority(assignmentId: string, attempt: number): Promise<void> {
+    const observedAdmission = this.deps.journal.execution.admission(assignmentId, attempt);
+    if (observedAdmission) {
+      const assertCurrent = () => {
+        this.requireNativeOwner();
+        if (observedAdmission.runnerIncarnation !== this.deps.runnerIncarnation?.() ||
+            observedAdmission.instanceId !== this.deps.instanceId() || observedAdmission.workspaceId !== this.deps.workspaceId()) {
+          throw new RemoteInstanceError("recovery_required", "Recovery observer no longer owns this execution.");
+        }
+        this.deps.journal.execution.assertAdmission(observedAdmission);
+      };
+      assertCurrent();
+      // The negative observation must survive even when cancellation never
+      // returns. It is not terminal authority and cannot release resources.
+      try {
+        await this.recordTurnSettledRecoveryEvidence(observedAdmission, assertCurrent, "stop_unconfirmed", false);
+        void this.retryRecoveryEvidence().catch(error => {
+          this.logger.warn({ assignmentId, attempt, code: recoveryEvidenceFailureCode(error) }, "Recovery evidence delivery remains pending");
+        });
+      } catch (error) {
+        // Diagnostic durability must never suppress the independent stop path.
+        this.logger.error({ event: "execution.recovery_observation_persist_failed", assignmentId, attempt,
+          code: recoveryEvidenceFailureCode(error), stopClass: "stop_unconfirmed", capacityReleased: false, err: error },
+        "Recovery observation could not be persisted; cancellation will still be attempted");
+      }
+    }
     await this.stopForRecovery(assignmentId, attempt);
     const admission = this.deps.journal.execution.admission(assignmentId, attempt);
     const entry = this.deps.journal.assignments.get(`${assignmentId}:${attempt}`);
@@ -1417,16 +1537,23 @@ export class WorkOrchestrator {
     return task;
   }
 
-  private async recordTurnSettledRecoveryEvidence(admission: LocalAdmission, assertCurrent: () => void): Promise<void> {
+  private async recordTurnSettledRecoveryEvidence(admission: LocalAdmission, assertCurrent: () => void,
+    stopClass: "turn_settled" | "stop_unconfirmed" = "turn_settled", deliver = true): Promise<void> {
     const execution = this.deps.journal.execution.execution(admission);
     const entry = this.deps.journal.assignments.get(`${admission.assignmentId}:${admission.attempt}`);
-    if (!execution || execution.phase !== "acp_settled" || !execution.acpSettledAt || !entry || entry.claimId !== admission.claimId) {
+    if (!execution || (stopClass === "turn_settled" && (execution.phase !== "acp_settled" || !execution.acpSettledAt)) || !entry || entry.claimId !== admission.claimId) {
       throw new RemoteInstanceError("recovery_required", "Durable ACP settlement does not match the current claim.");
     }
-    const recordedAt = this.deps.clock.nowIso();
-    const observedAt = execution.acpSettledAt;
-    const observedMs = Date.parse(observedAt);
-    const ageMs = Number.isFinite(observedMs) ? Math.max(0, this.deps.clock.coreNow() - observedMs) : 0;
+    // One clock for the whole record. The schema requires ageMs to equal
+    // recordedAt minus observedAt exactly, and acpSettledAt is host time;
+    // mixing in Core's fractional skew estimate made every live stop fail
+    // to parse, so a lost lease held its claim until the next restart.
+    const recordedMs = this.deps.clock.now();
+    const settledMs = stopClass === "turn_settled" ? Date.parse(execution.acpSettledAt!) : recordedMs;
+    const observedMs = Number.isFinite(settledMs) ? Math.min(settledMs, recordedMs) : recordedMs;
+    const recordedAt = new Date(recordedMs).toISOString();
+    const observedAt = new Date(observedMs).toISOString();
+    const ageMs = recordedMs - observedMs;
     const semantic = {
       instanceId: admission.instanceId,
       assignmentId: admission.assignmentId,
@@ -1436,12 +1563,12 @@ export class WorkOrchestrator {
       recoveryEpoch: entry.recoveryEpoch,
       evidenceKind: "stop_observation" as const,
       schemaVersion: "remote-recovery-evidence-v1" as const,
-      stopClass: "turn_settled" as const,
+      stopClass,
       reason: "ownership_scope_lost" as const,
       observedAt,
       recordedAt,
       ageMs,
-      nextRetryAt: new Date(this.deps.clock.coreNow() + 5_000).toISOString(),
+      nextRetryAt: new Date(recordedMs + 5_000).toISOString(),
       safeAction: { kind: "retry_later" as const, instanceId: admission.instanceId, agentId: admission.agentId },
       terminalDisposition: "not_terminal" as const,
       quiescenceAssertion: "not_asserted_by_recovery_evidence" as const,
@@ -1468,7 +1595,7 @@ export class WorkOrchestrator {
     // A retry reaches the same identity after time has passed. Reuse the
     // first fsynced bytes rather than recalculating recorded time/age/digest.
     const record = existing ?? this.deps.journal.recoveryEvidence.get(key);
-    if (record) await this.deliverRecoveryEvidence(record, assertCurrent);
+    if (record && deliver) await this.deliverRecoveryEvidence(record, assertCurrent);
   }
 
   private async deliverRecoveryEvidence(record: RecoveryEvidenceRecord, assertCurrent?: () => void): Promise<void> {
@@ -1491,13 +1618,44 @@ export class WorkOrchestrator {
       this.logger.info({ assignmentId: record.evidence.assignmentId, attempt: record.evidence.attempt, evidenceDigest: record.evidence.evidenceDigest, outcome: result.outcome }, "recovery stop observation accepted by Core");
     } catch (error) {
       const failureCode = recoveryEvidenceFailureCode(error);
-      const nextAttemptAt = new Date(this.deps.clock.coreNow() + 5_000).toISOString();
+      const supersededReason = this.recoveryEvidenceSuperseded(record, error);
+      if (supersededReason) {
+        const supersededAt = this.deps.clock.nowIso();
+        await this.deps.journal.recoveryEvidence.update(key, current => {
+          if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", "Recovery evidence record changed after delivery failure.");
+          if (current.delivery !== "pending") return current;
+          return { ...current, delivery: "superseded", supersededAt, supersededReason, lastFailureCode: failureCode, updatedAt: supersededAt };
+        });
+        this.logger.info({ assignmentId: record.evidence.assignmentId, attempt: record.evidence.attempt, evidenceDigest: record.evidence.evidenceDigest,
+          outcome: "superseded", reason: supersededReason, failureCode },
+        "recovery stop observation superseded by Core's settled state; kept for audit, no longer sent");
+        return;
+      }
+      const nextAttemptAt = new Date(this.deps.clock.coreNow() + recoveryEvidenceRetryDelayMs(record.attempts)).toISOString();
       await this.deps.journal.recoveryEvidence.update(key, current => {
         if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", "Recovery evidence record changed after delivery failure.");
         return { ...current, nextAttemptAt, lastFailureCode: failureCode, updatedAt: this.deps.clock.nowIso() };
       });
       this.logger.warn({ assignmentId: record.evidence.assignmentId, attempt: record.evidence.attempt, evidenceDigest: record.evidence.evidenceDigest, outcome: "pending", failureCode }, "recovery stop observation remains pending Core acknowledgement");
     }
+  }
+
+  /**
+   * Core refusals that no retry can change (WS2-159). `reconciliation_replay`
+   * for bytes observed by a process that is no longer this one: Core accepts
+   * evidence only from the current incarnation, so a retired one's can never
+   * land. `assignment_conflict` once Core has acknowledged this exact claim's
+   * terminal report: Core closed the claim, and a closed claim takes no more
+   * evidence. Anything else stays pending and is retried.
+   */
+  private recoveryEvidenceSuperseded(record: RecoveryEvidenceRecord, error: unknown): "incarnation_retired" | "claim_settled" | null {
+    if (!(error instanceof RemoteInstanceError)) return null;
+    const { evidence } = record;
+    const current = this.deps.runnerIncarnation?.();
+    if (error.code === "reconciliation_replay" && current !== undefined && evidence.runnerIncarnation !== current) return "incarnation_retired";
+    if (error.code === "assignment_conflict" &&
+        this.reports.acknowledgedTerminalReport(evidence.assignmentId, evidence.attempt, evidence.claimId) !== undefined) return "claim_settled";
+    return null;
   }
 
   /** D141: the same retained log serializes admission and exact absence. */
@@ -1530,6 +1688,16 @@ export class WorkOrchestrator {
     const session = this.sessions.get(`${assignmentId}:${attempt}`);
     if (session) await session.close("cancelled");
     this.logger.error({ assignmentId, attempt, reason }, "claim halted into recovery_required");
+  }
+
+  /**
+   * Before a claim reports itself stop-confirmed, its session must be closed
+   * and the agent told to stop any prompt still running on it. No session in
+   * this process means nothing of this claim runs here.
+   */
+  private async confirmSessionStopped(assignmentId: string, attempt: number): Promise<void> {
+    const session = this.sessions.get(`${assignmentId}:${attempt}`);
+    if (session) await session.confirmStopped();
   }
 
   private async finish(assignmentId: string, attempt: number): Promise<void> {
@@ -1592,7 +1760,34 @@ export function dispatchErrorIdentity(error: unknown): { errorName?: string; err
   return identity;
 }
 
+/** Same repository role session: instance, task, role, agent, model and repository all exact. */
+function sameHarnessRoleSession(predecessor: RemoteWorkAssignment, successor: RemoteWorkAssignment): boolean {
+  const before = predecessor.source, after = successor.source;
+  if (before.kind !== "harness_delivery" || after.kind !== "harness_delivery") return false;
+  return predecessor.instanceId === successor.instanceId &&
+    predecessor.workspaceId === successor.workspaceId &&
+    predecessor.taskId === successor.taskId &&
+    predecessor.agentRoute.requiredRole === successor.agentRoute.requiredRole &&
+    predecessor.agentRoute.agentId === successor.agentRoute.agentId &&
+    predecessor.agentRoute.sessionConfig?.model === successor.agentRoute.sessionConfig?.model &&
+    before.ownerInstanceId === after.ownerInstanceId &&
+    before.executionSessionId === after.executionSessionId &&
+    before.repositoryId === after.repositoryId &&
+    jcsDigest(before.modelBinding as JsonValue) === jcsDigest(after.modelBinding as JsonValue);
+}
+
+/** Exponential backoff for an unanswered stop observation: 5 s doubling to a 60 s ceiling. */
+function recoveryEvidenceRetryDelayMs(attemptsBefore: number): number {
+  return Math.min(60_000, 5_000 * 2 ** Math.min(Math.max(0, attemptsBefore), 4));
+}
+
 function recoveryEvidenceFailureCode(error: unknown): string {
   if (error instanceof RemoteInstanceError) return error.code.slice(0, 128);
   return "temporarily_unavailable";
+}
+
+/** The session label is display-only and Core may rename it between pulls; it is never admission identity. */
+function withoutDisplayLabel(assignment: RemoteWorkAssignment): Omit<RemoteWorkAssignment, "sessionLabel"> {
+  const { sessionLabel: _label, ...identity } = assignment;
+  return identity;
 }

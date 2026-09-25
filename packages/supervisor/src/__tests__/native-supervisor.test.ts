@@ -358,6 +358,18 @@ describe("native Supervisor composition", () => {
     expect(f.stop).toHaveBeenCalledOnce();
   });
 
+  it("tells the local operator which release Konteks accepts for this machine (WS1-093)", async () => {
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    const asked = vi.spyOn(supervisor.core, "acceptedRelease").mockResolvedValueOnce({ bundleVersion: "0.6.6-e2e.1", manifestDigest: "d" }).mockResolvedValueOnce(null);
+    expect(await supervisor.controlHandler()({ op: "release.accepted" }, { event: () => undefined } as never)).toEqual({ bundleVersion: "0.6.6-e2e.1" });
+    expect(await supervisor.controlHandler()({ op: "release.accepted" }, { event: () => undefined } as never)).toEqual({ bundleVersion: null });
+    expect(asked).toHaveBeenCalledTimes(2);
+    await supervisor.stop();
+  });
+
   it("refuses native startup without explicit native dependencies", async () => {
     const f = await fixture();
     const supervisor = new Supervisor(f.config);

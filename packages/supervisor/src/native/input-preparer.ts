@@ -48,10 +48,12 @@ interface NativeInputPreparerOptions {
   /** Connector-wide object cache; agent worktrees remain below `root`. */
   repositoryCacheRoot?: string;
   /** Optional local developer tool wiring for a newly materialized private
-   * worktree. Failure is observable but never withholds delivery inputs. */
-  prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void>;
+   * worktree. Failure is observable but never withholds delivery inputs. It
+   * runs alongside the rest of bootstrap and is awaited before the agent
+   * starts (`PreparedSessionInputs.toolWiring`). */
+  prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void | "unavailable" | "skipped" | "wired">;
   outputClient?: () => NativeOutputClient;
-  logger?: Pick<Logger, "warn">;
+  logger?: Pick<Logger, "warn"> & Partial<Pick<Logger, "info">>;
 }
 const ReceiptSchema = z
   .object({
@@ -281,19 +283,49 @@ export function createNativeInputPreparer(
 ): (assignment: RemoteWorkAssignment) => Promise<PreparedSessionInputs> {
   const busy = new Set<string>();
   const mutate = options.mutate ?? unrestrictedStateMutation;
+  /** One tool wiring at a time per worktree, shared by a retried bootstrap. */
+  const wiring = new Map<string, Promise<void>>();
+  const startToolWiring = (
+    cwd: string,
+    agentId: string,
+    repositoryId: string,
+    logStage: (name: string, durationMs: number, extra?: Record<string, unknown>) => void,
+  ): Promise<void> => {
+    const running = wiring.get(cwd);
+    if (running) return running;
+    const startedAt = Date.now();
+    // Inside the state gate, so stopping the owner settles it too.
+    const task = mutate(() => options.prepareRepositoryWorktree!(cwd, agentId)).then(
+      outcome => logStage("graft_wiring", Date.now() - startedAt, { outcome: outcome ?? "finished" }),
+      error => {
+        options.logger?.warn({ event: "repository_worktree.tool_wiring_failed", repositoryId, agentId,
+          durationMs: Date.now() - startedAt, errorClass: error instanceof Error ? error.name : "unknown" },
+        "optional repository tool wiring failed; delivery continues");
+      });
+    wiring.set(cwd, task);
+    void task.then(() => { if (wiring.get(cwd) === task) wiring.delete(cwd); });
+    return task;
+  };
   return (assignment) =>
     mutate(async () => {
       const key = assignment.id + ":" + assignment.attempt;
       if (busy.has(key)) throw unavailable();
       busy.add(key);
       let stage = "claim";
+      // One line per finished stage, so a slow bootstrap says where (WS2-156).
+      const logStage = (name: string, durationMs: number, extra: Record<string, unknown> = {}) =>
+        options.logger?.info?.({ event: "native.bootstrap.stage", parent: "input_preparation", stage: name,
+          assignmentId: assignment.id, attempt: assignment.attempt, durationMs, ...extra }, "native input stage finished");
+      let stageStartedAt = Date.now();
       try {
         const current = RemoteWorkAssignmentSchema.parse(assignment);
         const claimId = options.claimId(current);
         if (!claimId) throw unavailable();
         const client = options.client();
         stage = "selection";
+        stageStartedAt = Date.now();
         let envelope = await client.prepare(current, claimId);
+        logStage("selection", Date.now() - stageStartedAt);
         const selection = structuredClone(envelope.selection),
           digest = envelope.selectionDigest;
         const authorize = async () => {
@@ -304,6 +336,9 @@ export function createNativeInputPreparer(
         stage = "private_root";
         const root = await privateRoot(options.root);
         stage = "source_workspace";
+        stageStartedAt = Date.now();
+        let fetched: { bytes: number; durationMs: number } | undefined;
+        const wiringOf: { task?: Promise<void> } = {};
         const selectedRepository = selection.repository;
         const repositoryWorkspace = selection.repositoryWorkspace;
         const source = selectedRepository && options.repositoryCacheRoot && options.git
@@ -311,7 +346,10 @@ export function createNativeInputPreparer(
               root: options.repositoryCacheRoot!,
               tool: options.git,
               fetchRevision: async ({ gitDir, revision, haveRevisions }) => {
+                const fetchStartedAt = Date.now();
                 const bundle = await client.fetchRepository(current, claimId, envelope, haveRevisions);
+                const record = { bytes: bundle.byteLength, durationMs: 0 };
+                fetched = record;
                 const bundleDir = await mkdtemp(join(root, ".repository-bundle-"));
                 await chmod(bundleDir, 0o700);
                 const bundlePath = join(bundleDir, "source.bundle");
@@ -327,6 +365,7 @@ export function createNativeInputPreparer(
                   });
                 } finally {
                   await rm(bundleDir, { recursive: true, force: true });
+                  record.durationMs = Date.now() - fetchStartedAt;
                 }
               },
             }).prepare({
@@ -340,12 +379,14 @@ export function createNativeInputPreparer(
               // repository cache.
               worktreeId: selection.binding.sessionId,
               ...(repositoryWorkspace ? { mode: repositoryWorkspace.mode } : {}),
-            }).then(async worktree => {
+            }).then(worktree => {
+              const fetchMs = fetched?.durationMs ?? 0;
+              logStage("repository_fetch", fetchMs, { cacheHit: fetched === undefined, bytes: fetched?.bytes ?? 0 });
+              logStage("worktree", Date.now() - stageStartedAt - fetchMs);
+              // Optional and slow (a full index build): run it while skills,
+              // verification, capability redemption and the facade proceed.
               if (options.prepareRepositoryWorktree) {
-                await options.prepareRepositoryWorktree(worktree.cwd, current.agentRoute.agentId).catch(error =>
-                  options.logger?.warn({ event: "repository_worktree.tool_wiring_failed", repositoryId: selectedRepository.repositoryId,
-                    agentId: current.agentRoute.agentId, errorClass: error instanceof Error ? error.name : "unknown" },
-                  "optional repository tool wiring failed; delivery continues"));
+                wiringOf.task = startToolWiring(worktree.cwd, current.agentRoute.agentId, selectedRepository.repositoryId, logStage);
               }
               return { cwd: worktree.cwd, container: worktree.cwd,
                 baselineCommit: worktree.baselineCommit, verify: worktree.verify };
@@ -356,8 +397,12 @@ export function createNativeInputPreparer(
               () => client.read(current, claimId, envelope, selection.source.transferId),
               current.source.kind !== "conversation",
               options.git,
-            );
+            ).then(workspace => {
+              logStage("worktree", Date.now() - stageStartedAt);
+              return workspace;
+            });
         stage = "organization_skills";
+        stageStartedAt = Date.now();
         const prepared = await prepareOrganizationSkillSession({
           cwd: source.cwd,
           scratchRoot: join(root, "skills"),
@@ -373,8 +418,11 @@ export function createNativeInputPreparer(
           assertAuthorized: async () => undefined,
           fetchTree: (manifest) => client.read(current, claimId, envelope, manifest.transferId),
         });
+        logStage("skills", Date.now() - stageStartedAt);
         stage = "source_verification";
+        stageStartedAt = Date.now();
         await source.verify();
+        logStage("verify", Date.now() - stageStartedAt);
         const harnessTurn = current.kind === "delivery" && current.source.kind === "harness_delivery"
           ? current.source.turn
           : undefined;
@@ -498,7 +546,12 @@ export function createNativeInputPreparer(
                 // After local verification, so a local failure costs no call.
                 await authorize();
                 await source.verify();
-              } catch {
+              } catch (error) {
+                // The turn fails as unavailable either way; keep why (WS2-145).
+                options.logger?.warn({ event: "native.inputs.recheck_failed", assignmentId: assignment.id,
+                  attempt: assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "local_verification_failed",
+                  ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}) },
+                "Inputs could not be rechecked before the prompt");
                 throw unavailable();
               } finally {
                 prompting = false;
@@ -507,6 +560,7 @@ export function createNativeInputPreparer(
           ...(acceptDeliveryOutput && resumeDeliveryOutput
             ? { acceptDeliveryOutput, resumeDeliveryOutput }
             : {}),
+          ...(wiringOf.task ? { toolWiring: wiringOf.task } : {}),
         };
       } catch (error) {
         options.logger?.warn(

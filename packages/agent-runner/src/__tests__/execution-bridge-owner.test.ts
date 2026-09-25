@@ -26,6 +26,27 @@ it("does not change the normal local Codex login through connector auth actions"
   expect(startLoginFlow).toHaveBeenCalledTimes(loginCalls);
   expect(spawn).not.toHaveBeenCalled();
 });
+it("runs the device login the person asked for in their own Codex profile (WS1-115)", () => {
+  const config = RunnerConfigSchema.parse({
+    RUNNER_AGENT_ID: "codex", RUNNER_NATIVE_CODEX_HOME: "/operator/.codex",
+    RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture().profile,
+  });
+  const runtime = new AgentRuntime({ config, spawn: vi.fn() });
+  vi.mocked(startLoginFlow).mockReturnValueOnce({ loginId: "site-login", done: new Promise(() => undefined), input: vi.fn(), cancel: vi.fn(async () => undefined) });
+  expect(runtime.startLogin({ organization: false, loginId: "site-login", personal: true }).loginId).toBe("site-login");
+  expect(vi.mocked(startLoginFlow).mock.lastCall?.[0]).toMatchObject({ loginId: "site-login", env: expect.objectContaining({ CODEX_HOME: "/operator/.codex" }) });
+});
+it("runs the installed Claude Code's own login only when the person asked for it", () => {
+  const runtime = new AgentRuntime({ config: RunnerConfigSchema.parse({
+    RUNNER_AGENT_ID: "claude-code", RUNNER_NATIVE_CLAUDE_EXECUTABLE: "/operator/bin/claude",
+    RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture("macos", "arm64", "claude-code").profile,
+  }), spawn: vi.fn() });
+  const loginCalls = vi.mocked(startLoginFlow).mock.calls.length;
+  expect(() => runtime.startLogin({ organization: false })).toThrow(/installed Claude Code/);
+  expect(startLoginFlow).toHaveBeenCalledTimes(loginCalls);
+  vi.mocked(startLoginFlow).mockReturnValueOnce({ loginId: "site-login", done: new Promise(() => undefined), input: vi.fn(), cancel: vi.fn(async () => undefined) });
+  expect(runtime.startLogin({ organization: false, loginId: "site-login", personal: true }).loginId).toBe("site-login");
+});
 afterEach(async () => {
   for (const runtime of runtimes.splice(0)) await runtime.stop();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });

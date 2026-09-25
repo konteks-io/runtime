@@ -43,6 +43,8 @@ export const OnboardStateSchema = z
       /** The person answered the first task; the next run creates the initiative. */
       "initiative",
       "done",
+      /** This machine's access was revoked; the person is asked whether to connect it again (W1-Z4). */
+      "reconnect",
     ]),
     intentRef: z.string().min(1).optional(),
     /** Masked, for re-asking without holding the address. */
@@ -72,12 +74,18 @@ export const OnboardStateSchema = z
     repositoryKind: z.enum(["existing", "managed"]).optional(),
     /** The folder is not a git repository yet; the push makes it one (W1-A5). */
     repositoryNeedsInit: z.boolean().optional(),
+    /** The folder already has Konteks managed git as its "konteks" remote. */
+    repositoryOnManagedGit: z.boolean().optional(),
+    /** Commits the "konteks" remote does not have yet, when known. */
+    repositoryUnpushed: z.number().int().nonnegative().optional(),
     /** Who authors the first commit of a folder the push turns into a repository. */
     ownerEmail: z.string().min(1).optional(),
     /** A new conversation on a machine that finished onboarding (W1-A8). */
     revisit: z.boolean().optional(),
     /** How many times inspect has found the service still starting (WS1-036). */
     startWaits: z.number().int().min(0).optional(),
+    /** The last reply asked "Try that step again now?": its answer is not the step's own. */
+    retryAsked: z.boolean().optional(),
     /** The last step just finished: the next run closes this conversation instead of starting a revisit. */
     closing: z.boolean().optional(),
     /** The runtime this machine was before it lost its key; the next bind replaces it (W1-L1). */

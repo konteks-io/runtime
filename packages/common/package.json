@@ -26,7 +26,7 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@konteks/backstage-plugin-common": "6.2.0",
+    "@konteks/backstage-plugin-common": "6.4.0",
     "pino": "^9.5.0",
     "zod": "^4.0.0"
   }

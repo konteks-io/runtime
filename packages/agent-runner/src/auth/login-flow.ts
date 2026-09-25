@@ -45,6 +45,15 @@ export interface LoginFlow {
 const URL_PATTERN = /https?:\/\/[^\s<>"')\]]+/g;
 const USER_CODE_PATTERN = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/;
 const PROMPT_PATTERN = /(?:paste|enter|input|type)[^\n]*(?:code|token|key|url)[^\n]*[:?]\s*$/i;
+// Codex colours its device link and one-time code. Left in, the escape after
+// the link became part of the URL Konteks showed, and the one before the code
+// hid it from USER_CODE_PATTERN's word boundary (WS1-115).
+// eslint-disable-next-line no-control-regex
+const TERMINAL_ESCAPE = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b[@-_]/g;
+
+export function withoutTerminalEscapes(line: string): string {
+  return line.replace(TERMINAL_ESCAPE, "");
+}
 
 export function extractLoginSignals(line: string): { url?: string; userCode?: string; prompt?: { label: string; secret: boolean } } {
   const out: { url?: string; userCode?: string; prompt?: { label: string; secret: boolean } } = {};
@@ -73,7 +82,7 @@ export function startLoginFlow(options: LoginFlowOptions): LoginFlow {
     options.events.publish({ kind: "login_event", loginId, event });
   };
   const relay = (line: string): void => {
-    const sanitized = redactText(line).slice(0, 4_096);
+    const sanitized = redactText(withoutTerminalEscapes(line)).slice(0, 4_096);
     if (sanitized.trim().length === 0) return;
     emit({ type: "display", text: sanitized });
     const signals = extractLoginSignals(sanitized);

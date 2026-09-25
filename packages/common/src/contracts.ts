@@ -143,6 +143,7 @@ export type {
   EraseReceipt,
   // Work protocol
   RemoteWorkAssignment,
+  RemoteSessionLabel,
   // Permissions (D102)
   PendingPermissionView,
   PermissionAnswerRequest,
@@ -180,6 +181,15 @@ export {
   runtimeCancellationIntentDigest,
   RuntimeCancellationDeliveryRequestSchema,
   REMOTE_CANCELLATION_DELIVERY_CAPABILITY,
+  // A coding agent login the person starts on this machine from the site (WS1-115).
+  REMOTE_AGENT_LOGIN_CAPABILITY,
+  REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY,
+  AGENT_LOGIN_METHOD,
+  RuntimeAgentLoginDeliveryRequestSchema,
+  type RuntimeAgentLoginDeliveryRequest,
+  RuntimeAgentLoginReportSchema,
+  AgentLoginUserCodeSchema,
+  agentLoginUrlAllowed,
   EXECUTION_REVISION_CONTROL_SCHEMA_VERSION,
   EXECUTION_REVISION_CONTROL_CAPABILITY,
   EXECUTION_REVISION_CONTROL_MAX_DELIVERY_MS,
@@ -321,6 +331,8 @@ export {
   RelayRuntimeHandshakeResultSchema,
   RelayReplayRequestSchema,
   RemoteWorkAssignmentSchema,
+  REMOTE_SESSION_LABEL_CAPABILITY,
+  RemoteSessionLabelSchema,
   WorkAvailableSchema,
   ClaimResultSchema,
   ReportAckSchema,

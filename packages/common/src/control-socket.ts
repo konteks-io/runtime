@@ -64,6 +64,8 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   /** Ask the supervisor to launch the installer's transactional update in a separate process. */
   z.object({ op: z.literal("update.apply") }).strict(),
   z.object({ op: z.literal("update.status") }).strict(),
+  /** The release Konteks accepts for this machine, asked with this machine's lease (WS1-093). */
+  z.object({ op: z.literal("release.accepted") }).strict(),
   z
     .object({ op: z.literal("logs"), sinceSeconds: z.number().int().min(1).max(86_400 * 7) })
     .strict(),
@@ -74,6 +76,9 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("instance.retire") }).strict(),
 ]);
 export type ControlRequest = z.infer<typeof ControlRequestSchema>;
+
+/** `release.accepted`: the version Konteks accepts, or null where it does not say. */
+export const ReleaseAcceptedSchema = z.object({ bundleVersion: z.string().min(1).nullable() }).strict();
 
 /** Native update coordination as reported over the loopback control socket. */
 export const NativeUpdateStatusSchema = z

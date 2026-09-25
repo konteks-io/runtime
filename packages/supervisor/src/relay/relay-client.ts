@@ -8,6 +8,8 @@ import {
   DiagnosticCarrierCompanionDeliveryRequestSchema,
   RemoteExecutionRevisionControlDeliveryRequestSchema,
   RuntimePermissionAnswerDeliveryRequestSchema,
+  RuntimeAgentLoginDeliveryRequestSchema,
+  type RuntimeAgentLoginDeliveryRequest,
   type RemoteExecutionRevisionControlDeliveryRequest,
   type RuntimePermissionAnswerDeliveryRequest,
   type DiagnosticCarrierCompanionDeliveryRequest,
@@ -79,6 +81,11 @@ export interface RelayClientOptions {
     connectionEpoch: number;
     assertCurrent(): void;
   }) => Promise<void>;
+  /** A coding agent login the person started from the site (WS1-115). */
+  onAgentLogin?: (request: RuntimeAgentLoginDeliveryRequest, connection: {
+    connectionEpoch: number;
+    assertCurrent(): void;
+  }) => Promise<void>;
   /** Dedicated C02 safety-control intake; never a mux cursor or receipt ACK. */
   onExecutionRevisionControl?: (request: RemoteExecutionRevisionControlDeliveryRequest, connection: {
     connectionEpoch: number;
@@ -111,6 +118,8 @@ export class RelayClient {
   private readonly backoff = new ReconnectBackoff();
   private readonly logger: Logger;
   private connectedAt = 0;
+  /** Why this runtime closed a socket itself; a close without one came from the peer or the network. */
+  private readonly localCloseReasons = new WeakMap<object, string>();
   private lastConnectedAt: string | null = null;
   private consecutiveFailures = 0;
   private readonly outboundQueue: Array<{ socket: NodeWebSocket; payload: string; bytes: number }> = [];
@@ -159,6 +168,7 @@ export class RelayClient {
     this.discardHandshakeBuffer = null;
     if (!this.stopped) this.setState("reconnecting");
     this.options.mux.disconnected();
+    if (this.socket) this.localCloseReasons.set(this.socket, `rehandshake:${reason}`);
     this.socket?.close(1012, reason);
   }
 
@@ -268,7 +278,7 @@ export class RelayClient {
     let handshook = false;
     let handshakeProcessing = false;
     let validatedEpoch: number | null = null;
-    const pending: Array<ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest> = [];
+    const pending: Array<ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest> = [];
     let pendingBytes = 0;
     const discardPending = () => { pending.length = 0; pendingBytes = 0; };
     this.discardHandshakeBuffer = discardPending;
@@ -282,6 +292,7 @@ export class RelayClient {
       this.lastError = message;
       this.options.mux.disconnected();
       this.setState("reconnecting");
+      this.localCloseReasons.set(socket, `protocol:${reason}`);
       socket.close(1002, reason);
     };
     const failReceive = (error: unknown) => {
@@ -293,6 +304,7 @@ export class RelayClient {
       this.logger.warn({ err: error }, "relay durable receive failed; retaining replay for reconnect");
       this.options.mux.disconnected();
       this.setState("reconnecting");
+      this.localCloseReasons.set(socket, "durable_receive_failed");
       socket.close(1011, "durable_receive_failed");
     };
     const receive = async (value: unknown) => {
@@ -317,6 +329,26 @@ export class RelayClient {
         if (!this.options.onPermissionAnswer) throw new RemoteInstanceError("recovery_required", "Permission answer receiver is unavailable");
         await this.options.onPermissionAnswer(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
         assertCurrent();
+        return;
+      }
+      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_agent_login_delivery") {
+        // A login is the person's convenience, never work transport: whatever
+        // goes wrong with it is logged and dropped, and the socket stays up.
+        try {
+          const request = RuntimeAgentLoginDeliveryRequestSchema.parse(value);
+          const epoch = validatedEpoch;
+          const assertCurrent = () => {
+            if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
+              validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
+              throw new RemoteInstanceError("recovery_required", "Login socket ownership is not current");
+            }
+          };
+          assertCurrent();
+          if (!this.options.onAgentLogin) throw new RemoteInstanceError("recovery_required", "Agent login receiver is unavailable");
+          await this.options.onAgentLogin(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
+        } catch (error) {
+          this.logger.warn({ err: error }, "agent login delivery dropped");
+        }
         return;
       }
       if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_cancellation_delivery") {
@@ -388,6 +420,7 @@ export class RelayClient {
         this.lastError = "relay handshake timed out";
         this.options.mux.disconnected();
         this.setState("reconnecting");
+        this.localCloseReasons.set(socket, "handshake_timeout");
         socket.terminate();
       }
     }, this.options.handshakeTimeoutMs ?? 15_000);
@@ -434,8 +467,9 @@ export class RelayClient {
         const cancellation = RuntimeCancellationDeliveryRequestSchema.safeParse(parsed);
         const revisionControl = RemoteExecutionRevisionControlDeliveryRequestSchema.safeParse(parsed);
         const answer = RuntimePermissionAnswerDeliveryRequestSchema.safeParse(parsed);
+        const login = RuntimeAgentLoginDeliveryRequestSchema.safeParse(parsed);
         const replay = RelayReplayRequestSchema.safeParse(parsed);
-        const frame = answer.success ? answer : cancellation.success ? cancellation : revisionControl.success ? revisionControl : replay.success ? replay : ack.success ? ack : assignment?.success ? assignment : ToRuntimeRelayFrameSchema.safeParse(parsed);
+        const frame = answer.success ? answer : login.success ? login : cancellation.success ? cancellation : revisionControl.success ? revisionControl : replay.success ? replay : ack.success ? ack : assignment?.success ? assignment : ToRuntimeRelayFrameSchema.safeParse(parsed);
         if (!frame.success || frame.data.connectionEpoch !== validatedEpoch) {
           rejectProtocol("protocol", "relay sent an invalid post-handshake envelope");
           return;
@@ -498,6 +532,7 @@ export class RelayClient {
     socket.on("unexpected-response", (_request, response) => {
       this.lastError = `relay rejected the connection: HTTP ${response.statusCode ?? 0}`;
       response.resume();
+      this.localCloseReasons.set(socket, `http_${response.statusCode ?? 0}`);
       socket.terminate();
     });
     socket.on("error", (error: Error) => {
@@ -517,6 +552,13 @@ export class RelayClient {
         this.setState("offline");
         return;
       }
+      // Say who closed it and why, every time (WS2-157): a close with no
+      // local reason came from the relay or the network (1006: no close frame).
+      const localReason = this.localCloseReasons.get(socket) ?? null;
+      this.logger.warn({ event: "relay.socket.closed", code, reason: reason.toString("utf8").slice(0, 120),
+        closedBy: localReason ? "runtime" : "peer_or_network", localReason, handshook,
+        connectedForMs: handshook ? Date.now() - this.connectedAt : null, lastError: this.lastError,
+        connectionEpoch: this.options.mux.connectionEpoch }, "relay socket closed");
       if (this.lastError === null) this.lastError = `relay socket closed (code ${code}${reason.length > 0 ? `, ${reason.toString()}` : ""})`;
       this.consecutiveFailures += handshook ? 0 : 1;
       this.setState("reconnecting");

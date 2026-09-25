@@ -8,6 +8,7 @@ import {
   RemoteExecutionRevisionControlDeliveryRequestSchema,
   RuntimeCancellationDeliveryRequestSchema,
   RuntimePermissionAnswerDeliveryRequestSchema,
+  RuntimeAgentLoginDeliveryRequestSchema,
 } from "@konteks/remote-common";
 
 /**
@@ -41,6 +42,17 @@ export class CoreSignatureVerifier {
   /** Independent outer proof; the receiver must verify the inner operation. */
   verifyPermissionAnswerDelivery(candidate: unknown): boolean {
     const parsed = RuntimePermissionAnswerDeliveryRequestSchema.safeParse(candidate);
+    if (!parsed.success) return false;
+    const request = parsed.data, key = this.keys.get(request.keyId);
+    if (!key || !/^[A-Za-z0-9_-]{86}$/.test(request.signature) ||
+      Buffer.from(request.signature, "base64url").toString("base64url") !== request.signature) return false;
+    try { return ed25519Verify(key, remoteControlSigningBytes(request), request.signature); }
+    catch { return false; }
+  }
+
+  /** A login the person started from the site, signed by Core for this socket (WS1-115). */
+  verifyAgentLoginDelivery(candidate: unknown): boolean {
+    const parsed = RuntimeAgentLoginDeliveryRequestSchema.safeParse(candidate);
     if (!parsed.success) return false;
     const request = parsed.data, key = this.keys.get(request.keyId);
     if (!key || !/^[A-Za-z0-9_-]{86}$/.test(request.signature) ||

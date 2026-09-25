@@ -69,6 +69,26 @@ describe("session manager (D98 bootstrap)", () => {
     expect(manager.activeSessions).toBe(1);
   });
 
+  it("refuses and cancels work the agent starts on its own after a turn, so the next turn still continues (WS2-130)", async () => {
+    const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+    const first = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    // A background timer from the last turn fires; Claude Code starts a turn
+    // nobody asked for and wants a tool permission.
+    await expect(manager.onRequestPermission({ sessionId: "bridge-s1", toolCall: { toolCallId: "t9", title: "discovery_run_inventory_list" }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] }))
+      .resolves.toEqual({ outcome: { outcome: "cancelled" } });
+    await expect(manager.onCreateElicitation({ sessionId: "bridge-s1", message: "?", requestedSchema: { type: "object" } } as never)).resolves.toEqual({ action: "cancel" });
+    expect(calls.cancel).toEqual([{ sessionId: "bridge-s1" }, { sessionId: "bridge-s1" }]);
+    const continued = await manager.continueLive({ context: { ...context, assignmentId: "asg-2" }, cwd: "/w", mcpServers: [], acpSessionRef: first.acpSessionRef,
+      lifecycle: { beforeCreate: async () => undefined, recordProcessOwner: async () => undefined, assertCurrent: () => undefined } });
+    expect(continued).toMatchObject({ acpSessionRef: first.acpSessionRef, resumed: true });
+  });
+
   it("continues a sealed session whose closed predecessor owner now rejects its own fence", async () => {
     // The live shape: the first turn's RelayedSession installed a fence that
     // rejects once that turn has closed and settled. Continuation belongs to
@@ -189,6 +209,14 @@ describe("session manager (D98 bootstrap)", () => {
     await manager.create({ context: { ...context, agentId }, cwd: "/w", mcpServers: [], acpSessionRef: "acp-prior" });
     expect(calls.loadSession?.[0]).not.toHaveProperty("_meta");
     expect(calls.newSession).toHaveLength(1);
+  });
+  it("names a new session from Core's display label", async () => {
+    const { bridge, calls } = fakeBridge();
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });
+    const created = await manager.create({ context: { ...context, agentId: "claude-code" }, cwd: "/w", mcpServers: [],
+      sessionLabel: { system: "Todo List", kind: "initiative", title: "[v3] Stand up the todo list API" } });
+    const title = `[konteks/Todo List/initiative] [v3] Stand up the todo list API ${created.acpSessionRef.slice(-8)}`;
+    expect(calls.newSession?.[0]).toMatchObject({ _meta: { konteksSession: { version: 1, title }, claudeCode: { options: { title } } } });
   });
   it("refuses a later setting that resets an already confirmed model", async () => {
     const option = (id: string, currentValue: string) => ({ id, type: "select", name: id, currentValue, options: [{ value: currentValue, name: currentValue }] });
@@ -312,6 +340,25 @@ describe("session manager (D98 bootstrap)", () => {
       nativeObservation: { ...native, origin: "connector" },
     } } as never);
     expect((seen[1] as { params: { update: unknown } }).params.update).not.toHaveProperty("nativeObservation");
+  });
+
+  it("attributes a Codex reply to the turn the connector opened, and only that turn (WS2-158)", async () => {
+    const events = new RunnerEventBus(), seen: RunnerEvent[] = [];
+    events.subscribe(event => seen.push(event));
+    const { bridge } = fakeBridge();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+    await manager.create({ context, cwd: "/w", mcpServers: [] });
+    seen.length = 0;
+    const observed = (origin: string, turnId: string) => ({ version: 1, origin, turnId, itemId: `${turnId}-item` });
+    const send = (sessionUpdate: string, origin: string, turnId: string) => manager.onSessionUpdate({ sessionId: "bridge-s1", update: {
+      sessionUpdate, content: { type: "text", text: "x" }, _meta: { konteksNativeObservation: observed(origin, turnId) },
+    } } as never);
+    send("user_message_chunk", "connector", "konteks-turn");
+    send("agent_message_chunk", "unclassified", "konteks-turn");
+    send("user_message_chunk", "unclassified", "local-turn");
+    send("agent_message_chunk", "unclassified", "local-turn");
+    const origins = seen.map(event => (event as { params: { update: { nativeObservation?: { origin: string } } } }).params.update.nativeObservation?.origin);
+    expect(origins).toEqual(["connector", "connector", "unclassified", "unclassified"]);
   });
 
   it("ignores foreign bridge callbacks and exit even when its private ID matches", async () => {
@@ -546,6 +593,31 @@ describe("session manager (D98 bootstrap)", () => {
       observation: { instanceId: "inst", assignmentId: "asg", attempt: 1, agentId: "codex", totalTokens: 30, inputTokens: 20, outputTokens: 10, cacheReadTokens: 5, moneyBasis: "unavailable_local_subscription" },
     });
     expect(JSON.stringify(await usage)).not.toMatch(/"model"|amount|currency/);
+  });
+
+  it("refuses a second prompt while one runs on the session, before it reaches the bridge (WS2-153)", async () => {
+    let finish!: (value: { stopReason: "end_turn" }) => void;
+    const prompt = vi.fn(() => new Promise<{ stopReason: "end_turn" }>((resolve) => { finish = resolve; }));
+    const { bridge } = fakeBridge({ prompt });
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+    const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    const published: RunnerEvent[] = [];
+    events.subscribe((event) => void published.push(event));
+    manager.prompt(acpSessionRef, "first", { prompt: [] });
+    let refused: unknown;
+    try { manager.prompt(acpSessionRef, "second", { prompt: [] }); } catch (error) { refused = error; }
+    expect(refused).toBeInstanceOf(RemoteInstanceError);
+    expect(refused).toMatchObject({ code: "operation_conflict" });
+    expect(prompt).toHaveBeenCalledOnce();
+    const result = nextEvent(events, "prompt_result");
+    finish({ stopReason: "end_turn" });
+    expect(await result).toMatchObject({ requestId: "first" });
+    expect(published.some((event) => event.kind === "request_error")).toBe(false);
+    // The session takes its next turn once the first has ended.
+    await new Promise((resolve) => setImmediate(resolve));
+    manager.prompt(acpSessionRef, "third", { prompt: [] });
+    expect(prompt).toHaveBeenCalledTimes(2);
   });
 
   it("classifies bridge failures into the closed AcpJsonRpcError classes", async () => {

@@ -432,6 +432,27 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); vi.useRealTimers(); }
   });
 
+  it("logs who closed the relay socket and why (WS2-157)", async () => {
+    const warn = vi.fn();
+    const logger = { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never;
+    const closed = () => warn.mock.calls.filter(call => (call[0] as { event?: string }).event === "relay.socket.closed").map(call => call[0]);
+    const peer = fixture({ logger });
+    try {
+      peer.socket.message(confirmed); await flush();
+      peer.socket.emit("close", 1006, Buffer.from(""));
+      expect(closed()).toEqual([expect.objectContaining({ code: 1006, closedBy: "peer_or_network", localReason: null, handshook: true })]);
+    } finally { peer.client.stop(); }
+    warn.mockClear();
+    const local = fixture({ logger });
+    try {
+      local.socket.message(confirmed); await flush();
+      local.client.rehandshake("stall:session:s");
+      local.socket.emit("close", 1012, Buffer.from("stall:session:s"));
+      expect(closed()).toEqual([expect.objectContaining({ code: 1012, reason: "stall:session:s", closedBy: "runtime",
+        localReason: "rehandshake:stall:session:s" })]);
+    } finally { local.client.stop(); }
+  });
+
   it("rejects malformed inbound frames while mux cursor adoption is awaiting durability", async () => {
     const gate = Promise.withResolvers<void>();
     const f = fixture(); f.mux.applyHandshake.mockImplementation(() => gate.promise);

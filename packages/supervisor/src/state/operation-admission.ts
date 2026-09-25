@@ -81,6 +81,27 @@ export class OperationAdmissionJournal {
     this.active.delete(key);
   }
 
+  /** Whether this process began the operation and has not settled it yet. */
+  isDispatching(key: string): boolean {
+    return this.active.has(key);
+  }
+
+  /**
+   * The runner proved it refused the request before it reached the agent (for
+   * example, another prompt already runs on the session). The operation began
+   * in this process, so its refusal is a known non-dispatch, not an ambiguity.
+   */
+  async refuseAtDispatch(key: string, completion: SessionToCoreMessage): Promise<void> {
+    await this.journal.pendingRequests.update(key, current => {
+      if (!current?.authorization) throw conflict();
+      if (current.authorization.state === "denied") return current;
+      if (current.authorization.state !== "dispatch_started" || !this.active.has(key)) throw conflict();
+      return { ...current, closedAt: current.closedAt ?? this.clock.nowIso(), authorization: { ...current.authorization,
+        state: "denied", completion } };
+    });
+    this.active.delete(key);
+  }
+
   async denyBeforeDispatch(key: string, completion?: SessionToCoreMessage): Promise<void> {
     await this.journal.pendingRequests.update(key, current => {
       if (!current?.authorization || !["admitted", "denied"].includes(current.authorization.state)) throw conflict();

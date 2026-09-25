@@ -1,6 +1,7 @@
-import { AgentTurnUsageObservationSchema, GatewayCallObservationSchema } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, GatewayCallObservationSchema, RuntimeAgentLoginReportSchema } from "@konteks/remote-common";
+
 import { z } from "zod";
-import { createPublicKey, type KeyObject } from "node:crypto";
+import { createHash, createPublicKey, type KeyObject } from "node:crypto";
 import {
   BoundedJsonValueSchema,
   ClaimResultSchema,
@@ -97,6 +98,8 @@ import {
 } from "@konteks/remote-common";
 import { decodeLeaseClaims } from "../lease/lease.js";
 
+type RuntimeAgentLoginReport = ReturnType<typeof RuntimeAgentLoginReportSchema.parse>;
+
 /**
  * Core's private supervisor endpoints over TLS. CP3 mounts the
  * `remote-instance-backend` plugin at `/api/remote-instances`; its
@@ -150,6 +153,9 @@ export const CORE_PATHS = Object.freeze({
   // other route the runtime calls; Core forwards it to managed-git with the
   // instance id exactly as the contract describes.
   gitKeys: (instanceId: string) => instancePath(instanceId, "git-keys"),
+  // A coding agent login the person started from the site (WS1-115).
+  agentLoginReport: (instanceId: string) => instancePath(instanceId, "agent-logins/report"),
+  acceptedRelease: (instanceId: string) => instancePath(instanceId, "accepted-release"),
   // Uninstall: the runtime removes itself (W1-L2), lease-authenticated like the rest.
   retire: (instanceId: string) => instancePath(instanceId, "retire"),
   gitKey: (instanceId: string, keyRef: string) => instancePath(instanceId, `git-keys/${encodeURIComponent(keyRef)}`),
@@ -500,6 +506,9 @@ export class CoreClient {
    * machine-proof boundary; its acknowledgement records only acceptance of
    * observation bytes and never a terminal result or quiescence decision.
    */
+  // The identity key joins its fields with NUL, which no HTTP header may carry:
+  // sent raw, fetch refused every submission locally, so a fenced session could
+  // never be recovered over HTTPS (WS2-159). The header carries its digest.
   async submitRecoveryEvidence(input: { evidence: RemoteRecoveryEvidence; connection: RemoteReconciliationConnection }): Promise<RecoveryEvidenceIngressResult> {
     const evidence = RemoteRecoveryEvidenceSchema.parse(structuredClone(input.evidence));
     const connection = RemoteReconciliationConnectionSchema.parse(structuredClone(input.connection));
@@ -507,7 +516,7 @@ export class CoreClient {
     const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.recoveryEvidence(evidence.instanceId),
       bodyFactory: () => ({ ...request, proof: this.proof("recovery_evidence", evidence.instanceId, request as unknown as { [key: string]: JsonValue }) }),
       schema: RecoveryEvidenceIngressResultSchema,
-      idempotencyKey: `recovery-evidence:${remoteRecoveryEvidenceIdentityKey(evidence)}:${evidence.evidenceDigest}` });
+      idempotencyKey: `recovery-evidence:${jcsDigest(remoteRecoveryEvidenceIdentityKey(evidence))}:${evidence.evidenceDigest}` });
     if (result.instanceId !== evidence.instanceId || result.assignmentId !== evidence.assignmentId || result.attempt !== evidence.attempt ||
         result.claimId !== evidence.claimId || result.recoveryEpoch !== evidence.recoveryEpoch || result.evidenceDigest !== evidence.evidenceDigest) {
       throw new RemoteInstanceError("registration_mismatch", "Recovery evidence response does not match the submitted observation.");
@@ -735,6 +744,34 @@ export class CoreClient {
    * Register this runtime's managed-git public key. Only the public half is
    * ever sent; the private half stays on the machine that generated it.
    */
+  /** Only the login's state, the provider link and the device code: never output, never input. */
+  async reportAgentLogin(instanceId: string, report: RuntimeAgentLoginReport): Promise<{ accepted: boolean }> {
+    const body = RuntimeAgentLoginReportSchema.parse(report);
+    return this.http.request({
+      method: "POST", path: CORE_PATHS.agentLoginReport(instanceId), body,
+      schema: z.object({ accepted: z.boolean() }).strict(),
+      idempotencyKey: `agent-login:${body.loginId}:${body.state}:${body.userCode ?? ""}:${body.verificationUrl ? createHash("sha256").update(body.verificationUrl).digest("base64url").slice(0, 16) : ""}`,
+    });
+  }
+
+  /**
+   * The release this Core accepts right now (WS1-093). An update to anything
+   * else would be refused by Core and leave the machine offline until it
+   * rolls back. Null from a Core that does not say.
+   */
+  async acceptedRelease(instanceId: string): Promise<{ bundleVersion: string; manifestDigest: string } | null> {
+    try {
+      return await this.http.request({
+        method: "GET", path: CORE_PATHS.acceptedRelease(instanceId),
+        schema: z.object({ bundleVersion: z.string().min(1).max(64), manifestDigest: z.string().min(1).max(256) }).strict(),
+      });
+    } catch (error) {
+      if (error instanceof RemoteInstanceError && "status" in error && (error as { status: number }).status === 404) return null;
+      if (error instanceof RemoteInstanceError && error.code === "capability_unavailable") return null;
+      throw error;
+    }
+  }
+
   async registerGitKey(instanceId: string, body: { publicKey: string; title: string }): Promise<z.infer<typeof GitKeyRegisterResultSchema>> {
     return this.http.request({ method: "POST", path: CORE_PATHS.gitKeys(instanceId), body, schema: GitKeyRegisterResultSchema, idempotencyKey: `git-key:${instanceId}:${body.title}` });
   }

@@ -1,4 +1,4 @@
-import type { ConnectedAgentView, RetainedProcessOwner } from "@konteks/remote-common";
+import type { ConnectedAgentView, RemoteSessionLabel, RetainedProcessOwner } from "@konteks/remote-common";
 
 export interface RunnerSessionInput {
   context: { instanceId: string; assignmentId: string; attempt: number; agentId: string };
@@ -13,6 +13,8 @@ export interface RunnerSessionInput {
   restoreAcpSessionRef?: string;
   /** Start with staged platform context rather than loading the provider transcript. */
   freshProviderSessionOnRestore?: boolean;
+  /** Display-only naming for the provider session list; never authority. */
+  sessionLabel?: RemoteSessionLabel;
 }
 
 export interface RunnerSessionCreated {
@@ -52,7 +54,8 @@ export interface RunnerPort {
   setMode(ref: string, id: string, params: unknown): Promise<unknown>;
   setConfigOption(ref: string, id: string, params: unknown): Promise<unknown>;
   answer(ref: string, id: string, response: unknown): Promise<{ delivered: boolean }>;
-  login(organization: boolean, loginId: string): Promise<{ loginId: string }>;
+  /** `personal`: the person asked for their own device login on this machine (WS1-115). */
+  login(organization: boolean, loginId: string, personal?: boolean): Promise<{ loginId: string }>;
   loginInput(loginId: string, text: string): Promise<unknown>;
   loginCancel(loginId: string): Promise<unknown>;
   logout(): Promise<ConnectedAgentView>;

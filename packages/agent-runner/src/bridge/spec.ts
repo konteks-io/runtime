@@ -1,7 +1,7 @@
 import { userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import { RemoteInstanceError, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
-import { findAgentBridge, verifyOfflineAgentPackage, type AgentBridgeFamily, type NativeAgentPackageProfile } from "@konteks/remote-release";
+import { RemoteInstanceError, sanitizeInheritedChildProcessEnv, type Logger } from "@konteks/remote-common";
+import { findAgentBridge, verifyOfflineAgentPackageOnce, type AgentBridgeFamily, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 
 /**
@@ -156,11 +156,18 @@ function nativeCommand(config: RunnerConfig, entry: NativeAgentPackageProfile["b
   return { command: join(config.RUNNER_BRIDGE_PREFIX, ...runtime.entrypoint.split("/")), args: [path, ...args] };
 }
 
-/** Recheck the complete closure before process restart or official authentication. */
-export async function verifyNativeRunnerPackage(config: RunnerConfig): Promise<void> {
+/**
+ * Recheck the complete closure before process restart or official
+ * authentication. The first use in this process hashes every file; later
+ * uses rehash only when the package's stat fingerprint moved (WS2-156).
+ */
+export async function verifyNativeRunnerPackage(config: RunnerConfig, logger?: Pick<Logger, "info">): Promise<void> {
   if (!config.RUNNER_NATIVE_PACKAGE_PROFILE && !config.RUNNER_NATIVE_PACKAGE_ARTIFACT) return;
   const artifact = config.RUNNER_NATIVE_PACKAGE_ARTIFACT;
   if (!artifact) throw new RemoteInstanceError("bundle_untrusted", "native package authority is missing");
-  const profile = await verifyOfflineAgentPackage(config.RUNNER_BRIDGE_PREFIX, artifact);
+  const startedAt = Date.now();
+  const { profile, cached } = await verifyOfflineAgentPackageOnce(config.RUNNER_BRIDGE_PREFIX, artifact);
   if (profile.agentId !== config.RUNNER_AGENT_ID || JSON.stringify(profile) !== JSON.stringify(config.RUNNER_NATIVE_PACKAGE_PROFILE)) throw new RemoteInstanceError("bundle_untrusted", "native package profile changed");
+  logger?.info({ event: "native.bootstrap.stage", stage: "package_verify", agentId: config.RUNNER_AGENT_ID,
+    mode: cached ? "cached" : "full", durationMs: Date.now() - startedAt }, "agent package verified");
 }

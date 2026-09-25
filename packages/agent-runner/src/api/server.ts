@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
-import { RemoteInstanceError, createLogger, type Logger } from "@konteks/remote-common";
+import { RemoteInstanceError, RemoteSessionLabelSchema, createLogger, type Logger } from "@konteks/remote-common";
 import type { AgentRuntime } from "../runtime.js";
 import { SessionContextSchema } from "../sessions/manager.js";
 
@@ -32,6 +32,7 @@ const CreateSessionSchema = z
     mcpServers: z.array(McpServerSchema).max(8),
     sessionConfig: z.record(z.string(), z.string()).optional(),
     acpSessionRef: z.string().min(1).max(256).optional(),
+    sessionLabel: RemoteSessionLabelSchema.optional(),
   })
   .strict();
 
@@ -111,6 +112,7 @@ export function startRunnerApi(options: RunnerApiOptions): Promise<Server> {
         mcpServers: body.mcpServers,
         ...(body.sessionConfig === undefined ? {} : { sessionConfig: body.sessionConfig }),
         ...(body.acpSessionRef === undefined ? {} : { acpSessionRef: body.acpSessionRef }),
+        ...(body.sessionLabel === undefined ? {} : { sessionLabel: body.sessionLabel }),
       });
       return sendJson(response, 201, created);
     }
@@ -159,6 +161,7 @@ function statusFor(error: RemoteInstanceError): number {
     case "gateway_unavailable":
       return 503;
     case "recovery_required":
+    case "operation_conflict":
       return 409;
     default:
       return 400;

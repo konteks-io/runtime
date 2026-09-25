@@ -24,6 +24,12 @@ export interface NativeUpdateCoordinatorOptions {
   attemptWindowMs?: number;
   /** An `in_progress` attempt older than this is treated as abandoned. */
   staleAttemptMs?: number;
+  /**
+   * The release Core accepts (WS1-093): installing any other one is refused
+   * by Core and costs minutes offline and a rollback. Undefined when Core
+   * could not be asked; null when this Core does not say.
+   */
+  acceptedRelease?: () => Promise<{ bundleVersion: string } | null>;
 }
 
 const DEFAULT_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
@@ -124,6 +130,17 @@ export class NativeUpdateCoordinator {
     if (!ledger) return refuse("update ledger unreadable");
     const backoff = this.backoffReason(ledger, available.manifestDigest);
     if (backoff) return refuse(backoff);
+    if (this.options.acceptedRelease) {
+      const accepted = await this.options.acceptedRelease().catch((error: unknown) => {
+        this.options.logger.warn({ err: error }, "could not ask Konteks which release it accepts");
+        return undefined;
+      });
+      if (accepted === undefined) return refuse("Konteks could not be asked which release it accepts; staying on this one");
+      if (accepted === null) return refuse("this Konteks does not say which release it accepts; update by hand with `konteks-remote update`");
+      if (accepted.bundleVersion !== available.bundleVersion) {
+        return refuse(`Konteks accepts ${accepted.bundleVersion}, not ${available.bundleVersion} yet; staying on this one until it does`);
+      }
+    }
     try {
       const launched = await this.options.launch({ ...available, reason });
       const inFlight = { startedAt: new Date(this.now()).toISOString(), bundleVersion: available.bundleVersion, manifestDigest: available.manifestDigest, reason, pid: launched.pid };

@@ -4,6 +4,23 @@ import type { CancellationInbox, CancellationInboxRecord } from "../state/cancel
 import type { LocalExecutionJournal } from "../state/local-execution.js";
 import type { CoreClient } from "../core/client.js";
 
+type StartedAssignment = NonNullable<ReturnType<LocalExecutionJournal["start"]>>["assignment"];
+
+/** The work a Core cancellation may name: an Assistant conversation turn, or
+ * a native delivery turn of a repository-role Session whose cleanup Core owns
+ * (WS2-159). The session must be the assignment's own. */
+export function cancellationNamesAssignment(assignment: StartedAssignment, sessionId: string): boolean {
+  const source = assignment.source;
+  if (source.kind === "harness_delivery") return source.executionSessionId === sessionId;
+  return assignment.kind === "assistant_execution" && source.kind === "conversation" && source.sessionId === sessionId;
+}
+
+/** A delivery turn stops through the ordinary signed cancel: its session
+ * closes and reports a cancelled terminal, which is Core's stop proof. */
+export function isDeliveryCancellation(assignment: StartedAssignment): boolean {
+  return assignment.source.kind === "harness_delivery";
+}
+
 export interface CapturedCancellationConnection {
   instanceId: string;
   workspaceId: string;
@@ -51,8 +68,7 @@ export class CancellationReceiver {
       const start = this.deps.claims.start(assignmentId, attempt);
       if (!start || start.admission.instanceId !== scope.instanceId || start.admission.workspaceId !== scope.workspaceId ||
         start.admission.runnerIncarnation !== scope.runnerIncarnation || start.admission.claimId !== request.intent.claimId ||
-        start.assignment.kind !== "assistant_execution" || start.assignment.source.kind !== "conversation" ||
-        start.assignment.source.sessionId !== request.intent.sessionId) throw unavailable();
+        !cancellationNamesAssignment(start.assignment, request.intent.sessionId)) throw unavailable();
     };
     // The inbox repeats this guard under its write lane and after fsync. The
     // exact parsed intent cannot be changed by caller mutation during awaits.

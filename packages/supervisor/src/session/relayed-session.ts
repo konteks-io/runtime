@@ -158,6 +158,8 @@ export class RelayedSession {
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
   private readonly executionGate: NativeExecutionGate | null;
+  /** Durable key of the last prompt admitted on this session (see promptBusy). */
+  private promptReservation: string | null = null;
   private lastPromptCompletion: { usage: AgentTurnUsageObservation | null } = { usage: null };
   private deliveryAcceptance: RemoteDeliveryAcceptanceReceipt | null = null;
   private mcpFacade: McpCapabilityFacade | null = null;
@@ -191,7 +193,7 @@ export class RelayedSession {
     try { await (this.deps.onExecutionAuthorityLost?.() ?? this.stopForRecovery()); }
     catch (error) {
       this.logger.warn({ event: "execution.recovery_stop_unconfirmed", assignmentId: this.assignment.id,
-        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "recovery_required" },
+        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "recovery_required", err: error },
       "Execution remains fenced; recovery settlement is unconfirmed");
       throw error;
     }
@@ -222,8 +224,13 @@ export class RelayedSession {
    * workspace data and are deliberately excluded.
    */
   private async bootstrapStage<T>(stage: string, operation: () => Promise<T>): Promise<T> {
+    const startedAt = Date.now();
     try {
-      return await operation();
+      const result = await operation();
+      // One line per finished stage, so a slow bootstrap says where (WS2-156).
+      this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+        stage, durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
+      return result;
     } catch (error) {
       const known = error instanceof RemoteInstanceError;
       this.logger.warn({
@@ -264,7 +271,7 @@ export class RelayedSession {
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     const mcpServers: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }> = [];
     if (this.assignment.agentRoute.mcpCapabilityTokenRef) {
-      const issue = await this.bootstrapStage("mcp_capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
+      const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
       this.deps.assertExecutionOwned?.();
       if (this.deps.deploymentKind === "native_connector") {
         const facade = new McpCapabilityFacade({
@@ -284,7 +291,7 @@ export class RelayedSession {
           now: () => this.deps.clock.coreNow(),
         });
         this.mcpFacade = facade;
-        mcpServers.push({ type: "http", ...await this.bootstrapStage("mcp_facade_start", () => facade.start()) });
+        mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
       } else {
         mcpServers.push({ type: "http", ...issue.mcpServer });
       }
@@ -292,11 +299,20 @@ export class RelayedSession {
     if (this.assignment.agentRoute.requiredRole === "qa" && this.deps.browserToolUrl) {
       mcpServers.push({ type: "http", name: "konteks-browser-tool", url: this.deps.browserToolUrl, headers: [] });
     }
+    // Optional tool wiring (Graft) ran alongside redemption and the facade.
+    // The agent must find it in place, and the ownership commit below must
+    // stay a short step from runner adoption, so settle it here. It never
+    // rejects: a failed wiring is logged and the delivery continues.
+    if (this.preparedInputs?.toolWiring) {
+      await this.bootstrapStage("tool_wiring_wait", () => this.preparedInputs!.toolWiring!);
+      this.deps.assertExecutionOwned?.();
+      if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+    }
     // Keep every fallible cloud/file input ahead of the local ownership
     // commit. Once activation succeeds, only local channel reservation and
     // runner adoption stand between the old and new ACP generations.
     const activation = this.deps.activateExecution
-      ? await this.bootstrapStage("execution_activation", () => this.deps.activateExecution!())
+      ? await this.bootstrapStage("activation", () => this.deps.activateExecution!())
       : undefined;
     this.deps.assertExecutionOwned?.();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
@@ -352,6 +368,7 @@ export class RelayedSession {
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
       ...(restoreRef ? { restoreAcpSessionRef: restoreRef } : {}),
       ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
+      ...(this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
     }, lifecycle));
     this.creationReturned = true;
     if (lifecycle && reservedRef !== created.acpSessionRef) throw new RemoteInstanceError("recovery_required", "Runner did not preserve durable reference ownership.");
@@ -370,7 +387,7 @@ export class RelayedSession {
     if (this.deps.deploymentKind === "native_connector") {
       try {
         const binding = this.preparedInputs!.binding;
-        const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("core_readiness_registration", () =>
+        const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("readiness", () =>
           this.deps.registerReady!(this.assignment, binding, created.acpSessionRef)));
         this.deps.assertExecutionOwned?.();
         if (ready.workspaceId !== binding.workspaceId || ready.instanceId !== binding.instanceId || ready.sessionId !== binding.sessionId || ready.assignmentId !== binding.assignmentId || ready.attempt !== binding.attempt ||
@@ -649,6 +666,15 @@ export class RelayedSession {
     }
     const message = operation.envelope.message;
     const ref = this.acpSessionRef!;
+    if (message.kind === "acp" && message.method === "session/prompt") {
+      // Check and reserve with no await between them: exactly one prompt may
+      // be admitted or running on this ACP session at a time.
+      if (this.promptBusy(operation.key)) {
+        await this.refuseConcurrentPrompt(gate, operation.key, message.id);
+        return;
+      }
+      this.promptReservation = operation.key;
+    }
     let params = message.kind === "acp" ? message.params : null;
     try {
       if (message.kind === "acp" && message.method === "session/prompt") {
@@ -687,7 +713,20 @@ export class RelayedSession {
     }
     // Do not convert a bridge transport exception into proof of completion.
     if (message.kind === "acp") {
-      if (message.method === "session/prompt") await this.deps.runner.prompt(ref, message.id, params);
+      if (message.method === "session/prompt") {
+        try { await this.deps.runner.prompt(ref, message.id, params); }
+        catch (error) {
+          // The runner's backstop: it refused because a prompt already runs
+          // on this session. Nothing reached the agent, so this is a known
+          // denial and the running turn is left alone.
+          if (!(error instanceof RemoteInstanceError) || error.code !== "operation_conflict") throw error;
+          const completion = concurrentPromptError(message.id);
+          await gate.refuseAtDispatch(operation.key, completion);
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "prompt_dispatch",
+            outcome: "denied_concurrent_prompt", source: "runner" }, "runner refused a second prompt on a busy session");
+          if (!this.closed) await this.sendToCore(completion);
+        }
+      }
       else if (message.method === "session/set_mode") await this.deps.runner.setMode(ref, message.id, params);
       else if (message.method === "session/set_config_option") await this.deps.runner.setConfigOption(ref, message.id, params);
       else {
@@ -711,6 +750,29 @@ export class RelayedSession {
     const delivered = await this.deps.runner.answer(ref, message.id, answer);
     if (!delivered.delivered) throw new RemoteInstanceError("operation_interrupted", "Answer delivery is unproven.");
     await gate.complete(operation.key);
+  }
+
+  /**
+   * Whether another prompt on this session is admitted or running. The
+   * reservation names the last prompt that passed this check; it holds only
+   * while that prompt is admitted, or started in this process and unsettled
+   * (a started row recovered from a crashed process never blocks a new turn).
+   */
+  private promptBusy(key: string): boolean {
+    const reserved = this.promptReservation;
+    if (reserved === null || reserved === key) return false;
+    const state = this.deps.journal.pendingRequests.get(reserved)?.authorization?.state;
+    return state === "admitted" || (state === "dispatch_started" && this.executionGate?.isDispatching(reserved) === true);
+  }
+
+  /** Deny before dispatch: a known outcome with an ACP error that never reaches the runner. */
+  private async refuseConcurrentPrompt(gate: NativeExecutionGate, key: string, id: string): Promise<void> {
+    const completion = concurrentPromptError(id);
+    await gate.denyBeforeDispatch(key, completion);
+    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "prompt_dispatch",
+      outcome: "denied_concurrent_prompt", source: "supervisor" }, "refused a second prompt while one is running on this session");
+    // The running turn keeps the session; do not close it for this refusal.
+    if (!this.closed) await this.sendToCore(completion);
   }
 
   private async completeReceived(id: string, method: "session/prompt" | "session/set_mode" | "session/set_config_option", completion: SessionToCoreMessage): Promise<boolean> {
@@ -780,6 +842,10 @@ export class RelayedSession {
         const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
         if (accepted && event.method === "session/prompt" && this.deps.deploymentKind === "native_connector" &&
             (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery")) {
+          // Say why before the close: its SIGTERM on the bridge was the only
+          // trace of a Codex sign-in that could not refresh (WS2-141).
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable },
+            "native turn failed with a request error; closing the assignment as an agent exit");
           await this.close("agent_exited");
         }
         return;
@@ -940,6 +1006,19 @@ export class RelayedSession {
     (this.deps.assertRecoveryOwned ?? this.deps.assertExecutionOwned)?.();
   }
 
+  /**
+   * Resolves once this session is closed and every prompt on it was asked to
+   * stop. A session still open has not reached its own terminal, so it throws
+   * and the caller retries later. Used before a claim reports itself
+   * `interrupted(not_resumable)`.
+   */
+  async confirmStopped(): Promise<void> {
+    if (!this.closed) throw new RemoteInstanceError("recovery_required", "The session is still open.");
+    if (this.closeTask) await Promise.allSettled([this.closeTask]);
+    if (this.acpSessionRef !== null) await this.deps.runner.cancel(this.acpSessionRef).catch(() => undefined);
+    await Promise.allSettled([...this.activities]);
+  }
+
   /** Dispatch owns the failure report; disposal must not invent a user cancellation. */
   async disposeFailedBootstrap(): Promise<void> {
     this.executionGate?.stop();
@@ -1066,11 +1145,30 @@ export class RelayedSession {
     this.releaseChannel = null;
   }
 
+  /**
+   * A recovery-fenced owner keeps its channel reservation until the
+   * orchestrator has proven its exact process stopped and Core settled the
+   * claim (WS2-159). Only then may the next turn take the channel, always
+   * with a fresh ACP session. Its own recovery stop must have run to the end.
+   */
+  releaseRecoveredChannel(): void {
+    if (!this.closed || !this.recoveryStopping || this.recoveryStopTask === null || this.recoverySettlementInProgress) {
+      throw new RemoteInstanceError("assignment_conflict", "The previous execution still owns its session channel.");
+    }
+    this.releaseChannel?.();
+    this.releaseChannel = null;
+  }
+
   waitForAuthorityStop(): Promise<void> { return this.executionGate?.waitForAuthorityStop() ?? Promise.resolve(); }
 }
 
 function malformed(): AcpJsonRpcError {
   return { code: -32603, class: "malformed_response", message: "bridge response failed schema validation", retryable: false };
+}
+
+function concurrentPromptError(id: string): SessionToCoreMessage {
+  return { kind: "acp_error", id, method: "session/prompt",
+    error: { code: -32600, class: "invalid_params", message: "Another prompt is already running on this session.", retryable: false } };
 }
 
 function classify(error: unknown): AcpJsonRpcError {

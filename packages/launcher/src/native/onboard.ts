@@ -32,6 +32,8 @@ import { deleteOwnerToken, OWNER_ACCESS_REVOKED, OwnerApiClient, readOwnerToken,
 export interface OnboardStep {
   step: OnboardState["step"];
   note?: string;
+  /** Internal: news a later step in the same call says again, or a wait that is already over. Dropped when chained past. */
+  passing?: true;
   ask?: { question: string; kind: "email" | "code" | "choice" | "confirm" | "text"; choices?: string[] };
   run?: { argv: string[] };
   done?: {
@@ -71,7 +73,7 @@ export interface OnboardContext {
     /** Each installed agent's readiness as the running service reports it, or null when it cannot say. */
     agentReadiness?: (root: string) => Promise<Record<string, string> | null>;
     /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
-    waitForReady?: (root: string) => Promise<{ administrativeStatus: string; roles: string[] } | null>;
+    waitForReady?: (root: string, until?: "ready" | "answering") => Promise<{ administrativeStatus: string; roles: string[] } | null>;
     /** Graft, injectable for tests (W1-G1). */
     graft?: {
       available?: (root: string) => Promise<boolean>;
@@ -99,6 +101,7 @@ const NEGATION = /\b(no|not|don'?t|do not|never|cancel|stop|wait)\b/;
 const ASKS_OTHER_EMAIL = /\b(different|another|other|wrong|change( the)?) (e-?mail|address)\b/i;
 const ASKS_NEW_CODE = /\b(new code|another code|resend|send (it |a code )?again|didn'?t (get|receive|arrive)|did not (get|receive|arrive)|no (code|email) (came|arrived))\b/i;
 const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
+const RECONNECT_ASK = { question: "Connect this machine again? It starts over with your email and a new code.", kind: "confirm" } as const;
 /** How long, and how often, the agents step waits for the machine to advertise what it can run. */
 const AGENTS_WAIT_MS = 10_000;
 const AGENTS_WAIT_ATTEMPTS = 9;
@@ -175,7 +178,7 @@ const UNSETTLED_READINESS = new Set(["ready", "probing", "unknown"]);
  * the summary that says "your Claude Code login will run Konteks work here"
  * waits for that heartbeat rather than claiming it early (OS14).
  */
-async function waitForServiceReady(root: string): Promise<{ administrativeStatus: string; roles: string[] } | null> {
+async function waitForServiceReady(root: string, until: "ready" | "answering" = "ready"): Promise<{ administrativeStatus: string; roles: string[] } | null> {
   const record = await readNativeRecord(root).catch(() => null);
   if (!record) return null;
   const control = new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort);
@@ -185,6 +188,7 @@ async function waitForServiceReady(root: string): Promise<{ administrativeStatus
     try {
       const status = await control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 });
       last = { administrativeStatus: status.administrativeStatus, roles: status.roles };
+      if (until === "answering") return last;
       if (status.administrativeStatus === "active" && status.connectivity.reconciliationComplete) return last;
     } catch (error) {
       // No control token yet means the service has not come up; keep waiting.
@@ -229,14 +233,17 @@ export async function runOnboard(context: OnboardContext, maxChained = 4): Promi
     // that note always reaches the person before the long step starts.
     const slowNext = after !== undefined && SLOW_STEPS.has(after);
     if (!isAgain(result.run) || result.ask || result.done || !advanced || slowNext || hop >= maxChained) {
-      if (notes.length === 0) return result;
-      return { ...result, note: [...notes, result.note].filter(Boolean).join(" ") };
+      const { passing: _passing, ...shown } = result;
+      if (notes.length === 0) return shown;
+      return { ...shown, note: [...notes, shown.note].filter(Boolean).join(" ") };
     }
     // Every step's news reaches the person: the push that went through, the
     // Graft already there (pass 6 lost both behind the closing). The steps that
     // restated one wait ("will join… is joining… is now…", pass 27) no longer
     // chain, since the slow start is never entered in the same call.
-    if (result.note && !notes.includes(result.note)) notes.push(result.note);
+    // A wait already over, or news the next step says again, is not repeated
+    // (pass 5 read the initiative three times in one closing).
+    if (result.note && !result.passing && !notes.includes(result.note)) notes.push(result.note);
     const { answer: _answered, ...next } = current;
     current = next;
   }
@@ -255,6 +262,19 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       clock,
       ...(context.deps?.fetchFn ? { fetchFn: context.deps.fetchFn } : {}),
     });
+  // The workspace's name as the site shows it now: the person may have renamed
+  // it since this machine was told its id (WS1-108). Revoked access still
+  // speaks; anything else falls back to what this machine was told.
+  const currentWorkspaceName = async (tenantId: string): Promise<string | undefined> => {
+    if (!tenantId || !(await readOwnerToken(supervisorData).catch(() => null))) return undefined;
+    try {
+      const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
+      return await api.workspaceDisplayName(tenantId);
+    } catch (error) {
+      if (error instanceof RemoteInstanceError && error.message === OWNER_ACCESS_REVOKED) throw error;
+      return undefined;
+    }
+  };
   const families = context.deps?.families ?? detectAgentFamilies;
   const state = (await readOnboardState(context.root)) ?? {
     schemaVersion: 1 as const,
@@ -263,6 +283,19 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
   };
   const save = (next: Partial<OnboardState>) =>
     writeOnboardState(context.root, { ...state, ...next } as never);
+  // The last reply was "Try that step again now?". Its yes or no answers that
+  // question, never the step's own: pass 5's "yes" went on as an email address
+  // and was refused, again and again.
+  if (state.retryAsked) {
+    await save({ retryAsked: undefined } as never);
+    if (context.answer !== undefined) {
+      if (isNo(context.answer.trim())) {
+        return { step: state.step, note: "Stopped here; nothing you answered was lost. Paste the line again whenever you want to carry on." };
+      }
+      const { answer: _retry, ...again } = context;
+      return runOnboardStep(again);
+    }
+  }
   const links = () => ({
     site: siteUrl,
     ...(state.systemId ? { system: `${siteUrl}/systems/${state.systemId}` } : {}),
@@ -276,13 +309,14 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
   const lost = await lostMachineKey(supervisorData);
   if (lost) {
     await setAsideLostIdentity(context.root, lost.instanceId);
-    const email = state.email ?? state.resendTo;
+    const email = state.email ?? state.resendTo ?? state.ownerEmail;
     await writeOnboardState(context.root, {
       schemaVersion: 1,
       step: "email",
       updatedAt: new Date().toISOString(),
       replaces: lost.instanceId,
       ...(email ? { resendTo: email } : {}),
+      ...keptAnswers(state),
     } as never);
     const note =
       "This machine lost its Konteks key, so it can no longer connect as the runtime it was. It will connect again as a new runtime that takes the old one's place; your repository and your coding agents' logins are not affected.";
@@ -292,6 +326,30 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
   }
 
   switch (state.step) {
+    case "reconnect": {
+      if (context.answer === undefined || (!isYes(context.answer) && !isNo(context.answer))) {
+        return { step: "identity", note: OWNER_ACCESS_REVOKED, ask: RECONNECT_ASK };
+      }
+      if (isNo(context.answer)) {
+        await save({ step: "done", closing: true });
+        return { step: "identity", done: { summary: "This machine stays disconnected from Konteks.", links: { site: siteUrl } } };
+      }
+      // The revoked runtime can never act again; keep its record beside the
+      // install and enroll this machine afresh, as a new runtime.
+      const revoked = await new SupervisorStore(supervisorData).identity().catch(() => null);
+      if (revoked?.instanceId && revoked.instanceId !== "pending") await setAsideLostIdentity(context.root, revoked.instanceId);
+      const address = state.ownerEmail ?? state.email;
+      await writeOnboardState(context.root, {
+        schemaVersion: 1,
+        step: "email",
+        updatedAt: new Date().toISOString(),
+        ...(address ? { resendTo: address } : {}),
+        ...keptAnswers(state),
+      } as never);
+      return address
+        ? { step: "identity", note: "Starting over as a new runtime.", run: AGAIN }
+        : { step: "identity", ask: { question: "What email address should this machine belong to?", kind: "email" } };
+    }
     case "identity": {
       // A machine that already has an identity is not enrolling again; it is
       // being asked what it is (OS9).
@@ -324,7 +382,6 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "email" });
       return {
         step: "identity",
-        note: "This machine is not connected to Konteks yet.",
         ask: { question: "What email address should this machine belong to?", kind: "email" },
       };
     }
@@ -362,7 +419,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "code", intentRef, email, emailMasked: sent.sentToMasked, attemptsRemaining: sent.attemptsRemaining, resendTo: undefined, resendReason: undefined } as never);
       return {
         step: "email",
-        note: `${state.resendReason ? `${state.resendReason} ` : ""}A ${state.resendReason ? "new " : ""}six-digit code is on its way to ${sent.sentToMasked}. If it does not arrive within a minute or two, say "send a new code"; for another address, say "use a different email".`,
+        note: `${state.resendReason ? `${state.resendReason} ` : ""}A ${state.resendReason ? "new " : ""}six-digit code is on its way. If it does not arrive in a minute or two, say "send a new code", or "use a different email".`,
         run: AGAIN,
       };
     }
@@ -420,7 +477,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               ? "That code has expired; codes last ten minutes."
               : "That code was not accepted either, and after five wrong codes a code stops working, to keep your account safe.";
           await save({ step: "email", intentRef: undefined, emailMasked: undefined, attemptsRemaining: undefined, resendReason, ...(state.email ? { resendTo: state.email } : {}) } as never);
-          return { step: "code", note: `${resendReason} A new one will be sent.`, run: AGAIN };
+          // The email step the chain ends on says the reason again (Z2, pass 5).
+          return { step: "code", note: `${resendReason} A new one will be sent.`, run: AGAIN, passing: true };
         }
         throw error;
       }
@@ -452,9 +510,14 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         return { step: "workspace", ask: { question: "Which workspace should this machine join?", kind: "choice", choices } };
       }
       const wanted = context.answer.trim().toLowerCase();
-      const chosen = (state.workspaces ?? []).find(
-        entry => entry.displayName.toLowerCase() === wanted || entry.tenantId.toLowerCase() === wanted,
-      );
+      const offered = state.workspaces ?? [];
+      // A person answers in a sentence ("konteks-2 again please"): take the one
+      // offered name it mentions, and ask again only when it names none or two.
+      const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const mentions = (name: string) => new RegExp(`(^|[^\\p{L}\\p{N}-])${escape(name.toLowerCase())}($|[^\\p{L}\\p{N}-])`, "u").test(wanted);
+      const named = offered.filter(entry => mentions(entry.displayName) || mentions(entry.tenantId));
+      const chosen = offered.find(entry => entry.displayName.toLowerCase() === wanted || entry.tenantId.toLowerCase() === wanted) ??
+        (named.length === 1 ? named[0] : undefined);
       if (!chosen) {
         return {
           step: "workspace",
@@ -500,15 +563,26 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
             // to revoke. Stop here, but leave onboarding ready to try again:
             // "run onboard again" used to find a finished machine and replay
             // a summary instead of connecting. The next run sends a new code.
-            await save({ step: "email", intentRef: undefined, emailMasked: undefined, decision: undefined, attemptsRemaining: undefined, resendTo: state.email } as never);
             const said = error instanceof Error && /plan allows/i.test(error.message)
               ? error.message.trim().replace(/([^.!?])$/, "$1.")
               : "This workspace's plan allows one connected runtime, and it is in use.";
+            // With other workspaces on offer, the address this run proved is
+            // still good for them: ask again instead of sending a new code
+            // (W1-E2, WS1-104). Core only rolled the refused bind back.
+            if (state.decision === "choose" && (state.workspaces?.length ?? 0) > 1) {
+              await save({ step: "workspace", tenantId: undefined } as never);
+              return {
+                step: "workspace",
+                note: `${workspaceName(state, state.tenantId ?? "")} has no room for this machine. ${said} To use it here, revoke that runtime in Customize → Runtimes (${siteUrl}/customize/connected-runtimes) or move the workspace to a plan with more runtimes in Settings → Plan. Or choose another workspace.`,
+                ask: { question: "Which workspace should this machine join?", kind: "choice", choices: (state.workspaces ?? []).map(entry => entry.displayName) },
+              };
+            }
+            await save({ step: "email", intentRef: undefined, emailMasked: undefined, decision: undefined, attemptsRemaining: undefined, resendTo: state.email } as never);
             return {
               step: "start",
               done: {
-                summary: `${said} To move Konteks to this laptop, revoke that runtime in Settings → Connected runtimes, then run onboard again here; a new code will be sent to ${state.emailMasked ?? "your address"}.`,
-                links: { site: `${siteUrl}/settings/runtimes` },
+                summary: `${said} To move Konteks to this laptop, revoke that runtime in Customize → Runtimes, then run onboard again here; a new code will be sent to ${state.emailMasked ?? "your address"}. To keep both, move the workspace to a plan with more runtimes in Settings → Plan.`,
+                links: { site: `${siteUrl}/customize/connected-runtimes` },
               },
             };
           }
@@ -518,7 +592,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               step: "start",
               done: {
                 summary: "No new workspace can be created right now. Sign in on the site or try again later.",
-                links: { site: `${siteUrl}/settings/runtimes` },
+                links: { site: siteUrl },
               },
             };
           }
@@ -533,11 +607,13 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         });
         identity = bound.identity;
       }
-      const workspaceNote =
-        state.decision === "create"
-          ? `Your workspace is ready: ${identity.workspaceId}. You can rename it in Settings.`
-          : `This machine is joining ${identity.workspaceId}.`;
-      const announce = state.workspaceAnnounced ? "" : `${workspaceNote} `;
+      const joinedName = workspaceName(state, identity.workspaceId);
+      // A join was already said ("This machine will join X.", "Joining X.")
+      // and "is now X's runtime" below says it once more; only a new
+      // workspace has news here (pass 5 read the join three times).
+      const announce = state.workspaceAnnounced || state.decision !== "create"
+        ? ""
+        : `Your workspace is ready: ${identity.workspaceId}. You can rename it in Settings. `;
       // The agent packages unpack in the background from `install --enroll`
       // (WS1-012). Wait a while for them here, and if they are still going,
       // say how far they have got and come back, rather than sit silent.
@@ -580,7 +656,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       } as never);
       return {
         step: "start",
-        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${identity.workspaceId}'s`} runtime; starting it next.`,
+        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next, which takes about half a minute.`,
         // Registering and starting the service is the launcher's own command,
         // so the agent runs it rather than this process forking a service.
         run: { argv: ["konteks-remote", "start"] },
@@ -588,10 +664,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
     }
 
     case "inspect": {
-      // The service was just started; give it the first heartbeat before
-      // anything is said about what runs here (OS14). A machine that was
-      // already connected answers at once.
-      const ready = await (context.deps?.waitForReady ?? waitForServiceReady)(context.root).catch(() => null);
+      // The service was just started. The folder questions need only that it
+      // answers: its agents keep starting while the person reads and replies,
+      // and the agents step waits for the first heartbeat before anything is
+      // said about what runs here (OS14, WS1-116).
+      const ready = await (context.deps?.waitForReady ?? waitForServiceReady)(context.root, "answering").catch(() => null);
       // The previous step asked for `konteks-remote start`. If nothing answers
       // here, that step did not happen — and carrying on regardless is how a
       // missed start surfaced two questions later as "the supervisor has not
@@ -632,7 +709,6 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         };
       }
       if (state.startWaits) await save({ startWaits: 0 });
-      const notReady = ready.administrativeStatus !== "active" ? "The runtime service is still coming up; it will finish in the background. " : "";
       const facts = await (context.deps?.inspect ?? inspectRepository)(context.cwd ?? process.cwd());
       // A new conversation in the folder that is already this machine's
       // System: there is nothing to register again. Say so, and where the
@@ -643,12 +719,15 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         state.repositoryPath &&
         resolve(facts.path ?? context.cwd ?? process.cwd()) === resolve(state.repositoryPath)
       ) {
+        // "Nothing needs setting up" is only true while Core still accepts
+        // this machine; a revoked one is asked to connect again instead.
+        await currentWorkspaceName(state.tenantId ?? "");
         await save({ step: "done", revisit: false });
         return {
           step: "inspect",
           done: {
             summary: [
-              `This machine is connected to ${state.tenantId ?? "your workspace"}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}.`,
+              // The greeting just said who and where this machine is connected.
               `${state.repositoryName ?? "This folder"} is already your System${state.repositoryKind === "managed" ? " on Konteks managed git" : ""}; nothing here needs setting up again.`,
               state.initiativeId ? `Your first initiative "${state.initiativeTitle}" and its planning session are on the site.` : null,
               "Run onboard from another project folder to add it as a System.",
@@ -667,7 +746,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           await save({ step: "first_task", advertisedRoles: ready.roles });
           return {
             step: "inspect",
-            note: `${notReady}This is your ${directory === resolve("/") ? "root" : "home"} folder, not a project, so no System is made here. Run onboard again from inside a project folder to add one.`,
+            note: `This is your ${directory === resolve("/") ? "root" : "home"} folder, not a project, so no System is made here. Run onboard again from inside a project folder to add one.`,
             run: AGAIN,
           };
         }
@@ -685,11 +764,13 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         });
         return {
           step: "inspect",
-          note: `${notReady}You are in ${basename(directory)}, a folder that is not a git repository yet. Konteks can make it one and keep it on Konteks managed git.`,
+          note: `${basename(directory)} isn\u2019t a git repository yet.`,
           run: AGAIN,
         };
       }
-      const kind = facts.remoteUrl && facts.remoteReachable ? "existing" : "managed";
+      // A remote only this machine can open (a folder, a file:// URL) is not
+      // one Konteks can register; the folder is offered managed git instead.
+      const kind = facts.remoteUrl && facts.remoteReachable && !facts.remoteLocal ? "existing" : "managed";
       await save({
         step: "system",
         repositoryPath: facts.path,
@@ -697,17 +778,22 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         defaultBranch: facts.defaultBranch,
         repositoryKind: kind,
         ...(facts.remoteUrl ? { remoteUrl: facts.remoteUrl } : {}),
+        ...(facts.onManagedGit ? { repositoryOnManagedGit: true } : {}),
+        ...(facts.unpushedCommits !== undefined ? { repositoryUnpushed: facts.unpushedCommits } : {}),
         advertisedRoles: ready.roles,
       });
+      // A folder already on Konteks managed git says so in its question.
+      const where =
+        kind === "existing"
+          ? `You are in ${facts.name}, with remote ${facts.remoteUrl}.`
+          : facts.onManagedGit
+            ? ""
+            : facts.remoteLocal
+              ? `You are in ${facts.name}. Its remote is a folder on this machine, which Konteks can\u2019t reach.`
+              : `You are in ${facts.name}, which has no remote this machine can push to.`;
       return {
         step: "inspect",
-        note: `${notReady}${
-          kind === "existing"
-            ? `You are in ${facts.name}, with remote ${facts.remoteUrl}.`
-            : facts.onManagedGit
-              ? `You are in ${facts.name}, which is already on Konteks managed git (remote "konteks").`
-              : `You are in ${facts.name}, which has no remote this machine can push to.`
-        }`,
+        ...(where ? { note: where } : {}),
         run: AGAIN,
       };
     }
@@ -718,7 +804,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           ? `Make ${state.repositoryName} your first System in Konteks?`
           : state.repositoryNeedsInit
             ? `Make ${state.repositoryName} your first System, kept on Konteks managed git? Nothing is pushed until you say so.`
-            : `Make ${state.repositoryName} your first System, on Konteks managed git?`;
+            : state.repositoryOnManagedGit
+              ? `Use ${state.repositoryName} as your System here? It is already on Konteks managed git, so if your workspace has it, nothing is made twice.`
+              : `Make ${state.repositoryName} your first System, on Konteks managed git?`;
       if (context.answer === undefined) {
         // The repository is the one captured at the first inspect. A run from
         // somewhere else while this is pending asks which of the two is meant,
@@ -815,14 +903,21 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const question = !state.repositoryNeedsInit
         ? `Push ${state.defaultBranch} to the Konteks repository now?`
         : withFiles
-          ? `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it, with one commit of your ${plan.include.length} file${plan.include.length === 1 ? "" : "s"}.`
-          : `Push ${state.repositoryName} to Konteks managed git now? The folder becomes a git repository on ${state.defaultBranch}, joined to the repository Konteks made for it; none of your files are added or changed.`;
+          ? `Push ${state.repositoryName} to Konteks managed git now? It becomes a git repository on ${state.defaultBranch} with one commit of the files above.`
+          : `Push ${state.repositoryName} to Konteks managed git now? It becomes a git repository on ${state.defaultBranch}; none of your files are added or changed.`;
       if (context.answer === undefined) {
+        // A System this machine rejoined, whose branch Konteks already has:
+        // there is nothing to agree to. The push only registers this machine's
+        // key and changes nothing on the repository.
+        if (state.systemExisting && state.repositoryOnManagedGit && state.repositoryUnpushed === 0) {
+          await save({ step: "pushing" });
+          return { step: "push", note: `Konteks already has ${state.defaultBranch}; joining this machine to the repository.`, run: AGAIN };
+        }
         if (!withFiles) return { step: "push", ask: { question, kind: "confirm" } };
         const shown = plan.include.slice(0, 8);
         const more = plan.include.length - shown.length;
         const left = plan.leftOut.length > 0
-          ? ` Left out: ${listed(plan.leftOut.map(entry => `${entry.path} (${entry.why})`))}. A .gitignore listing ${plan.leftOut.length === 1 ? "it" : "them"} is added so ${plan.leftOut.length === 1 ? "it stays" : "they stay"} out.`
+          ? ` Left out: ${listed(plan.leftOut.map(entry => `${entry.path} (${entry.why})`))}; a new .gitignore in the commit keeps ${plan.leftOut.length === 1 ? "it" : "them"} out.`
           : "";
         return {
           step: "push",
@@ -837,7 +932,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "pushing" });
       return {
         step: "push",
-        note: `Pushing ${state.defaultBranch} to Konteks managed git. This usually takes a few seconds.`,
+        // An empty folder has nothing of the person's to push; it only joins
+        // the repository Konteks made (WS1-124).
+        note: state.repositoryNeedsInit && !withFiles
+          ? `Joining ${state.repositoryName} to its Konteks repository. This usually takes a few seconds.`
+          : `Pushing ${state.defaultBranch} to Konteks managed git. This usually takes a few seconds.`,
         run: AGAIN,
       };
     }
@@ -912,7 +1011,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           await save({ step: "graft" });
           return {
             step: "pushing",
-            note: `${initialized.message} Your code lives on Konteks managed git, on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}. Push your work with git as usual (remote "konteks").`,
+            note: `${initialized.message} It is on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}; push your work with git as usual (remote "konteks").`,
             run: AGAIN,
           };
         }
@@ -930,7 +1029,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "graft" });
       return {
         step: "pushing",
-        note: `${result.message} Your code now lives on Konteks managed git, on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}. This folder's ${state.defaultBranch} branch tracks it (remote "konteks").`,
+        note: `${result.message} It is on the ${state.repositoryName} System: ${siteUrl}/systems/${state.systemId}, and this folder's ${state.defaultBranch} branch tracks it (remote "konteks").`,
         run: AGAIN,
       };
     }
@@ -968,7 +1067,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           note:
             `Graft maps this repository's code so ${names} can find their way around it before they search. ` +
             "It runs only on this machine, sends nothing to a paid model, and its usage statistics stay off. " +
-            `Outside this folder it writes only in ~/.graft: its settings and its own copy of Graft, which keeps working if Konteks is ever removed.${tracked}`,
+            `Outside this folder it writes only its settings and its own copy in ~/.graft.${tracked}`,
           ask: { question, kind: "confirm" },
         };
       }
@@ -982,7 +1081,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "graft_setup", graftDecision: "accepted", graftRepository: repo });
       return {
         step: "graft",
-        note: `Setting up Graft: downloading it, then building its map of ${state.repositoryName ?? "this repository"} (${plan.files} file${plan.files === 1 ? "" : "s"}). That usually takes under ${graftBuildSeconds(plan.files) + 30} seconds.`,
+        note: `Setting up Graft: downloading it, then mapping ${state.repositoryName ?? "this repository"}. That usually takes under ${graftBuildSeconds(plan.files) + 30} seconds.`,
         run: AGAIN,
       };
     }
@@ -997,8 +1096,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         return {
           step: "graft_setup",
           note:
-            `Graft is set up in ${state.repositoryName ?? "this repository"}${wired.mappedFiles !== null ? `: its map covers ${wired.mappedFiles} file${wired.mappedFiles === 1 ? "" : "s"}` : ""}. ` +
-            `It added ${listed(wired.added)}, which git leaves out of your commits on this machine.${changed} A graft command sits next to konteks-remote for your agents.`,
+`Graft is set up in ${state.repositoryName ?? "this repository"} and kept out of your commits.${changed}`,
           run: AGAIN,
         };
       } catch (error) {
@@ -1022,9 +1120,26 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         }
       }
       if (context.answer === undefined) {
+        // An invited Viewer can look but not plan: asked for a first task,
+        // they got an initiative whose planning refused them, read as
+        // "access was refused" (WS1-131). Nothing is made, and they hear why.
+        if (state.systemId && !state.initiativeId) {
+          const allowed = await ownerApi(supervisorData, coreUrl, enrollment, context)
+            .then(api => api.canStartWork())
+            .catch(() => undefined);
+          if (allowed === false) {
+            const where = state.tenantId ? ((await currentWorkspaceName(state.tenantId)) ?? workspaceName(state, state.tenantId)) : "this workspace";
+            await save({ step: "done", closing: true });
+            return {
+              step: "first_task",
+              note: `Your role in ${where} can look but not start work, so no initiative was started. Once its owner makes you a Member, start one from the site with New initiative.`,
+              run: AGAIN,
+            };
+          }
+        }
         return {
           step: "first_task",
-          ask: { question: "What do you want to build first? (this first turn uses your starter grant)", kind: "text" },
+          ask: { question: "What do you want to build first? Your first planning turn is included.", kind: "text" },
         };
       }
       const wanted = context.answer.trim();
@@ -1046,6 +1161,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       return {
         step: "first_task",
         note: `Setting up your first initiative, "${title}", on ${state.repositoryName ?? "your System"}. Konteks is getting this machine's agents ready and opening the initiative's planning session; this takes up to a minute.`,
+        passing: true,
         run: AGAIN,
       };
     }
@@ -1055,6 +1171,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       // work, so its first planning session would be refused for want of a
       // profile (W1-A6). This machine's own agents are the answer, and they
       // are the person's own logins: nothing to ask, nothing to configure.
+      // The first heartbeat, which the folder questions did not wait for.
+      const service = await (context.deps?.waitForReady ?? waitForServiceReady)(context.root).catch(() => null);
+      if (service?.administrativeStatus === "active") await save({ advertisedRoles: service.roles });
       const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
       if (!(await api.hasExecutionProfile())) {
         const ready = await api.setUpAgentsFromThisMachine(hostLabel());
@@ -1082,7 +1201,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       }
       await save({ agentsWaited: undefined } as never);
       await save({ step: "initiative" });
-      return { step: "agents", note: "This machine's agents will run the work in this workspace.", run: AGAIN };
+      return { step: "agents", note: "This machine's agents will run the work in this workspace.", run: AGAIN, passing: true };
     }
 
     case "initiative": {
@@ -1124,6 +1243,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       return {
         step: "initiative",
         note: `Your first initiative, "${title}", is ready. Its planning session on this machine has your words as its first message and is replying now; follow it and answer it from the initiative: ${url}`,
+        passing: true,
         run: AGAIN,
       };
     }
@@ -1142,8 +1262,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       if (state.step === "done" && context.answer === undefined && !state.closing) {
         const identity = await new SupervisorStore(supervisorData).identity().catch(() => null);
         if (identity?.instanceId && identity.instanceId !== "pending") {
+          // Named before anything is saved: a revoked machine stops here, and
+          // the next paste meets the same question instead of a false "all set".
+          const tenant = state.tenantId ?? identity.workspaceId;
+          const where = tenant ? ((await currentWorkspaceName(tenant)) ?? workspaceName(state, tenant)) : "your workspace";
           await save({ step: "inspect", revisit: true });
-          const where = state.tenantId ?? identity.workspaceId ?? "your workspace";
           return {
             step: "identity",
             note: `This machine is already connected to ${where}${state.ownerEmail ? ` as ${state.ownerEmail}` : ""}; no sign-in is needed.`,
@@ -1167,6 +1290,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         remedies.push("To keep the runtime available after logout: loginctl enable-linger $USER");
       }
       const advertised = state.advertisedRoles;
+      const currentName = await currentWorkspaceName(state.tenantId ?? "");
       const agentsLine =
         present.length === 0
           ? installed.length > 0
@@ -1179,12 +1303,16 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         step: "done",
         done: {
           summary: [
-            `This machine is connected to your workspace ${state.tenantId ?? ""}`.trim() + " (you can rename it in Settings).",
+            joinedWorkspace(state) || (currentName !== undefined && currentName !== state.tenantId)
+              ? `This machine is connected to your workspace ${currentName ?? workspaceName(state, state.tenantId ?? "")}.`
+              : `This machine is connected to your workspace ${state.tenantId ?? ""}`.trim() + " (you can rename it in Settings).",
             state.systemEntityRef
               ? `${state.repositoryName} is your first System${state.repositoryKind === "managed" ? ", kept on Konteks managed git" : ""}.`
               : null,
             state.initiativeId
-              ? `Your first initiative is "${state.initiativeTitle}"${state.setupFailure ? "; its planning session still needs Retry setup on the initiative page" : ", and its planning session is working on it here"}.`
+              ? state.systemExisting
+                ? `Your first initiative "${state.initiativeTitle}" and its planning session are on the site.`
+                : `Your first initiative is "${state.initiativeTitle}"${state.setupFailure ? "; its planning session still needs Retry setup on the initiative page" : ". Its planning session is replying now; answer it from the initiative"}.`
               : null,
             agentsLine,
           ]
@@ -1223,6 +1351,29 @@ export function initiativeTitle(sentence: string): string {
   return `${(space > 40 ? cut.slice(0, space) : cut).trim()}…`;
 }
 
+/**
+ * A workspace this machine joined is named the way its owner named it (W1-E1);
+ * only one it made has just its derived id, with the note that it can be renamed.
+ */
+function joinedWorkspace(state: { decision?: string | undefined }): boolean {
+  return state.decision === "join" || state.decision === "choose";
+}
+
+/**
+ * What the person already answered about this machine and folder, kept when the
+ * machine connects again as a new runtime: they are not asked twice (W1-G2).
+ */
+function keptAnswers(state: { ownerEmail?: string | undefined; graftDecision?: string | undefined; graftRepository?: string | undefined }): Record<string, string> {
+  return {
+    ...(state.ownerEmail ? { ownerEmail: state.ownerEmail } : {}),
+    ...(state.graftDecision && state.graftRepository ? { graftDecision: state.graftDecision, graftRepository: state.graftRepository } : {}),
+  };
+}
+
+function workspaceName(state: { workspaces?: Array<{ tenantId: string; displayName: string }> | undefined }, tenantId: string): string {
+  return state.workspaces?.find(entry => entry.tenantId === tenantId)?.displayName ?? tenantId;
+}
+
 /** An agent family as people name it. */
 export function agentName(family: string): string {
   return ({ "claude-code": "Claude Code", codex: "Codex", opencode: "OpenCode", pi: "Pi" } as Record<string, string>)[family] ?? family;
@@ -1233,8 +1384,8 @@ export function agentName(family: string): string {
  *
  * The block teaches the agent three shapes and nothing else, so a failure is
  * said inside the protocol: what did not work, in plain words, and the same
- * question again, or an offer to try the step again. Revoked access is final
- * and ends the flow with where to go instead.
+ * question again, or an offer to try the step again. Revoked access ends that
+ * runtime, and the person is asked whether to connect the machine again.
  */
 export async function onboardFailureStep(context: OnboardContext, error: unknown): Promise<OnboardStep> {
   const state = await readOnboardState(context.root).catch(() => null);
@@ -1252,6 +1403,15 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
       intentRef: undefined,
     } as never).catch(() => undefined);
     return { step, done: { summary: said, links: { site: siteUrl } } };
+  }
+  // Revoked is final for that runtime, not for the machine: offer to connect
+  // it again rather than end on a refusal the next paste would only repeat.
+  if (error instanceof RemoteInstanceError && error.code === "permission_denied" && message === OWNER_ACCESS_REVOKED) {
+    await writeOnboardState(context.root, {
+      ...(state ?? { schemaVersion: 1 as const, updatedAt: new Date().toISOString() }),
+      step: "reconnect",
+    } as never).catch(() => undefined);
+    return { step: "identity", note: OWNER_ACCESS_REVOKED, ask: RECONNECT_ASK };
   }
   if (error instanceof RemoteInstanceError && error.code === "permission_denied") {
     return { step, done: { summary: `Konteks stopped this setup: ${said} Sign in on the site to see this machine and your workspace.`, links: { site: siteUrl } } };
@@ -1275,14 +1435,21 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
       run: AGAIN,
     };
   }
-  const note = /nothing you answered was lost/i.test(said)
-    ? `Konteks could not finish that step: ${said}`
-    : `Konteks could not finish that step: ${said} Nothing you answered was lost.`;
+  // A bare gateway status or a dropped connection anywhere else is Konteks
+  // being unreachable for a moment (a restart, a deploy), not a code for the
+  // person to read ("HTTP 502", pass 5).
+  const unreachable = /^HTTP 50[234]$/.test(message) || /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(message);
+  const note = unreachable
+    ? "Konteks could not be reached just now; it may be restarting. Nothing you answered was lost."
+    : /nothing you answered was lost/i.test(said)
+      ? `Konteks could not finish that step: ${said}`
+      : `Konteks could not finish that step: ${said} Nothing you answered was lost.`;
   if (step === "email" || step === "code" || step === "workspace" || step === "first_task") {
     const { answer: _answer, ...unanswered } = context;
     const again = await runOnboardStep(unanswered).catch(() => null);
     if (again?.ask) return { step, note: `${note} Answer again when you are ready.`, ask: again.ask };
   }
+  if (state) await writeOnboardState(context.root, { ...state, retryAsked: true } as never).catch(() => undefined);
   return { step, note, ask: { question: "Try that step again now?", kind: "confirm" } };
 }
 

@@ -125,6 +125,12 @@ const HeartbeatSeqSchema = z.object({ sequence: z.number().int().nonnegative().m
 
 export class SupervisorStore {
   private heartbeatWrites: Promise<void> = Promise.resolve();
+  /**
+   * Serialized JSON of each buffered relay frame already validated here. A
+   * buffered frame is never changed after it is sent, so it is validated and
+   * serialized once instead of on every relay-state write (WS2-157).
+   */
+  private readonly relayFrameJson = new WeakMap<object, string>();
   constructor(readonly dataDir: string, private readonly mutate: StateMutation = unrestrictedStateMutation) {}
 
   path(name: string): string {
@@ -247,8 +253,24 @@ export class SupervisorStore {
   }
 
   saveRelayState(value: RelayDurableState): Promise<void> {
-    RelayDurableStateSchema.parse(value);
-    return this.writeJson("relay-state.json", value);
+    // Full validation of cursors, entry metadata and every frame not seen
+    // before; a known frame reuses its checked JSON. Same file as before.
+    const unseen: RelayDurableState["outbound"] = {};
+    for (const [channelId, entries] of Object.entries(value.outbound)) {
+      unseen[channelId] = entries.filter(entry => !this.relayFrameJson.has(entry.frame));
+      for (const entry of entries) {
+        if (this.relayFrameJson.has(entry.frame) && !(Number.isSafeInteger(entry.bytes) && entry.bytes >= 0 &&
+            Number.isSafeInteger(entry.enqueuedAt) && entry.enqueuedAt >= 0)) throw new TypeError("relay outbound entry is invalid");
+      }
+    }
+    RelayDurableStateSchema.parse({ cursors: value.cursors, outbound: unseen });
+    for (const entries of Object.values(unseen)) {
+      for (const entry of entries) this.relayFrameJson.set(entry.frame, JSON.stringify(entry.frame));
+    }
+    const outbound = Object.entries(value.outbound).map(([channelId, entries]) => `${JSON.stringify(channelId)}:[${entries
+      .map(entry => `{"frame":${this.relayFrameJson.get(entry.frame)!},"bytes":${entry.bytes},"enqueuedAt":${entry.enqueuedAt}}`).join(",")}]`);
+    const text = `{"cursors":${JSON.stringify(value.cursors)},"outbound":{${outbound.join(",")}}}\n`;
+    return this.mutate(() => writeSecretFile(this.path("relay-state.json"), text));
   }
 
   async heartbeatSequence(): Promise<number> {

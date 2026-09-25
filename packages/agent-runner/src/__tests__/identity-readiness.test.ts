@@ -8,7 +8,7 @@ import { fallbackLoginIdentity, normalizeSignal, probeIdentity } from "../auth/i
 import { RunnerConfigSchema } from "../config.js";
 import { INITIAL_SCOPE_STATE } from "../auth/scope-store.js";
 import { projectReadiness } from "../readiness.js";
-import { extractLoginSignals } from "../auth/login-flow.js";
+import { extractLoginSignals, withoutTerminalEscapes } from "../auth/login-flow.js";
 
 describe("identity signal normalization (D111)", () => {
   it("uses official Codex account identity rather than empty status stdout or shared login text", async () => {
@@ -108,5 +108,8 @@ describe("login flow signal extraction", () => {
     expect(extractLoginSignals("Paste the authorization code here: ")).toMatchObject({ prompt: { secret: false } });
     expect(extractLoginSignals("Enter your API token: ")).toMatchObject({ prompt: { secret: true } });
     expect(extractLoginSignals("Logging in...")).toEqual({});
+    // Codex's device login colours the link and the code on their own lines.
+    expect(extractLoginSignals(withoutTerminalEscapes("   \u001b[94mhttps://auth.openai.com/codex/device\u001b[0m"))).toEqual({ url: "https://auth.openai.com/codex/device" });
+    expect(extractLoginSignals(withoutTerminalEscapes("   \u001b[94mABCD-EFGH\u001b[0m"))).toEqual({ userCode: "ABCD-EFGH" });
   });
 });

@@ -1,8 +1,12 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { createLogger, FixedClock, generateInstanceKey, logicalAssignmentRequestDigest, logicalAssignmentResponseDigest, verifyBody, type AssignmentReplyFrame, type AssignmentRequestFrame, type LogicalAssignmentRequestFrame, type RelayAck, type ToCoreRelayFrame, type ToRuntimeRelayFrame } from "@konteks/remote-common";
 import { CHANNEL_LIVENESS_MS, ChannelMux } from "../relay/channel-mux.js";
 import type { MuxOptions } from "../relay/channel-mux.js";
 import { ReplayBuffer } from "../relay/replay-buffer.js";
+import { SupervisorStore } from "../state/store.js";
 
 const key = generateInstanceKey();
 
@@ -141,6 +145,60 @@ describe("channel mux", () => {
     await vi.waitFor(() => expect(order).toEqual(["persist:start"]));
     gate.resolve();
     await vi.waitFor(() => expect(order).toEqual(["persist:start", "persist:done", "emit"]));
+  });
+
+  it("group-commits a burst: one write covers every frame queued behind the last, none is emitted before a write holds it, and a restart replays them all (WS2-157)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "kr-relay-burst-"));
+    try {
+      const store = new SupervisorStore(dir);
+      await store.init();
+      let writes = 0, gate: PromiseWithResolvers<void> | null = null;
+      const durable = new Set<number>();
+      const early: number[] = [];
+      const emittedSeqs: number[] = [];
+      const { mux } = buildMux({
+        replayBufferBytes: 1_000_000,
+        persistRelayState: async state => {
+          writes += 1;
+          if (gate) await gate.promise;
+          await store.saveRelayState(state);
+          for (const entry of state.outbound.s ?? []) durable.add(entry.frame.seq);
+        },
+        emit: envelope => {
+          const seq = (envelope as ToCoreRelayFrame).seq;
+          if (!durable.has(seq)) early.push(seq);
+          emittedSeqs.push(seq);
+          return true;
+        },
+      });
+      mux.openChannel("s", "session");
+      await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
+      writes = 0;
+      gate = Promise.withResolvers<void>();
+
+      const burst = 40;
+      mux.send("s", "session", { kind: "session_closed", assignmentId: "asg-0", reason: "completed" });
+      await vi.waitFor(() => expect(writes).toBe(1));
+      // Every later frame arrives while the first write is still running.
+      for (let i = 1; i < burst; i += 1) mux.send("s", "session", { kind: "session_closed", assignmentId: `asg-${i}`, reason: "completed" });
+      expect(emittedSeqs).toEqual([]);
+      gate.resolve();
+      gate = null;
+      await vi.waitFor(() => expect(emittedSeqs).toHaveLength(burst));
+
+      expect(writes).toBe(2);
+      expect(early).toEqual([]);
+      expect(emittedSeqs).toEqual(Array.from({ length: burst }, (_, index) => index + 1));
+
+      const restarted = buildMux({ replayBufferBytes: 1_000_000, persistRelayState: state => store.saveRelayState(state) });
+      restarted.mux.restoreDurableState((await new SupervisorStore(dir).relayState())!, () => "session");
+      await restarted.mux.applyHandshake({ connectionEpoch: 2, resume: { s: { to_core: 0, to_runtime: 0 } }, reset: [] });
+      expect(restarted.emitted.map(frame => [(frame as ToCoreRelayFrame).seq, (frame as ToCoreRelayFrame).connectionEpoch]))
+        .toEqual(Array.from({ length: burst }, (_, index) => [index + 1, 2]));
+      expect(restarted.mux.send("s", "session", { kind: "session_closed", assignmentId: "next", reason: "completed" })).toBe(burst + 1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("restores unacknowledged outbound frames after restart and deletes them only after a validated ACK", async () => {

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ConnectedAgentViewSchema, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
+import { ConnectedAgentViewSchema, REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
 import type { InventorySnapshot } from "../inventory/collector.js";
 import type { RunnerPort } from "../runner-port.js";
@@ -20,12 +20,22 @@ export interface NativeInventoryOptions {
   deliveryExecutionPermitsReady?: () => boolean;
   /** Cancellation remains available independently of agent sign-in/readiness. */
   cancellationDeliveryReady?: () => boolean;
+  /** A person may start this machine's Codex login from the site (WS1-115). */
+  agentLoginReady?: () => boolean;
+  /** ...and Claude Code's, which needs a browser this machine can open. */
+  agentLoginBrowserReady?: () => boolean;
   /** The machine's git probe (OB6 §1); omitted, the runtime is not `onboard`. */
   gitVersion?: () => Promise<string | null>;
   now?: () => Date;
 }
 
 /** No domain-service URLs, sysmon HTTP endpoint or fictitious gateway health. */
+/** A login that opens a browser here can only finish where someone sits at this machine. */
+export function machineHasDesktop(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (platform === "darwin" || platform === "win32") return env.SSH_CONNECTION === undefined;
+  return Boolean(env.DISPLAY || env.WAYLAND_DISPLAY);
+}
+
 export class NativeInventoryCollector {
   private readonly cached = new Map<string, ConnectedAgentView>();
   private readonly now: () => Date;
@@ -79,10 +89,15 @@ export class NativeInventoryCollector {
     if (agents.some(agent => agent.readiness === 'ready' && agent.connectionState === 'ready') &&
       this.options.deliveryExecutionPermitsReady?.()) capabilities.push(REMOTE_DELIVERY_PERMITS_CAPABILITY);
     if (this.options.cancellationDeliveryReady?.()) capabilities.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
+    if (this.options.agentLoginReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_CAPABILITY);
+    if (this.options.agentLoginBrowserReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);
     // The onboard role is git on THIS machine, not a signed-in agent: the
     // capabilities are advertised whenever git answers, and withheld the moment
     // it does not (OB6 §1).
     capabilities.push(...onboardCapabilities(gitVersion));
+    // This build names the person's coding sessions from Core's display label;
+    // an older one rejects the field, so Core sends it only on this signal.
+    if (agents.some(agent => agent.readiness === "ready" && agent.connectionState === "ready")) capabilities.push(REMOTE_SESSION_LABEL_CAPABILITY);
     return {
       components: [{ kind: "agent_runner", version: this.options.bundleVersion,
         healthStatus: healthyRunners === 0 ? "unhealthy" : healthyRunners === results.length ? "healthy" : "degraded",

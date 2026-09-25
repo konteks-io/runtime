@@ -19,16 +19,31 @@ export interface RepositoryFacts {
   remoteUrl: string | null;
   /** Whether the machine's own git can actually reach that remote (OS11). */
   remoteReachable: boolean;
+  /** The remote is a folder on this machine (a path or file:// URL): Konteks itself cannot reach it. */
+  remoteLocal?: boolean;
   currentBranch: string | null;
   defaultBranch: string;
   /** The repository already has Konteks managed git as its "konteks" remote. */
   onManagedGit?: boolean;
+  /** Commits on the current branch that its "konteks" remote does not have yet, when it tracks one. */
+  unpushedCommits?: number;
 }
 
 const env = () => sanitizeInheritedChildProcessEnv({ env: process.env });
 
 async function git(cwd: string, args: string[], timeoutMs = 10_000) {
   return runCommand({ command: "git", args, cwd, env: env(), timeoutMs });
+}
+
+/**
+ * A remote Konteks can register as the System's repository: a network URL
+ * (https, http, ssh, git) or git's scp form (`git@host:owner/repo.git`). A
+ * path or file:// URL only this machine can open is not one.
+ */
+export function remoteIsLocal(url: string): boolean {
+  if (/^(https?|ssh|git):\/\//i.test(url)) return false;
+  if (/^[\w.-]+@[\w.-]+:(?!\/\/)/.test(url)) return false;
+  return true;
 }
 
 export async function inspectRepository(cwd: string): Promise<RepositoryFacts> {
@@ -66,14 +81,22 @@ export async function inspectRepository(cwd: string): Promise<RepositoryFacts> {
   }
 
   const konteks = await git(path, ["remote", "get-url", "konteks"]).catch(() => null);
+  let unpushedCommits: number | undefined;
+  if (konteks && konteks.code === 0 && currentBranch) {
+    const ahead = await git(path, ["rev-list", "--count", `konteks/${currentBranch}..HEAD`]).catch(() => null);
+    const count = ahead && ahead.code === 0 ? Number.parseInt(ahead.stdout.trim(), 10) : Number.NaN;
+    if (Number.isFinite(count)) unpushedCommits = count;
+  }
   return {
     path,
     name,
     remoteUrl,
     remoteReachable,
+    ...(remoteUrl && remoteIsLocal(remoteUrl) ? { remoteLocal: true } : {}),
     currentBranch,
     defaultBranch: currentBranch ?? "main",
     ...(konteks && konteks.code === 0 ? { onManagedGit: true } : {}),
+    ...(unpushedCommits !== undefined ? { unpushedCommits } : {}),
   };
 }
 

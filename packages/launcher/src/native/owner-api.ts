@@ -3,9 +3,8 @@ import { join } from "node:path";
 import { z } from "zod";
 import { isFsErrorWithCode, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 
-/** What the person hears once their access on this machine was revoked in Settings. */
-export const OWNER_ACCESS_REVOKED =
-  "Your Konteks access on this machine was revoked in Settings, so nothing more can be done as you from here.";
+/** What the person hears once their access on this machine was revoked in Customize → Runtimes. */
+export const OWNER_ACCESS_REVOKED = "This machine's Konteks access was revoked in Customize → Runtimes.";
 
 /**
  * The person's own credential, and the three calls the onboarding flow makes
@@ -167,6 +166,18 @@ export class OwnerApiClient {
   }
 
   /**
+   * Whether this person may start planning work here: a Member or the owner
+   * can, a Viewer cannot (WS1-131). Undefined when Konteks cannot say, so a
+   * check that fails never stops someone who can.
+   */
+  async canStartWork(): Promise<boolean | undefined> {
+    const body = (await this.call("POST", "/api/platform/permissions/check", { permission: "app.session.manage" }).catch(() => undefined)) as
+      | { hasPermission?: unknown }
+      | undefined;
+    return typeof body?.hasPermission === "boolean" ? body.hasPermission : undefined;
+  }
+
+  /**
    * The person's first initiative on that System (W1-A6).
    *
    * Core's initiative setup creates the initiative and opens its planning
@@ -203,6 +214,16 @@ export class OwnerApiClient {
   }
 
   /** The initiatives a System already has, newest first as Konteks lists them (WS1-090). */
+  /** The workspace's name as people see it on the site, or undefined when Core does not say. */
+  async workspaceDisplayName(tenantId: string): Promise<string | undefined> {
+    const body = await this.call("GET", "/api/platform/tenants");
+    const match = (Array.isArray(body) ? body : []).find(
+      (entry: unknown): entry is { displayName?: unknown } =>
+        typeof entry === "object" && entry !== null && (entry as { name?: unknown }).name === tenantId,
+    );
+    return typeof match?.displayName === "string" && match.displayName.trim() ? match.displayName.trim() : undefined;
+  }
+
   async listInitiatives(systemId: string): Promise<Array<{ id: string; title: string }>> {
     const body = (await this.call("GET", `/api/collaboration/initiatives?systemId=${encodeURIComponent(systemId)}`)) as Record<string, unknown>;
     const list = Array.isArray(body.initiatives) ? (body.initiatives as Array<Record<string, unknown>>) : [];
@@ -257,7 +278,7 @@ export class OwnerApiClient {
       throw new RemoteInstanceError("temporarily_unavailable", "Konteks could not be reached.");
     }
     if (response.status === 401 || response.status === 403) {
-      // Core refuses a token revoked in Settings at its next use with the code
+      // Core refuses a token revoked in Customize → Runtimes at its next use with the code
       // a revoked refresh gets, so the person hears why rather than "refused".
       const detail = (await response.json().catch(() => ({}))) as Record<string, unknown>;
       if (response.status === 401 && detail.code === "enrollment_invalid") {

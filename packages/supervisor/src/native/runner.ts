@@ -2,7 +2,7 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
 import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
-import { RemoteInstanceError, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
+import { RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 
 const idSchema = z.string().min(1).max(128);
@@ -18,6 +18,7 @@ const inputSchema = z.object({
   acpSessionRef: z.string().min(1).max(256).optional(),
   restoreAcpSessionRef: z.string().min(1).max(256).optional(),
   freshProviderSessionOnRestore: z.boolean().optional(),
+  sessionLabel: RemoteSessionLabelSchema.optional(),
 }).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined);
 
 export interface NativeRunnerOptions {
@@ -110,9 +111,10 @@ export class NativeRunner implements RunnerPort {
     const parsed = inputSchema.safeParse(input);
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
-    const { context, readinessDeadlineAt, cwd, mcpServers, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore } = parsed.data;
+    const { context, readinessDeadlineAt, cwd, mcpServers, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel } = parsed.data;
     const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
-      ...(freshProviderSessionOnRestore === undefined ? {} : { freshProviderSessionOnRestore }), lifecycle: {
+      ...(freshProviderSessionOnRestore === undefined ? {} : { freshProviderSessionOnRestore }),
+      ...(sessionLabel === undefined ? {} : { sessionLabel }), lifecycle: {
       beforeCreate: async (ref: string) => { await lifecycle?.beforeCreate(ref); },
       recordProcessOwner: async (owner: RetainedProcessOwner) => { await lifecycle?.recordProcessOwner(owner); },
       replaceProcessOwner: async (previous: RetainedProcessOwner, replacement: RetainedProcessOwner) => {
@@ -214,12 +216,12 @@ export class NativeRunner implements RunnerPort {
     return { delivered: this.runtime.sessions.answer(ref, id, response) };
   }
 
-  async login(organization: boolean, loginId: string) {
+  async login(organization: boolean, loginId: string, personal = false) {
     this.requireStarted();
-    if (typeof organization !== "boolean" || !idSchema.safeParse(loginId).success) throw invalid();
+    if (typeof organization !== "boolean" || typeof personal !== "boolean" || !idSchema.safeParse(loginId).success) throw invalid();
     await verifyNativeRunnerPackage(this.options.config);
     this.requireStarted();
-    return { loginId: this.runtime.startLogin({ organization, loginId }).loginId };
+    return { loginId: this.runtime.startLogin({ organization, loginId, personal }).loginId };
   }
 
   async loginInput(loginId: string, text: string) {

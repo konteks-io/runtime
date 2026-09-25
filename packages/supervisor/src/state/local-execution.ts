@@ -329,6 +329,26 @@ export class LocalExecutionJournal {
     return structuredClone({ admission: state.admission, acpSessionRef: state.acpSessionRef, processOwner: state.processOwner });
   }
 
+  /** The execution that last took over a repository-role session head's ACP
+   * session, following its live or restored continuation chain. Undefined
+   * when the head was never continued. Read-only; grants nothing.
+   */
+  headContinuationTip(successorAssignment: RemoteWorkAssignment): LocalAdmission | undefined {
+    const successor = RemoteWorkAssignmentSchema.parse(successorAssignment);
+    if (successor.source.kind !== "harness_delivery") return undefined;
+    this.index();
+    const head = this.harnessHeads.get(successor.source.executionSessionId);
+    if (!head) return undefined;
+    let state = this.executions.get(head.executionGeneration);
+    const seen = new Set<string>();
+    while (state?.phase === "continued" && state.continuedToGeneration && !seen.has(state.continuedToGeneration)) {
+      seen.add(state.continuedToGeneration);
+      state = this.executions.get(state.continuedToGeneration);
+    }
+    if (!state || state.admission.executionGeneration === head.executionGeneration) return undefined;
+    return structuredClone(state.admission);
+  }
+
   /** Exact retry of a restore handoff whose provider load has not yet reserved
    * its fresh local reference. Once beforeCreate binds that reference, normal
    * recovery owns the uncertain side effect instead of replaying load.

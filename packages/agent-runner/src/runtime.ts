@@ -185,7 +185,7 @@ export class AgentRuntime {
       return Promise.reject(new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization."));
     }
     const bridge = Promise.resolve().then(async () => {
-      await verifyNativeRunnerPackage(this.options.config);
+      await verifyNativeRunnerPackage(this.options.config, this.logger);
       if (this.stopping || this.executionBridges.get(ref)!.stopping) throw new RemoteInstanceError("agent_unavailable", "Native execution owner is stopping.");
       // A resident process costs this reference one `session/new`; only when
       // none is idle does it pay the spawn plus ACP `initialize`.
@@ -651,7 +651,7 @@ export class AgentRuntime {
       let exitedDuringStart = false;
       const initializeStartedAt = Date.now();
       try {
-        await verifyNativeRunnerPackage(this.options.config);
+        await verifyNativeRunnerPackage(this.options.config, this.logger);
         if (this.stopping) return;
         const candidate = await (this.options.spawn ?? spawnBridge)({
           spec: this.spec,
@@ -752,8 +752,11 @@ export class AgentRuntime {
   }
 
   /** Starts the official login flow; completion re-probes readiness and applies the attestation. */
-  startLogin(args: { organization: boolean; loginId?: string }): LoginFlow {
-    this.assertConnectorOwnedAuthentication();
+  startLogin(args: { organization: boolean; loginId?: string; personal?: boolean }): LoginFlow {
+    // The person asking for their own login on their own machine (the site's
+    // Log in, or `konteks-remote auth login` they ran) is not Konteks changing
+    // their login behind their back (WS1-115).
+    if (!(args.personal && this.personalLogin())) this.assertConnectorOwnedAuthentication();
     if (this.activeLogin) {
       throw new RemoteInstanceError("temporarily_unavailable", "a login is already in progress for this agent");
     }
@@ -821,6 +824,13 @@ export class AgentRuntime {
     await this.ensureBridge();
     const view = await this.probe(false);
     return view;
+  }
+
+  /** A native install signs in with the agent's own login in the person's own profile. */
+  private personalLogin(): boolean {
+    if (this.family.agentId === "codex") return this.options.config.RUNNER_NATIVE_CODEX_HOME !== undefined;
+    if (this.family.agentId === "claude-code") return this.options.config.RUNNER_NATIVE_CLAUDE_EXECUTABLE !== undefined;
+    return false;
   }
 
   private assertConnectorOwnedAuthentication(): void {

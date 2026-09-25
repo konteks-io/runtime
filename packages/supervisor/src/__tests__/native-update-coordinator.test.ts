@@ -24,7 +24,7 @@ function manifests() {
   return { trust, same: signed("1.0.0"), newer: signed("1.1.0") };
 }
 
-function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdateLedger; canApply?: boolean; trust?: unknown[]; now?: () => number }) {
+function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdateLedger; canApply?: boolean; trust?: unknown[]; now?: () => number; acceptedRelease?: () => Promise<{ bundleVersion: string } | null> }) {
   const m = manifests();
   const launch = vi.fn(async () => ({ pid: 4242 }));
   const fetchManifest = vi.fn(async () => input.manifest === "same" ? m.same : m.newer);
@@ -33,6 +33,7 @@ function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdate
     currentBundleVersion: "1.0.0", trustedRoots: (input.trust ?? m.trust) as never, fetchManifest, launch, readLedger,
     canApply: () => input.canApply === false ? { ok: false, reason: "draining (user)" } : { ok: true },
     logger: createLogger({ name: "test" }), now: input.now ?? (() => Date.parse("2026-09-15T12:00:00Z")),
+    ...(input.acceptedRelease ? { acceptedRelease: input.acceptedRelease } : {}),
   });
   return { c, launch, fetchManifest, readLedger, m };
 }
@@ -40,6 +41,24 @@ function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdate
 const attempt = (over: Partial<NativeUpdateAttempt>): NativeUpdateAttempt => ({ id: `a-${Math.random()}`, bundleVersion: "1.1.0", manifestDigest: "d", releaseId: "release-x", reason: "unattended", startedAt: "2026-09-15T11:00:00Z", finishedAt: "2026-09-15T11:05:00Z", outcome: "rolled_back", detail: null, ...over });
 
 describe("native update coordinator", () => {
+  it("installs unattended only the release Core accepts (WS1-093)", async () => {
+    const ahead = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.0.0" }) });
+    expect(await ahead.c.apply("periodic")).toMatchObject({ started: false, reason: "Konteks accepts 1.0.0, not 1.1.0 yet; staying on this one until it does" });
+    expect(ahead.launch).not.toHaveBeenCalled();
+
+    const silent = coordinator({ acceptedRelease: async () => null });
+    expect((await silent.c.apply("periodic")).reason).toMatch(/does not say which release it accepts/);
+    const unreachable = coordinator({ acceptedRelease: async () => { throw new Error("offline"); } });
+    expect((await unreachable.c.apply("periodic")).reason).toMatch(/could not be asked/);
+    expect(silent.launch).not.toHaveBeenCalled();
+    expect(unreachable.launch).not.toHaveBeenCalled();
+
+    const accepted = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.1.0" }) });
+    expect(await accepted.c.apply("periodic")).toMatchObject({ started: true });
+    expect(accepted.launch).toHaveBeenCalledTimes(1);
+  });
+
+
   it("reports a newer verified release and launches exactly one transaction for it", async () => {
     const { c, launch, m } = coordinator({});
     expect(await c.check()).toMatchObject({ current: { bundleVersion: "1.0.0" }, available: { bundleVersion: "1.1.0", manifestDigest: m.newer.digest }, lastError: null, inFlight: null });

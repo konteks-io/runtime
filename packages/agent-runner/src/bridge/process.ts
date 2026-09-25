@@ -184,6 +184,18 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
   };
 }
 
+/**
+ * Codex reports a sign-in it can no longer refresh as a JSON-RPC internal
+ * error (-32603) whose data says "unauthorized"; read as "internal" it
+ * surfaced as "the provider call failed" instead of "sign in again" (WS2-141).
+ */
+function signInLapsed(data: unknown): boolean {
+  if (data === undefined || data === null) return false;
+  let text: string;
+  try { text = typeof data === "string" ? data : JSON.stringify(data); } catch { return false; }
+  return /unauthori[sz]ed|\b401\b|could not be refreshed|logged out/i.test(text.slice(0, 4_096));
+}
+
 /** Maps an SDK/JSON-RPC failure to the closed AcpJsonRpcError classification. */
 export function classifyBridgeError(error: unknown): {
   code: number;
@@ -193,7 +205,7 @@ export function classifyBridgeError(error: unknown): {
 } {
   if (error instanceof RequestError) {
     const message = error.message.slice(0, 1_024);
-    if (error.code === -32000 || /auth/i.test(message)) {
+    if (error.code === -32000 || /auth/i.test(message) || signInLapsed(error.data)) {
       return { code: error.code, class: "agent_auth_required", message: "agent authentication required", retryable: false };
     }
     if (error.code === -32602) return { code: error.code, class: "invalid_params", message, retryable: false };

@@ -16,7 +16,7 @@ import { AcpNativeObservationSchema, RemoteInstanceError, type AgentTurnUsageObs
 import type { BridgeProcess } from "../bridge/process.js";
 import { classifyBridgeError } from "../bridge/process.js";
 import type { RunnerEventBus } from "../events.js";
-import { konteksSessionMetadata } from "./title.js";
+import { konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
 
 /**
  * ACP sessions inside this runner. The supervisor creates them as a
@@ -47,6 +47,8 @@ export interface CreateSessionArgs {
   acpSessionRef?: string;
   /** Restart recovery whose durable context was staged outside the provider transcript. */
   freshProviderSessionOnRestore?: boolean;
+  /** Display-only naming for the provider session list; never authority. */
+  sessionLabel?: KonteksSessionLabel;
   /** Native in-process owner; opaque connector ref, never the bridge session ID. */
   lifecycle?: {
     beforeCreate(opaqueRef: string): Promise<void>;
@@ -77,7 +79,12 @@ interface SessionRecord {
   recoveryStop: Promise<void> | null;
   completedClose?: Promise<void>;
   assertCurrent?: () => void;
+  /** Native turns started by a connector-sent prompt (bounded, oldest evicted). */
+  connectorTurns?: Set<string>;
 }
+
+const MAX_CONNECTOR_TURNS = 256;
+type AcpNativeObservation = z.infer<typeof AcpNativeObservationSchema>;
 
 export interface SessionManagerOptions {
   bridge: () => BridgeProcess | null;
@@ -390,7 +397,7 @@ export class SessionManager {
       let created: { sessionId: string };
       try {
         created = await this.boundedBootstrap("session_new", args, bridge,
-          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: konteksSessionMetadata(`Coding session ${acpSessionRef.slice(-8)}`, args.context.agentId) }), bootstrapAttempt);
+          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId) }), bootstrapAttempt);
       } catch (error) {
         if (error instanceof RemoteInstanceError && error.retryable) throw error;
         const classified = classifyBridgeError(error);
@@ -660,6 +667,13 @@ export class SessionManager {
   prompt(acpSessionRef: string, requestId: string, params: Omit<PromptRequest, "sessionId">): void {
     const record = this.require(acpSessionRef);
     const bridge = this.requireBridge(record);
+    // One ACP session runs one turn at a time. A second prompt would share the
+    // agent's context with the first and one of them would end `interrupted`
+    // with no one having asked for it. Refuse it before it reaches the bridge;
+    // the supervisor settles it as a known pre-dispatch denial.
+    if (record.activeTurns > 0) {
+      throw new RemoteInstanceError("operation_conflict", "Another prompt is already running on this session.");
+    }
     record.completedTurn = false;
     record.activeTurns += 1;
     const operation = bridge.connection
@@ -724,10 +738,34 @@ export class SessionManager {
     const { nativeObservation: _untrusted, ...update } = params.update as typeof params.update & { nativeObservation?: unknown };
     const native = AcpNativeObservationSchema.safeParse(update._meta?.konteksNativeObservation);
     const messageChunk = update.sessionUpdate === "user_message_chunk" || update.sessionUpdate === "agent_message_chunk";
+    const observation = messageChunk && native.success ? this.attributeNativeTurn(record, update.sessionUpdate, native.data) : undefined;
     this.options.events.publish({ kind: "session_update", acpSessionRef: record.acpSessionRef, params: {
       ...withoutBridgeSessionId(params), sessionId: record.acpSessionRef,
-      update: { ...update, ...(messageChunk && native.success ? { nativeObservation: native.data } : {}) },
+      update: { ...update, ...(observation ? { nativeObservation: observation } : {}) },
     } });
+  }
+
+  /**
+   * The Codex bridge marks every agent chunk "unclassified" and leaves the
+   * join to its turn: only the user message that opened the turn says whether
+   * the connector sent it. Join here, under the session owner, so the reply to
+   * a Konteks prompt is the Konteks turn's output. Before this, every Codex
+   * reply to a Konteks prompt was treated as someone else's local turn and
+   * dropped, so a Codex QA could never return a verdict (WS2-158). A turn the
+   * connector did not open stays unclassified.
+   */
+  private attributeNativeTurn(record: SessionRecord, sessionUpdate: string, observation: AcpNativeObservation): AcpNativeObservation {
+    if (sessionUpdate === "user_message_chunk") {
+      if (observation.origin === "connector") {
+        const turns = record.connectorTurns ??= new Set();
+        turns.add(observation.turnId);
+        if (turns.size > MAX_CONNECTOR_TURNS) turns.delete(turns.values().next().value!);
+      }
+      return observation;
+    }
+    return observation.origin === "unclassified" && record.connectorTurns?.has(observation.turnId)
+      ? { ...observation, origin: "connector" }
+      : observation;
   }
 
   /**
@@ -738,6 +776,7 @@ export class SessionManager {
   onRequestPermission(params: RequestPermissionRequest, bridge = this.options.bridge()): Promise<RequestPermissionResponse> {
     const record = this.byBridgeId.get(params.sessionId);
     if (!record || record.bridge !== bridge || bridge.exited || record.recoveryStopping) return Promise.resolve({ outcome: { outcome: "cancelled" } });
+    if (record.continuationSealed) return this.refuseUnownedWork(record, { outcome: { outcome: "cancelled" } });
     const requestId = `perm-${randomUUID()}`;
     return this.awaitAnswer<RequestPermissionResponse>(record, requestId, () =>
       this.options.events.publish({ kind: "permission_request", acpSessionRef: record.acpSessionRef, requestId, params: withoutBridgeSessionId(params) }),
@@ -748,10 +787,26 @@ export class SessionManager {
     const sessionId = (params as { sessionId?: string }).sessionId;
     const record = sessionId ? this.byBridgeId.get(sessionId) : undefined;
     if (!record || record.bridge !== bridge || bridge.exited || record.recoveryStopping) return Promise.resolve({ action: "cancel" });
+    if (record.continuationSealed) return this.refuseUnownedWork(record, { action: "cancel" } as CreateElicitationResponse);
     const requestId = `elic-${randomUUID()}`;
     return this.awaitAnswer<CreateElicitationResponse>(record, requestId, () =>
       this.options.events.publish({ kind: "elicitation_request", acpSessionRef: record.acpSessionRef, requestId, params: withoutBridgeSessionId(params as unknown as Record<string, unknown>) }),
     );
+  }
+
+  /**
+   * A sealed session has no turn: its last one ended and no assignment owns it
+   * until the next adopts it. Work the agent starts on its own in between (a
+   * background timer from the last turn firing) has nobody to answer it. A
+   * request parked here was never answered and made the next turn refuse the
+   * session as busy (WS2-130). Refuse it at once and cancel that stray turn.
+   */
+  private refuseUnownedWork<T>(record: SessionRecord, refusal: T): Promise<T> {
+    const bridge = record.bridge;
+    if (bridge && !bridge.exited && record.bridgeSessionId) {
+      void bridge.connection.cancel({ sessionId: record.bridgeSessionId }).catch(() => undefined);
+    }
+    return Promise.resolve(refusal);
   }
 
   /** Supervisor → bridge: the single authorized answer for a pending request. */

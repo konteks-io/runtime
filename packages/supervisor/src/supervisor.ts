@@ -22,6 +22,10 @@ import {
   type RemoteWorkKind,
   type RelayRuntimeHandshakeResult,
   type SupervisorStatus,
+  AGENT_LOGIN_METHOD,
+  AgentLoginUserCodeSchema,
+  agentLoginUrlAllowed,
+  type RuntimeAgentLoginDeliveryRequest,
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, ReleaseManifestSchema, loadReleaseRootsFile, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot, type ReleaseManifest } from "@konteks/remote-release";
 import type { RunnerConfig } from "@konteks/remote-agent-runner";
@@ -60,7 +64,7 @@ import { RunnerClient } from "./runner-client.js";
 import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer } from "./native/model-capability-snapshot.js";
-import { NativeInventoryCollector } from "./native/inventory.js";
+import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { NativeInputClient } from "./native/input-client.js";
 import { NativeOutputClient } from "./native/output-client.js";
 import { createRetainedDeliveryOutputRecovery } from "./native/output-recovery.js";
@@ -127,7 +131,7 @@ export interface SupervisorOptions {
     git?: NativeGitTool;
     /** Shared object cache across every configured local agent. */
     repositoryCacheRoot?: string;
-    prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void>;
+    prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void | "unavailable" | "skipped" | "wired">;
     runtimeOptions?: NativeRunnerOptions["runtimeOptions"];
     /** Test/embedding seam for the independently supervised shared Codex owner. */
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;
@@ -363,6 +367,9 @@ export class Supervisor {
           if (!this.work || !this.nativeOwnership || this.stopping) return false;
           try { this.nativeOwnership.assertOwned(); return true; } catch { return false; }
         },
+        // A site-started login needs a native install with a Codex runner (WS1-115).
+        agentLoginReady: () => this.native && this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
+        agentLoginBrowserReady: () => this.native && this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
         cancellationDeliveryReady: () => {
           if (!this.relay || !this.cancellationReplay || !this.nativeOwnership || this.stopping) return false;
           try { this.nativeOwnership.assertOwned(); return true; } catch { return false; }
@@ -463,6 +470,7 @@ export class Supervisor {
           },
           validateHandshake: result => this.validateRelayHandshake(result),
           onConnected: result => this.onRelayConnected(result),
+          onAgentLogin: request => this.onAgentLogin(request, verifier),
           onPermissionAnswer: async (request, connection) => {
             const producer = this.config.SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER;
             if (!producer) throw new RemoteInstanceError("recovery_required", "Core answer producer is not configured");
@@ -823,6 +831,7 @@ export class Supervisor {
     if (this.native) this.cancellationReplay = new CancellationReplay({
       journal: this.journal,
       stopForRecovery: (assignmentId, attempt) => this.work.stopForRecovery(assignmentId, attempt),
+      cancelDelivery: directive => this.work.onCancel(directive),
       owner: () => {
         const ownership = this.nativeOwnership;
         const instanceId = this.instanceId;
@@ -1255,6 +1264,11 @@ export class Supervisor {
           trustedRoots: this.options.native!.trustedRoots,
           logger: this.logger,
           canApply: () => this.stopping ? { ok: false, reason: "supervisor is stopping" } : this.draining && this.drainReason !== "update" ? { ok: false, reason: `draining (${this.drainReason ?? "unknown"})` } : { ok: true },
+          // Only a release Core accepts is installed unattended (WS1-093).
+          acceptedRelease: async () => {
+            if (!this.instanceId) throw new Error("no instance identity yet");
+            return this.core.acceptedRelease(this.instanceId);
+          },
         });
         this.updates.start();
       }
@@ -1682,7 +1696,8 @@ export class Supervisor {
           const runner = this.requireRunner(request.agentId);
           const loginId = `login-${randomUUID()}`;
           this.activeLogins.set(loginId, { agentId: request.agentId, emit: (event) => emit.event(event) });
-          await runner.login(request.organization, loginId);
+          // The person ran this on their own machine: their own login (WS1-115).
+          await runner.login(request.organization, loginId, true);
           emit.event({ kind: "started", loginId, agentId: request.agentId });
           return { loginId };
         }
@@ -1761,6 +1776,11 @@ export class Supervisor {
           return this.requireUpdates().apply("operator");
         case "update.status":
           return this.requireUpdates().status();
+        case "release.accepted": {
+          if (!this.instanceId) return { bundleVersion: null };
+          const accepted = await this.core.acceptedRelease(this.instanceId);
+          return { bundleVersion: accepted?.bundleVersion ?? null };
+        }
         case "doctor":
           return this.doctor();
         case "logs":
@@ -1807,6 +1827,93 @@ export class Supervisor {
   private requireUpdates(): NativeUpdateCoordinator {
     if (!this.updates) throw new RemoteInstanceError("capability_unavailable", "Automatic updates are not configured for this connector.");
     return this.updates;
+  }
+
+  /**
+   * A login the person started from the site for an agent on this machine
+   * (WS1-115). Core signed it for this runtime; the runner runs the agent's
+   * official device login in the person's own profile, and only the provider
+   * link and code go back to Core. A login that asks for typed input is
+   * stopped: nothing the person types may cross Konteks.
+   */
+  private async onAgentLogin(request: RuntimeAgentLoginDeliveryRequest, verifier: CoreSignatureVerifier): Promise<void> {
+    if (!verifier.verifyAgentLoginDelivery(request)) {
+      throw new RemoteInstanceError("permission_denied", "Core agent login signatures are required");
+    }
+    const { intent } = request;
+    const instanceId = this.instanceId;
+    if (!this.native || !instanceId || intent.instanceId !== instanceId || intent.tenantId !== this.workspaceId) {
+      throw new RemoteInstanceError("recovery_required", "This agent login is for another runtime");
+    }
+    const report = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) =>
+      this.core.reportAgentLogin(instanceId, value).catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
+    if (intent.action === "cancel") {
+      const login = this.activeLogins.get(intent.loginId);
+      if (login) {
+        this.activeLogins.delete(intent.loginId);
+        await this.requireRunner(login.agentId).loginCancel(intent.loginId).catch(() => undefined);
+      }
+      return;
+    }
+    // A repeated delivery of a login already under way changes nothing.
+    if (this.activeLogins.has(intent.loginId)) return;
+    const runner = this.runners.get(intent.agentId);
+    if (!runner) {
+      await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
+      return;
+    }
+    // Claude Code finishes in a browser it opens on this machine: nothing to
+    // show but the page itself, and a code it asks for is never relayed.
+    const browser = AGENT_LOGIN_METHOD[intent.agentId] === "machine_browser";
+    let url: string | undefined;
+    let code: string | undefined;
+    let over = false;
+    const finish = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) => {
+      if (over) return;
+      over = true;
+      this.activeLogins.delete(intent.loginId);
+      void report(value);
+    };
+    const awaiting = () => {
+      if (over || (!url && !browser)) return;
+      void report({ loginId: intent.loginId, agentId: intent.agentId, state: "awaiting_person", ...(url ? { verificationUrl: url } : {}), ...(code && !browser ? { userCode: code } : {}) });
+    };
+    this.activeLogins.set(intent.loginId, {
+      agentId: intent.agentId,
+      emit: event => {
+        if (event.kind === "open_url") {
+          if (!agentLoginUrlAllowed(intent.agentId, event.url)) return;
+          url = event.url;
+          if (event.userCode && AgentLoginUserCodeSchema.safeParse(event.userCode).success) code = event.userCode;
+          awaiting();
+        } else if (event.kind === "display" && !browser) {
+          // The code may come on its own line after the link.
+          const found = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/.exec(event.text)?.[1];
+          if (found && found !== code) {
+            code = found;
+            awaiting();
+          }
+        } else if (event.kind === "prompt") {
+          // The browser's own callback completes Claude Code's login.
+          if (browser) return;
+          void runner.loginCancel(intent.loginId).catch(() => undefined);
+          finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "login_failed" });
+        } else if (event.kind === "completed") {
+          finish({ loginId: intent.loginId, agentId: intent.agentId, state: "succeeded" });
+          // Ready shows on the site now, not at the next heartbeat.
+          if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed"));
+        } else if (event.kind === "failed") {
+          finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "login_failed" });
+        }
+      },
+    });
+    try {
+      await runner.login(false, intent.loginId, true);
+      if (browser) awaiting();
+    } catch (error) {
+      const busy = error instanceof RemoteInstanceError && /already in progress/i.test(error.message);
+      finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: busy ? "already_in_progress" : "unavailable" });
+    }
   }
 
   private requireRunner(agentId: string): RunnerPort {

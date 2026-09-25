@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS } from "@konteks/remote-release";
 import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
+import { ReleaseAcceptedSchema, RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, status, supportBundle } from "../commands/lifecycle.js";
 import { SupervisorControl } from "../control.js";
 import { addNativeAgent, installNative, readNativeRecord, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
@@ -167,8 +167,27 @@ export const nativeCliActions: NativeCliActions = {
   },
   start,
   update: async input => {
+    // A release published before Konteks accepts it would install, be refused
+    // by Konteks and roll back minutes later (WS1-093). The running service
+    // asks Konteks with this machine's lease; only a definite other answer
+    // stops the update, so a machine that cannot ask still updates as asked.
+    const notAccepted = async (check: Awaited<ReturnType<typeof checkNativeUpdate>> | null): Promise<string | null> => {
+      if (!check || check.status === "current") return null;
+      const record = await readNativeRecord(input.root).catch(() => null);
+      if (!record) return null;
+      const control = new SupervisorControl({ supervisorData: join(input.root, "supervisor") }, record.controlPort);
+      const accepted = await control.call({ op: "release.accepted" }, ReleaseAcceptedSchema, { timeoutMs: 10_000 }).catch(() => null);
+      const version = check.release.manifest.bundleVersion;
+      return accepted?.bundleVersion && accepted.bundleVersion !== version ? accepted.bundleVersion : null;
+    };
     if (input.check) {
       const check = await checkNativeUpdate({ root: input.root });
+      const acceptedOther = await notAccepted(check);
+      if (acceptedOther && check.status !== "current") {
+        input.output.line(`Release ${check.release.manifest.bundleVersion} is published, but Konteks accepts ${acceptedOther} for this machine, so it stays on ${check.current.bundleVersion} until Konteks accepts the new one.`);
+        input.output.result({ state: "not_accepted", installed: check.current.bundleVersion, available: check.release.manifest.bundleVersion, accepted: acceptedOther });
+        return;
+      }
       const attempts = (await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts;
       if (check.status === "current") input.output.line([`Installed release ${check.bundleVersion} is current.`, selfUpdateNote(attempts, check.bundleVersion)].filter(Boolean).join(" "));
       const failed = check.status === "current" ? null : earlierFailure(attempts, check.release.manifest.digest);
@@ -180,6 +199,12 @@ export const nativeCliActions: NativeCliActions = {
     }
     if (!input.unattended) {
       const check = await checkNativeUpdate({ root: input.root }).catch(() => null);
+      const acceptedOther = await notAccepted(check);
+      if (acceptedOther && check && check.status !== "current") {
+        input.output.line(`Release ${check.release.manifest.bundleVersion} is published, but Konteks accepts ${acceptedOther} for this machine, so nothing was changed; ${check.current.bundleVersion} keeps running until Konteks accepts the new one.`);
+        input.output.result({ state: "not_accepted", installed: check.current.bundleVersion, available: check.release.manifest.bundleVersion, accepted: acceptedOther });
+        return;
+      }
       const attempts = (await readNativeUpdateLedger(input.root).catch(() => ({ attempts: [] }))).attempts;
       const failed = check && check.status !== "current" ? earlierFailure(attempts, check.release.manifest.digest) : null;
       if (failed) input.output.line(`Trying again as asked: ${earlierFailureNote(failed)}`);

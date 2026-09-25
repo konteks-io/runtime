@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ConnectedAgentView } from "@konteks/remote-common";
-import { NativeInventoryCollector } from "../native/inventory.js";
+import { NativeInventoryCollector, machineHasDesktop } from "../native/inventory.js";
 import { deriveAdvertisedRoles } from "../inventory/roles.js";
 
 const agent: ConnectedAgentView = { agentId: "codex", displayName: "Codex", connectionState: "ready", authMode: "agent_local_subscription", accountScope: "personal", readiness: "ready", moneyObservable: false, tokenUsageObservable: true, acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" } };
@@ -22,7 +22,7 @@ describe("native host inventory (A4 D133)", () => {
     const inventory = new NativeInventoryCollector({ runners, sampler: { sample: async () => signals }, bundleVersion: "1.0.0" });
     const snapshot = await inventory.collect();
     expect(snapshot.agents).toEqual([agent, claude]);
-    expect(snapshot.components[0]).toMatchObject({ healthStatus: "healthy", capabilities: ["agent:codex"] });
+    expect(snapshot.components[0]).toMatchObject({ healthStatus: "healthy", capabilities: ["agent:codex", "session-label-v1"] });
     expect(runners.get("codex")!.readiness).toHaveBeenCalledOnce();
     expect(runners.get("claude-code")!.readiness).toHaveBeenCalledOnce();
   });
@@ -30,17 +30,30 @@ describe("native host inventory (A4 D133)", () => {
   it('advertises delivery separately and removes it when ownership or local-agent readiness is lost', async () => {
     let owned = true;
     const f = fixture(() => true, undefined, () => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(['agent:codex', 'execution-permits-v1', 'delivery-execution-permits-v1']);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(['agent:codex', 'execution-permits-v1', 'delivery-execution-permits-v1', 'session-label-v1']);
     owned = false;
     expect((await f.inventory.collect()).components[0]?.capabilities).not.toContain('delivery-execution-permits-v1');
     owned = true;
     f.readiness.mockResolvedValue({ agent: { ...agent, readiness: 'not_configured' }, utilization: { activeSessions: 0, activeTurns: 0 } });
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual([]);
   });
+  it("offers a login from the site even while the agent is signed out, and Claude Code's only with a desktop (WS1-115)", async () => {
+    let browser = true;
+    const readiness = vi.fn(async () => ({ agent: { ...agent, readiness: "not_configured" as const }, utilization: { activeSessions: 0, activeTurns: 0 } }));
+    const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0",
+      agentLoginReady: () => true, agentLoginBrowserReady: () => browser });
+    expect((await inventory.collect()).components[0]?.capabilities).toEqual(["agent-login-v1", "agent-login-browser-v1"]);
+    browser = false;
+    expect((await inventory.collect()).components[0]?.capabilities).toEqual(["agent-login-v1"]);
+    expect(machineHasDesktop("darwin", {})).toBe(true);
+    expect(machineHasDesktop("darwin", { SSH_CONNECTION: "10.0.0.1 22 10.0.0.2 22" })).toBe(false);
+    expect(machineHasDesktop("linux", {})).toBe(false);
+    expect(machineHasDesktop("linux", { WAYLAND_DISPLAY: "wayland-0" })).toBe(true);
+  });
   it("advertises the composed cancellation owner independently of agent sign-in", async () => {
     let owned = true;
     const f = fixture(undefined, () => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "cancellation-delivery-v1"]);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "cancellation-delivery-v1", "session-label-v1"]);
     f.readiness.mockResolvedValue({ agent: { ...agent, readiness: "not_configured" }, utilization: { activeSessions: 0, activeTurns: 0 } });
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["cancellation-delivery-v1"]);
     owned = false;
@@ -49,9 +62,9 @@ describe("native host inventory (A4 D133)", () => {
   it("advertises permit admission only while a live owner and ready agent exist", async () => {
     let owned = true;
     const f = fixture(() => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "execution-permits-v1"]);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "execution-permits-v1", "session-label-v1"]);
     owned = false;
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex"]);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "session-label-v1"]);
     owned = true;
     f.readiness.mockRejectedValue(new Error("runner unavailable"));
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual([]);
@@ -59,7 +72,7 @@ describe("native host inventory (A4 D133)", () => {
   it("reports only the actual in-process runner and host pressure, never appliance components", async () => {
     const f = fixture();
     const snapshot = await f.inventory.collect();
-    expect(snapshot.components).toEqual([{ kind: "agent_runner", version: "1.0.0", healthStatus: "healthy", capabilities: ["agent:codex"], lastProbeAt: signals.observedAt }]);
+    expect(snapshot.components).toEqual([{ kind: "agent_runner", version: "1.0.0", healthStatus: "healthy", capabilities: ["agent:codex", "session-label-v1"], lastProbeAt: signals.observedAt }]);
     expect(snapshot).toMatchObject({ agents: [agent], hostPressure: 0.3, activeSessions: 2, activeTurns: 1, browserToolAvailable: false, gatewayRollupIncompleteSince: null, diskFreeBytes: 100 });
     expect(deriveAdvertisedRoles([
       { role: "generator", agentPreference: ["codex"] },

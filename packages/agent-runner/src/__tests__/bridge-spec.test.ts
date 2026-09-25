@@ -1,11 +1,11 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
-import { findAgentBridge } from "@konteks/remote-release";
+import { findAgentBridge, installOfflineAgentPackage } from "@konteks/remote-release";
 import { loadRunnerConfig } from "../config.js";
-import { bridgeEnvironment, resolveBridgeSpawnSpec, resolveToolingCommand } from "../bridge/spec.js";
+import { bridgeEnvironment, resolveBridgeSpawnSpec, resolveToolingCommand, verifyNativeRunnerPackage } from "../bridge/spec.js";
 import { importHostCache, planHostCacheImport } from "../auth/host-cache-import.js";
 import { RunnerEventSchema } from "../events.js";
 
@@ -100,6 +100,36 @@ describe("bridge spawn spec", () => {
 
   it("rejects an unsupported agent family", () => {
     expect(() => loadRunnerConfig({ RUNNER_AGENT_ID: "cline" })).toThrow();
+  });
+});
+
+describe("native agent package verification (WS2-156)", () => {
+  it("hashes the package on first use, then reuses it while unchanged, and logs which", async () => {
+    const fixture = offlineFixture();
+    const root = await mkdtemp(join(tmpdir(), "runner-package-"));
+    try {
+      const archive = join(root, "package.tgz"), prefix = join(root, "agent");
+      await writeFile(archive, fixture.archive, { mode: 0o600 });
+      await installOfflineAgentPackage(archive, prefix, fixture.artifact as never);
+      const config = { ...loadRunnerConfig({ RUNNER_AGENT_ID: "codex" }), RUNNER_BRIDGE_PREFIX: prefix,
+        RUNNER_NATIVE_PACKAGE_PROFILE: fixture.profile, RUNNER_NATIVE_PACKAGE_ARTIFACT: fixture.artifact } as never;
+      const logger = { info: vi.fn() };
+      const modes = () => logger.info.mock.calls.map(call => call[0] as { event: string; stage: string; mode: string; durationMs: number });
+      await verifyNativeRunnerPackage(config, logger as never);
+      await verifyNativeRunnerPackage(config, logger as never);
+      expect(modes().map(entry => entry.mode)).toEqual(["full", "cached"]);
+      expect(modes().every(entry => entry.event === "native.bootstrap.stage" && entry.stage === "package_verify" && entry.durationMs >= 0)).toBe(true);
+      // A touched file, even with its old bytes, is hashed again.
+      const later = new Date(Date.now() + 5_000);
+      await utimes(join(prefix, "bridge/index.js"), later, later);
+      await verifyNativeRunnerPackage(config, logger as never);
+      expect(modes().at(-1)?.mode).toBe("full");
+      // The profile the runner was configured with is still enforced on the cached path.
+      await expect(verifyNativeRunnerPackage({ ...(config as object), RUNNER_NATIVE_PACKAGE_PROFILE: { ...fixture.profile, os: "debian" } } as never))
+        .rejects.toThrow(/profile changed/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

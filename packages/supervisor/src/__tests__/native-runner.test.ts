@@ -35,6 +35,12 @@ function fixture(options: { loggedOut?: boolean; startGate?: Promise<void> } = {
 }
 
 describe("native in-process runner (A4)", () => {
+  it("names the provider session from Core's display label", async () => {
+    const f = fixture(); await f.runner.start();
+    const { acpSessionRef } = await f.runner.createSession({ ...f.input, sessionLabel: { system: "Todo List", kind: "initiative", title: "[v3] Stand up the todo list API" } });
+    expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: { konteksSession: { version: 1,
+      title: `[konteks/Todo List/initiative] [v3] Stand up the todo list API ${acpSessionRef.slice(-8)}` } } }));
+  });
   it("returns completed-turn settlement only after draining ACP and stopping its execution bridge", async () => {
     const f = fixture(); await f.runner.start(); f.runner.startEvents();
     const { acpSessionRef } = await f.runner.createSession(f.input);

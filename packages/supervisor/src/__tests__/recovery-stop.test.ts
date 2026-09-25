@@ -172,6 +172,21 @@ describe("proven per-session recovery stop", () => {
     expect(f.outbox.depth).toBe(0);
   });
 
+  it("records stop evidence on a host whose clock is not Core's", async () => {
+    // A live connector estimates a fractional skew from Core responses (-1.6 s on 09-24).
+    clock.observeCoreTime(clock.now() + 1_597.73, 0);
+    try {
+      const f = await realOwnedWork(); await f.dispatch();
+      await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+
+      await expect(f.work.stopForRecovery("assignment", 1)).rejects.toThrow("quiescence");
+
+      const [record] = f.journal.recoveryEvidence.all();
+      expect(record?.evidence).toMatchObject({ stopClass: "turn_settled", ageMs: 0 });
+      expect(f.recoveryEvidence.submit).toHaveBeenCalledTimes(1);
+    } finally { clock.observeCoreTime(clock.now(), 0); }
+  });
+
   it("keeps failed stop evidence pending and replays the same immutable bytes", async () => {
     const f = await realOwnedWork(); await f.dispatch();
     await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
@@ -563,4 +578,54 @@ it.each([true, false])("reports live authority loss only after exact process sto
   }
   expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
   expect(f.transport.closeChannel).not.toHaveBeenCalled();
+});
+
+
+it("persists authority-loss uncertainty before cancellation fails and replays the same evidence", async () => {
+  const f = await realOwnedWork(); await f.dispatch();
+  await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+  f.connection.cancel.mockImplementation(async () => {
+    expect(f.journal.recoveryEvidence.all()).toHaveLength(1);
+    expect(f.journal.recoveryEvidence.all()[0]?.evidence).toMatchObject({ stopClass: "stop_unconfirmed", terminalDisposition: "not_terminal" });
+    throw new Error("cancel response lost");
+  });
+  f.recoveryEvidence.submit.mockRejectedValueOnce(new RemoteInstanceError("temporarily_unavailable", "Core down"));
+  const recover = () => (f.work as unknown as { recoverLostExecutionAuthority(id: string, attempt: number): Promise<void> }).recoverLostExecutionAuthority("assignment", 1);
+  await expect(recover()).rejects.toThrow();
+  const first = f.journal.recoveryEvidence.all()[0];
+  expect(first).toBeDefined();
+  expect(first?.delivery).toBe("pending");
+  expect(f.outbox.depth).toBe(0);
+  expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
+  await f.journal.recoveryEvidence.update(recoveryEvidenceRecordKey(first!), record => ({ ...record!, nextAttemptAt: clock.nowIso() }));
+  await f.work.retryRecoveryEvidence();
+  expect(f.recoveryEvidence.submit).toHaveBeenCalledTimes(2);
+  expect(f.recoveryEvidence.submit.mock.calls[1]?.[0]?.evidence).toEqual(first?.evidence);
+  expect(f.journal.recoveryEvidence.all()[0]?.delivery).toBe("accepted");
+  expect(f.transport.closeChannel).not.toHaveBeenCalled();
+});
+
+it("persists authority-loss uncertainty on a host whose clock is not Core's", async () => {
+  clock.observeCoreTime(clock.now() + 1_597.73, 0);
+  try {
+    const f = await realOwnedWork(); await f.dispatch();
+    await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+    f.connection.cancel.mockRejectedValue(new Error("cancel response lost"));
+    await expect((f.work as unknown as { recoverLostExecutionAuthority(id: string, attempt: number): Promise<void> })
+      .recoverLostExecutionAuthority("assignment", 1)).rejects.toThrow();
+    expect(f.journal.recoveryEvidence.all().map(record => record.evidence)).toContainEqual(
+      expect.objectContaining({ stopClass: "stop_unconfirmed", ageMs: 0 }));
+  } finally { clock.observeCoreTime(clock.now(), 0); }
+});
+
+it("still attempts cancellation when persisting the uncertainty observation fails", async () => {
+  const f = await realOwnedWork(); await f.dispatch();
+  await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+  vi.spyOn(f.journal.recoveryEvidence, "put").mockRejectedValue(new Error("disk unavailable"));
+  f.connection.cancel.mockRejectedValue(new Error("cancel unavailable"));
+  await expect((f.work as unknown as { recoverLostExecutionAuthority(id: string, attempt: number): Promise<void> })
+    .recoverLostExecutionAuthority("assignment", 1)).rejects.toThrow();
+  expect(f.connection.cancel).toHaveBeenCalled();
+  expect(f.outbox.depth).toBe(0);
+  expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
 });

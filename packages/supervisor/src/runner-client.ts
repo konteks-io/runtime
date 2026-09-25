@@ -76,7 +76,8 @@ export class RunnerClient implements RunnerPort {
       const payload: unknown = await response.json().catch(() => ({}));
       if (!response.ok) {
         const error = z.object({ code: z.string(), message: z.string() }).passthrough().safeParse(payload);
-        const code = error.success && error.data.code === "agent_auth_required" ? "agent_auth_required" : error.success && error.data.code === "recovery_required" ? "recovery_required" : "agent_unavailable";
+        const known = ["agent_auth_required", "recovery_required", "operation_conflict"] as const;
+        const code = error.success && (known as readonly string[]).includes(error.data.code) ? error.data.code as typeof known[number] : "agent_unavailable";
         throw new RemoteInstanceError(code, error.success ? error.data.message : `runner returned HTTP ${response.status}`, { recoveryActions: code === "agent_auth_required" ? [{ kind: "login_agent", agentId: this.options.agentId }] : [] });
       }
       if (attempt > 1) this.logger.info({ operation, attempt, retries: attempt - 1, maxAttempts,
