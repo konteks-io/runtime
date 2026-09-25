@@ -1,5 +1,7 @@
 import type { SupervisorJournal } from "../state/journal.js";
 import { CancellationInboxRecordSchema, type CancellationInboxRecord } from "../state/cancellation-inbox.js";
+import type { CancelDirective } from "@konteks/remote-common";
+import { cancellationNamesAssignment, isDeliveryCancellation } from "./cancellation-receiver.js";
 
 interface ReplayOwner {
   instanceId: string;
@@ -21,6 +23,9 @@ export class CancellationReplay {
     owner: () => ReplayOwner | null;
     /** Must synchronously fence the exact attempt before returning its task. */
     stopForRecovery: (assignmentId: string, attempt: number) => Promise<void>;
+    /** A native delivery turn's signed cancel: close its session and report
+     * the cancelled terminal (WS2-159). Idempotent once reported. */
+    cancelDelivery?: (directive: CancelDirective) => Promise<void>;
   }) {}
 
   /** Called immediately after fsync. Never waits for ACP before receipt I/O. */
@@ -45,8 +50,7 @@ export class CancellationReplay {
           owner.instanceId !== record.intent.instanceId || owner.workspaceId !== record.intent.tenantId ||
           admission.instanceId !== owner.instanceId || admission.workspaceId !== owner.workspaceId ||
           admission.runnerIncarnation !== owner.runnerIncarnation || admission.claimId !== record.intent.claimId ||
-          entry?.claimId !== record.intent.claimId || start.assignment.kind !== "assistant_execution" ||
-          start.assignment.source.kind !== "conversation" || start.assignment.source.sessionId !== record.intent.sessionId) {
+          entry?.claimId !== record.intent.claimId || !cancellationNamesAssignment(start.assignment, record.intent.sessionId)) {
         throw new Error("Retained cancellation has no exact current execution owner");
       }
     };
@@ -55,7 +59,14 @@ export class CancellationReplay {
       // Reserve the slot before calling a synchronous fence (which can trigger
       // callbacks). The Work owner retains its own failed-stop retry evidence.
       this.inFlight.set(record.intent.intentId, Promise.resolve());
-      const stop = this.deps.stopForRecovery(assignmentId, attempt);
+      const entry = this.deps.journal.assignments.get(`${assignmentId}:${attempt}`);
+      const delivery = isDeliveryCancellation(this.deps.journal.execution.start(assignmentId, attempt)!.assignment);
+      // A reported delivery turn is already stopped; nothing is left to do.
+      if (delivery && (entry?.reports.terminalSequence !== undefined || !this.deps.cancelDelivery)) {
+        this.inFlight.delete(record.intent.intentId);
+        return;
+      }
+      const stop = delivery ? this.deps.cancelDelivery!(record.intent.directive) : this.deps.stopForRecovery(assignmentId, attempt);
       const task = stop.then(() => { assertCurrent(); }).catch(() => {
         // Unresolved stays durable; never erase, report terminal or infer stop.
       }).finally(() => { this.inFlight.delete(record.intent.intentId); });

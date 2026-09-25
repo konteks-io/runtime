@@ -831,6 +831,7 @@ export class Supervisor {
     if (this.native) this.cancellationReplay = new CancellationReplay({
       journal: this.journal,
       stopForRecovery: (assignmentId, attempt) => this.work.stopForRecovery(assignmentId, attempt),
+      cancelDelivery: directive => this.work.onCancel(directive),
       owner: () => {
         const ownership = this.nativeOwnership;
         const instanceId = this.instanceId;
