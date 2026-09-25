@@ -2,7 +2,7 @@ import { mkdir, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, parse, resolve } from "node:path";
 import { RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
-import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
@@ -48,7 +48,8 @@ export async function stageNativeUpdate(options: { root: string; output: Output;
     const check = await checkNativeUpdate({ root, ...(options.deps ? { deps: options.deps } : {}) });
     if (check.status === "current") return check;
     const { current, release } = check;
-    const agents = current.agents;
+    // The person's own DeepSeek Harness is not in any release; only bundled agents are restaged.
+    const agents = current.agents.filter(agent => !isHostAgentId(agent));
     const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: agents });
     if (artifacts.some(artifact => artifact.kind === "connector" ? artifact.format !== "executable" : artifact.format !== "offline_agent_tgz")) {
       throw new RemoteInstanceError("bundle_untrusted", "Native updates require a complete signed offline package with official login tooling.");

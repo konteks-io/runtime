@@ -165,6 +165,11 @@ export function compareAgentVersions(left: string, right: string): number {
   return 0;
 }
 
+/** Whether an agent family is used from the person's own installation (nothing of it in the release). */
+export function isHostAgentId(agentId: string): boolean {
+  return findAgentBridge(agentId)?.hostInstall !== undefined;
+}
+
 /**
  * Whether a host-installed agent's version is inside its tested range. The
  * ceiling compares release cores, so an untested prerelease of the next

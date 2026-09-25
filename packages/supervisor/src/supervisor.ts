@@ -74,7 +74,7 @@ import type { NativeGitTool } from "./native/git-workspace.js";
 import { verifyInstalledNativeBridges } from "./native/installed.js";
 import { acquireNativeRootLock, type NativeRootLock } from "./native/root-lock.js";
 import { NativeCodexAppServerOwner, type NativeCodexAppServerOwnerOptions } from "./native/codex-app-server-owner.js";
-import { startNativeAgents } from "./native/start-native-agents.js";
+import { NativeAgentRetry, startNativeAgents } from "./native/start-native-agents.js";
 import { StateMutationGate } from "./state/mutation-gate.js";
 import type { RelayedSessionDeps } from "./session/relayed-session.js";
 import { PermissionBroker } from "./session/permissions.js";
@@ -1006,6 +1006,9 @@ export class Supervisor {
         if (this.nativeRunners[index]!.agentId === "codex") this.nativeRunners.splice(index, 1);
       }
     }
+    // Any other agent that could not start is left out the same way and
+    // retried in the background, so one agent never takes the rest down.
+    for (const runner of agents.failed) this.parkNativeRunner(runner);
     if (this.native) this.lastSnapshot = await this.inventory.collect();
     if (this.stopping) return;
     if (this.instanceId && this.administrativeStatus !== "provisioning") {
@@ -1022,6 +1025,34 @@ export class Supervisor {
       this.cancellationTimer = setInterval(() => this.cancellationReplay?.tick(), 5_000);
       this.cancellationTimer.unref();
     }
+  }
+
+  private readonly nativeAgentRetry = new NativeAgentRetry({
+    onStarted: async agentId => {
+      const runner = this.parkedRunners.get(agentId);
+      this.parkedRunners.delete(agentId);
+      if (!runner || this.stopping) return;
+      this.nativeRunners.push(runner);
+      this.runners.set(runner.agentId, runner);
+      // The next heartbeat advertises it; nothing waits for this.
+      if (this.native) this.lastSnapshot = await this.inventory.collect().catch(() => this.lastSnapshot);
+      this.logger.info({ agentId }, "agent started on a later try; it is advertised again");
+    },
+    onGaveUp: (agentId, error) => {
+      this.parkedRunners.delete(agentId);
+      this.logger.error({ err: error, agentId }, "agent still could not start after ten tries; restart the connector once it is fixed");
+    },
+    log: (agentId, attempt, error) => this.logger.warn({ err: error, agentId, attempt }, "agent still could not start; trying again later"),
+  });
+  private readonly parkedRunners = new Map<string, NativeRunner>();
+
+  /** Leave one runner out of advertising and placement until a retry starts it. */
+  private parkNativeRunner(runner: NativeRunner): void {
+    this.runners.delete(runner.agentId);
+    const index = this.nativeRunners.indexOf(runner);
+    if (index >= 0) this.nativeRunners.splice(index, 1);
+    this.parkedRunners.set(runner.agentId, runner);
+    this.nativeAgentRetry.park(runner.agentId, () => runner.start());
   }
 
   private parkedCodex: { owner: NativeCodexAppServerOwner; runners: NativeRunner[] } | null = null;
@@ -1991,6 +2022,9 @@ export class Supervisor {
     if (this.codexRetryTimer) clearTimeout(this.codexRetryTimer);
     this.codexRetryTimer = null;
     this.parkedCodex = null;
+    this.nativeAgentRetry.stop();
+    for (const runner of this.parkedRunners.values()) await runner.stop().catch(() => undefined);
+    this.parkedRunners.clear();
     for (const runner of this.runners.values()) runner.stopEvents();
     this.transport?.stop();
     await this.internal?.close().catch(() => undefined);

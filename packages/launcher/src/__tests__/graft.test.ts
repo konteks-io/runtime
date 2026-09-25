@@ -69,6 +69,9 @@ describe("graft", () => {
     expect(plain.adds).toEqual(["graft/", ".claude/", ".mcp.json", "AGENTS.md", ".ignore"]);
     expect(plain.tracked).toEqual([]);
     expect(plain.files).toBe(1);
+    // Codex and DeepSeek Harness both read AGENTS.md: wired once.
+    expect((await planGraft(repo, ["codex", "dsh"])).agents).toEqual(["agents"]);
+    expect((await planGraft(repo, ["dsh"])).adds).toEqual(["graft/", "AGENTS.md", ".ignore"]);
 
     await writeFile(join(repo, "AGENTS.md"), "# rules\n");
     git(repo, "add", "AGENTS.md");

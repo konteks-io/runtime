@@ -43,7 +43,52 @@ async function fixture() {
   return { root, options, activate, trust, platform, manifest, oldManifest, fetchFn };
 }
 
+/** The person's own DeepSeek Harness and Node, as npm installs them (the Node only answers --version). */
+async function personDsh(root: string, version = "0.1.7-rc.2") {
+  const prefix = join(root, "person-npm");
+  const pkg = join(prefix, "lib", "node_modules", "@deepseek-ai", "dsh");
+  await mkdir(join(pkg, "lib"), { recursive: true });
+  await writeFile(join(pkg, "lib", "bin.js"), "#!/usr/bin/env node\n");
+  await writeFile(join(pkg, "package.json"), JSON.stringify({ name: "@deepseek-ai/dsh", version, bin: { dsh: "lib/bin.js" } }));
+  await mkdir(join(prefix, "bin"), { recursive: true });
+  await writeFile(join(prefix, "bin", "node"), "#!/bin/sh\necho v22.23.2\n");
+  await chmod(join(prefix, "bin", "node"), 0o755);
+  vi.stubEnv("DSH_EXECUTABLE", await realpath(pkg));
+  vi.stubEnv("DSH_NODE", await realpath(join(prefix, "bin", "node")));
+  return { pkg: await realpath(pkg), node: await realpath(join(prefix, "bin", "node")) };
+}
+
 describe("native install composition", () => {
+  it.runIf(process.platform !== "win32")("installs the person's own DeepSeek Harness beside bundled agents, with no package of it", async () => {
+    const f = await fixture();
+    const dsh = await personDsh(f.root);
+    await installNative({ ...f.options, agents: ["codex", "dsh"] } as never);
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.record).toMatchObject({ agents: ["codex", "dsh"], dshRoot: dsh.pkg, dshNode: dsh.node });
+    expect(loaded.runners.find(runner => runner.RUNNER_AGENT_ID === "dsh")).toMatchObject({ RUNNER_NATIVE_DSH_ROOT: dsh.pkg, RUNNER_NATIVE_DSH_NODE: dsh.node });
+    const release = join(f.root, "releases", loaded.record.releaseId, "agents");
+    expect(await readdir(release)).toEqual(["codex"]);
+    expect(await readdir(join(f.root, "credentials"))).toEqual(expect.arrayContaining(["codex", "dsh"]));
+  });
+  it.runIf(process.platform !== "win32")("refuses an unsupported DeepSeek Harness before any activation is used", async () => {
+    const f = await fixture();
+    await personDsh(f.root, "0.1.6-alpha.2");
+    await expect(installNative({ ...f.options, agents: ["codex", "dsh"] } as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_unsupported_version" });
+    expect(f.activate).not.toHaveBeenCalled();
+  });
+  it.runIf(process.platform !== "win32")("adds DeepSeek Harness to an installed runtime without a new release or reactivation", async () => {
+    const f = await fixture();
+    const first = await installNative(f.options as never);
+    const dsh = await personDsh(f.root);
+    const fetches = f.fetchFn.mock.calls.length;
+    const added = await addNativeAgent({ root: f.root, agentId: "dsh", output: createOutput({ json: true }), deps: { roots: f.trust, platform: f.platform, fetchFn: f.fetchFn } } as never);
+    expect(added).toMatchObject({ agents: ["codex", "dsh"], releaseId: first.releaseId, dshRoot: dsh.pkg, dshNode: dsh.node });
+    expect(f.fetchFn.mock.calls.length).toBe(fetches);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex", "dsh"]);
+    await expect(addNativeAgent({ root: f.root, agentId: "dsh", output: createOutput({ json: true }), deps: { roots: f.trust, platform: f.platform } } as never)).resolves.toMatchObject({ agents: ["codex", "dsh"] });
+  });
   it("creates the production native installation record and no domain-service volumes", async () => {
     const f = await fixture();
     await installNative(f.options as never);

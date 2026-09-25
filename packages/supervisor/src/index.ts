@@ -55,6 +55,7 @@ export * from "./native/installation.js";
 export * from "./native/codex-home.js";
 export * from "./native/codex-app-server-owner.js";
 export * from "./native/claude-executable.js";
+export * from "./native/dsh-installation.js";
 export * from "./native/installed.js";
 export * from "./native/root-lock.js";
 export * from "./native/git-workspace.js";

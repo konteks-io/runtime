@@ -58,12 +58,22 @@ export class NativeRunner implements RunnerPort {
 
   start(): Promise<void> {
     if (this.stopping) return Promise.reject(unavailable());
-    this.startPromise ??= Promise.resolve().then(async () => {
-      await this.checkDshProfile();
-      this.startEvents();
-      await this.runtime.start();
-      this.started = !this.stopping;
-    });
+    if (this.startPromise === null) {
+      const starting = Promise.resolve().then(async () => {
+        await this.checkDshProfile();
+        this.startEvents();
+        await this.runtime.start();
+        this.started = !this.stopping;
+      });
+      // A failed start is forgotten, so the supervisor's background retry
+      // starts it afresh instead of replaying the same rejection.
+      starting.catch(() => {
+        if (this.startPromise !== starting) return;
+        this.startPromise = null;
+        this.stopEvents();
+      });
+      this.startPromise = starting;
+    }
     return this.startPromise;
   }
 

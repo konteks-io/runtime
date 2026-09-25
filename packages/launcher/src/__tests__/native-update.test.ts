@@ -146,6 +146,18 @@ describe("native update transaction", () => {
     expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "applied"]);
     expect(h.currentRecord().releaseId).toBe("release-next");
   });
+  it("does not hold an update back for the person's own DeepSeek Harness when it is left out", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "dsh"] } });
+    const control = h.deps.control;
+    // dsh could not start (say the person upgraded it out of range): it is parked, not probed.
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => request.op === "agents"
+        ? { agents: record.agents.filter(agentId => agentId !== "dsh").map(agentId => ({ agentId, readiness: "ready" })) }
+        : (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest) } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+  });
   it("waits for a slow-stopping service to exit and release the runtime directory before committing", async () => {
     const h = harness({ previous });
     // The stop command acknowledges immediately, but the old process lingers for two polls and holds the runtime lock for one more.

@@ -7,9 +7,11 @@ not build or deploy the connector from that checkout.
 
 `konteks-remote` is the Konteks native runtime connector. It installs on a
 developer's or team's own machine, runs the coding agents that are already
-installed there (Claude Code, Codex, OpenCode) under their own subscriptions,
-and connects them to a Konteks workspace over an outbound, authenticated
-channel. No Docker, no local databases, no provider API keys on the host.
+installed there (Claude Code, Codex, OpenCode, DeepSeek Harness) under their
+own subscriptions or keys, and connects them to a Konteks workspace over an
+outbound, authenticated channel. No Docker, no local databases. The only
+provider key on the host is a DeepSeek API key, if you use DeepSeek Harness,
+kept in the connector's private folder.
 
 ## Install
 
@@ -37,7 +39,7 @@ rather than piped into `sh`. It ends by printing the first onboarding step as
 JSON; each later step comes from `konteks-remote onboard --json`.
 
 Once the folder is a repository, onboarding offers Graft, a map of the code
-that Claude Code and Codex read before they search. On a yes the connector
+that Claude Code, Codex and DeepSeek Harness read before they search. On a yes the connector
 downloads the release's Graft package, checks it against the digest the
 installer recorded from the signed checksums, and unpacks it in `~/.graft`
 with its own copy of Node, so it needs no Node on the laptop and keeps working
@@ -75,6 +77,7 @@ Supported platforms: macOS 13+ (Apple silicon and Intel), Windows 10/11
 ```
 konteks-remote status          # cloud readiness, lease, agents
 konteks-remote auth login codex
+konteks-remote auth login dsh  # asks for your DeepSeek API key, without echo
 konteks-remote agents
 konteks-remote doctor
 konteks-remote update --check  # what the stable channel offers
@@ -82,6 +85,27 @@ konteks-remote update          # stage, drain, swap, verify; rolls back on failu
 konteks-remote stop | start
 konteks-remote uninstall       # finish running work, remove this runtime from its workspace, delete the connector
 ```
+
+### DeepSeek Harness
+
+DeepSeek Harness (`dsh`) runs from your own install, not from a package in the
+release. Install a supported version with your Node (22.19+ in the 22 line, or
+24+), then add it and give it a key:
+
+```sh
+npm install -g @deepseek-ai/dsh@0.1.7-rc.2
+konteks-remote agent add dsh
+konteks-remote auth login dsh
+```
+
+The connector finds it on `PATH` or in npm's global folders (set
+`DSH_EXECUTABLE` and `DSH_NODE` for any other layout), checks the version, and
+proves its own settings are in force before every start. Every tool call
+DeepSeek Harness makes outside reading goes through the same policy as Claude
+Code and Codex. The key is checked with DeepSeek (no tokens used) and stored
+only in the connector's private folder. If it cannot start (an unsupported
+version, say), it is left out and retried in the background with the reason in
+the connector log; your other agents keep working.
 
 `uninstall` lets running work finish (up to 15 minutes), has Konteks drain,
 revoke and tombstone this runtime, stops and unregisters the service and

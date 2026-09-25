@@ -1088,6 +1088,16 @@ describe("onboard", () => {
     const probing = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "probing" }) });
     expect(probing.done?.summary).toContain("Your Claude Code and Codex login will run Konteks work here.");
   });
+  it("names DeepSeek Harness by name, and asks for its API key only when it is here without one", async () => {
+    await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
+    const keyless = await step({ families: async () => ["claude-code", "dsh"], agentReadiness: async () => ({ "claude-code": "ready", dsh: "not_configured" }) });
+    expect(keyless.done?.remedies).toContain("DeepSeek Harness is installed but has no DeepSeek API key here yet, so it will not run Konteks work. To add the key: konteks-remote auth login dsh");
+    const ready = await step({ families: async () => ["dsh"], agentReadiness: async () => ({ dsh: "ready" }) });
+    expect(ready.done?.summary).toContain("Your DeepSeek Harness login will run Konteks work here.");
+    // Nobody without it is told to install it.
+    const without = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }) });
+    expect(JSON.stringify(without.done)).not.toContain("DeepSeek");
+  });
   it("never asks the relaying agent to run anything but konteks-remote", async () => {
     for (const state of ["inspect", "system", "push", "first_task"] as const) {
       await writeOnboardState(root, {

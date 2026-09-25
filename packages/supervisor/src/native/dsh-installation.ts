@@ -238,3 +238,9 @@ function nodeVersion(node: string): Promise<string | null> {
     execFile(node, ["--version"], { timeout: 5_000, windowsHide: true, env: { PATH: process.env.PATH ?? "" } }, (error, stdout) => resolveVersion(error ? null : String(stdout).trim()));
   });
 }
+
+/** What an install record keeps for the person's DeepSeek Harness: its package and the Node that runs it. */
+export async function locateNativeDsh(env: NodeJS.ProcessEnv = process.env): Promise<{ dshRoot: string; dshNode: string }> {
+  const installation = await resolveNativeDshInstallation(env);
+  return { dshRoot: installation.root, dshNode: await resolveNativeDshNode(installation, env) };
+}

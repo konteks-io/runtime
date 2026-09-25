@@ -9,7 +9,7 @@ export interface NativeCliActions {
   install(input: NativeCommandContext & { activationId?: string; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
   onboard(input: NativeCommandContext & { answer?: string; cwd?: string }): Promise<void>;
   stageEnrollment(input: NativeCommandContext): Promise<void>;
-  addAgent(input: NativeCommandContext & { agent: "claude-code" | "codex" | "opencode" | "pi" }): Promise<void>;
+  addAgent(input: NativeCommandContext & { agent: "claude-code" | "codex" | "opencode" | "pi" | "dsh" }): Promise<void>;
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
@@ -41,9 +41,9 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     if (!/^[A-Za-z0-9._-]{8,128}$/.test(value)) throw new InvalidArgumentError("activation id must be an opaque identifier; the code is prompted securely");
     return value;
   };
-  const agent = (value: string): "claude-code" | "codex" | "opencode" | "pi" => {
-    if (!["claude-code", "codex", "opencode", "pi"].includes(value)) throw new InvalidArgumentError("unsupported agent family");
-    return value as "claude-code" | "codex" | "opencode" | "pi";
+  const agent = (value: string): "claude-code" | "codex" | "opencode" | "pi" | "dsh" => {
+    if (!["claude-code", "codex", "opencode", "pi", "dsh"].includes(value)) throw new InvalidArgumentError("unsupported agent family");
+    return value as "claude-code" | "codex" | "opencode" | "pi" | "dsh";
   };
   program.command("install").description("activate, verify and install the native connector, then start its user service")
     .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
@@ -52,7 +52,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
     .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")
-    .option("--agents <ids>", "agent families (default: claude-code,codex)", value => value.split(",").map(part => agent(part.trim())))
+    .option("--agents <ids>", "agent families: claude-code, codex, dsh (default: claude-code,codex)", value => value.split(",").map(part => agent(part.trim())))
     .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
       if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");

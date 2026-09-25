@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { z } from "zod";
 import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
+import { isHostAgentId } from "@konteks/remote-release";
 import { recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
@@ -260,7 +261,9 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
       // version answering here is the wrong executable, not a transition.
       if (status.version.bundle !== successor.bundleVersion) throw new RemoteInstanceError("update_required", `the service answering reports ${status.version.bundle}, not ${successor.bundleVersion}`);
       const probed = await control.call({ op: "agents" }, AgentsSchema, { timeoutMs: 5_000 });
-      const settled = successor.agents.every(agentId => probed.agents.some(agent => agent.agentId === agentId && agent.readiness !== "unknown" && agent.readiness !== "probing"));
+      // A host-installed agent (the person's own DeepSeek Harness) depends on
+      // their install, not on this release: it never holds an update back.
+      const settled = successor.agents.filter(agentId => !isHostAgentId(agentId)).every(agentId => probed.agents.some(agent => agent.agentId === agentId && agent.readiness !== "unknown" && agent.readiness !== "probing"));
       if (settled) break;
     } catch (error) {
       if (answered && error instanceof RemoteInstanceError && error.code === "update_required") throw error;

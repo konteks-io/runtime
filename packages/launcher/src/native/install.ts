@@ -4,8 +4,8 @@ import { chmod, lstat, mkdir, readFile, realpath, rename, rm } from "node:fs/pro
 import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
-import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { acquireNativeRootLock, compareSemver, loadNativeInstallation, locateNativeDsh, NativeRuntimeRecordSchema, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { z } from "zod";
 import type { Output } from "../output.js";
 import { promptSecret } from "../prompt.js";
@@ -25,7 +25,7 @@ export interface NativeInstallOptions {
 }
 export interface NativeAgentAddOptions {
   root: string;
-  agentId: "claude-code" | "codex" | "opencode" | "pi";
+  agentId: "claude-code" | "codex" | "opencode" | "pi" | "dsh";
   output: Output;
   deps?: {
     roots?: readonly EmbeddedReleaseRoot[];
@@ -69,10 +69,13 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     // activation and leave a partly installed, unstartable connector.
     const codexHome = agents.includes("codex") ? await resolveNativeCodexHome() : undefined;
     const claudeExecutable = agents.includes("claude-code") ? await resolveNativeClaudeExecutable() : undefined;
+    // The person's own DeepSeek Harness: located and version-checked now, never downloaded.
+    const dsh = agents.includes("dsh") ? await locateNativeDsh() : undefined;
+    const bundled = agents.filter(agent => !isHostAgentId(agent));
     const fetchFn = options.deps?.fetchFn ?? fetch;
     const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
     const release = verifyNativeRelease(payload, roots);
-    const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: agents });
+    const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: bundled });
     // A bridge without official tooling and a closed dependency tree is not a
     // usable native install. Raw npm archives never trigger registry resolution.
     if (artifacts.some(artifact => artifact.kind === "connector" ? artifact.format !== "executable" : artifact.format !== "offline_agent_tgz")) throw new RemoteInstanceError("bundle_untrusted", "Native agents require a complete signed offline package with official login tooling.");
@@ -84,11 +87,13 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     lock.assertOwned();
     const identity = await new SupervisorStore(join(root, "supervisor")).identity();
     if (!identity || identity.instanceId !== activated.instanceId || activated.manifestDigest !== release.manifest.digest) throw invalid();
-    const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn });
+    const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: bundled }, releasesDir: join(root, "releases"), fetchFn });
     await privateDirectory(join(staged.directory, "agents"));
     for (const agent of agents) {
-      const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
-      await installOfflineAgentPackage(staged.bridges[agent]!, join(staged.directory, "agents", agent), artifact);
+      if (bundled.includes(agent)) {
+        const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
+        await installOfflineAgentPackage(staged.bridges[agent]!, join(staged.directory, "agents", agent), artifact);
+      }
       await privateDirectory(join(root, "credentials", agent));
       await privateDirectory(join(root, "workspaces", agent));
     }
@@ -97,7 +102,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     const releaseDirectory = join(root, "releases", releaseId);
     await rename(staged.directory, releaseDirectory);
     const git = options.deps?.git === undefined ? await discoverGit() : options.deps.git;
-    const record = NativeRuntimeRecordSchema.parse({ ...draft, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
+    const record = NativeRuntimeRecordSchema.parse({ ...draft, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...(dsh ?? {}), ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
     lock.assertOwned();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
     await loadNativeInstallation(root, { roots, platform });
@@ -188,13 +193,14 @@ export async function recordNativeEnrollment(options: {
     else {
       if (await resolveNativeClaudeExecutable().then(() => true).catch(() => false)) detected.push("claude-code");
       if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
+      if (await locateNativeDsh().then(() => true).catch(() => false)) detected.push("dsh");
     }
     // None is required (OS14): a machine with no detectable family still
     // enrolls, and the closing summary says how to add one.
     const fetchFn = options.deps?.fetchFn ?? fetch;
     const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
     const release = verifyNativeRelease(payload, roots);
-    const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: detected });
+    const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: detected.filter(agent => !isHostAgentId(agent)) });
     if (artifacts.some(artifact => artifact.kind === "connector" ? artifact.format !== "executable" : artifact.format !== "offline_agent_tgz")) {
       throw new RemoteInstanceError("bundle_untrusted", "Native agents require a complete signed offline package with official login tooling.");
     }
@@ -245,15 +251,18 @@ export async function stageNativeEnrollment(options: {
       const payload = options.deps?.manifest ?? JSON.parse(await readFile(join(installLockDir, ENROLLMENT_MANIFEST), "utf8"));
       const release = verifyNativeRelease(payload, roots);
       if (release.manifest.digest !== prepared.manifestDigest) throw invalid();
-      const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: prepared.agents });
+      const bundled = prepared.agents.filter(agent => !isHostAgentId(agent));
+      const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: bundled });
       const fetchFn = options.deps?.fetchFn ?? fetch;
-      const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: prepared.agents }, releasesDir: join(root, "releases"), fetchFn });
+      const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: bundled }, releasesDir: join(root, "releases"), fetchFn });
       await privateDirectory(join(staged.directory, "agents"));
       let done = 0;
       for (const agent of prepared.agents) {
         await progress(done, agent);
-        const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
-        await installOfflineAgentPackage(staged.bridges[agent]!, join(staged.directory, "agents", agent), artifact);
+        if (bundled.includes(agent)) {
+          const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
+          await installOfflineAgentPackage(staged.bridges[agent]!, join(staged.directory, "agents", agent), artifact);
+        }
         await privateDirectory(join(root, "credentials", agent));
         await privateDirectory(join(root, "workspaces", agent));
         done += 1;
@@ -331,14 +340,15 @@ export async function completeNativeEnrollment(root: string, identity: { instanc
     if (release.manifest.digest !== prepared.manifestDigest) throw invalid();
     const codexHome = prepared.agents.includes("codex") ? await resolveNativeCodexHome().catch(() => undefined) : undefined;
     const claudeExecutable = prepared.agents.includes("claude-code") ? await resolveNativeClaudeExecutable().catch(() => undefined) : undefined;
-    const agents = prepared.agents.filter(agent => (agent === "codex" ? codexHome !== undefined : agent === "claude-code" ? claudeExecutable !== undefined : true));
+    const dsh = prepared.agents.includes("dsh") ? await locateNativeDsh().catch(() => undefined) : undefined;
+    const agents = prepared.agents.filter(agent => (agent === "codex" ? codexHome !== undefined : agent === "claude-code" ? claudeExecutable !== undefined : agent === "dsh" ? dsh !== undefined : true));
     const git = deps.git === undefined ? await discoverGit() : deps.git;
     const record = NativeRuntimeRecordSchema.parse({
       schemaVersion: 1, deploymentKind: "native_connector",
       instanceId: identity.instanceId, workspaceId: identity.workspaceId,
       releaseId: prepared.releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest,
       coreUrl: prepared.coreUrl, relayUrl: prepared.relayUrl, agents, controlPort: prepared.controlPort,
-      ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...(git ? { git: await verifyNativeGitTool(git) } : {}),
+      ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...(dsh ?? {}), ...(git ? { git: await verifyNativeGitTool(git) } : {}),
     });
     lock.assertOwned();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
@@ -374,6 +384,7 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
       options.output.line(`${options.agentId} is already installed; no files or identity were changed.`);
       return current.record;
     }
+    if (isHostAgentId(options.agentId)) return await addHostAgent(root, current.record, options, { roots, platform }, lock);
     const fetchFn = options.deps?.fetchFn ?? fetch;
     const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
     const release = verifyNativeRelease(payload, roots);
@@ -435,6 +446,29 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
     runtimeLock?.release();
     lock.release();
   }
+}
+
+/**
+ * An agent the person installed themselves (DeepSeek Harness) adds no files to
+ * the release: locate it, record it, give it private folders, and prove the
+ * installation still loads, restoring the previous record if it does not.
+ */
+async function addHostAgent(root: string, previous: NativeRuntimeRecord, options: NativeAgentAddOptions, deps: { roots: readonly EmbeddedReleaseRoot[]; platform: NativePlatform }, lock: ReturnType<typeof acquireNativeRootLock>): Promise<NativeRuntimeRecord> {
+  const dsh = await locateNativeDsh();
+  await privateDirectory(join(root, "credentials", options.agentId));
+  await privateDirectory(join(root, "workspaces", options.agentId));
+  const successor = NativeRuntimeRecordSchema.parse({ ...previous, agents: [...previous.agents, options.agentId], ...dsh });
+  try {
+    lock.assertOwned();
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(successor));
+    await loadNativeInstallation(root, deps);
+  } catch (error) {
+    lock.assertOwned();
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(previous));
+    throw error;
+  }
+  options.output.line(`${options.agentId} added from this machine's own installation; no release was downloaded and nothing else changed.`);
+  return successor;
 }
 
 /** Roll back only the exact successor written by this launcher invocation. */

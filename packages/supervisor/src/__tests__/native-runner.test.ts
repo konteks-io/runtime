@@ -268,6 +268,21 @@ describe("native DeepSeek Harness runner", () => {
     }));
   });
 
+  it("can be started again after a failed start, so a background retry really retries", async () => {
+    const spawn = vi.fn(async () => bridge());
+    let checks = 0;
+    const runner = new NativeRunner({ instanceId: "instance", config: dshConfig(), onEvent: () => undefined,
+      dshProfileCheck: async () => { checks += 1; if (checks === 1) throw new Error("dsh not supported yet"); },
+      runtimeOptions: { spawn, probe: async () => ({ kind: "logged_out" }) } });
+    runners.push(runner);
+    await expect(runner.start()).rejects.toThrow("dsh not supported yet");
+    expect(spawn).not.toHaveBeenCalled();
+    await runner.start();
+    expect(checks).toBe(2);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    await expect(runner.readiness()).resolves.toMatchObject({ agent: { agentId: "dsh" } });
+  });
+
   it("never spawns a dsh whose composed profile drifted", async () => {
     const spawn = vi.fn(async () => bridge());
     const drift = Object.assign(new Error("DeepSeek Harness 0.1.7-rc.2 does not accept the Konteks settings"), { code: "prerequisite_missing", diagnostic: "dsh_profile_drift" });

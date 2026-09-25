@@ -69,6 +69,9 @@ describe("native customer entry point", () => {
     const { program, actions } = fixture();
     await program.parseAsync(["--root", "/private/native-root", "agent", "add", "codex"], { from: "user" });
     expect(actions.addAgent).toHaveBeenCalledWith(expect.objectContaining({ root: "/private/native-root", agent: "codex" }));
+    // The person's own DeepSeek Harness is added the same way.
+    await program.parseAsync(["--root", "/private/native-root", "agent", "add", "dsh"], { from: "user" });
+    expect(actions.addAgent).toHaveBeenLastCalledWith(expect.objectContaining({ agent: "dsh" }));
     expect(actions.install).not.toHaveBeenCalled();
   });
 });
