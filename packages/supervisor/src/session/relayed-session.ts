@@ -1144,6 +1144,20 @@ export class RelayedSession {
     this.releaseChannel = null;
   }
 
+  /**
+   * A recovery-fenced owner keeps its channel reservation until the
+   * orchestrator has proven its exact process stopped and Core settled the
+   * claim (WS2-159). Only then may the next turn take the channel, always
+   * with a fresh ACP session. Its own recovery stop must have run to the end.
+   */
+  releaseRecoveredChannel(): void {
+    if (!this.closed || !this.recoveryStopping || this.recoveryStopTask === null || this.recoverySettlementInProgress) {
+      throw new RemoteInstanceError("assignment_conflict", "The previous execution still owns its session channel.");
+    }
+    this.releaseChannel?.();
+    this.releaseChannel = null;
+  }
+
   waitForAuthorityStop(): Promise<void> { return this.executionGate?.waitForAuthorityStop() ?? Promise.resolve(); }
 }
 

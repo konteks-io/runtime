@@ -165,16 +165,24 @@ export type EraseRecord = z.infer<typeof EraseRecordSchema>;
  */
 export const RecoveryEvidenceRecordSchema = z.object({
   evidence: RemoteRecoveryEvidenceSchema,
-  delivery: z.enum(["pending", "accepted", "duplicate"]),
+  // `superseded`: Core can never accept these bytes (their process retired, or
+  // Core already settled the claim) and says so. The record is kept for audit;
+  // it is simply no longer sent (WS2-159).
+  delivery: z.enum(["pending", "accepted", "duplicate", "superseded"]),
   attempts: z.number().int().nonnegative(),
   lastAttemptAt: z.string().nullable(),
   nextAttemptAt: z.string(),
   acceptedAt: z.string().nullable(),
   lastFailureCode: z.string().min(1).max(128).nullable(),
+  supersededAt: z.string().optional(),
+  supersededReason: z.enum(["incarnation_retired", "claim_settled"]).optional(),
   updatedAt: z.string(),
 }).strict().superRefine((record, ctx) => {
   if ((record.delivery === "accepted" || record.delivery === "duplicate") !== (record.acceptedAt !== null)) {
     ctx.addIssue({ code: "custom", path: ["acceptedAt"], message: "Accepted recovery evidence requires its immutable acceptance timestamp" });
+  }
+  if ((record.delivery === "superseded") !== (record.supersededAt !== undefined && record.supersededReason !== undefined)) {
+    ctx.addIssue({ code: "custom", path: ["supersededAt"], message: "Superseded recovery evidence requires when and why Core settled it" });
   }
 });
 export type RecoveryEvidenceRecord = z.infer<typeof RecoveryEvidenceRecordSchema>;
