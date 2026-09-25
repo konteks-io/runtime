@@ -185,7 +185,10 @@ describe("native recovery evidence HTTPS boundary", () => {
     await f.client.submitRecoveryEvidence({ ...recoveryEvidenceRequest, connection: { kind: "relay", connectionEpoch: 2 } });
     const [url, init] = f.fetchFn.mock.calls[0]!;
     expect(String(url)).toBe("https://core.example/api/remote-instances/internal/remote-instances/instance/recovery-evidence");
-    expect(init?.headers).not.toHaveProperty("authorization");
+    const headers = new Headers(init?.headers);
+    expect(headers.has("authorization")).toBe(false);
+    // A real fetch refuses NUL in a header; the key must be a sendable token (WS2-159).
+    expect(headers.get("idempotency-key")).toMatch(/^recovery-evidence:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$/u);
     const { proof, ...body } = JSON.parse(String(init?.body));
     expect(body).toEqual(recoveryEvidenceRequest);
     expect(verifyInstanceProof(f.key.publicKey, { method: "recovery_evidence", audience: CORE_AUDIENCE, subject: "instance", body }, proof)).toBe(true);

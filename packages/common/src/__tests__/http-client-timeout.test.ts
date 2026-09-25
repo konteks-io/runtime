@@ -64,6 +64,17 @@ describe("request-specific Core transport deadline", () => {
     expect(JSON.stringify(error.mock.calls)).not.toContain("secret");
   });
 
+  it("refuses a header fetch cannot send once, as a local failure, never as transport (WS2-159)", async () => {
+    const fetchFn = vi.fn();
+    const error = vi.fn();
+    const client = new JsonClient({ baseUrl: "https://core.example", fetchFn,
+      retrySleep: async () => undefined, logger: { ...nullLogger, error } as typeof nullLogger });
+    await expect(client.request({ method: "POST", path: "/check", idempotencyKey: "evidence:a\u0000b", body: {},
+      schema: { parse: value => value } })).rejects.toMatchObject({ retryable: false, diagnostic: "request_preparation_failed" });
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledWith(expect.objectContaining({ classification: "request_preparation" }), expect.any(String));
+  });
+
   it("bounds the fetch by the shorter request budget", async () => {
     const fetchFn = vi.fn(async (_url: string | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => { init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true }); }));
     const client = new JsonClient({ baseUrl: "https://core.example", timeoutMs: 1000, fetchFn, retrySleep: async () => undefined, logger: nullLogger });

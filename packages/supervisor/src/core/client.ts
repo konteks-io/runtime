@@ -506,6 +506,9 @@ export class CoreClient {
    * machine-proof boundary; its acknowledgement records only acceptance of
    * observation bytes and never a terminal result or quiescence decision.
    */
+  // The identity key joins its fields with NUL, which no HTTP header may carry:
+  // sent raw, fetch refused every submission locally, so a fenced session could
+  // never be recovered over HTTPS (WS2-159). The header carries its digest.
   async submitRecoveryEvidence(input: { evidence: RemoteRecoveryEvidence; connection: RemoteReconciliationConnection }): Promise<RecoveryEvidenceIngressResult> {
     const evidence = RemoteRecoveryEvidenceSchema.parse(structuredClone(input.evidence));
     const connection = RemoteReconciliationConnectionSchema.parse(structuredClone(input.connection));
@@ -513,7 +516,7 @@ export class CoreClient {
     const result = await this.proofHttp.request({ method: "POST", path: CORE_PATHS.recoveryEvidence(evidence.instanceId),
       bodyFactory: () => ({ ...request, proof: this.proof("recovery_evidence", evidence.instanceId, request as unknown as { [key: string]: JsonValue }) }),
       schema: RecoveryEvidenceIngressResultSchema,
-      idempotencyKey: `recovery-evidence:${remoteRecoveryEvidenceIdentityKey(evidence)}:${evidence.evidenceDigest}` });
+      idempotencyKey: `recovery-evidence:${jcsDigest(remoteRecoveryEvidenceIdentityKey(evidence))}:${evidence.evidenceDigest}` });
     if (result.instanceId !== evidence.instanceId || result.assignmentId !== evidence.assignmentId || result.attempt !== evidence.attempt ||
         result.claimId !== evidence.claimId || result.recoveryEpoch !== evidence.recoveryEpoch || result.evidenceDigest !== evidence.evidenceDigest) {
       throw new RemoteInstanceError("registration_mismatch", "Recovery evidence response does not match the submitted observation.");

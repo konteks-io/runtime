@@ -185,6 +185,10 @@ export class JsonClient {
       try {
         const body = request.bodyFactory?.() ?? request.body;
         const timeout = AbortSignal.timeout(Math.max(1, Math.floor(Math.min(perAttemptTimeoutMs, remainingMs))));
+        // Build the headers here: a value fetch would refuse (a NUL or line
+        // break) is a local defect to report once, never a network failure to
+        // retry forever (WS2-159).
+        new Headers(headers);
         init = {
           method: request.method,
           headers,
