@@ -597,6 +597,11 @@ it("persists authority-loss uncertainty before cancellation fails and replays th
   expect(first?.delivery).toBe("pending");
   expect(f.outbox.depth).toBe(0);
   expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
+  // Authority-loss recovery deliberately submits the durable observation in
+  // the background so cancellation is never delayed by Core. Join that first
+  // attempt before overriding its backoff; otherwise this test races the
+  // failed delivery's final journal update and can correctly find it not due.
+  await f.work.retryRecoveryEvidence();
   await f.journal.recoveryEvidence.update(recoveryEvidenceRecordKey(first!), record => ({ ...record!, nextAttemptAt: clock.nowIso() }));
   await f.work.retryRecoveryEvidence();
   expect(f.recoveryEvidence.submit).toHaveBeenCalledTimes(2);
