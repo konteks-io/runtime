@@ -245,3 +245,36 @@ describe("native in-process runner (A4)", () => {
     expect(JSON.stringify(f.events)).not.toContain("bridge-private");
   });
 });
+
+describe("native DeepSeek Harness runner", () => {
+  const dshConfig = () => RunnerConfigSchema.parse({
+    RUNNER_AGENT_ID: "dsh", RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_WORKSPACE_DIR: join(root, "work"), RUNNER_BRIDGE_PREFIX: "/opt/dsh",
+    RUNNER_NATIVE_DSH_ROOT: "/opt/dsh", RUNNER_NATIVE_DSH_ENTRY: "/opt/dsh/lib/bin.js", RUNNER_NATIVE_DSH_NODE: "/opt/node/bin/node", RUNNER_BRIDGE_VERSION: "0.1.7-rc.2",
+  });
+  const bridge = (): BridgeProcess => ({ connection: {} as ClientSideConnection, initializeResult: { protocolVersion: 1 }, exited: false, stderrTail: () => [], stop: vi.fn(async () => undefined) });
+
+  it("proves the Konteks overlay is in force in this exact installation before dsh ever starts", async () => {
+    const order: string[] = [];
+    const check = vi.fn(async (options: { node: string; installation: { root: string; entry: string; version: string }; dshHome: string; konteksDir: string }) => { order.push("check"); void options; });
+    const spawn = vi.fn(async () => { order.push("spawn"); return bridge(); });
+    const runner = new NativeRunner({ instanceId: "instance", config: dshConfig(), onEvent: () => undefined, dshProfileCheck: check,
+      runtimeOptions: { spawn, probe: async () => ({ kind: "logged_out" }) } });
+    runners.push(runner);
+    await runner.start();
+    expect(order).toEqual(["check", "spawn"]);
+    expect(check).toHaveBeenCalledWith(expect.objectContaining({
+      node: "/opt/node/bin/node", installation: { root: "/opt/dsh", entry: "/opt/dsh/lib/bin.js", version: "0.1.7-rc.2" },
+      dshHome: join(root, "credentials", ".dsh"), konteksDir: join(root, "credentials", "konteks-dsh"),
+    }));
+  });
+
+  it("never spawns a dsh whose composed profile drifted", async () => {
+    const spawn = vi.fn(async () => bridge());
+    const drift = Object.assign(new Error("DeepSeek Harness 0.1.7-rc.2 does not accept the Konteks settings"), { code: "prerequisite_missing", diagnostic: "dsh_profile_drift" });
+    const runner = new NativeRunner({ instanceId: "instance", config: dshConfig(), onEvent: () => undefined, dshProfileCheck: async () => { throw drift; },
+      runtimeOptions: { spawn, probe: async () => ({ kind: "logged_out" }) } });
+    runners.push(runner);
+    await expect(runner.start()).rejects.toMatchObject({ diagnostic: "dsh_profile_drift" });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+});

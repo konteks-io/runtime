@@ -3,6 +3,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import { RemoteInstanceError, sanitizeInheritedChildProcessEnv, type Logger } from "@konteks/remote-common";
 import { findAgentBridge, verifyOfflineAgentPackageOnce, type AgentBridgeFamily, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
+import { dshRuntimePaths, renderDshKonteksProfile } from "./dsh-profile.js";
 
 /**
  * How this runner spawns its bridge and its official tooling. The bridge is
@@ -42,6 +43,28 @@ export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamil
     CI: "1",
   };
   const profile = config.RUNNER_NATIVE_PACKAGE_PROFILE;
+  const hostDsh = config.RUNNER_NATIVE_DSH_ROOT !== undefined || config.RUNNER_NATIVE_DSH_ENTRY !== undefined || config.RUNNER_NATIVE_DSH_NODE !== undefined;
+  if (hostDsh || family.hostInstall !== undefined) {
+    const { node } = hostDshLauncher(config, family);
+    // The person's own DeepSeek Harness, in a runtime-owned home: its key is
+    // read from the credential document there, never from this environment.
+    const { dshHome } = dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
+    env.DSH_HOME = dshHome;
+    env.DSH_PERMISSION_MODE = "workspace-write";
+    env.DSH_TELEMETRY_DISABLED = "1";
+    const separator = process.platform === "win32" ? ";" : ":";
+    env.PATH = [dirname(node), base.PATH ?? ""].join(separator);
+    if (process.platform === "win32") {
+      env.USERPROFILE = config.RUNNER_CREDENTIAL_DIR;
+      env.APPDATA = join(config.RUNNER_CREDENTIAL_DIR, "AppData", "Roaming");
+      env.LOCALAPPDATA = join(config.RUNNER_CREDENTIAL_DIR, "AppData", "Local");
+    }
+    const extraCa = process.env.NODE_EXTRA_CA_CERTS;
+    if (extraCa) {
+      if (!isAbsolute(extraCa) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(extraCa)) throw new RemoteInstanceError("agent_unavailable", "Native additional CA certificate path must be absolute.");
+      env.NODE_EXTRA_CA_CERTS = extraCa;
+    }
+  }
   if (config.RUNNER_NATIVE_CODEX_HOME !== undefined) {
     if (!profile || family.agentId !== "codex" || config.RUNNER_AUTH_MODE !== "agent_local_subscription" ||
         !isAbsolute(config.RUNNER_NATIVE_CODEX_HOME) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(config.RUNNER_NATIVE_CODEX_HOME)) {
@@ -121,8 +144,23 @@ const PROVIDER_BASE_URL_ENV: Record<AgentBridgeFamily["egress"]["providers"][num
   deepseek: "DEEPSEEK_BASE_URL",
 };
 
+/** The located launcher and Node for a host-installed DeepSeek Harness runner; refuses anything else. */
+function hostDshLauncher(config: RunnerConfig, family: AgentBridgeFamily): { node: string; entry: string } {
+  const node = config.RUNNER_NATIVE_DSH_NODE, entry = config.RUNNER_NATIVE_DSH_ENTRY;
+  const safe = (path: string | undefined): path is string => path !== undefined && isAbsolute(path) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(path);
+  if (family.agentId !== "dsh" || family.hostInstall === undefined || config.RUNNER_AUTH_MODE !== "agent_local_subscription" || !safe(node) || !safe(entry) || !safe(config.RUNNER_NATIVE_DSH_ROOT)) {
+    throw new RemoteInstanceError("agent_unavailable", "A DeepSeek Harness runner requires the person's installed DeepSeek Harness launcher and Node at absolute local paths.");
+  }
+  return { node, entry };
+}
+
 export function resolveBridgeSpawnSpec(config: RunnerConfig): BridgeSpawnSpec {
   const family = resolveBridgeFamily(config.RUNNER_AGENT_ID);
+  if (family.hostInstall !== undefined) {
+    const { node, entry } = hostDshLauncher(config, family);
+    const { patches } = renderDshKonteksProfile(dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR).konteksDir, process.platform);
+    return { family, command: node, args: [entry, ...family.command, ...patches.flatMap(patch => ["--patch", patch])], env: bridgeEnvironment(config, family), cwd: config.RUNNER_WORKSPACE_DIR };
+  }
   const [command, ...args] = family.command;
   if (!command) throw new RemoteInstanceError("agent_unavailable", "bridge family has no command");
   if (config.RUNNER_NATIVE_PACKAGE_PROFILE) {

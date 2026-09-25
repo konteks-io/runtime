@@ -189,6 +189,14 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
  * error (-32603) whose data says "unauthorized"; read as "internal" it
  * surfaced as "the provider call failed" instead of "sign in again" (WS2-141).
  */
+/**
+ * DeepSeek Harness reports a missing or unusable API key as a failed turn
+ * (-32603) whose text names neither auth nor a status; these are its exact
+ * llm-deepseek messages (dsh-runtime-support CP0 #7). A revoked key already
+ * reads "Authentication Fails".
+ */
+const DSH_KEY_MISSING = /llm-deepseek: (?:no API key for provider route|the API key resolved from \S+ contains characters no HTTP header can carry)/;
+
 function signInLapsed(data: unknown): boolean {
   if (data === undefined || data === null) return false;
   let text: string;
@@ -205,7 +213,7 @@ export function classifyBridgeError(error: unknown): {
 } {
   if (error instanceof RequestError) {
     const message = error.message.slice(0, 1_024);
-    if (error.code === -32000 || /auth/i.test(message) || signInLapsed(error.data)) {
+    if (error.code === -32000 || /auth/i.test(message) || signInLapsed(error.data) || DSH_KEY_MISSING.test(message)) {
       return { code: error.code, class: "agent_auth_required", message: "agent authentication required", retryable: false };
     }
     if (error.code === -32602) return { code: error.code, class: "invalid_params", message, retryable: false };

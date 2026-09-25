@@ -98,6 +98,37 @@ describe("bridge spawn spec", () => {
     expect(() => resolveBridgeSpawnSpec(config)).toThrow(/gateway/);
   });
 
+  it("runs the person's own DeepSeek Harness launcher with their Node and the Konteks overlay, in a private dsh home", () => {
+    vi.stubEnv("DEEPSEEK_API_KEY", "sk-inherited-must-not-reach-dsh-000000");
+    vi.stubEnv("DSH_HOME", "/inherited/dsh-home");
+    vi.stubEnv("DSH_PERMISSION_MODE", "danger-full-access");
+    const config = loadRunnerConfig({
+      RUNNER_AGENT_ID: "dsh", RUNNER_CREDENTIAL_DIR: "/rt/credentials/dsh", RUNNER_WORKSPACE_DIR: "/rt/workspaces/dsh",
+      RUNNER_BRIDGE_PREFIX: "/usr/lib/node_modules/@deepseek-ai/dsh", RUNNER_NATIVE_DSH_ROOT: "/usr/lib/node_modules/@deepseek-ai/dsh",
+      RUNNER_NATIVE_DSH_ENTRY: "/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js", RUNNER_NATIVE_DSH_NODE: "/usr/bin/node",
+    });
+    const spec = resolveBridgeSpawnSpec(config);
+    expect(spec.command).toBe("/usr/bin/node");
+    expect(spec.args).toEqual([
+      "/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js", "--profile", "acp",
+      "--patch", join("/rt/credentials/dsh", "konteks-dsh", "konteks-dsh.patch.yml"),
+      "--patch", join("/rt/credentials/dsh", "konteks-dsh", "konteks-dsh-ask.patch.yml"),
+    ]);
+    expect(spec.cwd).toBe("/rt/workspaces/dsh");
+    expect(spec.env).toMatchObject({
+      DSH_HOME: join("/rt/credentials/dsh", ".dsh"), DSH_PERMISSION_MODE: "workspace-write", DSH_TELEMETRY_DISABLED: "1", NO_COLOR: "1", HOME: "/rt/credentials/dsh",
+    });
+    // The key lives only in the credential document; nothing secret or DSH_* is inherited.
+    expect(spec.env.DEEPSEEK_API_KEY).toBeUndefined();
+    expect(spec.env.PATH?.split(process.platform === "win32" ? ";" : ":")[0]).toBe("/usr/bin");
+    expect(Object.keys(spec.env).filter(key => /KEY|TOKEN|SECRET/i.test(key))).toEqual([]);
+    // Without a located launcher and Node there is nothing safe to spawn.
+    expect(() => resolveBridgeSpawnSpec({ ...config, RUNNER_NATIVE_DSH_NODE: undefined })).toThrow(/DeepSeek Harness/);
+    expect(() => resolveBridgeSpawnSpec({ ...config, RUNNER_NATIVE_DSH_ENTRY: "lib/bin.js" })).toThrow(/DeepSeek Harness/);
+    // dsh-only settings never leak to another family.
+    expect(() => bridgeEnvironment({ ...config, RUNNER_AGENT_ID: "codex" }, findAgentBridge("codex")!)).toThrow(/DeepSeek Harness/);
+  });
+
   it("rejects an unsupported agent family", () => {
     expect(() => loadRunnerConfig({ RUNNER_AGENT_ID: "cline" })).toThrow();
   });

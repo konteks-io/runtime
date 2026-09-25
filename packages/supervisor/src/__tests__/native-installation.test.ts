@@ -136,7 +136,7 @@ describe("closed native runtime installation", () => {
     expect(loaded.runners[0]).toMatchObject({ RUNNER_AGENT_ID: "codex", RUNNER_AUTH_MODE: "agent_local_subscription", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "codex"), RUNNER_WORKSPACE_DIR: join(root, "workspaces", "codex"), RUNNER_BRIDGE_PREFIX: join(f.releaseDir, "agents", "codex") });
     expect(loaded.runners[0]).not.toHaveProperty("RUNNER_GATEWAY_BASE_URL");
   });
-  it("runs DeepSeek Harness from the person's own installation, with no bundled artifact", async () => {
+  it.runIf(process.platform !== "win32")("runs DeepSeek Harness from the person's own installation, with no bundled artifact", async () => {
     const f = await fixture();
     const dsh = async (version: string) => {
       const pkg = join(root, `dsh-${version}`);
@@ -147,15 +147,20 @@ describe("closed native runtime installation", () => {
     };
     for (const directory of [join(root, "credentials", "dsh"), join(root, "workspaces", "dsh")]) await mkdir(directory, { recursive: true, mode: 0o700 });
     const supported = await dsh("0.1.7-rc.2");
-    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: supported }));
+    // The person's Node, as installed (a stand-in that only answers --version).
+    const node = join(root, "person-node", "bin", "node");
+    await mkdir(join(node, ".."), { recursive: true });
+    await writeFile(node, "#!/bin/sh\necho v22.23.2\n");
+    await chmod(node, 0o755);
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: supported, dshNode: node }));
     const loaded = await loadNativeInstallation(root, f.options);
     expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex", "dsh"]);
     const runner = loaded.runners[1]!;
-    expect(runner).toMatchObject({ RUNNER_AGENT_ID: "dsh", RUNNER_NATIVE_DSH_ROOT: supported, RUNNER_BRIDGE_VERSION: "0.1.7-rc.2", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "dsh"), RUNNER_WORKSPACE_DIR: join(root, "workspaces", "dsh") });
+    expect(runner).toMatchObject({ RUNNER_AGENT_ID: "dsh", RUNNER_NATIVE_DSH_ROOT: supported, RUNNER_NATIVE_DSH_ENTRY: join(supported, "lib", "bin.js"), RUNNER_NATIVE_DSH_NODE: node, RUNNER_BRIDGE_VERSION: "0.1.7-rc.2", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "dsh"), RUNNER_WORKSPACE_DIR: join(root, "workspaces", "dsh") });
     expect(runner).not.toHaveProperty("RUNNER_NATIVE_PACKAGE_PROFILE");
     expect(runner).not.toHaveProperty("RUNNER_NATIVE_PACKAGE_ARTIFACT");
     // An upgrade out of the tested range stops the load with the install hint, never a silent run.
-    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: await dsh("0.1.8") }));
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: await dsh("0.1.8"), dshNode: node }));
     await expect(loadNativeInstallation(root, f.options)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_unsupported_version" });
     expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["claude-code", "codex", "opencode", "pi", "dsh"] }).success).toBe(true);
   });

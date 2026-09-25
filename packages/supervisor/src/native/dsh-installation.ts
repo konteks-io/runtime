@@ -1,4 +1,6 @@
-import { lstat, readFile, realpath, stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { constants } from "node:fs";
+import { access, lstat, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
@@ -13,8 +15,8 @@ export interface NativeDshInstallation {
   version: string;
 }
 
-type Refusal = { diagnostic: "dsh_not_found" | "dsh_unsupported_version" | "dsh_unsafe_install"; message: string };
-const PRIORITY: Record<Refusal["diagnostic"], number> = { dsh_not_found: 0, dsh_unsafe_install: 1, dsh_unsupported_version: 2 };
+type Refusal = { diagnostic: "dsh_not_found" | "dsh_unsupported_version" | "dsh_unsafe_install" | "dsh_node_unsupported"; message: string };
+const PRIORITY: Record<Refusal["diagnostic"], number> = { dsh_not_found: 0, dsh_unsafe_install: 1, dsh_unsupported_version: 2, dsh_node_unsupported: 3 };
 
 function family(): AgentBridgeFamily & { hostInstall: NonNullable<AgentBridgeFamily["hostInstall"]> } {
   const dsh = findAgentBridge("dsh");
@@ -161,4 +163,78 @@ async function inspect(candidateRoot: string, platform: NodeJS.Platform): Promis
     }
   }
   return { root, entry, version: manifest.version };
+}
+
+/**
+ * The Node that runs the person's DeepSeek Harness. The connector is a Node
+ * single-executable app and cannot run another script, so dsh runs on the
+ * person's own Node, normally the one it was installed with: an absolute
+ * DSH_NODE override, the Node of the npm prefix holding dsh, PATH, then the
+ * usual install locations. It must satisfy dsh's engines (^22.19.0 || >=24).
+ * Running `node --version` is the only execution, of the binary that will run
+ * dsh anyway.
+ */
+export async function resolveNativeDshNode(
+  installation: NativeDshInstallation,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  deps: { version?: (node: string) => Promise<string | null> } = {},
+): Promise<string> {
+  const binary = platform === "win32" ? "node.exe" : "node";
+  const candidates: string[] = [];
+  if (env.DSH_NODE !== undefined) {
+    if (!isAbsolute(env.DSH_NODE) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(env.DSH_NODE)) throw refuse(nodeUnsupported(null));
+    candidates.push(env.DSH_NODE);
+  } else {
+    // <prefix>/lib/node_modules/@deepseek-ai/dsh -> <prefix>/bin/node (npm, nvm, Homebrew);
+    // <nodejs>\node_modules\@deepseek-ai\dsh -> <nodejs>\node.exe (Windows installer prefix).
+    candidates.push(platform === "win32" ? resolve(installation.root, "..", "..", "..", binary) : resolve(installation.root, "..", "..", "..", "..", "bin", binary));
+    for (const directory of (env.PATH ?? "").split(platform === "win32" ? ";" : ":")) if (directory && isAbsolute(directory)) candidates.push(join(directory, binary));
+    if (platform === "win32") {
+      for (const programs of [env.ProgramFiles, env["ProgramFiles(x86)"]]) if (programs && isAbsolute(programs)) candidates.push(join(programs, "nodejs", binary));
+    } else {
+      candidates.push("/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node");
+    }
+  }
+  const version = deps.version ?? nodeVersion;
+  let seen: string | null = null;
+  for (const candidate of [...new Set(candidates)]) {
+    let node: string;
+    try {
+      node = await realpath(candidate);
+      const info = await stat(node);
+      if (!info.isFile()) continue;
+      if (platform !== "win32" && process.platform !== "win32") {
+        const owner = info.uid === process.getuid?.() || info.uid === 0;
+        if (!owner || (info.mode & 0o022) !== 0) continue;
+        await access(node, constants.X_OK);
+      }
+    } catch {
+      continue;
+    }
+    const reported = await version(node).catch(() => null);
+    if (reported !== null && nodeSupported(reported)) return node;
+    seen ??= reported;
+  }
+  throw refuse(nodeUnsupported(seen));
+}
+
+function nodeSupported(reported: string): boolean {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(reported.trim());
+  if (!match) return false;
+  const major = Number(match[1]), minor = Number(match[2]);
+  return (major === 22 && minor >= 19) || major >= 24;
+}
+
+function nodeUnsupported(seen: string | null): Refusal {
+  return {
+    diagnostic: "dsh_node_unsupported",
+    message: `DeepSeek Harness needs Node 22.19 or newer in the 22 line, or Node 24 or newer${seen ? ` (found ${seen.trim().slice(0, 32)})` : ""}. Install it from https://nodejs.org, then retry.`,
+  };
+}
+
+function nodeVersion(node: string): Promise<string | null> {
+  return new Promise(resolveVersion => {
+    execFile(node, ["--version"], { timeout: 5_000, windowsHide: true, env: { PATH: process.env.PATH ?? "" } }, (error, stdout) => resolveVersion(error ? null : String(stdout).trim()));
+  });
 }

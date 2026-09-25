@@ -4,6 +4,8 @@ import { RemoteInstanceError, createLogger, writeSecretFile, type ConnectedAgent
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import { fallbackLoginIdentity, probeIdentity, type IdentityProbe } from "./auth/identity.js";
 import { runLogout, startLoginFlow, type LoginFlow } from "./auth/login-flow.js";
+import { removeDshApiKey, startDshKeyLogin } from "./auth/dsh-key.js";
+import { dshRuntimePaths, writeDshKonteksProfile } from "./bridge/dsh-profile.js";
 import { AgentScopeStore, applyIdentityObservation, type AgentScopeState } from "./auth/scope-store.js";
 import { classifyBridgeError, spawnBridge, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
 import { discoverBridgeModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
@@ -155,6 +157,9 @@ export class AgentRuntime {
     await mkdir(this.options.config.RUNNER_CREDENTIAL_DIR, { recursive: true, mode: 0o700 });
     await mkdir(this.options.config.RUNNER_WORKSPACE_DIR, { recursive: true });
     this.scope = await this.scopeStore.read();
+    // The person's own DeepSeek Harness reads the Konteks overlay from files
+    // its spawn arguments name; write them before its first start.
+    if (this.family.hostInstall !== undefined) await writeDshKonteksProfile(dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).konteksDir);
     await this.ensureBridge();
     await this.probe(false);
   }
@@ -760,19 +765,24 @@ export class AgentRuntime {
     if (this.activeLogin) {
       throw new RemoteInstanceError("temporarily_unavailable", "a login is already in progress for this agent");
     }
-    const flow = startLoginFlow({
-      config: this.options.config,
-      family: this.family,
-      env: this.spec.env,
-      events: this.events,
-      logger: this.logger,
-      ...(args.loginId === undefined ? {} : { loginId: args.loginId }),
-    });
+    // DeepSeek Harness has no login command: the runtime asks for the API key
+    // itself, checks it with DeepSeek and stores it in its dsh home.
+    const flow = this.family.agentId === "dsh"
+      ? startDshKeyLogin({ credentialsFile: dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).credentialsFile, events: this.events, logger: this.logger,
+        ...(args.loginId === undefined ? {} : { loginId: args.loginId }) })
+      : startLoginFlow({
+        config: this.options.config,
+        family: this.family,
+        env: this.spec.env,
+        events: this.events,
+        logger: this.logger,
+        ...(args.loginId === undefined ? {} : { loginId: args.loginId }),
+      });
     this.activeLogin = flow;
     void flow.done.then(async ({ code }) => {
       if (code !== 0) {
         this.activeLogin = null;
-        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: "official login tooling did not complete" } });
+        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: this.family.agentId === "dsh" ? "the DeepSeek API key was not saved" : "official login tooling did not complete" } });
         await this.probe(false);
         return;
       }
@@ -812,7 +822,8 @@ export class AgentRuntime {
     this.connectionState = "starting";
     this.publishReadiness();
     const stopping = this.stopExecutionForAuthChange().then(() => null, error => error);
-    await runLogout({ config: this.options.config, family: this.family, env: this.spec.env });
+    if (this.family.agentId === "dsh") await removeDshApiKey(dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).credentialsFile);
+    else await runLogout({ config: this.options.config, family: this.family, env: this.spec.env });
     const stopError = await stopping;
     await this.bridge?.stop();
     this.bridge = null;

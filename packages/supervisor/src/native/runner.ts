@@ -1,9 +1,10 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
-import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
+import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, dshRuntimePaths, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
 import { RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
+import { checkDshKonteksProfile } from "./dsh-profile-check.js";
 
 const idSchema = z.string().min(1).max(128);
 const inputSchema = z.object({
@@ -27,6 +28,8 @@ export interface NativeRunnerOptions {
   onEvent: (event: RunnerEvent) => void;
   runtimeOptions?: Pick<AgentRuntimeOptions, "spawn" | "probe" | "now" | "logger">;
   executionBridgeLimit?: () => number;
+  /** The DeepSeek Harness overlay self-check; replaced only in tests. */
+  dshProfileCheck?: typeof checkDshKonteksProfile;
 }
 
 /** Host-only runtime adapter. It never starts the legacy runner HTTP/WS API. */
@@ -56,11 +59,31 @@ export class NativeRunner implements RunnerPort {
   start(): Promise<void> {
     if (this.stopping) return Promise.reject(unavailable());
     this.startPromise ??= Promise.resolve().then(async () => {
+      await this.checkDshProfile();
       this.startEvents();
       await this.runtime.start();
       this.started = !this.stopping;
     });
     return this.startPromise;
+  }
+
+  /**
+   * The person's own DeepSeek Harness runs only once the Konteks overlay is
+   * proven in force in that exact installation (dsh-profile-check.ts): a dsh
+   * upgrade that stops a patch applying, the ask hook included, never spawns.
+   */
+  private async checkDshProfile(): Promise<void> {
+    const config = this.options.config;
+    if (config.RUNNER_AGENT_ID !== "dsh") return;
+    const { dshHome, konteksDir } = dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
+    if (!config.RUNNER_NATIVE_DSH_ROOT || !config.RUNNER_NATIVE_DSH_ENTRY || !config.RUNNER_NATIVE_DSH_NODE) {
+      throw new RemoteInstanceError("prerequisite_missing", "DeepSeek Harness was not located on this machine.", { diagnostic: "dsh_not_found" });
+    }
+    await (this.options.dshProfileCheck ?? checkDshKonteksProfile)({
+      node: config.RUNNER_NATIVE_DSH_NODE,
+      installation: { root: config.RUNNER_NATIVE_DSH_ROOT, entry: config.RUNNER_NATIVE_DSH_ENTRY, version: config.RUNNER_BRIDGE_VERSION },
+      dshHome, konteksDir,
+    });
   }
 
   stop(): Promise<void> {

@@ -9,6 +9,8 @@ import { RunnerConfigSchema } from "../config.js";
 import { INITIAL_SCOPE_STATE } from "../auth/scope-store.js";
 import { projectReadiness } from "../readiness.js";
 import { extractLoginSignals, withoutTerminalEscapes } from "../auth/login-flow.js";
+import { writeDshApiKey } from "../auth/dsh-key.js";
+import { dshRuntimePaths } from "../bridge/dsh-profile.js";
 
 describe("identity signal normalization (D111)", () => {
   it("uses official Codex account identity rather than empty status stdout or shared login text", async () => {
@@ -23,6 +25,26 @@ describe("identity signal normalization (D111)", () => {
       readAccount.mockResolvedValue("second@example.test");
       expect(await probeIdentity(config, findAgentBridge("codex")!, {}, { run, readAccount })).not.toEqual(first);
       expect(JSON.stringify(first)).not.toContain("example.test");
+      expect(run).not.toHaveBeenCalled();
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it("fingerprints the stored DeepSeek key for DeepSeek Harness, without running anything or exposing the key", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "dsh-identity-"));
+    try {
+      const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "dsh", RUNNER_CREDENTIAL_DIR: dir });
+      const run = vi.fn();
+      const family = findAgentBridge("dsh")!;
+      expect(await probeIdentity(config, family, {}, { run })).toEqual({ kind: "logged_out" });
+      const file = dshRuntimePaths(dir).credentialsFile;
+      await writeDshApiKey(file, "sk-first-key-00000000000000000000");
+      const first = await probeIdentity(config, family, {}, { run });
+      expect(first.kind).toBe("signal");
+      expect(await probeIdentity(config, family, {}, { run })).toEqual(first);
+      await writeDshApiKey(file, "sk-second-key-0000000000000000000");
+      const second = await probeIdentity(config, family, {}, { run });
+      expect(second.kind).toBe("signal");
+      expect(second).not.toEqual(first);
+      expect(JSON.stringify([first, second])).not.toMatch(/sk-/);
       expect(run).not.toHaveBeenCalled();
     } finally { await rm(dir, { recursive: true, force: true }); }
   });

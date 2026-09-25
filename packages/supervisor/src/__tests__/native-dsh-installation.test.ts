@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { resolveNativeDshInstallation, verifyNativeDshRoot } from "../native/dsh-installation.js";
+import { resolveNativeDshInstallation, resolveNativeDshNode, verifyNativeDshRoot } from "../native/dsh-installation.js";
 
 const posix = process.platform !== "win32";
 
@@ -102,5 +102,69 @@ describe("native DeepSeek Harness discovery", () => {
     await expect(verifyNativeDshRoot(installed, "linux")).rejects.toMatchObject({ diagnostic: "dsh_unsafe_install" });
     await chmod(installed, 0o755);
     await expect(verifyNativeDshRoot(installed, "linux")).resolves.toEqual(expected(installed));
+  });
+});
+
+describe("the Node that runs the person's DeepSeek Harness", () => {
+  let base = "";
+  afterEach(async () => { if (base) await rm(base, { recursive: true, force: true }); });
+  const file = async (path: string, mode = 0o755) => { await mkdir(join(path, ".."), { recursive: true }); await writeFile(path, "#!/bin/sh\n"); await chmod(path, mode); return path; };
+  const install = (root: string) => ({ root, entry: join(root, "lib", "bin.js"), version: "0.1.7-rc.2" });
+  const versions = (table: Record<string, string>) => async (node: string) => table[node] ?? null;
+
+  it("prefers the Node beside the npm prefix dsh was installed into, then PATH", async () => {
+    base = await realpath(await mkdtemp(join(tmpdir(), "dsh-node-")));
+    const prefix = join(base, ".nvm", "versions", "node", "v22.20.0");
+    const root = join(prefix, "lib", "node_modules", "@deepseek-ai", "dsh");
+    const beside = await file(join(prefix, "bin", "node"));
+    const onPath = await file(join(base, "usr", "bin", "node"));
+    const version = versions({ [beside]: "v22.20.0", [onPath]: "v24.1.0" });
+    await expect(resolveNativeDshNode(install(root), { PATH: join(base, "usr", "bin") }, "darwin", { version })).resolves.toBe(beside);
+    await expect(resolveNativeDshNode(install(join(base, "elsewhere", "dsh")), { PATH: join(base, "usr", "bin") }, "linux", { version })).resolves.toBe(onPath);
+  });
+
+  it("finds node.exe beside a Node install's own node_modules and on PATH on Windows", async () => {
+    base = await realpath(await mkdtemp(join(tmpdir(), "dsh-node-")));
+    const nodejs = join(base, "Program Files", "nodejs");
+    const beside = await file(join(nodejs, "node.exe"));
+    const version = versions({ [beside]: "v24.0.0" });
+    await expect(resolveNativeDshNode(install(join(nodejs, "node_modules", "@deepseek-ai", "dsh")), { PATH: "" }, "win32", { version })).resolves.toBe(beside);
+    const appDataRoot = join(base, "AppData", "Roaming", "npm", "node_modules", "@deepseek-ai", "dsh");
+    await expect(resolveNativeDshNode(install(appDataRoot), { PATH: `C:\\Windows;${nodejs}` }, "win32", { version })).resolves.toBe(beside);
+    await expect(resolveNativeDshNode(install(appDataRoot), { PATH: "", ProgramFiles: join(base, "Program Files") }, "win32", { version })).resolves.toBe(beside);
+  });
+
+  it("accepts only the Node versions dsh supports (^22.19.0 or >=24) and says what to install", async () => {
+    base = await realpath(await mkdtemp(join(tmpdir(), "dsh-node-")));
+    const node = await file(join(base, "bin", "node"));
+    for (const [reported, ok] of [["v22.19.0", true], ["v22.23.2", true], ["v24.3.1", true], ["v25.0.0", true], ["v22.18.9", false], ["v23.11.0", false], ["v20.17.0", false], ["garbage", false]] as const) {
+      const attempt = resolveNativeDshNode(install(join(base, "x")), { PATH: join(base, "bin") }, "linux", { version: versions({ [node]: reported }) });
+      if (ok) await expect(attempt, reported).resolves.toBe(node);
+      else await expect(attempt, reported).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_node_unsupported" });
+    }
+    const refusal = await resolveNativeDshNode(install(join(base, "x")), { PATH: join(base, "none") }, "linux", { version: versions({}) }).catch(error => error);
+    expect(refusal).toMatchObject({ diagnostic: "dsh_node_unsupported" });
+    expect(refusal.message).toMatch(/Node 22\.19 or newer/);
+  });
+
+  it("honours an absolute DSH_NODE override and refuses a Node other users can modify", async () => {
+    base = await realpath(await mkdtemp(join(tmpdir(), "dsh-node-")));
+    const override = await file(join(base, "custom", "node"));
+    const version = versions({ [override]: "v22.23.2" });
+    await expect(resolveNativeDshNode(install(join(base, "x")), { DSH_NODE: override, PATH: "" }, "linux", { version })).resolves.toBe(override);
+    await expect(resolveNativeDshNode(install(join(base, "x")), { DSH_NODE: "node", PATH: "" }, "linux", { version })).rejects.toMatchObject({ code: "prerequisite_missing" });
+    if (posix) {
+      await chmod(override, 0o777);
+      await expect(resolveNativeDshNode(install(join(base, "x")), { DSH_NODE: override, PATH: "" }, "linux", { version })).rejects.toMatchObject({ code: "prerequisite_missing" });
+    }
+  });
+
+  it.runIf(posix)("reads the version by running the candidate itself when not injected", async () => {
+    base = await realpath(await mkdtemp(join(tmpdir(), "dsh-node-")));
+    const node = join(base, "bin", "node");
+    await mkdir(join(base, "bin"), { recursive: true });
+    await writeFile(node, "#!/bin/sh\necho v22.21.0\n");
+    await chmod(node, 0o755);
+    await expect(resolveNativeDshNode(install(join(base, "x")), { PATH: join(base, "bin") }, "linux")).resolves.toBe(node);
   });
 });

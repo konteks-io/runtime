@@ -12,7 +12,7 @@ import { verifyInstalledNativeBridges } from "./installed.js";
 import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
 import { resolveNativeClaudeExecutable } from "./claude-executable.js";
-import { resolveNativeDshInstallation, verifyNativeDshRoot } from "./dsh-installation.js";
+import { resolveNativeDshInstallation, resolveNativeDshNode, verifyNativeDshRoot } from "./dsh-installation.js";
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
 function endpoint(protocol: "https:" | "wss:") {
@@ -41,6 +41,8 @@ export const NativeRuntimeRecordSchema = z.object({
   claudeExecutable: z.string().min(1).max(4096).optional(),
   /** The person's own installed DeepSeek Harness package root, located at install time. */
   dshRoot: z.string().min(1).max(4096).optional(),
+  /** The person's Node that runs it (the connector cannot run another script). */
+  dshNode: z.string().min(1).max(4096).optional(),
 }).strict();
 export type NativeRuntimeRecord = z.infer<typeof NativeRuntimeRecordSchema>;
 
@@ -94,10 +96,12 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
         const workspace = join(root, "workspaces", agent);
         for (const path of [credentials, workspace]) await directory(path);
         const dsh = record.dshRoot === undefined ? await resolveNativeDshInstallation() : await verifyNativeDshRoot(record.dshRoot);
+        const node = await resolveNativeDshNode(dsh, record.dshNode === undefined ? process.env : { DSH_NODE: record.dshNode });
         runners.push(RunnerConfigSchema.parse({
           RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
           RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
-          RUNNER_NATIVE_DSH_ROOT: dsh.root, RUNNER_BRIDGE_PREFIX: dsh.root, RUNNER_BRIDGE_VERSION: dsh.version,
+          RUNNER_NATIVE_DSH_ROOT: dsh.root, RUNNER_NATIVE_DSH_ENTRY: dsh.entry, RUNNER_NATIVE_DSH_NODE: node,
+          RUNNER_BRIDGE_PREFIX: dsh.root, RUNNER_BRIDGE_VERSION: dsh.version,
         }));
         continue;
       }

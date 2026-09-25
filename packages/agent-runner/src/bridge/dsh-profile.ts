@@ -53,6 +53,13 @@ export interface DshProfileRowExpectation {
 
 const paths = (platform: NodeJS.Platform) => (platform === "win32" ? win32 : posix);
 
+/** Where a dsh runner keeps its private state, all inside its credential directory. */
+export function dshRuntimePaths(credentialDir: string, platform: NodeJS.Platform = process.platform): { dshHome: string; konteksDir: string; credentialsFile: string } {
+  const path = paths(platform);
+  const dshHome = path.join(credentialDir, ".dsh");
+  return { dshHome, konteksDir: path.join(credentialDir, "konteks-dsh"), credentialsFile: path.join(dshHome, ".credentials.yaml") };
+}
+
 /** What a composed profile must contain for the overlay to be in force. */
 export function DSH_PROFILE_EXPECTATIONS(dir: string, platform: NodeJS.Platform): DshProfileRowExpectation[] {
   const path = paths(platform);

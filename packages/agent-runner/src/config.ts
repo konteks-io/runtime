@@ -20,6 +20,9 @@ export const RunnerConfigSchema = z
     RUNNER_NATIVE_CLAUDE_EXECUTABLE: z.string().min(1).optional(),
     /** The person's own installed DeepSeek Harness package root, resolved by native installation only. */
     RUNNER_NATIVE_DSH_ROOT: z.string().min(1).optional(),
+    /** Its `bin.dsh` launcher inside that root, and the person's Node that runs it. */
+    RUNNER_NATIVE_DSH_ENTRY: z.string().min(1).optional(),
+    RUNNER_NATIVE_DSH_NODE: z.string().min(1).optional(),
     /** Execution roots for session `cwd` (component checkouts are mounted beneath it). */
     RUNNER_WORKSPACE_DIR: z.string().min(1).default("/workspace"),
     RUNNER_AUTH_MODE: z.enum(["agent_local_subscription", "gateway_keyed"]).default("agent_local_subscription"),

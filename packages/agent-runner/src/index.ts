@@ -10,5 +10,6 @@ export * from "./sessions/manager.js";
 export * from "./auth/scope-store.js";
 export * from "./auth/identity.js";
 export * from "./auth/login-flow.js";
+export * from "./auth/dsh-key.js";
 export * from "./auth/host-cache-import.js";
 export * from "./api/server.js";
