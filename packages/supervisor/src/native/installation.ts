@@ -5,13 +5,14 @@ import { isAbsolute, join, parse, resolve } from "node:path";
 import { z } from "zod";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { RunnerConfigSchema } from "@konteks/remote-agent-runner";
-import { EmbeddedReleaseRootSchema, selectNativeArtifacts, verifyNativeRelease, verifyOfflineAgentPackage, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EmbeddedReleaseRootSchema, findAgentBridge, selectNativeArtifacts, verifyNativeRelease, verifyOfflineAgentPackage, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { SupervisorConfigSchema } from "../config.js";
 import { IdentitySchema, ManifestRecordSchema } from "../state/store.js";
 import { verifyInstalledNativeBridges } from "./installed.js";
 import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
 import { resolveNativeClaudeExecutable } from "./claude-executable.js";
+import { resolveNativeDshInstallation, verifyNativeDshRoot } from "./dsh-installation.js";
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
 function endpoint(protocol: "https:" | "wss:") {
@@ -30,7 +31,7 @@ export const NativeRuntimeRecordSchema = z.object({
   controlPort: z.number().int().min(1).max(65_535),
   // Zero agents is a machine enrolled from an agent door with nothing
   // detectable yet (OS14); it advertises no roles until one is added.
-  agents: z.array(z.enum(["claude-code", "codex", "opencode", "pi"])).max(4)
+  agents: z.array(z.enum(["claude-code", "codex", "opencode", "pi", "dsh"])).max(5)
     .refine(agents => new Set(agents).size === agents.length),
   git: NativeGitToolSchema.optional(),
   /** Local installer-owned profile binding, never a cloud-provided path. */
@@ -38,6 +39,8 @@ export const NativeRuntimeRecordSchema = z.object({
   codexSocket: z.string().min(1).max(4096).optional(),
   /** The operator's own installed Claude Code CLI, located at install time. */
   claudeExecutable: z.string().min(1).max(4096).optional(),
+  /** The person's own installed DeepSeek Harness package root, located at install time. */
+  dshRoot: z.string().min(1).max(4096).optional(),
 }).strict();
 export type NativeRuntimeRecord = z.infer<typeof NativeRuntimeRecordSchema>;
 
@@ -81,8 +84,23 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
     if (exchangeRecord.manifestDigest !== exchange.manifest.digest) throw invalid();
     if (release.manifest.bundleVersion !== record.bundleVersion) throw invalid();
     const runners = [];
-    const artifacts = selectNativeArtifacts(release, { ...options.platform, agentIds: record.agents });
+    // A host-installed agent (the person's own DeepSeek Harness) has no signed
+    // artifact: it is re-located and re-verified here on every load instead.
+    const bundled = record.agents.filter(agent => findAgentBridge(agent)?.hostInstall === undefined);
+    const artifacts = selectNativeArtifacts(release, { ...options.platform, agentIds: bundled });
     for (const agent of record.agents) {
+      if (!bundled.includes(agent)) {
+        const credentials = join(root, "credentials", agent);
+        const workspace = join(root, "workspaces", agent);
+        for (const path of [credentials, workspace]) await directory(path);
+        const dsh = record.dshRoot === undefined ? await resolveNativeDshInstallation() : await verifyNativeDshRoot(record.dshRoot);
+        runners.push(RunnerConfigSchema.parse({
+          RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
+          RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
+          RUNNER_NATIVE_DSH_ROOT: dsh.root, RUNNER_BRIDGE_PREFIX: dsh.root, RUNNER_BRIDGE_VERSION: dsh.version,
+        }));
+        continue;
+      }
       const prefix = join(releaseDir, "agents", agent);
       const credentials = join(root, "credentials", agent);
       const workspace = join(root, "workspaces", agent);
@@ -103,7 +121,8 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
         RUNNER_NATIVE_PACKAGE_PROFILE: profile, RUNNER_NATIVE_PACKAGE_ARTIFACT: artifact,
       }));
     }
-    await verifyInstalledNativeBridges(release, runners, options.platform);
+    const bundledRunners = runners.filter(runner => bundled.includes(runner.RUNNER_AGENT_ID));
+    if (bundledRunners.length > 0 || bundled.length === record.agents.length) await verifyInstalledNativeBridges(release, bundledRunners, options.platform);
     for (const [path, before] of directories) {
       const after = await lstat(path);
       if (!after.isDirectory() || !privateOwner(after) || !sameFile(before, after)) throw invalid();
