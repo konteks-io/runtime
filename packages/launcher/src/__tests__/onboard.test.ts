@@ -953,7 +953,8 @@ describe("onboard", () => {
     const fetchFn = vi.fn();
     const retried = await step({ fetchFn: fetchFn as never }, "yes");
     expect(retried.ask?.question).toBe("What do you want to build first? Your first planning turn is included.");
-    expect(fetchFn).not.toHaveBeenCalled();
+    // Only the may-this-person-plan check may run; no initiative is started.
+    expect(fetchFn.mock.calls.every(([url]) => String(url).endsWith("/api/platform/permissions/check"))).toBe(true);
     expect((await readOnboardState(root))?.retryAsked).toBeUndefined();
 
     await writeOnboardState(root, { step: "first_task", systemId: "sys-1", retryAsked: true } as never);
@@ -988,6 +989,24 @@ describe("onboard", () => {
     await writeOnboardState(root, { step: "first_task", systemId: "sys-1" } as never);
     const ask = await step({});
     expect(ask.ask?.question).toBe("What do you want to build first? Your first planning turn is included.");
+  });
+
+  it("tells an invited Viewer why no initiative is started, and asks nothing (WS1-131)", async () => {
+    await writeOnboardState(root, { step: "first_task", systemId: "sys-1", tenantId: "konteks-onboard", workspaces: [{ tenantId: "konteks-onboard", displayName: "Konteks-Onboard" }] } as never);
+    const fetchFn = vi.fn(async (url: string) =>
+      String(url).endsWith("/api/platform/permissions/check")
+        ? new Response(JSON.stringify({ hasPermission: false }), { status: 200, headers: { "content-type": "application/json" } })
+        : new Response("{}", { status: 404 }));
+    const result = await step({ fetchFn: fetchFn as never });
+    expect(result.ask).toBeUndefined();
+    expect(result.note).toMatch(/can look but not start work, so no initiative was started\. Once its owner makes you a Member/);
+    expect(await readOnboardState(root)).toMatchObject({ step: "done" });
+  });
+
+  it("asks for the first task when Konteks cannot say whether the person may plan", async () => {
+    await writeOnboardState(root, { step: "first_task", systemId: "sys-1" } as never);
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({ error: "tenant is required" }), { status: 400, headers: { "content-type": "application/json" } }));
+    expect((await step({ fetchFn: fetchFn as never })).ask?.question).toBe("What do you want to build first? Your first planning turn is included.");
   });
 
   it("ends without a session when the person answers nothing", async () => {

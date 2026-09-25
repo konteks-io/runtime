@@ -166,6 +166,18 @@ export class OwnerApiClient {
   }
 
   /**
+   * Whether this person may start planning work here: a Member or the owner
+   * can, a Viewer cannot (WS1-131). Undefined when Konteks cannot say, so a
+   * check that fails never stops someone who can.
+   */
+  async canStartWork(): Promise<boolean | undefined> {
+    const body = (await this.call("POST", "/api/platform/permissions/check", { permission: "app.session.manage" }).catch(() => undefined)) as
+      | { hasPermission?: unknown }
+      | undefined;
+    return typeof body?.hasPermission === "boolean" ? body.hasPermission : undefined;
+  }
+
+  /**
    * The person's first initiative on that System (W1-A6).
    *
    * Core's initiative setup creates the initiative and opens its planning

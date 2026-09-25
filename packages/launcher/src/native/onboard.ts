@@ -1120,6 +1120,23 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         }
       }
       if (context.answer === undefined) {
+        // An invited Viewer can look but not plan: asked for a first task,
+        // they got an initiative whose planning refused them, read as
+        // "access was refused" (WS1-131). Nothing is made, and they hear why.
+        if (state.systemId && !state.initiativeId) {
+          const allowed = await ownerApi(supervisorData, coreUrl, enrollment, context)
+            .then(api => api.canStartWork())
+            .catch(() => undefined);
+          if (allowed === false) {
+            const where = state.tenantId ? ((await currentWorkspaceName(state.tenantId)) ?? workspaceName(state, state.tenantId)) : "this workspace";
+            await save({ step: "done", closing: true });
+            return {
+              step: "first_task",
+              note: `Your role in ${where} can look but not start work, so no initiative was started. Once its owner makes you a Member, start one from the site with New initiative.`,
+              run: AGAIN,
+            };
+          }
+        }
         return {
           step: "first_task",
           ask: { question: "What do you want to build first? Your first planning turn is included.", kind: "text" },
