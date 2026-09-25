@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildReleaseFixture } from "../fixtures.js";
 import { agentModelCapabilityMappingSigningBytes, bundleManifestSigningBytes, computeAgentModelCapabilityMappingDigest, computeBundleManifestDigest } from "@konteks/remote-common";
-import { verifyNativeRelease, selectNativeArtifacts, stageNativeRelease } from "../native.js";
+import { verifyNativeRelease, selectNativeArtifacts, selectNativeModelCapabilityMappings, stageNativeRelease } from "../native.js";
 
 const bytes = Buffer.from('test executable bytes');
 const hash = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -70,6 +70,22 @@ describe('signed native executable staging', () => {
     const forged = { ...changed, mappingDigest: computeAgentModelCapabilityMappingDigest(changed), signature };
     expect(() => verifyNativeRelease(signed({ modelCapabilityMappings: [forged] }), roots, now))
       .toThrow(/model capability mapping/i);
+  });
+
+  it('selects a reviewed host-agent mapping for DeepSeek Harness only when it names the versions this runtime supports', () => {
+    const host = (versions: { min: string; belowCore: string }, agentId = 'dsh') => {
+      const body = { version: 1, mappingId: `host-${agentId}-${versions.min}`, mappingRevision: 1, hostAgent: { agentId, versions }, configId: 'model', optionType: 'select',
+        modelIdentities: [{ value: '["deepseek-official","deepseek-flash"]', canonicalProviderId: 'deepseek', canonicalModelId: 'deepseek-flash' }],
+        issuedAt: '2026-09-01T00:00:00Z', expiresAt: '2027-09-01T00:00:00Z' };
+      const unsigned = { ...body, mappingDigest: computeAgentModelCapabilityMappingDigest(body) };
+      const placeholder = { ...unsigned, signature: { algorithm: 'Ed25519', keyId: fixture.keyId, value: 'AA' } };
+      return { ...unsigned, signature: { algorithm: 'Ed25519', keyId: fixture.keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(placeholder), fixture.privateKey).toString('base64url') } };
+    };
+    const release = verifyNativeRelease(signed({ modelCapabilityMappings: [signedMapping(), host({ min: '0.1.7-rc.2', belowCore: '0.1.8' }), host({ min: '0.1.9', belowCore: '0.2.0' }), host({ min: '1.0.0', belowCore: '2.0.0' }, 'codex')] }), roots, now);
+    expect(selectNativeModelCapabilityMappings(release).map(({ agentId, mapping }) => [agentId, mapping.mappingId])).toEqual([
+      ['claude-code', 'claude-model'],
+      ['dsh', 'host-dsh-0.1.7-rc.2'],
+    ]);
   });
 
   it('cannot change signed artifacts after verification', () => {

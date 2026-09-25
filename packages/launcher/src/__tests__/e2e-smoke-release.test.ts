@@ -25,6 +25,15 @@ describe("signed E2E ACP releases", () => {
           optionType: "select",
           modelIdentities: [{ value: "e2e-model", canonicalProviderId: "e2e", canonicalModelId: "e2e-model" }],
         }),
+        // The person's own DeepSeek Harness: no artifact, bound by agent and supported versions.
+        expect.objectContaining({
+          hostAgent: { agentId: "dsh", versions: { min: "0.1.7-rc.2", belowCore: "0.1.8" } },
+          configId: "model",
+          modelIdentities: [
+            { value: '["deepseek-official","deepseek-flash"]', canonicalProviderId: "deepseek", canonicalModelId: "deepseek-flash" },
+            { value: '["deepseek-official","deepseek-v4-pro"]', canonicalProviderId: "deepseek", canonicalModelId: "deepseek-v4-pro" },
+          ],
+        }),
       ]);
       const prefix = join(root, "installed-agent");
       const profile = await installOfflineAgentPackage(prepared.artifactFiles.agent, prefix, artifact!);
@@ -139,9 +148,10 @@ describe("signed E2E ACP releases", () => {
       expect(verifyNativeRelease(old.manifest, [prepared.root]).manifest.nativeArtifacts?.filter(artifact => artifact.kind === "agent_bridge").map(artifact => artifact.agentId)).toEqual(["claude-code"]);
       expect(release.bundleVersion).toBe("0.2.0-e2e");
       expect(release.nativeArtifacts?.filter(artifact => artifact.kind === "agent_bridge").map(artifact => artifact.agentId)).toEqual(["claude-code", "codex"]);
-      expect(release.modelCapabilityMappings?.map(mapping => mapping.bridgeProfileRef)).toEqual([
+      expect(release.modelCapabilityMappings?.map(mapping => mapping.bridgeProfileRef ?? mapping.hostAgent?.agentId)).toEqual([
         "e2e-real-claude-code-acp",
         "e2e-real-codex-acp",
+        "dsh",
       ]);
       expect(release.modelCapabilityMappings?.[1]?.modelIdentities).toContainEqual({
         value: "gpt-5.6-sol",

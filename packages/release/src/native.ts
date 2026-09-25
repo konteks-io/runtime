@@ -8,6 +8,7 @@ import {
   type AgentModelCapabilityMapping, type RemoteNativeArtifact, type RemoteSignedBundleManifest,
 } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "./manifest.js";
+import { findAgentBridge } from "./bridges.js";
 
 const verified = Symbol("verified-native-release");
 export interface VerifiedNativeRelease {
@@ -54,11 +55,21 @@ export interface VerifiedNativeModelCapabilityMapping {
 /** Derives agent identity only from the exact artifact already bound by the strict manifest. */
 export function selectNativeModelCapabilityMappings(release: VerifiedNativeRelease): VerifiedNativeModelCapabilityMapping[] {
   if (release[verified] !== true) throw new RemoteInstanceError("bundle_untrusted", "native release has not been verified");
-  return (release.manifest.modelCapabilityMappings ?? []).map(mapping => {
+  return (release.manifest.modelCapabilityMappings ?? []).flatMap(mapping => {
+    if (mapping.hostAgent !== undefined) {
+      // A host-installed agent (the person's own DeepSeek Harness) has no
+      // artifact: the mapping holds only for the versions this runtime was
+      // built and tested against. A mapping for other versions is not ours.
+      const family = findAgentBridge(mapping.hostAgent.agentId);
+      const versions = family?.hostInstall?.versions;
+      return versions && versions.min === mapping.hostAgent.versions.min && versions.belowCore === mapping.hostAgent.versions.belowCore
+        ? [{ agentId: mapping.hostAgent.agentId, mapping }]
+        : [];
+    }
     const artifact = release.manifest.nativeArtifacts?.find(candidate => candidate.kind === "agent_bridge"
       && candidate.id === mapping.bridgeProfileRef && candidate.digest === mapping.bridgeArtifactDigest);
     if (!artifact?.agentId) throw new RemoteInstanceError("bundle_untrusted", "native model mapping lost its exact bridge binding");
-    return { agentId: artifact.agentId, mapping };
+    return [{ agentId: artifact.agentId, mapping }];
   });
 }
 

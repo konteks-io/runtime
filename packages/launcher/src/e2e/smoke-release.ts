@@ -10,7 +10,7 @@ import {
   type AgentModelCapabilityMapping,
   type RemoteNativeArtifact,
 } from "@konteks/remote-common";
-import { installOfflineAgentPackage, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
+import { HOST_AGENT_BRIDGES, installOfflineAgentPackage, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RemoteSignedBundleManifest } from "@konteks/remote-common";
 
 export interface E2ESmokeReleaseOptions {
@@ -138,7 +138,29 @@ async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directo
     const mappingPlaceholder: AgentModelCapabilityMapping = { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: "AA" } };
     return { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(mappingPlaceholder), privateKey).toString("base64url") } };
   };
-  const mappings = agentArtifacts.map(mappingFor);
+  // A host-installed agent (the person's own DeepSeek Harness) ships no
+  // artifact; its reviewed mapping names the agent and the versions this
+  // runtime supports, with the same canonical identities Core routes on.
+  const hostMappingFor = (family: (typeof HOST_AGENT_BRIDGES)[number]): AgentModelCapabilityMapping => {
+    const mappingBody = {
+      version: 1 as const,
+      mappingId: `e2e-${family.agentId}-model`,
+      mappingRevision: 1,
+      hostAgent: { agentId: family.agentId, versions: { ...family.hostInstall!.versions } },
+      configId: "model",
+      optionType: "select" as const,
+      modelIdentities: [
+        { value: '["deepseek-official","deepseek-flash"]', canonicalProviderId: "deepseek", canonicalModelId: "deepseek-flash" },
+        { value: '["deepseek-official","deepseek-v4-pro"]', canonicalProviderId: "deepseek", canonicalModelId: "deepseek-v4-pro" },
+      ],
+      issuedAt: issuedAt.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+    };
+    const mappingUnsigned = { ...mappingBody, mappingDigest: computeAgentModelCapabilityMappingDigest(mappingBody) };
+    const mappingPlaceholder: AgentModelCapabilityMapping = { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: "AA" } };
+    return { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(mappingPlaceholder), privateKey).toString("base64url") } };
+  };
+  const mappings = [...agentArtifacts.map(mappingFor), ...HOST_AGENT_BRIDGES.filter(family => family.hostInstall).map(hostMappingFor)];
   const manifest = signNativeReleaseManifest({
     bundleVersion, protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [connectorArtifact, ...agentArtifacts], modelCapabilityMappings: mappings, expiresAt: expiresAt.toISOString(),
   }, { keyId, privateKey });
