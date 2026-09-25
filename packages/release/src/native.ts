@@ -105,13 +105,17 @@ export interface VerifiedNativeModelCapabilityMapping {
 }
 
 /** Derives agent identity only from the exact artifact already bound by the strict manifest. */
-export function selectNativeModelCapabilityMappings(release: VerifiedNativeRelease): VerifiedNativeModelCapabilityMapping[] {
+export function selectNativeModelCapabilityMappings(
+  release: VerifiedNativeRelease,
+  target?: Pick<NativeArtifactTarget, "os" | "architecture">,
+): VerifiedNativeModelCapabilityMapping[] {
   if (release[verified] !== true) throw new RemoteInstanceError("bundle_untrusted", "native release has not been verified");
-  return (release.manifest.modelCapabilityMappings ?? []).map(mapping => {
+  return (release.manifest.modelCapabilityMappings ?? []).flatMap(mapping => {
     const artifact = release.manifest.nativeArtifacts?.find(candidate => candidate.kind === "agent_bridge"
       && candidate.id === mapping.bridgeProfileRef && candidate.digest === mapping.bridgeArtifactDigest);
     if (!artifact?.agentId) throw new RemoteInstanceError("bundle_untrusted", "native model mapping lost its exact bridge binding");
-    return { agentId: artifact.agentId, mapping };
+    if (target && (artifact.os !== target.os || artifact.architecture !== target.architecture)) return [];
+    return [{ agentId: artifact.agentId, mapping }];
   });
 }
 
