@@ -1,20 +1,21 @@
 /**
- * The supported agent-bridge matrix as this release pins it. Digests and
- * image refs come from the signed manifest at install time; this table is the
+ * The supported agent-bridge matrix as this release pins it. Artifact digests
+ * come from the signed native manifest at install time; this table is the
  * static knowledge the runner needs about each bridge family: how to spawn it,
  * which official tooling owns login/logout, whether an official identity
  * signal exists (D111), and whether a documented file-backed host cache may be
  * copied once with consent.
  *
  * Versions are the CP0-pinned bridge releases. A bridge is never resolved from
- * a package registry at runtime: the runner image vendors the exact version.
+ * a package registry at runtime: the signed offline agent package carries the
+ * exact version.
  */
 export interface AgentBridgeFamily {
   agentId: "claude-code" | "codex" | "dsh";
   displayName: string;
   package: string;
   version: string;
-  /** Spawned over stdio from the vendored install prefix inside the runner image. */
+  /** Spawned over stdio from the installed offline agent package. */
   command: readonly string[];
   tooling: {
     login: readonly string[];
@@ -23,10 +24,6 @@ export interface AgentBridgeFamily {
     identitySignal?: readonly string[];
     /** Documented file-backed cache eligible for a one-time consented copy. */
     hostCacheImport?: { relativePath: string; documentedBy: string };
-  };
-  egress: {
-    baseUrlEnv?: string;
-    providers: ReadonlyArray<"anthropic" | "openai" | "google" | "deepseek">;
   };
   acpProtocol: { min: number; max: number };
   /**
@@ -58,7 +55,6 @@ export const SUPPORTED_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.free
       identitySignal: ["claude", "auth", "status", "--json"],
       // Claude Code documents no safe file-backed import (keychain on macOS); fresh login only.
     },
-    egress: { baseUrlEnv: "ANTHROPIC_BASE_URL", providers: ["anthropic"] },
     acpProtocol: { min: 1, max: 1 },
   },
   {
@@ -76,7 +72,6 @@ export const SUPPORTED_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.free
         documentedBy: "https://github.com/openai/codex/blob/main/docs/authentication.md",
       },
     },
-    egress: { baseUrlEnv: "OPENAI_BASE_URL", providers: ["openai"] },
     acpProtocol: { min: 1, max: 1 },
   },
 ]);
@@ -95,7 +90,6 @@ export const HOST_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.freeze([
     command: ["--profile", "acp"],
     // No login command exists: the runtime owns the API-key entry (plan D1/D2).
     tooling: { login: [], logout: [] },
-    egress: { baseUrlEnv: "DEEPSEEK_BASE_URL", providers: ["deepseek"] },
     acpProtocol: { min: 1, max: 1 },
     hostInstall: {
       bin: "dsh",

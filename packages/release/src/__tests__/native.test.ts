@@ -34,7 +34,8 @@ describe('signed native executable staging', () => {
     expect(() => verifyNativeRelease(signed(), [], now)).toThrow();
     expect(() => verifyNativeRelease({ ...signed(), bundleVersion: '2.0.0' }, roots, now)).toThrow();
     expect(() => verifyNativeRelease(signed(), roots, Date.parse('2028-01-01'))).toThrow();
-    expect(() => verifyNativeRelease(fixture.manifest, roots, now)).toThrow();
+    // A retired appliance release (its components and no native topology) is refused.
+    expect(() => verifyNativeRelease(signed({ deploymentKind: 'appliance', components: ['harness', 'validation_runtime', 'agent_runner', 'gateway'] }), roots, now)).toThrow();
   });
 
   it('independently verifies every reviewed model mapping with the release root', () => {
