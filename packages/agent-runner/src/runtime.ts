@@ -35,7 +35,16 @@ export interface AgentRuntimeOptions {
   /** Deterministic test seams for bounded exponential retry timing. */
   retrySleep?: (delayMs: number) => Promise<void>;
   retryRandom?: () => number;
+  /** How long one authenticated discovery of the agent's offered models is reused. */
+  modelCapabilityTtlMs?: number;
 }
+
+/**
+ * The offered models are re-read at least this often (System One §6a, KM6),
+ * so a model the agent starts offering shows up without a restart. A sign-in
+ * change re-reads at once: the account fingerprint is part of the cache key.
+ */
+export const DEFAULT_MODEL_CAPABILITY_TTL_MS = 5 * 60_000;
 
 /** A wedged agent process must not outlive the conversation it served. */
 export const DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS = 30 * 60_000;
@@ -131,7 +140,7 @@ export class AgentRuntime {
   /** ACP exposes model choices only through session/new. Cache the immutable
    * capability by authenticated identity for this runtime lifetime so status
    * polling cannot create a visible Codex thread on every refresh. */
-  private readonly modelCapabilities = new Map<string, Promise<DiscoveredBridgeModelCapability>>();
+  private readonly modelCapabilities = new Map<string, { at: number; pending: Promise<DiscoveredBridgeModelCapability> }>();
   private stopping = false;
   /** Set when the agent broke a governance guarantee; no bridge starts again in this process. */
   private quarantined: string | null = null;
@@ -578,7 +587,13 @@ export class AgentRuntime {
       throw new RemoteInstanceError("agent_auth_required", "Model capability discovery requires the current authenticated agent identity.");
     }
     const cacheKey = `${view.authIdentityFingerprint}\u0000${this.options.config.RUNNER_BRIDGE_VERSION}\u0000${configId}`;
-    const cached = this.modelCapabilities.get(cacheKey);
+    const nowMs = this.now().getTime();
+    const ttlMs = this.options.modelCapabilityTtlMs ?? DEFAULT_MODEL_CAPABILITY_TTL_MS;
+    let cached = this.modelCapabilities.get(cacheKey)?.pending;
+    if (cached && nowMs - this.modelCapabilities.get(cacheKey)!.at >= ttlMs) {
+      this.modelCapabilities.delete(cacheKey);
+      cached = undefined;
+    }
     if (cached) {
       this.logger.debug({ event: "model_capability.cache_hit", agentId: this.family.agentId, configId },
         "reusing authenticated ACP model capability");
@@ -626,10 +641,10 @@ export class AgentRuntime {
       const oldest = this.modelCapabilities.keys().next().value as string | undefined;
       if (oldest) this.modelCapabilities.delete(oldest);
     }
-    this.modelCapabilities.set(cacheKey, pending);
+    this.modelCapabilities.set(cacheKey, { at: nowMs, pending });
     try { return structuredClone(await pending); }
     catch (error) {
-      if (this.modelCapabilities.get(cacheKey) === pending) this.modelCapabilities.delete(cacheKey);
+      if (this.modelCapabilities.get(cacheKey)?.pending === pending) this.modelCapabilities.delete(cacheKey);
       throw error;
     }
   }

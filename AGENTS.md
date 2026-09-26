@@ -81,6 +81,20 @@ write or install refuses them with `retiredAgentMessage` from
 `native-runtime.json` still listing them loads without them through
 `parseNativeRuntimeRecord`, with a logged warning).
 
+Every installed native agent reports the models it offers (System One §6a,
+KM6; `ModelCapabilitySnapshotProducer`): an agent whose release carries a
+reviewed signed mapping (`REVIEWED_NATIVE_MODEL_IDENTITIES`) reports under it,
+and every other one (or one whose mapping expired) under its fixed unsigned
+catalogue authority (`catalogueModelAuthority`, config `model`); Core resolves
+identity, tier and price from its own known-model catalogue. Each snapshot
+carries every option's value, name and group (`exactSelect` in
+`bridge/model-capability.ts`); malformed entries are skipped, and above 128
+values the known models come first (the current value is always kept) instead
+of the report failing. Discovery is re-read every
+`DEFAULT_MODEL_CAPABILITY_TTL_MS` (5 min) and at once on a sign-in change (the
+account fingerprint keys the cache). The signed mapping is no longer needed
+for a new model; keep it only for aliases that move.
+
 Before production changes, add or update a focused characterization test and
 observe its failure or baseline. Run focused tests serially; do not start
 multiple Vitest processes or a whole suite during local proof work unless the

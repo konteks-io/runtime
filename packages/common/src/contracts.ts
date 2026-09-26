@@ -286,6 +286,7 @@ export {
   agentModelCapabilityMappingSigningBytes,
   computeAgentModelCapabilityMappingDigest,
   computeAgentModelOfferedValuesSnapshotDigest,
+  catalogueModelAuthority,
   RemoteTransferBindingSchema,
   RemoteTransferManifestSchema,
   RemoteSkillCatalogSchema,

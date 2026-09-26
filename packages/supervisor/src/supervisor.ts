@@ -395,6 +395,9 @@ export class Supervisor {
         os: this.config.SUPERVISOR_PLATFORM_OS,
         architecture: this.config.SUPERVISOR_PLATFORM_ARCH,
       }) : [],
+      // Every installed native agent reports what it offers; one the release
+      // signed no mapping for does so under its catalogue authority.
+      catalogueAgents: () => this.nativeRunners.map(runner => runner.agentId),
       discover: async (agentId, configId) => {
         const runner = this.nativeRunners.find(candidate => candidate.agentId === agentId);
         if (!runner) throw new RemoteInstanceError("agent_unavailable", "Reviewed model mapping has no installed native runner.");
