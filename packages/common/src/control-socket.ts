@@ -449,6 +449,14 @@ export const SupervisorStatusSchema = z
       .strict(),
     pendingErase: z.number().int().nonnegative(),
     pendingRevocation: z.boolean(),
+    /**
+     * Retired in 7.0.0: a connector has no preview. Still emitted as `false` /
+     * `null` because a launcher installed before 7.0.0 (a user install's
+     * `<root>/bin/konteks-remote` is never replaced by an update) requires
+     * both, and still accepted from a connector rolled back to such a release.
+     */
+    previewEnabled: z.boolean().optional(),
+    previewExposure: z.object({ port: z.number().int(), grantPresent: z.boolean() }).strict().nullable().optional(),
     journal: z
       .object({
         assignments: z.number().int().nonnegative(),

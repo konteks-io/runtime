@@ -1571,6 +1571,9 @@ export class Supervisor {
       utilization: { acceptingWork: !this.draining && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
       pendingErase: this.journal.erase.all().filter((record) => !record.receiptSent).length,
       pendingRevocation: this.pendingRevocation,
+      // For launchers installed before 7.0.0, which require these fields.
+      previewEnabled: false,
+      previewExposure: null,
       journal: { assignments: this.journal.activeAssignments().length, outboxDepth: this.outbox.depth, recoveryRequired: this.journal.recoveryRequired().length },
     };
   }
