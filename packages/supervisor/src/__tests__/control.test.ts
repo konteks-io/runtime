@@ -30,7 +30,6 @@ async function harness(overrides: Partial<ConstructorParameters<typeof ControlHa
   const key = generateInstanceKey();
   const acks: ControlAck[] = [];
   const drains: string[] = [];
-  const gateway: string[] = [];
   const handlers = new ControlHandlers({
     store,
     journal,
@@ -42,10 +41,6 @@ async function harness(overrides: Partial<ConstructorParameters<typeof ControlHa
     bundleVersion: "1.2.0",
     protocolVersion: "1.0",
     manifestDigest: () => "digest",
-    applyGatewayConfig: async (config) => {
-      gateway.push(config.egressAllowlistRevision);
-      return config.egressAllowlistRevision === "allow-1" ? "applied" : "unsupported_revision";
-    },
     localCapacity: () => 4,
     onDrain: async (directive) => {
       drains.push(directive.reason);
@@ -58,18 +53,21 @@ async function harness(overrides: Partial<ConstructorParameters<typeof ControlHa
     ...overrides,
   });
   await handlers.load();
-  return { handlers, acks, drains, gateway, clock, key, journal, store };
+  return { handlers, acks, drains, clock, key, journal, store };
 }
 
-const configuration = { heartbeatIntervalSeconds: 15, logLevel: "info" as const, updateChannel: "stable" as const, evidenceUpload: "selected_artifacts" as const, gateway: { capEnforcementStage: "provider_enforce" as const, egressAllowlistRevision: "allow-1" }, permissionResponderDeadlineSeconds: 120, humanDeferralAllowed: true };
-const envelope = (revision: number, extra: Record<string, JsonValue> = {}) =>
-  signByCore({ type: "desired_configuration" as const, instanceId: "inst-1", revision, issuedAt: "2026-09-06T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z", digest: `${"d".repeat(42)}${revision}`, configuration: { ...configuration, ...extra } as never });
+const configuration = { heartbeatIntervalSeconds: 15, logLevel: "info" as const, updateChannel: "stable" as const, evidenceUpload: "selected_artifacts" as const, permissionResponderDeadlineSeconds: 120, humanDeferralAllowed: true, deploymentKind: "native_connector" as const, roleBindings: [] };
+/** The retired appliance shape: a gateway stage and no native deployment kind. */
+const applianceConfiguration = { heartbeatIntervalSeconds: 15, logLevel: "info" as const, updateChannel: "stable" as const, evidenceUpload: "selected_artifacts" as const, gateway: { capEnforcementStage: "provider_enforce" as const, egressAllowlistRevision: "allow-1" }, permissionResponderDeadlineSeconds: 120, humanDeferralAllowed: true };
+const envelope = (revision: number, extra: Record<string, JsonValue> = {}) => {
+  const value = { ...configuration, ...extra } as never;
+  return signByCore({ type: "desired_configuration" as const, instanceId: "inst-1", revision, issuedAt: "2026-09-06T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z", digest: jcsDigest(value), configuration: value });
+};
 
 describe("desired configuration", () => {
   it("serializes overlapping native deliveries so a slower write cannot roll back a newer revision", async () => {
-    const f = await harness({ deploymentKind: "native_connector" });
-    const { gateway: _gateway, ...base } = configuration;
-    const native = { ...base, deploymentKind: "native_connector", roleBindings: [] };
+    const f = await harness();
+    const native = { ...configuration };
     const message = (revision: number) => signByCore({ type: "desired_configuration", instanceId: "inst-1", revision, issuedAt: "2026-09-06T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z", digest: jcsDigest(native), configuration: native });
     let release!: () => void;
     const blocked = new Promise<void>(resolve => { release = resolve; });
@@ -93,20 +91,18 @@ describe("desired configuration", () => {
 
   it("applies and reloads native roles without a gateway, and re-acks an identical retry", async () => {
     const applied: unknown[] = [];
-    const f = await harness({ deploymentKind: "native_connector", onConfigurationApplied: value => { applied.push(value); } });
-    const { gateway: _gateway, ...base } = configuration;
-    const native = { ...base, deploymentKind: "native_connector", roleBindings: [{ role: "assistant", agentPreference: ["codex"] }] };
+    const f = await harness({ onConfigurationApplied: value => { applied.push(value); } });
+    const native = { ...configuration, roleBindings: [{ role: "assistant", agentPreference: ["codex"] }] };
     const message = signByCore({ type: "desired_configuration", instanceId: "inst-1", revision: 1, issuedAt: "2026-09-06T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z", digest: jcsDigest(native), configuration: native });
     await f.handlers.handle(message);
     expect(f.acks[0]).toMatchObject({ status: "applied", revision: 1 });
-    expect(f.gateway).toEqual([]);
     expect(applied).toEqual([native]);
     expect((await f.store.config())?.configuration).toEqual(native);
     await f.handlers.handle(message);
     expect(f.acks[1]).toMatchObject({ status: "applied", revision: 1 });
     expect(applied).toHaveLength(1);
     const restored: unknown[] = [];
-    await harness({ deploymentKind: "native_connector", onConfigurationApplied: value => { restored.push(value); } });
+    await harness({ onConfigurationApplied: value => { restored.push(value); } });
     expect(restored).toEqual([native]);
     await f.handlers.handle(signByCore({ ...message, revision: 2, digest: "d".repeat(43) }));
     expect(f.acks.at(-1)).toMatchObject({ status: "rejected", reason: "invalid_value" });
@@ -124,9 +120,8 @@ describe("desired configuration", () => {
 
   it("never acknowledges failed native persistence and recovers on the next delivery", async () => {
     const applied: unknown[] = [];
-    const f = await harness({ deploymentKind: "native_connector", onConfigurationApplied: value => { applied.push(value); } });
-    const { gateway: _gateway, ...base } = configuration;
-    const native = { ...base, deploymentKind: "native_connector", roleBindings: [] };
+    const f = await harness({ onConfigurationApplied: value => { applied.push(value); } });
+    const native = { ...configuration };
     const message = signByCore({ type: "desired_configuration", instanceId: "inst-1", revision: 1, issuedAt: "2026-09-06T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z", digest: jcsDigest(native), configuration: native });
     vi.spyOn(f.store, "saveConfig").mockRejectedValueOnce(new Error("disk unavailable"));
     await expect(f.handlers.handle(message)).rejects.toThrow("disk unavailable");
@@ -138,24 +133,22 @@ describe("desired configuration", () => {
     expect(applied).toEqual([native]);
   });
 
-  it("rejects a signed appliance configuration on a native connector without contacting a gateway", async () => {
-    const f = await harness({ deploymentKind: "native_connector" });
-    await f.handlers.handle(envelope(1));
+  it("rejects a signed appliance configuration (the retired gateway shape)", async () => {
+    const f = await harness();
+    await f.handlers.handle(signByCore({ type: "desired_configuration" as const, instanceId: "inst-1", revision: 1, issuedAt: "2026-09-06T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z", digest: jcsDigest(applianceConfiguration), configuration: applianceConfiguration as never }));
     expect(f.acks[0]).toMatchObject({ status: "rejected", reason: "invalid_value" });
-    expect(f.gateway).toEqual([]);
     expect(await f.store.config()).toBeNull();
   });
-  it("applies a signed monotonic revision, forwards the gateway stage, and acks with a signed body", async () => {
-    const { handlers, acks, gateway, key } = await harness();
+  it("applies a signed monotonic revision and acks with a signed body", async () => {
+    const { handlers, acks, key } = await harness();
     await handlers.handle(envelope(1));
-    expect(gateway).toEqual(["allow-1"]);
     expect(acks[0]).toMatchObject({ type: "desired_configuration_ack", revision: 1, status: "applied" });
     const { signature, ...body } = acks[0] as { signature: string } & Record<string, JsonValue>;
     expect(verifyBody(key.publicKey, body, signature)).toBe(true);
     expect(handlers.configRevision).toBe(1);
   });
 
-  it("rejects a stale revision, a forged signature, an unknown field, and an unsupported allowlist revision", async () => {
+  it("rejects a stale revision, a forged signature and an unknown field", async () => {
     const { handlers, acks } = await harness();
     await handlers.handle(envelope(2));
     await handlers.handle(envelope(1));
@@ -165,8 +158,6 @@ describe("desired configuration", () => {
     expect(handlers.counters.rejectedSignature).toBe(1);
     await handlers.handle({ ...envelope(4), shell: "rm -rf /" });
     expect(handlers.counters.rejectedUnknown).toBe(1);
-    await handlers.handle(envelope(5, { gateway: { capEnforcementStage: "observe", egressAllowlistRevision: "allow-9" } }));
-    expect(acks[2]).toMatchObject({ revision: 5, status: "rejected", reason: "unsupported_revision" });
   });
 
   it("rejects a soft ceiling above local capacity", async () => {

@@ -105,10 +105,8 @@ describe("ConnectedAgentView projection", () => {
     expect(JSON.stringify(view)).not.toMatch(/"(email|token|path|agentHome|agentHomePath|credentialPath|apiKey|subscriptionToken)":/i);
   });
 
-  it("gateway_keyed implies moneyObservable and readiness without a login", () => {
-    const view = projectReadiness({ ...base, authMode: "gateway_keyed", identity: "logged_out" });
-    expect(view.moneyObservable).toBe(true);
-    expect(view.readiness).toBe("ready");
+  it("never claims money observability for a native agent", () => {
+    expect(projectReadiness({ ...base, identity: "signal" }).moneyObservable).toBe(false);
   });
 
   it("a logged-out subscription agent is not_configured with login_locally", () => {

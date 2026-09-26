@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { ConnectedAgentViewSchema, REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
-import type { InventorySnapshot } from "../inventory/collector.js";
+import type { InventorySnapshot } from "../inventory/snapshot.js";
 import type { RunnerPort } from "../runner-port.js";
 import { onboardCapabilities } from "../inventory/roles.js";
 
@@ -110,7 +110,6 @@ export class NativeInventoryCollector {
       // a configured appliance URL is not evidence they exist on this host.
       browserToolAvailable: false,
       gitVersion,
-      gatewayRollupIncompleteSince: null,
       diskFreeBytes: metrics?.diskFreeBytes ?? 0,
     };
   }

@@ -84,14 +84,8 @@ describe("bridge spawn spec", () => {
     expect(spec.env.ANTHROPIC_BASE_URL).toBeUndefined();
   });
 
-  it("points a gateway-keyed bridge at the gateway through its documented base-URL variable", () => {
-    const config = loadRunnerConfig({ RUNNER_AGENT_ID: "codex", RUNNER_AUTH_MODE: "gateway_keyed", RUNNER_GATEWAY_BASE_URL: "http://gateway:41810/agents/codex/openai" });
-    expect(bridgeEnvironment(config, findAgentBridge("codex")!).OPENAI_BASE_URL).toBe("http://gateway:41810/agents/codex/openai");
-  });
-
-  it("refuses a gateway-keyed runner without a gateway base URL", () => {
-    const config = loadRunnerConfig({ RUNNER_AGENT_ID: "codex", RUNNER_AUTH_MODE: "gateway_keyed" });
-    expect(() => resolveBridgeSpawnSpec(config)).toThrow(/gateway/);
+  it("refuses the retired gateway-keyed auth mode (the appliance is gone)", () => {
+    expect(() => loadRunnerConfig({ RUNNER_AGENT_ID: "codex", RUNNER_AUTH_MODE: "gateway_keyed" })).toThrow();
   });
 
   it("runs the person's own DeepSeek Harness launcher with their Node and the Konteks overlay, in a private dsh home", () => {

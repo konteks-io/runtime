@@ -31,7 +31,6 @@
     "@konteks/backstage-plugin-common": "7.0.0",
     "@konteks/remote-agent-runner": "*",
     "@konteks/remote-common": "*",
-    "@konteks/remote-preview-forwarder": "*",
     "@konteks/remote-release": "*",
     "@konteks/remote-sysmon": "*",
     "pino": "^9.5.0",

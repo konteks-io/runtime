@@ -16,7 +16,7 @@ export const LeaseClaimsSchema = RemoteInstanceLeaseClaimsSchema.transform(claim
 });
 export type LeaseClaims = ReturnType<typeof LeaseClaimsSchema.parse>;
 
-interface ExpectedLease { instanceId: string; audience: string; deploymentKind?: "native_connector" | "appliance" }
+interface ExpectedLease { instanceId: string; audience: string; deploymentKind?: "native_connector" }
 
 /** Decodes canonical Core HTTPS claims; this does not verify a JWS signature. */
 export function decodeLeaseClaims(lease: string, expected: ExpectedLease): LeaseClaims {
@@ -46,7 +46,6 @@ function decode(lease: string, expected: ExpectedLease, stored: boolean): LeaseC
   if (expected.deploymentKind === "native_connector" && (claims.deployment_kind !== "native_connector" || claims.components.length !== 1 || claims.components[0] !== "agent_runner")) {
     throw new RemoteInstanceError("registration_mismatch", "lease topology does not match the native connector");
   }
-  if (expected.deploymentKind === "appliance" && claims.deployment_kind === "native_connector") throw new RemoteInstanceError("registration_mismatch", "native lease cannot authorize an appliance");
   return claims;
 }
 

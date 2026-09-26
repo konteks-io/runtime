@@ -57,7 +57,7 @@ async function workFixture(f: Awaited<ReturnType<typeof fixture>>, draining = fa
     // Core-signed cancellations are verified by the supervisor; this fixture accepts the test signature.
     verifyCancellation: () => true,
     reconciliationComplete: () => true, lease: { canPullNewWork: () => true }, draining: () => draining,
-    headroom: () => 0, maxPullItems: 1, acceptedKinds: () => ["delivery"], components: {},
+    headroom: () => 0, maxPullItems: 1, acceptedKinds: () => ["delivery"],
   } as never);
   await f.journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "delivery", placementId: "placement",
     workspaceId: "workspace", agentId: "codex", state: "running", recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 },

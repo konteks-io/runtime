@@ -120,29 +120,8 @@ export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamil
       env.LOCALAPPDATA = join(config.RUNNER_CREDENTIAL_DIR, "AppData", "Local");
     }
   }
-  if (config.RUNNER_AUTH_MODE === "gateway_keyed") {
-    if (!config.RUNNER_GATEWAY_BASE_URL) {
-      throw new RemoteInstanceError("gateway_unavailable", "gateway-keyed runner has no gateway base URL");
-    }
-    if (family.egress.baseUrlEnv) {
-      env[family.egress.baseUrlEnv] = config.RUNNER_GATEWAY_BASE_URL;
-    }
-    // A family without one base-URL variable routes by provider (standard per-provider variables).
-    if (!family.egress.baseUrlEnv) {
-      for (const provider of family.egress.providers) {
-        env[PROVIDER_BASE_URL_ENV[provider]] = `${config.RUNNER_GATEWAY_BASE_URL.replace(/\/$/, "")}/${provider}`;
-      }
-    }
-  }
   return env;
 }
-
-const PROVIDER_BASE_URL_ENV: Record<AgentBridgeFamily["egress"]["providers"][number], string> = {
-  anthropic: "ANTHROPIC_BASE_URL",
-  openai: "OPENAI_BASE_URL",
-  google: "GOOGLE_GEMINI_BASE_URL",
-  deepseek: "DEEPSEEK_BASE_URL",
-};
 
 /** The located launcher and Node for a host-installed DeepSeek Harness runner; refuses anything else. */
 function hostDshLauncher(config: RunnerConfig, family: AgentBridgeFamily): { node: string; entry: string } {

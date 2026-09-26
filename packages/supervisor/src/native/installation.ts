@@ -154,7 +154,7 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
       SUPERVISOR_CORE_URL: record.coreUrl, SUPERVISOR_RELAY_URL: record.relayUrl,
       SUPERVISOR_CONTROL_PORT: record.controlPort, SUPERVISOR_BUNDLE_VERSION: record.bundleVersion,
       SUPERVISOR_PLATFORM_OS: options.platform.os, SUPERVISOR_PLATFORM_ARCH: options.platform.architecture,
-      SUPERVISOR_RELEASE_MANIFEST_FILE: join(releaseDir, "manifest.json"), SUPERVISOR_RUNNER_URLS: "",
+      SUPERVISOR_RELEASE_MANIFEST_FILE: join(releaseDir, "manifest.json"),
       // The managed-git key lives in this runtime's private data, not at the
       // container default `/data/git-keys`, which a laptop does not have: key
       // registration failed there and onboarding could never push (WS1-024).

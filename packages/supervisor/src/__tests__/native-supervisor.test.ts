@@ -13,7 +13,7 @@ import { NativeInputClient } from "../native/input-client.js";
 import { SupervisorConfigSchema } from "../config.js";
 import { SupervisorStore } from "../state/store.js";
 import { submitReadiness } from "../provisioning/activation.js";
-import { SystemClock } from "@konteks/remote-common";
+import { REMOTE_INSTANCE_PROTOCOL_VERSION, SystemClock } from "@konteks/remote-common";
 import { LEASE_AUDIENCE, type CoreClient } from "../core/client.js";
 import { decodeLeaseClaims, leaseRecordFromClaims } from "../lease/lease.js";
 
@@ -44,9 +44,8 @@ async function fixture() {
   const body = { bundleVersion: "1.0.0", protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [artifact, agent.artifact], expiresAt: "2027-09-01T00:00:00Z" };
   const unsigned = { ...body, digest: computeBundleManifestDigest(body as never) };
   const manifest = { ...unsigned, signature: { algorithm: "Ed25519", keyId: signing.keyId, value: sign(null, bundleManifestSigningBytes(unsigned as never), signing.privateKey).toString("base64url") } };
-  const config = SupervisorConfigSchema.parse({ SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: join(root, "state"), SUPERVISOR_CORE_URL: "https://core.example", SUPERVISOR_BUNDLE_VERSION: "1.0.0", SUPERVISOR_PLATFORM_OS: "macos", SUPERVISOR_PLATFORM_ARCH: "arm64", SUPERVISOR_RELEASE_MANIFEST_FILE: join(root, "manifest.json"), SUPERVISOR_RELEASE_ROOTS_FILE: join(root, "roots.json") });
+  const config = SupervisorConfigSchema.parse({ SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: join(root, "state"), SUPERVISOR_CORE_URL: "https://core.example", SUPERVISOR_BUNDLE_VERSION: "1.0.0", SUPERVISOR_PLATFORM_OS: "macos", SUPERVISOR_PLATFORM_ARCH: "arm64", SUPERVISOR_RELEASE_MANIFEST_FILE: join(root, "manifest.json") });
   await writeSecretFile(config.SUPERVISOR_RELEASE_MANIFEST_FILE, JSON.stringify(manifest));
-  await writeSecretFile(config.SUPERVISOR_RELEASE_ROOTS_FILE, JSON.stringify({ roots: [{ ...signing.root, coreControlKeys: [{ keyId: signing.keyId, publicKeyJwk: signing.root.publicKeyJwk }] }] }));
   const store = new SupervisorStore(config.SUPERVISOR_DATA_DIR);
   await store.init();
   // An activated machine has its key; enrollment writes it before the identity.
@@ -72,6 +71,12 @@ describe("native Supervisor composition", () => {
     const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);
     await expect(supervisor.start()).rejects.toMatchObject({ code: "registration_mismatch" });
     expect(f.spawn).not.toHaveBeenCalled();
+  });
+  it("composes the assignment mux using the build protocol, not the presence of an empty cursor callback", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
+    const pull = () => supervisor.mux.send("assignment:i", "assignment", { instanceId: "i", maxItems: 1, acceptedKinds: ["delivery"] });
+    if (String(REMOTE_INSTANCE_PROTOCOL_VERSION) === "2.0") expect(pull).toThrow("retained logical frame owner");
+    else expect(pull()).toBe(1);
   });
   it("stops and says so when its key is gone, instead of making a new one Core would refuse (W1-L1)", async () => {
     const f = await fixture();
@@ -249,9 +254,8 @@ describe("native Supervisor composition", () => {
     await expect(deps.prepareInputs!(target)).rejects.toThrow();
     expect(prepare).not.toHaveBeenCalled();
   });
-  it("uses explicitly supplied release trust without consulting the writable roots file", async () => {
+  it("uses explicitly supplied release trust (there is no writable roots file)", async () => {
     const f = await fixture();
-    await rm(f.config.SUPERVISOR_RELEASE_ROOTS_FILE);
     const supervisor = new Supervisor(f.config, { native: { ...f.options.native, trustedRoots: [f.signing.root] } });
     supervisors.push(supervisor);
     await supervisor.start();

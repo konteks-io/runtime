@@ -3,14 +3,13 @@ import { RemoteNativeArtifactSchema } from "@konteks/remote-common";
 import { NativeAgentPackageProfileSchema } from "@konteks/remote-release";
 
 /**
- * Runner configuration. One container per agent family; everything here is
- * set by the launcher's Compose rendering. There is no instance key, no Core
- * token, and no Docker socket anywhere in this environment.
+ * Runner configuration. One in-process runner per agent family; everything
+ * here is derived by the native installation (`loadNativeInstallation`).
+ * There is no instance key and no Core token in this configuration.
  */
 export const RunnerConfigSchema = z
   .object({
     RUNNER_AGENT_ID: z.enum(["claude-code", "codex", "dsh"]),
-    RUNNER_PORT: z.coerce.number().int().min(1).max(65_535).default(41840),
     /** Private credential volume; becomes HOME/XDG for the bridge and its official tooling. */
     RUNNER_CREDENTIAL_DIR: z.string().min(1).default("/credentials"),
     /** Local operator's Codex profile, resolved by native installation only. Never supplied by an assignment. */
@@ -25,17 +24,14 @@ export const RunnerConfigSchema = z
     RUNNER_NATIVE_DSH_NODE: z.string().min(1).optional(),
     /** Execution roots for session `cwd` (component checkouts are mounted beneath it). */
     RUNNER_WORKSPACE_DIR: z.string().min(1).default("/workspace"),
-    RUNNER_AUTH_MODE: z.enum(["agent_local_subscription", "gateway_keyed"]).default("agent_local_subscription"),
-    /** Present only for gateway-keyed runners: the per-agent gateway base URL prefix. */
-    RUNNER_GATEWAY_BASE_URL: z.string().url().optional(),
-    /** Vendored bridge install prefix inside the image. */
+    /** Agents run under the person's own local login (or, for DeepSeek Harness, their own key). */
+    RUNNER_AUTH_MODE: z.literal("agent_local_subscription").default("agent_local_subscription"),
+    /** Installed offline agent package prefix (or the person's own DeepSeek Harness root). */
     RUNNER_BRIDGE_PREFIX: z.string().min(1).default("/opt/konteks/bridges"),
     RUNNER_BRIDGE_VERSION: z.string().min(1).default("unknown"),
     /** Native installer-only signed package facts; never loaded from an assignment. */
     RUNNER_NATIVE_PACKAGE_PROFILE: NativeAgentPackageProfileSchema.optional(),
     RUNNER_NATIVE_PACKAGE_ARTIFACT: RemoteNativeArtifactSchema.optional(),
-    /** Browser tool MCP endpoint offered to qa-role sessions. */
-    RUNNER_BROWSER_TOOL_URL: z.string().url().optional(),
     RUNNER_INITIALIZE_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
     /** Hard deadline for each state-changing ACP session bootstrap request. */
     RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),

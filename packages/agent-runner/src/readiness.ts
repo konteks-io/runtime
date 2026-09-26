@@ -37,7 +37,8 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
     authMode: inputs.authMode,
     accountScope: inputs.scope.accountScope,
     readiness,
-    moneyObservable: inputs.authMode === "gateway_keyed",
+    // Only a provider-keyed gateway could observe money; native agents never run behind one.
+    moneyObservable: false,
     // DeepSeek Harness returns no usage with a turn; its usage_update is
     // context occupancy, not billing tokens (dsh-runtime-support D4).
     tokenUsageObservable: inputs.family.agentId !== "dsh",
@@ -59,7 +60,6 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
 function deriveReadiness(inputs: ReadinessInputs): ConnectedAgentView["readiness"] {
   if (!inputs.bridgeVersionCompatible) return "reconnect_required";
   if (inputs.connectionState !== "ready") return inputs.connectionState === "starting" ? "unavailable" : "unavailable";
-  if (inputs.authMode === "gateway_keyed") return "ready";
   switch (inputs.identity) {
     case "signal":
       return "ready";

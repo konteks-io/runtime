@@ -3,11 +3,10 @@ import { RemoteInstanceError, type DoctorCheck, type DoctorReport } from "@konte
 
 /**
  * Allowlisted doctor checks: versions, reachability, lease, components,
- * gateway posture, agents, disk, preview exposure. Details carry statuses and
+ * agents, disk, preview exposure. Details carry statuses and
  * revisions — never a path, address, key, lease value, or raw probe output.
  */
 export interface DoctorInputs {
-  deploymentKind?: "appliance" | "native_connector";
   now: () => string;
   dataDir: string;
   identity: { instanceId: string | null; administrativeStatus: string };
@@ -17,9 +16,7 @@ export interface DoctorInputs {
   reconciliationComplete: boolean;
   components: Array<{ kind: string; healthStatus: string; version: string }>;
   agents: Array<{ agentId: string; readiness: string; recoveryAction?: string | undefined }>;
-  gateway: { healthy: boolean; capEnforcementStage: string; egressAllowlistRevision: string; rollupIncompleteSince: string | null } | null;
   configRevision: number;
-  expectedAllowlistRevision: string;
   diskFreeBytes: number;
   minimumDiskBytes: number;
   preview: { enabled: boolean; port: number | null; grantPresent: boolean };
@@ -49,12 +46,6 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   for (const component of inputs.components) {
     push({ id: `component-${component.kind}`, title: `Component ${component.kind}`, status: component.healthStatus === "healthy" ? "pass" : component.healthStatus === "degraded" ? "warn" : "fail", detail: `${component.healthStatus} (version ${component.version})` });
   }
-  if (inputs.deploymentKind !== "native_connector") push({
-    id: "gateway",
-    title: "Egress gateway",
-    status: inputs.gateway ? (inputs.gateway.healthy ? (inputs.gateway.egressAllowlistRevision === inputs.expectedAllowlistRevision ? "pass" : "warn") : "fail") : "fail",
-    detail: inputs.gateway ? `stage ${inputs.gateway.capEnforcementStage}, allowlist ${inputs.gateway.egressAllowlistRevision}${inputs.gateway.rollupIncompleteSince ? `, rollup incomplete since ${inputs.gateway.rollupIncompleteSince}` : ""}` : "gateway unreachable; keyed agents cannot reach providers",
-  });
   push({ id: "core-control-key", title: "Core control signing key", status: inputs.coreSignatureConfigured ? "pass" : "fail", detail: inputs.coreSignatureConfigured ? "release root certifies a Core control key" : "no Core control key in the embedded release roots; directives will be rejected", ...(inputs.coreSignatureConfigured ? {} : { recoveryActions: [{ kind: "update" }] }) });
   for (const agent of inputs.agents) {
     push({ id: `agent-${agent.agentId}`, title: `Agent ${agent.agentId}`, status: agent.readiness === "ready" ? "pass" : agent.readiness === "not_configured" ? "warn" : "fail", detail: `readiness ${agent.readiness}`, ...(agent.readiness === "not_configured" || agent.readiness === "reconnect_required" ? { recoveryActions: [{ kind: "login_agent", agentId: agent.agentId }] } : {}) });

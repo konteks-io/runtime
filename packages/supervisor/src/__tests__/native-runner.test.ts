@@ -198,7 +198,7 @@ describe("native in-process runner (A4)", () => {
 
   it("rejects BYOK configuration before spawning anything", () => {
     const f = fixture();
-    for (const config of [{ ...f.config, RUNNER_AUTH_MODE: "gateway_keyed" }, { ...f.config, RUNNER_GATEWAY_BASE_URL: "https://gateway.invalid" }]) {
+    for (const config of [{ ...f.config, RUNNER_AUTH_MODE: "gateway_keyed" }]) {
       expect(() => new NativeRunner({ instanceId: "instance", config: config as typeof f.config, onEvent: () => undefined })).toThrow(/native|subscription/i);
     }
     expect(f.spawn).not.toHaveBeenCalled();

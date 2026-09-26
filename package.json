@@ -13,7 +13,6 @@
     "packages/release",
     "packages/sysmon",
     "packages/agent-runner",
-    "packages/preview-forwarder",
     "packages/supervisor",
     "packages/launcher"
   ],

@@ -44,7 +44,7 @@ export class NativeRunner implements RunnerPort {
 
   constructor(private readonly options: NativeRunnerOptions) {
     const config = RunnerConfigSchema.safeParse(options.config);
-    if (!config.success || config.data.RUNNER_AUTH_MODE !== "agent_local_subscription" || config.data.RUNNER_GATEWAY_BASE_URL !== undefined ||
+    if (!config.success || config.data.RUNNER_AUTH_MODE !== "agent_local_subscription" ||
         !options.instanceId || ![config.data.RUNNER_CREDENTIAL_DIR, config.data.RUNNER_WORKSPACE_DIR, config.data.RUNNER_BRIDGE_PREFIX].every(isAbsolute)) {
       throw new RemoteInstanceError("protocol_incompatible", "A native runner requires local subscription authentication and absolute host paths.");
     }

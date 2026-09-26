@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { RemoteInstanceError, createLogger, jcsDigest, type BoundedJsonValue, type JsonValue, type Logger, type RemoteWorkAssignment } from "@konteks/remote-common";
-import type { PlatformMcpEntry, WorkloadDefinition } from "../work/components.js";
+import type { PlatformMcpEntry, WorkloadDefinition } from "../work/workload.js";
 import { McpOnboardFacade, requireBounds, type OnboardFacade, type OnboardRunView } from "./facade.js";
 import { OnboardEvidenceCollector, type EnrichmentScope, type OnboardEvidenceCollectorDeps } from "./evidence-collector.js";
 import { RepositoryRelocationWorker, type RelocationWorkerDeps } from "./relocation-worker.js";

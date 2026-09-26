@@ -10,7 +10,7 @@ import type { DeferredPermissionBody } from "../core/client.js";
 import { EvaluatorPolicyResponder, isSignInElicitation } from "../session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "../session/workspace-tool-policy.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
-import type { RunnerClient } from "../runner-client.js";
+import type { RunnerPort } from "../runner-port.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import type { OutboundMessage } from "../transport/transport.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
@@ -134,7 +134,7 @@ describe("relayed session (D98/D113/D114)", () => {
         return { delivered: true };
       }),
       closeSession: vi.fn(async () => undefined),
-    } as unknown as RunnerClient;
+    } as unknown as RunnerPort;
     const broker = new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined });
     const closed: string[] = [];
     const session = new RelayedSession(work, {

@@ -12,16 +12,16 @@ import {
   type RemoteInstanceReadinessRequest,
   type RemoteSignedBundleManifest,
 } from "@konteks/remote-common";
-import { assertSameBundle, verifyExchangeManifest, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot, type ReleaseManifest } from "@konteks/remote-release";
+import { assertSameBundle, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import type { CoreClient } from "../core/client.js";
 import type { SupervisorStore } from "../state/store.js";
 
 /**
  * Two-phase provisioning (invariants 27/31/32). Phase 1 exchanges the
- * one-time activation code before any image pull: generate/load the instance
- * key, prove possession, consume the activation, verify the returned bundle
- * manifest against the embedded release root AND the independently fetched
- * release manifest, and persist identity + the short provisioning credential.
+ * one-time activation code: generate/load the instance key, prove possession,
+ * consume the activation, verify the returned bundle manifest against the
+ * embedded release root AND the independently verified native release, and
+ * persist identity + the short provisioning credential.
  * The activation code exists only in the prompt closure and is dropped
  * immediately after the request is built.
  */
@@ -36,15 +36,11 @@ interface ActivationExchangeBase {
   roots: readonly EmbeddedReleaseRoot[];
   logger?: Logger;
 }
-export type ActivationExchangeArgs = ActivationExchangeBase & ({
+export type ActivationExchangeArgs = ActivationExchangeBase & {
   deploymentKind: "native_connector";
   platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64"; containerBackend: "none"; deploymentKind: "native_connector" };
   release: VerifiedNativeRelease;
-} | {
-  deploymentKind?: "appliance";
-  platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64"; containerBackend: "docker_compose" };
-  release: ReleaseManifest;
-});
+};
 
 export interface ActivationExchangeOutcome {
   instanceId: string;
@@ -67,25 +63,23 @@ export async function runActivationExchange(args: ActivationExchangeArgs): Promi
   // A retried exchange reuses this semantic nonce in its idempotency key.
   // The transport proof nonce is regenerated for every HTTP attempt.
   let nonce = existing?.exchangeNonce ?? newNonce();
-  if (args.deploymentKind === "native_connector") {
-    const independent = verifyNativeRelease(args.release.manifest, args.roots, args.clock.now());
-    const attempt = await args.store.activationAttempt();
-    if (existing && !attempt) throw new RemoteInstanceError("registration_mismatch", "Existing identity requires an explicit native migration; it cannot be relabelled during activation.");
-    const binding = { activationId: args.activationId, keyDigest: jcsDigest(args.key.publicKeyJwk as unknown as JsonValue), platformDigest: jcsDigest(args.platform), manifestDigest: independent.manifest.digest };
-    if (attempt) {
-      if (attempt.activationId !== binding.activationId || attempt.keyDigest !== binding.keyDigest || attempt.platformDigest !== binding.platformDigest || attempt.manifestDigest !== binding.manifestDigest || (existing && existing.exchangeNonce !== attempt.nonce)) throw new RemoteInstanceError("registration_mismatch", "Activation retry does not match its original identity, platform and release.");
-      nonce = attempt.nonce;
-    } else {
-      await args.store.saveActivationAttempt({ ...binding, nonce, createdAt: args.clock.nowIso() });
-    }
-    const provisioning = await args.store.provisioning();
-    const stored = await args.store.manifest();
-    if (existing && provisioning && stored) {
-      const verified = verifyNativeRelease(stored.manifest, args.roots, args.clock.now());
-      if (verified.manifest.digest !== binding.manifestDigest || stored.manifestDigest !== binding.manifestDigest || provisioning.manifestDigest !== binding.manifestDigest) throw new RemoteInstanceError("install_state_corrupt", "Stored native activation release is inconsistent.");
-      if (parseRfc3339(provisioning.provisioningWindowExpiresAt) <= args.clock.coreNow()) throw new RemoteInstanceError("provisioning_window_expired", "Native provisioning window expired; a fresh activation is required.");
-      return { instanceId: existing.instanceId, manifest: verified.manifest, manifestDigest: binding.manifestDigest, provisioningWindowExpiresAt: provisioning.provisioningWindowExpiresAt };
-    }
+  const independent = verifyNativeRelease(args.release.manifest, args.roots, args.clock.now());
+  const attempt = await args.store.activationAttempt();
+  if (existing && !attempt) throw new RemoteInstanceError("registration_mismatch", "Existing identity requires an explicit native migration; it cannot be relabelled during activation.");
+  const binding = { activationId: args.activationId, keyDigest: jcsDigest(args.key.publicKeyJwk as unknown as JsonValue), platformDigest: jcsDigest(args.platform), manifestDigest: independent.manifest.digest };
+  if (attempt) {
+    if (attempt.activationId !== binding.activationId || attempt.keyDigest !== binding.keyDigest || attempt.platformDigest !== binding.platformDigest || attempt.manifestDigest !== binding.manifestDigest || (existing && existing.exchangeNonce !== attempt.nonce)) throw new RemoteInstanceError("registration_mismatch", "Activation retry does not match its original identity, platform and release.");
+    nonce = attempt.nonce;
+  } else {
+    await args.store.saveActivationAttempt({ ...binding, nonce, createdAt: args.clock.nowIso() });
+  }
+  const provisioning = await args.store.provisioning();
+  const stored = await args.store.manifest();
+  if (existing && provisioning && stored) {
+    const verified = verifyNativeRelease(stored.manifest, args.roots, args.clock.now());
+    if (verified.manifest.digest !== binding.manifestDigest || stored.manifestDigest !== binding.manifestDigest || provisioning.manifestDigest !== binding.manifestDigest) throw new RemoteInstanceError("install_state_corrupt", "Stored native activation release is inconsistent.");
+    if (parseRfc3339(provisioning.provisioningWindowExpiresAt) <= args.clock.coreNow()) throw new RemoteInstanceError("provisioning_window_expired", "Native provisioning window expired; a fresh activation is required.");
+    return { instanceId: existing.instanceId, manifest: verified.manifest, manifestDigest: binding.manifestDigest, provisioningWindowExpiresAt: provisioning.provisioningWindowExpiresAt };
   }
   const activationCode = await args.readActivationCode();
   let result;
@@ -100,18 +94,12 @@ export async function runActivationExchange(args: ActivationExchangeArgs): Promi
     }
     throw error;
   }
-  let manifestDigest: string;
-  if (args.deploymentKind === "native_connector") {
-    const exchange = verifyNativeRelease(result.bundleManifest, args.roots, args.clock.now());
-    if (exchange.manifest.digest !== args.release.manifest.digest) throw new RemoteInstanceError("bundle_untrusted", "Native exchange differs from the independently verified release.");
-    manifestDigest = exchange.manifest.digest;
-  } else {
-    ({ manifestDigest } = verifyExchangeManifest({ exchange: result.bundleManifest, release: args.release, roots: args.roots, nowMs: args.clock.now() }));
-  }
+  const exchange = verifyNativeRelease(result.bundleManifest, args.roots, args.clock.now());
+  if (exchange.manifest.digest !== args.release.manifest.digest) throw new RemoteInstanceError("bundle_untrusted", "Native exchange differs from the independently verified release.");
+  const manifestDigest = exchange.manifest.digest;
   await args.store.saveIdentity({
     instanceId: result.instanceId,
-    // Known from the exchange: the components the launcher renders need it at
-    // boot, well before the lease that also carries it.
+    // Known from the exchange, well before the lease that also carries it.
     workspaceId: result.workspaceId,
     activationId: args.activationId,
     activatedAt: args.clock.nowIso(),
@@ -187,7 +175,7 @@ export function provisioningCredentialIsExpired(provisioning: { provisioningCred
 }
 
 /**
- * Phase 2: exact four-component signed readiness. Agent login is NOT a
+ * Phase 2: signed readiness of the native agent runner. Agent login is NOT a
  * readiness condition. On acceptance the provisioning credential is dropped
  * and the first lease is stored.
  */

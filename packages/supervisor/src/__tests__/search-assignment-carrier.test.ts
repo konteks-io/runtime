@@ -135,7 +135,7 @@ async function fixture(options: { controller?: { acceptClaimed: ReturnType<typeo
     browserToolAvailable: () => false,
     agents: () => [{ agentId: "codex", readiness: "ready", connectionState: "ready" }],
     instanceEvidencePolicy: () => "structured_only",
-    components: {},
+   
     runners: new Map([["codex", { createSession: vi.fn() } as never]]),
     ...(options.controller ? { searchController: options.controller } : {}),
   } as never);

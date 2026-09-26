@@ -73,7 +73,7 @@ describe("native host inventory (A4 D133)", () => {
     const f = fixture();
     const snapshot = await f.inventory.collect();
     expect(snapshot.components).toEqual([{ kind: "agent_runner", version: "1.0.0", healthStatus: "healthy", capabilities: ["agent:codex", "session-label-v1"], lastProbeAt: signals.observedAt }]);
-    expect(snapshot).toMatchObject({ agents: [agent], hostPressure: 0.3, activeSessions: 2, activeTurns: 1, browserToolAvailable: false, gatewayRollupIncompleteSince: null, diskFreeBytes: 100 });
+    expect(snapshot).toMatchObject({ agents: [agent], hostPressure: 0.3, activeSessions: 2, activeTurns: 1, browserToolAvailable: false, diskFreeBytes: 100 });
     expect(deriveAdvertisedRoles([
       { role: "generator", agentPreference: ["codex"] },
       { role: "qa", agentPreference: ["codex"] },

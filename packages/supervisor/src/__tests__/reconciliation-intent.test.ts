@@ -28,7 +28,7 @@ async function fixture() {
     assertOwned: () => { if (!owned) throw new Error("ownership lost"); },
     bundleVersion: "1.0.0", protocolVersion: "1.0", lastHeartbeatSequence: async () => allocated,
     reserveHeartbeatFloor: async () => undefined,
-    components: {}, stopLocalWork: async () => undefined, reports: {} as ReportSender, onLease: async () => undefined,
+    stopLocalWork: async () => undefined, reports: {} as ReportSender, onLease: async () => undefined,
   };
   return { journal, deps, resolve, reconnect, recovery: new Reconciliation(deps), loseOwnership: () => { owned = false; }, allocate: () => { allocated = 99; } };
 }

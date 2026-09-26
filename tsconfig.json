@@ -5,7 +5,6 @@
     { "path": "packages/release" },
     { "path": "packages/sysmon" },
     { "path": "packages/agent-runner" },
-    { "path": "packages/preview-forwarder" },
     { "path": "packages/supervisor" },
     { "path": "packages/launcher" }
   ]

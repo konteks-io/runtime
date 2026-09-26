@@ -2,8 +2,6 @@ import { randomUUID } from "node:crypto";
 import { RemoteInstanceError, RemoteInstanceReconciliationManifestSchema, RemoteReconnectIntentSnapshotSchema, computeRemoteReconciliationManifestDigest, createLogger, jcsDigest, parseRfc3339, type AgentModelOfferedValuesSnapshot, type Clock, type Logger, type RecoveryDecision, type RemoteReconciliationDecisionResult, type PendingClaimRequest, type RemoteReconnectIntentSnapshot, type RemoteReconciliationConnection, type RemoteInstanceReconciliationManifest, type RemoteInstanceReconnectRequest } from "@konteks/remote-common";
 import type { CoreClient } from "../core/client.js";
 import type { SupervisorJournal, JournalEntry } from "../state/journal.js";
-import type { ComponentAdapter, ComponentRecoveryRefusal } from "../work/components.js";
-import { componentForKind } from "../work/components.js";
 import type { ReportSender } from "../work/report-sender.js";
 import type { LeaseAcquisition } from "../lease/lease.js";
 
@@ -27,7 +25,6 @@ export interface ReconciliationDeps {
   lastHeartbeatSequence: () => Promise<number>;
   modelCapabilitySnapshots?: () => readonly AgentModelOfferedValuesSnapshot[];
   reserveHeartbeatFloor: (floor: number) => Promise<unknown>;
-  components: Partial<Record<"harness" | "validation_runtime", ComponentAdapter>>;
   /** Resolves only when this exact local work can no longer execute. */
   stopLocalWork: (assignmentId: string, attempt: number, assertCurrent: () => void) => Promise<void>;
   /** Actual retained-log owner; omission keeps unknown local work pending. */
@@ -393,25 +390,10 @@ export class Reconciliation {
     switch (decision.action) {
       case "resume_from_checkpoint": {
         if (parseRfc3339(decision.latestResumeAt) <= this.deps.clock.coreNow()) return this.interrupt(entry, "deadline_expired", assertCurrent, true);
-        const target = componentForKind(entry.kind);
-        if (target === "agent_runner" || !entry.checkpoint) {
-          // An ACP session resume counts as a checkpoint only where the bridge proves it; without a proven checkpoint this is agent_session_lost.
-          return this.interrupt(entry, entry.acpSessionRef ? "agent_session_lost" : "checkpoint_invalid", assertCurrent, true);
-        }
-        // The component owns checkpoint verification: it holds the artifact and
-        // compares ref/hash/epoch itself, so the decision is handed down whole
-        // rather than re-verified here and dispatched a second time.
-        const component = this.deps.components[target];
-        if (!component) return this.interrupt(entry, "agent_session_lost", assertCurrent, true);
-        const outcome = await component.recoveryDecision({
-          manifestId,
-          decision,
-          checkpoint: { ref: entry.checkpoint.ref, hash: entry.checkpoint.hash },
-          attempt: entry.attempt,
-        });
-        assertCurrent();
-        if (!outcome.applied) return this.interrupt(entry, resumeRefusal(outcome.reason), assertCurrent, true);
-        return "executed";
+        // A native connector has no domain component that could resume from a
+        // checkpoint. An ACP session resume counts as a checkpoint only where
+        // the bridge proves it; without one the attempt is agent_session_lost.
+        return this.interrupt(entry, entry.acpSessionRef || entry.checkpoint ? "agent_session_lost" : "checkpoint_invalid", assertCurrent, true);
       }
       case "replay_terminal":
         if (!this.deps.reports.hasDurableTerminalReport(entry.assignmentId, entry.attempt, entry.claimId)) return "rejected_report_missing";
@@ -447,25 +429,6 @@ export class Reconciliation {
 
   private terminalReplayOutcome(entry: JournalEntry): DecisionOutcome {
     return this.deps.reports.hasDurableTerminalReport(entry.assignmentId, entry.attempt, entry.claimId) ? "duplicate" : "rejected_report_missing";
-  }
-}
-
-/**
- * A component's refusal to resume, stated in the interrupted-report
- * vocabulary. Anything the component names outside the resumable reasons is
- * `not_resumable`: the attempt cannot continue, and the report says so
- * instead of inventing a cause.
- */
-function resumeRefusal(reason: ComponentRecoveryRefusal): "not_resumable" | "checkpoint_invalid" | "deadline_expired" | "agent_session_lost" {
-  switch (reason) {
-    case "checkpoint_invalid":
-      return "checkpoint_invalid";
-    case "resume_deadline_expired":
-      return "deadline_expired";
-    case "agent_session_lost":
-      return "agent_session_lost";
-    default:
-      return "not_resumable";
   }
 }
 

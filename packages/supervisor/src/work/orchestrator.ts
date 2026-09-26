@@ -16,7 +16,6 @@ import {
   parseRfc3339,
   type AgentTurnUsageObservation,
   type AssignmentClaim,
-  type AssignmentReport,
   type AssignmentRequestReference,
   type CancelDirective,
   type ClaimResult,
@@ -44,7 +43,6 @@ import { RecoveryAuthority } from "../transport/recovery-authority.js";
 import type { RunnerPort } from "../runner-port.js";
 import { RelayedSession, type RelayedSessionDeps, type SessionClosedReason } from "../session/relayed-session.js";
 import type { PendingHumanRequest } from "../session/permissions.js";
-import { componentForKind, type ComponentAdapter, type ComponentDispatch, type PlatformMcpEntry, type WorkloadDefinition } from "./components.js";
 import { intersectEvidencePolicy } from "./evidence.js";
 import { ReportSender } from "./report-sender.js";
 import type { AssignmentSender } from "./assignment-sender.js";
@@ -74,7 +72,6 @@ export type ClaimRejection =
   | "no_headroom";
 
 export interface OrchestratorDeps {
-  deploymentKind?: "appliance" | "native_connector";
   clock: Clock;
   journal: SupervisorJournal;
   outbox: DurableOutbox;
@@ -122,20 +119,9 @@ export interface OrchestratorDeps {
   }) => Promise<{ acpSessionRef: string; receipt: RemoteDeliveryAcceptanceReceipt } | null>;
   headroom: () => number;
   maxPullItems: number;
-  components: Partial<Record<"harness" | "validation_runtime", ComponentAdapter>>;
-  /** The instance's soft concurrency ceiling, carried into each component's effective policy. */
-  softMaxConcurrent: () => number | undefined;
-  /** The pinned bridge digest the runner serves for a placed agent, from the verified release manifest. */
-  bridgeDigest: (agentId: string) => string | undefined;
-  /** Redeems `mcpCapabilityTokenRef` at dispatch. The entry lives in memory and in the component's dispatch body only — never journaled. */
-  redeemPlatformMcp: (assignment: RemoteWorkAssignment) => Promise<PlatformMcpEntry | undefined>;
-  /** Reads the claimed assignment's work definition from Core (the Harness needs it in the envelope). */
-  fetchWorkload: (assignment: RemoteWorkAssignment) => Promise<WorkloadDefinition>;
   runners: Map<string, RunnerPort>;
   sessionDeps: (assignment: RemoteWorkAssignment, runner: RunnerPort) => Omit<RelayedSessionDeps, "onClosed" | "onUsage">;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
-  gatewayBind: (agentId: string, assignment: RemoteWorkAssignment) => Promise<void>;
-  gatewayRelease: (agentId: string) => Promise<void>;
   searchController?: SearchControllerBoundary;
   /** Present on a runtime tagged `onboard`; absent, both kinds are refused. */
   onboardCarrier?: Pick<OnboardWorkCarrier, "execute">;
@@ -169,7 +155,7 @@ export class WorkOrchestrator {
       ...(deps.assignmentSender ? { assignmentSender: deps.assignmentSender } : {}),
       clock: deps.clock,
       instanceId: () => deps.instanceId(),
-      canSend: () => deps.deploymentKind !== "native_connector" || deps.reportDeliveryAllowed?.() === true,
+      canSend: () => deps.reportDeliveryAllowed?.() === true,
       onConflict: async (assignmentId, attempt) => this.abandon(assignmentId, attempt, "assignment_conflict"),
       onTerminalDurable: async (assignmentId, attempt) => this.finish(assignmentId, attempt),
       confirmStopped: async (assignmentId, attempt) => this.confirmSessionStopped(assignmentId, attempt),
@@ -322,7 +308,7 @@ export class WorkOrchestrator {
       if (isSearchAssignment(assignment) && !this.deps.searchController) {
         throw new RemoteInstanceError("recovery_required", "Search assignment arrived without its dedicated controller boundary.");
       }
-      const retained = this.deps.deploymentKind === "native_connector" ? this.deps.journal.execution.start(assignment.id, assignment.attempt) : undefined;
+      const retained = this.deps.journal.execution.start(assignment.id, assignment.attempt);
       if (retained) {
         if (jcsDigest(withoutDisplayLabel(retained.assignment) as JsonValue) !== jcsDigest(withoutDisplayLabel(assignment) as JsonValue)) throw new RemoteInstanceError("recovery_required", "Retained admission assignment changed.");
         await this.reconstructAdmissionProjections(assignment.id, assignment.attempt);
@@ -339,53 +325,43 @@ export class WorkOrchestrator {
       const assertAuthority = this.captureNativeAuthority(assignment.id, assignment.attempt);
       const incarnation = this.deps.runnerIncarnation?.();
       const assertCurrent = () => {
-        if (this.deps.deploymentKind !== "native_connector") return;
         assertAuthority();
         this.requireNativeOwner();
         if (incarnation !== this.deps.runnerIncarnation?.() || assignment.instanceId !== this.deps.instanceId() || assignment.workspaceId !== this.deps.workspaceId() || this.canPull() !== null || this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) throw new RemoteInstanceError("recovery_required", "Claim admission authority changed.");
       };
-      if (this.deps.deploymentKind === "native_connector") {
-        await this.serializeAdmissionSetup(`${assignment.id}:${assignment.attempt}`, async () => {
-          assertCurrent();
-          await this.deps.journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1,
-            admission: { instanceId: assignment.instanceId, workspaceId: assignment.workspaceId, runnerIncarnation: incarnation, assignmentId: assignment.id, attempt: assignment.attempt, claimId: claim.claimId, agentId: claim.agentId, executionGeneration: randomUUID(), openedAt: this.deps.clock.nowIso() },
-            assignment, evidenceUpload: intersectEvidencePolicy(this.deps.instanceEvidencePolicy(), assignment.policy.evidenceUpload), projectionCreatedAt: this.deps.clock.nowIso(), claimCreatedAt: this.deps.clock.nowIso(),
-          }, assertCurrent);
-          assertCurrent();
-          await this.reconstructAdmissionProjectionsOwned(assignment.id, assignment.attempt, assertCurrent);
-          assertCurrent();
-          const start = this.deps.journal.execution.start(assignment.id, assignment.attempt)!;
-          const observability = createRuntimeAdmissionObservabilityContext({
-            runtimeIncarnationId: start.admission.runnerIncarnation,
-            assignmentId: start.admission.assignmentId,
-            attempt: start.admission.attempt,
-            claimId: start.admission.claimId,
-            executionId: start.admission.executionGeneration,
-          });
-          this.logger.info({ event: "runtime.admission.durable", observability }, "native claim admission persisted");
-          const initial = this.journalEntry(assignment, claim.claimId, "claimed", start.projectionCreatedAt, start.evidenceUpload);
-          const assertPrepared = () => {
-            assertCurrent();
-            const current = this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`);
-            const queued = this.deps.outbox.all("assignment").find(item => item.id === claim.claimId);
-            if (!current || jcsDigest(current as JsonValue) !== jcsDigest(initial as JsonValue) || !queued || queued.key !== `claim:${assignment.id}:${assignment.attempt}` || queued.createdAt !== start.claimCreatedAt || jcsDigest(queued.body as JsonValue) !== jcsDigest(claim as JsonValue)) throw new RemoteInstanceError("recovery_required", "Claim projections no longer prove initial prepared admission.");
-          };
-          if (this.deps.assignmentSender) await this.deps.assignmentSender.prepareClaim(start.admission, assertPrepared);
-          else await this.deps.journal.execution.reserveAllocation(start.admission, assertPrepared);
-          this.pendingClaims.set(`${assignment.id}:${assignment.attempt}`, assignment);
-          this.pendingClaimFences.set(`${assignment.id}:${assignment.attempt}`, assertAuthority);
-          assertPrepared();
-          if (this.deps.assignmentSender) this.deps.assignmentSender.scheduleRetained(message => { assertAuthority(); this.deps.transport.send(message); });
-          else this.deps.transport.send({ channel: "assignment", channelId: coreChannelId("assignment", this.deps.instanceId()), body: claim });
+      await this.serializeAdmissionSetup(`${assignment.id}:${assignment.attempt}`, async () => {
+        assertCurrent();
+        await this.deps.journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1,
+          admission: { instanceId: assignment.instanceId, workspaceId: assignment.workspaceId, runnerIncarnation: incarnation, assignmentId: assignment.id, attempt: assignment.attempt, claimId: claim.claimId, agentId: claim.agentId, executionGeneration: randomUUID(), openedAt: this.deps.clock.nowIso() },
+          assignment, evidenceUpload: intersectEvidencePolicy(this.deps.instanceEvidencePolicy(), assignment.policy.evidenceUpload), projectionCreatedAt: this.deps.clock.nowIso(), claimCreatedAt: this.deps.clock.nowIso(),
+        }, assertCurrent);
+        assertCurrent();
+        await this.reconstructAdmissionProjectionsOwned(assignment.id, assignment.attempt, assertCurrent);
+        assertCurrent();
+        const start = this.deps.journal.execution.start(assignment.id, assignment.attempt)!;
+        const observability = createRuntimeAdmissionObservabilityContext({
+          runtimeIncarnationId: start.admission.runnerIncarnation,
+          assignmentId: start.admission.assignmentId,
+          attempt: start.admission.attempt,
+          claimId: start.admission.claimId,
+          executionId: start.admission.executionGeneration,
         });
-        continue;
-      }
-      this.pendingClaims.set(`${assignment.id}:${assignment.attempt}`, assignment);
-      await this.deps.outbox.enqueue({ id: claim.claimId, channel: "assignment", key: `claim:${assignment.id}:${assignment.attempt}`, group: `claim:${assignment.id}:${assignment.attempt}`, order: 0, body: claim, createdAt: this.deps.clock.nowIso() });
-      assertCurrent();
-      await this.deps.journal.assignments.put(this.journalEntry(assignment, claim.claimId, "claimed"));
-      assertCurrent();
-      this.deps.transport.send({ channel: "assignment", channelId: coreChannelId("assignment", this.deps.instanceId()), body: claim });
+        this.logger.info({ event: "runtime.admission.durable", observability }, "native claim admission persisted");
+        const initial = this.journalEntry(assignment, claim.claimId, "claimed", start.projectionCreatedAt, start.evidenceUpload);
+        const assertPrepared = () => {
+          assertCurrent();
+          const current = this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`);
+          const queued = this.deps.outbox.all("assignment").find(item => item.id === claim.claimId);
+          if (!current || jcsDigest(current as JsonValue) !== jcsDigest(initial as JsonValue) || !queued || queued.key !== `claim:${assignment.id}:${assignment.attempt}` || queued.createdAt !== start.claimCreatedAt || jcsDigest(queued.body as JsonValue) !== jcsDigest(claim as JsonValue)) throw new RemoteInstanceError("recovery_required", "Claim projections no longer prove initial prepared admission.");
+        };
+        if (this.deps.assignmentSender) await this.deps.assignmentSender.prepareClaim(start.admission, assertPrepared);
+        else await this.deps.journal.execution.reserveAllocation(start.admission, assertPrepared);
+        this.pendingClaims.set(`${assignment.id}:${assignment.attempt}`, assignment);
+        this.pendingClaimFences.set(`${assignment.id}:${assignment.attempt}`, assertAuthority);
+        assertPrepared();
+        if (this.deps.assignmentSender) this.deps.assignmentSender.scheduleRetained(message => { assertAuthority(); this.deps.transport.send(message); });
+        else this.deps.transport.send({ channel: "assignment", channelId: coreChannelId("assignment", this.deps.instanceId()), body: claim });
+      });
     }
   }
 
@@ -484,19 +460,17 @@ export class WorkOrchestrator {
       if (result.outcome === "claimed") this.logger.warn({ assignmentId: result.assignmentId }, "claim result for an unknown pending claim");
       return unhandled();
     }
-    const assertAuthority = this.deps.deploymentKind === "native_connector" ? this.pendingClaimFences.get(key) : () => undefined;
+    const assertAuthority = this.pendingClaimFences.get(key);
     if (!assertAuthority) { this.fenceLostAuthority(key); throw new RemoteInstanceError("recovery_required", "Pending claim has no original accepted generation."); }
     assertAuthority();
-    if (this.deps.deploymentKind === "native_connector") {
-      this.requireNativeOwner();
-      const admission = this.deps.journal.execution.admission(result.assignmentId, result.attempt);
-      if (!admission || admission.claimId !== result.claimId || admission.instanceId !== assignment.instanceId || admission.workspaceId !== assignment.workspaceId || admission.agentId !== assignment.agentRoute.agentId || admission.runnerIncarnation !== this.deps.runnerIncarnation?.()) return unhandled();
-      this.deps.journal.execution.assertAdmission(admission);
-      const start = this.deps.journal.execution.start(result.assignmentId, result.attempt);
-      if (start && (this.deps.assignmentSender ? start.delivery !== "allocated" || !reference ||
-        jcsDigest(start.allocation as JsonValue) !== jcsDigest(reference) || start.claimEffect?.state !== "applying" : start.delivery !== "allocation_reserved")) return unhandled();
-      if (this.deps.assignmentSender && !start) return unhandled();
-    }
+    this.requireNativeOwner();
+    const admission = this.deps.journal.execution.admission(result.assignmentId, result.attempt);
+    if (!admission || admission.claimId !== result.claimId || admission.instanceId !== assignment.instanceId || admission.workspaceId !== assignment.workspaceId || admission.agentId !== assignment.agentRoute.agentId || admission.runnerIncarnation !== this.deps.runnerIncarnation?.()) return unhandled();
+    this.deps.journal.execution.assertAdmission(admission);
+    const start = this.deps.journal.execution.start(result.assignmentId, result.attempt);
+    if (start && (this.deps.assignmentSender ? start.delivery !== "allocated" || !reference ||
+      jcsDigest(start.allocation as JsonValue) !== jcsDigest(reference) || start.claimEffect?.state !== "applying" : start.delivery !== "allocation_reserved")) return unhandled();
+    if (this.deps.assignmentSender && !start) return unhandled();
     // Retire only the correlated claim, not all items sharing its assignment key.
     await this.deps.outbox.ack(result.claimId);
     assertAuthority();
@@ -566,7 +540,6 @@ export class WorkOrchestrator {
   }
 
   private captureNativeAuthority(assignmentId: string, attempt: number): () => void {
-    if (this.deps.deploymentKind !== "native_connector") return () => undefined;
     const key = `${assignmentId}:${attempt}`;
     let captured: () => void;
     try { captured = new RecoveryAuthority(this.deps.recoveryAuthority).capture("assignment"); }
@@ -596,9 +569,6 @@ export class WorkOrchestrator {
   }
 
   private async dispatchImpl(assignment: RemoteWorkAssignment, entry: JournalEntry, assertAuthority: () => void): Promise<void> {
-    const target = this.deps.deploymentKind === "native_connector" || isSearchAssignment(assignment)
-      ? "agent_runner"
-      : componentForKind(assignment.kind);
     try {
       assertAuthority();
       if (this.deps.onboardCarrier && isOnboardWorkAssignment(assignment)) {
@@ -609,15 +579,7 @@ export class WorkOrchestrator {
         await this.runOnboardWork(assignment, entry, assertAuthority);
         return;
       }
-      if (this.deps.deploymentKind === "native_connector" || target === "agent_runner") {
-        await this.startRelayedSession(assignment, entry, assertAuthority);
-      } else {
-        const component = this.deps.components[target];
-        if (!component) throw new Error("local domain component is not installed");
-        await component.dispatch(await this.dispatchRequest(assignment, entry, target));
-        await this.deps.journal.assignments.put({ ...entry, state: "running", updatedAt: this.deps.clock.nowIso() });
-      }
-      if (this.deps.deploymentKind !== "native_connector") await this.deps.gatewayBind(assignment.agentRoute.agentId, assignment);
+      await this.startRelayedSession(assignment, entry, assertAuthority);
     } catch (error) {
       await this.handleDispatchFailure(assignment, entry, assertAuthority, error);
     }
@@ -678,50 +640,14 @@ export class WorkOrchestrator {
     });
   }
 
-  /**
-   * Every supervisor-held fact a component may need, assembled once. Each
-   * adapter takes the subset its component's envelope declares; the Harness
-   * needs the work definition inline, the Validation Runtime asks for its
-   * specification lazily, so the workload is read only for the Harness.
-   */
-  private async dispatchRequest(assignment: RemoteWorkAssignment, entry: JournalEntry, target: "harness" | "validation_runtime"): Promise<ComponentDispatch> {
-    const lease = this.deps.lease.current();
-    if (!lease) throw new Error("dispatch requires a lease");
-    const agent = this.deps.agents().find(view => view.agentId === assignment.agentRoute.agentId);
-    if (!agent) throw new Error("the placed agent is no longer connected");
-    const platformMcp = await this.deps.redeemPlatformMcp(assignment);
-    const bridgeDigest = this.deps.bridgeDigest(assignment.agentRoute.agentId);
-    const softMaxConcurrent = this.deps.softMaxConcurrent();
-    const workload = target === "harness" ? await this.deps.fetchWorkload(assignment) : undefined;
-    return {
-      assignment,
-      claimId: entry.claimId,
-      claimedAt: entry.claimedAt ?? entry.updatedAt,
-      effectiveEvidenceUpload: entry.evidenceUpload,
-      recoveryEpoch: entry.recoveryEpoch,
-      lease: { mode: lease.mode, expiresAt: lease.expiresAt, ...(lease.drainDeadline ? { drainDeadline: lease.drainDeadline } : {}) },
-      policy: {
-        permissionResponderDeadlineSeconds: assignment.policy.permissionResponderDeadlineSeconds,
-        humanDeferralAllowed: assignment.policy.humanDeferralAllowed,
-        ...(softMaxConcurrent === undefined ? {} : { softMaxConcurrent }),
-      },
-      agent,
-      browserToolHealthy: this.deps.browserToolAvailable(),
-      ...(bridgeDigest ? { bridgeDigest } : {}),
-      ...(platformMcp ? { platformMcp } : {}),
-      ...(workload ? { workload } : {}),
-    };
-  }
-
   private async startRelayedSession(assignment: RemoteWorkAssignment, entry: JournalEntry, assertAuthority: () => void): Promise<void> {
     const admission = this.deps.journal.execution.admission(assignment.id, assignment.attempt);
     let reference: string | undefined;
     let takeover: { reference: string; mode: "live" | "restore" } | undefined;
-    let executionActivated = this.deps.deploymentKind !== "native_connector";
+    let executionActivated = false;
     const admissionOwned = () => admission !== undefined && this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`)?.claimId === entry.claimId && admission.claimId === entry.claimId && admission.runnerIncarnation === this.deps.runnerIncarnation?.() && admission.instanceId === this.deps.instanceId() && admission.workspaceId === this.deps.workspaceId() && admission.agentId === assignment.agentRoute.agentId;
     const noCurrentAdmission = () => new RemoteInstanceError("recovery_required", "Native execution has no current durable admission.");
     const assertAdmissionCurrent = () => {
-      if (this.deps.deploymentKind !== "native_connector") return;
       assertAuthority();
       this.requireNativeOwner();
       if (!admissionOwned() || this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) throw noCurrentAdmission();
@@ -732,7 +658,6 @@ export class WorkOrchestrator {
     // on (a new recovery epoch is usually why it is being stopped), so neither
     // is a refusal here. Ownership of the exact admission still is.
     const assertRecoveryOwned = () => {
-      if (this.deps.deploymentKind !== "native_connector") return;
       this.requireNativeOwner();
       if (!admissionOwned()) throw noCurrentAdmission();
       this.deps.journal.execution.assertAdmission(admission!);
@@ -740,17 +665,15 @@ export class WorkOrchestrator {
     assertAdmissionCurrent();
     const assertExecutionOwned = () => {
       assertAdmissionCurrent();
-      if (this.deps.deploymentKind === "native_connector" && executionActivated) this.deps.journal.execution.assertExecutable(admission!, reference);
+      if (executionActivated) this.deps.journal.execution.assertExecutable(admission!, reference);
     };
     assertExecutionOwned();
-    if (this.deps.deploymentKind === "native_connector") {
-      const pendingEvidence = this.recoveringPredecessors(assignment).flatMap(prior => this.pendingRecoveryEvidence(prior));
-      if (pendingEvidence.length > 0) {
-        await this.settleRecoveryEvidence(pendingEvidence);
-        assertExecutionOwned();
-      }
-      this.assertNoRecoveringPredecessor(assignment);
+    const pendingEvidence = this.recoveringPredecessors(assignment).flatMap(prior => this.pendingRecoveryEvidence(prior));
+    if (pendingEvidence.length > 0) {
+      await this.settleRecoveryEvidence(pendingEvidence);
+      assertExecutionOwned();
     }
+    this.assertNoRecoveringPredecessor(assignment);
     const key = `${assignment.id}:${assignment.attempt}`;
     if (this.sessions.has(key)) throw new Error("the assignment already has a local session owner");
     const runner = this.deps.runners.get(assignment.agentRoute.agentId);
@@ -769,8 +692,8 @@ export class WorkOrchestrator {
         },
         assertPromptAllowed: () => { assertExecutionOwned(); this.deps.journal.planning.assertPromptAllowed(admission!); },
       } : {}),
-      ...(this.deps.deploymentKind === "native_connector" && restoreReference !== undefined ? { restoreReference } : {}),
-      ...(this.deps.deploymentKind === "native_connector" ? { activateExecution: async () => {
+      ...(restoreReference !== undefined ? { restoreReference } : {}),
+      activateExecution: async () => {
         assertAdmissionCurrent();
         // Deliberately after input preparation and capability redemption. A
         // transient cloud failure must leave an idle live ACP predecessor
@@ -785,8 +708,8 @@ export class WorkOrchestrator {
           ...(takeover?.mode === "live" ? { continueReference: takeover.reference } : {}),
           ...(takeover?.mode === "restore" ? { restoreReference: takeover.reference } : {}),
         };
-      } } : {}),
-      ...(this.deps.deploymentKind === "native_connector" ? { recordCompletedSettlement: async (ref: string) => {
+      },
+      recordCompletedSettlement: async (ref: string) => {
         assertExecutionOwned();
         await this.deps.journal.execution.markCompletedTurnSettled(admission!, ref, this.deps.clock.nowIso(), assertExecutionOwned);
       }, reserveExecutionReference: async (ref: string) => {
@@ -800,7 +723,7 @@ export class WorkOrchestrator {
       }, replaceExecutionProcessOwner: async (previous, replacement) => {
         await this.deps.journal.execution.replaceBootstrapProcessOwner(admission!, previous, replacement, assertExecutionOwned);
         assertExecutionOwned();
-      } } : {}),
+      },
       reserveChannel: (channelId, owner) => {
         if (this.channelOwners.has(channelId)) throw new Error("the logical session channel already has a local owner");
         this.channelOwners.set(channelId, owner);
@@ -1150,7 +1073,6 @@ export class WorkOrchestrator {
    * starts a fresh session (Konteks supplies the conversation input).
    */
   async reapIdleCompletedSessions(idleMs: number): Promise<number> {
-    if (this.deps.deploymentKind !== "native_connector") return 0;
     let reaped = 0;
     const now = this.deps.clock.now();
     for (const [channelId, owner] of [...this.channelOwners]) {
@@ -1212,12 +1134,11 @@ export class WorkOrchestrator {
 
   private async onSessionClosed(session: RelayedSession, reason: SessionClosedReason, assertAuthority: () => void): Promise<void> {
     assertAuthority();
-    const retainCompletedOwner = this.deps.deploymentKind === "native_connector" && reason === "completed";
+    const retainCompletedOwner = reason === "completed";
     const key = `${session.assignment.id}:${session.assignment.attempt}`;
     if (this.recoveryFences.has(key)) return;
     if (this.sessions.get(key) !== session) return;
     const entry = this.deps.journal.assignments.get(key);
-    if (this.deps.deploymentKind !== "native_connector") await this.deps.gatewayRelease(session.assignment.agentRoute.agentId);
     assertAuthority();
     if (!entry || entry.reports.terminalSequence !== undefined) { if (!retainCompletedOwner) this.sessions.delete(key); return; }
     if (entry.kind === "planning" || entry.kind === "search_generation") {
@@ -1325,8 +1246,6 @@ export class WorkOrchestrator {
       return;
     }
     if (entry.kind === "planning") return; // Hosted settlement supplies the directive-bound terminal winner.
-    const target = componentForKind(entry.kind);
-    if (target !== "agent_runner" && this.deps.deploymentKind !== "native_connector") await this.deps.components[target]?.cancel(directive.assignmentId, directive.attempt, directive.reason).catch(() => undefined);
     await this.reports.submit({ assignmentId: directive.assignmentId, attempt: directive.attempt, claimId: entry.claimId, draft: { terminal: true, result: { class: "cancelled", reason: directive.reason, terminalResultHash: jcsDigest({ class: "cancelled", reason: directive.reason }) } } });
   }
 
@@ -1691,7 +1610,7 @@ export class WorkOrchestrator {
   }
 
   private requireNativeOwner(): void {
-    if (this.deps.deploymentKind !== "native_connector" || !this.deps.runnerIncarnation?.() || !this.deps.assertOwned) throw new RemoteInstanceError("recovery_required", "Native local ownership is unavailable.");
+    if (!this.deps.runnerIncarnation?.() || !this.deps.assertOwned) throw new RemoteInstanceError("recovery_required", "Native local ownership is unavailable.");
     this.deps.assertOwned();
   }
 
@@ -1719,45 +1638,6 @@ export class WorkOrchestrator {
     this.pendingClaims.delete(`${assignmentId}:${attempt}`);
     this.pendingClaimFences.delete(`${assignmentId}:${attempt}`);
     await this.deps.journal.prune();
-  }
-
-  /** Terminal/progress/checkpoint facts posted by Harness/Validation through the internal API. */
-  async onComponentTerminal(fact: { assignmentId: string; attempt: number; result: NonNullable<Parameters<ReportSender["submit"]>[0]["draft"]["result"]>; artifacts?: Parameters<ReportSender["submit"]>[0]["draft"]["artifacts"] | undefined; acpSessionRef?: string | undefined }): Promise<void> {
-    const entry = this.deps.journal.assignments.get(`${fact.assignmentId}:${fact.attempt}`);
-    if (!entry || entry.reports.terminalSequence !== undefined) return;
-    await this.deps.gatewayRelease(entry.agentId);
-    await this.reports.submit({ assignmentId: fact.assignmentId, attempt: fact.attempt, claimId: entry.claimId, draft: { terminal: true, result: fact.result, ...(fact.artifacts ? { artifacts: fact.artifacts } : {}), ...(fact.acpSessionRef ? { acpSessionRef: fact.acpSessionRef } : {}) } });
-  }
-
-  /**
-   * A report the component minted itself (both domain components run their own
-   * outbox). The supervisor is the `reportSequence` authority for a claim, so
-   * the component's identity fields are dropped and the report is re-minted
-   * here: one strictly consecutive sequence line per claim, whichever party
-   * observed the fact.
-   */
-  async onComponentReport(report: AssignmentReport): Promise<{ status: "journaled" } | { status: "unknown_assignment" }> {
-    const entry = this.deps.journal.assignments.get(`${report.assignmentId}:${report.attempt}`);
-    if (!entry) return { status: "unknown_assignment" };
-    // A closed claim swallows late reports rather than reopening it; the
-    // component's outbox stops resending once it is answered.
-    if (entry.reports.terminalSequence !== undefined) return { status: "journaled" };
-    const { reportId: _reportId, reportSequence: _reportSequence, payloadDigest: _payloadDigest, reportedAt: _reportedAt, assignmentId: _assignmentId, attempt: _attempt, claimId: _claimId, ...draft } = report;
-    if (report.terminal) await this.deps.gatewayRelease(entry.agentId);
-    await this.reports.submit({ assignmentId: report.assignmentId, attempt: report.attempt, claimId: entry.claimId, draft });
-    return { status: "journaled" };
-  }
-
-  async onComponentProgress(fact: { assignmentId: string; attempt: number; structuredOutput?: JsonValue | undefined }): Promise<void> {
-    const entry = this.deps.journal.assignments.get(`${fact.assignmentId}:${fact.attempt}`);
-    if (!entry || entry.reports.terminalSequence !== undefined) return;
-    await this.reports.submit({ assignmentId: fact.assignmentId, attempt: fact.attempt, claimId: entry.claimId, draft: { terminal: false } });
-  }
-
-  async onComponentCheckpoint(fact: { assignmentId: string; attempt: number; ref: string; hash: string; createdAt: string }): Promise<void> {
-    const entry = this.deps.journal.assignments.get(`${fact.assignmentId}:${fact.attempt}`);
-    if (!entry) return;
-    await this.deps.journal.assignments.put({ ...entry, state: "checkpointed", checkpoint: { ref: fact.ref, hash: fact.hash, createdAt: fact.createdAt }, updatedAt: this.deps.clock.nowIso() });
   }
 
   openSessions(): number {

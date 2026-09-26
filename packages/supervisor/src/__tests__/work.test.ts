@@ -486,14 +486,11 @@ describe("work orchestrator claim validation", () => {
       reportDeliveryAllowed: () => true,
       headroom: () => 2,
       maxPullItems: 4,
-      components: { harness: { kind: "harness", dispatch: async () => undefined, cancel: async () => undefined, erase: async () => ({ failed: [] }), verifyCheckpoint: async () => true }, validation_runtime: { kind: "validation_runtime", dispatch: async () => undefined, cancel: async () => undefined, erase: async () => ({ failed: [] }), verifyCheckpoint: async () => true } },
       runners: new Map(),
       sessionDeps: () => {
         throw new Error("not used");
       },
       onUsage: async () => undefined,
-      gatewayBind: async () => undefined,
-      gatewayRelease: async () => undefined,
       ...overrides,
     });
     return { work, sent, journal, lease, transport, outbox };
@@ -544,24 +541,18 @@ describe("work orchestrator claim validation", () => {
     expect(f.sent).toEqual([]);
   });
 
-  it("closes native and appliance work on an unrecoverable relay replay gap", async () => {
+  it("closes local work on an unrecoverable relay replay gap", async () => {
     const fake = (kind: string, source: string) => ({
       channelId: "session:live", isClosed: false, close: vi.fn(async () => undefined),
       assignment: { id: "live", attempt: 1, kind, source: { kind: source } },
     });
-    const native = await orchestrator({ deploymentKind: "native_connector" });
+    const native = await orchestrator();
     const nativeSession = fake("delivery", "harness_delivery");
     (native.work as unknown as { sessions: Map<string, unknown> }).sessions.set("live:1", nativeSession);
     const nativeClose = vi.spyOn(native.transport, "closeChannel");
     await native.work.onChannelReset("session:live");
     expect(nativeSession.close).toHaveBeenCalledExactlyOnceWith("relay_replay_gap");
     expect(nativeClose).not.toHaveBeenCalled();
-
-    const appliance = await orchestrator();
-    const applianceSession = fake("delivery", "harness_delivery");
-    (appliance.work as unknown as { sessions: Map<string, unknown> }).sessions.set("live:1", applianceSession);
-    await appliance.work.onChannelReset("session:live");
-    expect(applianceSession.close).toHaveBeenCalledExactlyOnceWith("relay_replay_gap");
 
     // a close that throws is logged and does not abort the reset handler
     const failing = await orchestrator();
@@ -571,7 +562,7 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("retires an ownerless terminal session channel after reset but preserves an ownerless live recovery channel", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     const close = vi.spyOn(f.transport, "closeChannel");
     const base = {
       attempt: 1, kind: "delivery" as const, placementId: "placement", workspaceId: "ws-1", agentId: "codex",
@@ -589,7 +580,7 @@ describe("work orchestrator claim validation", () => {
 
   it("native continuation rejects a newer accepted generation after admission fsync", async () => {
     let generation: string | null = "accepted-A";
-    const f = await orchestrator({ deploymentKind: "native_connector", recoveryAuthority: () => generation });
+    const f = await orchestrator({ recoveryAuthority: () => generation });
     const begin = f.journal.execution.beginAdmission.bind(f.journal.execution);
     vi.spyOn(f.journal.execution, "beginAdmission").mockImplementation(async (candidate, check) => {
       await begin(candidate, check);
@@ -611,7 +602,7 @@ describe("work orchestrator claim validation", () => {
       }
     });
     const logger = { info, warn: vi.fn(), error: vi.fn() } as unknown as Logger;
-    const f = await orchestrator({ deploymentKind: "native_connector", logger });
+    const f = await orchestrator({ logger });
     const begin = f.journal.execution.beginAdmission.bind(f.journal.execution);
     vi.spyOn(f.journal.execution, "beginAdmission").mockImplementation(async (candidate, check) => {
       await begin(candidate, check);
@@ -634,7 +625,7 @@ describe("work orchestrator claim validation", () => {
 
   it("claim ACK completion cannot adopt newer authority or invent a terminal", async () => {
     let generation: string | null = "accepted-A";
-    const f = await orchestrator({ deploymentKind: "native_connector", recoveryAuthority: () => generation });
+    const f = await orchestrator({ recoveryAuthority: () => generation });
     await f.work.onAssignmentMessage({ assignments: [assignment] });
     const entry = f.journal.assignments.get("asg-1:1")!;
     const ack = f.outbox.ack.bind(f.outbox);
@@ -648,7 +639,7 @@ describe("work orchestrator claim validation", () => {
 
   it("negative claim disposition cannot overwrite moved recovery while its final write waits", async () => {
     let generation = "accepted-A";
-    const f = await orchestrator({ deploymentKind: "native_connector", recoveryAuthority: () => generation });
+    const f = await orchestrator({ recoveryAuthority: () => generation });
     await f.work.onAssignmentMessage({ assignments: [assignment] });
     const original = f.journal.assignments.get("asg-1:1")!;
     const entered = Promise.withResolvers<void>();
@@ -675,7 +666,7 @@ describe("work orchestrator claim validation", () => {
 
   it("live admission does not create assignment projection after authority moves during outbox fsync", async () => {
     let generation: string | null = "accepted-A";
-    const f = await orchestrator({ deploymentKind: "native_connector", recoveryAuthority: () => generation });
+    const f = await orchestrator({ recoveryAuthority: () => generation });
     const enqueue = f.outbox.enqueue.bind(f.outbox);
     vi.spyOn(f.outbox, "enqueue").mockImplementation(async item => {
       const persisted = await enqueue(item);
@@ -690,10 +681,10 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("native admission requires non-null accepted authority, but unchanged renewal continues", async () => {
-    const blocked = await orchestrator({ deploymentKind: "native_connector", recoveryAuthority: () => null });
+    const blocked = await orchestrator({ recoveryAuthority: () => null });
     await expect(blocked.work.onAssignmentMessage({ assignments: [assignment] })).rejects.toThrow();
     expect(blocked.journal.execution.admission("asg-1", 1)).toBeUndefined();
-    const f = await orchestrator({ deploymentKind: "native_connector", recoveryAuthority: () => "accepted-A" });
+    const f = await orchestrator({ recoveryAuthority: () => "accepted-A" });
     const begin = f.journal.execution.beginAdmission.bind(f.journal.execution);
     vi.spyOn(f.journal.execution, "beginAdmission").mockImplementation(async (candidate, check) => { await begin(candidate, check); await Promise.resolve(); });
     await f.work.onAssignmentMessage({ assignments: [assignment] });
@@ -701,7 +692,7 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("native claim admission is retained before the first outbox/network effect", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     const enqueue = f.outbox.enqueue.bind(f.outbox);
     vi.spyOn(f.outbox, "enqueue").mockImplementation(async item => {
       const disk = new SupervisorJournal(dir); await disk.load();
@@ -714,21 +705,21 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("failed native admission write prevents claim enqueue, journal and delivery", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     vi.spyOn(f.journal.execution, "beginAdmission").mockRejectedValueOnce(new Error("admission disk full"));
     await expect(f.work.onAssignmentMessage({ assignments: [assignment] })).rejects.toThrow("admission disk full");
     expect(f.outbox.depth).toBe(0); expect(f.sent).toEqual([]); expect(f.journal.assignments.all()).toEqual([]);
   });
 
   it.each(["outbox", "assignment"] as const)("complete start repairs missing %s projections after reopening without sending", async failure => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     if (failure === "outbox") vi.spyOn(f.outbox, "enqueue").mockRejectedValueOnce(new Error("projection failed"));
     else vi.spyOn(f.journal.assignments, "update").mockRejectedValueOnce(new Error("projection failed"));
     await expect(f.work.onAssignmentMessage({ assignments: [assignment] })).rejects.toThrow("projection failed");
     const start = f.journal.execution.start("asg-1", 1)!;
     expect(start).toMatchObject({ assignment, mandatoryOpenVersion: 1, delivery: "unallocated" });
     expect(f.sent).toEqual([]);
-    const reopened = await orchestrator({ deploymentKind: "native_connector" });
+    const reopened = await orchestrator();
     await reopened.work.reconstructAdmissionProjections("asg-1", 1);
     expect(reopened.journal.assignments.get("asg-1:1")).toMatchObject({ claimId: start.admission.claimId, claimedAt: start.projectionCreatedAt, updatedAt: start.projectionCreatedAt });
     expect(reopened.outbox.all()[0]).toMatchObject({ id: start.admission.claimId, createdAt: start.claimCreatedAt });
@@ -737,20 +728,20 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("reserves before transport entry and never resends an uncertain claim on repeated work", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     vi.spyOn(f.transport, "send").mockImplementation(() => {
       expect(f.journal.execution.start("asg-1", 1)?.delivery).toBe("allocation_reserved");
       throw new Error("uncertain send");
     });
     await expect(f.work.onAssignmentMessage({ assignments: [assignment] })).rejects.toThrow("uncertain send");
-    const reopened = await orchestrator({ deploymentKind: "native_connector" });
+    const reopened = await orchestrator();
     await reopened.work.onAssignmentMessage({ assignments: [assignment] });
     expect(reopened.sent).toEqual([]);
     expect(reopened.journal.execution.start("asg-1", 1)?.delivery).toBe("allocation_reserved");
   });
 
   it("failed reservation permits no send and reconstruction preserves progressed state", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     vi.spyOn(f.journal.execution, "reserveAllocation").mockRejectedValueOnce(new Error("reserve failed"));
     await expect(f.work.onAssignmentMessage({ assignments: [assignment] })).rejects.toThrow("reserve failed");
     expect(f.sent).toEqual([]);
@@ -765,7 +756,7 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("repair rejects conflicting projection identity and changed assignment metadata", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     await f.work.onAssignmentMessage({ assignments: [assignment] });
     const original = f.journal.assignments.get("asg-1:1")!;
     await f.journal.assignments.put({ ...original, claimId: "foreign" });
@@ -775,11 +766,11 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("reserved initial projection with a retired claim outbox is not recreated by repair", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     await f.work.onAssignmentMessage({ assignments: [assignment] });
     const entry = f.journal.assignments.get("asg-1:1")!;
     await f.outbox.ack(entry.claimId);
-    const reopened = await orchestrator({ deploymentKind: "native_connector" });
+    const reopened = await orchestrator();
     await reopened.work.reconstructAdmissionProjections("asg-1", 1);
     expect(reopened.outbox.depth).toBe(0);
     expect(reopened.journal.assignments.get("asg-1:1")).toEqual(entry);
@@ -790,7 +781,7 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("a progressed projection encountered during first admission cannot grant reservation or send", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     const update = f.journal.assignments.update.bind(f.journal.assignments);
     vi.spyOn(f.journal.assignments, "update").mockImplementation(async (key, derive) => {
       await update(key, derive);
@@ -804,7 +795,7 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("repair cannot create initial assignment after reservation advances during outbox persistence", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     const enqueue = f.outbox.enqueue.bind(f.outbox);
     vi.spyOn(f.outbox, "enqueue").mockRejectedValueOnce(new Error("initial setup failed"));
     await expect(f.work.onAssignmentMessage({ assignments: [assignment] })).rejects.toThrow("initial setup failed");
@@ -819,7 +810,7 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("concurrent repair waits for the real admission setup and never duplicates allocation", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     let entered!: () => void;
     const waiting = new Promise<void>(resolve => { entered = resolve; });
     let release!: () => void;
@@ -839,19 +830,19 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("retained tombstone blocks late assignment admission after process restart", async () => {
-    const f = await orchestrator({ deploymentKind: "native_connector" });
+    const f = await orchestrator();
     const seed = { enrollmentId: "enrollment", activationId: "activation", keyDigest: "a".repeat(43), createdAt: clock.nowIso() };
     await f.journal.execution.seedEnrollment(seed);
     await f.journal.execution.bindEnrollment({ ...seed, instanceId: "inst-1", workspaceId: "ws-1", exchangeNonce: "exchange" });
     await f.journal.execution.cancelAbsent({ instanceId: "inst-1", workspaceId: "ws-1", runnerIncarnation: "old", manifestId: "old-manifest", assignmentId: "asg-1", attempt: 1, decisionDigest: "b".repeat(43), cancelledAt: clock.nowIso() }, () => undefined);
-    const reopened = await orchestrator({ deploymentKind: "native_connector" });
+    const reopened = await orchestrator();
     await reopened.work.onAssignmentMessage({ assignments: [assignment] });
     expect(reopened.work.counters.stale_attempt).toBe(1);
     expect(reopened.sent).toEqual([]); expect(reopened.journal.assignments.all()).toEqual([]);
   });
 
-  it.each(["native_connector", "appliance"] as const)("%s mismatched claim reply cannot retire the actual pending claim or outbox", async deploymentKind => {
-    const f = await orchestrator({ deploymentKind });
+  it("a mismatched claim reply cannot retire the actual pending claim or outbox", async () => {
+    const f = await orchestrator();
     await f.work.onAssignmentMessage({ assignments: [assignment] });
     const claim = f.journal.assignments.get("asg-1:1")!;
     const pending = f.outbox.all("assignment");
@@ -864,19 +855,17 @@ describe("work orchestrator claim validation", () => {
   });
 
   it("native report delivery fails closed without receipt authority even when local reconciliation says complete", async () => {
-    const { work, journal, sent } = await orchestrator({ deploymentKind: "native_connector", reportDeliveryAllowed: () => false });
+    const { work, journal, sent } = await orchestrator({ reportDeliveryAllowed: () => false });
     await journal.assignments.put({ assignmentId: "a", attempt: 1, claimId: "c", kind: "delivery", placementId: "p", workspaceId: "w", agentId: "codex", state: "running", recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only", expiresAt: "2026-09-07T00:00:00Z", latestResumeAt: "2026-09-07T00:00:00Z", updatedAt: clock.nowIso() });
     await work.reports.submit({ assignmentId: "a", attempt: 1, claimId: "c", draft: { terminal: false } });
     await work.reports.flushAll();
     expect(sent).toEqual([]);
   });
 
-  it.each(["delivery", "validation", "preview", "qa", "assistant_execution"] as const)("native %s claims bootstrap ACP without local domain dispatch or gateway use", async kind => {
-    const gatewayBind = vi.fn(async () => undefined);
-    const fetchWorkload = vi.fn(async () => { throw new Error("legacy component workload owner unavailable"); });
+  it.each(["delivery", "validation", "preview", "qa", "assistant_execution"] as const)("native %s claims bootstrap ACP", async kind => {
     const runner = { createSession: vi.fn(async (_input: RunnerSessionInput, lifecycle?: RunnerSessionLifecycle) => { await lifecycle?.beforeCreate("native-acp"); lifecycle?.assertCurrent(); return { acpSessionRef: "native-acp", resumed: false, capabilities: { forkSession: false, sessionResume: false } }; }), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined) } as unknown as RunnerPort;
     const role = kind === "delivery" ? "generator" : kind === "assistant_execution" ? "assistant" : "qa";
-    const f = await orchestrator({ deploymentKind: "native_connector", components: {}, runners: new Map([["codex", runner]]), gatewayBind, fetchWorkload, advertisedRoles: () => [role], browserToolAvailable: () => true,
+    const f = await orchestrator({ runners: new Map([["codex", runner]]), advertisedRoles: () => [role], browserToolAvailable: () => true,
       sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => { throw new Error("not needed"); }, workspaceRoot: "/native", deploymentKind: "native_connector", prepareInputs: async () => ({ binding: { workspaceId: target.workspaceId, assignmentId: target.id, attempt: target.attempt, instanceId: target.instanceId, sessionId: "cloud-session" }, cwd: "/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
         registerReady: createNativeReadyRegistrar({ clock, journal: f.journal, instanceId: target.instanceId, workspaceId: target.workspaceId, runnerIncarnation: "process", assertActive: () => undefined,
           client: { registerExecutionReady: async (_instanceId, request) => ({ ...request, workspaceId: target.workspaceId, instanceId: target.instanceId, sessionId: "cloud-session", channelId: "session:cloud-session", readyRevision: 1, registeredAt: clock.nowIso() }) },
@@ -889,8 +878,6 @@ describe("work orchestrator claim validation", () => {
     await settleBootstrap(f.work, "asg-1");
     expect(runner.createSession).toHaveBeenCalledOnce();
     expect(f.journal.assignments.get("asg-1:1")).toMatchObject({ state: "running", acpSessionRef: "native-acp", executionReady: { claimId: claim.claimId, readyRevision: 1, channelId: "session:cloud-session" } });
-    expect(gatewayBind).not.toHaveBeenCalled();
-    expect(fetchWorkload).not.toHaveBeenCalled();
     expect(reports(f.sent)).toEqual([]);
     expect(f.sent.at(-1)?.body).toMatchObject({ kind: "session_ready", agentId: "codex" });
     await f.work.drainSessions("drain");
@@ -944,7 +931,7 @@ describe("work orchestrator claim validation", () => {
       createSession: vi.fn(async (input: { context: { assignmentId: string }; acpSessionRef?: string; restoreAcpSessionRef?: string }, lifecycle?: RunnerSessionLifecycle) => { const ref = input.acpSessionRef ?? `acp:${input.context.assignmentId}`; await lifecycle?.beforeCreate(ref); lifecycle?.assertCurrent(); return { acpSessionRef: ref, resumed: input.acpSessionRef !== undefined || input.restoreAcpSessionRef !== undefined, capabilities: { forkSession: false, sessionResume: true } }; }),
       prompt: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined),
     } as unknown as RunnerPort;
-    const f = await orchestrator({ deploymentKind: "native_connector", recoveryAuthority, components: {}, runners: new Map([["codex", runner]]),
+    const f = await orchestrator({ recoveryAuthority, components: {}, runners: new Map([["codex", runner]]),
       advertisedRoles: () => ["generator", "assistant"],
       roleBindings: () => [{ role: "generator", agentPreference: ["codex"] }, { role: "assistant", agentPreference: ["codex"] }],
       sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => { throw new Error("not needed"); }, workspaceRoot: "/native", deploymentKind: "native_connector",
