@@ -1,7 +1,6 @@
 /**
  * The closed preview forwarding policy (D124/D125). Enforced independently by
- * the supervisor (on the channel), the preview forwarder (on the loopback
- * hop), and the relay (CP9). The viewer can never name a host, carry a
+ * the supervisor (on the channel) and the relay (CP9). The viewer can never name a host, carry a
  * credential, or use the channel as an open proxy.
  */
 export const PREVIEW_REQUEST_HEADERS = Object.freeze([

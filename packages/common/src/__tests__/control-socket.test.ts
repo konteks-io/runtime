@@ -150,7 +150,7 @@ describe("loopback control socket", () => {
     await expect(
       controlCall(
         { token, port: server.port },
-        { request: { op: "gateway.key.clear", agentId: "codex" }, schema: z.unknown() },
+        { request: { op: "auth.logout", agentId: "codex" }, schema: z.unknown() },
       ),
     ).rejects.toMatchObject({ message: "gateway_unavailable: gateway is down" });
   });
@@ -162,9 +162,8 @@ describe("loopback control socket", () => {
       expect(ControlRequestSchema.safeParse({ op, url: "https://evil.example/manifest.json" }).success).toBe(false);
     }
     expect(ControlRequestSchema.safeParse({ op: "status", extra: 1 }).success).toBe(false);
-    expect(
-      ControlRequestSchema.safeParse({ op: "gateway.key.set", agentId: "Codex Bad", key: "k".repeat(16) })
-        .success,
-    ).toBe(false);
+    expect(ControlRequestSchema.safeParse({ op: "auth.logout", agentId: "Codex Bad" }).success).toBe(false);
+    // The retired appliance's BYOK gateway operations are gone.
+    expect(ControlRequestSchema.safeParse({ op: "gateway.key.set", agentId: "codex", key: "k".repeat(16) }).success).toBe(false);
   });
 });

@@ -12,9 +12,9 @@ import { RuntimeRoleSchema } from "./contracts.js";
  * a named operation with a strict schema; there is no exec, no arbitrary
  * config field, and no remote reachability (loopback bind + token file).
  *
- * Transport: JSON lines over a loopback TCP socket (Docker Desktop cannot
- * share a Unix socket through a bind mount). The first line is the auth
- * envelope carrying a token the supervisor wrote 0600 into its volume.
+ * Transport: JSON lines over a loopback TCP socket (one transport on macOS,
+ * Linux and Windows). The first line is the auth envelope carrying a token
+ * the supervisor wrote 0600 into its private data folder.
  */
 export const CONTROL_SOCKET_DEFAULT_PORT = 41800;
 export const CONTROL_TOKEN_FILE_NAME = "control.token";
@@ -37,15 +37,6 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
     .strict(),
   z.object({ op: z.literal("auth.cancel"), loginId: z.string().min(1) }).strict(),
   z.object({ op: z.literal("auth.logout"), agentId: agentIdSchema }).strict(),
-  z
-    .object({
-      op: z.literal("gateway.key.set"),
-      agentId: agentIdSchema,
-      /** Carried only on this loopback hop; never journaled, logged, or echoed. */
-      key: z.string().min(8).max(4_096),
-    })
-    .strict(),
-  z.object({ op: z.literal("gateway.key.clear"), agentId: agentIdSchema }).strict(),
   // Managed-git key registration (ON16). Nothing here carries key material:
   // the private half is generated on the machine and never crosses this hop,
   // not even to be shown to the person who ran the command.

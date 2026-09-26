@@ -110,6 +110,12 @@ only in the connector's private folder. If it cannot start (an unsupported
 version, say), it is left out and retried in the background with the reason in
 the connector log; your other agents keep working.
 
+Pi and OpenCode are no longer supported: `install --agents` and `agent add`
+refuse them, and an installation that still lists one keeps working without
+it (the connector log says it was skipped). The Docker Compose remote
+instance is retired; the connector on your own computer is the only way to
+run Konteks agents.
+
 `uninstall` lets running work finish (up to 15 minutes), has Konteks drain,
 revoke and tombstone this runtime, stops and unregisters the service and
 deletes the connector's folder. Your repositories and your coding agents'

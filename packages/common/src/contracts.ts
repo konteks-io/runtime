@@ -1,6 +1,6 @@
 /**
  * The single boundary between this toolkit and the canonical shared contract
- * package. Every wire type, schema, constant, and error code the appliance
+ * package. Every wire type, schema, constant, and error code the runtime
  * uses is imported here by its exact `wire-contracts.md` name and re-exported;
  * no other module in this repository imports `@konteks/backstage-plugin-common`
  * directly. If CP1 lands a name differently, this file is the only place that
@@ -299,7 +299,7 @@ export {
   computeRemoteTransferManifestDigest,
   computeRemoteSkillCatalogDigest,
   validateRemoteTransfer,
-  // Strict parsers for every trust boundary the appliance validates.
+  // Strict parsers for every trust boundary the runtime validates.
   RemoteInstanceActivationExchangeResultSchema,
   RemoteSignedBundleManifestSchema,
   computeBundleManifestDigest,
@@ -392,7 +392,7 @@ export type {
 
 /**
  * Wire constants that CP1 publishes (protocol negotiation, ACP schema
- * version, frame/list bounds). Re-exported so the appliance never hard-codes
+ * version, frame/list bounds). Re-exported so the runtime never hard-codes
  * a value the control plane also owns.
  */
 export {

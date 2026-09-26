@@ -17,8 +17,7 @@ files listed below.
 | `packages/common/src/backoff.ts` | `packages/tunnel-client/src/reconnect.ts` | exponential backoff with jitter and connected-duration reset |
 | `packages/supervisor/src/relay/relay-client.ts` | `apps/host-daemon/connect-tunnel/`, `packages/tunnel-client/src/session.ts`, `headers.ts` | single-socket client shape, attempt fencing, handshake-then-stream ordering, reconnect scheduling |
 | `packages/supervisor/src/daemon.ts` | `apps/host-daemon/` (daemon lifecycle, signal handling, command dispatch structure) | startup/shutdown ordering, signal-driven drain, structured command handling; Konteks additionally waits for in-flight startup before cleanup and coalesces readiness for concurrent starts |
-| `packages/supervisor/src/control/handlers.ts`, `packages/supervisor/src/work/components.ts` | `packages/host-daemon-contract/` (`protocol.ts`, `commands.ts`) | versioned closed command-handler structure and typed dispatch |
-| `packages/preview-forwarder/src/forwarder.ts` | `packages/tunnel-client/` and `packages/tunnel-contract/` (open-http / body-chunk / body-end / resp-head / open-ws / ws-data / close-stream) | stream mechanics for mapping HTTP/WS exchanges onto chunked frames |
+| `packages/supervisor/src/control/handlers.ts` | `packages/host-daemon-contract/` (`protocol.ts`, `commands.ts`) | versioned closed command-handler structure and typed dispatch |
 | `packages/agent-runner/src/bridge/process.ts` | `packages/process-utils/`, `apps/host-daemon/` | bridge process spawn over stdio, environment rebuild, orderly termination |
 | `packages/agent-runner/src/auth/login-flow.ts` | `plugins/account-pool/src/oauth-login.ts`, `codex-device-login.ts` | device-flow / OAuth interaction model (display, open-URL + user code, prompt, completion) |
 | `packages/launcher/src/native/service.ts` | `apps/server/src/assets/install-machine.sh` | user-scoped launchd/systemd service layout, XML and unit escaping, persistent restart; translated to typed commands, with Konteks-specific paths and an additional Windows adapter |
@@ -31,7 +30,6 @@ files listed below.
 | `packages/supervisor/src/work/orchestrator.ts` (channel handoff, idle reaper), `packages/agent-runner/src/sessions/manager.ts` (`releaseSealed`) | `packages/provider-bridge-acp/src/bridge/bridge.ts` (`startAgentSession`, `releaseSession`, load-or-fresh fallback), `packages/agent-runtime/src/runtime.ts`, `apps/host-daemon/src/app.ts` (idle reaper) | stop a thread's existing session before starting another, release without faking an interruption, continue in a fresh session when the previous one cannot be restored, release sessions idle for 30 minutes; Konteks journals each stop and proves the process group exited |
 | `packages/supervisor/src/session/workspace-tool-policy.ts` | `plugins/provider-claude-code/src/interactive-contract.ts` (runtime permission policy → agent permission mode) | answer ordinary agent permission requests by a runtime policy instead of asking a human per call; Konteks keeps the hosted bash blocklist and workspace-confined file changes |
 | `packages/supervisor/src/session/permissions.ts` (`registerDeferral`), `packages/supervisor/src/session/relayed-session.ts` (`deferToHuman`) | `apps/host-daemon/src/server-client.ts` (`registerInteractiveRequest`), `apps/host-daemon/src/interactive-request-registry.ts` (`registerAndWait`) | register a pending interaction with the server before waiting on a human, retrying only transient failures (100 ms to 2 s, 5 retries), binding the registered record to the exact request, and failing the agent's request when registration never succeeds |
-| `packages/gateway/src/dialects/*.ts`, `packages/gateway/src/proxy.ts` | `plugins/account-pool/src/claude-adapter.ts`, `codex-adapter.ts`, `provider-adapter.ts`, `request-body.ts`, `usage.ts` | per-dialect request-body parsing, model/usage extraction, streaming usage accounting |
 
 ```
 MIT License
@@ -72,6 +70,6 @@ from them enters this repository. `npm run check:agpl` guards this.
 ## Runtime dependencies
 
 - `@agentclientprotocol/sdk` 1.4.0 — Apache-2.0
-- `@agentclientprotocol/claude-agent-acp` 0.75.1 — Apache-2.0 (vendored into the `claude-code` runner image)
-- `@agentclientprotocol/codex-acp` 1.10.0 — Apache-2.0 (vendored into the `codex` runner image)
-- `@modelcontextprotocol/sdk`, `playwright-core`, `ws`, `zod`, `pino`, `commander` — see each package's licence
+- `@agentclientprotocol/claude-agent-acp` 0.75.1 — Apache-2.0 (bundled in the `claude-code` offline agent package)
+- `@agentclientprotocol/codex-acp` 1.10.0 — Apache-2.0 (bundled in the `codex` offline agent package)
+- `ws`, `zod`, `pino`, `commander` — see each package's licence

@@ -12,7 +12,7 @@ import { canonicalize, withoutMembers, type JsonValue } from "./jcs.js";
 import { sha256Base64Url } from "./digest.js";
 
 /**
- * The appliance's ES256 (P-256) instance key. The private half never leaves
+ * The runtime's ES256 (P-256) instance key. The private half never leaves
  * the supervisor's restricted volume, is never mounted into a component or
  * runner, and is never sent after public-key registration.
  */

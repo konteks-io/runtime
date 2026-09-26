@@ -44,9 +44,9 @@ describe("DeepSeek Harness tool governance", () => {
     governance.observe(call("j1", "job_kill", { id: "1" }));
     governance.observe(call("p1", "plugin_manager", { action: "install" }));
     expect(governance.decide(ask("m1"), CWD)).toEqual({ kind: "allow" });
-    expect(governance.decide(ask("m2"), CWD)).toEqual({ kind: "allow" });
     expect(governance.decide(ask("r1"), CWD)).toEqual({ kind: "allow" });
-    for (const id of ["m3", "j1", "p1"]) expect(governance.decide(ask(id), CWD), id).toMatchObject({ kind: "deny" });
+    // The retired browser tool is never mounted, so a server using its name is not Konteks'.
+    for (const id of ["m2", "m3", "j1", "p1"]) expect(governance.decide(ask(id), CWD), id).toMatchObject({ kind: "deny" });
   });
 
   it("denies a request with no tool call behind it, or with nothing to judge", () => {

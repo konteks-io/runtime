@@ -26,6 +26,19 @@ Runtime, Assistant, and ai-manager remain cloud services. Reliability and
 performance are the primary design constraints. Prefer durable, bounded,
 observable recovery and simple ownership over extra coordination layers.
 
+The appliance (the Docker Compose remote instance with its gateway, browser
+tool, preview forwarder and runner images) is retired and deleted; the
+supervisor accepts only `SUPERVISOR_DEPLOYMENT_KIND=native_connector` and
+runners only `agent_local_subscription`. Do not reintroduce Compose, images,
+`gateway_keyed` or a local component server.
+
+Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
+person's own DeepSeek Harness (`dsh`). Pi and OpenCode are retired: every
+write or install refuses them with `retiredAgentMessage` from
+`@konteks/backstage-plugin-common`, while stored values stay readable (a
+`native-runtime.json` still listing them loads without them through
+`parseNativeRuntimeRecord`, with a logged warning).
+
 Before production changes, add or update a focused characterization test and
 observe its failure or baseline. Run focused tests serially; do not start
 multiple Vitest processes or a whole suite during local proof work unless the

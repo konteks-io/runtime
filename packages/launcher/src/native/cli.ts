@@ -23,7 +23,7 @@ export interface NativeCliActions {
   control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; title?: string; keyRef?: string }): Promise<void>;
 }
 
-/** One customer architecture. No appliance, provider-key or cloud-agent fallback switch. */
+/** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
 export function createNativeProgram(actions: NativeCliActions): Command {
   const program = new Command("konteks-remote").description("Konteks native agent connector")
     .option("--root <path>", "private user-scoped installation root")
@@ -104,8 +104,6 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   // description is what the agent finds in `--help`.
   program.command("uninstall").description("remove Konteks from this machine: finish running work, remove this runtime from your workspace, stop the background service and delete the connector's folder; your repositories and your coding agents' logins are left untouched")
     .action(async () => actions.uninstall(context()));
-  // Update/rollback must acquire the native lifecycle transaction; the old
-  // appliance implementations are deliberately not registered here.
   return program;
 }
 

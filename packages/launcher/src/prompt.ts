@@ -3,7 +3,7 @@ import { Writable } from "node:stream";
 import { RemoteInstanceError } from "@konteks/remote-common";
 
 /**
- * The secure no-echo prompt. The activation code and a gateway key are read
+ * The secure no-echo prompt. The activation code and an agent's API key are read
  * here and ONLY here: never from an argument, an environment variable, a
  * file the launcher writes, or a log. The readline output is muted so the
  * terminal never renders the characters; the value goes straight to the

@@ -161,8 +161,7 @@ export const CORE_PATHS = Object.freeze({
   gitKey: (instanceId: string, keyRef: string) => instancePath(instanceId, `git-keys/${encodeURIComponent(keyRef)}`),
   // CONTRACT-GAP: `RemoteWorkAssignment` carries no delivery/validation/qa
   // definition, so the supervisor reads it for a CLAIMED assignment from
-  // this lease-guarded route (added to Core with this seam) and serves it to
-  // the components as the Harness `workload` / the Validation Runtime `spec`.
+  // this lease-guarded route (added to Core with this seam).
   workload: (instanceId: string, assignmentId: string) => instancePath(instanceId, `assignments/${encodeURIComponent(assignmentId)}/workload`),
   // CONTRACT-GAP: durable task-checkout affinity (invariant 15) had no route
   // for the owner to report a materialization. Added to Core with this seam.

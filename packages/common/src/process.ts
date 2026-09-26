@@ -137,7 +137,7 @@ const INHERITED_ENV_DENYLIST = [
 ];
 
 /**
- * A child (bridge, login tool, Compose) receives only the environment it is
+ * A child (bridge, login tool) receives only the environment it is
  * meant to see. Provider keys, activation material, and supervisor secrets are
  * removed by name; callers add exactly the variables a bridge documents.
  */

@@ -6,3 +6,6 @@ Read [AGENTS.md](AGENTS.md) and [HARDENING.md](HARDENING.md) before editing.
 The hardening policy is mandatory for all maintenance work.
 Customer-visible file names are in AGENTS.md: resolve the connector with
 `resolveNativeConnectorExecutable`, never a literal `connector`.
+The runtime is native-only (the appliance is retired and deleted) and runs
+Claude Code, Codex and DeepSeek Harness; Pi and OpenCode are retired (see
+AGENTS.md for how stored values stay readable).

@@ -7,11 +7,10 @@ import { dshRuntimePaths, renderDshKonteksProfile } from "./dsh-profile.js";
 
 /**
  * How this runner spawns its bridge and its official tooling. The bridge is
- * the vendored binary under the image's bridge prefix — never `npx` or a
- * registry lookup. The environment is rebuilt from scratch: a dedicated HOME
- * and XDG directories inside the private credential volume, PATH to the
- * vendored prefix, and — only for a gateway-keyed runner — the provider
- * base-URL variable the bridge documents, pointing at the gateway.
+ * the binary in the installed offline agent package (or the person's own
+ * DeepSeek Harness) — never `npx` or a registry lookup. The environment is
+ * rebuilt from scratch: a dedicated HOME and XDG directories inside the
+ * private credential folder and PATH to the package prefix.
  */
 export interface BridgeSpawnSpec {
   family: AgentBridgeFamily;

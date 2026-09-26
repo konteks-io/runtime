@@ -352,10 +352,9 @@ describe("native Supervisor composition", () => {
     await supervisor.start();
     expect(f.spawn).toHaveBeenCalledOnce();
     expect(listen).not.toHaveBeenCalled();
-    expect(supervisor.gateway).toBeUndefined();
-    expect(supervisor.internal).toBeUndefined();
+    expect((supervisor as unknown as Record<string, unknown>).gateway).toBeUndefined();
+    expect((supervisor as unknown as Record<string, unknown>).internal).toBeUndefined();
     expect((await supervisor.inventory.collect()).components.map(component => component.kind)).toEqual(["agent_runner"]);
-    await expect(supervisor.controlHandler()({ op: "gateway.key.set", agentId: "codex", key: "test-key" }, { event: () => undefined } as never)).rejects.toMatchObject({ code: "capability_unavailable" });
     const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string }> };
     expect(doctor.checks.some(check => check.id === "gateway" || check.id === "component-harness")).toBe(false);
     await supervisor.stop();

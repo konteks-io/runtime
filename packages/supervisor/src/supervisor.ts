@@ -13,7 +13,6 @@ import {
   type ControlAck,
   type ControlHandler,
   type ControlLoginEvent,
-  type GatewayCallObservation,
   type HeartbeatResult,
   type InstanceKeyPair,
   type JsonValue,
@@ -1423,10 +1422,6 @@ export class Supervisor {
     }
   }
 
-  private async sendGatewayObservation(observation: GatewayCallObservation, _signature: string): Promise<void> {
-    await this.observationDelivery.submit(observation);
-  }
-
   private async sendUsageObservation(observation: AgentTurnUsageObservation): Promise<void> {
     await this.observationDelivery.submit(observation);
   }
@@ -1627,9 +1622,6 @@ export class Supervisor {
         }
         case "auth.logout":
           return this.requireRunner(request.agentId).logout();
-        case "gateway.key.set":
-        case "gateway.key.clear":
-          throw new RemoteInstanceError("capability_unavailable", "BYOK is not supported by a native connector.");
         case "git.key.add": {
           const store = this.gitKeys();
           const key = await store.add(request.title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);

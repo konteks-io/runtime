@@ -8,7 +8,7 @@ import { loadReleaseRootsFile } from "./roots.js";
 /**
  * `konteks-release`: the release-tooling stub used by CI. It signs and
  * verifies the exact native manifest consumed by the launcher. It has no
- * appliance/image signing command.
+ * image signing command.
  */
 const program = new Command("konteks-release").description("Konteks Remote Instance release tooling");
 
