@@ -39,7 +39,3 @@ export const RunnerConfigSchema = z
   })
   .passthrough();
 export type RunnerConfig = z.infer<typeof RunnerConfigSchema>;
-
-export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
-  return RunnerConfigSchema.parse(env);
-}

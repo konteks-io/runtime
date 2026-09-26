@@ -3,7 +3,7 @@ import { RemoteInstanceError, type DoctorCheck, type DoctorReport } from "@konte
 
 /**
  * Allowlisted doctor checks: versions, reachability, lease, components,
- * agents, disk, preview exposure. Details carry statuses and
+ * agents, disk. Details carry statuses and
  * revisions — never a path, address, key, lease value, or raw probe output.
  */
 export interface DoctorInputs {
@@ -19,7 +19,6 @@ export interface DoctorInputs {
   configRevision: number;
   diskFreeBytes: number;
   minimumDiskBytes: number;
-  preview: { enabled: boolean; port: number | null; grantPresent: boolean };
   outboxDepth: number;
   recoveryRequired: number;
   coreSignatureConfigured: boolean;
@@ -51,7 +50,6 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
     push({ id: `agent-${agent.agentId}`, title: `Agent ${agent.agentId}`, status: agent.readiness === "ready" ? "pass" : agent.readiness === "not_configured" ? "warn" : "fail", detail: `readiness ${agent.readiness}`, ...(agent.readiness === "not_configured" || agent.readiness === "reconnect_required" ? { recoveryActions: [{ kind: "login_agent", agentId: agent.agentId }] } : {}) });
   }
   push({ id: "disk", title: "Free disk", status: inputs.diskFreeBytes >= inputs.minimumDiskBytes ? "pass" : "fail", detail: `${Math.round(inputs.diskFreeBytes / 1024 ** 3)} GiB free`, ...(inputs.diskFreeBytes >= inputs.minimumDiskBytes ? {} : { recoveryActions: [{ kind: "free_disk" }] }) });
-  push({ id: "preview", title: "Preview exposure", status: inputs.preview.enabled ? "warn" : "pass", detail: inputs.preview.enabled ? `preview ENABLED on local port ${inputs.preview.port}; ${inputs.preview.grantPresent ? "a viewer grant is active" : "no viewer grant"}` : "preview disabled" });
   push({ id: "outbox", title: "Durable outbox", status: inputs.outboxDepth === 0 ? "pass" : "warn", detail: `${inputs.outboxDepth} item(s) awaiting Core acknowledgement` });
   push({ id: "recovery", title: "Recovery required", status: inputs.recoveryRequired === 0 ? "pass" : "warn", detail: `${inputs.recoveryRequired} assignment(s) need recovery` });
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });

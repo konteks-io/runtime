@@ -41,7 +41,6 @@ export * from "./skills/staging.js";
 export * from "./skills/session-inputs.js";
 export * from "./reconnect/reconciliation.js";
 export * from "./native/model-capability-snapshot.js";
-export * from "./preview/preview-channel.js";
 export * from "./support/doctor.js";
 export * from "./support/bundle.js";
 export * from "./runner-port.js";

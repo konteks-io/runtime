@@ -7,7 +7,7 @@ import { WebSocketServer } from "ws";
 import { afterEach, expect, it, vi } from "vitest";
 import { connectCodexLocalTransport } from "../bridge/codex-local-transport.js";
 import { readCodexAccount } from "../auth/codex-account.js";
-import { loadRunnerConfig } from "../config.js";
+import { RunnerConfigSchema } from "../config.js";
 import { findAgentBridge } from "@konteks/remote-release";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -66,7 +66,7 @@ it.skipIf(process.platform === "win32")("reads the executing shared server accou
     }
   }));
   const spawn = vi.fn(), stop = vi.fn();
-  const config = loadRunnerConfig({ RUNNER_AGENT_ID: "codex", RUNNER_NATIVE_CODEX_SOCKET: f.socket });
+  const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_NATIVE_CODEX_SOCKET: f.socket });
   expect(await readCodexAccount(config, findAgentBridge("codex")!, {}, { spawn, stop })).toBe("local-owner@example.test");
   expect(methods).toEqual(["initialize", "initialized", "account/read"]);
   expect(spawn).not.toHaveBeenCalled(); expect(stop).not.toHaveBeenCalled(); expect(f.server.listening).toBe(true);

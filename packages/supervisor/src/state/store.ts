@@ -102,9 +102,10 @@ export const DEFAULT_CONFIG: ConfigRecord["configuration"] = {
   logLevel: "info",
   updateChannel: "stable",
   evidenceUpload: "structured_only",
-  gateway: { capEnforcementStage: "observe", egressAllowlistRevision: "" },
   permissionResponderDeadlineSeconds: 300,
   humanDeferralAllowed: true,
+  deploymentKind: "native_connector",
+  roleBindings: [],
 };
 
 const CursorsSchema = z.record(z.string(), z.object({ to_core: z.number().int().nonnegative(), to_runtime: z.number().int().nonnegative(),

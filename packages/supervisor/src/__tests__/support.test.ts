@@ -5,11 +5,6 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SECRET_CANARIES, containsCanary } from "@konteks/remote-common";
 import { buildSupportBundle } from "../support/bundle.js";
 import { runDoctor } from "../support/doctor.js";
-import { PreviewChannel } from "../preview/preview-channel.js";
-import { LeaseState } from "../lease/lease.js";
-import { FixedClock } from "@konteks/remote-common";
-import type { TransportManager } from "../transport/relay-transport.js";
-import type { OutboundMessage } from "../transport/transport.js";
 
 let dir = "";
 beforeEach(async () => {
@@ -34,14 +29,13 @@ describe("doctor and support bundle", () => {
       configRevision: 3,
       diskFreeBytes: 100 * 1024 ** 3,
       minimumDiskBytes: 30 * 1024 ** 3,
-      preview: { enabled: true, port: 5173, grantPresent: false },
       outboxDepth: 0,
       recoveryRequired: 0,
       coreSignatureConfigured: true,
     });
     const agent = report.checks.find((check) => check.id === "agent-codex");
     expect(agent?.recoveryActions).toEqual([{ kind: "login_agent", agentId: "codex" }]);
-    expect(report.checks.find((check) => check.id === "preview")?.status).toBe("warn");
+    expect(report.checks.find((check) => check.id === "preview")).toBeUndefined();
     expect(JSON.stringify(report)).not.toContain(dir);
   });
 
@@ -60,32 +54,5 @@ describe("doctor and support bundle", () => {
     expect(containsCanary(JSON.stringify(bundle.document))).toBe(false);
     expect(JSON.stringify(bundle.document)).not.toContain("abcdefghijklmnop");
     expect(bundle.chunks[0]).toMatchObject({ index: 0, total: 1, contentType: "application/json" });
-  });
-});
-
-describe("preview channel policy on the supervisor", () => {
-  it("refuses while disabled or under a drain_only lease, enforces policy, and re-checks response headers", () => {
-    const clock = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
-    const lease = new LeaseState(clock);
-    lease.set({ lease: "2026-09-06T00:00:00Z", mode: "active", expiresAt: "2026-09-07T00:00:00Z", drainDeadline: null, issuedAt: "2026-09-06T00:00:00Z", workspaceId: "w" });
-    const sent: OutboundMessage[] = [];
-    const forwarded: unknown[] = [];
-    const transport = { send: (message: OutboundMessage) => void sent.push(message), openChannel: () => undefined, closeChannel: () => undefined } as unknown as TransportManager;
-    const preview = new PreviewChannel({ transport, lease, sendToForwarder: (_channelId, chunk) => (forwarded.push(chunk), true), configureForwarder: () => undefined });
-    preview.onToRuntime("preview:1", { streamId: "s", kind: "request", method: "GET", path: "/", headers: {}, final: true });
-    expect(preview.counters.refusedDisabled).toBe(1);
-    preview.enable(5173);
-    preview.onToRuntime("preview:1", { streamId: "s", kind: "request", method: "GET", path: "http://evil/", headers: {}, final: true });
-    expect(preview.counters.rejectedPaths).toBe(1);
-    preview.onToRuntime("preview:1", { streamId: "s", kind: "request", method: "GET", path: "/", headers: { cookie: "x" }, final: true });
-    expect(preview.counters.rejectedHeaders).toBe(1);
-    preview.onToRuntime("preview:1", { streamId: "s", kind: "request", method: "GET", path: "/ok", headers: { accept: "*/*" }, final: true });
-    expect(forwarded).toHaveLength(1);
-    preview.onToCore("preview:1", { streamId: "s", kind: "response", status: 200, headers: { "content-type": "text/html", "set-cookie": "leak" } as never, final: true });
-    expect((sent.at(-1)?.body as { headers: Record<string, string> }).headers).toEqual({ "content-type": "text/html" });
-    lease.set({ lease: "2026-09-06T00:00:00Z", mode: "drain_only", expiresAt: "2026-09-07T00:00:00Z", drainDeadline: "2026-09-07T00:00:00Z", issuedAt: "2026-09-06T00:00:00Z", workspaceId: "w" });
-    preview.onToRuntime("preview:2", { streamId: "s", kind: "request", method: "GET", path: "/", headers: {}, final: true });
-    expect(preview.counters.refusedDisabled).toBe(2);
-    expect(preview.exposure()).toMatchObject({ enabled: true, port: 5173, grantPresent: true });
   });
 });

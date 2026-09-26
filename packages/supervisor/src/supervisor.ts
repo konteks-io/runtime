@@ -52,7 +52,6 @@ import { OnboardWorkCarrier, type OnboardWorkAssignment } from "./onboard/carrie
 import type { PlatformMcpEntry } from "./work/workload.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
-import { PreviewChannel } from "./preview/preview-channel.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { ChannelMux } from "./relay/channel-mux.js";
@@ -95,7 +94,7 @@ import { evaluateHeartbeatLiveness } from "./heartbeat/liveness.js";
 
 /**
  * The composition root: wires state, transport, heartbeat, control, work,
- * sessions, preview, and the loopback control socket into one supervisor.
+ * sessions, and the loopback control socket into one supervisor.
  */
 // The onboard lane (evidence collector and relocation worker) is always
 // composed below, so its two kinds are accepted too. Leaving them out meant
@@ -152,6 +151,7 @@ export class Supervisor {
   private modelCapabilities: ModelCapabilitySnapshotProducer | null = null;
   private roots: EmbeddedReleaseRoot[] = [];
   private manifestDigest = "";
+  /** Core's desired configuration; native, with no roles, until Core sends one. */
   private configuration: ConfigRecord["configuration"] = DEFAULT_CONFIG;
   private roleBindings: RoleBinding[] = [];
   private draining = false;
@@ -185,7 +185,6 @@ export class Supervisor {
   private planningTerminal!: PlanningTerminalDirectiveProcessor;
   private planningDirectivePoller: ControllerDirectivePoller | null = null;
   reconciliation!: Reconciliation;
-  preview!: PreviewChannel;
   broker!: PermissionBroker;
   readonly runners = new Map<string, RunnerPort>();
   private readonly nativeRunners: NativeRunner[] = [];
@@ -232,8 +231,6 @@ export class Supervisor {
 
   constructor(config: SupervisorConfig = loadSupervisorConfig(), private readonly options: SupervisorOptions = {}) {
     this.config = config;
-    const { gateway: _gateway, ...policy } = DEFAULT_CONFIG;
-    this.configuration = { ...policy, deploymentKind: "native_connector", roleBindings: [] };
     this.logger = createLogger({ name: "supervisor" });
     this.stateMutations = new StateMutationGate(() => {
       if (!this.nativeOwnership) throw new RemoteInstanceError("temporarily_unavailable", "Native state ownership has not been acquired.");
@@ -846,9 +843,6 @@ export class Supervisor {
       withLeaseAcquisition: operation => this.withLeaseAcquisition(operation),
     });
 
-    // A native connector has no local preview forwarder: preview frames Core
-    // sends are answered as undeliverable and local exposure stays disabled.
-    this.preview = new PreviewChannel({ transport: this.transport, lease: this.lease, sendToForwarder: () => false, configureForwarder: () => undefined });
     this.heartbeat = new HeartbeatPublisher({
       store: this.store,
       runnerIncarnation: () => this.runnerIncarnation,
@@ -1372,7 +1366,7 @@ export class Supervisor {
         await this.work.onSessionMessage(message.channelId, message.body);
         return;
       case "preview":
-        this.preview.onToRuntime(message.channelId, message.body);
+        // No local preview is ever exposed: a preview frame has nothing to reach.
         return;
     }
   }
@@ -1380,7 +1374,6 @@ export class Supervisor {
   private async onChannelReset(channelId: string): Promise<void> {
     const channel = channelOf(channelId);
     if (channel === "session") await this.work.onChannelReset(channelId);
-    else if (channel === "preview") this.preview.closeChannel(channelId);
     else if (channel === "assignment" || channel === "observation") await this.work.reports.flushAll();
   }
 
@@ -1580,8 +1573,9 @@ export class Supervisor {
       roles: (this.heartbeat?.roles() ?? []) as SupervisorStatus["roles"],
       roleBindings: this.roleBindings,
       utilization: { acceptingWork: !this.draining && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
-      previewEnabled: this.preview?.exposure().enabled ?? false,
-      previewExposure: this.preview?.exposure().enabled ? { port: this.preview.exposure().port ?? 0, grantPresent: this.preview.exposure().grantPresent } : null,
+      // A native connector never forwards a local preview (wire fields kept for Core).
+      previewEnabled: false,
+      previewExposure: null,
       pendingErase: this.journal.erase.all().filter((record) => !record.receiptSent).length,
       pendingRevocation: this.pendingRevocation,
       journal: { assignments: this.journal.activeAssignments().length, outboxDepth: this.outbox.depth, recoveryRequired: this.journal.recoveryRequired().length },
@@ -1648,8 +1642,7 @@ export class Supervisor {
         case "preview.enable":
           throw new RemoteInstanceError("capability_unavailable", "Native preview forwarding has not been configured.");
         case "preview.disable":
-          this.preview.disable();
-          return this.preview.exposure();
+          return { enabled: false, port: null, grantPresent: false };
         case "drain":
           return { activeAssignments: await this.beginDrain(request.reason, null) };
         case "drain.status":
@@ -1689,7 +1682,7 @@ export class Supervisor {
             administrativeStatus: this.administrativeStatus,
             doctor,
             configurationKeys: flattenKeys(this.configuration),
-            counters: { relay: { ...this.mux.counters }, control: { ...this.control.counters }, work: { ...this.work.counters }, preview: { ...this.preview.counters } },
+            counters: { relay: { ...this.mux.counters }, control: { ...this.control.counters }, work: { ...this.work.counters } },
             recentLogLines: this.logLines,
             generatedAt: this.clock.nowIso(),
           }).document;
@@ -1833,7 +1826,6 @@ export class Supervisor {
       diskFreeBytes: snapshot.diskFreeBytes,
       // Native releases name no disk minimum; the check reports free space only.
       minimumDiskBytes: 0,
-      preview: this.preview.exposure(),
       outboxDepth: this.outbox.depth,
       recoveryRequired: this.journal.recoveryRequired().length,
       coreSignatureConfigured: this.roots.some((root) => (root.coreControlKeys ?? []).length > 0),
