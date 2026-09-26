@@ -491,6 +491,8 @@ export const PreviewStatusReportSchema = z
           message: z.string(),
           startedAt: z.string().nullable(),
           readyAt: z.string().nullable(),
+          /** Who started it: the agent (preview_start) or a viewer opening it in Konteks. Absent from an older connector. */
+          startedBy: z.enum(["agent", "viewer"]).nullable().optional(),
           viewerConnected: z.boolean(),
         })
         .strict(),

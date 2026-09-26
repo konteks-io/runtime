@@ -119,6 +119,11 @@ export class PreviewForwarder {
     return this.streams.size;
   }
 
+  /** Whether a viewer stream is open (a continuation chunk belongs to it). */
+  hasStream(streamId: string): boolean {
+    return this.streams.has(streamId);
+  }
+
   start(): void {
     if (this.sweeper) return;
     this.sweeper = setInterval(() => this.sweepIdle(), Math.min(10_000, Math.max(1_000, Math.floor(this.limits.idleStreamTimeoutMs / 4))));

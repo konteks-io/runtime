@@ -24,6 +24,13 @@ export interface SessionPreviewAccess {
   stop(sessionId: string, reason: string): Promise<PreviewStatus>;
   status(sessionId: string): PreviewStatus;
   touch(sessionId: string): void;
+  /**
+   * The session's worktree may be previewed: a viewer opening the preview in
+   * Konteks starts it when nothing runs. Remembered until `forget`.
+   */
+  permit?(sessionId: string, cwd: string): void;
+  /** The session ended: no viewer starts its preview any more. */
+  forget?(sessionId: string): void;
 }
 
 /** Work kinds whose agent may run a preview: code that changes, is validated or is checked. */
@@ -202,6 +209,8 @@ export class PreviewMcpServer {
 /** The plain-text answer an agent reads; the same facts are in structuredContent. */
 export function describeStatus(status: PreviewStatus): string {
   const lines = [`Preview: ${status.state}${status.phase && status.state === "starting" ? ` (${status.phase})` : ""}`, status.message];
+  if (status.startedBy === "viewer") lines.push("Started by a viewer who opened the preview in Konteks.");
+  else if (status.startedBy === "agent") lines.push("Started by the agent (preview_start).");
   if (status.url) lines.push(`Loopback URL (a browser on this computer): ${status.url}`);
   if (status.command) lines.push(`Command: ${status.command}${status.explanation ? ` — ${status.explanation}` : ""}`);
   if (status.install) lines.push(`Install step: ${status.install}`);

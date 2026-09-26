@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import type { PreviewToCoreChunk, RelayChannel } from "@konteks/remote-common";
 import { PreviewForwarder } from "../preview/forwarder.js";
-import { PreviewChannel, sessionIdOf } from "../preview/preview-channel.js";
+import { PreviewChannel, STARTING_MESSAGE, sessionIdOf } from "../preview/preview-channel.js";
 import type { OutboundMessage } from "../transport/transport.js";
 
 let server: Server;
@@ -189,7 +189,7 @@ describe("preview forwarder (loopback only, D125 policy on this hop)", () => {
 });
 
 describe("preview channel on the supervisor", () => {
-  function channel(options: { origin?: string | null; canOpen?: boolean } = {}) {
+  function channel(options: { origin?: string | null; canOpen?: boolean; autoStart?: (sessionId: string) => Promise<boolean> } = {}) {
     const sent: OutboundMessage[] = [];
     const opened: Array<[string, RelayChannel]> = [];
     const closed: string[] = [];
@@ -198,7 +198,11 @@ describe("preview channel on the supervisor", () => {
     const instance = new PreviewChannel({
       transport: { send: message => void sent.push(message), openChannel: (id, kind) => void opened.push([id, kind]), closeChannel: id => void closed.push(id) },
       lease: { canOpenChannel: () => canOpen },
-      previews: { originFor: () => options.origin === undefined ? origin : options.origin, touch: id => void touched.push(id) },
+      previews: {
+        originFor: () => options.origin === undefined ? origin : options.origin,
+        touch: id => void touched.push(id),
+        ...(options.autoStart ? { autoStart: options.autoStart } : {}),
+      },
     });
     return { instance, sent, opened, closed, touched, setCanOpen: (value: boolean) => { canOpen = value; } };
   }
@@ -236,7 +240,34 @@ describe("preview channel on the supervisor", () => {
     f.setCanOpen(true);
     f.instance.onToRuntime("preview:s", { streamId: "m", kind: "request", method: "TRACE", path: "/", headers: {}, final: true });
     expect(bodies(f.sent)[1]).toMatchObject({ streamId: "m", status: 400 });
-    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1 });
+    expect(f.instance.counters).toEqual({ malformed: 1, refusedDraining: 1, autoStarted: 0 });
+  });
+
+  it("starts the preview for a viewer's first request when nothing runs, and says it is starting", async () => {
+    const autoStart = vi.fn(async () => true);
+    const f = channel({ origin: null, autoStart });
+    f.instance.onToRuntime("preview:sess-3", { streamId: "v", kind: "request", method: "GET", path: "/", headers: { accept: "text/html" }, final: true });
+    await vi.waitFor(() => expect(f.sent).toHaveLength(1));
+    expect(autoStart).toHaveBeenCalledWith("sess-3");
+    const reply = bodies(f.sent)[0] as Extract<PreviewToCoreChunk, { kind: "response" }>;
+    expect(reply).toMatchObject({ streamId: "v", kind: "response", status: 503, final: true, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+    expect(Buffer.from(reply.body ?? "", "base64url").toString()).toBe(STARTING_MESSAGE);
+    expect(STARTING_MESSAGE.startsWith("Starting preview")).toBe(true);
+    expect(f.instance.counters.autoStarted).toBe(1);
+  });
+
+  it("answers plainly when a viewer may not start it, and never auto-starts for a multi-part body", async () => {
+    const autoStart = vi.fn(async () => false);
+    const f = channel({ origin: null, autoStart });
+    f.instance.onToRuntime("preview:sess-4", { streamId: "n", kind: "request", method: "GET", path: "/", headers: {}, final: true });
+    await vi.waitFor(() => expect(f.sent).toHaveLength(1));
+    const reply = bodies(f.sent)[0] as Extract<PreviewToCoreChunk, { kind: "response" }>;
+    expect(reply.status).toBe(503);
+    expect(Buffer.from(reply.body ?? "", "base64url").toString()).toMatch(/^No preview is running/);
+
+    autoStart.mockClear();
+    f.instance.onToRuntime("preview:sess-4", { streamId: "p", kind: "request", method: "POST", path: "/x", headers: {}, body: b64("part"), final: false });
+    expect(autoStart).not.toHaveBeenCalled();
   });
 
   it("reads the session id only from a well-formed preview channel id", () => {

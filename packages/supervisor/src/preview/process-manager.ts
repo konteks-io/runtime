@@ -24,6 +24,8 @@ import { resolvePreviewPath } from "./user-path.js";
  * machine responsive.
  */
 export type PreviewState = "not_started" | "starting" | "running" | "failed" | "stopped";
+/** Who started a preview: the session's agent (preview_start) or a viewer opening it in Konteks. */
+export type PreviewStarter = "agent" | "viewer";
 export type PreviewPhase = "install" | "prepare" | "serve";
 
 export interface PreviewStatus {
@@ -45,6 +47,8 @@ export interface PreviewStatus {
   readyAt: string | null;
   idleStopMinutes: number;
   logTail: string[];
+  /** Who started it; null when none has been started. */
+  startedBy: PreviewStarter | null;
 }
 
 export interface PreviewChild {
@@ -127,6 +131,7 @@ export function buildPreviewEnv(base: NodeJS.ProcessEnv, path: string, port: num
 interface Entry {
   sessionId: string;
   cwd: string;
+  startedBy: PreviewStarter;
   generation: number;
   state: PreviewState;
   phase: PreviewPhase | null;
@@ -176,7 +181,7 @@ export class PreviewProcessManager {
    * Resolves as soon as the attempt is under way; `waitForSettled` waits for
    * it to answer or fail.
    */
-  async start(sessionId: string, cwd: string): Promise<PreviewStatus> {
+  async start(sessionId: string, cwd: string, startedBy: PreviewStarter = "agent"): Promise<PreviewStatus> {
     if (this.closed) return this.refusal(sessionId, "The connector is stopping; previews cannot start now.");
     const current = this.entries.get(sessionId);
     if (current && (current.state === "starting" || current.state === "running") && current.cwd === cwd && !current.stopping) {
@@ -189,7 +194,7 @@ export class PreviewProcessManager {
       return this.refusal(sessionId, `${active.length} previews are already running on this computer (the limit is ${this.maxRunning}, to keep it responsive). Stop one with preview_stop, or wait until one stops after ${Math.round(this.idleMs / 60_000)} idle minutes.`);
     }
     const entry: Entry = {
-      sessionId, cwd, generation: ++this.generation, state: "starting", phase: null, plan: null, port: null, host: null, child: null,
+      sessionId, cwd, startedBy, generation: ++this.generation, state: "starting", phase: null, plan: null, port: null, host: null, child: null,
       logs: [], message: "Starting: reading how to serve this working copy.", notes: [], startedAt: this.now(), readyAt: null,
       lastActivityAt: this.now(), settled: Promise.resolve(), stopping: null,
     };
@@ -215,7 +220,7 @@ export class PreviewProcessManager {
     const entry = this.entries.get(sessionId) ?? [...this.ended].reverse().find(candidate => candidate.sessionId === sessionId);
     if (!entry) {
       return { sessionId, state: "not_started", phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [],
-        message: "No preview has been started for this session. Call preview_start.", startedAt: null, readyAt: null, idleStopMinutes: Math.round(this.idleMs / 60_000), logTail: [] };
+        message: "No preview has been started for this session. Call preview_start.", startedAt: null, readyAt: null, idleStopMinutes: Math.round(this.idleMs / 60_000), logTail: [], startedBy: null };
     }
     return this.view(entry);
   }
@@ -472,6 +477,7 @@ export class PreviewProcessManager {
       readyAt: entry.readyAt === null ? null : new Date(entry.readyAt).toISOString(),
       idleStopMinutes: Math.round(this.idleMs / 60_000),
       logTail: entry.logs.slice(-LOG_TAIL),
+      startedBy: entry.startedBy,
     };
   }
 }

@@ -313,6 +313,9 @@ export class RelayedSession {
       }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
       this.previewTools = tools;
       this.previewSessionId = sessionId;
+      // A viewer may start this worktree's preview too (the same process
+      // manager and inference as preview_start).
+      preview.permit?.(sessionId, cwd);
       mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
     }
     // Optional tool wiring (Graft) ran alongside redemption and the facade.
@@ -1179,6 +1182,7 @@ export class RelayedSession {
   private stopPreview(reason: string): void {
     const sessionId = this.previewSessionId;
     if (sessionId === null || !this.deps.preview) return;
+    this.deps.preview.forget?.(sessionId);
     void this.deps.preview.stop(sessionId, reason).catch(error => this.logger.warn({ event: "preview.stop_failed", assignmentId: this.assignment.id, err: error }, "session preview could not be stopped"));
   }
 

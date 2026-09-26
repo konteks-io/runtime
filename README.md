@@ -113,7 +113,14 @@ others), and the connector:
 
 People open the preview from the session in Konteks; the relay carries it on
 the session's `preview:<sessionId>` channel to this computer, which forwards
-it only to that session's own port. A preview stops after 30 minutes with no
+it only to that session's own port. Nobody has to ask the agent first: when a
+viewer opens a session's preview and nothing runs, the connector starts it
+itself (same inference, same caps) as long as the session's worktree is still
+here and this computer takes work, and answers "Starting preview" until it is
+up; Konteks shows a page that refreshes by itself meanwhile. A preview that
+just failed is not restarted on every refresh (at most once a minute).
+`preview_status` and `konteks-remote preview status` say whether the agent or
+a viewer started it. A preview stops after 30 minutes with no
 viewer and no agent activity, when its session ends, when this computer
 stops taking work or loses its lease, and when the connector stops; a
 restarted connector kills any preview a crashed one left and never adopts

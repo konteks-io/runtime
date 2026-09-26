@@ -49,7 +49,7 @@ export async function previewStatus(context: ControlContext): Promise<void> {
     : "Previews: not offered (this connector has no relay connection configured).");
   if (value.previews.length === 0) context.output.line("No session preview has run since the connector started.");
   for (const preview of value.previews) {
-    context.output.line(`${preview.sessionId}: ${preview.state}${preview.url ? ` at ${preview.url}` : ""}${preview.viewerConnected ? " (a viewer is connected)" : ""}`);
+    context.output.line(`${preview.sessionId}: ${preview.state}${preview.url ? ` at ${preview.url}` : ""}${preview.startedBy === "viewer" ? " (started by a viewer)" : ""}${preview.viewerConnected ? " (a viewer is connected)" : ""}`);
     if (preview.command) context.output.line(`  command: ${preview.command}${preview.explanation ? ` — ${preview.explanation}` : ""}`);
     context.output.line(`  ${preview.message}`);
   }

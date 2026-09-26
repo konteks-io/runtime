@@ -173,7 +173,7 @@ describe("relayed session (D98/D113/D114)", () => {
   describe("preview tools (native preview)", () => {
     function previewAccess() {
       const status = (sessionId: string, state: "running" | "stopped") => ({ sessionId, state, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: state, startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [] });
-      return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn() };
+      return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn(), permit: vi.fn(), forget: vi.fn() };
     }
 
     it("mounts the session's preview tools beside the platform facade, bound to its session and worktree", async () => {
@@ -195,6 +195,16 @@ describe("relayed session (D98/D113/D114)", () => {
       await expect(fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value }, body: "{}" })).rejects.toThrow();
     });
 
+    it("lets a viewer start the preview in the session's worktree while the session lasts", async () => {
+      const preview = previewAccess();
+      const f = await build({ preview });
+      await f.session.bootstrap();
+      expect(preview.permit).toHaveBeenCalledWith("s", "/private/native/checkout");
+      expect(preview.forget).not.toHaveBeenCalled();
+      await f.session.close("cancelled");
+      expect(preview.forget).toHaveBeenCalledWith("s");
+    });
+
     it("gives planning sessions no preview tools", async () => {
       const preview = previewAccess();
       const f = await build({ preview }, { ...assignment, kind: "planning" } as RemoteWorkAssignment);
@@ -203,6 +213,7 @@ describe("relayed session (D98/D113/D114)", () => {
       expect(mcpServers.map(server => server.name)).toEqual(["konteks"]);
       await f.session.close("cancelled");
       expect(preview.stop).not.toHaveBeenCalled();
+      expect(preview.permit).not.toHaveBeenCalled();
     });
   });
 

@@ -163,6 +163,18 @@ describe("supervised preview process manager", () => {
     expect(f.children).toHaveLength(1);
   });
 
+  it("records who started a preview: the agent by default, a viewer when one opened it, and keeps it on reuse", async () => {
+    const f = manager();
+    expect(f.instance.status("s1").startedBy).toBeNull();
+    expect(await f.instance.start("s1", "/work/s1", "viewer")).toMatchObject({ state: "starting", startedBy: "viewer" });
+    f.setUp(true);
+    await f.instance.waitForSettled("s1", 2_000);
+    // The agent's preview_start reuses the running preview; who started it does not change.
+    expect(await f.instance.start("s1", "/work/s1")).toMatchObject({ state: "running", startedBy: "viewer" });
+    expect(f.instance.list()[0]).toMatchObject({ sessionId: "s1", startedBy: "viewer" });
+    expect(await f.instance.start("s2", "/work/s2")).toMatchObject({ startedBy: "agent" });
+  });
+
   it("runs install before the server, and reports a failing step with its log", async () => {
     const f = manager({}, { ok: true, plan: { command: "npm run dev", install: "npm install", healthPath: "/", env: {}, source: "inferred", explanation: "x", notes: [] } });
     await f.instance.start("s", "/w");

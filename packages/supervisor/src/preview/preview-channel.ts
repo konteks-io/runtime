@@ -1,4 +1,4 @@
-import { PreviewToRuntimeChunkSchema, createLogger, type Logger, type PreviewToCoreChunk, type RelayChannel } from "@konteks/remote-common";
+import { PreviewToRuntimeChunkSchema, createLogger, type Logger, type PreviewToCoreChunk, type PreviewToRuntimeChunk, type RelayChannel } from "@konteks/remote-common";
 import type { OutboundMessage } from "../transport/transport.js";
 import { PreviewForwarder, type PreviewForwarderCounters, type PreviewForwarderOptions } from "./forwarder.js";
 
@@ -20,6 +20,12 @@ export interface PreviewChannelDeps {
     originFor(sessionId: string): string | null;
     /** Viewer traffic counts as activity for the idle stop. */
     touch(sessionId: string): void;
+    /**
+     * A viewer asked for a preview that is not running. Start it (same process
+     * manager, inference and caps as preview_start) when this session's
+     * worktree exists and a preview is permitted; true while one is starting.
+     */
+    autoStart?(sessionId: string): Promise<boolean>;
   };
   /** True while the channel may take more to_core bytes (the mux's unacked window). */
   hasCapacity?: (channelId: string) => boolean;
@@ -28,13 +34,18 @@ export interface PreviewChannelDeps {
 }
 
 const CAPACITY_POLL_MS = 25;
+/**
+ * The answer while a viewer's preview starts. Konteks recognises the phrase
+ * (a 503, plain text, no-store) and shows a page that refreshes by itself.
+ */
+export const STARTING_MESSAGE = "Starting preview. This page refreshes when it is ready.";
 const CAPACITY_WAIT_MS = 120_000;
 
 export class PreviewChannel {
   private readonly forwarders = new Map<string, PreviewForwarder>();
   private readonly logger: Logger;
   private disposed = false;
-  readonly counters = { malformed: 0, refusedDraining: 0 };
+  readonly counters = { malformed: 0, refusedDraining: 0, autoStarted: 0 };
 
   constructor(private readonly deps: PreviewChannelDeps) {
     this.logger = deps.logger ?? createLogger({ name: "preview-channel" });
@@ -56,6 +67,36 @@ export class PreviewChannel {
       if (chunk.kind === "request") this.reply(channelId, chunk.streamId, 503, "This computer is not taking preview traffic right now (it is draining or disconnected).");
       return;
     }
+    // A viewer's first request for a session with nothing running: start it
+    // and say so, instead of "nothing is running". Only a request that is
+    // complete in one chunk (a page load, an asset, an upgrade): a multi-part
+    // body keeps going to the forwarder, which answers it plainly.
+    if (
+      chunk.kind === "request" &&
+      chunk.final &&
+      this.deps.previews.autoStart &&
+      this.deps.previews.originFor(sessionId) === null &&
+      !this.forwarders.get(channelId)?.hasStream(chunk.streamId)
+    ) {
+      void this.startForViewer(channelId, sessionId, chunk);
+      return;
+    }
+    this.forwarderFor(channelId, sessionId).handle(chunk);
+  }
+
+  private async startForViewer(channelId: string, sessionId: string, chunk: Extract<PreviewToRuntimeChunk, { kind: "request" }>): Promise<void> {
+    let starting = false;
+    try {
+      starting = await this.deps.previews.autoStart!(sessionId);
+    } catch (error) {
+      this.logger.warn({ event: "preview.auto_start_failed", err: error }, "a viewer's preview could not be started");
+    }
+    if (starting) {
+      this.counters.autoStarted += 1;
+      this.reply(channelId, chunk.streamId, 503, STARTING_MESSAGE);
+      return;
+    }
+    // Not permitted or not possible here: the forwarder answers as it always has.
     this.forwarderFor(channelId, sessionId).handle(chunk);
   }
 
@@ -84,7 +125,7 @@ export class PreviewChannel {
     return total;
   }
 
-  counterTotals(): PreviewForwarderCounters & { channels: number; malformed: number; refusedDraining: number } {
+  counterTotals(): PreviewForwarderCounters & { channels: number; malformed: number; refusedDraining: number; autoStarted: number } {
     const totals: PreviewForwarderCounters = { streams: 0, rejectedPaths: 0, rejectedHeaders: 0, refusedNoPreview: 0, refusedStreamCap: 0, oversized: 0, idleClosed: 0, upstreamFailures: 0 };
     for (const forwarder of this.forwarders.values()) {
       for (const key of Object.keys(totals) as Array<keyof PreviewForwarderCounters>) totals[key] += forwarder.counters[key];

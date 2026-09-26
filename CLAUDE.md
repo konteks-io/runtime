@@ -11,4 +11,9 @@ Claude Code, Codex and DeepSeek Harness; Pi and OpenCode are retired (see
 AGENTS.md for how stored values stay readable).
 Session previews run in the supervisor (`packages/supervisor/src/preview/`):
 one supervised dev server per session, forwarded only to its own loopback
-port; the per-machine switch is Core's (see AGENTS.md).
+port; the per-machine switch is Core's (see AGENTS.md). A viewer's first
+request for a session with nothing running starts it (`PreviewChannel`
+`autoStart`, `Supervisor.startPreviewForViewer`) in the worktree the session
+registered with `SessionPreviewAccess.permit`, answering 503
+`STARTING_MESSAGE` ("Starting preview…", which Core turns into a refreshing
+page); `startedBy` records agent or viewer.
