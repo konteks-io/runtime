@@ -12,9 +12,7 @@
     "packages/common",
     "packages/release",
     "packages/sysmon",
-    "packages/gateway",
     "packages/agent-runner",
-    "packages/browser-tool",
     "packages/preview-forwarder",
     "packages/supervisor",
     "packages/launcher"
@@ -32,8 +30,7 @@
     "release:manifest": "tsx packages/release/src/cli.ts",
     "ci:check": "npm run lint && npm run typecheck && npm test && npm run check:agpl && npm run check:secret-canary",
     "check:agpl": "node scripts/check-agpl.mjs",
-    "check:secret-canary": "node scripts/check-secret-canary.mjs",
-    "image:deps": "node scripts/pin-registry-deps.mjs"
+    "check:secret-canary": "node scripts/check-secret-canary.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

@@ -269,7 +269,7 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
   const beforePrompt = vi.fn(async () => undefined);
   const session = new RelayedSession(work, { clock: f.clock, journal: f.journal, runner: runner as unknown as RunnerPort,
     transport: { send, openChannel: vi.fn() } as unknown as TransportManager,
-    instanceId: "instance", deploymentKind: "native_connector", workspaceRoot: root, browserToolUrl: null,
+    instanceId: "instance", deploymentKind: "native_connector", workspaceRoot: root,
     executionAuthority: { client: f.client, runnerIncarnation: "runner" }, assertExecutionOwned: f.assertOwned,
     // The orchestrator wires settlement recording for every native session.
     recordCompletedSettlement: async () => undefined,

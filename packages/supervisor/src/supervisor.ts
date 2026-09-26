@@ -770,7 +770,6 @@ export class Supervisor {
           const deadlineAtMs = Date.now() + Math.max(0, Date.parse(target.expiresAt) - this.clock.coreNow());
           return this.core.redeemCapabilityToken(this.instanceId ?? "", { assignmentId: target.id, attempt: target.attempt, mcpCapabilityTokenRef: target.agentRoute.mcpCapabilityTokenRef ?? "" }, deadlineAtMs);
         },
-        browserToolUrl: this.native ? null : this.config.SUPERVISOR_BROWSER_TOOL_URL,
         workspaceRoot: this.native ? this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR : "/workspace",
         ...(this.native ? {
           deploymentKind: "native_connector" as const,

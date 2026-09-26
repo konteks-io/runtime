@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
-import type { HostOs } from "../paths.js";
+/** The host operating systems a native connector runs on. */
+export type HostOs = "macos" | "windows" | "debian";
 
 export interface NativePlatform {
   os: HostOs;
@@ -17,7 +18,7 @@ export function nativePlatform(platform: NodeJS.Platform = process.platform, arc
   return { os, architecture: arch === "x64" ? "amd64" : "arm64", containerBackend: "none", deploymentKind: "native_connector" };
 }
 
-/** Separate from appliance volumes: no database, domain runtime, browser, or gateway. */
+/** The connector's private folder: no database, domain runtime, browser, or gateway. */
 export function nativePaths(input: { os: HostOs; home?: string; root?: string }) {
   const path = input.os === "windows" ? win32 : posix;
   const home = input.home ?? homedir();

@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 // npm/npx are .cmd shims on Windows and need a shell to spawn.
 const shell = process.platform === "win32";
 const npx = shell ? "npx.cmd" : "npx";
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) => (value.startsWith("--") ? [value.slice(2), all[index + 1]] : [])).filter((pair) => pair.length === 2));
@@ -30,7 +30,6 @@ JSON.parse(roots); // must be valid
 execFileSync(npx, ["tsc", "--build", "packages/launcher"], { stdio: "inherit", shell });
 const work = join("dist", "launcher-build");
 mkdirSync(work, { recursive: true });
-const composeTemplate = readFileSync(join("compose", "compose.template.yaml"), "utf8");
 // Embed the roots and version as build-time constants: the SEA reads them
 // from process.env-equivalent defaults baked into the entry stub.
 const entry = join(work, "entry.cjs");
@@ -40,7 +39,7 @@ writeFileSync(
   // no URL, so a release must know which Konteks it belongs to. An explicit
   // KONTEKS_CORE_URL / KONTEKS_RELAY_URL in the environment still wins at run
   // time (the e2e stack relies on that).
-  `process.env.KONTEKS_RELEASE_ROOTS_JSON = ${JSON.stringify(roots)};\nprocess.env.KONTEKS_LAUNCHER_VERSION = ${JSON.stringify(process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0")};\nprocess.env.KONTEKS_CORE_URL ??= ${JSON.stringify(process.env.KONTEKS_DEFAULT_CORE_URL ?? "https://api.konteks.io")};\nprocess.env.KONTEKS_RELAY_URL ??= ${JSON.stringify(process.env.KONTEKS_DEFAULT_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")};\nprocess.env.KONTEKS_EMBEDDED_COMPOSE_TEMPLATE = ${JSON.stringify(composeTemplate)};\nimport("../../packages/launcher/dist/cli.js");\n`,
+  `process.env.KONTEKS_RELEASE_ROOTS_JSON = ${JSON.stringify(roots)};\nprocess.env.KONTEKS_LAUNCHER_VERSION = ${JSON.stringify(process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0")};\nprocess.env.KONTEKS_CORE_URL ??= ${JSON.stringify(process.env.KONTEKS_DEFAULT_CORE_URL ?? "https://api.konteks.io")};\nprocess.env.KONTEKS_RELAY_URL ??= ${JSON.stringify(process.env.KONTEKS_DEFAULT_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")};\nimport("../../packages/launcher/dist/cli.js");\n`,
 );
 execFileSync(npx, [
   "esbuild",
@@ -51,8 +50,8 @@ execFileSync(npx, [
   "--format=cjs",
   // npx.cmd is spawned through cmd.exe on Windows. Keep every argument free
   // of shell syntax so cmd cannot split one option into extra input files.
-  // createRequire accepts __filename, and composeTemplatePath handles either
-  // that path or the file URL used by repository ESM builds.
+  // createRequire accepts __filename as well as the file URL that
+  // repository ESM builds use.
   "--define:import.meta.url=__filename",
   `--outfile=${join(work, "launcher.bundle.cjs")}`,
 ], { stdio: "inherit", shell });

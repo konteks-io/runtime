@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * AGPL guard (CP2 item 1 / CI acceptance): no Shellular (AGPL-3.0) code may
- * enter this repository. It scans source, scripts, Dockerfiles, and the
- * Compose template for AGPL licence headers, Shellular identifiers, and
+ * enter this repository. It scans source, scripts and release metadata for
+ * AGPL licence headers, Shellular identifiers, and
  * imports of Shellular packages, and fails the build on any hit. Design
  * reading is fine; copying or paraphrasing is not (THIRD_PARTY_NOTICES.md).
  */

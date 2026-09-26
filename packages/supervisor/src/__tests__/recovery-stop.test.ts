@@ -39,7 +39,7 @@ async function sessionFixture(overrides: Partial<RelayedSessionDeps> = {}, mutat
   const transport = { send: vi.fn(), openChannel: vi.fn(), closeChannel: vi.fn() };
   const onClosed = vi.fn(async () => undefined);
   const binding = { workspaceId: "workspace", instanceId: "instance", assignmentId: "assignment", attempt: 1, sessionId: "cloud-session" };
-  const deps: RelayedSessionDeps = { clock, journal, transport: transport as never, runner: runner as never, instanceId: "instance", browserToolUrl: null, workspaceRoot: "/workspace", deploymentKind: "native_connector", redeemCapabilityToken: async () => { throw new Error("not needed"); },
+  const deps: RelayedSessionDeps = { clock, journal, transport: transport as never, runner: runner as never, instanceId: "instance", workspaceRoot: "/workspace", deploymentKind: "native_connector", redeemCapabilityToken: async () => { throw new Error("not needed"); },
     broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), policy: new EvaluatorPolicyResponder(null, () => true),
     prepareInputs: async () => ({ binding, cwd: "/workspace", skillInstructions: "", beforePrompt: async () => undefined }),
     registerReady: async () => ({ ...binding, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "process", channelId: "session:cloud-session", agentId: "codex", acpSessionRef: "acp", readyRevision: 1, registeredAt: clock.nowIso() }), onUsage: async () => undefined, onClosed, ...overrides };

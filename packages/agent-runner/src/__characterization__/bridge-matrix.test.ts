@@ -10,8 +10,8 @@ import { spawnBridge } from "../bridge/process.js";
 /**
  * Characterization: each supported bridge at the CP0-pinned version —
  * spawn, `initialize` result, login/logout tooling presence, host-cache
- * documentation, and stdio framing. Runs only inside a built runner image
- * (REMOTE_INSTANCE_CHARACTERIZE=1 with /opt/konteks/bridges populated) and
+ * documentation, and stdio framing. Runs against an unpacked offline agent
+ * package (REMOTE_INSTANCE_CHARACTERIZE=1 with RUNNER_BRIDGE_PREFIX set) and
  * records the observed capabilities so the CP0 matrix can be diffed.
  */
 const prefix = process.env.RUNNER_BRIDGE_PREFIX ?? "/opt/konteks/bridges";

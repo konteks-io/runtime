@@ -69,7 +69,6 @@ export interface RelayedSessionDeps {
   instanceId: string;
   /** Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory. */
   redeemCapabilityToken: (assignment: RemoteWorkAssignment) => Promise<CapabilityTokenIssue>;
-  browserToolUrl: string | null;
   workspaceRoot: string;
   /** Legacy appliance callers may omit this during migration. Native cannot. */
   deploymentKind?: "appliance" | "native_connector";
@@ -299,9 +298,6 @@ export class RelayedSession {
       } else {
         mcpServers.push({ type: "http", ...issue.mcpServer });
       }
-    }
-    if (this.assignment.agentRoute.requiredRole === "qa" && this.deps.browserToolUrl) {
-      mcpServers.push({ type: "http", name: "konteks-browser-tool", url: this.deps.browserToolUrl, headers: [] });
     }
     // Optional tool wiring (Graft) ran alongside redemption and the facade.
     // The agent must find it in place, and the ownership commit below must
