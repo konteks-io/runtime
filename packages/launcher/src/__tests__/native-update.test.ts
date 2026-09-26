@@ -10,6 +10,7 @@ import { installNative, readNativeRecord, restoreNativeRecord } from "../native/
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
 import { earlierFailure, earlierFailureNote, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { createOutput } from "../output.js";
+import { nativeServiceDefinition, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 
 const roots: string[] = [];
@@ -183,6 +184,48 @@ describe("native update transaction", () => {
         : (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest) } as never;
     };
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+  });
+  describe("on Windows, where a stopped scheduled task still exists", () => {
+    const root = "C:\\Users\\a\\AppData\\Local\\konteks-remote";
+    const connector = (releaseId: string) => `${root}\\releases\\${releaseId}\\konteks-connector.exe`;
+    const definitionFor = (record: NativeRuntimeRecord) => nativeServiceDefinition({ os: "windows", home: "C:\\Users\\a", root, executable: connector(record.releaseId), userId: "S-1-5-21-1-2-3-1001" });
+    /** Task Scheduler as far as the connector sees it: the task exists throughout, running or not, and runs the <Command> it was last registered with. */
+    function windows(h: ReturnType<typeof harness>) {
+      const task = { running: true, command: connector(previous.releaseId) };
+      const written = new Map<string, string>();
+      const scheduler = async (command: NativeServiceCommand): Promise<number> => {
+        if (command.command === "powershell.exe") return task.running ? 0 : 1;
+        if (command.command !== "schtasks.exe") throw new Error(`unexpected ${command.command}`);
+        switch (command.args[0]) {
+          case "/Query": return 0; // exists, whether or not it runs
+          case "/Create": task.command = /<Command>(.*?)<\/Command>/.exec(written.get(command.args[4]!)!)![1]!; return 0;
+          case "/Run": task.running = true; return 0;
+          case "/End": task.running = false; return 0;
+          default: return 1;
+        }
+      };
+      const harnessExecute = h.deps.execute, harnessStart = h.deps.start;
+      h.deps.serviceDefinition = async () => definitionFor(h.currentRecord());
+      // The harness's control socket follows the task: /End stops what serves, a start serves the record.
+      h.deps.execute = async command => { const code = await scheduler(command); if (command.args[0] === "/End") await harnessExecute({ command: "stop", args: [] }); return code; };
+      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, contents); } }); await harnessStart(input); };
+      return task;
+    }
+
+    it("stops without waiting out the deadline and restarts the task on the new release", async () => {
+      const h = harness({ previous });
+      const task = windows(h);
+      await expect(runNativeUpdate({ root, output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+      expect(task).toEqual({ running: true, command: connector("release-next") });
+    });
+
+    it("rolls back to a task that runs the previous release again", async () => {
+      const h = harness({ previous, gate: "new_failure" });
+      const task = windows(h);
+      await expect(runNativeUpdate({ root, output: h.output }, h.deps)).rejects.toThrow();
+      expect(h.currentRecord().releaseId).toBe("release-prev");
+      expect(task).toEqual({ running: true, command: connector("release-prev") });
+    });
   });
   it("waits for a slow-stopping service to exit and release the runtime directory before committing", async () => {
     const h = harness({ previous });

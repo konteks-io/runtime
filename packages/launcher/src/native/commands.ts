@@ -9,7 +9,7 @@ import { SupervisorControl } from "../control.js";
 import { addNativeAgent, installNative, readNativeRecord, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
-import { nativePlatform, nativeServiceDefinition, parseServiceExits, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
+import { nativePlatform, nativeServiceDefinition, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
 import { prepareDeliveryGraft } from "./graft.js";
 import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
@@ -43,11 +43,10 @@ async function start(input: NativeCommandContext): Promise<void> {
   const installation = await loadNativeInstallation(input.root, { roots: EMBEDDED_RELEASE_ROOTS, platform });
   await verifyInstalledNativeConnector(installation.release, join(input.root, "releases", installation.record.releaseId), platform);
   const definition = await serviceDefinition(input.root);
-  if (await execute(definition.status) === 0) { input.output.line("Native user service is already registered/running; use status to inspect cloud readiness."); return; }
-  await writeSecretFile(definition.path, definition.contents);
-  for (const command of [...definition.install, definition.start]) {
-    if (await execute(command) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native user service could not start; installed identity and credentials were preserved.");
-  }
+  const started = await startNativeServiceDefinition(definition, { execute, write: writeSecretFile }).catch(error => {
+    throw new RemoteInstanceError("temporarily_unavailable", "The native user service could not start; installed identity and credentials were preserved.", { cause: error });
+  });
+  if (started === "already_running") { input.output.line("Native user service is already running; use status to inspect cloud readiness."); return; }
   if (definition.requiresLinger) input.output.line("This Linux user service needs user lingering to remain available after logout. Configure it explicitly if required.");
   // Starting the process is not the same as being open for work: the service
   // finishes unpacking and opens its control port about a minute later. Saying

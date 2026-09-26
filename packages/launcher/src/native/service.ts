@@ -50,11 +50,34 @@ export interface NativeServiceDefinition {
   start: NativeServiceCommand;
   stop: NativeServiceCommand;
   remove: NativeServiceCommand[];
+  /**
+   * Exits 0 only while the service is RUNNING, never merely registered:
+   * `start` returns early on it, and the update transaction waits on it for a
+   * stopped service to exit.
+   */
   status: NativeServiceCommand;
   /** Reads how often the OS has started the service and how it last exited (`parseServiceExits`); absent where the OS does not say. */
   exits?: NativeServiceCommand;
   /** User services on Linux need linger to survive logout/reboot without a login. */
   requiresLinger: boolean;
+}
+
+/**
+ * Register and start the service from its definition unless it is already
+ * running. The definition is rewritten and re-registered every time (the
+ * install commands replace an existing registration), so a start after an
+ * update or rollback runs the release the record now names.
+ */
+export async function startNativeServiceDefinition(
+  definition: NativeServiceDefinition,
+  deps: { execute: (command: NativeServiceCommand) => Promise<number | null>; write: (path: string, contents: string) => Promise<void> },
+): Promise<"already_running" | "started"> {
+  if (await deps.execute(definition.status) === 0) return "already_running";
+  await deps.write(definition.path, definition.contents);
+  for (const command of [...definition.install, definition.start]) {
+    if (await deps.execute(command) !== 0) throw new Error(`${command.command} exited unsuccessfully`);
+  }
+  return "started";
 }
 
 /** Definitions contain only a fixed serve command and non-secret install paths. */
@@ -103,7 +126,11 @@ export function nativeServiceDefinition(input: {
     start: { command: "schtasks.exe", args: ["/Run", "/TN", label] },
     stop: { command: "schtasks.exe", args: ["/End", "/TN", label] },
     remove: [{ command: "schtasks.exe", args: ["/Delete", "/TN", label, "/F"] }],
-    status: { command: "schtasks.exe", args: ["/Query", "/TN", label, "/XML"] },
+    // `schtasks /Query` succeeds whenever the task exists, running or not, so
+    // updates waited out the stop deadline and `start` never re-created the
+    // task for the new release. The task's state enum reads the same in every
+    // Windows language, unlike schtasks' text; the label is hex, so it quotes safely.
+    status: { command: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-Command", `$task = Get-ScheduledTask -TaskPath '\\' -TaskName '${label}' -ErrorAction SilentlyContinue; if ($task -and $task.State -eq 'Running') { exit 0 }; exit 1`] },
   };
 }
 

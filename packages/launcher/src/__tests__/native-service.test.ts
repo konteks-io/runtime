@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { nativePlatform, nativePaths, nativeServiceDefinition, parseServiceExits } from "../native/service.js";
+import { describe, expect, it, vi } from "vitest";
+import { nativePlatform, nativePaths, nativeServiceDefinition, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 
 describe("native install layout", () => {
   it.each([['darwin', 'macos'], ['win32', 'windows'], ['linux', 'debian']] as const)("supports %s x64 and arm64 without a container backend", (os, expected) => {
@@ -56,6 +56,28 @@ describe("native background service definitions", () => {
     expect(service.contents).toContain('<UserId>S-1-5-21-123-456-789-1001</UserId>');
     expect(service.contents).toContain('<Arguments>serve --root &quot;C:\\Users\\Test User\\AppData\\Local\\konteks-remote&quot;</Arguments>');
     expect(service.install).toEqual([{ command: 'schtasks.exe', args: ['/Create', '/TN', service.label, '/XML', service.path, '/F'] }]);
+    // Status means running, not registered: `schtasks /Query` succeeds for a stopped task too.
+    expect(service.status.command).toBe('powershell.exe');
+    expect(service.status.args.slice(0, 3)).toEqual(['-NoProfile', '-NonInteractive', '-Command']);
+    expect(service.status.args[3]).toBe(`$task = Get-ScheduledTask -TaskPath '\\' -TaskName '${service.label}' -ErrorAction SilentlyContinue; if ($task -and $task.State -eq 'Running') { exit 0 }; exit 1`);
+  });
+
+  it("starts by rewriting and re-registering the definition, so a start after an update runs the new release", async () => {
+    const root = 'C:\\Users\\a\\AppData\\Local\\konteks-remote';
+    const next = nativeServiceDefinition({ os: 'windows', home: 'C:\\Users\\a', root, executable: `${root}\\releases\\release-next\\konteks-connector.exe`, userId: 'S-1-5-21-1-2-3-1001' });
+    // The task exists (registered for the previous release) but is stopped.
+    const calls: NativeServiceCommand[] = [];
+    const execute = vi.fn(async (command: NativeServiceCommand) => { calls.push(command); return command === next.status ? 1 : 0; });
+    const write = vi.fn(async () => undefined);
+    await expect(startNativeServiceDefinition(next, { execute, write })).resolves.toBe('started');
+    expect(write).toHaveBeenCalledWith(next.path, expect.stringContaining(`<Command>${root}\\releases\\release-next\\konteks-connector.exe</Command>`));
+    expect(calls).toEqual([next.status, ...next.install, next.start]);
+    // Only a running service is left alone.
+    const running = vi.fn(async () => 0), untouched = vi.fn(async () => undefined);
+    await expect(startNativeServiceDefinition(next, { execute: running, write: untouched })).resolves.toBe('already_running');
+    expect(untouched).not.toHaveBeenCalled();
+    // A registration the OS refuses is an error, not a silent start.
+    await expect(startNativeServiceDefinition(next, { execute: async command => command === next.status ? 1 : command === next.install[0] ? 1 : 0, write })).rejects.toThrow(/schtasks/);
   });
 
   it("keeps different install roots isolated and requires explicit user identity", () => {
