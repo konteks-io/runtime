@@ -81,10 +81,10 @@ describe('signed native executable staging', () => {
       const placeholder = { ...unsigned, signature: { algorithm: 'Ed25519', keyId: fixture.keyId, value: 'AA' } };
       return { ...unsigned, signature: { algorithm: 'Ed25519', keyId: fixture.keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(placeholder), fixture.privateKey).toString('base64url') } };
     };
-    const release = verifyNativeRelease(signed({ modelCapabilityMappings: [signedMapping(), host({ min: '0.1.7-rc.2', belowCore: '0.1.8' }), host({ min: '0.1.9', belowCore: '0.2.0' }), host({ min: '1.0.0', belowCore: '2.0.0' }, 'codex')] }), roots, now);
+    const release = verifyNativeRelease(signed({ modelCapabilityMappings: [signedMapping(), host({ min: '0.1.7-rc.2', belowCore: '0.1.8' }), host({ min: '0.1.5-rc.3', belowCore: '0.1.8' }), host({ min: '0.1.9', belowCore: '0.2.0' }), host({ min: '1.0.0', belowCore: '2.0.0' }, 'codex')] }), roots, now);
     expect(selectNativeModelCapabilityMappings(release).map(({ agentId, mapping }) => [agentId, mapping.mappingId])).toEqual([
       ['claude-code', 'claude-model'],
-      ['dsh', 'host-dsh-0.1.7-rc.2'],
+      ['dsh', 'host-dsh-0.1.5-rc.3'],
     ]);
   });
 

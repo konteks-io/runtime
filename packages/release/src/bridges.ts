@@ -128,7 +128,8 @@ export const HOST_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.freeze([
     acpProtocol: { min: 1, max: 1 },
     hostInstall: {
       bin: "dsh",
-      versions: { min: "0.1.7-rc.2", belowCore: "0.1.8" },
+      // 0.1.5-rc.3 is npm `latest`, what `npx @deepseek-ai/dsh` installs; 0.1.7-rc.2 is `next`.
+      versions: { min: "0.1.5-rc.3", belowCore: "0.1.8" },
       installCommand: "npm install -g @deepseek-ai/dsh@0.1.7-rc.2",
     },
   },

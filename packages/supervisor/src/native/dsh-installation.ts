@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
-import { access, lstat, readFile, realpath, stat } from "node:fs/promises";
+import { access, lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
-import { findAgentBridge, hostAgentVersionSupported, type AgentBridgeFamily } from "@konteks/remote-release";
+import { compareAgentVersions, findAgentBridge, hostAgentVersionSupported, type AgentBridgeFamily } from "@konteks/remote-release";
 
 /** The person's own installed DeepSeek Harness, as the runtime will launch it. */
 export interface NativeDshInstallation {
@@ -40,8 +40,10 @@ function notFound(): Refusal {
  * package root by following symlinks to the package's own `package.json`, or,
  * for a shim (Windows `.cmd`, a POSIX wrapper script), by the npm layout beside
  * it; a shim is never parsed or run. Managers with other layouts (pnpm, volta,
- * yarn global) are reached through DSH_EXECUTABLE. The first supported,
- * safely owned package wins. Operator process configuration only; never take
+ * yarn global) are reached through DSH_EXECUTABLE. Last comes npm's npx cache
+ * (`<npm cache>/_npx/<hash>/node_modules/@deepseek-ai/dsh`), where the
+ * homepage's `npx @deepseek-ai/dsh web` leaves it; there the newest supported
+ * copy wins. Otherwise the first supported, safely owned package wins. Operator process configuration only; never take
  * this path from Core or ACP.
  */
 export async function resolveNativeDshInstallation(env: NodeJS.ProcessEnv = process.env, operatorHome = homedir(), platform: NodeJS.Platform = process.platform): Promise<NativeDshInstallation> {
@@ -73,6 +75,13 @@ export async function resolveNativeDshInstallation(env: NodeJS.ProcessEnv = proc
       if ("root" in outcome) return outcome;
       if (outcome.diagnostic !== "dsh_not_found" && PRIORITY[outcome.diagnostic] > PRIORITY[best.diagnostic]) best = outcome;
     }
+    let newest: NativeDshInstallation | null = null;
+    for (const packageRoot of await npxPackageRoots(env, operatorHome, platform)) {
+      const outcome = await inspect(packageRoot, platform);
+      if ("root" in outcome) { if (!newest || compareAgentVersions(outcome.version, newest.version) > 0) newest = outcome; continue; }
+      if (outcome.diagnostic !== "dsh_not_found" && PRIORITY[outcome.diagnostic] > PRIORITY[best.diagnostic]) best = outcome;
+    }
+    if (newest) return newest;
   }
   throw refuse(best);
 }
@@ -119,6 +128,18 @@ function globalPackageRoots(env: NodeJS.ProcessEnv, operatorHome: string, platfo
   }
   const prefixes = [env.npm_config_prefix, ...(perUser ? [join(operatorHome, ".npm-global"), join(operatorHome, ".local")] : []), "/opt/homebrew", "/usr/local", "/usr"];
   return prefixes.filter((prefix): prefix is string => Boolean(prefix && isAbsolute(prefix))).map(prefix => join(prefix, "lib", "node_modules", "@deepseek-ai", "dsh"));
+}
+
+/** Copies `npx` left in npm's cache: `npm_config_cache`, else `~/.npm` (`%LOCALAPPDATA%\npm-cache` on Windows). */
+async function npxPackageRoots(env: NodeJS.ProcessEnv, operatorHome: string, platform: NodeJS.Platform): Promise<string[]> {
+  if (platform !== "win32" && process.getuid?.() === 0) return []; // root must not inherit a user-writable cache
+  const cache = env.npm_config_cache && isAbsolute(env.npm_config_cache) ? env.npm_config_cache
+    : platform === "win32" ? (env.LOCALAPPDATA && isAbsolute(env.LOCALAPPDATA) ? join(env.LOCALAPPDATA, "npm-cache") : undefined)
+      : join(operatorHome, ".npm");
+  if (!cache) return [];
+  const entries = await readdir(join(cache, "_npx"), { withFileTypes: true }).catch(() => []);
+  return entries.filter(entry => entry.isDirectory()).map(entry => entry.name).sort()
+    .map(name => join(cache, "_npx", name, "node_modules", "@deepseek-ai", "dsh"));
 }
 
 async function inspect(candidateRoot: string, platform: NodeJS.Platform): Promise<NativeDshInstallation | Refusal> {

@@ -89,8 +89,10 @@ konteks-remote uninstall       # finish running work, remove this runtime from i
 ### DeepSeek Harness
 
 DeepSeek Harness (`dsh`) runs from your own install, not from a package in the
-release. Install a supported version with your Node (22.19+ in the 22 line, or
-24+), then add it and give it a key:
+release. Supported versions are 0.1.5-rc.3 (npm `latest`, what the DeepSeek
+Harness homepage's `npx @deepseek-ai/dsh web` installs) up to, not including,
+0.1.8. Install one with your Node (22.19+ in the 22 line, or 24+), then add it
+and give it a key:
 
 ```sh
 npm install -g @deepseek-ai/dsh@0.1.7-rc.2
@@ -98,8 +100,9 @@ konteks-remote agent add dsh
 konteks-remote auth login dsh
 ```
 
-The connector finds it on `PATH` or in npm's global folders (set
-`DSH_EXECUTABLE` and `DSH_NODE` for any other layout), checks the version, and
+The connector finds it on `PATH`, in npm's global folders, or in npm's npx
+cache (the newest supported copy there; set `DSH_EXECUTABLE` and `DSH_NODE` for
+any other layout), checks the version, and
 proves its own settings are in force before every start. Every tool call
 DeepSeek Harness makes outside reading goes through the same policy as Claude
 Code and Codex. The key is checked with DeepSeek (no tokens used) and stored

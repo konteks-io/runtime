@@ -57,6 +57,31 @@ describe("native DeepSeek Harness discovery", () => {
     await expect(resolveNativeDshInstallation({ PATH: "", APPDATA: appData }, join(base, "winhome"), "win32")).resolves.toEqual(expected(windows));
   });
 
+  it("finds the newest supported copy `npx @deepseek-ai/dsh` left in npm's cache, after every installed one", async () => {
+    const base = await fresh();
+    const home = join(base, "home");
+    const npx = (cache: string, hash: string, version: string) => pkg(join(cache, "_npx", hash, "node_modules", "@deepseek-ai", "dsh"), { version });
+    await npx(join(home, ".npm"), "0a", "0.1.5-rc.2");
+    const latest = await npx(join(home, ".npm"), "1b", "0.1.5-rc.3");
+    await npx(join(home, ".npm"), "2c", "0.1.8");
+    await mkdir(join(home, ".npm", "_npx", "3d", "node_modules"), { recursive: true });
+    await expect(resolveNativeDshInstallation({ PATH: "" }, home, "darwin")).resolves.toEqual(expected(latest, "0.1.5-rc.3"));
+    const next = await npx(join(home, ".npm"), "4e", "0.1.7-rc.2");
+    await expect(resolveNativeDshInstallation({ PATH: "" }, home, "linux")).resolves.toEqual(expected(next));
+    // An installed copy still wins over the cache; npm_config_cache and Windows' %LOCALAPPDATA% are honoured.
+    const prefix = join(base, "prefix");
+    const installed = await pkg(join(prefix, "lib", "node_modules", "@deepseek-ai", "dsh"), { version: "0.1.5-rc.3" });
+    await expect(resolveNativeDshInstallation({ PATH: "", npm_config_prefix: prefix }, home, "linux")).resolves.toEqual(expected(installed, "0.1.5-rc.3"));
+    const custom = await npx(join(base, "custom-cache"), "5f", "0.1.5-rc.3");
+    await expect(resolveNativeDshInstallation({ PATH: "", npm_config_cache: join(base, "custom-cache") }, join(base, "other"), "linux")).resolves.toEqual(expected(custom, "0.1.5-rc.3"));
+    const local = await npx(join(base, "Local", "npm-cache"), "6a", "0.1.5-rc.3");
+    await expect(resolveNativeDshInstallation({ PATH: "", LOCALAPPDATA: join(base, "Local") }, join(base, "winhome"), "win32")).resolves.toEqual(expected(local, "0.1.5-rc.3"));
+    // Only unsupported copies: say so, not "not installed".
+    await expect(resolveNativeDshInstallation({ PATH: "" }, join(base, "only-old"), "linux").catch(() => null)).resolves.toBeNull();
+    await npx(join(base, "only-old", ".npm"), "7b", "0.1.3-alpha.2");
+    await expect(resolveNativeDshInstallation({ PATH: "" }, join(base, "only-old"), "linux")).rejects.toMatchObject({ diagnostic: "dsh_unsupported_version" });
+  });
+
   it("honours an absolute operator override naming the package root or its launcher", async () => {
     const base = await fresh();
     const installed = await pkg(join(base, "opt", "dsh"));
@@ -67,17 +92,17 @@ describe("native DeepSeek Harness discovery", () => {
 
   it("refuses an out-of-range version and says which version to install", async () => {
     const base = await fresh();
-    const old = await pkg(join(base, "old"), { version: "0.1.6-alpha.2" });
+    const old = await pkg(join(base, "old"), { version: "0.1.5-rc.2" });
     const refusal = await resolveNativeDshInstallation({ DSH_EXECUTABLE: old, PATH: "" }, join(base, "home"), "linux").catch(error => error);
     expect(refusal).toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_unsupported_version" });
-    expect(refusal.message).toContain("0.1.6-alpha.2");
+    expect(refusal.message).toContain("0.1.5-rc.2");
     expect(refusal.message).toContain("npm install -g @deepseek-ai/dsh@0.1.7-rc.2");
     await expect(verifyNativeDshRoot(await pkg(join(base, "next"), { version: "0.1.8-alpha.1" }), "linux")).rejects.toMatchObject({ diagnostic: "dsh_unsupported_version" });
   });
 
   it("prefers a supported install over an unsupported one found earlier", async () => {
     const base = await fresh();
-    const old = await pkg(join(base, "a", "node_modules", "@deepseek-ai", "dsh"), { version: "0.1.5-rc.3" });
+    const old = await pkg(join(base, "a", "node_modules", "@deepseek-ai", "dsh"), { version: "0.1.5-rc.2" });
     const good = await pkg(join(base, "b", "node_modules", "@deepseek-ai", "dsh"));
     await writeFile(join(base, "a", "dsh.cmd"), ""); await writeFile(join(base, "b", "dsh.cmd"), "");
     expect(old).not.toBe(good);

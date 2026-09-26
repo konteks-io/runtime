@@ -29,11 +29,12 @@ describe("host-installed agent families", () => {
 
   it("accepts only the tested range: at least the minimum, and a release core below the ceiling", () => {
     const dsh = findAgentBridge("dsh")!;
+    expect(hostAgentVersionSupported(dsh, "0.1.5-rc.3")).toBe(true);
     expect(hostAgentVersionSupported(dsh, "0.1.7-rc.2")).toBe(true);
     expect(hostAgentVersionSupported(dsh, "0.1.7-rc.3")).toBe(true);
     expect(hostAgentVersionSupported(dsh, "0.1.7")).toBe(true);
-    expect(hostAgentVersionSupported(dsh, "0.1.7-rc.1")).toBe(false);
-    expect(hostAgentVersionSupported(dsh, "0.1.6-alpha.2")).toBe(false);
+    expect(hostAgentVersionSupported(dsh, "0.1.5-rc.2")).toBe(false);
+    expect(hostAgentVersionSupported(dsh, "0.1.3-alpha.2")).toBe(false);
     // An untested prerelease of the next release is outside the range too.
     expect(hostAgentVersionSupported(dsh, "0.1.8-alpha.1")).toBe(false);
     expect(hostAgentVersionSupported(dsh, "0.1.8")).toBe(false);

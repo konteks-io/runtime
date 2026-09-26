@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { RemoteInstanceError } from "@konteks/remote-common";
+import { compareAgentVersions } from "@konteks/remote-release";
 import { DSH_PROFILE_EXPECTATIONS, writeDshKonteksProfile } from "@konteks/remote-agent-runner";
 import type { NativeDshInstallation } from "./dsh-installation.js";
 
@@ -39,7 +40,7 @@ export async function checkDshKonteksProfile(options: DshProfileCheckOptions): P
   const patches = await writeDshKonteksProfile(options.konteksDir, platform);
   const args = [options.installation.entry, "--profile", "acp", ...patches.flatMap(patch => ["--patch", patch]), "--dump-config"];
   const result = await (options.run ?? runDump)(options.node, args, { env: dumpEnvironment(options.dshHome), timeoutMs: options.timeoutMs ?? 30_000 });
-  const drift = result.code === 0 ? dshProfileDrift(result.stdout, options.konteksDir, platform) : [`profile dump exited with ${result.code ?? "a signal"}`];
+  const drift = result.code === 0 ? dshProfileDrift(result.stdout, options.konteksDir, platform, options.installation.version) : [`profile dump exited with ${result.code ?? "a signal"}`];
   if (drift.length > 0) {
     throw new RemoteInstanceError("prerequisite_missing",
       `DeepSeek Harness ${options.installation.version} does not accept the Konteks settings (${drift.slice(0, 4).join("; ")}${drift.length > 4 ? "; …" : ""}). Install a supported version, then retry.`,
@@ -47,13 +48,20 @@ export async function checkDshKonteksProfile(options: DshProfileCheckOptions): P
   }
 }
 
-/** Human-readable mismatches between a composed profile and the Konteks overlay; empty when in force. */
-export function dshProfileDrift(dump: string, konteksDir: string, platform: NodeJS.Platform): string[] {
+/**
+ * Human-readable mismatches between a composed profile and the Konteks overlay;
+ * empty when in force. `version` is the installed dsh: a row newer than it may
+ * be absent (a row that is absent cannot run).
+ */
+export function dshProfileDrift(dump: string, konteksDir: string, platform: NodeJS.Platform, version?: string): string[] {
   const rows = parseDshDumpConfig(dump);
   const drift: string[] = [];
   for (const expected of DSH_PROFILE_EXPECTATIONS(konteksDir, platform)) {
     const row = rows.get(expected.id);
-    if (!row) { drift.push(`${expected.id}: missing`); continue; }
+    if (!row) {
+      if (!(expected.absentBelow !== undefined && version !== undefined && olderThan(version, expected.absentBelow))) drift.push(`${expected.id}: missing`);
+      continue;
+    }
     if (expected.name !== undefined && row.name !== expected.name) drift.push(`${expected.id}: module is ${JSON.stringify(row.name ?? null)}, expected ${JSON.stringify(expected.name)}`);
     if (expected.disabled === true && row.disabled !== "true") drift.push(`${expected.id}: expected disabled`);
     if (expected.disabled === false && row.disabled === "true") drift.push(`${expected.id}: expected enabled`);
@@ -62,6 +70,10 @@ export function dshProfileDrift(dump: string, konteksDir: string, platform: Node
     }
   }
   return drift;
+}
+
+function olderThan(version: string, than: string): boolean {
+  try { return compareAgentVersions(version, than) < 0; } catch { return false; }
 }
 
 /**

@@ -27,7 +27,7 @@ describe("signed E2E ACP releases", () => {
         }),
         // The person's own DeepSeek Harness: no artifact, bound by agent and supported versions.
         expect.objectContaining({
-          hostAgent: { agentId: "dsh", versions: { min: "0.1.7-rc.2", belowCore: "0.1.8" } },
+          hostAgent: { agentId: "dsh", versions: { min: "0.1.5-rc.3", belowCore: "0.1.8" } },
           configId: "model",
           modelIdentities: [
             { value: '["deepseek-official","deepseek-flash"]', canonicalProviderId: "deepseek", canonicalModelId: "deepseek-flash" },

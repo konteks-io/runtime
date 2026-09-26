@@ -8,6 +8,7 @@ import { checkDshKonteksProfile, dshProfileDrift, parseDshDumpConfig } from "../
 // A real `dsh --profile acp --patch … --dump-config` of 0.1.7-rc.2 with the
 // Konteks patch set, captured with the patch directory at "/konteks/dsh home".
 const DUMP = readFileSync(new URL("./fixtures/dsh-0.1.7-rc.2-dump-config.yml", import.meta.url), "utf8");
+const DUMP_0_1_5 = readFileSync(new URL("./fixtures/dsh-0.1.5-rc.3-dump-config.yml", import.meta.url), "utf8");
 const DIR = "/konteks/dsh home";
 
 const folders: string[] = [];
@@ -43,6 +44,15 @@ describe("DeepSeek Harness profile self-check", () => {
 
   it("finds no drift in the composed Konteks profile", () => {
     expect(dshProfileDrift(DUMP, DIR, "darwin")).toEqual([]);
+    expect(dshProfileDrift(DUMP, DIR, "darwin", "0.1.7-rc.2")).toEqual([]);
+  });
+
+  it("lets rows dsh added in 0.1.7 be absent only from older versions (npm latest 0.1.5-rc.3)", () => {
+    expect(dshProfileDrift(DUMP_0_1_5, DIR, "darwin", "0.1.5-rc.3")).toEqual([]);
+    expect(dshProfileDrift(DUMP_0_1_5, DIR, "darwin", "0.1.7-rc.2")).toEqual(["deepseek-account: missing", "llm-deepseek-account: missing", "tool-plugin-manager: missing"]);
+    expect(dshProfileDrift(DUMP_0_1_5, DIR, "darwin")).toHaveLength(3);
+    // Every other row stays required on an older version.
+    expect(dshProfileDrift(DUMP_0_1_5.replace("- id: tool-subagent\n", "- id: tool-subagent-renamed\n"), DIR, "darwin", "0.1.5-rc.3")).toEqual(["tool-subagent: missing"]);
   });
 
   it("names every row that drifted: removed, re-enabled, repointed or reconfigured", () => {

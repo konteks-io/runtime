@@ -72,7 +72,7 @@ describe("native install composition", () => {
   });
   it.runIf(process.platform !== "win32")("refuses an unsupported DeepSeek Harness before any activation is used", async () => {
     const f = await fixture();
-    await personDsh(f.root, "0.1.6-alpha.2");
+    await personDsh(f.root, "0.1.5-rc.2");
     await expect(installNative({ ...f.options, agents: ["codex", "dsh"] } as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_unsupported_version" });
     expect(f.activate).not.toHaveBeenCalled();
   });

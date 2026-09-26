@@ -40,6 +40,15 @@ const DISABLED_ROWS = [
   "goal-round-driver", "tool-goal", "command-goal", "tool-ralph", "tool-workflow",
 ] as const;
 
+/**
+ * Rows dsh added in 0.1.7: 0.1.5-rc.3 (npm `latest`, what `npx @deepseek-ai/dsh`
+ * installs) has no DeepSeek-account route and no plugin_manager tool. The patch
+ * still names them (dsh warns and goes on), so any version that has them turns
+ * them off; the self-check lets them be absent only below this version.
+ */
+const ROWS_SINCE_0_1_7: ReadonlySet<string> = new Set(["deepseek-account", "llm-deepseek-account", "tool-plugin-manager"]);
+const ROWS_SINCE_0_1_7_VERSION = "0.1.7-rc.2";
+
 export const DSH_KONTEKS_MODEL = { provider: "deepseek-official", model: "deepseek-flash" } as const;
 
 export interface DshProfileRowExpectation {
@@ -49,6 +58,8 @@ export interface DshProfileRowExpectation {
   disabled?: boolean;
   /** Expected scalar config values, compared as strings. */
   config?: Record<string, string>;
+  /** The row may be absent in versions below this one (it did not exist yet). */
+  absentBelow?: string;
 }
 
 const paths = (platform: NodeJS.Platform) => (platform === "win32" ? win32 : posix);
@@ -64,7 +75,7 @@ export function dshRuntimePaths(credentialDir: string, platform: NodeJS.Platform
 export function DSH_PROFILE_EXPECTATIONS(dir: string, platform: NodeJS.Platform): DshProfileRowExpectation[] {
   const path = paths(platform);
   return [
-    ...DISABLED_ROWS.map(id => ({ id, disabled: true })),
+    ...DISABLED_ROWS.map(id => ({ id, disabled: true, ...(ROWS_SINCE_0_1_7.has(id) ? { absentBelow: ROWS_SINCE_0_1_7_VERSION } : {}) })),
     { id: "acp", disabled: false, config: { ...DSH_KONTEKS_MODEL } },
     { id: platform === "win32" ? "tool-pwsh" : "tool-bash", disabled: false, config: { enableRunInBackground: "false" } },
     { id: "konteks-ask-hook", name: "@deepseek-ai/dsh-hooks-claude-code", disabled: false, config: { configPath: path.join(dir, "konteks-hooks.json") } },
