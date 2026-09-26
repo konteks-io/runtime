@@ -28,8 +28,12 @@ interface ObservedCall { title: string; rawInput: Record<string, unknown> }
 const EXECUTE = new Set(["bash", "pwsh"]);
 const EDIT = new Set(["write", "edit", "str_replace_editor"]);
 const READ_ONLY = new Set(DSH_READ_ONLY_TOOLS);
-/** The only MCP servers the runtime gives a session: Konteks' own. */
-const KONTEKS_MCP = /^mcp__konteks-platform__[A-Za-z0-9_-]+$/;
+/**
+ * The only MCP servers the runtime gives a session: Konteks' own — the
+ * platform facade and the session's preview tools (which act only inside the
+ * session's worktree and take no arguments).
+ */
+const KONTEKS_MCP = /^mcp__konteks-(platform|preview)__[A-Za-z0-9_-]+$/;
 const SANDBOX_WITHIN_WORKSPACE = new Set(["read-only", "workspace-write"]);
 
 /** ACP kinds for dsh's own tools, for activity; never a policy grant by itself. */

@@ -40,10 +40,15 @@ describe("DeepSeek Harness tool governance", () => {
     governance.observe(call("m1", "mcp__konteks-platform__platform__builtin__echo", { text: "ping" }));
     governance.observe(call("m2", "mcp__konteks-browser-tool__navigate", { url: "http://localhost" }));
     governance.observe(call("m3", "mcp__someone-else__run", {}));
+    governance.observe(call("m4", "mcp__konteks-preview__preview_start", {}));
+    governance.observe(call("m5", "mcp__konteks-previewx__preview_start", {}));
     governance.observe(call("r1", "grep", { pattern: "x" }));
     governance.observe(call("j1", "job_kill", { id: "1" }));
     governance.observe(call("p1", "plugin_manager", { action: "install" }));
     expect(governance.decide(ask("m1"), CWD)).toEqual({ kind: "allow" });
+    // The session's own preview tools act only inside its worktree.
+    expect(governance.decide(ask("m4"), CWD)).toEqual({ kind: "allow" });
+    expect(governance.decide(ask("m5"), CWD)).toMatchObject({ kind: "deny" });
     expect(governance.decide(ask("r1"), CWD)).toEqual({ kind: "allow" });
     // The retired browser tool is never mounted, so a server using its name is not Konteks'.
     for (const id of ["m2", "m3", "j1", "p1"]) expect(governance.decide(ask(id), CWD), id).toMatchObject({ kind: "deny" });

@@ -24,6 +24,9 @@ describe("native workspace tool policy", () => {
   it("answers ordinary tool calls by policy instead of deferring them to a human", async () => {
     await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-platform__prd_submit" }), context))
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
+    // The session's preview tools run without a prompt: they only act inside its worktree.
+    await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-preview__preview_start", rawInput: {} }), context))
+      .resolves.toEqual({ kind: "allow", optionId: "allow" });
     await expect(responder.evaluatePermission(request({ kind: "execute", title: "npm test", rawInput: { command: "npm test" } }), context))
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
     await expect(responder.evaluatePermission(request({ kind: "edit", title: "Write", rawInput: { file_path: join(root, "src", "a.ts") } }), context))

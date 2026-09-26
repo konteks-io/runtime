@@ -170,6 +170,42 @@ describe("relayed session (D98/D113/D114)", () => {
     await session.close("cancelled");
   });
 
+  describe("preview tools (native preview)", () => {
+    function previewAccess() {
+      const status = (sessionId: string, state: "running" | "stopped") => ({ sessionId, state, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: state, startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [] });
+      return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn() };
+    }
+
+    it("mounts the session's preview tools beside the platform facade, bound to its session and worktree", async () => {
+      const preview = previewAccess();
+      const f = await build({ preview });
+      await f.session.bootstrap();
+      const mcpServers = (f.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string; url: string; headers: Array<{ value: string }> }> }).mcpServers;
+      expect(mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-preview"]);
+      const tools = mcpServers[1]!;
+      expect(tools.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+      const answer = await (await fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value, "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview_start", arguments: {} } }) })).json();
+      expect(answer).toMatchObject({ result: { structuredContent: { sessionId: "s", state: "running" } } });
+      expect(preview.start).toHaveBeenCalledWith("s", "/private/native/checkout");
+      await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } } } });
+      expect(preview.touch).toHaveBeenCalledWith("s");
+      await f.session.close("cancelled");
+      expect(preview.stop).toHaveBeenCalledWith("s", "cancelled");
+      await expect(fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value }, body: "{}" })).rejects.toThrow();
+    });
+
+    it("gives planning sessions no preview tools", async () => {
+      const preview = previewAccess();
+      const f = await build({ preview }, { ...assignment, kind: "planning" } as RemoteWorkAssignment);
+      await f.session.bootstrap();
+      const mcpServers = (f.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string }> }).mcpServers;
+      expect(mcpServers.map(server => server.name)).toEqual(["konteks"]);
+      await f.session.close("cancelled");
+      expect(preview.stop).not.toHaveBeenCalled();
+    });
+  });
+
   it("reports native interruption even when the broken relay cannot carry session_closed", async () => {
     const f = await build({
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),

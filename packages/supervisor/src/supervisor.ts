@@ -55,6 +55,7 @@ import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFrom
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
 import { PreviewChannel } from "./preview/preview-channel.js";
 import { PreviewProcessManager, PreviewProcessRegistry } from "./preview/process-manager.js";
+import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { ChannelMux } from "./relay/channel-mux.js";
@@ -104,6 +105,9 @@ import { evaluateHeartbeatLiveness } from "./heartbeat/liveness.js";
 // Core never offered a discovery run's evidence work, and grouping evidence
 // was never read.
 const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation"];
+
+/** How long preview_start waits for the dev server before answering "still starting". */
+const PREVIEW_START_WAIT_MS = 45_000;
 
 /** bb releases sessions idle for 30 minutes, checked every 5 minutes. */
 const IDLE_SESSION_RELEASE_MS = 30 * 60_000;
@@ -676,6 +680,7 @@ export class Supervisor {
     this.broker = new PermissionBroker({ clock: this.clock, deadlineSeconds: () => this.configuration.permissionResponderDeadlineSeconds, onTimeout: async (request) => this.work.onPermissionTimeout(request) });
     this.work = new WorkOrchestrator({
       verifyCancellation: directive => verifier.verify(directive, directive.signature),
+      onSessionReleased: sessionId => void this.previews.stop(sessionId, "session_released"),
       ...(this.assignmentSender ? { assignmentSender: this.assignmentSender } : {}),
       runnerIncarnation: () => this.runnerIncarnation,
       assertOwned: () => {
@@ -726,6 +731,7 @@ export class Supervisor {
         journal: this.journal,
         transport: this.transport,
         runner,
+        preview: this.sessionPreviewAccess(),
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
         broker: this.broker,
         registerDeferral: (body) => this.core.deferPermission(this.instanceId ?? "", body),
@@ -1585,6 +1591,27 @@ export class Supervisor {
         revoke: keyRef => this.core.revokeGitKey(instanceId, keyRef),
       },
     });
+  }
+
+  /**
+   * What a session's preview tools may do: start, stop and read that session's
+   * own preview. Starting is refused while this computer takes no new work;
+   * a start waits (bounded) for the dev server to answer or fail so the agent
+   * gets a useful first answer.
+   */
+  private sessionPreviewAccess(): SessionPreviewAccess {
+    return {
+      start: async (sessionId, cwd) => {
+        if (this.stopping || this.draining || this.lease.mode() !== "active") {
+          return { ...this.previews.status(sessionId), message: "This computer is not taking new work right now, so a preview cannot start." };
+        }
+        const started = await this.previews.start(sessionId, cwd);
+        return started.state === "starting" ? this.previews.waitForSettled(sessionId, PREVIEW_START_WAIT_MS) : started;
+      },
+      stop: (sessionId, reason) => this.previews.stop(sessionId, reason),
+      status: sessionId => this.previews.status(sessionId),
+      touch: sessionId => this.previews.touch(sessionId),
+    };
   }
 
   /** The non-agent facts a role may depend on; one source for every reader. */

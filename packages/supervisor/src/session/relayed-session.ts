@@ -31,6 +31,7 @@ import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/clien
 import type { PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade } from "../mcp/capability-facade.js";
+import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import {
   canonicalizeAcpToolActivity,
   continuesAtBoundary,
@@ -117,6 +118,14 @@ export interface RelayedSessionDeps {
   assertPromptAllowed?: () => void;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
+  /**
+   * This machine's preview dev servers. Present, the session's agent gets the
+   * preview tools (a loopback MCP server beside the platform facade) and the
+   * session's preview stops when the session ends other than by a completed
+   * turn (a completed turn's preview stays for the next turn, bounded by the
+   * idle stop).
+   */
+  preview?: SessionPreviewAccess;
   logger?: Logger;
 }
 
@@ -165,6 +174,9 @@ export class RelayedSession {
   private lastPromptCompletion: { usage: AgentTurnUsageObservation | null } = { usage: null };
   private deliveryAcceptance: RemoteDeliveryAcceptanceReceipt | null = null;
   private mcpFacade: McpCapabilityFacade | null = null;
+  private previewTools: PreviewMcpServer | null = null;
+  /** The logical session whose preview this session's agent drives. */
+  private previewSessionId: string | null = null;
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
 
   constructor(readonly assignment: RemoteWorkAssignment, private readonly deps: RelayedSessionDeps) {
@@ -289,6 +301,19 @@ export class RelayedSession {
       });
       this.mcpFacade = facade;
       mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
+    }
+    const preview = this.deps.preview;
+    if (preview && PREVIEW_WORK_KINDS.has(this.assignment.kind)) {
+      const sessionId = binding.sessionId;
+      const cwd = prepared.cwd;
+      const tools = new PreviewMcpServer({
+        start: () => preview.start(sessionId, cwd),
+        stop: () => preview.stop(sessionId, "agent"),
+        status: () => preview.status(sessionId),
+      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+      this.previewTools = tools;
+      this.previewSessionId = sessionId;
+      mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
     }
     // Optional tool wiring (Graft) ran alongside redemption and the facade.
     // The agent must find it in place, and the ownership commit below must
@@ -611,6 +636,7 @@ export class RelayedSession {
           if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
           this.deps.assertExecutionOwned?.();
           this.deps.assertPromptAllowed?.();
+          if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
           const instructions = this.preparedInputs?.skillInstructions;
           const params = instructions ? { ...request.params, prompt: [{ type: "text" as const, text: instructions }, ...request.params.prompt] } : request.params;
           await this.deps.runner.prompt(ref, request.id, params);
@@ -785,6 +811,8 @@ export class RelayedSession {
     this.deps.assertExecutionOwned?.();
     switch (event.kind) {
       case "session_update": {
+        // A working agent keeps its preview from stopping as idle.
+        if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
         const bypass = this.dshGovernance?.observe((event.params as { update?: unknown } | null)?.update) ?? null;
         await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
         if (bypass) await this.onDshGovernanceBypass(bypass);
@@ -989,6 +1017,7 @@ export class RelayedSession {
     this.fenceForRecovery();
     this.recoveryStopTask = (async () => {
       await this.closeMcpFacade();
+      this.stopPreview("claim_lost");
       const initialRef = this.creationReturned ? this.acpSessionRef : null;
       const stop = async (ref: string): Promise<void> => {
         const stopRunner = this.deps.runner.stopForRecovery;
@@ -1126,6 +1155,7 @@ export class RelayedSession {
       throw error;
     } finally {
       await this.closeMcpFacade();
+      if (!nativeCompletion) this.stopPreview(reason);
       this.completedSettlementInProgress = false;
       // The completed receipt is not qualified handoff. Keep the channel's
       // retry owner even after its terminal report has been persisted.
@@ -1140,7 +1170,16 @@ export class RelayedSession {
   private async closeMcpFacade(): Promise<void> {
     const facade = this.mcpFacade;
     this.mcpFacade = null;
-    await facade?.close();
+    const tools = this.previewTools;
+    this.previewTools = null;
+    await Promise.all([facade?.close(), tools?.close()]);
+  }
+
+  /** The session's preview goes with the session (not with a completed turn). */
+  private stopPreview(reason: string): void {
+    const sessionId = this.previewSessionId;
+    if (sessionId === null || !this.deps.preview) return;
+    void this.deps.preview.stop(sessionId, reason).catch(error => this.logger.warn({ event: "preview.stop_failed", assignmentId: this.assignment.id, err: error }, "session preview could not be stopped"));
   }
 
   get isClosed(): boolean {

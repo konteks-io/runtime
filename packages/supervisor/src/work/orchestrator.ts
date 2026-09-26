@@ -124,6 +124,8 @@ export interface OrchestratorDeps {
   searchController?: SearchControllerBoundary;
   /** Present on a runtime tagged `onboard`; absent, both kinds are refused. */
   onboardCarrier?: Pick<OnboardWorkCarrier, "execute">;
+  /** An idle completed session was released and no other session holds its channel (its preview may go). */
+  onSessionReleased?: (sessionId: string) => void;
   logger?: Logger;
 }
 
@@ -1104,6 +1106,7 @@ export class WorkOrchestrator {
         await this.stopCompletedOwner(prior, ref, execution.processOwner, assertCurrent);
         owner.releaseCompletedChannel();
         if (this.sessions.get(key) === owner) this.sessions.delete(key);
+        if (!this.channelOwners.has(channelId) && channelId.startsWith("session:")) this.deps.onSessionReleased?.(channelId.slice("session:".length));
         reaped += 1;
         this.logger.info({ assignmentId: owner.assignment.id, attempt: owner.assignment.attempt, stage: "idle_reaper", outcome: "released",
           idleMs: now - Date.parse(execution.completedTurnSettledAt) }, "released an idle completed session");
