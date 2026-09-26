@@ -385,7 +385,10 @@ export class Supervisor {
       this.modelCapabilities = new ModelCapabilitySnapshotProducer({
         clock: this.clock, instanceId: () => this.instanceId ?? "", runnerIncarnation: () => this.runnerIncarnation,
         manifestId: () => this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation)?.manifest?.manifestId ?? null,
-        mappings: () => this.nativeRelease ? selectNativeModelCapabilityMappings(this.nativeRelease) : [],
+        mappings: () => this.nativeRelease ? selectNativeModelCapabilityMappings(this.nativeRelease, {
+          os: this.config.SUPERVISOR_PLATFORM_OS,
+          architecture: this.config.SUPERVISOR_PLATFORM_ARCH,
+        }) : [],
         discover: async (agentId, configId) => {
           const runner = this.nativeRunners.find(candidate => candidate.agentId === agentId);
           if (!runner) throw new RemoteInstanceError("agent_unavailable", "Reviewed model mapping has no installed native runner.");

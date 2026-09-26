@@ -88,6 +88,21 @@ describe('signed native executable staging', () => {
     ]);
   });
 
+  it('selects model authority only for bridge artifacts installed on this platform', () => {
+    const macBridge = { ...artifact, id: 'claude-macos-arm64', kind: 'agent_bridge', agentId: 'claude-code' };
+    const windowsBridge = { ...artifact, id: 'claude-windows-amd64', kind: 'agent_bridge', agentId: 'claude-code', os: 'windows', architecture: 'amd64' };
+    const release = verifyNativeRelease(signed({
+      nativeArtifacts: [artifact, macBridge, windowsBridge],
+      modelCapabilityMappings: [
+        signedMapping({ mappingId: 'claude-macos-model', bridgeProfileRef: macBridge.id }),
+        signedMapping({ mappingId: 'claude-windows-model', bridgeProfileRef: windowsBridge.id }),
+      ],
+    }), roots, now);
+
+    expect(selectNativeModelCapabilityMappings(release, { os: 'macos', architecture: 'arm64' })
+      .map(value => value.mapping.mappingId)).toEqual(['claude-macos-model']);
+  });
+
   it('cannot change signed artifacts after verification', () => {
     const release = verifyNativeRelease(signed(), roots, now);
     expect(() => { release.manifest.nativeArtifacts![0]!.url = 'https://evil.test/unsigned'; }).toThrow();
