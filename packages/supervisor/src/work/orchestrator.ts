@@ -953,18 +953,22 @@ export class WorkOrchestrator {
         try {
           retained = this.deps.journal.execution.liveContinuation(assignment);
         } catch (error) {
-          if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required" ||
-              (!this.canStartFreshAfterUnresumableHarnessPredecessor(assignment) &&
-               !this.canStartFreshAfterRecoveredHarnessContinuation(assignment))) throw error;
-          // The exact predecessor has already durably reported that it cannot
-          // resume, and no qualified session head exists to transfer. Its old
-          // generation/reference remain fenced in the execution journal; do
-          // not turn the explicit interruption into a permanent channel
-          // conflict. Opening below gives this successor a fresh session/new
-          // in the same repository worktree and admitted local boundary.
+          if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error;
+          const unresumablePredecessor = this.canStartFreshAfterUnresumableHarnessPredecessor(assignment);
+          const recoveredContinuation = this.canStartFreshAfterRecoveredHarnessContinuation(assignment);
+          const repositoryAnchor = this.canStartFreshRepositoryAnchorAfterSettledHead(assignment);
+          if (!unresumablePredecessor && !recoveredContinuation && !repositoryAnchor) throw error;
+          // A settled head is not always this turn's predecessor: a fresh
+          // repository anchor deliberately declines generated workspace state.
+          // Otherwise the exact predecessor was already fenced or reported as
+          // unresumable. In every case its old generation/reference stays
+          // fenced; opening below creates a fresh session inside the admitted
+          // repository, role, agent and model boundary.
           this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt,
-            stage: "channel_handoff", outcome: "discarded_unresumable_predecessor" },
-          "the repository role's exact predecessor is not resumable; starting a fresh ACP session");
+            stage: "channel_handoff", outcome: repositoryAnchor ? "fresh_repository_anchor" : "discarded_unresumable_predecessor" },
+          repositoryAnchor
+            ? "the new cycle is repository-anchored and the previous role session is settled; starting a fresh ACP session"
+            : "the repository role's exact predecessor is not resumable; starting a fresh ACP session");
           return undefined;
         }
         if (!retained) {
@@ -1116,6 +1120,20 @@ export class WorkOrchestrator {
     if (!tip || !fenced || fenced.source.kind !== "harness_delivery" || !sameHarnessRoleSession(fenced, successor) ||
         jcsDigest((fenced.source.turn.predecessor ?? null) as JsonValue) !== jcsDigest(successor.source.turn.predecessor as JsonValue)) return false;
     return this.recoveredExecutionSettled(tip);
+  }
+
+  /** A new proposal can deliberately start from the repository rather than
+   * reuse generated workspace state. That absence of a predecessor is not a
+   * licence to discard preserved changes: only an ACP-settled role head whose
+   * exact terminal report Core acknowledged may be left behind. */
+  private canStartFreshRepositoryAnchorAfterSettledHead(successor: RemoteWorkAssignment): boolean {
+    if (successor.source.kind !== "harness_delivery" || successor.source.turn.predecessor) return false;
+    const head = this.deps.journal.execution.harnessRoleHead(successor);
+    const execution = head && this.deps.journal.execution.execution(head);
+    const predecessor = head && this.deps.journal.execution.start(head.assignmentId, head.attempt)?.assignment;
+    if (!head || !execution || execution.phase !== "acp_settled" || !predecessor ||
+        predecessor.source.kind !== "harness_delivery" || !sameHarnessRoleSession(predecessor, successor)) return false;
+    return this.reports.acknowledgedTerminalReport(head.assignmentId, head.attempt, head.claimId) !== undefined;
   }
 
   /** Release an idle sealed completion, then journal its proven stop. */

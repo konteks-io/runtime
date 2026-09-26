@@ -28,7 +28,7 @@ const work = (identity: LocalAdmission, acpSessionRef?: string): RemoteWorkAssig
   policy: { maxDurationSeconds: 3600, maxArtifactBytes: 0, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted",
     latestResumeAt: "2026-09-06T01:00:00.000Z", permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: true },
 });
-const delivery = (identity: LocalAdmission, invocationId: string): RemoteWorkAssignment => ({
+const delivery = (identity: LocalAdmission, invocationId: string, includePredecessor = identity.assignmentId === "next"): RemoteWorkAssignment => ({
   id: identity.assignmentId, kind: "delivery", placementId: `placement-${identity.assignmentId}`, instanceId: identity.instanceId,
   workspaceId: identity.workspaceId, taskId: "repository-task", correlationId: invocationId, attempt: identity.attempt,
   expiresAt: "2026-09-06T01:00:00.000Z", requiredCapabilities: [],
@@ -37,7 +37,7 @@ const delivery = (identity: LocalAdmission, invocationId: string): RemoteWorkAss
     executionSessionId: "repository-generator-session", repositoryId: "https://git.example.com/acme/store",
     modelBinding: { canonicalProviderId: "anthropic", canonicalModelId: "claude-sonnet" },
     turn: { invocationId, dispatchGeneration: 0,
-      ...(identity.assignmentId === "next" ? { predecessor: { invocationId: "generate-1", dispatchGeneration: 0 } } : {}) } },
+      ...(includePredecessor ? { predecessor: { invocationId: "generate-1", dispatchGeneration: 0 } } : {}) } },
   policy: { maxDurationSeconds: 3600, maxArtifactBytes: 0, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted",
     latestResumeAt: "2026-09-06T01:00:00.000Z", permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: true },
 });
@@ -210,6 +210,70 @@ it("starts a fresh repository-role session after its exact predecessor terminate
 
   await expect(internal.takeOverCompletedChannel(delivery(restarted, "generate-2"), restarted, current)).resolves.toBeUndefined();
   expect(journal.execution.execution(restarted)).toBeUndefined();
+});
+
+it("starts a fresh repository-anchored cycle after the previous empty-output session was durably settled", async () => {
+  const journal = new SupervisorJournal(dir); await journal.load();
+  const outbox = new DurableOutbox(dir); await outbox.load();
+  const restarted = { ...next, runnerIncarnation: "restarted-process" };
+  const predecessor = delivery(prior, "generate-1");
+  const repositoryAnchor = delivery(restarted, "generate-2", false);
+  for (const [identity, assignment] of [[prior, predecessor], [restarted, repositoryAnchor]] as const) {
+    await journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1, admission: identity, assignment,
+      evidenceUpload: "structured_only", projectionCreatedAt: identity.openedAt, claimCreatedAt: identity.openedAt }, current);
+    await journal.execution.reserveAllocation(identity, current);
+  }
+  await journal.execution.open(prior, current, prior.openedAt);
+  await journal.execution.bindReference(prior, "generator-ref", current);
+  await journal.execution.bindProcessOwner(prior, processOwner, current);
+  await journal.execution.markCompletedTurnSettled(prior, "generator-ref", "2026-09-06T00:00:01.000Z", current);
+  await journal.execution.markStopping(prior, "2026-09-06T00:00:02.000Z", current);
+  await journal.execution.markAcpSettled(prior, "generator-ref", "2026-09-06T00:00:03.000Z", current);
+  await journal.assignments.put({ assignmentId: "prior", attempt: 1, claimId: "prior-claim", kind: "delivery", placementId: "placement-prior", workspaceId: "workspace",
+    agentId: "claude-code", state: "completed", recoveryEpoch: 0, terminalResultHash: "s".repeat(43),
+    reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1,
+      terminalAck: { assignmentId: "prior", attempt: 1, claimId: "prior-claim",
+        acknowledged: { reportId: "report-prior", reportSequence: 1 }, durableWatermark: 1, terminalSequence: 1, outcome: "accepted" } },
+    evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
+  const orchestrator = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock,
+    runners: new Map(), sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
+    runnerIncarnation: () => "restarted-process", assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
+  const internal = orchestrator as unknown as {
+    takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined>;
+  };
+
+  await expect(internal.takeOverCompletedChannel(repositoryAnchor, restarted, current)).resolves.toBeUndefined();
+  expect(journal.execution.execution(prior)).toMatchObject({ phase: "acp_settled", acpSessionRef: "generator-ref" });
+  expect(journal.execution.execution(restarted)).toBeUndefined();
+});
+
+it("does not bypass the predecessor chain when preserved changes require revalidation", async () => {
+  const journal = new SupervisorJournal(dir); await journal.load();
+  const outbox = new DurableOutbox(dir); await outbox.load();
+  const restarted = { ...next, runnerIncarnation: "restarted-process" };
+  for (const [identity, assignment] of [[prior, delivery(prior, "generate-1")], [restarted, delivery(restarted, "generate-2")]] as const) {
+    await journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1, admission: identity, assignment,
+      evidenceUpload: "structured_only", projectionCreatedAt: identity.openedAt, claimCreatedAt: identity.openedAt }, current);
+    await journal.execution.reserveAllocation(identity, current);
+  }
+  await journal.execution.open(prior, current, prior.openedAt);
+  await journal.execution.bindReference(prior, "generator-ref", current);
+  await journal.execution.bindProcessOwner(prior, processOwner, current);
+  await journal.execution.markCompletedTurnSettled(prior, "generator-ref", "2026-09-06T00:00:01.000Z", current);
+  await journal.assignments.put({ assignmentId: "prior", attempt: 1, claimId: "prior-claim", kind: "delivery", placementId: "placement-prior", workspaceId: "workspace",
+    agentId: "claude-code", state: "completed", recoveryEpoch: 0,
+    reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1 }, evidenceUpload: "structured_only",
+    expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
+  const orchestrator = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock,
+    runners: new Map(), sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
+    runnerIncarnation: () => "restarted-process", assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
+  const internal = orchestrator as unknown as {
+    takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined>;
+  };
+
+  await expect(internal.takeOverCompletedChannel(delivery(restarted, "generate-2"), restarted, current))
+    .resolves.toEqual({ reference: "generator-ref", mode: "restore" });
+  expect(journal.execution.execution(prior)).toMatchObject({ phase: "continued", continuedToGeneration: "next-generation" });
 });
 
 it("leaves the previous execution untouched when its session is not an idle sealed completion", async () => {
