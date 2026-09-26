@@ -10,7 +10,6 @@ export interface InventorySnapshot {
   hostPressure: number;
   activeSessions: number;
   activeTurns: number;
-  browserToolAvailable: boolean;
   /**
    * The machine's git version, or `null` when git is not on PATH. The `onboard`
    * role is derived from it (OB6 §1); nothing else reads it.

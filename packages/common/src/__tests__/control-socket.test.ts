@@ -141,7 +141,7 @@ describe("loopback control socket", () => {
       token,
       port: 0,
       handler: async () => {
-        throw new RemoteInstanceError("gateway_unavailable", "gateway is down", {
+        throw new RemoteInstanceError("agent_unavailable", "agent is down", {
           recoveryActions: [{ kind: "run_doctor" }],
         });
       },
@@ -152,7 +152,7 @@ describe("loopback control socket", () => {
         { token, port: server.port },
         { request: { op: "auth.logout", agentId: "codex" }, schema: z.unknown() },
       ),
-    ).rejects.toMatchObject({ message: "gateway_unavailable: gateway is down" });
+    ).rejects.toMatchObject({ message: "agent_unavailable: agent is down" });
   });
 
   it("rejects a request outside the closed protocol at once instead of waiting for a timeout", async () => {
@@ -177,5 +177,8 @@ describe("loopback control socket", () => {
     expect(ControlRequestSchema.safeParse({ op: "auth.logout", agentId: "Codex Bad" }).success).toBe(false);
     // The retired appliance's BYOK gateway operations are gone.
     expect(ControlRequestSchema.safeParse({ op: "gateway.key.set", agentId: "codex", key: "k".repeat(16) }).success).toBe(false);
+    // Relay previews left the protocol: no local port is ever exposed.
+    expect(ControlRequestSchema.safeParse({ op: "preview.enable", port: 3000 }).success).toBe(false);
+    expect(ControlRequestSchema.safeParse({ op: "preview.disable" }).success).toBe(false);
   });
 });

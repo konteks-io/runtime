@@ -191,9 +191,10 @@ export async function submitReadiness(args: {
   const logger = args.logger ?? createLogger({ name: "provisioning" });
   const [identity, stored] = await Promise.all([args.store.identity(), args.store.manifest()]);
   if (!identity || !stored) throw new RemoteInstanceError("install_state_corrupt", "cannot submit readiness without identity and manifest");
+  if (stored.manifest.deploymentKind !== "native_connector") throw new RemoteInstanceError("bundle_untrusted", "a native connector requires a native release");
   const result = await args.core.submitReadiness({
     instanceId: identity.instanceId,
-    ...(stored.manifest.deploymentKind === "native_connector" ? { deploymentKind: "native_connector" as const } : {}),
+    deploymentKind: "native_connector",
     bundleVersion: args.bundleVersion,
     protocolVersion: args.protocolVersion,
     manifestDigest: stored.manifestDigest,

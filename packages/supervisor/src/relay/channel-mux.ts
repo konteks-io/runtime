@@ -560,7 +560,7 @@ export class ChannelMux {
     }
     if (ack.dataDirection !== "to_core") return;
     assertRecovery();
-    const origin = state.channel === "session" || state.channel === "preview" ? "grant_holder" : "core";
+    const origin = state.channel === "session" ? "grant_holder" : "core";
     if (ack.origin !== origin || ack.cumulativeSeq > highestSent) {
       this.counters.invalidFrames += 1;
       return;
@@ -672,13 +672,13 @@ export class ChannelMux {
     for (const [channelId, state] of this.channels) {
       if (!this.recovery.permits(state.channel)) continue;
       if (state.receivedCursor > state.lastEmittedAckCursor) this.emitAck(channelId, state);
-      // Session and preview receivers attach independently from the runtime
+      // Session receivers attach independently from the runtime
       // socket. Their absence is normal and D156 asks us to replay as soon as
       // a holder binds; it is not evidence that the shared socket is dead.
       // Rolling that socket only fences unrelated work and cannot make a
       // detached holder appear. Buffer bounds still produce explicit reset if
       // a later replay is no longer complete.
-      if (state.channel === "session" || state.channel === "preview") continue;
+      if (state.channel === "session") continue;
       const stallDeadlineMs = socketLive ? Math.max(this.stallDeadlineMs(state, intervalMs), STALL_BACKOFF_CEILING_MS) : this.stallDeadlineMs(state, intervalMs);
       // A late acknowledgement from a peer that is still sending on this
       // channel means busy, not dead (bb reconnects on a missed heartbeat,

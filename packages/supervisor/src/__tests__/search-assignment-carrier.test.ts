@@ -131,7 +131,6 @@ async function fixture(options: { controller?: { acceptClaimed: ReturnType<typeo
     maxPullItems: 1,
     acceptedKinds: () => ["search_generation"],
     advertisedRoles: () => ["assistant"],
-    browserToolAvailable: () => false,
     agents: () => [{ agentId: "codex", readiness: "ready", connectionState: "ready" }],
     instanceEvidencePolicy: () => "structured_only",
    

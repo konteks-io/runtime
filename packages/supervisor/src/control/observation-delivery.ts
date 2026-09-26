@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { AgentTurnUsageObservationSchema, GatewayCallObservationSchema, createLogger, jcsDigest,
+import { AgentTurnUsageObservationSchema, createLogger, jcsDigest,
   RemoteInstanceError, type Clock, type Logger, type JsonValue } from "@konteks/remote-common";
 import type { CoreClient } from "../core/client.js";
 import type { DurableOutbox } from "../state/outbox.js";
 
 /** Durable source bodies survive both relay ACK loss and process restart.
  * HTTPS returns a content-bound receipt after Core commits; socket ACKs never
- * retire this journal. Old usage/gateway keys are reconciled by the same path. */
+ * retire this journal. Old usage keys are reconciled by the same path. */
 export class ObservationDelivery {
   private flushing: Promise<void> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -27,8 +27,7 @@ export class ObservationDelivery {
     await this.flushing;
   }
   async submit(body: unknown): Promise<void> {
-    const usage = AgentTurnUsageObservationSchema.safeParse(body);
-    const observation = usage.success ? usage.data : GatewayCallObservationSchema.parse(body);
+    const observation = AgentTurnUsageObservationSchema.parse(body);
     if (observation.instanceId !== this.options.instanceId()) throw new Error("Observation instance mismatch");
     await this.options.outbox.enqueue({ id: randomUUID(), channel: "observation",
       key: `observation:${jcsDigest(observation as unknown as JsonValue)}`, group: "observation", order: this.options.clock.now(),

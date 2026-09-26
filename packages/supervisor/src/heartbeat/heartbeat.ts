@@ -208,7 +208,7 @@ export class HeartbeatPublisher {
     const snapshot = await this.options.inventory.collect();
     assertCurrent();
     this.options.onInventory?.(snapshot.agents);
-    const roles = deriveAdvertisedRoles(this.options.roleBindings(), snapshot.agents, { browserToolAvailable: snapshot.browserToolAvailable, gitVersion: snapshot.gitVersion });
+    const roles = deriveAdvertisedRoles(this.options.roleBindings(), snapshot.agents, { gitVersion: snapshot.gitVersion });
     this.lastRoles = roles;
     const requiredHealthy = snapshot.components.every((component) => component.healthStatus === "healthy" || component.healthStatus === "degraded");
     const utilization = computeUtilization({

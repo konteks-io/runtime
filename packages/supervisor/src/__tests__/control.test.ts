@@ -133,10 +133,11 @@ describe("desired configuration", () => {
     expect(applied).toEqual([native]);
   });
 
-  it("rejects a signed appliance configuration (the retired gateway shape)", async () => {
+  it("drops a signed appliance configuration (the retired gateway shape) at the shared schema", async () => {
     const f = await harness();
     await f.handlers.handle(signByCore({ type: "desired_configuration" as const, instanceId: "inst-1", revision: 1, issuedAt: "2026-09-06T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z", digest: jcsDigest(applianceConfiguration), configuration: applianceConfiguration as never }));
-    expect(f.acks[0]).toMatchObject({ status: "rejected", reason: "invalid_value" });
+    expect(f.acks).toEqual([]);
+    expect(f.handlers.counters.rejectedUnknown).toBe(1);
     expect(await f.store.config()).toBeNull();
   });
   it("applies a signed monotonic revision and acks with a signed body", async () => {
@@ -211,22 +212,22 @@ describe("erase, drain, version, rotation", () => {
 });
 
 describe("roles and utilization", () => {
-  const ready = { agentId: "codex", displayName: "Codex", connectionState: "ready" as const, authMode: "agent_local_subscription" as const, accountScope: "personal" as const, readiness: "ready" as const, moneyObservable: false, tokenUsageObservable: true, acpCapabilities: { sessionResume: true, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const } };
+  const ready = { agentId: "codex", displayName: "Codex", connectionState: "ready" as const, authMode: "agent_local_subscription" as const, accountScope: "personal" as const, readiness: "ready" as const, tokenUsageObservable: true, acpCapabilities: { sessionResume: true, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const } };
   it("advertises a role only when a preferred agent is ready and capable", () => {
     const bindings = [{ role: "planner" as const, agentPreference: ["claude-code", "codex"] }, { role: "generator" as const, agentPreference: ["codex"] }, { role: "qa" as const, agentPreference: ["codex"] }, { role: "assistant" as const, agentPreference: ["pi"] }];
-    expect(deriveAdvertisedRoles(bindings, [ready], { browserToolAvailable: false })).toEqual(["planner", "generator", "qa"]);
-    expect(deriveAdvertisedRoles([{ role: "ops", agentPreference: [ready.agentId] }], [ready], { browserToolAvailable: true })).toEqual([]);
-    expect(deriveAdvertisedRoles(bindings, [ready], { browserToolAvailable: true })).toEqual(["planner", "generator", "qa"]);
-    expect(deriveAdvertisedRoles(bindings, [{ ...ready, readiness: "not_configured" }], { browserToolAvailable: true })).toEqual([]);
+    expect(deriveAdvertisedRoles(bindings, [ready], {})).toEqual(["planner", "generator", "qa"]);
+    expect(deriveAdvertisedRoles([{ role: "ops", agentPreference: [ready.agentId] }], [ready], {})).toEqual([]);
+    expect(deriveAdvertisedRoles(bindings, [ready], {})).toEqual(["planner", "generator", "qa"]);
+    expect(deriveAdvertisedRoles(bindings, [{ ...ready, readiness: "not_configured" }], {})).toEqual([]);
     // Enrollment binds a machine's roles before it has said what it has, so
     // the preference is empty. Reading that as "no candidate" made the machine
     // refuse its own workspace's first assignment as role_not_advertised.
-    expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: [] }], [ready], { browserToolAvailable: true })).toEqual(["assistant"]);
-    expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: [] }], [{ ...ready, readiness: "not_configured" }], { browserToolAvailable: true })).toEqual([]);
-    expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: [] }], [], { browserToolAvailable: true })).toEqual([]);
-    expect(placedAgentReady([ready], "codex", "planner", { browserToolAvailable: false })).toBe(true);
-    expect(placedAgentReady([ready], "codex", "generator", { browserToolAvailable: false })).toBe(true);
-    expect(placedAgentReady([ready], "claude-code", "planner", { browserToolAvailable: false })).toBe(false);
+    expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: [] }], [ready], {})).toEqual(["assistant"]);
+    expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: [] }], [{ ...ready, readiness: "not_configured" }], {})).toEqual([]);
+    expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: [] }], [], {})).toEqual([]);
+    expect(placedAgentReady([ready], "codex", "planner", {})).toBe(true);
+    expect(placedAgentReady([ready], "codex", "generator", {})).toBe(true);
+    expect(placedAgentReady([ready], "claude-code", "planner", {})).toBe(false);
   });
 
   it("utilization is the max of active-turn load against the soft ceiling and host pressure", () => {

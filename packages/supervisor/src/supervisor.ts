@@ -100,7 +100,7 @@ import { evaluateHeartbeatLiveness } from "./heartbeat/liveness.js";
 // composed below, so its two kinds are accepted too. Leaving them out meant
 // Core never offered a discovery run's evidence work, and grouping evidence
 // was never read.
-const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "preview", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation"];
+const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation"];
 
 /** bb releases sessions idle for 30 minutes, checked every 5 minutes. */
 const IDLE_SESSION_RELEASE_MS = 30 * 60_000;
@@ -294,7 +294,7 @@ export class Supervisor {
     } catch { throw new RemoteInstanceError("bundle_untrusted", "Native startup requires matching signed activation and installed release artifacts."); }
     const storedLease = await this.store.lease();
     if (storedLease) {
-      const claims = decodeStoredLeaseClaims(storedLease.lease, { instanceId: this.instanceId!, audience: LEASE_AUDIENCE, deploymentKind: "native_connector" });
+      const claims = decodeStoredLeaseClaims(storedLease.lease, { instanceId: this.instanceId!, audience: LEASE_AUDIENCE });
       if (claims.workspace_id !== this.workspaceId || storedLease.workspaceId !== this.workspaceId) throw new RemoteInstanceError("registration_mismatch", "lease workspace does not match the native activation");
       const expected = leaseRecordFromClaims(storedLease.lease, claims);
       if (storedLease.mode !== expected.mode
@@ -663,7 +663,6 @@ export class Supervisor {
       agents: () => this.lastSnapshot?.agents ?? [],
       roleBindings: () => this.roleBindings,
       advertisedRoles: () => deriveAdvertisedRoles(this.roleBindings, this.lastSnapshot?.agents ?? [], this.roleCapabilityInputs()),
-      browserToolAvailable: () => this.lastSnapshot?.browserToolAvailable ?? false,
       roleCapabilityInputs: () => this.roleCapabilityInputs(),
       acceptedKinds: () => ALL_KINDS,
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
@@ -1273,7 +1272,7 @@ export class Supervisor {
 
   private async adoptLease(lease: string, assertCurrent = this.captureLeaseFence()): Promise<void> {
     assertCurrent();
-    const claims = decodeLeaseClaims(lease, { instanceId: this.instanceId ?? "", audience: LEASE_AUDIENCE, deploymentKind: "native_connector" });
+    const claims = decodeLeaseClaims(lease, { instanceId: this.instanceId ?? "", audience: LEASE_AUDIENCE });
     if (claims.workspace_id !== this.workspaceId) throw new RemoteInstanceError("registration_mismatch", "lease workspace does not match the native activation");
     const record = leaseRecordFromClaims(lease, claims);
     await this.mutateLease(async () => {
@@ -1295,7 +1294,7 @@ export class Supervisor {
 
   private async adoptHeartbeat(result: HeartbeatResult, assertCurrent: () => void): Promise<void> {
     if (this.stopping) return;
-    const claims = decodeLeaseClaims(result.lease, { instanceId: this.instanceId ?? "", audience: LEASE_AUDIENCE, deploymentKind: "native_connector" });
+    const claims = decodeLeaseClaims(result.lease, { instanceId: this.instanceId ?? "", audience: LEASE_AUDIENCE });
     if (result.instanceId !== this.instanceId || result.leaseMode !== claims.lease_mode || parseRfc3339(result.leaseExpiresAt) !== claims.exp * 1000 ||
         (result.drainDeadline === undefined ? undefined : parseRfc3339(result.drainDeadline) / 1000) !== claims.drain_deadline) {
       throw new RemoteInstanceError("registration_mismatch", "Heartbeat lease metadata does not match its claims.");
@@ -1364,9 +1363,6 @@ export class Supervisor {
       }
       case "session":
         await this.work.onSessionMessage(message.channelId, message.body);
-        return;
-      case "preview":
-        // No local preview is ever exposed: a preview frame has nothing to reach.
         return;
     }
   }
@@ -1553,7 +1549,7 @@ export class Supervisor {
 
   /** The non-agent facts a role may depend on; one source for every reader. */
   private roleCapabilityInputs(): RoleCapabilityInputs {
-    return { browserToolAvailable: this.lastSnapshot?.browserToolAvailable ?? false, gitVersion: this.lastSnapshot?.gitVersion ?? null };
+    return { gitVersion: this.lastSnapshot?.gitVersion ?? null };
   }
 
   // ── Status and control socket ─────────────────────────────────────────────
@@ -1573,9 +1569,6 @@ export class Supervisor {
       roles: (this.heartbeat?.roles() ?? []) as SupervisorStatus["roles"],
       roleBindings: this.roleBindings,
       utilization: { acceptingWork: !this.draining && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
-      // A native connector never forwards a local preview (wire fields kept for Core).
-      previewEnabled: false,
-      previewExposure: null,
       pendingErase: this.journal.erase.all().filter((record) => !record.receiptSent).length,
       pendingRevocation: this.pendingRevocation,
       journal: { assignments: this.journal.activeAssignments().length, outboxDepth: this.outbox.depth, recoveryRequired: this.journal.recoveryRequired().length },
@@ -1639,10 +1632,6 @@ export class Supervisor {
           this.managedGitBinding = await store.binding();
           return { keyRef: request.keyRef, revoked: true };
         }
-        case "preview.enable":
-          throw new RemoteInstanceError("capability_unavailable", "Native preview forwarding has not been configured.");
-        case "preview.disable":
-          return { enabled: false, port: null, grantPresent: false };
         case "drain":
           return { activeAssignments: await this.beginDrain(request.reason, null) };
         case "drain.status":

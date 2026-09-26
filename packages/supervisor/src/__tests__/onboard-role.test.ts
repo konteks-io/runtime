@@ -27,8 +27,8 @@ describe("the onboard role is the machine's git", () => {
       ONBOARD_RELOCATION_CAPABILITY,
       "git:2.45.2",
     ]);
-    expect(deriveAdvertisedRoles(bindings, [ready], { browserToolAvailable: false, gitVersion: "2.45.2" })).toEqual(["onboard"]);
-    expect(placedAgentReady([ready], "codex", "onboard", { browserToolAvailable: false, gitVersion: "2.45.2" })).toBe(true);
+    expect(deriveAdvertisedRoles(bindings, [ready], { gitVersion: "2.45.2" })).toEqual(["onboard"]);
+    expect(placedAgentReady([ready], "codex", "onboard", { gitVersion: "2.45.2" })).toBe(true);
   });
 
   it("advertises neither capability and no role without git on PATH", () => {
@@ -36,14 +36,14 @@ describe("the onboard role is the machine's git", () => {
     expect(onboardCapabilities("")).toEqual([]);
     // An absent probe is not a licence to claim the role: the runtime is
     // ineligible for both work kinds and Core reports the ordinary reason.
-    expect(deriveAdvertisedRoles(bindings, [ready], { browserToolAvailable: true })).toEqual([]);
-    expect(deriveAdvertisedRoles(bindings, [ready], { browserToolAvailable: true, gitVersion: null })).toEqual([]);
-    expect(placedAgentReady([ready], "codex", "onboard", { browserToolAvailable: true, gitVersion: null })).toBe(false);
+    expect(deriveAdvertisedRoles(bindings, [ready], {})).toEqual([]);
+    expect(deriveAdvertisedRoles(bindings, [ready], { gitVersion: null })).toEqual([]);
+    expect(placedAgentReady([ready], "codex", "onboard", { gitVersion: null })).toBe(false);
   });
 
   it("still needs a ready agent, because the session's turns run on one", () => {
     const unavailable = { ...ready, readiness: "unavailable" } as ConnectedAgentView;
-    expect(agentSatisfiesRole(unavailable, "onboard", { browserToolAvailable: false, gitVersion: "2.45.2" })).toBe(false);
+    expect(agentSatisfiesRole(unavailable, "onboard", { gitVersion: "2.45.2" })).toBe(false);
   });
 
   it("does not disturb the roles that came before it", () => {
@@ -53,7 +53,7 @@ describe("the onboard role is the machine's git", () => {
       { role: "qa" as const, agentPreference: ["codex"] },
       { role: "ops" as const, agentPreference: ["codex"] },
     ];
-    expect(deriveAdvertisedRoles(all, [ready], { browserToolAvailable: false, gitVersion: null })).toEqual(["planner", "generator", "qa"]);
+    expect(deriveAdvertisedRoles(all, [ready], { gitVersion: null })).toEqual(["planner", "generator", "qa"]);
   });
 });
 

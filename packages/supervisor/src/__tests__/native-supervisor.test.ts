@@ -65,7 +65,7 @@ async function fixture() {
 describe("native Supervisor composition", () => {
   it.each(["mode", "expiresAt", "issuedAt", "drainDeadline"])("rejects stored lease %s metadata that disagrees with its canonical claims", async field => {
     const f = await fixture(), result = heartbeatLease();
-    const claims = decodeLeaseClaims(result.lease, { instanceId: "instance", audience: LEASE_AUDIENCE, deploymentKind: "native_connector" });
+    const claims = decodeLeaseClaims(result.lease, { instanceId: "instance", audience: LEASE_AUDIENCE });
     const record = leaseRecordFromClaims(result.lease, claims);
     await f.store.saveLease({ ...record, [field]: field === "mode" ? "drain_only" : new Date(Date.now() + 3600000).toISOString() });
     const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);

@@ -3,7 +3,7 @@ import type { ConnectedAgentView } from "@konteks/remote-common";
 import { NativeInventoryCollector, machineHasDesktop } from "../native/inventory.js";
 import { deriveAdvertisedRoles } from "../inventory/roles.js";
 
-const agent: ConnectedAgentView = { agentId: "codex", displayName: "Codex", connectionState: "ready", authMode: "agent_local_subscription", accountScope: "personal", readiness: "ready", moneyObservable: false, tokenUsageObservable: true, acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" } };
+const agent: ConnectedAgentView = { agentId: "codex", displayName: "Codex", connectionState: "ready", authMode: "agent_local_subscription", accountScope: "personal", readiness: "ready", tokenUsageObservable: true, acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" } };
 const signals = { cpuRatio: 0.2, memoryRatio: 0.3, diskFreeBytes: 100, diskTotalBytes: 200, loadAverage1m: 0, cpuCount: 4, observedAt: "2026-09-06T00:00:00.000Z" };
 function fixture(executionPermitsReady?: () => boolean, cancellationDeliveryReady?: () => boolean, deliveryExecutionPermitsReady?: () => boolean) {
   const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 2, activeTurns: 1 } }));
@@ -73,7 +73,7 @@ describe("native host inventory (A4 D133)", () => {
     const f = fixture();
     const snapshot = await f.inventory.collect();
     expect(snapshot.components).toEqual([{ kind: "agent_runner", version: "1.0.0", healthStatus: "healthy", capabilities: ["agent:codex", "session-label-v1"], lastProbeAt: signals.observedAt }]);
-    expect(snapshot).toMatchObject({ agents: [agent], hostPressure: 0.3, activeSessions: 2, activeTurns: 1, browserToolAvailable: false, diskFreeBytes: 100 });
+    expect(snapshot).toMatchObject({ agents: [agent], hostPressure: 0.3, activeSessions: 2, activeTurns: 1, diskFreeBytes: 100 });
     expect(deriveAdvertisedRoles([
       { role: "generator", agentPreference: ["codex"] },
       { role: "qa", agentPreference: ["codex"] },

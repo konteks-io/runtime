@@ -243,7 +243,7 @@ describe("durable outbox", () => {
 describe("lease state", () => {
   const clock = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
   const token = (claims: Record<string, unknown>): string => `h.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.s`;
-  const base = { iss: "konteks:control-plane", aud: "konteks:remote-instance:lease", sub: "inst-1", workspace_id: "ws", jti: "j", iat: 1_788_652_800, exp: 1_788_652_800 + 600, protocol: "1.0", bundle_version: "1.0.0", components: ["harness", "validation_runtime", "agent_runner", "gateway"], ownership_scope: "personal", administrative_status: "active" };
+  const base = { iss: "konteks:control-plane", aud: "konteks:remote-instance:lease", sub: "inst-1", workspace_id: "ws", jti: "j", iat: 1_788_652_800, exp: 1_788_652_800 + 600, protocol: "1.0", bundle_version: "1.0.0", deployment_kind: "native_connector", components: ["agent_runner"], ownership_scope: "personal", administrative_status: "active" };
 
   it("decodes claims and rejects a lease for another instance or audience", () => {
     const claims = decodeLeaseClaims(token({ ...base, lease_mode: "active" }), { instanceId: "inst-1", audience: base.aud });
@@ -252,7 +252,7 @@ describe("lease state", () => {
     expect(() => decodeLeaseClaims(token({ ...base, lease_mode: "drain_only" }), { instanceId: "inst-1", audience: base.aud })).toThrow();
   });
 
-  it("an active lease pulls and opens every channel; drain_only opens no session/preview; expired opens only control", () => {
+  it("an active lease pulls and opens every channel; drain_only opens no session; expired opens only control", () => {
     const state = new LeaseState(clock);
     state.set(leaseRecordFromClaims("t", decodeLeaseClaims(token({ ...base, lease_mode: "active" }), { instanceId: "inst-1", audience: base.aud })));
     expect(state.canPullNewWork()).toBe(true);
@@ -260,7 +260,6 @@ describe("lease state", () => {
     state.set(leaseRecordFromClaims("t", decodeLeaseClaims(token({ ...base, lease_mode: "drain_only", drain_deadline: new Date(base.exp * 1000).toISOString() }), { instanceId: "inst-1", audience: base.aud })));
     expect(state.canPullNewWork()).toBe(false);
     expect(state.canOpenChannel("session")).toBe(false);
-    expect(state.canOpenChannel("preview")).toBe(false);
     expect(state.canOpenChannel("assignment")).toBe(true);
     clock.advance(700_000);
     expect(state.mode()).toBe("none");

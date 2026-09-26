@@ -46,7 +46,7 @@ describe("doctor and support bundle", () => {
       instanceId: "inst",
       administrativeStatus: "active",
       doctor: { checks: [], generatedAt: "2026-09-06T00:00:00Z" },
-      configurationKeys: ["heartbeatIntervalSeconds", "gateway.capEnforcementStage"],
+      configurationKeys: ["heartbeatIntervalSeconds", "evidenceUpload"],
       counters: { relay: { epochStale: 1 } },
       recentLogLines: [`token ${SECRET_CANARIES.openAiKey} seen`, "Bearer abcdefghijklmnop"],
       generatedAt: "2026-09-06T00:00:00Z",

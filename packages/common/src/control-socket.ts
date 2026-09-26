@@ -43,8 +43,6 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("git.key.add"), title: z.string().trim().min(1).max(256).optional() }).strict(),
   z.object({ op: z.literal("git.key.list") }).strict(),
   z.object({ op: z.literal("git.key.remove"), keyRef: z.string().trim().min(1).max(200) }).strict(),
-  z.object({ op: z.literal("preview.enable"), port: z.number().int().min(1).max(65_535) }).strict(),
-  z.object({ op: z.literal("preview.disable") }).strict(),
   z.object({ op: z.literal("drain"), reason: z.enum(["user", "update", "remove"]) }).strict(),
   z.object({ op: z.literal("drain.status") }).strict(),
   /** Clears a launcher-initiated drain that will not be followed by a stop (e.g. an aborted update). */
@@ -423,7 +421,7 @@ export const SupervisorStatusSchema = z
     components: z.array(
       z
         .object({
-          kind: z.enum(["harness", "validation_runtime", "agent_runner", "gateway"]),
+          kind: z.enum(["agent_runner"]),
           version: z.string(),
           healthStatus: z.enum(["healthy", "degraded", "unhealthy", "unknown"]),
           capabilities: z.array(z.string()),
@@ -449,8 +447,6 @@ export const SupervisorStatusSchema = z
         softMaxConcurrent: z.number().int().optional(),
       })
       .strict(),
-    previewEnabled: z.boolean(),
-    previewExposure: z.object({ port: z.number().int(), grantPresent: z.boolean() }).strict().nullable(),
     pendingErase: z.number().int().nonnegative(),
     pendingRevocation: z.boolean(),
     journal: z

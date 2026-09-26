@@ -454,7 +454,7 @@ describe("work orchestrator claim validation", () => {
     source: { kind: "harness_task_checkout", portability: "instance_bound", ownerInstanceId: "inst-1", workspaceRef: "ref" },
     policy: { maxDurationSeconds: 60, maxArtifactBytes: 1, evidenceUpload: "structured_only", allowedArtifactKinds: [], recoveryMode: "report_interrupted", latestResumeAt: "2026-09-06T02:00:00Z", permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: true },
   };
-  const readyAgent = { agentId: "codex", displayName: "Codex", connectionState: "ready" as const, authMode: "agent_local_subscription" as const, accountScope: "personal" as const, readiness: "ready" as const, moneyObservable: false, tokenUsageObservable: true, acpCapabilities: { sessionResume: true, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const } };
+  const readyAgent = { agentId: "codex", displayName: "Codex", connectionState: "ready" as const, authMode: "agent_local_subscription" as const, accountScope: "personal" as const, readiness: "ready" as const, tokenUsageObservable: true, acpCapabilities: { sessionResume: true, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const } };
 
   async function orchestrator(overrides: Partial<ConstructorParameters<typeof WorkOrchestrator>[0]> = {}) {
     const journal = new SupervisorJournal(dir);
@@ -477,8 +477,7 @@ describe("work orchestrator claim validation", () => {
       agents: () => [readyAgent],
       roleBindings: () => [{ role: "generator", agentPreference: ["codex"] }],
       advertisedRoles: () => ["generator"],
-      browserToolAvailable: () => false,
-      acceptedKinds: () => ["delivery", "validation", "preview", "qa", "assistant_execution"],
+      acceptedKinds: () => ["delivery", "validation", "qa", "assistant_execution"],
       instanceEvidencePolicy: () => "structured_only",
       draining: () => false,
       reconciliationComplete: () => true,
@@ -862,10 +861,10 @@ describe("work orchestrator claim validation", () => {
     expect(sent).toEqual([]);
   });
 
-  it.each(["delivery", "validation", "preview", "qa", "assistant_execution"] as const)("native %s claims bootstrap ACP", async kind => {
+  it.each(["delivery", "validation", "qa", "assistant_execution"] as const)("native %s claims bootstrap ACP", async kind => {
     const runner = { createSession: vi.fn(async (_input: RunnerSessionInput, lifecycle?: RunnerSessionLifecycle) => { await lifecycle?.beforeCreate("native-acp"); lifecycle?.assertCurrent(); return { acpSessionRef: "native-acp", resumed: false, capabilities: { forkSession: false, sessionResume: false } }; }), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined) } as unknown as RunnerPort;
     const role = kind === "delivery" ? "generator" : kind === "assistant_execution" ? "assistant" : "qa";
-    const f = await orchestrator({ runners: new Map([["codex", runner]]), advertisedRoles: () => [role], browserToolAvailable: () => true,
+    const f = await orchestrator({ runners: new Map([["codex", runner]]), advertisedRoles: () => [role],
       sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => { throw new Error("not needed"); }, workspaceRoot: "/native", prepareInputs: async () => ({ binding: { workspaceId: target.workspaceId, assignmentId: target.id, attempt: target.attempt, instanceId: target.instanceId, sessionId: "cloud-session" }, cwd: "/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
         registerReady: createNativeReadyRegistrar({ clock, journal: f.journal, instanceId: target.instanceId, workspaceId: target.workspaceId, runnerIncarnation: "process", assertActive: () => undefined,
           client: { registerExecutionReady: async (_instanceId, request) => ({ ...request, workspaceId: target.workspaceId, instanceId: target.instanceId, sessionId: "cloud-session", channelId: "session:cloud-session", readyRevision: 1, registeredAt: clock.nowIso() }) },

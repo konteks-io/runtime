@@ -18,7 +18,7 @@ async function fixture() {
   const heartbeat = vi.fn(async (_body: unknown) => result);
   const transport = { send: vi.fn(), activeKind: "relay" };
   const onResult = vi.fn(async () => undefined), onFailure = vi.fn(async () => undefined);
-  const inventory = { collect: vi.fn(async () => ({ components: [], agents: [], browserToolAvailable: false, hostPressure: 0, activeSessions: 0, activeTurns: 0 })) };
+  const inventory = { collect: vi.fn(async () => ({ components: [], agents: [], hostPressure: 0, activeSessions: 0, activeTurns: 0 })) };
   const options = { store, key: () => key, clock, instanceId: () => "instance", inventory, roleBindings: () => [], activeAssignmentIds: () => [], modelCapabilitySnapshots: () => [], configRevision: () => 0, bundleVersion: "1.0.0", softMaxConcurrent: () => undefined, acceptingWork: () => true, intervalSeconds: () => 15, renewalDelayMs: () => 5000, core: { heartbeat }, transport, onResult, onFailure };
   const publisher = new HeartbeatPublisher({ ...options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(publisher);
   return { store, key, heartbeat, transport, inventory, onResult, onFailure, publisher, result, options };

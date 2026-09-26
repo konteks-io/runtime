@@ -16,8 +16,6 @@ const supervisorStatus: SupervisorStatus = {
   roles: [],
   roleBindings: [],
   utilization: { acceptingWork: true, activeSessions: 0, activeTurns: 0, utilizationRatio: 0 },
-  previewEnabled: false,
-  previewExposure: null,
   pendingErase: 0,
   pendingRevocation: false,
   journal: { assignments: 0, outboxDepth: 0, recoveryRequired: 0 },

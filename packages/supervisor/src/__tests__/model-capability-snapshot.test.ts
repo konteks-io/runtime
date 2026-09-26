@@ -5,7 +5,7 @@ import { ModelCapabilitySnapshotProducer } from "../native/model-capability-snap
 const clock = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
 const body = { version: 1 as const, mappingId: "mapping", mappingRevision: 1, bridgeProfileRef: "claude-profile", bridgeArtifactDigest: `sha256:${"a".repeat(64)}`, configId: "exact-model-id", optionType: "select" as const, issuedAt: "2026-09-01T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z" };
 const mapping = { ...body, mappingDigest: computeAgentModelCapabilityMappingDigest(body), signature: { algorithm: "Ed25519" as const, keyId: "release", value: "AA" } };
-const ready = { agentId: "claude-code", displayName: "Claude", authMode: "agent_local_subscription" as const, accountScope: "personal" as const, authIdentityFingerprint: "identity-a", connectionState: "ready" as const, readiness: "ready" as const, capabilities: [], acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const }, moneyObservable: false, tokenUsageObservable: true, lastProbeAt: "2026-09-06T00:00:00Z" };
+const ready = { agentId: "claude-code", displayName: "Claude", authMode: "agent_local_subscription" as const, accountScope: "personal" as const, authIdentityFingerprint: "identity-a", connectionState: "ready" as const, readiness: "ready" as const, capabilities: [], acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const }, tokenUsageObservable: true, lastProbeAt: "2026-09-06T00:00:00Z" };
 
 describe("authenticated model offered-values snapshot producer", () => {
   it("coalesces discovery for one authority tuple and emits a bounded stable snapshot", async () => {

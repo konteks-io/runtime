@@ -123,11 +123,6 @@ export type {
   AssignmentReport,
   ReportAck,
   CancelDirective,
-  PreviewRequestHeader,
-  PreviewResponseHeader,
-  PreviewToRuntimeChunk,
-  PreviewToCoreChunk,
-  PreviewChunk,
   SupportChunk,
   AcpJsonRpcError,
   SessionToCoreMessage,
@@ -156,9 +151,8 @@ export type {
   DurableReportRow,
   ReportVerdict,
   // Economics
-  GatewayCallObservation,
   AgentTurnUsageObservation,
-  // Existing shared enums the gateway reuses
+  // Existing shared enums
   RemoteCapEnforcementStage as CapEnforcementStage,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
 
@@ -347,8 +341,6 @@ export {
   EraseDirectiveSchema,
   SessionToRuntimeMessageSchema,
   SessionToCoreMessageSchema,
-  PreviewToRuntimeChunkSchema,
-  PreviewToCoreChunkSchema,
   PendingPermissionViewSchema,
   PermissionAnswerRequestSchema,
   PlanningControllerTerminalDirectiveSchema,
@@ -356,7 +348,6 @@ export {
   PlanningControllerDirectivePullResultSchema,
   planningControllerTerminalDirectiveSigningBytes,
   BoundedJsonValueSchema,
-  GatewayCallObservationSchema,
   AgentTurnUsageObservationSchema,
   HeartbeatMessageSchema,
   HeartbeatResultSchema,

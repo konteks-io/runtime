@@ -50,7 +50,7 @@ async function fixture(claimOutcome: "denied" | "claimed" = "denied", overrides:
   const work = new WorkOrchestrator({ journal, outbox, assignmentSender: sender, clock,     transport: { send: (message: OutboundMessage) => sent.push(message) }, instanceId: () => "instance", workspaceId: () => "workspace",
     runnerIncarnation: () => "process", assertOwned: () => undefined, recoveryAuthority: () => authority.key,
     reportDeliveryAllowed: () => true, reconciliationComplete: () => true, lease: { canPullNewWork: () => true }, draining: () => false,
-    headroom: () => 2, maxPullItems: 1, acceptedKinds: () => ["delivery"], advertisedRoles: () => ["generator"], browserToolAvailable: () => false,
+    headroom: () => 2, maxPullItems: 1, acceptedKinds: () => ["delivery"], advertisedRoles: () => ["generator"],
     agents: () => [{ agentId: "codex", readiness: "ready", connectionState: "ready" }], instanceEvidencePolicy: () => "structured_only",
     ...overrides,
   } as never);

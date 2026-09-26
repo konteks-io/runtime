@@ -87,11 +87,10 @@ export interface OrchestratorDeps {
   agents: () => ConnectedAgentView[];
   roleBindings: () => RoleBinding[];
   advertisedRoles: () => string[];
-  browserToolAvailable: () => boolean;
   /**
-   * Non-agent facts a role depends on (the browser tool, the machine's git).
-   * Optional: omitted, only the browser-tool fact is known, so a role that
-   * needs anything else is refused rather than claimed.
+   * Non-agent facts a role depends on (the machine's git). Optional: omitted,
+   * no such fact is known, so a role that needs one is refused rather than
+   * claimed.
    */
   roleCapabilityInputs?: () => RoleCapabilityInputs;
   acceptedKinds: () => RemoteWorkKind[];
@@ -261,7 +260,7 @@ export class WorkOrchestrator {
   }
 
   private roleCapabilityInputs(): RoleCapabilityInputs {
-    return this.deps.roleCapabilityInputs?.() ?? { browserToolAvailable: this.deps.browserToolAvailable() };
+    return this.deps.roleCapabilityInputs?.() ?? {};
   }
 
   /** Inbound `assignment` channel bodies: work available, claim results, report acks, cancel directives. */

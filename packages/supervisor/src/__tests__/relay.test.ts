@@ -328,7 +328,7 @@ describe("channel mux", () => {
     expect(mux.handshakeCursors().heartbeat?.to_core).toBe(0);
   });
 
-  it.each(["session", "preview"] as const)("accepts a current grant-holder acknowledgement only for the %s channel", async channel => {
+  it.each(["session"] as const)("accepts a current grant-holder acknowledgement only for the %s channel", async channel => {
     const { mux } = buildMux();
     await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
     mux.send(channel, channel, heartbeat as never);

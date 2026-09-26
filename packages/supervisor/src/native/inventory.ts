@@ -106,9 +106,6 @@ export class NativeInventoryCollector {
       hostPressure: metrics ? hostPressureRatio(metrics) : 1,
       activeSessions,
       activeTurns,
-      // Local QA/browser capabilities need a proven native capability source;
-      // a configured appliance URL is not evidence they exist on this host.
-      browserToolAvailable: false,
       gitVersion,
       diskFreeBytes: metrics?.diskFreeBytes ?? 0,
     };

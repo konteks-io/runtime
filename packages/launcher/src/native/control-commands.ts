@@ -35,7 +35,6 @@ export async function status(context: ControlContext): Promise<void> {
     ["roles", value.roles.join(", ") || "(none advertised — log in an agent and tag roles in App/MCP)"],
     ["utilization", `${value.utilization.activeSessions} sessions, ${value.utilization.activeTurns} turns, ratio ${value.utilization.utilizationRatio}${value.utilization.acceptingWork ? "" : " — not accepting work"}`],
     ["components", value.components.map((component) => `${component.kind}=${component.healthStatus}`).join(" ")],
-    ["preview", value.previewEnabled ? `ENABLED on local port ${value.previewExposure?.port} (${value.previewExposure?.grantPresent ? "viewer grant active" : "no viewer grant"})` : "disabled"],
     ["journal", `${value.journal.assignments} active, ${value.journal.outboxDepth} queued, ${value.journal.recoveryRequired} recovery required`],
   ]);
 }

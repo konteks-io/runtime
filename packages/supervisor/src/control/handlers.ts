@@ -79,7 +79,6 @@ export class ControlHandlers {
   async load(): Promise<void> {
     const stored = await this.deps.store.config();
     if (!stored) return;
-    if (stored.configuration.deploymentKind !== "native_connector") throw new Error("Stored configuration deployment mismatch");
     if (stored.digest !== jcsDigest(stored.configuration as unknown as JsonValue)) throw new Error("Stored configuration digest mismatch");
     this.deps.onConfigurationApplied?.(stored.configuration);
     this.appliedRevision = stored.revision;
@@ -137,9 +136,6 @@ export class ControlHandlers {
     const ackBase = { type: "desired_configuration_ack" as const, instanceId: envelope.instanceId, revision: envelope.revision, digest: envelope.digest, acknowledgedAt: this.deps.clock.nowIso() };
     const reject = async (reason: DesiredConfigurationAck["reason"]): Promise<void> => { await this.deps.sendAck(this.signed({ ...ackBase, status: "rejected", reason })); };
     const configuration = envelope.configuration;
-    // A native connector applies only native configuration; the retired
-    // appliance shape (with its gateway stage) is refused.
-    if (configuration.deploymentKind !== "native_connector") return reject("invalid_value");
     if (envelope.digest !== jcsDigest(configuration as unknown as JsonValue)) return reject("invalid_value");
     if (parseRfc3339(envelope.expiresAt) <= this.deps.clock.coreNow()) {
       this.counters.rejectedStale += 1;

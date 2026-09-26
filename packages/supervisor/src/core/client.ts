@@ -1,4 +1,4 @@
-import { AgentTurnUsageObservationSchema, GatewayCallObservationSchema, RuntimeAgentLoginReportSchema } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema } from "@konteks/remote-common";
 
 import { z } from "zod";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
@@ -209,7 +209,7 @@ export interface CapabilityTokenIssue {
   mcpServer: { name: string; url: string; headers: Array<{ name: string; value: string }> };
   expiresAt: string;
 }
-const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "preview", "qa", "assistant_execution", "onboarding", "repository_relocation"]), workload: BoundedJsonValueSchema }).strict();
+const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "qa", "assistant_execution", "onboarding", "repository_relocation"]), workload: BoundedJsonValueSchema }).strict();
 export type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
 const TaskCheckoutMaterializedResultSchema = z.object({ workspaceRef: z.string().min(1) }).strict();
 
@@ -653,12 +653,10 @@ export class CoreClient {
 
   /** The mounted Core route accepts one body, and replies only after commit. */
   async submitObservation(instanceId: string, body: unknown): Promise<void> {
-    const parsed = AgentTurnUsageObservationSchema.safeParse(body);
-    const observation = parsed.success ? parsed.data : GatewayCallObservationSchema.parse(body);
+    const observation = AgentTurnUsageObservationSchema.parse(body);
     if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Observation instance mismatch");
     const digest = jcsDigest(observation as unknown as JsonValue);
-    const kind = observation.moneyBasis === "gateway_priced" ? "gw" : "turn";
-    const expectedId = `ri:${kind}:${instanceId}:${observation.assignmentId}:${observation.attempt}:${digest.slice(0, 24)}`;
+    const expectedId = `ri:turn:${instanceId}:${observation.assignmentId}:${observation.attempt}:${digest.slice(0, 24)}`;
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId), body: observation,
       schema: ObservationReceiptSchema, idempotencyKey: `observation:${expectedId}`, operationPolicy: "progressRead" });
     if (result.observationId !== expectedId || result.observationDigest !== digest)

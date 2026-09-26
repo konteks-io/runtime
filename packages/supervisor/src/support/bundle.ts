@@ -5,7 +5,7 @@ import { containsCanary, redactText, redactValue, sha256Hex, type DoctorReport, 
  * Support bundle: an allowlisted, redacted, bounded set of facts — versions,
  * status, configuration KEYS without values, doctor output, counters — that
  * the operator previews locally before it is sent as `support` chunks. It
- * never contains gateway state, agent volumes, checkpoint references,
+ * never contains agent volumes, checkpoint references,
  * task-checkout paths, prompts, model output, or a credential.
  */
 export interface SupportBundleInputs {

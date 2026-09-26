@@ -16,7 +16,13 @@ export const LeaseClaimsSchema = RemoteInstanceLeaseClaimsSchema.transform(claim
 });
 export type LeaseClaims = ReturnType<typeof LeaseClaimsSchema.parse>;
 
-interface ExpectedLease { instanceId: string; audience: string; deploymentKind?: "native_connector" }
+interface ExpectedLease { instanceId: string; audience: string }
+
+function isForeignTopology(candidate: unknown): boolean {
+  if (!candidate || typeof candidate !== "object") return false;
+  const { deployment_kind: kind, components } = candidate as { deployment_kind?: unknown; components?: unknown };
+  return kind !== "native_connector" || !Array.isArray(components) || components.length !== 1 || components[0] !== "agent_runner";
+}
 
 /** Decodes canonical Core HTTPS claims; this does not verify a JWS signature. */
 export function decodeLeaseClaims(lease: string, expected: ExpectedLease): LeaseClaims {
@@ -33,19 +39,22 @@ function decode(lease: string, expected: ExpectedLease, stored: boolean): LeaseC
   const payload = segments.length === 3 ? segments[1] : undefined;
   if (!payload) throw new RemoteInstanceError("temporarily_unavailable", "lease is not a compact JWS");
   let claims: LeaseClaims;
+  let candidate: unknown;
   try {
-    const candidate: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    candidate = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     if (stored && candidate && typeof candidate === "object" && "drain_deadline" in candidate && typeof candidate.drain_deadline === "number" && Number.isSafeInteger(candidate.drain_deadline) && candidate.drain_deadline >= 0) {
       claims = LeaseClaimsSchema.parse({ ...candidate, drain_deadline: new Date(candidate.drain_deadline * 1000).toISOString() });
     } else claims = LeaseClaimsSchema.parse(candidate);
   } catch (error) {
+    // The shared schema admits only the native topology. A lease for another
+    // one (the retired appliance) is a registration mismatch, not a fault.
+    if (isForeignTopology(candidate)) {
+      throw new RemoteInstanceError("registration_mismatch", "lease topology does not match the native connector", { cause: error });
+    }
     throw new RemoteInstanceError("temporarily_unavailable", "lease claims do not parse", { cause: error });
   }
   if (claims.sub !== expected.instanceId) throw new RemoteInstanceError("registration_mismatch", "lease subject is not this instance");
   if (claims.aud !== expected.audience) throw new RemoteInstanceError("registration_mismatch", "lease audience mismatch");
-  if (expected.deploymentKind === "native_connector" && (claims.deployment_kind !== "native_connector" || claims.components.length !== 1 || claims.components[0] !== "agent_runner")) {
-    throw new RemoteInstanceError("registration_mismatch", "lease topology does not match the native connector");
-  }
   return claims;
 }
 

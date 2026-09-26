@@ -94,19 +94,19 @@ describe("ConnectedAgentView projection", () => {
 
   it("says DeepSeek Harness reports no token usage, so no turn is priced from a count it never gave", () => {
     const view = projectReadiness({ ...base, family: findAgentBridge("dsh")! });
-    expect(view).toMatchObject({ agentId: "dsh", readiness: "ready", tokenUsageObservable: false, moneyObservable: false });
+    expect(view).toMatchObject({ agentId: "dsh", readiness: "ready", tokenUsageObservable: false });
   });
 
   it("is ready with sanitized capabilities and only the opaque fingerprint", () => {
     const view = projectReadiness(base);
-    expect(view).toMatchObject({ agentId: "codex", readiness: "ready", accountScope: "personal", moneyObservable: false, tokenUsageObservable: true });
+    expect(view).toMatchObject({ agentId: "codex", readiness: "ready", accountScope: "personal", tokenUsageObservable: true });
     expect(view.acpCapabilities).toEqual({ sessionResume: true, forkSession: true, structuredOutputShim: true, toolControl: "approve" });
     expect(view.authIdentityFingerprint).toBe("fp-opaque-0123456789abcdef");
     expect(JSON.stringify(view)).not.toMatch(/"(email|token|path|agentHome|agentHomePath|credentialPath|apiKey|subscriptionToken)":/i);
   });
 
-  it("never claims money observability for a native agent", () => {
-    expect(projectReadiness({ ...base, identity: "signal" }).moneyObservable).toBe(false);
+  it("carries no money observability field (packages 7.0.0 removed it)", () => {
+    expect("moneyObservable" in projectReadiness({ ...base, identity: "signal" })).toBe(false);
   });
 
   it("a logged-out subscription agent is not_configured with login_locally", () => {

@@ -172,7 +172,7 @@ describe("native in-process runner (A4)", () => {
     f.runner.startEvents();
     expect(f.spawn).toHaveBeenCalledOnce();
     expect(listen).not.toHaveBeenCalled();
-    expect(await f.port.readiness()).toMatchObject({ agent: { agentId: "codex", authMode: "agent_local_subscription", readiness: "ready", moneyObservable: false }, utilization: { activeSessions: 0, activeTurns: 0 } });
+    expect(await f.port.readiness()).toMatchObject({ agent: { agentId: "codex", authMode: "agent_local_subscription", readiness: "ready" }, utilization: { activeSessions: 0, activeTurns: 0 } });
     const count = f.events.length;
     await f.port.probe();
     expect(f.events.length).toBe(count + 1);
