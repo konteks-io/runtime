@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { EMBEDDED_RELEASE_ROOTS } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, status, supportBundle } from "../commands/lifecycle.js";
@@ -34,7 +34,9 @@ async function serviceDefinition(root: string) {
     const result = await runCommand({ command: "whoami.exe", args: ["/user", "/fo", "csv", "/nh"], env: environment(), timeoutMs: 10_000 });
     userId = result.code === 0 ? result.stdout.match(/S-1-\d+(?:-\d+)+/)?.[0] : undefined;
   }
-  return nativeServiceDefinition({ os: platform.os, home: homedir(), root, executable: join(root, "releases", record.releaseId, platform.os === "windows" ? "connector.exe" : "connector"), uid: process.getuid?.(), ...(userId ? { userId } : {}) });
+  // `konteks-connector`, or `connector` in a release from before the rename (a rollback may return to one).
+  const executable = await resolveNativeConnectorExecutable(join(root, "releases", record.releaseId), platform.os);
+  return nativeServiceDefinition({ os: platform.os, home: homedir(), root, executable, uid: process.getuid?.(), ...(userId ? { userId } : {}) });
 }
 async function start(input: NativeCommandContext): Promise<void> {
   const platform = nativePlatform();

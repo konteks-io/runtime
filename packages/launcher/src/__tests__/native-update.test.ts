@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
-import { buildReleaseFixture } from "@konteks/remote-release";
-import { loadNativeInstallation, readNativeUpdateLedger, SupervisorStore, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { buildReleaseFixture, resolveNativeConnectorExecutable } from "@konteks/remote-release";
+import { loadNativeInstallation, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
 import { earlierFailure, earlierFailureNote, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
@@ -58,6 +58,7 @@ describe("native update staging and commit", () => {
     if (staged.status !== "staged") throw new Error("unreachable");
     // Nothing running changed: the record still names the previous release.
     expect(await readNativeRecord(f.root)).toEqual(f.installed);
+    expect(await readFile(join(staged.directory, "konteks-connector"))).toEqual(Buffer.from("test-native-executable-not-run-1.1.0"));
     expect(await readFile(join(staged.directory, "connector"))).toEqual(Buffer.from("test-native-executable-not-run-1.1.0"));
     expect(JSON.parse(await readFile(join(staged.directory, "manifest.json"), "utf8"))).toEqual(f.manifest);
 
@@ -71,6 +72,31 @@ describe("native update staging and commit", () => {
 
     await restoreNativeRecord(f.root, successor.releaseId, f.installed, { roots: f.trust, platform: f.platform });
     await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).resolves.toMatchObject({ record: { releaseId: f.installed.releaseId, bundleVersion: "1.0.0" } });
+  });
+  it("updates from a release staged before the rename, and rolls back to it", async () => {
+    const f = await fixture();
+    // The installed release as an older connector staged it: `connector` only.
+    const previous = join(f.root, "releases", f.installed.releaseId);
+    await rm(join(previous, "konteks-connector"));
+    expect(await resolveNativeConnectorExecutable(previous, "macos")).toBe(join(previous, "connector"));
+    const before = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    await expect(verifyInstalledNativeConnector(before.release, previous, f.platform)).resolves.toBeUndefined();
+
+    const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } });
+    if (staged.status !== "staged") throw new Error("unreachable");
+    expect(await resolveNativeConnectorExecutable(staged.directory, "macos")).toBe(join(staged.directory, "konteks-connector"));
+    // Once the transition copy is dropped, a release with only the Konteks name commits too.
+    await rm(join(staged.directory, "connector"));
+    const successor = await commitNativeUpdate({ root: f.root, releaseId: staged.releaseId, output: f.output, deps: f.deps });
+    const after = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    await expect(verifyInstalledNativeConnector(after.release, staged.directory, f.platform)).resolves.toBeUndefined();
+
+    // Rollback returns to the pre-rename folder; the service is found under its old name.
+    await restoreNativeRecord(f.root, successor.releaseId, f.installed, { roots: f.trust, platform: f.platform });
+    const restored = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(restored.record.releaseId).toBe(f.installed.releaseId);
+    await expect(verifyInstalledNativeConnector(restored.release, previous, f.platform)).resolves.toBeUndefined();
+    expect(await resolveNativeConnectorExecutable(previous, "macos")).toBe(join(previous, "connector"));
   });
   it("refuses same-version, untrusted and tampered releases without touching the record", async () => {
     const f = await fixture();

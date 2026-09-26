@@ -12,6 +12,14 @@ artifacts, it must use this repository. Product/API identifiers such as
 stable protocol and user-facing names; do not rename them merely because the
 source repository is named `runtime`.
 
+The connector's file in a release folder is `konteks-connector(.exe)`
+(`NATIVE_CONNECTOR_FILE` in `packages/release/src/native.ts`), because people
+see it in their process list. Never hard-code a connector file name: resolve it
+with `resolveNativeConnectorExecutable`, which also accepts the pre-rename
+`connector` that older releases, older launchers and rollbacks leave behind.
+The manifest's `kind: "connector"` and the service label
+`dev.konteks.remote.<hash>` are protocol, not file names; do not rename them.
+
 Preserve the native-only architecture: this machine runs the connector, ACP
 bridges, local agents, and their local authentication. Harness, Validation
 Runtime, Assistant, and ai-manager remain cloud services. Reliability and

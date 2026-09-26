@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { createDaemon, type CreateDaemonOptions, type Daemon } from "../daemon.js";
 import { Supervisor, type SupervisorOptions } from "../supervisor.js";
 import { loadNativeInstallation, type NativeInstallationOptions } from "./installation.js";
-import { fetchNativeReleaseManifest } from "@konteks/remote-release";
+import { fetchNativeReleaseManifest, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { launchNativeUpdater } from "./update-launch.js";
 import { readNativeUpdateLedger } from "./update-ledger.js";
 
@@ -30,7 +30,8 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
     ...(options.exitProcess ? { exitProcess: options.exitProcess } : {}),
     onStart: async () => {
       const installation = await loadNativeInstallation(options.root, options);
-      const executable = join(options.root, "releases", installation.record.releaseId, options.platform.os === "windows" ? "connector.exe" : "connector");
+      // The connector of the release now serving: `konteks-connector`, or `connector` in a release from before the rename.
+      const executable = await resolveNativeConnectorExecutable(join(options.root, "releases", installation.record.releaseId), options.platform.os);
       const update = options.update === false ? undefined : {
         fetchManifest: () => fetchNativeReleaseManifest(),
         launch: async () => launchNativeUpdater({ root: options.root, executable, os: options.platform.os }),

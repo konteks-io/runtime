@@ -156,14 +156,14 @@ describe("native updater launch", () => {
     vi.stubEnv("NODE_EXTRA_CA_CERTS", "/corp/ca.pem");
     vi.stubEnv("KONTEKS_RELEASE_MANIFEST_URL", "https://channel.example/latest/native-manifest.json");
     const spawnFn = ((command: string, args: string[], options: Record<string, unknown>) => { children.push({ command, args, options }); return { pid: 77, unref: () => {}, once: () => {} }; }) as never;
-    await launchNativeUpdater({ root, executable: join(root, "releases", "release-a", "connector"), os: "macos", logPath: join(root, "update.log"), spawnFn });
-    expect(children[0]).toMatchObject({ command: join(root, "releases", "release-a", "connector"), args: ["--root", root, "--json", "update", "--unattended"], options: { detached: true } });
+    await launchNativeUpdater({ root, executable: join(root, "releases", "release-a", "konteks-connector"), os: "macos", logPath: join(root, "update.log"), spawnFn });
+    expect(children[0]).toMatchObject({ command: join(root, "releases", "release-a", "konteks-connector"), args: ["--root", root, "--json", "update", "--unattended"], options: { detached: true } });
     expect((children[0]!.options.env as Record<string, string>)).not.toHaveProperty("KONTEKS_ACTIVATION_CODE");
     expect((children[0]!.options.env as Record<string, string>).NODE_EXTRA_CA_CERTS).toBe("/corp/ca.pem");
     expect((children[0]!.options.env as Record<string, string>).KONTEKS_RELEASE_MANIFEST_URL).toBe("https://channel.example/latest/native-manifest.json");
-    await launchNativeUpdater({ root, executable: join(root, "releases", "release-a", "connector"), os: "debian", spawnFn });
+    await launchNativeUpdater({ root, executable: join(root, "releases", "release-a", "konteks-connector"), os: "debian", spawnFn });
     expect(children[1]!.command).toBe("systemd-run");
-    expect(children[1]!.args).toEqual(expect.arrayContaining(["--user", "--collect", "--property=KillMode=process", join(root, "releases", "release-a", "connector"), "update", "--unattended"]));
+    expect(children[1]!.args).toEqual(expect.arrayContaining(["--user", "--collect", "--property=KillMode=process", join(root, "releases", "release-a", "konteks-connector"), "update", "--unattended"]));
     await expect(launchNativeUpdater({ root: "relative", executable: "/x", os: "macos", spawnFn })).rejects.toThrow(/absolute/);
   });
 });

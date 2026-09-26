@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
-import { chmod, mkdir, mkdtemp, open, rm } from "node:fs/promises";
+import { chmod, constants as fsConstants, copyFile, lstat, mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import {
   RemoteInstanceError, RemoteSignedBundleManifestSchema, bundleManifestSigningBytes,
@@ -97,6 +97,52 @@ function freezeJson(value: object): void {
 }
 
 /**
+ * The connector's file name inside a release folder. It is what a person sees
+ * in Activity Monitor, `ps` and Task Manager, and what the OS service runs, so
+ * it says Konteks. Releases staged before the rename hold `connector`, and so
+ * does a release an older launcher stages: every lookup accepts both, the
+ * Konteks name first. `kind: "connector"` in the signed manifest is protocol
+ * and is not a file name.
+ */
+export const NATIVE_CONNECTOR_FILE = "konteks-connector";
+export const LEGACY_NATIVE_CONNECTOR_FILE = "connector";
+
+/**
+ * While launchers from before the rename are still installed (a package's
+ * `konteks-remote`, or a user install's `<root>/bin/konteks-remote`, is never
+ * replaced by an update), each staged release also carries an independent copy
+ * under the old name, so their `start` and rollback still find it. The service
+ * always runs the Konteks name. Drop the copy once no supported launcher
+ * predates the rename.
+ */
+export const STAGE_LEGACY_NATIVE_CONNECTOR_COPY = true;
+
+/** Both file names for an OS, the Konteks name first. */
+export function nativeConnectorFileNames(os: NativeArtifactTarget["os"]): [string, string] {
+  const extension = os === "windows" ? ".exe" : "";
+  return [`${NATIVE_CONNECTOR_FILE}${extension}`, `${LEGACY_NATIVE_CONNECTOR_FILE}${extension}`];
+}
+
+/** Every connector executable present in a release folder, the Konteks name first. */
+export async function presentNativeConnectorExecutables(directory: string, os: NativeArtifactTarget["os"]): Promise<string[]> {
+  const present: string[] = [];
+  for (const name of nativeConnectorFileNames(os)) {
+    const path = join(directory, name);
+    if (await lstat(path).then(() => true, () => false)) present.push(path);
+  }
+  return present;
+}
+
+/**
+ * The connector a release folder runs: the Konteks name, else the old one
+ * (a release from before the rename, which a rollback may return to). With
+ * neither, the Konteks name, so the refusal names what is missing.
+ */
+export async function resolveNativeConnectorExecutable(directory: string, os: NativeArtifactTarget["os"]): Promise<string> {
+  return (await presentNativeConnectorExecutables(directory, os))[0] ?? join(directory, nativeConnectorFileNames(os)[0]);
+}
+
+/**
  * Stage immutable candidates without changing the running installation. As in
  * bb's updater, failed downloads leave the existing host running. Unlike its
  * optional response-header digest, every byte here must match signed metadata.
@@ -119,7 +165,7 @@ export async function stageNativeRelease(args: {
     for (const [index, artifact] of artifacts.entries()) {
       const extension = artifact.format !== "executable" ? ".tgz" : args.target.os === "windows" ? ".exe" : "";
       // File names never come from untrusted URL paths or manifest identifiers.
-      const file = join(directory, `${index === 0 ? "connector" : `bridge-${index}`}${extension}`);
+      const file = join(directory, `${index === 0 ? NATIVE_CONNECTOR_FILE : `bridge-${index}`}${extension}`);
       // Release hosts redirect to an asset store; every byte is still pinned by
       // the signed digest and size, so only the final scheme is constrained.
       const response = await fetchFn(artifact.url, { redirect: "follow", credentials: "omit", signal: AbortSignal.timeout(300_000) });
@@ -140,6 +186,12 @@ export async function stageNativeRelease(args: {
         await handle.close();
       }
       if (artifact.format === "executable") await chmod(file, 0o700);
+      if (artifact.kind === "connector" && artifact.format === "executable" && STAGE_LEGACY_NATIVE_CONNECTOR_COPY) {
+        // A copy, not a link: installed-executable verification refuses both.
+        const legacy = join(directory, nativeConnectorFileNames(args.target.os)[1]);
+        await copyFile(file, legacy, fsConstants.COPYFILE_EXCL);
+        await chmod(legacy, 0o700);
+      }
       if (artifact.kind === "connector") result.connector = file;
       else result.bridges[artifact.agentId!] = file;
     }

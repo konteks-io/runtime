@@ -10,7 +10,7 @@ import { connectCodexLocalTransport } from '../packages/agent-runner/dist/bridge
 import { spawnBridge } from '../packages/agent-runner/dist/bridge/process.js';
 import { resolveBridgeSpawnSpec, resolveToolingCommand, resolveBridgeFamily } from '../packages/agent-runner/dist/bridge/spec.js';
 import { RunnerConfigSchema } from '../packages/agent-runner/dist/config.js';
-import { signNativeReleaseManifest, verifyNativeRelease } from '../packages/release/dist/native.js';
+import { resolveNativeConnectorExecutable, signNativeReleaseManifest, verifyNativeRelease } from '../packages/release/dist/native.js';
 import { installOfflineAgentPackage } from '../packages/release/dist/offline-agent.js';
 import { resolveNativeCodexHome } from '../packages/supervisor/dist/native/codex-home.js';
 import { konteksSessionMetadata } from '../packages/agent-runner/dist/sessions/title.js';
@@ -75,7 +75,7 @@ try {
     if (!connectorReleaseDirectory || !isAbsolute(connectorReleaseDirectory)) throw new Error('Existing real connector release directory required for the native manifest');
     const existing = JSON.parse(await readFile(join(connectorReleaseDirectory, 'manifest.json'), 'utf8'));
     const connector = existing.nativeArtifacts?.find(a => a.kind === 'connector' && a.os === 'debian' && a.architecture === 'amd64');
-    const connectorBytes = await readFile(join(connectorReleaseDirectory, 'connector'));
+    const connectorBytes = await readFile(await resolveNativeConnectorExecutable(connectorReleaseDirectory, 'debian'));
     if (!connector || connector.digest !== `sha256:${createHash('sha256').update(connectorBytes).digest('hex')}`) throw new Error('Existing connector does not match its artifact inventory');
     const keys = generateKeyPairSync('ed25519'), keyId = 'local-probe-only';
     const manifest = signNativeReleaseManifest({ bundleVersion: '0.1.0-local-probe', protocol: { min: '1.0', max: '1.0' }, deploymentKind: 'native_connector', components: ['agent_runner'], images: [], agentBridges: [], nativeArtifacts: [artifact, connector], expiresAt: new Date(Date.now() + 86_400_000).toISOString() }, { keyId, privateKey: keys.privateKey });

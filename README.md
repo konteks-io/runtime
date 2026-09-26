@@ -126,6 +126,13 @@ rolled back after three failed starts, within seconds, rather than at the
 gate's three-minute deadline. `update` and `update --check` say when the
 connector updated itself, and when a release already failed here.
 
+In Activity Monitor, `ps` or Task Manager the service shows as
+`konteks-connector` (Linux cuts process names to 15 characters:
+`konteks-connect`), and a command you run as `konteks-remote`. Both are the
+same signed program. Releases installed before the rename call it `connector`;
+the service, `start` and rollback accept either name, and each new release
+keeps a `connector` copy for launchers installed before the rename.
+
 ## How releases are trusted
 
 Every release is a signed `native-manifest.json` that pins each artifact by

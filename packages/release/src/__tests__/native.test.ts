@@ -1,11 +1,11 @@
 import { createHash, sign } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildReleaseFixture } from "../fixtures.js";
 import { agentModelCapabilityMappingSigningBytes, bundleManifestSigningBytes, computeAgentModelCapabilityMappingDigest, computeBundleManifestDigest } from "@konteks/remote-common";
-import { verifyNativeRelease, selectNativeArtifacts, selectNativeModelCapabilityMappings, stageNativeRelease } from "../native.js";
+import { nativeConnectorFileNames, presentNativeConnectorExecutables, resolveNativeConnectorExecutable, verifyNativeRelease, selectNativeArtifacts, selectNativeModelCapabilityMappings, stageNativeRelease } from "../native.js";
 
 const bytes = Buffer.from('test executable bytes');
 const hash = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -105,12 +105,39 @@ describe('signed native executable staging', () => {
     expect((await readdir(parent)).length).toBe(1);
   });
 
+  it('names the connector konteks-connector, with an independent pre-rename copy older launchers still run', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'native-artifact-test-')); folders.push(parent);
+    const staged = await stageNativeRelease({ release: verifyNativeRelease(signed(), roots, now), target, releasesDir: parent, fetchFn: (async () => new Response(bytes)) as typeof fetch });
+    expect(staged.connector).toBe(join(staged.directory, 'konteks-connector'));
+    const legacy = join(staged.directory, 'connector');
+    expect(await readFile(legacy)).toEqual(bytes);
+    const [renamed, old] = [await stat(staged.connector), await stat(legacy)];
+    // Two files, not a link: installed-executable verification refuses links.
+    expect(renamed.ino).not.toBe(old.ino);
+    expect([renamed.nlink, old.nlink]).toEqual([1, 1]);
+    expect(old.mode & 0o777).toBe(0o700);
+    expect(nativeConnectorFileNames('windows')).toEqual(['konteks-connector.exe', 'connector.exe']);
+  });
+
+  it('finds a release folder\'s connector by the Konteks name first, else the pre-rename name', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'native-connector-name-')); folders.push(directory);
+    expect(await presentNativeConnectorExecutables(directory, 'macos')).toEqual([]);
+    expect(await resolveNativeConnectorExecutable(directory, 'macos')).toBe(join(directory, 'konteks-connector'));
+    await writeFile(join(directory, 'connector'), bytes);
+    expect(await resolveNativeConnectorExecutable(directory, 'macos')).toBe(join(directory, 'connector'));
+    await writeFile(join(directory, 'konteks-connector'), bytes);
+    expect(await presentNativeConnectorExecutables(directory, 'macos')).toEqual([join(directory, 'konteks-connector'), join(directory, 'connector')]);
+    expect(await resolveNativeConnectorExecutable(directory, 'macos')).toBe(join(directory, 'konteks-connector'));
+    expect(await resolveNativeConnectorExecutable(directory, 'windows')).toBe(join(directory, 'konteks-connector.exe'));
+  });
+
   it('stages bb-style host-only npm packages without executing them or enabling archive executable bits', async () => {
     const parent = await mkdtemp(join(tmpdir(), 'native-artifact-test-')); folders.push(parent);
     const release = verifyNativeRelease(signed({ nativeArtifacts: [{ ...artifact, format: 'npm_tgz' }] }), roots, now);
     const staged = await stageNativeRelease({ release, target: { ...target, agentIds: [] }, releasesDir: parent, fetchFn: (async () => new Response(bytes)) as typeof fetch });
     expect(staged.connector).toMatch(/\.tgz$/);
     expect((await stat(staged.connector)).mode & 0o111).toBe(0);
+    expect(await readdir(staged.directory)).toEqual(['konteks-connector.tgz']);
   });
 
   it.each(['corrupt', 'oversized', 'truncated', 'redirect'])('rejects %s downloads and leaves no executable candidate', async failure => {

@@ -195,8 +195,17 @@ describe("native install composition", () => {
     const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
     const directory = join(f.root, "releases", record.releaseId);
     await expect(verifyInstalledNativeConnector(loaded.release, directory, f.platform)).resolves.toBeUndefined();
-    await writeFile(join(directory, "connector"), "tampered");
-    await chmod(join(directory, "connector"), 0o700);
+    // Either name tampered is refused: the service runs one, older launchers the other.
+    for (const name of ["konteks-connector", "connector"]) {
+      const original = await readFile(join(directory, name));
+      await writeFile(join(directory, name), "tampered");
+      await chmod(join(directory, name), 0o700);
+      await expect(verifyInstalledNativeConnector(loaded.release, directory, f.platform)).rejects.toThrow();
+      await writeFile(join(directory, name), original);
+    }
+    await expect(verifyInstalledNativeConnector(loaded.release, directory, f.platform)).resolves.toBeUndefined();
+    // A folder with no connector under either name is refused.
+    for (const name of ["konteks-connector", "connector"]) await rm(join(directory, name));
     await expect(verifyInstalledNativeConnector(loaded.release, directory, f.platform)).rejects.toThrow();
   });
 });
