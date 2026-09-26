@@ -4,8 +4,8 @@ import type { RelayChannel } from "@konteks/remote-common";
  * Channel identifiers. Core-bound streams (`control`, `heartbeat`,
  * `assignment`, `observation`, `support`) are minted `<channel>:<instanceId>`
  * so the relay can tell from a handshake whose endpoint cursor to ask (CP9
- * `channelKindOf`); `session` ids are minted per stream by their owners
- * and also lead with the channel name. The channel name before
+ * `channelKindOf`); `session` and `preview` ids (`<channel>:<sessionId>`)
+ * are minted per logical session and also lead with the channel name. The channel name before
  * the first `:` is therefore always the authoritative `RelayChannel`.
  */
 export const CORE_BOUND_CHANNELS = Object.freeze(["control", "heartbeat", "assignment", "observation"] as const);
@@ -23,6 +23,7 @@ export function channelOfId(channelId: string): RelayChannel | null {
     case "assignment":
     case "session":
     case "observation":
+    case "preview":
     case "support":
       return head;
     default:

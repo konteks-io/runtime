@@ -52,6 +52,7 @@ import { OnboardWorkCarrier, type OnboardWorkAssignment } from "./onboard/carrie
 import type { PlatformMcpEntry } from "./work/workload.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
+import { PreviewChannel } from "./preview/preview-channel.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { ChannelMux } from "./relay/channel-mux.js";
@@ -185,6 +186,8 @@ export class Supervisor {
   private planningTerminal!: PlanningTerminalDirectiveProcessor;
   private planningDirectivePoller: ControllerDirectivePoller | null = null;
   reconciliation!: Reconciliation;
+  /** The `preview:<sessionId>` relay channels, forwarded to each session's own loopback preview. */
+  previewChannel!: PreviewChannel;
   broker!: PermissionBroker;
   readonly runners = new Map<string, RunnerPort>();
   private readonly nativeRunners: NativeRunner[] = [];
@@ -613,6 +616,17 @@ export class Supervisor {
     });
     this.transport.onInbound((message) => this.onInbound(message));
     void relayHandler;
+    // The to_core window per preview channel: a quarter of the replay bound,
+    // so a large response waits for the viewer's acknowledgements instead of
+    // evicting replay and resetting the channel.
+    const previewWindowBytes = Math.max(256 * 1024, Math.min(2 * 1024 * 1024, Math.floor(this.config.SUPERVISOR_REPLAY_BUFFER_BYTES / 4)));
+    this.previewChannel = new PreviewChannel({
+      transport: this.transport,
+      lease: this.lease,
+      previews: { originFor: () => null, touch: () => undefined },
+      hasCapacity: channelId => this.mux.unackedBytes(channelId) < previewWindowBytes,
+      logger: this.logger,
+    });
 
     this.control = new ControlHandlers({
       store: this.store,
@@ -1364,12 +1378,17 @@ export class Supervisor {
       case "session":
         await this.work.onSessionMessage(message.channelId, message.body);
         return;
+      case "preview":
+        // Answered asynchronously on the stream; receipt is not the response.
+        this.previewChannel.onToRuntime(message.channelId, message.body);
+        return;
     }
   }
 
   private async onChannelReset(channelId: string): Promise<void> {
     const channel = channelOf(channelId);
     if (channel === "session") await this.work.onChannelReset(channelId);
+    else if (channel === "preview") this.previewChannel.closeChannel(channelId);
     else if (channel === "assignment" || channel === "observation") await this.work.reports.flushAll();
   }
 
@@ -1862,6 +1881,7 @@ export class Supervisor {
     await this.leaseMutation;
     await this.leaseLossCleanup;
     await this.work?.drainSessions("drain");
+    this.previewChannel?.dispose();
     for (const runner of this.nativeRunners) await runner.stop();
     await this.nativeCodexOwner?.stop();
     if (this.codexRetryTimer) clearTimeout(this.codexRetryTimer);

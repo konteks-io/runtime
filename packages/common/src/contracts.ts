@@ -423,3 +423,30 @@ export type {
   CatalogLearningEvidence,
   CatalogLearningEvidenceKind,
 } from "@konteks/backstage-plugin-common";
+
+/**
+ * The native preview channel (`preview:<sessionId>`): its chunk shapes, the
+ * capability a connector advertises when it can serve previews, the caps and
+ * the D125 forwarding policy. The connector enforces the same rules as the
+ * relay, on its own hop, rather than trusting the relay did.
+ */
+export {
+  PreviewToRuntimeChunkSchema,
+  PreviewToCoreChunkSchema,
+  REMOTE_PREVIEW_CAPABILITY,
+  advertisesPreview,
+  PREVIEW_LIMITS,
+  PREVIEW_REQUEST_HEADERS,
+  PREVIEW_RESPONSE_HEADERS,
+  validatePreviewHeaders,
+  sanitizePreviewHeaders,
+  validatePreviewPath,
+  rewritePreviewLocation,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
+export type {
+  PreviewToRuntimeChunk,
+  PreviewToCoreChunk,
+  PreviewChunk,
+  PreviewHeaderRejection,
+  PreviewPathRejection,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";

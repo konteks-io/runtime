@@ -328,12 +328,14 @@ describe("channel mux", () => {
     expect(mux.handshakeCursors().heartbeat?.to_core).toBe(0);
   });
 
-  it.each(["session"] as const)("accepts a current grant-holder acknowledgement only for the %s channel", async channel => {
+  it.each(["session", "preview"] as const)("accepts a current grant-holder acknowledgement only for the %s channel", async channel => {
     const { mux } = buildMux();
     await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
     mux.send(channel, channel, heartbeat as never);
+    expect(mux.unackedBytes(channel)).toBeGreaterThan(0);
     await mux.receive({ kind: "ack", channelId: channel, connectionEpoch: 1, cumulativeSeq: 1, issuedAt: "2026-09-06T00:00:00Z", dataDirection: "to_core", origin: "grant_holder", grantId: "grant" });
     expect(mux.snapshot()[0]?.unacked).toBe(0);
+    expect(mux.unackedBytes(channel)).toBe(0);
     expect(mux.handshakeCursors()[channel]?.to_core).toBe(1);
   });
 
@@ -579,10 +581,11 @@ describe("channel mux", () => {
     expect(stalls).toEqual([]);
   });
 
-  it("never rolls the shared runtime socket merely because a session holder is detached", async () => {
+  it("never rolls the shared runtime socket merely because a session or preview viewer is detached", async () => {
     const { mux, clock, stalls } = buildMux();
     await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
     mux.send("session:waiting", "session", { kind: "session_ready", assignmentId: "a" } as never);
+    mux.send("preview:waiting", "preview", { streamId: "s1", kind: "response", status: 200, headers: {}, final: true });
     mux.send("heartbeat", "heartbeat", heartbeat);
 
     for (let elapsed = 0; elapsed < 20 * 60_000; elapsed += 60_000) {
@@ -594,6 +597,7 @@ describe("channel mux", () => {
 
     expect(stalls).toEqual([]);
     expect(mux.snapshot().find(channel => channel.channelId === "session:waiting")).toMatchObject({ unacked: 1, stalled: false });
+    expect(mux.snapshot().find(channel => channel.channelId === "preview:waiting")).toMatchObject({ unacked: 1, stalled: false });
   });
 
   it("durably removes a closed channel so restart handshakes cannot resurrect it", async () => {

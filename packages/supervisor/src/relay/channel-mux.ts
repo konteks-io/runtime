@@ -69,6 +69,15 @@ export interface MuxOptions {
   logger?: Logger;
 }
 
+/**
+ * Channels whose to_core data a grant holder (a viewer), not Core, receives
+ * and acknowledges: `session:<id>` and `preview:<id>`. Their replay is kept
+ * until that endpoint acknowledges it, and a quiet one is never a stall.
+ */
+function holderBound(channel: RelayChannel): boolean {
+  return channel === "session" || channel === "preview";
+}
+
 /** Upper bound for repeated stalls of one unacknowledged channel. */
 const STALL_BACKOFF_CEILING_MS = 5 * 60_000;
 /** Silence on a channel with unacknowledged frames before its peer is presumed dead. */
@@ -206,7 +215,7 @@ export class ChannelMux {
         // unacknowledged final frame here would poison the next ready frame.
         // Keep endpoint-ACK ownership and the byte bound, including on restore.
         buffer: new ReplayBuffer<ToCoreRelayFrame>({ maxBytes: this.options.replayBufferBytes,
-          maxAgeMs: channel === "session" ? Number.POSITIVE_INFINITY : this.options.replayBufferAgeMs }),
+          maxAgeMs: holderBound(channel) ? Number.POSITIVE_INFINITY : this.options.replayBufferAgeMs }),
         receivedCursor: 0,
         ackedByEndpoint: 0,
         lastAckAt: this.options.clock.now(),
@@ -560,7 +569,7 @@ export class ChannelMux {
     }
     if (ack.dataDirection !== "to_core") return;
     assertRecovery();
-    const origin = state.channel === "session" ? "grant_holder" : "core";
+    const origin = holderBound(state.channel) ? "grant_holder" : "core";
     if (ack.origin !== origin || ack.cumulativeSeq > highestSent) {
       this.counters.invalidFrames += 1;
       return;
@@ -672,13 +681,13 @@ export class ChannelMux {
     for (const [channelId, state] of this.channels) {
       if (!this.recovery.permits(state.channel)) continue;
       if (state.receivedCursor > state.lastEmittedAckCursor) this.emitAck(channelId, state);
-      // Session receivers attach independently from the runtime
+      // Session and preview receivers attach independently from the runtime
       // socket. Their absence is normal and D156 asks us to replay as soon as
       // a holder binds; it is not evidence that the shared socket is dead.
       // Rolling that socket only fences unrelated work and cannot make a
       // detached holder appear. Buffer bounds still produce explicit reset if
       // a later replay is no longer complete.
-      if (state.channel === "session") continue;
+      if (holderBound(state.channel)) continue;
       const stallDeadlineMs = socketLive ? Math.max(this.stallDeadlineMs(state, intervalMs), STALL_BACKOFF_CEILING_MS) : this.stallDeadlineMs(state, intervalMs);
       // A late acknowledgement from a peer that is still sending on this
       // channel means busy, not dead (bb reconnects on a missed heartbeat,
@@ -717,8 +726,17 @@ export class ChannelMux {
       unackedCount: state.buffer.unackedCount, unackedBytes: state.buffer.unackedBytes,
       oldestUnackedAgeMs: state.buffer.snapshot()[0] ? Math.max(0, this.options.clock.now() - state.buffer.snapshot()[0]!.enqueuedAt) : null,
       replayMaxBytes: this.options.replayBufferBytes,
-      replayRetention: state.channel === "session" ? "endpoint_ack_or_byte_limit" : "age_or_byte_limit",
+      replayRetention: holderBound(state.channel) ? "endpoint_ack_or_byte_limit" : "age_or_byte_limit",
       ...peer }, "channel replay reset");
+  }
+
+  /**
+   * Bytes sent on a channel and not yet acknowledged by its endpoint. The
+   * preview forwarder reads it as its flow-control window so a large response
+   * never outruns the viewer's acknowledgements into a replay reset.
+   */
+  unackedBytes(channelId: string): number {
+    return this.channels.get(channelId)?.buffer.unackedBytes ?? 0;
   }
 
   /** For the launcher status and the heartbeat. */
