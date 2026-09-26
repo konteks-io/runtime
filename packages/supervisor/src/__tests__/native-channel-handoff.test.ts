@@ -247,7 +247,7 @@ it("starts a fresh repository-anchored cycle after the previous empty-output ses
   expect(journal.execution.execution(restarted)).toBeUndefined();
 });
 
-it("does not bypass the predecessor chain when preserved changes require revalidation", async () => {
+it("starts a fresh agent session to revalidate preserved changes after the exact predecessor was durably settled", async () => {
   const journal = new SupervisorJournal(dir); await journal.load();
   const outbox = new DurableOutbox(dir); await outbox.load();
   const restarted = { ...next, runnerIncarnation: "restarted-process" };
@@ -260,9 +260,13 @@ it("does not bypass the predecessor chain when preserved changes require revalid
   await journal.execution.bindReference(prior, "generator-ref", current);
   await journal.execution.bindProcessOwner(prior, processOwner, current);
   await journal.execution.markCompletedTurnSettled(prior, "generator-ref", "2026-09-06T00:00:01.000Z", current);
+  await journal.execution.markStopping(prior, "2026-09-06T00:00:02.000Z", current);
+  await journal.execution.markAcpSettled(prior, "generator-ref", "2026-09-06T00:00:03.000Z", current);
   await journal.assignments.put({ assignmentId: "prior", attempt: 1, claimId: "prior-claim", kind: "delivery", placementId: "placement-prior", workspaceId: "workspace",
-    agentId: "claude-code", state: "completed", recoveryEpoch: 0,
-    reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1 }, evidenceUpload: "structured_only",
+    agentId: "claude-code", state: "completed", recoveryEpoch: 0, terminalResultHash: "s".repeat(43),
+    reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1,
+      terminalAck: { assignmentId: "prior", attempt: 1, claimId: "prior-claim",
+        acknowledged: { reportId: "report-prior", reportSequence: 1 }, durableWatermark: 1, terminalSequence: 1, outcome: "accepted" } }, evidenceUpload: "structured_only",
     expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
   const orchestrator = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock,
     runners: new Map(), sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
@@ -271,9 +275,14 @@ it("does not bypass the predecessor chain when preserved changes require revalid
     takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined>;
   };
 
-  await expect(internal.takeOverCompletedChannel(delivery(restarted, "generate-2"), restarted, current))
-    .resolves.toEqual({ reference: "generator-ref", mode: "restore" });
-  expect(journal.execution.execution(prior)).toMatchObject({ phase: "continued", continuedToGeneration: "next-generation" });
+  const wrongPredecessor = delivery(restarted, "generate-2");
+  if (wrongPredecessor.source.kind !== "harness_delivery") throw new Error("delivery fixture mismatch");
+  wrongPredecessor.source.turn.predecessor = { invocationId: "some-other-turn", dispatchGeneration: 0 };
+  await expect(internal.takeOverCompletedChannel(wrongPredecessor, restarted, current))
+    .rejects.toMatchObject({ code: "recovery_required", diagnostic: "local_execution_unprovable" });
+  await expect(internal.takeOverCompletedChannel(delivery(restarted, "generate-2"), restarted, current)).resolves.toBeUndefined();
+  expect(journal.execution.execution(prior)).toMatchObject({ phase: "acp_settled", acpSessionRef: "generator-ref" });
+  expect(journal.execution.execution(restarted)).toBeUndefined();
 });
 
 it("leaves the previous execution untouched when its session is not an idle sealed completion", async () => {

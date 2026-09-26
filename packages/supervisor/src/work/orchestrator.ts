@@ -956,8 +956,9 @@ export class WorkOrchestrator {
           if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error;
           const unresumablePredecessor = this.canStartFreshAfterUnresumableHarnessPredecessor(assignment);
           const recoveredContinuation = this.canStartFreshAfterRecoveredHarnessContinuation(assignment);
+          const settledPredecessor = this.canStartFreshAfterSettledHarnessPredecessor(assignment);
           const repositoryAnchor = this.canStartFreshRepositoryAnchorAfterSettledHead(assignment);
-          if (!unresumablePredecessor && !recoveredContinuation && !repositoryAnchor) throw error;
+          if (!unresumablePredecessor && !recoveredContinuation && !settledPredecessor && !repositoryAnchor) throw error;
           // A settled head is not always this turn's predecessor: a fresh
           // repository anchor deliberately declines generated workspace state.
           // Otherwise the exact predecessor was already fenced or reported as
@@ -965,9 +966,11 @@ export class WorkOrchestrator {
           // fenced; opening below creates a fresh session inside the admitted
           // repository, role, agent and model boundary.
           this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt,
-            stage: "channel_handoff", outcome: repositoryAnchor ? "fresh_repository_anchor" : "discarded_unresumable_predecessor" },
+            stage: "channel_handoff", outcome: repositoryAnchor ? "fresh_repository_anchor" : settledPredecessor ? "fresh_after_settled_predecessor" : "discarded_unresumable_predecessor" },
           repositoryAnchor
             ? "the new cycle is repository-anchored and the previous role session is settled; starting a fresh ACP session"
+            : settledPredecessor
+              ? "the exact predecessor session was durably settled; starting a fresh ACP session to preserve the required review"
             : "the repository role's exact predecessor is not resumable; starting a fresh ACP session");
           return undefined;
         }
@@ -1120,6 +1123,23 @@ export class WorkOrchestrator {
     if (!tip || !fenced || fenced.source.kind !== "harness_delivery" || !sameHarnessRoleSession(fenced, successor) ||
         jcsDigest((fenced.source.turn.predecessor ?? null) as JsonValue) !== jcsDigest(successor.source.turn.predecessor as JsonValue)) return false;
     return this.recoveredExecutionSettled(tip);
+  }
+
+  /** The idle reaper may settle a completed role session before a later
+   * preserved-change review is requested. The review still has to run, but it
+   * cannot restore an ACP process that was deliberately retired. Permit a
+   * fresh process only for the exact acknowledged head named as predecessor;
+   * repository, task, role, agent and model identity remain unchanged. */
+  private canStartFreshAfterSettledHarnessPredecessor(successor: RemoteWorkAssignment): boolean {
+    if (successor.source.kind !== "harness_delivery" || !successor.source.turn.predecessor) return false;
+    const head = this.deps.journal.execution.harnessRoleHead(successor);
+    const execution = head && this.deps.journal.execution.execution(head);
+    const predecessor = head && this.deps.journal.execution.start(head.assignmentId, head.attempt)?.assignment;
+    if (!head || !execution || execution.phase !== "acp_settled" || !predecessor ||
+        predecessor.source.kind !== "harness_delivery" || !sameHarnessRoleSession(predecessor, successor) ||
+        jcsDigest({ invocationId: predecessor.source.turn.invocationId, dispatchGeneration: predecessor.source.turn.dispatchGeneration } as JsonValue) !==
+          jcsDigest(successor.source.turn.predecessor as JsonValue)) return false;
+    return this.reports.acknowledgedTerminalReport(head.assignmentId, head.attempt, head.claimId) !== undefined;
   }
 
   /** A new proposal can deliberately start from the repository rather than
