@@ -21,10 +21,10 @@ describe("startNativeAgents", () => {
 
   it("leaves out any agent whose runner cannot start and starts the rest, keeping Codex's server up", async () => {
     const codexOwner = { start: vi.fn(async () => {}), stop: vi.fn(async () => {}) };
-    const codex = runner("codex"), claude = runner("claude-code", true), dsh = runner("dsh", true), opencode = runner("opencode");
+    const codex = runner("codex"), claude = runner("claude-code", true), dsh = runner("dsh", true);
     const onUnavailable = vi.fn();
-    const result = await startNativeAgents({ codexOwner, runners: [codex, claude, dsh, opencode], onUnavailable });
-    expect(result.started).toEqual([codex, opencode]);
+    const result = await startNativeAgents({ codexOwner, runners: [codex, claude, dsh], onUnavailable });
+    expect(result.started).toEqual([codex]);
     expect(result.failed).toEqual([claude, dsh]);
     expect(result.unavailable).toEqual([{ agentId: "claude-code", reason: "claude-code failed" }, { agentId: "dsh", reason: "dsh failed" }]);
     expect(onUnavailable).toHaveBeenCalledWith("dsh", expect.any(Error));

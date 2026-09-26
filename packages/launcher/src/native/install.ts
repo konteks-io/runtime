@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { acquireNativeRootLock, compareSemver, loadNativeInstallation, locateNativeDsh, NativeRuntimeRecordSchema, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, compareSemver, loadNativeInstallation, locateNativeDsh, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
 import type { Output } from "../output.js";
 import { promptSecret } from "../prompt.js";
@@ -25,7 +26,7 @@ export interface NativeInstallOptions {
 }
 export interface NativeAgentAddOptions {
   root: string;
-  agentId: "claude-code" | "codex" | "opencode" | "pi" | "dsh";
+  agentId: NativeRuntimeRecord["agents"][number];
   output: Output;
   deps?: {
     roots?: readonly EmbeddedReleaseRoot[];
@@ -43,7 +44,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
   if (root === parse(root).root || root === resolve(homedir())) throw invalid();
   // Validate endpoints/agent selection before any activation or executable download.
   const agents = options.agents ?? ["claude-code", "codex"];
-  if (agents.includes("pi")) throw new RemoteInstanceError("agent_unavailable", "Pi native authentication and MCP compatibility are not yet supported.");
+  refuseRetiredAgents(agents);
   const draft = NativeRuntimeRecordSchema.parse({ schemaVersion: 1, deploymentKind: "native_connector", instanceId: "pending", workspaceId: "pending", releaseId: "pending", manifestDigest: "pending", bundleVersion: "pending", coreUrl: options.coreUrl, relayUrl: options.relayUrl, agents, controlPort: options.controlPort ?? CONTROL_SOCKET_DEFAULT_PORT });
   await privateDirectory(root);
   const installLockDir = join(root, "installer");
@@ -370,7 +371,7 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
   const roots = options.deps?.roots ?? EMBEDDED_RELEASE_ROOTS;
   const root = resolve(options.root);
   if (root === parse(root).root || root === resolve(homedir())) throw invalid();
-  if (options.agentId === "pi") throw new RemoteInstanceError("agent_unavailable", "Pi native authentication and MCP compatibility are not yet supported.");
+  refuseRetiredAgents([options.agentId]);
   await privateDirectory(root);
   const installLockDir = join(root, "installer");
   await privateDirectory(installLockDir);
@@ -517,11 +518,16 @@ async function discoverGit(): Promise<NativeRuntimeRecord["git"] | null> {
   return null;
 }
 function invalid() { return new RemoteInstanceError("install_state_corrupt", "Native installation cannot be completed; existing identity and credentials were preserved."); }
+/** Pi and OpenCode are retired (7.0.0): refused on install with the one shared sentence. */
+function refuseRetiredAgents(agents: readonly string[]): void {
+  const retired = agents.find(agent => isRetiredAgentId(agent));
+  if (retired !== undefined) throw new RemoteInstanceError("agent_unavailable", retiredAgentMessage(retired));
+}
 
 /** Read only the private installer record for status/stop, even when a release has expired. */
 export async function readNativeRecord(root: string): Promise<NativeRuntimeRecord> {
   const path = join(resolve(root), "native-runtime.json");
   const info = await lstat(path);
   if (!info.isFile() || info.nlink !== 1 || info.size > 1024 * 1024 || (process.platform !== "win32" && (info.mode & 0o077) !== 0)) throw invalid();
-  return NativeRuntimeRecordSchema.parse(JSON.parse(await readFile(path, "utf8")));
+  return parseNativeRuntimeRecord(JSON.parse(await readFile(path, "utf8"))).record;
 }

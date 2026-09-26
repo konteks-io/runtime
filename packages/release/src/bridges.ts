@@ -10,7 +10,7 @@
  * a package registry at runtime: the runner image vendors the exact version.
  */
 export interface AgentBridgeFamily {
-  agentId: "claude-code" | "codex" | "opencode" | "pi" | "dsh";
+  agentId: "claude-code" | "codex" | "dsh";
   displayName: string;
   package: string;
   version: string;
@@ -77,35 +77,6 @@ export const SUPPORTED_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.free
       },
     },
     egress: { baseUrlEnv: "OPENAI_BASE_URL", providers: ["openai"] },
-    acpProtocol: { min: 1, max: 1 },
-  },
-  {
-    agentId: "opencode",
-    displayName: "OpenCode",
-    package: "opencode-ai",
-    version: "1.2.0",
-    command: ["opencode", "acp"],
-    tooling: {
-      login: ["opencode", "auth", "login"],
-      logout: ["opencode", "auth", "logout"],
-      identitySignal: ["opencode", "auth", "list"],
-    },
-    egress: { providers: ["anthropic", "openai", "google", "deepseek"] },
-    acpProtocol: { min: 1, max: 1 },
-  },
-  {
-    agentId: "pi",
-    displayName: "Pi",
-    package: "pi-acp",
-    version: "0.0.33",
-    command: ["pi-acp"],
-    tooling: {
-      login: ["pi", "login"],
-      logout: ["pi", "logout"],
-      // CONTRACT-GAP: CP0 has not yet proven an official identity signal for pi;
-      // every login is treated as an identity change (conservative fallback, D111).
-    },
-    egress: { providers: ["anthropic", "openai", "google", "deepseek"] },
     acpProtocol: { min: 1, max: 1 },
   },
 ]);

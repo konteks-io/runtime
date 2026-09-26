@@ -74,6 +74,4 @@ from them enters this repository. `npm run check:agpl` guards this.
 - `@agentclientprotocol/sdk` 1.4.0 — Apache-2.0
 - `@agentclientprotocol/claude-agent-acp` 0.75.1 — Apache-2.0 (vendored into the `claude-code` runner image)
 - `@agentclientprotocol/codex-acp` 1.10.0 — Apache-2.0 (vendored into the `codex` runner image)
-- `pi-acp` 0.0.33 — MIT (vendored into the `pi` runner image)
-- OpenCode `opencode acp` — vendored into the `opencode` runner image under its own licence
 - `@modelcontextprotocol/sdk`, `playwright-core`, `ws`, `zod`, `pino`, `commander` — see each package's licence

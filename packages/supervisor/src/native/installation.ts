@@ -3,6 +3,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, parse, resolve } from "node:path";
 import { z } from "zod";
+import { isRetiredAgentId } from "@konteks/backstage-plugin-common";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { RunnerConfigSchema } from "@konteks/remote-agent-runner";
 import { EmbeddedReleaseRootSchema, findAgentBridge, selectNativeArtifacts, verifyNativeRelease, verifyOfflineAgentPackage, type EmbeddedReleaseRoot } from "@konteks/remote-release";
@@ -22,6 +23,9 @@ function endpoint(protocol: "https:" | "wss:") {
   });
 }
 
+/** The agents a native runtime runs: Claude Code, Codex and the person's own DeepSeek Harness. */
+export const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh"] as const;
+
 /** Installer-owned metadata, not an environment file or arbitrary process configuration. */
 export const NativeRuntimeRecordSchema = z.object({
   schemaVersion: z.literal(1), deploymentKind: z.literal("native_connector"),
@@ -31,7 +35,7 @@ export const NativeRuntimeRecordSchema = z.object({
   controlPort: z.number().int().min(1).max(65_535),
   // Zero agents is a machine enrolled from an agent door with nothing
   // detectable yet (OS14); it advertises no roles until one is added.
-  agents: z.array(z.enum(["claude-code", "codex", "opencode", "pi", "dsh"])).max(5)
+  agents: z.array(z.enum(NATIVE_AGENT_IDS)).max(NATIVE_AGENT_IDS.length)
     .refine(agents => new Set(agents).size === agents.length),
   git: NativeGitToolSchema.optional(),
   /** Local installer-owned profile binding, never a cloud-provided path. */
@@ -45,6 +49,20 @@ export const NativeRuntimeRecordSchema = z.object({
   dshNode: z.string().min(1).max(4096).optional(),
 }).strict();
 export type NativeRuntimeRecord = z.infer<typeof NativeRuntimeRecordSchema>;
+
+/**
+ * Read a stored record. One written before 7.0.0 may still list Pi or
+ * OpenCode: those agents are no longer run, so they are dropped (and reported
+ * back for a warning) instead of failing the whole installation. Every write
+ * still goes through the strict schema, which refuses them.
+ */
+export function parseNativeRuntimeRecord(value: unknown): { record: NativeRuntimeRecord; retiredAgents: string[] } {
+  const agents = (value as { agents?: unknown } | null)?.agents;
+  if (!Array.isArray(agents)) return { record: NativeRuntimeRecordSchema.parse(value), retiredAgents: [] };
+  const retiredAgents = agents.filter((agent): agent is string => typeof agent === "string" && isRetiredAgentId(agent));
+  const kept = agents.filter(agent => !(typeof agent === "string" && isRetiredAgentId(agent)));
+  return { record: NativeRuntimeRecordSchema.parse({ ...(value as object), agents: kept }), retiredAgents };
+}
 
 export interface NativeInstallationOptions {
   /** Supplied by the verified executable, never discovered in the writable installation. */
@@ -68,7 +86,7 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
     await directory(root);
     // Canonicalize ancestors (e.g. macOS /var -> /private/var), but never accept a linked root.
     root = await realpath(root);
-    const record = NativeRuntimeRecordSchema.parse(await readPrivateJson(join(root, "native-runtime.json")));
+    const { record, retiredAgents } = parseNativeRuntimeRecord(await readPrivateJson(join(root, "native-runtime.json")));
     if (record.git) await verifyNativeGitTool(record.git);
     const roots = z.array(EmbeddedReleaseRootSchema).parse(options.roots);
     const dataDir = join(root, "supervisor");
@@ -145,7 +163,7 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
       // exist on a laptop, so every grouping read failed with ENOENT.
       SUPERVISOR_ONBOARD_SCRATCH_ROOT: join(dataDir, "onboard"),
     });
-    return { record, config, runners, roots, release };
+    return { record, config, runners, roots, release, retiredAgents };
   } catch (error) {
     if (error instanceof RemoteInstanceError) throw error;
     throw invalid();

@@ -8,11 +8,11 @@ export const OFFLINE_AGENT_LIMITS = Object.freeze({ files: 20_000, bytes: 1024 *
 const pathSchema = RemoteTransferPathSchema.refine(path => Buffer.byteLength(path, "utf8") <= 240);
 const exactVersion = z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
 const entrypoint = z.object({ package: z.string().min(1).max(128), version: exactVersion, entrypoint: pathSchema, runtime: z.enum(["native", "node"]) }).strict();
-const toolingPackages = { "claude-code": "@anthropic-ai/claude-code", codex: "@openai/codex", opencode: "opencode-ai", pi: "@earendil-works/pi-coding-agent" } as const;
+const toolingPackages = { "claude-code": "@anthropic-ai/claude-code", codex: "@openai/codex" } as const;
 
 /** Local release-package format, not another cloud execution protocol. */
 export const NativeAgentPackageProfileSchema = z.object({
-  schemaVersion: z.literal(1), agentId: z.enum(["claude-code", "codex", "opencode", "pi"]),
+  schemaVersion: z.literal(1), agentId: z.enum(["claude-code", "codex"]),
   os: z.enum(["macos", "windows", "debian"]), architecture: z.enum(["amd64", "arm64"]),
   bridge: entrypoint, tooling: entrypoint,
   codexLocalProxy: z.object({ version: z.literal(1), entrypoint: pathSchema }).strict().optional(),
@@ -20,9 +20,6 @@ export const NativeAgentPackageProfileSchema = z.object({
   files: z.array(z.object({ path: pathSchema, digest: z.string().regex(/^sha256:[a-f0-9]{64}$/), sizeBytes: z.number().int().min(0).max(OFFLINE_AGENT_LIMITS.bytes), executable: z.boolean() }).strict()).min(1).max(OFFLINE_AGENT_LIMITS.files),
 }).strict().superRefine((profile, ctx) => {
   const fail = (message: string) => ctx.addIssue({ code: "custom", message });
-  // Pinned pi-acp does not forward MCP servers; official local auth is unproven.
-  // Keep its identity vocabulary, but never admit a native runnable package yet.
-  if (profile.agentId === "pi") fail("Pi native authentication and MCP compatibility are not yet supported");
   const family = findAgentBridge(profile.agentId)!;
   if (profile.bridge.package !== family.package || profile.bridge.version !== family.version || profile.tooling.package !== toolingPackages[profile.agentId]) fail("package identity does not match the pinned agent family");
   const seen = new Set<string>(), directories = new Map<string, string>();

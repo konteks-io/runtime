@@ -19,7 +19,7 @@ const ALL_TARGETS = [["macos", "amd64"], ["macos", "arm64"], ["windows", "amd64"
 const targets = args.targets
   ? args.targets.split(",").map(pair => { const target = ALL_TARGETS.find(([os, architecture]) => `${os}/${architecture}` === pair.trim()); if (!target) fail(`unknown target ${pair}`); return target; })
   : ALL_TARGETS;
-const agents = ["claude-code", "codex", "opencode"], ids = new Set(), coordinates = new Set();
+const agents = ["claude-code", "codex"], ids = new Set(), coordinates = new Set();
 for (const artifact of index.artifacts) {
   const bridge = artifact.kind === "agent_bridge";
   exactKeys(artifact, bridge

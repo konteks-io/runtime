@@ -21,7 +21,7 @@ const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) =>
 if (!args.agent || !args.os || !args.architecture || !args.out || !args.profile || !args.approval || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{7,255}$/.test(args.approval)) throw new Error("offline agent packaging requires an explicit redistribution approval reference");
 const config = JSON.parse(readFileSync(args.config ?? "release/native-agent-builds.json", "utf8"));
 const selected = config.agents?.[args.agent];
-if (!selected || args.agent === "pi") throw new Error("agent is not approved for native offline distribution");
+if (!selected) throw new Error("agent is not approved for native offline distribution");
 if (process.version !== `v${config.nodeVersion}`) throw new Error(`offline bundles require Node ${config.nodeVersion}`);
 const work = mkdtempSync(join(tmpdir(), "konteks-agent-build-")), root = join(work, "root");
 try {

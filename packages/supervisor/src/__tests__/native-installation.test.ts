@@ -10,7 +10,7 @@ import { bundleManifestSigningBytes, computeBundleManifestDigest, controlCall, S
 import type { BridgeProcess } from "@konteks/remote-agent-runner";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
-import { loadNativeInstallation, NativeRuntimeRecordSchema } from "../native/installation.js";
+import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord } from "../native/installation.js";
 import { createNativeService } from "../native/service.js";
 import { SupervisorStore } from "../state/store.js";
 import { acquireNativeRootLock } from "../native/root-lock.js";
@@ -162,7 +162,18 @@ describe("closed native runtime installation", () => {
     // An upgrade out of the tested range stops the load with the install hint, never a silent run.
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: await dsh("0.1.8"), dshNode: node }));
     await expect(loadNativeInstallation(root, f.options)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_unsupported_version" });
-    expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["claude-code", "codex", "opencode", "pi", "dsh"] }).success).toBe(true);
+    expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["claude-code", "codex", "dsh"] }).success).toBe(true);
+  });
+  it("still loads a record written before 7.0.0 that lists Pi or OpenCode, without them", async () => {
+    const f = await fixture();
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "opencode", "pi"] }));
+    const loaded = await loadNativeInstallation(root, f.options);
+    expect(loaded.record.agents).toEqual(["codex"]);
+    expect(loaded.retiredAgents).toEqual(["opencode", "pi"]);
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
+    // Tolerant reading only: a new record naming a retired agent is refused.
+    expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["codex", "opencode"] }).success).toBe(false);
+    expect(parseNativeRuntimeRecord({ ...f.record, agents: ["pi", "codex"] }).record.agents).toEqual(["codex"]);
   });
   it.each([{ releaseId: "../outside" }, { agents: ["codex", "codex"] }, { coreUrl: "http://core.example" }, { coreUrl: "https://user:password@core.example" }, { relayUrl: "ws://relay.example" }, { gatewayKey: "forbidden" }, { environment: { NODE_OPTIONS: "--require untrusted" } }, { deploymentKind: "appliance" }, { command: "/bin/sh" }])("rejects unsafe or unimplemented install fields", async patch => {
     const f = await fixture();

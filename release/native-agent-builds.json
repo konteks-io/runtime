@@ -26,18 +26,6 @@
         "version": "0.153.4",
         "bin": "codex"
       }
-    },
-    "opencode": {
-      "bridge": {
-        "package": "opencode-ai",
-        "version": "1.2.0",
-        "bin": "opencode"
-      },
-      "tooling": {
-        "package": "opencode-ai",
-        "version": "1.2.0",
-        "bin": "opencode"
-      }
     }
   },
   "tools": {

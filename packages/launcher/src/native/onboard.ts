@@ -1381,7 +1381,7 @@ function workspaceName(state: { workspaces?: Array<{ tenantId: string; displayNa
 
 /** An agent family as people name it. */
 export function agentName(family: string): string {
-  return ({ "claude-code": "Claude Code", codex: "Codex", opencode: "OpenCode", pi: "Pi", dsh: "DeepSeek Harness" } as Record<string, string>)[family] ?? family;
+  return ({ "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness" } as Record<string, string>)[family] ?? family;
 }
 
 /**

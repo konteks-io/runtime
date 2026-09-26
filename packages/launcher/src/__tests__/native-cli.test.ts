@@ -74,4 +74,15 @@ describe("native customer entry point", () => {
     expect(actions.addAgent).toHaveBeenLastCalledWith(expect.objectContaining({ agent: "dsh" }));
     expect(actions.install).not.toHaveBeenCalled();
   });
+  it.each(["pi", "opencode"])("refuses the retired %s agent with the shared sentence", async retired => {
+    const { program, actions } = fixture();
+    program.exitOverride();
+    for (const command of [program.commands.find(c => c.name() === "agent")!, ...program.commands.find(c => c.name() === "agent")!.commands]) command.exitOverride();
+    let stderr = "";
+    program.configureOutput({ writeErr: text => { stderr += text; } });
+    for (const command of program.commands.find(c => c.name() === "agent")!.commands) command.configureOutput({ writeErr: text => { stderr += text; } });
+    await expect(program.parseAsync(["--root", "/private/native-root", "agent", "add", retired], { from: "user" })).rejects.toThrow();
+    expect(stderr).toContain(`${retired} is no longer supported. Choose Claude Code, Codex or DeepSeek Harness on your computer.`);
+    expect(actions.addAgent).not.toHaveBeenCalled();
+  });
 });

@@ -127,7 +127,7 @@ export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamil
     if (family.egress.baseUrlEnv) {
       env[family.egress.baseUrlEnv] = config.RUNNER_GATEWAY_BASE_URL;
     }
-    // OpenCode/Pi route by provider; they honour the standard per-provider base URL variables.
+    // A family without one base-URL variable routes by provider (standard per-provider variables).
     if (!family.egress.baseUrlEnv) {
       for (const provider of family.egress.providers) {
         env[PROVIDER_BASE_URL_ENV[provider]] = `${config.RUNNER_GATEWAY_BASE_URL.replace(/\/$/, "")}/${provider}`;

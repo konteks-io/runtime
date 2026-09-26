@@ -9,7 +9,7 @@ import { NativeAgentPackageProfileSchema } from "@konteks/remote-release";
  */
 export const RunnerConfigSchema = z
   .object({
-    RUNNER_AGENT_ID: z.enum(["claude-code", "codex", "opencode", "pi", "dsh"]),
+    RUNNER_AGENT_ID: z.enum(["claude-code", "codex", "dsh"]),
     RUNNER_PORT: z.coerce.number().int().min(1).max(65_535).default(41840),
     /** Private credential volume; becomes HOME/XDG for the bridge and its official tooling. */
     RUNNER_CREDENTIAL_DIR: z.string().min(1).default("/credentials"),

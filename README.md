@@ -7,7 +7,7 @@ not build or deploy the connector from that checkout.
 
 `konteks-remote` is the Konteks native runtime connector. It installs on a
 developer's or team's own machine, runs the coding agents that are already
-installed there (Claude Code, Codex, OpenCode, DeepSeek Harness) under their
+installed there (Claude Code, Codex, DeepSeek Harness) under their
 own subscriptions or keys, and connects them to a Konteks workspace over an
 outbound, authenticated channel. No Docker, no local databases. The only
 provider key on the host is a DeepSeek API key, if you use DeepSeek Harness,

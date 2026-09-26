@@ -87,10 +87,6 @@ describe("bridge spawn spec", () => {
   it("points a gateway-keyed bridge at the gateway through its documented base-URL variable", () => {
     const config = loadRunnerConfig({ RUNNER_AGENT_ID: "codex", RUNNER_AUTH_MODE: "gateway_keyed", RUNNER_GATEWAY_BASE_URL: "http://gateway:41810/agents/codex/openai" });
     expect(bridgeEnvironment(config, findAgentBridge("codex")!).OPENAI_BASE_URL).toBe("http://gateway:41810/agents/codex/openai");
-    const multi = loadRunnerConfig({ RUNNER_AGENT_ID: "opencode", RUNNER_AUTH_MODE: "gateway_keyed", RUNNER_GATEWAY_BASE_URL: "http://gateway:41810/agents/opencode" });
-    const env = bridgeEnvironment(multi, findAgentBridge("opencode")!);
-    expect(env.ANTHROPIC_BASE_URL).toBe("http://gateway:41810/agents/opencode/anthropic");
-    expect(env.DEEPSEEK_BASE_URL).toBe("http://gateway:41810/agents/opencode/deepseek");
   });
 
   it("refuses a gateway-keyed runner without a gateway base URL", () => {

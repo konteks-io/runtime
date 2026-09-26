@@ -53,6 +53,9 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
           ...(options.runtimeOptions ? { runtimeOptions: options.runtimeOptions } : {}),
         },
       });
+      if (installation.retiredAgents.length > 0) {
+        supervisor.logger.warn({ retiredAgents: installation.retiredAgents }, "this installation still lists agents Konteks no longer runs; they are skipped (Claude Code, Codex and DeepSeek Harness are supported)");
+      }
       await supervisor.start();
       control = await startControlSocketServer({
         token: await supervisor.store.controlToken(),

@@ -27,7 +27,7 @@ import { fetchReleaseManifest, persistReleaseArtifacts } from "../release-fetch.
  * duplicate identity. The activation code exists only inside the prompt
  * closure and is never printed, persisted, or passed to a child process.
  */
-export const DEFAULT_AGENTS = Object.freeze(["claude-code", "codex", "opencode", "pi"] as const);
+export const DEFAULT_AGENTS = Object.freeze(["claude-code", "codex"] as const);
 
 export interface InstallOptions {
   activationId: string;

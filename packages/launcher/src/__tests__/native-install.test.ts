@@ -182,10 +182,11 @@ describe("native install composition", () => {
     await expect(installNative(f.options as never)).rejects.toThrow();
     expect(f.activate).not.toHaveBeenCalled();
   });
-  it("refuses unsupported Pi compatibility before activation or downloads", async () => {
+  it.each(["pi", "opencode"])("refuses the retired %s agent before activation or downloads", async retired => {
     const f = await fixture();
-    f.options.agents = ["pi"];
-    await expect(installNative(f.options as never)).rejects.toThrow("Pi native authentication and MCP compatibility are not yet supported");
+    f.options.agents = ["codex", retired];
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "agent_unavailable", message: `${retired} is no longer supported. Choose Claude Code, Codex or DeepSeek Harness on your computer.` });
+    await expect(addNativeAgent({ root: f.root, agentId: retired, output: f.options.output } as never)).rejects.toMatchObject({ code: "agent_unavailable" });
     expect(f.activate).not.toHaveBeenCalled();
     expect(f.options.deps.fetchFn).not.toHaveBeenCalled();
   });

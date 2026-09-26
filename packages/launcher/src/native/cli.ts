@@ -1,15 +1,20 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Command, InvalidArgumentError } from "commander";
+import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { nativePaths, nativePlatform } from "./service.js";
 import { createOutput, type Output } from "../output.js";
+
+/** The agents a native runtime runs (Pi and OpenCode are retired). */
+const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh"] as const;
+type NativeAgentId = (typeof NATIVE_AGENT_IDS)[number];
 
 export interface NativeCommandContext { root: string; output: Output }
 export interface NativeCliActions {
   install(input: NativeCommandContext & { activationId?: string; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
   onboard(input: NativeCommandContext & { answer?: string; cwd?: string }): Promise<void>;
   stageEnrollment(input: NativeCommandContext): Promise<void>;
-  addAgent(input: NativeCommandContext & { agent: "claude-code" | "codex" | "opencode" | "pi" | "dsh" }): Promise<void>;
+  addAgent(input: NativeCommandContext & { agent: NativeAgentId }): Promise<void>;
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
@@ -41,9 +46,10 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     if (!/^[A-Za-z0-9._-]{8,128}$/.test(value)) throw new InvalidArgumentError("activation id must be an opaque identifier; the code is prompted securely");
     return value;
   };
-  const agent = (value: string): "claude-code" | "codex" | "opencode" | "pi" | "dsh" => {
-    if (!["claude-code", "codex", "opencode", "pi", "dsh"].includes(value)) throw new InvalidArgumentError("unsupported agent family");
-    return value as "claude-code" | "codex" | "opencode" | "pi" | "dsh";
+  const agent = (value: string): NativeAgentId => {
+    if (isRetiredAgentId(value)) throw new InvalidArgumentError(retiredAgentMessage(value));
+    if (!(NATIVE_AGENT_IDS as readonly string[]).includes(value)) throw new InvalidArgumentError("unsupported agent family");
+    return value as NativeAgentId;
   };
   program.command("install").description("activate, verify and install the native connector, then start its user service")
     .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
@@ -73,7 +79,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   const agentLifecycle = program.command("agent").description("manage agents installed on this native runtime");
   agentLifecycle.command("add").description("add one signed offline agent package without reactivation")
     .argument("<agent>", "agent family", agent)
-    .action(async (value: "claude-code" | "codex" | "opencode" | "pi") => actions.addAgent({ ...context(), agent: value }));
+    .action(async (value: NativeAgentId) => actions.addAgent({ ...context(), agent: value }));
   for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).action(async () => actions.control({ ...context(), operation }));
   const auth = program.command("auth").description("official local agent subscription authentication");
   auth.command("status").argument("[agent]", "agent family", agent).action(async (value?: string) => actions.control({ ...context(), operation: "auth.status", ...(value ? { agent: value } : {}) }));
