@@ -1,5 +1,6 @@
 import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import type { PolicyEvaluator } from "@konteks/agent-core";
+import { browserToolFromTitle, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
 
 /**
  * The ACP policy responder (D87 step 1): a permission request or elicitation
@@ -11,8 +12,11 @@ import type { PolicyEvaluator } from "@konteks/agent-core";
  */
 export type PolicyDecision = { kind: "allow"; optionId: string } | { kind: "deny"; optionId: string | null } | { kind: "defer" };
 
+/** `browserTools`: this session was given the QA browser (its gateway admits only the session's preview). */
+export interface PermissionContext { assignmentId: string; agentId: string; workspaceRoot: string; browserTools?: boolean }
+
 export interface PolicyResponder {
-  evaluatePermission(request: RequestPermissionRequest, context: { assignmentId: string; agentId: string; workspaceRoot: string }): Promise<PolicyDecision>;
+  evaluatePermission(request: RequestPermissionRequest, context: PermissionContext): Promise<PolicyDecision>;
   evaluateElicitation(request: CreateElicitationRequest): Promise<{ kind: "defer" } | { kind: "decline" }>;
 }
 
@@ -39,9 +43,17 @@ export function isSignInElicitation(request: CreateElicitationRequest): boolean 
 export class EvaluatorPolicyResponder implements PolicyResponder {
   constructor(private readonly evaluator: PolicyEvaluator | null, private readonly humanDeferralAllowed: () => boolean) {}
 
-  async evaluatePermission(request: RequestPermissionRequest, context: { assignmentId: string; agentId: string; workspaceRoot: string }): Promise<PolicyDecision> {
+  async evaluatePermission(request: RequestPermissionRequest, context: PermissionContext): Promise<PolicyDecision> {
     const allow = preferredOption(request, ["allow_once", "allow_always"]);
     const deny = preferredOption(request, ["reject_once", "reject_always"]);
+    // The QA browser's tools: allowed on a session that was given the browser
+    // (its gateway already confines it to the session's preview), refused on
+    // any other session, and the few it never allows are refused everywhere.
+    const browserTool = browserToolFromTitle((request.toolCall as { title?: string | null }).title);
+    if (browserTool !== null) {
+      if (context.browserTools === true && !isDeniedBrowserTool(browserTool) && allow !== null) return { kind: "allow", optionId: allow };
+      return { kind: "deny", optionId: deny };
+    }
     if (this.evaluator === null) return this.humanDeferralAllowed() ? { kind: "defer" } : { kind: "deny", optionId: deny };
     const toolCall = request.toolCall as { rawInput?: unknown; kind?: string | null; title?: string | null; locations?: unknown };
     const raw = toolCall.rawInput && typeof toolCall.rawInput === "object" && !Array.isArray(toolCall.rawInput) ? (toolCall.rawInput as Record<string, unknown>) : {};

@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { createServer, request as httpRequest } from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -214,6 +217,58 @@ describe("relayed session (D98/D113/D114)", () => {
       await f.session.close("cancelled");
       expect(preview.stop).not.toHaveBeenCalled();
       expect(preview.permit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("QA browser (Claude Code and Codex)", () => {
+    function access(origin: () => string | null) {
+      const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
+      return { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(), forget: vi.fn(),
+        origin: vi.fn((_sessionId: string) => origin()), browsersPath: "/private/native/browsers" };
+    }
+    const viaProxy = (proxyUrl: string, url: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const proxy = new URL(proxyUrl);
+      const req = httpRequest({ host: proxy.hostname, port: proxy.port, method: "GET", path: url, headers: { host: new URL(url).host } }, res => {
+        let body = "";
+        res.on("data", chunk => { body += chunk; });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+
+    it("gives a validation session a browser whose gateway reaches only the session's running preview", async () => {
+      const upstream = createServer((_req, res) => res.end("the preview"));
+      await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+      const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+      const preview = access(() => origin);
+      const f = await build({ preview }, { ...assignment, kind: "validation" } as RemoteWorkAssignment);
+      (f.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+      await f.session.bootstrap();
+      const input = f.runnerCalls[0]?.[1][0] as { browser?: { proxyUrl: string; outputDir: string; browsersPath: string }; mcpServers: Array<{ name: string }> };
+      expect(input.mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-preview"]);
+      expect(input.browser).toMatchObject({ proxyUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), browsersPath: "/private/native/browsers" });
+      expect(existsSync(input.browser!.outputDir)).toBe(true);
+      await expect(viaProxy(input.browser!.proxyUrl, `${origin}/`)).resolves.toEqual({ status: 200, body: "the preview" });
+      expect(preview.touch).toHaveBeenCalledWith("s");
+      expect((await viaProxy(input.browser!.proxyUrl, "http://127.0.0.1:1/")).status).toBe(403);
+      await f.session.close("cancelled");
+      await expect(viaProxy(input.browser!.proxyUrl, `${origin}/`)).rejects.toThrow();
+      expect(existsSync(input.browser!.outputDir)).toBe(false);
+      upstream.close();
+    });
+
+    it("gives no browser to assistant turns or to an agent without one (DeepSeek Harness)", async () => {
+      const assistant = await build({ preview: access(() => null) });
+      (assistant.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+      await assistant.session.bootstrap();
+      expect((assistant.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
+      await assistant.session.close("cancelled");
+      const dsh = await build({ preview: access(() => null) }, { ...assignment, kind: "validation", agentRoute: { ...assignment.agentRoute, agentId: "dsh" } } as RemoteWorkAssignment);
+      (dsh.runner as { browserVersion?: () => string | null }).browserVersion = () => null;
+      await dsh.session.bootstrap();
+      expect((dsh.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
+      await dsh.session.close("cancelled");
     });
   });
 

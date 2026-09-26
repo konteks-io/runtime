@@ -1,5 +1,6 @@
 export * from "./manifest.js";
 export * from "./bridges.js";
+export * from "./browser.js";
 export * from "./roots.js";
 export * from "./fixtures.js";
 export * from "./native.js";

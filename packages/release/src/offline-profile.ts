@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { RemoteInstanceError, RemoteTransferPathSchema, type RemoteNativeArtifact } from "@konteks/remote-common";
 import { findAgentBridge } from "./bridges.js";
+import { BROWSER_MCP_PACKAGE, BROWSER_MCP_LAUNCHER_PATH } from "./browser.js";
 
 export const OFFLINE_AGENT_PROFILE_FILE = "konteks-agent.json";
 export const OFFLINE_AGENT_LIMITS = Object.freeze({ files: 20_000, bytes: 1024 ** 3, profileBytes: 4 * 1024 ** 2 });
@@ -16,6 +17,8 @@ export const NativeAgentPackageProfileSchema = z.object({
   os: z.enum(["macos", "windows", "debian"]), architecture: z.enum(["amd64", "arm64"]),
   bridge: entrypoint, tooling: entrypoint,
   codexLocalProxy: z.object({ version: z.literal(1), entrypoint: pathSchema }).strict().optional(),
+  /** The bundled browser MCP server (Playwright MCP) and the connector's launcher that runs it. */
+  browser: z.object({ package: z.literal(BROWSER_MCP_PACKAGE.package), version: exactVersion, entrypoint: pathSchema, launcher: pathSchema, runtime: z.literal("node") }).strict().optional(),
   node: z.object({ version: z.literal("22.23.2"), entrypoint: pathSchema }).strict().optional(),
   files: z.array(z.object({ path: pathSchema, digest: z.string().regex(/^sha256:[a-f0-9]{64}$/), sizeBytes: z.number().int().min(0).max(OFFLINE_AGENT_LIMITS.bytes), executable: z.boolean() }).strict()).min(1).max(OFFLINE_AGENT_LIMITS.files),
 }).strict().superRefine((profile, ctx) => {
@@ -46,6 +49,11 @@ export const NativeAgentPackageProfileSchema = z.object({
   if (profile.node) {
     const file = profile.files.find(candidate => candidate.path === profile.node!.entrypoint);
     if (!file?.executable || profile.os === "windows" && !profile.node.entrypoint.endsWith(".exe")) fail("bundled Node is not an inventoried executable");
+  }
+  if (profile.browser) {
+    const { entrypoint: cli, launcher, version } = profile.browser;
+    if (version !== BROWSER_MCP_PACKAGE.version || launcher !== BROWSER_MCP_LAUNCHER_PATH || !profile.node ||
+        ![cli, launcher].every(path => profile.files.some(candidate => candidate.path === path))) fail("browser MCP server must be the pinned, inventoried package with its launcher and bundled Node");
   }
   if (profile.codexLocalProxy) {
     const file = profile.files.find(candidate => candidate.path === profile.codexLocalProxy!.entrypoint);

@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import { BROWSER_MCP_SERVER_NAME } from "@konteks/remote-agent-runner";
 import type { PreviewStatus } from "./process-manager.js";
 
 /**
@@ -31,10 +32,21 @@ export interface SessionPreviewAccess {
   permit?(sessionId: string, cwd: string): void;
   /** The session ended: no viewer starts its preview any more. */
   forget?(sessionId: string): void;
+  /** The loopback origin of the session's preview while it answers (what its browser may reach), else null. */
+  origin?(sessionId: string): string | null;
+  /** Where Playwright's own Chromium is installed when this computer has no Chrome; absent = no browsers. */
+  browsersPath?: string;
 }
 
 /** Work kinds whose agent may run a preview: code that changes, is validated or is checked. */
 export const PREVIEW_WORK_KINDS: ReadonlySet<string> = new Set(["delivery", "validation", "qa", "assistant_execution"]);
+
+/**
+ * Work kinds whose agent also gets a browser on the preview (Claude Code and
+ * Codex): the validator and QA, which check the work in its UI, and the
+ * executor, which can look at what it builds. Not assistant turns.
+ */
+export const BROWSER_WORK_KINDS: ReadonlySet<string> = new Set(["delivery", "validation", "qa"]);
 
 export interface PreviewToolHost {
   start(): Promise<PreviewStatus>;
@@ -77,7 +89,7 @@ export class PreviewMcpServer {
   private server: Server | null = null;
   private closed = false;
 
-  constructor(private readonly host: PreviewToolHost, private readonly options: { logger?: Logger; context?: Record<string, unknown> } = {}) {
+  constructor(private readonly host: PreviewToolHost, private readonly options: { logger?: Logger; context?: Record<string, unknown>; browser?: boolean } = {}) {
     this.logger = options.logger ?? createLogger({ name: "preview-mcp" });
   }
 
@@ -155,7 +167,9 @@ export class PreviewMcpServer {
           protocolVersion: typeof asked === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(asked) ? asked : SUPPORTED_PROTOCOL_VERSIONS[0],
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: PREVIEW_MCP_SERVER_NAME, title: "Konteks live preview", version: "1.0.0" },
-          instructions: "Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. A browser on this computer can open the returned http://127.0.0.1 URL.",
+          instructions: this.options.browser
+            ? `Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. Open the returned http://127.0.0.1 URL with the ${BROWSER_MCP_SERVER_NAME} tools (browser_navigate, browser_snapshot, browser_click, browser_type, browser_take_screenshot): that browser reaches only this preview.`
+            : "Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. A browser on this computer can open the returned http://127.0.0.1 URL.",
         });
       }
       case "ping":
@@ -185,7 +199,7 @@ export class PreviewMcpServer {
       return { content: [{ type: "text", text: `The preview tool failed: ${error instanceof Error ? error.message.slice(0, 300) : "unexpected error"}.` }], isError: true };
     }
     this.logger.info({ event: "preview.tool_called", tool: name, state: status.state, ...this.options.context }, "preview tool called");
-    return { content: [{ type: "text", text: describeStatus(status) }], structuredContent: status, ...(name === "preview_start" && status.state === "failed" ? { isError: true } : {}) };
+    return { content: [{ type: "text", text: describeStatus(status, { browser: this.options.browser === true }) }], structuredContent: status, ...(name === "preview_start" && status.state === "failed" ? { isError: true } : {}) };
   }
 
   private authorized(value: string | undefined): boolean {
@@ -207,11 +221,12 @@ export class PreviewMcpServer {
 }
 
 /** The plain-text answer an agent reads; the same facts are in structuredContent. */
-export function describeStatus(status: PreviewStatus): string {
+export function describeStatus(status: PreviewStatus, options: { browser?: boolean } = {}): string {
   const lines = [`Preview: ${status.state}${status.phase && status.state === "starting" ? ` (${status.phase})` : ""}`, status.message];
   if (status.startedBy === "viewer") lines.push("Started by a viewer who opened the preview in Konteks.");
   else if (status.startedBy === "agent") lines.push("Started by the agent (preview_start).");
   if (status.url) lines.push(`Loopback URL (a browser on this computer): ${status.url}`);
+  if (status.url && options.browser) lines.push(`Open it with ${BROWSER_MCP_SERVER_NAME} browser_navigate; that browser reaches only this URL.`);
   if (status.command) lines.push(`Command: ${status.command}${status.explanation ? ` — ${status.explanation}` : ""}`);
   if (status.install) lines.push(`Install step: ${status.install}`);
   if (status.prepare) lines.push(`Prepare step: ${status.prepare}`);

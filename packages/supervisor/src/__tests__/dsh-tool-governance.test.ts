@@ -42,6 +42,7 @@ describe("DeepSeek Harness tool governance", () => {
     governance.observe(call("m3", "mcp__someone-else__run", {}));
     governance.observe(call("m4", "mcp__konteks-preview__preview_start", {}));
     governance.observe(call("m5", "mcp__konteks-previewx__preview_start", {}));
+    governance.observe(call("m6", "mcp__konteks-browser__browser_navigate", { url: "http://127.0.0.1:43100/" }));
     governance.observe(call("r1", "grep", { pattern: "x" }));
     governance.observe(call("j1", "job_kill", { id: "1" }));
     governance.observe(call("p1", "plugin_manager", { action: "install" }));
@@ -51,7 +52,8 @@ describe("DeepSeek Harness tool governance", () => {
     expect(governance.decide(ask("m5"), CWD)).toMatchObject({ kind: "deny" });
     expect(governance.decide(ask("r1"), CWD)).toEqual({ kind: "allow" });
     // The retired browser tool is never mounted, so a server using its name is not Konteks'.
-    for (const id of ["m2", "m3", "j1", "p1"]) expect(governance.decide(ask(id), CWD), id).toMatchObject({ kind: "deny" });
+    // DeepSeek Harness gets no QA browser (it carries no package to run it), so its name is refused too.
+    for (const id of ["m2", "m3", "m6", "j1", "p1"]) expect(governance.decide(ask(id), CWD), id).toMatchObject({ kind: "deny" });
   });
 
   it("denies a request with no tool call behind it, or with nothing to judge", () => {

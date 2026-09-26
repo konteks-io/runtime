@@ -30,7 +30,7 @@ import {
   type RuntimeAgentLoginDeliveryRequest,
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import type { RunnerConfig } from "@konteks/remote-agent-runner";
+import { chromeInstalled, type RunnerConfig } from "@konteks/remote-agent-runner";
 import { SignalSampler } from "@konteks/remote-sysmon";
 import { loadSupervisorConfig, type SupervisorConfig } from "./config.js";
 import { CoreClient, LEASE_AUDIENCE } from "./core/client.js";
@@ -1630,6 +1630,9 @@ export class Supervisor {
       touch: sessionId => this.previews.touch(sessionId),
       permit: (sessionId, cwd) => this.previewWorktrees.set(sessionId, cwd),
       forget: sessionId => this.forgetPreviewWorktree(sessionId),
+      origin: sessionId => this.previews.originFor(sessionId),
+      // Playwright's own Chromium, when this computer has no Chrome, is installed here once.
+      browsersPath: join(this.config.SUPERVISOR_DATA_DIR, "browsers"),
     };
   }
 
@@ -1661,6 +1664,19 @@ export class Supervisor {
   private forgetPreviewWorktree(sessionId: string): void {
     this.previewWorktrees.delete(sessionId);
     this.previewViewerStarts.delete(sessionId);
+  }
+
+  /** Which agents can drive the QA browser (Playwright MCP) and whether it uses Chrome or Playwright's Chromium. */
+  private browserReport(): { version: string | null; agents: string[]; chrome: boolean } {
+    const agents: string[] = [];
+    let version: string | null = null;
+    for (const [agentId, runner] of this.runners) {
+      const bundled = runner.browserVersion?.() ?? null;
+      if (bundled === null) continue;
+      agents.push(agentId);
+      version ??= bundled;
+    }
+    return { version, agents: agents.sort(), chrome: chromeInstalled() };
   }
 
   private previewCapable(): boolean {
@@ -1967,6 +1983,7 @@ export class Supervisor {
       recoveryRequired: this.journal.recoveryRequired().length,
       coreSignatureConfigured: this.roots.some((root) => (root.coreControlKeys ?? []).length > 0),
       preview: { advertised: this.previewCapable(), running: this.previews.health().running, lastFailureAt: this.previews.health().lastFailure?.at ?? null },
+      browser: this.browserReport(),
     });
   }
 

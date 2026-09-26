@@ -68,4 +68,9 @@ describe("session preview tools (loopback MCP)", () => {
   it("describes a starting preview with the next step", () => {
     expect(describeStatus({ ...running, state: "starting", phase: "install", url: null })).toContain("Still starting: call preview_status");
   });
+
+  it("points a session that has the QA browser at it, and only then", () => {
+    expect(describeStatus(running, { browser: true })).toContain("Open it with konteks-browser browser_navigate");
+    expect(describeStatus(running)).not.toContain("konteks-browser");
+  });
 });

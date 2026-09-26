@@ -142,6 +142,35 @@ serve:
     VITE_API_URL: http://127.0.0.1:8787
 ```
 
+### A browser for QA
+
+Claude Code and Codex sessions that check or build work (the validator, QA
+and the executor, not ordinary assistant turns) also get a headless browser
+on the session's preview: Microsoft's Playwright MCP (`@playwright/mcp`
+0.0.82, pinned in `release/native-agent-builds.json` and carried inside the
+Claude Code and Codex agent packages, run on their own Node). Its tools
+(`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`,
+`browser_take_screenshot`, `browser_verify_*`, …) appear as the
+`konteks-browser` MCP server. There is nothing to set up:
+
+- it uses Google Chrome when it is installed, headless with a throwaway
+  in-memory profile (never your own); without Chrome it installs
+  Playwright's Chromium once, the first time an agent uses the browser, into
+  the connector's data folder;
+- every request the page makes goes through that session's gateway on
+  `127.0.0.1`, which lets through only the session's running preview (its
+  `http://127.0.0.1:<port>`, and the WebSocket hot reload on the same port).
+  Other ports on this computer, the internet and HTTPS are refused, and so
+  is anything while no preview runs: the browser shows "No live preview is
+  running for this session. Call preview_start …";
+- the tools that could run code outside the page or rewrite its traffic
+  (`browser_run_code_unsafe`, `browser_route`, …) are hidden and refused;
+- DeepSeek Harness sessions get no browser (dsh carries no agent package to
+  run it in).
+
+`doctor` reports the browser's version, which agents carry it, and whether it
+uses Chrome or Playwright's Chromium.
+
 To stop offering previews from a computer, switch previews off for that
 runtime in Konteks (Customize → Runtimes); it is on by default. Konteks and
 the relay then open no preview channel to it. `konteks-remote preview status`

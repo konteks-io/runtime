@@ -1,7 +1,7 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
-import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, dshRuntimePaths, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
+import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServer, bundledBrowserVersion, dshRuntimePaths, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
 import { RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 import { checkDshKonteksProfile } from "./dsh-profile-check.js";
@@ -20,6 +20,11 @@ const inputSchema = z.object({
   restoreAcpSessionRef: z.string().min(1).max(256).optional(),
   freshProviderSessionOnRestore: z.boolean().optional(),
   sessionLabel: RemoteSessionLabelSchema.optional(),
+  browser: z.object({
+    proxyUrl: z.string().regex(/^http:\/\/127\.0\.0\.1:\d{1,5}$/),
+    outputDir: z.string().min(1).refine(isAbsolute),
+    browsersPath: z.string().min(1).refine(isAbsolute),
+  }).strict().optional(),
 }).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined);
 
 export interface NativeRunnerOptions {
@@ -41,6 +46,11 @@ export class NativeRunner implements RunnerPort {
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private unsubscribe: (() => void) | null = null;
+
+  /** The browser (Playwright MCP) version this agent's package carries; null for DeepSeek Harness or an older package. */
+  browserVersion(): string | null {
+    return bundledBrowserVersion(this.options.config);
+  }
 
   constructor(private readonly options: NativeRunnerOptions) {
     const config = RunnerConfigSchema.safeParse(options.config);
@@ -148,7 +158,11 @@ export class NativeRunner implements RunnerPort {
     const parsed = inputSchema.safeParse(input);
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
-    const { context, readinessDeadlineAt, cwd, mcpServers, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel } = parsed.data;
+    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, browser } = parsed.data;
+    // The session's browser is a stdio MCP server the agent launches from its
+    // own package; composed here, where the package paths are known.
+    const browserServer = browser === undefined ? null : browserMcpServer(this.options.config, browser);
+    const mcpServers = browserServer === null ? parsed.data.mcpServers : [...parsed.data.mcpServers, browserServer];
     const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
       ...(freshProviderSessionOnRestore === undefined ? {} : { freshProviderSessionOnRestore }),
       ...(sessionLabel === undefined ? {} : { sessionLabel }), lifecycle: {

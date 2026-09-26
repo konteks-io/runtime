@@ -54,6 +54,21 @@ describe("doctor and support bundle", () => {
     expect(offline.checks.find(check => check.id === "preview")?.status).toBe("warn");
   });
 
+  it("reports the QA browser's version, the agents that carry it, and Chrome or Playwright's Chromium", async () => {
+    const base = {
+      now: () => "2026-09-06T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
+      relay: { state: "connected", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: true, components: [], agents: [],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true,
+    };
+    const chrome = await runDoctor({ ...base, browser: { version: "0.0.82", agents: ["claude-code", "codex"], chrome: true } });
+    expect(chrome.checks.find(check => check.id === "browser")).toMatchObject({ status: "pass", detail: expect.stringMatching(/^Playwright MCP 0\.0\.82 for claude-code, codex; uses the installed Google Chrome/) });
+    const chromium = await runDoctor({ ...base, browser: { version: "0.0.82", agents: ["codex"], chrome: false } });
+    expect(chromium.checks.find(check => check.id === "browser")?.detail).toContain("Playwright's Chromium is installed on first use");
+    const none = await runDoctor({ ...base, browser: { version: null, agents: [], chrome: true } });
+    expect(none.checks.find(check => check.id === "browser")?.status).toBe("warn");
+    expect(assertDoctorHasNoSecrets(chrome)).toBeUndefined();
+  });
+
   it("the support bundle carries config keys without values, is redacted, chunked, and secret-scanned", () => {
     const bundle = buildSupportBundle({
       bundleVersion: "1.0.0",

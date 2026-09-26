@@ -24,6 +24,8 @@ export interface DoctorInputs {
   coreSignatureConfigured: boolean;
   /** Session previews: whether the capability is advertised, how many run, and the last failure's time. */
   preview?: { advertised: boolean; running: number; lastFailureAt: string | null };
+  /** The QA browser: the bundled Playwright MCP version, the agents that carry it, and whether Chrome is installed. */
+  browser?: { version: string | null; agents: string[]; chrome: boolean };
 }
 
 export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
@@ -61,6 +63,14 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
       detail: !advertised
         ? "preview capability not advertised (no relay configured), so nobody can open this computer's previews"
         : `preview capability advertised; ${running} preview(s) running${lastFailureAt ? `; the last preview failed to start at ${lastFailureAt} (see konteks-remote preview status)` : ""}` });
+  }
+  if (inputs.browser) {
+    const { version, agents, chrome } = inputs.browser;
+    push({ id: "browser", title: "QA browser",
+      status: version === null ? "warn" : "pass",
+      detail: version === null
+        ? "no connected agent carries the QA browser (Claude Code or Codex does), so QA and validator sessions check work without opening it"
+        : `Playwright MCP ${version} for ${agents.join(", ")}; ${chrome ? "uses the installed Google Chrome" : "no Google Chrome, so Playwright's Chromium is installed on first use"}; reaches only the session's preview` });
   }
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };

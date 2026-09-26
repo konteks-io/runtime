@@ -41,6 +41,14 @@ describe("native in-process runner (A4)", () => {
     expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: { konteksSession: { version: 1,
       title: `[konteks/Todo List/initiative] [v3] Stand up the todo list API ${acpSessionRef.slice(-8)}` } } }));
   });
+  it("adds no browser for an agent package that carries none, and refuses a browser request that is not a loopback gateway", async () => {
+    const f = fixture(); await f.runner.start();
+    expect(f.runner.browserVersion()).toBeNull();
+    const browser = { proxyUrl: "http://127.0.0.1:50123", outputDir: join(root, "out"), browsersPath: join(root, "browsers") };
+    await f.runner.createSession({ ...f.input, browser });
+    expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: [] }));
+    await expect(f.runner.createSession({ ...f.input, browser: { ...browser, proxyUrl: "http://proxy.example:8080" } })).rejects.toThrow();
+  });
   it("returns completed-turn settlement only after draining ACP and stopping its execution bridge", async () => {
     const f = fixture(); await f.runner.start(); f.runner.startEvents();
     const { acpSessionRef } = await f.runner.createSession(f.input);

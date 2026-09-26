@@ -72,4 +72,5 @@ from them enters this repository. `npm run check:agpl` guards this.
 - `@agentclientprotocol/sdk` 1.4.0 — Apache-2.0
 - `@agentclientprotocol/claude-agent-acp` 0.75.1 — Apache-2.0 (bundled in the `claude-code` offline agent package)
 - `@agentclientprotocol/codex-acp` 1.10.0 — Apache-2.0 (bundled in the `codex` offline agent package)
+- `@playwright/mcp` 0.0.82, with `playwright` and `playwright-core` — Apache-2.0 (Microsoft; bundled in the `claude-code` and `codex` offline agent packages as the QA browser; no browser binary is bundled)
 - `ws`, `zod`, `pino`, `commander` — see each package's licence

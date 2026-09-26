@@ -1,4 +1,6 @@
-import { isAbsolute } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import {
   SessionToCoreMessageSchema,
@@ -31,7 +33,8 @@ import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/clien
 import type { PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade } from "../mcp/capability-facade.js";
-import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
+import { BROWSER_WORK_KINDS, PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
+import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
   canonicalizeAcpToolActivity,
   continuesAtBoundary,
@@ -175,6 +178,9 @@ export class RelayedSession {
   private deliveryAcceptance: RemoteDeliveryAcceptanceReceipt | null = null;
   private mcpFacade: McpCapabilityFacade | null = null;
   private previewTools: PreviewMcpServer | null = null;
+  /** The QA browser's gateway (Claude Code and Codex validation, QA and delivery sessions) and its output folder. */
+  private browserGateway: PreviewBrowserGateway | null = null;
+  private browserOutputDir: string | null = null;
   /** The logical session whose preview this session's agent drives. */
   private previewSessionId: string | null = null;
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
@@ -303,14 +309,32 @@ export class RelayedSession {
       mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
     }
     const preview = this.deps.preview;
+    let browser: { proxyUrl: string; outputDir: string; browsersPath: string } | undefined;
     if (preview && PREVIEW_WORK_KINDS.has(this.assignment.kind)) {
       const sessionId = binding.sessionId;
       const cwd = prepared.cwd;
+      // The session's browser: only for an agent whose package carries one
+      // (Claude Code, Codex; never DeepSeek Harness), reaching only this
+      // session's running preview through its own gateway.
+      const browserVersion = this.deps.runner.browserVersion?.() ?? null;
+      if (browserVersion !== null && BROWSER_WORK_KINDS.has(this.assignment.kind) && preview.origin && preview.browsersPath) {
+        const origin = preview.origin.bind(preview);
+        const gateway = new PreviewBrowserGateway({
+          target: () => origin(sessionId),
+          onActivity: () => preview.touch(sessionId),
+          logger: this.logger,
+          context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+        });
+        this.browserGateway = gateway;
+        const proxyUrl = await this.bootstrapStage("browser_gateway", () => gateway.start());
+        this.browserOutputDir = await mkdtemp(join(tmpdir(), "konteks-browser-"));
+        browser = { proxyUrl, outputDir: this.browserOutputDir, browsersPath: preview.browsersPath };
+      }
       const tools = new PreviewMcpServer({
         start: () => preview.start(sessionId, cwd),
         stop: () => preview.stop(sessionId, "agent"),
         status: () => preview.status(sessionId),
-      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, browser: browser !== undefined });
       this.previewTools = tools;
       this.previewSessionId = sessionId;
       // A viewer may start this worktree's preview too (the same process
@@ -386,6 +410,7 @@ export class RelayedSession {
       ...(restoreRef ? { restoreAcpSessionRef: restoreRef } : {}),
       ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
       ...(this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
+      ...(browser ? { browser } : {}),
     }, lifecycle));
     this.creationReturned = true;
     if (lifecycle && reservedRef !== created.acpSessionRef) throw new RemoteInstanceError("recovery_required", "Runner did not preserve durable reference ownership.");
@@ -909,7 +934,8 @@ export class RelayedSession {
       }
       params = verdict.request;
     }
-    const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.deps.workspaceRoot });
+    const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.deps.workspaceRoot,
+      browserTools: this.browserGateway !== null });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
     if (decision.kind === "allow") return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
@@ -1175,7 +1201,12 @@ export class RelayedSession {
     this.mcpFacade = null;
     const tools = this.previewTools;
     this.previewTools = null;
-    await Promise.all([facade?.close(), tools?.close()]);
+    const gateway = this.browserGateway;
+    this.browserGateway = null;
+    const outputDir = this.browserOutputDir;
+    this.browserOutputDir = null;
+    await Promise.all([facade?.close(), tools?.close(), gateway?.close(),
+      outputDir ? rm(outputDir, { recursive: true, force: true }).catch(() => undefined) : undefined]);
   }
 
   /** The session's preview goes with the session (not with a completed turn). */

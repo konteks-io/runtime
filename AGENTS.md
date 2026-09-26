@@ -43,6 +43,22 @@ on/off switch is Core's (`PUT /api/remote-instances/:instanceId/preview`); do
 not add a local one. Do not restore the preview Compose service, the `preview`
 work kind or a separate forwarder process.
 
+The QA browser is Playwright MCP (`@playwright/mcp`, pinned in
+`release/native-agent-builds.json` `browser` and `BROWSER_MCP_PACKAGE` in
+`packages/release/src/browser.ts`; bump both together), bundled into the
+Claude Code and Codex offline agent packages with the connector's launcher
+(`packages/agent-runner/src/bridge/browser-{mcp,launcher,tools}.ts`, copied to
+`konteks/` in the package). `NativeRunner` adds it as a stdio ACP MCP server
+(`konteks-browser`) for `delivery`/`validation`/`qa` sessions
+(`BROWSER_WORK_KINDS`); `RelayedSession` gives each such session a
+`PreviewBrowserGateway` (`preview/browser-gateway.ts`), the browser's HTTP
+proxy, which admits only that session's running preview origin. Chromium
+proxies loopback too (Playwright forces `<-loopback>`), so the gateway is the
+boundary; `--allowed-origins` is only a second layer (Playwright says it is
+not a security boundary). Never pass `PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK`,
+never npx it at runtime, and never give it to dsh (its governance admits only
+`konteks-platform`/`konteks-preview`).
+
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`). Pi and OpenCode are retired: every
 write or install refuses them with `retiredAgentMessage` from

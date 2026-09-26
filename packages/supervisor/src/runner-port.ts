@@ -15,6 +15,12 @@ export interface RunnerSessionInput {
   freshProviderSessionOnRestore?: boolean;
   /** Display-only naming for the provider session list; never authority. */
   sessionLabel?: RemoteSessionLabel;
+  /**
+   * Give the agent the session's browser (QA and validator sessions): the
+   * runner adds its bundled browser MCP server, launched through this
+   * session's gateway. Ignored by a runner whose agent carries no browser.
+   */
+  browser?: { proxyUrl: string; outputDir: string; browsersPath: string };
 }
 
 export interface RunnerSessionCreated {
@@ -35,6 +41,8 @@ export interface RunnerSessionLifecycle {
 /** The supervisor depends on behavior, not an appliance HTTP endpoint. */
 export interface RunnerPort {
   readonly agentId: string;
+  /** The browser version this agent can drive (its package's Playwright MCP), or null for none. */
+  browserVersion?(): string | null;
   readiness(): Promise<{ agent: ConnectedAgentView; utilization: { activeSessions: number; activeTurns: number } }>;
   createSession(input: RunnerSessionInput, lifecycle?: RunnerSessionLifecycle): Promise<RunnerSessionCreated>;
   closeSession(ref: string, options?: { completed: true }): Promise<unknown>;
