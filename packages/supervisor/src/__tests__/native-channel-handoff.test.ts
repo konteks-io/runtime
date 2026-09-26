@@ -58,7 +58,7 @@ async function fixture(options: { terminal?: boolean; closed?: boolean; priorReq
     agentId: "claude-code", state: "running", recoveryEpoch: 0, reports: { nextSequence: 2, durableWatermark: 0, ...(options.terminal === false ? {} : { terminalSequence: 1 }) },
     evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
   const runner = { stopForRecovery: vi.fn(async () => undefined), releaseSealedSession: vi.fn(async () => undefined), stopRetainedExecution: vi.fn(async () => undefined) };
-  const orchestrator = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock, runners: new Map([["claude-code", runner]]),
+  const orchestrator = new WorkOrchestrator({ journal, outbox, transport: {}, clock, runners: new Map([["claude-code", runner]]),
     sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process",
     assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
   const internal = orchestrator as unknown as { channelOwners: Map<string, unknown>; sessions: Map<string, unknown>;
@@ -173,7 +173,7 @@ it("restores a repository generator session from the durable journal after conne
   await journal.assignments.put({ assignmentId: "prior", attempt: 1, claimId: "prior-claim", kind: "delivery", placementId: "placement-prior", workspaceId: "workspace",
     agentId: "claude-code", state: "running", recoveryEpoch: 0, reports: { nextSequence: 2, durableWatermark: 0, terminalSequence: 1 },
     evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
-  const orchestrator = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock,
+  const orchestrator = new WorkOrchestrator({ journal, outbox, transport: {}, clock,
     runners: new Map(), sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
     runnerIncarnation: () => "restarted-process", assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
   const internal = orchestrator as unknown as {
@@ -201,7 +201,7 @@ it("starts a fresh repository-role session after its exact predecessor terminate
     reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1,
       terminalResult: { class: "interrupted", reason: "not_resumable", terminalResultHash: "n".repeat(43) } },
     evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
-  const orchestrator = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock,
+  const orchestrator = new WorkOrchestrator({ journal, outbox, transport: {}, clock,
     runners: new Map(), sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
     runnerIncarnation: () => "restarted-process", assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
   const internal = orchestrator as unknown as {

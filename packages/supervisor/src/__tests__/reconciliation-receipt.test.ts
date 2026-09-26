@@ -39,7 +39,7 @@ async function absentFixture() {
   const seed = { enrollmentId: "enrollment", activationId: "activation", keyDigest: "a".repeat(43), createdAt: f.clock.nowIso() };
   await f.journal.execution.seedEnrollment(seed);
   await f.journal.execution.bindEnrollment({ ...seed, instanceId: "instance", workspaceId: "w", exchangeNonce: "exchange" });
-  const work = new WorkOrchestrator({ clock: f.clock, journal: f.journal, outbox: f.outbox, transport: { send: f.send }, deploymentKind: "native_connector", instanceId: () => "instance", workspaceId: () => "w", runnerIncarnation: () => "process", assertOwned: () => undefined } as never);
+  const work = new WorkOrchestrator({ clock: f.clock, journal: f.journal, outbox: f.outbox, transport: { send: f.send }, instanceId: () => "instance", workspaceId: () => "w", runnerIncarnation: () => "process", assertOwned: () => undefined } as never);
   f.deps.cancelAbsentLocalWork = (manifest, decision, assertCurrent) => work.cancelAbsentForRecovery(manifest, decision, assertCurrent);
   return { ...f, work };
 }

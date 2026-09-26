@@ -146,9 +146,11 @@ describe("relayed session (D98/D113/D114)", () => {
       broker,
       instanceId: "inst",
       redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" }),
-     
-      workspaceRoot: "/workspace",
-      ...(overrides.deploymentKind === "native_connector" ? { registerReady: async (target: RemoteWorkAssignment, binding: { sessionId: string }, acpSessionRef: string) => ({ workspaceId: target.workspaceId, instanceId: target.instanceId, sessionId: binding.sessionId, channelId: `session:${binding.sessionId}`, assignmentId: target.id, attempt: target.attempt, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner-process", agentId: target.agentRoute.agentId, acpSessionRef, readyRevision: 1, registeredAt: clock.nowIso() }) } : {}),
+      // The runner's workspace folder; prepared inputs check out beneath it.
+      workspaceRoot: "/private/native",
+      // The native path is the only path: verified inputs, then Core readiness.
+      prepareInputs: async (target: RemoteWorkAssignment) => ({ binding: { workspaceId: target.workspaceId, sessionId: target.source.kind === "conversation" ? target.source.sessionId : "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
+      registerReady: async (target: RemoteWorkAssignment, binding: { sessionId: string }, acpSessionRef: string) => ({ workspaceId: target.workspaceId, instanceId: target.instanceId, sessionId: binding.sessionId, channelId: `session:${binding.sessionId}`, assignmentId: target.id, attempt: target.attempt, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner-process", agentId: target.agentRoute.agentId, acpSessionRef, readyRevision: 1, registeredAt: clock.nowIso() }),
       onUsage: async () => undefined,
       onClosed: async (_session, reason) => void closed.push(reason),
       ...overrides,
@@ -159,13 +161,17 @@ describe("relayed session (D98/D113/D114)", () => {
   it("bootstraps with the redeemed token in mcpServers and announces session_ready", async () => {
     const { session, sent, runnerCalls, journal } = await build();
     await session.bootstrap();
-    expect((runnerCalls[0]?.[1][0] as { mcpServers: unknown[] }).mcpServers).toEqual([{ type: "http", name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }]);
+    // The agent reaches the platform through the local capability facade; the bearer never leaves memory.
+    const mcpServers = (runnerCalls[0]?.[1][0] as { mcpServers: Array<{ url: string; headers: Array<{ value: string }> }> }).mcpServers;
+    expect(mcpServers).toEqual([{ type: "http", name: "konteks", url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/), headers: [{ name: "authorization", value: expect.stringMatching(/^Bearer /) }] }]);
+    expect(JSON.stringify(mcpServers)).not.toContain("cap-token");
     expect(sent[0]?.body).toMatchObject({ kind: "session_ready", assignmentId: "asg", acpSessionRef: "acp-1", resumed: false, agentId: "codex" });
     expect(JSON.stringify(journal.assignments.all())).not.toContain("cap-token");
+    await session.close("cancelled");
   });
 
   it("reports native interruption even when the broken relay cannot carry session_closed", async () => {
-    const f = await build({ deploymentKind: "native_connector",
+    const f = await build({
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
     });
     await f.session.bootstrap();
@@ -257,14 +263,9 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(JSON.stringify(base.sent)).not.toMatch(/private-bridge-session|private-thought-canary|wrong-session-canary/);
   });
 
-  it("requires native preparation and never announces readiness after a staging failure", async () => {
-    const missing = await build({ deploymentKind: "native_connector" });
-    await expect(missing.session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable" });
-    expect(missing.runner.createSession).not.toHaveBeenCalled();
-    expect(missing.sent).toEqual([]);
+  it("never announces readiness after a staging failure", async () => {
     const warn = vi.fn();
     const failed = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => { throw new Error("input delivery failed secret-body"); },
       logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
     });
@@ -288,7 +289,6 @@ describe("relayed session (D98/D113/D114)", () => {
       return { continueReference: "continued-ref" };
     });
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => {
         order.push("inputs");
         return { binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined };
@@ -314,7 +314,6 @@ describe("relayed session (D98/D113/D114)", () => {
     const toolWiring = new Promise<void>(resolve => { finishWiring = resolve; });
     const info = vi.fn();
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       logger: { warn: vi.fn(), info, error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
       prepareInputs: async () => {
         order.push("inputs");
@@ -362,7 +361,6 @@ describe("relayed session (D98/D113/D114)", () => {
 
   it("prefers a live continuation over the restart-only restore fallback", async () => {
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       reserveChannel: () => () => undefined,
       restoreReference: "durable-restart-ref",
@@ -381,7 +379,6 @@ describe("relayed session (D98/D113/D114)", () => {
   it("uses staged conversation context instead of stale Claude provider tools after restart", async () => {
     const claude = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } };
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       reserveChannel: () => () => undefined,
       restoreReference: "durable-restart-ref",
@@ -398,7 +395,6 @@ describe("relayed session (D98/D113/D114)", () => {
   it("does not activate local execution ownership when cloud preparation fails", async () => {
     const activateExecution = vi.fn(async () => ({ continueReference: "continued-ref" }));
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       redeemCapabilityToken: async () => { throw new RemoteInstanceError("temporarily_unavailable", "Core is restarting.", { retryable: true }); },
       activateExecution,
@@ -411,7 +407,6 @@ describe("relayed session (D98/D113/D114)", () => {
 
   it("closes a native turn that ends without end_turn as an agent exit so a terminal reaches Core", async () => {
     const { session, closed, runner, journal, sent } = await build({
-      deploymentKind: "native_connector",
       reserveChannel: () => vi.fn(),
       reserveExecutionReference: async () => undefined,
       recordExecutionProcessOwner: async () => undefined,
@@ -435,7 +430,6 @@ describe("relayed session (D98/D113/D114)", () => {
     for (const attempt of [1, 2]) {
       const work = { ...assignment, id: `asg-${attempt}`, attempt };
       const { session, sent, transport } = await build({
-        deploymentKind: "native_connector",
         prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: work.id, instanceId: "inst", attempt }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       }, work);
       expect(session.channelId).toBeNull();
@@ -452,7 +446,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("does not announce or close an invented native channel when cancelled before preparation", async () => {
-    const { session, sent, transport } = await build({ deploymentKind: "native_connector" });
+    const { session, sent, transport } = await build();
     await session.close("cancelled");
     expect(session.channelId).toBeNull();
     expect(sent).toEqual([]);
@@ -460,19 +454,11 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(transport.closeChannel).not.toHaveBeenCalled();
   });
 
-  it("requires Core registration for native bootstrap before creating a local agent session", async () => {
-    const { session, runner } = await build({ deploymentKind: "native_connector", registerReady: undefined,
-      prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
-    });
-    await expect(session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable" });
-    expect(runner.createSession).not.toHaveBeenCalled();
-  });
-
   it("waits for Core readiness and never prompts or emits readiness while registration is pending", async () => {
     let reject!: (error: Error) => void;
     let entered!: () => void;
     const registering = new Promise<void>(resolve => { entered = resolve; });
-    const { session, runner, sent, transport } = await build({ deploymentKind: "native_connector",
+    const { session, runner, sent, transport } = await build({
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       registerReady: async () => { entered(); return new Promise((_, fail) => { reject = fail; }); },
     });
@@ -501,7 +487,7 @@ describe("relayed session (D98/D113/D114)", () => {
       send: (message: OutboundMessage) => mux.send(message.channelId, message.channel, message.body, message.signature) } as TransportManager;
     for (const attempt of [1, 2]) {
       const work = { ...assignment, id: `asg-${attempt}`, attempt };
-      const { session } = await build({ deploymentKind: "native_connector", transport,
+      const { session } = await build({ transport,
         prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: work.id, instanceId: "inst", attempt }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       }, work);
       await session.bootstrap();
@@ -519,7 +505,7 @@ describe("relayed session (D98/D113/D114)", () => {
     const { session, sent } = await build();
     await session.bootstrap();
     await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
-      sessionId: "acp-1", update: { sessionUpdate: "tool_call", toolCallId: "tool", title: `Test /workspace/asg/src/index.ts using ${SECRET_CANARIES.openAiKey}`, status: "in_progress",
+      sessionId: "acp-1", update: { sessionUpdate: "tool_call", toolCallId: "tool", title: `Test /private/native/checkout/src/index.ts using ${SECRET_CANARIES.openAiKey}`, status: "in_progress",
         rawInput: { password: "unshaped-input-secret" }, rawOutput: { value: "unshaped-output-secret" },
         locations: [{ path: "/Users/private-person/private-repo/secret.ts" }],
         content: [{ type: "content", content: { type: "text", text: `Read /Users/private-person/secret.txt with ${SECRET_CANARIES.bearer}` } }],
@@ -530,7 +516,7 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(serialized).not.toMatch(/unshaped-input-secret|unshaped-output-secret|private-person|metadata-canary/);
     expect(serialized).not.toContain(SECRET_CANARIES.openAiKey);
     expect(serialized).not.toContain(SECRET_CANARIES.bearer);
-    expect(serialized).not.toContain("/workspace/asg");
+    expect(serialized).not.toContain("/private/native/checkout");
     expect(sent.at(-1)?.body).toMatchObject({ kind: "acp", method: "session/update", params: { sessionId: "acp-1", update: { toolCallId: "tool", status: "in_progress" } } });
     expect(serialized).toContain("src/index.ts");
   });
@@ -607,7 +593,7 @@ describe("relayed session (D98/D113/D114)", () => {
     const beforePrompt = vi.fn(async () => undefined);
     const skillInstructions = "Read the required org skill at /private/native/org/review/SKILL.md";
     const prepareInputs = vi.fn(async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions, beforePrompt }));
-    const { session, runner, sent, journal } = await build({ deploymentKind: "native_connector", prepareInputs });
+    const { session, runner, sent, journal } = await build({ prepareInputs });
     await session.bootstrap();
     expect(prepareInputs).toHaveBeenCalledWith(assignment);
     expect(sent[0]?.body).toMatchObject({ kind: 'session_ready', attempt: 1, recoveryEpoch: 0, readyRevision: 1 });
@@ -621,7 +607,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("rejects a prepared checkout bound to a different assignment before runner creation", async () => {
-    const { session, runner } = await build({ deploymentKind: "native_connector", prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "other", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }) });
+    const { session, runner } = await build({ prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "other", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }) });
     await expect(session.bootstrap()).rejects.toMatchObject({ code: "workspace_binding_invalid" });
     expect(runner.createSession).not.toHaveBeenCalled();
   });
@@ -629,7 +615,7 @@ describe("relayed session (D98/D113/D114)", () => {
   it("does not create an agent session after cancellation during input staging", async () => {
     let finish!: (value: { binding: { workspaceId: string; sessionId: string; assignmentId: string; instanceId: string; attempt: number }; cwd: string; skillInstructions: string; beforePrompt: () => Promise<void> }) => void;
     const preparation = new Promise<Parameters<typeof finish>[0]>(resolve => { finish = resolve; });
-    const { session, runner, sent } = await build({ deploymentKind: "native_connector", prepareInputs: async () => preparation });
+    const { session, runner, sent } = await build({ prepareInputs: async () => preparation });
     const boot = session.bootstrap();
     await session.close("cancelled");
     finish({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined });
@@ -642,7 +628,6 @@ describe("relayed session (D98/D113/D114)", () => {
     const recordCompletedSettlement = vi.fn(async () => undefined);
     const release = vi.fn();
     const { session, sent, closed, transport, runner, journal } = await build({
-      deploymentKind: "native_connector",
       recordCompletedSettlement,
       reserveChannel: () => release,
       reserveExecutionReference: async () => undefined,
@@ -682,7 +667,7 @@ describe("relayed session (D98/D113/D114)", () => {
     const release = vi.fn();
     const recordCompletedSettlement = vi.fn(async () => { if (failure === "write_failed") throw new Error("disk unavailable"); });
     const { session, sent, closed, runner, journal } = await build({
-      deploymentKind: "native_connector", recordCompletedSettlement,
+      recordCompletedSettlement,
       reserveChannel: () => release,
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
     });
@@ -700,7 +685,7 @@ describe("relayed session (D98/D113/D114)", () => {
   it.each([true, false])("requires independent recovery settlement after a completed journal failure (settled=%s)", async settled => {
     const release = vi.fn();
     const { session, sent, closed, runner } = await build({
-      deploymentKind: "native_connector", reserveChannel: () => release,
+      reserveChannel: () => release,
       recordCompletedSettlement: async () => { throw new Error("disk unavailable"); },
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
     });
@@ -719,8 +704,12 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(sent.some(message => (message.body as { kind?: string }).kind === "session_closed")).toBe(false);
   });
 
+  /** A native validation session: its checkout source has no execution gate, so ACP frames flow directly. */
+  const validation: RemoteWorkAssignment = { ...assignment, kind: "validation", agentRoute: { requiredRole: "qa", agentId: "codex" },
+    source: { kind: "harness_task_checkout", portability: "instance_bound", ownerInstanceId: "inst", workspaceRef: "ref" } };
+
   it("journals a received prompt, completes it once with the same id and method, and rejects duplicates/unknown completions", async () => {
-    const { session, sent, runner, journal } = await build();
+    const { session, sent, runner, journal } = await build({}, validation);
     await session.bootstrap();
     await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "hi" }] } });
     expect(runner.prompt).toHaveBeenCalledWith("acp-1", "p1", { sessionId: "acp-1", prompt: [{ type: "text", text: "hi" }] });
@@ -737,7 +726,7 @@ describe("relayed session (D98/D113/D114)", () => {
   it("backpressures a terminal-fenced prompt before journaling or emitting any transcript frame", async () => {
     const { session, sent, runner, journal } = await build({
       assertPromptAllowed: () => { throw new Error("terminal directive already fenced this prompt lane"); },
-    });
+    }, validation);
     await session.bootstrap();
     const sentBeforePrompt = sent.length;
 
@@ -748,7 +737,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("converts a malformed bridge result into acp_error(malformed_response)", async () => {
-    const { session, sent } = await build();
+    const { session, sent } = await build({}, validation);
     await session.bootstrap();
     await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p2", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "go" }] } });
     await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p2", result: { stopReason: "not-a-real-reason" } });
@@ -757,7 +746,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("rejects cross-session requests and notifications even on the correct channel", async () => {
-    const { session, sent, runner, journal } = await build();
+    const { session, sent, runner, journal } = await build({}, validation);
     await session.bootstrap();
     await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "wrong", params: { sessionId: "other", prompt: [{ type: "text", text: "not this session" }] } });
     await session.onToRuntime({ kind: "acp", method: "session/cancel", params: { sessionId: "other" } });
@@ -771,7 +760,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("forwards a deferred permission once, delivers the first valid answer once, and rejects a mismatched completion", async () => {
-    const { session, sent, runner } = await build();
+    const { session, sent, runner } = await build({}, validation);
     await session.bootstrap();
     await session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "perm-1", params: permissionRequest });
     const forwarded = sent.at(-1)?.body as { kind: string; method: string; id: string; params: { options: unknown[] } };

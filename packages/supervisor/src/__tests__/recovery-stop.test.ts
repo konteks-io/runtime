@@ -39,7 +39,7 @@ async function sessionFixture(overrides: Partial<RelayedSessionDeps> = {}, mutat
   const transport = { send: vi.fn(), openChannel: vi.fn(), closeChannel: vi.fn() };
   const onClosed = vi.fn(async () => undefined);
   const binding = { workspaceId: "workspace", instanceId: "instance", assignmentId: "assignment", attempt: 1, sessionId: "cloud-session" };
-  const deps: RelayedSessionDeps = { clock, journal, transport: transport as never, runner: runner as never, instanceId: "instance", workspaceRoot: "/workspace", deploymentKind: "native_connector", redeemCapabilityToken: async () => { throw new Error("not needed"); },
+  const deps: RelayedSessionDeps = { clock, journal, transport: transport as never, runner: runner as never, instanceId: "instance", workspaceRoot: "/workspace", redeemCapabilityToken: async () => { throw new Error("not needed"); },
     broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), policy: new EvaluatorPolicyResponder(null, () => true),
     prepareInputs: async () => ({ binding, cwd: "/workspace", skillInstructions: "", beforePrompt: async () => undefined }),
     registerReady: async () => ({ ...binding, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "process", channelId: "session:cloud-session", agentId: "codex", acpSessionRef: "acp", readyRevision: 1, registeredAt: clock.nowIso() }), onUsage: async () => undefined, onClosed, ...overrides };
@@ -61,7 +61,7 @@ async function realOwnedWork() {
       return { outcome: "accepted" as const, acceptedAt: clock.nowIso() };
     }),
   };
-  const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
+  const work = new WorkOrchestrator({ journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
     recoveryEvidence,
     runners: new Map([["codex", f.runner]]), sessionDeps: () => f.deps, onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process", assertOwned: () => undefined, recoveryAuthority: () => "accepted-A", reportDeliveryAllowed: () => false } as never);
   const entry = { assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution" as const, placementId: "placement", workspaceId: "workspace", agentId: "codex", state: "claimed" as const, recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only" as const, expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() };
@@ -99,7 +99,8 @@ describe("proven per-session recovery stop", () => {
     // exact, sealed, still-live predecessor may be adopted. The session never
     // decides that itself, and an unqualified reference still fails there.
     const f = await sessionFixture();
-    const prior = new RelayedSession({ ...assignment, source: { kind: "conversation", portability: "portable_before_claim", sessionId: "cloud-session", turnRef: "next", acpSessionRef: "legacy-ref" } }, f.deps);
+    // The orchestrator hands the live predecessor over as the continuation reference.
+    const prior = new RelayedSession({ ...assignment, source: { kind: "conversation", portability: "portable_before_claim", sessionId: "cloud-session", turnRef: "next", acpSessionRef: "legacy-ref" } }, { ...f.deps, continueReference: "legacy-ref" });
     f.runner.createSession.mockRejectedValueOnce(new RemoteInstanceError("recovery_required", "Live continuation predecessor is unavailable."));
     await expect(prior.bootstrap()).rejects.toThrow("Live continuation predecessor is unavailable.");
     expect(f.runner.createSession.mock.calls[0]?.[0]).toMatchObject({ acpSessionRef: "legacy-ref" });
@@ -360,14 +361,16 @@ describe("proven per-session recovery stop", () => {
     expect(f.onClosed).not.toHaveBeenCalled();
   });
 
-  it("fences a legacy appliance prompt waiting on local inputs and settles that callback before returning", async () => {
+  it("fences a prompt waiting on local inputs in an ungated native validation session and settles that callback before returning", async () => {
     const gate = Promise.withResolvers<void>(); const entered = vi.fn();
-    const f = await sessionFixture({ deploymentKind: "appliance" });
+    const f = await sessionFixture();
     f.deps.prepareInputs = async () => ({ binding: { workspaceId: "workspace", instanceId: "instance", assignmentId: "assignment", attempt: 1, sessionId: "cloud-session" }, cwd: "/workspace", skillInstructions: "", beforePrompt: async () => { entered(); await gate.promise; } });
-    await f.session.bootstrap(); f.transport.send.mockClear();
-    const request = f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "request", params: { sessionId: "acp", prompt: [{ type: "text", text: "work" }] } });
+    // A checkout-sourced validation session has no execution gate; its prompt runs the direct ACP path.
+    const session = new RelayedSession({ ...assignment, kind: "validation", agentRoute: { requiredRole: "qa", agentId: "codex" }, source: { kind: "harness_task_checkout", portability: "instance_bound", ownerInstanceId: "instance", workspaceRef: "ref" } }, f.deps);
+    await session.bootstrap(); f.transport.send.mockClear();
+    const request = session.onToRuntime({ kind: "acp", method: "session/prompt", id: "request", params: { sessionId: "acp", prompt: [{ type: "text", text: "work" }] } });
     await vi.waitFor(() => expect(entered).toHaveBeenCalledTimes(1));
-    let settled = false; const stop = f.session.stopForRecovery().then(() => { settled = true; });
+    let settled = false; const stop = session.stopForRecovery().then(() => { settled = true; });
     await Promise.resolve(); expect(settled).toBe(false);
     gate.resolve(); await request; await stop;
     expect(f.runner.prompt).not.toHaveBeenCalled(); expect(f.transport.send).not.toHaveBeenCalled();
@@ -412,7 +415,7 @@ describe("proven per-session recovery stop", () => {
     const f = await sessionFixture();
     const created = Promise.withResolvers<Awaited<ReturnType<typeof f.runner.createSession>>>();
     f.runner.createSession.mockImplementation(() => created.promise);
-    const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
+    const work = new WorkOrchestrator({ journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
       runners: new Map([["codex", f.runner]]), sessionDeps: () => f.deps, onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process", assertOwned: () => undefined, recoveryAuthority: () => "accepted-A", reportDeliveryAllowed: () => false } as never);
     const begun = Promise.withResolvers<void>();
     (f.runner.createSession as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (_input, lifecycle) => { await lifecycle.beforeCreate("late"); begun.resolve(); return created.promise; });
@@ -433,7 +436,7 @@ describe("proven per-session recovery stop", () => {
 
   it("the orchestrator does not interpret a missing process owner as stopped prior journal work", async () => {
     const f = await sessionFixture();
-    const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
+    const work = new WorkOrchestrator({ journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
       runners: new Map([["codex", f.runner]]), sessionDeps: () => f.deps, onUsage: async () => undefined, instanceId: () => "instance", reportDeliveryAllowed: () => false } as never);
     await f.journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "assistant_execution", placementId: "placement", workspaceId: "workspace", agentId: "codex", state: "running", acpSessionRef: "prior-process-ref", recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only", expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() });
     await expect(work.stopForRecovery("assignment", 1)).rejects.toMatchObject({ code: "recovery_required" });
@@ -443,7 +446,7 @@ describe("proven per-session recovery stop", () => {
 
   it("settles a claimed admission that never opened local execution without demanding a process owner", async () => {
     const f = await sessionFixture();
-    const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
+    const work = new WorkOrchestrator({ journal: f.journal, outbox: f.outbox, transport: f.transport, clock,
       runners: new Map([["codex", f.runner]]), sessionDeps: () => f.deps, onUsage: async () => undefined,
       instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "successor", assertOwned: () => undefined,
       recoveryAuthority: () => "accepted-successor", reportDeliveryAllowed: () => false } as never);
@@ -467,7 +470,7 @@ describe("proven per-session recovery stop", () => {
     const owner = { version: 1 as const, platform: "darwin" as const, pid: 123, processGroupId: 123, startToken: "start", commandDigest: "A".repeat(43) };
     await f.journal.execution.bindProcessOwner(admission, owner, () => undefined);
     const restarted = new SupervisorJournal(dir); await restarted.load();
-    const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal: restarted, outbox: f.outbox, transport: f.transport, clock,
+    const work = new WorkOrchestrator({ journal: restarted, outbox: f.outbox, transport: f.transport, clock,
       runners: new Map([["codex", { ...f.runner, stopRetainedExecution: retainedStop }]]), sessionDeps: () => f.deps, onUsage: async () => undefined,
       instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "successor", assertOwned: () => undefined,
       recoveryAuthority: () => "accepted-successor", reportDeliveryAllowed: () => false } as never);
@@ -500,7 +503,7 @@ describe("proven per-session recovery stop", () => {
     await f.journal.execution.markAcpSettled(admission, "prior-process-ref", clock.nowIso(), () => undefined);
     const restarted = new SupervisorJournal(dir); await restarted.load();
     const acpSettledAt = restarted.execution.execution(admission)?.acpSettledAt;
-    const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal: restarted, outbox: f.outbox, transport: f.transport, clock,
+    const work = new WorkOrchestrator({ journal: restarted, outbox: f.outbox, transport: f.transport, clock,
       runners: new Map([["codex", { ...f.runner, stopRetainedExecution: retainedStop }]]), sessionDeps: () => f.deps, onUsage: async () => undefined,
       instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "successor", assertOwned: () => undefined,
       recoveryAuthority: () => "accepted-successor", reportDeliveryAllowed: () => false } as never);
@@ -540,7 +543,7 @@ describe("proven per-session recovery stop", () => {
     const owner = { version: 1 as const, platform: "darwin" as const, pid: 123, processGroupId: 123, startToken: "start", commandDigest: "A".repeat(43) };
     await f.journal.execution.bindProcessOwner(admission, owner, () => undefined);
     const restarted = new SupervisorJournal(dir); await restarted.load();
-    const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal: restarted, outbox: f.outbox, transport: f.transport, clock,
+    const work = new WorkOrchestrator({ journal: restarted, outbox: f.outbox, transport: f.transport, clock,
       runners: new Map([["codex", { ...f.runner, stopRetainedExecution: retainedStop }]]), sessionDeps: () => f.deps, onUsage: async () => undefined,
       instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "successor", assertOwned: () => undefined,
       recoveryAuthority: () => "accepted-successor", reportDeliveryAllowed: () => false, recoverPendingDeliveryOutput } as never);

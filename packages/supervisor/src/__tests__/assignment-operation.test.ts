@@ -51,8 +51,7 @@ async function workFixture(f: Awaited<ReturnType<typeof fixture>>, draining = fa
   const box = new DurableOutbox(dir); await box.load();
   const sent: Array<{ body: unknown; assignmentRequest?: Parameters<AssignmentSender["deliverAllocated"]>[0] }> = [];
   const work = new WorkOrchestrator({ journal: f.journal, outbox: box, assignmentSender: f.sender,
-    transport: { send: (message: typeof sent[number]) => sent.push(message) }, deploymentKind: "native_connector",
-    clock: new FixedClock(Date.parse(at)), instanceId: () => "instance", workspaceId: () => "workspace",
+    transport: { send: (message: typeof sent[number]) => sent.push(message) },     clock: new FixedClock(Date.parse(at)), instanceId: () => "instance", workspaceId: () => "workspace",
     recoveryAuthority: () => f.authority.key, reportDeliveryAllowed: () => true,
     // Core-signed cancellations are verified by the supervisor; this fixture accepts the test signature.
     verifyCancellation: () => true,

@@ -47,8 +47,7 @@ async function fixture(claimOutcome: "denied" | "claimed" = "denied", overrides:
     instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process", originManifestId: () => "manifest",
     assertOwned: () => undefined, captureRecoveryAuthority: () => new RecoveryAuthority(() => authority.key).capture("assignment"),
     captureClaimAuthority: admission => work.capturePendingClaimAuthority(admission) });
-  const work = new WorkOrchestrator({ journal, outbox, assignmentSender: sender, clock, deploymentKind: "native_connector",
-    transport: { send: (message: OutboundMessage) => sent.push(message) }, instanceId: () => "instance", workspaceId: () => "workspace",
+  const work = new WorkOrchestrator({ journal, outbox, assignmentSender: sender, clock,     transport: { send: (message: OutboundMessage) => sent.push(message) }, instanceId: () => "instance", workspaceId: () => "workspace",
     runnerIncarnation: () => "process", assertOwned: () => undefined, recoveryAuthority: () => authority.key,
     reportDeliveryAllowed: () => true, reconciliationComplete: () => true, lease: { canPullNewWork: () => true }, draining: () => false,
     headroom: () => 2, maxPullItems: 1, acceptedKinds: () => ["delivery"], advertisedRoles: () => ["generator"], browserToolAvailable: () => false,
@@ -180,7 +179,7 @@ it("does not fence or duplicate a live claim handoff when maintenance runs durin
   const barrier = new Promise<never>((_resolve, reject) => { release = () => reject(new Error("bounded input fixture unavailable")); });
   const preparing = vi.fn(() => barrier);
   const f = await fixture("claimed", { runners: new Map([["codex", {} as never]]),
-    sessionDeps: () => ({ deploymentKind: "native_connector", instanceId: "instance", prepareInputs: preparing, registerReady: vi.fn() } as never) });
+    sessionDeps: () => ({ instanceId: "instance", prepareInputs: preparing, registerReady: vi.fn() } as never) });
   const ref = f.reference(); const delivery = f.deliver(ref).then(() => undefined, error => error);
   try {
     await vi.waitFor(() => expect(preparing).toHaveBeenCalledOnce());
@@ -210,7 +209,7 @@ it("keeps the durable claim handoff applied when its execution owner is later fe
   const barrier = new Promise<never>((_resolve, reject) => { release = () => reject(new Error("input preparation interrupted")); });
   const preparing = vi.fn(() => barrier);
   const f = await fixture("claimed", { runners: new Map([["codex", {} as never]]),
-    sessionDeps: () => ({ deploymentKind: "native_connector", instanceId: "instance", prepareInputs: preparing, registerReady: vi.fn() } as never) });
+    sessionDeps: () => ({ instanceId: "instance", prepareInputs: preparing, registerReady: vi.fn() } as never) });
   const delivery = f.deliver(f.reference()).then(() => undefined, error => error);
   try {
     await vi.waitFor(() => expect(preparing).toHaveBeenCalledOnce());
