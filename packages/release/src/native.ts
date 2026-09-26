@@ -9,7 +9,7 @@ import {
   type AgentModelCapabilityMapping, type RemoteNativeArtifact, type RemoteSignedBundleManifest,
 } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "./manifest.js";
-import { findAgentBridge } from "./bridges.js";
+import { findAgentBridge, HOST_AGENT_BRIDGES } from "./bridges.js";
 import { reviewedNativeModelIdentities } from "./reviewed-model-capabilities.js";
 
 const verified = Symbol("verified-native-release");
@@ -79,7 +79,28 @@ export function signNativeProductionReleaseManifest(
       },
     }];
   });
-  return signNativeReleaseManifest({ ...unsigned, modelCapabilityMappings: mappings }, key);
+  // Host-installed agents (the person's own DeepSeek Harness) have no artifact
+  // to bind to: their reviewed mapping names the agent and the exact versions
+  // this runtime supports, and a runtime selects it only on an exact match.
+  const hostMappings = HOST_AGENT_BRIDGES.flatMap(family => {
+    const modelIdentities = family.hostInstall ? reviewedNativeModelIdentities(family.agentId) : undefined;
+    if (!family.hostInstall || !modelIdentities) return [];
+    const body = {
+      version: 1 as const,
+      mappingId: `host-${family.agentId}-models`,
+      mappingRevision: 1,
+      hostAgent: { agentId: family.agentId, versions: { ...family.hostInstall.versions } },
+      configId: "model",
+      optionType: "select" as const,
+      modelIdentities: modelIdentities.map(identity => ({ ...identity })),
+      issuedAt,
+      expiresAt: unsigned.expiresAt,
+    };
+    const withDigest = { ...body, mappingDigest: computeAgentModelCapabilityMappingDigest(body) };
+    const placeholder: AgentModelCapabilityMapping = { ...withDigest, signature: { algorithm: "Ed25519", keyId: key.keyId, value: "AA" } };
+    return [{ ...withDigest, signature: { algorithm: "Ed25519" as const, keyId: key.keyId, value: ed25519Sign(key.privateKey, agentModelCapabilityMappingSigningBytes(placeholder)) } }];
+  });
+  return signNativeReleaseManifest({ ...unsigned, modelCapabilityMappings: [...mappings, ...hostMappings] }, key);
 }
 
 /** Adapted from bb's host-only update pipeline; Konteks additionally requires release-root signatures. */

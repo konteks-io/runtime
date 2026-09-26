@@ -5,7 +5,9 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RemoteSignedBundleManifestSchema } from "@konteks/remote-common";
 import { buildReleaseFixture } from "../fixtures.js";
+import { findAgentBridge } from "../bridges.js";
 import {
+  selectNativeModelCapabilityMappings,
   signNativeProductionReleaseManifest,
   verifyNativeRelease,
 } from "../native.js";
@@ -50,8 +52,14 @@ describe("native release pipeline", () => {
       Date.parse("2026-09-26T00:00:00Z"),
     ).manifest;
     expect(verified.nativeArtifacts).toHaveLength(20);
-    expect(verified.modelCapabilityMappings).toHaveLength(10);
-    expect(verified.modelCapabilityMappings?.map(mapping => mapping.bridgeProfileRef).sort()).toEqual(
+    expect(verified.modelCapabilityMappings).toHaveLength(11);
+    // The person's own DeepSeek Harness: one mapping bound to the agent and its supported versions, on every platform.
+    const host = verified.modelCapabilityMappings?.filter(mapping => mapping.hostAgent !== undefined);
+    expect(host).toEqual([expect.objectContaining({ mappingId: "host-dsh-models", hostAgent: { agentId: "dsh", versions: findAgentBridge("dsh")!.hostInstall!.versions } })]);
+    expect(host?.[0]?.modelIdentities.map(identity => identity.canonicalModelId)).toEqual(["deepseek-flash", "deepseek-v4-pro"]);
+    expect(selectNativeModelCapabilityMappings(verifyNativeRelease(signed, [fixture.root], Date.parse("2026-09-26T00:00:00Z")), { os: "windows", architecture: "amd64" })
+      .map(({ agentId }) => agentId)).toEqual(["claude-code", "codex", "dsh"]);
+    expect(verified.modelCapabilityMappings?.filter(mapping => mapping.hostAgent === undefined).map(mapping => mapping.bridgeProfileRef).sort()).toEqual(
       artifacts
         .filter(artifact => artifact.kind === "agent_bridge" && artifact.agentId !== "opencode")
         .map(artifact => artifact.id)

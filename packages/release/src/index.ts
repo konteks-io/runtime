@@ -4,5 +4,6 @@ export * from "./roots.js";
 export * from "./signing.js";
 export * from "./fixtures.js";
 export * from "./native.js";
+export * from "./reviewed-model-capabilities.js";
 export * from "./offline-profile.js";
 export * from "./offline-agent.js";

@@ -10,7 +10,7 @@ import {
   type AgentModelCapabilityMapping,
   type RemoteNativeArtifact,
 } from "@konteks/remote-common";
-import { HOST_AGENT_BRIDGES, installOfflineAgentPackage, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
+import { HOST_AGENT_BRIDGES, installOfflineAgentPackage, reviewedNativeModelIdentities, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RemoteSignedBundleManifest } from "@konteks/remote-common";
 
 export interface E2ESmokeReleaseOptions {
@@ -149,10 +149,7 @@ async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directo
       hostAgent: { agentId: family.agentId, versions: { ...family.hostInstall!.versions } },
       configId: "model",
       optionType: "select" as const,
-      modelIdentities: [
-        { value: '["deepseek-official","deepseek-flash"]', canonicalProviderId: "deepseek", canonicalModelId: "deepseek-flash" },
-        { value: '["deepseek-official","deepseek-v4-pro"]', canonicalProviderId: "deepseek", canonicalModelId: "deepseek-v4-pro" },
-      ],
+      modelIdentities: (reviewedNativeModelIdentities(family.agentId) ?? []).map(identity => ({ ...identity })),
       issuedAt: issuedAt.toISOString(),
       expiresAt: expiresAt.toISOString(),
     };
