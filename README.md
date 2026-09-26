@@ -80,11 +80,66 @@ konteks-remote auth login codex
 konteks-remote auth login dsh  # asks for your DeepSeek API key, without echo
 konteks-remote agents
 konteks-remote doctor
+konteks-remote preview status  # this computer's live session previews (read-only)
 konteks-remote update --check  # what the stable channel offers
 konteks-remote update          # stage, drain, swap, verify; rolls back on failure
 konteks-remote stop | start
 konteks-remote uninstall       # finish running work, remove this runtime from its workspace, delete the connector
 ```
+
+### Live previews
+
+A session's agent can run a live preview of its work: a dev server started
+from the session's working copy on this computer. There is nothing to set up.
+The agent calls `preview_start` (one of three tools the connector gives it,
+beside the platform tools; `preview_status` and `preview_stop` are the
+others), and the connector:
+
+- reads `.konteks/preview.yaml` if the repository has one (`serve.command`,
+  `install`, `prepare`, `healthPath`, `env`: the same `serve` fields as the
+  cloud preview), or otherwise works out the command: the `dev` (else
+  `start`, `serve`) script in `package.json`, run with the package manager its
+  lockfile names, with the host/port flags Vite, Next.js, Astro, Nuxt,
+  Angular and similar dev servers need; `npm install` (or the matching
+  manager) first when `node_modules` is missing; `manage.py runserver` for
+  Django and `bin/rails server` for Rails;
+- picks a free port on `127.0.0.1` (43100–43999), passes it as `$PORT` with
+  `HOST=127.0.0.1`, and runs the command with only an allow-listed
+  environment (your `PATH` from your login shell, home, locale, package
+  manager folders; never the connector's keys or tokens);
+- answers with the state, `http://127.0.0.1:<port>` for a browser on this
+  computer (a QA agent's, say), what command it used or inferred and why,
+  and the last log lines.
+
+People open the preview from the session in Konteks; the relay carries it on
+the session's `preview:<sessionId>` channel to this computer, which forwards
+it only to that session's own port. A preview stops after 30 minutes with no
+viewer and no agent activity, when its session ends, when this computer
+stops taking work or loses its lease, and when the connector stops; a
+restarted connector kills any preview a crashed one left and never adopts
+it. At most 3 run at once. `SUPERVISOR_PREVIEW_IDLE_MINUTES` and
+`SUPERVISOR_PREVIEW_MAX_RUNNING` in the connector service's environment
+change those two numbers (whole minutes up to 1440, and up to 16 previews;
+anything else keeps the default). A command the connector's command policy refuses (`git push`,
+`ssh`, `sudo`, …) is refused in `preview.yaml` too.
+
+A repository with an unusual dev server says how to serve it:
+
+```yaml
+# .konteks/preview.yaml
+serve:
+  command: pnpm --filter web dev --host $HOST --port $PORT
+  install: pnpm install
+  healthPath: /
+  env:
+    VITE_API_URL: http://127.0.0.1:8787
+```
+
+To stop offering previews from a computer, switch previews off for that
+runtime in Konteks (Customize → Runtimes); it is on by default. Konteks and
+the relay then open no preview channel to it. `konteks-remote preview status`
+shows what runs here; `doctor` reports whether previews are offered and when
+one last failed to start.
 
 ### DeepSeek Harness
 

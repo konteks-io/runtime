@@ -69,6 +69,8 @@ export interface NativeInstallationOptions {
   roots: readonly EmbeddedReleaseRoot[];
   platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" };
   nowMs?: number;
+  /** The service environment, for preview tuning only (defaults to process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** Read-only preflight. The supervisor must still acquire ownership and reverify before spawning. */
@@ -162,12 +164,27 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
       // Same for the evidence collector's scratch: `/data/onboard` does not
       // exist on a laptop, so every grouping read failed with ENOENT.
       SUPERVISOR_ONBOARD_SCRATCH_ROOT: join(dataDir, "onboard"),
+      // Preview tuning is the only setting read from the service environment,
+      // and only a valid whole number is taken; anything else keeps the default.
+      ...previewTuning(options.env ?? process.env),
     });
     return { record, config, runners, roots, release, retiredAgents };
   } catch (error) {
     if (error instanceof RemoteInstanceError) throw error;
     throw invalid();
   }
+}
+
+/** `SUPERVISOR_PREVIEW_IDLE_MINUTES` (1–1440) and `SUPERVISOR_PREVIEW_MAX_RUNNING` (1–16), when valid. */
+export function previewTuning(env: NodeJS.ProcessEnv): { SUPERVISOR_PREVIEW_IDLE_MINUTES?: number; SUPERVISOR_PREVIEW_MAX_RUNNING?: number } {
+  const whole = (value: string | undefined, max: number): number | undefined => {
+    if (value === undefined || !/^\d{1,5}$/.test(value.trim())) return undefined;
+    const parsed = Number(value.trim());
+    return parsed >= 1 && parsed <= max ? parsed : undefined;
+  };
+  const idle = whole(env.SUPERVISOR_PREVIEW_IDLE_MINUTES, 24 * 60);
+  const running = whole(env.SUPERVISOR_PREVIEW_MAX_RUNNING, 16);
+  return { ...(idle === undefined ? {} : { SUPERVISOR_PREVIEW_IDLE_MINUTES: idle }), ...(running === undefined ? {} : { SUPERVISOR_PREVIEW_MAX_RUNNING: running }) };
 }
 
 function privateOwner(info: Stats): boolean {

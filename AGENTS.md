@@ -32,6 +32,17 @@ supervisor accepts only `SUPERVISOR_DEPLOYMENT_KIND=native_connector` and
 runners only `agent_local_subscription`. Do not reintroduce Compose, images,
 `gateway_keyed` or a local component server.
 
+Session previews are native (packages 7.0.0 `preview.dev_server`): the
+supervisor runs at most one dev server per session in that session's
+worktree (`packages/supervisor/src/preview/`), on a loopback port it picks,
+with an allow-listed environment, and serves the relay channel
+`preview:<sessionId>` through an in-process forwarder that may dial ONLY that
+port. Agents reach it through the connector-local `konteks-preview` MCP server
+(`preview_start`/`preview_status`/`preview_stop`, no arguments). The per-machine
+on/off switch is Core's (`PUT /api/remote-instances/:instanceId/preview`); do
+not add a local one. Do not restore the preview Compose service, the `preview`
+work kind or a separate forwarder process.
+
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`). Pi and OpenCode are retired: every
 write or install refuses them with `retiredAgentMessage` from

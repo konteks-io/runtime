@@ -4,7 +4,7 @@ import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
-import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, status, supportBundle } from "./control-commands.js";
+import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
 import { addNativeAgent, installNative, readNativeRecord, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
@@ -231,6 +231,7 @@ export const nativeCliActions: NativeCliActions = {
       case "agents": return agents(context);
       case "doctor": if (!await doctor(context)) process.exitCode = 2; return;
       case "support": return supportBundle(context);
+      case "preview.status": return previewStatus(context);
       case "auth.status": return authStatus(context, input.agent);
       case "auth.login": return authLogin(context, input.agent!, input.organization ?? false);
       case "auth.logout": return authLogout(context, input.agent!);

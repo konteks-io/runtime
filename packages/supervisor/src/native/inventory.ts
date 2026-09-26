@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ConnectedAgentViewSchema, REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
+import { ConnectedAgentViewSchema, REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
 import type { InventorySnapshot } from "../inventory/snapshot.js";
 import type { RunnerPort } from "../runner-port.js";
@@ -24,6 +24,12 @@ export interface NativeInventoryOptions {
   agentLoginReady?: () => boolean;
   /** ...and Claude Code's, which needs a browser this machine can open. */
   agentLoginBrowserReady?: () => boolean;
+  /**
+   * This connector can serve session previews over the relay
+   * (`preview.dev_server`). Core offers the `preview` attach scope, and the
+   * relay opens `preview:<sessionId>`, only for a connector that says so.
+   */
+  previewReady?: () => boolean;
   /** The machine's git probe (OB6 §1); omitted, the runtime is not `onboard`. */
   gitVersion?: () => Promise<string | null>;
   now?: () => Date;
@@ -98,6 +104,7 @@ export class NativeInventoryCollector {
     // This build names the person's coding sessions from Core's display label;
     // an older one rejects the field, so Core sends it only on this signal.
     if (agents.some(agent => agent.readiness === "ready" && agent.connectionState === "ready")) capabilities.push(REMOTE_SESSION_LABEL_CAPABILITY);
+    if (this.options.previewReady?.()) capabilities.push(REMOTE_PREVIEW_CAPABILITY);
     return {
       components: [{ kind: "agent_runner", version: this.options.bundleVersion,
         healthStatus: healthyRunners === 0 ? "unhealthy" : healthyRunners === results.length ? "healthy" : "degraded",

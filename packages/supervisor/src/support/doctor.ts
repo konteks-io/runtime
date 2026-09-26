@@ -3,7 +3,7 @@ import { RemoteInstanceError, type DoctorCheck, type DoctorReport } from "@konte
 
 /**
  * Allowlisted doctor checks: versions, reachability, lease, components,
- * agents, disk. Details carry statuses and
+ * agents, disk, previews. Details carry statuses and
  * revisions — never a path, address, key, lease value, or raw probe output.
  */
 export interface DoctorInputs {
@@ -22,6 +22,8 @@ export interface DoctorInputs {
   outboxDepth: number;
   recoveryRequired: number;
   coreSignatureConfigured: boolean;
+  /** Session previews: whether the capability is advertised, how many run, and the last failure's time. */
+  preview?: { advertised: boolean; running: number; lastFailureAt: string | null };
 }
 
 export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
@@ -52,6 +54,14 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   push({ id: "disk", title: "Free disk", status: inputs.diskFreeBytes >= inputs.minimumDiskBytes ? "pass" : "fail", detail: `${Math.round(inputs.diskFreeBytes / 1024 ** 3)} GiB free`, ...(inputs.diskFreeBytes >= inputs.minimumDiskBytes ? {} : { recoveryActions: [{ kind: "free_disk" }] }) });
   push({ id: "outbox", title: "Durable outbox", status: inputs.outboxDepth === 0 ? "pass" : "warn", detail: `${inputs.outboxDepth} item(s) awaiting Core acknowledgement` });
   push({ id: "recovery", title: "Recovery required", status: inputs.recoveryRequired === 0 ? "pass" : "warn", detail: `${inputs.recoveryRequired} assignment(s) need recovery` });
+  if (inputs.preview) {
+    const { advertised, running, lastFailureAt } = inputs.preview;
+    push({ id: "preview", title: "Session previews",
+      status: !advertised || lastFailureAt ? "warn" : "pass",
+      detail: !advertised
+        ? "preview capability not advertised (no relay configured), so nobody can open this computer's previews"
+        : `preview capability advertised; ${running} preview(s) running${lastFailureAt ? `; the last preview failed to start at ${lastFailureAt} (see konteks-remote preview status)` : ""}` });
+  }
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };
 }

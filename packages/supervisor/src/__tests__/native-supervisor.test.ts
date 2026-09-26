@@ -361,6 +361,23 @@ describe("native Supervisor composition", () => {
     expect(f.stop).toHaveBeenCalledOnce();
   });
 
+  it("reports previews in status (old launchers too), preview.status and the doctor, and advertises no preview without a relay", async () => {
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    expect(supervisor.status()).toMatchObject({ previewEnabled: false, previewExposure: null });
+    const running = { ...supervisor.previews.status("sess-1"), state: "running" as const, url: "http://127.0.0.1:43100", port: 43100, command: "npm run dev", source: "inferred" as const };
+    vi.spyOn(supervisor.previews, "list").mockReturnValue([running]);
+    expect(supervisor.status()).toMatchObject({ previewEnabled: true, previewExposure: { port: 43100, grantPresent: false } });
+    const report = await supervisor.controlHandler()({ op: "preview.status" }, { event: () => undefined } as never);
+    expect(report).toMatchObject({ capabilityAdvertised: false, idleStopMinutes: 30, maxRunning: 3, previews: [{ sessionId: "sess-1", state: "running", url: "http://127.0.0.1:43100", viewerConnected: false }] });
+    // This fixture has no relay: a viewer could never reach a preview, so none is advertised.
+    expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("preview.dev_server");
+    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string }> };
+    expect(doctor.checks.find(check => check.id === "preview")).toMatchObject({ status: "warn" });
+  });
+
   it("tells the local operator which release Konteks accepts for this machine (WS1-093)", async () => {
     const f = await fixture();
     const supervisor = new Supervisor(f.config, f.options);

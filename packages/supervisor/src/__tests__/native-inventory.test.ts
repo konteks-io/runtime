@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ConnectedAgentView } from "@konteks/remote-common";
+import { advertisesPreview, type ConnectedAgentView } from "@konteks/remote-common";
 import { NativeInventoryCollector, machineHasDesktop } from "../native/inventory.js";
 import { deriveAdvertisedRoles } from "../inventory/roles.js";
 
@@ -49,6 +49,16 @@ describe("native host inventory (A4 D133)", () => {
     expect(machineHasDesktop("darwin", { SSH_CONNECTION: "10.0.0.1 22 10.0.0.2 22" })).toBe(false);
     expect(machineHasDesktop("linux", {})).toBe(false);
     expect(machineHasDesktop("linux", { WAYLAND_DISPLAY: "wayland-0" })).toBe(true);
+  });
+  it("advertises preview.dev_server on the agent_runner component while previews can reach a viewer", async () => {
+    let relay = true;
+    const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 0, activeTurns: 0 } }));
+    const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0", previewReady: () => relay });
+    const snapshot = await inventory.collect();
+    expect(snapshot.components[0]).toMatchObject({ kind: "agent_runner", capabilities: ["agent:codex", "session-label-v1", "preview.dev_server"] });
+    expect(advertisesPreview(snapshot.components)).toBe(true);
+    relay = false;
+    expect(advertisesPreview((await inventory.collect()).components)).toBe(false);
   });
   it("advertises the composed cancellation owner independently of agent sign-in", async () => {
     let owned = true;

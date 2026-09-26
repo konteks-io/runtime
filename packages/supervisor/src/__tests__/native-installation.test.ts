@@ -10,7 +10,7 @@ import { bundleManifestSigningBytes, computeBundleManifestDigest, controlCall, S
 import type { BridgeProcess } from "@konteks/remote-agent-runner";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
-import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord } from "../native/installation.js";
+import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, previewTuning } from "../native/installation.js";
 import { createNativeService } from "../native/service.js";
 import { SupervisorStore } from "../state/store.js";
 import { acquireNativeRootLock } from "../native/root-lock.js";
@@ -48,6 +48,15 @@ async function fixture() {
   const options = { roots: [{ ...keys.root, coreControlKeys: [{ keyId: keys.keyId, publicKeyJwk: keys.root.publicKeyJwk }] }], platform: { os: "macos" as const, architecture: "arm64" as const }, nowMs: Date.parse("2026-09-06T00:00:00Z") };
   return { record, manifest, releaseDir, executable, options };
 }
+
+describe("preview tuning from the service environment", () => {
+  it("takes only valid whole numbers and otherwise keeps the defaults", () => {
+    expect(previewTuning({ SUPERVISOR_PREVIEW_IDLE_MINUTES: "90", SUPERVISOR_PREVIEW_MAX_RUNNING: "1" })).toEqual({ SUPERVISOR_PREVIEW_IDLE_MINUTES: 90, SUPERVISOR_PREVIEW_MAX_RUNNING: 1 });
+    expect(previewTuning({ SUPERVISOR_PREVIEW_IDLE_MINUTES: "0", SUPERVISOR_PREVIEW_MAX_RUNNING: "99" })).toEqual({});
+    expect(previewTuning({ SUPERVISOR_PREVIEW_IDLE_MINUTES: "5m", SUPERVISOR_PREVIEW_MAX_RUNNING: "-1" })).toEqual({});
+    expect(previewTuning({})).toEqual({});
+  });
+});
 
 describe("closed native runtime installation", () => {
   it("loads only the digest-matching installer-selected Git executable", async () => {

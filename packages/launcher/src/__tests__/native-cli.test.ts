@@ -45,6 +45,13 @@ describe("native customer entry point", () => {
     await program.parseAsync(["auth", "login", "codex", "--organization"], { from: "user" });
     expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.login", agent: "codex", organization: true }));
   });
+  it("offers a read-only preview status, and no local preview switch", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["preview", "status"], { from: "user" });
+    expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "preview.status" }));
+    const preview = program.commands.find(command => command.name() === "preview");
+    expect(preview?.commands.map(command => command.name())).toEqual(["status"]);
+  });
   it("reports the installed release as its version, so it matches status after an update (W1-L4)", async () => {
     const root = await mkdtemp(join(tmpdir(), "konteks-version-"));
     try {

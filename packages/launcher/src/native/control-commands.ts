@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlLoginEvent } from "@konteks/remote-common";
+import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlLoginEvent } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
 import type { Output } from "../output.js";
 import { confirm, promptSecret } from "../prompt.js";
@@ -35,8 +35,25 @@ export async function status(context: ControlContext): Promise<void> {
     ["roles", value.roles.join(", ") || "(none advertised — log in an agent and tag roles in App/MCP)"],
     ["utilization", `${value.utilization.activeSessions} sessions, ${value.utilization.activeTurns} turns, ratio ${value.utilization.utilizationRatio}${value.utilization.acceptingWork ? "" : " — not accepting work"}`],
     ["components", value.components.map((component) => `${component.kind}=${component.healthStatus}`).join(" ")],
+    ["preview", value.previewEnabled ? `running on 127.0.0.1:${value.previewExposure?.port ?? "?"}${value.previewExposure?.grantPresent ? " (a viewer is connected)" : ""}` : "none running"],
     ["journal", `${value.journal.assignments} active, ${value.journal.outboxDepth} queued, ${value.journal.recoveryRequired} recovery required`],
   ]);
+}
+
+/** `preview status`: read-only; the per-machine on/off switch lives in Konteks. */
+export async function previewStatus(context: ControlContext): Promise<void> {
+  const value = await context.control.call({ op: "preview.status" }, PreviewStatusReportSchema);
+  context.output.result(value);
+  context.output.line(value.capabilityAdvertised
+    ? `Previews: served from this computer (at most ${value.maxRunning} at once, each stops after ${value.idleStopMinutes} idle minutes). Switch them off for this computer in Konteks: Customize → Runtimes.`
+    : "Previews: not offered (this connector has no relay connection configured).");
+  if (value.previews.length === 0) context.output.line("No session preview has run since the connector started.");
+  for (const preview of value.previews) {
+    context.output.line(`${preview.sessionId}: ${preview.state}${preview.url ? ` at ${preview.url}` : ""}${preview.viewerConnected ? " (a viewer is connected)" : ""}`);
+    if (preview.command) context.output.line(`  command: ${preview.command}${preview.explanation ? ` — ${preview.explanation}` : ""}`);
+    context.output.line(`  ${preview.message}`);
+  }
+  if (value.lastFailure) context.output.line(`Last failure (${value.lastFailure.at}): ${value.lastFailure.message}`);
 }
 
 export async function agents(context: ControlContext): Promise<void> {

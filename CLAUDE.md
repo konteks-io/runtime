@@ -9,3 +9,6 @@ Customer-visible file names are in AGENTS.md: resolve the connector with
 The runtime is native-only (the appliance is retired and deleted) and runs
 Claude Code, Codex and DeepSeek Harness; Pi and OpenCode are retired (see
 AGENTS.md for how stored values stay readable).
+Session previews run in the supervisor (`packages/supervisor/src/preview/`):
+one supervised dev server per session, forwarded only to its own loopback
+port; the per-machine switch is Core's (see AGENTS.md).

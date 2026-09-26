@@ -20,7 +20,7 @@ export interface NativeCliActions {
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
-  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; title?: string; keyRef?: string }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; title?: string; keyRef?: string }): Promise<void>;
 }
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
@@ -81,6 +81,11 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .argument("<agent>", "agent family", agent)
     .action(async (value: NativeAgentId) => actions.addAgent({ ...context(), agent: value }));
   for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).action(async () => actions.control({ ...context(), operation }));
+  // Read-only. Whether this computer serves previews is switched per machine
+  // in Konteks (Customize → Runtimes), never here.
+  const preview = program.command("preview").description("live previews of sessions' work, served from this computer");
+  preview.command("status").description("list this computer's session previews: state, loopback URL, command and why it stopped")
+    .action(async () => actions.control({ ...context(), operation: "preview.status" }));
   const auth = program.command("auth").description("official local agent subscription authentication");
   auth.command("status").argument("[agent]", "agent family", agent).action(async (value?: string) => actions.control({ ...context(), operation: "auth.status", ...(value ? { agent: value } : {}) }));
   auth.command("login").argument("<agent>", "agent family", agent).option("--organization", "attest that the account is organization-owned", false)

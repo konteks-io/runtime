@@ -1,7 +1,7 @@
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import type { ControlRequest, SupervisorStatus } from "@konteks/remote-common";
-import { authLogin, status, type ControlContext } from "../native/control-commands.js";
+import { authLogin, previewStatus, status, type ControlContext } from "../native/control-commands.js";
 import { createOutput } from "../output.js";
 
 const supervisorStatus: SupervisorStatus = {
@@ -29,6 +29,11 @@ function fake(options: { json?: boolean; confirm?: boolean } = {}) {
     call: async <T,>(request: ControlRequest, schema: { parse: (value: unknown) => T }, callOptions?: { onEvent?: (event: unknown) => void }): Promise<T> => {
       calls.push(request);
       if (request.op === "status") return schema.parse(supervisorStatus);
+      if (request.op === "preview.status") {
+        return schema.parse({ capabilityAdvertised: true, idleStopMinutes: 30, maxRunning: 3, lastFailure: null, previews: [
+          { sessionId: "sess-1", state: "running", url: "http://127.0.0.1:43100", port: 43100, command: "npm run dev", source: "inferred", explanation: "Inferred from package.json.", message: "Running.", startedAt: null, readyAt: null, viewerConnected: true },
+        ] });
+      }
       if (request.op === "auth.login") {
         callOptions?.onEvent?.({ kind: "started", loginId: "l1", agentId: request.agentId });
         callOptions?.onEvent?.({ kind: "open_url", loginId: "l1", url: "https://login.example/device", userCode: "ABCD-1234" });
@@ -49,6 +54,23 @@ function fake(options: { json?: boolean; confirm?: boolean } = {}) {
 }
 
 describe("native control commands", () => {
+  it("shows session previews read-only and points to Konteks for the per-machine switch", async () => {
+    const f = fake();
+    await previewStatus(f.context);
+    expect(f.calls).toEqual([{ op: "preview.status" }]);
+    expect(f.text()).toContain("sess-1: running at http://127.0.0.1:43100 (a viewer is connected)");
+    expect(f.text()).toContain("command: npm run dev — Inferred from package.json.");
+    expect(f.text()).toContain("Customize → Runtimes");
+  });
+
+  it("reads a connector status with a running preview", async () => {
+    const f = fake();
+    supervisorStatus.previewEnabled = true;
+    supervisorStatus.previewExposure = { port: 43100, grantPresent: false };
+    try { await status(f.context); } finally { delete supervisorStatus.previewEnabled; delete supervisorStatus.previewExposure; }
+    expect(f.text()).toContain("running on 127.0.0.1:43100");
+  });
+
   it("exposes only the public lease summary in machine-readable status", async () => {
     const f = fake({ json: true });
     await status(f.context);

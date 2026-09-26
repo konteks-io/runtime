@@ -48,6 +48,8 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   /** Clears a launcher-initiated drain that will not be followed by a stop (e.g. an aborted update). */
   z.object({ op: z.literal("drain.cancel") }).strict(),
   z.object({ op: z.literal("doctor") }).strict(),
+  /** Read-only: this computer's session previews. The on/off switch is Core's, per machine. */
+  z.object({ op: z.literal("preview.status") }).strict(),
   /** Fetch and verify the release channel; reports without installing anything. */
   z.object({ op: z.literal("update.check") }).strict(),
   /** Ask the supervisor to launch the installer's transactional update in a separate process. */
@@ -450,10 +452,11 @@ export const SupervisorStatusSchema = z
     pendingErase: z.number().int().nonnegative(),
     pendingRevocation: z.boolean(),
     /**
-     * Retired in 7.0.0: a connector has no preview. Still emitted as `false` /
-     * `null` because a launcher installed before 7.0.0 (a user install's
+     * Whether a session preview is running on this computer, and the first
+     * one's loopback port and whether a viewer reached it through the relay.
+     * Always emitted: a launcher installed before 7.0.0 (a user install's
      * `<root>/bin/konteks-remote` is never replaced by an update) requires
-     * both, and still accepted from a connector rolled back to such a release.
+     * both; optional so a launcher still reads a connector without them.
      */
     previewEnabled: z.boolean().optional(),
     previewExposure: z.object({ port: z.number().int(), grantPresent: z.boolean() }).strict().nullable().optional(),
@@ -467,6 +470,35 @@ export const SupervisorStatusSchema = z
   })
   .strict();
 export type SupervisorStatus = z.infer<typeof SupervisorStatusSchema>;
+
+/** `preview.status`: every session preview this connector runs or recently ran. */
+export const PreviewStatusReportSchema = z
+  .object({
+    /** The connector advertises `preview.dev_server` (it can serve preview channels). */
+    capabilityAdvertised: z.boolean(),
+    idleStopMinutes: z.number().int().positive(),
+    maxRunning: z.number().int().positive(),
+    previews: z.array(
+      z
+        .object({
+          sessionId: z.string(),
+          state: z.enum(["not_started", "starting", "running", "failed", "stopped"]),
+          url: z.string().nullable(),
+          port: z.number().int().nullable(),
+          command: z.string().nullable(),
+          source: z.enum(["preview_yaml", "inferred"]).nullable(),
+          explanation: z.string().nullable(),
+          message: z.string(),
+          startedAt: z.string().nullable(),
+          readyAt: z.string().nullable(),
+          viewerConnected: z.boolean(),
+        })
+        .strict(),
+    ),
+    lastFailure: z.object({ at: z.string(), message: z.string() }).strict().nullable(),
+  })
+  .strict();
+export type PreviewStatusReport = z.infer<typeof PreviewStatusReportSchema>;
 
 export const DoctorCheckSchema = z
   .object({

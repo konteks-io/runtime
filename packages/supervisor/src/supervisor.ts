@@ -22,6 +22,7 @@ import {
   type RemoteWorkKind,
   type RelayRuntimeHandshakeResult,
   type SupervisorStatus,
+  type PreviewStatusReport,
   AGENT_LOGIN_METHOD,
   AgentLoginUserCodeSchema,
   agentLoginUrlAllowed,
@@ -366,6 +367,8 @@ export class Supervisor {
       // A site-started login needs a native install with a Codex runner (WS1-115).
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
+      // Previews reach a viewer only over the relay's preview channel.
+      previewReady: () => this.previewCapable(),
       cancellationDeliveryReady: () => {
         if (!this.relay || !this.cancellationReplay || !this.nativeOwnership || this.stopping) return false;
         try { this.nativeOwnership.assertOwned(); return true; } catch { return false; }
@@ -1614,6 +1617,33 @@ export class Supervisor {
     };
   }
 
+  private previewCapable(): boolean {
+    return !this.stopping && this.relay !== null && this.relay !== undefined;
+  }
+
+  /** Status's preview fields: the first running preview's port and whether a viewer reached it. */
+  private previewExposure(): { previewEnabled: boolean; previewExposure: { port: number; grantPresent: boolean } | null } {
+    const running = this.previews.list().find(preview => preview.state === "running" && preview.port !== null);
+    return running
+      ? { previewEnabled: true, previewExposure: { port: running.port!, grantPresent: this.previewChannel?.hasViewer(running.sessionId) ?? false } }
+      : { previewEnabled: false, previewExposure: null };
+  }
+
+  private previewReport(): PreviewStatusReport {
+    const health = this.previews.health();
+    return {
+      capabilityAdvertised: this.previewCapable(),
+      idleStopMinutes: this.config.SUPERVISOR_PREVIEW_IDLE_MINUTES,
+      maxRunning: this.config.SUPERVISOR_PREVIEW_MAX_RUNNING,
+      previews: this.previews.list().map(preview => ({
+        sessionId: preview.sessionId, state: preview.state, url: preview.url, port: preview.port, command: preview.command, source: preview.source,
+        explanation: preview.explanation, message: preview.message, startedAt: preview.startedAt, readyAt: preview.readyAt,
+        viewerConnected: this.previewChannel?.hasViewer(preview.sessionId) ?? false,
+      })),
+      lastFailure: health.lastFailure,
+    };
+  }
+
   /** The non-agent facts a role may depend on; one source for every reader. */
   private roleCapabilityInputs(): RoleCapabilityInputs {
     return { gitVersion: this.lastSnapshot?.gitVersion ?? null };
@@ -1638,9 +1668,8 @@ export class Supervisor {
       utilization: { acceptingWork: !this.draining && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
       pendingErase: this.journal.erase.all().filter((record) => !record.receiptSent).length,
       pendingRevocation: this.pendingRevocation,
-      // For launchers installed before 7.0.0, which require these fields.
-      previewEnabled: false,
-      previewExposure: null,
+      // Also read by launchers installed before 7.0.0, which require both fields.
+      ...this.previewExposure(),
       journal: { assignments: this.journal.activeAssignments().length, outboxDepth: this.outbox.depth, recoveryRequired: this.journal.recoveryRequired().length },
     };
   }
@@ -1728,6 +1757,8 @@ export class Supervisor {
           const accepted = await this.core.acceptedRelease(this.instanceId);
           return { bundleVersion: accepted?.bundleVersion ?? null };
         }
+        case "preview.status":
+          return this.previewReport();
         case "doctor":
           return this.doctor();
         case "logs":
@@ -1888,6 +1919,7 @@ export class Supervisor {
       outboxDepth: this.outbox.depth,
       recoveryRequired: this.journal.recoveryRequired().length,
       coreSignatureConfigured: this.roots.some((root) => (root.coreControlKeys ?? []).length > 0),
+      preview: { advertised: this.previewCapable(), running: this.previews.health().running, lastFailureAt: this.previews.health().lastFailure?.at ?? null },
     });
   }
 

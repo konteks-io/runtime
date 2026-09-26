@@ -16,7 +16,7 @@ describe("supervisor status across releases", () => {
     journal: { assignments: 0, outboxDepth: 0, recoveryRequired: 0 },
   };
 
-  it("reads a 7.0.0 connector's status, which still carries the retired preview fields for older launchers", () => {
+  it("reads a connector's status with its preview fields, which launchers installed before 7.0.0 require", () => {
     expect(SupervisorStatusSchema.parse({ ...status, previewEnabled: false, previewExposure: null })).toMatchObject({ previewEnabled: false, previewExposure: null });
   });
 
