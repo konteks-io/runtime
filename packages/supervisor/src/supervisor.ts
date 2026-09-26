@@ -1,6 +1,7 @@
 import { ObservationDelivery } from "./control/observation-delivery.js";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import {
   REMOTE_INSTANCE_PROTOCOL_VERSION,
   PlanningControllerTerminalDirectiveSchema,
@@ -53,6 +54,7 @@ import type { PlatformMcpEntry } from "./work/workload.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
 import { PreviewChannel } from "./preview/preview-channel.js";
+import { PreviewProcessManager, PreviewProcessRegistry } from "./preview/process-manager.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { ChannelMux } from "./relay/channel-mux.js";
@@ -188,6 +190,9 @@ export class Supervisor {
   reconciliation!: Reconciliation;
   /** The `preview:<sessionId>` relay channels, forwarded to each session's own loopback preview. */
   previewChannel!: PreviewChannel;
+  /** Each session's supervised preview dev server (at most one per session). */
+  readonly previews: PreviewProcessManager;
+  private readonly previewRegistry: PreviewProcessRegistry;
   broker!: PermissionBroker;
   readonly runners = new Map<string, RunnerPort>();
   private readonly nativeRunners: NativeRunner[] = [];
@@ -243,6 +248,14 @@ export class Supervisor {
     this.journal = new SupervisorJournal(this.store.path("journal"), this.stateMutations.run);
     this.outbox = new DurableOutbox(this.store.path("outbox"), this.stateMutations.run);
     this.lease = new LeaseState(this.clock);
+    this.previewRegistry = new PreviewProcessRegistry(join(config.SUPERVISOR_DATA_DIR, "preview-processes.json"));
+    this.previews = new PreviewProcessManager({
+      idleMs: config.SUPERVISOR_PREVIEW_IDLE_MINUTES * 60_000,
+      maxRunning: config.SUPERVISOR_PREVIEW_MAX_RUNNING,
+      registry: this.previewRegistry,
+      onStopped: sessionId => this.previewChannel?.previewStopped(sessionId),
+      logger: this.logger,
+    });
   }
 
   // ── Startup ────────────────────────────────────────────────────────────────
@@ -260,6 +273,8 @@ export class Supervisor {
       void this.stop().catch(() => this.logger.error("native ownership-loss shutdown failed"));
     } });
     await this.store.init();
+    // A restart never adopts a preview: kill what a crashed process left running.
+    await this.previewRegistry.sweep().catch(error => this.logger.warn({ err: error }, "leftover preview processes could not be checked"));
     await this.journal.load();
     await this.outbox.load();
     // A native machine that has an identity but no key has lost the only
@@ -623,7 +638,7 @@ export class Supervisor {
     this.previewChannel = new PreviewChannel({
       transport: this.transport,
       lease: this.lease,
-      previews: { originFor: () => null, touch: () => undefined },
+      previews: { originFor: sessionId => this.previews.originFor(sessionId), touch: sessionId => this.previews.touch(sessionId) },
       hasCapacity: channelId => this.mux.unackedBytes(channelId) < previewWindowBytes,
       logger: this.logger,
     });
@@ -1177,6 +1192,7 @@ export class Supervisor {
     // bb: every 5 minutes release sessions idle for 30 minutes.
     this.reaperTimer = setInterval(() => void this.work.reapIdleCompletedSessions(IDLE_SESSION_RELEASE_MS).catch(() => undefined), IDLE_SESSION_SWEEP_MS);
     this.reaperTimer.unref();
+    this.previews.startIdleSweep();
     const update = this.options.native?.update;
     if (update && !this.updates) {
       this.updates = new NativeUpdateCoordinator({
@@ -1335,6 +1351,7 @@ export class Supervisor {
       // work stays drained until both cleanup and fresh Core authority agree.
       if (!this.leaseLossCleanup) {
         this.leaseLossCleanupFailed = false;
+        void this.previews.stopAll("lease_lost");
         this.leaseLossCleanup = Promise.resolve().then(() => this.work.drainSessions("lease_lost"))
           .catch(() => { this.leaseLossCleanupFailed = true; this.logger.error("lease-loss session cleanup failed; work remains drained"); })
           .finally(() => { this.leaseLossCleanup = null; this.restoreLeaseDrain(); });
@@ -1457,6 +1474,10 @@ export class Supervisor {
       };
       expire();
     }
+    // Previews of sessions still working stop with those sessions; the rest
+    // (a finished turn's preview left open) stop now.
+    const live = this.work.liveSessionIds();
+    for (const preview of this.previews.list()) if (!live.has(preview.sessionId)) void this.previews.stop(preview.sessionId, "drain");
     this.logger.info({ reason, active }, "draining: no new claims");
     return active;
   }
@@ -1881,6 +1902,7 @@ export class Supervisor {
     await this.leaseMutation;
     await this.leaseLossCleanup;
     await this.work?.drainSessions("drain");
+    await this.previews.close();
     this.previewChannel?.dispose();
     for (const runner of this.nativeRunners) await runner.stop();
     await this.nativeCodexOwner?.stop();

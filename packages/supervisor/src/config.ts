@@ -35,6 +35,10 @@ export const SupervisorConfigSchema = z
     SUPERVISOR_REPLAY_BUFFER_AGE_MS: z.coerce.number().int().positive().default(10 * 60_000),
     SUPERVISOR_SOFT_MAX_CONCURRENT: z.coerce.number().int().positive().optional(),
     SUPERVISOR_PULL_MAX_ITEMS: z.coerce.number().int().positive().default(4),
+    /** A session's preview dev server stops after this long with no viewer and no agent activity. */
+    SUPERVISOR_PREVIEW_IDLE_MINUTES: z.coerce.number().int().min(1).max(24 * 60).default(30),
+    /** Previews running at once on this computer (one per session at most). */
+    SUPERVISOR_PREVIEW_MAX_RUNNING: z.coerce.number().int().min(1).max(16).default(3),
   })
   .passthrough();
 export type SupervisorConfig = z.infer<typeof SupervisorConfigSchema>;

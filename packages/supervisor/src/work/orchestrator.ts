@@ -169,6 +169,16 @@ export class WorkOrchestrator {
     return this.deps.journal.activeAssignments().length;
   }
 
+  /** Logical session ids with an open (not yet closed) session on this machine. */
+  liveSessionIds(): Set<string> {
+    const live = new Set<string>();
+    for (const session of this.sessions.values()) {
+      const channelId = session.channelId;
+      if (!session.isClosed && channelId?.startsWith("session:")) live.add(channelId.slice("session:".length));
+    }
+    return live;
+  }
+
   /** Resolve existing original ownership; absent maps never establish authority. */
   capturePendingClaimAuthority(admission: LocalAdmission): () => void {
     const key = `${admission.assignmentId}:${admission.attempt}`;
