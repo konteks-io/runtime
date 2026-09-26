@@ -17,7 +17,8 @@ request for a session with nothing running starts it (`PreviewChannel`
 registered with `SessionPreviewAccess.permit`, answering 503
 `STARTING_MESSAGE` ("Starting preview…", which Core turns into a refreshing
 page); `startedBy` records agent or viewer.
-Claude Code and Codex QA/validator/executor sessions get a headless browser
+Claude Code and Codex sessions with a preview (validator, QA-mode and other
+conversations, executor) get a headless browser
 (Playwright MCP, `konteks-browser`, bundled in their agent packages) whose
 every request goes through the session's `PreviewBrowserGateway`, which
 admits only that session's running preview (see AGENTS.md); dsh gets none.

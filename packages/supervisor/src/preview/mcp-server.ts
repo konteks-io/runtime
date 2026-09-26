@@ -43,10 +43,13 @@ export const PREVIEW_WORK_KINDS: ReadonlySet<string> = new Set(["delivery", "val
 
 /**
  * Work kinds whose agent also gets a browser on the preview (Claude Code and
- * Codex): the validator and QA, which check the work in its UI, and the
- * executor, which can look at what it builds. Not assistant turns.
+ * Codex): every kind that has a preview. The validator checks the work in its
+ * UI; a QA-mode conversation is an `assistant_execution` turn whose agent
+ * exercises the preview and reports the run (`run_submit`); the executor and
+ * an ordinary chat can look at what they build. The browser reaches only the
+ * session's own preview, and it starts only when a tool is first used.
  */
-export const BROWSER_WORK_KINDS: ReadonlySet<string> = new Set(["delivery", "validation", "qa"]);
+export const BROWSER_WORK_KINDS: ReadonlySet<string> = PREVIEW_WORK_KINDS;
 
 export interface PreviewToolHost {
   start(): Promise<PreviewStatus>;

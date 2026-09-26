@@ -258,12 +258,17 @@ describe("relayed session (D98/D113/D114)", () => {
       upstream.close();
     });
 
-    it("gives no browser to assistant turns or to an agent without one (DeepSeek Harness)", async () => {
+    it("gives a conversation turn (a QA-mode chat) the browser too, but not planning or an agent without one (DeepSeek Harness)", async () => {
       const assistant = await build({ preview: access(() => null) });
       (assistant.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
       await assistant.session.bootstrap();
-      expect((assistant.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
+      expect((assistant.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toMatchObject({ proxyUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/) });
       await assistant.session.close("cancelled");
+      const planning = await build({ preview: access(() => null) }, { ...assignment, kind: "planning" } as RemoteWorkAssignment);
+      (planning.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+      await planning.session.bootstrap();
+      expect((planning.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
+      await planning.session.close("cancelled");
       const dsh = await build({ preview: access(() => null) }, { ...assignment, kind: "validation", agentRoute: { ...assignment.agentRoute, agentId: "dsh" } } as RemoteWorkAssignment);
       (dsh.runner as { browserVersion?: () => string | null }).browserVersion = () => null;
       await dsh.session.bootstrap();

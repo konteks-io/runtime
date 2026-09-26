@@ -49,8 +49,9 @@ The QA browser is Playwright MCP (`@playwright/mcp`, pinned in
 Claude Code and Codex offline agent packages with the connector's launcher
 (`packages/agent-runner/src/bridge/browser-{mcp,launcher,tools}.ts`, copied to
 `konteks/` in the package). `NativeRunner` adds it as a stdio ACP MCP server
-(`konteks-browser`) for `delivery`/`validation`/`qa` sessions
-(`BROWSER_WORK_KINDS`); `RelayedSession` gives each such session a
+(`konteks-browser`) for every session that has a preview (`BROWSER_WORK_KINDS`
+= `PREVIEW_WORK_KINDS`: delivery, validation, qa and assistant_execution, which
+is how a QA-mode conversation runs); `RelayedSession` gives each such session a
 `PreviewBrowserGateway` (`preview/browser-gateway.ts`), the browser's HTTP
 proxy, which admits only that session's running preview origin. Chromium
 proxies loopback too (Playwright forces `<-loopback>`), so the gateway is the

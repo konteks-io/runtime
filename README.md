@@ -144,8 +144,8 @@ serve:
 
 ### A browser for QA
 
-Claude Code and Codex sessions that check or build work (the validator, QA
-and the executor, not ordinary assistant turns) also get a headless browser
+Claude Code and Codex sessions that have a preview (the validator, QA-mode
+and other conversations, and the executor; not planning) also get a headless browser
 on the session's preview: Microsoft's Playwright MCP (`@playwright/mcp`
 0.0.82, pinned in `release/native-agent-builds.json` and carried inside the
 Claude Code and Codex agent packages, run on their own Node). Its tools
