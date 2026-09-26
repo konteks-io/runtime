@@ -1,5 +1,5 @@
 import { connect } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   ControlRequestSchema,
@@ -153,6 +153,18 @@ describe("loopback control socket", () => {
         { request: { op: "auth.logout", agentId: "codex" }, schema: z.unknown() },
       ),
     ).rejects.toMatchObject({ message: "gateway_unavailable: gateway is down" });
+  });
+
+  it("rejects a request outside the closed protocol at once instead of waiting for a timeout", async () => {
+    const handler = vi.fn(async () => ({}));
+    const server = await startControlSocketServer({ token, port: 0, handler });
+    servers.push(server);
+    const started = Date.now();
+    await expect(
+      controlCall({ token, port: server.port, timeoutMs: 10_000 }, { request: { op: "exec", command: "id" } as never, schema: z.unknown() }),
+    ).rejects.toThrow(/control_request_invalid/);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("the protocol is closed: no exec or free-form config field parses", () => {

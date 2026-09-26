@@ -335,7 +335,9 @@ export function controlCall<T>(options: ControlSocketClientOptions, call: Contro
     lines.on("error", error => finish(() => reject(unavailable("cannot read the supervisor control socket", error))));
     lines.on("line", (line) => {
       const parsed = ControlResponseSchema.safeParse(safeJson(line));
-      if (!parsed.success || parsed.data.id !== id) return;
+      // A request the server cannot parse is answered with id "unknown". Each
+      // call owns its connection and sends one request, so that error is ours.
+      if (!parsed.success || (parsed.data.id !== id && !(parsed.data.kind === "error" && parsed.data.id === "unknown"))) return;
       const response = parsed.data;
       if (response.kind === "event") {
         call.onEvent?.(response.event);

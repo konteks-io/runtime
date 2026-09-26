@@ -82,7 +82,7 @@ describe("closed native runtime installation", () => {
       expect(result.components.map(component => component.kind)).toEqual(["agent_runner"]);
       await expect(controlCall({ port, token: "wrong", timeoutMs: 500 }, { request: { op: "status" }, schema: z.unknown() })).rejects.toThrow();
       // The retired appliance's BYOK operation is no longer part of the closed protocol.
-      await expect(controlCall({ port, token, timeoutMs: 500 }, { request: { op: "gateway.key.set", agentId: "codex", key: "not-a-provider-key" } as never, schema: z.unknown() })).rejects.toThrow();
+      await expect(controlCall({ port, token }, { request: { op: "gateway.key.set", agentId: "codex", key: "not-a-provider-key" } as never, schema: z.unknown() })).rejects.toThrow(/control_request_invalid/);
       expect(spawn).toHaveBeenCalledOnce();
       signals.emit("SIGTERM");
       await service.waitUntilStopped();
