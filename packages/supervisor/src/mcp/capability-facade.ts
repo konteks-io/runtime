@@ -21,6 +21,18 @@ const FORWARDED_RESPONSE_HEADERS = new Set([
   "retry-after",
 ]);
 
+/** Core's tool that opens a cloud preview or a registered application in the session's browser. */
+export const ENVIRONMENT_OPEN_TOOL = "platform__quality-assurance__environment_open";
+const MAX_OBSERVED_RESPONSE_BYTES = 1024 * 1024;
+/** No Core grant is trusted for longer than a day, whatever it says. */
+const MAX_GRANT_MS = 24 * 60 * 60 * 1000;
+
+/** The origins Core opened for this session's browser, as Core answered `environment_open`. */
+export interface BrowserAccessGrant {
+  kind: "cloud_preview" | "external";
+  origins: Array<{ origin: string; expiresAt: string }>;
+}
+
 export interface McpCapabilityFacadeOptions {
   initial: CapabilityTokenIssue;
   renew: () => Promise<CapabilityTokenIssue>;
@@ -28,6 +40,13 @@ export interface McpCapabilityFacadeOptions {
   logger?: Logger;
   now?: () => number;
   onUnavailable?: () => void | Promise<void>;
+  /**
+   * Core answered `environment_open` for this session: the session's browser
+   * may now reach these origins. Read only from Core's response to that one
+   * tool, never from anything the agent sent, and only when it names this
+   * facade's own session.
+   */
+  onBrowserAccess?: (grant: BrowserAccessGrant) => void;
 }
 
 /**
@@ -124,7 +143,9 @@ export class McpCapabilityFacade {
         await this.refresh(true, "auth_rejection");
         upstream = await this.forward(request, body, true);
       }
-      await this.writeUpstream(upstream.response, upstream.controller, response);
+      const observed = this.options.onBrowserAccess ? environmentOpenRequestId(body) : undefined;
+      if (observed !== undefined) await this.writeObserved(upstream.response, upstream.controller, response, observed);
+      else await this.writeUpstream(upstream.response, upstream.controller, response);
     } catch (error) {
       if (!response.headersSent) this.fail(response, 503, "upstream_unavailable");
       else response.destroy();
@@ -187,6 +208,47 @@ export class McpCapabilityFacade {
     } finally {
       this.activeRequests.delete(controller);
     }
+  }
+
+  /**
+   * Relay Core's answer to `environment_open` after reading the browser
+   * access it grants. Buffered (bounded) because the grant must be in place
+   * before the agent's next call opens the link; anything that is not a
+   * single JSON answer to that request passes through untouched and grants
+   * nothing.
+   */
+  private async writeObserved(upstream: Response, controller: AbortController, response: ServerResponse, requestId: string | number): Promise<void> {
+    const contentType = upstream.headers.get("content-type") ?? "";
+    if (upstream.status !== 200 || !contentType.toLowerCase().includes("application/json") || !upstream.body) {
+      return this.writeUpstream(upstream, controller, response);
+    }
+    let text: string;
+    try {
+      const reader = upstream.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > MAX_OBSERVED_RESPONSE_BYTES) { controller.abort(); throw new Error("response too large"); }
+        chunks.push(value);
+      }
+      text = Buffer.concat(chunks).toString("utf8");
+    } finally {
+      this.activeRequests.delete(controller);
+    }
+    try {
+      const grant = browserAccessFrom(text, requestId, this.options.context.sessionId, this.now());
+      if (grant) this.options.onBrowserAccess?.(grant);
+    } catch {
+      this.logger.warn({ event: "mcp_capability.browser_access_unreadable", ...this.options.context }, "environment_open answer could not be read; the browser gains nothing");
+    }
+    response.statusCode = upstream.status;
+    for (const [name, value] of upstream.headers) {
+      if (FORWARDED_RESPONSE_HEADERS.has(name.toLowerCase())) response.setHeader(name, value);
+    }
+    response.end(text);
   }
 
   private refresh(force: boolean, reason: "request" | "timer" | "auth_rejection"): Promise<CapabilityTokenIssue> {
@@ -269,6 +331,43 @@ export class McpCapabilityFacade {
     response.setHeader("Content-Type", "application/json");
     response.end(JSON.stringify({ error: code }));
   }
+}
+
+/** The JSON-RPC id of a single `tools/call` of `environment_open`, else undefined (batches and everything else pass through). */
+export function environmentOpenRequestId(body: Buffer): string | number | undefined {
+  let message: unknown;
+  try { message = JSON.parse(body.toString("utf8")); } catch { return undefined; }
+  if (!message || typeof message !== "object" || Array.isArray(message)) return undefined;
+  const { method, params, id } = message as { method?: unknown; params?: { name?: unknown }; id?: unknown };
+  if (method !== "tools/call" || params?.name !== ENVIRONMENT_OPEN_TOOL) return undefined;
+  return typeof id === "string" || typeof id === "number" ? id : undefined;
+}
+
+/**
+ * The browser access in Core's answer to that request, when it names this
+ * session: http(s) origins only, each with an expiry in the future (capped
+ * at a day). Null when the answer grants nothing.
+ */
+export function browserAccessFrom(text: string, requestId: string | number, sessionId: string, now: number): BrowserAccessGrant | null {
+  const message = JSON.parse(text) as { id?: unknown; result?: { structuredContent?: unknown } };
+  if (!message || message.id !== requestId) return null;
+  const content = message.result?.structuredContent as { target?: { kind?: unknown }; browserAccess?: { sessionId?: unknown; origins?: unknown } } | undefined;
+  const access = content?.browserAccess;
+  if (!access || access.sessionId !== sessionId || !Array.isArray(access.origins)) return null;
+  const kind = content?.target?.kind === "preview" ? "cloud_preview" : content?.target?.kind === "external" ? "external" : null;
+  if (kind === null) return null;
+  const origins: BrowserAccessGrant["origins"] = [];
+  for (const entry of access.origins.slice(0, 16) as Array<{ origin?: unknown; expiresAt?: unknown }>) {
+    if (typeof entry?.origin !== "string" || typeof entry.expiresAt !== "string") continue;
+    let url: URL;
+    try { url = new URL(entry.origin); } catch { continue; }
+    if ((url.protocol !== "https:" && url.protocol !== "http:") || url.origin !== entry.origin) continue;
+    if (kind === "external" && url.protocol !== "https:") continue;
+    const expiresAt = Date.parse(entry.expiresAt);
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) continue;
+    origins.push({ origin: url.origin, expiresAt: new Date(Math.min(expiresAt, now + MAX_GRANT_MS)).toISOString() });
+  }
+  return origins.length > 0 ? { kind, origins } : null;
 }
 
 function refreshLead(remainingMs: number): number {

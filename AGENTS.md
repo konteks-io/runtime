@@ -56,7 +56,21 @@ is how a QA-mode conversation runs); `RelayedSession` gives each such session a
 proxy, which admits only that session's running preview origin. Chromium
 proxies loopback too (Playwright forces `<-loopback>`), so the gateway is the
 boundary; `--allowed-origins` is only a second layer (Playwright says it is
-not a security boundary). Never pass `PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK`,
+not a security boundary). The gateway also admits origins Core issued for the
+session (`PreviewBrowserGateway.grant`): Core's answer to the QA tool
+`platform__quality-assurance__environment_open` carries
+`browserAccess: {sessionId, origins[{origin, expiresAt}]}` (a signed-in cloud
+preview, or a registered application), and `McpCapabilityFacade` reads it from
+that one tool's JSON answer as it relays it (`onBrowserAccess`; same session,
+http(s) origins only, external https only, expiry capped at a day) and hands
+it to the session's gateway. Never add another way to grant an origin: the
+agent must not be able to widen the list with its own input. A registered
+application's host must not resolve to this computer (the CONNECT dials the
+checked address). The launcher keeps `--allowed-origins` in step: before each
+tool call it reads `GET <gateway>/.konteks/browser-origins`
+(`KONTEKS_BROWSER_ORIGINS_URL`) and, when the set changed and nothing is in
+flight, restarts Playwright MCP with loopback plus those origins, replaying
+the agent's `initialize` (Playwright reads the flag once per context). Never pass `PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK`,
 never npx it at runtime, and never give it to dsh (its governance admits only
 `konteks-platform`/`konteks-preview`).
 

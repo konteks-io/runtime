@@ -9,7 +9,7 @@ import { BROWSER_MCP_PACKAGE, NativeAgentPackageProfileSchema } from "@konteks/r
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { RunnerConfigSchema } from "../config.js";
 import { BROWSER_ALLOWED_ORIGINS, BROWSER_MCP_SERVER_NAME, browserMcpServer, browserToolFromTitle, bundledBrowserVersion, chromeCandidates, isDeniedBrowserTool } from "../bridge/browser.js";
-import { launcherEnvironment, startBrowserLauncher } from "../bridge/browser-launcher.js";
+import { launcherEnvironment, sanitizeOrigins, startBrowserLauncher, withAllowedOrigins } from "../bridge/browser-launcher.js";
 
 const digest = `sha256:${"a".repeat(64)}`;
 function withBrowser(agentId: "claude-code" | "codex" = "codex") {
@@ -43,7 +43,11 @@ describe("the QA browser MCP server", () => {
     expect(flag("--allowed-origins")).toBe(BROWSER_ALLOWED_ORIGINS);
     expect(flag("--browser")).toBe("chrome");
     expect(flag("--output-dir")).toBe(request.outputDir);
-    expect(chrome.env).toEqual([{ name: "PLAYWRIGHT_BROWSERS_PATH", value: "/state/browsers" }]);
+    // The launcher asks the session's gateway which origins Core opened, to keep --allowed-origins in step.
+    expect(chrome.env).toEqual([
+      { name: "PLAYWRIGHT_BROWSERS_PATH", value: "/state/browsers" },
+      { name: "KONTEKS_BROWSER_ORIGINS_URL", value: `${request.proxyUrl}/.konteks/browser-origins` },
+    ]);
     // No Chrome: Playwright's Chromium, which the launcher installs on first use.
     const chromium = browserMcpServer(config, request, { chrome: () => false })!;
     expect(chromium.args[chromium.args.indexOf("--browser") + 1]).toBe("chromium");
@@ -83,19 +87,21 @@ const fs = require("node:fs"); const path = require("node:path");
 if (process.argv[2] === "install-browser") { fs.writeFileSync(path.join(${JSON.stringify(dir)}, "installed"), process.argv[3]); process.exit(${installExit}); }
 require("node:readline").createInterface({ input: process.stdin }).on("line", line => {
   const m = JSON.parse(line);
+  if (m.method === "initialize") { fs.appendFileSync(path.join(${JSON.stringify(dir)}, "initialized"), String(m.id) + "\\n"); process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: "2025-03-26", capabilities: {} } }) + "\\n"); }
   if (m.method === "tools/list") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { tools: [{ name: "browser_navigate" }, { name: "browser_run_code_unsafe" }, { name: "browser_route" }] } }) + "\\n");
   if (m.method === "tools/call") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { content: [{ type: "text", text: m.params.name + " flags=" + process.argv.slice(2).join(" ") + " installed=" + fs.existsSync(path.join(${JSON.stringify(dir)}, "installed")) + " env=" + Object.keys(process.env).filter(k => k.startsWith("PLAYWRIGHT_")).sort().join(",") }] } }) + "\\n");
 });`);
     return cli;
   }
 
-  function launch(cli: string, env: NodeJS.ProcessEnv) {
+  function launch(cli: string, env: NodeJS.ProcessEnv, extra: { flags?: string[]; fetchOrigins?: () => Promise<string[] | null> } = {}) {
     const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
     const answers = new Map<number, (message: { result: { tools?: Array<{ name: string }>; content?: Array<{ text: string }>; isError?: boolean } }) => void>();
     createInterface({ input: stdout }).on("line", line => { const message = JSON.parse(line); answers.get(message.id)?.(message); });
     let exited: (code: number) => void = () => undefined;
     const exit = new Promise<number>(resolve => { exited = resolve; });
-    startBrowserLauncher({ cli, flags: ["--headless", "--proxy-server", "http://127.0.0.1:1"], env, stdin, stdout, stderr, onExit: code => exited(code) });
+    startBrowserLauncher({ cli, flags: extra.flags ?? ["--headless", "--proxy-server", "http://127.0.0.1:1"], env, stdin, stdout, stderr, onExit: code => exited(code),
+      ...(extra.fetchOrigins ? { fetchOrigins: extra.fetchOrigins } : {}) });
     let id = 0;
     const rpc = (method: string, params: unknown) => new Promise<{ result: { tools?: Array<{ name: string }>; content?: Array<{ text: string }>; isError?: boolean } }>(resolve => {
       const current = ++id;
@@ -133,6 +139,33 @@ require("node:readline").createInterface({ input: process.stdin }).on("line", li
   });
 
   it("keeps Playwright overrides out of the environment", () => {
-    expect(launcherEnvironment({ A: "1", PLAYWRIGHT_MCP_ALLOWED_ORIGINS: "*", KONTEKS_BROWSER_INSTALL: "chromium" })).toEqual({ env: { A: "1" }, installChromium: true });
+    expect(launcherEnvironment({ A: "1", PLAYWRIGHT_MCP_ALLOWED_ORIGINS: "*", KONTEKS_BROWSER_INSTALL: "chromium" })).toEqual({ env: { A: "1" }, installChromium: true, originsUrl: null });
+    // The origins URL is the session gateway on loopback, and never reaches Playwright.
+    expect(launcherEnvironment({ KONTEKS_BROWSER_ORIGINS_URL: "http://127.0.0.1:5000/.konteks/browser-origins" })).toEqual({ env: {}, installChromium: false, originsUrl: "http://127.0.0.1:5000/.konteks/browser-origins" });
+    expect(launcherEnvironment({ KONTEKS_BROWSER_ORIGINS_URL: "https://evil.example/origins" }).originsUrl).toBeNull();
+  });
+
+  it("reads only well-formed http(s) origins from the gateway, and sets the flag in place", () => {
+    expect(sanitizeOrigins({ origins: ["https://b.example", "https://a.example", "https://a.example/path", "javascript:x", 7, "http://c.example:8089"] }))
+      .toEqual(["http://c.example:8089", "https://a.example", "https://b.example"]);
+    expect(sanitizeOrigins({ nope: [] })).toBeNull();
+    expect(withAllowedOrigins(["--x", "--allowed-origins", "a", "--y"], "a;b")).toEqual(["--x", "--allowed-origins", "a;b", "--y"]);
+  });
+
+  it("restarts Playwright MCP with exactly the origins Core opened before the call that needs them, replaying initialize", async () => {
+    const answers: Array<string[] | null> = [[], null, ["https://sess-1.preview.example.com"], ["https://sess-1.preview.example.com"]];
+    const flags = ["--headless", "--allowed-origins", "http://127.0.0.1:*;http://localhost:*"];
+    const launcher = launch(await fakeCli(), { PATH: process.env.PATH }, { flags, fetchOrigins: async () => answers.shift() ?? null });
+    await launcher.rpc("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "agent", version: "1" } });
+    // Nothing opened yet, then the gateway cannot be asked: the flag stays loopback only.
+    expect((await launcher.rpc("tools/call", { name: "browser_navigate", arguments: {} })).result.content![0]!.text).toContain("--allowed-origins http://127.0.0.1:*;http://localhost:* ");
+    expect((await launcher.rpc("tools/call", { name: "browser_navigate", arguments: {} })).result.content![0]!.text).toContain("--allowed-origins http://127.0.0.1:*;http://localhost:* ");
+    // Core opened the session's cloud preview: the next call runs on a restarted server allowing it too.
+    const widened = (await launcher.rpc("tools/call", { name: "browser_navigate", arguments: {} })).result.content![0]!.text;
+    expect(widened).toContain("--allowed-origins http://127.0.0.1:*;http://localhost:*;https://sess-1.preview.example.com ");
+    expect((await launcher.rpc("tools/call", { name: "browser_snapshot", arguments: {} })).result.content![0]!.text).toContain("https://sess-1.preview.example.com");
+    const initialized = (await import("node:fs")).readFileSync(join(dir, "initialized"), "utf8").trim().split("\n");
+    expect(initialized).toEqual(["1", "konteks-browser-restart-1"]);
+    expect(await launcher.close()).toBe(0);
   });
 });

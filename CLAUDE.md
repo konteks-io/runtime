@@ -21,4 +21,6 @@ Claude Code and Codex sessions with a preview (validator, QA-mode and other
 conversations, executor) get a headless browser
 (Playwright MCP, `konteks-browser`, bundled in their agent packages) whose
 every request goes through the session's `PreviewBrowserGateway`, which
-admits only that session's running preview (see AGENTS.md); dsh gets none.
+admits only that session's running preview plus the origins Core's
+`environment_open` answer grants it (read by the session's MCP facade; see
+AGENTS.md); dsh gets none.

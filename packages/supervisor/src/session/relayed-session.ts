@@ -297,6 +297,9 @@ export class RelayedSession {
           return this.deps.redeemCapabilityToken(this.assignment);
         },
         onUnavailable: () => this.close("agent_exited"),
+        // Core's answer to environment_open is the only thing that widens
+        // this session's browser, and only to what Core named.
+        onBrowserAccess: grant => { this.browserGateway?.grant(grant.origins, grant.kind); },
         context: {
           assignmentId: this.assignment.id,
           attempt: this.assignment.attempt,

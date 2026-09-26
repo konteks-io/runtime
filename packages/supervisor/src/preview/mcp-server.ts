@@ -171,7 +171,7 @@ export class PreviewMcpServer {
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: PREVIEW_MCP_SERVER_NAME, title: "Konteks live preview", version: "1.0.0" },
           instructions: this.options.browser
-            ? `Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. Open the returned http://127.0.0.1 URL with the ${BROWSER_MCP_SERVER_NAME} tools (browser_navigate, browser_snapshot, browser_click, browser_type, browser_take_screenshot): that browser reaches only this preview.`
+            ? `Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. Open the returned http://127.0.0.1 URL with the ${BROWSER_MCP_SERVER_NAME} tools (browser_navigate, browser_snapshot, browser_click, browser_type, browser_take_screenshot): that browser reaches only this preview, plus a cloud preview or registered application you open with the quality-assurance environment_open tool (browser_navigate to the signInUrl or url it returns).`
             : "Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. A browser on this computer can open the returned http://127.0.0.1 URL.",
         });
       }
@@ -229,7 +229,7 @@ export function describeStatus(status: PreviewStatus, options: { browser?: boole
   if (status.startedBy === "viewer") lines.push("Started by a viewer who opened the preview in Konteks.");
   else if (status.startedBy === "agent") lines.push("Started by the agent (preview_start).");
   if (status.url) lines.push(`Loopback URL (a browser on this computer): ${status.url}`);
-  if (status.url && options.browser) lines.push(`Open it with ${BROWSER_MCP_SERVER_NAME} browser_navigate; that browser reaches only this URL.`);
+  if (status.url && options.browser) lines.push(`Open it with ${BROWSER_MCP_SERVER_NAME} browser_navigate; that browser reaches only this URL (and what environment_open opens).`);
   if (status.command) lines.push(`Command: ${status.command}${status.explanation ? ` — ${status.explanation}` : ""}`);
   if (status.install) lines.push(`Install step: ${status.install}`);
   if (status.prepare) lines.push(`Prepare step: ${status.prepare}`);

@@ -8,6 +8,16 @@
 export const BROWSER_MCP_SERVER_NAME = "konteks-browser";
 
 /**
+ * Where the session's browser gateway lists the origins Core opened for it
+ * (`GET` on the gateway itself, origin-form). The launcher reads it to keep
+ * Playwright's own `--allowed-origins` in step with the gateway.
+ */
+export const BROWSER_ORIGINS_PATH = "/.konteks/browser-origins";
+
+/** The environment variable that tells the launcher that URL. */
+export const BROWSER_ORIGINS_ENV = "KONTEKS_BROWSER_ORIGINS_URL";
+
+/**
  * Tools the launcher hides from the agent and refuses if called anyway:
  * `browser_run_code_unsafe` runs arbitrary JavaScript in the MCP server's own
  * Node process (outside the browser and its gateway), and the network tools

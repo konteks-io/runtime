@@ -161,3 +161,68 @@ it("never forwards a still-unexpired bearer after renewal closes the owner", asy
   await expect(forward.forward({ headers: {}, url: "/mcp" }, Buffer.from("{}"), false)).rejects.toThrow("Owner lost");
   expect(calls).not.toHaveBeenCalled();
 });
+
+describe("browser access Core opens with environment_open", () => {
+  const later = () => new Date(Date.now() + 600_000).toISOString();
+  const answer = (id: number, over: Record<string, unknown> = {}) => ({
+    jsonrpc: "2.0", id,
+    result: { structuredContent: {
+      target: { kind: "preview", environmentId: "env-1" },
+      signInUrl: "https://session.preview.example.com/__konteks/auth?token=t",
+      browserAccess: { sessionId: "session", origins: [{ origin: "https://session.preview.example.com", expiresAt: later() }] },
+      ...over,
+    } },
+  });
+  async function facadeAnswering(body: unknown, onBrowserAccess = vi.fn()) {
+    const url = await upstream((_request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify(body));
+    });
+    const { entry } = await started({ initial: issue(url, "cloud", Date.now() + 300_000), renew: vi.fn(), onBrowserAccess });
+    const call = (payload: unknown) => fetch(entry.url, { method: "POST", headers: { ...localHeaders(entry), "content-type": "application/json" }, body: JSON.stringify(payload) });
+    return { call, onBrowserAccess };
+  }
+  const open = (id: number, args: Record<string, unknown> = { environmentId: "env-1" }) =>
+    ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "platform__quality-assurance__environment_open", arguments: args } });
+
+  it("hands the session's browser what Core answered, and relays the answer unchanged", async () => {
+    const body = answer(4);
+    const { call, onBrowserAccess } = await facadeAnswering(body);
+    const response = await call(open(4));
+    expect(await response.json()).toEqual(body);
+    expect(onBrowserAccess).toHaveBeenCalledWith({ kind: "cloud_preview", origins: [{ origin: "https://session.preview.example.com", expiresAt: expect.any(String) }] });
+  });
+
+  it("grants nothing from anything the agent says: its arguments, another tool, another session, or a mismatched id", async () => {
+    const other = await facadeAnswering(answer(5));
+    await other.call({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "platform__catalog__get_system", arguments: { origin: "https://evil.example" } } });
+    expect(other.onBrowserAccess).not.toHaveBeenCalled();
+    const foreign = await facadeAnswering(answer(6, { browserAccess: { sessionId: "someone-else", origins: [{ origin: "https://x.example", expiresAt: later() }] } }));
+    await foreign.call(open(6));
+    expect(foreign.onBrowserAccess).not.toHaveBeenCalled();
+    const mismatched = await facadeAnswering(answer(99));
+    await mismatched.call(open(7, { environmentId: "env-1", browserAccess: { sessionId: "session", origins: [{ origin: "https://evil.example", expiresAt: later() }] } }));
+    expect(mismatched.onBrowserAccess).not.toHaveBeenCalled();
+    const batch = await facadeAnswering([answer(8)]);
+    await batch.call([open(8)]);
+    expect(batch.onBrowserAccess).not.toHaveBeenCalled();
+  });
+
+  it("drops expired, non-origin and plain-http external entries, and a refusal grants nothing", async () => {
+    const past = new Date(Date.now() - 1_000).toISOString();
+    const external = await facadeAnswering(answer(9, {
+      target: { kind: "external", registrationId: "reg-1" },
+      browserAccess: { sessionId: "session", origins: [
+        { origin: "https://app.example.com", expiresAt: later() },
+        { origin: "http://app.example.com", expiresAt: later() },
+        { origin: "https://app.example.com/login", expiresAt: later() },
+        { origin: "https://old.example.com", expiresAt: past },
+      ] },
+    }));
+    await external.call(open(9, { registrationId: "reg-1" }));
+    expect(external.onBrowserAccess).toHaveBeenCalledWith({ kind: "external", origins: [{ origin: "https://app.example.com", expiresAt: expect.any(String) }] });
+    const refused = await facadeAnswering({ jsonrpc: "2.0", id: 10, result: { structuredContent: { error: { code: "environment_not_ready" } } } });
+    await refused.call(open(10));
+    expect(refused.onBrowserAccess).not.toHaveBeenCalled();
+  });
+});

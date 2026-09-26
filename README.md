@@ -163,6 +163,15 @@ Claude Code and Codex agent packages, run on their own Node). Its tools
   Other ports on this computer, the internet and HTTPS are refused, and so
   is anything while no preview runs: the browser shows "No live preview is
   running for this session. Call preview_start …";
+- a QA agent can also test the session's cloud preview or a registered
+  application: it calls Konteks' `environment_open` tool, which answers with
+  a one-time sign-in link (cloud preview) or the application's address, and
+  the session's browser may then reach exactly those origins until Konteks
+  says they expire. The connector reads them from Konteks' answer as it
+  passes through the session's platform tool connection, so the agent
+  cannot add an address of its own; a registered application whose name
+  points at this computer is refused. Playwright's own origin list follows
+  (the browser restarts once, before the call that opens the new address);
 - the tools that could run code outside the page or rewrite its traffic
   (`browser_run_code_unsafe`, `browser_route`, …) are hidden and refused;
 - DeepSeek Harness sessions get no browser (dsh carries no agent package to

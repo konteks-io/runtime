@@ -3,9 +3,9 @@ import { join } from "node:path";
 import type { McpServerStdio } from "@agentclientprotocol/sdk";
 import { BROWSER_MCP_PACKAGE } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
-import { BROWSER_MCP_SERVER_NAME } from "./browser-tools.js";
+import { BROWSER_MCP_SERVER_NAME, BROWSER_ORIGINS_ENV, BROWSER_ORIGINS_PATH } from "./browser-tools.js";
 
-export { BROWSER_MCP_SERVER_NAME, BROWSER_DENIED_TOOLS, browserToolFromTitle, isDeniedBrowserTool } from "./browser-tools.js";
+export { BROWSER_MCP_SERVER_NAME, BROWSER_DENIED_TOOLS, BROWSER_ORIGINS_ENV, BROWSER_ORIGINS_PATH, browserToolFromTitle, isDeniedBrowserTool } from "./browser-tools.js";
 
 /**
  * What the supervisor asks for when a session gets a browser: the session's
@@ -19,7 +19,11 @@ export interface BrowserSessionRequest {
   browsersPath: string;
 }
 
-/** Origins the MCP server lets the page request: loopback only (the gateway narrows it to the preview's port). */
+/**
+ * Origins the MCP server lets the page request at start: loopback only (the
+ * gateway narrows it to the preview's port). The launcher adds the origins
+ * Core opens for the session later (see browser-launcher.ts).
+ */
 export const BROWSER_ALLOWED_ORIGINS = "http://127.0.0.1:*;http://localhost:*";
 
 /** Where Playwright's `chrome` channel looks for Google Chrome, per platform. */
@@ -70,6 +74,7 @@ export function browserMcpServer(config: RunnerConfig, request: BrowserSessionRe
     ],
     env: [
       { name: "PLAYWRIGHT_BROWSERS_PATH", value: request.browsersPath },
+      { name: BROWSER_ORIGINS_ENV, value: `${request.proxyUrl}${BROWSER_ORIGINS_PATH}` },
       ...(chrome ? [] : [{ name: "KONTEKS_BROWSER_INSTALL", value: "chromium" }]),
     ],
   };
