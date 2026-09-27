@@ -1,12 +1,12 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { EMBEDDED_RELEASE_ROOTS, resolveNativeConnectorExecutable } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { ReleaseAcceptedSchema, RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
+import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
-import { addNativeAgent, installNative, readNativeRecord, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
+import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
 import { nativePlatform, nativeServiceDefinition, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
@@ -38,21 +38,92 @@ async function serviceDefinition(root: string) {
   const executable = await resolveNativeConnectorExecutable(join(root, "releases", record.releaseId), platform.os);
   return nativeServiceDefinition({ os: platform.os, home: homedir(), root, executable, uid: process.getuid?.(), ...(userId ? { userId } : {}) });
 }
-async function start(input: NativeCommandContext): Promise<void> {
-  const platform = nativePlatform();
-  const installation = await loadNativeInstallation(input.root, { roots: EMBEDDED_RELEASE_ROOTS, platform });
-  await verifyInstalledNativeConnector(installation.release, join(input.root, "releases", installation.record.releaseId), platform);
-  const definition = await serviceDefinition(input.root);
-  const started = await startNativeServiceDefinition(definition, { execute, write: writeSecretFile }).catch(error => {
-    throw new RemoteInstanceError("temporarily_unavailable", "The native user service could not start; installed identity and credentials were preserved.", { cause: error });
+/** The real start path with narrow hooks for collision and stopped-service tests. */
+export async function startNativeConnector(
+  input: NativeCommandContext,
+  deps: {
+    roots?: readonly EmbeddedReleaseRoot[];
+    platform?: ReturnType<typeof nativePlatform>;
+    definition?: (root: string) => Promise<NativeServiceDefinition>;
+    execute?: typeof execute;
+  } = {},
+): Promise<void> {
+  const platform = deps.platform ?? nativePlatform();
+  const roots = deps.roots ?? EMBEDDED_RELEASE_ROOTS;
+  const executeService = deps.execute ?? execute;
+  const installation = await loadNativeInstallation(input.root, { roots, platform });
+  await verifyInstalledNativeConnector(
+    installation.release,
+    join(input.root, "releases", installation.record.releaseId),
+    platform,
+  );
+  const definition = await (deps.definition ?? serviceDefinition)(input.root);
+  // The OS service managers use distinct exit codes for a known stopped
+  // service. Other failures cannot prove this root is safe to rewrite.
+  // systemctl uses 3 for inactive and 4 for a unit not installed yet.
+  const stoppedCodes = platform.os === "macos" ? [113] : platform.os === "debian" ? [3, 4] : [1];
+  const serviceState = async (): Promise<"running" | "stopped"> => {
+    let code: number | null;
+    try { code = await executeService(definition.status); }
+    catch { code = null; }
+    if (code === 0) return "running";
+    if (code !== null && stoppedCodes.includes(code)) return "stopped";
+    throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation is stopped. Inspect and stop only this installation's service before retrying start; identity and local work are unchanged.");
+  };
+  if ((await serviceState()) === "running") {
+    try {
+      await new SupervisorControl(
+        { supervisorData: join(input.root, "supervisor") },
+        installation.record.controlPort,
+      ).call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 2_000 });
+    } catch {
+      throw new RemoteInstanceError(
+        "temporarily_unavailable",
+        `This installation's service is registered or starting, but its control socket on port ${installation.record.controlPort} is unavailable. Stop only this installation's service, then run start again to repair an occupied port; identity and local work are preserved.`,
+      );
+    }
+    input.output.line(
+      "Native user service is already running; use status to inspect cloud readiness.",
+    );
+    return;
+  }
+  const moved = await reassignOccupiedNativeControlPort({
+    root: input.root,
+    roots,
+    platform,
+    serviceStopped: async () => (await serviceState()) === "stopped",
   });
-  if (started === "already_running") { input.output.line("Native user service is already running; use status to inspect cloud readiness."); return; }
-  if (definition.requiresLinger) input.output.line("This Linux user service needs user lingering to remain available after logout. Configure it explicitly if required.");
+  if (moved)
+    input.output.line(
+      `Control port ${moved.previousPort} is occupied by another local process; this stopped connector now uses port ${moved.controlPort}. Its identity and local work are unchanged.`,
+    );
+  const started = await startNativeServiceDefinition(definition, {
+    execute: command => command === definition.status ? serviceState().then(state => state === "running" ? 0 : stoppedCodes[0]!) : executeService(command),
+    write: writeSecretFile,
+  }).catch((error) => {
+    throw new RemoteInstanceError(
+      "temporarily_unavailable",
+      "The native user service could not start; installed identity and credentials were preserved.",
+      { cause: error },
+    );
+  });
+  if (started === "already_running") {
+    input.output.line(
+      "Native user service is already running; use status to inspect cloud readiness.",
+    );
+    return;
+  }
+  if (definition.requiresLinger)
+    input.output.line(
+      "This Linux user service needs user lingering to remain available after logout. Configure it explicitly if required.",
+    );
   // Starting the process is not the same as being open for work: the service
   // finishes unpacking and opens its control port about a minute later. Saying
   // only "started" invited a second and third `start` against a service that
   // was already coming up.
-  input.output.line("Native user service started. It takes about a minute after a fresh install before it is ready for work; agent login and cloud readiness are reported separately by status.");
+  input.output.line(
+    "Native user service started. It takes about a minute after a fresh install before it is ready for work; agent login and cloud readiness are reported separately by status.",
+  );
 }
 
 /** One onboarding step, with a failure said as a step too, never a crash. */
@@ -104,7 +175,7 @@ export const nativeCliActions: NativeCliActions = {
       return;
     }
     const record = await installNative({ ...input, activationId: input.activationId! });
-    await start(input);
+    await startNativeConnector(input);
     input.output.result({ instanceId: record.instanceId, deploymentKind: record.deploymentKind, state: "installed" });
   },
   stageEnrollment: async input => {
@@ -148,14 +219,14 @@ export const nativeCliActions: NativeCliActions = {
     let successor: Awaited<ReturnType<typeof addNativeAgent>> | undefined;
     try {
       successor = await addNativeAgent({ root: input.root, agentId: input.agent, output: input.output });
-      if (wasRunning) await start(input);
+      if (wasRunning) await startNativeConnector(input);
       input.output.result({ instanceId: successor.instanceId, agents: successor.agents, state: "installed" });
     } catch (error) {
       if (successor) {
         try { await restoreNativeRecord(input.root, successor.releaseId, previous); }
         catch (rollbackError) { throw new RemoteInstanceError("temporarily_unavailable", "The new agent did not start and automatic rollback failed; credentials and workspaces remain preserved.", { cause: rollbackError }); }
       }
-      if (wasRunning) await start(input).catch(() => undefined);
+      if (wasRunning) await startNativeConnector(input).catch(() => undefined);
       throw error;
     }
   },
@@ -166,7 +237,7 @@ export const nativeCliActions: NativeCliActions = {
     await service.start();
     await service.waitUntilStopped();
   },
-  start,
+  start: startNativeConnector,
   update: async input => {
     // A release published before Konteks accepts it would install, be refused
     // by Konteks and roll back minutes later (WS1-093). The running service
@@ -212,7 +283,7 @@ export const nativeCliActions: NativeCliActions = {
       const selfUpdated = check?.status === "current" ? selfUpdateNote(attempts, check.bundleVersion) : null;
       if (selfUpdated) input.output.line(selfUpdated);
     }
-    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start, serviceExits }));
+    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits }));
   },
   uninstall: async input => {
     const result = await uninstallNative(input, productionUninstallDeps({ root: input.root, serviceDefinition, execute }));

@@ -149,7 +149,7 @@ const ENROLLMENT_MANIFEST = "enrollment-manifest.json";
  */
 export async function chooseControlPort(preferred = CONTROL_SOCKET_DEFAULT_PORT): Promise<number> {
   const tryListen = (port: number) =>
-    new Promise<number | null>(resolveListen => {
+    new Promise<number | null>((resolveListen) => {
       const server = createServer();
       server.once("error", () => resolveListen(null));
       server.listen(port, "127.0.0.1", () => {
@@ -158,7 +158,69 @@ export async function chooseControlPort(preferred = CONTROL_SOCKET_DEFAULT_PORT)
         server.close(() => resolveListen(chosen));
       });
     });
-  return (await tryListen(preferred)) ?? (await tryListen(0)) ?? preferred;
+  const chosen = (await tryListen(preferred)) ?? (await tryListen(0));
+  if (chosen === null)
+    throw new RemoteInstanceError(
+      "temporarily_unavailable",
+      "No local control port is available; the native connector was not changed.",
+    );
+  return chosen;
+}
+
+/**
+ * A stopped connector may carry a port that another local process has since
+ * taken. Reassign only that installer-owned field, under both native locks,
+ * after verifying the signed installation and the service manager's state.
+ */
+export async function reassignOccupiedNativeControlPort(options: {
+  root: string;
+  serviceStopped: () => Promise<boolean>;
+  roots?: readonly EmbeddedReleaseRoot[];
+  platform?: NativePlatform;
+}): Promise<{ previousPort: number; controlPort: number } | null> {
+  const root = resolve(options.root);
+  if (root === parse(root).root || root === resolve(homedir())) throw invalid();
+  if (!(await options.serviceStopped()))
+    throw new RemoteInstanceError(
+      "temporarily_unavailable",
+      "This connector's service is still registered or running. Stop this installation's service before retrying start; its identity and local work are unchanged.",
+    );
+  const installer = acquireNativeRootLock(join(root, "installer"));
+  let supervisor: ReturnType<typeof acquireNativeRootLock> | undefined;
+  try {
+    supervisor = acquireNativeRootLock(join(root, "supervisor"));
+    if (!(await options.serviceStopped()))
+      throw new RemoteInstanceError(
+        "temporarily_unavailable",
+        "This connector's service began starting. Stop this installation's service before retrying start; its identity and local work are unchanged.",
+      );
+    const roots = options.roots ?? EMBEDDED_RELEASE_ROOTS;
+    const platform = options.platform ?? nativePlatform();
+    const current = (await loadNativeInstallation(root, { roots, platform })).record;
+    const chosen = await chooseControlPort(current.controlPort);
+    if (chosen === current.controlPort) return null;
+    const successor = NativeRuntimeRecordSchema.parse({ ...current, controlPort: chosen });
+    installer.assertOwned();
+    supervisor.assertOwned();
+    if (!(await options.serviceStopped()))
+      throw new RemoteInstanceError(
+        "temporarily_unavailable",
+        "This connector's service began starting. Stop this installation's service before retrying start; its identity and local work are unchanged.",
+      );
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(successor));
+    try {
+      await loadNativeInstallation(root, { roots, platform });
+    } catch (error) {
+      installer.assertOwned();
+      supervisor.assertOwned();
+      await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(current));
+      throw error;
+    }
+    return { previousPort: current.controlPort, controlPort: chosen };
+  } finally {
+    supervisor?.release();
+    installer.release();
+  }
 }
 
 /**

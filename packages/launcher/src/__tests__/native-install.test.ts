@@ -1,12 +1,14 @@
 import { createHash, sign } from "node:crypto";
+import { createServer } from "node:net";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
-import { loadNativeInstallation, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { addNativeAgent, installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
+import { acquireNativeRootLock, loadNativeInstallation, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
+import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, restoreNativeRecord } from "../native/install.js";
+import { startNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { resolveBridgeSpawnSpec, resolveToolingCommand, resolveBridgeFamily } from "@konteks/remote-agent-runner";
@@ -59,6 +61,217 @@ async function personDsh(root: string, version = "0.1.7-rc.2") {
 }
 
 describe("native install composition", () => {
+  it("moves a stopped installation off a port owned by another process without changing durable identity or work", async () => {
+    const f = await fixture();
+    const holder = createServer();
+    await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", resolve));
+    const taken = (holder.address() as { port: number }).port;
+    try {
+      const installed = await installNative({ ...f.options, controlPort: taken } as never);
+      await writeSecretFile(join(f.root, "credentials", "codex", "keep"), "credential");
+      await writeSecretFile(join(f.root, "supervisor", "assignment-journal.keep"), "journal");
+      const identity = await readFile(join(f.root, "supervisor", "identity.json"), "utf8");
+      const manifest = await readFile(join(f.root, "supervisor", "manifest.json"), "utf8");
+
+      const moved = await reassignOccupiedNativeControlPort({
+        root: f.root,
+        roots: f.trust,
+        platform: f.platform,
+        serviceStopped: async () => true,
+      });
+
+      expect(moved).toMatchObject({ previousPort: taken, controlPort: expect.any(Number) });
+      expect(moved?.controlPort).not.toBe(taken);
+      expect(await readNativeRecord(f.root)).toEqual({
+        ...installed,
+        controlPort: moved?.controlPort,
+      });
+      expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(identity);
+      expect(await readFile(join(f.root, "supervisor", "manifest.json"), "utf8")).toBe(manifest);
+      expect(await readFile(join(f.root, "credentials", "codex", "keep"), "utf8")).toBe(
+        "credential",
+      );
+      expect(await readFile(join(f.root, "supervisor", "assignment-journal.keep"), "utf8")).toBe(
+        "journal",
+      );
+      expect(f.activate).toHaveBeenCalledTimes(1);
+      await expect(
+        loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform }),
+      ).resolves.toMatchObject({ record: { controlPort: moved?.controlPort } });
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        holder.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
+  it("leaves an available installed port and its record unchanged", async () => {
+    const f = await fixture();
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const free = (probe.address() as { port: number }).port;
+    await new Promise<void>((resolve, reject) =>
+      probe.close((error) => (error ? reject(error) : resolve())),
+    );
+    const installed = await installNative({ ...f.options, controlPort: free } as never);
+    expect(
+      await reassignOccupiedNativeControlPort({
+        root: f.root,
+        roots: f.trust,
+        platform: f.platform,
+        serviceStopped: async () => true,
+      }),
+    ).toBeNull();
+    expect(await readNativeRecord(f.root)).toEqual(installed);
+  });
+
+  it("refuses to move an installed port while the connector owns its supervisor directory", async () => {
+    const f = await fixture();
+    const holder = createServer();
+    await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", resolve));
+    const taken = (holder.address() as { port: number }).port;
+    try {
+      const installed = await installNative({ ...f.options, controlPort: taken } as never);
+      const owner = acquireNativeRootLock(join(f.root, "supervisor"));
+      try {
+        await expect(
+          reassignOccupiedNativeControlPort({
+            root: f.root,
+            roots: f.trust,
+            platform: f.platform,
+            serviceStopped: async () => true,
+          }),
+        ).rejects.toMatchObject({ code: "temporarily_unavailable" });
+        expect(await readNativeRecord(f.root)).toEqual(installed);
+      } finally {
+        owner.release();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        holder.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
+  it("refuses to move a port when the OS still reports this root's service running", async () => {
+    const f = await fixture();
+    const holder = createServer();
+    await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", resolve));
+    const taken = (holder.address() as { port: number }).port;
+    try {
+      const installed = await installNative({ ...f.options, controlPort: taken } as never);
+      await expect(
+        reassignOccupiedNativeControlPort({
+          root: f.root,
+          roots: f.trust,
+          platform: f.platform,
+          serviceStopped: async () => false,
+        }),
+      ).rejects.toMatchObject({ code: "temporarily_unavailable" });
+      expect(await readNativeRecord(f.root)).toEqual(installed);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        holder.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
+  it("explains the actual port collision and starts the stopped connector on the replacement port", async () => {
+    const f = await fixture();
+    const holder = createServer();
+    await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", resolve));
+    const taken = (holder.address() as { port: number }).port;
+    try {
+      await installNative({ ...f.options, controlPort: taken } as never);
+      const lines: string[] = [];
+      const status = { command: "service-status", args: [] };
+      const definition = {
+        path: join(f.root, "service.plist"),
+        contents: "service",
+        install: [],
+        start: { command: "service-start", args: [] },
+        status,
+        requiresLinger: false,
+      } as never;
+      await startNativeConnector(
+        { root: f.root, output: { ...f.options.output, line: (text) => lines.push(text) } },
+        {
+          roots: f.trust,
+          platform: f.platform,
+          definition: async () => definition,
+          execute: async (command) => (command === status ? 113 : 0),
+        },
+      );
+      expect(lines.join("\n")).toMatch(
+        new RegExp(`Control port ${taken} is occupied by another local process`),
+      );
+      expect(lines.join("\n")).toContain("Native user service started");
+      expect((await readNativeRecord(f.root)).controlPort).not.toBe(taken);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        holder.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
+  it("does not claim a loaded but unreachable service is running or change its port", async () => {
+    const f = await fixture();
+    const holder = createServer();
+    await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", resolve));
+    const taken = (holder.address() as { port: number }).port;
+    try {
+      const installed = await installNative({ ...f.options, controlPort: taken } as never);
+      const status = { command: "service-status", args: [] };
+      const definition = {
+        path: join(f.root, "service.plist"),
+        contents: "service",
+        install: [],
+        start: { command: "service-start", args: [] },
+        status,
+        requiresLinger: false,
+      } as never;
+      await expect(
+        startNativeConnector(
+          { root: f.root, output: f.options.output },
+          {
+            roots: f.trust,
+            platform: f.platform,
+            definition: async () => definition,
+            execute: async () => 0,
+          },
+        ),
+      ).rejects.toMatchObject({
+        code: "temporarily_unavailable",
+        message: expect.stringMatching(
+          /control socket.*unavailable.*Stop only this installation's service/,
+        ),
+      });
+      expect(await readNativeRecord(f.root)).toEqual(installed);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        holder.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
+  it("refuses port recovery when the service manager cannot determine whether this root is stopped", async () => {
+    const f = await fixture();
+    const holder = createServer();
+    await new Promise<void>(resolve => holder.listen(0, "127.0.0.1", resolve));
+    const taken = (holder.address() as { port: number }).port;
+    try {
+      const installed = await installNative({ ...f.options, controlPort: taken } as never);
+      const status = { command: "service-status", args: [] };
+      const definition = { path: join(f.root, "service.plist"), contents: "service", install: [], start: { command: "service-start", args: [] }, status, requiresLinger: false } as never;
+      await expect(startNativeConnector({ root: f.root, output: f.options.output }, {
+        roots: f.trust, platform: f.platform, definition: async () => definition, execute: async () => 7,
+      })).rejects.toMatchObject({ code: "temporarily_unavailable", message: expect.stringMatching(/cannot confirm.*stopped/i) });
+      expect(await readNativeRecord(f.root)).toEqual(installed);
+    } finally {
+      await new Promise<void>((resolve, reject) => holder.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
   it.runIf(process.platform !== "win32")("installs the person's own DeepSeek Harness beside bundled agents, with no package of it", async () => {
     const f = await fixture();
     const dsh = await personDsh(f.root);
