@@ -30,10 +30,11 @@ const EDIT = new Set(["write", "edit", "str_replace_editor"]);
 const READ_ONLY = new Set(DSH_READ_ONLY_TOOLS);
 /**
  * The only MCP servers the runtime gives a session: Konteks' own — the
- * platform facade and the session's preview tools (which act only inside the
- * session's worktree and take no arguments).
+ * platform facade, the session's preview tools (which act only inside the
+ * session's worktree and take no arguments) and the turn result tool
+ * (`submit_result`, which only records a value on this computer).
  */
-const KONTEKS_MCP = /^mcp__konteks-(platform|preview)__[A-Za-z0-9_-]+$/;
+const KONTEKS_MCP = /^mcp__konteks-(platform|preview|result)__[A-Za-z0-9_-]+$/;
 const SANDBOX_WITHIN_WORKSPACE = new Set(["read-only", "workspace-write"]);
 
 /** ACP kinds for dsh's own tools, for activity; never a policy grant by itself. */

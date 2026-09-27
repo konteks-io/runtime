@@ -24,3 +24,9 @@ every request goes through the session's `PreviewBrowserGateway`, which
 admits only that session's running preview plus the origins Core's
 `environment_open` answer grants it (read by the session's MCP facade; see
 AGENTS.md); dsh gets none.
+Every session also gets the `konteks-result` MCP server (`submit_result`,
+`packages/supervisor/src/structured-result/`): a prompt ending with the
+structured-output contract binds its schema to the tool, the connector
+validates the agent's call, falls back to a fenced result and then one
+follow-up prompt, and returns `structuredOutput: { source, value }` with the
+prompt completion (see AGENTS.md).

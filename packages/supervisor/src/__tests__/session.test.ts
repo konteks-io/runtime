@@ -13,6 +13,7 @@ import type { DeferredPermissionBody } from "../core/client.js";
 import { EvaluatorPolicyResponder, isSignInElicitation } from "../session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "../session/workspace-tool-policy.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
+import { renderStructuredOutputContract } from "@konteks/agent-core";
 import type { RunnerPort } from "../runner-port.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import type { OutboundMessage } from "../transport/transport.js";
@@ -166,7 +167,11 @@ describe("relayed session (D98/D113/D114)", () => {
     await session.bootstrap();
     // The agent reaches the platform through the local capability facade; the bearer never leaves memory.
     const mcpServers = (runnerCalls[0]?.[1][0] as { mcpServers: Array<{ url: string; headers: Array<{ value: string }> }> }).mcpServers;
-    expect(mcpServers).toEqual([{ type: "http", name: "konteks", url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/), headers: [{ name: "authorization", value: expect.stringMatching(/^Bearer /) }] }]);
+    // Every session also gets the turn result tool (submit_result), generic until a turn asks for a result.
+    expect(mcpServers).toEqual([
+      { type: "http", name: "konteks", url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/), headers: [{ name: "authorization", value: expect.stringMatching(/^Bearer /) }] },
+      { type: "http", name: "konteks-result", url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/), headers: [{ name: "authorization", value: expect.stringMatching(/^Bearer /) }] },
+    ]);
     expect(JSON.stringify(mcpServers)).not.toContain("cap-token");
     expect(sent[0]?.body).toMatchObject({ kind: "session_ready", assignmentId: "asg", acpSessionRef: "acp-1", resumed: false, agentId: "codex" });
     expect(JSON.stringify(journal.assignments.all())).not.toContain("cap-token");
@@ -184,7 +189,7 @@ describe("relayed session (D98/D113/D114)", () => {
       const f = await build({ preview });
       await f.session.bootstrap();
       const mcpServers = (f.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string; url: string; headers: Array<{ value: string }> }> }).mcpServers;
-      expect(mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-preview"]);
+      expect(mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-preview", "konteks-result"]);
       const tools = mcpServers[1]!;
       expect(tools.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
       const answer = await (await fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value, "content-type": "application/json" },
@@ -213,7 +218,7 @@ describe("relayed session (D98/D113/D114)", () => {
       const f = await build({ preview }, { ...assignment, kind: "planning" } as RemoteWorkAssignment);
       await f.session.bootstrap();
       const mcpServers = (f.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string }> }).mcpServers;
-      expect(mcpServers.map(server => server.name)).toEqual(["konteks"]);
+      expect(mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-result"]);
       await f.session.close("cancelled");
       expect(preview.stop).not.toHaveBeenCalled();
       expect(preview.permit).not.toHaveBeenCalled();
@@ -246,7 +251,7 @@ describe("relayed session (D98/D113/D114)", () => {
       (f.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
       await f.session.bootstrap();
       const input = f.runnerCalls[0]?.[1][0] as { browser?: { proxyUrl: string; outputDir: string; browsersPath: string }; mcpServers: Array<{ name: string }> };
-      expect(input.mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-preview"]);
+      expect(input.mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-preview", "konteks-result"]);
       expect(input.browser).toMatchObject({ proxyUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), browsersPath: "/private/native/browsers" });
       expect(existsSync(input.browser!.outputDir)).toBe(true);
       await expect(viaProxy(input.browser!.proxyUrl, `${origin}/`)).resolves.toEqual({ status: 200, body: "the preview" });
@@ -451,7 +456,7 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(order).toEqual(["inputs", "capability", "wired", "activate", "acp"]);
     const stages = info.mock.calls.filter(call => (call[0] as { event?: string }).event === "native.bootstrap.stage")
       .map(call => call[0] as { stage: string; durationMs: number });
-    expect(stages.map(stage => stage.stage)).toEqual(["input_preparation", "capability_redemption", "facade", "tool_wiring_wait",
+    expect(stages.map(stage => stage.stage)).toEqual(["input_preparation", "capability_redemption", "facade", "result_tool", "tool_wiring_wait",
       "activation", "acp_session_bootstrap", "readiness"]);
     for (const stage of stages) expect(stage.durationMs).toBeGreaterThanOrEqual(0);
   });
@@ -828,6 +833,129 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(journal.openRequests("acp-1")).toHaveLength(0);
     await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } });
     expect(session.counters.unknownCompletions).toBe(2);
+  });
+
+  describe("structured result (submit_result)", () => {
+    const schema = { type: "object", properties: { verdict: { type: "string", enum: ["pass", "fail"] } }, required: ["verdict"], additionalProperties: false };
+    const contract = renderStructuredOutputContract(schema);
+    const promptWithContract = { sessionId: "acp-1", prompt: [{ type: "text" as const, text: "Review the change." }, { type: "text" as const, text: contract }] };
+
+    /** The session's result tool as its agent reaches it; `relists` makes it behave like Claude Code (re-read tools on list_changed). */
+    async function resultTool(runnerCalls: Array<[string, unknown[]]>, relists: boolean) {
+      const servers = (runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string; url: string; headers: Array<{ value: string }> }> }).mcpServers;
+      const tool = servers.find(server => server.name === "konteks-result")!;
+      const headers = { authorization: tool.headers[0]!.value, "content-type": "application/json" };
+      const post = async (body: unknown) => (await fetch(tool.url, { method: "POST", headers, body: JSON.stringify(body) })).json() as Promise<{ result: { tools?: Array<{ inputSchema: unknown }>; content: Array<{ text: string }>; isError?: boolean } }>;
+      const list = () => post({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+      const stream = await fetch(tool.url, { headers: { authorization: tool.headers[0]!.value, accept: "text/event-stream" } });
+      const reader = stream.body!.getReader();
+      void (async () => {
+        for (;;) {
+          const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true }));
+          if (done) return;
+          if (relists && new TextDecoder().decode(value).includes("list_changed")) void list();
+        }
+      })();
+      const submit = (args: unknown) => post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "submit_result", arguments: args } });
+      return { list, submit, stop: () => reader.cancel().catch(() => undefined) };
+    }
+
+    it("lifts the contract into the tool, prompts with one line, and returns the tool's value with the completion", async () => {
+      const { session, sent, runner, runnerCalls } = await build({}, validation);
+      await session.bootstrap();
+      const agent = await resultTool(runnerCalls, true);
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      // The agent read the tool list again, so the schema is only in the tool definition.
+      expect(runner.prompt).toHaveBeenCalledWith("acp-1", "p1", { sessionId: "acp-1", prompt: [{ type: "text", text: "Review the change." }, { type: "text", text: "When you are finished, call `submit_result` once with your result." }] });
+      expect((await agent.list()).result.tools![0]!.inputSchema).toEqual(schema);
+      const wrong = await agent.submit({ verdict: "maybe" });
+      expect(wrong.result.isError).toBe(true);
+      expect(wrong.result.content[0]!.text).toContain("/verdict");
+      await agent.submit({ verdict: "pass" });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn", usage: { totalTokens: 3, inputTokens: 1, outputTokens: 2 } } });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p1", method: "session/prompt", result: { stopReason: "end_turn", usage: { totalTokens: 3, inputTokens: 1, outputTokens: 2 }, structuredOutput: { source: "tool", value: { verdict: "pass" } } } });
+      // The turn is over: the tool is generic again.
+      expect((await agent.list()).result.tools![0]!.inputSchema).toEqual({ type: "object", additionalProperties: true });
+      await agent.stop();
+      await session.close("cancelled");
+    });
+
+    it("puts the schema in the prompt line for an agent that keeps its first tool list (Codex), and still validates the call", async () => {
+      const { session, sent, runner, runnerCalls } = await build({}, validation);
+      await session.bootstrap();
+      const agent = await resultTool(runnerCalls, false);
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      const forwarded = (vi.mocked(runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+      expect(forwarded[1]!.text).toContain("call the `submit_result` tool once with your whole result as its arguments");
+      expect(forwarded[1]!.text).toContain(JSON.stringify(schema, null, 2));
+      expect(forwarded[1]!.text).not.toContain("konteks-structured-output");
+      await agent.submit({ verdict: "fail" });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } });
+      expect(sent.at(-1)?.body).toMatchObject({ result: { structuredOutput: { source: "tool", value: { verdict: "fail" } } } });
+      await agent.stop();
+      await session.close("cancelled");
+    });
+
+    it("accepts a valid fenced result in the agent's text when the tool was not called", async () => {
+      const { session, sent, runner } = await build({}, validation);
+      await session.bootstrap();
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done.\n```konteks-structured-output\n{\"verdict\":" } } } });
+      await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\"pass\"}\n```" } } } });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } });
+      expect(runner.prompt).toHaveBeenCalledTimes(1);
+      expect(sent.at(-1)?.body).toMatchObject({ kind: "acp_result", id: "p1", result: { structuredOutput: { source: "fence", value: { verdict: "pass" } } } });
+      await session.close("cancelled");
+    });
+
+    it("asks once more in the same session when the turn ended with no result, and reports the original prompt after it", async () => {
+      const { session, sent, runner, runnerCalls } = await build({}, validation);
+      await session.bootstrap();
+      const agent = await resultTool(runnerCalls, true);
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "I think it passes." } } } });
+      const before = sent.length;
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn", usage: { totalTokens: 3, inputTokens: 1, outputTokens: 2 } } });
+      // Nothing reported yet: the follow-up runs in the same ACP session.
+      expect(sent.slice(before).some(message => (message.body as { kind?: string }).kind === "acp_result")).toBe(false);
+      expect(runner.prompt).toHaveBeenLastCalledWith("acp-1", "p1#konteks-result-follow-up", { prompt: [{ type: "text", text: "You did not call `submit_result` with a valid result. Call it now, once, with your whole result." }] });
+      await agent.submit({ verdict: "pass" });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1#konteks-result-follow-up", result: { stopReason: "end_turn", usage: { totalTokens: 5, inputTokens: 4, outputTokens: 1 } } });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p1", method: "session/prompt", result: { stopReason: "end_turn", usage: { totalTokens: 8, inputTokens: 5, outputTokens: 3 }, structuredOutput: { source: "follow_up", value: { verdict: "pass" } } } });
+      expect(runner.prompt).toHaveBeenCalledTimes(2);
+      await agent.stop();
+      await session.close("cancelled");
+    });
+
+    it("reports the turn without a result when the follow-up also fails, and never asks twice", async () => {
+      const { session, sent, runner } = await build({}, validation);
+      await session.bootstrap();
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1#konteks-result-follow-up", result: { stopReason: "end_turn" } });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p1", method: "session/prompt", result: { stopReason: "end_turn" } });
+      expect(runner.prompt).toHaveBeenCalledTimes(2);
+      // A follow-up that errors settles the original completion too.
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p2", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p2", result: { stopReason: "end_turn" } });
+      await session.onRunnerEvent({ kind: "request_error", acpSessionRef: "acp-1", requestId: "p2#konteks-result-follow-up", method: "session/prompt", code: -32603, class: "internal", message: "bridge gone", retryable: false });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p2", method: "session/prompt", result: { stopReason: "end_turn" } });
+      await session.close("cancelled");
+    });
+
+    it("does not ask again after a turn that did not end normally, and leaves an ordinary prompt alone", async () => {
+      const { session, sent, runner } = await build({}, validation);
+      await session.bootstrap();
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "cancelled" } });
+      expect(runner.prompt).toHaveBeenCalledTimes(1);
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p1", method: "session/prompt", result: { stopReason: "cancelled" } });
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p2", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Just chat." }] } });
+      expect(runner.prompt).toHaveBeenLastCalledWith("acp-1", "p2", { sessionId: "acp-1", prompt: [{ type: "text", text: "Just chat." }] });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p2", result: { stopReason: "end_turn" } });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p2", method: "session/prompt", result: { stopReason: "end_turn" } });
+      await session.close("cancelled");
+    });
   });
 
   it("backpressures a terminal-fenced prompt before journaling or emitting any transcript frame", async () => {

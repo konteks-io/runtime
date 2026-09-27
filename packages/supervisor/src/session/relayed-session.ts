@@ -44,6 +44,20 @@ import {
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
 import { DshToolGovernance } from "./dsh-tool-governance.js";
+import { compileResultSchema as compileTurnValidator, StructuredResultToolServer, toolInputSchema } from "../structured-result/result-tool-server.js";
+import {
+  findStructuredContract,
+  followUpRequestId,
+  MAX_STRUCTURED_TURN_TEXT,
+  parseFencedResult,
+  RESULT_FOLLOW_UP,
+  RESULT_TOOL_LINE,
+  resultToolLineWithSchema,
+  rewriteStructuredPrompt,
+  sumPromptUsage,
+  type PromptBlock,
+  type StructuredTurnState,
+} from "../structured-result/structured-turn.js";
 
 /**
  * One relayed ACP session (D98/D113/D114): bootstrapped by the supervisor as a
@@ -178,6 +192,10 @@ export class RelayedSession {
   private deliveryAcceptance: RemoteDeliveryAcceptanceReceipt | null = null;
   private mcpFacade: McpCapabilityFacade | null = null;
   private previewTools: PreviewMcpServer | null = null;
+  /** The session's `submit_result` tool (every session has one; it is generic until a turn asks for a result). */
+  private resultTools: StructuredResultToolServer | null = null;
+  /** The turn that asked for a structured result, while it (or its one follow-up) runs. */
+  private structuredTurn: StructuredTurnState | null = null;
   /** The QA browser's gateway (Claude Code and Codex validation, QA and delivery sessions) and its output folder. */
   private browserGateway: PreviewBrowserGateway | null = null;
   private browserOutputDir: string | null = null;
@@ -345,6 +363,11 @@ export class RelayedSession {
       preview.permit?.(sessionId, cwd);
       mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
     }
+    // The turn result tool: every session gets it, so a turn that asks for a
+    // structured result can be answered through a validated tool call.
+    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+    this.resultTools = resultTools;
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
     // Optional tool wiring (Graft) ran alongside redemption and the facade.
     // The agent must find it in place, and the ownership commit below must
     // stay a short step from runner adoption, so settle it here. It never
@@ -670,7 +693,9 @@ export class RelayedSession {
           if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
           const instructions = this.preparedInputs?.skillInstructions;
           const params = instructions ? { ...request.params, prompt: [{ type: "text" as const, text: instructions }, ...request.params.prompt] } : request.params;
-          await this.deps.runner.prompt(ref, request.id, params);
+          const prompt = await this.prepareStructuredPrompt(request.id, params.prompt);
+          try { await this.deps.runner.prompt(ref, request.id, { ...params, prompt }); }
+          catch (error) { this.endStructuredTurn(request.id); throw error; }
         }
         else if (request.method === "session/set_mode") await this.deps.runner.setMode(ref, request.id, request.params);
         else await this.deps.runner.setConfigOption(ref, request.id, request.params);
@@ -757,8 +782,13 @@ export class RelayedSession {
     // Do not convert a bridge transport exception into proof of completion.
     if (message.kind === "acp") {
       if (message.method === "session/prompt") {
-        try { await this.deps.runner.prompt(ref, message.id, params); }
+        try {
+          const current = params as typeof message.params;
+          const prompt = await this.prepareStructuredPrompt(message.id, current.prompt);
+          await this.deps.runner.prompt(ref, message.id, { ...current, prompt });
+        }
         catch (error) {
+          this.endStructuredTurn(message.id);
           // The runner's backstop: it refused because a prompt already runs
           // on this session. Nothing reached the agent, so this is a known
           // denial and the running turn is left alone.
@@ -844,39 +874,16 @@ export class RelayedSession {
       case "session_update": {
         // A working agent keeps its preview from stopping as idle.
         if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
+        this.observeStructuredText((event.params as { update?: unknown } | null)?.update);
         const bypass = this.dshGovernance?.observe((event.params as { update?: unknown } | null)?.update) ?? null;
         await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
         if (bypass) await this.onDshGovernanceBypass(bypass);
         return;
       }
       case "prompt_result": {
-        if (this.assignment.kind === "delivery" && this.assignment.source.kind === "harness_delivery") {
-          if (!this.preparedInputs?.acceptDeliveryOutput) {
-            throw new RemoteInstanceError("capability_unavailable", "Generated delivery output cannot be accepted without current delivery authority.");
-          }
-          await this.completeDeliveryOutput(event.requestId, { kind: "acp_result", id: event.requestId, method: "session/prompt", result: event.result as never });
-          return;
-        }
-        const accepted = await this.completeReceived(event.requestId, "session/prompt", { kind: "acp_result", id: event.requestId, method: "session/prompt", result: event.result as never });
-        // Assistant admission creates one assignment per turn. A persistent
-        // native Codex thread does not exit when its turn ends, so waiting for
-        // session_exited leaks a claimed assignment and blocks the next turn.
-        // Close this assignment, not the shared native server or its history.
-        const stopReason = (event.result as { stopReason?: string })?.stopReason;
-        const nativeTurn = accepted &&
-          (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery");
-        if (nativeTurn && stopReason === "end_turn") await this.close("completed");
-        else if (nativeTurn && typeof stopReason === "string" && !this.closed) {
-          // A turn that ends any other way has still ENDED: a rejected tool
-          // interrupts Claude Code's turn as `cancelled`, a refusal or token
-          // cap ends it likewise. Left open, the claimed assignment kept
-          // heartbeating until the harness deadline (2026-09-15, 27 minutes
-          // for a turn that had stopped at minute ten). Close it so a
-          // terminal reaches Core now.
-          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stopReason },
-            "native turn ended without end_turn; closing the assignment as an agent exit");
-          await this.close("agent_exited");
-        }
+        const settled = await this.settleStructuredTurn(event.requestId, event.result as Record<string, unknown>);
+        if (settled === null) return;
+        await this.onPromptResult(settled.requestId, settled.result);
         return;
       }
       case "set_mode_result":
@@ -886,6 +893,14 @@ export class RelayedSession {
         await this.completeReceived(event.requestId, "session/set_config_option", { kind: "acp_result", id: event.requestId, method: "session/set_config_option", result: event.result as never });
         return;
       case "request_error": {
+        if (event.method === "session/prompt") {
+          const settled = await this.settleStructuredTurnError(event.requestId);
+          if (settled === null) return;
+          if (settled !== undefined) {
+            await this.onPromptResult(settled.requestId, settled.result);
+            return;
+          }
+        }
         const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
         if (accepted && event.method === "session/prompt" &&
             (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery")) {
@@ -916,6 +931,139 @@ export class RelayedSession {
       default:
         return;
     }
+  }
+
+  /** A prompt's completion (with any structured result already attached) goes to its holder. */
+  private async onPromptResult(requestId: string, result: Record<string, unknown>): Promise<void> {
+    if (this.assignment.kind === "delivery" && this.assignment.source.kind === "harness_delivery") {
+      if (!this.preparedInputs?.acceptDeliveryOutput) {
+        throw new RemoteInstanceError("capability_unavailable", "Generated delivery output cannot be accepted without current delivery authority.");
+      }
+      await this.completeDeliveryOutput(requestId, { kind: "acp_result", id: requestId, method: "session/prompt", result: result as never });
+      return;
+    }
+    const accepted = await this.completeReceived(requestId, "session/prompt", { kind: "acp_result", id: requestId, method: "session/prompt", result: result as never });
+    // Assistant admission creates one assignment per turn. A persistent
+    // native Codex thread does not exit when its turn ends, so waiting for
+    // session_exited leaks a claimed assignment and blocks the next turn.
+    // Close this assignment, not the shared native server or its history.
+    const stopReason = (result as { stopReason?: string })?.stopReason;
+    const nativeTurn = accepted &&
+      (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery");
+    if (nativeTurn && stopReason === "end_turn") await this.close("completed");
+    else if (nativeTurn && typeof stopReason === "string" && !this.closed) {
+      // A turn that ends any other way has still ENDED: a rejected tool
+      // interrupts Claude Code's turn as `cancelled`, a refusal or token
+      // cap ends it likewise. Left open, the claimed assignment kept
+      // heartbeating until the harness deadline (2026-09-15, 27 minutes
+      // for a turn that had stopped at minute ten). Close it so a
+      // terminal reaches Core now.
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stopReason },
+        "native turn ended without end_turn; closing the assignment as an agent exit");
+      await this.close("agent_exited");
+    }
+  }
+
+  /**
+   * A prompt that ends with the structured-output contract: bind its schema
+   * to the result tool and give the agent the tool line instead of the
+   * contract. Any other prompt (or a second one while a structured turn still
+   * runs, which the runner refuses anyway) passes unchanged. A schema the
+   * tool cannot compile leaves the contract in place: the fenced answer still
+   * works.
+   */
+  private async prepareStructuredPrompt<B extends PromptBlock>(requestId: string, prompt: B[]): Promise<B[]> {
+    const tools = this.resultTools;
+    if (!tools || this.structuredTurn !== null) return prompt;
+    const contract = findStructuredContract(prompt);
+    if (!contract) return prompt;
+    let definition: Awaited<ReturnType<StructuredResultToolServer["bind"]>>;
+    try { definition = await tools.bind(contract.schema); }
+    catch {
+      this.logger.warn({ event: "structured_result.schema_unusable", assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+        "turn result schema cannot be compiled; the agent answers with the fenced block");
+      return prompt;
+    }
+    this.structuredTurn = { requestId, validate: compileTurnValidator(contract.schema), definition, text: "", followUp: null };
+    const line = definition === "schema" ? RESULT_TOOL_LINE : resultToolLineWithSchema(contract.schema, toolInputSchema(contract.schema).wrapped);
+    return rewriteStructuredPrompt(prompt, contract, line);
+  }
+
+  /** The turn never reached the agent (or was refused): forget it and put the tool back. */
+  private endStructuredTurn(requestId: string): void {
+    const turn = this.structuredTurn;
+    if (!turn || (turn.requestId !== requestId && turn.followUp?.requestId !== requestId)) return;
+    this.structuredTurn = null;
+    this.resultTools?.unbind();
+  }
+
+  /** The agent's own message text during a structured turn, for the fenced fallback. */
+  private observeStructuredText(update: unknown): void {
+    const turn = this.structuredTurn;
+    if (!turn || update === null || typeof update !== "object") return;
+    const value = update as { sessionUpdate?: unknown; content?: { type?: unknown; text?: unknown } };
+    if (value.sessionUpdate !== "agent_message_chunk" || value.content?.type !== "text" || typeof value.content.text !== "string") return;
+    if (turn.text.length < MAX_STRUCTURED_TURN_TEXT) turn.text += value.content.text;
+  }
+
+  /**
+   * A prompt ended. For a structured turn: the tool's recorded value, else a
+   * valid fenced result in the agent's text, else ONE follow-up prompt in
+   * this same ACP session asking for the tool call (its completion settles
+   * the original request). Returns the completion to report, or null while
+   * the follow-up runs.
+   */
+  private async settleStructuredTurn(requestId: string, result: Record<string, unknown>): Promise<{ requestId: string; result: Record<string, unknown> } | null> {
+    const turn = this.structuredTurn;
+    if (!turn) return { requestId, result };
+    const context = { assignmentId: this.assignment.id, attempt: this.assignment.attempt };
+    if (turn.followUp && requestId === turn.followUp.requestId) {
+      const original = turn.followUp.original;
+      const found = this.resultTools?.result() ?? parseFencedResult(turn.text, turn.validate);
+      this.endStructuredTurn(requestId);
+      this.logger.info({ event: "structured_result.settled", ...context, source: found ? "follow_up" : "none" }, "structured turn settled after its follow-up");
+      const usage = sumPromptUsage(original.usage as Record<string, unknown> | null | undefined, result.usage as Record<string, unknown> | null | undefined);
+      return { requestId: turn.requestId, result: { ...original, ...(usage ? { usage } : {}), ...(found ? { structuredOutput: { source: "follow_up", value: found.value } } : {}) } };
+    }
+    if (requestId !== turn.requestId) return { requestId, result };
+    const recorded = this.resultTools?.result();
+    const fenced = recorded ? null : parseFencedResult(turn.text, turn.validate);
+    const found = recorded ? { source: "tool" as const, value: recorded.value } : fenced ? { source: "fence" as const, value: fenced.value } : null;
+    if (found || result.stopReason !== "end_turn" || this.closed || !this.acpSessionRef) {
+      this.endStructuredTurn(requestId);
+      this.logger.info({ event: "structured_result.settled", ...context, source: found?.source ?? "none", stopReason: result.stopReason }, "structured turn settled");
+      return { requestId, result: found ? { ...result, structuredOutput: found } : result };
+    }
+    // Neither a valid call nor a valid fenced result: ask once, in the same session.
+    const followUpId = followUpRequestId(requestId);
+    turn.followUp = { requestId: followUpId, original: result };
+    turn.text = "";
+    this.logger.info({ event: "structured_result.follow_up", ...context }, "structured turn ended without a result; asking once more");
+    try {
+      await this.deps.runner.prompt(this.acpSessionRef, followUpId, { prompt: [{ type: "text", text: RESULT_FOLLOW_UP }] });
+    } catch {
+      this.endStructuredTurn(followUpId);
+      return { requestId, result };
+    }
+    return null;
+  }
+
+  /**
+   * A prompt failed. The follow-up failing settles the original request with
+   * its own completion (undefined = not ours, null = nothing to report); the
+   * original failing just ends the structured turn.
+   */
+  private async settleStructuredTurnError(requestId: string): Promise<{ requestId: string; result: Record<string, unknown> } | null | undefined> {
+    const turn = this.structuredTurn;
+    if (!turn) return undefined;
+    if (turn.followUp && requestId === turn.followUp.requestId) {
+      const original = turn.followUp.original;
+      this.endStructuredTurn(requestId);
+      this.logger.warn({ event: "structured_result.follow_up_failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt }, "the structured follow-up prompt failed; reporting the turn without a result");
+      return { requestId: turn.requestId, result: original };
+    }
+    if (requestId === turn.requestId) this.endStructuredTurn(requestId);
+    return undefined;
   }
 
   /** D87: policy first; defer to a human via the relay when policy allows; fail closed at the deadline. */
@@ -1204,11 +1352,14 @@ export class RelayedSession {
     this.mcpFacade = null;
     const tools = this.previewTools;
     this.previewTools = null;
+    const resultTools = this.resultTools;
+    this.resultTools = null;
+    this.structuredTurn = null;
     const gateway = this.browserGateway;
     this.browserGateway = null;
     const outputDir = this.browserOutputDir;
     this.browserOutputDir = null;
-    await Promise.all([facade?.close(), tools?.close(), gateway?.close(),
+    await Promise.all([facade?.close(), tools?.close(), resultTools?.close(), gateway?.close(),
       outputDir ? rm(outputDir, { recursive: true, force: true }).catch(() => undefined) : undefined]);
   }
 

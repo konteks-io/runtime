@@ -142,6 +142,29 @@ serve:
     VITE_API_URL: http://127.0.0.1:8787
 ```
 
+### Structured results
+
+Some Konteks turns need a typed answer: a plan from the planner, a verdict
+from a validator or QA reviewer, an estimate from ideation. Every session gets
+a third local tool server beside the platform and preview tools,
+`konteks-result`, with one tool, `submit_result`. When a turn's prompt ends
+with Konteks' structured-output contract, the connector takes the JSON Schema
+out of the prompt, makes it the tool's input schema, and tells the agent in
+one line to call `submit_result` when it is finished. It checks every call
+against the schema and answers with exactly what to fix, so the agent corrects
+itself in the same turn; the first valid call is kept and returned to Konteks
+with the turn's completion. If the turn ends without one, the connector looks
+for the result in the agent's final message, and failing that asks the agent
+once more in the same session before it reports the turn. Nothing leaves this
+computer through the tool, and your agent's own session history shows the
+one-line request and the tool call instead of a schema dump.
+
+Claude Code re-reads its tools when the connector announces the schema, so
+the schema only appears in the tool definition. Codex keeps the tool list it
+read when the session started; for Codex the prompt line carries the schema,
+and the tool still validates. A connector older than this keeps the contract
+in the prompt and the agent answers with a fenced JSON block, as before.
+
 ### A browser for QA
 
 Claude Code and Codex sessions that have a preview (the validator, QA-mode

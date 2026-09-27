@@ -43,6 +43,8 @@ describe("DeepSeek Harness tool governance", () => {
     governance.observe(call("m4", "mcp__konteks-preview__preview_start", {}));
     governance.observe(call("m5", "mcp__konteks-previewx__preview_start", {}));
     governance.observe(call("m6", "mcp__konteks-browser__browser_navigate", { url: "http://127.0.0.1:43100/" }));
+    governance.observe(call("m7", "mcp__konteks-result__submit_result", { verdict: "pass" }));
+    governance.observe(call("m8", "mcp__konteks-resultx__submit_result", { verdict: "pass" }));
     governance.observe(call("r1", "grep", { pattern: "x" }));
     governance.observe(call("j1", "job_kill", { id: "1" }));
     governance.observe(call("p1", "plugin_manager", { action: "install" }));
@@ -50,6 +52,9 @@ describe("DeepSeek Harness tool governance", () => {
     // The session's own preview tools act only inside its worktree.
     expect(governance.decide(ask("m4"), CWD)).toEqual({ kind: "allow" });
     expect(governance.decide(ask("m5"), CWD)).toMatchObject({ kind: "deny" });
+    // The turn result tool only records a value on this computer.
+    expect(governance.decide(ask("m7"), CWD)).toEqual({ kind: "allow" });
+    expect(governance.decide(ask("m8"), CWD)).toMatchObject({ kind: "deny" });
     expect(governance.decide(ask("r1"), CWD)).toEqual({ kind: "allow" });
     // The retired browser tool is never mounted, so a server using its name is not Konteks'.
     // DeepSeek Harness gets no QA browser (it carries no package to run it), so its name is refused too.

@@ -74,6 +74,30 @@ the agent's `initialize` (Playwright reads the flag once per context). Never pas
 never npx it at runtime, and never give it to dsh (its governance admits only
 `konteks-platform`/`konteks-preview`).
 
+Structured results go through a tool (`packages/supervisor/src/structured-result/`).
+Every session gets the connector-local `konteks-result` MCP server with one
+tool, `submit_result` (generic, permissive definition while no turn asks). A
+prompt whose LAST text block ends with agent-core's structured-output contract
+(`readStructuredOutputContract`: the `## Required structured output` heading
+and a fenced JSON Schema) binds that schema to the tool
+(`StructuredResultToolServer.bind`): the server sends
+`notifications/tools/list_changed` on the agent's event stream and waits up to
+2 s for a re-read (`toolDefinition: schema`, Claude Code); an agent that does
+not re-read (Codex 0.144, `toolDefinition: generic`, remembered per session)
+gets the schema in the prompt line instead. The contract block is replaced by
+one line (`RESULT_TOOL_LINE`). Calls are validated with Ajv (Ajv2020 for a
+draft 2020-12 schema), a mismatch answers with each problem's path, the first
+valid call wins. At the turn's `prompt_result`: the tool value
+(`source: tool`), else a valid fenced/JSON result in the agent's message text
+(`fence`), else ONE follow-up prompt in the same ACP session
+(`RESULT_FOLLOW_UP`, request id `<id>#konteks-result-follow-up`, never sent to
+Core; its usage is summed into the original completion) whose result is
+`follow_up`; the original request's completion then carries
+`structuredOutput: { source, value }` (packages 7.0.0, additive). Never move
+the schema into a `session/prompt` request field: the native operation permit
+signs the parsed request's digest and an older connector strips unknown
+fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
+
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`). Pi and OpenCode are retired: every
 write or install refuses them with `retiredAgentMessage` from
