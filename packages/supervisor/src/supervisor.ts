@@ -1438,6 +1438,7 @@ export class Supervisor {
   private async onRunnerEvent(agentId: string, event: Parameters<WorkOrchestrator["onRunnerEvent"]>[0]): Promise<void> {
     if (event.kind === "readiness_changed") {
       this.inventory.updateAgent(event.agent);
+      if (this.lastSnapshot) this.lastSnapshot = { ...this.lastSnapshot, agents: this.inventory.agents() };
       const agents = this.inventory.agents();
       this.modelCapabilities?.invalidateForAgents(agents);
       void this.modelCapabilities?.refresh(agents).catch(error => this.logger.warn({ err: error }, "native model capability discovery failed"));
@@ -1753,8 +1754,21 @@ export class Supervisor {
           const runner = this.requireRunner(request.agentId);
           const loginId = `login-${randomUUID()}`;
           this.activeLogins.set(loginId, { agentId: request.agentId, emit: (event) => emit.event(event) });
+          emit.signal.addEventListener("abort", () => {
+            if (!this.activeLogins.delete(loginId)) return;
+            void runner.loginCancel(loginId).catch(error => this.logger.warn({ err: error }, "orphaned local login cancellation failed"));
+          }, { once: true });
           // The person ran this on their own machine: their own login (WS1-115).
-          await runner.login(request.organization, loginId, true);
+          try {
+            await runner.login(request.organization, loginId, true);
+            if (emit.signal.aborted) {
+              await runner.loginCancel(loginId);
+              throw new RemoteInstanceError("temporarily_unavailable", "login caller disconnected");
+            }
+          } catch (error) {
+            this.activeLogins.delete(loginId);
+            throw error;
+          }
           emit.event({ kind: "started", loginId, agentId: request.agentId });
           return { loginId };
         }
@@ -1767,8 +1781,9 @@ export class Supervisor {
         case "auth.cancel": {
           const login = this.activeLogins.get(request.loginId);
           if (!login) return {};
-          await this.requireRunner(login.agentId).loginCancel(request.loginId);
           this.activeLogins.delete(request.loginId);
+          await this.requireRunner(login.agentId).loginCancel(request.loginId);
+          login.emit({ kind: "failed", loginId: request.loginId, code: "login_cancelled", message: "login cancelled" });
           return {};
         }
         case "auth.logout":

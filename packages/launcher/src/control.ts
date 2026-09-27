@@ -21,6 +21,6 @@ export class SupervisorControl {
 
   async call<T>(request: ControlRequest, schema: SchemaParser<T>, options: Partial<Omit<ControlCall<T>, "request" | "schema">> & { timeoutMs?: number } = {}): Promise<T> {
     const token = await this.token();
-    return controlCall({ token, port: this.port, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, { request, schema, ...(options.onEvent ? { onEvent: options.onEvent } : {}) });
+    return controlCall({ token, port: this.port, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, { request, schema, ...(options.onEvent ? { onEvent: options.onEvent } : {}), ...(options.signal ? { signal: options.signal } : {}) });
   }
 }

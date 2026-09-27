@@ -147,6 +147,8 @@ const RequestEnvelopeSchema = z
 
 export interface ControlEmitter {
   event(event: ControlLoginEvent): void;
+  /** Closes when the authenticated caller leaves, including process death. */
+  signal: AbortSignal;
 }
 
 export type ControlHandler = (request: ControlRequest, emit: ControlEmitter) => Promise<unknown>;
@@ -192,6 +194,8 @@ export function startControlSocketServer(
 
 function handleConnection(socket: Socket, options: ControlSocketServerOptions): void {
   socket.setNoDelay(true);
+  const disconnect = new AbortController();
+  socket.once("close", () => disconnect.abort());
   const lines = createInterface({ input: socket, terminal: false });
   // A client that resets mid-read (a `status` probe exiting early) surfaces as
   // an 'error' on the socket AND, independently, on the readline interface.
@@ -235,7 +239,7 @@ function handleConnection(socket: Socket, options: ControlSocketServerOptions): 
       return;
     }
     const { id, request } = envelope.data;
-    const emit: ControlEmitter = { event: (event) => send({ kind: "event", id, event }) };
+    const emit: ControlEmitter = { event: (event) => send({ kind: "event", id, event }), signal: disconnect.signal };
     options
       .handler(request, emit)
       .then((result) => {
@@ -277,6 +281,7 @@ export interface ControlCall<T> {
   request: ControlRequest;
   schema: SchemaParser<T>;
   onEvent?: (event: ControlLoginEvent) => void;
+  signal?: AbortSignal;
 }
 
 function unavailable(message: string, cause?: unknown): RemoteInstanceError {
@@ -300,9 +305,16 @@ export function controlCall<T>(options: ControlSocketClientOptions, call: Contro
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      call.signal?.removeEventListener("abort", onAbort);
       socket.end();
       fn();
     };
+    const onAbort = () => {
+      socket.destroy();
+      finish(() => reject(new RemoteInstanceError("temporarily_unavailable", "control operation interrupted")));
+    };
+    call.signal?.addEventListener("abort", onAbort, { once: true });
+    if (call.signal?.aborted) { onAbort(); return; }
     socket.once("error", (error) => {
       finish(() => reject(unavailable("cannot reach the supervisor control socket", error)));
     });

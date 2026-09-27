@@ -63,6 +63,43 @@ async function fixture() {
 }
 
 describe("native Supervisor composition", () => {
+  it("shows a runner's changed readiness immediately in local auth status", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    const control = supervisor.controlHandler();
+    const emitter = { event: () => undefined } as never;
+    const before = await control({ op: "auth.status", agentId: "codex" }, emitter) as { agents: Array<{ readiness: string }> };
+    expect(before.agents[0]?.readiness).toBe("not_configured");
+    await (supervisor as unknown as { onRunnerEvent(agentId: string, event: unknown): Promise<void> }).onRunnerEvent("codex", {
+      kind: "readiness_changed", agent: { ...before.agents[0], readiness: "ready", connectionState: "ready", recoveryAction: undefined },
+    });
+    const after = await control({ op: "auth.status", agentId: "codex" }, emitter) as { agents: Array<{ readiness: string }> };
+    expect(after.agents[0]?.readiness).toBe("ready");
+    const roster = await control({ op: "agents" }, emitter) as { agents: Array<{ readiness: string }> };
+    expect(roster.agents[0]?.readiness).toBe("ready");
+    expect((supervisor as unknown as { lastSnapshot: { agents: Array<{ readiness: string }> } }).lastSnapshot.agents[0]?.readiness).toBe("ready");
+  });
+  it("cancels a local login when its control caller disconnects", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    const runner = (supervisor as unknown as { runners: Map<string, { login: (organization: boolean, loginId: string, personal?: boolean) => Promise<{ loginId: string }>; loginCancel: (loginId: string) => Promise<unknown> }> }).runners.get("codex")!;
+    const login = vi.spyOn(runner, "login").mockImplementation(async (_organization, loginId) => ({ loginId }));
+    const cancel = vi.spyOn(runner, "loginCancel").mockResolvedValue({ cancelled: true });
+    const disconnect = new AbortController();
+    const events = vi.fn();
+    const started = await supervisor.controlHandler()({ op: "auth.login", agentId: "codex", organization: false }, { event: events, signal: disconnect.signal });
+    expect(started).toMatchObject({ loginId: expect.any(String) });
+    expect(login).toHaveBeenCalledWith(false, (started as { loginId: string }).loginId, true);
+    disconnect.abort();
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith((started as { loginId: string }).loginId));
+    expect((supervisor as unknown as { activeLogins: Map<string, unknown> }).activeLogins.size).toBe(0);
+    const next = await supervisor.controlHandler()({ op: "auth.login", agentId: "codex", organization: false }, { event: events, signal: new AbortController().signal }) as { loginId: string };
+    await supervisor.controlHandler()({ op: "auth.cancel", loginId: next.loginId }, { event: () => undefined, signal: new AbortController().signal });
+    expect(events).toHaveBeenCalledWith({ kind: "failed", loginId: next.loginId, code: "login_cancelled", message: "login cancelled" });
+    expect((supervisor as unknown as { activeLogins: Map<string, unknown> }).activeLogins.size).toBe(0);
+  });
   it.each(["mode", "expiresAt", "issuedAt", "drainDeadline"])("rejects stored lease %s metadata that disagrees with its canonical claims", async field => {
     const f = await fixture(), result = heartbeatLease();
     const claims = decodeLeaseClaims(result.lease, { instanceId: "instance", audience: LEASE_AUDIENCE });

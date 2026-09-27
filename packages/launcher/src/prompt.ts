@@ -27,9 +27,19 @@ export async function promptSecret(options: SecretPromptOptions): Promise<string
   const muted = new Writable({ write: (_chunk, _encoding, callback) => callback() });
   const rl = createInterface({ input, output: muted, terminal: true });
   output.write(`${options.label} (input hidden): `);
-  const value = await new Promise<string>((resolve) => rl.question("", resolve));
-  rl.close();
-  output.write("\n");
+  let value: string;
+  try {
+    value = await new Promise<string>((resolve, reject) => {
+      let answered = false;
+      const interrupted = () => reject(new RemoteInstanceError("temporarily_unavailable", `${options.label} entry was interrupted`));
+      rl.once("SIGINT", () => { rl.close(); interrupted(); });
+      rl.once("close", () => { if (!answered) interrupted(); });
+      rl.question("", answer => { answered = true; resolve(answer); });
+    });
+  } finally {
+    rl.close();
+    output.write("\n");
+  }
   const trimmed = value.trim();
   if (trimmed.length < (options.minLength ?? 8) || trimmed.length > (options.maxLength ?? 4_096)) {
     throw new RemoteInstanceError("activation_invalid", `${options.label} has an unexpected length`);

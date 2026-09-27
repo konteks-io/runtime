@@ -84,6 +84,9 @@ export async function authLogin(context: ControlContext, agentId: string, organi
     const ok = await ask(`Attest that the ${agentId} account you are about to log in is owned by your organization and may serve colleagues' work?`);
     if (!ok) throw new RemoteInstanceError("ownership_promotion_denied", "organization attestation declined; log in without --organization for a personal account");
   }
+  const interrupted = new AbortController();
+  let promptError: unknown = null;
+  let loginFailure: Extract<ControlLoginEvent, { kind: "failed" }> | null = null;
   const onEvent = (event: ControlLoginEvent): void => {
     switch (event.kind) {
       case "started":
@@ -98,17 +101,26 @@ export async function authLogin(context: ControlContext, agentId: string, organi
       case "prompt":
         void secret(event.label)
           .then((text) => context.control.call({ op: "auth.input", loginId: event.loginId, text }, z.unknown()))
-          .catch((error: unknown) => context.output.error(error));
+          .catch((error: unknown) => { promptError = error; interrupted.abort(); });
         return;
       case "completed":
         context.output.line(`login complete: ${agentId} is ${event.readiness}${organization ? " (organization scope attested)" : ""}`);
         return;
       case "failed":
-        context.output.line(`login failed (${event.code}): ${event.message}`);
+        loginFailure = event;
         return;
     }
   };
-  await context.control.call({ op: "auth.login", agentId, organization }, z.object({ loginId: z.string() }), { onEvent, timeoutMs: 20 * 60_000 });
+  try {
+    await context.control.call({ op: "auth.login", agentId, organization }, z.object({ loginId: z.string() }), { onEvent, signal: interrupted.signal, timeoutMs: 20 * 60_000 });
+  } catch (error) {
+    if (promptError !== null) throw promptError;
+    throw error;
+  }
+  if (loginFailure !== null) {
+    const failure: Extract<ControlLoginEvent, { kind: "failed" }> = loginFailure;
+    throw new RemoteInstanceError("agent_auth_required", `login failed (${failure.code}): ${failure.message}`);
+  }
 }
 
 export async function authLogout(context: ControlContext, agentId: string): Promise<void> {

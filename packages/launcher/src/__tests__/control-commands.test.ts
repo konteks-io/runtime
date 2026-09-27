@@ -1,6 +1,6 @@
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
-import type { ControlRequest, SupervisorStatus } from "@konteks/remote-common";
+import { RemoteInstanceError, type ControlRequest, type SupervisorStatus } from "@konteks/remote-common";
 import { authLogin, previewStatus, status, type ControlContext } from "../native/control-commands.js";
 import { createOutput } from "../output.js";
 
@@ -21,7 +21,7 @@ const supervisorStatus: SupervisorStatus = {
   journal: { assignments: 0, outboxDepth: 0, recoveryRequired: 0 },
 };
 
-function fake(options: { json?: boolean; confirm?: boolean } = {}) {
+function fake(options: { json?: boolean; confirm?: boolean; loginFailure?: boolean } = {}) {
   const calls: ControlRequest[] = [];
   let text = "";
   const sink = new Writable({ write(chunk, _encoding, done) { text += chunk.toString(); done(); } });
@@ -36,6 +36,10 @@ function fake(options: { json?: boolean; confirm?: boolean } = {}) {
       }
       if (request.op === "auth.login") {
         callOptions?.onEvent?.({ kind: "started", loginId: "l1", agentId: request.agentId });
+        if (options.loginFailure) {
+          callOptions?.onEvent?.({ kind: "failed", loginId: "l1", code: "agent_auth_required", message: "the DeepSeek API key was not saved" });
+          return schema.parse({ loginId: "l1" });
+        }
         callOptions?.onEvent?.({ kind: "open_url", loginId: "l1", url: "https://login.example/device", userCode: "ABCD-1234" });
         callOptions?.onEvent?.({ kind: "prompt", loginId: "l1", label: "Paste the code", secret: true });
         callOptions?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
@@ -54,6 +58,24 @@ function fake(options: { json?: boolean; confirm?: boolean } = {}) {
 }
 
 describe("native control commands", () => {
+  it("fails the command when the supervisor reports a failed login", async () => {
+    const f = fake({ loginFailure: true });
+    await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "agent_auth_required" });
+    expect(f.text()).not.toContain("pasted-secret-value");
+  });
+  it("ends the login connection when the hidden prompt is interrupted", async () => {
+    const f = fake();
+    let signal: AbortSignal | undefined;
+    f.context.promptSecret = async () => { throw new RemoteInstanceError("temporarily_unavailable", "key entry interrupted"); };
+    f.context.control.call = (async (request: ControlRequest, _schema: unknown, options?: { onEvent?: (event: unknown) => void; signal?: AbortSignal }) => {
+      if (request.op !== "auth.login") throw new Error("unexpected control request");
+      signal = options?.signal;
+      options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "DeepSeek API key", secret: true });
+      return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new RemoteInstanceError("temporarily_unavailable", "control operation interrupted")), { once: true }));
+    }) as typeof f.context.control.call;
+    await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(signal?.aborted).toBe(true);
+  });
   it("shows session previews read-only and points to Konteks for the per-machine switch", async () => {
     const f = fake();
     await previewStatus(f.context);

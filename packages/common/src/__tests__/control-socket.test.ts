@@ -17,6 +17,48 @@ afterEach(async () => {
 const token = "t".repeat(32);
 
 describe("loopback control socket", () => {
+  it("notifies an active login when its authenticated client disconnects", async () => {
+    let started!: () => void;
+    const handled = new Promise<void>(resolve => { started = resolve; });
+    const disconnected = vi.fn();
+    const server = await startControlSocketServer({ token, port: 0, handler: async (request, emit) => {
+      if (request.op !== "auth.login") return {};
+      (emit as typeof emit & { signal: AbortSignal }).signal.addEventListener("abort", disconnected);
+      emit.event({ kind: "started", loginId: "l1", agentId: request.agentId });
+      started();
+      return { loginId: "l1" };
+    } });
+    servers.push(server);
+    const client = connect({ host: "127.0.0.1", port: server.port });
+    await new Promise<void>(resolve => client.once("connect", resolve));
+    client.write(`${JSON.stringify({ auth: token })}\n`);
+    client.write(`${JSON.stringify({ id: "login", request: { op: "auth.login", agentId: "codex", organization: false } })}\n`);
+    await handled;
+    client.destroy();
+    await vi.waitFor(() => expect(disconnected).toHaveBeenCalledOnce());
+  });
+  it("aborts an interactive login call and closes its socket", async () => {
+    let started!: () => void;
+    const handled = new Promise<void>(resolve => { started = resolve; });
+    const disconnected = vi.fn();
+    const server = await startControlSocketServer({ token, port: 0, handler: async (request, emit) => {
+      if (request.op !== "auth.login") return {};
+      emit.signal.addEventListener("abort", disconnected);
+      emit.event({ kind: "started", loginId: "l1", agentId: request.agentId });
+      started();
+      return { loginId: "l1" };
+    } });
+    servers.push(server);
+    const abort = new AbortController();
+    const login = controlCall({ token, port: server.port }, {
+      request: { op: "auth.login", agentId: "codex", organization: false },
+      schema: z.object({ loginId: z.string() }), signal: abort.signal,
+    });
+    await handled;
+    abort.abort();
+    await expect(login).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    await vi.waitFor(() => expect(disconnected).toHaveBeenCalledOnce());
+  });
   it("returns an unavailable error when the service has stopped, without an uncaught stream error", async () => {
     const server = await startControlSocketServer({ token, port: 0, handler: async () => ({}) });
     await server.close();
