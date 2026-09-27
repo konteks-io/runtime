@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { FixedClock, catalogueModelAuthority, computeAgentModelCapabilityMappingDigest } from "@konteks/remote-common";
+import { FixedClock, catalogueModelAuthority, computeAgentModelCapabilityMappingDigest, keyedFingerprint } from "@konteks/remote-common";
 import { ModelCapabilitySnapshotProducer } from "../native/model-capability-snapshot.js";
 
 const clock = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
@@ -75,5 +75,21 @@ describe("authenticated model offered-values snapshot producer", () => {
       mappings: () => [expired], catalogueAgents: () => ["claude-code"], discover: async () => ({ currentValue: "sonnet", offeredValues: ["sonnet"] }), newId: () => "snapshot" });
     await producer.refresh([ready]);
     expect(producer.snapshots().map(snapshot => snapshot.mappingId)).toEqual(["catalogue-claude-code-models"]);
+  });
+
+  it("publishes DSH catalogue models when its HMAC digest begins with base64url punctuation", async () => {
+    const dsh = { ...ready, agentId: "dsh", displayName: "DeepSeek Harness",
+      authIdentityFingerprint: keyedFingerprint(Buffer.alloc(32), "identity-28") };
+    const currentValue = '["deepseek-official","deepseek-flash"]';
+    const producer = new ModelCapabilitySnapshotProducer({ clock, instanceId: () => "instance",
+      runnerIncarnation: () => "process", manifestId: () => "manifest", mappings: () => [],
+      catalogueAgents: () => ["dsh"], discover: async () => ({ currentValue, offeredValues: [currentValue] }),
+      newId: () => "snapshot" });
+
+    await producer.refresh([dsh]);
+
+    expect(producer.snapshots()).toEqual([expect.objectContaining({ agentId: "dsh",
+      mappingId: "catalogue-dsh-models", authIdentityFingerprint: dsh.authIdentityFingerprint,
+      offeredValues: [currentValue] })]);
   });
 });
