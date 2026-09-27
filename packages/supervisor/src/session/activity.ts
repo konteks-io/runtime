@@ -21,6 +21,20 @@ export interface CanonicalAcpToolIdentity {
 }
 
 /**
+ * Tool arguments, results, and bridge metadata are private to the local
+ * agent. Remove them before the first bounded wire parse: a legitimate deep
+ * result must not make the public tool completion disappear. The ordinary
+ * activity redaction still checks every field that is allowed onto the wire.
+ */
+export function omitPrivateAcpToolPayload(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const update = value as Record<string, unknown>;
+  if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") return value;
+  return Object.fromEntries(Object.entries(update).filter(([key]) =>
+    key !== "rawInput" && key !== "rawOutput" && key !== "_meta"));
+}
+
+/**
  * Promote a bridge-specific tool identity into ACP's ordinary public fields
  * before `_meta` is discarded. The relay intentionally never persists private
  * metadata, so this local boundary is the last place Claude's safe Agent and

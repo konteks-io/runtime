@@ -39,6 +39,7 @@ import {
   canonicalizeAcpToolActivity,
   continuesAtBoundary,
   endsInsidePath,
+  omitPrivateAcpToolPayload,
   redactActivity,
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
@@ -575,7 +576,7 @@ export class RelayedSession {
       }
       canonicalMessage = {
         ...message,
-        params: { ...message.params, update: canonicalUpdate },
+        params: { ...message.params, update: omitPrivateAcpToolPayload(canonicalUpdate) },
       };
     }
     const parsed = SessionToCoreMessageSchema.safeParse(canonicalMessage);

@@ -633,6 +633,62 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(serialized).toContain("src/index.ts");
   });
 
+  it.each(["completed", "failed"] as const)("relays a %s terminal for a deep private MCP result without changing its public outcome", async status => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    const deepBreakdown = { result: { structuredContent: { breakdown: { roadmap: { milestones: [{ sprints: [{
+      id: "S1", tickets: [{ ref: "T2", dependsOnRefs: ["T1"] }],
+    }] }] } } } } };
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: {
+        sessionUpdate: "tool_call_update", toolCallId: "exec-breakdown", status,
+        rawInput: { token: SECRET_CANARIES.openAiKey }, rawOutput: deepBreakdown,
+        content: [{ type: "content", content: { type: "text", text: `Plan ready in /private/native/checkout with ${SECRET_CANARIES.bearer}` } }],
+      },
+    } });
+    expect(sent).toHaveLength(before + 1);
+    expect(sent.at(-1)?.body).toMatchObject({ kind: "acp", method: "session/update", params: {
+      update: { toolCallId: "exec-breakdown", status, content: [{ type: "content", content: { type: "text", text: expect.stringContaining("Plan ready") } }] },
+    } });
+    const serialized = JSON.stringify(sent.at(-1)?.body);
+    expect(serialized).not.toMatch(/rawInput|rawOutput|structuredContent|private\/native/);
+    expect(serialized).not.toContain(SECRET_CANARIES.openAiKey);
+    expect(serialized).not.toContain(SECRET_CANARIES.bearer);
+    expect(serialized).toContain("Bearer [redacted]");
+    expect(session.counters.malformedResponses).toBe(0);
+  });
+
+  it("allows an oversized private tool result without forwarding it", async () => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: {
+        sessionUpdate: "tool_call_update", toolCallId: "oversized-private", status: "completed",
+        rawOutput: { result: "x".repeat(530_000) },
+      },
+    } });
+    expect(sent).toHaveLength(before + 1);
+    expect(sent.at(-1)?.body).toMatchObject({ kind: "acp", params: { update: { toolCallId: "oversized-private", status: "completed" } } });
+    expect(JSON.stringify(sent.at(-1)?.body)).not.toContain("rawOutput");
+    expect(session.counters.malformedResponses).toBe(0);
+  });
+
+  it("still rejects invalid public tool fields and oversized public content after private payload normalization", async () => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    for (const update of [
+      { sessionUpdate: "tool_call_update", toolCallId: "bad-title", status: "completed", title: "x".repeat(2049), rawOutput: { secret: "hidden" } },
+      { sessionUpdate: "tool_call_update", toolCallId: "bad-content", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(70_000) } }], rawOutput: { secret: "hidden" } },
+    ]) {
+      await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update } });
+    }
+    expect(sent).toHaveLength(before);
+    expect(session.counters.malformedResponses).toBe(2);
+  });
+
   it.each([
     ["Agent", "other"],
     ["ToolSearch", "search"],
