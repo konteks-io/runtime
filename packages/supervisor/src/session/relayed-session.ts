@@ -582,6 +582,13 @@ export class RelayedSession {
     if (!parsed.success) {
       // A bridge payload that fails the vendored ACP schema is converted, never forwarded (D113).
       this.counters.malformedResponses += 1;
+      this.logger.warn({
+        event: "session.acp_message_rejected",
+        assignmentId: this.assignment.id,
+        acpSessionRef: this.acpSessionRef,
+        toolCallId: canonicalIdentity?.toolCallId,
+        stage: "wire_schema",
+      }, "Native session update did not match the relay contract");
       if ("id" in message && typeof message.id === "string" && "method" in message && message.kind !== "acp") {
         await this.sendToCore({ kind: "acp_error", id: message.id, method: message.method as "session/prompt", error: malformed() });
       }
@@ -612,7 +619,17 @@ export class RelayedSession {
       else this.lastChunkText.set(update.sessionUpdate, { text: chunkText, inPath: endsInsidePath(chunkText, continuesPath, startsAtBoundary) });
       const safe = SessionToCoreMessageSchema.safeParse(redactActivity(body, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
         { startsAtBoundary, continuesPath }));
-      if (!safe.success) { this.counters.malformedResponses += 1; return; }
+      if (!safe.success) {
+        this.counters.malformedResponses += 1;
+        this.logger.warn({
+          event: "session.acp_message_rejected",
+          assignmentId: this.assignment.id,
+          acpSessionRef: this.acpSessionRef,
+          toolCallId: canonicalIdentity?.toolCallId,
+          stage: "redacted_schema",
+        }, "Redacted native session update did not match the relay contract");
+        return;
+      }
       body = safe.data;
     }
     const sourceSequence = await this.deps.beforeSendToCore?.(body);
