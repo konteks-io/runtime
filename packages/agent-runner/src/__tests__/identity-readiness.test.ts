@@ -97,6 +97,11 @@ describe("ConnectedAgentView projection", () => {
     expect(view).toMatchObject({ agentId: "dsh", readiness: "ready", tokenUsageObservable: false });
   });
 
+  it("projects a verified host version only for DeepSeek Harness", () => {
+    expect(projectReadiness({ ...base, family: findAgentBridge("dsh")!, hostAgentVersion: "0.1.5-rc.3" }).hostAgentVersion).toBe("0.1.5-rc.3");
+    expect(projectReadiness({ ...base, hostAgentVersion: "bridge-1" })).not.toHaveProperty("hostAgentVersion");
+  });
+
   it("is ready with sanitized capabilities and only the opaque fingerprint", () => {
     const view = projectReadiness(base);
     expect(view).toMatchObject({ agentId: "codex", readiness: "ready", accountScope: "personal", tokenUsageObservable: true });

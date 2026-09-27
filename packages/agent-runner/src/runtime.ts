@@ -573,6 +573,8 @@ export class AgentRuntime {
       scope: this.scope,
       identity: this.identity,
       bridgeVersionCompatible: true,
+      ...(this.family.agentId === "dsh" && this.options.config.RUNNER_BRIDGE_VERSION !== "unknown"
+        ? { hostAgentVersion: this.options.config.RUNNER_BRIDGE_VERSION } : {}),
       lastProbeAt: this.lastProbeAt,
     });
   }

@@ -24,6 +24,8 @@ export interface ReadinessInputs {
   scope: AgentScopeState;
   identity: "signal" | "logged_out" | "no_official_signal" | "unknown";
   bridgeVersionCompatible: boolean;
+  /** The verified installed DSH version; never an ACP bridge version. */
+  hostAgentVersion?: string;
   lastProbeAt: string | null;
 }
 
@@ -47,6 +49,7 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
       toolControl: TOOL_CONTROL[inputs.family.agentId],
     },
   };
+  if (inputs.family.agentId === "dsh" && inputs.hostAgentVersion) view.hostAgentVersion = inputs.hostAgentVersion;
   if (inputs.scope.authIdentityFingerprint !== null) view.authIdentityFingerprint = inputs.scope.authIdentityFingerprint;
   if (inputs.scope.scopeAttestedAt !== null) view.scopeAttestedAt = inputs.scope.scopeAttestedAt;
   if (inputs.lastProbeAt !== null) view.lastProbeAt = inputs.lastProbeAt;
