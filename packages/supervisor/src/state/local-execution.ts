@@ -329,6 +329,17 @@ export class LocalExecutionJournal {
     return structuredClone({ admission: state.admission, acpSessionRef: state.acpSessionRef, processOwner: state.processOwner });
   }
 
+  /** Current durable owner of a repository-role session head. Read-only: this
+   * does not make the head continuable and grants no execution authority. */
+  harnessRoleHead(successorAssignment: RemoteWorkAssignment): LocalAdmission | undefined {
+    const successor = RemoteWorkAssignmentSchema.parse(successorAssignment);
+    if (successor.source.kind !== "harness_delivery") return undefined;
+    this.index();
+    const head = this.harnessHeads.get(successor.source.executionSessionId);
+    const state = head && this.executions.get(head.executionGeneration);
+    return state ? structuredClone(state.admission) : undefined;
+  }
+
   /** The execution that last took over a repository-role session head's ACP
    * session, following its live or restored continuation chain. Undefined
    * when the head was never continued. Read-only; grants nothing.
