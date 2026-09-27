@@ -190,6 +190,12 @@ describe("erase, drain, version, rotation", () => {
     await handlers.handle(signByCore({ type: "version_policy" as const, instanceId: "inst-1", targetBundle: "1.3.0", manifestDigest: "d".repeat(43), updateAvailable: true, minimumSupportedBundle: "1.0.0", issuedAt: "2026-09-06T00:00:00Z" }));
     expect(acks[0]).toMatchObject({ type: "version_ack", bundleVersion: "1.2.0", status: "running" });
     expect(compareSemver("1.2.0", "1.10.0")).toBeLessThan(0);
+    expect(compareSemver("0.7.6-rc.2", "0.7.6-rc.1")).toBeGreaterThan(0);
+    expect(compareSemver("0.7.6", "0.7.6-rc.2")).toBeGreaterThan(0);
+    expect(compareSemver("1.0.0-rc.10", "1.0.0-rc.2")).toBeGreaterThan(0);
+    expect(compareSemver("1.0.0-1", "1.0.0-alpha")).toBeLessThan(0);
+    expect(compareSemver("1.0.0+build.2", "1.0.0+build.1")).toBe(0);
+    expect(compareSemver("1.2", "1.10")).toBeLessThan(0);
   });
 
   it("answers a rotation challenge with both signatures and never swaps before commit", async () => {

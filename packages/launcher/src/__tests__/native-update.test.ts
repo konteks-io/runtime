@@ -16,7 +16,7 @@ import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fix
 const roots: string[] = [];
 afterEach(async () => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
-async function fixture() {
+async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0" }: { oldVersion?: string; nextVersion?: string } = {}) {
   const root = await mkdtemp(join(tmpdir(), "native-cli-update-")); roots.push(root);
   const claudeTool = join(root, "operator-claude");
   await writeFile(claudeTool, "claude-not-executed", { mode: 0o700 });
@@ -27,14 +27,14 @@ async function fixture() {
     const bytes = Buffer.from(`test-native-executable-not-run-${version}`);
     return { bytes, artifact: { id: "connector", kind: "connector", format: "executable", os: "macos", architecture: "arm64", url: `https://releases.example/connector-${version}`, digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, sizeBytes: bytes.byteLength } };
   };
-  const old = connector("1.0.0"), next = connector("1.1.0");
+  const old = connector(oldVersion), next = connector(nextVersion);
   const signed = (body: Record<string, unknown>) => {
     const unsigned = { ...body, digest: computeBundleManifestDigest(body as never) };
     return { ...unsigned, signature: { algorithm: "Ed25519", keyId: keys.keyId, value: sign(null, bundleManifestSigningBytes(unsigned as never), keys.privateKey).toString("base64url") } };
   };
   const base = { protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], expiresAt: "2027-01-01T00:00:00Z" };
-  const oldManifest = signed({ ...base, bundleVersion: "1.0.0", nativeArtifacts: [old.artifact, claude.artifact] });
-  const manifest = signed({ ...base, bundleVersion: "1.1.0", nativeArtifacts: [next.artifact, claude.artifact] });
+  const oldManifest = signed({ ...base, bundleVersion: oldVersion, nativeArtifacts: [old.artifact, claude.artifact] });
+  const manifest = signed({ ...base, bundleVersion: nextVersion, nativeArtifacts: [next.artifact, claude.artifact] });
   const trust = [{ ...keys.root, coreControlKeys: [{ keyId: keys.keyId, publicKeyJwk: keys.root.publicKeyJwk }] }];
   const platform = { os: "macos", architecture: "arm64", deploymentKind: "native_connector", containerBackend: "none" } as const;
   const activate = vi.fn(async ({ release }: { release: { manifest: typeof manifest } }) => {
@@ -51,6 +51,12 @@ async function fixture() {
 }
 
 describe("native update staging and commit", () => {
+  it("offers a newer signed rc build with the same release core", async () => {
+    const f = await fixture({ oldVersion: "0.7.6-rc.1", nextVersion: "0.7.6-rc.2" });
+    expect(await checkNativeUpdate({ root: f.root, deps: { ...f.deps, manifest: f.manifest } })).toMatchObject({
+      status: "available", release: { manifest: { bundleVersion: "0.7.6-rc.2" } },
+    });
+  });
   it("explains the long signed-package staging wait and how to return to the result (WS3-008)", async () => {
     const f = await fixture();
     const lines: string[] = [];

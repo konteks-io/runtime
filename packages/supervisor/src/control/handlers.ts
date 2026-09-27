@@ -24,6 +24,7 @@ import {
   type VersionAcknowledgement,
   type VersionPolicy,
 } from "@konteks/remote-common";
+import { compareAgentVersions } from "@konteks/remote-release";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { SupervisorStore } from "../state/store.js";
 import type { SupervisorJournal } from "../state/journal.js";
@@ -258,6 +259,11 @@ export class ControlHandlers {
 }
 
 export function compareSemver(a: string, b: string): number {
+  // Signed releases use SemVer precedence, including prerelease identifiers.
+  // Older wire projections accepted broader version strings, so retain their
+  // previous numeric-core ordering when either value is not valid SemVer.
+  try { return compareAgentVersions(a, b); }
+  catch { /* Compatibility with pre-SemVer bundle strings. */ }
   const parse = (value: string): number[] => value.split("-")[0]!.split(".").map((part) => Number.parseInt(part, 10) || 0);
   const left = parse(a);
   const right = parse(b);
