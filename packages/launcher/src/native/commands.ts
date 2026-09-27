@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
+import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
@@ -144,6 +144,124 @@ async function onboardStep(input: { root: string; output: NativeCommandContext["
   }
 }
 
+interface NativeAgentAddDeps {
+  readRecord: (root: string) => Promise<NativeRuntimeRecord>;
+  serviceDefinition: (root: string) => Promise<NativeServiceDefinition>;
+  execute: (command: NativeServiceCommand) => Promise<number | null>;
+  control: (root: string, record: NativeRuntimeRecord) => Pick<SupervisorControl, "call">;
+  add: typeof addNativeAgent;
+  restore: typeof restoreNativeRecord;
+  start: (input: NativeCommandContext) => Promise<void>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  platform: ReturnType<typeof nativePlatform>;
+  stopDeadlineMs?: number;
+  pollMs?: number;
+}
+
+const productionAgentAddDeps: NativeAgentAddDeps = {
+  readRecord: readNativeRecord,
+  serviceDefinition,
+  execute,
+  control: (root, record) => new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort),
+  add: addNativeAgent,
+  restore: restoreNativeRecord,
+  start: startNativeConnector,
+  sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+  now: Date.now,
+  platform: nativePlatform(),
+};
+
+/** Drain, stop and wait for ownership before changing an installed agent list. */
+export async function runNativeAgentAdd(input: NativeCommandContext & { agent: string }, deps: NativeAgentAddDeps = productionAgentAddDeps): Promise<void> {
+  const previous = await deps.readRecord(input.root);
+  if (previous.agents.includes(input.agent as NativeRuntimeRecord["agents"][number])) {
+    input.output.line(`${input.agent} is already installed; no restart is needed.`);
+    return;
+  }
+  const definition = await deps.serviceDefinition(input.root);
+  const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
+  const initialStatus = await deps.execute(definition.status);
+  if (initialStatus !== 0 && (initialStatus === null || !stoppedCodes.includes(initialStatus))) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation's service state. Inspect only this installation's service before adding an agent; identity and local work are unchanged.");
+  const wasRunning = initialStatus === 0;
+  let stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+  const wait = async () => deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
+  const stopped = async () => {
+    const code = await deps.execute(definition.status);
+    if (code === 0) return false;
+    if (code !== null && stoppedCodes.includes(code)) return true;
+    throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation stopped; its identity and local work are unchanged.");
+  };
+  if (wasRunning) {
+    const control = deps.control(input.root, previous);
+    const drain = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
+    await control.call({ op: "drain", reason: "update" }, z.unknown());
+    const drainDeadline = deps.now() + 15 * 60_000;
+    for (;;) {
+      const state = await control.call({ op: "drain.status" }, drain);
+      if (state.activeAssignments === 0) break;
+      if (deps.now() >= drainDeadline) throw new RemoteInstanceError("active_work", "Agent installation waited 15 minutes for active work; the runtime remains running and drained so it can be inspected safely.");
+      input.output.line(`waiting for ${state.activeAssignments} active assignment(s) before installing ${input.agent}…`);
+      await deps.sleep(deps.pollMs ?? 5_000);
+    }
+    if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
+    stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+    while (!await stopped()) {
+      if (deps.now() >= stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping; its installed agents were not changed.");
+      await wait();
+    }
+  }
+  let successor: NativeRuntimeRecord | undefined;
+  let ownershipUnsettled = false;
+  let saidWaiting = false;
+  try {
+    for (;;) {
+      try {
+        successor = await deps.add({ root: input.root, agentId: input.agent as NativeRuntimeRecord["agents"][number], output: input.output });
+        ownershipUnsettled = false;
+        break;
+      } catch (error) {
+        const owned = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message);
+        if (!owned) throw error;
+        ownershipUnsettled = true;
+        if (deps.now() >= stopDeadline) throw error;
+        if (!saidWaiting) { input.output.line("Waiting for the stopped connector to release its private data before adding the agent…"); saidWaiting = true; }
+        await wait();
+        if (wasRunning && !await stopped()) throw new RemoteInstanceError("temporarily_unavailable", "This connector started again before agent installation; stop only this installation's service and retry.");
+      }
+    }
+    if (wasRunning) await deps.start(input);
+    input.output.result({ instanceId: successor.instanceId, agents: successor.agents, state: "installed" });
+  } catch (error) {
+    if (successor) {
+      try {
+        if (wasRunning) {
+          const code = await deps.execute(definition.status);
+          if (code === 0 && await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The new service could not be stopped before agent rollback.");
+          if (code !== 0 && (code === null || !stoppedCodes.includes(code))) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm the new service stopped before agent rollback.");
+          stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+          while (!await stopped()) {
+            if (deps.now() >= stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", "The new service did not finish stopping before agent rollback.");
+            await wait();
+          }
+        }
+        for (;;) {
+          try { await deps.restore(input.root, successor.releaseId, previous); break; }
+          catch (restoreError) {
+            const owned = restoreError instanceof RemoteInstanceError && restoreError.code === "temporarily_unavailable" && /owns this native data directory/.test(restoreError.message);
+            if (!owned || deps.now() >= stopDeadline) throw restoreError;
+            await wait();
+          }
+        }
+      } catch (rollbackError) {
+        throw new RemoteInstanceError("temporarily_unavailable", "Agent installation failed and automatic rollback could not restore the previous record; identity and local work were preserved.", { cause: rollbackError });
+      }
+    }
+    if (wasRunning && !ownershipUnsettled) await deps.start(input).catch(() => undefined);
+    throw error;
+  }
+}
+
 export const nativeCliActions: NativeCliActions = {
   install: async input => {
     if (input.enroll) {
@@ -192,44 +310,7 @@ export const nativeCliActions: NativeCliActions = {
     else if (step.done) input.output.line(`${step.done.summary}\n${step.done.links.site}`);
     else if (step.note) input.output.line(step.note);
   },
-  addAgent: async input => {
-    const previous = await readNativeRecord(input.root);
-    if (previous.agents.includes(input.agent)) {
-      input.output.line(`${input.agent} is already installed; no restart is needed.`);
-      return;
-    }
-    const definition = await serviceDefinition(input.root);
-    const wasRunning = await execute(definition.status) === 0;
-    if (wasRunning) {
-      const control = new SupervisorControl({ supervisorData: join(input.root, "supervisor") }, previous.controlPort);
-      const drain = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
-      await control.call({ op: "drain", reason: "update" }, z.unknown());
-      const deadline = Date.now() + 15 * 60_000;
-      for (;;) {
-        const state = await control.call({ op: "drain.status" }, drain);
-        // Idle ACP sessions are durable and resume after restart; only an
-        // executing assignment must reach its terminal report first.
-        if (state.activeAssignments === 0) break;
-        if (Date.now() >= deadline) throw new RemoteInstanceError("active_work", "Agent installation waited 15 minutes for active work; the runtime remains running and drained so it can be inspected safely.");
-        input.output.line(`waiting for ${state.activeAssignments} active assignment(s) before installing ${input.agent}…`);
-        await new Promise(resolve => setTimeout(resolve, 5_000));
-      }
-      if (await execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
-    }
-    let successor: Awaited<ReturnType<typeof addNativeAgent>> | undefined;
-    try {
-      successor = await addNativeAgent({ root: input.root, agentId: input.agent, output: input.output });
-      if (wasRunning) await startNativeConnector(input);
-      input.output.result({ instanceId: successor.instanceId, agents: successor.agents, state: "installed" });
-    } catch (error) {
-      if (successor) {
-        try { await restoreNativeRecord(input.root, successor.releaseId, previous); }
-        catch (rollbackError) { throw new RemoteInstanceError("temporarily_unavailable", "The new agent did not start and automatic rollback failed; credentials and workspaces remain preserved.", { cause: rollbackError }); }
-      }
-      if (wasRunning) await startNativeConnector(input).catch(() => undefined);
-      throw error;
-    }
-  },
+  addAgent: runNativeAgentAdd,
   serve: async input => {
     const service = createNativeService({ root: input.root, roots: EMBEDDED_RELEASE_ROOTS, platform: nativePlatform(),
       prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(input.root, cwd, agentId),
