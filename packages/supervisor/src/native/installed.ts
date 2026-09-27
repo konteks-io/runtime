@@ -2,14 +2,18 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { RemoteInstanceError, type RemoteNativeArtifact } from "@konteks/remote-common";
-import { presentNativeConnectorExecutables, selectNativeArtifacts, verifyOfflineAgentPackage, type VerifiedNativeRelease } from "@konteks/remote-release";
+import { isHostAgentId, presentNativeConnectorExecutables, selectNativeArtifacts, verifyOfflineAgentPackage, type VerifiedNativeRelease } from "@konteks/remote-release";
 import type { RunnerConfig } from "@konteks/remote-agent-runner";
 
 /** Verify the complete installed package before any native bridge is spawned. */
 export async function verifyInstalledNativeBridges(release: VerifiedNativeRelease, runners: readonly RunnerConfig[], platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" }): Promise<void> {
   if (runners.length === 0) throw untrusted();
-  const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: runners.map(runner => runner.RUNNER_AGENT_ID) });
-  for (const runner of runners) {
+  // Host-installed agents are verified against their local package at load,
+  // and intentionally have no signed offline bridge artifact in the release.
+  const bundled = runners.filter(runner => !isHostAgentId(runner.RUNNER_AGENT_ID));
+  if (bundled.length === 0) return;
+  const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: bundled.map(runner => runner.RUNNER_AGENT_ID) });
+  for (const runner of bundled) {
     const artifact = artifacts.find(candidate => candidate.agentId === runner.RUNNER_AGENT_ID);
     if (artifact?.format === "offline_agent_tgz") {
       const profile = await verifyOfflineAgentPackage(runner.RUNNER_BRIDGE_PREFIX, artifact);

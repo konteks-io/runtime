@@ -11,6 +11,7 @@ import type { BridgeProcess } from "@konteks/remote-agent-runner";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, previewTuning } from "../native/installation.js";
+import { verifyInstalledNativeBridges } from "../native/installed.js";
 import { createNativeService } from "../native/service.js";
 import { SupervisorStore } from "../state/store.js";
 import { acquireNativeRootLock } from "../native/root-lock.js";
@@ -169,9 +170,19 @@ describe("closed native runtime installation", () => {
     expect(runner).toMatchObject({ RUNNER_AGENT_ID: "dsh", RUNNER_NATIVE_DSH_ROOT: supported, RUNNER_NATIVE_DSH_ENTRY: join(supported, "lib", "bin.js"), RUNNER_NATIVE_DSH_NODE: node, RUNNER_BRIDGE_VERSION: "0.1.7-rc.2", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "dsh"), RUNNER_WORKSPACE_DIR: join(root, "workspaces", "dsh") });
     expect(runner).not.toHaveProperty("RUNNER_NATIVE_PACKAGE_PROFILE");
     expect(runner).not.toHaveProperty("RUNNER_NATIVE_PACKAGE_ARTIFACT");
+    // Startup rechecks the full runner list; a host-installed dsh has no
+    // signed bridge archive, while Codex's bundled archive remains verified.
+    await expect(verifyInstalledNativeBridges(loaded.release, loaded.runners, f.options.platform)).resolves.toBeUndefined();
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["dsh"], dshRoot: supported, dshNode: node }));
+    const hostOnly = await loadNativeInstallation(root, f.options);
+    await expect(verifyInstalledNativeBridges(hostOnly.release, hostOnly.runners, f.options.platform)).resolves.toBeUndefined();
     // An upgrade out of the tested range stops the load with the install hint, never a silent run.
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: await dsh("0.1.8"), dshNode: node }));
     await expect(loadNativeInstallation(root, f.options)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_unsupported_version" });
+    await writeFile(f.executable, "tampered");
+    await expect(verifyInstalledNativeBridges(loaded.release, loaded.runners, f.options.platform)).rejects.toMatchObject({ code: "bundle_untrusted" });
+    await rm(f.executable);
+    await expect(verifyInstalledNativeBridges(loaded.release, loaded.runners, f.options.platform)).rejects.toMatchObject({ code: "bundle_untrusted" });
     expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["claude-code", "codex", "dsh"] }).success).toBe(true);
   });
   it("still loads a record written before 7.0.0 that lists Pi or OpenCode, without them", async () => {
