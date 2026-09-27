@@ -1,12 +1,12 @@
 import { ChildProcess } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { expect, it, vi } from "vitest";
-import { spawnPiped, type PipedChildProcess } from "@konteks/remote-common";
+import { isProcessGroupAlive, spawnPiped, type PipedChildProcess } from "@konteks/remote-common";
 import { spawnBridge, type BridgeStopOwner } from "../bridge/process.js";
 import type { BridgeSpawnSpec } from "../bridge/spec.js";
 
 vi.mock("@konteks/remote-common", async importOriginal => ({
-  ...await importOriginal<object>(), spawnPiped: vi.fn(), stopProcessGroupLeaderFirst: vi.fn(async () => undefined),
+  ...await importOriginal<object>(), spawnPiped: vi.fn(), stopProcessGroupLeaderFirst: vi.fn(async () => undefined), isProcessGroupAlive: vi.fn(() => false),
 }));
 
 it("refuses an unobserved process exit and retains the provisional stop owner for retry", async () => {
@@ -27,6 +27,8 @@ it("refuses an unobserved process exit and retains the provisional stop owner fo
   await expect(owners[0]!.stop()).rejects.toThrow("Bridge process exit remains unconfirmed");
   child.exitCode = 0;
   child.emit("exit", 0, null);
+  vi.mocked(isProcessGroupAlive).mockReturnValueOnce(true);
+  await expect(owners[0]!.stop()).rejects.toThrow("Bridge process group exit remains unconfirmed");
   await expect(owners[0]!.stop()).resolves.toBeUndefined();
   expect(owners[0]!.exited).toBe(true);
   child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy();

@@ -619,7 +619,7 @@ export class CoreClient {
   }
 
   /** Long-poll Core's retained planning terminal intents for this native owner. */
-  async pullControllerDirectives(instanceId: string, candidate: ControllerDirectivePullInput): Promise<PlanningControllerDirectivePullResult> {
+  async pullControllerDirectives(instanceId: string, candidate: ControllerDirectivePullInput, signal?: AbortSignal): Promise<PlanningControllerDirectivePullResult> {
     const input = ControllerDirectivePullInputSchema.parse(candidate);
     const result = await this.http.request({
       method: "POST",
@@ -627,6 +627,7 @@ export class CoreClient {
       bodyFactory: () => PlanningControllerDirectivePullRequestSchema.parse({ ...input,
         proof: this.proof("controller_directives_pull", instanceId, input as unknown as { [key: string]: JsonValue }) }),
       schema: PlanningControllerDirectivePullResultSchema,
+      ...(signal ? { signal } : {}),
       idempotencyKey: `controller-directives:${instanceId}:${input.runnerIncarnation}:${input.afterSequence}`,
     });
     if (result.highWater < input.afterSequence || (result.directives.length === 0 && result.highWater > input.afterSequence)) throw new RemoteInstanceError("assignment_conflict", "Controller directive page skipped retained work");

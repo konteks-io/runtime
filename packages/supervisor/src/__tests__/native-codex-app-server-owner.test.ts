@@ -5,6 +5,10 @@ import type { PipedChildProcess } from "@konteks/remote-common";
 import type { RunnerConfig } from "@konteks/remote-agent-runner";
 import { NativeCodexAppServerOwner } from "../native/codex-app-server-owner.js";
 
+vi.mock("@konteks/remote-common", async importOriginal => ({
+  ...await importOriginal<object>(), isProcessGroupAlive: vi.fn(() => false),
+}));
+
 function child(): PipedChildProcess {
   const process = new EventEmitter() as PipedChildProcess;
   Object.assign(process, {
@@ -44,6 +48,22 @@ function fixture() {
 }
 
 describe("native shared Codex app-server owner", () => {
+  it("refuses to attest shutdown while the exact owned process group remains alive", async () => {
+    const f = fixture();
+    let groupAlive = true;
+    const owner = new NativeCodexAppServerOwner({
+      config, spawn: f.spawn, stop: f.stop, prepareSocket: f.prepareSocket,
+      waitUntilReady: f.waitUntilReady, cleanupSocket: f.cleanupSocket,
+      verifyPackage: f.verifyPackage, groupAlive: () => groupAlive,
+    });
+    await owner.start();
+
+    await expect(owner.stop()).rejects.toMatchObject({ code: "agent_unavailable" });
+    expect(f.cleanupSocket).not.toHaveBeenCalled();
+    groupAlive = false;
+    await owner.stop();
+  });
+
   it("can be started again after a start that failed (WS1-018)", async () => {
     const f = fixture();
     f.waitUntilReady.mockRejectedValueOnce(new Error("socket never came up"));

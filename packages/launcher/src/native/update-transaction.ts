@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
 import { isHostAgentId } from "@konteks/remote-release";
-import { recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
+import { NATIVE_SHUTDOWN_RECEIPT_FILE, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
@@ -27,6 +28,8 @@ export interface NativeUpdateTransactionDeps {
   recordAttempt: (root: string, attempt: NativeUpdateAttempt) => Promise<unknown>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  /** A fresh receipt is written only after this connector's shutdown steps succeed. */
+  readStopReceipt?: (root: string) => Promise<string | null>;
   /** How often the OS has started the service and its last exit code; null where it cannot say. */
   serviceExits?: (definition: NativeServiceDefinition) => Promise<{ runs: number; lastExitCode: number | null } | null>;
   drainDeadlineMs?: number;
@@ -60,6 +63,10 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
     recordAttempt: recordNativeUpdateAttempt,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     now: Date.now,
+    readStopReceipt: async root => readFile(join(root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), "utf8").catch(error => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }),
   };
 }
 
@@ -101,11 +108,13 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
   const wasRunning = await deps.execute(definition.status) === 0;
   const control = deps.control(input.root, previous);
   let stopped = false;
+  let stopConfirmed = false;
   let successor: NativeRuntimeRecord | undefined;
   try {
     const failingBefore = wasRunning ? await failingDoctorChecks(control).catch(() => new Set<string>()) : new Set<string>();
     if (wasRunning) {
       await drain(input, control, deps);
+      const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
       if (await deps.execute(definition.stop) !== 0) {
         await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
         throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
@@ -114,7 +123,8 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       // launchd and Task Scheduler acknowledge a stop before the process has
       // finished its graceful shutdown; the record may only move once the old
       // service is gone and has released the runtime directory.
-      await waitForServiceExit(input, definition, deps);
+      await waitForServiceExit(input, definition, deps, previousReceipt);
+      stopConfirmed = true;
     }
     successor = await commitOnceReleased(input, staged.releaseId, deps);
     if (wasRunning) {
@@ -132,7 +142,8 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     if (successor) {
       input.output.line(`Update to ${successor.bundleVersion} failed its health gate; rolling back to ${previous.releaseId}.`);
       try {
-        if (await deps.execute(definition.stop).catch(() => null) === 0) await waitForServiceExit(input, definition, deps);
+        const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
+        if (await deps.execute(definition.stop).catch(() => null) === 0) await waitForServiceExit(input, definition, deps, previousReceipt);
         await restoreOnceReleased(input, successor.releaseId, previous, deps);
         if (wasRunning) {
           await deps.start(input);
@@ -148,17 +159,17 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
         throw new RemoteInstanceError("temporarily_unavailable", "The updated connector did not pass its health gate and automatic rollback failed; identity, credentials and workspaces remain preserved.", { cause: rollbackError });
       }
     } else {
-      if (stopped && wasRunning) await deps.start(input).catch(() => undefined);
+      if (stopped && stopConfirmed && wasRunning) await deps.start(input).catch(() => undefined);
       await finish("failed", detail);
     }
     throw error;
   }
 }
 
-async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
+async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null): Promise<void> {
   const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
   const progress = progressLines(input, deps, "Stopping the connector: it closes its agent sessions and relay first, which usually takes under a minute…", "still stopping the connector");
-  while (await deps.execute(definition.status) === 0) {
+  while (await deps.execute(definition.status) === 0 || (deps.readStopReceipt && await deps.readStopReceipt(input.root).then(receipt => receipt === null || receipt === previousReceipt))) {
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
     progress();
     await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));

@@ -15,6 +15,7 @@ import {
 import {
   RemoteInstanceError,
   captureRetainedProcessOwner,
+  isProcessGroupAlive,
   createLogger,
   spawnPiped,
   stopProcessGroupLeaderFirst,
@@ -122,6 +123,9 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
       // quiescence or authorize release of retained execution capacity.
       if (!exited && child.exitCode === null && child.signalCode === null) {
         throw new RemoteInstanceError("recovery_required", "Bridge process exit remains unconfirmed.");
+      }
+      if (isProcessGroupAlive(child)) {
+        throw new RemoteInstanceError("recovery_required", "Bridge process group exit remains unconfirmed.");
       }
     },
   };

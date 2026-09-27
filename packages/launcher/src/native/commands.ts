@@ -1,8 +1,9 @@
 import { homedir } from "node:os";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
@@ -37,6 +38,54 @@ async function serviceDefinition(root: string) {
   // `konteks-connector`, or `connector` in a release from before the rename (a rollback may return to one).
   const executable = await resolveNativeConnectorExecutable(join(root, "releases", record.releaseId), platform.os);
   return nativeServiceDefinition({ os: platform.os, home: homedir(), root, executable, uid: process.getuid?.(), ...(userId ? { userId } : {}) });
+}
+
+interface NativeStopDeps {
+  definition: (root: string) => Promise<NativeServiceDefinition>;
+  execute: typeof execute;
+  readReceipt: (root: string) => Promise<string | null>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  platform: ReturnType<typeof nativePlatform>;
+  deadlineMs?: number;
+  pollMs?: number;
+}
+
+const productionNativeStopDeps: NativeStopDeps = {
+  definition: serviceDefinition,
+  execute,
+  readReceipt: async root => readFile(join(root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), "utf8").catch(error => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }),
+  sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+  now: Date.now,
+  platform: nativePlatform(),
+};
+
+/** launchctl bootout acknowledges deregistration before asynchronous owned
+ * process cleanup has necessarily finished. A new private receipt is written
+ * only after every daemon shutdown step succeeds. */
+export async function stopNativeConnector(input: NativeCommandContext, deps: NativeStopDeps = productionNativeStopDeps): Promise<void> {
+  const definition = await deps.definition(input.root);
+  const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
+  const initialStatus = await deps.execute(definition.status);
+  if (initialStatus !== 0) {
+    if (initialStatus !== null && stoppedCodes.includes(initialStatus)) throw new RemoteInstanceError("temporarily_unavailable", "The native service is already stopped; this invocation cannot attest an earlier owned-process cleanup. Inspect only this installation before changing its release.");
+    throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation is running; no stop was attempted.");
+  }
+  const previousReceipt = await deps.readReceipt(input.root);
+  if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native user service could not be stopped; inspect its OS service status.");
+  input.output.line("Service manager accepted stop; waiting for this connector's owned-process cleanup…");
+  const deadline = deps.now() + (deps.deadlineMs ?? 30_000);
+  for (;;) {
+    const receipt = await deps.readReceipt(input.root);
+    const status = await deps.execute(definition.status);
+    if (receipt !== null && receipt !== previousReceipt && status !== null && stoppedCodes.includes(status)) break;
+    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The service manager stopped this connector, but its owned process cleanup is unconfirmed. Inspect only this installation before changing its release.");
+    await deps.sleep(deps.pollMs ?? 250);
+  }
+  input.output.line("Native service stopped; identity, credentials and local work are preserved.");
 }
 /** The real start path with narrow hooks for collision and stopped-service tests. */
 export async function startNativeConnector(
@@ -370,11 +419,7 @@ export const nativeCliActions: NativeCliActions = {
     const result = await uninstallNative(input, productionUninstallDeps({ root: input.root, serviceDefinition, execute }));
     input.output.result(result);
   },
-  stop: async input => {
-    const definition = await serviceDefinition(input.root);
-    if (await execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native user service could not be stopped; inspect its OS service status.");
-    input.output.line("Native service stopped; identity, credentials and local work are preserved.");
-  },
+  stop: stopNativeConnector,
   control: async input => {
     const record = await readNativeRecord(input.root);
     const context = { output: input.output, control: new SupervisorControl({ supervisorData: join(input.root, "supervisor") }, record.controlPort) };

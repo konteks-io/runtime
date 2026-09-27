@@ -191,6 +191,18 @@ describe("native update transaction", () => {
     expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "applied"]);
     expect(h.currentRecord().releaseId).toBe("release-next");
   });
+  it("waits for the old connector's new cleanup receipt before committing a signed update", async () => {
+    const h = harness({ previous });
+    let receipt = "prior-stop";
+    let waits = 0;
+    h.deps.readStopReceipt = async () => receipt;
+    h.deps.sleep = async () => { waits += 1; if (waits === 2) receipt = "current-stop"; };
+
+    await runNativeUpdate({ root: "/root", output: h.output }, h.deps);
+
+    expect(waits).toBe(2);
+    expect(h.calls.indexOf("commit")).toBeGreaterThan(h.calls.indexOf("stop"));
+  });
   it("does not hold an update back for the person's own DeepSeek Harness when it is left out", async () => {
     const h = harness({ previous: { ...previous, agents: ["claude-code", "dsh"] } });
     const control = h.deps.control;

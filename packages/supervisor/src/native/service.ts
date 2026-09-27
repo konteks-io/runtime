@@ -1,12 +1,16 @@
 import { startControlSocketServer, type ControlSocketServer } from "@konteks/remote-common";
 import { join } from "node:path";
-import { createDaemon, type CreateDaemonOptions, type Daemon } from "../daemon.js";
+import { randomUUID } from "node:crypto";
+import { createDaemon, type CreateDaemonOptions, type Daemon, type DaemonStep } from "../daemon.js";
 import { SupervisorStore } from "../state/store.js";
 import { Supervisor, type SupervisorOptions } from "../supervisor.js";
 import { loadNativeInstallation, type NativeInstallationOptions } from "./installation.js";
 import { fetchNativeReleaseManifest, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { launchNativeUpdater } from "./update-launch.js";
 import { readNativeUpdateLedger } from "./update-ledger.js";
+import { writeSecretFile } from "@konteks/remote-common";
+
+export const NATIVE_SHUTDOWN_RECEIPT_FILE = "shutdown-complete";
 
 export interface NativeServiceOptions extends NativeInstallationOptions {
   root: string;
@@ -18,6 +22,26 @@ export interface NativeServiceOptions extends NativeInstallationOptions {
   exitProcess?: CreateDaemonOptions["exitProcess"];
   /** `false` disables self-update; an object overrides the production channel/launcher (tests). */
   update?: false | Partial<NonNullable<NonNullable<SupervisorOptions["native"]>["update"]>>;
+}
+
+/** Fence work and stop owned processes before closing the control listener.
+ * `server.close()` waits for existing clients, so putting it first can consume
+ * the daemon watchdog while bridge and app-server cleanup has not even begun. */
+export function nativeShutdownSteps(
+  supervisor: () => Pick<Supervisor, "stop"> | undefined,
+  control: () => Pick<ControlSocketServer, "close"> | undefined,
+  writeReceipt: () => Promise<void> = async () => undefined,
+): DaemonStep[] {
+  let supervisorStopped = false;
+  let controlClosed = false;
+  return [
+    { name: "stopNativeSupervisor", run: async () => { await supervisor()?.stop(); supervisorStopped = true; } },
+    { name: "closeNativeControl", run: async () => { await control()?.close(); controlClosed = true; } },
+    { name: "recordNativeShutdown", run: async () => {
+      if (!supervisorStopped || !controlClosed) throw new Error("Native shutdown cleanup did not complete; no shutdown receipt was written.");
+      await writeReceipt();
+    } },
+  ];
 }
 
 /** Native service composition: local agents plus authenticated control, no domain services. */
@@ -67,10 +91,8 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         onUnexpectedError: (error, operation) => supervisor?.logger.error({ err: error, operation }, "control operation failed"),
       });
     },
-    shutdownSteps: () => [
-      { name: "closeNativeControl", run: async () => { await control?.close(); } },
-      { name: "stopNativeSupervisor", run: async () => { await supervisor?.stop(); } },
-    ],
+    shutdownSteps: () => nativeShutdownSteps(() => supervisor, () => control, () =>
+      writeSecretFile(join(options.root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), randomUUID())),
   });
   return daemon;
 }

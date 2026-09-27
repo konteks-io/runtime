@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { dirname, isAbsolute } from "node:path";
 import {
   RemoteInstanceError,
+  isProcessGroupAlive,
   spawnPiped,
   stopProcessGroupLeaderFirst,
   type PipedChildProcess,
@@ -24,6 +25,8 @@ export interface NativeCodexAppServerOwnerOptions {
   config: RunnerConfig;
   spawn?: typeof spawnPiped;
   stop?: typeof stopProcessGroupLeaderFirst;
+  /** Exact child group check after bounded stop; tests can model a surviving group. */
+  groupAlive?: typeof isProcessGroupAlive;
   prepareSocket?: typeof prepareCodexSocket;
   socketAvailable?: (socketPath: string) => Promise<boolean>;
   adoptedPollMs?: number;
@@ -135,7 +138,12 @@ export class NativeCodexAppServerOwner {
         throw unavailable("The adopted Codex owner changed; refusing to stop another process.");
       }
     }
-    if (child) await (this.options.stop ?? stopProcessGroupLeaderFirst)({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
+    if (child) {
+      await (this.options.stop ?? stopProcessGroupLeaderFirst)({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
+      if ((this.options.groupAlive ?? isProcessGroupAlive)(child)) {
+        throw unavailable("The signed Codex app-server process group did not finish stopping.");
+      }
+    }
     else if (adopted) await (this.options.stopHolder ?? stopProcessGroup)(adopted.pid);
     this.child = null;
     this.adoptedHolder = null;
@@ -373,5 +381,9 @@ async function stopProcessGroup(pid: number): Promise<void> {
   // The server runs in its own group (detached spawn); end the group, as a stop does.
   try { process.kill(-pid, "SIGTERM"); } catch { try { process.kill(pid, "SIGTERM"); } catch { return; } }
   for (let waited = 0; waited < 5_000 && alive(); waited += 100) await pause(100);
-  if (alive()) { try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } }
+  if (alive()) {
+    try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+    for (let waited = 0; waited < 2_000 && alive(); waited += 100) await pause(100);
+  }
+  if (alive()) throw unavailable("The adopted Codex app-server did not finish stopping.");
 }
