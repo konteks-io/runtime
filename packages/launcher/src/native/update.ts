@@ -55,7 +55,7 @@ export async function stageNativeUpdate(options: { root: string; output: Output;
       throw new RemoteInstanceError("bundle_untrusted", "Native updates require a complete signed offline package with official login tooling.");
     }
     const fetchFn = options.deps?.fetchFn ?? fetch;
-    options.output.line(`Staging native release ${release.manifest.bundleVersion} (installed: ${current.bundleVersion})…`);
+    options.output.line(`Staging native release ${release.manifest.bundleVersion} (installed: ${current.bundleVersion})… Downloading, verifying and unpacking its signed packages can take a few minutes; leave this command running and return for the result.`);
     const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn });
     let directory: string | null = null;
     try {

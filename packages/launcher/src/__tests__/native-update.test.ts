@@ -51,6 +51,18 @@ async function fixture() {
 }
 
 describe("native update staging and commit", () => {
+  it("explains the long signed-package staging wait and how to return to the result (WS3-008)", async () => {
+    const f = await fixture();
+    const lines: string[] = [];
+    const output = { ...f.output, line: (line: string) => { lines.push(line); } };
+    await stageNativeUpdate({ root: f.root, output, deps: { ...f.deps, manifest: f.manifest } });
+    expect(lines[0]).toContain("Staging native release 1.1.0");
+    expect(lines[0]).toMatch(/download|verify|unpack/i);
+    expect(lines[0]).toMatch(/minute/i);
+    expect(lines[0]).toMatch(/leave.*running|return.*result/i);
+    expect(lines.at(-1)).toContain("staged");
+  });
+
   it("stages a strictly newer signed release beside the running one and commits it, keeping the previous directory", async () => {
     const f = await fixture();
     expect(await checkNativeUpdate({ root: f.root, deps: { ...f.deps, manifest: f.oldManifest } })).toMatchObject({ status: "current", bundleVersion: "1.0.0" });

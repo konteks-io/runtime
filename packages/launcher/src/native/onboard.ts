@@ -12,7 +12,7 @@ import { nativePlatform } from "./service.js";
 import { commitFirstFiles, initializeRepository, inspectRepository, planFirstCommit, pushToManagedRemote, type FirstCommitPlan } from "./repository-inspect.js";
 import { enrollmentStagingStatus, releaseStaged, spawnEnrollmentStaging, type StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
-import { ensureGraft, graftAlreadyWired, graftBuildSeconds, planGraft, readGraftRecord, wireGraft, type GraftTool } from "./graft.js";
+import { ensureGraft, graftAlreadyWired, planGraft, readGraftRecord, wireGraft, type GraftTool } from "./graft.js";
 import { deleteOwnerToken, OWNER_ACCESS_REVOKED, OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
 
 /**
@@ -413,7 +413,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           // `assistant` is what a project-management turn places as, and
           // `onboard` is what the catalog work needs (OS14). Which agent
           // families exist here is recorded locally, not requested as a role.
-          requestedRoles: ["assistant", "onboard"],
+          requestedRoles: ["assistant", "onboard", "planner", "generator", "qa"],
           bundleVersion: release.manifest.bundleVersion,
           manifestDigest: release.manifest.digest,
         });
@@ -659,7 +659,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       } as never);
       return {
         step: "start",
-        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next, which takes about half a minute.`,
+        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next, which takes about a minute.`,
         // Registering and starting the service is the launcher's own command,
         // so the agent runs it rather than this process forking a service.
         run: { argv: ["konteks-remote", "start"] },
@@ -1084,7 +1084,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "graft_setup", graftDecision: "accepted", graftRepository: repo });
       return {
         step: "graft",
-        note: `Setting up Graft: downloading it, then mapping ${state.repositoryName ?? "this repository"}. That usually takes under ${graftBuildSeconds(plan.files) + 30} seconds.`,
+        note: `Setting up Graft: downloading it, then mapping ${state.repositoryName ?? "this repository"}. This can take a minute or more; leave the command running and come back for the result.`,
         run: AGAIN,
       };
     }
@@ -1179,7 +1179,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       if (service?.administrativeStatus === "active") await save({ advertisedRoles: service.roles });
       const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
       if (!(await api.hasExecutionProfile())) {
-        const ready = await api.setUpAgentsFromThisMachine(hostLabel());
+        const ready = await api.setUpAgentsFromThisMachine();
         if (!ready) {
           // What the machine can run is discovered by the runtime and accepted
           // on a later heartbeat, a minute or so after it starts, so an empty
