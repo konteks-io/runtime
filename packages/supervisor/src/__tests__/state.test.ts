@@ -44,6 +44,18 @@ it("keeps legacy delivery transcript state but strips its obsolete execution aut
 });
 
 describe("supervisor store", () => {
+  it("keeps one private bounded last-exit classification record", async () => {
+    const store = new SupervisorStore(dir);
+    await store.recordLastExit("liveness_lost", "2026-09-27T08:00:00.000Z");
+    await store.recordLastExit("uncaught_exception", "2026-09-27T08:01:00.000Z");
+    expect(await new SupervisorStore(dir).lastExit()).toEqual({
+      schemaVersion: 1, reason: "uncaught_exception", occurredAt: "2026-09-27T08:01:00.000Z",
+    });
+    const path = store.path("last-exit.json");
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect(await readFile(path, "utf8")).not.toContain("liveness_lost");
+  });
+
   it("creates the instance key once with restricted mode and reloads the same key", async () => {
     const store = new SupervisorStore(dir);
     await store.init();

@@ -1,6 +1,7 @@
 import { startControlSocketServer, type ControlSocketServer } from "@konteks/remote-common";
 import { join } from "node:path";
 import { createDaemon, type CreateDaemonOptions, type Daemon } from "../daemon.js";
+import { SupervisorStore } from "../state/store.js";
 import { Supervisor, type SupervisorOptions } from "../supervisor.js";
 import { loadNativeInstallation, type NativeInstallationOptions } from "./installation.js";
 import { fetchNativeReleaseManifest, resolveNativeConnectorExecutable } from "@konteks/remote-release";
@@ -23,11 +24,13 @@ export interface NativeServiceOptions extends NativeInstallationOptions {
 export function createNativeService(options: NativeServiceOptions): Daemon {
   let supervisor: Supervisor | undefined;
   let control: ControlSocketServer | undefined;
+  const exitStore = new SupervisorStore(join(options.root, "supervisor"));
   // The liveness callback reads `daemon` only after createDaemon has returned.
   const daemon: Daemon = createDaemon({
     name: "native-connector",
     ...(options.signalSource ? { signalSource: options.signalSource } : {}),
     ...(options.exitProcess ? { exitProcess: options.exitProcess } : {}),
+    recordNonzeroExit: reason => exitStore.recordLastExit(reason),
     onStart: async () => {
       const installation = await loadNativeInstallation(options.root, options);
       // The connector of the release now serving: `konteks-connector`, or `connector` in a release from before the rename.

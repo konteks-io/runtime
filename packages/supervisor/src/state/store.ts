@@ -31,6 +31,7 @@ import type { RelayDurableState } from "../relay/channel-mux.js";
  *   heartbeat.json       monotonic heartbeat sequence
  *   cursors.json         legacy durable receive cursors (migration fallback)
  *   relay-state.json     atomic cursors, allocation floors, and unacked relay frames
+ *   last-exit.json       last controlled nonzero exit classification and timestamp
  *   control.token        loopback control-socket token
  *   journal/             assignment recovery journal, pending requests, decisions, erase
  *   outbox/              durable outbox
@@ -124,6 +125,17 @@ const RelayDurableStateSchema = z.object({
 
 const HeartbeatSeqSchema = z.object({ sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict();
 
+export const ControlledExitReasonSchema = z.enum([
+  "liveness_lost", "uncaught_exception", "unhandled_rejection", "startup_failed", "shutdown_step_failed", "other",
+]);
+export type ControlledExitReason = z.infer<typeof ControlledExitReasonSchema>;
+export const LastExitSchema = z.object({
+  schemaVersion: z.literal(1),
+  reason: ControlledExitReasonSchema,
+  occurredAt: z.string().datetime(),
+}).strict();
+export type LastExit = z.infer<typeof LastExitSchema>;
+
 export class SupervisorStore {
   private heartbeatWrites: Promise<void> = Promise.resolve();
   /**
@@ -164,6 +176,23 @@ export class SupervisorStore {
 
   private async writeJson(name: string, value: unknown): Promise<void> {
     await this.mutate(() => writeSecretFile(this.path(name), `${JSON.stringify(value)}\n`));
+  }
+
+  /** Replaces the single private record before a controlled nonzero exit. */
+  async recordLastExit(reason: ControlledExitReason, occurredAt = new Date().toISOString()): Promise<void> {
+    await this.writeJson("last-exit.json", LastExitSchema.parse({ schemaVersion: 1, reason, occurredAt }));
+  }
+
+  /** Readable after the service has stopped, without its control socket. */
+  async lastExit(): Promise<LastExit | null> {
+    const path = this.path("last-exit.json");
+    try {
+      await assertRestrictedMode(path);
+    } catch (error) {
+      if (isFsErrorWithCode(error, "ENOENT")) return null;
+      throw error;
+    }
+    return this.readJson("last-exit.json", LastExitSchema);
   }
 
   /** The machine key, or null when there is none on disk. */
