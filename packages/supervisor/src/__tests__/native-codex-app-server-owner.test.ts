@@ -72,7 +72,7 @@ describe("native shared Codex app-server owner", () => {
     const f = fixture();
     await f.owner.start();
     expect(f.verifyPackage).toHaveBeenCalledWith(config);
-    expect(f.prepareSocket).toHaveBeenCalledWith(config.RUNNER_NATIVE_CODEX_SOCKET);
+    expect(f.prepareSocket).toHaveBeenCalledWith(config.RUNNER_NATIVE_CODEX_SOCKET, false);
     expect(f.spawn).toHaveBeenCalledWith(expect.objectContaining({
       command: "/signed/codex/bin/codex",
       args: ["app-server", "--listen", `unix://${config.RUNNER_NATIVE_CODEX_SOCKET}`],
@@ -83,6 +83,16 @@ describe("native shared Codex app-server owner", () => {
     await f.owner.stop();
     expect(f.stop).toHaveBeenCalledWith({ child: f.children[0], timeoutMs: 5_000, killGraceMs: 2_000 });
     expect(f.cleanupSocket).toHaveBeenCalledWith(config.RUNNER_NATIVE_CODEX_SOCKET);
+  });
+
+  it("restarts the exact owned app-server after a successful login before reporting ready", async () => {
+    const f = fixture();
+    await f.owner.start();
+    await f.owner.refreshAfterLogin();
+    expect(f.stop).toHaveBeenCalledWith({ child: f.children[0], timeoutMs: 5_000, killGraceMs: 2_000 });
+    expect(f.spawn).toHaveBeenCalledTimes(2);
+    expect(f.waitUntilReady).toHaveBeenCalledTimes(2);
+    await f.owner.stop();
   });
 
   it("restarts a crashed shared owner without coupling its lifecycle to runner bridges", async () => {
@@ -100,11 +110,54 @@ describe("native shared Codex app-server owner", () => {
 
   it("adopts a healthy same-user server across connector restart without spawning a race", async () => {
     const f = fixture();
-    f.prepareSocket.mockResolvedValueOnce("adopt");
-    await f.owner.start();
+    const releases = "/operator/connector/releases/";
+    const socketHolder = vi.fn(async () => ({ pid: 4411, command: `${releases}release-new/agents/codex/bin/codex app-server --listen unix://${config.RUNNER_NATIVE_CODEX_SOCKET}` }));
+    const stopHolder = vi.fn(async () => undefined);
+    const owner = new NativeCodexAppServerOwner({ config: { ...config, RUNNER_BRIDGE_PREFIX: `${releases}release-new/agents/codex` } as RunnerConfig,
+      spawn: f.spawn, stop: f.stop, prepareSocket: vi.fn(async () => "adopt" as const), waitUntilReady: f.waitUntilReady,
+      cleanupSocket: f.cleanupSocket, verifyPackage: f.verifyPackage, socketHolder, stopHolder });
+    await owner.start();
     expect(f.spawn).not.toHaveBeenCalled();
     expect(f.waitUntilReady).not.toHaveBeenCalled();
-    await f.owner.stop();
+    await owner.stop();
+    expect(stopHolder).toHaveBeenCalledWith(4411);
+    expect(f.cleanupSocket).toHaveBeenCalledWith(config.RUNNER_NATIVE_CODEX_SOCKET);
+  });
+
+  it("recycles a proven adopted owner after login and leaves an uncertain holder untouched", async () => {
+    const releases = "/operator/connector/releases/";
+    const f = fixture();
+    const holder = { pid: 4411, command: `${releases}release-new/agents/codex/bin/codex app-server --listen unix://${config.RUNNER_NATIVE_CODEX_SOCKET}` };
+    const socketHolder = vi.fn(async () => holder);
+    const stopHolder = vi.fn(async () => undefined);
+    const prepareSocket = vi.fn().mockResolvedValueOnce("adopt").mockResolvedValue("spawn");
+    const owner = new NativeCodexAppServerOwner({ config: { ...config, RUNNER_BRIDGE_PREFIX: `${releases}release-new/agents/codex` } as RunnerConfig,
+      spawn: f.spawn, stop: f.stop, prepareSocket, waitUntilReady: f.waitUntilReady,
+      cleanupSocket: f.cleanupSocket, verifyPackage: f.verifyPackage, socketHolder, stopHolder });
+    await owner.start();
+    socketHolder.mockResolvedValueOnce({ ...holder, pid: 9922 });
+    await expect(owner.refreshAfterLogin()).rejects.toThrow();
+    expect(stopHolder).not.toHaveBeenCalled();
+    await owner.refreshAfterLogin();
+    expect(stopHolder).toHaveBeenCalledWith(4411);
+    expect(f.spawn).toHaveBeenCalledOnce();
+    await owner.stop();
+  });
+
+  it("stops the replacement child after an adopted socket disappears", async () => {
+    const releases = "/operator/connector/releases/";
+    const f = fixture();
+    const socketHolder = vi.fn(async () => ({ pid: 4411, command: `${releases}release-new/agents/codex/bin/codex app-server --listen unix://${config.RUNNER_NATIVE_CODEX_SOCKET}` }));
+    const stopHolder = vi.fn(async () => undefined);
+    const prepareSocket = vi.fn().mockResolvedValueOnce("adopt").mockResolvedValue("spawn");
+    const owner = new NativeCodexAppServerOwner({ config: { ...config, RUNNER_BRIDGE_PREFIX: `${releases}release-new/agents/codex` } as RunnerConfig,
+      spawn: f.spawn, stop: f.stop, prepareSocket, socketAvailable: vi.fn(async () => false), adoptedPollMs: 5,
+      waitUntilReady: f.waitUntilReady, cleanupSocket: f.cleanupSocket, verifyPackage: f.verifyPackage, socketHolder, stopHolder });
+    await owner.start();
+    await vi.waitFor(() => expect(f.spawn).toHaveBeenCalledOnce());
+    await owner.stop();
+    expect(f.stop).toHaveBeenCalledWith({ child: f.children[0], timeoutMs: 5_000, killGraceMs: 2_000 });
+    expect(stopHolder).toHaveBeenCalledWith(4411);
   });
 
   it("replaces a live server left by an older release of this connector instead of adopting it (WS2-141)", async () => {
@@ -116,7 +169,7 @@ describe("native shared Codex app-server owner", () => {
       config: { ...config, RUNNER_BRIDGE_PREFIX: `${releases}release-new/agents/codex` } as RunnerConfig,
       spawn: f.spawn, stop: f.stop, prepareSocket: vi.fn(async () => "adopt" as const), waitUntilReady: f.waitUntilReady,
       cleanupSocket: f.cleanupSocket, verifyPackage: f.verifyPackage, restartDelaysMs: [5, 10],
-      socketHolder: vi.fn(async () => ({ pid: 4411, command: `${releases}release-old/agents/codex/node_modules/@openai/codex/bin/codex app-server --listen unix:///s` })),
+      socketHolder: vi.fn(async () => ({ pid: 4411, command: `${releases}release-old/agents/codex/node_modules/@openai/codex/bin/codex app-server --listen unix://${config.RUNNER_NATIVE_CODEX_SOCKET}` })),
       stopHolder, onStaleReplaced,
     });
     await owner.start();
@@ -126,9 +179,9 @@ describe("native shared Codex app-server owner", () => {
     await owner.stop();
   });
 
-  it("still adopts its own release's server, and never stops a holder it cannot place", async () => {
+  it("adopts only its own release's server and refuses a foreign or unprovable holder without cleanup", async () => {
     const releases = "/operator/connector/releases/";
-    for (const command of [`${releases}release-new/agents/codex/bin/codex app-server`, "/Applications/Codex.app/Contents/Resources/codex app-server"]) {
+    for (const [command, own] of [[`${releases}release-new/agents/codex/bin/codex app-server --listen unix://${config.RUNNER_NATIVE_CODEX_SOCKET}`, true], ["/Applications/Codex.app/Contents/Resources/codex app-server", false], [`/personal/releases/release-other/agents/codex/bin/codex app-server --listen unix://${config.RUNNER_NATIVE_CODEX_SOCKET}`, false]] as const) {
       const f = fixture();
       const stopHolder = vi.fn(async () => undefined);
       const owner = new NativeCodexAppServerOwner({
@@ -137,10 +190,12 @@ describe("native shared Codex app-server owner", () => {
         cleanupSocket: f.cleanupSocket, verifyPackage: f.verifyPackage, restartDelaysMs: [5, 10],
         socketHolder: vi.fn(async () => ({ pid: 4411, command })), stopHolder,
       });
-      await owner.start();
+      if (own) await owner.start();
+      else await expect(owner.start()).rejects.toThrow();
       expect(stopHolder).not.toHaveBeenCalled();
       expect(f.spawn).not.toHaveBeenCalled();
       await owner.stop();
+      if (!own) expect(f.cleanupSocket).not.toHaveBeenCalled();
     }
   });
 

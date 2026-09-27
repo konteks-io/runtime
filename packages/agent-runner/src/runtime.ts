@@ -37,6 +37,8 @@ export interface AgentRuntimeOptions {
   retryRandom?: () => number;
   /** How long one authenticated discovery of the agent's offered models is reused. */
   modelCapabilityTtlMs?: number;
+  /** Native supervisor-owned provider process must reload a completed official login. */
+  afterSuccessfulLogin?: () => Promise<void>;
 }
 
 /**
@@ -137,6 +139,7 @@ export class AgentRuntime {
   private scope: AgentScopeState = { accountScope: "personal", authIdentityFingerprint: null, scopeAttestedAt: null, lastLoginAt: null };
   private lastProbeAt: string | null = null;
   private activeLogin: LoginFlow | null = null;
+  private authRequired = false;
   /** ACP exposes model choices only through session/new. Cache the immutable
    * capability by authenticated identity for this runtime lifetime so status
    * polling cannot create a visible Codex thread on every refresh. */
@@ -161,6 +164,10 @@ export class AgentRuntime {
       bootstrapTimeoutMs: options.config.RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS,
       now: this.now,
       logger: this.logger,
+      onAuthRequired: () => {
+        this.authRequired = true;
+        this.publishReadiness();
+      },
     });
   }
 
@@ -191,6 +198,8 @@ export class AgentRuntime {
 
   private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"]): Promise<BridgeProcess> {
     const limit = this.options.executionBridgeLimit?.();
+    if (this.authRequired) return Promise.reject(new RemoteInstanceError("agent_auth_required", "Sign in to the selected local agent.", { recoveryActions: [{ kind: "login_agent", agentId: this.family.agentId }] }));
+    if (this.activeLogin !== null) return Promise.reject(new RemoteInstanceError("temporarily_unavailable", "The local agent is signing in."));
     // Only unfinalized owners hold capacity; retained keys still refuse reuse.
     let held = 0;
     for (const owner of this.executionBridges.values()) if (!owner.finalized) held += 1;
@@ -570,8 +579,8 @@ export class AgentRuntime {
       authMode: this.options.config.RUNNER_AUTH_MODE,
       connectionState: this.connectionState,
       initializeResult: this.bridge?.initializeResult ?? null,
-      scope: this.scope,
-      identity: this.identity,
+      scope: this.authRequired ? { ...this.scope, authIdentityFingerprint: null, scopeAttestedAt: null } : this.scope,
+      identity: this.authRequired ? "logged_out" : this.identity,
       bridgeVersionCompatible: true,
       ...(this.family.agentId === "dsh" && this.options.config.RUNNER_BRIDGE_VERSION !== "unknown"
         ? { hostAgentVersion: this.options.config.RUNNER_BRIDGE_VERSION } : {}),
@@ -792,6 +801,7 @@ export class AgentRuntime {
       result = { kind: "logged_out" };
     }
     this.identity = result.kind;
+    if (isLogin && (result.kind === "signal" || result.kind === "no_official_signal")) this.authRequired = false;
     const at = this.now().toISOString();
     this.lastProbeAt = at;
     const fingerprint =
@@ -818,6 +828,10 @@ export class AgentRuntime {
     if (this.activeLogin) {
       throw new RemoteInstanceError("temporarily_unavailable", "a login is already in progress for this agent");
     }
+    if (this.options.afterSuccessfulLogin && this.sessions.activeSessions > 0) {
+      throw new RemoteInstanceError("temporarily_unavailable", "Finish or recover active Codex sessions before signing in again.");
+    }
+    const previousConnectionState = this.connectionState;
     // DeepSeek Harness has no login command: the runtime asks for the API key
     // itself, checks it with DeepSeek and stores it in its dsh home.
     const flow = this.family.agentId === "dsh"
@@ -832,9 +846,14 @@ export class AgentRuntime {
         ...(args.loginId === undefined ? {} : { loginId: args.loginId }),
       });
     this.activeLogin = flow;
+    if (this.options.afterSuccessfulLogin) {
+      this.connectionState = "starting";
+      this.publishReadiness();
+    }
     void flow.done.then(async ({ code }) => {
       if (code !== 0) {
         this.activeLogin = null;
+        this.connectionState = previousConnectionState;
         this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: this.family.agentId === "dsh" ? "the DeepSeek API key was not saved" : "official login tooling did not complete" } });
         await this.probe(false);
         return;
@@ -845,6 +864,7 @@ export class AgentRuntime {
       await this.stopExecutionForAuthChange();
       await this.bridge?.stop();
       this.bridge = null;
+      await this.options.afterSuccessfulLogin?.();
       await this.ensureBridge();
       const view = await this.probe(true, args.organization);
       this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "completed", readiness: view.readiness } });
@@ -854,6 +874,7 @@ export class AgentRuntime {
       this.connectionState = "failed";
       this.publishReadiness();
       this.logger.warn({ err: error }, "agent authentication transition failed");
+      this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: "the agent login completed, but its local authentication refresh failed" } });
     });
     return flow;
   }

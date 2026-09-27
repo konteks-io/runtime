@@ -10,7 +10,7 @@ import { bundleManifestSigningBytes, computeBundleManifestDigest, controlCall, S
 import type { BridgeProcess } from "@konteks/remote-agent-runner";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
-import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, previewTuning } from "../native/installation.js";
+import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, previewTuning, resolveNativeCodexSocket } from "../native/installation.js";
 import { verifyInstalledNativeBridges } from "../native/installed.js";
 import { createNativeService } from "../native/service.js";
 import { SupervisorStore } from "../state/store.js";
@@ -146,6 +146,18 @@ describe("closed native runtime installation", () => {
     expect(loaded.runners).toHaveLength(1);
     expect(loaded.runners[0]).toMatchObject({ RUNNER_AGENT_ID: "codex", RUNNER_AUTH_MODE: "agent_local_subscription", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "codex"), RUNNER_WORKSPACE_DIR: join(root, "workspaces", "codex"), RUNNER_BRIDGE_PREFIX: join(f.releaseDir, "agents", "codex") });
     expect(loaded.runners[0]).not.toHaveProperty("RUNNER_GATEWAY_BASE_URL");
+  });
+  it("derives a short connector-private Codex socket even for a long installation root", async () => {
+    const home = join(root, "operator-codex");
+    const first = await resolveNativeCodexSocket(root, home);
+    expect(first).not.toBe(join(home, "app-server-control", "app-server-control.sock"));
+    expect(Buffer.byteLength(first)).toBeLessThanOrEqual(96);
+    expect(await resolveNativeCodexSocket(root, home)).toBe(first);
+    expect(await resolveNativeCodexSocket(`${root}-other`, home)).not.toBe(first);
+    expect(await resolveNativeCodexSocket(root, home, join(home, "app-server-control", "app-server-control.sock"))).toBe(first);
+    const custom = join(root, "socket", "s");
+    expect(await resolveNativeCodexSocket(root, home, custom)).toBe(custom);
+    await expect(resolveNativeCodexSocket(root, home, `${root}/../foreign/s`)).rejects.toThrow();
   });
   it.runIf(process.platform !== "win32")("runs DeepSeek Harness from the person's own installation, with no bundled artifact", async () => {
     const f = await fixture();

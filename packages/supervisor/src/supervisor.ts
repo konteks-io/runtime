@@ -358,6 +358,7 @@ export class Supervisor {
     });
     for (const config of this.options.native!.runners) {
       const runner = new NativeRunner({ instanceId: identity!.instanceId, config,
+        ...(config.RUNNER_AGENT_ID === "codex" && this.nativeCodexOwner ? { afterSuccessfulLogin: () => this.nativeCodexOwner!.refreshAfterLogin() } : {}),
         executionBridgeLimit: () => Math.min(4, this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT ?? 4),
         onEvent: event => { void this.onRunnerEvent(config.RUNNER_AGENT_ID, event).catch(error => this.logger.warn({ err: error }, "native runner event failed")); }, ...(this.options.native!.runtimeOptions ? { runtimeOptions: this.options.native!.runtimeOptions } : {}) });
       this.nativeRunners.push(runner);

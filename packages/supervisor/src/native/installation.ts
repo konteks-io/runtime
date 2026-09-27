@@ -1,6 +1,7 @@
 import { constants, type Stats } from "node:fs";
+import { createHash } from "node:crypto";
 import { lstat, open, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, parse, resolve } from "node:path";
 import { z } from "zod";
 import { isRetiredAgentId } from "@konteks/backstage-plugin-common";
@@ -49,6 +50,34 @@ export const NativeRuntimeRecordSchema = z.object({
   dshNode: z.string().min(1).max(4096).optional(),
 }).strict();
 export type NativeRuntimeRecord = z.infer<typeof NativeRuntimeRecordSchema>;
+
+/** Short, private per-installation namespace; the official Codex home remains shared. */
+export async function resolveNativeCodexSocket(root: string, codexHome: string, requested?: string): Promise<string> {
+  const digest = createHash("sha256").update(root).digest("hex").slice(0, 20);
+  const uid = process.getuid?.() ?? 0;
+  const name = `konteks-codex-${uid}-${digest}`;
+  let base = await realpath(tmpdir());
+  let socket = join(base, name, "s");
+  if (Buffer.byteLength(socket) > 96) {
+    base = await realpath("/tmp");
+    socket = join(base, name, "s");
+  }
+  if (Buffer.byteLength(socket) > 96) throw invalid();
+  // An older record may point at the global Codex socket. Migrate its path
+  // without operating on the existing holder. Other short explicit sockets
+  // retain their installer-owned path; startup separately proves private
+  // directory ownership and rejects a foreign process at that socket.
+  if (requested !== undefined) {
+    const legacy = join(codexHome, "app-server-control", "app-server-control.sock");
+    if (requested !== legacy && requested !== socket) {
+      if (!isAbsolute(requested) || resolve(requested) !== requested ||
+          /[\p{Cc}\p{Cf}\p{Cs}]/u.test(requested) || Buffer.byteLength(requested) > 96) throw invalid();
+      return requested;
+    }
+  }
+  if (socket === join(codexHome, "app-server-control", "app-server-control.sock")) throw invalid();
+  return socket;
+}
 
 /**
  * Read a stored record. One written before 7.0.0 may still list Pi or
@@ -138,9 +167,9 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
         RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
         ...(codexHome ? { RUNNER_NATIVE_CODEX_HOME: codexHome } : {}),
         ...(claudeExecutable ? { RUNNER_NATIVE_CLAUDE_EXECUTABLE: claudeExecutable } : {}),
-        // The supervisor owns this shared service lifecycle. The path remains
-        // under the operator's local profile and is never cloud supplied.
-        ...(codexHome && profile.codexLocalProxy ? { RUNNER_NATIVE_CODEX_SOCKET: record.codexSocket ?? join(codexHome, "app-server-control", "app-server-control.sock") } : {}),
+        // The supervisor owns this shared service lifecycle. Its default socket
+        // is per connector; only the official CODEX_HOME remains shared.
+        ...(codexHome && profile.codexLocalProxy ? { RUNNER_NATIVE_CODEX_SOCKET: await resolveNativeCodexSocket(root, codexHome, record.codexSocket) } : {}),
         RUNNER_BRIDGE_PREFIX: prefix, RUNNER_BRIDGE_VERSION: profile.bridge.version,
         RUNNER_NATIVE_PACKAGE_PROFILE: profile, RUNNER_NATIVE_PACKAGE_ARTIFACT: artifact,
       }));

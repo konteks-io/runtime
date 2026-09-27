@@ -33,6 +33,7 @@ export interface NativeRunnerOptions {
   onEvent: (event: RunnerEvent) => void;
   runtimeOptions?: Pick<AgentRuntimeOptions, "spawn" | "probe" | "now" | "logger">;
   executionBridgeLimit?: () => number;
+  afterSuccessfulLogin?: () => Promise<void>;
   /** The DeepSeek Harness overlay self-check; replaced only in tests. */
   dshProfileCheck?: typeof checkDshKonteksProfile;
 }
@@ -60,6 +61,7 @@ export class NativeRunner implements RunnerPort {
     }
     this.agentId = config.data.RUNNER_AGENT_ID;
     this.runtime = new AgentRuntime({ ...options.runtimeOptions, config: config.data,
+      ...(options.afterSuccessfulLogin ? { afterSuccessfulLogin: options.afterSuccessfulLogin } : {}),
       // Same four-per-ready-agent basis as Supervisor headroom; a lower
       // configured ceiling is supplied by the supervisor. Slots include
       // uncertain owners, not just currently running prompts.
