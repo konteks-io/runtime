@@ -395,10 +395,14 @@ describe("native install composition", () => {
     await expect(installNative(f.options as never)).rejects.toThrow();
     expect(f.activate).not.toHaveBeenCalled();
   });
-  it.each(["pi", "opencode"])("refuses the retired %s agent before activation or downloads", async retired => {
+  it.each([
+    ["pi", "pi is no longer supported. Choose Claude Code, Codex, DeepSeek Harness or OpenCode on your computer."],
+    // Un-retired in packages 7.1.0 as the host OpenCode 2, but not offered until CP6.
+    ["opencode", "opencode cannot be added on this computer yet."],
+  ])("refuses %s before activation or downloads", async (retired, message) => {
     const f = await fixture();
     f.options.agents = ["codex", retired];
-    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "agent_unavailable", message: `${retired} is no longer supported. Choose Claude Code, Codex or DeepSeek Harness on your computer.` });
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "agent_unavailable", message });
     await expect(addNativeAgent({ root: f.root, agentId: retired, output: f.options.output } as never)).rejects.toMatchObject({ code: "agent_unavailable" });
     expect(f.activate).not.toHaveBeenCalled();
     expect(f.options.deps.fetchFn).not.toHaveBeenCalled();

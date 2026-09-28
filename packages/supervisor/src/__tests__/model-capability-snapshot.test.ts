@@ -54,8 +54,8 @@ describe("authenticated model offered-values snapshot producer", () => {
       configId,
     }));
     const producer = new ModelCapabilitySnapshotProducer({ clock, instanceId: () => "instance", runnerIncarnation: () => "process", manifestId: () => "manifest",
-      mappings: () => [{ agentId: "claude-code", mapping }], catalogueAgents: () => ["claude-code", "codex", "opencode"], discover, newId: () => "snapshot" });
-    await producer.refresh([ready, codex, { ...ready, agentId: "opencode" }]);
+      mappings: () => [{ agentId: "claude-code", mapping }], catalogueAgents: () => ["claude-code", "codex", "pi"], discover, newId: () => "snapshot" });
+    await producer.refresh([ready, codex, { ...ready, agentId: "pi" }]);
     // claude-code keeps its signed mapping; codex reports under its catalogue authority; a retired agent never does.
     expect(discover.mock.calls.map(call => call[0]).sort()).toEqual(["claude-code", "codex"]);
     expect(discover).toHaveBeenCalledWith("codex", "model");
