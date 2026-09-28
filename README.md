@@ -239,8 +239,12 @@ working without it (the connector log says it was skipped). OpenCode 2 (your
 own install, `curl -fsSL https://opencode.ai/v2/install | bash`) is being added
 the same way as DeepSeek Harness: the connector can already find and
 version-check it (2.0.18 up to, not including, 3.0.0; `OPENCODE_EXECUTABLE`
-for other layouts), but it is not offered yet and cannot be installed or run
-until its security review is done. The Docker Compose remote
+for other layouts). Its tool calls already go through the same policy as the
+other agents (shell commands, edits inside the working copy only, its code
+blocks limited to calls to Konteks' own tools, plan mode refused, and any
+call that skips the check takes OpenCode out of service on that computer),
+but it is not offered yet: it cannot be installed or run until sign-in lands.
+The Docker Compose remote
 instance is retired; the connector on your own computer is the only way to
 run Konteks agents.
 
