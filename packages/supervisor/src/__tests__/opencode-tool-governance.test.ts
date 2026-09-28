@@ -159,10 +159,21 @@ describe("OpenCode tool governance", () => {
     // A refused block that ran anyway trips, even as a failure.
     code("a4", "await tools.opencode.session_move({});");
     expect(governance.observe(done("a4", "failed", ran("opencode.session_move")), WC)).toMatchObject({ toolCallId: "a4" });
+    // In a refused block, the call that asked is listed as an error (declined, 2.0.18): it never ran.
+    code("a5", 'for (const i of [1]) { await tools["konteks-result"].submit_result({}); }');
+    expect(governance.observe(done("a5", "completed", { metadata: { toolCalls: [{ tool: "konteks-result.submit_result", status: "error" }] } }), WC)).toBeNull();
+    // An approved call that answered with an error still ran as approved.
+    code("a6", 'await tools["konteks-result"].submit_result({ ok: true });');
+    expect(governance.observe(done("a6", "completed", { metadata: { toolCalls: [{ tool: "konteks-result.submit_result", status: "error" }] } }), WC)).toBeNull();
     // A catalogue lookup runs without asking and calls nothing.
     governance.observe(call("s1", "execute"), WC);
     governance.observe(input("s1", { code: 'return await tools.search({ query: "submit" });' }), WC);
     expect(governance.observe(done("s1", "completed", ran("search")), WC)).toBeNull();
+    // Code Mode's fetch never asks (2.0.18); a web fetch is allowed for every agent, so it never trips.
+    governance.observe(call("f1", "execute"), WC);
+    expect(governance.observe(done("f1", "completed", ran("fetch")), WC)).toBeNull();
+    code("f2", 'await tools["konteks-result"].submit_result({ ok: true });');
+    expect(governance.observe(done("f2", "completed", ran("fetch", "konteks-result.submit_result")), WC)).toBeNull();
     // A block that ran a tool without asking trips.
     governance.observe(call("s2", "execute"), WC);
     expect(governance.observe(done("s2", "completed", ran("konteks-result.submit_result")), WC)).toEqual({ toolCallId: "s2", title: "execute: konteks-result.submit_result" });

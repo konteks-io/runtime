@@ -130,9 +130,10 @@ export interface OpenCodePermissionRule {
  * rule and puts its own defaults before ours (CP0-v2, verified with `opencode
  * debug agents`), so the leading `* ask` overrides every default, and the
  * `.env` rows are restated after our `read` allow, which would otherwise
- * re-open them. `external_directory` and the built-in browser are denied
- * outright (no request reaches Konteks). The start self-check asserts these
- * rows end every agent's resolved list.
+ * re-open them. `external_directory`, Code Mode's built-in browser and
+ * OpenCode's own Code Mode tools are denied outright (no request reaches
+ * Konteks). The start self-check asserts these rows end every agent's
+ * resolved list.
  */
 export const OPENCODE_KONTEKS_PERMISSIONS: readonly OpenCodePermissionRule[] = Object.freeze([
   { action: "*", resource: "*", effect: "ask" },
@@ -145,9 +146,14 @@ export const OPENCODE_KONTEKS_PERMISSIONS: readonly OpenCodePermissionRule[] = O
   { action: "grep", resource: "*", effect: "allow" },
   { action: "todowrite", resource: "*", effect: "allow" },
   { action: "external_directory", resource: "*", effect: "deny" },
-  // Code Mode's catalogue carries a built-in browser (`tools.browser.*`) that
-  // reaches any site; a deny removes it from the catalogue (CP0 part 2).
-  { action: "browser.*", resource: "*", effect: "deny" },
+  // Code Mode's catalogue (`execute`) also holds tools that run WITHOUT any
+  // permission request: the built-in browser (`tools.browser.*`, permission
+  // `browser`) and OpenCode's own (`tools.opencode.session_move`, which moves
+  // the session to another folder, `session_rename`, `models`, the MCP
+  // resource readers; permission `opencode_<tool>`). A deny drops a tool from
+  // the catalogue (live on 2.0.18, CP4: `browser.*` and `opencode.*` do not).
+  { action: "browser", resource: "*", effect: "deny" },
+  { action: "opencode_*", resource: "*", effect: "deny" },
 ].map(rule => Object.freeze(rule as OpenCodePermissionRule)));
 
 /** Agents the Konteks configuration switches off (`plan` runs shell unasked; `title` spends a model call per session). */

@@ -106,7 +106,12 @@
         "effect": "deny"
       },
       {
-        "action": "browser.*",
+        "action": "browser",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "opencode_*",
         "resource": "*",
         "effect": "deny"
       }
@@ -214,7 +219,12 @@
         "effect": "deny"
       },
       {
-        "action": "browser.*",
+        "action": "browser",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "opencode_*",
         "resource": "*",
         "effect": "deny"
       }
@@ -397,7 +407,12 @@
         "effect": "deny"
       },
       {
-        "action": "browser.*",
+        "action": "browser",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "opencode_*",
         "resource": "*",
         "effect": "deny"
       }
@@ -515,7 +530,12 @@
         "effect": "deny"
       },
       {
-        "action": "browser.*",
+        "action": "browser",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "opencode_*",
         "resource": "*",
         "effect": "deny"
       }
@@ -628,7 +648,12 @@
         "effect": "deny"
       },
       {
-        "action": "browser.*",
+        "action": "browser",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "opencode_*",
         "resource": "*",
         "effect": "deny"
       }

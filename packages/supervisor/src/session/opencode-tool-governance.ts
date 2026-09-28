@@ -35,6 +35,13 @@ import type { HostPermissionContext, HostPermissionDecision, HostToolBypass, Hos
  * `rawOutput.metadata.toolCalls` lists a call Konteks did not approve, or a
  * read of `.env` or outside the working copy that ran unasked, all report a
  * bypass and the session quarantines OpenCode on this connector.
+ *
+ * What 2.0.18 does NOT let Konteks judge beforehand (live, CP4): Code Mode
+ * asks at a block's first MCP call, not before the block runs, and only for
+ * MCP tools. OpenCode's own Code Mode tools and its built-in browser never
+ * ask, so the locked configuration removes them from the catalogue (`deny`
+ * `opencode_*` and `browser`; the tripwire still trips if one ever runs);
+ * Code Mode's `fetch` can only be observed (see CODE_MODE_WEB_FETCH).
  */
 
 /** OpenCode 2's own tool names and the ACP kind each one means (the bridge's `kind`, packages' `OPENCODE_TOOL_KINDS`). */
@@ -55,6 +62,13 @@ const SEARCH = new Set(["read", "grep", "glob", "list"]);
 const UNGATED = new Set(["read", "grep", "glob", "list", "todowrite", "todoread"]);
 /** The Code Mode catalogue lookup (`tools.search`): it runs without asking and calls nothing. */
 const CATALOGUE_LOOKUPS = new Set(["search", "tools.search"]);
+/**
+ * Code Mode's `fetch` runs without any permission request in 2.0.18 (live,
+ * CP4), even before the block's first Konteks call asks. It is a web fetch,
+ * which the runtime policy allows every agent (`createWorkspaceToolPolicy`),
+ * so it is at parity and never trips; it just cannot be judged beforehand.
+ */
+const CODE_MODE_WEB_FETCH = "fetch";
 const ENV_FILE = /(^|[\\/])\.env(\.[^\\/]*)?$/;
 const ENV_EXAMPLE = /(^|[\\/])\.env\.example$/;
 const PATH_KEYS = ["filePath", "filepath", "file_path", "path", "movePath"] as const;
@@ -108,11 +122,14 @@ function namedPaths(input: Record<string, unknown>): string[] {
   return paths;
 }
 
-/** Code Mode's own record of the calls a block made (`rawOutput.metadata.toolCalls[].tool`). */
-function codeModeCallsRan(rawOutput: unknown): string[] {
+/** Code Mode's own record of the calls a block made (`rawOutput.metadata.toolCalls[]`: tool path and status). */
+function codeModeCallsRan(rawOutput: unknown): Array<{ tool: string; status: string }> {
   const calls = record(record(rawOutput).metadata).toolCalls;
   if (!Array.isArray(calls)) return [];
-  return calls.map(entry => record(entry).tool).map(tool => (typeof tool === "string" ? tool : "<unnamed>"));
+  return calls.map(entry => record(entry)).map(entry => ({
+    tool: typeof entry.tool === "string" ? entry.tool : "<unnamed>",
+    status: typeof entry.status === "string" ? entry.status : "unknown",
+  }));
 }
 
 /** The path Code Mode lists for an approved call. */
@@ -126,6 +143,8 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
   private readonly asked = new Set<string>();
   /** Per Code Mode block: the calls Konteks approved (empty when refused). */
   private readonly approved = new Map<string, string[]>();
+  /** Code Mode blocks Konteks refused. */
+  private readonly refused = new Set<string>();
 
   constructor(private readonly limit = 512) {}
 
@@ -158,16 +177,19 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     const observed = this.calls.get(toolCallId);
     const askedFirst = this.asked.has(toolCallId);
     const approved = this.approved.get(toolCallId);
+    const refusedBlock = this.refused.has(toolCallId);
     this.forget(toolCallId);
     if (!observed || status === "cancelled") return null;
     if (Object.keys(input).length > 0) observed.rawInput = input;
     if (observed.tool === "execute") {
       // A block may have run some of its calls even when it then failed.
       const allowed = [...(approved ?? [])];
-      for (const ran of codeModeCallsRan(value.rawOutput)) {
-        if (!askedFirst && CATALOGUE_LOOKUPS.has(ran)) continue;
-        const index = allowed.indexOf(ran);
-        if (index === -1) return { toolCallId, title: `execute: ${ran}` };
+      for (const { tool, status } of codeModeCallsRan(value.rawOutput)) {
+        if (tool === CODE_MODE_WEB_FETCH || (!askedFirst && CATALOGUE_LOOKUPS.has(tool))) continue;
+        // In a refused block the call that asked is listed as an error (Permission.DeclinedError): it never ran.
+        if (refusedBlock && status === "error") continue;
+        const index = allowed.indexOf(tool);
+        if (index === -1) return { toolCallId, title: `execute: ${tool}` };
         allowed.splice(index, 1);
       }
       return null;
@@ -223,6 +245,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     }
     if (tool === "execute") {
       this.approved.set(toolCallId, []);
+      this.refused.add(toolCallId);
       const code = same("code");
       if (code === null) return { kind: "deny", reason: "the code asked for is not the code the call reported" };
       const block = parseKonteksCodeModeBlock(code ?? "", context.servers);
@@ -232,6 +255,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
           return { kind: "deny", reason: `the browser tool ${call.tool} is not allowed in this session` };
         }
       }
+      this.refused.delete(toolCallId);
       this.approved.set(toolCallId, block.calls.map(codeModeCallPath));
       return { kind: "allow" };
     }
@@ -259,5 +283,6 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     this.calls.delete(toolCallId);
     this.asked.delete(toolCallId);
     this.approved.delete(toolCallId);
+    this.refused.delete(toolCallId);
   }
 }

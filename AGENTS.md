@@ -172,9 +172,17 @@ session's first prompt carries one line with the accepted form
 `await tools["konteks-result"].submit_result({ ... })`. The runner refuses
 OpenCode's `plan` mode (`HostAgentRunnerAdapter.refusedSessionModes`: on
 `set_mode`, `set_config_option`, an admitted session configuration, and in
-what is reported), the locked config denies Code Mode's built-in browser
-(`browser.*`, checked by the self-check), and every bridge client answers
-`fs/*` and `terminal/*` with "method not found".
+what is reported), and every bridge client answers `fs/*` and `terminal/*`
+with "method not found". Found live on 2.0.18 (CP4): Code Mode asks at a
+block's FIRST MCP call, not before the block runs, and never for its own
+tools: the built-in browser and OpenCode's own `tools.opencode.*`
+(`session_move` moves the session to another folder) ran unasked, so the
+locked config denies them by their permission names (`browser`,
+`opencode_*`; `browser.*`/`opencode.*` do not match), which drops them from
+the catalogue, and the self-check asserts both. Code Mode's `fetch` also
+runs unasked and cannot be removed short of denying `execute` (which would
+drop every MCP tool): it is treated as the web fetch the policy allows every
+agent and never trips; this is the one thing Konteks cannot judge beforehand.
 
 Every installed native agent reports the models it offers (System One §6a,
 KM6; `ModelCapabilitySnapshotProducer`): an agent whose release carries a
