@@ -1,5 +1,5 @@
 import { userInfo } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
 import { RemoteInstanceError, sanitizeInheritedChildProcessEnv, type Logger } from "@konteks/remote-common";
 import { findAgentBridge, verifyOfflineAgentPackageOnce, type AgentBridgeFamily, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
@@ -32,7 +32,9 @@ export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamil
   const base = sanitizeInheritedChildProcessEnv({ env: { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", TERM: "dumb" } });
   let env: NodeJS.ProcessEnv = {
     ...base,
-    PATH: `${join(config.RUNNER_BRIDGE_PREFIX, "bin")}:${base.PATH ?? ""}`,
+    // The platform's own separator: a `:` on Windows fused the prefix with the
+    // first PATH entry, which a host agent's environment then inherited.
+    PATH: `${join(config.RUNNER_BRIDGE_PREFIX, "bin")}${delimiter}${base.PATH ?? ""}`,
     HOME: config.RUNNER_CREDENTIAL_DIR,
     XDG_CONFIG_HOME: join(config.RUNNER_CREDENTIAL_DIR, ".config"),
     XDG_DATA_HOME: join(config.RUNNER_CREDENTIAL_DIR, ".local", "share"),
