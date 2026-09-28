@@ -154,11 +154,40 @@ Antigravity execution gets `antigravityEnvironment` (agent-runner
 allow-list, `HOME`/`GEMINI_HOME` in `<credentials>/antigravity/antigravity/home`,
 `AGY_ACP_FORCE_FILE_STORAGE=1`, and (API key, CP3) only a loopback
 `GOOGLE_GEMINI_BASE_URL`; never `GEMINI_*`, `GOOGLE_*`, `CLOUDSDK_*`, other
-`AGY_*`/`ANTIGRAVITY_*`, `GITHUB_TOKEN`/`GH_TOKEN` or provider keys. It is NOT
-offered (`antigravityInstallAdapter.offered = false`) until its CP3 and CP4:
-the CLI does not list it, install and `agent add` refuse it, enrollment never
-detects it, a stored record drops it, and its runner refuses to spawn, sign in
-or start (after re-verifying the copy).
+`AGY_*`/`ANTIGRAVITY_*`, `GITHUB_TOKEN`/`GH_TOKEN` or provider keys. CP2 (spawn): before every
+process `prepareToSpawn` (`prepareAntigravityHome`) keeps the private folders
+0700, writes `settings.json` from the connector's own sign-in record
+(`<credentials>/antigravity/antigravity/sign-in.json`, outside the home, CP3
+writes it; none writes `{}`), removes the workspace-trust file and empties
+`config/` and `antigravity-cli/skills/`; every `session/new`, `session/load`
+and `session/resume` (and model discovery) carries `_meta.agy` with the A4
+`enabledTools` allowlist and `disabledTools` (`start_subagent`,
+`generate_image`, `ask_question`); `auto_edit`/`yolo` are refused and dropped;
+a session not in `default` mode or without a `model` select never reads ready
+(`verifyAntigravitySession`); the working copy's `AGENTS.md` (a regular file
+inside it) is sent as an embedded resource in a session's first prompt and
+again only when it changed (`promptPrelude`, digests in `instructions.json`);
+at most two execution processes, a third session waits up to two minutes,
+the resident process is kept five minutes, the control process stops after a
+minute idle (readiness keeps its `initialize`), stop sweeps anything left with
+the private `HOME`; session bootstraps may take 30 s. Its failures are read in
+plain words (`classifyBridgeError` for `data.reason` `ge_*`/`admin_controls_*`,
+the missing licence naming the Business AI Code API and `gcloud services
+enable businessaicode.googleapis.com --project <project id>`;
+`antigravityStderrFailure` ends a bootstrap or turn that would open a sign-in
+or licence page; `antigravityAgentErrorText` turns quota/model errors the
+server writes as its reply into a failed turn). The start check
+(`native/antigravity-self-check.ts`) runs one `initialize` in the private home
+after the integrity check: `antigravity-acp` at the pinned version, the four
+sign-in methods and no gateway, MCP over http, load/resume, embedded context;
+drift is `antigravity_unsupported_version`. These seams are generic
+`HostAgentRunnerAdapter` fields (`sessionMeta`, `verifySession`,
+`promptPrelude`, `processLimits`, `stderrFailure`, `agentErrorText`,
+`sweepLeftovers`, `sessionBootstrapTimeoutMs`). It is NOT offered
+(`antigravityInstallAdapter.offered = false`) until its CP3 and CP4: the CLI
+does not list it, install and `agent add` refuse it, enrollment never detects
+it, a stored record drops it, so no connector builds its runner; its runner
+still refuses to sign in or out (CP3) and reads signed out.
 
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never

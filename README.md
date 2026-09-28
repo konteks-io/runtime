@@ -302,9 +302,13 @@ exact version, sizes, hashes and Google signature this Konteks release pins,
 keeps it in the connector's own folder, and checks it again before every
 start. It runs with a scrubbed environment and a private home: never your
 `GITHUB_TOKEN`, Gemini or Google Cloud variables, provider keys, `~/.gemini`,
-the Antigravity app or your macOS keychain. It is not offered yet: `install
---agents` and `agent add` refuse it until its sign-in and permission checks
-are finished.
+the Antigravity app or your macOS keychain. Before it starts, the connector
+checks that the server answers as the version it knows. Every session keeps
+subagents and image tools off, stays in the mode that asks before commands and
+edits, and gets your repository's `AGENTS.md` in its first prompt (Google's
+server does not read it). At most two Antigravity sessions run at once on a
+computer. It is not offered yet: `install --agents` and `agent add` refuse it
+until its sign-in and permission checks are finished.
 
 Pi is no longer supported: `install --agents` and `agent add` refuse it, and
 an installation that still lists it keeps working without it (the connector
