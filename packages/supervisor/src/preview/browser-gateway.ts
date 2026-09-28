@@ -209,6 +209,10 @@ export class PreviewBrowserGateway {
    * itself (WebSockets for hot reload) or a Core-granted one (https).
    */
   private onConnect(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    // Node hands a CONNECT socket over with no 'error' listener: a browser
+    // that resets it (Chrome does, for a refused background request) must
+    // never crash the connector.
+    socket.on("error", () => undefined);
     const refuse = (status: number, message: string) => {
       this.counters.refused += 1;
       if (status !== 404) this.logger.info({ event: "preview.browser_refused", status, ...this.options.context }, "the QA browser asked for something outside its preview");
@@ -216,7 +220,6 @@ export class PreviewBrowserGateway {
     };
     const verdict = this.closed ? { ok: false as const, status: 503, message: "The session has ended." } : this.admit(`http://${request.url ?? ""}`, true);
     if (!verdict.ok) return refuse(verdict.status, verdict.message);
-    socket.on("error", () => undefined);
     void this.address(verdict).then(address => {
       if (address === null) return refuse(403, `${verdict.target.origin} resolves to this computer, which a registered application may not.`);
       if (this.closed) return refuse(503, "The session has ended.");
@@ -251,6 +254,8 @@ export class PreviewBrowserGateway {
 
   /** An absolute-form WebSocket upgrade sent to the proxy (not tunnelled): relay it raw. */
   private onUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    // As for CONNECT: an upgraded socket has no 'error' listener of its own.
+    socket.on("error", () => undefined);
     const verdict = this.closed ? { ok: false as const, status: 503, message: "The session has ended." } : this.admit(request.url);
     if (!verdict.ok) {
       this.counters.refused += 1;

@@ -53,6 +53,7 @@ export * from "./native/codex-home.js";
 export * from "./native/codex-app-server-owner.js";
 export * from "./native/claude-executable.js";
 export * from "./native/dsh-installation.js";
+export * from "./native/browser-capability.js";
 export * from "./native/host-agents.js";
 export * from "./native/opencode-installation.js";
 export * from "./native/opencode-self-check.js";
