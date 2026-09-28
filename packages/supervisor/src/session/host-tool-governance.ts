@@ -1,10 +1,11 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
+import { AntigravityToolGovernance } from "./antigravity-tool-governance.js";
 import { DshToolGovernance } from "./dsh-tool-governance.js";
 import { OpenCodeToolGovernance } from "./opencode-tool-governance.js";
 
 /**
  * Tool governance for an agent used from the person's own installation
- * (DeepSeek Harness, OpenCode): the agent's permission requests do not carry
+ * (DeepSeek Harness, OpenCode, Google Antigravity): the agent's permission requests do not carry
  * what the runtime policy needs, or the agent can be steered around them, so
  * each request is rebuilt from the tool call it names (or refused) before the
  * unchanged `EvaluatorPolicyResponder` + `createWorkspaceToolPolicy()` judge
@@ -26,8 +27,8 @@ export interface HostPermissionContext {
   browserTools?: boolean;
 }
 
-/** A gated call that ran without Konteks' approval. */
-export interface HostToolBypass { toolCallId: string; title: string }
+/** A gated call that ran without Konteks' approval; `unaskedCommand`: it was a command that never asked (Antigravity's A21 line). */
+export interface HostToolBypass { toolCallId: string; title: string; unaskedCommand?: boolean }
 
 export interface HostToolGovernance {
   /** The agent's name in logs and the quarantine line. */
@@ -38,11 +39,24 @@ export interface HostToolGovernance {
   /** Record a session update; returns the call that ran without approval, if any. */
   observe(update: unknown, cwd: string): HostToolBypass | null;
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision;
+  /**
+   * Konteks' final answer to a request `decide` saw (after policy or a
+   * person): Antigravity pairs the server's own report of an allowed change
+   * with it.
+   */
+  answered?(toolCallId: string, allowed: boolean): void;
+  /**
+   * The quarantine line for this bypass given the credential the agent runs
+   * on (its sign-in method, when the connector reports one); absent: always
+   * `quarantineMessage`.
+   */
+  quarantineMessageFor?(bypass: HostToolBypass, credentialMethod: string | undefined): string;
 }
 
 /** The governance a host agent's session runs under; null for Claude Code and Codex (their requests carry what policy needs). */
 export function hostToolGovernance(agentId: string): HostToolGovernance | null {
   if (agentId === "opencode") return new OpenCodeToolGovernance();
+  if (agentId === "antigravity") return new AntigravityToolGovernance();
   if (agentId !== "dsh") return null;
   const dsh = new DshToolGovernance();
   return {

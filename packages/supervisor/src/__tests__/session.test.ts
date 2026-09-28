@@ -582,6 +582,156 @@ describe("relayed session (D98/D113/D114)", () => {
     });
   });
 
+  describe("Google Antigravity tool governance (antigravity-runtime-support CP4)", () => {
+    const agyWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "antigravity" } };
+    // antigravity-acp 1.2.1 with an API key offers allow_always too; Gemini Enterprise only once / reject.
+    const options = [{ optionId: "allow_always", name: "Allow Always (risky)", kind: "allow_always" }, { optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }];
+    const CWD = "/private/native/checkout";
+    const SESSION = "7f941318-42d2-4710-9eca-c791fbc0770a";
+    async function agySession(work: RemoteWorkAssignment = agyWork, credentialMethod?: string) {
+      const quarantine = vi.fn(async () => undefined);
+      const f = await build({
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+        redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks-platform", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" }),
+      }, work);
+      (f.runner as unknown as { quarantine: typeof quarantine }).quarantine = quarantine;
+      (f.runner as unknown as { readiness: () => Promise<unknown> }).readiness = async () => ({
+        agent: { agentId: "antigravity", credentials: credentialMethod === undefined ? [] : [{ providerId: "google", label: "x", kind: credentialMethod === "gemini-api-key" ? "api_key" : "sign_in", method: credentialMethod, state: "ready" }] },
+        utilization: { activeSessions: 1, activeTurns: 1 },
+      });
+      await f.session.bootstrap();
+      const update = (value: Record<string, unknown>) => f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+      /** The call as the server reports it, then its request with the same title, kind and input. */
+      const asked = async (requestId: string, call: Record<string, unknown>) => {
+        await update({ sessionUpdate: "tool_call", status: "pending", ...call });
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { ...call, status: "pending" }, options } as never });
+      };
+      const command = (id: string, line: string, cwd = CWD) => ({ toolCallId: id, title: line, kind: "execute", rawInput: { CommandLine: line, Cwd: cwd, WaitMsBeforeAsync: 5000 } });
+      const createFile = (id: string, path: string) => ({ toolCallId: id, title: "Run create_file?", kind: "edit", rawInput: { CodeContent: "hi", Description: "probe", Overwrite: true, TargetFile: path }, locations: [{ path }], content: [{ path, newText: "hi", type: "diff" }] });
+      const mcp = (id: string, server: string, tool: string) => ({ toolCallId: id, title: `${server}_${tool}`, kind: "other", rawInput: { arguments: {} }, _meta: { mcp: { server, tool }, is_mcp_tool_call: true } });
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string; outcome: string } } | undefined)?.outcome.optionId ?? "none";
+      return { ...f, quarantine, update, asked, command, createFile, mcp, answer };
+    }
+
+    it("refuses git push, sudo, outside writes, other MCP servers, subagents and the trust question; allows echo, in-folder writes and our tools; never allow_always", async () => {
+      const f = await agySession();
+      await f.asked("p-echo", f.command("c-echo", "echo hello"));
+      await f.asked("p-push", f.command("c-push", "git push origin HEAD:probe-push"));
+      await f.asked("p-sudo", f.command("c-sudo", "sudo rm -rf /tmp/x"));
+      await f.asked("p-cwd", f.command("c-cwd", "ls", "/etc"));
+      await f.asked("p-in", f.createFile("e-in", `${CWD}/inside.txt`));
+      await f.asked("p-out", f.createFile("e-out", "/private/native/outside.txt"));
+      await f.asked("p-result", f.mcp("m-result", "konteks-result", "submit_result"));
+      await f.asked("p-platform", f.mcp("m-platform", "konteks-platform", "platform__harness__plan_get"));
+      // A hostile repository's `.agents/mcp_config.json` server, had it loaded.
+      await f.asked("p-repo", f.mcp("m-repo", "repo-tools", "exfiltrate"));
+      // A hostile repository's `.agents/hooks.json`: the server first asks whether to trust it.
+      await f.asked("p-trust", { toolCallId: "interaction_9cf7b4aa", title: "Do you trust the authors of this workspace to execute automated agent hooks?", rawInput: {} });
+      await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "p-ghost", params: { sessionId: "acp-1", toolCall: f.command("never-seen", "echo"), options } as never });
+      expect({
+        echo: f.answer("p-echo"), push: f.answer("p-push"), sudo: f.answer("p-sudo"), cwd: f.answer("p-cwd"), inside: f.answer("p-in"), outside: f.answer("p-out"),
+        result: f.answer("p-result"), platform: f.answer("p-platform"), repo: f.answer("p-repo"), trust: f.answer("p-trust"), ghost: f.answer("p-ghost"),
+      }).toEqual({
+        echo: "allow", push: "deny", sudo: "deny", cwd: "deny", inside: "allow", outside: "deny",
+        result: "allow", platform: "allow", repo: "deny", trust: "deny", ghost: "deny",
+      });
+      expect(JSON.stringify(vi.mocked(f.runner.answer).mock.calls.map(call => call[2]))).not.toContain("allow_always");
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.session.close("cancelled");
+    });
+
+    it("pairs Gemini Enterprise's approved create_file with the Running edit_file that writes it, and trips on one nobody allowed", async () => {
+      const f = await agySession(agyWork, "oauth-business");
+      const path = `${CWD}/inside.txt`;
+      await f.asked("p-1", f.createFile("67f8e438", path));
+      expect(f.answer("p-1")).toBe("allow");
+      await f.update({ sessionUpdate: "tool_call", toolCallId: `${SESSION}:2`, title: "Running edit_file", kind: "edit", status: "in_progress", rawInput: { file_path: path }, locations: [{ path }] });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: `${SESSION}:2`, status: "completed" });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: "67f8e438", status: "failed", rawOutput: "Tool call was approved but never executed." });
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.update({ sessionUpdate: "tool_call", toolCallId: `${SESSION}:3`, title: "Running edit_file", kind: "edit", status: "in_progress", rawInput: { file_path: `${CWD}/other.txt` }, locations: [{ path: `${CWD}/other.txt` }] });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: `${SESSION}:3`, status: "completed" });
+      expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
+      // Not a command: the generic line, even on Gemini Enterprise.
+      expect(f.quarantine).toHaveBeenCalledWith("Google Antigravity ran a tool without Konteks' approval. Update the connector, then restart it.");
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("A21: a command that ran with no request on Gemini Enterprise names the Require review setting", async () => {
+      const f = await agySession(agyWork, "oauth-business");
+      await f.update({ sessionUpdate: "tool_call", status: "in_progress", ...f.command("auto", "echo unasked") });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: "auto", status: "completed", rawOutput: { exitCode: 0, combinedOutput: "unasked\n" } });
+      expect(f.quarantine).toHaveBeenCalledWith("Your organisation's Gemini Enterprise settings let Antigravity run commands without asking. Ask your Google Cloud admin to set Terminal auto-execution to Require review, then restart the connector.");
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("a subagent's command (never asked) trips; on a Gemini API key the line is the generic one", async () => {
+      const f = await agySession(agyWork, "gemini-api-key");
+      const id = "e1b92d65-1f8c-4c53-8885-e7cc4443b095:1";
+      await f.update({ sessionUpdate: "tool_call", toolCallId: id, title: "git push origin HEAD:probe-push", kind: "execute", status: "in_progress", rawInput: { command_line: "git push origin HEAD:probe-push", working_dir: CWD } });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: id, status: "completed", rawOutput: { exitCode: 0 } });
+      expect(f.quarantine).toHaveBeenCalledWith("Google Antigravity ran a tool without Konteks' approval. Update the connector, then restart it.");
+    });
+
+    it("a subagent tool in a tool_call takes Antigravity out of service at once", async () => {
+      const f = await agySession();
+      await f.update({ sessionUpdate: "tool_call", toolCallId: "sub", title: "Run invoke_subagent?", kind: "other", status: "pending", rawInput: { Subagents: [{ Prompt: "push the code" }] } });
+      expect(f.quarantine).toHaveBeenCalledOnce();
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("admits the connector's QA browser as konteks-browser, never its hidden tools", async () => {
+      const upstream = createServer((_req, res) => res.end("the preview"));
+      await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+      const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+      const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
+      const preview = { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(), forget: vi.fn(),
+        origin: vi.fn((_sessionId: string) => origin), browsersPath: "/private/native/browsers" };
+      const f = await build({ preview,
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) }, { ...agyWork, kind: "qa", agentRoute: { requiredRole: "qa", agentId: "antigravity" } } as RemoteWorkAssignment);
+      (f.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+      await f.session.bootstrap();
+      expect((f.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeDefined();
+      await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Check the page." }] } });
+      const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+      expect(forwarded[0]!.text).toContain("`konteks-browser`");
+      for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+        const call = { toolCallId: id, title: `konteks-browser_${tool}`, kind: "other", rawInput: { url: origin }, _meta: { mcp: { server: "konteks-browser", tool }, is_mcp_tool_call: true } };
+        await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "tool_call", status: "pending", ...call } } });
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: `p-${id}`, params: { sessionId: "acp-1", toolCall: call, options } as never });
+      }
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
+      expect({ navigate: answer("p-n"), unsafe: answer("p-u") }).toEqual({ navigate: "allow", unsafe: "deny" });
+      await f.session.close("cancelled");
+      upstream.close();
+    });
+
+    it("tells an Antigravity session the call_mcp_tool form with its own servers, and asks for the result that way", async () => {
+      const f = await agySession({ ...validation, agentRoute: { requiredRole: "qa", agentId: "antigravity", mcpCapabilityTokenRef: "ref-1" } } as RemoteWorkAssignment);
+      await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Review the change." }, { type: "text", text: renderStructuredOutputContract({ type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] }) }] } });
+      const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+      expect(forwarded[0]!.text).toBe("Call Konteks tools through your `call_mcp_tool` tool: `ServerName` is the server (`konteks-platform`, `konteks-result`), `ToolName` is the tool's name exactly as listed, and its parameters go in `Arguments` (for example `ServerName` `konteks-platform`). Konteks refuses every other MCP server, subagents and commands outside this working copy.");
+      expect(forwarded.at(-1)!.text).toContain("call `submit_result` through your `call_mcp_tool` tool (`ServerName` `konteks-result`, `ToolName` `submit_result`, its arguments in `Arguments`) once");
+      // Only the first prompt carries the line.
+      await f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } } as never);
+      await f.session.close("cancelled");
+    });
+
+    it("names Antigravity's tools in plain words and an MCP call as the Konteks tool it calls", async () => {
+      const f = await agySession();
+      await f.update({ sessionUpdate: "tool_call", status: "pending", ...f.createFile("t-1", `${CWD}/a.txt`) });
+      await f.update({ sessionUpdate: "tool_call", status: "pending", ...f.mcp("t-2", "konteks-platform", "platform__harness__plan_get") });
+      await f.update({ sessionUpdate: "tool_call", status: "in_progress", toolCallId: `${SESSION}:1`, title: "Running list_directory", kind: "search", rawInput: { directory_path: CWD } });
+      await f.update({ sessionUpdate: "tool_call", status: "pending", ...f.command("t-3", "npm test") });
+      const updates = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } }).filter(body => body.method === "session/update").map(body => body.params!.update!);
+      expect(updates.find(update => update.toolCallId === "t-1")).toMatchObject({ name: "create_file", kind: "edit", title: "Create file" });
+      expect(updates.find(update => update.toolCallId === "t-2")).toMatchObject({ name: "platform__harness__plan_get", kind: "other", title: "platform__harness__plan_get" });
+      expect(updates.find(update => update.toolCallId === `${SESSION}:1`)).toMatchObject({ name: "list_directory", kind: "search", title: "List folder" });
+      expect(updates.find(update => update.toolCallId === "t-3")).toMatchObject({ name: "run_command", kind: "execute", title: "npm test" });
+      await f.session.close("cancelled");
+    });
+  });
+
   it("relays actual runner message/tool updates with the opaque session reference, never hidden thoughts", async () => {
     const events = new RunnerEventBus();
     const bridge = { exited: false, initializeResult: { protocolVersion: 1 }, connection: { newSession: async () => ({ sessionId: "private-bridge-session" }) } } as unknown as BridgeProcess;

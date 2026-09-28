@@ -1,4 +1,5 @@
 import { isSecretKey, redactText } from "@konteks/remote-common";
+import { ANTIGRAVITY_TOOL_KINDS, antigravityCallTool } from "./antigravity-tool-governance.js";
 import { DSH_TOOL_KINDS } from "./dsh-tool-governance.js";
 import { KONTEKS_CODE_MODE_SERVERS, parseKonteksCodeModeBlock } from "./opencode-code-mode.js";
 import { OPENCODE_TOOL_KINDS, openCodeToolName } from "./opencode-tool-governance.js";
@@ -54,6 +55,7 @@ export function canonicalizeAcpToolActivity(
   }
   if (dialectId === "dsh") return canonicalizeDshToolActivity(candidate, prior);
   if (dialectId === "opencode") return canonicalizeOpenCodeToolActivity(candidate, prior);
+  if (dialectId === "antigravity") return canonicalizeAntigravityToolActivity(candidate, prior);
   if (dialectId !== "claude-code") return value;
   const meta = candidate._meta;
   const rawTool = meta !== null && typeof meta === "object" && !Array.isArray(meta)
@@ -169,6 +171,58 @@ function canonicalizeOpenCodeToolActivity(candidate: Record<string, unknown>, pr
     ...(kind !== undefined && (currentKind === undefined || currentKind === "other") ? { kind } : {}),
     // Code Mode's own title is always `execute`; show what it runs instead.
     ...(title !== undefined && (currentTitle === undefined || currentTitle === "execute" || kind === "other") ? { title } : {}),
+  };
+}
+
+/** Google Antigravity's own tools in plain words (the titles `Run <tool>?` and `Running <tool>` name them). */
+const ANTIGRAVITY_PLAIN_TITLES: Readonly<Record<string, string>> = Object.freeze({
+  create_file: "Create file", edit_file: "Edit file", write_to_file: "Write file", replace_file_content: "Edit file", multi_replace_file_content: "Edit file",
+  view_file: "Read file", list_directory: "List folder", list_dir: "List folder", search_directory: "Search folder", find_file: "Find file",
+  find_by_name: "Find file", grep_search: "Search files", read_url_content: "Fetch web page", search_web: "Search the web", finish: "Finish",
+});
+const ANTIGRAVITY_TOOL_TITLE = /^(?:Run [a-z][a-z0-9_]*\?|Running [a-z][a-z0-9_]*)$/;
+
+/**
+ * Google Antigravity names a tool in its title (`Run create_file?`, `Running
+ * view_file`, a command's own text) and an MCP call in `_meta.mcp`, which the
+ * relay never keeps: carry the name and ACP kind forward from the first
+ * `tool_call`, show an MCP call as the Konteks tool it calls (the federated
+ * `platform__*` name, `submit_result`, `preview_start`, …) and the trust
+ * question as such. A command keeps its own text as the title; an arbitrary
+ * title never becomes a name.
+ */
+function canonicalizeAntigravityToolActivity(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+  let name = prior?.name;
+  let kind = prior?.kind;
+  let title = prior?.title;
+  if (candidate.sessionUpdate === "tool_call" && prior === undefined) {
+    const meta = candidate._meta !== null && typeof candidate._meta === "object" ? (candidate._meta as { mcp?: { server?: unknown; tool?: unknown } }).mcp : undefined;
+    if (typeof meta?.server === "string" && typeof meta.tool === "string" && meta.server.startsWith("konteks-")) {
+      name = meta.tool;
+      kind = "other";
+      title = meta.tool;
+    } else {
+      const tool = antigravityCallTool(candidate);
+      if (tool === "workspace_trust") {
+        name = tool;
+        kind = "other";
+        title = "Workspace trust question";
+      } else if (tool !== undefined && tool !== "mcp" && Object.hasOwn(ANTIGRAVITY_TOOL_KINDS, tool)) {
+        name = tool;
+        kind = ANTIGRAVITY_TOOL_KINDS[tool];
+        title = ANTIGRAVITY_PLAIN_TITLES[tool];
+      }
+    }
+  }
+  if (name === undefined && kind === undefined) return candidate;
+  const currentKind = typeof candidate.kind === "string" ? candidate.kind : undefined;
+  const currentTitle = typeof candidate.title === "string" ? candidate.title.trim() : undefined;
+  const replaceTitle = title !== undefined && (currentTitle === undefined || ANTIGRAVITY_TOOL_TITLE.test(currentTitle) || name === title || name === "workspace_trust" || kind === "other");
+  return {
+    ...candidate,
+    ...(name !== undefined ? { name } : {}),
+    ...(kind !== undefined && (currentKind === undefined || currentKind === "other") ? { kind } : {}),
+    ...(replaceTitle ? { title } : {}),
   };
 }
 

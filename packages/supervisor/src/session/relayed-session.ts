@@ -45,6 +45,7 @@ import {
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
+import { antigravityKonteksToolsLine, antigravityResultToolReference } from "./antigravity-prompt.js";
 import { openCodeKonteksToolsLine, openCodeResultToolReference } from "./opencode-prompt.js";
 import { compileResultSchema as compileTurnValidator, StructuredResultToolServer, toolInputSchema } from "../structured-result/result-tool-server.js";
 import {
@@ -192,9 +193,11 @@ export class RelayedSession {
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
   /** Rebuilds a host agent's permission requests and trips on an unapproved tool (host-tool-governance.ts: DeepSeek Harness, OpenCode). */
   private readonly toolGovernance: HostToolGovernance | null;
-  /** The MCP servers this session gave its agent (the only Code Mode namespaces an OpenCode block may call). */
+  /** The MCP servers this session gave its agent (the only Code Mode namespaces an OpenCode block may call, the only servers Antigravity may reach). */
   private sessionServers: ReadonlySet<string> = new Set();
-  /** An OpenCode session is told once how Konteks runs its tools (in its first prompt). */
+  /** A governed permission request's tool call and options, until Konteks answers it. */
+  private readonly governedPermissions = new Map<string, { toolCallId: string; options: RequestPermissionRequest["options"] }>();
+  /** An OpenCode or Antigravity session is told once how Konteks runs its tools (in its first prompt). */
   private toolFormTold = false;
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
@@ -872,6 +875,7 @@ export class RelayedSession {
     const answer = message.kind === "acp_result" ? message.result : message.method === "elicitation/create" ? { action: "cancel" } : { outcome: { outcome: "cancelled" } };
     const verdict = this.deps.broker.answer(ref, message.id, answer);
     if (!verdict.ok) throw new RemoteInstanceError("operation_conflict", "The pending human answer is no longer admissible.");
+    this.notePermissionAnswer(message.id, answer);
     const delivered = await this.deps.runner.answer(ref, message.id, answer);
     if (!delivered.delivered) throw new RemoteInstanceError("operation_interrupted", "Answer delivery is unproven.");
     await gate.complete(operation.key);
@@ -1044,19 +1048,24 @@ export class RelayedSession {
 
   /**
    * The prompt the agent receives: the structured-result rewrite, and for an
-   * OpenCode session's first prompt, the one line saying how Konteks runs its
-   * tools (Code Mode, opencode-code-mode.ts).
+   * OpenCode or Google Antigravity session's first prompt, the one line
+   * saying how Konteks runs its tools (OpenCode's Code Mode,
+   * opencode-code-mode.ts; Antigravity's `call_mcp_tool`, antigravity-prompt.ts).
    */
   private async prepareAgentPrompt<B extends PromptBlock>(requestId: string, prompt: B[]): Promise<B[]> {
     const prepared = await this.prepareStructuredPrompt(requestId, prompt);
-    if (this.assignment.agentRoute.agentId !== "opencode" || this.toolFormTold) return prepared;
+    const agentId = this.assignment.agentRoute.agentId;
+    if ((agentId !== "opencode" && agentId !== "antigravity") || this.toolFormTold) return prepared;
     this.toolFormTold = true;
-    return [{ type: "text", text: openCodeKonteksToolsLine(this.sessionServers) } as unknown as B, ...prepared];
+    const line = agentId === "opencode" ? openCodeKonteksToolsLine(this.sessionServers) : antigravityKonteksToolsLine(this.sessionServers);
+    return [{ type: "text", text: line } as unknown as B, ...prepared];
   }
 
   /** How this session's agent is told to call the result tool; undefined for the plain tool name. */
   private resultToolCall(): string | undefined {
-    return this.assignment.agentRoute.agentId === "opencode" ? `\`${openCodeResultToolReference}\`` : undefined;
+    const agentId = this.assignment.agentRoute.agentId;
+    if (agentId === "antigravity") return antigravityResultToolReference;
+    return agentId === "opencode" ? `\`${openCodeResultToolReference}\`` : undefined;
   }
 
   /** The turn never reached the agent (or was refused): forget it and put the tool back. */
@@ -1142,8 +1151,10 @@ export class RelayedSession {
     if (ref === null) return;
     if (this.toolGovernance) {
       // A host agent is never answered "always", by policy or by a person:
-      // OpenCode would store it and stop asking.
+      // OpenCode would store it and stop asking; Antigravity would stop asking
+      // for that command in this workspace.
       params = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
+      this.governedPermissions.set(requestId, { toolCallId: params.toolCall.toolCallId, options: params.options });
       // A host agent's request is judged by the call it names, or refused.
       const verdict = this.toolGovernance.decide(params, { cwd: this.sessionCwd(), servers: this.sessionServers, browserTools: this.browserGateway !== null });
       if (verdict.kind !== "evaluate") {
@@ -1154,7 +1165,7 @@ export class RelayedSession {
           this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId, reason: verdict.reason.slice(0, 512) },
             `${this.toolGovernance.agentName} tool call refused by policy`);
         }
-        return void (await this.deps.runner.answer(ref, requestId, optionId === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
+        return void (await this.answerPermission(ref, requestId, optionId === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
       }
       params = verdict.request;
     }
@@ -1162,7 +1173,7 @@ export class RelayedSession {
       browserTools: this.browserGateway !== null });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
-    if (decision.kind === "allow") return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
+    if (decision.kind === "allow") return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
     // A refused tool ends the agent's turn on Claude Code; the log named
     // nothing about it, so a turn that stopped at a build command read as a
     // hung agent. Bounded, sanitized title only.
@@ -1170,13 +1181,28 @@ export class RelayedSession {
       title: sanitizePermissionRequest(params).params.title, decision: decision.kind,
       humanDeferralAllowed: this.assignment.policy.humanDeferralAllowed }, "tool permission not allowed by policy");
     if (decision.kind === "deny") {
-      return void (await this.deps.runner.answer(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
+      return void (await this.answerPermission(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
     }
-    if (!this.assignment.policy.humanDeferralAllowed) return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "cancelled" } }));
+    if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
     const sanitized = sanitizePermissionRequest(params);
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
-    if (!pending) return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "cancelled" } }));
+    if (!pending) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: params.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
+  }
+
+  /** Answer a permission request, telling a host agent's governance what was decided (Antigravity pairs its own reports with it). */
+  private async answerPermission(ref: string, requestId: string, response: { outcome: { outcome: string; optionId?: string } }): Promise<void> {
+    this.notePermissionAnswer(requestId, response);
+    await this.deps.runner.answer(ref, requestId, response);
+  }
+
+  private notePermissionAnswer(requestId: string, response: unknown): void {
+    const governed = this.governedPermissions.get(requestId);
+    if (!governed) return;
+    this.governedPermissions.delete(requestId);
+    const outcome = (response as { outcome?: { outcome?: unknown; optionId?: unknown } } | null)?.outcome;
+    const option = outcome?.outcome === "selected" ? governed.options.find(candidate => candidate.optionId === outcome.optionId) : undefined;
+    this.toolGovernance?.answered?.(governed.toolCallId, option?.kind === "allow_once");
   }
 
   /** The working copy the session's agent runs in. */
@@ -1196,8 +1222,17 @@ export class RelayedSession {
     const ref = this.acpSessionRef;
     this.logger.error({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: bypass.toolCallId, tool: bypass.title.slice(0, 128), diagnostic: governance.bypassDiagnostic },
       `${governance.agentName} ran a gated tool without approval; stopping the turn and taking it out of service`);
+    // The line names what to fix: for Antigravity on Gemini Enterprise, a
+    // command that never asked is the organisation's admin setting (A21).
+    let credentialMethod: string | undefined;
+    if (governance.quarantineMessageFor) {
+      // The connector lists the credential in use first.
+      try { credentialMethod = (await this.deps.runner.readiness()).agent.credentials?.[0]?.method; }
+      catch { credentialMethod = undefined; }
+    }
+    const message = governance.quarantineMessageFor?.(bypass, credentialMethod) ?? governance.quarantineMessage;
     if (ref !== null) await this.deps.runner.cancel(ref).catch(error => this.logger.warn({ err: error }, "cancel after a governance bypass failed"));
-    await this.deps.runner.quarantine?.(governance.quarantineMessage)
+    await this.deps.runner.quarantine?.(message)
       .catch(error => this.logger.warn({ err: error }, "quarantine after a governance bypass failed"));
     await this.close("agent_exited");
   }
