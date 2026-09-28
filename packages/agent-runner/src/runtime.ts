@@ -191,6 +191,7 @@ export class AgentRuntime {
       ...(options.executionBridgeLimit ? { replaceBridge: (ref: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle, cwd) } : {}),
       ...(this.perWorkingCopy ? { beforePrompt: (bridge: BridgeProcess) => this.workingCopyBindings.get(bridge)?.beforePrompt() } : {}),
       ...(this.host?.refusedSessionModes ? { refusedModes: this.host.refusedSessionModes } : {}),
+      ...(this.host?.refusedPromptCommands ? { refusedPromptCommands: this.host.refusedPromptCommands } : {}),
       ...(this.host?.offersModel ? { modelAllowed: (value: string) => this.host!.offersModel!(value, this.hostSettings) } : {}),
       ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
       ...(this.host?.verifySession ? { verifySession: (response: { configOptions?: unknown; modes?: unknown }) => this.host!.verifySession!(response) } : {}),

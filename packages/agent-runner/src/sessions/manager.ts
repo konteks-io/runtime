@@ -138,6 +138,8 @@ export interface SessionManagerOptions {
    * configuration, and dropped from the configuration the agent reports.
    */
   refusedModes?: { readonly modeIds: readonly string[]; readonly message: string };
+  /** Slash commands this agent is never sent (Antigravity's `/plan`, `/logout`): such a prompt is refused before it reaches the agent. */
+  refusedPromptCommands?: { readonly commands: readonly string[]; readonly message: string };
   /**
    * Whether a model value may be used (OpenCode: Zen's free models only when
    * switched on, O6). A session that would start on a model it may not use is
@@ -801,6 +803,14 @@ export class SessionManager {
     if (record.activeTurns > 0) {
       throw new RemoteInstanceError("operation_conflict", "Another prompt is already running on this session.");
     }
+    const command = this.refusedPromptCommand(params.prompt);
+    if (command !== undefined) {
+      this.logger.warn({ assignmentId: record.context.assignmentId, attempt: record.context.attempt, command }, "refused a prompt that starts with one of the agent's own commands");
+      this.track(record, Promise.resolve().then(() => this.options.events.publish({
+        kind: "request_error", acpSessionRef, requestId, method: "session/prompt", code: -32602, class: "invalid_params", message: this.options.refusedPromptCommands!.message, retryable: false,
+      })));
+      return;
+    }
     record.completedTurn = false;
     record.activeTurns += 1;
     // The last turn's end is this turn's start, so a cost the agent reports
@@ -905,6 +915,24 @@ export class SessionManager {
         throw error;
       });
     this.track(record, operation);
+  }
+
+  /**
+   * The refused slash command a prompt starts with, if any: any text block, or
+   * the text blocks joined (the server reads `/logout` from the whole prompt).
+   */
+  private refusedPromptCommand(prompt: readonly unknown[]): string | undefined {
+    const commands = this.options.refusedPromptCommands?.commands;
+    if (!commands || commands.length === 0) return undefined;
+    const texts = prompt.flatMap(block => {
+      const value = block as { type?: unknown; text?: unknown } | null;
+      return value?.type === "text" && typeof value.text === "string" ? [value.text] : [];
+    });
+    for (const candidate of [...texts, texts.join("")]) {
+      const match = /^\/([A-Za-z][\w-]*)(?=\s|$)/.exec(candidate.trimStart());
+      if (match && commands.includes(match[1]!.toLowerCase())) return match[1]!.toLowerCase();
+    }
+    return undefined;
   }
 
   private refusesMode(modeId: unknown): boolean {

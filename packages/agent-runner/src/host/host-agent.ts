@@ -68,6 +68,12 @@ export interface HostAgentRunnerAdapter {
    */
   readonly refusedSessionModes?: { readonly modeIds: readonly string[]; readonly message: string };
   /**
+   * The agent's own slash commands Konteks never sends it (Antigravity's
+   * `/plan` and `/logout`): a prompt that starts with one is refused before it
+   * reaches the agent, with this plain line.
+   */
+  readonly refusedPromptCommands?: { readonly commands: readonly string[]; readonly message: string };
+  /**
    * Extra `_meta` every `session/new`, `session/load` and `session/resume` of
    * this agent carries, model discovery's included (Antigravity: its built-in
    * tool filter, which a persisted session could otherwise override).

@@ -43,13 +43,14 @@ process.stdin.on("data", async chunk => {
 });
 `;
 
-it("answers fs and terminal calls with method not found and never acts on them", async () => {
+// Every bridge answers the same way; Google Antigravity's included (antigravity-runtime-support CP4).
+it.each(["opencode", "antigravity"])("answers %s's fs and terminal calls with method not found and never acts on them", async agentId => {
   const root = await mkdtemp(join(tmpdir(), "bridge-client-")); roots.push(root);
   const script = join(root, "agent.cjs");
   const out = join(root, "answers.json");
   await writeFile(script, AGENT);
   const bridge = await spawnBridge({
-    spec: { family: { agentId: "opencode" }, command: process.execPath, args: [script, out], env: { PATH: process.env.PATH }, cwd: root } as unknown as BridgeSpawnSpec,
+    spec: { family: { agentId }, command: process.execPath, args: [script, out], env: { PATH: process.env.PATH }, cwd: root } as unknown as BridgeSpawnSpec,
     initializeTimeoutMs: 10_000, clientVersion: "test",
     handlers: { onSessionUpdate: () => undefined, onRequestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
       onCreateElicitation: async () => ({ action: "cancel" }), onExit: () => undefined },

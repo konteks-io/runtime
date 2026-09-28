@@ -140,6 +140,8 @@ export const ANTIGRAVITY_SESSION_META: Readonly<Record<string, unknown>> = Objec
 
 /** Modes Konteks never lets Antigravity enter (A4): only `default` asks before commands and edits. */
 export const ANTIGRAVITY_REFUSED_MODES: readonly string[] = Object.freeze(["auto_edit", "yolo"]);
+/** Antigravity's own slash commands Konteks never sends (A4). */
+export const ANTIGRAVITY_REFUSED_COMMANDS: readonly string[] = Object.freeze(["plan", "logout"]);
 
 /**
  * Which sign-in the connector holds for Antigravity: the file the connector
@@ -541,6 +543,9 @@ export const antigravityRunnerAdapter: HostAgentRunnerAdapter = {
     return () => geminiMeasuredTurn(relay.meter.since(mark));
   },
   refusedSessionModes: { modeIds: ANTIGRAVITY_REFUSED_MODES, message: "Google Antigravity runs only in its default mode on Konteks, where it asks before commands and edits." },
+  // `/plan` waits on its own approval outside Konteks' governance; `/logout`
+  // would sign the connector's Antigravity out (A4: never sent).
+  refusedPromptCommands: { commands: ANTIGRAVITY_REFUSED_COMMANDS, message: "Google Antigravity's /plan and /logout commands are not available on Konteks." },
   sessionMeta: ANTIGRAVITY_SESSION_META,
   verifySession: verifyAntigravitySession,
   promptPrelude: (config, session) => antigravityPromptPrelude(config.RUNNER_CREDENTIAL_DIR, session),
