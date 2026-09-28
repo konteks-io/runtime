@@ -7,6 +7,7 @@ import {
   REMOTE_INSTANCE_PROTOCOL_VERSION,
   PlanningControllerTerminalDirectiveSchema,
   RemoteInstanceError,
+  OpenCodeLoginOptionIdSchema,
   SystemClock,
   createLogger,
   parseRfc3339,
@@ -2000,8 +2001,20 @@ export class Supervisor {
     if (!instanceId || intent.instanceId !== instanceId || intent.tenantId !== this.workspaceId) {
       throw new RemoteInstanceError("recovery_required", "This agent login is for another runtime");
     }
-    // An OpenCode login names its sign-in option; every report echoes it.
-    const loginOption = intent.agentId === "opencode" ? intent.loginOption : undefined;
+    // Google Antigravity's site sign-in (packages already carry its intent)
+    // arrives with antigravity-runtime-support CP3: until then it reads
+    // unavailable, and nothing starts.
+    if (intent.agentId !== "codex" && intent.agentId !== "claude-code" && intent.agentId !== "opencode") {
+      if (intent.action !== "cancel") {
+        await this.core.reportAgentLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as Parameters<CoreClient["reportAgentLogin"]>[1])
+          .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
+      }
+      return;
+    }
+    // An OpenCode login names its sign-in option; every report echoes it. An
+    // option of another agent is never started for OpenCode.
+    const requestedOption = intent.agentId === "opencode" && intent.loginOption !== undefined ? OpenCodeLoginOptionIdSchema.safeParse(intent.loginOption) : undefined;
+    const loginOption = requestedOption?.success ? requestedOption.data : undefined;
     const report = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) =>
       this.core.reportAgentLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as Parameters<CoreClient["reportAgentLogin"]>[1])
         .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
@@ -2021,7 +2034,7 @@ export class Supervisor {
       return;
     }
     // A sign-in this machine does not offer (any more) is not started.
-    if (loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(loginOption)) {
+    if ((requestedOption !== undefined && !requestedOption.success) || (loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(loginOption))) {
       await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
       return;
     }

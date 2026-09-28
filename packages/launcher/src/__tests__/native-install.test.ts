@@ -411,7 +411,8 @@ describe("native install composition", () => {
     expect(f.activate).not.toHaveBeenCalled();
   });
   it.each([
-    ["pi", "pi is no longer supported. Choose Claude Code, Codex, DeepSeek Harness or OpenCode on your computer."],
+    // The agent list is packages' (7.1.0 names four; the Antigravity minor adds Google Antigravity).
+    ["pi", expect.stringMatching(/^pi is no longer supported\. Choose Claude Code, Codex, DeepSeek Harness(,| or) OpenCode( or Google Antigravity)? on your computer\.$/)],
   ])("refuses %s before activation or downloads", async (retired, message) => {
     const f = await fixture();
     f.options.agents = ["codex", retired];

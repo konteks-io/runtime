@@ -94,7 +94,8 @@ describe("native customer entry point", () => {
     program.configureOutput({ writeErr: text => { stderr += text; } });
     for (const command of program.commands.find(c => c.name() === "agent")!.commands) command.configureOutput({ writeErr: text => { stderr += text; } });
     await expect(program.parseAsync(["--root", "/private/native-root", "agent", "add", retired], { from: "user" })).rejects.toThrow();
-    expect(stderr).toContain(`${retired} is no longer supported. Choose Claude Code, Codex, DeepSeek Harness or OpenCode on your computer.`);
+    // The agent list is packages' (7.1.0 names four; the Antigravity minor adds Google Antigravity).
+    expect(stderr).toMatch(new RegExp(`${retired} is no longer supported\\. Choose Claude Code, Codex, DeepSeek Harness(,| or) OpenCode( or Google Antigravity)? on your computer\\.`));
     expect(actions.addAgent).not.toHaveBeenCalled();
   });
   it("adds, installs, signs in and out the person's own OpenCode 2, and its help names it (CP6)", async () => {

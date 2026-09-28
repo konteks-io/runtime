@@ -32,7 +32,8 @@ export function turnUsageLabel(input: {
   } else if (agentId === "dsh") {
     providerId = "deepseek";
   }
-  const credential = agentId === "opencode" ? credentialKindFor(input.credentials, providerId) : undefined;
+  // The cast only bridges packages' optional `billing` (declared without `| undefined`) under exactOptionalPropertyTypes.
+  const credential = agentId === "opencode" ? credentialKindFor(input.credentials as Parameters<typeof credentialKindFor>[0], providerId) : undefined;
   const basis = remoteMoneyBasisFor(classifyAgentBilling({ agentId, ...(providerId ? { providerId } : {}), ...(credential ? { credential } : {}) }));
   if (basis === "unavailable_local_subscription") return { moneyBasis: basis };
   if (!input.coreAcceptsRouteBilling || !providerId) return null;
