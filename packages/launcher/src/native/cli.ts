@@ -24,7 +24,7 @@ export interface NativeCliActions {
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
-  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; title?: string; keyRef?: string }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
 }
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
@@ -58,6 +58,18 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     if (isRetiredAgentId(value)) throw new InvalidArgumentError(retiredAgentMessage(value));
     if (!(NATIVE_AGENT_IDS as readonly string[]).includes(value)) throw new InvalidArgumentError("unsupported agent family");
     return value as NativeAgentId;
+  };
+  // Signing in and out also takes Google Antigravity (its CP3), which install
+  // and `agent add` do not offer yet: the connector refuses it if no runner of
+  // it runs here.
+  const authAgent = (value: string): string => (value === "antigravity" ? value : agent(value));
+  const project = (value: string): string => {
+    if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(value)) throw new InvalidArgumentError("expected a Google Cloud project ID: 6 to 30 lower-case letters, digits or hyphens, starting with a letter");
+    return value;
+  };
+  const location = (value: string): string => {
+    if (!["global", "us", "eu"].includes(value)) throw new InvalidArgumentError("expected global, us or eu");
+    return value;
   };
   program.command("install").description("activate, verify and install the native connector, then start its user service")
     .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
@@ -96,14 +108,32 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .action(async () => actions.control({ ...context(), operation: "preview.status" }));
   const auth = program.command("auth").description("official local agent subscription authentication");
   auth.command("status").argument("[agent]", "agent family", agent).action(async (value?: string) => actions.control({ ...context(), operation: "auth.status", ...(value ? { agent: value } : {}) }));
-  auth.command("login").argument("<agent>", "agent family: claude-code, codex, dsh or opencode", agent).option("--organization", "attest that the account is organization-owned", false)
+  auth.command("login").argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", authAgent).option("--organization", "attest that the account is organization-owned", false)
     .option("--provider <id>", "OpenCode: the provider to sign in to (asked when omitted)", providerId)
     .option("--method <id>", "OpenCode: the provider's sign-in method, or key for an API key", providerId)
     .option("--reuse", "OpenCode: see which providers your own OpenCode uses, to sign in to the same ones", false)
-    .action(async (value: string, options: { organization: boolean; provider?: string; method?: string; reuse: boolean }) => actions.control({ ...context(), operation: "auth.login", agent: value, organization: options.organization,
-      ...(options.provider ? { provider: options.provider } : {}), ...(options.method ? { method: options.method } : {}), ...(options.reuse ? { reuse: true } : {}) }));
-  auth.command("logout").argument("<agent>", "agent family", agent).option("--provider <id>", "OpenCode: sign out of one provider only", providerId)
-    .action(async (value: string, options: { provider?: string }) => actions.control({ ...context(), operation: "auth.logout", agent: value, ...(options.provider ? { provider: options.provider } : {}) }));
+    .option("--api-key", "Google Antigravity: sign in with a Gemini API key (asked without echo)", false)
+    .option("--enterprise", "Google Antigravity: sign in with Gemini Enterprise in the browser on this computer", false)
+    .option("--project <id>", "Google Antigravity: the Google Cloud project that holds the Gemini Enterprise licence", project)
+    .option("--location <location>", "Google Antigravity: the licence's location, global, us or eu (default global)", location)
+    .action(async (value: string, options: { organization: boolean; provider?: string; method?: string; reuse: boolean; apiKey: boolean; enterprise: boolean; project?: string; location?: string }) => {
+      if (value !== "antigravity" && (options.apiKey || options.enterprise || options.project || options.location)) throw new InvalidArgumentError("--api-key, --enterprise, --project and --location are for antigravity");
+      if (options.apiKey && (options.enterprise || options.project || options.location)) throw new InvalidArgumentError("a Gemini API key and Gemini Enterprise are different sign-ins; choose one");
+      if (options.location && !options.project) throw new InvalidArgumentError("--location goes with --project");
+      const method = options.apiKey ? "gemini-api-key" : options.enterprise || options.project ? "oauth-business" : options.method;
+      await actions.control({ ...context(), operation: "auth.login", agent: value, organization: options.organization,
+        ...(options.provider ? { provider: options.provider } : {}), ...(method ? { method } : {}), ...(options.reuse ? { reuse: true } : {}),
+        ...(options.project ? { project: options.project, location: options.location ?? "global" } : {}) });
+    });
+  auth.command("logout").argument("<agent>", "agent family", authAgent).option("--provider <id>", "OpenCode: sign out of one provider only", providerId)
+    .option("--api-key", "Google Antigravity: forget only the Gemini API key", false)
+    .option("--enterprise", "Google Antigravity: sign out of Gemini Enterprise only", false)
+    .action(async (value: string, options: { provider?: string; apiKey: boolean; enterprise: boolean }) => {
+      if (value !== "antigravity" && (options.apiKey || options.enterprise)) throw new InvalidArgumentError("--api-key and --enterprise are for antigravity");
+      if (options.apiKey && options.enterprise) throw new InvalidArgumentError("to sign out of both, leave out --api-key and --enterprise");
+      const method = options.apiKey ? "gemini-api-key" : options.enterprise ? "oauth-business" : undefined;
+      await actions.control({ ...context(), operation: "auth.logout", agent: value, ...(options.provider ? { provider: options.provider } : {}), ...(method ? { method } : {}) });
+    });
   program.command("update").description("stage the newest signed native release, drain, swap the user service and verify it; rolls back on a failed health gate")
     .option("--check", "report the available release without installing anything", false)
     .option("--unattended", "launched by the connector itself; recorded as such in the update ledger", false)

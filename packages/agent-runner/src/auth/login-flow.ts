@@ -39,8 +39,12 @@ export interface LoginFlow {
   loginId: string;
   input(text: string): void;
   cancel(): Promise<void>;
-  readonly done: Promise<{ code: number | null }>;
+  /** `reason`: why a sign-in failed, when the person can act on it (Gemini Enterprise found no licence). */
+  readonly done: Promise<{ code: number | null; reason?: LoginFailureReason }>;
 }
+
+/** A failed sign-in's reason the site shows in its own words (Core 7.1.0 `AgentLoginFailure`). */
+export type LoginFailureReason = "no_license";
 
 const URL_PATTERN = /https?:\/\/[^\s<>"')\]]+/g;
 const USER_CODE_PATTERN = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/;

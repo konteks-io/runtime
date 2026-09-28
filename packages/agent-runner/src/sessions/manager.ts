@@ -18,6 +18,7 @@ import { classifyBridgeError } from "../bridge/process.js";
 import type { RunnerEventBus } from "../events.js";
 import type { HostPromptPrelude, HostPromptSession, HostTurnError } from "../host/host-agent.js";
 import { konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
+import type { MeasuredTurn } from "./usage-label.js";
 
 /**
  * ACP sessions inside this runner. The supervisor creates them as a
@@ -153,6 +154,12 @@ export interface SessionManagerOptions {
   promptPrelude?: (session: HostPromptSession) => Promise<HostPromptPrelude | null>;
   /** A reply text that is really the agent's failure report; never forwarded, reported as the turn's error. */
   agentErrorText?: (text: string) => HostTurnError | null;
+  /**
+   * A turn measured outside the agent (Antigravity's Gemini API key relay):
+   * called as a turn starts on `bridge`; the returned function reads the turn
+   * once it ended, or null when it must not be reported (an older Core).
+   */
+  measureTurn?: (bridge: BridgeProcess) => (() => MeasuredTurn | null) | null;
 }
 
 /** The current value of a session's `model` select, from any ACP configuration list. */
@@ -800,6 +807,12 @@ export class SessionManager {
     // after a turn's response is counted with the next turn, never lost.
     if (record.turnCostStartUsd === undefined && record.sessionCostUsd !== undefined) record.turnCostStartUsd = record.sessionCostUsd;
     delete record.turnError;
+    // Tokens counted outside the agent (a relay): the span starts now.
+    const measured = this.options.measureTurn?.(bridge) ?? null;
+    const publishMeasured = () => {
+      const turn = measured?.();
+      if (turn) this.publishMeasuredUsage(record, turn);
+    };
     const send = async () => {
       // The agent's own preparation of this prompt (Antigravity: its working
       // copy's AGENTS.md, which its server never loads, A9).
@@ -830,16 +843,20 @@ export class SessionManager {
           // not use): a failed turn, in plain words, never a result.
           record.completedTurn = false;
           if (turnError.class === "agent_auth_required") this.options.onAuthRequired?.();
+          // What the key paid for is reported even when the turn failed.
+          publishMeasured();
           this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/prompt", code: -32603, ...turnError });
           return;
         }
         record.completedTurn = result.stopReason === "end_turn";
         if (result.usage) this.publishUsage(record, result.usage, true);
+        else publishMeasured();
         this.options.events.publish({ kind: "prompt_result", acpSessionRef, requestId, result });
       })
       .catch((error: unknown) => {
         const classified = classifyBridgeError(error);
         if (classified.class === "agent_auth_required") this.options.onAuthRequired?.();
+        publishMeasured();
         this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/prompt", ...classified });
         throw error;
       })
@@ -1056,6 +1073,30 @@ export class SessionManager {
       record.pendingClientRequests.set(requestId, { resolve: (value) => resolve(value as T), reject });
       publish();
     });
+  }
+
+  /**
+   * A turn measured outside the agent: pay-per-use on the person's own key,
+   * with the list-price estimate when every model it used has a price (A8).
+   */
+  private publishMeasuredUsage(record: SessionRecord, turn: MeasuredTurn): void {
+    const observation: AgentTurnUsageObservation = {
+      instanceId: record.context.instanceId,
+      assignmentId: record.context.assignmentId,
+      attempt: record.context.attempt,
+      agentId: record.context.agentId,
+      totalTokens: turn.totalTokens,
+      inputTokens: turn.inputTokens,
+      outputTokens: turn.outputTokens,
+      thoughtTokens: turn.thoughtTokens,
+      cacheReadTokens: turn.cacheReadTokens,
+      observedAt: this.now().toISOString(),
+      moneyBasis: "pay_per_use",
+      provider: turn.provider,
+      model: turn.model,
+      ...(turn.estimate ? { reportedCost: { currency: "USD", amountMicros: turn.estimate.amountMicros }, costSource: "list_price_estimate" as const, pricingSnapshotId: turn.estimate.pricingSnapshotId } : {}),
+    };
+    this.options.events.publish({ kind: "usage_observation", acpSessionRef: record.acpSessionRef, observation });
   }
 
   private publishUsage(record: SessionRecord, usage: Usage, turnEnded = false): void {

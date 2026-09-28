@@ -37,13 +37,18 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
       provider: providerIdSchema.optional(),
       method: methodIdSchema.optional(),
       reuse: z.boolean().optional(),
+      // Google Antigravity's Gemini Enterprise: the licence's Google Cloud
+      // project and location (checked again by the runner).
+      project: z.string().regex(/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/).optional(),
+      location: z.string().regex(/^(?:global|us|eu)$/).optional(),
     })
     .strict(),
   z
     .object({ op: z.literal("auth.input"), loginId: z.string().min(1), text: z.string().max(8_192) })
     .strict(),
   z.object({ op: z.literal("auth.cancel"), loginId: z.string().min(1) }).strict(),
-  z.object({ op: z.literal("auth.logout"), agentId: agentIdSchema, provider: providerIdSchema.optional() }).strict(),
+  // `method`: which of an agent's sign-ins to remove (Antigravity: its key or Gemini Enterprise).
+  z.object({ op: z.literal("auth.logout"), agentId: agentIdSchema, provider: providerIdSchema.optional(), method: methodIdSchema.optional() }).strict(),
   // Managed-git key registration (ON16). Nothing here carries key material:
   // the private half is generated on the machine and never crosses this hop,
   // not even to be shown to the person who ran the command.
@@ -126,6 +131,8 @@ export const ControlLoginEventSchema = z.discriminatedUnion("kind", [
       loginId: z.string(),
       code: z.string(),
       message: z.string().max(1_024),
+      /** Why, when the site words it itself (Gemini Enterprise found no licence). */
+      reason: z.literal("no_license").optional(),
     })
     .strict(),
 ]);

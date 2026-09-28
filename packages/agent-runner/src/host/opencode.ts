@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises";
 import { isAbsolute, posix, resolve, win32 } from "node:path";
-import { RemoteInstanceError, keyedFingerprint, readOrCreateSecretFile } from "@konteks/remote-common";
+import { OpenCodeLoginOptionIdSchema, RemoteInstanceError, keyedFingerprint, readOrCreateSecretFile } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
-import type { HostAgentRunnerAdapter, HostWorkingCopyBinding } from "./host-agent.js";
+import type { HostAgentRunnerAdapter, HostLoginRequest, HostWorkingCopyBinding } from "./host-agent.js";
 import { allowListEnvironment, HOST_INHERITED_VARIABLES } from "./allow-list-environment.js";
 import { instructionsInside } from "./working-copy-instructions.js";
 import {
@@ -18,6 +18,7 @@ import {
   personalOpenCodeHome,
   startOpenCodeLogin,
   type OpenCodeCommandContext,
+  type OpenCodeLoginRequest,
 } from "../auth/opencode-auth.js";
 
 /** Same file as `FINGERPRINT_KEY_FILE` in auth/identity.ts (kept literal to avoid an import cycle). */
@@ -328,6 +329,15 @@ function binary(config: RunnerConfig, family: AgentBridgeFamily): string {
   return located;
 }
 
+/** A sign-in request narrowed to OpenCode's: only its own reviewed options, never another agent's (or a Google Cloud project). */
+function openCodeLoginRequest(request: HostLoginRequest): OpenCodeLoginRequest {
+  const { loginOption, gcp: _gcp, ...rest } = request;
+  if (loginOption === undefined) return rest;
+  const option = OpenCodeLoginOptionIdSchema.safeParse(loginOption);
+  if (!option.success) throw new RemoteInstanceError("agent_unavailable", "That sign-in is not one of OpenCode's.");
+  return { ...rest, loginOption: option.data };
+}
+
 /**
  * OpenCode 2, launched as `<binary> acp` (no Node) with the allow-list
  * environment, the locked Konteks configuration and a private home shared by
@@ -363,7 +373,7 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
     const context = openCodeCommandContext(config);
     const paths = openCodeRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
     return startOpenCodeLogin({ context, events, logger, stateDir: paths.root, timeoutMs: config.RUNNER_LOGIN_TIMEOUT_MS, prepare: () => prepareOpenCodeHome(config),
-      ...(loginId === undefined ? {} : { loginId }), ...(request === undefined ? {} : { request }),
+      ...(loginId === undefined ? {} : { loginId }), ...(request === undefined ? {} : { request: openCodeLoginRequest(request) }),
       personal: personalOpenCodeHome({ binary: context.binary, scratchDir: (process.platform === "win32" ? win32 : posix).join(paths.root, "personal-list"),
         allowList: home => openCodeEnvironment({ home }) }) });
   },

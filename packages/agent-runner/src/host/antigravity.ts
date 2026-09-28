@@ -4,11 +4,16 @@ import { isAbsolute, posix, win32 } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
-import { fetchedAgentPlatformPin, type AgentBridgeFamily, type FetchedAgentPlatformPin } from "@konteks/remote-release";
-import { AgentLoginGcpSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
+import { fetchedAgentPlatformPin, findAgentBridge, type AgentBridgeFamily, type FetchedAgentPlatformPin } from "@konteks/remote-release";
+import { ANTIGRAVITY_GOOGLE_SIGN_IN_RELEASED, ANTIGRAVITY_LOGIN_OPTIONS, AgentLoginGcpSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import type { RunnerConfig } from "../config.js";
-import { ANTIGRAVITY_LICENCE_REASON } from "../bridge/process.js";
-import type { HostAgentRunnerAdapter, HostPromptPrelude, HostPromptSession, HostTurnError } from "./host-agent.js";
+import { ANTIGRAVITY_LICENCE_REASON, spawnBridge, type BridgeProcess } from "../bridge/process.js";
+import type { HostAgentRunnerAdapter, HostPromptPrelude, HostPromptSession, HostSpawn, HostTurnError } from "./host-agent.js";
+import { geminiMeasuredTurn } from "../sessions/usage-label.js";
+import { startAntigravityRelay, type AntigravityRelay, type GeminiRelayUpstream } from "./antigravity-relay.js";
+import {
+  antigravityIdentity, antigravityLogout, markNoLicence, readAntigravityApiKey, startAntigravityLogin, type GoogleSignInProcess,
+} from "../auth/antigravity-auth.js";
 import { allowListEnvironment } from "./allow-list-environment.js";
 import { privateHomeProcesses, type PrivateHomeProcesses } from "./process-sweep.js";
 import { instructionsInside } from "./working-copy-instructions.js";
@@ -139,15 +144,30 @@ export const ANTIGRAVITY_REFUSED_MODES: readonly string[] = Object.freeze(["auto
 /**
  * Which sign-in the connector holds for Antigravity: the file the connector
  * writes `settings.json` from before every spawn (the server treats
- * `auth.type` there as the single source of truth). CP3's sign-in writes it;
- * without one the settings name no method and a session reads "Needs
- * sign-in". Never read from the person's `~/.gemini`.
+ * `auth.type` there as the single source of truth). CP3's sign-in and
+ * sign-out write it; without one the settings name no method and a session
+ * reads "Needs sign-in". Never read from the person's `~/.gemini`.
+ * - `method`: the sign-in the server uses (`none` after signing out of all);
+ * - `gcp`: Gemini Enterprise's project and location as the server resolved
+ *   them after its licence picker; kept after a sign-out so the next sign-in
+ *   offers it again;
+ * - `tier`: the licence tier the server logged at sign-in
+ *   (`gcp-ge-plus-tier`), which names the credential and its billing;
+ * - `licence: "none"`: the last Gemini Enterprise attempt found no licence
+ *   (the credential then reads "Needs sign-in" with that reason).
  */
-export const AntigravitySignInSchema = z.discriminatedUnion("method", [
-  z.object({ method: z.literal("gemini-api-key") }).strict(),
-  z.object({ method: z.literal("oauth-business"), gcp: AgentLoginGcpSchema }).strict(),
-]);
+const TIER = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/);
+export const ANTIGRAVITY_SIGN_IN_METHODS = ["gemini-api-key", "oauth-business", "oauth-personal", "none"] as const;
+export const AntigravitySignInSchema = z.object({
+  method: z.enum(ANTIGRAVITY_SIGN_IN_METHODS),
+  gcp: AgentLoginGcpSchema.optional(),
+  tier: TIER.optional(),
+  licence: z.literal("none").optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.method === "oauth-business" && value.gcp === undefined) ctx.addIssue({ code: "custom", path: ["gcp"], message: "Gemini Enterprise names its Google Cloud project" });
+});
 export type AntigravitySignIn = z.infer<typeof AntigravitySignInSchema>;
+export type AntigravitySignInMethod = AntigravitySignIn["method"];
 
 /** The connector's sign-in record, or null when there is none or it is not one Konteks wrote. */
 export async function readAntigravitySignIn(credentialDir: string, platform: NodeJS.Platform = process.platform): Promise<AntigravitySignIn | null> {
@@ -171,12 +191,44 @@ export async function writeAntigravitySignIn(credentialDir: string, signIn: Anti
 /**
  * `settings.json` exactly as the contract names it: `{"auth": {"type":
  * "gemini-api-key"}}`, or `{"auth": {"type": "oauth-business"}, "gcp":
- * {"project": …, "location": …}}`; `{}` when nothing is signed in.
+ * {"project": …, "location": …}}`; `{}` when nothing is signed in. Personal
+ * Google sign-in (`oauth-personal`, A10) is written only while its switch is
+ * on, which it is not.
  */
 export function renderAntigravitySettings(signIn: AntigravitySignIn | null): string {
-  if (signIn === null) return "{}\n";
+  if (signIn === null || signIn.method === "none") return "{}\n";
   if (signIn.method === "gemini-api-key") return `${JSON.stringify({ auth: { type: "gemini-api-key" } })}\n`;
-  return `${JSON.stringify({ auth: { type: "oauth-business" }, gcp: { project: signIn.gcp.project, location: signIn.gcp.location } })}\n`;
+  if (signIn.method === "oauth-personal") return ANTIGRAVITY_GOOGLE_SIGN_IN_RELEASED ? `${JSON.stringify({ auth: { type: "oauth-personal" } })}\n` : "{}\n";
+  return `${JSON.stringify({ auth: { type: "oauth-business" }, gcp: { project: signIn.gcp!.project, location: signIn.gcp!.location } })}\n`;
+}
+
+/**
+ * While the connector drives a sign-in or sign-out over ACP, the server reads
+ * and rewrites `settings.json` itself (the licence picker writes the project
+ * it resolved); no other preparation of the home may overwrite it meanwhile.
+ */
+const signInsUnderWay = new Set<string>();
+
+/** Hold the private home for a sign-in; the returned function releases it. */
+export function holdAntigravityHomeForSignIn(credentialDir: string, platform: NodeJS.Platform = process.platform): () => void {
+  const home = antigravityRuntimePaths(credentialDir, platform).home;
+  if (signInsUnderWay.has(home)) throw new RemoteInstanceError("temporarily_unavailable", "Google Antigravity is already signing in on this computer.");
+  signInsUnderWay.add(home);
+  let released = false;
+  return () => { if (!released) { released = true; signInsUnderWay.delete(home); } };
+}
+
+/** The server's own token files in the private home (Gemini Enterprise, and personal Google sign-in behind its switch). The connector only checks they exist. */
+export function antigravityTokenFiles(credentialDir: string, platform: NodeJS.Platform = process.platform): { business: string; personal: string } {
+  const path = platform === "win32" ? win32 : posix;
+  const acp = path.join(antigravityRuntimePaths(credentialDir, platform).geminiHome, "antigravity-acp");
+  return { business: path.join(acp, "acp_business_token.json"), personal: path.join(acp, "acp_token.json") };
+}
+
+/** Whether a token file the server wrote is there (a regular file, never a link); its contents are never read. */
+export async function antigravityTokenPresent(file: string): Promise<boolean> {
+  const found = await lstat(file).catch(() => null);
+  return found !== null && found.isFile() && found.size > 0;
 }
 
 /**
@@ -200,7 +252,8 @@ export async function prepareAntigravityHome(credentialDir: string, platform: No
     if (!found.isDirectory() || found.isSymbolicLink()) throw new RemoteInstanceError("agent_unavailable", "Google Antigravity's private folder is not a folder.", { diagnostic: "antigravity_home_unsafe" });
     if (platform !== "win32") await chmod(folder, 0o700);
   }
-  await writeSecretFile(paths.settingsFile, renderAntigravitySettings(await readAntigravitySignIn(credentialDir, platform)));
+  // A sign-in under way owns settings.json until it ends (the server writes it too).
+  if (!signInsUnderWay.has(paths.home)) await writeSecretFile(paths.settingsFile, renderAntigravitySettings(await readAntigravitySignIn(credentialDir, platform)));
   await rm(paths.trustFile, { force: true, recursive: true });
   for (const owned of [config, cliSkills]) {
     await rm(owned, { force: true, recursive: true });
@@ -294,9 +347,13 @@ export function verifyAntigravitySession(response: { configOptions?: unknown; mo
  * Only execution and discovery processes are read this way; the sign-in flow
  * (CP3) expects these lines.
  */
-export function antigravityStderrFailure(line: string): RemoteInstanceError | null {
+export function antigravityStderrFailure(line: string, credentialDir?: string): RemoteInstanceError | null {
   const auth = (message: string, diagnostic: string) => new RemoteInstanceError("agent_auth_required", message, { diagnostic, recoveryActions: [{ kind: "login_agent", agentId: "antigravity" }] });
-  if (/has no available license/i.test(line)) return auth(ANTIGRAVITY_LICENCE_REASON, "antigravity_no_licence");
+  if (/has no available license/i.test(line)) {
+    // The Enterprise credential reads "Needs sign-in" with this reason until the next sign-in (CP3).
+    if (credentialDir !== undefined) void markNoLicence(credentialDir).catch(() => undefined);
+    return auth(ANTIGRAVITY_LICENCE_REASON, "antigravity_no_licence");
+  }
   if (/Open the following link to (?:authenticate|choose your Gemini Enterprise license)|Launching browser login flow/i.test(line)) {
     return auth("Google Antigravity needs to sign in again. Run `konteks-remote auth login antigravity`.", "antigravity_sign_in_needed");
   }
@@ -354,10 +411,64 @@ export async function sweepAntigravityProcesses(credentialDir: string, control: 
  */
 export const ANTIGRAVITY_PROCESS_LIMITS = Object.freeze({ executionProcesses: 2, queueMs: 120_000, idleExecutionMs: 5 * 60_000, controlIdleMs: 60_000 });
 
-function notYet(): RemoteInstanceError {
-  // Sign-in (the Gemini API key relay and Gemini Enterprise) is CP3; until
-  // then the connector holds no Antigravity credential to use or remove.
-  return new RemoteInstanceError("agent_unavailable", "Google Antigravity cannot sign in on this computer yet.");
+/** The relay of every live Antigravity process that runs on a Gemini API key. */
+const relays = new WeakMap<BridgeProcess, AntigravityRelay>();
+
+/** Test and live-proof seam only: where relays forward (a fake Google endpoint). Never from config, Core or the environment. */
+let relayUpstream: GeminiRelayUpstream | undefined;
+export function setAntigravityRelayUpstreamForTests(upstream: GeminiRelayUpstream | undefined): void {
+  relayUpstream = upstream;
+}
+
+/**
+ * Every Antigravity process (control, execution, discovery) spawned while
+ * the connector holds a Gemini API key and uses it (A7): a relay of its own
+ * starts first on 127.0.0.1, the server gets only its address
+ * (`GOOGLE_GEMINI_BASE_URL`) and, once initialized, a per-process token
+ * through `authenticate` `_meta["api-key"]`; the relay stops when the process
+ * exits. Gemini Enterprise and nothing signed in spawn as before.
+ */
+export function antigravitySpawn(credentialDir: string, spawn: HostSpawn): HostSpawn {
+  return async options => {
+    const record = await readAntigravitySignIn(credentialDir);
+    const key = record?.method === "gemini-api-key" ? await readAntigravityApiKey(credentialDir) : null;
+    if (key === null) return spawn(options);
+    const relay = await startAntigravityRelay({ key, ...(options.logger ? { logger: options.logger } : {}), ...(relayUpstream ? { upstream: relayUpstream } : {}) });
+    const env = antigravityProcessEnvironment(credentialDir, { relayBaseUrl: relay.url });
+    let bridge: BridgeProcess;
+    try {
+      bridge = await spawn({ ...options, spec: { ...options.spec, env },
+        handlers: { ...options.handlers, onExit: info => { void relay.close(); options.handlers.onExit(info); } } });
+    } catch (error) {
+      await relay.close();
+      throw error;
+    }
+    try {
+      await bridge.connection.authenticate({ methodId: "gemini-api-key", _meta: { "api-key": relay.token } });
+    } catch (error) {
+      await bridge.stop().catch(() => undefined);
+      await relay.close();
+      throw new RemoteInstanceError("agent_auth_required", "Google Antigravity did not take the Gemini API key. Run `konteks-remote auth login antigravity`.", {
+        cause: error, diagnostic: "antigravity_key_refused", recoveryActions: [{ kind: "login_agent", agentId: "antigravity" }],
+      });
+    }
+    relays.set(bridge, relay);
+    return bridge;
+  };
+}
+
+/** The process a Google sign-in or sign-out runs on: the fetched server, the private home, the allow-list environment, no relay. */
+function signInProcess(config: RunnerConfig, spawn: HostSpawn | undefined): GoogleSignInProcess {
+  const family = findAgentBridge("antigravity");
+  if (!family) throw new RemoteInstanceError("agent_unavailable", "Google Antigravity is not known to this connector.");
+  const { command, args } = antigravityRunnerAdapter.launch(config, family);
+  const paths = antigravityRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
+  return {
+    spec: { family, command, args, env: antigravityProcessEnvironment(config.RUNNER_CREDENTIAL_DIR), cwd: paths.home },
+    spawn: spawn ?? spawnBridge,
+    clientVersion: config.RUNNER_BRIDGE_VERSION,
+    initializeTimeoutMs: config.RUNNER_INITIALIZE_TIMEOUT_MS,
+  };
 }
 
 /** The verified fetched folder of an Antigravity runner and this platform's pin; refuses anything else. */
@@ -378,8 +489,9 @@ function fetched(config: RunnerConfig, family: AgentBridgeFamily): { root: strin
  * home the connector prepares before every spawn (CP2): the locked
  * configuration (settings, no trust, owned `config/`), the tool filter on
  * every session, `default` mode only, the working copy's `AGENTS.md` in the
- * prompt, at most two sessions at once. Sign-in is CP3; not offered until
- * CP4 (`antigravityInstallAdapter.offered` in the supervisor).
+ * prompt, at most two sessions at once. CP3: signs in with a Gemini API key
+ * (through a loopback relay per process) or Gemini Enterprise. Not offered
+ * until CP4 (`antigravityInstallAdapter.offered` in the supervisor).
  */
 export const antigravityRunnerAdapter: HostAgentRunnerAdapter = {
   agentId: "antigravity",
@@ -401,14 +513,33 @@ export const antigravityRunnerAdapter: HostAgentRunnerAdapter = {
     }
     await prepareAntigravityHome(config.RUNNER_CREDENTIAL_DIR);
   },
-  startLogin: () => { throw notYet(); },
-  logout: async () => { throw notYet(); },
+  // CP3: a Gemini API key typed on this computer, or Gemini Enterprise
+  // through Google's own sign-in on this computer (from here or the site).
+  startLogin: ({ config, events, logger, loginId, request, spawn }) => {
+    fetched(config, findAgentBridge("antigravity")!);
+    return startAntigravityLogin({ credentialDir: config.RUNNER_CREDENTIAL_DIR, events, logger, process: signInProcess(config, spawn),
+      timeoutMs: config.RUNNER_LOGIN_TIMEOUT_MS, ...(loginId === undefined ? {} : { loginId }), ...(request === undefined ? {} : { request }) });
+  },
+  logout: async (config, request, spawn) => {
+    fetched(config, findAgentBridge("antigravity")!);
+    await antigravityLogout({ credentialDir: config.RUNNER_CREDENTIAL_DIR, process: signInProcess(config, spawn), ...(request === undefined ? {} : { request }) });
+  },
   loginFailedMessage: "Google Antigravity did not finish signing in",
-  identity: async () => ({ kind: "logged_out" }),
+  identity: (config, settings) => antigravityIdentity(config.RUNNER_CREDENTIAL_DIR, settings),
+  // Gemini Enterprise is the one sign-in the site may start (a browser on this
+  // computer); personal Google sign-in stays held back (A10).
+  siteLoginOptions: async () => Object.values(ANTIGRAVITY_LOGIN_OPTIONS).filter(option => option.released).map(option => option.id),
   hostVersion: config => config.RUNNER_BRIDGE_VERSION !== "unknown" ? config.RUNNER_BRIDGE_VERSION : undefined,
-  // The server reports no usage (CP0 B11); the relay counts tokens for an
-  // API key from CP3 on, and Gemini Enterprise is a subscription (A7, A8).
+  // The server reports no usage (CP0 B11). On a Gemini API key the relay
+  // counts it (the identity says so, A7); Gemini Enterprise reports none (A8).
   tokenUsageObservable: false,
+  wrapSpawn: (config, spawn) => antigravitySpawn(config.RUNNER_CREDENTIAL_DIR, spawn),
+  measureTurn: bridge => {
+    const relay = relays.get(bridge);
+    if (!relay) return null;
+    const mark = relay.meter.mark();
+    return () => geminiMeasuredTurn(relay.meter.since(mark));
+  },
   refusedSessionModes: { modeIds: ANTIGRAVITY_REFUSED_MODES, message: "Google Antigravity runs only in its default mode on Konteks, where it asks before commands and edits." },
   sessionMeta: ANTIGRAVITY_SESSION_META,
   verifySession: verifyAntigravitySession,
@@ -416,7 +547,7 @@ export const antigravityRunnerAdapter: HostAgentRunnerAdapter = {
   processLimits: ANTIGRAVITY_PROCESS_LIMITS,
   // Enterprise `session/new` fetches the organisation's settings first (3 to 7 s live, CP2).
   sessionBootstrapTimeoutMs: 30_000,
-  stderrFailure: antigravityStderrFailure,
+  stderrFailure: (line, config) => antigravityStderrFailure(line, config.RUNNER_CREDENTIAL_DIR),
   agentErrorText: antigravityAgentErrorText,
   sweepLeftovers: async config => { await sweepAntigravityProcesses(config.RUNNER_CREDENTIAL_DIR); },
 };

@@ -19,7 +19,8 @@ export const FINGERPRINT_KEY_FILE = "fingerprint.key";
 
 export type IdentityProbe =
   // `credentials`: what an agent with several sign-ins reported (OpenCode's `auth list`), no secret.
-  | { kind: "signal"; fingerprint: string; credentials?: ConnectedAgentCredential[] }
+  // `tokenUsageObservable`: whether turns under this identity report billing usage (Antigravity: only through its key relay).
+  | { kind: "signal"; fingerprint: string; credentials?: ConnectedAgentCredential[]; tokenUsageObservable?: boolean }
   | { kind: "logged_out"; credentials?: ConnectedAgentCredential[] }
   | { kind: "no_official_signal" };
 

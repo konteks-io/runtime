@@ -139,11 +139,20 @@ describe("the Antigravity runner adapter", () => {
     expect(() => resolveBridgeSpawnSpec(config({ RUNNER_NATIVE_DSH_NODE: "/usr/bin/node" }))).toThrow(/DeepSeek Harness/);
   });
 
-  it("still refuses to sign in or out until CP3, and reads signed out", async () => {
-    const runner = config();
-    expect(() => antigravityRunnerAdapter.startLogin!({ config: runner, events: {} as never, logger: { info: () => undefined, warn: () => undefined } })).toThrow(/cannot sign in on this computer yet/);
-    await expect(antigravityRunnerAdapter.logout!(runner)).rejects.toMatchObject({ code: "agent_unavailable" });
-    await expect(antigravityRunnerAdapter.identity!(runner, { openCodeFreeModels: false, coreAcceptsRouteBilling: false })).resolves.toEqual({ kind: "logged_out" });
+  it("signs in only from the fetched copy, refuses personal Google sign-in (A10), and reads signed out with nothing held (CP3)", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "agy-adapter-")));
+    try {
+      const runner = config({ RUNNER_CREDENTIAL_DIR: join(root, "credentials") });
+      const logger = { info: () => undefined, warn: () => undefined };
+      expect(() => antigravityRunnerAdapter.startLogin!({ config: config({ RUNNER_NATIVE_ANTIGRAVITY_ROOT: undefined }), events: {} as never, logger })).toThrow(/copy the connector fetched/);
+      expect(() => antigravityRunnerAdapter.startLogin!({ config: runner, events: {} as never, logger, request: { loginOption: "google-account" } })).toThrow(/personal Google account is not available/);
+      expect(() => antigravityRunnerAdapter.startLogin!({ config: runner, events: {} as never, logger, request: { loginOption: "chatgpt" } })).toThrow(/not one of Google Antigravity's/);
+      await expect(antigravityRunnerAdapter.logout!(runner, { method: "gemini-api-key" })).rejects.toMatchObject({ code: "prerequisite_missing" });
+      await expect(antigravityRunnerAdapter.identity!(runner, { openCodeFreeModels: false, coreAcceptsRouteBilling: true })).resolves.toEqual({ kind: "logged_out", credentials: [] });
+      await expect(antigravityRunnerAdapter.siteLoginOptions!(runner)).resolves.toEqual(["gemini-enterprise"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("carries the locked session configuration: the tool filter, default mode only, two processes, a longer bootstrap", () => {
@@ -158,7 +167,7 @@ describe("the Antigravity runner adapter", () => {
     expect(antigravityRunnerAdapter.sessionBootstrapTimeoutMs).toBe(30_000);
   });
 
-  it("reports its pinned version, and no billing usage until the relay (CP3)", () => {
+  it("reports its pinned version, and no billing usage unless its identity says the key relay counts it (CP3)", () => {
     const view = projectReadiness({
       family: findAgentBridge("antigravity")!, authMode: "agent_local_subscription", connectionState: "ready", initializeResult: null,
       scope: INITIAL_SCOPE_STATE,
@@ -189,8 +198,17 @@ describe("Google Antigravity's private home (CP2)", () => {
     // A project or location that is not one, or any other shape, is not a sign-in.
     await expect(writeAntigravitySignIn(cred, { method: "oauth-business", gcp: { project: "../../etc", location: "global" } } as never)).rejects.toThrow();
     await expect(writeAntigravitySignIn(cred, { method: "oauth-business", gcp: { project: "gemini-enterprise-qa-25d3", location: "asia" } } as never)).rejects.toThrow();
-    await writeFile(paths.signIn, JSON.stringify({ method: "oauth-personal" }));
+    await writeFile(paths.signIn, JSON.stringify({ method: "oauth-business" }));
     expect(await readAntigravitySignIn(cred)).toBeNull();
+    await writeFile(paths.signIn, JSON.stringify({ method: "gemini-api-key", token: "x" }));
+    expect(await readAntigravitySignIn(cred)).toBeNull();
+    // CP3: the key in use keeps Enterprise's project for the next sign-in; settings name only the method.
+    expect(JSON.parse(renderAntigravitySettings({ method: "gemini-api-key", gcp: { project: "gemini-enterprise-qa-25d3", location: "global" }, tier: "gcp-ge-plus-tier" }))).toEqual({ auth: { type: "gemini-api-key" } });
+    expect(renderAntigravitySettings({ method: "none", gcp: { project: "gemini-enterprise-qa-25d3", location: "global" } })).toBe("{}\n");
+    // Personal Google sign-in stays held back (A10): even a recorded one names no method.
+    await writeFile(paths.signIn, JSON.stringify({ method: "oauth-personal" }));
+    await prepareAntigravityHome(cred);
+    expect(await readFile(paths.settingsFile, "utf8")).toBe("{}\n");
     await writeFile(paths.signIn, "not json");
     await prepareAntigravityHome(cred);
     expect(await readFile(paths.settingsFile, "utf8")).toBe("{}\n");

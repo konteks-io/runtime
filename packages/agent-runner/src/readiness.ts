@@ -34,6 +34,8 @@ export interface ReadinessInputs {
   bridgeVersionCompatible: boolean;
   /** The verified installed version of a host-installed agent; never an ACP bridge version. */
   hostAgentVersion?: string;
+  /** Whether turns report billing usage under the current sign-in, when the agent says (Antigravity: only on its key relay). */
+  tokenUsageObservable?: boolean;
   lastProbeAt: string | null;
 }
 
@@ -49,7 +51,7 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
     readiness,
     // A host agent may send no billing usage with a turn (DeepSeek Harness:
     // its usage_update is context occupancy, dsh-runtime-support D4).
-    tokenUsageObservable: hostAgentRunnerAdapter(inputs.family.agentId)?.tokenUsageObservable ?? true,
+    tokenUsageObservable: inputs.tokenUsageObservable ?? hostAgentRunnerAdapter(inputs.family.agentId)?.tokenUsageObservable ?? true,
     acpCapabilities: {
       sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
       forkSession: caps?.sessionCapabilities?.fork != null,

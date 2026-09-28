@@ -61,7 +61,8 @@ export const RunnerEventSchema = z.discriminatedUnion("kind", [
         // pick); everything else is read with the launcher's hidden prompt.
         z.object({ type: z.literal("prompt"), label: z.string().max(256), secret: z.boolean(), visible: z.literal(true).optional() }).strict(),
         z.object({ type: z.literal("completed"), readiness: z.string() }).strict(),
-        z.object({ type: z.literal("failed"), code: z.string(), message: z.string().max(1_024) }).strict(),
+        // `reason`: a failure the site words itself (Gemini Enterprise found no licence).
+        z.object({ type: z.literal("failed"), code: z.string(), message: z.string().max(1_024), reason: z.literal("no_license").optional() }).strict(),
       ]),
     })
     .strict(),

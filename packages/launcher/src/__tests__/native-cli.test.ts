@@ -50,6 +50,35 @@ describe("native customer entry point", () => {
     await program.parseAsync(["auth", "logout", "opencode", "--provider", "openai"], { from: "user" });
     expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.logout", agent: "opencode", provider: "openai" }));
   });
+  it("signs Google Antigravity in and out with a Gemini API key or Gemini Enterprise, though it cannot be installed yet (antigravity CP3)", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["auth", "login", "antigravity"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.login", agent: "antigravity", organization: false }));
+    expect(actions.control.mock.calls.at(-1)?.[0]).not.toHaveProperty("method");
+    await program.parseAsync(["auth", "login", "antigravity", "--api-key"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ agent: "antigravity", method: "gemini-api-key" }));
+    // The key itself is never an argument: only the choice is.
+    expect(JSON.stringify(actions.control.mock.calls.at(-1))).not.toMatch(/AIza/);
+    await program.parseAsync(["auth", "login", "antigravity", "--enterprise"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ agent: "antigravity", method: "oauth-business" }));
+    await program.parseAsync(["auth", "login", "antigravity", "--project", "gemini-enterprise-qa-25d3"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ agent: "antigravity", method: "oauth-business", project: "gemini-enterprise-qa-25d3", location: "global" }));
+    await program.parseAsync(["auth", "login", "antigravity", "--enterprise", "--project", "gemini-enterprise-qa-25d3", "--location", "eu"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ project: "gemini-enterprise-qa-25d3", location: "eu" }));
+    const calls = actions.control.mock.calls.length;
+    for (const argv of [["auth", "login", "antigravity", "--project", "Bad_Project"], ["auth", "login", "antigravity", "--project", "gemini-enterprise-qa-25d3", "--location", "asia"],
+      ["auth", "login", "antigravity", "--api-key", "--enterprise"], ["auth", "login", "antigravity", "--location", "us"], ["auth", "login", "codex", "--api-key"],
+      ["auth", "logout", "antigravity", "--api-key", "--enterprise"], ["auth", "logout", "opencode", "--enterprise"]]) {
+      await expect(program.parseAsync(argv, { from: "user" }), argv.join(" ")).rejects.toThrow();
+    }
+    expect(actions.control.mock.calls.length).toBe(calls);
+    await program.parseAsync(["auth", "logout", "antigravity", "--enterprise"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.logout", agent: "antigravity", method: "oauth-business" }));
+    await program.parseAsync(["auth", "logout", "antigravity"], { from: "user" });
+    expect(actions.control.mock.calls.at(-1)?.[0]).not.toHaveProperty("method");
+    // Install and `agent add` still refuse it (CP6 lifts that).
+    await expect(program.parseAsync(["agent", "add", "antigravity"], { from: "user" })).rejects.toThrow();
+  });
   it("offers a read-only preview status, and no local preview switch", async () => {
     const { program, actions } = fixture();
     await program.parseAsync(["preview", "status"], { from: "user" });

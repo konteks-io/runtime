@@ -195,10 +195,28 @@ export {
   openCodeLoginOptionCapability,
   OpenCodeLoginUserCodeSchema,
   agentLoginMethod,
+  // Google Antigravity's sign-ins (antigravity-runtime-support CP3): Gemini
+  // Enterprise from the site with its Google Cloud project; any agent's option.
+  REMOTE_AGENT_LOGIN_ANTIGRAVITY_CAPABILITY,
+  ANTIGRAVITY_LOGIN_OPTIONS,
+  AntigravityLoginOptionIdSchema,
+  type AntigravityLoginOptionId,
+  antigravityLoginOptionCapability,
+  AgentLoginOptionIdSchema,
+  type AgentLoginOptionId,
+  AgentLoginGcpSchema,
+  type AgentLoginGcp,
+  GoogleCloudProjectIdSchema,
+  GeminiEnterpriseLocationSchema,
+  GEMINI_ENTERPRISE_LOCATIONS,
+  type AgentLoginFailure,
   // A connected agent's credentials (CP3) and the money basis of a turn (O7).
   ConnectedAgentCredentialSchema,
   type ConnectedAgentCredential,
   MAX_CONNECTED_AGENT_CREDENTIALS,
+  // A fetched host agent's download state (Antigravity CP3 prep).
+  HostAgentDownloadSchema,
+  type HostAgentDownload,
   remoteMoneyBasisFor,
   type RemoteMoneyBasis,
   REMOTE_OPENCODE_FREE_MODELS_CAPABILITY,

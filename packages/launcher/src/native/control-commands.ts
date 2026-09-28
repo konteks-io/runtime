@@ -79,7 +79,7 @@ export async function authStatus(context: ControlContext, agentId?: string): Pro
  * pasted input is read from the terminal and forwarded without echo when the
  * tool asks for a secret. `--organization` records the operator's attestation.
  */
-export async function authLogin(context: ControlContext, agentId: string, organization: boolean, which: { provider?: string; method?: string; reuse?: boolean } = {}): Promise<void> {
+export async function authLogin(context: ControlContext, agentId: string, organization: boolean, which: { provider?: string; method?: string; reuse?: boolean; project?: string; location?: string } = {}): Promise<void> {
   const ask = context.confirm ?? ((question: string) => confirm(question, context.input ? { input: context.input } : {}));
   const secret = context.promptSecret ?? ((label: string) => promptSecret({ label, minLength: 1, ...(context.input ? { input: context.input } : {}) }));
   const line = context.promptLine ?? ((label: string) => promptLine(label, context.input ? { input: context.input } : {}));
@@ -128,10 +128,10 @@ export async function authLogin(context: ControlContext, agentId: string, organi
   }
 }
 
-export async function authLogout(context: ControlContext, agentId: string, provider?: string): Promise<void> {
-  const value = await context.control.call({ op: "auth.logout", agentId, ...(provider ? { provider } : {}) }, z.record(z.string(), z.unknown()));
+export async function authLogout(context: ControlContext, agentId: string, provider?: string, method?: string): Promise<void> {
+  const value = await context.control.call({ op: "auth.logout", agentId, ...(provider ? { provider } : {}), ...(method ? { method } : {}) }, z.record(z.string(), z.unknown()));
   context.output.result(value);
-  context.output.line(`logged out ${agentId}${provider ? ` from ${provider}` : ""}; readiness ${String(value.readiness)}`);
+  context.output.line(`logged out ${agentId}${provider ? ` from ${provider}` : method ? ` (${method})` : ""}; readiness ${String(value.readiness)}`);
 }
 
 /**

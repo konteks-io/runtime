@@ -8,7 +8,10 @@ import { AgentRuntime } from "../runtime.js";
 import { RunnerConfigSchema } from "../config.js";
 import type { BridgeProcess, SpawnBridgeOptions } from "../bridge/process.js";
 import { ANTIGRAVITY_LICENCE_REASON } from "../bridge/process.js";
-import { ANTIGRAVITY_SESSION_META, antigravityRuntimePaths } from "../host/antigravity.js";
+import { ANTIGRAVITY_SESSION_META, antigravityRuntimePaths, setAntigravityRelayUpstreamForTests, writeAntigravitySignIn } from "../host/antigravity.js";
+import { writeAntigravityApiKey } from "../auth/antigravity-auth.js";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import type { RunnerEvent } from "../events.js";
 
 /**
@@ -28,6 +31,8 @@ const INITIALIZE = { protocolVersion: 1, agentCapabilities: { loadSession: true,
 
 type Fake = {
   input: SpawnBridgeOptions;
+  /** The per-process relay token the runtime sent through `authenticate` (API key only). */
+  token?: string;
   bridge: BridgeProcess;
   connection: Record<string, ReturnType<typeof vi.fn>>;
   /** Feed a stderr line through the adapter's reading, as spawnBridge would. */
@@ -35,14 +40,17 @@ type Fake = {
 };
 
 const roots: string[] = [], runtimes: AgentRuntime[] = [];
+const googles: Server[] = [];
 afterEach(async () => {
+  setAntigravityRelayUpstreamForTests(undefined);
+  for (const server of googles.splice(0)) await new Promise(resolve => server.close(resolve));
   vi.useRealTimers();
   vi.restoreAllMocks();
   for (const runtime of runtimes.splice(0)) await runtime.stop().catch(() => undefined);
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 
-async function fixture(options: { newSession?: (fake: Fake) => Promise<unknown>; prompt?: (fake: Fake, params: { sessionId: string }) => Promise<unknown>; limit?: number; bootstrapMs?: number } = {}) {
+async function fixture(options: { newSession?: (fake: Fake) => Promise<unknown>; prompt?: (fake: Fake, params: { sessionId: string }) => Promise<unknown>; limit?: number; bootstrapMs?: number; realIdentity?: boolean; key?: string; authenticate?: (fake: Fake, params: { methodId: string }) => Promise<unknown> } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "runtime-antigravity-"))); roots.push(root);
   const spawned: Fake[] = [];
   let sessions = 0;
@@ -53,6 +61,11 @@ async function fixture(options: { newSession?: (fake: Fake) => Promise<unknown>;
     void failure?.catch(() => undefined);
     const fake = {} as Fake;
     const connection = {
+      authenticate: vi.fn(async (params: { methodId: string; _meta?: Record<string, string> }) => {
+        if (options.authenticate) return options.authenticate(fake, params);
+        fake.token = params._meta?.["api-key"];
+        return {};
+      }),
       newSession: vi.fn(async () => options.newSession ? options.newSession(fake) : ({ sessionId: `agy-${++sessions}`, configOptions: [MODEL, MODE], modes: { currentModeId: "default" } })),
       loadSession: vi.fn(async () => ({ configOptions: [MODEL, MODE] })),
       resumeSession: vi.fn(async () => ({ configOptions: [MODEL, MODE], modes: { currentModeId: "default" } })),
@@ -78,8 +91,12 @@ async function fixture(options: { newSession?: (fake: Fake) => Promise<unknown>;
     RUNNER_BRIDGE_PREFIX: folder, RUNNER_BRIDGE_VERSION: "1.2.1", RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder,
     ...(options.bootstrapMs === undefined ? {} : { RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS: options.bootstrapMs }),
   });
+  if (options.key !== undefined) {
+    await writeAntigravityApiKey(config.RUNNER_CREDENTIAL_DIR, options.key);
+    await writeAntigravitySignIn(config.RUNNER_CREDENTIAL_DIR, { method: "gemini-api-key" });
+  }
   const events: RunnerEvent[] = [];
-  const runtime = new AgentRuntime({ config, spawn, probe: async () => ({ kind: "signal", fingerprint: "fp-antigravity-0123456789" }), executionBridgeLimit: () => options.limit ?? 4 });
+  const runtime = new AgentRuntime({ config, spawn, ...(options.realIdentity ? {} : { probe: async () => ({ kind: "signal" as const, fingerprint: "fp-antigravity-0123456789" }) }), executionBridgeLimit: () => options.limit ?? 4 });
   runtime.events.subscribe(event => events.push(event));
   runtimes.push(runtime);
   const workingCopy = async (name: string, agents?: string) => {
@@ -277,5 +294,114 @@ describe.runIf(pinned)("Google Antigravity's runtime (CP2)", () => {
     await f.runtime.start();
     await f.runtime.stop();
     expect(sweep).toHaveBeenCalledWith(f.config);
+  });
+});
+
+/** A fake Gemini API: every model call answers with the recorded turn's usage. */
+async function fakeGoogle(): Promise<{ origin: string; keys: string[] }> {
+  const keys: string[] = [];
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      keys.push(String(req.headers["x-goog-api-key"]));
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(`data: ${JSON.stringify({ usageMetadata: { promptTokenCount: 12_480, cachedContentTokenCount: 8_192, candidatesTokenCount: 412, thoughtsTokenCount: 1_536, totalTokenCount: 14_428 } })}\r\n\r\n`);
+    });
+  });
+  googles.push(server);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  return { origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, keys };
+}
+
+const KEY = "AIzaSyOWNER-runtime-relay-key-0123456789";
+
+describe.runIf(pinned)("Google Antigravity's runtime on a Gemini API key (CP3)", () => {
+  const turn = async (fake: Fake) => {
+    const base = fake.input.spec.env.GOOGLE_GEMINI_BASE_URL!;
+    await fetch(`${base}/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse`, { method: "POST", headers: { "x-goog-api-key": fake.token! }, body: "{}" }).then(response => response.text());
+    return { stopReason: "end_turn" };
+  };
+
+  it("gives every process its own relay and token, reads ready from what it holds, and reports a turn as pay-per-use at the list price to a 7.1.0 Core", async () => {
+    const google = await fakeGoogle();
+    setAntigravityRelayUpstreamForTests({ origin: google.origin });
+    const f = await fixture({ key: KEY, realIdentity: true, prompt: turn });
+    await f.runtime.applyHostSettings({ openCodeFreeModels: false, coreAcceptsRouteBilling: true });
+    await f.runtime.start();
+    expect(f.runtime.readiness()).toMatchObject({ readiness: "ready", tokenUsageObservable: true,
+      credentials: [{ providerId: "google", label: "Gemini API key", kind: "api_key", method: "gemini-api-key", billing: "pay_per_use", state: "ready" }] });
+    // Opaque assignment ids (a path is not one, and the observation refuses it).
+    const created = await f.runtime.sessions.create(f.args(await f.workingCopy("repo"), "assignment-1"));
+    const [control, execution] = f.spawned;
+    for (const fake of [control!, execution!]) {
+      expect(fake.input.spec.env.GOOGLE_GEMINI_BASE_URL).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(fake.connection.authenticate).toHaveBeenCalledWith({ methodId: "gemini-api-key", _meta: { "api-key": fake.token } });
+      expect(fake.token).not.toBe(KEY);
+      expect(JSON.stringify(fake.input.spec.env)).not.toContain(KEY);
+    }
+    expect(control!.input.spec.env.GOOGLE_GEMINI_BASE_URL).not.toBe(execution!.input.spec.env.GOOGLE_GEMINI_BASE_URL);
+    expect(control!.token).not.toBe(execution!.token);
+    f.runtime.sessions.prompt(created.acpSessionRef, "p1", { prompt: [{ type: "text", text: "hi" }] });
+    await vi.waitFor(() => expect(f.events.some(event => event.kind === "prompt_result")).toBe(true));
+    const usage = f.events.find(event => event.kind === "usage_observation");
+    expect(usage).toMatchObject({ kind: "usage_observation", observation: {
+      agentId: "antigravity", moneyBasis: "pay_per_use", provider: "google", model: "gemini-3.8-flash",
+      totalTokens: 14_428, inputTokens: 12_480, cacheReadTokens: 8_192, outputTokens: 412, thoughtTokens: 1_536,
+      reportedCost: { currency: "USD", amountMicros: 11_135 }, costSource: "list_price_estimate", pricingSnapshotId: expect.stringContaining(":google/gemini-3.8-flash"),
+    } });
+    expect(google.keys).toEqual([KEY]);
+    expect(JSON.stringify(f.events)).not.toContain(KEY);
+  });
+
+  it("reports no turn to an older Core (never mislabelled), and nothing measured on Gemini Enterprise", async () => {
+    const google = await fakeGoogle();
+    setAntigravityRelayUpstreamForTests({ origin: google.origin });
+    const f = await fixture({ key: KEY, prompt: turn });
+    await f.runtime.start();
+    const created = await f.runtime.sessions.create(f.args(await f.workingCopy("repo")));
+    f.runtime.sessions.prompt(created.acpSessionRef, "p1", { prompt: [{ type: "text", text: "hi" }] });
+    await vi.waitFor(() => expect(f.events.some(event => event.kind === "prompt_result")).toBe(true));
+    expect(google.keys).toEqual([KEY]);
+    expect(f.events.some(event => event.kind === "usage_observation")).toBe(false);
+
+    const enterprise = await fixture({ prompt: async () => ({ stopReason: "end_turn" }) });
+    await writeAntigravitySignIn(enterprise.config.RUNNER_CREDENTIAL_DIR, { method: "oauth-business", gcp: { project: "gemini-enterprise-qa-25d3", location: "global" } });
+    await enterprise.runtime.applyHostSettings({ openCodeFreeModels: false, coreAcceptsRouteBilling: true });
+    await enterprise.runtime.start();
+    const session = await enterprise.runtime.sessions.create(enterprise.args(await enterprise.workingCopy("repo")));
+    expect(enterprise.spawned.every(fake => fake.input.spec.env.GOOGLE_GEMINI_BASE_URL === undefined && fake.connection.authenticate.mock.calls.length === 0)).toBe(true);
+    enterprise.runtime.sessions.prompt(session.acpSessionRef, "p1", { prompt: [{ type: "text", text: "hi" }] });
+    await vi.waitFor(() => expect(enterprise.events.some(event => event.kind === "prompt_result")).toBe(true));
+    expect(enterprise.events.some(event => event.kind === "usage_observation")).toBe(false);
+  });
+
+  it("a site-started Gemini Enterprise sign-in that finds no licence fails with that reason, keeping what was in use", async () => {
+    const f = await fixture({ key: KEY, realIdentity: true, authenticate: async (fake, params) => {
+      // The control process keeps running on the key; only the sign-in process asks for Enterprise.
+      if (params.methodId === "gemini-api-key") return {};
+      expect(params).toEqual({ methodId: "oauth-business" });
+      fake.input.onStderrLine?.("Open the following link to authenticate the ACP server: https://accounts.google.com/o/oauth2/v2/auth?client_id=x&redirect_uri=http%3A%2F%2F127.0.0.1%3A5%2F");
+      fake.input.onStderrLine?.("W0929 business_auth.py:462] Configured project=gemini-enterprise-qa-25d3 location=global has no available license; falling through to the license picker (b/558693144).");
+      fake.input.onStderrLine?.("Open the following link to choose your Gemini Enterprise license: http://127.0.0.1:50694/");
+      throw Object.assign(new Error("Gemini Enterprise license selection was cancelled"), { code: -32000, data: { reason: "ge_license_cancelled" } });
+    } });
+    await f.runtime.start();
+    const flow = f.runtime.startLogin({ organization: false, personal: true, loginId: "login-agy-1", request: { loginOption: "gemini-enterprise", gcp: { project: "gemini-enterprise-qa-25d3", location: "global" } } });
+    await expect(flow.done).resolves.toEqual({ code: 1, reason: "no_license" });
+    await vi.waitFor(() => expect(f.events).toContainEqual(expect.objectContaining({ kind: "login_event", loginId: "login-agy-1", event: expect.objectContaining({ type: "failed", reason: "no_license" }) })));
+    const logins = f.events.flatMap(event => (event.kind === "login_event" ? [event.event] : []));
+    expect(logins.filter(event => event.type === "open_url")).toEqual([{ type: "open_url", url: expect.stringMatching(/^https:\/\/accounts\.google\.com\//) }]);
+    expect(logins.some(event => event.type === "prompt")).toBe(false);
+    await vi.waitFor(() => expect(f.runtime.readiness()).toMatchObject({ readiness: "ready", credentials: [expect.objectContaining({ method: "gemini-api-key", state: "ready" }), expect.objectContaining({ method: "oauth-business", state: "needs_sign_in" })] }));
+  });
+
+  it("a session that finds no licence marks the Enterprise credential with that reason for a 7.1.0 Core", async () => {
+    const f = await fixture({ realIdentity: true, newSession: async fake => { fake.stderr("W0929 business_auth.py:462] Configured project=p location=global has no available license; falling through to the license picker (b/558693144)."); return new Promise(() => undefined); } });
+    await writeAntigravityApiKey(f.config.RUNNER_CREDENTIAL_DIR, KEY);
+    await writeAntigravitySignIn(f.config.RUNNER_CREDENTIAL_DIR, { method: "gemini-api-key", gcp: { project: "gemini-enterprise-qa-25d3", location: "global" } });
+    await f.runtime.applyHostSettings({ openCodeFreeModels: false, coreAcceptsRouteBilling: true });
+    await f.runtime.start();
+    await expect(f.runtime.sessions.create(f.args(await f.workingCopy("repo")))).rejects.toMatchObject({ code: "agent_auth_required" });
+    await vi.waitFor(async () => expect(f.runtime.readiness().credentials).toContainEqual(expect.objectContaining({ method: "oauth-business", state: "needs_sign_in", reason: "no_license" })));
   });
 });

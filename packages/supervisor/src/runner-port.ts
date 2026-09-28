@@ -1,11 +1,13 @@
-import type { ConnectedAgentView, OpenCodeLoginOptionId, RemoteSessionLabel, RetainedProcessOwner } from "@konteks/remote-common";
+import type { AgentLoginGcp, AgentLoginOptionId, ConnectedAgentView, RemoteSessionLabel, RetainedProcessOwner } from "@konteks/remote-common";
 
-/** Which sign-in to start or remove, for an agent with several (OpenCode). */
+/** Which sign-in to start or remove, for an agent with several (OpenCode, Antigravity). */
 export interface RunnerLoginRequest {
   provider?: string;
   method?: string;
-  loginOption?: OpenCodeLoginOptionId;
+  loginOption?: AgentLoginOptionId;
   reuse?: boolean;
+  /** Gemini Enterprise's Google Cloud project and location (Antigravity). */
+  gcp?: AgentLoginGcp;
 }
 
 /** Core's settings for host agents on this computer (from the applied desired configuration). */
@@ -83,8 +85,8 @@ export interface RunnerPort {
   logout(request?: RunnerLoginRequest): Promise<ConnectedAgentView>;
   /** Apply Core's host-agent settings (OpenCode's free models, route billing). */
   applyHostSettings?(settings: RunnerHostSettings): Promise<void>;
-  /** The reviewed sign-ins the site may start for this agent here (OpenCode); empty for the others. */
-  siteLoginOptions?(): readonly OpenCodeLoginOptionId[];
+  /** The reviewed sign-ins the site may start for this agent here (OpenCode, Antigravity); empty for the others. */
+  siteLoginOptions?(): readonly AgentLoginOptionId[];
   /** Take the agent out of service until the connector restarts (a governance bypass). */
   quarantine?(reason: string): Promise<void>;
   probe(): Promise<ConnectedAgentView>;

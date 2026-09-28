@@ -1,12 +1,12 @@
 import { mkdir, readFile } from "node:fs/promises";
 import type { InitializeResponse } from "@agentclientprotocol/sdk";
 import { join } from "node:path";
-import { RemoteInstanceError, createLogger, writeSecretFile, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type OpenCodeLoginOptionId, type RetainedProcessOwner } from "@konteks/remote-common";
+import { RemoteInstanceError, createLogger, writeSecretFile, type AgentLoginOptionId, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import { fallbackLoginIdentity, probeIdentity, type IdentityProbe } from "./auth/identity.js";
 import { runLogout, startLoginFlow, type LoginFlow } from "./auth/login-flow.js";
 import { hostAgentRunnerAdapter } from "./host/registry.js";
-import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentRunnerAdapter, type HostAgentSettings, type HostLoginRequest, type HostWorkingCopyBinding } from "./host/host-agent.js";
+import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentRunnerAdapter, type HostAgentSettings, type HostLoginRequest, type HostSpawn, type HostWorkingCopyBinding } from "./host/host-agent.js";
 import { AgentScopeStore, applyIdentityObservation, type AgentScopeState } from "./auth/scope-store.js";
 import { classifyBridgeError, spawnBridge, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
 import { discoverBridgeModelCapability, offerableModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
@@ -160,7 +160,11 @@ export class AgentRuntime {
   /** The credentials the last identity probe read (OpenCode's `auth list`); never a secret. */
   private credentials: ConnectedAgentCredential[] | undefined;
   /** The reviewed sign-ins the site may start here (OpenCode), read once the runtime started. */
-  private siteLoginOptionIds: readonly OpenCodeLoginOptionId[] = [];
+  private siteLoginOptionIds: readonly AgentLoginOptionId[] = [];
+  /** Whether turns report billing usage under the current sign-in, when the agent's identity says (Antigravity's key relay). */
+  private tokenUsageObservable: boolean | undefined;
+  /** How every process of this agent is spawned: the runtime's own, or its adapter's around it (Antigravity's key relay). */
+  private readonly spawnProcess: HostSpawn;
   /** Stops an idle control process (`processLimits.controlIdleMs`). */
   private controlIdleTimer: NodeJS.Timeout | null = null;
   /** What the control process answered before it was stopped for being idle; readiness keeps reading it. */
@@ -174,6 +178,8 @@ export class AgentRuntime {
     this.family = this.spec.family;
     this.host = hostAgentRunnerAdapter(this.family.agentId) ?? null;
     this.perWorkingCopy = this.host?.bindWorkingCopy !== undefined;
+    const spawn = options.spawn ?? spawnBridge;
+    this.spawnProcess = this.host?.wrapSpawn ? this.host.wrapSpawn(options.config, spawn) : spawn;
     if (this.perWorkingCopy && !options.executionBridgeLimit) {
       // Its control process has no working copy, so it never runs a session.
       throw new RemoteInstanceError("agent_unavailable", `${this.family.displayName} runs every session in a process of its own working copy.`);
@@ -190,6 +196,11 @@ export class AgentRuntime {
       ...(this.host?.verifySession ? { verifySession: (response: { configOptions?: unknown; modes?: unknown }) => this.host!.verifySession!(response) } : {}),
       ...(this.host?.promptPrelude ? { promptPrelude: (session: { cwd: string; sessionKey: string }) => this.host!.promptPrelude!(options.config, session) } : {}),
       ...(this.host?.agentErrorText ? { agentErrorText: (text: string) => this.host!.agentErrorText!(text) } : {}),
+      // A turn measured outside the agent is pay-per-use: only a Core that takes it gets it.
+      ...(this.host?.measureTurn ? { measureTurn: (bridge: BridgeProcess) => {
+        const read = this.host!.measureTurn!(bridge);
+        return read ? () => (this.hostSettings.coreAcceptsRouteBilling ? read() : null) : null;
+      } } : {}),
       usageLabel: modelValue => this.usageLabel(modelValue),
       events: this.events,
       refStore: new FileSessionRefStore(join(options.config.RUNNER_CREDENTIAL_DIR, "session-refs.json")),
@@ -199,6 +210,8 @@ export class AgentRuntime {
       onAuthRequired: () => {
         this.authRequired = true;
         this.publishReadiness();
+        // A host agent's credentials may now say why (Antigravity: no licence found).
+        if (this.host?.identity && !this.stopping) void this.probe(false).catch(() => undefined);
       },
     });
   }
@@ -213,7 +226,7 @@ export class AgentRuntime {
   }
 
   /** The reviewed sign-ins the site may start on this machine (OpenCode); empty for every other agent. */
-  siteLoginOptions(): readonly OpenCodeLoginOptionId[] {
+  siteLoginOptions(): readonly AgentLoginOptionId[] {
     return this.siteLoginOptionIds;
   }
 
@@ -234,8 +247,11 @@ export class AgentRuntime {
   async applyHostSettings(settings: HostAgentSettings): Promise<void> {
     const previous = this.hostSettings;
     this.hostSettings = Object.freeze({ ...settings });
-    if (previous.openCodeFreeModels === settings.openCodeFreeModels || !this.host?.offersModel) return;
-    this.modelCapabilities.clear();
+    const freeModelsChanged = previous.openCodeFreeModels !== settings.openCodeFreeModels && this.host?.offersModel !== undefined;
+    // What a host agent's credentials say depends on what Core takes (Antigravity's no-licence reason).
+    const coreChanged = previous.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling && this.host?.identity !== undefined;
+    if (!freeModelsChanged && !coreChanged) return;
+    if (freeModelsChanged) this.modelCapabilities.clear();
     if (this.connectionState !== "unavailable" && !this.stopping) await this.probe(false);
   }
 
@@ -360,7 +376,7 @@ export class AgentRuntime {
     let exitedDuringStart = false;
     let ownerPersistence: Promise<void> = Promise.resolve();
     const { spec, binding } = await this.executionSpec(cwd);
-    const candidate = await (this.options.spawn ?? spawnBridge)({
+    const candidate = await this.spawnProcess({
       spec, initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
       clientVersion: this.options.config.RUNNER_BRIDGE_VERSION, logger: this.logger,
       onProcessOwner: process => {
@@ -370,7 +386,7 @@ export class AgentRuntime {
         return ownerPersistence;
       },
       ...(this.options.executionSpawnProcess ? { spawnProcess: this.options.executionSpawnProcess } : {}),
-      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line) } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line, this.options.config) } : {}),
       // Callback authority is the initialized process object, which a later
       // reference reuses as-is: the session manager resolves every update,
       // permission, elicitation and exit to the sessions bound to exactly it.
@@ -733,6 +749,7 @@ export class AgentRuntime {
       ...(this.credentials === undefined ? {} : { credentials: this.authRequired ? this.credentials.map(credential => ({ ...credential, state: "needs_sign_in" as const })) : this.credentials }),
       bridgeVersionCompatible: true,
       ...(this.hostVersion() === undefined ? {} : { hostAgentVersion: this.hostVersion()! }),
+      ...(this.tokenUsageObservable === undefined ? {} : { tokenUsageObservable: this.tokenUsageObservable }),
       lastProbeAt: this.lastProbeAt,
     });
   }
@@ -770,9 +787,9 @@ export class AgentRuntime {
       logger: this.logger,
       ...(this.options.retrySleep ? { retrySleep: this.options.retrySleep } : {}),
       ...(this.options.retryRandom ? { retryRandom: this.options.retryRandom } : {}),
-      ...(this.options.spawn ? { spawn: this.options.spawn } : {}),
+      spawn: this.spawnProcess,
       ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
-      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line) } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line, this.options.config) } : {}),
     };
     // The periodic probe used to spawn and initialize its own throwaway
     // process. An idle resident bridge answers the same `session/new` without
@@ -918,7 +935,7 @@ export class AgentRuntime {
       try {
         await this.prepareToSpawn(this.logger);
         if (this.stopping) return;
-        const candidate = await (this.options.spawn ?? spawnBridge)({
+        const candidate = await this.spawnProcess({
           spec: this.spec,
           initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
           clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
@@ -1003,6 +1020,7 @@ export class AgentRuntime {
     }
     this.identity = result.kind;
     if (result.kind !== "no_official_signal" && result.credentials !== undefined) this.credentials = result.credentials;
+    if (this.host?.identity) this.tokenUsageObservable = result.kind === "signal" ? result.tokenUsageObservable : undefined;
     if (isLogin && (result.kind === "signal" || result.kind === "no_official_signal")) this.authRequired = false;
     const at = this.now().toISOString();
     this.lastProbeAt = at;
@@ -1038,7 +1056,7 @@ export class AgentRuntime {
     // login command: the runtime asks for the API key itself).
     const host = hostAgentRunnerAdapter(this.family.agentId);
     const flow = host?.startLogin
-      ? host.startLogin({ config: this.options.config, events: this.events, logger: this.logger,
+      ? host.startLogin({ config: this.options.config, events: this.events, logger: this.logger, spawn: this.options.spawn ?? spawnBridge,
         ...(args.loginId === undefined ? {} : { loginId: args.loginId }), ...(args.request === undefined ? {} : { request: args.request }) })
       : startLoginFlow({
         config: this.options.config,
@@ -1053,11 +1071,11 @@ export class AgentRuntime {
       this.connectionState = "starting";
       this.publishReadiness();
     }
-    void flow.done.then(async ({ code }) => {
+    void flow.done.then(async ({ code, reason }) => {
       if (code !== 0) {
         this.activeLogin = null;
         this.connectionState = previousConnectionState;
-        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: host?.loginFailedMessage ?? "official login tooling did not complete" } });
+        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: host?.loginFailedMessage ?? "official login tooling did not complete", ...(reason ? { reason } : {}) } });
         await this.probe(false);
         return;
       }
@@ -1104,7 +1122,7 @@ export class AgentRuntime {
     // brings the agent back before the refusal is returned.
     let logoutError: unknown = null;
     try {
-      if (host?.logout) await host.logout(this.options.config, request);
+      if (host?.logout) await host.logout(this.options.config, request, this.options.spawn ?? spawnBridge);
       else await runLogout({ config: this.options.config, family: this.family, env: this.spec.env });
     } catch (error) {
       logoutError = error;

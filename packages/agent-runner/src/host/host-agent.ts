@@ -1,10 +1,12 @@
 import type { ContentBlock } from "@agentclientprotocol/sdk";
-import type { Logger, OpenCodeLoginOptionId, RemoteInstanceError } from "@konteks/remote-common";
+import type { AgentLoginGcp, AgentLoginOptionId, Logger, RemoteInstanceError } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import type { RunnerEventBus } from "../events.js";
 import type { IdentityProbe } from "../auth/identity.js";
 import type { LoginFlow } from "../auth/login-flow.js";
+import type { BridgeProcess, spawnBridge } from "../bridge/process.js";
+import type { MeasuredTurn } from "../sessions/usage-label.js";
 
 /**
  * An agent used from the person's own installation (DeepSeek Harness,
@@ -45,14 +47,14 @@ export interface HostAgentRunnerAdapter {
   bindWorkingCopy?(config: RunnerConfig, family: AgentBridgeFamily, workingCopy: string): Promise<HostWorkingCopyBinding>;
   /** A runtime-owned sign-in, used instead of the family's official login tooling when present. */
   startLogin?(options: HostAgentLoginOptions): LoginFlow;
-  /** A runtime-owned sign-out, used instead of the family's official logout tooling when present. */
-  logout?(config: RunnerConfig, request?: HostLoginRequest): Promise<void>;
+  /** A runtime-owned sign-out, used instead of the family's official logout tooling when present; `spawn` is the runtime's own (Antigravity signs out over ACP). */
+  logout?(config: RunnerConfig, request?: HostLoginRequest, spawn?: HostSpawn): Promise<void>;
   /** Plain line shown when this agent's sign-in did not complete. */
   readonly loginFailedMessage?: string;
   /** The identity signal (D111) when it is not an official tooling command; may carry the credentials it read. */
   identity?(config: RunnerConfig, settings: HostAgentSettings): Promise<IdentityProbe>;
-  /** The reviewed sign-ins the site may start for this agent, as its installation offers them (OpenCode). */
-  siteLoginOptions?(config: RunnerConfig): Promise<readonly OpenCodeLoginOptionId[]>;
+  /** The reviewed sign-ins the site may start for this agent, as its installation offers them (OpenCode, Antigravity). */
+  siteLoginOptions?(config: RunnerConfig): Promise<readonly AgentLoginOptionId[]>;
   /** Whether a model value may be offered under `settings` (OpenCode: Zen's free models only when switched on, O6). */
   offersModel?(value: string, settings: HostAgentSettings): boolean;
   /** The verified installed version to report with readiness, when known. */
@@ -94,7 +96,7 @@ export interface HostAgentRunnerAdapter {
    * person (Antigravity: a sign-in or licence page it would open on this
    * computer); the refusal ends that process's current bootstrap or turn.
    */
-  stderrFailure?(line: string): RemoteInstanceError | null;
+  stderrFailure?(line: string, config: RunnerConfig): RemoteInstanceError | null;
   /**
    * A message the agent sent as its own reply that is really a failure
    * (Antigravity reports quota and model errors as text and ends the turn): the
@@ -110,7 +112,24 @@ export interface HostAgentRunnerAdapter {
   readonly sessionBootstrapTimeoutMs?: number;
   /** After every process of this runner was stopped: stop anything it left behind (Antigravity: its harness child). */
   sweepLeftovers?(config: RunnerConfig): Promise<void>;
+  /**
+   * How every process of this agent is spawned, given the runtime's own spawn
+   * (control, execution and discovery alike): an agent may start something
+   * beside each process and finish signing it in after `initialize`
+   * (Antigravity with a Gemini API key: its own loopback relay, A7).
+   */
+  wrapSpawn?(config: RunnerConfig, spawn: HostSpawn): HostSpawn;
+  /**
+   * The tokens and money of a turn measured outside the agent, when the agent
+   * reports none itself (Antigravity with a Gemini API key: its relay).
+   * Called as the turn starts; the returned function reads the turn once it
+   * ended. Null: nothing is measured for this process.
+   */
+  measureTurn?(bridge: BridgeProcess): (() => MeasuredTurn | null) | null;
 }
+
+/** The runtime's process spawn (`spawnBridge`, or a test's). */
+export type HostSpawn = typeof spawnBridge;
 
 /** Which session a prompt prelude is for. */
 export interface HostPromptSession {
@@ -160,6 +179,8 @@ export interface HostAgentLoginOptions {
   logger: Pick<Logger, "info" | "warn">;
   loginId?: string;
   request?: HostLoginRequest;
+  /** The runtime's own process spawn, for a sign-in driven over ACP (Antigravity's Gemini Enterprise). */
+  spawn?: HostSpawn;
 }
 
 /** Which sign-in the person (or the site) asked for; only agents with several sign-ins read it. */
@@ -168,8 +189,10 @@ export interface HostLoginRequest {
   provider?: string;
   /** The provider's sign-in method (OpenCode's method id, or `key`). */
   method?: string;
-  /** The reviewed sign-in the site started (OpenCode). */
-  loginOption?: OpenCodeLoginOptionId;
+  /** The reviewed sign-in the site started (OpenCode, Antigravity). */
+  loginOption?: AgentLoginOptionId;
+  /** Gemini Enterprise: the licence's Google Cloud project and location (Antigravity). */
+  gcp?: AgentLoginGcp;
   /** Offer to repeat the sign-ins of the person's own installation (OpenCode O10). */
   reuse?: boolean;
 }

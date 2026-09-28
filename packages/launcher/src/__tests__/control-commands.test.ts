@@ -85,6 +85,27 @@ describe("native control commands", () => {
     expect(f.calls.slice(1)).toEqual([{ op: "auth.input", loginId: "l1", text: "deepseek" }, { op: "auth.input", loginId: "l1", text: "sk-typed-key-never-shown" }]);
     expect(f.text()).not.toContain("sk-typed-key-never-shown");
   });
+  it("passes Google Antigravity's Gemini Enterprise project and location on, and its key only through the hidden prompt (antigravity CP3)", async () => {
+    const f = fake();
+    const hidden: string[] = [];
+    f.context.promptSecret = async label => { hidden.push(label); return "AIzaSyTYPED-never-shown-000000000000"; };
+    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
+      f.calls.push(request);
+      if (request.op !== "auth.login") return schema.parse({});
+      if (request.method === "gemini-api-key") options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "Gemini API key", secret: true });
+      else options?.onEvent?.({ kind: "open_url", loginId: "l1", url: "https://accounts.google.com/o/oauth2/v2/auth?client_id=x" });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
+      return schema.parse({ loginId: "l1" });
+    }) as typeof f.context.control.call;
+    await authLogin(f.context, "antigravity", false, { method: "oauth-business", project: "gemini-enterprise-qa-25d3", location: "global" });
+    expect(f.calls[0]).toEqual({ op: "auth.login", agentId: "antigravity", organization: false, method: "oauth-business", project: "gemini-enterprise-qa-25d3", location: "global" });
+    expect(f.text()).toContain("open this URL to sign in: https://accounts.google.com/");
+    await authLogin(f.context, "antigravity", false, { method: "gemini-api-key" });
+    expect(hidden).toEqual(["Gemini API key"]);
+    expect(f.calls.at(-1)).toEqual({ op: "auth.input", loginId: "l1", text: "AIzaSyTYPED-never-shown-000000000000" });
+    expect(f.text()).not.toContain("AIzaSyTYPED");
+  });
   it("ends the login connection when the hidden prompt is interrupted", async () => {
     const f = fake();
     let signal: AbortSignal | undefined;

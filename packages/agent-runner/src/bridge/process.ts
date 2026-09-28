@@ -75,6 +75,11 @@ export interface SpawnBridgeOptions {
   onProcessOwner?: (owner: BridgeStopOwner) => void | Promise<void>;
   /** A host agent's reading of its stderr lines (`HostAgentRunnerAdapter.stderrFailure`). */
   stderrFailure?: (line: string) => RemoteInstanceError | null;
+  /**
+   * Every complete stderr line, as it arrives (a sign-in driven over ACP
+   * reads the link and the result the agent prints there). Never logged.
+   */
+  onStderrLine?: (line: string) => void;
 }
 
 export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgeProcess> {
@@ -111,10 +116,14 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
       stderrLines.push(line.slice(0, 512));
       if (stderrLines.length > STDERR_TAIL_MAX_LINES) stderrLines.shift();
     }
-    if (options.stderrFailure && failWith) {
+    if (options.onStderrLine || (options.stderrFailure && failWith)) {
       const lines = (partial + chunk).split(/\r?\n/);
       partial = (lines.pop() ?? "").slice(-4_096);
       for (const line of lines) {
+        if (line && options.onStderrLine) {
+          try { options.onStderrLine(line.slice(0, 4_096)); } catch { /* an observer never breaks the process */ }
+        }
+        if (!options.stderrFailure || !failWith) continue;
         const refusal = line ? options.stderrFailure(line.slice(0, 4_096)) : null;
         if (refusal && failWith) {
           const fail: (error: RemoteInstanceError) => void = failWith;

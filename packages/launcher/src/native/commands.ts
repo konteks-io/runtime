@@ -431,8 +431,9 @@ export const nativeCliActions: NativeCliActions = {
       case "preview.status": return previewStatus(context);
       case "auth.status": return authStatus(context, input.agent);
       case "auth.login": return authLogin(context, input.agent!, input.organization ?? false, {
-        ...(input.provider ? { provider: input.provider } : {}), ...(input.method ? { method: input.method } : {}), ...(input.reuse ? { reuse: true } : {}) });
-      case "auth.logout": return authLogout(context, input.agent!, input.provider);
+        ...(input.provider ? { provider: input.provider } : {}), ...(input.method ? { method: input.method } : {}), ...(input.reuse ? { reuse: true } : {}),
+        ...(input.project ? { project: input.project, location: input.location ?? "global" } : {}) });
+      case "auth.logout": return authLogout(context, input.agent!, input.provider, input.method);
       case "git.key.add": return gitKeyAdd(context, input.title);
       case "git.key.list": return gitKeyList(context);
       case "git.key.remove": return gitKeyRemove(context, input.keyRef!);
