@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
 import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, restoreNativeRecord } from "../native/install.js";
+import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
 import { startNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
@@ -421,26 +421,79 @@ describe("native install composition", () => {
     expect(f.activate).not.toHaveBeenCalled();
     expect(f.options.deps.fetchFn).not.toHaveBeenCalled();
   });
-  it("keeps Google Antigravity gated until its security checkpoint: never detected, installed, added or fetched", async () => {
+  it("never detects Google Antigravity at enrollment, and adds it there only after onboarding (antigravity CP6)", async () => {
+    const adapter = hostAgentInstallAdapter("antigravity")!;
+    expect(adapter.offered).toBe(true);
+    const locate = vi.spyOn(adapter, "locate").mockResolvedValue({ antigravityVersion: "1.2.1", antigravityRoot: "/nowhere" });
+    const fetch = vi.spyOn(adapter, "fetch");
+    try {
+      vi.stubEnv("DSH_EXECUTABLE", "/no-dsh");
+      vi.stubEnv("OPENCODE_EXECUTABLE", "/no-opencode");
+      const g = await fixture();
+      const enrolled = await recordNativeEnrollment({ root: g.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", deps: g.options.deps as never });
+      expect(enrolled.agents).not.toContain("antigravity");
+      const h = await fixture();
+      await expect(recordNativeEnrollment({ root: h.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", agents: ["codex", "antigravity"], deps: h.options.deps as never }))
+        .rejects.toMatchObject({ code: "agent_unavailable", message: "Google Antigravity is added after onboarding, once you agree to its download: konteks-remote agent add antigravity" });
+      expect(fetch).not.toHaveBeenCalled();
+    } finally { locate.mockRestore(); fetch.mockRestore(); }
+  });
+  it("installs, adds and removes Google Antigravity only on the person's yes, never consuming an activation on a no (antigravity CP6)", async () => {
     const f = await fixture();
     const adapter = hostAgentInstallAdapter("antigravity")!;
-    expect(adapter.offered).toBe(false);
-    const fetch = vi.spyOn(adapter, "fetch");
-    const locate = vi.spyOn(adapter, "locate");
-    vi.stubEnv("DSH_EXECUTABLE", join(f.root, "no-dsh"));
-    vi.stubEnv("OPENCODE_EXECUTABLE", join(f.root, "no-opencode"));
-    const g = await fixture();
-    const enrolled = await recordNativeEnrollment({ root: g.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", deps: g.options.deps as never });
-    expect(enrolled.agents).not.toContain("antigravity");
-    f.options.agents = ["codex", "antigravity"];
-    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "agent_unavailable", message: "antigravity cannot be added on this computer yet." });
-    await expect(addNativeAgent({ root: f.root, agentId: "antigravity", output: f.options.output } as never)).rejects.toMatchObject({ code: "agent_unavailable" });
-    expect(f.activate).not.toHaveBeenCalled();
-    expect(f.options.deps.fetchFn).not.toHaveBeenCalled();
-    expect(fetch).not.toHaveBeenCalled();
-    expect(locate).not.toHaveBeenCalled();
-    fetch.mockRestore();
-    locate.mockRestore();
+    const folder = join(f.root, "agents", "antigravity", "1.2.1-darwin-arm64");
+    const fields = { antigravityVersion: "1.2.1", antigravityRoot: folder };
+    let fetched = false;
+    const spies = [
+      vi.spyOn(adapter, "assertFetchable").mockImplementation(() => undefined),
+      vi.spyOn(adapter, "locate").mockImplementation(async () => { if (!fetched) throw new Error("not fetched"); return fields; }),
+      vi.spyOn(adapter, "fetch").mockImplementation(async request => { expect(request).toEqual({ root: f.root, consent: true }); fetched = true; await mkdir(folder, { recursive: true, mode: 0o700 }); return fields; }),
+      vi.spyOn(adapter, "runnerSettings").mockImplementation(async record => {
+        if (record.antigravityRoot !== folder || !fetched) throw new Error("does not verify");
+        return { RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder, RUNNER_BRIDGE_PREFIX: folder, RUNNER_BRIDGE_VERSION: "1.2.1" };
+      }),
+    ];
+    try {
+      const asked: string[] = [];
+      f.options.agents = ["codex", "antigravity"];
+      // No: nothing downloaded, nothing activated.
+      await expect(installNative({ ...f.options, deps: { ...f.options.deps, consent: async (_agent: string, text: string) => { asked.push(text); return false; } } } as never))
+        .rejects.toMatchObject({ code: "agent_unavailable", message: "Nothing was downloaded: Google Antigravity was not added." });
+      expect(asked).toEqual([adapter.consentText]);
+      expect(adapter.fetch).not.toHaveBeenCalled();
+      expect(f.activate).not.toHaveBeenCalled();
+      // Yes: fetched before the activation, recorded beside Codex.
+      const installed = await installNative({ ...f.options, deps: { ...f.options.deps, consent: async () => true } } as never);
+      expect(installed).toMatchObject({ agents: ["codex", "antigravity"], ...fields });
+      expect(f.activate).toHaveBeenCalledTimes(1);
+      const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+      expect(loaded.runners.find(runner => runner.RUNNER_AGENT_ID === "antigravity")).toMatchObject({ RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder, RUNNER_BRIDGE_VERSION: "1.2.1" });
+      expect(await readdir(join(f.root, "releases", loaded.record.releaseId, "agents"))).toEqual(["codex"]);
+      // Removed: signed out first, dropped from the record, its folders gone, Codex untouched.
+      const signOut = vi.fn(async () => true);
+      const lines: string[] = [];
+      const output = { ...f.options.output, line: (text: string) => { lines.push(text); } };
+      await writeFile(join(f.root, "credentials", "antigravity", "sign-in.json"), "{}");
+      const removed = await removeNativeAgent({ root: f.root, agentId: "antigravity", output, deps: { roots: f.trust, platform: f.platform, signOut } });
+      expect(signOut).toHaveBeenCalledWith(f.root, expect.objectContaining({ agents: ["codex", "antigravity"] }));
+      expect(removed.agents).toEqual(["codex"]);
+      expect(removed).not.toHaveProperty("antigravityVersion");
+      expect(removed).not.toHaveProperty("antigravityRoot");
+      expect(await readNativeRecord(f.root)).toEqual(removed);
+      expect(await readdir(join(f.root, "credentials"))).toEqual(["codex"]);
+      expect(await readdir(join(f.root, "workspaces"))).toEqual(["codex"]);
+      await expect(readdir(join(f.root, "agents", "antigravity"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(lines.at(-1)).toBe("Google Antigravity removed from this computer: signed out, its download and its sign-ins here were deleted. Nothing else changed.");
+      // Added back without reactivation or a release, once it is fetched again.
+      fetched = true;
+      await mkdir(folder, { recursive: true, mode: 0o700 });
+      const added = await addNativeAgent({ root: f.root, agentId: "antigravity", output, deps: { roots: f.trust, platform: f.platform } });
+      expect(added).toMatchObject({ agents: ["codex", "antigravity"], ...fields, releaseId: removed.releaseId });
+      expect(lines.at(-1)).toBe("Google Antigravity 1.2.1 added: downloaded from Google and its signature checked; nothing else changed. To sign it in here with a Gemini API key: konteks-remote auth login antigravity --api-key. With Gemini Enterprise: konteks-remote auth login antigravity --enterprise --project <project id>");
+      expect(f.activate).toHaveBeenCalledTimes(1);
+      // Only Google Antigravity is removed this way.
+      await expect(removeNativeAgent({ root: f.root, agentId: "codex", output, deps: { roots: f.trust, platform: f.platform, signOut } })).rejects.toMatchObject({ code: "agent_unavailable" });
+    } finally { for (const spy of spies) spy.mockRestore(); }
   });
   it.runIf(process.platform !== "win32")("installs the person's own OpenCode 2 beside bundled agents, with no package of it, and enrollment detects it (CP6)", async () => {
     const f = await fixture();

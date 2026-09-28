@@ -18,6 +18,12 @@ import { proxyFor, readZipEntries, safeArchivePath, verifyFetchedSignature } fro
 import { antigravityDownloadState } from "../native/antigravity-download.js";
 import { HostAgentDownloadSchema } from "@konteks/remote-common";
 import { antigravityInstallAdapter, hostAgentInstallAdapter, nativeAgentOffered } from "../native/host-agents.js";
+import { antigravityDiskBytes, antigravityFetchUnderWay } from "../native/antigravity-installation.js";
+import { antigravityUpdateNeeded, recordFetchedAntigravity, updateNativeAntigravity } from "../native/antigravity-update.js";
+import { deleteNativeAntigravity, signOutNativeAntigravity } from "../native/antigravity-removal.js";
+import { NativeRuntimeRecordSchema, type NativeRuntimeRecord } from "../native/installation.js";
+import { acquireNativeRootLock } from "../native/root-lock.js";
+import { RemoteInstanceError } from "@konteks/remote-common";
 
 const posix = process.platform !== "win32";
 const haveOpenssl = (() => { try { execFileSync("openssl", ["version"], { stdio: "ignore" }); return true; } catch { return false; } })();
@@ -408,15 +414,18 @@ describe("the zip reader and the signature check", () => {
   });
 });
 
-describe("the Antigravity install adapter (not offered until CP4)", () => {
-  it("is registered, fetched, not offered, and refuses without the connector's folder", async () => {
+describe("the Antigravity install adapter", () => {
+  it("is registered, fetched, offered since CP6, and refuses without the connector's folder", async () => {
     expect(hostAgentInstallAdapter("antigravity")).toBe(antigravityInstallAdapter);
-    expect(antigravityInstallAdapter.offered).toBe(false);
-    expect(nativeAgentOffered("antigravity")).toBe(false);
+    expect(antigravityInstallAdapter.offered).toBe(true);
+    expect(nativeAgentOffered("antigravity")).toBe(true);
     expect(nativeAgentOffered("opencode")).toBe(true);
     await expect(antigravityInstallAdapter.locate()).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_not_fetched" });
     await expect(antigravityInstallAdapter.runnerSettings({} as never)).rejects.toMatchObject({ code: "prerequisite_missing" });
     await expect(antigravityInstallAdapter.selfCheck(RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "antigravity" }))).rejects.toMatchObject({ diagnostic: "antigravity_not_fetched" });
+    // Refused before any consent question where Google publishes no copy (plainly, with nothing to run).
+    if (`${process.platform}-${process.arch}` === "darwin-arm64") expect(() => antigravityInstallAdapter.assertFetchable!()).not.toThrow();
+    else expect(() => antigravityInstallAdapter.assertFetchable!()).toThrow(expect.objectContaining({ diagnostic: "antigravity_unsupported_platform", message: "Google Antigravity is not available for this computer yet.", recoveryActions: [] }));
   });
 
   it("carries this release's pin: Google's 1.2.1 zip for macOS arm64 from dl.google.com, and nothing for platforms not yet proven", () => {
@@ -431,5 +440,124 @@ describe("the Antigravity install adapter (not offered until CP4)", () => {
     } else {
       expect(() => antigravityPin()).toThrow(/not available for this computer yet/);
     }
+  });
+});
+
+describe.runIf(haveOpenssl)("keeping Google Antigravity current and removing it (A17, A18, CP6)", () => {
+  let root = "";
+  const signature = vi.fn(async () => true);
+  const deps = (pin: AntigravityPin = pinFor(GOOD)): AntigravityInstallDeps => ({
+    pin, verifySignature: signature, freeBytes: async () => 50 * 1024 ** 3, download: { ca: cert, env: {} },
+  });
+  afterEach(async () => {
+    hits.length = 0;
+    clearAntigravityVerificationCache();
+    if (root) await rm(root, { recursive: true, force: true });
+  });
+  /** A connector root whose record lists Antigravity at an older version, with that version's folder still there. */
+  const updatedRoot = async (): Promise<{ record: NativeRuntimeRecord; old: string }> => {
+    root = await realpath(await mkdtemp(join(tmpdir(), "agy-update-")));
+    await chmod(root, 0o700);
+    const old = join(root, "agents", "antigravity", "1.1.1-darwin-arm64");
+    await mkdir(old, { recursive: true, mode: 0o700 });
+    await writeFile(join(old, "agy_acp_server.par"), "the previous release's copy");
+    const record = NativeRuntimeRecordSchema.parse({
+      schemaVersion: 1, deploymentKind: "native_connector", instanceId: "instance", workspaceId: "tenant", releaseId: "release-1", manifestDigest: "digest",
+      bundleVersion: "1.1.0", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", controlPort: 7777,
+      agents: ["codex", "antigravity"], antigravityVersion: "1.1.1", antigravityRoot: old,
+    });
+    await writeFile(join(root, "native-runtime.json"), JSON.stringify(record), { mode: 0o600 });
+    return { record, old };
+  };
+  const runnerConfig = async (_root: string, record: NativeRuntimeRecord) => RunnerConfigSchema.parse({
+    RUNNER_AGENT_ID: "antigravity", RUNNER_NATIVE_ANTIGRAVITY_ROOT: record.antigravityRoot, RUNNER_BRIDGE_PREFIX: record.antigravityRoot, RUNNER_BRIDGE_VERSION: record.antigravityVersion,
+  });
+  const stored = async () => JSON.parse(await readFile(join(root, "native-runtime.json"), "utf8")) as NativeRuntimeRecord;
+
+  it("is needed only for a listed Antigravity whose copy is another version or missing, never for one that does not verify", () => {
+    const listed = { agents: ["antigravity" as const] };
+    const refusal = (diagnostic: string) => new RemoteInstanceError("prerequisite_missing", "x", { diagnostic });
+    expect(antigravityUpdateNeeded(listed, refusal("antigravity_unsupported_version"))).toBe(true);
+    expect(antigravityUpdateNeeded(listed, refusal("antigravity_not_fetched"))).toBe(true);
+    expect(antigravityUpdateNeeded(listed, refusal("antigravity_unsafe_install"))).toBe(false);
+    expect(antigravityUpdateNeeded(listed, refusal("antigravity_unsupported_platform"))).toBe(false);
+    expect(antigravityUpdateNeeded({ agents: [] }, refusal("antigravity_not_fetched"))).toBe(false);
+  });
+
+  it("fetches the new pin on the first yes, checks it before switching, records it, and prunes the old version", async () => {
+    const { record, old } = await updatedRoot();
+    const checked: string[] = [];
+    const updated = await updateNativeAntigravity(root, record, { ...deps(), runnerConfig, selfCheck: async config => { checked.push(config.RUNNER_NATIVE_ANTIGRAVITY_ROOT!); } });
+    const folder = join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
+    expect(updated.fetched).toEqual({ antigravityVersion: "1.2.1", antigravityRoot: folder });
+    expect(updated.config.RUNNER_NATIVE_ANTIGRAVITY_ROOT).toBe(folder);
+    expect(checked).toEqual([folder]);
+    expect(await stored()).toMatchObject({ agents: ["codex", "antigravity"], antigravityVersion: "1.2.1", antigravityRoot: folder, instanceId: "instance" });
+    expect(await readdir(join(root, "agents", "antigravity"))).toEqual(["1.2.1-darwin-arm64"]);
+    await expect(lstat(old)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(hits).toEqual(["/good.zip"]);
+  });
+
+  it("keeps the old version and the record when the new copy's start check fails, and a later try does not download again", async () => {
+    const { record, old } = await updatedRoot();
+    const before = await stored();
+    await expect(updateNativeAntigravity(root, record, { ...deps(), runnerConfig, selfCheck: async () => { throw new RemoteInstanceError("prerequisite_missing", "drift", { diagnostic: "antigravity_unsupported_version" }); } }))
+      .rejects.toMatchObject({ diagnostic: "antigravity_unsupported_version" });
+    expect(await stored()).toEqual(before);
+    expect((await lstat(old)).isDirectory()).toBe(true);
+    await updateNativeAntigravity(root, record, { ...deps(), runnerConfig, selfCheck: async () => undefined });
+    expect(hits).toEqual(["/good.zip"]);
+    expect((await stored()).antigravityVersion).toBe("1.2.1");
+  });
+
+  it("keeps the old version and the record when the download fails, and asks nothing of a record that never listed it", async () => {
+    const { record, old } = await updatedRoot();
+    const before = await stored();
+    const missing = { ...pinFor(GOOD, "/gone.zip") };
+    await expect(updateNativeAntigravity(root, record, { ...deps(missing), runnerConfig, selfCheck: async () => undefined })).rejects.toMatchObject({ code: "prerequisite_missing" });
+    expect(await stored()).toEqual(before);
+    expect((await lstat(old)).isDirectory()).toBe(true);
+    hits.length = 0;
+    await expect(updateNativeAntigravity(root, { ...record, agents: ["codex"] }, { ...deps(), runnerConfig, selfCheck: async () => undefined })).rejects.toMatchObject({ code: "agent_unavailable" });
+    expect(hits).toEqual([]);
+  });
+
+  it("switches in memory and writes the record on a later start when an installer holds the lock", async () => {
+    const { record } = await updatedRoot();
+    const before = await stored();
+    const lock = acquireNativeRootLock(join(root, "installer"));
+    const deferred = vi.fn();
+    try {
+      const updated = await updateNativeAntigravity(root, record, { ...deps(), runnerConfig, selfCheck: async () => undefined, onRecordDeferred: deferred });
+      expect(updated.fetched.antigravityVersion).toBe("1.2.1");
+      expect(deferred).toHaveBeenCalledWith(expect.objectContaining({ code: "temporarily_unavailable" }));
+      expect(await stored()).toEqual(before);
+    } finally { lock.release(); }
+    await recordFetchedAntigravity(root, { antigravityVersion: "1.2.1", antigravityRoot: join(root, "agents", "antigravity", "1.2.1-darwin-arm64") });
+    expect((await stored()).antigravityVersion).toBe("1.2.1");
+  });
+
+  it("shows another process's download as under way while it grows, never a stale one, and says what the copy takes on disk", async () => {
+    root = await realpath(await mkdtemp(join(tmpdir(), "agy-progress-")));
+    const pin = pinFor(GOOD);
+    const staging = join(root, "agents", "antigravity", ".fetch-launcher");
+    await mkdir(staging, { recursive: true, mode: 0o700 });
+    await writeFile(join(staging, "archive.zip"), Buffer.alloc(200));
+    expect(await antigravityFetchUnderWay(root, { pin })).toEqual({ receivedBytes: 200, sizeBytes: GOOD.length });
+    expect(await antigravityDownloadState(root, undefined, { pin })).toEqual({ state: "downloading", receivedBytes: 200, sizeBytes: GOOD.length });
+    expect(await antigravityFetchUnderWay(root, { pin }, Date.now() + 60_000)).toBeUndefined();
+    expect(antigravityDiskBytes(pin)).toBe(SERVER.length + HARNESS.length);
+  });
+
+  it("removes every copy, the private home and the workspace, and never another agent's; signing out a copy that cannot run is skipped", async () => {
+    const { record } = await updatedRoot();
+    for (const dir of ["credentials/antigravity/antigravity/home/.gemini/antigravity-acp", "credentials/codex", "workspaces/antigravity", "workspaces/codex"]) await mkdir(join(root, dir), { recursive: true, mode: 0o700 });
+    await writeFile(join(root, "credentials/antigravity/antigravity/home/.gemini/antigravity-acp/acp_business_token.json"), "{}");
+    await expect(signOutNativeAntigravity(root, record)).resolves.toBe(false);
+    await deleteNativeAntigravity(root);
+    expect((await readdir(root)).sort()).toEqual(["agents", "credentials", "native-runtime.json", "workspaces"]);
+    expect(await readdir(join(root, "agents"))).toEqual([]);
+    expect(await readdir(join(root, "credentials"))).toEqual(["codex"]);
+    expect(await readdir(join(root, "workspaces"))).toEqual(["codex"]);
   });
 });

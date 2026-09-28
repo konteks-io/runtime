@@ -5,13 +5,14 @@ import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { acquireNativeRootLock, compareSemver, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, compareSemver, deleteNativeAntigravity, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, signOutNativeAntigravity, type HostAgentInstallAdapter, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
 import type { Output } from "../output.js";
 import { promptSecret } from "../prompt.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
 import { releaseStaged, writeStagingProgress } from "./enrollment-staging.js";
+import type { FetchConsent } from "./consent.js";
 
 export { NATIVE_MANIFEST_URL };
 export interface NativeInstallOptions {
@@ -22,6 +23,8 @@ export interface NativeInstallOptions {
     manifest?: unknown; fetchFn?: typeof fetch; activate?: typeof runNativeActivationExchange;
     readActivationCode?: () => Promise<string>;
     git?: NativeRuntimeRecord["git"] | null;
+    /** A fetched agent's consent line answered (Google Antigravity, A20); without it nothing is downloaded. */
+    consent?: FetchConsent;
   };
 }
 export interface NativeAgentAddOptions {
@@ -72,8 +75,10 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     const claudeExecutable = agents.includes("claude-code") ? await resolveNativeClaudeExecutable() : undefined;
     // Agents the person installed themselves (DeepSeek Harness, OpenCode 2):
     // located and version-checked now, never downloaded, so an unsupported
-    // one (OpenCode 1, say) is refused before an activation is used up.
-    const hosted = await locateHostAgents(agents, root);
+    // one (OpenCode 1, say) is refused before an activation is used up. A
+    // fetched one (Google Antigravity) is downloaded now on the person's yes
+    // to its consent line, for the same reason.
+    const hosted = await locateHostAgents(agents, root, options.deps?.consent, options.output);
     const bundled = agents.filter(agent => !isHostAgentId(agent));
     const fetchFn = options.deps?.fetchFn ?? fetch;
     const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
@@ -254,12 +259,19 @@ export async function recordNativeEnrollment(options: {
       return { agents: prepared.agents, bundleVersion: prepared.bundleVersion, staged: await releaseStaged(root, prepared.releaseId) };
     }
     const detected: string[] = [];
+    // A fetched agent (Google Antigravity) is downloaded on the person's yes
+    // after onboarding, never as part of it: `agent add` asks its question.
+    const fetched = options.agents?.find(agent => hostAgentInstallAdapter(agent)?.fetch !== undefined);
+    if (fetched !== undefined) throw new RemoteInstanceError("agent_unavailable", `${findAgentBridge(fetched)?.displayName ?? fetched} is added after onboarding, once you agree to its download: konteks-remote agent add ${fetched}`);
     if (options.agents && options.agents.length > 0) detected.push(...options.agents);
     else {
       if (await resolveNativeClaudeExecutable().then(() => true).catch(() => false)) detected.push("claude-code");
       if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
-      // Agents the person installed themselves (DeepSeek Harness, OpenCode 2), when offered.
+      // Agents the person installed themselves (DeepSeek Harness, OpenCode 2),
+      // when offered. A fetched one (Google Antigravity) is never detected:
+      // the connector downloads it, it is not found.
       for (const host of HOST_AGENT_INSTALL_ADAPTERS) {
+        if (host.fetch !== undefined) continue;
         if (host.offered && await host.locate(undefined, { root }).then(() => true).catch(() => false)) detected.push(host.agentId);
       }
     }
@@ -456,6 +468,9 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
     runtimeLock = acquireNativeRootLock(join(root, "supervisor"));
     const current = await loadNativeInstallation(root, { roots, platform });
     if (current.record.agents.includes(options.agentId)) {
+      // A fetched agent whose copy no longer verifies (or an update's new
+      // copy just fetched) is recorded again from the verified folder.
+      if (await fetchedAgentStale(root, current.record, options.agentId)) return await addHostAgent(root, current.record, options, { roots, platform }, lock);
       options.output.line(`${options.agentId} is already installed; no files or identity were changed.`);
       return current.record;
     }
@@ -532,10 +547,12 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
 async function addHostAgent(root: string, previous: NativeRuntimeRecord, options: NativeAgentAddOptions, deps: { roots: readonly EmbeddedReleaseRoot[]; platform: NativePlatform }, lock: ReturnType<typeof acquireNativeRootLock>): Promise<NativeRuntimeRecord> {
   const host = hostAgentInstallAdapter(options.agentId);
   if (!host?.offered) throw notOffered(options.agentId);
+  // A fetched agent was downloaded before the service stopped (runNativeAgentAdd); here it is only verified again.
   const located = await host.locate(undefined, { root });
   await privateDirectory(join(root, "credentials", options.agentId));
   await privateDirectory(join(root, "workspaces", options.agentId));
-  const successor = NativeRuntimeRecordSchema.parse({ ...previous, agents: [...previous.agents, options.agentId], ...located });
+  const listed = previous.agents.includes(options.agentId);
+  const successor = NativeRuntimeRecordSchema.parse({ ...previous, agents: listed ? previous.agents : [...previous.agents, options.agentId], ...located });
   try {
     lock.assertOwned();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(successor));
@@ -546,9 +563,88 @@ async function addHostAgent(root: string, previous: NativeRuntimeRecord, options
     throw error;
   }
   const name = findAgentBridge(options.agentId)?.displayName ?? options.agentId;
+  if (host.fetch !== undefined) {
+    const version = located.antigravityVersion;
+    options.output.line(listed
+      ? `${name}${version ? ` ${version}` : ""} downloaded from Google again and its signature checked; its sign-ins were kept.`
+      : `${name}${version ? ` ${version}` : ""} added: downloaded from Google and its signature checked; nothing else changed. To sign it in here with a Gemini API key: konteks-remote auth login ${options.agentId} --api-key. With Gemini Enterprise: konteks-remote auth login ${options.agentId} --enterprise --project <project id>`);
+    return successor;
+  }
   const version = located.opencodeVersion;
   options.output.line(`${name}${version ? ` ${version}` : ""} added from this machine's own installation; no release was downloaded and nothing else changed. To sign it in here: konteks-remote auth login ${options.agentId}`);
   return successor;
+}
+
+/** A listed fetched agent whose recorded copy does not verify now while this release's copy does (fetched again, or an update's). */
+async function fetchedAgentStale(root: string, record: NativeRuntimeRecord, agentId: string): Promise<boolean> {
+  const host = hostAgentInstallAdapter(agentId);
+  if (host?.fetch === undefined) return false;
+  const recordedOk = await host.runnerSettings(record, { root }).then(() => true, () => false);
+  if (recordedOk) return false;
+  return host.locate(undefined, { root }).then(() => true, () => false);
+}
+
+export interface NativeAgentRemoveOptions {
+  root: string;
+  agentId: NativeRuntimeRecord["agents"][number];
+  output: Output;
+  deps?: {
+    roots?: readonly EmbeddedReleaseRoot[];
+    platform?: NativePlatform;
+    /** Sign out on a process of the connector's own (tests replace it). */
+    signOut?: typeof signOutNativeAntigravity;
+  };
+}
+
+/**
+ * Remove a fetched agent (Google Antigravity, A18) without reactivation:
+ * with the service stopped (the caller's part, as for `agent add`), sign it
+ * out on a process of the connector's own, drop it from the runtime record
+ * (the installation must still load), then delete every downloaded version,
+ * its private home with its sign-ins, and its workspace folder. Other agents,
+ * the identity and the release are untouched.
+ */
+export async function removeNativeAgent(options: NativeAgentRemoveOptions): Promise<NativeRuntimeRecord> {
+  const platform = options.deps?.platform ?? nativePlatform();
+  const roots = options.deps?.roots ?? EMBEDDED_RELEASE_ROOTS;
+  const root = resolve(options.root);
+  if (root === parse(root).root || root === resolve(homedir())) throw invalid();
+  const host = hostAgentInstallAdapter(options.agentId);
+  if (host?.fetch === undefined) throw notRemovable(options.agentId);
+  const lock = acquireNativeRootLock(join(root, "installer"));
+  let runtimeLock: ReturnType<typeof acquireNativeRootLock> | undefined;
+  try {
+    runtimeLock = acquireNativeRootLock(join(root, "supervisor"));
+    const current = await loadNativeInstallation(root, { roots, platform });
+    const name = findAgentBridge(options.agentId)?.displayName ?? options.agentId;
+    if (current.record.agents.includes(options.agentId)) {
+      const signedOut = await (options.deps?.signOut ?? signOutNativeAntigravity)(root, current.record);
+      const { antigravityVersion: _version, antigravityRoot: _root, ...rest } = current.record;
+      const successor = NativeRuntimeRecordSchema.parse({ ...rest, agents: current.record.agents.filter(agent => agent !== options.agentId) });
+      try {
+        lock.assertOwned();
+        await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(successor));
+        await loadNativeInstallation(root, { roots, platform });
+      } catch (error) {
+        lock.assertOwned();
+        await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(current.record));
+        throw error;
+      }
+      await deleteNativeAntigravity(root);
+      options.output.line(`${name} removed from this computer: ${signedOut ? "signed out, " : ""}its download and its sign-ins here were deleted. Nothing else changed.`);
+      return successor;
+    }
+    // Not listed: a download left from an unfinished add is deleted all the same.
+    await deleteNativeAntigravity(root);
+    options.output.line(`${name} is not added on this computer; nothing of it is left here.`);
+    return current.record;
+  } finally {
+    runtimeLock?.release();
+    lock.release();
+  }
+}
+function notRemovable(agentId: string) {
+  return new RemoteInstanceError("agent_unavailable", `${findAgentBridge(agentId)?.displayName ?? agentId} cannot be removed on its own. Only Google Antigravity, which Konteks downloads, can: konteks-remote agent remove antigravity. To remove Konteks from this computer: konteks-remote uninstall`);
 }
 
 /** Roll back only the exact successor written by this launcher invocation. */
@@ -611,14 +707,42 @@ function refuseRetiredAgents(agents: readonly string[]): void {
 }
 function notOffered(agentId: string) { return new RemoteInstanceError("agent_unavailable", `${agentId} cannot be added on this computer yet.`); }
 
-/** Locate every host-installed agent in `agents`; the install-record fields they need. */
-async function locateHostAgents(agents: readonly string[], root: string): Promise<Partial<NativeRuntimeRecord>> {
+/**
+ * Locate every host-installed agent in `agents`; the install-record fields
+ * they need. A fetched agent is downloaded here on the person's yes to its
+ * consent line (a copy that already verifies is kept); no answer, or no, is
+ * a refusal and nothing is downloaded.
+ */
+async function locateHostAgents(agents: readonly string[], root: string, consent?: FetchConsent, output?: Output): Promise<Partial<NativeRuntimeRecord>> {
   const fields: Partial<NativeRuntimeRecord> = {};
   for (const agent of agents) {
     const host = hostAgentInstallAdapter(agent);
-    if (host) Object.assign(fields, await host.locate(undefined, { root }));
+    if (!host) continue;
+    if (host.fetch !== undefined) {
+      Object.assign(fields, await fetchHostAgent(host, root, consent, output));
+      continue;
+    }
+    Object.assign(fields, await host.locate(undefined, { root }));
   }
   return fields;
+}
+
+/**
+ * A fetched agent's download (A20): refused first where the release pins no
+ * copy for this computer, then the consent line, then Google's zip into the
+ * connector's own folder, checked. A copy that already verifies is kept
+ * without asking.
+ */
+export async function fetchHostAgent(host: HostAgentInstallAdapter, root: string, consent: FetchConsent | undefined, output?: Output): Promise<Partial<NativeRuntimeRecord>> {
+  if (host.fetch === undefined) throw notOffered(host.agentId);
+  host.assertFetchable?.();
+  const kept = await host.locate(undefined, { root }).catch(() => null);
+  if (kept) return kept;
+  const name = findAgentBridge(host.agentId)?.displayName ?? host.agentId;
+  const yes = consent ? await consent(host.agentId, host.consentText ?? `Download ${name}? [y/N]`) : false;
+  if (!yes) throw new RemoteInstanceError("agent_unavailable", `Nothing was downloaded: ${name} was not added.`);
+  output?.line(`Downloading ${name} from Google and checking Google's signature; this takes a minute or two.`);
+  return host.fetch({ root, consent: true });
 }
 
 /** Read only the private installer record for status/stop, even when a release has expired. */

@@ -7,10 +7,11 @@ import { createOutput, type Output } from "../output.js";
 
 /**
  * The agents a native runtime runs: Claude Code and Codex from signed
- * packages, and the person's own DeepSeek Harness and OpenCode 2 (Pi is
- * retired; OpenCode 2 is the host agent, not the old bundled one).
+ * packages, the person's own DeepSeek Harness and OpenCode 2 (Pi is retired;
+ * OpenCode 2 is the host agent, not the old bundled one), and Google
+ * Antigravity, which the connector downloads from Google on the person's yes.
  */
-const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode"] as const;
+const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode", "antigravity"] as const;
 type NativeAgentId = (typeof NATIVE_AGENT_IDS)[number];
 
 export interface NativeCommandContext { root: string; output: Output }
@@ -18,7 +19,8 @@ export interface NativeCliActions {
   install(input: NativeCommandContext & { activationId?: string; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
   onboard(input: NativeCommandContext & { answer?: string; cwd?: string }): Promise<void>;
   stageEnrollment(input: NativeCommandContext): Promise<void>;
-  addAgent(input: NativeCommandContext & { agent: NativeAgentId }): Promise<void>;
+  addAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
+  removeAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
@@ -59,10 +61,6 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     if (!(NATIVE_AGENT_IDS as readonly string[]).includes(value)) throw new InvalidArgumentError("unsupported agent family");
     return value as NativeAgentId;
   };
-  // Signing in and out also takes Google Antigravity (its CP3), which install
-  // and `agent add` do not offer yet: the connector refuses it if no runner of
-  // it runs here.
-  const authAgent = (value: string): string => (value === "antigravity" ? value : agent(value));
   const project = (value: string): string => {
     if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(value)) throw new InvalidArgumentError("expected a Google Cloud project ID: 6 to 30 lower-case letters, digits or hyphens, starting with a letter");
     return value;
@@ -78,7 +76,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
     .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")
-    .option("--agents <ids>", "agent families: claude-code, codex, dsh, opencode (default: claude-code,codex)", value => value.split(",").map(part => agent(part.trim())))
+    .option("--agents <ids>", "agent families: claude-code, codex, dsh, opencode, antigravity (default: claude-code,codex; antigravity asks before downloading Google Antigravity from Google)", value => value.split(",").map(part => agent(part.trim())))
     .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
       if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
@@ -97,9 +95,17 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   program.command("start").description("start the installed native user service").action(async () => actions.start(context()));
   program.command("stop").description("stop the native user service, preserving identity and local work").action(async () => actions.stop(context()));
   const agentLifecycle = program.command("agent").description("manage agents installed on this native runtime");
-  agentLifecycle.command("add").description("add one agent without reactivation: a signed package for Claude Code or Codex, or your own DeepSeek Harness or OpenCode 2 install (nothing downloaded)")
-    .argument("<agent>", "agent family: claude-code, codex, dsh or opencode", agent)
-    .action(async (value: NativeAgentId) => actions.addAgent({ ...context(), agent: value }));
+  agentLifecycle.command("add").description("add one agent without reactivation: a signed package for Claude Code or Codex, your own DeepSeek Harness or OpenCode 2 install (nothing downloaded), or Google Antigravity, downloaded from Google (dl.google.com, about 110 MB) after you say yes")
+    .argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", agent)
+    .option("--yes", "Google Antigravity: you read the download question and agree (it is asked otherwise)", false)
+    .action(async (value: NativeAgentId, options: { yes: boolean }) => {
+      if (options.yes && value !== "antigravity") throw new InvalidArgumentError("--yes answers Google Antigravity's download question; other agents ask none");
+      await actions.addAgent({ ...context(), agent: value, ...(options.yes ? { yes: true } : {}) });
+    });
+  agentLifecycle.command("remove").description("remove Google Antigravity from this computer: sign it out, delete its download and its sign-ins here; other agents are untouched")
+    .argument("<agent>", "antigravity", agent)
+    .option("--yes", "you agree to the removal (it is asked otherwise)", false)
+    .action(async (value: NativeAgentId, options: { yes: boolean }) => actions.removeAgent({ ...context(), agent: value, ...(options.yes ? { yes: true } : {}) }));
   for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).action(async () => actions.control({ ...context(), operation }));
   // Read-only. Whether this computer serves previews is switched per machine
   // in Konteks (Customize → Runtimes), never here.
@@ -108,7 +114,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .action(async () => actions.control({ ...context(), operation: "preview.status" }));
   const auth = program.command("auth").description("official local agent subscription authentication");
   auth.command("status").argument("[agent]", "agent family", agent).action(async (value?: string) => actions.control({ ...context(), operation: "auth.status", ...(value ? { agent: value } : {}) }));
-  auth.command("login").argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", authAgent).option("--organization", "attest that the account is organization-owned", false)
+  auth.command("login").argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", agent).option("--organization", "attest that the account is organization-owned", false)
     .option("--provider <id>", "OpenCode: the provider to sign in to (asked when omitted)", providerId)
     .option("--method <id>", "OpenCode: the provider's sign-in method, or key for an API key", providerId)
     .option("--reuse", "OpenCode: see which providers your own OpenCode uses, to sign in to the same ones", false)
@@ -125,7 +131,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
         ...(options.provider ? { provider: options.provider } : {}), ...(method ? { method } : {}), ...(options.reuse ? { reuse: true } : {}),
         ...(options.project ? { project: options.project, location: options.location ?? "global" } : {}) });
     });
-  auth.command("logout").argument("<agent>", "agent family", authAgent).option("--provider <id>", "OpenCode: sign out of one provider only", providerId)
+  auth.command("logout").argument("<agent>", "agent family", agent).option("--provider <id>", "OpenCode: sign out of one provider only", providerId)
     .option("--api-key", "Google Antigravity: forget only the Gemini API key", false)
     .option("--enterprise", "Google Antigravity: sign out of Gemini Enterprise only", false)
     .action(async (value: string, options: { provider?: string; apiKey: boolean; enterprise: boolean }) => {

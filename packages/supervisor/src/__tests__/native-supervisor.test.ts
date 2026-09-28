@@ -17,7 +17,8 @@ import { REMOTE_INSTANCE_PROTOCOL_VERSION, SystemClock } from "@konteks/remote-c
 import { LEASE_AUDIENCE, type CoreClient } from "../core/client.js";
 import { decodeLeaseClaims, leaseRecordFromClaims } from "../lease/lease.js";
 import { BROWSER_NO_PACKAGE_MESSAGE } from "../native/browser-capability.js";
-import { openCodeInstallAdapter } from "../native/host-agents.js";
+import { antigravityInstallAdapter, openCodeInstallAdapter } from "../native/host-agents.js";
+import { ANTIGRAVITY_ENTERPRISE_QUARANTINE_MESSAGE } from "../session/antigravity-tool-governance.js";
 
 let root: string;
 const supervisors: Supervisor[] = [];
@@ -552,6 +553,67 @@ describe("native Supervisor composition", () => {
       expect(retry.parked()).toEqual([]);
       expect([...supervisor.runners.keys()]).toEqual(["codex", "opencode"]);
       expect((await doctorOf(supervisor)).find(entry => entry.id === "opencode")).toMatchObject({ status: "warn", detail: expect.stringMatching(/^OpenCode 2\.0\.18, installed with npm; Konteks settings check passed;/) });
+    });
+  });
+
+  describe("Google Antigravity (antigravity CP6)", () => {
+    const folder = () => join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
+    const antigravityConfig = () => RunnerConfigSchema.parse({
+      RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "antigravity-work"),
+      RUNNER_BRIDGE_PREFIX: folder(), RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder(), RUNNER_BRIDGE_VERSION: "1.2.1",
+    });
+    const doctorOf = async (supervisor: Supervisor) => (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
+
+    it("runs beside Codex; doctor names it, its start check and sign-in commands without a path, and the Require review line after an A21 quarantine", async () => {
+      const f = await fixture();
+      vi.spyOn(antigravityInstallAdapter, "selfCheck").mockResolvedValue(undefined);
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, runners: [...f.options.native.runners, antigravityConfig()] } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex", "antigravity"]);
+      const check = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
+      expect(check).toMatchObject({ title: "Google Antigravity", status: "warn", recoveryActions: [{ kind: "login_agent", agentId: "antigravity" }] });
+      expect(check!.detail).toContain("start check passed; not signed in (konteks-remote auth login antigravity --api-key, or --enterprise --project <project id>)");
+      expect(check!.detail).not.toContain(root);
+      const runner = supervisor.runners.get("antigravity") as unknown as { quarantine(reason: string): Promise<void> };
+      await runner.quarantine(ANTIGRAVITY_ENTERPRISE_QUARANTINE_MESSAGE);
+      const quarantined = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
+      expect(quarantined).toMatchObject({ status: "fail" });
+      expect(quarantined!.detail).toContain('Needs your organisation\'s Require review setting: in Gemini Enterprise, Settings, AI developer tools, set "Terminal auto-execution: Require review"');
+    });
+
+    it("is left out when its start check fails, while Codex keeps running; doctor says why", async () => {
+      const f = await fixture();
+      vi.spyOn(antigravityInstallAdapter, "selfCheck").mockRejectedValue(new RemoteInstanceError("prerequisite_missing", "Google Antigravity on this computer does not match Google's release.", { diagnostic: "antigravity_unsafe_install" }));
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, runners: [...f.options.native.runners, antigravityConfig()] } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex"]);
+      const check = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
+      expect(check).toMatchObject({ status: "fail", recoveryActions: [{ kind: "install_backend", agentId: "antigravity" }] });
+      expect(check!.detail).toContain("is not running Konteks work: the downloaded copy does not match Google's release, so it never runs (konteks-remote agent add antigravity downloads it again); it is tried again in the background, and the other agents keep running");
+    });
+
+    it("fetches an update's new pin at once on the first yes, and joins when it is switched to (A17)", async () => {
+      const f = await fixture();
+      vi.spyOn(antigravityInstallAdapter, "selfCheck").mockResolvedValue(undefined);
+      let finish: (() => void) | undefined;
+      const relocate = vi.fn(() => new Promise<ReturnType<typeof antigravityConfig>>(resolve => { finish = () => resolve(antigravityConfig()); }));
+      const error = new RemoteInstanceError("prerequisite_missing", "Google Antigravity on this computer is not the version this connector runs.", { diagnostic: "antigravity_unsupported_version" });
+      const unavailableAgents = [{ agentId: "antigravity", error, relocate, updating: true, fetched: { antigravityVersion: "1.1.1", antigravityRoot: join(root, "agents", "antigravity", "1.1.1-darwin-arm64") } }];
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, unavailableAgents } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      // Started now, not in a minute.
+      await vi.waitFor(() => expect(relocate).toHaveBeenCalledTimes(1));
+      expect([...supervisor.runners.keys()]).toEqual(["codex"]);
+      const pinned = `${process.platform}-${process.arch}` === "darwin-arm64";
+      const updating = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
+      expect(updating).toMatchObject({ status: "fail" });
+      if (pinned) expect(updating!.detail).toContain("this connector release runs 1.2.1, which is being downloaded from Google and checked before it is used");
+      finish!();
+      await vi.waitFor(() => expect([...supervisor.runners.keys()]).toEqual(["codex", "antigravity"]));
+      expect((await doctorOf(supervisor)).find(entry => entry.id === "antigravity")).toMatchObject({ status: "warn", detail: expect.stringContaining("start check passed") });
     });
   });
 

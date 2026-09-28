@@ -50,7 +50,9 @@ export interface GraftTool {
 }
 
 /** The agent families Graft knows how to wire, by Graft's own ids. */
-export const GRAFT_AGENT_IDS: Record<string, string> = { "claude-code": "claude", codex: "agents", dsh: "agents", opencode: "agents" };
+// Google Antigravity does not read AGENTS.md itself; the connector puts it
+// in each session's first prompt (antigravity A9), so it is wired like Codex.
+export const GRAFT_AGENT_IDS: Record<string, string> = { "claude-code": "claude", codex: "agents", dsh: "agents", opencode: "agents", antigravity: "agents" };
 
 /** What each wired agent adds to the repository, in words for the offer. */
 const GRAFT_FILES: Record<string, string[]> = { claude: [".claude/", ".mcp.json"], agents: ["AGENTS.md"] };
@@ -204,7 +206,8 @@ export async function graftAlreadyWired(repo: string): Promise<boolean> {
 
 /** What the offer says: the files Graft adds, and any the repository already tracks. */
 export async function planGraft(repo: string, families: string[]): Promise<{ agents: string[]; adds: string[]; tracked: string[]; files: number }> {
-  // Codex, DeepSeek Harness and OpenCode all read AGENTS.md: one Graft id, wired once.
+  // Codex, DeepSeek Harness and OpenCode read AGENTS.md, and the connector
+  // gives it to Google Antigravity: one Graft id, wired once.
   const agents = [...new Set(families.map(family => GRAFT_AGENT_IDS[family]).filter((id): id is string => Boolean(id)))];
   const adds = ["graft/", ...agents.flatMap(id => GRAFT_FILES[id] ?? []), ".ignore"];
   const listed = (await git(repo, ["ls-files", "--", ...TRACKABLE]).catch(() => "")).split("\n").filter(Boolean);

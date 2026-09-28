@@ -33,6 +33,7 @@ import {
   readAntigravitySignIn,
   renderAntigravitySettings,
   writeAntigravitySignIn,
+  clearAntigravityAdminObservation,
   type AntigravitySignIn,
 } from "../host/antigravity.js";
 import type { LoginEvent, LoginFailureReason, LoginFlow } from "./login-flow.js";
@@ -447,6 +448,8 @@ async function recordGoogleSignIn(credentialDir: string, method: "oauth-business
     return;
   }
   await writeAntigravitySignIn(credentialDir, { method: "oauth-business", gcp: outcome.gcp!, ...(outcome.tier ? { tier: outcome.tier } : {}) });
+  // A new sign-in may come after the organisation changed its settings: what doctor showed of them is seen afresh.
+  await clearAntigravityAdminObservation(credentialDir);
 }
 
 /**
@@ -558,6 +561,7 @@ export async function antigravityLogout(options: { credentialDir: string; reques
   if (which !== undefined && apiKey && !held.key) throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity holds no Gemini API key on this computer.");
   if (enterprise && held.enterpriseToken && held.record?.gcp) await acpLogout(options.credentialDir, held.record.gcp, options.process).catch(() => undefined);
   if (enterprise) await rm(antigravityTokenFiles(options.credentialDir).business, { force: true });
+  if (enterprise) await clearAntigravityAdminObservation(options.credentialDir);
   if (apiKey) await removeAntigravityApiKey(options.credentialDir);
   const after = await antigravityHeld(options.credentialDir);
   const method = after.key ? "gemini-api-key" : after.enterpriseToken && after.record?.gcp ? "oauth-business" : "none";

@@ -61,6 +61,8 @@ export * from "./native/antigravity-installation.js";
 export * from "./native/opencode-self-check.js";
 export * from "./native/antigravity-self-check.js";
 export * from "./native/antigravity-download.js";
+export * from "./native/antigravity-update.js";
+export * from "./native/antigravity-removal.js";
 export * from "./native/installed.js";
 export * from "./native/root-lock.js";
 export * from "./native/git-workspace.js";

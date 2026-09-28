@@ -53,6 +53,8 @@ export interface AntigravityRuntimePaths {
   signIn: string;
   /** What each session was last given as its `AGENTS.md` (A9), by the agent's own session id. */
   instructions: string;
+  /** What a Gemini Enterprise session showed of the organisation's admin settings (MCP Servers off, A21), for doctor. */
+  adminControls: string;
 }
 
 export function antigravityRuntimePaths(credentialDir: string, platform: NodeJS.Platform = process.platform): AntigravityRuntimePaths {
@@ -67,6 +69,7 @@ export function antigravityRuntimePaths(credentialDir: string, platform: NodeJS.
     relay: path.join(root, "relay"),
     signIn: path.join(root, "sign-in.json"),
     instructions: path.join(root, "instructions.json"),
+    adminControls: path.join(root, "admin-controls.json"),
   };
 }
 
@@ -350,6 +353,7 @@ export function verifyAntigravitySession(response: { configOptions?: unknown; mo
  * (CP3) expects these lines.
  */
 export function antigravityStderrFailure(line: string, credentialDir?: string): RemoteInstanceError | null {
+  if (credentialDir !== undefined) void observeAntigravityAdminLine(line, credentialDir).catch(() => undefined);
   const auth = (message: string, diagnostic: string) => new RemoteInstanceError("agent_auth_required", message, { diagnostic, recoveryActions: [{ kind: "login_agent", agentId: "antigravity" }] });
   if (/has no available license/i.test(line)) {
     // The Enterprise credential reads "Needs sign-in" with this reason until the next sign-in (CP3).
@@ -360,6 +364,52 @@ export function antigravityStderrFailure(line: string, credentialDir?: string): 
     return auth("Google Antigravity needs to sign in again. Run `konteks-remote auth login antigravity`.", "antigravity_sign_in_needed");
   }
   return null;
+}
+
+/**
+ * The organisation's "MCP Servers" setting as a Gemini Enterprise session
+ * showed it (A21, CP4 found it off on the owner's organisation): the server
+ * logs "Admin MCP control active: dropping N client-requested custom MCP
+ * server(s)" when it drops the servers a session asked for (every Konteks
+ * session asks for `konteks-result` at least), or an allowlist that leaves
+ * ours out. Then Konteks tools are unavailable and results come back through
+ * the fenced fallback; doctor says so. An allowlist that keeps ours, a new
+ * Gemini Enterprise sign-in or a sign-out clears it. Never a secret, never
+ * the project.
+ */
+export interface AntigravityAdminObservation {
+  /** When a session last had the Konteks MCP servers dropped by the organisation's settings. */
+  mcpServersOffAt: string;
+}
+
+const MCP_DROPPED = /Admin MCP control active: dropping (\d+) client-requested custom MCP server/i;
+const MCP_ALLOWLIST = /Admin MCP allowlist active: custom MCP servers (.*?) -> (.*)$/i;
+
+/** Read one stderr line of an execution or discovery process for the admin settings it shows; writes the observation. */
+export async function observeAntigravityAdminLine(line: string, credentialDir: string, now: () => Date = () => new Date()): Promise<void> {
+  const dropped = MCP_DROPPED.exec(line);
+  const allowlist = dropped ? null : MCP_ALLOWLIST.exec(line);
+  if (!dropped && !allowlist) return;
+  const file = antigravityRuntimePaths(credentialDir).adminControls;
+  if (allowlist && /konteks-result/.test(allowlist[2] ?? "")) { await clearAntigravityAdminObservation(credentialDir); return; }
+  if (dropped && Number(dropped[1]) === 0) return;
+  await mkdir(antigravityRuntimePaths(credentialDir).root, { recursive: true, mode: 0o700 });
+  await writeSecretFile(file, `${JSON.stringify({ mcpServersOffAt: now().toISOString() } satisfies AntigravityAdminObservation)}\n`);
+}
+
+/** The last observation, or null (none, or unreadable). */
+export async function readAntigravityAdminObservation(credentialDir: string): Promise<AntigravityAdminObservation | null> {
+  try {
+    const value = JSON.parse(await readFile(antigravityRuntimePaths(credentialDir).adminControls, "utf8")) as Partial<AntigravityAdminObservation>;
+    return typeof value.mcpServersOffAt === "string" && !Number.isNaN(Date.parse(value.mcpServersOffAt)) ? { mcpServersOffAt: value.mcpServersOffAt } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Forget the observation (a new Gemini Enterprise sign-in or a sign-out). */
+export async function clearAntigravityAdminObservation(credentialDir: string): Promise<void> {
+  await rm(antigravityRuntimePaths(credentialDir).adminControls, { force: true });
 }
 
 /**

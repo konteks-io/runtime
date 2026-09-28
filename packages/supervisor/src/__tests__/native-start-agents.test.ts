@@ -122,3 +122,65 @@ describe("an OpenCode that cannot start", () => {
     }
   });
 });
+
+/** Google Antigravity (antigravity CP6): a copy that fails its start check is parked like any agent, the others run. */
+describe("a Google Antigravity that cannot start", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("is left out when its start check fails, the rest start, and a background retry brings it back", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(join(tmpdir(), "native-start-antigravity-"));
+    try {
+      const folder = join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
+      const config = RunnerConfigSchema.parse({
+        RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_WORKSPACE_DIR: join(root, "work"),
+        RUNNER_BRIDGE_PREFIX: folder, RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder, RUNNER_BRIDGE_VERSION: "1.2.1",
+      });
+      const drift = new RemoteInstanceError("prerequisite_missing", "Google Antigravity on this computer does not match Google's release.", { diagnostic: "antigravity_unsafe_install" });
+      let checks = 0;
+      const spawn = vi.fn(async (): Promise<BridgeProcess> => ({ connection: {} as ClientSideConnection, initializeResult: { protocolVersion: 1 }, exited: false, stderrTail: () => [], stop: vi.fn(async () => undefined) }));
+      const antigravity = new NativeRunner({ instanceId: "instance", config, onEvent: () => undefined,
+        antigravitySelfCheck: async () => { checks += 1; if (checks === 1) throw drift; },
+        runtimeOptions: { spawn, probe: async () => ({ kind: "logged_out" }) } });
+      // The folder check before the start check: stand in for a verified copy.
+      const { antigravityInstallAdapter } = await import("../native/host-agents.js");
+      const selfCheck = vi.spyOn(antigravityInstallAdapter, "selfCheck").mockImplementation(async (_config, deps) => { await deps!.antigravitySelfCheck!({ config }); });
+      const claude = { agentId: "claude-code", start: vi.fn(async () => undefined) };
+      const result = await startNativeAgents({ codexOwner: null, runners: [claude, antigravity] });
+      expect(result.started).toEqual([claude]);
+      expect(result.failed).toEqual([antigravity]);
+      expect(result.unavailable).toEqual([{ agentId: "antigravity", reason: "Google Antigravity on this computer does not match Google's release." }]);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(antigravity.hostInstallation()).toEqual({ version: "1.2.1", executable: null, fetchedRoot: folder, selfCheck: "failed" });
+      const onStarted = vi.fn();
+      const retry = new NativeAgentRetry({ onStarted, onGaveUp: vi.fn(), log: () => undefined });
+      retry.park("antigravity", () => antigravity.start());
+      await vi.advanceTimersByTimeAsync(60_000);
+      vi.useRealTimers();
+      await vi.waitFor(() => expect(onStarted).toHaveBeenCalledWith("antigravity"));
+      expect(checks).toBe(2);
+      expect(antigravity.hostInstallation()?.selfCheck).toBe("passed");
+      expect(antigravity.quarantineReason()).toBeNull();
+      retry.stop();
+      await antigravity.stop();
+      selfCheck.mockRestore();
+    } finally {
+      vi.useRealTimers();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+
+  it("starts an update's retry at once, not after a minute (A17)", async () => {
+    vi.useFakeTimers();
+    const started = vi.fn(async () => undefined);
+    const retry = new NativeAgentRetry({ onStarted: vi.fn(), onGaveUp: vi.fn(), log: () => undefined });
+    retry.park("antigravity", started, { firstDelayMs: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toHaveBeenCalledTimes(1);
+    const later = vi.fn(async () => undefined);
+    retry.park("opencode", later);
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(later).not.toHaveBeenCalled();
+    retry.stop();
+  });
+});

@@ -15,6 +15,7 @@ import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
 import { resolveNativeClaudeExecutable } from "./claude-executable.js";
 import { hostAgentInstallAdapter, nativeAgentOffered } from "./host-agents.js";
+import { antigravityUpdateNeeded, updateNativeAntigravity } from "./antigravity-update.js";
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
 function endpoint(protocol: "https:" | "wss:") {
@@ -27,7 +28,8 @@ function endpoint(protocol: "https:" | "wss:") {
 /**
  * The agents a native runtime knows: Claude Code, Codex, the person's own
  * DeepSeek Harness and OpenCode 2, and Google Antigravity, which the
- * connector fetches itself (host-agents.ts; not offered yet).
+ * connector fetches itself on the person's yes (host-agents.ts, offered since
+ * antigravity CP6).
  */
 export const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode", "antigravity"] as const;
 
@@ -99,7 +101,8 @@ export async function resolveNativeCodexSocket(root: string, codexHome: string, 
  * reported back for a warning) instead of failing the whole installation. A
  * host agent that is not offered is dropped the same way (none today: since
  * opencode-runtime-support CP6 an old record naming `opencode` reads as the
- * person's own OpenCode 2, O13). The strict schema refuses a retired id that
+ * person's own OpenCode 2, O13, and Google Antigravity is offered since its
+ * CP6). The strict schema refuses a retired id that
  * is not a native agent (Pi); the installer refuses the rest.
  */
 export function parseNativeRuntimeRecord(value: unknown): { record: NativeRuntimeRecord; retiredAgents: string[] } {
@@ -175,8 +178,28 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
           runners.push(await nativeHostRunnerConfig(canonicalRoot, record, agent));
         } catch (error) {
           if (!hostAgentUnavailable(error)) throw error;
-          unavailableAgents.push({ agentId: agent, error, relocate: () => nativeHostRunnerConfig(canonicalRoot, record, agent),
-            ...(agent === "antigravity" ? { fetched: { ...(record.antigravityVersion === undefined ? {} : { antigravityVersion: record.antigravityVersion }), ...(record.antigravityRoot === undefined ? {} : { antigravityRoot: record.antigravityRoot }) } } : {}) });
+          if (agent === "antigravity") {
+            // Google Antigravity (A17): a record naming another version (a
+            // runtime update carried a new pin) or a copy gone missing is
+            // fetched again on the person's first yes, checked, and switched
+            // to; the retry does it, at once. Anything else waits for them.
+            const entry: NativeUnavailableAgent = {
+              agentId: agent, error,
+              relocate: () => nativeHostRunnerConfig(canonicalRoot, record, agent),
+              fetched: { ...(record.antigravityVersion === undefined ? {} : { antigravityVersion: record.antigravityVersion }), ...(record.antigravityRoot === undefined ? {} : { antigravityRoot: record.antigravityRoot }) },
+            };
+            if (antigravityUpdateNeeded(record, error)) {
+              entry.updating = true;
+              entry.relocate = async () => {
+                const updated = await updateNativeAntigravity(canonicalRoot, record, { selfCheck: config => host.selfCheck(config) });
+                entry.fetched = updated.fetched;
+                return updated.config;
+              };
+            }
+            unavailableAgents.push(entry);
+            continue;
+          }
+          unavailableAgents.push({ agentId: agent, error, relocate: () => nativeHostRunnerConfig(canonicalRoot, record, agent) });
         }
         continue;
       }
@@ -230,13 +253,25 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
   }
 }
 
+/** The stored runtime record of `root` (private, checked like every load), without loading the release. */
+export async function readNativeRuntimeRecord(root: string): Promise<NativeRuntimeRecord> {
+  try {
+    return parseNativeRuntimeRecord(await readPrivateJson(join(root, "native-runtime.json"))).record;
+  } catch (error) {
+    if (error instanceof RemoteInstanceError) throw error;
+    throw invalid();
+  }
+}
+
 /** A listed host agent the load could not find or verify; `relocate` tries again (supervisor retry). */
 export interface NativeUnavailableAgent {
   agentId: string;
   error: RemoteInstanceError;
   relocate: () => Promise<RunnerConfig>;
-  /** Google Antigravity: the copy the install record names (its download state reads it). */
+  /** Google Antigravity: the copy the install record names (its download state reads it); the new copy once an update switched to it. */
   fetched?: Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot">;
+  /** Google Antigravity: `relocate` fetches this release's pin (A17), so the retry starts at once. */
+  updating?: boolean;
 }
 
 /** The locators' refusals (not found, unsupported version, unsafe install): the person can fix these, the connector runs on. */

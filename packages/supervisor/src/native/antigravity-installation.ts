@@ -44,7 +44,8 @@ const MESSAGES: Record<Diagnostic, string> = {
 function refuse(diagnostic: Diagnostic, cause?: unknown): RemoteInstanceError {
   return new RemoteInstanceError("prerequisite_missing", MESSAGES[diagnostic], {
     diagnostic,
-    recoveryActions: [{ kind: diagnostic === "antigravity_no_disk_space" ? "free_disk" : "install_backend", agentId: ANTIGRAVITY_AGENT_ID }],
+    // Nothing the person can run fixes a computer Google publishes no copy for.
+    recoveryActions: diagnostic === "antigravity_unsupported_platform" ? [] : [{ kind: diagnostic === "antigravity_no_disk_space" ? "free_disk" : "install_backend", agentId: ANTIGRAVITY_AGENT_ID }],
     ...(cause === undefined ? {} : { cause }),
   });
 }
@@ -289,10 +290,41 @@ export function antigravityFetchProgress(root: string): { receivedBytes: number;
   return running ? { ...running } : undefined;
 }
 
+/** A staging download written to this recently is a fetch still under way (another process's). */
+const FETCH_ACTIVE_MS = 30_000;
+
+/**
+ * A fetch into `root` by this process or another one (`konteks-remote agent
+ * add antigravity` downloads in the launcher while the service keeps
+ * running): this process's own counter first, otherwise the size of a
+ * staging download written to in the last 30 seconds. A staging folder a
+ * crashed fetch left behind is older than that and never reads as running.
+ */
+export async function antigravityFetchUnderWay(root: string, deps: AntigravityInstallDeps = {}, now: number = Date.now()): Promise<{ receivedBytes: number; sizeBytes: number } | undefined> {
+  const running = antigravityFetchProgress(root);
+  if (running) return running;
+  let pin: AntigravityPin;
+  try { pin = antigravityPin(deps); } catch { return undefined; }
+  const base = antigravityFolders(root, pin).base;
+  const entries = await readdir(base).catch(() => [] as string[]);
+  let newest: Stats | undefined;
+  for (const name of entries) {
+    if (!name.startsWith(".fetch-")) continue;
+    const info = await lstat(join(base, name, "archive.zip")).catch(() => undefined);
+    if (info?.isFile() && now - info.mtimeMs <= FETCH_ACTIVE_MS && (!newest || info.mtimeMs > newest.mtimeMs)) newest = info;
+  }
+  return newest ? { receivedBytes: Math.min(newest.size, pin.platform.archive.size), sizeBytes: pin.platform.archive.size } : undefined;
+}
+
+/** What the pinned copy takes on disk once unpacked (doctor's "disk used"). */
+export function antigravityDiskBytes(pin: Pick<AntigravityPin, "platform">): number {
+  return pin.platform.files.reduce((total, file) => total + file.size, 0);
+}
+
 /**
  * Remove every downloaded copy (A18's file part; signing out and the private
- * home are the launcher's `agent remove`, CP6). Sign-ins live under
- * `<root>/credentials`, which this never touches.
+ * home are `agent remove antigravity`, antigravity-removal.ts). Sign-ins live
+ * under `<root>/credentials`, which this never touches.
  */
 export async function removeNativeAntigravity(root: string): Promise<void> {
   await rm(join(root, "agents", ANTIGRAVITY_AGENT_ID), { recursive: true, force: true });

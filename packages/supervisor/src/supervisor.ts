@@ -31,8 +31,8 @@ import {
   coreContractAtLeast,
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { chromeInstalled, type RunnerConfig } from "@konteks/remote-agent-runner";
-import type { NativeUnavailableAgent } from "./native/installation.js";
+import { chromeInstalled, readAntigravityAdminObservation, type RunnerConfig } from "@konteks/remote-agent-runner";
+import type { NativeRuntimeRecord, NativeUnavailableAgent } from "./native/installation.js";
 import { SignalSampler } from "@konteks/remote-sysmon";
 import { loadSupervisorConfig, type SupervisorConfig } from "./config.js";
 import { CoreClient, LEASE_AUDIENCE } from "./core/client.js";
@@ -70,6 +70,7 @@ import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOpti
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
+import { antigravityDiskBytes, antigravityFetchUnderWay, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
 import { NativeInputClient } from "./native/input-client.js";
 import { NativeOutputClient } from "./native/output-client.js";
@@ -90,7 +91,7 @@ import { SupervisorJournal } from "./state/journal.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
 import { buildSupportBundle } from "./support/bundle.js";
-import { runDoctor, type OpenCodeDoctorInputs } from "./support/doctor.js";
+import { runDoctor, type AntigravityDoctorInputs, type OpenCodeDoctorInputs } from "./support/doctor.js";
 import { openCodeInstallKind } from "./native/opencode-installation.js";
 import { HttpsFallbackTransport } from "./transport/https-fallback.js";
 import { RecoveryAuthority } from "./transport/recovery-authority.js";
@@ -1019,6 +1020,8 @@ export class Supervisor {
   private parkUnavailableHostAgent(entry: NativeUnavailableAgent): void {
     this.agentStartFailures.set(entry.agentId, entry.error);
     this.logger.error({ err: entry.error, agentId: entry.agentId }, "agent could not be found or verified; the runtime continues without it");
+    // Google Antigravity's update (A17): its `relocate` fetches this release's
+    // pin, checks it and switches to it, starting now rather than in a minute.
     this.nativeAgentRetry.park(entry.agentId, async () => {
       const [config] = withConnectorBrowser([await entry.relocate()], this.connectorBrowser);
       const runner = this.createNativeRunner(config!);
@@ -1029,7 +1032,7 @@ export class Supervisor {
         throw error;
       }
       this.parkedRunners.set(entry.agentId, runner);
-    });
+    }, entry.updating ? { firstDelayMs: 0 } : {});
   }
 
   /** The last reason each left-out agent could not start (doctor), cleared when it starts. */
@@ -2108,14 +2111,34 @@ export class Supervisor {
   private async withAntigravityDownload(agents: ConnectedAgentView[]): Promise<ConnectedAgentView[]> {
     const native = this.options.native;
     if (!native || !this.hostSettings.coreAcceptsRouteBilling) return agents;
-    const config = native.runners.find(runner => runner.RUNNER_AGENT_ID === "antigravity");
-    const unavailable = native.unavailableAgents?.find(entry => entry.agentId === "antigravity");
-    if (!config && !unavailable) return agents;
-    const record = config?.RUNNER_NATIVE_ANTIGRAVITY_ROOT !== undefined
-      ? { antigravityVersion: config.RUNNER_BRIDGE_VERSION, antigravityRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT }
-      : unavailable?.fetched;
-    const download = await antigravityDownloadState(dirname(this.config.SUPERVISOR_DATA_DIR), record).catch(() => undefined);
+    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
+    const record = this.antigravityRecordFields();
+    if (record === null) {
+      // Not added yet, but `agent add antigravity` is downloading it in the
+      // launcher (the service keeps running meanwhile): say so on the site.
+      const running = await antigravityFetchUnderWay(root).catch(() => undefined);
+      return running ? withAntigravityDownload(agents, { state: "downloading", ...running }) : agents;
+    }
+    const download = await antigravityDownloadState(root, record).catch(() => undefined);
     return download ? withAntigravityDownload(agents, download) : agents;
+  }
+
+  /**
+   * The copy of Google Antigravity this installation runs or names: a live
+   * runner's (after an update switched it, too), else the load's; null when
+   * the installation does not list it.
+   */
+  private antigravityRecordFields(): Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot"> | null {
+    const native = this.options.native;
+    if (!native) return null;
+    const runner = this.nativeRunners.find(candidate => candidate.agentId === "antigravity") ?? this.parkedRunners.get("antigravity") ?? this.gaveUpRunners.get("antigravity");
+    const live = runner?.hostInstallation();
+    if (live?.fetchedRoot !== undefined) return { antigravityVersion: live.version, antigravityRoot: live.fetchedRoot };
+    const unavailable = native.unavailableAgents?.find(entry => entry.agentId === "antigravity");
+    if (unavailable) return unavailable.fetched ?? {};
+    const config = native.runners.find(candidate => candidate.RUNNER_AGENT_ID === "antigravity");
+    if (config?.RUNNER_NATIVE_ANTIGRAVITY_ROOT !== undefined) return { antigravityVersion: config.RUNNER_BRIDGE_VERSION, antigravityRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT };
+    return null;
   }
 
   /** What this connector advertises for Google Antigravity: its Gemini Enterprise sign-in from the site (CP3). */
@@ -2134,6 +2157,7 @@ export class Supervisor {
   private async doctor() {
     const snapshot = this.lastSnapshot ?? (await this.inventory.collect());
     const openCode = this.openCodeDoctor(snapshot.agents);
+    const antigravity = await this.antigravityDoctor(snapshot.agents).catch(() => undefined);
     return runDoctor({
       now: () => this.clock.nowIso(),
       dataDir: this.config.SUPERVISOR_DATA_DIR,
@@ -2154,7 +2178,39 @@ export class Supervisor {
       preview: { advertised: this.previewCapable(), running: this.previews.health().running, lastFailureAt: this.previews.health().lastFailure?.at ?? null },
       browser: this.browserReport(),
       ...(openCode ? { openCode } : {}),
+      ...(antigravity ? { antigravity } : {}),
     });
+  }
+
+  /** The Google Antigravity doctor line's facts, when this installation lists it (running, updating, retried or given up). */
+  private async antigravityDoctor(agents: Array<{ agentId: string; credentials?: Array<{ label: string; state: string; method?: string | undefined; reason?: string | undefined }> | undefined }>): Promise<AntigravityDoctorInputs | undefined> {
+    const running = this.nativeRunners.find(runner => runner.agentId === "antigravity" && this.runners.get("antigravity") === runner);
+    const retrying = this.nativeAgentRetry.parked().includes("antigravity");
+    const gaveUp = this.gaveUpRunners.get("antigravity");
+    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has("antigravity")) return undefined;
+    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
+    let pin: ReturnType<typeof antigravityPin> | null = null;
+    try { pin = antigravityPin(); } catch { pin = null; }
+    const installation = (running ?? this.parkedRunners.get("antigravity") ?? gaveUp)?.hostInstallation() ?? null;
+    const record = this.antigravityRecordFields();
+    const download = record === null ? undefined : (await antigravityDownloadState(root, record).catch(() => undefined))?.state;
+    const failure = this.agentStartFailures.get("antigravity");
+    const updating = retrying && this.options.native?.unavailableAgents?.some(entry => entry.agentId === "antigravity" && entry.updating === true) === true;
+    const observation = await readAntigravityAdminObservation(join(root, "credentials", "antigravity")).catch(() => null);
+    return {
+      state: running ? "running" : retrying ? "retrying" : "given_up",
+      pinnedVersion: pin?.version ?? null,
+      ...(download === undefined ? {} : { download }),
+      selfCheck: installation?.selfCheck ?? "not_run",
+      failure: failure instanceof RemoteInstanceError ? failure.diagnostic : undefined,
+      updating,
+      credentials: (agents.find(agent => agent.agentId === "antigravity")?.credentials ?? [])
+        .map(credential => ({ label: credential.label, state: credential.state, method: credential.method, reason: credential.reason })),
+      quarantine: running?.quarantineReason() ?? null,
+      mcpServersOffAt: observation?.mcpServersOffAt ?? null,
+      diskBytes: pin && (download === "ready" || download === "update_available") ? antigravityDiskBytes(pin) : null,
+      browser: running ? running.browserVersion() !== null : this.connectorBrowser.available,
+    };
   }
 
   /** The OpenCode doctor line's facts, when this installation lists OpenCode (running, retried or given up). */

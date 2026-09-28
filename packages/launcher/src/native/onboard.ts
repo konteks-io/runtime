@@ -149,7 +149,12 @@ export function isNo(answer: string): boolean {
   return leadsWith(NEGATIVE, normalizeAnswer(answer));
 }
 
-/** Every family whose local tooling this machine actually has (OS14). */
+/**
+ * Every family whose local tooling this machine actually has (OS14). Google
+ * Antigravity is never detected: the connector downloads it on the person's
+ * yes (`konteks-remote agent add antigravity`), so neither the Antigravity
+ * app nor the `agy` CLI (other products) counts.
+ */
 export async function detectAgentFamilies(): Promise<string[]> {
   const { locateNativeDsh, locateNativeOpenCode, resolveNativeClaudeExecutable, resolveNativeCodexHome } = await import(
     "@konteks/remote-supervisor"
@@ -1306,13 +1311,15 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           };
         }
       }
-      const installed = await families();
       // Installed is not logged in: name only the agents that can run work (pass 28).
       const readiness = await (context.deps?.agentReadiness ?? readAgentReadiness)(context.root).catch(() => null);
       // An agent the person installed themselves (DeepSeek Harness, OpenCode)
       // runs only once the connector lists it and it started: when the service
       // answers without it, say which of the two is missing (opencode CP6).
-      const recorded = readiness === null ? null : await (context.deps?.recordedAgents ?? recordedNativeAgents)(context.root).catch(() => null);
+      const recorded = await (context.deps?.recordedAgents ?? recordedNativeAgents)(context.root).catch(() => null);
+      // Google Antigravity is never detected, only added (antigravity CP6): it
+      // is here when this installation lists it.
+      const installed = [...await families(), ...(recorded?.includes("antigravity") ? ["antigravity"] : [])];
       const hostMissing = installed.filter(family => HOST_FAMILIES.has(family) && readiness !== null && readiness[family] === undefined);
       const notLoggedIn = installed.filter(family => readiness?.[family] !== undefined && !UNSETTLED_READINESS.has(readiness[family]!));
       const present = installed.filter(family => !notLoggedIn.includes(family) && !hostMissing.includes(family));
@@ -1327,6 +1334,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           ? `${agentName(family)} is added here but could not start, so it will not run Konteks work yet. To see why: konteks-remote doctor`
           : `${agentName(family)} is installed on this machine but not added to Konteks here yet. To add it: konteks-remote agent add ${family}`);
       }
+      if (notLoggedIn.includes("antigravity")) remedies.push(`${agentName("antigravity")} is added but not signed in here yet, so it will not run Konteks work. To sign it in with a Gemini API key: konteks-remote auth login antigravity --api-key. With Gemini Enterprise: konteks-remote auth login antigravity --enterprise --project <your Google Cloud project ID> --location global (the project needs Google's Business AI Code API: gcloud services enable businessaicode.googleapis.com --project <your Google Cloud project ID>).`);
       if (notLoggedIn.includes("dsh")) remedies.push(`${agentName("dsh")} is installed but has no DeepSeek API key here yet, so it will not run Konteks work. To add the key: konteks-remote auth login dsh`);
       if (notLoggedIn.includes("opencode")) {
         const reuse = await (context.deps?.personalOpenCode ?? personalOpenCodeData)().catch(() => false);
@@ -1341,6 +1349,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         // With no agent at all, OpenCode's own install command is one way in.
         else if (installed.length === 0) remedies.push(`To run OpenCode work here: install it with \`${hostInstallCommand(hostAgentFamily("opencode"), process.platform)}\`, then: konteks-remote agent add opencode`);
       }
+      // With no agent at all, one line for a person who wants Gemini: the
+      // connector downloads Google Antigravity only after they say yes.
+      if (installed.length === 0) remedies.push("If you want Gemini: konteks-remote agent add antigravity downloads Google Antigravity from Google (about 110 MB) after you say yes, then: konteks-remote auth login antigravity");
       // People know their agents by name, not by id (WS1-083).
       const presentNames = present.map(agentName);
       if (nativePlatform().os === "debian") {
@@ -1352,7 +1363,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         present.length === 0
           ? installed.length > 0
             ? `No coding agent is logged in here yet, so no Konteks work can run on this machine until one is (see below).`
-            : "No coding agent was found on this machine; install Claude Code, Codex, DeepSeek Harness or OpenCode and run konteks-remote auth login."
+            : "No coding agent was found on this machine; install Claude Code, Codex, DeepSeek Harness or OpenCode, or add Google Antigravity, and run konteks-remote auth login."
           : advertised && advertised.length === 0
             ? `Your ${presentNames.join(" and ")} login is set up; the runtime will advertise it once its first heartbeat lands.`
             : `Your ${presentNames.join(" and ")} login will run Konteks work here.`;
@@ -1433,11 +1444,15 @@ function workspaceName(state: { workspaces?: Array<{ tenantId: string; displayNa
 
 /** An agent family as people name it. */
 export function agentName(family: string): string {
-  return ({ "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness", opencode: "OpenCode" } as Record<string, string>)[family] ?? family;
+  return ({ "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness", opencode: "OpenCode", antigravity: "Google Antigravity" } as Record<string, string>)[family] ?? family;
 }
 
-/** Agents the person installs themselves; the connector never downloads them. */
-const HOST_FAMILIES = new Set(["dsh", "opencode"]);
+/**
+ * Agents the connector does not ship: the person's own DeepSeek Harness and
+ * OpenCode, and Google Antigravity, which it downloads on their yes. Each runs
+ * only once the installation lists it and it started.
+ */
+const HOST_FAMILIES = new Set(["dsh", "opencode", "antigravity"]);
 
 async function recordedNativeAgents(root: string): Promise<string[] | null> {
   const record = await readNativeRecord(root).catch(() => null);

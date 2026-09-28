@@ -300,6 +300,18 @@ describe("native update transaction", () => {
     };
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
   });
+  it("does not hold an update back while Google Antigravity fetches the new pin in the background (antigravity CP6, A17)", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "antigravity"] } });
+    const control = h.deps.control;
+    // The new connector's Antigravity is still downloading its new pin, so it reports nothing yet.
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => request.op === "agents"
+        ? { agents: [{ agentId: "claude-code", readiness: "ready" }] }
+        : (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest) } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+  });
   describe("on Windows, where a stopped scheduled task still exists", () => {
     const root = "C:\\Users\\a\\AppData\\Local\\konteks-remote";
     const connector = (releaseId: string) => `${root}\\releases\\${releaseId}\\konteks-connector.exe`;

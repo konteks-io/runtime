@@ -3,11 +3,13 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
-import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
+import { addNativeAgent, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
+import { terminalFetchConsent, type FetchConsent } from "./consent.js";
+import { confirm } from "../prompt.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
 import { nativePlatform, nativeServiceDefinition, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
@@ -195,6 +197,10 @@ async function onboardStep(input: { root: string; output: NativeCommandContext["
 
 interface NativeAgentAddDeps {
   readRecord: (root: string) => Promise<NativeRuntimeRecord>;
+  /** A fetched agent's consent line answered (Google Antigravity, A20). */
+  consent?: FetchConsent;
+  /** A fetched agent's download, while the service keeps running (tests replace it). */
+  fetchAgent?: typeof fetchHostAgent;
   serviceDefinition: (root: string) => Promise<NativeServiceDefinition>;
   execute: (command: NativeServiceCommand) => Promise<number | null>;
   control: (root: string, record: NativeRuntimeRecord) => Pick<SupervisorControl, "call">;
@@ -221,12 +227,26 @@ const productionAgentAddDeps: NativeAgentAddDeps = {
   platform: nativePlatform(),
 };
 
-/** Drain, stop and wait for ownership before changing an installed agent list. */
-export async function runNativeAgentAdd(input: NativeCommandContext & { agent: string }, deps: NativeAgentAddDeps = productionAgentAddDeps): Promise<void> {
+/**
+ * Drain, stop and wait for ownership before changing an installed agent list.
+ * A fetched agent (Google Antigravity) is asked about and downloaded first,
+ * while the service keeps running: a no, or a failed download, changes
+ * nothing and stops nothing.
+ */
+export async function runNativeAgentAdd(input: NativeCommandContext & { agent: string; yes?: boolean }, deps: NativeAgentAddDeps = productionAgentAddDeps): Promise<void> {
   const previous = await deps.readRecord(input.root);
-  if (previous.agents.includes(input.agent as NativeRuntimeRecord["agents"][number])) {
+  const host = hostAgentInstallAdapter(input.agent);
+  const fetched = host?.fetch !== undefined;
+  const listed = previous.agents.includes(input.agent as NativeRuntimeRecord["agents"][number]);
+  // A listed fetched agent is fetched again only when its recorded copy no longer verifies (A16's remedy).
+  const intact = listed && (!fetched || await host!.runnerSettings(previous, { root: input.root }).then(() => true, () => false));
+  if (intact) {
     input.output.line(`${findAgentBridge(input.agent)?.displayName ?? input.agent} is already installed; no restart is needed.`);
     return;
+  }
+  if (fetched) {
+    const consent = deps.consent ?? terminalFetchConsent({ ...(input.yes === undefined ? {} : { yes: input.yes }), line: text => input.output.line(text) });
+    await (deps.fetchAgent ?? fetchHostAgent)(host!, input.root, consent, input.output);
   }
   const definition = await deps.serviceDefinition(input.root);
   const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
@@ -311,6 +331,100 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
   }
 }
 
+interface NativeAgentRemoveDeps {
+  readRecord: (root: string) => Promise<NativeRuntimeRecord>;
+  serviceDefinition: (root: string) => Promise<NativeServiceDefinition>;
+  execute: (command: NativeServiceCommand) => Promise<number | null>;
+  control: (root: string, record: NativeRuntimeRecord) => Pick<SupervisorControl, "call">;
+  remove: typeof removeNativeAgent;
+  start: (input: NativeCommandContext) => Promise<void>;
+  /** The one question (A18); `--yes` answers it up front. */
+  confirm: (question: string) => Promise<boolean>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  platform: ReturnType<typeof nativePlatform>;
+  stopDeadlineMs?: number;
+  pollMs?: number;
+}
+
+/**
+ * `konteks-remote agent remove antigravity` (A18): asks once, drains and
+ * stops the service (its processes stop with it), signs out, drops it from
+ * the record, deletes its downloads and its private home, and starts the
+ * service again if it was running. Only a fetched agent is removed this way.
+ */
+export async function runNativeAgentRemove(input: NativeCommandContext & { agent: string; yes?: boolean }, deps: NativeAgentRemoveDeps): Promise<void> {
+  const host = hostAgentInstallAdapter(input.agent);
+  const name = findAgentBridge(input.agent)?.displayName ?? input.agent;
+  if (host?.fetch === undefined) {
+    throw new RemoteInstanceError("agent_unavailable", `${name} cannot be removed on its own. Only Google Antigravity, which Konteks downloads, can: konteks-remote agent remove antigravity. To remove Konteks from this computer: konteks-remote uninstall`);
+  }
+  const previous = await deps.readRecord(input.root);
+  const listed = previous.agents.includes(input.agent as NativeRuntimeRecord["agents"][number]);
+  const question = `Remove ${name} from this computer? Konteks signs it out, deletes its download and its sign-ins here, and restarts the connector if it is running.`;
+  if (input.yes === true) input.output.line(`${question} Answered yes with --yes.`);
+  else if (!await deps.confirm(question)) {
+    input.output.line(`Nothing was removed; ${name} is ${listed ? "still added" : "not added"} here.`);
+    return;
+  }
+  const definition = await deps.serviceDefinition(input.root);
+  const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
+  const initialStatus = await deps.execute(definition.status);
+  if (initialStatus !== 0 && (initialStatus === null || !stoppedCodes.includes(initialStatus))) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation's service state. Inspect only this installation's service before removing an agent; identity and local work are unchanged.");
+  const wasRunning = initialStatus === 0;
+  const wait = async () => deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
+  const stopped = async () => {
+    const code = await deps.execute(definition.status);
+    if (code === 0) return false;
+    if (code !== null && stoppedCodes.includes(code)) return true;
+    throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation stopped; its identity and local work are unchanged.");
+  };
+  let stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+  if (wasRunning) {
+    const control = deps.control(input.root, previous);
+    const drain = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
+    await control.call({ op: "drain", reason: "update" }, z.unknown());
+    const drainDeadline = deps.now() + 15 * 60_000;
+    for (;;) {
+      const state = await control.call({ op: "drain.status" }, drain);
+      if (state.activeAssignments === 0) break;
+      if (deps.now() >= drainDeadline) throw new RemoteInstanceError("active_work", "Removing the agent waited 15 minutes for active work; the runtime remains running and drained so it can be inspected safely.");
+      input.output.line(`waiting for ${state.activeAssignments} active assignment(s) before removing ${name}…`);
+      await deps.sleep(deps.pollMs ?? 5_000);
+    }
+    if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; nothing was removed.");
+    stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+    while (!await stopped()) {
+      if (deps.now() >= stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping; nothing was removed.");
+      await wait();
+    }
+  }
+  let successor: NativeRuntimeRecord;
+  try {
+    for (;;) {
+      try {
+        successor = await deps.remove({ root: input.root, agentId: input.agent as NativeRuntimeRecord["agents"][number], output: input.output });
+        break;
+      } catch (error) {
+        const owned = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message);
+        if (!owned || deps.now() >= stopDeadline) throw error;
+        await wait();
+      }
+    }
+  } catch (error) {
+    if (wasRunning) await deps.start(input).catch(() => undefined);
+    throw error;
+  }
+  if (wasRunning) await deps.start(input);
+  input.output.result({ instanceId: successor.instanceId, agents: successor.agents, state: "removed" });
+}
+
+/** The removal's one question, in a terminal only (`--yes` answers it elsewhere). */
+async function confirmOnTerminal(question: string): Promise<boolean> {
+  if (process.stdin.isTTY !== true) throw new RemoteInstanceError("agent_unavailable", `${question} Nothing was removed: answer in a terminal, or run the command again with --yes.`);
+  return confirm(question);
+}
+
 export const nativeCliActions: NativeCliActions = {
   install: async input => {
     if (input.enroll) {
@@ -341,7 +455,9 @@ export const nativeCliActions: NativeCliActions = {
       input.output.result({ state: "ready-to-onboard", agents: prepared.agents, bundleVersion: prepared.bundleVersion, unpacking, firstStep: first });
       return;
     }
-    const record = await installNative({ ...input, activationId: input.activationId! });
+    // A fetched agent in --agents (Google Antigravity) asks its consent line in this terminal before anything is activated.
+    const consent = terminalFetchConsent({ line: text => input.output.line(text) });
+    const record = await installNative({ ...input, activationId: input.activationId!, deps: { consent } });
     await startNativeConnector(input);
     input.output.result({ instanceId: record.instanceId, deploymentKind: record.deploymentKind, state: "installed" });
   },
@@ -359,7 +475,14 @@ export const nativeCliActions: NativeCliActions = {
     else if (step.done) input.output.line(`${step.done.summary}\n${step.done.links.site}`);
     else if (step.note) input.output.line(step.note);
   },
-  addAgent: runNativeAgentAdd,
+  addAgent: input => runNativeAgentAdd(input),
+  removeAgent: input => runNativeAgentRemove(input, {
+    readRecord: readNativeRecord, serviceDefinition, execute,
+    control: (root, record) => new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort),
+    remove: removeNativeAgent, start: startNativeConnector,
+    confirm: question => confirmOnTerminal(question),
+    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now, platform: nativePlatform(),
+  }),
   serve: async input => {
     const service = createNativeService({ root: input.root, roots: EMBEDDED_RELEASE_ROOTS, platform: nativePlatform(),
       prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(input.root, cwd, agentId),

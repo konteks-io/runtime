@@ -839,6 +839,11 @@ export class AgentRuntime {
    * bridge, refuse new ones and read as unavailable. Used when DeepSeek
    * Harness ran a gated tool without asking (dsh-tool-governance.ts).
    */
+  /** Why this agent was taken out of service (the tripwire's line), or null (doctor). */
+  quarantineReason(): string | null {
+    return this.quarantined;
+  }
+
   async quarantine(reason: string): Promise<void> {
     this.quarantined = reason;
     this.logger.error({ event: "agent.quarantined", agentId: this.family.agentId }, "agent taken out of service");

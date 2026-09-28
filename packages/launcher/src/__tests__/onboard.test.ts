@@ -1151,8 +1151,29 @@ describe("onboard", () => {
     expect(JSON.stringify(without.done)).not.toContain("OpenCode");
     // With no agent at all, the no-agent line names it, with its install command.
     const none = await step({ families: async () => [], agentReadiness: async () => ({}) });
-    expect(none.done?.summary).toContain("No coding agent was found on this machine; install Claude Code, Codex, DeepSeek Harness or OpenCode and run konteks-remote auth login.");
+    expect(none.done?.summary).toContain("No coding agent was found on this machine; install Claude Code, Codex, DeepSeek Harness or OpenCode, or add Google Antigravity, and run konteks-remote auth login.");
     expect(none.done?.remedies).toContain("To run OpenCode work here: install it with `curl -fsSL https://opencode.ai/v2/install | bash`, then: konteks-remote agent add opencode");
+  });
+  it("offers Google Antigravity in one line only to a person with no agent, and names it once added: sign-in, or doctor (antigravity CP6)", async () => {
+    await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
+    const offer = "If you want Gemini: konteks-remote agent add antigravity downloads Google Antigravity from Google (about 110 MB) after you say yes, then: konteks-remote auth login antigravity";
+    const none = await step({ families: async () => [], agentReadiness: async () => ({}), recordedAgents: async () => [] });
+    expect(none.done?.remedies).toContain(offer);
+    // Never detected (an Antigravity app or `agy` CLI is another product), never pushed on a person with an agent.
+    const other = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }), recordedAgents: async () => ["claude-code"] });
+    expect(JSON.stringify(other.done)).not.toContain("Antigravity");
+    // Added, not signed in: both sign-ins, with the Business AI Code API for Enterprise.
+    const unsigned = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready", antigravity: "not_configured" }), recordedAgents: async () => ["claude-code", "antigravity"] });
+    expect(unsigned.done?.remedies).toContain("Google Antigravity is added but not signed in here yet, so it will not run Konteks work. To sign it in with a Gemini API key: konteks-remote auth login antigravity --api-key. With Gemini Enterprise: konteks-remote auth login antigravity --enterprise --project <your Google Cloud project ID> --location global (the project needs Google's Business AI Code API: gcloud services enable businessaicode.googleapis.com --project <your Google Cloud project ID>).");
+    expect(unsigned.done?.remedies).not.toContain(offer);
+    // Added and ready: named by name with the others.
+    const ready = await step({ families: async () => ["codex"], agentReadiness: async () => ({ codex: "ready", antigravity: "ready" }), recordedAgents: async () => ["codex", "antigravity"] });
+    expect(ready.done?.summary).toContain("Your Codex and Google Antigravity login will run Konteks work here.");
+    // Added but left out (not downloaded, or its copy failed its checks): doctor says why.
+    const parked = await step({ families: async () => [], agentReadiness: async () => ({}), recordedAgents: async () => ["antigravity"] });
+    expect(parked.done?.remedies).toContain("Google Antigravity is added here but could not start, so it will not run Konteks work yet. To see why: konteks-remote doctor");
+    expect(await detectAgentFamilies()).not.toContain("antigravity");
+    expect(agentName("antigravity")).toBe("Google Antigravity");
   });
   it("finds a supported OpenCode 2 and names an OpenCode 1 with the install command (opencode CP6)", async () => {
     const dir = await mkdtemp(join(tmpdir(), "onboard-opencode-"));

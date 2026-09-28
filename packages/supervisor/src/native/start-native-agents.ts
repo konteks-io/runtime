@@ -76,11 +76,12 @@ export class NativeAgentRetry {
     log: (agentId: string, attempt: number, error: unknown) => void;
   }) {}
 
-  park(agentId: string, start: () => Promise<void>): void {
+  /** `firstDelayMs`: when the first try runs (default a minute; Google Antigravity's update fetch starts at once). */
+  park(agentId: string, start: () => Promise<void>, options: { firstDelayMs?: number } = {}): void {
     if (this.stopped) return;
     this.cancel(agentId);
     this.entries.set(agentId, { start, attempt: 0, timer: null });
-    this.schedule(agentId);
+    this.schedule(agentId, options.firstDelayMs);
   }
 
   parked(): string[] { return [...this.entries.keys()]; }
@@ -96,10 +97,10 @@ export class NativeAgentRetry {
     this.entries.delete(agentId);
   }
 
-  private schedule(agentId: string): void {
+  private schedule(agentId: string, firstDelayMs?: number): void {
     const entry = this.entries.get(agentId);
     if (!entry || this.stopped) return;
-    const delay = Math.min(60_000 * 2 ** entry.attempt, 15 * 60_000);
+    const delay = firstDelayMs ?? Math.min(60_000 * 2 ** entry.attempt, 15 * 60_000);
     entry.timer = setTimeout(() => { void this.retry(agentId); }, delay);
     entry.timer.unref?.();
   }

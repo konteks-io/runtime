@@ -6,7 +6,7 @@ import { locateNativeDsh, resolveNativeDshInstallation, resolveNativeDshNode, ve
 import { checkDshKonteksProfile } from "./dsh-profile-check.js";
 import { locateNativeOpenCode, resolveNativeOpenCodeInstallation, verifyNativeOpenCodeBinary } from "./opencode-installation.js";
 import { checkOpenCodeKonteksConfig } from "./opencode-self-check.js";
-import { ANTIGRAVITY_CONSENT_TEXT, fetchNativeAntigravity, locateNativeAntigravity, verifyNativeAntigravityFolder, verifyNativeAntigravityRecord, type AntigravityInstallDeps } from "./antigravity-installation.js";
+import { ANTIGRAVITY_CONSENT_TEXT, antigravityPin, fetchNativeAntigravity, locateNativeAntigravity, verifyNativeAntigravityFolder, verifyNativeAntigravityRecord, type AntigravityInstallDeps } from "./antigravity-installation.js";
 import { checkAntigravityServer } from "./antigravity-self-check.js";
 
 /** The runner settings a host adapter derives from an install record (merged into `RunnerConfigSchema`). */
@@ -61,6 +61,12 @@ export interface HostAgentInstallAdapter {
   runnerSettings(record: NativeRuntimeRecord, context?: HostAgentInstallContext): Promise<HostAgentRunnerSettings>;
   /** A fetched agent only: the plain line the person answers before anything is downloaded. */
   readonly consentText?: string;
+  /**
+   * A fetched agent only: refuses, before the consent question, on a computer
+   * the release pins no copy for (the plain "not available for this computer
+   * yet" line).
+   */
+  assertFetchable?(): void;
   /**
    * A fetched agent only, used by the launcher: download the pinned release
    * on the person's yes, verify it, and keep it in the connector's own folder;
@@ -133,20 +139,23 @@ export const openCodeInstallAdapter: HostAgentInstallAdapter = {
 };
 
 /**
- * Google Antigravity (antigravity-runtime-support CP1, CP2): the first
+ * Google Antigravity (antigravity-runtime-support CP1-CP6): the first
  * FETCHED host agent. Nothing is located on the person's machine: `fetch`
  * downloads Google's pinned zip into `<root>/agents/antigravity/` on the
  * person's yes, `locate` and every load re-verify that copy against the
  * release's pin (sizes, sha256, Google's signature), and the start check
  * verifies it again, then proves its `initialize` (antigravity-self-check.ts).
- * NOT offered until its security checkpoint (CP4) and sign-in (CP3): refused
- * on install and `agent add`, never detected at enrollment, and dropped from
- * a stored record, so no connector builds its runner yet.
+ * Offered since CP6, once its governance (CP4) and sign-in (CP3) were in:
+ * `install --agents …,antigravity` and `agent add antigravity` ask the
+ * consent line and fetch, a stored record keeps it (and, after an update
+ * carried a new pin, fetches that on the first yes, A17). Never detected at
+ * enrollment: it is fetched, not found.
  */
 export const antigravityInstallAdapter: HostAgentInstallAdapter = {
   agentId: "antigravity",
-  offered: false,
+  offered: true,
   consentText: ANTIGRAVITY_CONSENT_TEXT,
+  assertFetchable: () => { antigravityPin(); },
   async locate(_env, context) {
     if (!context) throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity is kept in the connector's own folder; its location was not given.", { diagnostic: "antigravity_not_fetched" });
     return locateNativeAntigravity(context.root);

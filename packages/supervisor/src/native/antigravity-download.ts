@@ -1,14 +1,15 @@
 import { ConnectedAgentViewSchema, HostAgentDownloadSchema, RemoteInstanceError, type ConnectedAgentView, type HostAgentDownload } from "@konteks/remote-common";
 import type { NativeRuntimeRecord } from "./installation.js";
-import { antigravityFetchProgress, antigravityPin, verifyNativeAntigravityFolder, verifyNativeAntigravityRecord, type AntigravityInstallDeps } from "./antigravity-installation.js";
+import { antigravityFetchUnderWay, antigravityPin, verifyNativeAntigravityFolder, verifyNativeAntigravityRecord, type AntigravityInstallDeps } from "./antigravity-installation.js";
 
 /**
  * What the site shows about Google Antigravity's download (antigravity CP3
  * prep: `hostAgentDownload` on the connected agent), from the connector's own
  * fetch state. The runtime keeps no state enum of its own, so this reads it
  * off the checks every start runs (A16):
- * - a fetch running in this process → `downloading`, bytes received of the
- *   pinned zip's size;
+ * - a fetch running in this process, or in the launcher's `agent add
+ *   antigravity` (its staging download still growing) → `downloading`,
+ *   bytes received of the pinned zip's size;
  * - the recorded copy verifies → `ready`;
  * - nothing recorded, or nothing fetched → `not_downloaded`, with the zip's
  *   size;
@@ -27,7 +28,7 @@ export async function antigravityDownloadState(
   let pin: ReturnType<typeof antigravityPin>;
   try { pin = antigravityPin(deps); } catch { return undefined; }
   const sizeBytes = pin.platform.archive.size;
-  const running = antigravityFetchProgress(root);
+  const running = await antigravityFetchUnderWay(root, deps);
   if (running) return HostAgentDownloadSchema.parse({ state: "downloading", sizeBytes: running.sizeBytes, receivedBytes: Math.min(running.receivedBytes, running.sizeBytes) });
   try {
     await verifyNativeAntigravityRecord(record ?? {}, root, deps);

@@ -12,6 +12,7 @@ import {
   readAntigravitySignIn, renderAntigravitySettings, sweepAntigravityProcesses, verifyAntigravitySession, writeAntigravitySignIn,
 } from "../host/antigravity.js";
 import { HOST_INHERITED_VARIABLES } from "../host/allow-list-environment.js";
+import { antigravityStderrFailure as stderrFailure, clearAntigravityAdminObservation, observeAntigravityAdminLine, readAntigravityAdminObservation } from "../host/antigravity.js";
 import { hostAgentRunnerAdapter } from "../host/registry.js";
 import { projectReadiness } from "../readiness.js";
 import { INITIAL_SCOPE_STATE } from "../auth/scope-store.js";
@@ -343,5 +344,33 @@ describe("what Google Antigravity reports, read for the person", () => {
     expect(asked).toEqual({ home: antigravityRuntimePaths("/rt/credentials/antigravity").home, programs: ["agy_acp_server", "localharness"] });
     expect(stopped).toEqual([[101, 102]]);
     expect(await sweepAntigravityProcesses("/rt/credentials/antigravity", { list: async () => [], stop: async () => { throw new Error("never"); } })).toBe(0);
+  });
+});
+
+describe("the organisation's MCP Servers setting as a Gemini Enterprise session shows it (antigravity CP6)", () => {
+  it("records the servers dropped by the admin setting, never zero, clears on an allowlist that keeps ours, and never writes a secret", async () => {
+    const credentialDir = await mkdtemp(join(tmpdir(), "agy-admin-"));
+    try {
+      expect(await readAntigravityAdminObservation(credentialDir)).toBeNull();
+      const at = () => new Date("2026-09-29T01:02:03.000Z");
+      await observeAntigravityAdminLine("I0929 00:25:18.673131 server.py:2900] Admin MCP control active: dropping 0 client-requested custom MCP server(s) for this session.", credentialDir, at);
+      expect(await readAntigravityAdminObservation(credentialDir)).toBeNull();
+      await observeAntigravityAdminLine("I0929 00:25:18.673131 server.py:2900] Admin MCP control active: dropping 3 client-requested custom MCP server(s) for this session.", credentialDir, at);
+      expect(await readAntigravityAdminObservation(credentialDir)).toEqual({ mcpServersOffAt: "2026-09-29T01:02:03.000Z" });
+      const file = join(credentialDir, "antigravity", "admin-controls.json");
+      expect(((await stat(file)).mode & 0o077)).toBe(0);
+      expect(await readFile(file, "utf8")).toBe('{"mcpServersOffAt":"2026-09-29T01:02:03.000Z"}\n');
+      await observeAntigravityAdminLine("I0929 mcp_servers.py:1] Admin MCP allowlist active: custom MCP servers ['konteks-platform', 'konteks-result'] -> ['konteks-platform', 'konteks-result'].", credentialDir, at);
+      expect(await readAntigravityAdminObservation(credentialDir)).toBeNull();
+      await observeAntigravityAdminLine("I0929 mcp_servers.py:1] Admin MCP allowlist active: custom MCP servers ['konteks-platform', 'konteks-result'] -> [].", credentialDir, at);
+      expect(await readAntigravityAdminObservation(credentialDir)).not.toBeNull();
+      await clearAntigravityAdminObservation(credentialDir);
+      expect(await readAntigravityAdminObservation(credentialDir)).toBeNull();
+      // Read from every execution process's stderr, beside the licence lines.
+      expect(stderrFailure("I0929 server.py:2900] Admin MCP control active: dropping 4 client-requested custom MCP server(s) for this session.", credentialDir)).toBeNull();
+      await vi.waitFor(async () => expect(await readAntigravityAdminObservation(credentialDir)).not.toBeNull());
+    } finally {
+      await rm(credentialDir, { recursive: true, force: true });
+    }
   });
 });

@@ -76,6 +76,9 @@ describe("graft", () => {
     expect((await planGraft(repo, ["codex", "dsh", "opencode"])).agents).toEqual(["agents"]);
     expect((await planGraft(repo, ["claude-code", "opencode"])).agents).toEqual(["claude", "agents"]);
     expect((await planGraft(repo, ["opencode"])).adds).toEqual(["graft/", "AGENTS.md", ".ignore"]);
+    // Google Antigravity gets AGENTS.md from the connector (A9): the same Graft id (antigravity CP6).
+    expect((await planGraft(repo, ["codex", "antigravity"])).agents).toEqual(["agents"]);
+    expect((await planGraft(repo, ["claude-code", "antigravity"])).agents).toEqual(["claude", "agents"]);
 
     await writeFile(join(repo, "AGENTS.md"), "# rules\n");
     git(repo, "add", "AGENTS.md");

@@ -139,10 +139,13 @@ export class NativeRunner implements RunnerPort {
    * version, its executable, and how the last start self-check went. Null for
    * an agent from a release package.
    */
-  hostInstallation(): { version: string; executable: string | null; selfCheck: "passed" | "failed" | "not_run" } | null {
+  hostInstallation(): { version: string; executable: string | null; fetchedRoot?: string; selfCheck: "passed" | "failed" | "not_run" } | null {
     const config = this.options.config;
     if (!hostAgentInstallAdapter(config.RUNNER_AGENT_ID)) return null;
-    return { version: config.RUNNER_BRIDGE_VERSION, executable: config.RUNNER_NATIVE_OPENCODE_BINARY ?? config.RUNNER_NATIVE_DSH_ENTRY ?? null, selfCheck: this.hostSelfCheck };
+    return { version: config.RUNNER_BRIDGE_VERSION, executable: config.RUNNER_NATIVE_OPENCODE_BINARY ?? config.RUNNER_NATIVE_DSH_ENTRY ?? null,
+      // A fetched agent's own folder (Google Antigravity), for its download state; never shown.
+      ...(config.RUNNER_NATIVE_ANTIGRAVITY_ROOT === undefined ? {} : { fetchedRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT }),
+      selfCheck: this.hostSelfCheck };
   }
 
   stop(): Promise<void> {
@@ -154,6 +157,11 @@ export class NativeRunner implements RunnerPort {
       this.stopEvents();
     });
     return this.stopPromise;
+  }
+
+  /** Why this agent was taken out of service, or null (doctor). */
+  quarantineReason(): string | null {
+    return this.runtime.quarantineReason();
   }
 
   async quarantine(reason: string): Promise<void> {

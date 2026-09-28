@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createNativeProgram, installedReleaseVersion } from "../native/cli.js";
 
 function fixture() {
-  const actions = { install: vi.fn(async () => {}), addAgent: vi.fn(async () => {}), serve: vi.fn(async () => {}), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), update: vi.fn(async () => {}), uninstall: vi.fn(async () => {}), control: vi.fn(async () => {}) };
+  const actions = { install: vi.fn(async () => {}), addAgent: vi.fn(async () => {}), removeAgent: vi.fn(async () => {}), serve: vi.fn(async () => {}), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), update: vi.fn(async () => {}), uninstall: vi.fn(async () => {}), control: vi.fn(async () => {}) };
   const program = createNativeProgram(actions).exitOverride().configureOutput({ writeOut: () => {}, writeErr: () => {} });
   return { program, actions };
 }
@@ -50,7 +50,7 @@ describe("native customer entry point", () => {
     await program.parseAsync(["auth", "logout", "opencode", "--provider", "openai"], { from: "user" });
     expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.logout", agent: "opencode", provider: "openai" }));
   });
-  it("signs Google Antigravity in and out with a Gemini API key or Gemini Enterprise, though it cannot be installed yet (antigravity CP3)", async () => {
+  it("signs Google Antigravity in and out with a Gemini API key or Gemini Enterprise (antigravity CP3)", async () => {
     const { program, actions } = fixture();
     await program.parseAsync(["auth", "login", "antigravity"], { from: "user" });
     expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.login", agent: "antigravity", organization: false }));
@@ -76,8 +76,28 @@ describe("native customer entry point", () => {
     expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.logout", agent: "antigravity", method: "oauth-business" }));
     await program.parseAsync(["auth", "logout", "antigravity"], { from: "user" });
     expect(actions.control.mock.calls.at(-1)?.[0]).not.toHaveProperty("method");
-    // Install and `agent add` still refuse it (CP6 lifts that).
-    await expect(program.parseAsync(["agent", "add", "antigravity"], { from: "user" })).rejects.toThrow();
+  });
+  it("adds Google Antigravity on the person's yes, installs it, removes it, and its help names it (antigravity CP6)", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["--root", "/private/native-root", "agent", "add", "antigravity"], { from: "user" });
+    expect(actions.addAgent).toHaveBeenLastCalledWith(expect.objectContaining({ root: "/private/native-root", agent: "antigravity" }));
+    expect(actions.addAgent.mock.calls.at(-1)?.[0]).not.toHaveProperty("yes");
+    await program.parseAsync(["agent", "add", "antigravity", "--yes"], { from: "user" });
+    expect(actions.addAgent).toHaveBeenLastCalledWith(expect.objectContaining({ agent: "antigravity", yes: true }));
+    // Other agents ask no download question.
+    await expect(program.parseAsync(["agent", "add", "codex", "--yes"], { from: "user" })).rejects.toThrow();
+    await program.parseAsync(["--root", "/private/native-root", "install", "--activation-id", "activation-123", "--agents", "codex,antigravity"], { from: "user" });
+    expect(actions.install).toHaveBeenLastCalledWith(expect.objectContaining({ agents: ["codex", "antigravity"] }));
+    await program.parseAsync(["agent", "remove", "antigravity"], { from: "user" });
+    expect(actions.removeAgent).toHaveBeenLastCalledWith(expect.objectContaining({ agent: "antigravity" }));
+    await program.parseAsync(["agent", "remove", "antigravity", "--yes"], { from: "user" });
+    expect(actions.removeAgent).toHaveBeenLastCalledWith(expect.objectContaining({ agent: "antigravity", yes: true }));
+    await program.parseAsync(["auth", "status", "antigravity"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.status", agent: "antigravity" }));
+    const agentCommand = program.commands.find(c => c.name() === "agent")!;
+    expect(agentCommand.commands.find(c => c.name() === "add")!.helpInformation().replace(/\s+/g, " ")).toMatch(/Google Antigravity, downloaded from Google \(dl\.google\.com, about 110 MB\) after you say yes/);
+    expect(agentCommand.commands.find(c => c.name() === "remove")!.helpInformation().replace(/\s+/g, " ")).toMatch(/remove Google Antigravity from this computer/);
+    expect(program.commands.find(c => c.name() === "install")!.helpInformation().replace(/\s+/g, " ")).toContain("claude-code, codex, dsh, opencode, antigravity");
   });
   it("offers a read-only preview status, and no local preview switch", async () => {
     const { program, actions } = fixture();
@@ -138,7 +158,7 @@ describe("native customer entry point", () => {
     await program.parseAsync(["--root", "/private/native-root", "auth", "login", "opencode", "--reuse"], { from: "user" });
     expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.login", agent: "opencode", reuse: true }));
     const agent = program.commands.find(c => c.name() === "agent")!.commands.find(c => c.name() === "add")!;
-    expect(agent.helpInformation()).toContain("dsh or opencode");
-    expect(program.commands.find(c => c.name() === "install")!.helpInformation()).toContain("claude-code, codex, dsh, opencode");
+    expect(agent.helpInformation().replace(/\s+/g, " ")).toContain("dsh, opencode or antigravity");
+    expect(program.commands.find(c => c.name() === "install")!.helpInformation().replace(/\s+/g, " ")).toContain("claude-code, codex, dsh, opencode");
   });
 });
