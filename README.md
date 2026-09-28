@@ -328,8 +328,19 @@ Sign it in on the computer with `konteks-remote auth login antigravity`:
 
 Signing in with a personal Google account is not offered.
 `konteks-remote auth logout antigravity [--api-key | --enterprise]` signs out.
-It is not offered yet: `install --agents` and `agent add` refuse it until its
-permission checks are finished.
+
+Every command, file change, web fetch and tool call it asks for goes through
+the same Konteks checks as the other agents: no `git push` or `sudo`, no
+changes outside the working copy, only Konteks' own tools, never "always
+allow". Your repository cannot switch its hooks on (Konteks always answers
+"Don't trust"), and subagents stay off. If Antigravity ever runs something
+without asking, the connector stops it and takes it out of service until you
+restart the connector; on Gemini Enterprise that usually means your
+organisation's Terminal auto-execution setting is not Require review, and the
+message says so. Its `/plan` and `/logout` commands are not available.
+
+It is not offered yet: `install --agents` and `agent add` refuse it until the
+download and onboarding steps are finished.
 
 Pi is no longer supported: `install --agents` and `agent add` refuse it, and
 an installation that still lists it keeps working without it (the connector

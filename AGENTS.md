@@ -235,8 +235,9 @@ free-models capability (the 7.1.0 Core signal), puts the credential in use's
 billing on offered Gemini models (`antigravityOptionBilling`) and
 `hostAgentDownload` on the connected agent (`native/antigravity-download.ts`,
 7.1.0 Core only; an Antigravity that cannot start is still reported with
-it). It is NOT offered (`antigravityInstallAdapter.offered = false`) until
-CP4: install and `agent add` refuse it (its `auth` commands take it),
+it). CP4 (governance, below) is built; it is still NOT offered
+(`antigravityInstallAdapter.offered = false`) until CP6 (launcher, onboarding,
+updates): install and `agent add` refuse it (its `auth` commands take it),
 enrollment never detects it, a stored record drops it, so no connector builds
 its runner yet.
 
@@ -333,6 +334,57 @@ the catalogue, and the self-check asserts both. Code Mode's `fetch` also
 runs unasked and cannot be removed short of denying `execute` (which would
 drop every MCP tool): it is treated as the web fetch the policy allows every
 agent and never trips; this is the one thing Konteks cannot judge beforehand.
+
+Google Antigravity's tool governance (antigravity-runtime-support CP4, A4 and
+A21) sits behind the same seam: `hostToolGovernance("antigravity")` is
+`AntigravityToolGovernance` (`supervisor/src/session/antigravity-tool-governance.ts`).
+A request must match the `tool_call` it names (title, kind, command, files,
+`_meta.mcp`) and is rebuilt for the unchanged policy: `run_command` →
+`rawInput.CommandLine` (a `Cwd` outside the working copy refused, and a
+command naming the private home, `~`, `$HOME`, `$GEMINI_HOME`, `.gemini` or
+the token files, refused by name: the server counts its own `GEMINI_HOME` as
+workspace, so neither its scoping nor an organisation's "Outside file access:
+Deny" keeps a command out of it); `create_file`/`edit_file`/… → every
+`content[].path`, `locations[].path` and `rawInput.TargetFile`, all inside the
+working copy; `read_url_content`/`search_web` (live: kind `search`, `query`)
+→ a web fetch; an asked read (an organisation's "Always ask") → inside the
+working copy only; MCP (`call_mcp_tool`: `_meta.mcp {server, tool}`) → only
+this session's own `konteks-platform`/`konteks-preview`/`konteks-result`, and
+`konteks-browser` only on a session given the QA browser (never a hidden
+browser tool); the workspace-trust question ("Do you trust the authors of this
+workspace…", before a repository's `.agents/hooks.json` runs) → always "Don't
+Trust"; `invoke_subagent`, other subagent tools and unknown tools → refused.
+`allow_always` is stripped before anything sees the request (Antigravity
+offers it on a key, and on Enterprise for web search). The session tells the
+governance every final answer (`HostToolGovernance.answered`, from policy or
+a person), because the server reports the work of an ALLOWED
+request as a separate call of its own (`<conversationId>:<n>`, `Running
+edit_file`, snake_case input; the `create_file` request then ends "failed",
+"approved but never executed"): such a report is paired with an allowed
+request for the same file or command and uses it once. The tripwire trips on
+a subagent tool (or the admin browser subagent's `chrome-devtools`) in any
+`tool_call`; a command, file change, MCP call or unknown tool that completed
+with no allowed request (a subagent's command, a refused request run anyway);
+and a read outside the working copy (its private home included). A command
+that never asked is marked (`HostToolBypass.unaskedCommand`) and, when the
+credential in use (the runner's first reported credential) is Gemini
+Enterprise, the quarantine line names the organisation's setting (A21:
+"Your organisation's Gemini Enterprise settings let Antigravity run commands
+without asking. Ask your Google Cloud admin to set Terminal auto-execution to
+Require review, then restart the connector.";
+`HostToolGovernance.quarantineMessageFor`); otherwise "Google Antigravity ran
+a tool without Konteks' approval. Update the connector, then restart it."
+An Antigravity session's first prompt names `call_mcp_tool` with its own
+servers (`antigravity-prompt.ts`, the same words as the Assistant's hint and
+`konteks-platform`), its result lines name `submit_result` through
+`call_mcp_tool`, activity names its tools in plain words and an MCP call as the
+Konteks tool it calls, and the runner refuses a prompt that starts with its
+own `/plan` or `/logout` (`HostAgentRunnerAdapter.refusedPromptCommands`).
+Found live (CP4): a Gemini Enterprise organisation with "MCP Servers" off
+drops the session's MCP servers (no `call_mcp_tool`), so results come back
+through the fenced fallback; on a Gemini API key reads of the private home run
+unasked (the tripwire fires), reads elsewhere outside the working copy are
+refused by the server.
 
 OpenCode's sign-ins (CP3) are OpenCode's own commands, run by
 `auth/opencode-auth.ts` in the private home with the allow-list environment

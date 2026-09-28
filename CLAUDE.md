@@ -32,7 +32,12 @@ working copy's AGENTS.md in the first prompt and at most two processes;
 CP3: it signs in with a Gemini API key held by the connector and relayed per
 process on loopback (`host/antigravity-relay.ts`, turns priced at the list
 price) or with Gemini Enterprise over ACP `authenticate` (`auth/antigravity-auth.ts`,
-also from the site); registered but not offered until its CP4, see AGENTS.md); OpenCode 2 is offered (CP6:
+also from the site); CP4: its sessions are governed like OpenCode's
+(`antigravity-tool-governance.ts`: request rebuilding, trust question always
+refused, its own report of an allowed change paired with the request, the
+tripwire and quarantine with the Gemini Enterprise Require review line,
+`/plan` and `/logout` refused); registered but not offered until its CP6, see
+AGENTS.md); OpenCode 2 is offered (CP6:
 install, enrollment detection, `agent add opencode`, onboarding remedies,
 Graft, a doctor line; a host agent missing or unsupported at load is left out
 and retried, never fatal to the connector); its runner spawns with the
