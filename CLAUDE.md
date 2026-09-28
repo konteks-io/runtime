@@ -10,7 +10,9 @@ The runtime is native-only (the appliance is retired and deleted) and runs
 Claude Code, Codex and DeepSeek Harness; Pi and the old bundled OpenCode are
 retired (see AGENTS.md for how stored values stay readable). Host-installed
 agents go through per-agent host adapters; OpenCode 2 is registered and
-detected but gated (not offered) until its CP4 security checkpoint (AGENTS.md).
+detected but gated (not offered) until its CP4 security checkpoint; its
+runner already spawns with the locked config, one process per working copy,
+after a start self-check (AGENTS.md).
 Session previews run in the supervisor (`packages/supervisor/src/preview/`):
 one supervised dev server per session, forwarded only to its own loopback
 port; the per-machine switch is Core's (see AGENTS.md). A viewer's first

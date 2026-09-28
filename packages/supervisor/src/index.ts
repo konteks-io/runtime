@@ -55,6 +55,7 @@ export * from "./native/claude-executable.js";
 export * from "./native/dsh-installation.js";
 export * from "./native/host-agents.js";
 export * from "./native/opencode-installation.js";
+export * from "./native/opencode-self-check.js";
 export * from "./native/installed.js";
 export * from "./native/root-lock.js";
 export * from "./native/git-workspace.js";

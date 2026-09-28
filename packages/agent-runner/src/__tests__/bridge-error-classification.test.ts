@@ -40,3 +40,51 @@ describe("a DeepSeek Harness turn that failed on the provider after dsh's own re
     expect(classifyBridgeError(new RequestError(-32603, message))).toMatchObject({ class: "provider_failure", retryable: false });
   });
 });
+
+describe("OpenCode 2 turn failures (JSON-RPC -32603 with data.errorName, CP0-v2)", () => {
+  const failed = (safeMessage: string, errorName: string) => new RequestError(-32603, `Internal error: ${safeMessage}`, { service: "session", errorName });
+
+  it("reads an empty balance as out of credit, never retried", () => {
+    // Captured from OpenCode 2.0.18 with an empty OpenCode Zen balance.
+    expect(classifyBridgeError(failed("Upstream request failed: Insufficient account funds", "provider.quota")))
+      .toEqual({ code: -32603, class: "provider_failure", retryable: false, message: expect.stringMatching(/out of credit/) });
+  });
+
+  it("reads a model outside the account as unavailable, never retried", () => {
+    // Captured: a Go model through the Console sign-in.
+    const result = classifyBridgeError(failed("Model unavailable: opencode/glm-5.1", "provider.no-route"));
+    expect(result).toMatchObject({ class: "provider_failure", retryable: false, message: expect.stringMatching(/not available.*Pick another model/) });
+  });
+
+  it.each([
+    ["ACP auth required", new RequestError(-32000, "provider authentication required")],
+    ["a failed provider sign-in", failed("Invalid API key", "provider.auth")],
+    ["a 401 behind another reason", failed("Upstream request failed: 401 Unauthorized", "provider.invalid-request")],
+    ["a 403 behind another reason", failed("Upstream request failed with status 403", "provider.error")],
+  ])("reads %s as sign-in required", (_name, error) => {
+    expect(classifyBridgeError(error)).toMatchObject({ class: "agent_auth_required", retryable: false, message: "agent authentication required" });
+  });
+
+  it.each([
+    ["provider.rate-limit", "Upstream request failed: 429 Too Many Requests"],
+    ["provider.internal", "Upstream request failed: 503 Service Unavailable"],
+    ["provider.timeout", "Upstream request timed out"],
+    ["provider.transport", "fetch failed"],
+    ["provider.unknown", "Upstream request failed: 503"],
+  ])("reads %s as a provider failure the session resumes from", (errorName, message) => {
+    expect(classifyBridgeError(failed(message, errorName))).toMatchObject({ class: "provider_failure", retryable: true, message: expect.stringMatching(/session is kept/) });
+  });
+
+  it("keeps the wording plain: no provider internals, no em dash", () => {
+    const result = classifyBridgeError(failed("Upstream request failed: {\"error\":{\"message\":\"bad schema\"}}", "provider.invalid-request"));
+    expect(result).toEqual({ code: -32603, class: "provider_failure", retryable: false, message: "The provider could not handle this request." });
+    for (const name of ["provider.quota", "provider.no-route", "provider.rate-limit", "provider.internal", "provider.timeout", "provider.transport", "provider.content-filter"]) {
+      expect(classifyBridgeError(failed("x", name)).message).not.toMatch(/—/);
+    }
+  });
+
+  it("leaves OpenCode's non-provider failures to the generic rules", () => {
+    expect(classifyBridgeError(new RequestError(-32603, "Internal service failure", { service: "session", errorName: "Error" }))).toMatchObject({ class: "internal" });
+    expect(classifyBridgeError(new RequestError(-32602, "session not found: ses_1", { sessionId: "ses_1" }))).toMatchObject({ class: "invalid_params" });
+  });
+});

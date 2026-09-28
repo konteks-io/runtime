@@ -89,9 +89,15 @@ type AcpNativeObservation = z.infer<typeof AcpNativeObservationSchema>;
 export interface SessionManagerOptions {
   bridge: () => BridgeProcess | null;
   /** Native execution allocator; called only after the durable ref reservation. */
-  createBridge?: (acpSessionRef: string, lifecycle?: CreateSessionArgs["lifecycle"]) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
+  createBridge?: (acpSessionRef: string, lifecycle?: CreateSessionArgs["lifecycle"], cwd?: string) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
   /** Bootstrap-only allocator. The previous bridge is already confirmed stopped. */
-  replaceBridge?: (acpSessionRef: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: CreateSessionArgs["lifecycle"]) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
+  replaceBridge?: (acpSessionRef: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: CreateSessionArgs["lifecycle"], cwd?: string) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
+  /**
+   * Before each prompt on a bridge: the agent's own preparation (OpenCode
+   * re-checks, and on Windows refreshes, its working copy's instructions).
+   * Returns nothing when there is none, so the prompt is sent at once.
+   */
+  beforePrompt?: (bridge: BridgeProcess) => Promise<void> | undefined;
   events: RunnerEventBus;
   /** Durable map acpSessionRef → bridge session id inside the credential volume (survives restart). */
   refStore: SessionRefStore;
@@ -272,7 +278,7 @@ export class SessionManager {
       args.lifecycle?.assertCurrent();
       await args.lifecycle?.beforeCreate(ref);
       args.lifecycle?.assertCurrent();
-      const initial = this.options.createBridge ? await this.options.createBridge(ref, args.lifecycle) : { bridge: this.requireBridge(), bootstrapAttempt: 1 };
+      const initial = this.options.createBridge ? await this.options.createBridge(ref, args.lifecycle, args.cwd) : { bridge: this.requireBridge(), bootstrapAttempt: 1 };
       let bridge = initial.bridge;
       for (let bootstrapAttempt = initial.bootstrapAttempt; bootstrapAttempt <= 4; bootstrapAttempt += 1) {
         let reservedBridgeId: string | null = null;
@@ -326,7 +332,7 @@ export class SessionManager {
           await this.bootstrapRetrySleep(delayMs);
           args.lifecycle?.assertCurrent();
           const recoveredFromAttempt = bootstrapAttempt;
-          const replacement = await this.options.replaceBridge(ref, bridge, bootstrapAttempt + 1, args.lifecycle);
+          const replacement = await this.options.replaceBridge(ref, bridge, bootstrapAttempt + 1, args.lifecycle, args.cwd);
           bridge = replacement.bridge;
           // Fresh-process initialization failures consume logical attempts too.
           // The loop increment below advances to the attempt returned here.
@@ -679,8 +685,9 @@ export class SessionManager {
     }
     record.completedTurn = false;
     record.activeTurns += 1;
-    const operation = bridge.connection
-      .prompt({ ...params, sessionId: record.bridgeSessionId })
+    const send = () => bridge.connection.prompt({ ...params, sessionId: record.bridgeSessionId });
+    const prepared = this.options.beforePrompt?.(bridge);
+    const operation = (prepared ? prepared.then(send) : send())
       .then((result) => {
         record.completedTurn = result.stopReason === "end_turn";
         if (result.usage) this.publishUsage(record, result.usage);

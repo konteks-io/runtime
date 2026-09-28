@@ -5,6 +5,7 @@ import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServe
 import { RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 import type { checkDshKonteksProfile } from "./dsh-profile-check.js";
+import type { checkOpenCodeKonteksConfig } from "./opencode-self-check.js";
 import { hostAgentInstallAdapter } from "./host-agents.js";
 
 const idSchema = z.string().min(1).max(128);
@@ -37,6 +38,8 @@ export interface NativeRunnerOptions {
   afterSuccessfulLogin?: () => Promise<void>;
   /** The DeepSeek Harness overlay self-check; replaced only in tests. */
   dshProfileCheck?: typeof checkDshKonteksProfile;
+  /** The OpenCode locked-config self-check; replaced only in tests. */
+  openCodeSelfCheck?: typeof checkOpenCodeKonteksConfig;
 }
 
 /** Host-only runtime adapter. It never starts the legacy runner HTTP/WS API. */
@@ -98,7 +101,10 @@ export class NativeRunner implements RunnerPort {
    */
   private async checkHostAgent(): Promise<void> {
     const host = hostAgentInstallAdapter(this.options.config.RUNNER_AGENT_ID);
-    await host?.selfCheck(this.options.config, this.options.dshProfileCheck ? { dshProfileCheck: this.options.dshProfileCheck } : {});
+    await host?.selfCheck(this.options.config, {
+      ...(this.options.dshProfileCheck ? { dshProfileCheck: this.options.dshProfileCheck } : {}),
+      ...(this.options.openCodeSelfCheck ? { openCodeSelfCheck: this.options.openCodeSelfCheck } : {}),
+    });
   }
 
   stop(): Promise<void> {

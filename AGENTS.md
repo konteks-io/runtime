@@ -117,10 +117,27 @@ whose adapter is not `offered` is refused on install and `agent add`, never
 detected at enrollment, and dropped from a stored record like a retired one.
 OpenCode 2 is registered (binary launch mode, `>=2.0.18 <3.0.0`) and located
 by `opencode-installation.ts`, but NOT offered until its security checkpoint
-(opencode-runtime-support CP4); its runner refuses to spawn or sign in until
-then. Every OpenCode execution, `--version` included, gets the allow-list
+(opencode-runtime-support CP4); its runner refuses to sign in until CP3. Every
+OpenCode execution, `--version` and `debug` included, gets the allow-list
 environment of `openCodeEnvironment` (never `GITHUB_TOKEN`, `GH_TOKEN` or any
-other credential or inherited `OPENCODE_*` variable).
+other credential or inherited `OPENCODE_*` variable) plus Konteks' own
+settings (`openCodeKonteksSettings`: the locked config from
+`renderOpenCodeKonteksConfig` as `OPENCODE_CONFIG_CONTENT`,
+`OPENCODE_CONFIG_PROJECT_DISABLE=1`, `OPENCODE_FILEWATCHER_DISABLE=1`), in a
+private home under `<credentials>/opencode`. Each OpenCode execution process
+serves exactly one working copy (`HostAgentRunnerAdapter.bindWorkingCopy`):
+its `XDG_CONFIG_HOME` is `config/<hash of the path>`, whose
+`opencode/AGENTS.md` links to the working copy's own (a copy refreshed before
+each prompt where symlinks are refused; never a file outside the working
+copy), and the runtime never parks such a process for another session (MCP
+servers are process-wide in OpenCode). The control process (discovery,
+sign-in) uses `config/control`, which carries no instructions. Runner start
+runs `opencode-self-check.ts`: `opencode debug agents` in the private home on
+a private service port, asserting every agent ends with the Konteks rules and
+that `plan`/`title` are off, and stopping any background service of the
+private home before and after (only processes whose environment names it;
+the person's own service is never touched). Drift reads
+`opencode_unsupported_installation`.
 
 Every installed native agent reports the models it offers (System One §6a,
 KM6; `ModelCapabilitySnapshotProducer`): an agent whose release carries a

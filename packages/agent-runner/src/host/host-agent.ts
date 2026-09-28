@@ -34,6 +34,14 @@ export interface HostAgentRunnerAdapter {
   environment(config: RunnerConfig, family: AgentBridgeFamily, generic: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
   /** Before any process of this agent starts: write the Konteks overlay or config it boots from. */
   prepareToSpawn(config: RunnerConfig): Promise<void>;
+  /**
+   * For an agent whose execution process serves exactly one working copy
+   * (OpenCode: the working copy's instructions ride on a per-process config
+   * folder, and MCP servers are process-wide): prepare that process before it
+   * spawns. Its process is never parked for reuse by another session. Absent
+   * for agents whose processes serve any working copy.
+   */
+  bindWorkingCopy?(config: RunnerConfig, family: AgentBridgeFamily, workingCopy: string): Promise<HostWorkingCopyBinding>;
   /** A runtime-owned sign-in, used instead of the family's official login tooling when present. */
   startLogin?(options: HostAgentLoginOptions): LoginFlow;
   /** A runtime-owned sign-out, used instead of the family's official logout tooling when present. */
@@ -46,6 +54,16 @@ export interface HostAgentRunnerAdapter {
   hostVersion(config: RunnerConfig): string | undefined;
   /** Whether a turn reports billing token usage (false when the agent sends none). */
   readonly tokenUsageObservable: boolean;
+}
+
+/** One execution process's hold on its working copy (`bindWorkingCopy`). */
+export interface HostWorkingCopyBinding {
+  /** The complete environment of the process serving this working copy. */
+  readonly env: NodeJS.ProcessEnv;
+  /** Before each prompt: re-check (and, where it is a copy, refresh) what the process reads from the working copy. */
+  beforePrompt(): Promise<void>;
+  /** Once the process is gone: undo what `bindWorkingCopy` prepared, when no other process of the same working copy needs it. Idempotent. */
+  release(): Promise<void>;
 }
 
 export interface HostAgentLoginOptions {

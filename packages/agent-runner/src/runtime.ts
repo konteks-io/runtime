@@ -5,6 +5,7 @@ import type { AgentBridgeFamily } from "@konteks/remote-release";
 import { fallbackLoginIdentity, probeIdentity, type IdentityProbe } from "./auth/identity.js";
 import { runLogout, startLoginFlow, type LoginFlow } from "./auth/login-flow.js";
 import { hostAgentRunnerAdapter } from "./host/registry.js";
+import type { HostAgentRunnerAdapter, HostWorkingCopyBinding } from "./host/host-agent.js";
 import { AgentScopeStore, applyIdentityObservation, type AgentScopeState } from "./auth/scope-store.js";
 import { classifyBridgeError, spawnBridge, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
 import { discoverBridgeModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
@@ -146,6 +147,12 @@ export class AgentRuntime {
   private stopping = false;
   /** Set when the agent broke a governance guarantee; no bridge starts again in this process. */
   private quarantined: string | null = null;
+  /** A host-installed agent's adapter (DeepSeek Harness, OpenCode); null for a bundled agent. */
+  private readonly host: HostAgentRunnerAdapter | null;
+  /** Each execution process of this agent serves one working copy and is never reused by another session (OpenCode). */
+  private readonly perWorkingCopy: boolean;
+  /** What each such process holds on its working copy, released when it exits. */
+  private readonly workingCopyBindings = new WeakMap<BridgeProcess, HostWorkingCopyBinding>();
 
   constructor(private readonly options: AgentRuntimeOptions) {
     this.events = options.events ?? new RunnerEventBus();
@@ -153,11 +160,18 @@ export class AgentRuntime {
     this.now = options.now ?? (() => new Date());
     this.spec = resolveBridgeSpawnSpec(options.config);
     this.family = this.spec.family;
+    this.host = hostAgentRunnerAdapter(this.family.agentId) ?? null;
+    this.perWorkingCopy = this.host?.bindWorkingCopy !== undefined;
+    if (this.perWorkingCopy && !options.executionBridgeLimit) {
+      // Its control process has no working copy, so it never runs a session.
+      throw new RemoteInstanceError("agent_unavailable", `${this.family.displayName} runs every session in a process of its own working copy.`);
+    }
     this.scopeStore = new AgentScopeStore(options.config.RUNNER_CREDENTIAL_DIR);
     this.sessions = new SessionManager({
       bridge: () => this.bridge,
-      ...(options.executionBridgeLimit ? { createBridge: (ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"]) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle) } : {}),
-      ...(options.executionBridgeLimit ? { replaceBridge: (ref: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"]) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle) } : {}),
+      ...(options.executionBridgeLimit ? { createBridge: (ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle, cwd) } : {}),
+      ...(options.executionBridgeLimit ? { replaceBridge: (ref: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle, cwd) } : {}),
+      ...(this.perWorkingCopy ? { beforePrompt: (bridge: BridgeProcess) => this.workingCopyBindings.get(bridge)?.beforePrompt() } : {}),
       events: this.events,
       refStore: new FileSessionRefStore(join(options.config.RUNNER_CREDENTIAL_DIR, "session-refs.json")),
       bootstrapTimeoutMs: options.config.RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS,
@@ -195,7 +209,7 @@ export class AgentRuntime {
     if (errors.length) throw new AggregateError(errors, "Native execution owners could not all be stopped.");
   }
 
-  private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"]): Promise<BridgeProcess> {
+  private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
     const limit = this.options.executionBridgeLimit?.();
     if (this.authRequired) return Promise.reject(new RemoteInstanceError("agent_auth_required", "Sign in to the selected local agent.", { recoveryActions: [{ kind: "login_agent", agentId: this.family.agentId }] }));
     if (this.activeLogin !== null) return Promise.reject(new RemoteInstanceError("temporarily_unavailable", "The local agent is signing in."));
@@ -211,8 +225,8 @@ export class AgentRuntime {
       if (this.stopping || this.executionBridges.get(ref)!.stopping) throw new RemoteInstanceError("agent_unavailable", "Native execution owner is stopping.");
       // A resident process costs this reference one `session/new`; only when
       // none is idle does it pay the spawn plus ACP `initialize`.
-      const idle = this.takeIdleExecutionBridge();
-      return idle ? this.adoptIdleExecutionBridge(ref, idle, lifecycle) : this.spawnExecutionBridge(ref, lifecycle);
+      const idle = this.perWorkingCopy ? null : this.takeIdleExecutionBridge();
+      return idle ? this.adoptIdleExecutionBridge(ref, idle, lifecycle) : this.spawnExecutionBridge(ref, lifecycle, cwd);
     });
     // Reserve the bounded owner before any executable await. Even a rejected
     // bootstrap retains its slot; no missing handle is interpreted as stopped.
@@ -220,13 +234,30 @@ export class AgentRuntime {
     return bridge;
   }
 
-  private async spawnExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"]): Promise<BridgeProcess> {
+  /**
+   * The spawn spec of one execution process: the runtime's own, or for an
+   * agent whose process serves one working copy (OpenCode), the environment
+   * its adapter prepared for exactly `cwd`, held until that process exits.
+   */
+  private async executionSpec(cwd: string | undefined): Promise<{ spec: BridgeSpawnSpec; binding: HostWorkingCopyBinding | null }> {
+    if (!this.perWorkingCopy) return { spec: this.spec, binding: null };
+    if (cwd === undefined) throw new RemoteInstanceError("agent_unavailable", `${this.family.displayName} needs the session's working copy before it starts.`);
+    const binding = await this.host!.bindWorkingCopy!(this.options.config, this.family, cwd);
+    return { spec: { ...this.spec, env: binding.env }, binding };
+  }
+
+  private releaseWorkingCopy(binding: HostWorkingCopyBinding | null): void {
+    if (binding) void binding.release().catch(error => this.logger.warn({ agentId: this.family.agentId, err: error }, "working copy preparation could not be removed"));
+  }
+
+  private async spawnExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
     const record = this.executionBridges.get(ref)!;
     let owner: BridgeProcess | null = null;
     let exitedDuringStart = false;
     let ownerPersistence: Promise<void> = Promise.resolve();
+    const { spec, binding } = await this.executionSpec(cwd);
     const candidate = await (this.options.spawn ?? spawnBridge)({
-      spec: this.spec, initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
+      spec, initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
       clientVersion: this.options.config.RUNNER_BRIDGE_VERSION, logger: this.logger,
       onProcessOwner: process => {
         record.process = process;
@@ -243,6 +274,7 @@ export class AgentRuntime {
         onRequestPermission: params => this.sessions.onRequestPermission(params, owner),
         onCreateElicitation: params => this.sessions.onCreateElicitation(params, owner),
         onExit: () => {
+          this.releaseWorkingCopy(binding);
           if (!owner) { exitedDuringStart = true; return; }
           this.sessions.closeAll("agent_exited", owner);
           this.observeExecutionExit(owner);
@@ -250,7 +282,12 @@ export class AgentRuntime {
           // automatically respawn an uncertain execution generation.
         },
       },
+    }).catch((error: unknown) => {
+      // A process that never started never exits: undo its preparation here.
+      this.releaseWorkingCopy(binding);
+      throw error;
     });
+    if (binding) this.workingCopyBindings.set(candidate, binding);
     await ownerPersistence;
     owner = candidate;
     record.process = candidate;
@@ -274,8 +311,9 @@ export class AgentRuntime {
     previous: BridgeProcess,
     bootstrapAttempt: number,
     lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"],
+    cwd?: string,
   ): Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }> {
-    return this.acquireBootstrapExecutionBridge(ref, bootstrapAttempt, previous, lifecycle);
+    return this.acquireBootstrapExecutionBridge(ref, bootstrapAttempt, previous, lifecycle, cwd);
   }
 
   /** Spawn/initialize belongs to the same four-attempt bootstrap budget as the
@@ -286,6 +324,7 @@ export class AgentRuntime {
     firstAttempt: number,
     previous: BridgeProcess | undefined,
     lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"],
+    cwd?: string,
   ): Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }> {
     let durablePrevious: RetainedProcessOwner | undefined;
     if (previous) {
@@ -321,7 +360,7 @@ export class AgentRuntime {
       } : undefined;
       const initializeStartedAt = Date.now();
       try {
-        const bridge = await this.createExecutionBridge(ref, attemptLifecycle);
+        const bridge = await this.createExecutionBridge(ref, attemptLifecycle, cwd);
         this.logger.info({
           agentId: this.family.agentId,
           acpSessionRef: ref,
@@ -505,6 +544,9 @@ export class AgentRuntime {
   private parkIdle(bridge: BridgeProcess, durable: BridgeStopOwner): boolean {
     // A later reference must record this process's durable owner; without a
     // captured identity there is nothing to record, so the process stops.
+    // A process serving one working copy (OpenCode) keeps that copy's
+    // instructions and its sessions' MCP servers, so no other session reuses it.
+    if (this.perWorkingCopy) return false;
     if (this.stopping || bridge.exited || durable.retainedProcessOwner === undefined || this.idleExecutionBridge !== null || this.sessions.sessionsBoundTo(bridge) !== 0) return false;
     const entry: IdleExecutionBridge = { bridge, durable, authEpoch: this.authEpoch, expiry: setTimeout(() => void this.expireIdleExecutionBridge(entry), this.idleExecutionBridgeTtlMs()) };
     entry.expiry.unref();
@@ -687,7 +729,7 @@ export class AgentRuntime {
    */
   private async prepareToSpawn(logger?: Pick<Logger, "info">): Promise<void> {
     await verifyNativeRunnerPackage(this.options.config, logger);
-    await hostAgentRunnerAdapter(this.family.agentId)?.prepareToSpawn(this.options.config);
+    await this.host?.prepareToSpawn(this.options.config);
   }
 
   /** The verified installed version of a host-installed agent, when known. */

@@ -5,6 +5,7 @@ import type { NativeRuntimeRecord } from "./installation.js";
 import { locateNativeDsh, resolveNativeDshInstallation, resolveNativeDshNode, verifyNativeDshRoot } from "./dsh-installation.js";
 import { checkDshKonteksProfile } from "./dsh-profile-check.js";
 import { locateNativeOpenCode, resolveNativeOpenCodeInstallation, verifyNativeOpenCodeBinary } from "./opencode-installation.js";
+import { checkOpenCodeKonteksConfig } from "./opencode-self-check.js";
 
 /** The runner settings a host adapter derives from an install record (merged into `RunnerConfigSchema`). */
 export type HostAgentRunnerSettings = Partial<RunnerConfig> & { RUNNER_BRIDGE_PREFIX: string; RUNNER_BRIDGE_VERSION: string };
@@ -12,6 +13,7 @@ export type HostAgentRunnerSettings = Partial<RunnerConfig> & { RUNNER_BRIDGE_PR
 /** Replaceable checks, for tests only. */
 export interface HostAgentSelfCheckDeps {
   dshProfileCheck?: typeof checkDshKonteksProfile;
+  openCodeSelfCheck?: typeof checkOpenCodeKonteksConfig;
 }
 
 /**
@@ -67,11 +69,12 @@ export const dshInstallAdapter: HostAgentInstallAdapter = {
 };
 
 /**
- * The person's own OpenCode 2 (opencode-runtime-support CP1): found, version
- * checked and recorded like dsh, but NOT offered until its security
- * checkpoint (CP4) lifts the gate: until then it is refused on install, never
- * detected at enrollment, skipped when a stored record lists it, and its
- * runner refuses to start.
+ * The person's own OpenCode 2 (opencode-runtime-support CP1, CP2): found,
+ * version checked and recorded like dsh, and proven at runner start to run
+ * with the locked Konteks configuration (`opencode debug agents`). NOT
+ * offered until its security checkpoint (CP4) lifts the gate: until then it
+ * is refused on install, never detected at enrollment and skipped when a
+ * stored record lists it, so no connector builds an OpenCode runner.
  */
 export const openCodeInstallAdapter: HostAgentInstallAdapter = {
   agentId: "opencode",
@@ -81,9 +84,14 @@ export const openCodeInstallAdapter: HostAgentInstallAdapter = {
     const opencode = record.opencodeBinary === undefined ? await resolveNativeOpenCodeInstallation() : await verifyNativeOpenCodeBinary(record.opencodeBinary);
     return { RUNNER_NATIVE_OPENCODE_BINARY: opencode.binary, RUNNER_BRIDGE_PREFIX: dirname(opencode.binary), RUNNER_BRIDGE_VERSION: opencode.version };
   },
-  // The locked-config self-check (`opencode debug agents` in the private home) arrives in CP2.
-  async selfCheck() {
-    throw new RemoteInstanceError("agent_unavailable", "OpenCode cannot run Konteks work on this computer yet.");
+  // A release that stops honouring the locked configuration never spawns.
+  async selfCheck(config, deps = {}) {
+    if (!config.RUNNER_NATIVE_OPENCODE_BINARY) {
+      throw new RemoteInstanceError("prerequisite_missing", "OpenCode was not located on this machine.", { diagnostic: "opencode_not_found" });
+    }
+    await (deps.openCodeSelfCheck ?? checkOpenCodeKonteksConfig)({
+      binary: config.RUNNER_NATIVE_OPENCODE_BINARY, version: config.RUNNER_BRIDGE_VERSION, credentialDir: config.RUNNER_CREDENTIAL_DIR,
+    });
   },
 };
 

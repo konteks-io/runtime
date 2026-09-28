@@ -231,7 +231,7 @@ describe("closed native runtime installation", () => {
     await packageJson("1.18.33");
     await expect(openCodeInstallAdapter.runnerSettings(record)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_unsupported_version" });
     await packageJson("2.0.18");
-    // The gate: not offered, so a stored record naming it loads without it, and a runner refuses to start.
+    // The gate: not offered, so a stored record naming it loads without it and no runner is ever built for it.
     expect(openCodeInstallAdapter.offered).toBe(false);
     expect(nativeAgentOffered("opencode")).toBe(false);
     expect(nativeAgentOffered("dsh")).toBe(true);
@@ -241,7 +241,8 @@ describe("closed native runtime installation", () => {
     expect(loaded.record.agents).toEqual(["codex"]);
     expect(loaded.retiredAgents).toEqual(["opencode"]);
     expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
-    await expect(openCodeInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "agent_unavailable" });
+    // A runner built directly (tests, CP2's live proof) still proves the locked configuration first.
+    await expect(openCodeInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_not_found" });
   });
   it.each([{ releaseId: "../outside" }, { agents: ["codex", "codex"] }, { coreUrl: "http://core.example" }, { coreUrl: "https://user:password@core.example" }, { relayUrl: "ws://relay.example" }, { gatewayKey: "forbidden" }, { environment: { NODE_OPTIONS: "--require untrusted" } }, { deploymentKind: "appliance" }, { command: "/bin/sh" }])("rejects unsafe or unimplemented install fields", async patch => {
     const f = await fixture();

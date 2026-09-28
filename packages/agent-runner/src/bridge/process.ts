@@ -209,6 +209,42 @@ const DSH_KEY_MISSING = /llm-deepseek: (?:no API key for provider route|the API 
  */
 const DSH_PROVIDER_FAILURE = /turn failed: DeepSeek Messages (?:stream idle timeout|transport failed|returned no response body)$/;
 
+type BridgeErrorClass = ReturnType<typeof classifyBridgeError>;
+
+/**
+ * OpenCode 2 fails a turn as JSON-RPC -32603 whose data names the failure:
+ * `{ service: "session", errorName: "provider.<reason>" }` (CP0-v2: an empty
+ * Zen balance was `provider.quota`, a model outside the account
+ * `provider.no-route`); a failed sign-in is ACP's auth-required error. The
+ * provider's HTTP status is not forwarded, so 429 arrives as
+ * `provider.rate-limit` and 5xx as `provider.internal`, `timeout` or
+ * `transport`. Wording is for the person, plain and short.
+ */
+const OPENCODE_PROVIDER_ERRORS: Readonly<Record<string, { class: BridgeErrorClass["class"]; message: string; retryable: boolean }>> = {
+  "provider.auth": { class: "agent_auth_required", message: "agent authentication required", retryable: false },
+  "provider.quota": { class: "provider_failure", message: "The provider account OpenCode uses is out of credit. Add credit or pick another model.", retryable: false },
+  "provider.no-route": { class: "provider_failure", message: "This model is not available to the account OpenCode is signed in with. Pick another model.", retryable: false },
+  // Transient: OpenCode already retried with backoff. The session is kept, so
+  // the work resumes on the same session once the provider answers again.
+  "provider.rate-limit": { class: "provider_failure", message: "The provider is limiting requests right now. The session is kept and can continue shortly.", retryable: true },
+  "provider.internal": { class: "provider_failure", message: "The provider had a problem answering. The session is kept and can continue shortly.", retryable: true },
+  "provider.timeout": { class: "provider_failure", message: "The provider did not answer in time. The session is kept and can continue shortly.", retryable: true },
+  "provider.transport": { class: "provider_failure", message: "OpenCode could not reach the provider. The session is kept and can continue shortly.", retryable: true },
+  "provider.content-filter": { class: "provider_failure", message: "The provider declined this request under its content rules.", retryable: false },
+};
+
+function openCodeProviderError(error: RequestError): BridgeErrorClass | null {
+  const data = error.data as { service?: unknown; errorName?: unknown } | null | undefined;
+  if (data === null || typeof data !== "object" || typeof data.errorName !== "string" || !data.errorName.startsWith("provider.")) return null;
+  const text = error.message.slice(0, 1_024);
+  // A provider that answered 401/403 behind another reason still means sign in again.
+  if (/\b40[13]\b|unauthori[sz]ed|forbidden/i.test(text)) return { code: error.code, ...OPENCODE_PROVIDER_ERRORS["provider.auth"]! };
+  const known = OPENCODE_PROVIDER_ERRORS[data.errorName];
+  if (known) return { code: error.code, ...known };
+  if (/\b(429|503)\b/.test(text)) return { code: error.code, ...OPENCODE_PROVIDER_ERRORS["provider.internal"]! };
+  return { code: error.code, class: "provider_failure", message: "The provider could not handle this request.", retryable: false };
+}
+
 function signInLapsed(data: unknown): boolean {
   if (data === undefined || data === null) return false;
   let text: string;
@@ -224,6 +260,8 @@ export function classifyBridgeError(error: unknown): {
   retryable: boolean;
 } {
   if (error instanceof RequestError) {
+    const openCode = openCodeProviderError(error);
+    if (openCode) return openCode;
     const message = error.message.slice(0, 1_024);
     if (error.code === -32000 || /auth/i.test(message) || signInLapsed(error.data) || DSH_KEY_MISSING.test(message)) {
       return { code: error.code, class: "agent_auth_required", message: "agent authentication required", retryable: false };
