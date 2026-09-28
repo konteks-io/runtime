@@ -18,7 +18,7 @@ import { basename, join } from "node:path";
 
 const [command, ...rest] = process.argv.slice(2);
 const args = Object.fromEntries(rest.map((value, index, all) => (value.startsWith("--") ? [value.slice(2), all[index + 1]] : [])).filter(pair => pair.length === 2));
-const AGENTS = ["claude-code", "codex", "opencode"];
+const AGENTS = ["claude-code", "codex"];
 const sha = bytes => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 const node = (script, argv) => execFileSync(process.execPath, [script, ...argv], { stdio: "inherit" });
 

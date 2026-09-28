@@ -1,11 +1,11 @@
 import { createHash, sign } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildReleaseFixture } from "../fixtures.js";
 import { agentModelCapabilityMappingSigningBytes, bundleManifestSigningBytes, computeAgentModelCapabilityMappingDigest, computeBundleManifestDigest } from "@konteks/remote-common";
-import { verifyNativeRelease, selectNativeArtifacts, selectNativeModelCapabilityMappings, stageNativeRelease } from "../native.js";
+import { nativeConnectorFileNames, presentNativeConnectorExecutables, resolveNativeConnectorExecutable, verifyNativeRelease, selectNativeArtifacts, selectNativeModelCapabilityMappings, stageNativeRelease } from "../native.js";
 
 const bytes = Buffer.from('test executable bytes');
 const hash = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -34,7 +34,8 @@ describe('signed native executable staging', () => {
     expect(() => verifyNativeRelease(signed(), [], now)).toThrow();
     expect(() => verifyNativeRelease({ ...signed(), bundleVersion: '2.0.0' }, roots, now)).toThrow();
     expect(() => verifyNativeRelease(signed(), roots, Date.parse('2028-01-01'))).toThrow();
-    expect(() => verifyNativeRelease(fixture.manifest, roots, now)).toThrow();
+    // A retired appliance release (its components and no native topology) is refused.
+    expect(() => verifyNativeRelease(signed({ deploymentKind: 'appliance', components: ['harness', 'validation_runtime', 'agent_runner', 'gateway'] }), roots, now)).toThrow();
   });
 
   it('independently verifies every reviewed model mapping with the release root', () => {
@@ -72,6 +73,22 @@ describe('signed native executable staging', () => {
       .toThrow(/model capability mapping/i);
   });
 
+  it('selects a reviewed host-agent mapping for DeepSeek Harness only when it names the versions this runtime supports', () => {
+    const host = (versions: { min: string; belowCore: string }, agentId = 'dsh') => {
+      const body = { version: 1, mappingId: `host-${agentId}-${versions.min}`, mappingRevision: 1, hostAgent: { agentId, versions }, configId: 'model', optionType: 'select',
+        modelIdentities: [{ value: '["deepseek-official","deepseek-flash"]', canonicalProviderId: 'deepseek', canonicalModelId: 'deepseek-flash' }],
+        issuedAt: '2026-09-01T00:00:00Z', expiresAt: '2027-09-01T00:00:00Z' };
+      const unsigned = { ...body, mappingDigest: computeAgentModelCapabilityMappingDigest(body) };
+      const placeholder = { ...unsigned, signature: { algorithm: 'Ed25519', keyId: fixture.keyId, value: 'AA' } };
+      return { ...unsigned, signature: { algorithm: 'Ed25519', keyId: fixture.keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(placeholder), fixture.privateKey).toString('base64url') } };
+    };
+    const release = verifyNativeRelease(signed({ modelCapabilityMappings: [signedMapping(), host({ min: '0.1.7-rc.2', belowCore: '0.1.8' }), host({ min: '0.1.5-rc.3', belowCore: '0.1.8' }), host({ min: '0.1.9', belowCore: '0.2.0' }), host({ min: '1.0.0', belowCore: '2.0.0' }, 'codex')] }), roots, now);
+    expect(selectNativeModelCapabilityMappings(release).map(({ agentId, mapping }) => [agentId, mapping.mappingId])).toEqual([
+      ['claude-code', 'claude-model'],
+      ['dsh', 'host-dsh-0.1.5-rc.3'],
+    ]);
+  });
+
   it('selects model authority only for bridge artifacts installed on this platform', () => {
     const macBridge = { ...artifact, id: 'claude-macos-arm64', kind: 'agent_bridge', agentId: 'claude-code' };
     const windowsBridge = { ...artifact, id: 'claude-windows-amd64', kind: 'agent_bridge', agentId: 'claude-code', os: 'windows', architecture: 'amd64' };
@@ -104,12 +121,39 @@ describe('signed native executable staging', () => {
     expect((await readdir(parent)).length).toBe(1);
   });
 
+  it('names the connector konteks-connector, with an independent pre-rename copy older launchers still run', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'native-artifact-test-')); folders.push(parent);
+    const staged = await stageNativeRelease({ release: verifyNativeRelease(signed(), roots, now), target, releasesDir: parent, fetchFn: (async () => new Response(bytes)) as typeof fetch });
+    expect(staged.connector).toBe(join(staged.directory, 'konteks-connector'));
+    const legacy = join(staged.directory, 'connector');
+    expect(await readFile(legacy)).toEqual(bytes);
+    const [renamed, old] = [await stat(staged.connector), await stat(legacy)];
+    // Two files, not a link: installed-executable verification refuses links.
+    expect(renamed.ino).not.toBe(old.ino);
+    expect([renamed.nlink, old.nlink]).toEqual([1, 1]);
+    expect(old.mode & 0o777).toBe(0o700);
+    expect(nativeConnectorFileNames('windows')).toEqual(['konteks-connector.exe', 'connector.exe']);
+  });
+
+  it('finds a release folder\'s connector by the Konteks name first, else the pre-rename name', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'native-connector-name-')); folders.push(directory);
+    expect(await presentNativeConnectorExecutables(directory, 'macos')).toEqual([]);
+    expect(await resolveNativeConnectorExecutable(directory, 'macos')).toBe(join(directory, 'konteks-connector'));
+    await writeFile(join(directory, 'connector'), bytes);
+    expect(await resolveNativeConnectorExecutable(directory, 'macos')).toBe(join(directory, 'connector'));
+    await writeFile(join(directory, 'konteks-connector'), bytes);
+    expect(await presentNativeConnectorExecutables(directory, 'macos')).toEqual([join(directory, 'konteks-connector'), join(directory, 'connector')]);
+    expect(await resolveNativeConnectorExecutable(directory, 'macos')).toBe(join(directory, 'konteks-connector'));
+    expect(await resolveNativeConnectorExecutable(directory, 'windows')).toBe(join(directory, 'konteks-connector.exe'));
+  });
+
   it('stages bb-style host-only npm packages without executing them or enabling archive executable bits', async () => {
     const parent = await mkdtemp(join(tmpdir(), 'native-artifact-test-')); folders.push(parent);
     const release = verifyNativeRelease(signed({ nativeArtifacts: [{ ...artifact, format: 'npm_tgz' }] }), roots, now);
     const staged = await stageNativeRelease({ release, target: { ...target, agentIds: [] }, releasesDir: parent, fetchFn: (async () => new Response(bytes)) as typeof fetch });
     expect(staged.connector).toMatch(/\.tgz$/);
     expect((await stat(staged.connector)).mode & 0o111).toBe(0);
+    expect(await readdir(staged.directory)).toEqual(['konteks-connector.tgz']);
   });
 
   it.each(['corrupt', 'oversized', 'truncated', 'redirect'])('rejects %s downloads and leaves no executable candidate', async failure => {

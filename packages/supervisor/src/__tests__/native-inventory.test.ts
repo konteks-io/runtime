@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ConnectedAgentView } from "@konteks/remote-common";
+import { advertisesPreview, type ConnectedAgentView } from "@konteks/remote-common";
 import { NativeInventoryCollector, machineHasDesktop } from "../native/inventory.js";
 import { deriveAdvertisedRoles } from "../inventory/roles.js";
 
-const agent: ConnectedAgentView = { agentId: "codex", displayName: "Codex", connectionState: "ready", authMode: "agent_local_subscription", accountScope: "personal", readiness: "ready", moneyObservable: false, tokenUsageObservable: true, acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" } };
+const agent: ConnectedAgentView = { agentId: "codex", displayName: "Codex", connectionState: "ready", authMode: "agent_local_subscription", accountScope: "personal", readiness: "ready", tokenUsageObservable: true, acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" } };
 const signals = { cpuRatio: 0.2, memoryRatio: 0.3, diskFreeBytes: 100, diskTotalBytes: 200, loadAverage1m: 0, cpuCount: 4, observedAt: "2026-09-06T00:00:00.000Z" };
 function fixture(executionPermitsReady?: () => boolean, cancellationDeliveryReady?: () => boolean, deliveryExecutionPermitsReady?: () => boolean) {
   const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 2, activeTurns: 1 } }));
@@ -50,6 +50,16 @@ describe("native host inventory (A4 D133)", () => {
     expect(machineHasDesktop("linux", {})).toBe(false);
     expect(machineHasDesktop("linux", { WAYLAND_DISPLAY: "wayland-0" })).toBe(true);
   });
+  it("advertises preview.dev_server on the agent_runner component while previews can reach a viewer", async () => {
+    let relay = true;
+    const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 0, activeTurns: 0 } }));
+    const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0", previewReady: () => relay });
+    const snapshot = await inventory.collect();
+    expect(snapshot.components[0]).toMatchObject({ kind: "agent_runner", capabilities: ["agent:codex", "session-label-v1", "preview.dev_server"] });
+    expect(advertisesPreview(snapshot.components)).toBe(true);
+    relay = false;
+    expect(advertisesPreview((await inventory.collect()).components)).toBe(false);
+  });
   it("advertises the composed cancellation owner independently of agent sign-in", async () => {
     let owned = true;
     const f = fixture(undefined, () => owned);
@@ -73,7 +83,7 @@ describe("native host inventory (A4 D133)", () => {
     const f = fixture();
     const snapshot = await f.inventory.collect();
     expect(snapshot.components).toEqual([{ kind: "agent_runner", version: "1.0.0", healthStatus: "healthy", capabilities: ["agent:codex", "session-label-v1"], lastProbeAt: signals.observedAt }]);
-    expect(snapshot).toMatchObject({ agents: [agent], hostPressure: 0.3, activeSessions: 2, activeTurns: 1, browserToolAvailable: false, gatewayRollupIncompleteSince: null, diskFreeBytes: 100 });
+    expect(snapshot).toMatchObject({ agents: [agent], hostPressure: 0.3, activeSessions: 2, activeTurns: 1, diskFreeBytes: 100 });
     expect(deriveAdvertisedRoles([
       { role: "generator", agentPreference: ["codex"] },
       { role: "qa", agentPreference: ["codex"] },

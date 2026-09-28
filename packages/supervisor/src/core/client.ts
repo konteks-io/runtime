@@ -1,4 +1,4 @@
-import { AgentTurnUsageObservationSchema, GatewayCallObservationSchema, RuntimeAgentLoginReportSchema } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema } from "@konteks/remote-common";
 
 import { z } from "zod";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
@@ -161,8 +161,7 @@ export const CORE_PATHS = Object.freeze({
   gitKey: (instanceId: string, keyRef: string) => instancePath(instanceId, `git-keys/${encodeURIComponent(keyRef)}`),
   // CONTRACT-GAP: `RemoteWorkAssignment` carries no delivery/validation/qa
   // definition, so the supervisor reads it for a CLAIMED assignment from
-  // this lease-guarded route (added to Core with this seam) and serves it to
-  // the components as the Harness `workload` / the Validation Runtime `spec`.
+  // this lease-guarded route (added to Core with this seam).
   workload: (instanceId: string, assignmentId: string) => instancePath(instanceId, `assignments/${encodeURIComponent(assignmentId)}/workload`),
   // CONTRACT-GAP: durable task-checkout affinity (invariant 15) had no route
   // for the owner to report a materialization. Added to Core with this seam.
@@ -210,7 +209,7 @@ export interface CapabilityTokenIssue {
   mcpServer: { name: string; url: string; headers: Array<{ name: string; value: string }> };
   expiresAt: string;
 }
-const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "preview", "qa", "assistant_execution", "onboarding", "repository_relocation"]), workload: BoundedJsonValueSchema }).strict();
+const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "qa", "assistant_execution", "onboarding", "repository_relocation"]), workload: BoundedJsonValueSchema }).strict();
 export type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
 const TaskCheckoutMaterializedResultSchema = z.object({ workspaceRef: z.string().min(1) }).strict();
 
@@ -620,7 +619,7 @@ export class CoreClient {
   }
 
   /** Long-poll Core's retained planning terminal intents for this native owner. */
-  async pullControllerDirectives(instanceId: string, candidate: ControllerDirectivePullInput): Promise<PlanningControllerDirectivePullResult> {
+  async pullControllerDirectives(instanceId: string, candidate: ControllerDirectivePullInput, signal?: AbortSignal): Promise<PlanningControllerDirectivePullResult> {
     const input = ControllerDirectivePullInputSchema.parse(candidate);
     const result = await this.http.request({
       method: "POST",
@@ -628,6 +627,7 @@ export class CoreClient {
       bodyFactory: () => PlanningControllerDirectivePullRequestSchema.parse({ ...input,
         proof: this.proof("controller_directives_pull", instanceId, input as unknown as { [key: string]: JsonValue }) }),
       schema: PlanningControllerDirectivePullResultSchema,
+      ...(signal ? { signal } : {}),
       idempotencyKey: `controller-directives:${instanceId}:${input.runnerIncarnation}:${input.afterSequence}`,
     });
     if (result.highWater < input.afterSequence || (result.directives.length === 0 && result.highWater > input.afterSequence)) throw new RemoteInstanceError("assignment_conflict", "Controller directive page skipped retained work");
@@ -654,12 +654,10 @@ export class CoreClient {
 
   /** The mounted Core route accepts one body, and replies only after commit. */
   async submitObservation(instanceId: string, body: unknown): Promise<void> {
-    const parsed = AgentTurnUsageObservationSchema.safeParse(body);
-    const observation = parsed.success ? parsed.data : GatewayCallObservationSchema.parse(body);
+    const observation = AgentTurnUsageObservationSchema.parse(body);
     if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Observation instance mismatch");
     const digest = jcsDigest(observation as unknown as JsonValue);
-    const kind = observation.moneyBasis === "gateway_priced" ? "gw" : "turn";
-    const expectedId = `ri:${kind}:${instanceId}:${observation.assignmentId}:${observation.attempt}:${digest.slice(0, 24)}`;
+    const expectedId = `ri:turn:${instanceId}:${observation.assignmentId}:${observation.attempt}:${digest.slice(0, 24)}`;
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId), body: observation,
       schema: ObservationReceiptSchema, idempotencyKey: `observation:${expectedId}`, operationPolicy: "progressRead" });
     if (result.observationId !== expectedId || result.observationDigest !== digest)

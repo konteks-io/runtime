@@ -1,6 +1,6 @@
 /**
  * The single boundary between this toolkit and the canonical shared contract
- * package. Every wire type, schema, constant, and error code the appliance
+ * package. Every wire type, schema, constant, and error code the runtime
  * uses is imported here by its exact `wire-contracts.md` name and re-exported;
  * no other module in this repository imports `@konteks/backstage-plugin-common`
  * directly. If CP1 lands a name differently, this file is the only place that
@@ -123,11 +123,6 @@ export type {
   AssignmentReport,
   ReportAck,
   CancelDirective,
-  PreviewRequestHeader,
-  PreviewResponseHeader,
-  PreviewToRuntimeChunk,
-  PreviewToCoreChunk,
-  PreviewChunk,
   SupportChunk,
   AcpJsonRpcError,
   SessionToCoreMessage,
@@ -156,9 +151,8 @@ export type {
   DurableReportRow,
   ReportVerdict,
   // Economics
-  GatewayCallObservation,
   AgentTurnUsageObservation,
-  // Existing shared enums the gateway reuses
+  // Existing shared enums
   RemoteCapEnforcementStage as CapEnforcementStage,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
 
@@ -292,6 +286,7 @@ export {
   agentModelCapabilityMappingSigningBytes,
   computeAgentModelCapabilityMappingDigest,
   computeAgentModelOfferedValuesSnapshotDigest,
+  catalogueModelAuthority,
   RemoteTransferBindingSchema,
   RemoteTransferManifestSchema,
   RemoteSkillCatalogSchema,
@@ -299,7 +294,7 @@ export {
   computeRemoteTransferManifestDigest,
   computeRemoteSkillCatalogDigest,
   validateRemoteTransfer,
-  // Strict parsers for every trust boundary the appliance validates.
+  // Strict parsers for every trust boundary the runtime validates.
   RemoteInstanceActivationExchangeResultSchema,
   RemoteSignedBundleManifestSchema,
   computeBundleManifestDigest,
@@ -347,8 +342,6 @@ export {
   EraseDirectiveSchema,
   SessionToRuntimeMessageSchema,
   SessionToCoreMessageSchema,
-  PreviewToRuntimeChunkSchema,
-  PreviewToCoreChunkSchema,
   PendingPermissionViewSchema,
   PermissionAnswerRequestSchema,
   PlanningControllerTerminalDirectiveSchema,
@@ -356,7 +349,6 @@ export {
   PlanningControllerDirectivePullResultSchema,
   planningControllerTerminalDirectiveSigningBytes,
   BoundedJsonValueSchema,
-  GatewayCallObservationSchema,
   AgentTurnUsageObservationSchema,
   HeartbeatMessageSchema,
   HeartbeatResultSchema,
@@ -392,7 +384,7 @@ export type {
 
 /**
  * Wire constants that CP1 publishes (protocol negotiation, ACP schema
- * version, frame/list bounds). Re-exported so the appliance never hard-codes
+ * version, frame/list bounds). Re-exported so the runtime never hard-codes
  * a value the control plane also owns.
  */
 export {
@@ -432,3 +424,30 @@ export type {
   CatalogLearningEvidence,
   CatalogLearningEvidenceKind,
 } from "@konteks/backstage-plugin-common";
+
+/**
+ * The native preview channel (`preview:<sessionId>`): its chunk shapes, the
+ * capability a connector advertises when it can serve previews, the caps and
+ * the D125 forwarding policy. The connector enforces the same rules as the
+ * relay, on its own hop, rather than trusting the relay did.
+ */
+export {
+  PreviewToRuntimeChunkSchema,
+  PreviewToCoreChunkSchema,
+  REMOTE_PREVIEW_CAPABILITY,
+  advertisesPreview,
+  PREVIEW_LIMITS,
+  PREVIEW_REQUEST_HEADERS,
+  PREVIEW_RESPONSE_HEADERS,
+  validatePreviewHeaders,
+  sanitizePreviewHeaders,
+  validatePreviewPath,
+  rewritePreviewLocation,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";
+export type {
+  PreviewToRuntimeChunk,
+  PreviewToCoreChunk,
+  PreviewChunk,
+  PreviewHeaderRejection,
+  PreviewPathRejection,
+} from "@konteks/backstage-plugin-common/remote-instance-internal";

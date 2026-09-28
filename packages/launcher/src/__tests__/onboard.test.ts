@@ -65,6 +65,21 @@ describe("onboard", () => {
     vi.restoreAllMocks();
   });
 
+  it("requests first-machine work roles before promising Auto planning, engineering and review (WS1-144)", async () => {
+    await writeOnboardState(root, { step: "email" } as never);
+    const { writeSecretFile } = await import("@konteks/remote-common");
+    await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+      schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: ["claude-code"],
+      bundleVersion: "0.7.6-rc.1", manifestDigest: "digest-1", controlPort: 41800,
+    }));
+    const openIntent = vi.fn(async () => ({ intentRef: "intent-1" }));
+    const sendChallenge = vi.fn(async () => ({ sentToMasked: "a••@acme.test", attemptsRemaining: 5 }));
+    await step({ enrollment: { openIntent, sendChallenge } as never }, "ada@acme.test");
+    expect(openIntent).toHaveBeenCalledWith(expect.objectContaining({
+      requestedRoles: ["assistant", "onboard", "planner", "generator", "qa"],
+    }));
+  });
+
   it("asks only for the repository once a machine is already connected", async () => {
     await writeOnboardState(root, {
       step: "inspect",
@@ -658,32 +673,30 @@ describe("onboard", () => {
       if (url.endsWith("/execution-profiles") && init.method === "GET") {
         return new Response(JSON.stringify({ profiles: [] }), { status: 200, headers: { "content-type": "application/json" } });
       }
-      if (url.endsWith("/agent-setup/capabilities")) {
-        return new Response(JSON.stringify({
-          roles: {
-            planner: { recommendedOptionId: "native_a", options: [{ optionId: "native_a", runtimeId: "claude-code", providerId: "anthropic", modelId: "claude-sonnet-5", availability: "available" }] },
-            executor: { recommendedOptionId: "native_b", options: [{ optionId: "native_b", runtimeId: "claude-code", providerId: "anthropic", modelId: "claude-opus-5", availability: "available" }] },
-          },
-        }), { status: 200, headers: { "content-type": "application/json" } });
-      }
-      if (url.endsWith("/execution-profiles") && init.method === "POST") {
-        return new Response(JSON.stringify({ profile: { id: "profile-1" } }), { status: 201, headers: { "content-type": "application/json" } });
-      }
-      return new Response(JSON.stringify({ revision: { revision: 1 } }), { status: 201, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ executionProfileId: "profile-1", revision: 1 }), { status: 200, headers: { "content-type": "application/json" } });
     });
 
     const result = await step({ fetchFn: fetchFn as never });
 
-    const revision = calls.find(call => call.url.endsWith("/revisions"))!;
-    expect(revision.body).toEqual({
-      configuration: {
-        planner: { runtimeId: "claude-code", agentId: "claude-code", provider: "anthropic", model: "claude-sonnet-5", authMode: "managed_local_auth" },
-        executor: { runtimeId: "claude-code", agentId: "claude-code", provider: "anthropic", model: "claude-opus-5", authMode: "managed_local_auth" },
-      },
-      makeDefault: true,
-    });
+    expect(calls.map(call => `${call.method} ${call.url}`)).toEqual([
+      "GET https://core.test/api/app/execution-profiles",
+      "POST https://core.test/api/app/execution-profiles/auto",
+    ]);
     expect(result.note).toContain("agents will run the work");
     expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
+  });
+
+  it("waits when Core Auto has no eligible work route (WS1-144)", async () => {
+    await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
+    const calls: Array<{ url: string; method: string }> = [];
+    const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
+      calls.push({ url, method: String(init.method) });
+      if (url.endsWith("/auto")) return new Response(JSON.stringify({ error: { code: "native_execution_profile_unavailable", message: "No eligible planner or executor" } }), { status: 503, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ profiles: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const waiting = await step({ fetchFn: fetchFn as never, agentsWaitMs: 1 });
+    expect(waiting.note).toContain("still learning what this machine's agents can do");
+    expect(calls.filter(call => call.method === "POST").map(call => call.url)).toEqual(["https://core.test/api/app/execution-profiles/auto"]);
   });
 
   it("leaves a workspace that already chose its agents alone", async () => {
@@ -691,11 +704,25 @@ describe("onboard", () => {
     const urls: string[] = [];
     const fetchFn = vi.fn(async (url: string) => {
       urls.push(url);
-      return new Response(JSON.stringify({ profiles: [{ id: "profile-9" }] }), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ profiles: [{ id: "profile-9", isDefault: true, status: "active", currentReadyRevision: 3 }] }), { status: 200, headers: { "content-type": "application/json" } });
     });
     await step({ fetchFn: fetchFn as never });
     expect(urls).toEqual(["https://core.test/api/app/execution-profiles"]);
     expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
+  });
+
+  it("does not treat a profile without a ready default revision as first-machine setup (WS1-144)", async () => {
+    await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
+    const calls: string[] = [];
+    const fetchFn = vi.fn(async (url: string) => {
+      calls.push(url);
+      if (url.endsWith("/auto")) return new Response(JSON.stringify({ error: { code: "native_execution_profile_unavailable", message: "No eligible work route" } }), { status: 503, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ profiles: [{ id: "incomplete", isDefault: false, status: "active", currentReadyRevision: null }] }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const waiting = await step({ fetchFn: fetchFn as never, agentsWaitMs: 1 });
+    expect(calls).toContain("https://core.test/api/app/execution-profiles/auto");
+    expect(waiting.note).toContain("still learning what this machine's agents can do");
+    expect(await readOnboardState(root)).toMatchObject({ step: "agents", agentsWaited: 1 });
   });
 
   it("waits for the machine to say what its agents can run, then goes on without it", async () => {
@@ -755,7 +782,7 @@ describe("onboard", () => {
   it("closes once: no stale wait and no initiative said three times (pass 5)", async () => {
     await writeOnboardState(root, { step: "agents", systemId: "sys-1", repositoryName: "recipe-box", firstTask: "Recipes", initiativeTitle: "Recipes", instanceId: "instance-1", tenantId: "acme" } as never);
     const fetchFn = vi.fn(async (url: string) => {
-      const body = url.endsWith("/execution-profiles") ? { profiles: [{ id: "p1" }] }
+      const body = url.endsWith("/execution-profiles") ? { profiles: [{ id: "p1", isDefault: true, status: "active", currentReadyRevision: 1 }] }
         : url.endsWith("/initiatives") ? { initiative: { id: "init-7", title: "Recipes", setup: { state: "ready" } }, reconciliation: "recorded", pmSessionId: "session-9", retrySetup: false }
         : url.includes("/messages") ? { id: "turn-1" } : {};
       return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
@@ -1088,6 +1115,16 @@ describe("onboard", () => {
     const probing = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "probing" }) });
     expect(probing.done?.summary).toContain("Your Claude Code and Codex login will run Konteks work here.");
   });
+  it("names DeepSeek Harness by name, and asks for its API key only when it is here without one", async () => {
+    await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
+    const keyless = await step({ families: async () => ["claude-code", "dsh"], agentReadiness: async () => ({ "claude-code": "ready", dsh: "not_configured" }) });
+    expect(keyless.done?.remedies).toContain("DeepSeek Harness is installed but has no DeepSeek API key here yet, so it will not run Konteks work. To add the key: konteks-remote auth login dsh");
+    const ready = await step({ families: async () => ["dsh"], agentReadiness: async () => ({ dsh: "ready" }) });
+    expect(ready.done?.summary).toContain("Your DeepSeek Harness login will run Konteks work here.");
+    // Nobody without it is told to install it.
+    const without = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }) });
+    expect(JSON.stringify(without.done)).not.toContain("DeepSeek");
+  });
   it("never asks the relaying agent to run anything but konteks-remote", async () => {
     for (const state of ["inspect", "system", "push", "first_task"] as const) {
       await writeOnboardState(root, {
@@ -1237,7 +1274,11 @@ describe("onboard", () => {
       const ensure = vi.fn(async () => ({ node: "/n", cli: "/c" }));
       const wire = vi.fn(async () => ({ added: [".claude/settings.json", ".mcp.json", "AGENTS.md", "graft/"], changedTracked: [] as string[], mappedFiles: 3 }));
       const yes = await step(graftDeps({ ensure, wire }), "yes");
-      expect(yes.note).toMatch(/^Setting up Graft: downloading it, then mapping table-booking\. That usually takes under \d+ seconds\.$/);
+      expect(yes.note).toContain("Setting up Graft: downloading it, then mapping table-booking.");
+      // WS1-145: first install can exceed a file-count estimate before the
+      // next reply; do not promise a hard upper bound for this synchronous step.
+      expect(yes.note).not.toMatch(/under \d+ seconds/);
+      expect(yes.note).toMatch(/come back|return later/i);
       expect(ensure).not.toHaveBeenCalled();
       expect(await readOnboardState(root)).toMatchObject({ step: "graft_setup", graftDecision: "accepted" });
 
@@ -1355,7 +1396,8 @@ describe("onboard", () => {
     }));
     const started = await step({ enrollment: { bind } as never, complete: vi.fn(async () => ({}) as never), staging: { status: async () => ({ state: "done" }), spawn: vi.fn() } });
     // The join was already said; the step says it once (pass 5).
-    expect(started.note).toBe("This machine is now Acme Kitchen's runtime; starting it next, which takes about half a minute.");
+    expect(started.note).toContain("This machine is now Acme Kitchen's runtime; starting it next");
+    expect(started.note).toContain("about a minute");
     expect(started.note).not.toContain("acme-kitchen");
 
     await writeOnboardState(root, { ...(await readOnboardState(root)), step: "done" } as never);
@@ -1387,7 +1429,7 @@ describe("onboard", () => {
     expect(result.note).toContain("rename it in Settings");
     // The start took 32 to 39 s on pass 6 with nothing said in between
     // (WS1-124), so the note gives the person the wait to expect.
-    expect(result.note).toContain("starting it next, which takes about half a minute.");
+    expect(result.note).toContain("starting it next, which takes about a minute.");
     const state = await readOnboardState(root);
     expect(state).toMatchObject({ step: "inspect", instanceId: "instance-9", tenantId: "acme" });
     expect(state?.email).toBeUndefined();

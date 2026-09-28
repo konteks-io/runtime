@@ -1,9 +1,10 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
-import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
+import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServer, bundledBrowserVersion, dshRuntimePaths, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
 import { RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
+import { checkDshKonteksProfile } from "./dsh-profile-check.js";
 
 const idSchema = z.string().min(1).max(128);
 const inputSchema = z.object({
@@ -19,6 +20,11 @@ const inputSchema = z.object({
   restoreAcpSessionRef: z.string().min(1).max(256).optional(),
   freshProviderSessionOnRestore: z.boolean().optional(),
   sessionLabel: RemoteSessionLabelSchema.optional(),
+  browser: z.object({
+    proxyUrl: z.string().regex(/^http:\/\/127\.0\.0\.1:\d{1,5}$/),
+    outputDir: z.string().min(1).refine(isAbsolute),
+    browsersPath: z.string().min(1).refine(isAbsolute),
+  }).strict().optional(),
 }).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined);
 
 export interface NativeRunnerOptions {
@@ -27,6 +33,9 @@ export interface NativeRunnerOptions {
   onEvent: (event: RunnerEvent) => void;
   runtimeOptions?: Pick<AgentRuntimeOptions, "spawn" | "probe" | "now" | "logger">;
   executionBridgeLimit?: () => number;
+  afterSuccessfulLogin?: () => Promise<void>;
+  /** The DeepSeek Harness overlay self-check; replaced only in tests. */
+  dshProfileCheck?: typeof checkDshKonteksProfile;
 }
 
 /** Host-only runtime adapter. It never starts the legacy runner HTTP/WS API. */
@@ -39,14 +48,20 @@ export class NativeRunner implements RunnerPort {
   private stopPromise: Promise<void> | null = null;
   private unsubscribe: (() => void) | null = null;
 
+  /** The browser (Playwright MCP) version this agent's package carries; null for DeepSeek Harness or an older package. */
+  browserVersion(): string | null {
+    return bundledBrowserVersion(this.options.config);
+  }
+
   constructor(private readonly options: NativeRunnerOptions) {
     const config = RunnerConfigSchema.safeParse(options.config);
-    if (!config.success || config.data.RUNNER_AUTH_MODE !== "agent_local_subscription" || config.data.RUNNER_GATEWAY_BASE_URL !== undefined ||
+    if (!config.success || config.data.RUNNER_AUTH_MODE !== "agent_local_subscription" ||
         !options.instanceId || ![config.data.RUNNER_CREDENTIAL_DIR, config.data.RUNNER_WORKSPACE_DIR, config.data.RUNNER_BRIDGE_PREFIX].every(isAbsolute)) {
       throw new RemoteInstanceError("protocol_incompatible", "A native runner requires local subscription authentication and absolute host paths.");
     }
     this.agentId = config.data.RUNNER_AGENT_ID;
     this.runtime = new AgentRuntime({ ...options.runtimeOptions, config: config.data,
+      ...(options.afterSuccessfulLogin ? { afterSuccessfulLogin: options.afterSuccessfulLogin } : {}),
       // Same four-per-ready-agent basis as Supervisor headroom; a lower
       // configured ceiling is supplied by the supervisor. Slots include
       // uncertain owners, not just currently running prompts.
@@ -55,12 +70,42 @@ export class NativeRunner implements RunnerPort {
 
   start(): Promise<void> {
     if (this.stopping) return Promise.reject(unavailable());
-    this.startPromise ??= Promise.resolve().then(async () => {
-      this.startEvents();
-      await this.runtime.start();
-      this.started = !this.stopping;
-    });
+    if (this.startPromise === null) {
+      const starting = Promise.resolve().then(async () => {
+        await this.checkDshProfile();
+        this.startEvents();
+        await this.runtime.start();
+        this.started = !this.stopping;
+      });
+      // A failed start is forgotten, so the supervisor's background retry
+      // starts it afresh instead of replaying the same rejection.
+      starting.catch(() => {
+        if (this.startPromise !== starting) return;
+        this.startPromise = null;
+        this.stopEvents();
+      });
+      this.startPromise = starting;
+    }
     return this.startPromise;
+  }
+
+  /**
+   * The person's own DeepSeek Harness runs only once the Konteks overlay is
+   * proven in force in that exact installation (dsh-profile-check.ts): a dsh
+   * upgrade that stops a patch applying, the ask hook included, never spawns.
+   */
+  private async checkDshProfile(): Promise<void> {
+    const config = this.options.config;
+    if (config.RUNNER_AGENT_ID !== "dsh") return;
+    const { dshHome, konteksDir } = dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
+    if (!config.RUNNER_NATIVE_DSH_ROOT || !config.RUNNER_NATIVE_DSH_ENTRY || !config.RUNNER_NATIVE_DSH_NODE) {
+      throw new RemoteInstanceError("prerequisite_missing", "DeepSeek Harness was not located on this machine.", { diagnostic: "dsh_not_found" });
+    }
+    await (this.options.dshProfileCheck ?? checkDshKonteksProfile)({
+      node: config.RUNNER_NATIVE_DSH_NODE,
+      installation: { root: config.RUNNER_NATIVE_DSH_ROOT, entry: config.RUNNER_NATIVE_DSH_ENTRY, version: config.RUNNER_BRIDGE_VERSION },
+      dshHome, konteksDir,
+    });
   }
 
   stop(): Promise<void> {
@@ -72,6 +117,10 @@ export class NativeRunner implements RunnerPort {
       this.stopEvents();
     });
     return this.stopPromise;
+  }
+
+  async quarantine(reason: string): Promise<void> {
+    await this.runtime.quarantine(reason);
   }
 
   startEvents(): void {
@@ -111,7 +160,11 @@ export class NativeRunner implements RunnerPort {
     const parsed = inputSchema.safeParse(input);
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
-    const { context, readinessDeadlineAt, cwd, mcpServers, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel } = parsed.data;
+    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, browser } = parsed.data;
+    // The session's browser is a stdio MCP server the agent launches from its
+    // own package; composed here, where the package paths are known.
+    const browserServer = browser === undefined ? null : browserMcpServer(this.options.config, browser);
+    const mcpServers = browserServer === null ? parsed.data.mcpServers : [...parsed.data.mcpServers, browserServer];
     const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
       ...(freshProviderSessionOnRestore === undefined ? {} : { freshProviderSessionOnRestore }),
       ...(sessionLabel === undefined ? {} : { sessionLabel }), lifecycle: {

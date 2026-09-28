@@ -3,8 +3,8 @@
  * Secret-canary guard (security-operations-observability.md "Release is
  * blocked by … any test that places a canary … into a log, metric, backup
  * default, or support bundle"). It scans every committed artifact that could
- * ship to a customer — source, Dockerfiles, the Compose template, bootstrap
- * scripts, CI workflows, `.env.example` — for the shared canary markers and
+ * ship to a customer — source, release metadata, bootstrap scripts, CI
+ * workflows, `.env.example` — for the shared canary markers and
  * for credential-shaped literals, and fails on any hit outside the redaction
  * module and its tests.
  */

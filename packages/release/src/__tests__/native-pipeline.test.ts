@@ -5,7 +5,9 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RemoteSignedBundleManifestSchema } from "@konteks/remote-common";
 import { buildReleaseFixture } from "../fixtures.js";
+import { findAgentBridge } from "../bridges.js";
 import {
+  selectNativeModelCapabilityMappings,
   signNativeProductionReleaseManifest,
   verifyNativeRelease,
 } from "../native.js";
@@ -24,7 +26,7 @@ describe("native release pipeline", () => {
     const root = await mkdtemp(join(tmpdir(), "native-release-pipeline-")); roots.push(root);
     const artifacts = targets.flatMap(([os, architecture], targetIndex) => [
       { id: `connector-${os}-${architecture}`, kind: "connector", format: "executable", os, architecture, url: `https://releases.example/v1.2.3/${os}/${architecture}/connector`, digest: digest(String(targetIndex + 1)), sizeBytes: 1024 },
-      ...["claude-code", "codex", "opencode"].map((agentId, agentIndex) => ({
+      ...["claude-code", "codex"].map((agentId, agentIndex) => ({
         id: `${agentId}-${os}-${architecture}`, kind: "agent_bridge", format: "offline_agent_tgz",
         agentId, os, architecture, url: `https://releases.example/v1.2.3/${os}/${architecture}/${agentId}.tgz`,
         digest: digest(String(targetIndex + agentIndex + 2)), profileDigest: digest(String(targetIndex + agentIndex + 5)), sizeBytes: 2048,
@@ -42,18 +44,24 @@ describe("native release pipeline", () => {
     );
     expect(RemoteSignedBundleManifestSchema.safeParse(signed).success).toBe(true);
     expect(manifest).toMatchObject({ bundleVersion: "1.2.3", deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [] });
-    expect(manifest.nativeArtifacts).toHaveLength(20);
+    expect(manifest.nativeArtifacts).toHaveLength(15);
     expect(JSON.stringify(manifest)).not.toMatch(/harness|validation.runtime|gateway|compose|docker|postgres|valkey/i);
     const verified = verifyNativeRelease(
       signed,
       [fixture.root],
       Date.parse("2026-09-26T00:00:00Z"),
     ).manifest;
-    expect(verified.nativeArtifacts).toHaveLength(20);
-    expect(verified.modelCapabilityMappings).toHaveLength(10);
-    expect(verified.modelCapabilityMappings?.map(mapping => mapping.bridgeProfileRef).sort()).toEqual(
+    expect(verified.nativeArtifacts).toHaveLength(15);
+    expect(verified.modelCapabilityMappings).toHaveLength(11);
+    // The person's own DeepSeek Harness: one mapping bound to the agent and its supported versions, on every platform.
+    const host = verified.modelCapabilityMappings?.filter(mapping => mapping.hostAgent !== undefined);
+    expect(host).toEqual([expect.objectContaining({ mappingId: "host-dsh-models", hostAgent: { agentId: "dsh", versions: findAgentBridge("dsh")!.hostInstall!.versions } })]);
+    expect(host?.[0]?.modelIdentities.map(identity => identity.canonicalModelId)).toEqual(["deepseek-flash", "deepseek-v4-pro"]);
+    expect(selectNativeModelCapabilityMappings(verifyNativeRelease(signed, [fixture.root], Date.parse("2026-09-26T00:00:00Z")), { os: "windows", architecture: "amd64" })
+      .map(({ agentId }) => agentId)).toEqual(["claude-code", "codex", "dsh"]);
+    expect(verified.modelCapabilityMappings?.filter(mapping => mapping.hostAgent === undefined).map(mapping => mapping.bridgeProfileRef).sort()).toEqual(
       artifacts
-        .filter(artifact => artifact.kind === "agent_bridge" && artifact.agentId !== "opencode")
+        .filter(artifact => artifact.kind === "agent_bridge")
         .map(artifact => artifact.id)
         .sort(),
     );
@@ -66,6 +74,17 @@ describe("native release pipeline", () => {
     const root = await mkdtemp(join(tmpdir(), "native-release-pipeline-")); roots.push(root);
     const index = join(root, "native-artifacts.json"), out = join(root, "manifest.json");
     await writeFile(index, JSON.stringify({ schemaVersion: 1, artifacts: [] }));
+    expect(() => execFileSync(process.execPath, [resolve("scripts/assemble-release-manifest.mjs"), "--tag", "v1.2.3", "--artifacts", index, "--policy", resolve("release/release-policy.json"), "--out", out], { cwd: resolve("."), stdio: "pipe" })).toThrow();
+    // A retired agent (OpenCode) is never assembled into a release, even beside a complete matrix.
+    const withRetired = targets.flatMap(([os, architecture], targetIndex) => [
+      { id: `connector-${os}-${architecture}`, kind: "connector", format: "executable", os, architecture, url: `https://releases.example/v1.2.3/${os}/${architecture}/connector`, digest: digest(String(targetIndex + 1)), sizeBytes: 1024 },
+      ...["claude-code", "codex", "opencode"].map((agentId, agentIndex) => ({
+        id: `${agentId}-${os}-${architecture}`, kind: "agent_bridge", format: "offline_agent_tgz",
+        agentId, os, architecture, url: `https://releases.example/v1.2.3/${os}/${architecture}/${agentId}.tgz`,
+        digest: digest(String(targetIndex + agentIndex + 2)), profileDigest: digest(String(targetIndex + agentIndex + 5)), sizeBytes: 2048,
+      })),
+    ]);
+    await writeFile(index, JSON.stringify({ schemaVersion: 1, artifacts: withRetired }));
     expect(() => execFileSync(process.execPath, [resolve("scripts/assemble-release-manifest.mjs"), "--tag", "v1.2.3", "--artifacts", index, "--policy", resolve("release/release-policy.json"), "--out", out], { cwd: resolve("."), stdio: "pipe" })).toThrow();
   });
 

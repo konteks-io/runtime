@@ -2,12 +2,11 @@ import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
 const hash = (bytes: Buffer | string) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 
-export function offlineFixture(os = "macos", architecture = "arm64", agentId: "claude-code" | "codex" | "opencode" = "codex") {
+export function offlineFixture(os = "macos", architecture = "arm64", agentId: "claude-code" | "codex" = "codex") {
   const suffix = os === "windows" ? ".exe" : "";
   const family = {
     "claude-code": { bridgePackage: "@agentclientprotocol/claude-agent-acp", bridgeVersion: "0.75.1", toolingPackage: "@anthropic-ai/claude-code", tooling: `bin/claude${suffix}` },
     codex: { bridgePackage: "@agentclientprotocol/codex-acp", bridgeVersion: "1.10.0", toolingPackage: "@openai/codex", tooling: `bin/codex${suffix}` },
-    opencode: { bridgePackage: "opencode-ai", bridgeVersion: "1.2.0", toolingPackage: "opencode-ai", tooling: `bin/opencode${suffix}` },
   }[agentId];
   const files = [
     { path: family.tooling, bytes: Buffer.from(`official-${agentId}-not-executed`), executable: true },

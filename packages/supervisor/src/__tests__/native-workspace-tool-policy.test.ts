@@ -24,10 +24,28 @@ describe("native workspace tool policy", () => {
   it("answers ordinary tool calls by policy instead of deferring them to a human", async () => {
     await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-platform__prd_submit" }), context))
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
+    // The session's preview tools run without a prompt: they only act inside its worktree.
+    await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-preview__preview_start", rawInput: {} }), context))
+      .resolves.toEqual({ kind: "allow", optionId: "allow" });
     await expect(responder.evaluatePermission(request({ kind: "execute", title: "npm test", rawInput: { command: "npm test" } }), context))
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
     await expect(responder.evaluatePermission(request({ kind: "edit", title: "Write", rawInput: { file_path: join(root, "src", "a.ts") } }), context))
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
+  });
+
+  it("allows the QA browser's tools only on a session given the browser, and never the unsafe ones", async () => {
+    const browser = { ...context, browserTools: true };
+    await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-browser__browser_navigate", rawInput: { url: "http://127.0.0.1:43100/" } }), browser))
+      .resolves.toEqual({ kind: "allow", optionId: "allow" });
+    await expect(responder.evaluatePermission(request({ kind: "other", title: "konteks-browser.browser_click" }), browser))
+      .resolves.toEqual({ kind: "allow", optionId: "allow" });
+    await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-browser__browser_navigate" }), context))
+      .resolves.toEqual({ kind: "deny", optionId: "reject" });
+    await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-browser__browser_run_code_unsafe" }), browser))
+      .resolves.toEqual({ kind: "deny", optionId: "reject" });
+    // Human deferral is never how a browser call is decided.
+    await expect(new EvaluatorPolicyResponder(null, () => true).evaluatePermission(request({ kind: "other", title: "mcp__konteks-browser__browser_route" }), browser))
+      .resolves.toEqual({ kind: "deny", optionId: "reject" });
   });
 
   it("denies blocklisted commands, including a shell call judged by its title", async () => {

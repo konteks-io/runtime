@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { createServer, request as httpRequest } from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,8 +11,10 @@ import { SupervisorJournal } from "../state/journal.js";
 import { PermissionBroker, answerIsValid, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest } from "../session/permissions.js";
 import type { DeferredPermissionBody } from "../core/client.js";
 import { EvaluatorPolicyResponder, isSignInElicitation } from "../session/policy-responder.js";
+import { createWorkspaceToolPolicy } from "../session/workspace-tool-policy.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
-import type { RunnerClient } from "../runner-client.js";
+import { renderStructuredOutputContract } from "@konteks/agent-core";
+import type { RunnerPort } from "../runner-port.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import type { OutboundMessage } from "../transport/transport.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
@@ -133,7 +138,7 @@ describe("relayed session (D98/D113/D114)", () => {
         return { delivered: true };
       }),
       closeSession: vi.fn(async () => undefined),
-    } as unknown as RunnerClient;
+    } as unknown as RunnerPort;
     const broker = new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined });
     const closed: string[] = [];
     const session = new RelayedSession(work, {
@@ -145,9 +150,11 @@ describe("relayed session (D98/D113/D114)", () => {
       broker,
       instanceId: "inst",
       redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" }),
-      browserToolUrl: null,
-      workspaceRoot: "/workspace",
-      ...(overrides.deploymentKind === "native_connector" ? { registerReady: async (target: RemoteWorkAssignment, binding: { sessionId: string }, acpSessionRef: string) => ({ workspaceId: target.workspaceId, instanceId: target.instanceId, sessionId: binding.sessionId, channelId: `session:${binding.sessionId}`, assignmentId: target.id, attempt: target.attempt, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner-process", agentId: target.agentRoute.agentId, acpSessionRef, readyRevision: 1, registeredAt: clock.nowIso() }) } : {}),
+      // The runner's workspace folder; prepared inputs check out beneath it.
+      workspaceRoot: "/private/native",
+      // The native path is the only path: verified inputs, then Core readiness.
+      prepareInputs: async (target: RemoteWorkAssignment) => ({ binding: { workspaceId: target.workspaceId, sessionId: target.source.kind === "conversation" ? target.source.sessionId : "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
+      registerReady: async (target: RemoteWorkAssignment, binding: { sessionId: string }, acpSessionRef: string) => ({ workspaceId: target.workspaceId, instanceId: target.instanceId, sessionId: binding.sessionId, channelId: `session:${binding.sessionId}`, assignmentId: target.id, attempt: target.attempt, claimId: "claim", recoveryEpoch: 0, runnerIncarnation: "runner-process", agentId: target.agentRoute.agentId, acpSessionRef, readyRevision: 1, registeredAt: clock.nowIso() }),
       onUsage: async () => undefined,
       onClosed: async (_session, reason) => void closed.push(reason),
       ...overrides,
@@ -155,16 +162,212 @@ describe("relayed session (D98/D113/D114)", () => {
     return { session, sent, runner, runnerCalls, journal, closed, transport };
   }
 
+  it.each([false, true])("admits a legacy Codex reference only when the pinned owner proves it unloaded (unloaded=%s)", async unloaded => {
+    const assertLegacyCodexThreadUnloaded = vi.fn(async () => unloaded);
+    const f = await build({ restoreReference: "legacy-acp-ref", assertLegacyCodexThreadUnloaded });
+    try {
+      if (unloaded) {
+        await f.session.bootstrap();
+        expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ restoreAcpSessionRef: "legacy-acp-ref" }), undefined);
+      } else {
+        await expect(f.session.bootstrap()).rejects.toMatchObject({ code: "recovery_required" });
+        expect(f.runner.createSession).not.toHaveBeenCalled();
+      }
+      expect(assertLegacyCodexThreadUnloaded).toHaveBeenCalledWith("legacy-acp-ref");
+    } finally { await f.session.close("cancelled"); }
+  });
+
   it("bootstraps with the redeemed token in mcpServers and announces session_ready", async () => {
     const { session, sent, runnerCalls, journal } = await build();
     await session.bootstrap();
-    expect((runnerCalls[0]?.[1][0] as { mcpServers: unknown[] }).mcpServers).toEqual([{ type: "http", name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }]);
+    // The agent reaches the platform through the local capability facade; the bearer never leaves memory.
+    const mcpServers = (runnerCalls[0]?.[1][0] as { mcpServers: Array<{ url: string; headers: Array<{ value: string }> }> }).mcpServers;
+    // Every session also gets the turn result tool (submit_result), generic until a turn asks for a result.
+    expect(mcpServers).toEqual([
+      { type: "http", name: "konteks", url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/), headers: [{ name: "authorization", value: expect.stringMatching(/^Bearer /) }] },
+      { type: "http", name: "konteks-result", url: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/), headers: [{ name: "authorization", value: expect.stringMatching(/^Bearer /) }] },
+    ]);
+    expect(JSON.stringify(mcpServers)).not.toContain("cap-token");
     expect(sent[0]?.body).toMatchObject({ kind: "session_ready", assignmentId: "asg", acpSessionRef: "acp-1", resumed: false, agentId: "codex" });
     expect(JSON.stringify(journal.assignments.all())).not.toContain("cap-token");
+    await session.close("cancelled");
+  });
+
+  it.each(["live", "restored"] as const)("keeps a %s Codex thread's MCP transport bound to only the current fenced turn", async continuation => {
+    const seen: string[] = [];
+    let holdNext = false;
+    let inFlightStarted!: () => void;
+    let releaseInFlight!: () => void;
+    const inFlightSeen = new Promise<void>(resolve => { inFlightStarted = resolve; });
+    const inFlightRelease = new Promise<void>(resolve => { releaseInFlight = resolve; });
+    const upstream = createServer((request, response) => {
+      seen.push(request.headers.authorization ?? "");
+      const finish = () => {
+        response.setHeader("content-type", "application/json");
+        response.end('{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}');
+      };
+      if (holdNext) {
+        holdNext = false;
+        inFlightStarted();
+        void inFlightRelease.then(finish);
+      } else finish();
+    });
+    await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("missing upstream address");
+    const upstreamUrl = `http://127.0.0.1:${address.port}/mcp`;
+    const capability = (bearer: string) => ({ mcpServer: { name: "konteks", url: upstreamUrl,
+      headers: [{ name: "authorization", value: `Bearer ${bearer}` }] }, expiresAt: "2026-09-07T00:00:00Z" });
+    const call = (entry: { url: string; headers: Array<{ name: string; value: string }> }) =>
+      fetch(entry.url, { method: "POST", headers: { ...Object.fromEntries(entry.headers.map(header => [header.name, header.value])), "content-type": "application/json" },
+        body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' });
+    let first: Awaited<ReturnType<typeof build>> | undefined;
+    let second: Awaited<ReturnType<typeof build>> | undefined;
+    try {
+      first = await build({ redeemCapabilityToken: async () => capability("turn-A"), recordCompletedSettlement: async () => undefined });
+      vi.mocked(first.runner.closeSession).mockResolvedValue({ completion: "native_continuation_ready" });
+      await first.session.bootstrap();
+      const firstEntry = (first.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ url: string; headers: Array<{ name: string; value: string }> }> }).mcpServers[0]!;
+      expect((await call(firstEntry)).status).toBe(200);
+      expect(seen).toEqual(["Bearer turn-A"]);
+
+      // Hold a request admitted under A across the ownership handoff.
+      holdNext = true;
+      const inFlight = call(firstEntry).catch(() => undefined);
+      await inFlightSeen;
+
+      // A completed owner has no authority while the provider thread remains loaded.
+      await first.session.close("completed");
+      const betweenTurns = await call(firstEntry).then(response => response.status, () => "connection_refused" as const);
+      expect([503, "connection_refused"]).toContain(betweenTurns);
+      expect(seen).toEqual(["Bearer turn-A", "Bearer turn-A"]);
+
+      const nextAssignment = { ...assignment, id: "asg-B", attempt: 2, source: { ...assignment.source, turnRef: "turn-B" } } as RemoteWorkAssignment;
+      second = await build({ redeemCapabilityToken: async () => capability("turn-B"),
+        mcpLocalTransport: { port: Number(new URL(firstEntry.url).port), credential: firstEntry.headers[0]!.value.slice("Bearer ".length) },
+        activateExecution: async () => continuation === "live" ? { continueReference: "acp-1" } : { restoreReference: "acp-1" } }, nextAssignment);
+      vi.mocked(second.runner.createSession).mockResolvedValue({ acpSessionRef: "acp-1", resumed: true, capabilities: { forkSession: false, sessionResume: true } });
+      await second.session.bootstrap();
+      // Codex app-server can accept thread/resume yet ignore the new MCP config
+      // for a loaded thread. The provider therefore keeps calling firstEntry.
+      expect((await call(firstEntry)).status).toBe(200);
+      releaseInFlight();
+      await inFlight;
+      expect(seen).toEqual(["Bearer turn-A", "Bearer turn-A", "Bearer turn-B"]);
+    } finally {
+      releaseInFlight();
+      await second?.session.close("cancelled");
+      await first?.session.close("cancelled");
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
+  });
+
+  describe("preview tools (native preview)", () => {
+    function previewAccess() {
+      const status = (sessionId: string, state: "running" | "stopped") => ({ sessionId, state, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: state, startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [] });
+      return { start: vi.fn(async (sessionId: string) => status(sessionId, "running")), stop: vi.fn(async (sessionId: string) => status(sessionId, "stopped")), status: vi.fn((sessionId: string) => status(sessionId, "running")), touch: vi.fn(), permit: vi.fn(), forget: vi.fn() };
+    }
+
+    it("mounts the session's preview tools beside the platform facade, bound to its session and worktree", async () => {
+      const preview = previewAccess();
+      const f = await build({ preview });
+      await f.session.bootstrap();
+      const mcpServers = (f.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string; url: string; headers: Array<{ value: string }> }> }).mcpServers;
+      expect(mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-preview", "konteks-result"]);
+      const tools = mcpServers[1]!;
+      expect(tools.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+      const answer = await (await fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value, "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview_start", arguments: {} } }) })).json();
+      expect(answer).toMatchObject({ result: { structuredContent: { sessionId: "s", state: "running" } } });
+      expect(preview.start).toHaveBeenCalledWith("s", "/private/native/checkout");
+      await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } } } });
+      expect(preview.touch).toHaveBeenCalledWith("s");
+      await f.session.close("cancelled");
+      expect(preview.stop).toHaveBeenCalledWith("s", "cancelled");
+      await expect(fetch(tools.url, { method: "POST", headers: { authorization: tools.headers[0]!.value }, body: "{}" })).rejects.toThrow();
+    });
+
+    it("lets a viewer start the preview in the session's worktree while the session lasts", async () => {
+      const preview = previewAccess();
+      const f = await build({ preview });
+      await f.session.bootstrap();
+      expect(preview.permit).toHaveBeenCalledWith("s", "/private/native/checkout");
+      expect(preview.forget).not.toHaveBeenCalled();
+      await f.session.close("cancelled");
+      expect(preview.forget).toHaveBeenCalledWith("s");
+    });
+
+    it("gives planning sessions no preview tools", async () => {
+      const preview = previewAccess();
+      const f = await build({ preview }, { ...assignment, kind: "planning" } as RemoteWorkAssignment);
+      await f.session.bootstrap();
+      const mcpServers = (f.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string }> }).mcpServers;
+      expect(mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-result"]);
+      await f.session.close("cancelled");
+      expect(preview.stop).not.toHaveBeenCalled();
+      expect(preview.permit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("QA browser (Claude Code and Codex)", () => {
+    function access(origin: () => string | null) {
+      const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
+      return { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(), forget: vi.fn(),
+        origin: vi.fn((_sessionId: string) => origin()), browsersPath: "/private/native/browsers" };
+    }
+    const viaProxy = (proxyUrl: string, url: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const proxy = new URL(proxyUrl);
+      const req = httpRequest({ host: proxy.hostname, port: proxy.port, method: "GET", path: url, headers: { host: new URL(url).host } }, res => {
+        let body = "";
+        res.on("data", chunk => { body += chunk; });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+
+    it("gives a validation session a browser whose gateway reaches only the session's running preview", async () => {
+      const upstream = createServer((_req, res) => res.end("the preview"));
+      await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+      const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+      const preview = access(() => origin);
+      const f = await build({ preview }, { ...assignment, kind: "validation" } as RemoteWorkAssignment);
+      (f.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+      await f.session.bootstrap();
+      const input = f.runnerCalls[0]?.[1][0] as { browser?: { proxyUrl: string; outputDir: string; browsersPath: string }; mcpServers: Array<{ name: string }> };
+      expect(input.mcpServers.map(server => server.name)).toEqual(["konteks", "konteks-preview", "konteks-result"]);
+      expect(input.browser).toMatchObject({ proxyUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), browsersPath: "/private/native/browsers" });
+      expect(existsSync(input.browser!.outputDir)).toBe(true);
+      await expect(viaProxy(input.browser!.proxyUrl, `${origin}/`)).resolves.toEqual({ status: 200, body: "the preview" });
+      expect(preview.touch).toHaveBeenCalledWith("s");
+      expect((await viaProxy(input.browser!.proxyUrl, "http://127.0.0.1:1/")).status).toBe(403);
+      await f.session.close("cancelled");
+      await expect(viaProxy(input.browser!.proxyUrl, `${origin}/`)).rejects.toThrow();
+      expect(existsSync(input.browser!.outputDir)).toBe(false);
+      upstream.close();
+    });
+
+    it("gives a conversation turn (a QA-mode chat) the browser too, but not planning or an agent without one (DeepSeek Harness)", async () => {
+      const assistant = await build({ preview: access(() => null) });
+      (assistant.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+      await assistant.session.bootstrap();
+      expect((assistant.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toMatchObject({ proxyUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/) });
+      await assistant.session.close("cancelled");
+      const planning = await build({ preview: access(() => null) }, { ...assignment, kind: "planning" } as RemoteWorkAssignment);
+      (planning.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+      await planning.session.bootstrap();
+      expect((planning.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
+      await planning.session.close("cancelled");
+      const dsh = await build({ preview: access(() => null) }, { ...assignment, kind: "validation", agentRoute: { ...assignment.agentRoute, agentId: "dsh" } } as RemoteWorkAssignment);
+      (dsh.runner as { browserVersion?: () => string | null }).browserVersion = () => null;
+      await dsh.session.bootstrap();
+      expect((dsh.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
+      await dsh.session.close("cancelled");
+    });
   });
 
   it("reports native interruption even when the broken relay cannot carry session_closed", async () => {
-    const f = await build({ deploymentKind: "native_connector",
+    const f = await build({
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
     });
     await f.session.bootstrap();
@@ -174,6 +377,60 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(f.closed).toEqual(["relay_replay_gap"]);
     await f.session.close("relay_replay_gap");
     expect(f.closed).toHaveLength(1);
+  });
+
+  describe("DeepSeek Harness tool governance (dsh-runtime-support CP3)", () => {
+    const dshWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "dsh" } };
+    const options = [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }, { optionId: "reject-once", name: "Reject", kind: "reject_once" }];
+    async function dshSession() {
+      const quarantine = vi.fn(async () => undefined);
+      const f = await build({ policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) }, dshWork);
+      (f.runner as unknown as { quarantine: typeof quarantine }).quarantine = quarantine;
+      await f.session.bootstrap();
+      const toolCall = (toolCallId: string, title: string, rawInput: Record<string, unknown>) =>
+        f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "tool_call", toolCallId, title, kind: "other", status: "in_progress", rawInput } } });
+      const finished = (toolCallId: string) =>
+        f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "tool_call_update", toolCallId, status: "completed", content: [] } } });
+      const ask = (requestId: string, toolCallId: string) =>
+        f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId }, options } });
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
+      return { ...f, quarantine, toolCall, finished, ask, answer };
+    }
+
+    it("judges the real command and path behind each dsh request with the native policy", async () => {
+      const f = await dshSession();
+      await f.toolCall("t-echo", "bash", { command: "echo hello" }); await f.ask("p-echo", "t-echo");
+      await f.toolCall("t-push", "bash", { command: "git push origin main" }); await f.ask("p-push", "t-push");
+      await f.toolCall("t-sudo", "bash", { command: "sudo rm -rf /tmp/x" }); await f.ask("p-sudo", "t-sudo");
+      await f.toolCall("t-in", "write", { file_path: "notes.txt", content: "hi" }); await f.ask("p-in", "t-in");
+      await f.toolCall("t-out", "write", { file_path: "/etc/outside.txt", content: "no" }); await f.ask("p-out", "t-out");
+      await f.toolCall("t-mcp", "mcp__konteks-platform__platform__builtin__echo", { text: "ping" }); await f.ask("p-mcp", "t-mcp");
+      await f.toolCall("t-esc", "bash", { command: "ls", sandbox_permissions: "danger-full-access", justification: "x" }); await f.ask("p-esc", "t-esc");
+      await f.ask("p-ghost", "t-never-seen");
+      expect({ echo: f.answer("p-echo"), push: f.answer("p-push"), sudo: f.answer("p-sudo"), inside: f.answer("p-in"), outside: f.answer("p-out"), mcp: f.answer("p-mcp"), escalation: f.answer("p-esc"), ghost: f.answer("p-ghost") })
+        .toEqual({ echo: "allow-once", push: "reject-once", sudo: "reject-once", inside: "allow-once", outside: "reject-once", mcp: "allow-once", escalation: "reject-once", ghost: "reject-once" });
+      expect(f.quarantine).not.toHaveBeenCalled();
+    });
+
+    it("gives dsh tool calls their ACP kind and the platform tool name in relayed activity", async () => {
+      const f = await dshSession();
+      await f.toolCall("t-1", "bash", { command: "ls" });
+      await f.toolCall("t-2", "mcp__konteks-platform__platform__builtin__echo", { text: "ping" });
+      const updates = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } }).filter(body => body.method === "session/update").map(body => body.params!.update!);
+      expect(updates[0]).toMatchObject({ toolCallId: "t-1", kind: "execute", title: "bash" });
+      expect(updates[1]).toMatchObject({ toolCallId: "t-2", name: "platform__builtin__echo" });
+    });
+
+    it("stops the turn and takes dsh out of service when a gated tool ran without asking", async () => {
+      const f = await dshSession();
+      await f.toolCall("t-ok", "bash", { command: "ls" }); await f.ask("p-ok", "t-ok"); await f.finished("t-ok");
+      await f.toolCall("t-read", "read", { file_path: "a" }); await f.finished("t-read");
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.toolCall("t-bypass", "bash", { command: "curl https://example.com" }); await f.finished("t-bypass");
+      expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
+      expect(f.quarantine).toHaveBeenCalledWith(expect.stringMatching(/without asking/));
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
   });
 
   it("relays actual runner message/tool updates with the opaque session reference, never hidden thoughts", async () => {
@@ -202,14 +459,9 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(JSON.stringify(base.sent)).not.toMatch(/private-bridge-session|private-thought-canary|wrong-session-canary/);
   });
 
-  it("requires native preparation and never announces readiness after a staging failure", async () => {
-    const missing = await build({ deploymentKind: "native_connector" });
-    await expect(missing.session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable" });
-    expect(missing.runner.createSession).not.toHaveBeenCalled();
-    expect(missing.sent).toEqual([]);
+  it("never announces readiness after a staging failure", async () => {
     const warn = vi.fn();
     const failed = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => { throw new Error("input delivery failed secret-body"); },
       logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
     });
@@ -233,7 +485,6 @@ describe("relayed session (D98/D113/D114)", () => {
       return { continueReference: "continued-ref" };
     });
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => {
         order.push("inputs");
         return { binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined };
@@ -244,7 +495,7 @@ describe("relayed session (D98/D113/D114)", () => {
       },
       reserveChannel: () => () => undefined,
       activateExecution,
-    });
+    }, { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } });
 
     await session.bootstrap();
 
@@ -259,7 +510,6 @@ describe("relayed session (D98/D113/D114)", () => {
     const toolWiring = new Promise<void>(resolve => { finishWiring = resolve; });
     const info = vi.fn();
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       logger: { warn: vi.fn(), info, error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
       prepareInputs: async () => {
         order.push("inputs");
@@ -290,7 +540,7 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(order).toEqual(["inputs", "capability", "wired", "activate", "acp"]);
     const stages = info.mock.calls.filter(call => (call[0] as { event?: string }).event === "native.bootstrap.stage")
       .map(call => call[0] as { stage: string; durationMs: number });
-    expect(stages.map(stage => stage.stage)).toEqual(["input_preparation", "capability_redemption", "facade", "tool_wiring_wait",
+    expect(stages.map(stage => stage.stage)).toEqual(["input_preparation", "capability_redemption", "facade", "result_tool", "tool_wiring_wait",
       "activation", "acp_session_bootstrap", "readiness"]);
     for (const stage of stages) expect(stage.durationMs).toBeGreaterThanOrEqual(0);
   });
@@ -307,12 +557,11 @@ describe("relayed session (D98/D113/D114)", () => {
 
   it("prefers a live continuation over the restart-only restore fallback", async () => {
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       reserveChannel: () => () => undefined,
       restoreReference: "durable-restart-ref",
       activateExecution: async () => ({ continueReference: "live-ref" }),
-    });
+    }, { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } });
 
     await session.bootstrap();
 
@@ -326,7 +575,6 @@ describe("relayed session (D98/D113/D114)", () => {
   it("uses staged conversation context instead of stale Claude provider tools after restart", async () => {
     const claude = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } };
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       reserveChannel: () => () => undefined,
       restoreReference: "durable-restart-ref",
@@ -343,7 +591,6 @@ describe("relayed session (D98/D113/D114)", () => {
   it("does not activate local execution ownership when cloud preparation fails", async () => {
     const activateExecution = vi.fn(async () => ({ continueReference: "continued-ref" }));
     const { session, runner } = await build({
-      deploymentKind: "native_connector",
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       redeemCapabilityToken: async () => { throw new RemoteInstanceError("temporarily_unavailable", "Core is restarting.", { retryable: true }); },
       activateExecution,
@@ -356,7 +603,6 @@ describe("relayed session (D98/D113/D114)", () => {
 
   it("closes a native turn that ends without end_turn as an agent exit so a terminal reaches Core", async () => {
     const { session, closed, runner, journal, sent } = await build({
-      deploymentKind: "native_connector",
       reserveChannel: () => vi.fn(),
       reserveExecutionReference: async () => undefined,
       recordExecutionProcessOwner: async () => undefined,
@@ -380,7 +626,6 @@ describe("relayed session (D98/D113/D114)", () => {
     for (const attempt of [1, 2]) {
       const work = { ...assignment, id: `asg-${attempt}`, attempt };
       const { session, sent, transport } = await build({
-        deploymentKind: "native_connector",
         prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: work.id, instanceId: "inst", attempt }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       }, work);
       expect(session.channelId).toBeNull();
@@ -397,7 +642,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("does not announce or close an invented native channel when cancelled before preparation", async () => {
-    const { session, sent, transport } = await build({ deploymentKind: "native_connector" });
+    const { session, sent, transport } = await build();
     await session.close("cancelled");
     expect(session.channelId).toBeNull();
     expect(sent).toEqual([]);
@@ -405,19 +650,11 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(transport.closeChannel).not.toHaveBeenCalled();
   });
 
-  it("requires Core registration for native bootstrap before creating a local agent session", async () => {
-    const { session, runner } = await build({ deploymentKind: "native_connector", registerReady: undefined,
-      prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
-    });
-    await expect(session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable" });
-    expect(runner.createSession).not.toHaveBeenCalled();
-  });
-
   it("waits for Core readiness and never prompts or emits readiness while registration is pending", async () => {
     let reject!: (error: Error) => void;
     let entered!: () => void;
     const registering = new Promise<void>(resolve => { entered = resolve; });
-    const { session, runner, sent, transport } = await build({ deploymentKind: "native_connector",
+    const { session, runner, sent, transport } = await build({
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       registerReady: async () => { entered(); return new Promise((_, fail) => { reject = fail; }); },
     });
@@ -446,7 +683,7 @@ describe("relayed session (D98/D113/D114)", () => {
       send: (message: OutboundMessage) => mux.send(message.channelId, message.channel, message.body, message.signature) } as TransportManager;
     for (const attempt of [1, 2]) {
       const work = { ...assignment, id: `asg-${attempt}`, attempt };
-      const { session } = await build({ deploymentKind: "native_connector", transport,
+      const { session } = await build({ transport,
         prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: work.id, instanceId: "inst", attempt }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
       }, work);
       await session.bootstrap();
@@ -464,7 +701,7 @@ describe("relayed session (D98/D113/D114)", () => {
     const { session, sent } = await build();
     await session.bootstrap();
     await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
-      sessionId: "acp-1", update: { sessionUpdate: "tool_call", toolCallId: "tool", title: `Test /workspace/asg/src/index.ts using ${SECRET_CANARIES.openAiKey}`, status: "in_progress",
+      sessionId: "acp-1", update: { sessionUpdate: "tool_call", toolCallId: "tool", title: `Test /private/native/checkout/src/index.ts using ${SECRET_CANARIES.openAiKey}`, status: "in_progress",
         rawInput: { password: "unshaped-input-secret" }, rawOutput: { value: "unshaped-output-secret" },
         locations: [{ path: "/Users/private-person/private-repo/secret.ts" }],
         content: [{ type: "content", content: { type: "text", text: `Read /Users/private-person/secret.txt with ${SECRET_CANARIES.bearer}` } }],
@@ -475,9 +712,65 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(serialized).not.toMatch(/unshaped-input-secret|unshaped-output-secret|private-person|metadata-canary/);
     expect(serialized).not.toContain(SECRET_CANARIES.openAiKey);
     expect(serialized).not.toContain(SECRET_CANARIES.bearer);
-    expect(serialized).not.toContain("/workspace/asg");
+    expect(serialized).not.toContain("/private/native/checkout");
     expect(sent.at(-1)?.body).toMatchObject({ kind: "acp", method: "session/update", params: { sessionId: "acp-1", update: { toolCallId: "tool", status: "in_progress" } } });
     expect(serialized).toContain("src/index.ts");
+  });
+
+  it.each(["completed", "failed"] as const)("relays a %s terminal for a deep private MCP result without changing its public outcome", async status => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    const deepBreakdown = { result: { structuredContent: { breakdown: { roadmap: { milestones: [{ sprints: [{
+      id: "S1", tickets: [{ ref: "T2", dependsOnRefs: ["T1"] }],
+    }] }] } } } } };
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: {
+        sessionUpdate: "tool_call_update", toolCallId: "exec-breakdown", status,
+        rawInput: { token: SECRET_CANARIES.openAiKey }, rawOutput: deepBreakdown,
+        content: [{ type: "content", content: { type: "text", text: `Plan ready in /private/native/checkout with ${SECRET_CANARIES.bearer}` } }],
+      },
+    } });
+    expect(sent).toHaveLength(before + 1);
+    expect(sent.at(-1)?.body).toMatchObject({ kind: "acp", method: "session/update", params: {
+      update: { toolCallId: "exec-breakdown", status, content: [{ type: "content", content: { type: "text", text: expect.stringContaining("Plan ready") } }] },
+    } });
+    const serialized = JSON.stringify(sent.at(-1)?.body);
+    expect(serialized).not.toMatch(/rawInput|rawOutput|structuredContent|private\/native/);
+    expect(serialized).not.toContain(SECRET_CANARIES.openAiKey);
+    expect(serialized).not.toContain(SECRET_CANARIES.bearer);
+    expect(serialized).toContain("Bearer [redacted]");
+    expect(session.counters.malformedResponses).toBe(0);
+  });
+
+  it("allows an oversized private tool result without forwarding it", async () => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: {
+        sessionUpdate: "tool_call_update", toolCallId: "oversized-private", status: "completed",
+        rawOutput: { result: "x".repeat(530_000) },
+      },
+    } });
+    expect(sent).toHaveLength(before + 1);
+    expect(sent.at(-1)?.body).toMatchObject({ kind: "acp", params: { update: { toolCallId: "oversized-private", status: "completed" } } });
+    expect(JSON.stringify(sent.at(-1)?.body)).not.toContain("rawOutput");
+    expect(session.counters.malformedResponses).toBe(0);
+  });
+
+  it("still rejects invalid public tool fields and oversized public content after private payload normalization", async () => {
+    const { session, sent } = await build();
+    await session.bootstrap();
+    const before = sent.length;
+    for (const update of [
+      { sessionUpdate: "tool_call_update", toolCallId: "bad-title", status: "completed", title: "x".repeat(2049), rawOutput: { secret: "hidden" } },
+      { sessionUpdate: "tool_call_update", toolCallId: "bad-content", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(70_000) } }], rawOutput: { secret: "hidden" } },
+    ]) {
+      await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update } });
+    }
+    expect(sent).toHaveLength(before);
+    expect(session.counters.malformedResponses).toBe(2);
   });
 
   it.each([
@@ -552,7 +845,7 @@ describe("relayed session (D98/D113/D114)", () => {
     const beforePrompt = vi.fn(async () => undefined);
     const skillInstructions = "Read the required org skill at /private/native/org/review/SKILL.md";
     const prepareInputs = vi.fn(async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions, beforePrompt }));
-    const { session, runner, sent, journal } = await build({ deploymentKind: "native_connector", prepareInputs });
+    const { session, runner, sent, journal } = await build({ prepareInputs });
     await session.bootstrap();
     expect(prepareInputs).toHaveBeenCalledWith(assignment);
     expect(sent[0]?.body).toMatchObject({ kind: 'session_ready', attempt: 1, recoveryEpoch: 0, readyRevision: 1 });
@@ -566,7 +859,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("rejects a prepared checkout bound to a different assignment before runner creation", async () => {
-    const { session, runner } = await build({ deploymentKind: "native_connector", prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "other", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }) });
+    const { session, runner } = await build({ prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "other", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }) });
     await expect(session.bootstrap()).rejects.toMatchObject({ code: "workspace_binding_invalid" });
     expect(runner.createSession).not.toHaveBeenCalled();
   });
@@ -574,7 +867,7 @@ describe("relayed session (D98/D113/D114)", () => {
   it("does not create an agent session after cancellation during input staging", async () => {
     let finish!: (value: { binding: { workspaceId: string; sessionId: string; assignmentId: string; instanceId: string; attempt: number }; cwd: string; skillInstructions: string; beforePrompt: () => Promise<void> }) => void;
     const preparation = new Promise<Parameters<typeof finish>[0]>(resolve => { finish = resolve; });
-    const { session, runner, sent } = await build({ deploymentKind: "native_connector", prepareInputs: async () => preparation });
+    const { session, runner, sent } = await build({ prepareInputs: async () => preparation });
     const boot = session.bootstrap();
     await session.close("cancelled");
     finish({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined });
@@ -587,7 +880,6 @@ describe("relayed session (D98/D113/D114)", () => {
     const recordCompletedSettlement = vi.fn(async () => undefined);
     const release = vi.fn();
     const { session, sent, closed, transport, runner, journal } = await build({
-      deploymentKind: "native_connector",
       recordCompletedSettlement,
       reserveChannel: () => release,
       reserveExecutionReference: async () => undefined,
@@ -627,7 +919,7 @@ describe("relayed session (D98/D113/D114)", () => {
     const release = vi.fn();
     const recordCompletedSettlement = vi.fn(async () => { if (failure === "write_failed") throw new Error("disk unavailable"); });
     const { session, sent, closed, runner, journal } = await build({
-      deploymentKind: "native_connector", recordCompletedSettlement,
+      recordCompletedSettlement,
       reserveChannel: () => release,
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
     });
@@ -645,7 +937,7 @@ describe("relayed session (D98/D113/D114)", () => {
   it.each([true, false])("requires independent recovery settlement after a completed journal failure (settled=%s)", async settled => {
     const release = vi.fn();
     const { session, sent, closed, runner } = await build({
-      deploymentKind: "native_connector", reserveChannel: () => release,
+      reserveChannel: () => release,
       recordCompletedSettlement: async () => { throw new Error("disk unavailable"); },
       prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
     });
@@ -664,8 +956,12 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(sent.some(message => (message.body as { kind?: string }).kind === "session_closed")).toBe(false);
   });
 
+  /** A native validation session: its checkout source has no execution gate, so ACP frames flow directly. */
+  const validation: RemoteWorkAssignment = { ...assignment, kind: "validation", agentRoute: { requiredRole: "qa", agentId: "codex" },
+    source: { kind: "harness_task_checkout", portability: "instance_bound", ownerInstanceId: "inst", workspaceRef: "ref" } };
+
   it("journals a received prompt, completes it once with the same id and method, and rejects duplicates/unknown completions", async () => {
-    const { session, sent, runner, journal } = await build();
+    const { session, sent, runner, journal } = await build({}, validation);
     await session.bootstrap();
     await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "hi" }] } });
     expect(runner.prompt).toHaveBeenCalledWith("acp-1", "p1", { sessionId: "acp-1", prompt: [{ type: "text", text: "hi" }] });
@@ -679,10 +975,133 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(session.counters.unknownCompletions).toBe(2);
   });
 
+  describe("structured result (submit_result)", () => {
+    const schema = { type: "object", properties: { verdict: { type: "string", enum: ["pass", "fail"] } }, required: ["verdict"], additionalProperties: false };
+    const contract = renderStructuredOutputContract(schema);
+    const promptWithContract = { sessionId: "acp-1", prompt: [{ type: "text" as const, text: "Review the change." }, { type: "text" as const, text: contract }] };
+
+    /** The session's result tool as its agent reaches it; `relists` makes it behave like Claude Code (re-read tools on list_changed). */
+    async function resultTool(runnerCalls: Array<[string, unknown[]]>, relists: boolean) {
+      const servers = (runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string; url: string; headers: Array<{ value: string }> }> }).mcpServers;
+      const tool = servers.find(server => server.name === "konteks-result")!;
+      const headers = { authorization: tool.headers[0]!.value, "content-type": "application/json" };
+      const post = async (body: unknown) => (await fetch(tool.url, { method: "POST", headers, body: JSON.stringify(body) })).json() as Promise<{ result: { tools?: Array<{ inputSchema: unknown }>; content: Array<{ text: string }>; isError?: boolean } }>;
+      const list = () => post({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+      const stream = await fetch(tool.url, { headers: { authorization: tool.headers[0]!.value, accept: "text/event-stream" } });
+      const reader = stream.body!.getReader();
+      void (async () => {
+        for (;;) {
+          const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true }));
+          if (done) return;
+          if (relists && new TextDecoder().decode(value).includes("list_changed")) void list();
+        }
+      })();
+      const submit = (args: unknown) => post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "submit_result", arguments: args } });
+      return { list, submit, stop: () => reader.cancel().catch(() => undefined) };
+    }
+
+    it("lifts the contract into the tool, prompts with one line, and returns the tool's value with the completion", async () => {
+      const { session, sent, runner, runnerCalls } = await build({}, validation);
+      await session.bootstrap();
+      const agent = await resultTool(runnerCalls, true);
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      // The agent read the tool list again, so the schema is only in the tool definition.
+      expect(runner.prompt).toHaveBeenCalledWith("acp-1", "p1", { sessionId: "acp-1", prompt: [{ type: "text", text: "Review the change." }, { type: "text", text: "When you are finished, call `submit_result` once with your result." }] });
+      expect((await agent.list()).result.tools![0]!.inputSchema).toEqual(schema);
+      const wrong = await agent.submit({ verdict: "maybe" });
+      expect(wrong.result.isError).toBe(true);
+      expect(wrong.result.content[0]!.text).toContain("/verdict");
+      await agent.submit({ verdict: "pass" });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn", usage: { totalTokens: 3, inputTokens: 1, outputTokens: 2 } } });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p1", method: "session/prompt", result: { stopReason: "end_turn", usage: { totalTokens: 3, inputTokens: 1, outputTokens: 2 }, structuredOutput: { source: "tool", value: { verdict: "pass" } } } });
+      // The turn is over: the tool is generic again.
+      expect((await agent.list()).result.tools![0]!.inputSchema).toEqual({ type: "object", additionalProperties: true });
+      await agent.stop();
+      await session.close("cancelled");
+    });
+
+    it("puts the schema in the prompt line for an agent that keeps its first tool list (Codex), and still validates the call", async () => {
+      const { session, sent, runner, runnerCalls } = await build({}, validation);
+      await session.bootstrap();
+      const agent = await resultTool(runnerCalls, false);
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      const forwarded = (vi.mocked(runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+      expect(forwarded[1]!.text).toContain("call the `submit_result` tool once with your whole result as its arguments");
+      expect(forwarded[1]!.text).toContain(JSON.stringify(schema, null, 2));
+      expect(forwarded[1]!.text).not.toContain("konteks-structured-output");
+      await agent.submit({ verdict: "fail" });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } });
+      expect(sent.at(-1)?.body).toMatchObject({ result: { structuredOutput: { source: "tool", value: { verdict: "fail" } } } });
+      await agent.stop();
+      await session.close("cancelled");
+    });
+
+    it("accepts a valid fenced result in the agent's text when the tool was not called", async () => {
+      const { session, sent, runner } = await build({}, validation);
+      await session.bootstrap();
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done.\n```konteks-structured-output\n{\"verdict\":" } } } });
+      await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\"pass\"}\n```" } } } });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } });
+      expect(runner.prompt).toHaveBeenCalledTimes(1);
+      expect(sent.at(-1)?.body).toMatchObject({ kind: "acp_result", id: "p1", result: { structuredOutput: { source: "fence", value: { verdict: "pass" } } } });
+      await session.close("cancelled");
+    });
+
+    it("asks once more in the same session when the turn ended with no result, and reports the original prompt after it", async () => {
+      const { session, sent, runner, runnerCalls } = await build({}, validation);
+      await session.bootstrap();
+      const agent = await resultTool(runnerCalls, true);
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "I think it passes." } } } });
+      const before = sent.length;
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn", usage: { totalTokens: 3, inputTokens: 1, outputTokens: 2 } } });
+      // Nothing reported yet: the follow-up runs in the same ACP session.
+      expect(sent.slice(before).some(message => (message.body as { kind?: string }).kind === "acp_result")).toBe(false);
+      expect(runner.prompt).toHaveBeenLastCalledWith("acp-1", "p1#konteks-result-follow-up", { prompt: [{ type: "text", text: "You did not call `submit_result` with a valid result. Call it now, once, with your whole result." }] });
+      await agent.submit({ verdict: "pass" });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1#konteks-result-follow-up", result: { stopReason: "end_turn", usage: { totalTokens: 5, inputTokens: 4, outputTokens: 1 } } });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p1", method: "session/prompt", result: { stopReason: "end_turn", usage: { totalTokens: 8, inputTokens: 5, outputTokens: 3 }, structuredOutput: { source: "follow_up", value: { verdict: "pass" } } } });
+      expect(runner.prompt).toHaveBeenCalledTimes(2);
+      await agent.stop();
+      await session.close("cancelled");
+    });
+
+    it("reports the turn without a result when the follow-up also fails, and never asks twice", async () => {
+      const { session, sent, runner } = await build({}, validation);
+      await session.bootstrap();
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1#konteks-result-follow-up", result: { stopReason: "end_turn" } });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p1", method: "session/prompt", result: { stopReason: "end_turn" } });
+      expect(runner.prompt).toHaveBeenCalledTimes(2);
+      // A follow-up that errors settles the original completion too.
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p2", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p2", result: { stopReason: "end_turn" } });
+      await session.onRunnerEvent({ kind: "request_error", acpSessionRef: "acp-1", requestId: "p2#konteks-result-follow-up", method: "session/prompt", code: -32603, class: "internal", message: "bridge gone", retryable: false });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p2", method: "session/prompt", result: { stopReason: "end_turn" } });
+      await session.close("cancelled");
+    });
+
+    it("does not ask again after a turn that did not end normally, and leaves an ordinary prompt alone", async () => {
+      const { session, sent, runner } = await build({}, validation);
+      await session.bootstrap();
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: promptWithContract });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "cancelled" } });
+      expect(runner.prompt).toHaveBeenCalledTimes(1);
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p1", method: "session/prompt", result: { stopReason: "cancelled" } });
+      await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p2", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Just chat." }] } });
+      expect(runner.prompt).toHaveBeenLastCalledWith("acp-1", "p2", { sessionId: "acp-1", prompt: [{ type: "text", text: "Just chat." }] });
+      await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p2", result: { stopReason: "end_turn" } });
+      expect(sent.at(-1)?.body).toEqual({ kind: "acp_result", id: "p2", method: "session/prompt", result: { stopReason: "end_turn" } });
+      await session.close("cancelled");
+    });
+  });
+
   it("backpressures a terminal-fenced prompt before journaling or emitting any transcript frame", async () => {
     const { session, sent, runner, journal } = await build({
       assertPromptAllowed: () => { throw new Error("terminal directive already fenced this prompt lane"); },
-    });
+    }, validation);
     await session.bootstrap();
     const sentBeforePrompt = sent.length;
 
@@ -693,7 +1112,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("converts a malformed bridge result into acp_error(malformed_response)", async () => {
-    const { session, sent } = await build();
+    const { session, sent } = await build({}, validation);
     await session.bootstrap();
     await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p2", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "go" }] } });
     await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p2", result: { stopReason: "not-a-real-reason" } });
@@ -702,7 +1121,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("rejects cross-session requests and notifications even on the correct channel", async () => {
-    const { session, sent, runner, journal } = await build();
+    const { session, sent, runner, journal } = await build({}, validation);
     await session.bootstrap();
     await session.onToRuntime({ kind: "acp", method: "session/prompt", id: "wrong", params: { sessionId: "other", prompt: [{ type: "text", text: "not this session" }] } });
     await session.onToRuntime({ kind: "acp", method: "session/cancel", params: { sessionId: "other" } });
@@ -716,7 +1135,7 @@ describe("relayed session (D98/D113/D114)", () => {
   });
 
   it("forwards a deferred permission once, delivers the first valid answer once, and rejects a mismatched completion", async () => {
-    const { session, sent, runner } = await build();
+    const { session, sent, runner } = await build({}, validation);
     await session.bootstrap();
     await session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "perm-1", params: permissionRequest });
     const forwarded = sent.at(-1)?.body as { kind: string; method: string; id: string; params: { options: unknown[] } };

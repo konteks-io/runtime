@@ -12,10 +12,7 @@
     "packages/common",
     "packages/release",
     "packages/sysmon",
-    "packages/gateway",
     "packages/agent-runner",
-    "packages/browser-tool",
-    "packages/preview-forwarder",
     "packages/supervisor",
     "packages/launcher"
   ],
@@ -32,8 +29,7 @@
     "release:manifest": "tsx packages/release/src/cli.ts",
     "ci:check": "npm run lint && npm run typecheck && npm test && npm run check:agpl && npm run check:secret-canary",
     "check:agpl": "node scripts/check-agpl.mjs",
-    "check:secret-canary": "node scripts/check-secret-canary.mjs",
-    "image:deps": "node scripts/pin-registry-deps.mjs"
+    "check:secret-canary": "node scripts/check-secret-canary.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
@@ -49,11 +45,11 @@
     "zod": "4.4.3"
   },
   "dependencies": {
-    "@konteks/agent-core": "file:vendor/konteks-agent-core-6.5.1.tgz",
-    "@konteks/backstage-plugin-common": "file:vendor/konteks-backstage-plugin-common-6.5.1.tgz"
+    "@konteks/agent-core": "file:vendor/konteks-agent-core-7.0.0.tgz",
+    "@konteks/backstage-plugin-common": "file:vendor/konteks-backstage-plugin-common-7.0.0.tgz"
   },
   "konteksContracts": {
-    "@konteks/agent-core": "6.5.1",
-    "@konteks/backstage-plugin-common": "6.5.1"
+    "@konteks/agent-core": "7.0.0",
+    "@konteks/backstage-plugin-common": "7.0.0"
   }
 }

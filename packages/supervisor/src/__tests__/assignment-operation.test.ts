@@ -51,13 +51,12 @@ async function workFixture(f: Awaited<ReturnType<typeof fixture>>, draining = fa
   const box = new DurableOutbox(dir); await box.load();
   const sent: Array<{ body: unknown; assignmentRequest?: Parameters<AssignmentSender["deliverAllocated"]>[0] }> = [];
   const work = new WorkOrchestrator({ journal: f.journal, outbox: box, assignmentSender: f.sender,
-    transport: { send: (message: typeof sent[number]) => sent.push(message) }, deploymentKind: "native_connector",
-    clock: new FixedClock(Date.parse(at)), instanceId: () => "instance", workspaceId: () => "workspace",
+    transport: { send: (message: typeof sent[number]) => sent.push(message) },     clock: new FixedClock(Date.parse(at)), instanceId: () => "instance", workspaceId: () => "workspace",
     recoveryAuthority: () => f.authority.key, reportDeliveryAllowed: () => true,
     // Core-signed cancellations are verified by the supervisor; this fixture accepts the test signature.
     verifyCancellation: () => true,
     reconciliationComplete: () => true, lease: { canPullNewWork: () => true }, draining: () => draining,
-    headroom: () => 0, maxPullItems: 1, acceptedKinds: () => ["delivery"], components: {},
+    headroom: () => 0, maxPullItems: 1, acceptedKinds: () => ["delivery"],
   } as never);
   await f.journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "delivery", placementId: "placement",
     workspaceId: "workspace", agentId: "codex", state: "running", recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 },

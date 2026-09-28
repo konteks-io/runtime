@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as decoder from "../lease/lease.js";
 const claims = { iss: "konteks:control-plane", aud: "konteks:remote-instance:lease", sub: "instance", workspace_id: "tenant", jti: "lease", iat: 1788652800, exp: 1788652860, protocol: "1.0", bundle_version: "1.0.0", deployment_kind: "native_connector", components: ["agent_runner"], ownership_scope: "personal", administrative_status: "active", lease_mode: "active" };
 const token = (body: object) => `header.${Buffer.from(JSON.stringify(body)).toString("base64url")}.not-a-real-signature`;
-const expected = { instanceId: "instance", audience: "konteks:remote-instance:lease", deploymentKind: "native_connector" as const };
+const expected = { instanceId: "instance", audience: "konteks:remote-instance:lease" };
 describe("canonical native lease decoding (not signature verification)", () => {
   it("accepts actual Core claims and normalizes only local deadline scheduling", () => {
     const body = { ...claims, lease_mode: "drain_only", drain_deadline: "2026-09-06T00:02:00.123Z" };

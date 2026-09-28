@@ -26,9 +26,6 @@
     },
     {
       "path": "../agent-runner"
-    },
-    {
-      "path": "../preview-forwarder"
     }
   ]
 }

@@ -17,7 +17,7 @@ async function fixture() {
   const identity = { instanceId: "instance", incarnation: "process", epoch: 1 };
   const result = { instanceId: "instance", lease: "renewed", leaseExpiresAt: "2026-09-06T00:10:00Z", leaseMode: "active" as const, roles: [], strippedRoles: [], configRevision: 0, heartbeatIntervalSeconds: 15 };
   const heartbeat = vi.fn(async (_body: HeartbeatMessage & { signature: string }) => result);
-  const inventory = { collect: vi.fn(async () => ({ components: [], agents: [], browserToolAvailable: false, hostPressure: 0, activeSessions: 0, activeTurns: 0 })) };
+  const inventory = { collect: vi.fn(async () => ({ components: [], agents: [], hostPressure: 0, activeSessions: 0, activeTurns: 0 })) };
   const onResult = vi.fn(async (_result: typeof result, assertCurrent: () => void) => { assertCurrent(); });
   const onFailure = vi.fn(async (_error: unknown) => undefined);
   const options: HeartbeatOptions = { store, key: () => key, clock, instanceId: () => identity.instanceId, runnerIncarnation: () => identity.incarnation,

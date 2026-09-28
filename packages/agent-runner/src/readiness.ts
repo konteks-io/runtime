@@ -12,8 +12,8 @@ import type { AgentScopeState } from "./auth/scope-store.js";
 const TOOL_CONTROL: Record<AgentBridgeFamily["agentId"], ConnectedAgentView["acpCapabilities"]["toolControl"]> = {
   "claude-code": "approve",
   codex: "approve",
-  opencode: "approve",
-  pi: "approve",
+  // Every non-read-only dsh tool asks through the Konteks hook (dsh-profile.ts).
+  dsh: "approve",
 };
 
 export interface ReadinessInputs {
@@ -24,6 +24,8 @@ export interface ReadinessInputs {
   scope: AgentScopeState;
   identity: "signal" | "logged_out" | "no_official_signal" | "unknown";
   bridgeVersionCompatible: boolean;
+  /** The verified installed DSH version; never an ACP bridge version. */
+  hostAgentVersion?: string;
   lastProbeAt: string | null;
 }
 
@@ -37,8 +39,9 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
     authMode: inputs.authMode,
     accountScope: inputs.scope.accountScope,
     readiness,
-    moneyObservable: inputs.authMode === "gateway_keyed",
-    tokenUsageObservable: true,
+    // DeepSeek Harness returns no usage with a turn; its usage_update is
+    // context occupancy, not billing tokens (dsh-runtime-support D4).
+    tokenUsageObservable: inputs.family.agentId !== "dsh",
     acpCapabilities: {
       sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
       forkSession: caps?.sessionCapabilities?.fork != null,
@@ -46,6 +49,7 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
       toolControl: TOOL_CONTROL[inputs.family.agentId],
     },
   };
+  if (inputs.family.agentId === "dsh" && inputs.hostAgentVersion) view.hostAgentVersion = inputs.hostAgentVersion;
   if (inputs.scope.authIdentityFingerprint !== null) view.authIdentityFingerprint = inputs.scope.authIdentityFingerprint;
   if (inputs.scope.scopeAttestedAt !== null) view.scopeAttestedAt = inputs.scope.scopeAttestedAt;
   if (inputs.lastProbeAt !== null) view.lastProbeAt = inputs.lastProbeAt;
@@ -57,7 +61,6 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
 function deriveReadiness(inputs: ReadinessInputs): ConnectedAgentView["readiness"] {
   if (!inputs.bridgeVersionCompatible) return "reconnect_required";
   if (inputs.connectionState !== "ready") return inputs.connectionState === "starting" ? "unavailable" : "unavailable";
-  if (inputs.authMode === "gateway_keyed") return "ready";
   switch (inputs.identity) {
     case "signal":
       return "ready";

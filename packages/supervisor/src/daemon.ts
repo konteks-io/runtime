@@ -1,4 +1,5 @@
 import { createLogger, normalizeCaughtError, type Logger } from "@konteks/remote-common";
+import type { ControlledExitReason } from "./state/store.js";
 
 /**
  * Process lifecycle (adapted from bb `apps/host-daemon/daemon.ts`): ordered
@@ -29,6 +30,8 @@ export interface CreateDaemonOptions {
   /** Where uncaught exceptions and unhandled rejections arrive; defaults to the process. */
   failureSource?: ProcessFailureSource;
   exitProcess?: (code: number) => void;
+  /** Best-effort durable classification, never allowed to change shutdown behavior. */
+  recordNonzeroExit?: (reason: ControlledExitReason) => Promise<void>;
   shutdownExitGraceMs?: number;
   logger?: Logger;
 }
@@ -56,6 +59,7 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
   let startPromise: Promise<void> | null = null;
   let startupSettled: Promise<void> = Promise.resolve();
   let shutdownExitCode: 0 | 1 = 0;
+  let exitRecorded = false;
   let resolveStopped: (() => void) | undefined;
   const stopped = new Promise<void>((resolve) => {
     resolveStopped = resolve;
@@ -66,6 +70,21 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
     listeners.clear();
     for (const [event, listener] of failureListeners) failureSource.off(event, listener);
     failureListeners.clear();
+  }
+
+  async function recordExit(reason: string): Promise<void> {
+    if (exitRecorded || !options.recordNonzeroExit) return;
+    exitRecorded = true;
+    const classification: ControlledExitReason = reason === "liveness-lost" ? "liveness_lost"
+      : reason === "uncaughtException" ? "uncaught_exception"
+      : reason === "unhandledRejection" ? "unhandled_rejection"
+      : reason === "startup-failed" ? "startup_failed"
+      : reason === "shutdown-step-failed" ? "shutdown_step_failed" : "other";
+    try {
+      await options.recordNonzeroExit(classification);
+    } catch (error) {
+      logger.warn({ err: normalizeCaughtError(error) }, "could not record controlled exit classification");
+    }
   }
 
   async function stop(reason: string, exitCode: 0 | 1): Promise<void> {
@@ -82,6 +101,7 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
     stopPromise = (async () => {
       unregister();
       logger.info({ reason }, "shutting down");
+      if (shutdownExitCode === 1) await recordExit(reason);
       // Startup may still be acquiring ownership or spawning children. The
       // watchdog remains active, but cleanup cannot race those operations.
       await startupSettled;
@@ -97,6 +117,7 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
       }
       if (failure) {
         shutdownExitCode = 1;
+        await recordExit("shutdown-step-failed");
         stopFailure = failure;
         resolveStopped?.();
         throw failure;

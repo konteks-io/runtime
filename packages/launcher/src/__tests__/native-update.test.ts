@@ -4,18 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
-import { buildReleaseFixture } from "@konteks/remote-release";
-import { loadNativeInstallation, readNativeUpdateLedger, SupervisorStore, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { buildReleaseFixture, resolveNativeConnectorExecutable } from "@konteks/remote-release";
+import { loadNativeInstallation, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
 import { earlierFailure, earlierFailureNote, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { createOutput } from "../output.js";
+import { nativeServiceDefinition, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 
 const roots: string[] = [];
 afterEach(async () => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
-async function fixture() {
+async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0" }: { oldVersion?: string; nextVersion?: string } = {}) {
   const root = await mkdtemp(join(tmpdir(), "native-cli-update-")); roots.push(root);
   const claudeTool = join(root, "operator-claude");
   await writeFile(claudeTool, "claude-not-executed", { mode: 0o700 });
@@ -26,14 +27,14 @@ async function fixture() {
     const bytes = Buffer.from(`test-native-executable-not-run-${version}`);
     return { bytes, artifact: { id: "connector", kind: "connector", format: "executable", os: "macos", architecture: "arm64", url: `https://releases.example/connector-${version}`, digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`, sizeBytes: bytes.byteLength } };
   };
-  const old = connector("1.0.0"), next = connector("1.1.0");
+  const old = connector(oldVersion), next = connector(nextVersion);
   const signed = (body: Record<string, unknown>) => {
     const unsigned = { ...body, digest: computeBundleManifestDigest(body as never) };
     return { ...unsigned, signature: { algorithm: "Ed25519", keyId: keys.keyId, value: sign(null, bundleManifestSigningBytes(unsigned as never), keys.privateKey).toString("base64url") } };
   };
   const base = { protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], expiresAt: "2027-01-01T00:00:00Z" };
-  const oldManifest = signed({ ...base, bundleVersion: "1.0.0", nativeArtifacts: [old.artifact, claude.artifact] });
-  const manifest = signed({ ...base, bundleVersion: "1.1.0", nativeArtifacts: [next.artifact, claude.artifact] });
+  const oldManifest = signed({ ...base, bundleVersion: oldVersion, nativeArtifacts: [old.artifact, claude.artifact] });
+  const manifest = signed({ ...base, bundleVersion: nextVersion, nativeArtifacts: [next.artifact, claude.artifact] });
   const trust = [{ ...keys.root, coreControlKeys: [{ keyId: keys.keyId, publicKeyJwk: keys.root.publicKeyJwk }] }];
   const platform = { os: "macos", architecture: "arm64", deploymentKind: "native_connector", containerBackend: "none" } as const;
   const activate = vi.fn(async ({ release }: { release: { manifest: typeof manifest } }) => {
@@ -50,6 +51,24 @@ async function fixture() {
 }
 
 describe("native update staging and commit", () => {
+  it("offers a newer signed rc build with the same release core", async () => {
+    const f = await fixture({ oldVersion: "0.7.6-rc.1", nextVersion: "0.7.6-rc.2" });
+    expect(await checkNativeUpdate({ root: f.root, deps: { ...f.deps, manifest: f.manifest } })).toMatchObject({
+      status: "available", release: { manifest: { bundleVersion: "0.7.6-rc.2" } },
+    });
+  });
+  it("explains the long signed-package staging wait and how to return to the result (WS3-008)", async () => {
+    const f = await fixture();
+    const lines: string[] = [];
+    const output = { ...f.output, line: (line: string) => { lines.push(line); } };
+    await stageNativeUpdate({ root: f.root, output, deps: { ...f.deps, manifest: f.manifest } });
+    expect(lines[0]).toContain("Staging native release 1.1.0");
+    expect(lines[0]).toMatch(/download|verify|unpack/i);
+    expect(lines[0]).toMatch(/minute/i);
+    expect(lines[0]).toMatch(/leave.*running|return.*result/i);
+    expect(lines.at(-1)).toContain("staged");
+  });
+
   it("stages a strictly newer signed release beside the running one and commits it, keeping the previous directory", async () => {
     const f = await fixture();
     expect(await checkNativeUpdate({ root: f.root, deps: { ...f.deps, manifest: f.oldManifest } })).toMatchObject({ status: "current", bundleVersion: "1.0.0" });
@@ -58,6 +77,7 @@ describe("native update staging and commit", () => {
     if (staged.status !== "staged") throw new Error("unreachable");
     // Nothing running changed: the record still names the previous release.
     expect(await readNativeRecord(f.root)).toEqual(f.installed);
+    expect(await readFile(join(staged.directory, "konteks-connector"))).toEqual(Buffer.from("test-native-executable-not-run-1.1.0"));
     expect(await readFile(join(staged.directory, "connector"))).toEqual(Buffer.from("test-native-executable-not-run-1.1.0"));
     expect(JSON.parse(await readFile(join(staged.directory, "manifest.json"), "utf8"))).toEqual(f.manifest);
 
@@ -71,6 +91,31 @@ describe("native update staging and commit", () => {
 
     await restoreNativeRecord(f.root, successor.releaseId, f.installed, { roots: f.trust, platform: f.platform });
     await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).resolves.toMatchObject({ record: { releaseId: f.installed.releaseId, bundleVersion: "1.0.0" } });
+  });
+  it("updates from a release staged before the rename, and rolls back to it", async () => {
+    const f = await fixture();
+    // The installed release as an older connector staged it: `connector` only.
+    const previous = join(f.root, "releases", f.installed.releaseId);
+    await rm(join(previous, "konteks-connector"));
+    expect(await resolveNativeConnectorExecutable(previous, "macos")).toBe(join(previous, "connector"));
+    const before = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    await expect(verifyInstalledNativeConnector(before.release, previous, f.platform)).resolves.toBeUndefined();
+
+    const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } });
+    if (staged.status !== "staged") throw new Error("unreachable");
+    expect(await resolveNativeConnectorExecutable(staged.directory, "macos")).toBe(join(staged.directory, "konteks-connector"));
+    // Once the transition copy is dropped, a release with only the Konteks name commits too.
+    await rm(join(staged.directory, "connector"));
+    const successor = await commitNativeUpdate({ root: f.root, releaseId: staged.releaseId, output: f.output, deps: f.deps });
+    const after = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    await expect(verifyInstalledNativeConnector(after.release, staged.directory, f.platform)).resolves.toBeUndefined();
+
+    // Rollback returns to the pre-rename folder; the service is found under its old name.
+    await restoreNativeRecord(f.root, successor.releaseId, f.installed, { roots: f.trust, platform: f.platform });
+    const restored = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(restored.record.releaseId).toBe(f.installed.releaseId);
+    await expect(verifyInstalledNativeConnector(restored.release, previous, f.platform)).resolves.toBeUndefined();
+    expect(await resolveNativeConnectorExecutable(previous, "macos")).toBe(join(previous, "connector"));
   });
   it("refuses same-version, untrusted and tampered releases without touching the record", async () => {
     const f = await fixture();
@@ -145,6 +190,123 @@ describe("native update transaction", () => {
     expect(h.calls).toEqual(["status", "control:doctor@release-prev", "control:drain@release-prev", "control:drain.status@release-prev", "stop", "status", "commit", "start", "control:status@release-next", "control:agents@release-next", "control:doctor@release-next", "control:agents@release-next"]);
     expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "applied"]);
     expect(h.currentRecord().releaseId).toBe("release-next");
+  });
+  it("cancels an update drain before service stop when Codex idle preflight cannot prove safety", async () => {
+    const h = harness({ previous: { ...previous, agents: ["codex"] } });
+    const originalControl = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = originalControl(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        if (request.op === "codex.maintenance.preflight") {
+          h.calls.push(`control:${request.op}@${record.releaseId}`);
+          throw new RemoteInstanceError("active_work", "Codex has an active or unreadable loaded thread");
+        }
+        return (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+      } } as never;
+    };
+
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "active_work" });
+    expect(h.calls).toContain("control:codex.maintenance.preflight@release-prev");
+    expect(h.calls).toContain("control:drain.cancel@release-prev");
+    expect(h.calls).not.toContain("stop");
+    expect(h.calls).not.toContain("commit");
+    expect(h.calls).not.toContain("start");
+    expect(h.currentRecord().releaseId).toBe("release-prev");
+    expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "failed"]);
+  });
+  it.each([false, true])("uses a verified private-socket inventory when the previous connector lacks the new preflight op (idle=%s)", async idle => {
+    const h = harness({ previous: { ...previous, agents: ["codex"] } });
+    const originalControl = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = originalControl(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        if (request.op === "codex.maintenance.preflight") {
+          h.calls.push(`control:${request.op}@${record.releaseId}`);
+          throw new RemoteInstanceError("temporarily_unavailable", "control_request_invalid: request does not match the closed control protocol");
+        }
+        return (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+      } } as never;
+    };
+    const legacyCodexPreflight = vi.fn(async () => {
+      h.calls.push("legacy-codex-inventory");
+      if (!idle) throw new RemoteInstanceError("active_work", "old owner has an active thread");
+    });
+    h.deps.legacyCodexPreflight = legacyCodexPreflight;
+    if (idle) await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated" });
+    else await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "active_work" });
+    expect(legacyCodexPreflight).toHaveBeenCalledWith("/root", expect.objectContaining({ releaseId: "release-prev" }));
+    expect(h.calls.indexOf("legacy-codex-inventory")).toBeLessThan(h.calls.indexOf(idle ? "stop" : "control:drain.cancel@release-prev"));
+    if (!idle) {
+      expect(h.calls).not.toContain("stop");
+      expect(h.calls).not.toContain("commit");
+      expect(h.currentRecord().releaseId).toBe("release-prev");
+    }
+  });
+  it("waits for the old connector's new cleanup receipt before committing a signed update", async () => {
+    const h = harness({ previous });
+    let receipt = "prior-stop";
+    let waits = 0;
+    h.deps.readStopReceipt = async () => receipt;
+    h.deps.sleep = async () => { waits += 1; if (waits === 2) receipt = "current-stop"; };
+
+    await runNativeUpdate({ root: "/root", output: h.output }, h.deps);
+
+    expect(waits).toBe(2);
+    expect(h.calls.indexOf("commit")).toBeGreaterThan(h.calls.indexOf("stop"));
+  });
+  it("does not hold an update back for the person's own DeepSeek Harness when it is left out", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "dsh"] } });
+    const control = h.deps.control;
+    // dsh could not start (say the person upgraded it out of range): it is parked, not probed.
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => request.op === "agents"
+        ? { agents: record.agents.filter(agentId => agentId !== "dsh").map(agentId => ({ agentId, readiness: "ready" })) }
+        : (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest) } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+  });
+  describe("on Windows, where a stopped scheduled task still exists", () => {
+    const root = "C:\\Users\\a\\AppData\\Local\\konteks-remote";
+    const connector = (releaseId: string) => `${root}\\releases\\${releaseId}\\konteks-connector.exe`;
+    const definitionFor = (record: NativeRuntimeRecord) => nativeServiceDefinition({ os: "windows", home: "C:\\Users\\a", root, executable: connector(record.releaseId), userId: "S-1-5-21-1-2-3-1001" });
+    /** Task Scheduler as far as the connector sees it: the task exists throughout, running or not, and runs the <Command> it was last registered with. */
+    function windows(h: ReturnType<typeof harness>) {
+      const task = { running: true, command: connector(previous.releaseId) };
+      const written = new Map<string, string>();
+      const scheduler = async (command: NativeServiceCommand): Promise<number> => {
+        if (command.command === "powershell.exe") return task.running ? 0 : 1;
+        if (command.command !== "schtasks.exe") throw new Error(`unexpected ${command.command}`);
+        switch (command.args[0]) {
+          case "/Query": return 0; // exists, whether or not it runs
+          case "/Create": task.command = /<Command>(.*?)<\/Command>/.exec(written.get(command.args[4]!)!)![1]!; return 0;
+          case "/Run": task.running = true; return 0;
+          case "/End": task.running = false; return 0;
+          default: return 1;
+        }
+      };
+      const harnessExecute = h.deps.execute, harnessStart = h.deps.start;
+      h.deps.serviceDefinition = async () => definitionFor(h.currentRecord());
+      // The harness's control socket follows the task: /End stops what serves, a start serves the record.
+      h.deps.execute = async command => { const code = await scheduler(command); if (command.args[0] === "/End") await harnessExecute({ command: "stop", args: [] }); return code; };
+      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, contents); } }); await harnessStart(input); };
+      return task;
+    }
+
+    it("stops without waiting out the deadline and restarts the task on the new release", async () => {
+      const h = harness({ previous });
+      const task = windows(h);
+      await expect(runNativeUpdate({ root, output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+      expect(task).toEqual({ running: true, command: connector("release-next") });
+    });
+
+    it("rolls back to a task that runs the previous release again", async () => {
+      const h = harness({ previous, gate: "new_failure" });
+      const task = windows(h);
+      await expect(runNativeUpdate({ root, output: h.output }, h.deps)).rejects.toThrow();
+      expect(h.currentRecord().releaseId).toBe("release-prev");
+      expect(task).toEqual({ running: true, command: connector("release-prev") });
+    });
   });
   it("waits for a slow-stopping service to exit and release the runtime directory before committing", async () => {
     const h = harness({ previous });

@@ -1,4 +1,5 @@
 import { isSecretKey, redactText } from "@konteks/remote-common";
+import { DSH_TOOL_KINDS } from "./dsh-tool-governance.js";
 
 const TOOL_TITLE_PLACEHOLDER = /^(?:other|tool|unknown[ _-]?tool)$/i;
 const ACP_TOOL_KINDS = new Set([
@@ -20,6 +21,20 @@ export interface CanonicalAcpToolIdentity {
 }
 
 /**
+ * Tool arguments, results, and bridge metadata are private to the local
+ * agent. Remove them before the first bounded wire parse: a legitimate deep
+ * result must not make the public tool completion disappear. The ordinary
+ * activity redaction still checks every field that is allowed onto the wire.
+ */
+export function omitPrivateAcpToolPayload(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const update = value as Record<string, unknown>;
+  if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") return value;
+  return Object.fromEntries(Object.entries(update).filter(([key]) =>
+    key !== "rawInput" && key !== "rawOutput" && key !== "_meta"));
+}
+
+/**
  * Promote a bridge-specific tool identity into ACP's ordinary public fields
  * before `_meta` is discarded. The relay intentionally never persists private
  * metadata, so this local boundary is the last place Claude's safe Agent and
@@ -35,6 +50,7 @@ export function canonicalizeAcpToolActivity(
   if (candidate.sessionUpdate !== "tool_call" && candidate.sessionUpdate !== "tool_call_update") {
     return value;
   }
+  if (dialectId === "dsh") return canonicalizeDshToolActivity(candidate, prior);
   if (dialectId !== "claude-code") return value;
   const meta = candidate._meta;
   const rawTool = meta !== null && typeof meta === "object" && !Array.isArray(meta)
@@ -85,6 +101,25 @@ export function canonicalizeAcpToolActivity(
     ...(titleFallback !== undefined && (currentTitle === undefined || TOOL_TITLE_PLACEHOLDER.test(currentTitle.trim()))
       ? { title: titleFallback }
       : {}),
+  };
+}
+
+/**
+ * DeepSeek Harness reports every tool call as ACP `other`, titled with its own
+ * tool name from a closed set. Give those their ACP kind for activity, and
+ * promote the federated `platform__*` name behind an MCP title as for Claude.
+ * An arbitrary title still never becomes a name.
+ */
+function canonicalizeDshToolActivity(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+  const title = typeof candidate.title === "string" ? candidate.title : undefined;
+  const name = platformMcpToolName(title) ?? prior?.name;
+  const kind = (title !== undefined ? DSH_TOOL_KINDS[title] : undefined) ?? prior?.kind;
+  const currentKind = typeof candidate.kind === "string" ? candidate.kind : undefined;
+  if (name === undefined && kind === undefined) return candidate;
+  return {
+    ...candidate,
+    ...(name !== undefined && typeof candidate.name !== "string" ? { name } : {}),
+    ...(kind !== undefined && (currentKind === undefined || currentKind === "other") ? { kind } : {}),
   };
 }
 

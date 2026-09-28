@@ -44,6 +44,33 @@ it("keeps legacy delivery transcript state but strips its obsolete execution aut
 });
 
 describe("supervisor store", () => {
+  it("keeps one private bounded last-exit classification record", async () => {
+    const store = new SupervisorStore(dir);
+    await store.recordLastExit("liveness_lost", "2026-09-27T08:00:00.000Z");
+    await store.recordLastExit("uncaught_exception", "2026-09-27T08:01:00.000Z");
+    expect(await new SupervisorStore(dir).lastExit()).toEqual({
+      schemaVersion: 1, reason: "uncaught_exception", occurredAt: "2026-09-27T08:01:00.000Z",
+    });
+    const path = store.path("last-exit.json");
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect(await readFile(path, "utf8")).not.toContain("liveness_lost");
+  });
+
+  it("replaces shutdown progress with one private phase-only record", async () => {
+    const store = new SupervisorStore(dir);
+    await store.recordShutdownProgress("work_drain", "entered", "2026-09-28T01:00:00.000Z");
+    await store.recordShutdownProgress("codex_owner_stop", "entered", "2026-09-28T01:01:00.000Z");
+
+    expect(await new SupervisorStore(dir).shutdownProgress()).toEqual({
+      schemaVersion: 1, phase: "codex_owner_stop", state: "entered", observedAt: "2026-09-28T01:01:00.000Z",
+    });
+    const path = store.path("shutdown-progress.json");
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    const contents = await readFile(path, "utf8");
+    expect(contents).not.toContain("work_drain");
+    expect(Object.keys(JSON.parse(contents))).toEqual(["schemaVersion", "phase", "state", "observedAt"]);
+  });
+
   it("creates the instance key once with restricted mode and reloads the same key", async () => {
     const store = new SupervisorStore(dir);
     await store.init();
@@ -243,7 +270,7 @@ describe("durable outbox", () => {
 describe("lease state", () => {
   const clock = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
   const token = (claims: Record<string, unknown>): string => `h.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.s`;
-  const base = { iss: "konteks:control-plane", aud: "konteks:remote-instance:lease", sub: "inst-1", workspace_id: "ws", jti: "j", iat: 1_788_652_800, exp: 1_788_652_800 + 600, protocol: "1.0", bundle_version: "1.0.0", components: ["harness", "validation_runtime", "agent_runner", "gateway"], ownership_scope: "personal", administrative_status: "active" };
+  const base = { iss: "konteks:control-plane", aud: "konteks:remote-instance:lease", sub: "inst-1", workspace_id: "ws", jti: "j", iat: 1_788_652_800, exp: 1_788_652_800 + 600, protocol: "1.0", bundle_version: "1.0.0", deployment_kind: "native_connector", components: ["agent_runner"], ownership_scope: "personal", administrative_status: "active" };
 
   it("decodes claims and rejects a lease for another instance or audience", () => {
     const claims = decodeLeaseClaims(token({ ...base, lease_mode: "active" }), { instanceId: "inst-1", audience: base.aud });
@@ -252,7 +279,7 @@ describe("lease state", () => {
     expect(() => decodeLeaseClaims(token({ ...base, lease_mode: "drain_only" }), { instanceId: "inst-1", audience: base.aud })).toThrow();
   });
 
-  it("an active lease pulls and opens every channel; drain_only opens no session/preview; expired opens only control", () => {
+  it("an active lease pulls and opens every channel; drain_only opens no session; expired opens only control", () => {
     const state = new LeaseState(clock);
     state.set(leaseRecordFromClaims("t", decodeLeaseClaims(token({ ...base, lease_mode: "active" }), { instanceId: "inst-1", audience: base.aud })));
     expect(state.canPullNewWork()).toBe(true);
@@ -260,7 +287,6 @@ describe("lease state", () => {
     state.set(leaseRecordFromClaims("t", decodeLeaseClaims(token({ ...base, lease_mode: "drain_only", drain_deadline: new Date(base.exp * 1000).toISOString() }), { instanceId: "inst-1", audience: base.aud })));
     expect(state.canPullNewWork()).toBe(false);
     expect(state.canOpenChannel("session")).toBe(false);
-    expect(state.canOpenChannel("preview")).toBe(false);
     expect(state.canOpenChannel("assignment")).toBe(true);
     clock.advance(700_000);
     expect(state.mode()).toBe("none");

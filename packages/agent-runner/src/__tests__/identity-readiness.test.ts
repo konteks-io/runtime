@@ -9,6 +9,8 @@ import { RunnerConfigSchema } from "../config.js";
 import { INITIAL_SCOPE_STATE } from "../auth/scope-store.js";
 import { projectReadiness } from "../readiness.js";
 import { extractLoginSignals, withoutTerminalEscapes } from "../auth/login-flow.js";
+import { writeDshApiKey } from "../auth/dsh-key.js";
+import { dshRuntimePaths } from "../bridge/dsh-profile.js";
 
 describe("identity signal normalization (D111)", () => {
   it("uses official Codex account identity rather than empty status stdout or shared login text", async () => {
@@ -23,6 +25,26 @@ describe("identity signal normalization (D111)", () => {
       readAccount.mockResolvedValue("second@example.test");
       expect(await probeIdentity(config, findAgentBridge("codex")!, {}, { run, readAccount })).not.toEqual(first);
       expect(JSON.stringify(first)).not.toContain("example.test");
+      expect(run).not.toHaveBeenCalled();
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it("fingerprints the stored DeepSeek key for DeepSeek Harness, without running anything or exposing the key", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "dsh-identity-"));
+    try {
+      const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "dsh", RUNNER_CREDENTIAL_DIR: dir });
+      const run = vi.fn();
+      const family = findAgentBridge("dsh")!;
+      expect(await probeIdentity(config, family, {}, { run })).toEqual({ kind: "logged_out" });
+      const file = dshRuntimePaths(dir).credentialsFile;
+      await writeDshApiKey(file, "sk-first-key-00000000000000000000");
+      const first = await probeIdentity(config, family, {}, { run });
+      expect(first.kind).toBe("signal");
+      expect(await probeIdentity(config, family, {}, { run })).toEqual(first);
+      await writeDshApiKey(file, "sk-second-key-0000000000000000000");
+      const second = await probeIdentity(config, family, {}, { run });
+      expect(second.kind).toBe("signal");
+      expect(second).not.toEqual(first);
+      expect(JSON.stringify([first, second])).not.toMatch(/sk-/);
       expect(run).not.toHaveBeenCalled();
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
@@ -70,18 +92,26 @@ describe("ConnectedAgentView projection", () => {
     lastProbeAt: "2026-09-06T00:00:00Z",
   };
 
+  it("says DeepSeek Harness reports no token usage, so no turn is priced from a count it never gave", () => {
+    const view = projectReadiness({ ...base, family: findAgentBridge("dsh")! });
+    expect(view).toMatchObject({ agentId: "dsh", readiness: "ready", tokenUsageObservable: false });
+  });
+
+  it("projects a verified host version only for DeepSeek Harness", () => {
+    expect(projectReadiness({ ...base, family: findAgentBridge("dsh")!, hostAgentVersion: "0.1.5-rc.3" }).hostAgentVersion).toBe("0.1.5-rc.3");
+    expect(projectReadiness({ ...base, hostAgentVersion: "bridge-1" })).not.toHaveProperty("hostAgentVersion");
+  });
+
   it("is ready with sanitized capabilities and only the opaque fingerprint", () => {
     const view = projectReadiness(base);
-    expect(view).toMatchObject({ agentId: "codex", readiness: "ready", accountScope: "personal", moneyObservable: false, tokenUsageObservable: true });
+    expect(view).toMatchObject({ agentId: "codex", readiness: "ready", accountScope: "personal", tokenUsageObservable: true });
     expect(view.acpCapabilities).toEqual({ sessionResume: true, forkSession: true, structuredOutputShim: true, toolControl: "approve" });
     expect(view.authIdentityFingerprint).toBe("fp-opaque-0123456789abcdef");
     expect(JSON.stringify(view)).not.toMatch(/"(email|token|path|agentHome|agentHomePath|credentialPath|apiKey|subscriptionToken)":/i);
   });
 
-  it("gateway_keyed implies moneyObservable and readiness without a login", () => {
-    const view = projectReadiness({ ...base, authMode: "gateway_keyed", identity: "logged_out" });
-    expect(view.moneyObservable).toBe(true);
-    expect(view.readiness).toBe("ready");
+  it("carries no money observability field (packages 7.0.0 removed it)", () => {
+    expect("moneyObservable" in projectReadiness({ ...base, identity: "signal" })).toBe(false);
   });
 
   it("a logged-out subscription agent is not_configured with login_locally", () => {

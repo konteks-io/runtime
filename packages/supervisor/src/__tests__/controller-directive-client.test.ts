@@ -43,6 +43,28 @@ function fixture(response: unknown = { version: 1, directives: [directive], high
 }
 
 describe("planning controller terminal directive pull", () => {
+  it("passes cancellation through transport and prevents retry after shutdown", async () => {
+    const abort = new AbortController();
+    const fetchFn = vi.fn((_url: unknown, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+    }));
+    const client = new CoreClient({
+      baseUrl: "https://core.example",
+      clock: new FixedClock(Date.parse("2026-09-08T00:00:01.000Z")),
+      key: () => generateInstanceKey(),
+      credential: () => "lease",
+      fetchFn,
+    });
+    const pull = client.pullControllerDirectives("instance-1", {
+      version: 1, afterSequence: 0, runnerIncarnation: "runner-1", maxItems: 16, waitSeconds: 20,
+    }, abort.signal);
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledOnce());
+
+    abort.abort();
+    await expect(pull).rejects.toMatchObject({ code: "operation_interrupted" });
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+
   it("signs the strict path-bound request and returns the exact bounded page", async () => {
     const f = fixture();
     await expect(f.client.pullControllerDirectives("instance-1", {

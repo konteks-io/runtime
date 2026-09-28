@@ -8,7 +8,6 @@ import { SupervisorJournal, type JournalEntry } from "../state/journal.js";
 import { DurableOutbox } from "../state/outbox.js";
 import { ReportSender } from "../work/report-sender.js";
 import type { CoreClient } from "../core/client.js";
-import type { ComponentAdapter } from "../work/components.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import type { OutboundMessage } from "../transport/transport.js";
 
@@ -41,7 +40,7 @@ const entry = (overrides: Partial<JournalEntry>): JournalEntry => ({
 type Intent = { instanceId: string; runnerIncarnation: string; reconnectIntentId: string; lastHeartbeatSequence: number };
 
 let harnessCount = 0;
-async function harness(entries: JournalEntry[], checkpointValid = true) {
+async function harness(entries: JournalEntry[]) {
   // Each harness owns its journal: two in one test must not share decisions.
   const dir = await mkdtemp(join(testDir, `h${(harnessCount += 1)}-`));
   const journal = new SupervisorJournal(dir);
@@ -53,22 +52,8 @@ async function harness(entries: JournalEntry[], checkpointValid = true) {
   const sent: OutboundMessage[] = [];
   const transport = { send: (message: OutboundMessage) => void sent.push(message), openChannel: () => undefined, closeChannel: () => undefined } as unknown as TransportManager;
   const reports = new ReportSender({ journal, outbox, transport, clock, canSend: () => true, instanceId: () => "inst-1", onConflict: async () => undefined, onTerminalDurable: async () => undefined });
-  const dispatched: unknown[] = [];
-  const recoveries: unknown[] = [];
-  const component: ComponentAdapter = {
-    kind: "harness",
-    dispatch: async (request) => void dispatched.push(request),
-    cancel: async () => "cancelled",
-    erase: async () => ({ failed: [] }),
-    // The component owns checkpoint verification; a rejected checkpoint is its refusal, not a supervisor verdict.
-    recoveryDecision: async (request) => {
-      recoveries.push(request);
-      return checkpointValid ? { applied: true } : { applied: false, reason: "checkpoint_invalid" };
-    },
-    answerPermission: async () => true,
-    drain: async () => undefined,
-    health: async () => null,
-  };
+  // Resolves when the exact local work can no longer execute; a test may hold it.
+  const local = { stop: async (): Promise<void> => undefined };
   const leases: string[] = [];
   const core = {
     resolveRuntimeOwner: async () => ({ instanceId: "inst", ownerRevision: 0, currentIncarnation: null, acceptedHeartbeatSequence: 0, heartbeatSequenceFloor: 0 }),
@@ -82,7 +67,7 @@ async function harness(entries: JournalEntry[], checkpointValid = true) {
     }),
     reconnect: vi.fn(async (request: Intent) => ({ lease: "lease-2", leaseExpiresAt: "2026-09-06T01:00:00Z", manifest: manifest(request, { manifestId: "m1", lease: "lease-2" }) })),
   } as unknown as CoreClient;
-  const reconciliation = new Reconciliation({ clock, journal, core, instanceId: () => "inst", runnerIncarnation: () => "process", assertOwned: () => undefined, reserveHeartbeatFloor: async () => undefined, stopLocalWork: async () => undefined, bundleVersion: "1.0.0", protocolVersion: "1.0", lastHeartbeatSequence: async () => 5, components: { harness: component, validation_runtime: component }, reports, onLease: async (lease) => void leases.push(lease) });
+  const reconciliation = new Reconciliation({ clock, journal, core, instanceId: () => "inst", runnerIncarnation: () => "process", assertOwned: () => undefined, reserveHeartbeatFloor: async () => undefined, stopLocalWork: () => local.stop(), bundleVersion: "1.0.0", protocolVersion: "1.0", lastHeartbeatSequence: async () => 5, reports, onLease: async (lease) => void leases.push(lease) });
   /** A complete manifest for the generation `run()` would sign. */
   function manifest(intent: Intent, patch: Record<string, unknown>) {
     return {
@@ -115,7 +100,7 @@ async function harness(entries: JournalEntry[], checkpointValid = true) {
   /** A generation this process never bound; identity alone must refuse it. */
   const unbound = (instanceId: string, patch: Record<string, unknown>) =>
     manifest({ instanceId, runnerIncarnation: "process", reconnectIntentId: "unbound", lastHeartbeatSequence: 5 }, patch);
-  return { reconciliation, journal, sent, dispatched, recoveries, leases, core, component, dir, reports, outbox, manifest, bound, unbound };
+  return { reconciliation, journal, sent, leases, core, local, dir, reports, outbox, manifest, bound, unbound };
 }
 
 const terminalReports = (sent: OutboundMessage[]) => sent.map((message) => message.body as AssignmentReport).filter((body) => "reportId" in body && body.terminal);
@@ -136,19 +121,16 @@ describe("reconnect and reconciliation", () => {
     expect(leases).toEqual(["lease-2"]);
   });
 
-  it("resumes from a verified checkpoint with an advanced epoch and journals the decision before dispatch", async () => {
-    const { reconciliation, journal, dispatched, recoveries, bound } = await harness([entry({ state: "checkpointed", checkpoint: { ref: "ckpt", hash: "h".repeat(43), createdAt: "2026-09-06T00:00:00Z" } })]);
+  it("never resumes from a checkpoint: a native connector reports the attempt interrupted and journals the decision", async () => {
+    const { reconciliation, journal, sent, bound } = await harness([entry({ state: "checkpointed", checkpoint: { ref: "ckpt", hash: "h".repeat(43), createdAt: "2026-09-06T00:00:00Z" } })]);
     const outcomes = await reconciliation.apply((await bound({ manifestId: "m", decisions: [{ action: "resume_from_checkpoint", assignmentId: "a", attempt: 1, recoveryEpoch: 2, authorization: "auth", latestResumeAt: "2026-09-07T00:00:00Z" }] })));
-    expect(outcomes.get("a:1")).toBe("executed");
+    expect(outcomes.get("a:1")).toBe("interrupted");
     expect(journal.decisions.get("m:a:1")?.executedAt).not.toBeNull();
-    expect(journal.assignments.get("a:1")).toMatchObject({ state: "running", recoveryEpoch: 2 });
-    // The decision travels whole; the supervisor never re-dispatches the assignment to resume it.
-    expect(recoveries[0]).toMatchObject({ manifestId: "m", attempt: 1, checkpoint: { ref: "ckpt" }, decision: { action: "resume_from_checkpoint", recoveryEpoch: 2, authorization: "auth" } });
-    expect(dispatched).toHaveLength(0);
+    expect(terminalReports(sent)[0]?.result).toMatchObject({ class: "interrupted", reason: "agent_session_lost" });
   });
 
   it("rejects a stale recovery epoch, a wrong attempt, an unknown assignment, and a foreign instance", async () => {
-    const { reconciliation, dispatched, bound, unbound } = await harness([entry({ state: "checkpointed", checkpoint: { ref: "ckpt", hash: "h".repeat(43), createdAt: "2026-09-06T00:00:00Z" }, recoveryEpoch: 3 })]);
+    const { reconciliation, sent, bound, unbound } = await harness([entry({ state: "checkpointed", checkpoint: { ref: "ckpt", hash: "h".repeat(43), createdAt: "2026-09-06T00:00:00Z" }, recoveryEpoch: 3 })]);
     const stale = await reconciliation.apply((await bound({ manifestId: "m", decisions: [{ action: "resume_from_checkpoint", assignmentId: "a", attempt: 1, recoveryEpoch: 3, authorization: "x", latestResumeAt: "2026-09-07T00:00:00Z" }] })));
     expect(stale.get("a:1")).toBe("rejected_stale_epoch");
     expect(reconciliation.isComplete).toBe(false);
@@ -159,7 +141,7 @@ describe("reconnect and reconciliation", () => {
     // this process's bound recovery generation.
     await expect(reconciliation.apply(unbound("other", { manifestId: "m3", decisions: [{ action: "cancel", assignmentId: "a", attempt: 1, reason: "revoked" }] })))
       .rejects.toMatchObject({ code: "registration_mismatch" });
-    expect(dispatched).toHaveLength(0);
+    expect(terminalReports(sent)).toHaveLength(0);
   });
 
   it("invalid and foreign empty manifests close a previously completed local gate", async () => {
@@ -180,28 +162,28 @@ describe("reconnect and reconciliation", () => {
     expect(reconciliation.isComplete).toBe(false);
   });
 
-  it("a repeated executed epoch is a duplicate only for the identical durable decision", async () => {
-    const { reconciliation, recoveries, bound } = await harness([entry({ state: "checkpointed", checkpoint: { ref: "ckpt", hash: "h".repeat(43), createdAt: "2026-09-06T00:00:00Z" } })]);
-    const decision = { action: "resume_from_checkpoint", assignmentId: "a", attempt: 1, recoveryEpoch: 2, authorization: "x", latestResumeAt: "2026-09-07T00:00:00Z" };
+  it("a repeated executed decision is a duplicate only for the identical durable decision", async () => {
+    const { reconciliation, sent, bound } = await harness([entry({})]);
+    const decision = { action: "cancel", assignmentId: "a", attempt: 1, reason: "revoked" };
     const applied = (await bound({ manifestId: "m", decisions: [decision] }));
     expect((await reconciliation.apply(applied)).get("a:1")).toBe("executed");
     expect((await reconciliation.apply(applied)).get("a:1")).toBe("duplicate");
     expect(reconciliation.isComplete).toBe(true);
     // Changed content under the same manifest ID is no longer the generation
     // this process bound; it is refused before any local effect.
-    await expect(reconciliation.apply({ ...applied, decisions: [{ ...decision, authorization: "changed" }] })).rejects.toMatchObject({ code: "registration_mismatch" });
+    await expect(reconciliation.apply({ ...applied, decisions: [{ ...decision, reason: "policy_denied" }] })).rejects.toMatchObject({ code: "registration_mismatch" });
     expect(reconciliation.isComplete).toBe(false);
-    expect(recoveries).toHaveLength(1);
+    expect(terminalReports(sent)).toHaveLength(1);
   });
 
   it("an older in-flight apply cannot reopen the gate after a newer rejection", async () => {
-    const f = await harness([entry({ state: "checkpointed", checkpoint: { ref: "ckpt", hash: "h".repeat(43), createdAt: "2026-09-06T00:00:00Z" } })]);
+    const f = await harness([entry({})]);
     let release!: () => void;
     let entered!: () => void;
     const waiting = new Promise<void>(resolve => { release = resolve; });
     const started = new Promise<void>(resolve => { entered = resolve; });
-    f.component.recoveryDecision = async () => { entered(); await waiting; return { applied: true }; };
-    const pending = f.reconciliation.apply((await f.bound({ manifestId: "m", decisions: [{ action: "resume_from_checkpoint", assignmentId: "a", attempt: 1, recoveryEpoch: 2, authorization: "x", latestResumeAt: "2026-09-07T00:00:00Z" }] })));
+    f.local.stop = async () => { entered(); await waiting; };
+    const pending = f.reconciliation.apply((await f.bound({ manifestId: "m", decisions: [{ action: "cancel", assignmentId: "a", attempt: 1, reason: "revoked" }] })));
     const settled = pending.then(() => undefined, () => undefined);
     await started;
     await expect(f.reconciliation.apply(f.unbound("foreign", { manifestId: "other", decisions: [] }))).rejects.toMatchObject({ code: "registration_mismatch" });
@@ -268,8 +250,8 @@ describe("reconnect and reconciliation", () => {
     expect(f.reconciliation.isComplete).toBe(true);
   });
 
-  it("checkpoint refusal is a locally applied interruption only after its report is durable", async () => {
-    const f = await harness([entry({ state: "checkpointed", checkpoint: { ref: "ckpt", hash: "h".repeat(43), createdAt: "2026-09-06T00:00:00Z" } })], false);
+  it("a refused resume is a locally applied interruption only after its report is durable", async () => {
+    const f = await harness([entry({})]);
     const outcomes = await f.reconciliation.apply((await f.bound({ manifestId: "m", decisions: [{ action: "resume_from_checkpoint", assignmentId: "a", attempt: 1, recoveryEpoch: 2, authorization: "x", latestResumeAt: "2026-09-07T00:00:00Z" }] })));
     expect(outcomes.get("a:1")).toBe("interrupted");
     expect(f.reconciliation.isComplete).toBe(true);
@@ -303,11 +285,10 @@ describe("reconnect and reconciliation", () => {
     expect(f.journal.recovery.current("inst", "process")?.receipt?.digest).toBe(frozen?.digest);
   });
 
-  it("an invalid checkpoint or an expired resume deadline becomes an interrupted terminal report, never execution", async () => {
-    const invalid = await harness([entry({ state: "checkpointed", checkpoint: { ref: "ckpt", hash: "b".repeat(43), createdAt: "2026-09-06T00:00:00Z" } })], false);
+  it("a resume without a proven checkpoint or past its deadline becomes an interrupted terminal report, never execution", async () => {
+    const invalid = await harness([entry({})]);
     await invalid.reconciliation.apply((await invalid.bound({ manifestId: "m", decisions: [{ action: "resume_from_checkpoint", assignmentId: "a", attempt: 1, recoveryEpoch: 2, authorization: "x", latestResumeAt: "2026-09-07T00:00:00Z" }] })));
     expect(terminalReports(invalid.sent)[0]?.result).toMatchObject({ class: "interrupted", reason: "checkpoint_invalid" });
-    expect(invalid.dispatched).toHaveLength(0);
     const expired = await harness([entry({ state: "checkpointed", checkpoint: { ref: "ckpt", hash: "h".repeat(43), createdAt: "2026-09-06T00:00:00Z" } })]);
     await expired.reconciliation.apply((await expired.bound({ manifestId: "m", decisions: [{ action: "resume_from_checkpoint", assignmentId: "a", attempt: 1, recoveryEpoch: 2, authorization: "x", latestResumeAt: "2026-09-05T00:00:00Z" }] })));
     expect(terminalReports(expired.sent)[0]?.result).toMatchObject({ class: "interrupted", reason: "deadline_expired" });
@@ -329,9 +310,10 @@ describe("reconnect and reconciliation", () => {
   });
 
   it("replay_terminal resends the outbox without rerunning execution", async () => {
-    const { reconciliation, dispatched, reports, bound } = await harness([entry({})]);
+    const { reconciliation, local, reports, bound } = await harness([entry({})]);
     await reports.submit({ assignmentId: "a", attempt: 1, claimId: "c", draft: { terminal: true, result: { class: "interrupted", reason: "agent_session_lost", terminalResultHash: "h".repeat(43) } } });
+    const stop = vi.spyOn(local, "stop");
     expect((await reconciliation.apply((await bound({ manifestId: "m", decisions: [{ action: "replay_terminal", assignmentId: "a", attempt: 1, recoveryEpoch: 2, authorization: "x" }] })))).get("a:1")).toBe("executed");
-    expect(dispatched).toHaveLength(0);
+    expect(stop).not.toHaveBeenCalled();
   });
 });

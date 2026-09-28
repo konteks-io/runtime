@@ -1,12 +1,16 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:net";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { FixedClock, RemoteInstanceError, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { SupervisorJournal } from "../state/journal.js";
 import { DurableOutbox } from "../state/outbox.js";
 import { WorkOrchestrator } from "../work/orchestrator.js";
 import type { LocalAdmission } from "../state/local-admission.js";
+import { PermissionBroker } from "../session/permissions.js";
+import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
+import type { RelayedSession } from "../session/relayed-session.js";
 
 let dir: string;
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "channel-handoff-")); });
@@ -58,7 +62,7 @@ async function fixture(options: { terminal?: boolean; closed?: boolean; priorReq
     agentId: "claude-code", state: "running", recoveryEpoch: 0, reports: { nextSequence: 2, durableWatermark: 0, ...(options.terminal === false ? {} : { terminalSequence: 1 }) },
     evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
   const runner = { stopForRecovery: vi.fn(async () => undefined), releaseSealedSession: vi.fn(async () => undefined), stopRetainedExecution: vi.fn(async () => undefined) };
-  const orchestrator = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock, runners: new Map([["claude-code", runner]]),
+  const orchestrator = new WorkOrchestrator({ journal, outbox, transport: {}, clock, runners: new Map([["claude-code", runner]]),
     sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "process",
     assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
   const internal = orchestrator as unknown as { channelOwners: Map<string, unknown>; sessions: Map<string, unknown>;
@@ -89,6 +93,89 @@ it("continues the exact live reference through the journaled generation transfer
   expect(f.journal.execution.execution(prior)).toMatchObject({ phase: "continued", continuedToGeneration: "next-generation" });
   expect(() => f.journal.execution.assertExecutable(next, "ref")).not.toThrow();
   expect(f.internal.sessions.has("prior:1")).toBe(false);
+});
+
+it.each(["fresh", "live"] as const)("binds a %s conversation bootstrap to the transport chosen by takeover", async mode => {
+  const previous = { ...prior, agentId: "codex" };
+  const successor = { ...next, agentId: "codex" };
+  const assignment = { ...work(successor, mode === "live" ? "prior-ref" : undefined),
+    agentRoute: { requiredRole: "assistant" as const, agentId: "codex", mcpCapabilityTokenRef: "capability" } };
+  const previousAssignment = { ...work(previous), agentRoute: assignment.agentRoute };
+  const journal = new SupervisorJournal(dir); await journal.load();
+  const outbox = new DurableOutbox(dir); await outbox.load();
+  for (const [identity, item] of [[previous, previousAssignment], [successor, assignment]] as const) {
+    await journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1, admission: identity, assignment: item,
+      evidenceUpload: "structured_only", projectionCreatedAt: identity.openedAt, claimCreatedAt: identity.openedAt }, current);
+    await journal.execution.reserveAllocation(identity, current);
+  }
+  const listener = createServer();
+  await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  if (!address || typeof address === "string") throw new Error("missing listener port");
+  const priorTransport = { port: address.port, credential: "p".repeat(43) };
+  await new Promise<void>(resolve => listener.close(() => resolve()));
+  await journal.execution.open(previous, current, previous.openedAt);
+  await journal.execution.bindReference(previous, "prior-ref", current);
+  await journal.execution.bindMcpLocalTransport(previous, priorTransport, current);
+  await journal.execution.bindProcessOwner(previous, processOwner, current);
+  await journal.execution.markCompletedTurnSettled(previous, "prior-ref", "2026-09-06T00:00:01.000Z", current);
+  await journal.assignments.put({ assignmentId: previous.assignmentId, attempt: 1, claimId: previous.claimId,
+    kind: "assistant_execution", placementId: previousAssignment.placementId, workspaceId: previous.workspaceId,
+    agentId: "codex", state: "completed", recoveryEpoch: 0, reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1 },
+    evidenceUpload: "structured_only", expiresAt: previousAssignment.expiresAt, latestResumeAt: previousAssignment.policy.latestResumeAt, updatedAt: clock.nowIso() });
+  const entry = { assignmentId: successor.assignmentId, attempt: 1, claimId: successor.claimId,
+    kind: "assistant_execution" as const, placementId: assignment.placementId, workspaceId: successor.workspaceId,
+    agentId: "codex", state: "claimed" as const, recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 },
+    evidenceUpload: "structured_only" as const, expiresAt: assignment.expiresAt,
+    latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() };
+  await journal.assignments.put(entry);
+  const createSession = vi.fn(async (_request: unknown, lifecycle?: { beforeCreate(ref: string): Promise<void> }) => {
+    const ref = mode === "live" ? "prior-ref" : "fresh-ref";
+    await lifecycle?.beforeCreate(ref);
+    return { acpSessionRef: ref, resumed: mode === "live", capabilities: { forkSession: false, sessionResume: true } };
+  });
+  const runner = { createSession, releaseSealedSession: vi.fn(async () => undefined), stopRetainedExecution: vi.fn(async () => undefined),
+    closeSession: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined) };
+  const broker = new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined });
+  const orchestrator = new WorkOrchestrator({ journal, outbox, transport: { send: () => undefined, openChannel: () => undefined, closeChannel: () => undefined },
+    clock, runners: new Map([["codex", runner]]), instanceId: () => "instance", workspaceId: () => "workspace",
+    runnerIncarnation: () => "process", assertOwned: () => undefined, recoveryAuthority: () => "accepted",
+    reportDeliveryAllowed: () => false, onUsage: async () => undefined,
+    sessionDeps: () => ({ clock, journal, transport: { send: () => undefined, openChannel: () => undefined, closeChannel: () => undefined },
+      runner, policy: new EvaluatorPolicyResponder(null, () => true), broker, instanceId: "instance", workspaceRoot: dir,
+      prepareInputs: async (item: RemoteWorkAssignment) => ({ binding: { workspaceId: item.workspaceId, sessionId: "session",
+        assignmentId: item.id, instanceId: item.instanceId, attempt: item.attempt }, cwd: dir, skillInstructions: "", beforePrompt: async () => undefined }),
+      redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer current" }] },
+        expiresAt: "2026-09-07T00:00:00Z" }),
+      registerReady: async () => ({ workspaceId: "workspace", instanceId: "instance", sessionId: "session", channelId: "session:session",
+        assignmentId: successor.assignmentId, attempt: 1, claimId: successor.claimId, recoveryEpoch: 0, runnerIncarnation: "process",
+        agentId: "codex", acpSessionRef: mode === "live" ? "prior-ref" : "fresh-ref", readyRevision: 1, registeredAt: clock.nowIso() }) }),
+  } as never);
+  const internal = orchestrator as unknown as { channelOwners: Map<string, unknown>; sessions: Map<string, unknown>;
+    bootstrapping: Map<string, Promise<void>>; startRelayedSession(item: RemoteWorkAssignment, claim: typeof entry, assertCurrent: () => void): Promise<void>;
+    bootstrapRelayedSession(session: RelayedSession): Promise<void>; handleDispatchFailure(): Promise<void> };
+  const predecessor = { assignment: previousAssignment, acpSessionRef: "prior-ref", isClosed: true,
+    releaseCompletedChannel: () => { internal.channelOwners.delete("session:session"); } };
+  internal.channelOwners.set("session:session", predecessor);
+  internal.sessions.set(`${previous.assignmentId}:1`, predecessor);
+  let session: RelayedSession | undefined;
+  vi.spyOn(internal, "bootstrapRelayedSession").mockImplementation(async value => { session = value; await value.bootstrap(); });
+  vi.spyOn(internal, "handleDispatchFailure").mockResolvedValue(undefined);
+  try {
+    await internal.startRelayedSession(assignment, entry, current);
+    await internal.bootstrapping.get(`${successor.assignmentId}:1`);
+    expect(createSession).toHaveBeenCalledOnce();
+    const transport = journal.execution.execution(successor)?.mcpLocalTransport;
+    expect(transport).toBeDefined();
+    if (mode === "live") {
+      expect(transport).toEqual(priorTransport);
+      expect(createSession.mock.calls[0]?.[0]).toMatchObject({ acpSessionRef: "prior-ref" });
+    } else {
+      expect(transport?.credential).not.toBe(priorTransport.credential);
+      expect(createSession.mock.calls[0]?.[0]).not.toHaveProperty("acpSessionRef");
+      expect(createSession.mock.calls[0]?.[0]).not.toHaveProperty("restoreAcpSessionRef");
+    }
+  } finally { await session?.close("cancelled"); }
 });
 
 it("continues the reference a predecessor actually opened, not the stale one it asked for", async () => {
@@ -173,7 +260,7 @@ it("restores a repository generator session from the durable journal after conne
   await journal.assignments.put({ assignmentId: "prior", attempt: 1, claimId: "prior-claim", kind: "delivery", placementId: "placement-prior", workspaceId: "workspace",
     agentId: "claude-code", state: "running", recoveryEpoch: 0, reports: { nextSequence: 2, durableWatermark: 0, terminalSequence: 1 },
     evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
-  const orchestrator = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock,
+  const orchestrator = new WorkOrchestrator({ journal, outbox, transport: {}, clock,
     runners: new Map(), sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
     runnerIncarnation: () => "restarted-process", assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
   const internal = orchestrator as unknown as {
@@ -201,7 +288,7 @@ it("starts a fresh repository-role session after its exact predecessor terminate
     reports: { nextSequence: 2, durableWatermark: 1, terminalSequence: 1,
       terminalResult: { class: "interrupted", reason: "not_resumable", terminalResultHash: "n".repeat(43) } },
     evidenceUpload: "structured_only", expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
-  const orchestrator = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock,
+  const orchestrator = new WorkOrchestrator({ journal, outbox, transport: {}, clock,
     runners: new Map(), sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
     runnerIncarnation: () => "restarted-process", assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
   const internal = orchestrator as unknown as {

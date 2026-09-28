@@ -27,13 +27,13 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
-    "@konteks/agent-core": "6.5.1",
-    "@konteks/backstage-plugin-common": "6.5.1",
+    "@konteks/agent-core": "7.0.0",
+    "@konteks/backstage-plugin-common": "7.0.0",
     "@konteks/remote-agent-runner": "*",
     "@konteks/remote-common": "*",
-    "@konteks/remote-preview-forwarder": "*",
     "@konteks/remote-release": "*",
     "@konteks/remote-sysmon": "*",
+    "ajv": "^8.20.0",
     "pino": "^9.5.0",
     "ws": "^8.18.0",
     "zod": "^4.0.0"

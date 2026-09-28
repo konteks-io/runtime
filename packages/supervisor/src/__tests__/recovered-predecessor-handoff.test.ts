@@ -70,7 +70,7 @@ async function interruptedClaim(journal: SupervisorJournal, identity: LocalAdmis
 }
 
 function orchestrator(journal: SupervisorJournal, outbox: DurableOutbox, runnerIncarnation: string, submit: ReturnType<typeof vi.fn>) {
-  const work = new WorkOrchestrator({ deploymentKind: "native_connector", journal, outbox, transport: {}, clock, recoveryEvidence: { submit },
+  const work = new WorkOrchestrator({ journal, outbox, transport: {}, clock, recoveryEvidence: { submit },
     runners: new Map(), sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
     runnerIncarnation: () => runnerIncarnation, assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
   const internal = work as unknown as {

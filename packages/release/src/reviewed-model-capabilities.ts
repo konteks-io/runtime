@@ -16,6 +16,12 @@ export const REVIEWED_NATIVE_MODEL_IDENTITIES = {
   codex: [
     { value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" },
   ],
+  // The person's own DeepSeek Harness ships no bridge artifact: its mapping is
+  // bound to the agent and the versions this runtime supports (hostInstall).
+  dsh: [
+    { value: '["deepseek-official","deepseek-flash"]', canonicalProviderId: "deepseek", canonicalModelId: "deepseek-flash" },
+    { value: '["deepseek-official","deepseek-v4-pro"]', canonicalProviderId: "deepseek", canonicalModelId: "deepseek-v4-pro" },
+  ],
 } as const;
 
 export type ReviewedNativeAgentId = keyof typeof REVIEWED_NATIVE_MODEL_IDENTITIES;

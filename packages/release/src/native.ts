@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
-import { chmod, mkdir, mkdtemp, open, rm } from "node:fs/promises";
+import { chmod, constants as fsConstants, copyFile, lstat, mkdir, mkdtemp, open, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import {
   RemoteInstanceError, RemoteSignedBundleManifestSchema, bundleManifestSigningBytes,
@@ -9,6 +9,7 @@ import {
   type AgentModelCapabilityMapping, type RemoteNativeArtifact, type RemoteSignedBundleManifest,
 } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "./manifest.js";
+import { findAgentBridge, HOST_AGENT_BRIDGES } from "./bridges.js";
 import { reviewedNativeModelIdentities } from "./reviewed-model-capabilities.js";
 
 const verified = Symbol("verified-native-release");
@@ -78,7 +79,28 @@ export function signNativeProductionReleaseManifest(
       },
     }];
   });
-  return signNativeReleaseManifest({ ...unsigned, modelCapabilityMappings: mappings }, key);
+  // Host-installed agents (the person's own DeepSeek Harness) have no artifact
+  // to bind to: their reviewed mapping names the agent and the exact versions
+  // this runtime supports, and a runtime selects it only on an exact match.
+  const hostMappings = HOST_AGENT_BRIDGES.flatMap(family => {
+    const modelIdentities = family.hostInstall ? reviewedNativeModelIdentities(family.agentId) : undefined;
+    if (!family.hostInstall || !modelIdentities) return [];
+    const body = {
+      version: 1 as const,
+      mappingId: `host-${family.agentId}-models`,
+      mappingRevision: 1,
+      hostAgent: { agentId: family.agentId, versions: { ...family.hostInstall.versions } },
+      configId: "model",
+      optionType: "select" as const,
+      modelIdentities: modelIdentities.map(identity => ({ ...identity })),
+      issuedAt,
+      expiresAt: unsigned.expiresAt,
+    };
+    const withDigest = { ...body, mappingDigest: computeAgentModelCapabilityMappingDigest(body) };
+    const placeholder: AgentModelCapabilityMapping = { ...withDigest, signature: { algorithm: "Ed25519", keyId: key.keyId, value: "AA" } };
+    return [{ ...withDigest, signature: { algorithm: "Ed25519" as const, keyId: key.keyId, value: ed25519Sign(key.privateKey, agentModelCapabilityMappingSigningBytes(placeholder)) } }];
+  });
+  return signNativeReleaseManifest({ ...unsigned, modelCapabilityMappings: [...mappings, ...hostMappings] }, key);
 }
 
 /** Adapted from bb's host-only update pipeline; Konteks additionally requires release-root signatures. */
@@ -111,6 +133,16 @@ export function selectNativeModelCapabilityMappings(
 ): VerifiedNativeModelCapabilityMapping[] {
   if (release[verified] !== true) throw new RemoteInstanceError("bundle_untrusted", "native release has not been verified");
   return (release.manifest.modelCapabilityMappings ?? []).flatMap(mapping => {
+    if (mapping.hostAgent !== undefined) {
+      // A host-installed agent (the person's own DeepSeek Harness) has no
+      // artifact: the mapping holds only for the versions this runtime was
+      // built and tested against. A mapping for other versions is not ours.
+      const family = findAgentBridge(mapping.hostAgent.agentId);
+      const versions = family?.hostInstall?.versions;
+      return versions && versions.min === mapping.hostAgent.versions.min && versions.belowCore === mapping.hostAgent.versions.belowCore
+        ? [{ agentId: mapping.hostAgent.agentId, mapping }]
+        : [];
+    }
     const artifact = release.manifest.nativeArtifacts?.find(candidate => candidate.kind === "agent_bridge"
       && candidate.id === mapping.bridgeProfileRef && candidate.digest === mapping.bridgeArtifactDigest);
     if (!artifact?.agentId) throw new RemoteInstanceError("bundle_untrusted", "native model mapping lost its exact bridge binding");
@@ -143,6 +175,52 @@ function freezeJson(value: object): void {
 }
 
 /**
+ * The connector's file name inside a release folder. It is what a person sees
+ * in Activity Monitor, `ps` and Task Manager, and what the OS service runs, so
+ * it says Konteks. Releases staged before the rename hold `connector`, and so
+ * does a release an older launcher stages: every lookup accepts both, the
+ * Konteks name first. `kind: "connector"` in the signed manifest is protocol
+ * and is not a file name.
+ */
+export const NATIVE_CONNECTOR_FILE = "konteks-connector";
+export const LEGACY_NATIVE_CONNECTOR_FILE = "connector";
+
+/**
+ * While launchers from before the rename are still installed (a package's
+ * `konteks-remote`, or a user install's `<root>/bin/konteks-remote`, is never
+ * replaced by an update), each staged release also carries an independent copy
+ * under the old name, so their `start` and rollback still find it. The service
+ * always runs the Konteks name. Drop the copy once no supported launcher
+ * predates the rename.
+ */
+export const STAGE_LEGACY_NATIVE_CONNECTOR_COPY = true;
+
+/** Both file names for an OS, the Konteks name first. */
+export function nativeConnectorFileNames(os: NativeArtifactTarget["os"]): [string, string] {
+  const extension = os === "windows" ? ".exe" : "";
+  return [`${NATIVE_CONNECTOR_FILE}${extension}`, `${LEGACY_NATIVE_CONNECTOR_FILE}${extension}`];
+}
+
+/** Every connector executable present in a release folder, the Konteks name first. */
+export async function presentNativeConnectorExecutables(directory: string, os: NativeArtifactTarget["os"]): Promise<string[]> {
+  const present: string[] = [];
+  for (const name of nativeConnectorFileNames(os)) {
+    const path = join(directory, name);
+    if (await lstat(path).then(() => true, () => false)) present.push(path);
+  }
+  return present;
+}
+
+/**
+ * The connector a release folder runs: the Konteks name, else the old one
+ * (a release from before the rename, which a rollback may return to). With
+ * neither, the Konteks name, so the refusal names what is missing.
+ */
+export async function resolveNativeConnectorExecutable(directory: string, os: NativeArtifactTarget["os"]): Promise<string> {
+  return (await presentNativeConnectorExecutables(directory, os))[0] ?? join(directory, nativeConnectorFileNames(os)[0]);
+}
+
+/**
  * Stage immutable candidates without changing the running installation. As in
  * bb's updater, failed downloads leave the existing host running. Unlike its
  * optional response-header digest, every byte here must match signed metadata.
@@ -165,7 +243,7 @@ export async function stageNativeRelease(args: {
     for (const [index, artifact] of artifacts.entries()) {
       const extension = artifact.format !== "executable" ? ".tgz" : args.target.os === "windows" ? ".exe" : "";
       // File names never come from untrusted URL paths or manifest identifiers.
-      const file = join(directory, `${index === 0 ? "connector" : `bridge-${index}`}${extension}`);
+      const file = join(directory, `${index === 0 ? NATIVE_CONNECTOR_FILE : `bridge-${index}`}${extension}`);
       // Release hosts redirect to an asset store; every byte is still pinned by
       // the signed digest and size, so only the final scheme is constrained.
       const response = await fetchFn(artifact.url, { redirect: "follow", credentials: "omit", signal: AbortSignal.timeout(300_000) });
@@ -186,6 +264,12 @@ export async function stageNativeRelease(args: {
         await handle.close();
       }
       if (artifact.format === "executable") await chmod(file, 0o700);
+      if (artifact.kind === "connector" && artifact.format === "executable" && STAGE_LEGACY_NATIVE_CONNECTOR_COPY) {
+        // A copy, not a link: installed-executable verification refuses both.
+        const legacy = join(directory, nativeConnectorFileNames(args.target.os)[1]);
+        await copyFile(file, legacy, fsConstants.COPYFILE_EXCL);
+        await chmod(legacy, 0o700);
+      }
       if (artifact.kind === "connector") result.connector = file;
       else result.bridges[artifact.agentId!] = file;
     }

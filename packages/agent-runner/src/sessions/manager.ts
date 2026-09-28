@@ -101,6 +101,8 @@ export interface SessionManagerOptions {
   bootstrapRetryRandom?: () => number;
   now?: () => Date;
   logger?: Logger;
+  /** Auth failures must invalidate a prior identity probe before new work is admitted. */
+  onAuthRequired?: () => void;
 }
 
 export interface SessionRefStore {
@@ -401,6 +403,7 @@ export class SessionManager {
       } catch (error) {
         if (error instanceof RemoteInstanceError && error.retryable) throw error;
         const classified = classifyBridgeError(error);
+        if (classified.class === "agent_auth_required") this.options.onAuthRequired?.();
         throw new RemoteInstanceError(classified.class === "agent_auth_required" ? "agent_auth_required" : "agent_unavailable", classified.message, {
           recoveryActions: classified.class === "agent_auth_required" ? [{ kind: "login_agent", agentId: args.context.agentId }] : [{ kind: "run_doctor" }],
         });
@@ -685,6 +688,7 @@ export class SessionManager {
       })
       .catch((error: unknown) => {
         const classified = classifyBridgeError(error);
+        if (classified.class === "agent_auth_required") this.options.onAuthRequired?.();
         this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/prompt", ...classified });
         throw error;
       })

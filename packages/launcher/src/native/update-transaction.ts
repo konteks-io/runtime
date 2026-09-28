@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
-import { recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
+import { isHostAgentId } from "@konteks/remote-release";
+import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
@@ -26,6 +28,10 @@ export interface NativeUpdateTransactionDeps {
   recordAttempt: (root: string, attempt: NativeUpdateAttempt) => Promise<unknown>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
+  /** A fresh receipt is written only after this connector's shutdown steps succeed. */
+  readStopReceipt?: (root: string) => Promise<string | null>;
+  /** Verify a running older connector's private Codex owner when it lacks preflight control. */
+  legacyCodexPreflight?: (root: string, previous: NativeRuntimeRecord) => Promise<void>;
   /** How often the OS has started the service and its last exit code; null where it cannot say. */
   serviceExits?: (definition: NativeServiceDefinition) => Promise<{ runs: number; lastExitCode: number | null } | null>;
   drainDeadlineMs?: number;
@@ -47,6 +53,7 @@ export type NativeUpdateOutcome =
 
 const DrainStatusSchema = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
 const AgentsSchema = z.object({ agents: z.array(z.object({ agentId: z.string(), readiness: z.string() }).passthrough()) }).passthrough();
+const CodexMaintenanceSchema = z.object({ idle: z.literal(true) }).strict();
 
 export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTransactionDeps["serviceDefinition"]; execute: NativeUpdateTransactionDeps["execute"]; start: NativeUpdateTransactionDeps["start"]; serviceExits: NonNullable<NativeUpdateTransactionDeps["serviceExits"]> }): NativeUpdateTransactionDeps {
   return {
@@ -59,6 +66,13 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
     recordAttempt: recordNativeUpdateAttempt,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     now: Date.now,
+    readStopReceipt: async root => readFile(join(root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), "utf8").catch(error => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }),
+    legacyCodexPreflight: (root, previous) => assertLegacyCodexOwnerIdle({ root, releaseId: previous.releaseId,
+      ...(previous.codexHome ? { codexHome: previous.codexHome } : {}),
+      ...(previous.codexSocket ? { codexSocket: previous.codexSocket } : {}) }),
   };
 }
 
@@ -100,11 +114,27 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
   const wasRunning = await deps.execute(definition.status) === 0;
   const control = deps.control(input.root, previous);
   let stopped = false;
+  let stopConfirmed = false;
   let successor: NativeRuntimeRecord | undefined;
   try {
     const failingBefore = wasRunning ? await failingDoctorChecks(control).catch(() => new Set<string>()) : new Set<string>();
     if (wasRunning) {
       await drain(input, control, deps);
+      if (previous.agents.includes("codex")) {
+        try { await control.call({ op: "codex.maintenance.preflight" }, CodexMaintenanceSchema); }
+        catch (error) {
+          const unsupported = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" &&
+            error.message === "control_request_invalid: request does not match the closed control protocol";
+          try {
+            if (!unsupported || !deps.legacyCodexPreflight) throw error;
+            await deps.legacyCodexPreflight(input.root, previous);
+          } catch (failure) {
+            await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
+            throw failure;
+          }
+        }
+      }
+      const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
       if (await deps.execute(definition.stop) !== 0) {
         await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
         throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
@@ -113,7 +143,8 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       // launchd and Task Scheduler acknowledge a stop before the process has
       // finished its graceful shutdown; the record may only move once the old
       // service is gone and has released the runtime directory.
-      await waitForServiceExit(input, definition, deps);
+      await waitForServiceExit(input, definition, deps, previousReceipt);
+      stopConfirmed = true;
     }
     successor = await commitOnceReleased(input, staged.releaseId, deps);
     if (wasRunning) {
@@ -131,7 +162,8 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     if (successor) {
       input.output.line(`Update to ${successor.bundleVersion} failed its health gate; rolling back to ${previous.releaseId}.`);
       try {
-        if (await deps.execute(definition.stop).catch(() => null) === 0) await waitForServiceExit(input, definition, deps);
+        const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
+        if (await deps.execute(definition.stop).catch(() => null) === 0) await waitForServiceExit(input, definition, deps, previousReceipt);
         await restoreOnceReleased(input, successor.releaseId, previous, deps);
         if (wasRunning) {
           await deps.start(input);
@@ -147,17 +179,17 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
         throw new RemoteInstanceError("temporarily_unavailable", "The updated connector did not pass its health gate and automatic rollback failed; identity, credentials and workspaces remain preserved.", { cause: rollbackError });
       }
     } else {
-      if (stopped && wasRunning) await deps.start(input).catch(() => undefined);
+      if (stopped && stopConfirmed && wasRunning) await deps.start(input).catch(() => undefined);
       await finish("failed", detail);
     }
     throw error;
   }
 }
 
-async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
+async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null): Promise<void> {
   const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
   const progress = progressLines(input, deps, "Stopping the connector: it closes its agent sessions and relay first, which usually takes under a minute…", "still stopping the connector");
-  while (await deps.execute(definition.status) === 0) {
+  while (await deps.execute(definition.status) === 0 || (deps.readStopReceipt && await deps.readStopReceipt(input.root).then(receipt => receipt === null || receipt === previousReceipt))) {
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
     progress();
     await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
@@ -260,7 +292,9 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
       // version answering here is the wrong executable, not a transition.
       if (status.version.bundle !== successor.bundleVersion) throw new RemoteInstanceError("update_required", `the service answering reports ${status.version.bundle}, not ${successor.bundleVersion}`);
       const probed = await control.call({ op: "agents" }, AgentsSchema, { timeoutMs: 5_000 });
-      const settled = successor.agents.every(agentId => probed.agents.some(agent => agent.agentId === agentId && agent.readiness !== "unknown" && agent.readiness !== "probing"));
+      // A host-installed agent (the person's own DeepSeek Harness) depends on
+      // their install, not on this release: it never holds an update back.
+      const settled = successor.agents.filter(agentId => !isHostAgentId(agentId)).every(agentId => probed.agents.some(agent => agent.agentId === agentId && agent.readiness !== "unknown" && agent.readiness !== "probing"));
       if (settled) break;
     } catch (error) {
       if (answered && error instanceof RemoteInstanceError && error.code === "update_required") throw error;

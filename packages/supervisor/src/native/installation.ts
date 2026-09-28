@@ -1,17 +1,20 @@
 import { constants, type Stats } from "node:fs";
+import { createHash } from "node:crypto";
 import { lstat, open, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, parse, resolve } from "node:path";
 import { z } from "zod";
+import { isRetiredAgentId } from "@konteks/backstage-plugin-common";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { RunnerConfigSchema } from "@konteks/remote-agent-runner";
-import { EmbeddedReleaseRootSchema, selectNativeArtifacts, verifyNativeRelease, verifyOfflineAgentPackage, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EmbeddedReleaseRootSchema, findAgentBridge, selectNativeArtifacts, verifyNativeRelease, verifyOfflineAgentPackage, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { SupervisorConfigSchema } from "../config.js";
 import { IdentitySchema, ManifestRecordSchema } from "../state/store.js";
 import { verifyInstalledNativeBridges } from "./installed.js";
 import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
 import { resolveNativeClaudeExecutable } from "./claude-executable.js";
+import { resolveNativeDshInstallation, resolveNativeDshNode, verifyNativeDshRoot } from "./dsh-installation.js";
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
 function endpoint(protocol: "https:" | "wss:") {
@@ -20,6 +23,9 @@ function endpoint(protocol: "https:" | "wss:") {
     return url.protocol === protocol && !url.username && !url.password && !url.search && !url.hash;
   });
 }
+
+/** The agents a native runtime runs: Claude Code, Codex and the person's own DeepSeek Harness. */
+export const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh"] as const;
 
 /** Installer-owned metadata, not an environment file or arbitrary process configuration. */
 export const NativeRuntimeRecordSchema = z.object({
@@ -30,7 +36,7 @@ export const NativeRuntimeRecordSchema = z.object({
   controlPort: z.number().int().min(1).max(65_535),
   // Zero agents is a machine enrolled from an agent door with nothing
   // detectable yet (OS14); it advertises no roles until one is added.
-  agents: z.array(z.enum(["claude-code", "codex", "opencode", "pi"])).max(4)
+  agents: z.array(z.enum(NATIVE_AGENT_IDS)).max(NATIVE_AGENT_IDS.length)
     .refine(agents => new Set(agents).size === agents.length),
   git: NativeGitToolSchema.optional(),
   /** Local installer-owned profile binding, never a cloud-provided path. */
@@ -38,14 +44,62 @@ export const NativeRuntimeRecordSchema = z.object({
   codexSocket: z.string().min(1).max(4096).optional(),
   /** The operator's own installed Claude Code CLI, located at install time. */
   claudeExecutable: z.string().min(1).max(4096).optional(),
+  /** The person's own installed DeepSeek Harness package root, located at install time. */
+  dshRoot: z.string().min(1).max(4096).optional(),
+  /** The person's Node that runs it (the connector cannot run another script). */
+  dshNode: z.string().min(1).max(4096).optional(),
 }).strict();
 export type NativeRuntimeRecord = z.infer<typeof NativeRuntimeRecordSchema>;
+
+/** Short, private per-installation namespace; the official Codex home remains shared. */
+export async function resolveNativeCodexSocket(root: string, codexHome: string, requested?: string): Promise<string> {
+  const digest = createHash("sha256").update(root).digest("hex").slice(0, 20);
+  const uid = process.getuid?.() ?? 0;
+  const name = `konteks-codex-${uid}-${digest}`;
+  let base = await realpath(tmpdir());
+  let socket = join(base, name, "s");
+  if (Buffer.byteLength(socket) > 96) {
+    base = await realpath("/tmp");
+    socket = join(base, name, "s");
+  }
+  if (Buffer.byteLength(socket) > 96) throw invalid();
+  // An older record may point at the global Codex socket. Migrate its path
+  // without operating on the existing holder. Other short explicit sockets
+  // retain their installer-owned path; startup separately proves private
+  // directory ownership and rejects a foreign process at that socket.
+  if (requested !== undefined) {
+    const legacy = join(codexHome, "app-server-control", "app-server-control.sock");
+    if (requested !== legacy && requested !== socket) {
+      if (!isAbsolute(requested) || resolve(requested) !== requested ||
+          /[\p{Cc}\p{Cf}\p{Cs}]/u.test(requested) || Buffer.byteLength(requested) > 96) throw invalid();
+      return requested;
+    }
+  }
+  if (socket === join(codexHome, "app-server-control", "app-server-control.sock")) throw invalid();
+  return socket;
+}
+
+/**
+ * Read a stored record. One written before 7.0.0 may still list Pi or
+ * OpenCode: those agents are no longer run, so they are dropped (and reported
+ * back for a warning) instead of failing the whole installation. Every write
+ * still goes through the strict schema, which refuses them.
+ */
+export function parseNativeRuntimeRecord(value: unknown): { record: NativeRuntimeRecord; retiredAgents: string[] } {
+  const agents = (value as { agents?: unknown } | null)?.agents;
+  if (!Array.isArray(agents)) return { record: NativeRuntimeRecordSchema.parse(value), retiredAgents: [] };
+  const retiredAgents = agents.filter((agent): agent is string => typeof agent === "string" && isRetiredAgentId(agent));
+  const kept = agents.filter(agent => !(typeof agent === "string" && isRetiredAgentId(agent)));
+  return { record: NativeRuntimeRecordSchema.parse({ ...(value as object), agents: kept }), retiredAgents };
+}
 
 export interface NativeInstallationOptions {
   /** Supplied by the verified executable, never discovered in the writable installation. */
   roots: readonly EmbeddedReleaseRoot[];
   platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" };
   nowMs?: number;
+  /** The service environment, for preview tuning only (defaults to process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** Read-only preflight. The supervisor must still acquire ownership and reverify before spawning. */
@@ -63,7 +117,7 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
     await directory(root);
     // Canonicalize ancestors (e.g. macOS /var -> /private/var), but never accept a linked root.
     root = await realpath(root);
-    const record = NativeRuntimeRecordSchema.parse(await readPrivateJson(join(root, "native-runtime.json")));
+    const { record, retiredAgents } = parseNativeRuntimeRecord(await readPrivateJson(join(root, "native-runtime.json")));
     if (record.git) await verifyNativeGitTool(record.git);
     const roots = z.array(EmbeddedReleaseRootSchema).parse(options.roots);
     const dataDir = join(root, "supervisor");
@@ -81,8 +135,25 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
     if (exchangeRecord.manifestDigest !== exchange.manifest.digest) throw invalid();
     if (release.manifest.bundleVersion !== record.bundleVersion) throw invalid();
     const runners = [];
-    const artifacts = selectNativeArtifacts(release, { ...options.platform, agentIds: record.agents });
+    // A host-installed agent (the person's own DeepSeek Harness) has no signed
+    // artifact: it is re-located and re-verified here on every load instead.
+    const bundled = record.agents.filter(agent => findAgentBridge(agent)?.hostInstall === undefined);
+    const artifacts = selectNativeArtifacts(release, { ...options.platform, agentIds: bundled });
     for (const agent of record.agents) {
+      if (!bundled.includes(agent)) {
+        const credentials = join(root, "credentials", agent);
+        const workspace = join(root, "workspaces", agent);
+        for (const path of [credentials, workspace]) await directory(path);
+        const dsh = record.dshRoot === undefined ? await resolveNativeDshInstallation() : await verifyNativeDshRoot(record.dshRoot);
+        const node = await resolveNativeDshNode(dsh, record.dshNode === undefined ? process.env : { DSH_NODE: record.dshNode });
+        runners.push(RunnerConfigSchema.parse({
+          RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
+          RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
+          RUNNER_NATIVE_DSH_ROOT: dsh.root, RUNNER_NATIVE_DSH_ENTRY: dsh.entry, RUNNER_NATIVE_DSH_NODE: node,
+          RUNNER_BRIDGE_PREFIX: dsh.root, RUNNER_BRIDGE_VERSION: dsh.version,
+        }));
+        continue;
+      }
       const prefix = join(releaseDir, "agents", agent);
       const credentials = join(root, "credentials", agent);
       const workspace = join(root, "workspaces", agent);
@@ -96,14 +167,15 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
         RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
         ...(codexHome ? { RUNNER_NATIVE_CODEX_HOME: codexHome } : {}),
         ...(claudeExecutable ? { RUNNER_NATIVE_CLAUDE_EXECUTABLE: claudeExecutable } : {}),
-        // The supervisor owns this shared service lifecycle. The path remains
-        // under the operator's local profile and is never cloud supplied.
-        ...(codexHome && profile.codexLocalProxy ? { RUNNER_NATIVE_CODEX_SOCKET: record.codexSocket ?? join(codexHome, "app-server-control", "app-server-control.sock") } : {}),
+        // The supervisor owns this shared service lifecycle. Its default socket
+        // is per connector; only the official CODEX_HOME remains shared.
+        ...(codexHome && profile.codexLocalProxy ? { RUNNER_NATIVE_CODEX_SOCKET: await resolveNativeCodexSocket(root, codexHome, record.codexSocket) } : {}),
         RUNNER_BRIDGE_PREFIX: prefix, RUNNER_BRIDGE_VERSION: profile.bridge.version,
         RUNNER_NATIVE_PACKAGE_PROFILE: profile, RUNNER_NATIVE_PACKAGE_ARTIFACT: artifact,
       }));
     }
-    await verifyInstalledNativeBridges(release, runners, options.platform);
+    const bundledRunners = runners.filter(runner => bundled.includes(runner.RUNNER_AGENT_ID));
+    if (bundledRunners.length > 0 || bundled.length === record.agents.length) await verifyInstalledNativeBridges(release, bundledRunners, options.platform);
     for (const [path, before] of directories) {
       const after = await lstat(path);
       if (!after.isDirectory() || !privateOwner(after) || !sameFile(before, after)) throw invalid();
@@ -113,7 +185,7 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
       SUPERVISOR_CORE_URL: record.coreUrl, SUPERVISOR_RELAY_URL: record.relayUrl,
       SUPERVISOR_CONTROL_PORT: record.controlPort, SUPERVISOR_BUNDLE_VERSION: record.bundleVersion,
       SUPERVISOR_PLATFORM_OS: options.platform.os, SUPERVISOR_PLATFORM_ARCH: options.platform.architecture,
-      SUPERVISOR_RELEASE_MANIFEST_FILE: join(releaseDir, "manifest.json"), SUPERVISOR_RUNNER_URLS: "",
+      SUPERVISOR_RELEASE_MANIFEST_FILE: join(releaseDir, "manifest.json"),
       // The managed-git key lives in this runtime's private data, not at the
       // container default `/data/git-keys`, which a laptop does not have: key
       // registration failed there and onboarding could never push (WS1-024).
@@ -121,12 +193,27 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
       // Same for the evidence collector's scratch: `/data/onboard` does not
       // exist on a laptop, so every grouping read failed with ENOENT.
       SUPERVISOR_ONBOARD_SCRATCH_ROOT: join(dataDir, "onboard"),
+      // Preview tuning is the only setting read from the service environment,
+      // and only a valid whole number is taken; anything else keeps the default.
+      ...previewTuning(options.env ?? process.env),
     });
-    return { record, config, runners, roots, release };
+    return { record, config, runners, roots, release, retiredAgents };
   } catch (error) {
     if (error instanceof RemoteInstanceError) throw error;
     throw invalid();
   }
+}
+
+/** `SUPERVISOR_PREVIEW_IDLE_MINUTES` (1–1440) and `SUPERVISOR_PREVIEW_MAX_RUNNING` (1–16), when valid. */
+export function previewTuning(env: NodeJS.ProcessEnv): { SUPERVISOR_PREVIEW_IDLE_MINUTES?: number; SUPERVISOR_PREVIEW_MAX_RUNNING?: number } {
+  const whole = (value: string | undefined, max: number): number | undefined => {
+    if (value === undefined || !/^\d{1,5}$/.test(value.trim())) return undefined;
+    const parsed = Number(value.trim());
+    return parsed >= 1 && parsed <= max ? parsed : undefined;
+  };
+  const idle = whole(env.SUPERVISOR_PREVIEW_IDLE_MINUTES, 24 * 60);
+  const running = whole(env.SUPERVISOR_PREVIEW_MAX_RUNNING, 16);
+  return { ...(idle === undefined ? {} : { SUPERVISOR_PREVIEW_IDLE_MINUTES: idle }), ...(running === undefined ? {} : { SUPERVISOR_PREVIEW_MAX_RUNNING: running }) };
 }
 
 function privateOwner(info: Stats): boolean {

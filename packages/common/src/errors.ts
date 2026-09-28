@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /**
- * Stable error codes the appliance itself raises. Codes shared with Core come
+ * Stable error codes the runtime itself raises. Codes shared with Core come
  * from `wire-contracts.md` ("Stable error codes"); the launcher-only codes are
  * local operational diagnostics and never travel on the wire.
  */
@@ -9,7 +9,7 @@ export const RemoteInstanceErrorCodeSchema = z.enum([
   "workload_delegation_invalid", "workload_delegation_expired", "workload_delegation_revoked",
   "execution_authority_unavailable", "execution_not_ready", "execution_conflict", "execution_fenced",
   "operation_permit_required", "operation_permit_invalid", "operation_conflict", "operation_expired", "operation_interrupted",
-  // Wire-contract codes the appliance raises or surfaces verbatim.
+  // Wire-contract codes the runtime raises or surfaces verbatim.
   "activation_expired",
   "activation_consumed",
   "activation_invalid",
@@ -38,7 +38,6 @@ export const RemoteInstanceErrorCodeSchema = z.enum([
   "key_rotation_invalid",
   "erase_incomplete",
   "configuration_stale",
-  "gateway_unavailable",
   "relay_unavailable",
   "relay_replay_gap",
   "relay_epoch_stale",
@@ -46,8 +45,6 @@ export const RemoteInstanceErrorCodeSchema = z.enum([
   "permission_already_answered",
   "permission_schema_mismatch",
   "recovery_required",
-  "preview_path_invalid",
-  "preview_header_rejected",
   "report_out_of_order",
   "report_sequence_gap",
   "report_payload_conflict",

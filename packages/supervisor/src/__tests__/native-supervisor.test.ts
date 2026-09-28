@@ -13,7 +13,7 @@ import { NativeInputClient } from "../native/input-client.js";
 import { SupervisorConfigSchema } from "../config.js";
 import { SupervisorStore } from "../state/store.js";
 import { submitReadiness } from "../provisioning/activation.js";
-import { SystemClock } from "@konteks/remote-common";
+import { REMOTE_INSTANCE_PROTOCOL_VERSION, SystemClock } from "@konteks/remote-common";
 import { LEASE_AUDIENCE, type CoreClient } from "../core/client.js";
 import { decodeLeaseClaims, leaseRecordFromClaims } from "../lease/lease.js";
 
@@ -44,9 +44,8 @@ async function fixture() {
   const body = { bundleVersion: "1.0.0", protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [artifact, agent.artifact], expiresAt: "2027-09-01T00:00:00Z" };
   const unsigned = { ...body, digest: computeBundleManifestDigest(body as never) };
   const manifest = { ...unsigned, signature: { algorithm: "Ed25519", keyId: signing.keyId, value: sign(null, bundleManifestSigningBytes(unsigned as never), signing.privateKey).toString("base64url") } };
-  const config = SupervisorConfigSchema.parse({ SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: join(root, "state"), SUPERVISOR_CORE_URL: "https://core.example", SUPERVISOR_BUNDLE_VERSION: "1.0.0", SUPERVISOR_PLATFORM_OS: "macos", SUPERVISOR_PLATFORM_ARCH: "arm64", SUPERVISOR_RELEASE_MANIFEST_FILE: join(root, "manifest.json"), SUPERVISOR_RELEASE_ROOTS_FILE: join(root, "roots.json") });
+  const config = SupervisorConfigSchema.parse({ SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: join(root, "state"), SUPERVISOR_CORE_URL: "https://core.example", SUPERVISOR_BUNDLE_VERSION: "1.0.0", SUPERVISOR_PLATFORM_OS: "macos", SUPERVISOR_PLATFORM_ARCH: "arm64", SUPERVISOR_RELEASE_MANIFEST_FILE: join(root, "manifest.json") });
   await writeSecretFile(config.SUPERVISOR_RELEASE_MANIFEST_FILE, JSON.stringify(manifest));
-  await writeSecretFile(config.SUPERVISOR_RELEASE_ROOTS_FILE, JSON.stringify({ roots: [{ ...signing.root, coreControlKeys: [{ keyId: signing.keyId, publicKeyJwk: signing.root.publicKeyJwk }] }] }));
   const store = new SupervisorStore(config.SUPERVISOR_DATA_DIR);
   await store.init();
   // An activated machine has its key; enrollment writes it before the identity.
@@ -64,14 +63,57 @@ async function fixture() {
 }
 
 describe("native Supervisor composition", () => {
+  it("shows a runner's changed readiness immediately in local auth status", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    const control = supervisor.controlHandler();
+    const emitter = { event: () => undefined } as never;
+    const before = await control({ op: "auth.status", agentId: "codex" }, emitter) as { agents: Array<{ readiness: string }> };
+    expect(before.agents[0]?.readiness).toBe("not_configured");
+    await (supervisor as unknown as { onRunnerEvent(agentId: string, event: unknown): Promise<void> }).onRunnerEvent("codex", {
+      kind: "readiness_changed", agent: { ...before.agents[0], readiness: "ready", connectionState: "ready", recoveryAction: undefined },
+    });
+    const after = await control({ op: "auth.status", agentId: "codex" }, emitter) as { agents: Array<{ readiness: string }> };
+    expect(after.agents[0]?.readiness).toBe("ready");
+    const roster = await control({ op: "agents" }, emitter) as { agents: Array<{ readiness: string }> };
+    expect(roster.agents[0]?.readiness).toBe("ready");
+    expect((supervisor as unknown as { lastSnapshot: { agents: Array<{ readiness: string }> } }).lastSnapshot.agents[0]?.readiness).toBe("ready");
+  });
+  it("cancels a local login when its control caller disconnects", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    const runner = (supervisor as unknown as { runners: Map<string, { login: (organization: boolean, loginId: string, personal?: boolean) => Promise<{ loginId: string }>; loginCancel: (loginId: string) => Promise<unknown> }> }).runners.get("codex")!;
+    const login = vi.spyOn(runner, "login").mockImplementation(async (_organization, loginId) => ({ loginId }));
+    const cancel = vi.spyOn(runner, "loginCancel").mockResolvedValue({ cancelled: true });
+    const disconnect = new AbortController();
+    const events = vi.fn();
+    const started = await supervisor.controlHandler()({ op: "auth.login", agentId: "codex", organization: false }, { event: events, signal: disconnect.signal });
+    expect(started).toMatchObject({ loginId: expect.any(String) });
+    expect(login).toHaveBeenCalledWith(false, (started as { loginId: string }).loginId, true);
+    disconnect.abort();
+    await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith((started as { loginId: string }).loginId));
+    expect((supervisor as unknown as { activeLogins: Map<string, unknown> }).activeLogins.size).toBe(0);
+    const next = await supervisor.controlHandler()({ op: "auth.login", agentId: "codex", organization: false }, { event: events, signal: new AbortController().signal }) as { loginId: string };
+    await supervisor.controlHandler()({ op: "auth.cancel", loginId: next.loginId }, { event: () => undefined, signal: new AbortController().signal });
+    expect(events).toHaveBeenCalledWith({ kind: "failed", loginId: next.loginId, code: "login_cancelled", message: "login cancelled" });
+    expect((supervisor as unknown as { activeLogins: Map<string, unknown> }).activeLogins.size).toBe(0);
+  });
   it.each(["mode", "expiresAt", "issuedAt", "drainDeadline"])("rejects stored lease %s metadata that disagrees with its canonical claims", async field => {
     const f = await fixture(), result = heartbeatLease();
-    const claims = decodeLeaseClaims(result.lease, { instanceId: "instance", audience: LEASE_AUDIENCE, deploymentKind: "native_connector" });
+    const claims = decodeLeaseClaims(result.lease, { instanceId: "instance", audience: LEASE_AUDIENCE });
     const record = leaseRecordFromClaims(result.lease, claims);
     await f.store.saveLease({ ...record, [field]: field === "mode" ? "drain_only" : new Date(Date.now() + 3600000).toISOString() });
     const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);
     await expect(supervisor.start()).rejects.toMatchObject({ code: "registration_mismatch" });
     expect(f.spawn).not.toHaveBeenCalled();
+  });
+  it("composes the assignment mux using the build protocol, not the presence of an empty cursor callback", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
+    const pull = () => supervisor.mux.send("assignment:i", "assignment", { instanceId: "i", maxItems: 1, acceptedKinds: ["delivery"] });
+    if (String(REMOTE_INSTANCE_PROTOCOL_VERSION) === "2.0") expect(pull).toThrow("retained logical frame owner");
+    else expect(pull()).toBe(1);
   });
   it("stops and says so when its key is gone, instead of making a new one Core would refuse (W1-L1)", async () => {
     const f = await fixture();
@@ -249,9 +291,8 @@ describe("native Supervisor composition", () => {
     await expect(deps.prepareInputs!(target)).rejects.toThrow();
     expect(prepare).not.toHaveBeenCalled();
   });
-  it("uses explicitly supplied release trust without consulting the writable roots file", async () => {
+  it("uses explicitly supplied release trust (there is no writable roots file)", async () => {
     const f = await fixture();
-    await rm(f.config.SUPERVISOR_RELEASE_ROOTS_FILE);
     const supervisor = new Supervisor(f.config, { native: { ...f.options.native, trustedRoots: [f.signing.root] } });
     supervisors.push(supervisor);
     await supervisor.start();
@@ -348,14 +389,30 @@ describe("native Supervisor composition", () => {
     await supervisor.start();
     expect(f.spawn).toHaveBeenCalledOnce();
     expect(listen).not.toHaveBeenCalled();
-    expect(supervisor.gateway).toBeUndefined();
-    expect(supervisor.internal).toBeUndefined();
+    expect((supervisor as unknown as Record<string, unknown>).gateway).toBeUndefined();
+    expect((supervisor as unknown as Record<string, unknown>).internal).toBeUndefined();
     expect((await supervisor.inventory.collect()).components.map(component => component.kind)).toEqual(["agent_runner"]);
-    await expect(supervisor.controlHandler()({ op: "gateway.key.set", agentId: "codex", key: "test-key" }, { event: () => undefined } as never)).rejects.toMatchObject({ code: "capability_unavailable" });
     const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string }> };
     expect(doctor.checks.some(check => check.id === "gateway" || check.id === "component-harness")).toBe(false);
     await supervisor.stop();
     expect(f.stop).toHaveBeenCalledOnce();
+  });
+
+  it("reports previews in status (old launchers too), preview.status and the doctor, and advertises no preview without a relay", async () => {
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    expect(supervisor.status()).toMatchObject({ previewEnabled: false, previewExposure: null });
+    const running = { ...supervisor.previews.status("sess-1"), state: "running" as const, url: "http://127.0.0.1:43100", port: 43100, command: "npm run dev", source: "inferred" as const };
+    vi.spyOn(supervisor.previews, "list").mockReturnValue([running]);
+    expect(supervisor.status()).toMatchObject({ previewEnabled: true, previewExposure: { port: 43100, grantPresent: false } });
+    const report = await supervisor.controlHandler()({ op: "preview.status" }, { event: () => undefined } as never);
+    expect(report).toMatchObject({ capabilityAdvertised: false, idleStopMinutes: 30, maxRunning: 3, previews: [{ sessionId: "sess-1", state: "running", url: "http://127.0.0.1:43100", viewerConnected: false }] });
+    // This fixture has no relay: a viewer could never reach a preview, so none is advertised.
+    expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("preview.dev_server");
+    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string }> };
+    expect(doctor.checks.find(check => check.id === "preview")).toMatchObject({ status: "warn" });
   });
 
   it("tells the local operator which release Konteks accepts for this machine (WS1-093)", async () => {

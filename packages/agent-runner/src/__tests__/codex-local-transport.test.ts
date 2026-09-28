@@ -6,8 +6,9 @@ import { once } from "node:events";
 import { WebSocketServer } from "ws";
 import { afterEach, expect, it, vi } from "vitest";
 import { connectCodexLocalTransport } from "../bridge/codex-local-transport.js";
+import { codexLoadedThreadStatuses } from "../bridge/codex-thread-inventory.js";
 import { readCodexAccount } from "../auth/codex-account.js";
-import { loadRunnerConfig } from "../config.js";
+import { RunnerConfigSchema } from "../config.js";
 import { findAgentBridge } from "@konteks/remote-release";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -66,8 +67,38 @@ it.skipIf(process.platform === "win32")("reads the executing shared server accou
     }
   }));
   const spawn = vi.fn(), stop = vi.fn();
-  const config = loadRunnerConfig({ RUNNER_AGENT_ID: "codex", RUNNER_NATIVE_CODEX_SOCKET: f.socket });
+  const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_NATIVE_CODEX_SOCKET: f.socket });
   expect(await readCodexAccount(config, findAgentBridge("codex")!, {}, { spawn, stop })).toBe("local-owner@example.test");
   expect(methods).toEqual(["initialize", "initialized", "account/read"]);
   expect(spawn).not.toHaveBeenCalled(); expect(stop).not.toHaveBeenCalled(); expect(f.server.listening).toBe(true);
+});
+it.skipIf(process.platform === "win32")("reads every loaded Codex page and its runtime statuses through the private transport", async () => {
+  const f = await fixture();
+  const first = "00000000-0000-7000-8000-000000000001", second = "00000000-0000-7000-8000-000000000002";
+  const calls: string[] = [];
+  f.ws.on("connection", socket => socket.on("message", data => {
+    const message = JSON.parse(data.toString());
+    if (message.id === undefined) return;
+    calls.push(message.method);
+    if (message.method === "initialize") expect(message.params.capabilities.experimentalApi).toBe(true);
+    const result = message.method === "thread/loaded/list"
+      ? message.params.cursor ? { data: [second], nextCursor: null } : { data: [first], nextCursor: first }
+      : message.method === "thread/read" ? { thread: { id: message.params.threadId, status: { type: message.params.threadId === first ? "idle" : "active", activeFlags: [] } } } : {};
+    socket.send(JSON.stringify({ id: message.id, result }));
+  }));
+  expect(Object.fromEntries(await codexLoadedThreadStatuses(f.socket))).toEqual({ [first]: "idle", [second]: "active" });
+  expect(calls).toEqual(["initialize", "thread/loaded/list", "thread/loaded/list", "thread/read", "thread/read"]);
+});
+it.skipIf(process.platform === "win32")("rejects a disconnect between loaded-list pages without hanging", async () => {
+  const f = await fixture();
+  const first = "00000000-0000-7000-8000-000000000001";
+  f.ws.on("connection", socket => socket.on("message", data => {
+    const message = JSON.parse(data.toString());
+    if (message.method === "initialize") socket.send(JSON.stringify({ id: message.id, result: {} }));
+    if (message.method === "thread/loaded/list") {
+      if (!message.params.cursor) socket.send(JSON.stringify({ id: message.id, result: { data: [first], nextCursor: first } }));
+      else socket.close();
+    }
+  }));
+  await expect(codexLoadedThreadStatuses(f.socket)).rejects.toThrow(/inventory unavailable/);
 });

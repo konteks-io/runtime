@@ -51,7 +51,7 @@ afterEach(async () => {
   for (const runtime of runtimes.splice(0)) await runtime.stop();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
-async function fixture(limit = 2, executionSpawnProcess?: SpawnBridgeOptions["spawnProcess"], bootstrapTimeoutMs?: number) {
+async function fixture(limit = 2, executionSpawnProcess?: SpawnBridgeOptions["spawnProcess"], bootstrapTimeoutMs?: number, afterSuccessfulLogin?: () => Promise<void>, probe?: () => Promise<{ kind: "signal"; fingerprint: string } | { kind: "no_official_signal" }>) {
   const root = await mkdtemp(join(tmpdir(), "execution-owner-")); roots.push(root);
   const owners: Array<{ bridge: BridgeProcess; handlers: SpawnBridgeOptions["handlers"] }> = [];
   const spawn = vi.fn(async (input: SpawnBridgeOptions) => {
@@ -63,6 +63,8 @@ async function fixture(limit = 2, executionSpawnProcess?: SpawnBridgeOptions["sp
   });
   const runtime = new AgentRuntime({ config: RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: root, RUNNER_WORKSPACE_DIR: root,
     ...(bootstrapTimeoutMs === undefined ? {} : { RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS: bootstrapTimeoutMs }) }), spawn, executionBridgeLimit: () => limit,
+    ...(afterSuccessfulLogin ? { afterSuccessfulLogin } : {}),
+    ...(probe ? { probe } : {}),
     ...(executionSpawnProcess ? { executionSpawnProcess } : {}) });
   runtimes.push(runtime); await runtime.ensureBridge();
   return { root, runtime, owners, spawn, input: { context: { instanceId: "i", assignmentId: "a", attempt: 1, agentId: "codex" }, cwd: root, mcpServers: [] } };
@@ -247,6 +249,69 @@ it("keeps login reserved until execution owners stop and control authentication 
   await vi.waitFor(() => expect(f.runtime.loginInput("test-login", "")).toBe(false));
   expect(f.owners[0]!.bridge.stop).toHaveBeenCalledOnce();
   expect(f.spawn).toHaveBeenCalledTimes(3);
+});
+
+it("does not begin a native login while a Codex session is still owned", async () => {
+  const f = await fixture(2, undefined, undefined, vi.fn(async () => undefined));
+  await f.runtime.sessions.create(f.input);
+  const calls = vi.mocked(startLoginFlow).mock.calls.length;
+  expect(() => f.runtime.startLogin({ organization: false, personal: true })).toThrow();
+  expect(startLoginFlow).toHaveBeenCalledTimes(calls);
+});
+
+it("refreshes the supervisor-owned Codex service before completing native login", async () => {
+  const refresh = vi.fn(async () => undefined);
+  const f = await fixture(2, undefined, undefined, refresh);
+  let finishLogin!: (value: { code: number }) => void;
+  const done = new Promise<{ code: number }>(resolve => { finishLogin = resolve; });
+  vi.mocked(startLoginFlow).mockReturnValueOnce({ loginId: "native-login", done, input: vi.fn(), cancel: vi.fn(async () => undefined) });
+  const completed = vi.fn();
+  f.runtime.events.subscribe(event => { if (event.kind === "login_event" && event.event.type === "completed") completed(); });
+  f.runtime.startLogin({ organization: false, personal: true });
+  finishLogin({ code: 0 });
+  await vi.waitFor(() => expect(completed).toHaveBeenCalledOnce());
+  expect(refresh).toHaveBeenCalledOnce();
+  expect(refresh.mock.invocationCallOrder[0]).toBeLessThan(completed.mock.invocationCallOrder[0]!);
+});
+
+it("reports a terminal login failure if the shared Codex owner cannot refresh", async () => {
+  const f = await fixture(2, undefined, undefined, vi.fn(async () => { throw new Error("owner stop uncertain"); }));
+  let finishLogin!: (value: { code: number }) => void;
+  const done = new Promise<{ code: number }>(resolve => { finishLogin = resolve; });
+  vi.mocked(startLoginFlow).mockReturnValueOnce({ loginId: "failed-refresh", done, input: vi.fn(), cancel: vi.fn(async () => undefined) });
+  const failed = vi.fn();
+  f.runtime.events.subscribe(event => { if (event.kind === "login_event" && event.event.type === "failed") failed(event.event); });
+  f.runtime.startLogin({ organization: false, personal: true });
+  finishLogin({ code: 0 });
+  await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce());
+  expect(f.runtime.readiness().readiness).toBe("unavailable");
+});
+
+it("demotes stale Ready immediately after a prompt reports agent authentication required", async () => {
+  const f = await fixture(2, undefined, undefined, undefined, async () => ({ kind: "signal", fingerprint: "account-identity1" }));
+  await f.runtime.probe(false);
+  const session = await f.runtime.sessions.create(f.input);
+  vi.mocked(f.owners[1]!.bridge.connection.prompt).mockRejectedValueOnce(new RemoteInstanceError("agent_auth_required", "provider token could not refresh"));
+  f.runtime.sessions.prompt(session.acpSessionRef, "auth-fail", { prompt: [] });
+  await vi.waitFor(() => expect(f.runtime.readiness().readiness).toBe("not_configured"));
+  expect(f.runtime.readiness().recoveryAction).toBe("login_locally");
+  expect(f.runtime.readiness().authIdentityFingerprint).toBeUndefined();
+  await f.runtime.probe(false);
+  expect(f.runtime.readiness().readiness).toBe("not_configured");
+  await f.runtime.probe(true);
+  expect(f.runtime.readiness().readiness).toBe("ready");
+});
+
+it("allows a supported no-official-signal agent to recover after a successful official login", async () => {
+  const f = await fixture(2, undefined, undefined, undefined, async () => ({ kind: "no_official_signal" }));
+  const session = await f.runtime.sessions.create(f.input);
+  vi.mocked(f.owners[1]!.bridge.connection.prompt).mockRejectedValueOnce(new RemoteInstanceError("agent_auth_required", "expired"));
+  f.runtime.sessions.prompt(session.acpSessionRef, "auth-fail", { prompt: [] });
+  await vi.waitFor(() => expect(f.runtime.readiness().readiness).toBe("not_configured"));
+  await f.runtime.probe(false);
+  expect(f.runtime.readiness().readiness).toBe("not_configured");
+  await f.runtime.probe(true);
+  expect(f.runtime.readiness().readiness).toBe("ready");
 });
 
 it("stops the exact session bridge once without touching its sibling or control owner", async () => {

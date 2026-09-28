@@ -26,18 +26,6 @@
         "version": "0.153.4",
         "bin": "codex"
       }
-    },
-    "opencode": {
-      "bridge": {
-        "package": "opencode-ai",
-        "version": "1.2.0",
-        "bin": "opencode"
-      },
-      "tooling": {
-        "package": "opencode-ai",
-        "version": "1.2.0",
-        "bin": "opencode"
-      }
     }
   },
   "tools": {
@@ -46,5 +34,14 @@
       "version": "0.18.0",
       "entrypoint": "dist/cli.js"
     }
+  },
+  "browser": {
+    "package": "@playwright/mcp",
+    "version": "0.0.82",
+    "bin": "playwright-mcp",
+    "agents": [
+      "claude-code",
+      "codex"
+    ]
   }
 }

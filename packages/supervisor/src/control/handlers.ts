@@ -24,6 +24,7 @@ import {
   type VersionAcknowledgement,
   type VersionPolicy,
 } from "@konteks/remote-common";
+import { compareAgentVersions } from "@konteks/remote-release";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { SupervisorStore } from "../state/store.js";
 import type { SupervisorJournal } from "../state/journal.js";
@@ -46,9 +47,6 @@ export interface ControlDeps {
   bundleVersion: string;
   protocolVersion: string;
   manifestDigest: () => string;
-  /** Apply the gateway stage/allowlist revision; false when the gateway rejects the revision. */
-  applyGatewayConfig: (config: NonNullable<DesiredConfigurationEnvelope["configuration"]["gateway"]>) => Promise<"applied" | "unsupported_revision" | "unavailable">;
-  deploymentKind?: "appliance" | "native_connector";
   onConfigurationApplied?: (configuration: DesiredConfigurationEnvelope["configuration"]) => void;
   /** Local capacity check for `softMaxConcurrent`. */
   localCapacity: () => number;
@@ -82,8 +80,7 @@ export class ControlHandlers {
   async load(): Promise<void> {
     const stored = await this.deps.store.config();
     if (!stored) return;
-    if ((stored.configuration.deploymentKind ?? "appliance") !== (this.deps.deploymentKind ?? "appliance")) throw new Error("Stored configuration deployment mismatch");
-    if (this.deps.deploymentKind === "native_connector" && stored.digest !== jcsDigest(stored.configuration as unknown as JsonValue)) throw new Error("Stored configuration digest mismatch");
+    if (stored.digest !== jcsDigest(stored.configuration as unknown as JsonValue)) throw new Error("Stored configuration digest mismatch");
     this.deps.onConfigurationApplied?.(stored.configuration);
     this.appliedRevision = stored.revision;
   }
@@ -140,13 +137,12 @@ export class ControlHandlers {
     const ackBase = { type: "desired_configuration_ack" as const, instanceId: envelope.instanceId, revision: envelope.revision, digest: envelope.digest, acknowledgedAt: this.deps.clock.nowIso() };
     const reject = async (reason: DesiredConfigurationAck["reason"]): Promise<void> => { await this.deps.sendAck(this.signed({ ...ackBase, status: "rejected", reason })); };
     const configuration = envelope.configuration;
-    if ((configuration.deploymentKind ?? "appliance") !== (this.deps.deploymentKind ?? "appliance")) return reject("invalid_value");
-    if (this.deps.deploymentKind === "native_connector" && envelope.digest !== jcsDigest(configuration as unknown as JsonValue)) return reject("invalid_value");
+    if (envelope.digest !== jcsDigest(configuration as unknown as JsonValue)) return reject("invalid_value");
     if (parseRfc3339(envelope.expiresAt) <= this.deps.clock.coreNow()) {
       this.counters.rejectedStale += 1;
       return reject("unsupported_revision");
     }
-    if (envelope.revision === this.appliedRevision && this.deps.deploymentKind === "native_connector") {
+    if (envelope.revision === this.appliedRevision) {
       const stored = await this.deps.store.config();
       if (stored?.digest === envelope.digest) {
         await this.deps.sendAck(this.signed({ ...ackBase, status: "applied" }));
@@ -159,12 +155,10 @@ export class ControlHandlers {
     }
     if (configuration.softMaxConcurrent !== undefined && configuration.softMaxConcurrent > this.deps.localCapacity()) return reject("local_capacity_too_low");
     if (configuration.heartbeatIntervalSeconds < 5 || configuration.permissionResponderDeadlineSeconds < 1) return reject("invalid_value");
-    const gateway = this.deps.deploymentKind === "native_connector" ? "applied" : await this.deps.applyGatewayConfig(configuration.gateway!);
-    if (gateway === "unsupported_revision") return reject("unsupported_revision");
     await this.deps.store.saveConfig({ revision: envelope.revision, digest: envelope.digest, configuration, acknowledgedAt: ackBase.acknowledgedAt });
     this.deps.onConfigurationApplied?.(configuration);
     this.appliedRevision = envelope.revision;
-    await this.deps.sendAck(this.signed({ ...ackBase, status: gateway === "unavailable" ? "restart_required" : "applied" }));
+    await this.deps.sendAck(this.signed({ ...ackBase, status: "applied" }));
   }
 
   async handleVersionPolicy(policy: VersionPolicy): Promise<void> {
@@ -265,6 +259,11 @@ export class ControlHandlers {
 }
 
 export function compareSemver(a: string, b: string): number {
+  // Signed releases use SemVer precedence, including prerelease identifiers.
+  // Older wire projections accepted broader version strings, so retain their
+  // previous numeric-core ordering when either value is not valid SemVer.
+  try { return compareAgentVersions(a, b); }
+  catch { /* Compatibility with pre-SemVer bundle strings. */ }
   const parse = (value: string): number[] => value.split("-")[0]!.split(".").map((part) => Number.parseInt(part, 10) || 0);
   const left = parse(a);
   const right = parse(b);

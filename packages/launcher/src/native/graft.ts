@@ -50,7 +50,7 @@ export interface GraftTool {
 }
 
 /** The agent families Graft knows how to wire, by Graft's own ids. */
-export const GRAFT_AGENT_IDS: Record<string, string> = { "claude-code": "claude", codex: "agents" };
+export const GRAFT_AGENT_IDS: Record<string, string> = { "claude-code": "claude", codex: "agents", dsh: "agents" };
 
 /** What each wired agent adds to the repository, in words for the offer. */
 const GRAFT_FILES: Record<string, string[]> = { claude: [".claude/", ".mcp.json"], agents: ["AGENTS.md"] };
@@ -204,7 +204,8 @@ export async function graftAlreadyWired(repo: string): Promise<boolean> {
 
 /** What the offer says: the files Graft adds, and any the repository already tracks. */
 export async function planGraft(repo: string, families: string[]): Promise<{ agents: string[]; adds: string[]; tracked: string[]; files: number }> {
-  const agents = families.map(family => GRAFT_AGENT_IDS[family]).filter((id): id is string => Boolean(id));
+  // Codex and DeepSeek Harness both read AGENTS.md: one Graft id, wired once.
+  const agents = [...new Set(families.map(family => GRAFT_AGENT_IDS[family]).filter((id): id is string => Boolean(id)))];
   const adds = ["graft/", ...agents.flatMap(id => GRAFT_FILES[id] ?? []), ".ignore"];
   const listed = (await git(repo, ["ls-files", "--", ...TRACKABLE]).catch(() => "")).split("\n").filter(Boolean);
   const files = (await git(repo, ["ls-files", "--cached", "--others", "--exclude-standard"]).catch(() => "")).split("\n").filter(Boolean).length;

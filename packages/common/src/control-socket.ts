@@ -12,9 +12,9 @@ import { RuntimeRoleSchema } from "./contracts.js";
  * a named operation with a strict schema; there is no exec, no arbitrary
  * config field, and no remote reachability (loopback bind + token file).
  *
- * Transport: JSON lines over a loopback TCP socket (Docker Desktop cannot
- * share a Unix socket through a bind mount). The first line is the auth
- * envelope carrying a token the supervisor wrote 0600 into its volume.
+ * Transport: JSON lines over a loopback TCP socket (one transport on macOS,
+ * Linux and Windows). The first line is the auth envelope carrying a token
+ * the supervisor wrote 0600 into its private data folder.
  */
 export const CONTROL_SOCKET_DEFAULT_PORT = 41800;
 export const CONTROL_TOKEN_FILE_NAME = "control.token";
@@ -37,28 +37,21 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
     .strict(),
   z.object({ op: z.literal("auth.cancel"), loginId: z.string().min(1) }).strict(),
   z.object({ op: z.literal("auth.logout"), agentId: agentIdSchema }).strict(),
-  z
-    .object({
-      op: z.literal("gateway.key.set"),
-      agentId: agentIdSchema,
-      /** Carried only on this loopback hop; never journaled, logged, or echoed. */
-      key: z.string().min(8).max(4_096),
-    })
-    .strict(),
-  z.object({ op: z.literal("gateway.key.clear"), agentId: agentIdSchema }).strict(),
   // Managed-git key registration (ON16). Nothing here carries key material:
   // the private half is generated on the machine and never crosses this hop,
   // not even to be shown to the person who ran the command.
   z.object({ op: z.literal("git.key.add"), title: z.string().trim().min(1).max(256).optional() }).strict(),
   z.object({ op: z.literal("git.key.list") }).strict(),
   z.object({ op: z.literal("git.key.remove"), keyRef: z.string().trim().min(1).max(200) }).strict(),
-  z.object({ op: z.literal("preview.enable"), port: z.number().int().min(1).max(65_535) }).strict(),
-  z.object({ op: z.literal("preview.disable") }).strict(),
   z.object({ op: z.literal("drain"), reason: z.enum(["user", "update", "remove"]) }).strict(),
   z.object({ op: z.literal("drain.status") }).strict(),
+  /** Verify the shared Codex owner before a cancellable update drain becomes service stop. */
+  z.object({ op: z.literal("codex.maintenance.preflight") }).strict(),
   /** Clears a launcher-initiated drain that will not be followed by a stop (e.g. an aborted update). */
   z.object({ op: z.literal("drain.cancel") }).strict(),
   z.object({ op: z.literal("doctor") }).strict(),
+  /** Read-only: this computer's session previews. The on/off switch is Core's, per machine. */
+  z.object({ op: z.literal("preview.status") }).strict(),
   /** Fetch and verify the release channel; reports without installing anything. */
   z.object({ op: z.literal("update.check") }).strict(),
   /** Ask the supervisor to launch the installer's transactional update in a separate process. */
@@ -156,6 +149,8 @@ const RequestEnvelopeSchema = z
 
 export interface ControlEmitter {
   event(event: ControlLoginEvent): void;
+  /** Closes when the authenticated caller leaves, including process death. */
+  signal: AbortSignal;
 }
 
 export type ControlHandler = (request: ControlRequest, emit: ControlEmitter) => Promise<unknown>;
@@ -201,6 +196,8 @@ export function startControlSocketServer(
 
 function handleConnection(socket: Socket, options: ControlSocketServerOptions): void {
   socket.setNoDelay(true);
+  const disconnect = new AbortController();
+  socket.once("close", () => disconnect.abort());
   const lines = createInterface({ input: socket, terminal: false });
   // A client that resets mid-read (a `status` probe exiting early) surfaces as
   // an 'error' on the socket AND, independently, on the readline interface.
@@ -244,7 +241,7 @@ function handleConnection(socket: Socket, options: ControlSocketServerOptions): 
       return;
     }
     const { id, request } = envelope.data;
-    const emit: ControlEmitter = { event: (event) => send({ kind: "event", id, event }) };
+    const emit: ControlEmitter = { event: (event) => send({ kind: "event", id, event }), signal: disconnect.signal };
     options
       .handler(request, emit)
       .then((result) => {
@@ -286,6 +283,7 @@ export interface ControlCall<T> {
   request: ControlRequest;
   schema: SchemaParser<T>;
   onEvent?: (event: ControlLoginEvent) => void;
+  signal?: AbortSignal;
 }
 
 function unavailable(message: string, cause?: unknown): RemoteInstanceError {
@@ -309,9 +307,16 @@ export function controlCall<T>(options: ControlSocketClientOptions, call: Contro
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      call.signal?.removeEventListener("abort", onAbort);
       socket.end();
       fn();
     };
+    const onAbort = () => {
+      socket.destroy();
+      finish(() => reject(new RemoteInstanceError("temporarily_unavailable", "control operation interrupted")));
+    };
+    call.signal?.addEventListener("abort", onAbort, { once: true });
+    if (call.signal?.aborted) { onAbort(); return; }
     socket.once("error", (error) => {
       finish(() => reject(unavailable("cannot reach the supervisor control socket", error)));
     });
@@ -344,7 +349,9 @@ export function controlCall<T>(options: ControlSocketClientOptions, call: Contro
     lines.on("error", error => finish(() => reject(unavailable("cannot read the supervisor control socket", error))));
     lines.on("line", (line) => {
       const parsed = ControlResponseSchema.safeParse(safeJson(line));
-      if (!parsed.success || parsed.data.id !== id) return;
+      // A request the server cannot parse is answered with id "unknown". Each
+      // call owns its connection and sends one request, so that error is ours.
+      if (!parsed.success || (parsed.data.id !== id && !(parsed.data.kind === "error" && parsed.data.id === "unknown"))) return;
       const response = parsed.data;
       if (response.kind === "event") {
         call.onEvent?.(response.event);
@@ -430,7 +437,7 @@ export const SupervisorStatusSchema = z
     components: z.array(
       z
         .object({
-          kind: z.enum(["harness", "validation_runtime", "agent_runner", "gateway"]),
+          kind: z.enum(["agent_runner"]),
           version: z.string(),
           healthStatus: z.enum(["healthy", "degraded", "unhealthy", "unknown"]),
           capabilities: z.array(z.string()),
@@ -456,10 +463,17 @@ export const SupervisorStatusSchema = z
         softMaxConcurrent: z.number().int().optional(),
       })
       .strict(),
-    previewEnabled: z.boolean(),
-    previewExposure: z.object({ port: z.number().int(), grantPresent: z.boolean() }).strict().nullable(),
     pendingErase: z.number().int().nonnegative(),
     pendingRevocation: z.boolean(),
+    /**
+     * Whether a session preview is running on this computer, and the first
+     * one's loopback port and whether a viewer reached it through the relay.
+     * Always emitted: a launcher installed before 7.0.0 (a user install's
+     * `<root>/bin/konteks-remote` is never replaced by an update) requires
+     * both; optional so a launcher still reads a connector without them.
+     */
+    previewEnabled: z.boolean().optional(),
+    previewExposure: z.object({ port: z.number().int(), grantPresent: z.boolean() }).strict().nullable().optional(),
     journal: z
       .object({
         assignments: z.number().int().nonnegative(),
@@ -470,6 +484,37 @@ export const SupervisorStatusSchema = z
   })
   .strict();
 export type SupervisorStatus = z.infer<typeof SupervisorStatusSchema>;
+
+/** `preview.status`: every session preview this connector runs or recently ran. */
+export const PreviewStatusReportSchema = z
+  .object({
+    /** The connector advertises `preview.dev_server` (it can serve preview channels). */
+    capabilityAdvertised: z.boolean(),
+    idleStopMinutes: z.number().int().positive(),
+    maxRunning: z.number().int().positive(),
+    previews: z.array(
+      z
+        .object({
+          sessionId: z.string(),
+          state: z.enum(["not_started", "starting", "running", "failed", "stopped"]),
+          url: z.string().nullable(),
+          port: z.number().int().nullable(),
+          command: z.string().nullable(),
+          source: z.enum(["preview_yaml", "inferred"]).nullable(),
+          explanation: z.string().nullable(),
+          message: z.string(),
+          startedAt: z.string().nullable(),
+          readyAt: z.string().nullable(),
+          /** Who started it: the agent (preview_start) or a viewer opening it in Konteks. Absent from an older connector. */
+          startedBy: z.enum(["agent", "viewer"]).nullable().optional(),
+          viewerConnected: z.boolean(),
+        })
+        .strict(),
+    ),
+    lastFailure: z.object({ at: z.string(), message: z.string() }).strict().nullable(),
+  })
+  .strict();
+export type PreviewStatusReport = z.infer<typeof PreviewStatusReportSchema>;
 
 export const DoctorCheckSchema = z
   .object({

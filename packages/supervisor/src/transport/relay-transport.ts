@@ -131,6 +131,12 @@ export class TransportManager {
       this.relay.send(message);
       return;
     }
+    // Preview is a relay-only stream with the same replay owner as a session;
+    // there is no HTTPS carrier for it, so without a relay it has nowhere to go.
+    if (message.channel === "preview") {
+      this.relay?.send(message);
+      return;
+    }
     this.active.send(message);
   }
 

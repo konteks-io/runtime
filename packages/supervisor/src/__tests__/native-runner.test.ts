@@ -41,6 +41,14 @@ describe("native in-process runner (A4)", () => {
     expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: { konteksSession: { version: 1,
       title: `[konteks/Todo List/initiative] [v3] Stand up the todo list API ${acpSessionRef.slice(-8)}` } } }));
   });
+  it("adds no browser for an agent package that carries none, and refuses a browser request that is not a loopback gateway", async () => {
+    const f = fixture(); await f.runner.start();
+    expect(f.runner.browserVersion()).toBeNull();
+    const browser = { proxyUrl: "http://127.0.0.1:50123", outputDir: join(root, "out"), browsersPath: join(root, "browsers") };
+    await f.runner.createSession({ ...f.input, browser });
+    expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ mcpServers: [] }));
+    await expect(f.runner.createSession({ ...f.input, browser: { ...browser, proxyUrl: "http://proxy.example:8080" } })).rejects.toThrow();
+  });
   it("returns completed-turn settlement only after draining ACP and stopping its execution bridge", async () => {
     const f = fixture(); await f.runner.start(); f.runner.startEvents();
     const { acpSessionRef } = await f.runner.createSession(f.input);
@@ -172,7 +180,7 @@ describe("native in-process runner (A4)", () => {
     f.runner.startEvents();
     expect(f.spawn).toHaveBeenCalledOnce();
     expect(listen).not.toHaveBeenCalled();
-    expect(await f.port.readiness()).toMatchObject({ agent: { agentId: "codex", authMode: "agent_local_subscription", readiness: "ready", moneyObservable: false }, utilization: { activeSessions: 0, activeTurns: 0 } });
+    expect(await f.port.readiness()).toMatchObject({ agent: { agentId: "codex", authMode: "agent_local_subscription", readiness: "ready" }, utilization: { activeSessions: 0, activeTurns: 0 } });
     const count = f.events.length;
     await f.port.probe();
     expect(f.events.length).toBe(count + 1);
@@ -198,7 +206,7 @@ describe("native in-process runner (A4)", () => {
 
   it("rejects BYOK configuration before spawning anything", () => {
     const f = fixture();
-    for (const config of [{ ...f.config, RUNNER_AUTH_MODE: "gateway_keyed" }, { ...f.config, RUNNER_GATEWAY_BASE_URL: "https://gateway.invalid" }]) {
+    for (const config of [{ ...f.config, RUNNER_AUTH_MODE: "gateway_keyed" }]) {
       expect(() => new NativeRunner({ instanceId: "instance", config: config as typeof f.config, onEvent: () => undefined })).toThrow(/native|subscription/i);
     }
     expect(f.spawn).not.toHaveBeenCalled();
@@ -243,5 +251,53 @@ describe("native in-process runner (A4)", () => {
     await expect(pending).resolves.toEqual(answer);
     await vi.waitFor(() => expect(f.events).toContainEqual({ kind: "prompt_result", acpSessionRef: ref, requestId: "turn", result: { stopReason: "end_turn" } }));
     expect(JSON.stringify(f.events)).not.toContain("bridge-private");
+  });
+});
+
+describe("native DeepSeek Harness runner", () => {
+  const dshConfig = () => RunnerConfigSchema.parse({
+    RUNNER_AGENT_ID: "dsh", RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_WORKSPACE_DIR: join(root, "work"), RUNNER_BRIDGE_PREFIX: "/opt/dsh",
+    RUNNER_NATIVE_DSH_ROOT: "/opt/dsh", RUNNER_NATIVE_DSH_ENTRY: "/opt/dsh/lib/bin.js", RUNNER_NATIVE_DSH_NODE: "/opt/node/bin/node", RUNNER_BRIDGE_VERSION: "0.1.7-rc.2",
+  });
+  const bridge = (): BridgeProcess => ({ connection: {} as ClientSideConnection, initializeResult: { protocolVersion: 1 }, exited: false, stderrTail: () => [], stop: vi.fn(async () => undefined) });
+
+  it("proves the Konteks overlay is in force in this exact installation before dsh ever starts", async () => {
+    const order: string[] = [];
+    const check = vi.fn(async (options: { node: string; installation: { root: string; entry: string; version: string }; dshHome: string; konteksDir: string }) => { order.push("check"); void options; });
+    const spawn = vi.fn(async () => { order.push("spawn"); return bridge(); });
+    const runner = new NativeRunner({ instanceId: "instance", config: dshConfig(), onEvent: () => undefined, dshProfileCheck: check,
+      runtimeOptions: { spawn, probe: async () => ({ kind: "logged_out" }) } });
+    runners.push(runner);
+    await runner.start();
+    expect(order).toEqual(["check", "spawn"]);
+    expect(check).toHaveBeenCalledWith(expect.objectContaining({
+      node: "/opt/node/bin/node", installation: { root: "/opt/dsh", entry: "/opt/dsh/lib/bin.js", version: "0.1.7-rc.2" },
+      dshHome: join(root, "credentials", ".dsh"), konteksDir: join(root, "credentials", "konteks-dsh"),
+    }));
+  });
+
+  it("can be started again after a failed start, so a background retry really retries", async () => {
+    const spawn = vi.fn(async () => bridge());
+    let checks = 0;
+    const runner = new NativeRunner({ instanceId: "instance", config: dshConfig(), onEvent: () => undefined,
+      dshProfileCheck: async () => { checks += 1; if (checks === 1) throw new Error("dsh not supported yet"); },
+      runtimeOptions: { spawn, probe: async () => ({ kind: "logged_out" }) } });
+    runners.push(runner);
+    await expect(runner.start()).rejects.toThrow("dsh not supported yet");
+    expect(spawn).not.toHaveBeenCalled();
+    await runner.start();
+    expect(checks).toBe(2);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    await expect(runner.readiness()).resolves.toMatchObject({ agent: { agentId: "dsh" } });
+  });
+
+  it("never spawns a dsh whose composed profile drifted", async () => {
+    const spawn = vi.fn(async () => bridge());
+    const drift = Object.assign(new Error("DeepSeek Harness 0.1.7-rc.2 does not accept the Konteks settings"), { code: "prerequisite_missing", diagnostic: "dsh_profile_drift" });
+    const runner = new NativeRunner({ instanceId: "instance", config: dshConfig(), onEvent: () => undefined, dshProfileCheck: async () => { throw drift; },
+      runtimeOptions: { spawn, probe: async () => ({ kind: "logged_out" }) } });
+    runners.push(runner);
+    await expect(runner.start()).rejects.toMatchObject({ diagnostic: "dsh_profile_drift" });
+    expect(spawn).not.toHaveBeenCalled();
   });
 });

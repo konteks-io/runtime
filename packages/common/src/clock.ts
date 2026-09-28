@@ -1,6 +1,6 @@
 /**
- * A clock the appliance can reason about. Core timestamps are authoritative;
- * the appliance keeps an estimate of its own skew from Core response times so
+ * A clock the runtime can reason about. Core timestamps are authoritative;
+ * the runtime keeps an estimate of its own skew from Core response times so
  * lease renewal and proof timestamps stay inside Core's acceptance window even
  * on a host with a drifting clock.
  */

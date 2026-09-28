@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
 import { AgentRuntime } from "../runtime.js";
-import { loadRunnerConfig } from "../config.js";
+import { RunnerConfigSchema } from "../config.js";
 import type { BridgeProcess, SpawnBridgeOptions } from "../bridge/process.js";
 
 const roots: string[] = [];
@@ -15,7 +15,7 @@ function bridge(): BridgeProcess {
 }
 async function runtime(spawn: (input: SpawnBridgeOptions) => Promise<BridgeProcess>) {
   const root = await mkdtemp(join(tmpdir(), "bridge-owner-test-")); roots.push(root);
-  return new AgentRuntime({ config: loadRunnerConfig({ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: root, RUNNER_WORKSPACE_DIR: root }),
+  return new AgentRuntime({ config: RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: root, RUNNER_WORKSPACE_DIR: root }),
     spawn, retrySleep: async () => undefined, retryRandom: () => 0.5 });
 }
 

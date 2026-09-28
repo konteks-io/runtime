@@ -5,6 +5,7 @@ import { RemoteInstanceError, createLogger, type Logger } from "@konteks/remote-
 import { classifyBridgeError, spawnBridge, type BridgeProcess, type SpawnBridgeOptions } from "./process.js";
 import type { BridgeSpawnSpec } from "./spec.js";
 import { konteksSessionMetadata } from "../sessions/title.js";
+import { orderKnownFirst, recogniseNativeModel } from "@konteks/backstage-plugin-common/known-models";
 
 export interface DiscoverBridgeModelCapabilityOptions {
   configId: string;
@@ -22,10 +23,23 @@ export interface DiscoverBridgeModelCapabilityOptions {
   retryRandom?: () => number;
 }
 
+/** One offered value as the agent presents it: display name and group (dsh groups by provider). */
+export interface DiscoveredModelOption {
+  value: string;
+  name?: string;
+  group?: string;
+  groupName?: string;
+}
+
 export interface DiscoveredBridgeModelCapability {
   currentValue: string;
   offeredValues: string[];
+  /** Parallel to `offeredValues`: same values, same order. */
+  offeredOptions: DiscoveredModelOption[];
 }
+
+/** The most values one snapshot may carry (the Core wire bound). */
+export const MAX_OFFERED_MODEL_VALUES = 128;
 
 const unavailable = () => new RemoteInstanceError("agent_unavailable", "ACP model capability discovery was refused or malformed");
 
@@ -85,7 +99,7 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
         const matches = (created.configOptions ?? []).filter(option => option.id === options.configId);
         const selected = matches[0];
         if (matches.length !== 1 || selected === undefined || selected.type !== "select") throw unavailable();
-        const capability = exactSelect(selected);
+        const capability = exactSelect(selected, options.spec.family.agentId);
         if (attempt === 1 && options.bridge && options.bridge.initializeResult.agentCapabilities?.sessionCapabilities?.close != null) {
           await options.bridge.connection.closeSession({ sessionId: created.sessionId }).catch(() => undefined);
         }
@@ -133,18 +147,58 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
   }
 }
 
-function exactSelect(option: Extract<SessionConfigOption, { type: "select" }>): DiscoveredBridgeModelCapability {
-  const flattened: SessionConfigSelectOption[] = [];
-  if (option.options.length > 128) throw unavailable();
+function isControl(code: number): boolean {
+  return code <= 0x1f || code === 0x7f;
+}
+
+/** A display label safe for the wire: no control characters, at most 128 characters. */
+function label(text: unknown): string | undefined {
+  if (typeof text !== "string") return undefined;
+  const cleaned = [...text].map(char => (isControl(char.charCodeAt(0)) ? " " : char)).join("").trim().slice(0, 128);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+function validValue(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256
+    && ![...value].some(char => isControl(char.charCodeAt(0)));
+}
+
+/**
+ * Every option the agent offers, with its name and group (System One §6a,
+ * KM6). Malformed entries and repeats are skipped rather than failing the
+ * whole report. Above the wire bound the known models come first, then the
+ * recognised, so a DeepSeek Harness fronting many providers still reports
+ * what Konteks can price; the current value is always kept.
+ */
+export function exactSelect(option: Extract<SessionConfigOption, { type: "select" }>, agentId: string): DiscoveredBridgeModelCapability {
+  if (!validValue(option.currentValue)) throw unavailable();
+  const seen = new Set<string>();
+  const all: DiscoveredModelOption[] = [];
+  const add = (entry: SessionConfigSelectOption, group?: { group: string; name: string }) => {
+    if (!validValue(entry.value) || seen.has(entry.value)) return;
+    seen.add(entry.value);
+    const name = label(entry.name);
+    const groupId = group ? label(group.group) : undefined;
+    const groupName = group ? label(group.name) : undefined;
+    all.push({ value: entry.value, ...(name ? { name } : {}), ...(groupId ? { group: groupId } : {}), ...(groupName ? { groupName } : {}) });
+  };
   for (const entry of option.options) {
-    if ("value" in entry) flattened.push(entry);
-    else {
-      if (entry.options.length > 128 || flattened.length + entry.options.length > 128) throw unavailable();
-      flattened.push(...entry.options);
-    }
+    if ("value" in entry) add(entry);
+    else for (const nested of entry.options) add(nested, { group: entry.group, name: entry.name });
   }
-  const offeredValues = flattened.map(entry => entry.value);
-  if (offeredValues.length === 0 || offeredValues.some(value => value.length === 0 || value.length > 256)
-    || new Set(offeredValues).size !== offeredValues.length || !offeredValues.includes(option.currentValue)) throw unavailable();
-  return { currentValue: option.currentValue, offeredValues };
+  if (!seen.has(option.currentValue)) throw unavailable();
+  let offered = all;
+  if (all.length > MAX_OFFERED_MODEL_VALUES) {
+    const ranked = orderKnownFirst(all.map(entry => ({ entry, status: recogniseNativeModel(agentId, entry.value).status })));
+    const current = ranked.find(item => item.entry.value === option.currentValue)!;
+    const kept = new Set([current, ...ranked.filter(item => item !== current).slice(0, MAX_OFFERED_MODEL_VALUES - 1)]
+      .map(item => item.entry));
+    // Keep the agent's own order among what is kept.
+    offered = all.filter(entry => kept.has(entry));
+  }
+  return {
+    currentValue: option.currentValue,
+    offeredValues: offered.map(entry => entry.value),
+    offeredOptions: offered,
+  };
 }

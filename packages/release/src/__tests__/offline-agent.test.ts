@@ -88,11 +88,13 @@ describe("complete signed offline agent profile", () => {
     profile.files.sort((a, b) => a.path < b.path ? -1 : 1);
     expect(NativeAgentPackageProfileSchema.safeParse(profile).success).toBe(false);
   });
-  it("rejects Pi even with official tooling until native auth and MCP compatibility are proven", () => {
+  it("rejects retired agents (Pi, OpenCode) even with their official tooling", () => {
     const { profile } = offlineFixture();
     const pi = { ...profile, agentId: "pi", bridge: { ...profile.bridge, package: "pi-acp", version: "0.0.33" }, tooling: { ...profile.tooling, package: "@earendil-works/pi-coding-agent", version: "0.80.4" } };
     expect(NativeAgentPackageProfileSchema.safeParse(pi).success).toBe(false);
     expect(NativeAgentPackageProfileSchema.safeParse({ ...pi, tooling: { ...pi.tooling, package: "@mariozechner/pi-coding-agent" } }).success).toBe(false);
+    const opencode = { ...profile, agentId: "opencode", bridge: { ...profile.bridge, package: "opencode-ai", version: "1.2.0" }, tooling: { ...profile.tooling, package: "opencode-ai", version: "1.2.0" } };
+    expect(NativeAgentPackageProfileSchema.safeParse(opencode).success).toBe(false);
   });
   it.each(["runtime", "official_tooling", "entrypoint", "arguments"])("rejects an incomplete or mutable %s profile", failure => {
     const { profile } = offlineFixture();

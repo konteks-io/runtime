@@ -88,4 +88,30 @@ describe("bb-derived native daemon lifecycle", () => {
     expect(failureSource.listenerCount('unhandledRejection')).toBe(0);
     expect(failureSource.listenerCount('uncaughtException')).toBe(0);
   });
+
+  it("records liveness loss before a controlled nonzero exit", async () => {
+    const order: string[] = [];
+    const daemon = createDaemon({ name: "test", onStart: async () => undefined, signalSource: new EventEmitter(),
+      recordNonzeroExit: async reason => { order.push(`record:${reason}`); },
+      shutdownSteps: () => [{ name: "release", run: async () => { order.push("release"); } }],
+      exitProcess: code => { order.push(`exit:${code}`); },
+    });
+    await daemon.start();
+    await daemon.shutdown("liveness-lost", 1);
+    expect(order).toEqual(["record:liveness_lost", "release", "exit:1"]);
+  });
+
+  it("classifies process failure without persisting its raw error and still exits if recording fails", async () => {
+    const failureSource = new EventEmitter();
+    const recordNonzeroExit = vi.fn(async () => { throw new Error("disk unavailable"); });
+    const exitProcess = vi.fn();
+    const daemon = createDaemon({ name: "test", onStart: async () => undefined, signalSource: new EventEmitter(), failureSource,
+      recordNonzeroExit, exitProcess, shutdownSteps: () => [],
+    });
+    await daemon.start();
+    failureSource.emit("uncaughtException", new Error("private error text"));
+    await daemon.waitUntilStopped();
+    expect(recordNonzeroExit).toHaveBeenCalledWith("uncaught_exception");
+    expect(exitProcess).toHaveBeenCalledWith(1);
+  });
 });

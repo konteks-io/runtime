@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { isNativeAgentRuntimeId } from "@konteks/backstage-plugin-common";
 import {
   AgentModelOfferedValuesSnapshotSchema,
+  catalogueModelAuthority,
   computeAgentModelOfferedValuesSnapshotDigest,
   parseRfc3339,
   type AgentModelCapabilityMapping,
@@ -11,13 +13,36 @@ import {
 
 export interface ResolvedModelCapabilityMapping { agentId: string; mapping: AgentModelCapabilityMapping }
 
+/**
+ * What one snapshot is bound to: a reviewed signed mapping from the release,
+ * or, for an agent the release signed nothing for, the fixed catalogue
+ * authority Core resolves through its own known-model catalogue (System One
+ * §6a, KM5). A catalogue authority has no expiry of its own.
+ */
+interface OfferedAuthority {
+  agentId: string;
+  mappingId: string;
+  mappingRevision: number;
+  mappingDigest: string;
+  configId: string;
+  expiresAt?: string;
+}
+
+interface DiscoveredOffer {
+  currentValue: string;
+  offeredValues: string[];
+  offeredOptions?: Array<{ value: string; name?: string; group?: string; groupName?: string }>;
+}
+
 export interface ModelCapabilitySnapshotProducerOptions {
   clock: Clock;
   instanceId: () => string;
   runnerIncarnation: () => string;
   manifestId: () => string | null;
   mappings: () => readonly ResolvedModelCapabilityMapping[];
-  discover: (agentId: string, configId: string) => Promise<{ currentValue: string; offeredValues: string[] }>;
+  /** Installed native agents; each one without a current signed mapping reports under its catalogue authority. */
+  catalogueAgents?: () => readonly string[];
+  discover: (agentId: string, configId: string) => Promise<DiscoveredOffer>;
   newId?: () => string;
   ttlMs?: number;
   /** Renew asynchronously before expiry so heartbeat publication never gaps. */
@@ -38,11 +63,25 @@ export class ModelCapabilitySnapshotProducer {
 
   constructor(private readonly options: ModelCapabilitySnapshotProducerOptions) {}
 
+  /** Every authority snapshots may be taken under now: signed mappings first, then catalogue authorities. */
+  private authorities(): OfferedAuthority[] {
+    const now = this.options.clock.now();
+    const signed: OfferedAuthority[] = this.options.mappings()
+      .filter(value => parseRfc3339(value.mapping.expiresAt) > now)
+      .map(value => ({ agentId: value.agentId, mappingId: value.mapping.mappingId, mappingRevision: value.mapping.mappingRevision,
+        mappingDigest: value.mapping.mappingDigest, configId: value.mapping.configId, expiresAt: value.mapping.expiresAt }));
+    const covered = new Set(signed.map(value => value.agentId));
+    const catalogue = [...new Set(this.options.catalogueAgents?.() ?? [])]
+      .filter(agentId => isNativeAgentRuntimeId(agentId) && !covered.has(agentId))
+      .map(agentId => ({ agentId, ...catalogueModelAuthority(agentId) }));
+    return [...signed, ...catalogue];
+  }
+
   invalidateForAgents(agents: readonly ConnectedAgentView[]): void {
     this.agents = structuredClone(agents);
     const now = this.options.clock.now();
     const manifestId = this.options.manifestId();
-    const mappings = new Map(this.options.mappings().map(value => [identity(value), value]));
+    const mappings = new Map(this.authorities().map(value => [identity(value), value]));
     const agentMap = new Map(agents.map(agent => [agent.agentId, agent]));
     for (const [id, entry] of this.cache) {
       const resolved = mappings.get(id), agent = resolved ? agentMap.get(resolved.agentId) : undefined;
@@ -53,8 +92,8 @@ export class ModelCapabilitySnapshotProducer {
 
   invalidateAgent(agentId: string): void {
     this.agentEpochs.set(agentId, (this.agentEpochs.get(agentId) ?? 0) + 1);
-    for (const resolved of this.options.mappings()) {
-      if (resolved.agentId === agentId) this.cache.delete(identity(resolved));
+    for (const id of [...this.cache.keys()]) {
+      if (id.startsWith(`${agentId}\0`)) this.cache.delete(id);
     }
   }
 
@@ -63,9 +102,9 @@ export class ModelCapabilitySnapshotProducer {
     const manifestId = this.options.manifestId();
     if (manifestId === null) return;
     const work: Promise<void>[] = [];
-    for (const resolved of this.options.mappings().slice(0, 8)) {
+    for (const resolved of this.authorities().slice(0, 8)) {
       const agent = agents.find(candidate => candidate.agentId === resolved.agentId);
-      if (!eligible(agent) || parseRfc3339(resolved.mapping.expiresAt) <= this.options.clock.now()) continue;
+      if (!eligible(agent)) continue;
       const id = identity(resolved), key = this.authorityKey(resolved, agent, manifestId);
       const cached = this.cache.get(id);
       const refreshAheadMs = this.options.refreshAheadMs ?? Math.min(2 * 60_000, (this.options.ttlMs ?? 5 * 60_000) / 2);
@@ -89,13 +128,14 @@ export class ModelCapabilitySnapshotProducer {
     return [...this.cache.values()].map(value => structuredClone(value.snapshot)).sort((a, b) => a.agentId.localeCompare(b.agentId) || a.mappingId.localeCompare(b.mappingId));
   }
 
-  private async discoverOne(id: string, key: string, resolved: ResolvedModelCapabilityMapping, agent: ConnectedAgentView, manifestId: string): Promise<void> {
+  private async discoverOne(id: string, key: string, resolved: OfferedAuthority, agent: ConnectedAgentView, manifestId: string): Promise<void> {
     try {
-      const observed = await this.options.discover(resolved.agentId, resolved.mapping.configId);
+      const observed = await this.options.discover(resolved.agentId, resolved.configId);
       const currentAgent = this.agents.find(candidate => candidate.agentId === resolved.agentId);
       if (!eligible(currentAgent) || key !== this.authorityKey(resolved, currentAgent, this.options.manifestId() ?? "")) return;
       const now = this.options.clock.now();
-      const expires = Math.min(parseRfc3339(resolved.mapping.expiresAt), now + (this.options.ttlMs ?? 5 * 60_000));
+      const ttlEnd = now + (this.options.ttlMs ?? 5 * 60_000);
+      const expires = resolved.expiresAt ? Math.min(parseRfc3339(resolved.expiresAt), ttlEnd) : ttlEnd;
       if (expires <= now) return;
       const snapshotRevision = (this.revisions.get(id) ?? 0) + 1;
       const body = {
@@ -103,9 +143,10 @@ export class ModelCapabilitySnapshotProducer {
         instanceId: this.options.instanceId(), agentId: resolved.agentId,
         authIdentityFingerprint: currentAgent.authIdentityFingerprint,
         runnerIncarnation: this.options.runnerIncarnation(), manifestId,
-        mappingId: resolved.mapping.mappingId, mappingRevision: resolved.mapping.mappingRevision,
-        mappingDigest: resolved.mapping.mappingDigest, configId: resolved.mapping.configId,
+        mappingId: resolved.mappingId, mappingRevision: resolved.mappingRevision,
+        mappingDigest: resolved.mappingDigest, configId: resolved.configId,
         currentValue: observed.currentValue, offeredValues: observed.offeredValues,
+        ...(observed.offeredOptions?.length ? { offeredOptions: observed.offeredOptions } : {}),
         observedAt: new Date(now).toISOString(), expiresAt: new Date(expires).toISOString(),
       };
       const snapshot = AgentModelOfferedValuesSnapshotSchema.parse({ ...body, snapshotDigest: computeAgentModelOfferedValuesSnapshotDigest(body) });
@@ -122,8 +163,8 @@ export class ModelCapabilitySnapshotProducer {
     }
   }
 
-  private authorityKey(value: ResolvedModelCapabilityMapping, agent: ConnectedAgentView & { authIdentityFingerprint: string }, manifestId: string): string {
-    return JSON.stringify([manifestId, value.mapping.mappingId, value.mapping.mappingRevision, value.mapping.mappingDigest,
+  private authorityKey(value: OfferedAuthority, agent: ConnectedAgentView & { authIdentityFingerprint: string }, manifestId: string): string {
+    return JSON.stringify([manifestId, value.mappingId, value.mappingRevision, value.mappingDigest,
       agent.authIdentityFingerprint, this.options.runnerIncarnation(), this.agentEpochs.get(value.agentId) ?? 0]);
   }
 }
@@ -131,4 +172,4 @@ export class ModelCapabilitySnapshotProducer {
 function eligible(agent: ConnectedAgentView | undefined): agent is ConnectedAgentView & { authIdentityFingerprint: string } {
   return agent?.authMode === "agent_local_subscription" && agent.readiness === "ready" && agent.connectionState === "ready" && typeof agent.authIdentityFingerprint === "string" && agent.authIdentityFingerprint.length > 0;
 }
-function identity(value: ResolvedModelCapabilityMapping): string { return `${value.agentId}\0${value.mapping.mappingId}`; }
+function identity(value: OfferedAuthority): string { return `${value.agentId}\0${value.mappingId}`; }

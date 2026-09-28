@@ -80,15 +80,6 @@ const FirstSystemSchema = z
 
 export type FirstSystemRegistered = z.infer<typeof FirstSystemSchema>;
 
-/** One agent this machine advertises for a role, as the capabilities read names it. */
-interface MachineAgentOption {
-  optionId: string;
-  runtimeId?: string;
-  providerId?: string;
-  modelId: string;
-  availability?: string;
-}
-
 export class OwnerApiClient {
   constructor(
     private readonly options: {
@@ -117,52 +108,33 @@ export class OwnerApiClient {
    * Whether this workspace can already run work (W1-A6).
    *
    * A workspace made from a coding agent has never been through the setup the
-   * site offers, so it has no execution profile and its first session is
-   * refused for want of one. Any profile at all means somebody has chosen.
+   * site offers, so its first session needs a ready default revision. A
+   * draft or an unrelated profile cannot carry that session.
    */
   async hasExecutionProfile(): Promise<boolean> {
     const body = (await this.call("GET", "/api/app/execution-profiles")) as { profiles?: unknown };
-    return Array.isArray(body.profiles) && body.profiles.length > 0;
+    return Array.isArray(body.profiles) && body.profiles.some((profile: unknown) => {
+      if (!profile || typeof profile !== "object") return false;
+      const entry = profile as Record<string, unknown>;
+      return entry.isDefault === true && entry.status === "active"
+        && typeof entry.currentReadyRevision === "number" && entry.currentReadyRevision > 0;
+    });
   }
 
   /**
-   * Make this machine's own agents the workspace's default execution profile:
-   * the recommended option for the planner and the executor, which are the
-   * person's own agent logins on their own machine, so there is nothing to ask.
-   * Answers false when the machine advertises nothing that can carry the work.
+   * Ask Core's Auto provisioner to bind a ready default using the machine's
+   * eligible agents. Core owns role ranking, readiness and retry idempotence.
    */
-  async setUpAgentsFromThisMachine(name: string): Promise<boolean> {
-    const capabilities = (await this.call("GET", "/api/app/agent-setup/capabilities")) as {
-      roles?: Record<string, { recommendedOptionId?: string; preferredOptionId?: string; options?: MachineAgentOption[] }>;
-    };
-    const roles = capabilities.roles ?? {};
-    const pick = (role: string): MachineAgentOption | undefined => {
-      const offer = roles[role];
-      if (!offer) return undefined;
-      const wanted = offer.recommendedOptionId ?? offer.preferredOptionId;
-      const options = offer.options ?? [];
-      return options.find(option => option.optionId === wanted) ?? options.find(option => option.availability === "available");
-    };
-    const planner = pick("planner") ?? pick("assistant");
-    const executor = pick("executor") ?? planner;
-    if (!planner || !executor) return false;
-    const role = (option: MachineAgentOption) => ({
-      ...(option.runtimeId ? { runtimeId: option.runtimeId, agentId: option.runtimeId } : {}),
-      ...(option.providerId ? { provider: option.providerId } : {}),
-      model: option.modelId,
-      authMode: "managed_local_auth" as const,
-    });
-    const created = (await this.call("POST", "/api/app/execution-profiles", {
-      name,
-      description: "Set up from this machine when it was connected.",
-    })) as { profile?: { id?: unknown } };
-    const profileId = typeof created.profile?.id === "string" ? created.profile.id : "";
-    if (!profileId) throw new RemoteInstanceError("temporarily_unavailable", "Konteks did not answer with a profile.");
-    await this.call("POST", `/api/app/execution-profiles/${encodeURIComponent(profileId)}/revisions`, {
-      configuration: { planner: role(planner), executor: role(executor) },
-      makeDefault: true,
-    });
-    return true;
+  async setUpAgentsFromThisMachine(): Promise<boolean> {
+    let binding: Record<string, unknown>;
+    try {
+      binding = (await this.call("POST", "/api/app/execution-profiles/auto")) as Record<string, unknown>;
+    } catch (error) {
+      if (error instanceof RemoteInstanceError && error.code === "role_not_advertised") return false;
+      throw error;
+    }
+    return typeof binding.executionProfileId === "string" && binding.executionProfileId.length > 0
+      && typeof binding.revision === "number" && binding.revision > 0;
   }
 
   /**
@@ -295,6 +267,10 @@ export class OwnerApiClient {
     }
     if (!response.ok) {
       const detail = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+      if (response.status === 503 && path === "/api/app/execution-profiles/auto"
+        && (detail.error as { code?: unknown } | undefined)?.code === "native_execution_profile_unavailable") {
+        throw new RemoteInstanceError("role_not_advertised", "Konteks is still learning what this machine's agents can do.");
+      }
       throw new RemoteInstanceError(
         "temporarily_unavailable",
         typeof detail.message === "string" ? detail.message : `Konteks answered ${response.status}.`,

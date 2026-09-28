@@ -29,6 +29,7 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
+    "@konteks/backstage-plugin-common": "7.0.0",
     "@konteks/remote-common": "*",
     "@konteks/remote-release": "*",
     "@konteks/remote-supervisor": "*",

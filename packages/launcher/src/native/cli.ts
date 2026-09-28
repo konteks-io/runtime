@@ -1,24 +1,29 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Command, InvalidArgumentError } from "commander";
+import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { nativePaths, nativePlatform } from "./service.js";
 import { createOutput, type Output } from "../output.js";
+
+/** The agents a native runtime runs (Pi and OpenCode are retired). */
+const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh"] as const;
+type NativeAgentId = (typeof NATIVE_AGENT_IDS)[number];
 
 export interface NativeCommandContext { root: string; output: Output }
 export interface NativeCliActions {
   install(input: NativeCommandContext & { activationId?: string; enroll?: boolean; coreUrl: string; relayUrl: string; agents?: string[] }): Promise<void>;
   onboard(input: NativeCommandContext & { answer?: string; cwd?: string }): Promise<void>;
   stageEnrollment(input: NativeCommandContext): Promise<void>;
-  addAgent(input: NativeCommandContext & { agent: "claude-code" | "codex" | "opencode" | "pi" }): Promise<void>;
+  addAgent(input: NativeCommandContext & { agent: NativeAgentId }): Promise<void>;
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
-  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; title?: string; keyRef?: string }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; title?: string; keyRef?: string }): Promise<void>;
 }
 
-/** One customer architecture. No appliance, provider-key or cloud-agent fallback switch. */
+/** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
 export function createNativeProgram(actions: NativeCliActions): Command {
   const program = new Command("konteks-remote").description("Konteks native agent connector")
     .option("--root <path>", "private user-scoped installation root")
@@ -41,9 +46,10 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     if (!/^[A-Za-z0-9._-]{8,128}$/.test(value)) throw new InvalidArgumentError("activation id must be an opaque identifier; the code is prompted securely");
     return value;
   };
-  const agent = (value: string): "claude-code" | "codex" | "opencode" | "pi" => {
-    if (!["claude-code", "codex", "opencode", "pi"].includes(value)) throw new InvalidArgumentError("unsupported agent family");
-    return value as "claude-code" | "codex" | "opencode" | "pi";
+  const agent = (value: string): NativeAgentId => {
+    if (isRetiredAgentId(value)) throw new InvalidArgumentError(retiredAgentMessage(value));
+    if (!(NATIVE_AGENT_IDS as readonly string[]).includes(value)) throw new InvalidArgumentError("unsupported agent family");
+    return value as NativeAgentId;
   };
   program.command("install").description("activate, verify and install the native connector, then start its user service")
     .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
@@ -52,7 +58,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
     .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")
-    .option("--agents <ids>", "agent families (default: claude-code,codex)", value => value.split(",").map(part => agent(part.trim())))
+    .option("--agents <ids>", "agent families: claude-code, codex, dsh (default: claude-code,codex)", value => value.split(",").map(part => agent(part.trim())))
     .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
       if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
@@ -73,8 +79,13 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   const agentLifecycle = program.command("agent").description("manage agents installed on this native runtime");
   agentLifecycle.command("add").description("add one signed offline agent package without reactivation")
     .argument("<agent>", "agent family", agent)
-    .action(async (value: "claude-code" | "codex" | "opencode" | "pi") => actions.addAgent({ ...context(), agent: value }));
+    .action(async (value: NativeAgentId) => actions.addAgent({ ...context(), agent: value }));
   for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).action(async () => actions.control({ ...context(), operation }));
+  // Read-only. Whether this computer serves previews is switched per machine
+  // in Konteks (Customize → Runtimes), never here.
+  const preview = program.command("preview").description("live previews of sessions' work, served from this computer");
+  preview.command("status").description("list this computer's session previews: state, loopback URL, command and why it stopped")
+    .action(async () => actions.control({ ...context(), operation: "preview.status" }));
   const auth = program.command("auth").description("official local agent subscription authentication");
   auth.command("status").argument("[agent]", "agent family", agent).action(async (value?: string) => actions.control({ ...context(), operation: "auth.status", ...(value ? { agent: value } : {}) }));
   auth.command("login").argument("<agent>", "agent family", agent).option("--organization", "attest that the account is organization-owned", false)
@@ -98,8 +109,6 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   // description is what the agent finds in `--help`.
   program.command("uninstall").description("remove Konteks from this machine: finish running work, remove this runtime from your workspace, stop the background service and delete the connector's folder; your repositories and your coding agents' logins are left untouched")
     .action(async () => actions.uninstall(context()));
-  // Update/rollback must acquire the native lifecycle transaction; the old
-  // appliance implementations are deliberately not registered here.
   return program;
 }
 

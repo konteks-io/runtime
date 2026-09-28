@@ -1,5 +1,6 @@
-import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import {
   SessionToCoreMessageSchema,
@@ -31,15 +32,33 @@ import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeEli
 import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
 import type { PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
-import { McpCapabilityFacade } from "../mcp/capability-facade.js";
+import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
+import { BROWSER_WORK_KINDS, PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
+import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
   canonicalizeAcpToolActivity,
   continuesAtBoundary,
   endsInsidePath,
+  omitPrivateAcpToolPayload,
   redactActivity,
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
+import { DshToolGovernance } from "./dsh-tool-governance.js";
+import { compileResultSchema as compileTurnValidator, StructuredResultToolServer, toolInputSchema } from "../structured-result/result-tool-server.js";
+import {
+  findStructuredContract,
+  followUpRequestId,
+  MAX_STRUCTURED_TURN_TEXT,
+  parseFencedResult,
+  RESULT_FOLLOW_UP,
+  RESULT_TOOL_LINE,
+  resultToolLineWithSchema,
+  rewriteStructuredPrompt,
+  sumPromptUsage,
+  type PromptBlock,
+  type StructuredTurnState,
+} from "../structured-result/structured-turn.js";
 
 /**
  * One relayed ACP session (D98/D113/D114): bootstrapped by the supervisor as a
@@ -68,11 +87,17 @@ export interface RelayedSessionDeps {
   instanceId: string;
   /** Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory. */
   redeemCapabilityToken: (assignment: RemoteWorkAssignment) => Promise<CapabilityTokenIssue>;
-  browserToolUrl: string | null;
+  /** Retained local address/header for the same provider thread, never Core delegation. */
+  mcpLocalTransport?: McpLocalTransportIdentity;
+  mcpLocalTransportReference?: string;
+  /** Persist the local transport identity before the provider sees its MCP config. */
+  recordMcpLocalTransport?: (identity: McpLocalTransportIdentity) => Promise<void>;
+  /** Legacy first load only: the owner must prove this reference absent. */
+  assertLegacyCodexThreadUnloaded?: (reference: string) => Promise<boolean>;
+  /** The runner's workspace folder: the confinement root the tool policy judges against. */
   workspaceRoot: string;
-  /** Legacy appliance callers may omit this during migration. Native cannot. */
-  deploymentKind?: "appliance" | "native_connector";
-  prepareInputs?: (assignment: RemoteWorkAssignment) => Promise<PreparedSessionInputs>;
+  /** Verified local inputs (workspace, skills, binding) for the claimed assignment. */
+  prepareInputs: (assignment: RemoteWorkAssignment) => Promise<PreparedSessionInputs>;
   /**
    * Native-only local ownership commit. Cloud/file preparation and capability
    * redemption finish before this is called; the callback then opens or
@@ -80,7 +105,8 @@ export interface RelayedSessionDeps {
    * adopts/creates provider state.
    */
   activateExecution?: () => Promise<{ continueReference?: string; restoreReference?: string }>;
-  registerReady?: (assignment: RemoteWorkAssignment, binding: RemoteTransferBinding, acpSessionRef: string) => Promise<RemoteExecutionReadyResult>;
+  /** Registers execution readiness with Core before the session is announced. */
+  registerReady: (assignment: RemoteWorkAssignment, binding: RemoteTransferBinding, acpSessionRef: string) => Promise<RemoteExecutionReadyResult>;
   /** Reserve an exclusive local channel after input verification, before bridge bootstrap. */
   reserveChannel?: (channelId: string, session: RelayedSession) => () => void;
   /** Actual WorkOrchestrator retained-admission fence, not a permission grant. */
@@ -117,6 +143,14 @@ export interface RelayedSessionDeps {
   assertPromptAllowed?: () => void;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
+  /**
+   * This machine's preview dev servers. Present, the session's agent gets the
+   * preview tools (a loopback MCP server beside the platform facade) and the
+   * session's preview stops when the session ends other than by a completed
+   * turn (a completed turn's preview stays for the next turn, bounded by the
+   * idle stop).
+   */
+  preview?: SessionPreviewAccess;
   logger?: Logger;
 }
 
@@ -155,6 +189,8 @@ export class RelayedSession {
   private readonly lastChunkText = new Map<string, { text: string; inPath: boolean }>();
   /** Safe tool identity carried from `tool_call` to sparse terminal updates. */
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
+  /** Rebuilds DeepSeek Harness permission requests and trips on an unasked tool (dsh-tool-governance.ts). */
+  private readonly dshGovernance: DshToolGovernance | null;
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
   private readonly executionGate: NativeExecutionGate | null;
@@ -163,13 +199,24 @@ export class RelayedSession {
   private lastPromptCompletion: { usage: AgentTurnUsageObservation | null } = { usage: null };
   private deliveryAcceptance: RemoteDeliveryAcceptanceReceipt | null = null;
   private mcpFacade: McpCapabilityFacade | null = null;
+  private previewTools: PreviewMcpServer | null = null;
+  /** The session's `submit_result` tool (every session has one; it is generic until a turn asks for a result). */
+  private resultTools: StructuredResultToolServer | null = null;
+  /** The turn that asked for a structured result, while it (or its one follow-up) runs. */
+  private structuredTurn: StructuredTurnState | null = null;
+  /** The QA browser's gateway (Claude Code and Codex validation, QA and delivery sessions) and its output folder. */
+  private browserGateway: PreviewBrowserGateway | null = null;
+  private browserOutputDir: string | null = null;
+  /** The logical session whose preview this session's agent drives. */
+  private previewSessionId: string | null = null;
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
 
   constructor(readonly assignment: RemoteWorkAssignment, private readonly deps: RelayedSessionDeps) {
-    this.boundChannelId = deps.deploymentKind === "native_connector" ? null : `session:${assignment.id}:${assignment.attempt}:${randomUUID().slice(0, 8)}`;
+    this.dshGovernance = assignment.agentRoute.agentId === "dsh" ? new DshToolGovernance() : null;
+    // Bound only after input preparation proves Core's claim-bound session.
+    this.boundChannelId = null;
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
-    this.executionGate = deps.deploymentKind === "native_connector" &&
-      (assignment.kind === "assistant_execution" || assignment.source.kind === "harness_delivery") && deps.executionAuthority
+    this.executionGate = (assignment.kind === "assistant_execution" || assignment.source.kind === "harness_delivery") && deps.executionAuthority
       ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, logger: this.logger, journal: deps.journal, clock: deps.clock,
         assertOwned: () => {
           if (!deps.assertExecutionOwned) throw new RemoteInstanceError("execution_fenced", "Execution ownership is unavailable.");
@@ -248,57 +295,89 @@ export class RelayedSession {
   private async bootstrapImpl(): Promise<{ acpSessionRef: string; resumed: boolean }> {
     this.deps.assertExecutionOwned?.();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-    if (this.deps.deploymentKind === "native_connector" && (!this.deps.prepareInputs || !this.deps.registerReady)) {
-      throw new RemoteInstanceError("capability_unavailable", "Native input preparation and Core readiness registration are required.");
+    let prepared: PreparedSessionInputs;
+    try { prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs(this.assignment)); }
+    catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+    this.deps.assertExecutionOwned?.();
+    const parsedBinding = RemoteTransferBindingSchema.safeParse(prepared.binding);
+    if (!parsedBinding.success) throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
+    const binding = parsedBinding.data;
+    if (binding.workspaceId !== this.assignment.workspaceId || binding.assignmentId !== this.assignment.id || binding.attempt !== this.assignment.attempt || binding.instanceId !== this.assignment.instanceId || binding.instanceId !== this.deps.instanceId ||
+        (this.assignment.source.kind === "conversation" && binding.sessionId !== this.assignment.source.sessionId) || !isAbsolute(prepared.cwd) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(prepared.cwd)) {
+      throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
     }
-    if (this.deps.prepareInputs) {
-      let prepared: PreparedSessionInputs;
-      try { prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs!(this.assignment)); }
-      catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
-      this.deps.assertExecutionOwned?.();
-      const parsedBinding = RemoteTransferBindingSchema.safeParse(prepared.binding);
-      if (!parsedBinding.success) throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
-      const binding = parsedBinding.data;
-      if (binding.workspaceId !== this.assignment.workspaceId || binding.assignmentId !== this.assignment.id || binding.attempt !== this.assignment.attempt || binding.instanceId !== this.assignment.instanceId || binding.instanceId !== this.deps.instanceId ||
-          (this.assignment.source.kind === "conversation" && binding.sessionId !== this.assignment.source.sessionId) || !isAbsolute(prepared.cwd) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(prepared.cwd)) {
-        throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
-      }
-      this.preparedInputs = prepared;
-      // Input preparation verifies Core's claim-bound selection. Use its logical
-      // session identity, never a bridge ref or an assignment-local random ID.
-      if (this.deps.deploymentKind === "native_connector") this.boundChannelId = `session:${binding.sessionId}`;
-    }
+    this.preparedInputs = prepared;
+    // Input preparation verifies Core's claim-bound selection. Use its logical
+    // session identity, never a bridge ref or an assignment-local random ID.
+    this.boundChannelId = `session:${binding.sessionId}`;
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     const mcpServers: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }> = [];
     if (this.assignment.agentRoute.mcpCapabilityTokenRef) {
       const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
       this.deps.assertExecutionOwned?.();
-      if (this.deps.deploymentKind === "native_connector") {
-        const facade = new McpCapabilityFacade({
-          initial: issue,
-          renew: () => {
-            this.deps.assertExecutionOwned?.();
-            if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
-            return this.deps.redeemCapabilityToken(this.assignment);
-          },
-          onUnavailable: () => this.close("agent_exited"),
-          context: {
-            assignmentId: this.assignment.id,
-            attempt: this.assignment.attempt,
-            sessionId: this.preparedInputs?.binding.sessionId ?? this.assignment.id,
-          },
+      const facade = new McpCapabilityFacade({
+        initial: issue,
+        ...(this.deps.mcpLocalTransport ? { localTransport: this.deps.mcpLocalTransport } : {}),
+        initiallyInactive: true,
+        renew: () => {
+          this.deps.assertExecutionOwned?.();
+          if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
+          return this.deps.redeemCapabilityToken(this.assignment);
+        },
+        onUnavailable: () => this.close("agent_exited"),
+        // Core's answer to environment_open is the only thing that widens
+        // this session's browser, and only to what Core named.
+        onBrowserAccess: grant => { this.browserGateway?.grant(grant.origins, grant.kind); },
+        context: {
+          assignmentId: this.assignment.id,
+          attempt: this.assignment.attempt,
+          sessionId: binding.sessionId,
+        },
+        logger: this.logger,
+        now: () => this.deps.clock.coreNow(),
+      });
+      this.mcpFacade = facade;
+      mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
+    }
+    const preview = this.deps.preview;
+    let browser: { proxyUrl: string; outputDir: string; browsersPath: string } | undefined;
+    if (preview && PREVIEW_WORK_KINDS.has(this.assignment.kind)) {
+      const sessionId = binding.sessionId;
+      const cwd = prepared.cwd;
+      // The session's browser: only for an agent whose package carries one
+      // (Claude Code, Codex; never DeepSeek Harness), reaching only this
+      // session's running preview through its own gateway.
+      const browserVersion = this.deps.runner.browserVersion?.() ?? null;
+      if (browserVersion !== null && BROWSER_WORK_KINDS.has(this.assignment.kind) && preview.origin && preview.browsersPath) {
+        const origin = preview.origin.bind(preview);
+        const gateway = new PreviewBrowserGateway({
+          target: () => origin(sessionId),
+          onActivity: () => preview.touch(sessionId),
           logger: this.logger,
-          now: () => this.deps.clock.coreNow(),
+          context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
         });
-        this.mcpFacade = facade;
-        mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
-      } else {
-        mcpServers.push({ type: "http", ...issue.mcpServer });
+        this.browserGateway = gateway;
+        const proxyUrl = await this.bootstrapStage("browser_gateway", () => gateway.start());
+        this.browserOutputDir = await mkdtemp(join(tmpdir(), "konteks-browser-"));
+        browser = { proxyUrl, outputDir: this.browserOutputDir, browsersPath: preview.browsersPath };
       }
+      const tools = new PreviewMcpServer({
+        start: () => preview.start(sessionId, cwd),
+        stop: () => preview.stop(sessionId, "agent"),
+        status: () => preview.status(sessionId),
+      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, browser: browser !== undefined });
+      this.previewTools = tools;
+      this.previewSessionId = sessionId;
+      // A viewer may start this worktree's preview too (the same process
+      // manager and inference as preview_start).
+      preview.permit?.(sessionId, cwd);
+      mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
     }
-    if (this.assignment.agentRoute.requiredRole === "qa" && this.deps.browserToolUrl) {
-      mcpServers.push({ type: "http", name: "konteks-browser-tool", url: this.deps.browserToolUrl, headers: [] });
-    }
+    // The turn result tool: every session gets it, so a turn that asks for a
+    // structured result can be answered through a validated tool call.
+    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+    this.resultTools = resultTools;
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
     // Optional tool wiring (Graft) ran alongside redemption and the facade.
     // The agent must find it in place, and the ownership commit below must
     // stay a short step from runner adoption, so settle it here. It never
@@ -316,19 +395,33 @@ export class RelayedSession {
       : undefined;
     this.deps.assertExecutionOwned?.();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+    if (this.mcpFacade && this.deps.recordMcpLocalTransport) {
+      await this.bootstrapStage("mcp_transport_identity", () => this.deps.recordMcpLocalTransport!(this.mcpFacade!.localTransportIdentity()));
+      this.deps.assertExecutionOwned?.();
+    }
     if (this.boundChannelId !== null && this.deps.reserveChannel) {
       this.releaseChannel = this.deps.reserveChannel(this.boundChannelId, this);
     }
     const source = this.assignment.source;
-    const priorRef = this.deps.deploymentKind === "native_connector" && this.deps.reserveChannel
-      ? activation?.continueReference ?? this.deps.continueReference
-      : source.kind === "conversation" ? source.acpSessionRef : undefined;
+    const priorRef = activation?.continueReference ?? this.deps.continueReference;
     // A live in-process owner is strictly stronger than Core's restart-only
     // restore fallback. Passing both references is ambiguous and rejected by
     // the native runner; once live continuation wins, suppress the fallback.
     const restoreRef = priorRef === undefined
       ? activation?.restoreReference ?? this.deps.restoreReference
       : undefined;
+    if (this.deps.mcpLocalTransportReference && priorRef !== this.deps.mcpLocalTransportReference && restoreRef !== this.deps.mcpLocalTransportReference) {
+      throw new RemoteInstanceError("recovery_required", "The retained MCP transport does not belong to the chosen provider session.",
+        { diagnostic: "mcp_transport_reference_mismatch" });
+    }
+    if (this.assignment.agentRoute.agentId === "codex" && this.assignment.agentRoute.mcpCapabilityTokenRef &&
+        (priorRef || restoreRef) && !this.deps.mcpLocalTransport) {
+      const legacyReference = priorRef ?? restoreRef!;
+      const unloaded = await this.deps.assertLegacyCodexThreadUnloaded?.(legacyReference).catch(() => false);
+      if (!unloaded) throw new RemoteInstanceError("recovery_required", "The retained Codex thread cannot safely refresh its local MCP transport.",
+        { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
+    }
+    this.mcpFacade?.enable();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     this.deps.assertExecutionOwned?.();
     let reservedRef: string | undefined;
@@ -362,13 +455,14 @@ export class RelayedSession {
     const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession({
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
-      cwd: this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
+      cwd: prepared.cwd,
       mcpServers,
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
       ...(restoreRef ? { restoreAcpSessionRef: restoreRef } : {}),
       ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
       ...(this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
+      ...(browser ? { browser } : {}),
     }, lifecycle));
     this.creationReturned = true;
     if (lifecycle && reservedRef !== created.acpSessionRef) throw new RemoteInstanceError("recovery_required", "Runner did not preserve durable reference ownership.");
@@ -384,28 +478,26 @@ export class RelayedSession {
       throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     }
     let readyProjection: Pick<RemoteExecutionReadyResult, "attempt" | "recoveryEpoch" | "readyRevision"> | undefined;
-    if (this.deps.deploymentKind === "native_connector") {
-      try {
-        const binding = this.preparedInputs!.binding;
-        const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("readiness", () =>
-          this.deps.registerReady!(this.assignment, binding, created.acpSessionRef)));
-        this.deps.assertExecutionOwned?.();
-        if (ready.workspaceId !== binding.workspaceId || ready.instanceId !== binding.instanceId || ready.sessionId !== binding.sessionId || ready.assignmentId !== binding.assignmentId || ready.attempt !== binding.attempt ||
-            ready.agentId !== this.assignment.agentRoute.agentId || ready.acpSessionRef !== created.acpSessionRef || ready.channelId !== this.boundChannelId) {
-          throw new RemoteInstanceError("workspace_binding_invalid", "Core readiness does not match the prepared local session.");
-        }
-        if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-        readyProjection = { attempt: ready.attempt, recoveryEpoch: ready.recoveryEpoch, readyRevision: ready.readyRevision };
-      } catch (error) {
-        this.deps.assertExecutionOwned?.();
-        if (!this.recoveryStopping) {
-          await this.deps.runner.cancel(created.acpSessionRef).catch(() => undefined);
-          this.deps.assertExecutionOwned?.();
-          await this.deps.runner.closeSession(created.acpSessionRef).catch(() => undefined);
-          this.deps.assertExecutionOwned?.();
-        }
-        throw error;
+    try {
+      const binding = this.preparedInputs!.binding;
+      const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("readiness", () =>
+        this.deps.registerReady(this.assignment, binding, created.acpSessionRef)));
+      this.deps.assertExecutionOwned?.();
+      if (ready.workspaceId !== binding.workspaceId || ready.instanceId !== binding.instanceId || ready.sessionId !== binding.sessionId || ready.assignmentId !== binding.assignmentId || ready.attempt !== binding.attempt ||
+          ready.agentId !== this.assignment.agentRoute.agentId || ready.acpSessionRef !== created.acpSessionRef || ready.channelId !== this.boundChannelId) {
+        throw new RemoteInstanceError("workspace_binding_invalid", "Core readiness does not match the prepared local session.");
       }
+      if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+      readyProjection = { attempt: ready.attempt, recoveryEpoch: ready.recoveryEpoch, readyRevision: ready.readyRevision };
+    } catch (error) {
+      this.deps.assertExecutionOwned?.();
+      if (!this.recoveryStopping) {
+        await this.deps.runner.cancel(created.acpSessionRef).catch(() => undefined);
+        this.deps.assertExecutionOwned?.();
+        await this.deps.runner.closeSession(created.acpSessionRef).catch(() => undefined);
+        this.deps.assertExecutionOwned?.();
+      }
+      throw error;
     }
     if (this.boundChannelId === null) throw new RemoteInstanceError("workspace_binding_invalid", "The session channel has no authorized binding.");
     this.deps.assertExecutionOwned?.();
@@ -477,7 +569,7 @@ export class RelayedSession {
     if (this.recoveryStopping) return;
     this.deps.assertExecutionOwned?.();
     const channelId = this.boundChannelId;
-    if (channelId === null || (this.deps.deploymentKind === "native_connector" && !this.channelOpened)) return;
+    if (channelId === null || !this.channelOpened) return;
     // Canonicalize while the bridge's private metadata is still present. The
     // strict relay schema deliberately discards `_meta`; doing this after its
     // first parse would permanently lose Claude's safe Agent/ToolSearch name.
@@ -509,13 +601,20 @@ export class RelayedSession {
       }
       canonicalMessage = {
         ...message,
-        params: { ...message.params, update: canonicalUpdate },
+        params: { ...message.params, update: omitPrivateAcpToolPayload(canonicalUpdate) },
       };
     }
     const parsed = SessionToCoreMessageSchema.safeParse(canonicalMessage);
     if (!parsed.success) {
       // A bridge payload that fails the vendored ACP schema is converted, never forwarded (D113).
       this.counters.malformedResponses += 1;
+      this.logger.warn({
+        event: "session.acp_message_rejected",
+        assignmentId: this.assignment.id,
+        acpSessionRef: this.acpSessionRef,
+        toolCallId: canonicalIdentity?.toolCallId,
+        stage: "wire_schema",
+      }, "Native session update did not match the relay contract");
       if ("id" in message && typeof message.id === "string" && "method" in message && message.kind !== "acp") {
         await this.sendToCore({ kind: "acp_error", id: message.id, method: message.method as "session/prompt", error: malformed() });
       }
@@ -546,7 +645,17 @@ export class RelayedSession {
       else this.lastChunkText.set(update.sessionUpdate, { text: chunkText, inPath: endsInsidePath(chunkText, continuesPath, startsAtBoundary) });
       const safe = SessionToCoreMessageSchema.safeParse(redactActivity(body, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
         { startsAtBoundary, continuesPath }));
-      if (!safe.success) { this.counters.malformedResponses += 1; return; }
+      if (!safe.success) {
+        this.counters.malformedResponses += 1;
+        this.logger.warn({
+          event: "session.acp_message_rejected",
+          assignmentId: this.assignment.id,
+          acpSessionRef: this.acpSessionRef,
+          toolCallId: canonicalIdentity?.toolCallId,
+          stage: "redacted_schema",
+        }, "Redacted native session update did not match the relay contract");
+        return;
+      }
       body = safe.data;
     }
     const sourceSequence = await this.deps.beforeSendToCore?.(body);
@@ -577,8 +686,7 @@ export class RelayedSession {
     const channelId = this.boundChannelId;
     if (this.closed || this.acpSessionRef === null || channelId === null || !this.channelOpened) return;
     this.deps.assertExecutionOwned?.();
-    if (this.deps.deploymentKind === "native_connector" &&
-      (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery")) {
+    if (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery") {
       // Prepared Harness delivery must never fall back to bare ACP. The gate
       // must independently support its workload authority before dispatch.
       if (!this.executionGate) throw new RemoteInstanceError("execution_authority_unavailable", "Native execution admission is unavailable.");
@@ -625,9 +733,12 @@ export class RelayedSession {
           if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
           this.deps.assertExecutionOwned?.();
           this.deps.assertPromptAllowed?.();
+          if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
           const instructions = this.preparedInputs?.skillInstructions;
           const params = instructions ? { ...request.params, prompt: [{ type: "text" as const, text: instructions }, ...request.params.prompt] } : request.params;
-          await this.deps.runner.prompt(ref, request.id, params);
+          const prompt = await this.prepareStructuredPrompt(request.id, params.prompt);
+          try { await this.deps.runner.prompt(ref, request.id, { ...params, prompt }); }
+          catch (error) { this.endStructuredTurn(request.id); throw error; }
         }
         else if (request.method === "session/set_mode") await this.deps.runner.setMode(ref, request.id, request.params);
         else await this.deps.runner.setConfigOption(ref, request.id, request.params);
@@ -714,8 +825,13 @@ export class RelayedSession {
     // Do not convert a bridge transport exception into proof of completion.
     if (message.kind === "acp") {
       if (message.method === "session/prompt") {
-        try { await this.deps.runner.prompt(ref, message.id, params); }
+        try {
+          const current = params as typeof message.params;
+          const prompt = await this.prepareStructuredPrompt(message.id, current.prompt);
+          await this.deps.runner.prompt(ref, message.id, { ...current, prompt });
+        }
         catch (error) {
+          this.endStructuredTurn(message.id);
           // The runner's backstop: it refused because a prompt already runs
           // on this session. Nothing reached the agent, so this is a known
           // denial and the running turn is left alone.
@@ -798,38 +914,19 @@ export class RelayedSession {
     if (this.closed || this.acpSessionRef === null || !("acpSessionRef" in event) || event.acpSessionRef !== this.acpSessionRef) return;
     this.deps.assertExecutionOwned?.();
     switch (event.kind) {
-      case "session_update":
+      case "session_update": {
+        // A working agent keeps its preview from stopping as idle.
+        if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
+        this.observeStructuredText((event.params as { update?: unknown } | null)?.update);
+        const bypass = this.dshGovernance?.observe((event.params as { update?: unknown } | null)?.update) ?? null;
         await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
+        if (bypass) await this.onDshGovernanceBypass(bypass);
         return;
+      }
       case "prompt_result": {
-        if (this.deps.deploymentKind === "native_connector" && this.assignment.kind === "delivery" &&
-            this.assignment.source.kind === "harness_delivery") {
-          if (!this.preparedInputs?.acceptDeliveryOutput) {
-            throw new RemoteInstanceError("capability_unavailable", "Generated delivery output cannot be accepted without current delivery authority.");
-          }
-          await this.completeDeliveryOutput(event.requestId, { kind: "acp_result", id: event.requestId, method: "session/prompt", result: event.result as never });
-          return;
-        }
-        const accepted = await this.completeReceived(event.requestId, "session/prompt", { kind: "acp_result", id: event.requestId, method: "session/prompt", result: event.result as never });
-        // Assistant admission creates one assignment per turn. A persistent
-        // native Codex thread does not exit when its turn ends, so waiting for
-        // session_exited leaks a claimed assignment and blocks the next turn.
-        // Close this assignment, not the shared native server or its history.
-        const stopReason = (event.result as { stopReason?: string })?.stopReason;
-        const nativeTurn = accepted && this.deps.deploymentKind === "native_connector" &&
-          (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery");
-        if (nativeTurn && stopReason === "end_turn") await this.close("completed");
-        else if (nativeTurn && typeof stopReason === "string" && !this.closed) {
-          // A turn that ends any other way has still ENDED: a rejected tool
-          // interrupts Claude Code's turn as `cancelled`, a refusal or token
-          // cap ends it likewise. Left open, the claimed assignment kept
-          // heartbeating until the harness deadline (2026-09-15, 27 minutes
-          // for a turn that had stopped at minute ten). Close it so a
-          // terminal reaches Core now.
-          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stopReason },
-            "native turn ended without end_turn; closing the assignment as an agent exit");
-          await this.close("agent_exited");
-        }
+        const settled = await this.settleStructuredTurn(event.requestId, event.result as Record<string, unknown>);
+        if (settled === null) return;
+        await this.onPromptResult(settled.requestId, settled.result);
         return;
       }
       case "set_mode_result":
@@ -839,8 +936,16 @@ export class RelayedSession {
         await this.completeReceived(event.requestId, "session/set_config_option", { kind: "acp_result", id: event.requestId, method: "session/set_config_option", result: event.result as never });
         return;
       case "request_error": {
+        if (event.method === "session/prompt") {
+          const settled = await this.settleStructuredTurnError(event.requestId);
+          if (settled === null) return;
+          if (settled !== undefined) {
+            await this.onPromptResult(settled.requestId, settled.result);
+            return;
+          }
+        }
         const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
-        if (accepted && event.method === "session/prompt" && this.deps.deploymentKind === "native_connector" &&
+        if (accepted && event.method === "session/prompt" &&
             (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery")) {
           // Say why before the close: its SIGTERM on the bridge was the only
           // trace of a Codex sign-in that could not refresh (WS2-141).
@@ -871,11 +976,160 @@ export class RelayedSession {
     }
   }
 
+  /** A prompt's completion (with any structured result already attached) goes to its holder. */
+  private async onPromptResult(requestId: string, result: Record<string, unknown>): Promise<void> {
+    if (this.assignment.kind === "delivery" && this.assignment.source.kind === "harness_delivery") {
+      if (!this.preparedInputs?.acceptDeliveryOutput) {
+        throw new RemoteInstanceError("capability_unavailable", "Generated delivery output cannot be accepted without current delivery authority.");
+      }
+      await this.completeDeliveryOutput(requestId, { kind: "acp_result", id: requestId, method: "session/prompt", result: result as never });
+      return;
+    }
+    const accepted = await this.completeReceived(requestId, "session/prompt", { kind: "acp_result", id: requestId, method: "session/prompt", result: result as never });
+    // Assistant admission creates one assignment per turn. A persistent
+    // native Codex thread does not exit when its turn ends, so waiting for
+    // session_exited leaks a claimed assignment and blocks the next turn.
+    // Close this assignment, not the shared native server or its history.
+    const stopReason = (result as { stopReason?: string })?.stopReason;
+    const nativeTurn = accepted &&
+      (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery");
+    if (nativeTurn && stopReason === "end_turn") await this.close("completed");
+    else if (nativeTurn && typeof stopReason === "string" && !this.closed) {
+      // A turn that ends any other way has still ENDED: a rejected tool
+      // interrupts Claude Code's turn as `cancelled`, a refusal or token
+      // cap ends it likewise. Left open, the claimed assignment kept
+      // heartbeating until the harness deadline (2026-09-15, 27 minutes
+      // for a turn that had stopped at minute ten). Close it so a
+      // terminal reaches Core now.
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stopReason },
+        "native turn ended without end_turn; closing the assignment as an agent exit");
+      await this.close("agent_exited");
+    }
+  }
+
+  /**
+   * A prompt that ends with the structured-output contract: bind its schema
+   * to the result tool and give the agent the tool line instead of the
+   * contract. Any other prompt (or a second one while a structured turn still
+   * runs, which the runner refuses anyway) passes unchanged. A schema the
+   * tool cannot compile leaves the contract in place: the fenced answer still
+   * works.
+   */
+  private async prepareStructuredPrompt<B extends PromptBlock>(requestId: string, prompt: B[]): Promise<B[]> {
+    const tools = this.resultTools;
+    if (!tools || this.structuredTurn !== null) return prompt;
+    const contract = findStructuredContract(prompt);
+    if (!contract) return prompt;
+    let definition: Awaited<ReturnType<StructuredResultToolServer["bind"]>>;
+    try { definition = await tools.bind(contract.schema); }
+    catch {
+      this.logger.warn({ event: "structured_result.schema_unusable", assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+        "turn result schema cannot be compiled; the agent answers with the fenced block");
+      return prompt;
+    }
+    this.structuredTurn = { requestId, validate: compileTurnValidator(contract.schema), definition, text: "", followUp: null };
+    const line = definition === "schema" ? RESULT_TOOL_LINE : resultToolLineWithSchema(contract.schema, toolInputSchema(contract.schema).wrapped);
+    return rewriteStructuredPrompt(prompt, contract, line);
+  }
+
+  /** The turn never reached the agent (or was refused): forget it and put the tool back. */
+  private endStructuredTurn(requestId: string): void {
+    const turn = this.structuredTurn;
+    if (!turn || (turn.requestId !== requestId && turn.followUp?.requestId !== requestId)) return;
+    this.structuredTurn = null;
+    this.resultTools?.unbind();
+  }
+
+  /** The agent's own message text during a structured turn, for the fenced fallback. */
+  private observeStructuredText(update: unknown): void {
+    const turn = this.structuredTurn;
+    if (!turn || update === null || typeof update !== "object") return;
+    const value = update as { sessionUpdate?: unknown; content?: { type?: unknown; text?: unknown } };
+    if (value.sessionUpdate !== "agent_message_chunk" || value.content?.type !== "text" || typeof value.content.text !== "string") return;
+    if (turn.text.length < MAX_STRUCTURED_TURN_TEXT) turn.text += value.content.text;
+  }
+
+  /**
+   * A prompt ended. For a structured turn: the tool's recorded value, else a
+   * valid fenced result in the agent's text, else ONE follow-up prompt in
+   * this same ACP session asking for the tool call (its completion settles
+   * the original request). Returns the completion to report, or null while
+   * the follow-up runs.
+   */
+  private async settleStructuredTurn(requestId: string, result: Record<string, unknown>): Promise<{ requestId: string; result: Record<string, unknown> } | null> {
+    const turn = this.structuredTurn;
+    if (!turn) return { requestId, result };
+    const context = { assignmentId: this.assignment.id, attempt: this.assignment.attempt };
+    if (turn.followUp && requestId === turn.followUp.requestId) {
+      const original = turn.followUp.original;
+      const found = this.resultTools?.result() ?? parseFencedResult(turn.text, turn.validate);
+      this.endStructuredTurn(requestId);
+      this.logger.info({ event: "structured_result.settled", ...context, source: found ? "follow_up" : "none" }, "structured turn settled after its follow-up");
+      const usage = sumPromptUsage(original.usage as Record<string, unknown> | null | undefined, result.usage as Record<string, unknown> | null | undefined);
+      return { requestId: turn.requestId, result: { ...original, ...(usage ? { usage } : {}), ...(found ? { structuredOutput: { source: "follow_up", value: found.value } } : {}) } };
+    }
+    if (requestId !== turn.requestId) return { requestId, result };
+    const recorded = this.resultTools?.result();
+    const fenced = recorded ? null : parseFencedResult(turn.text, turn.validate);
+    const found = recorded ? { source: "tool" as const, value: recorded.value } : fenced ? { source: "fence" as const, value: fenced.value } : null;
+    if (found || result.stopReason !== "end_turn" || this.closed || !this.acpSessionRef) {
+      this.endStructuredTurn(requestId);
+      this.logger.info({ event: "structured_result.settled", ...context, source: found?.source ?? "none", stopReason: result.stopReason }, "structured turn settled");
+      return { requestId, result: found ? { ...result, structuredOutput: found } : result };
+    }
+    // Neither a valid call nor a valid fenced result: ask once, in the same session.
+    const followUpId = followUpRequestId(requestId);
+    turn.followUp = { requestId: followUpId, original: result };
+    turn.text = "";
+    this.logger.info({ event: "structured_result.follow_up", ...context }, "structured turn ended without a result; asking once more");
+    try {
+      await this.deps.runner.prompt(this.acpSessionRef, followUpId, { prompt: [{ type: "text", text: RESULT_FOLLOW_UP }] });
+    } catch {
+      this.endStructuredTurn(followUpId);
+      return { requestId, result };
+    }
+    return null;
+  }
+
+  /**
+   * A prompt failed. The follow-up failing settles the original request with
+   * its own completion (undefined = not ours, null = nothing to report); the
+   * original failing just ends the structured turn.
+   */
+  private async settleStructuredTurnError(requestId: string): Promise<{ requestId: string; result: Record<string, unknown> } | null | undefined> {
+    const turn = this.structuredTurn;
+    if (!turn) return undefined;
+    if (turn.followUp && requestId === turn.followUp.requestId) {
+      const original = turn.followUp.original;
+      this.endStructuredTurn(requestId);
+      this.logger.warn({ event: "structured_result.follow_up_failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt }, "the structured follow-up prompt failed; reporting the turn without a result");
+      return { requestId: turn.requestId, result: original };
+    }
+    if (requestId === turn.requestId) this.endStructuredTurn(requestId);
+    return undefined;
+  }
+
   /** D87: policy first; defer to a human via the relay when policy allows; fail closed at the deadline. */
   private async onPermissionRequest(requestId: string, params: RequestPermissionRequest): Promise<void> {
     const ref = this.acpSessionRef;
     if (ref === null) return;
-    const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.deps.workspaceRoot });
+    if (this.dshGovernance) {
+      // dsh asks with only a tool call id; judge the call it names, or refuse.
+      const verdict = this.dshGovernance.decide(params, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`);
+      if (verdict.kind !== "evaluate") {
+        if (this.closed) return;
+        this.deps.assertExecutionOwned?.();
+        const kind = verdict.kind === "allow" ? "allow_once" : "reject_once";
+        const optionId = params.options.find(option => option.kind === kind)?.optionId;
+        if (verdict.kind === "deny") {
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId, reason: verdict.reason }, "DeepSeek Harness tool call refused by policy");
+        }
+        return void (await this.deps.runner.answer(ref, requestId, optionId === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
+      }
+      params = verdict.request;
+    }
+    const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.deps.workspaceRoot,
+      browserTools: this.browserGateway !== null });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
     if (decision.kind === "allow") return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
@@ -893,6 +1147,21 @@ export class RelayedSession {
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "cancelled" } }));
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: params.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
+  }
+
+  /**
+   * The Konteks ask hook did not run for a gated dsh tool that has now
+   * completed: stop the turn and take dsh out of service until the connector
+   * restarts, so at most one call ever runs unjudged.
+   */
+  private async onDshGovernanceBypass(bypass: { toolCallId: string; title: string }): Promise<void> {
+    const ref = this.acpSessionRef;
+    this.logger.error({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: bypass.toolCallId, tool: bypass.title.slice(0, 128), diagnostic: "dsh_tool_governance_bypassed" },
+      "DeepSeek Harness ran a gated tool without asking; stopping the turn and taking it out of service");
+    if (ref !== null) await this.deps.runner.cancel(ref).catch(error => this.logger.warn({ err: error }, "cancel after a governance bypass failed"));
+    await this.deps.runner.quarantine?.("DeepSeek Harness ran a tool without asking Konteks first. Update or reinstall DeepSeek Harness, then restart the connector.")
+      .catch(error => this.logger.warn({ err: error }, "quarantine after a governance bypass failed"));
+    await this.close("agent_exited");
   }
 
   private async onElicitationRequest(requestId: string, params: CreateElicitationRequest): Promise<void> {
@@ -971,6 +1240,7 @@ export class RelayedSession {
     this.fenceForRecovery();
     this.recoveryStopTask = (async () => {
       await this.closeMcpFacade();
+      this.stopPreview("claim_lost");
       const initialRef = this.creationReturned ? this.acpSessionRef : null;
       const stop = async (ref: string): Promise<void> => {
         const stopRunner = this.deps.runner.stopForRecovery;
@@ -1054,14 +1324,14 @@ export class RelayedSession {
     this.executionGate?.stop();
     if (this.closeTask) return this.closeTask;
     if (this.closed) return Promise.resolve();
-    this.completedSettlementInProgress = reason === "completed" && this.deps.deploymentKind === "native_connector";
+    this.completedSettlementInProgress = reason === "completed";
     this.closed = true;
     this.closeTask = Promise.resolve().then(() => this.finishClose(reason));
     return this.closeTask;
   }
 
   private async finishClose(reason: SessionClosedReason): Promise<void> {
-    const nativeCompletion = reason === "completed" && this.deps.deploymentKind === "native_connector";
+    const nativeCompletion = reason === "completed";
     let settlementRecorded = false;
     try {
       if (nativeCompletion && this.acpSessionRef === null) throw new RemoteInstanceError("recovery_required", "Native completed closure requires its exact session reference.");
@@ -1093,16 +1363,14 @@ export class RelayedSession {
       } catch (error) {
         // A broken transcript channel must not suppress the independent durable
         // terminal report. Ownership and native completion checks still apply.
-        if (this.deps.deploymentKind !== "native_connector") throw error;
         this.deps.assertExecutionOwned?.();
         this.logger.warn({ event: "session.close.relay_unavailable", assignmentId: this.assignment.id,
           attempt: this.assignment.attempt, channelId: this.boundChannelId, reason,
           stage: "terminal_report", code: error instanceof RemoteInstanceError ? error.code : "transport_failed" },
           "session closure could not use relay; continuing durable terminal reporting");
       }
-      // Native assignment closure is not logical-session channel retirement.
-      // Retain its final frame, replay buffer and sequence space for the next turn.
-      if (this.deps.deploymentKind !== "native_connector" && this.boundChannelId !== null) this.deps.transport.closeChannel(this.boundChannelId);
+      // Native assignment closure is not logical-session channel retirement:
+      // its final frame, replay buffer and sequence space stay for the next turn.
       if (!this.recoveryStopping) await this.deps.onClosed(this, reason);
       this.deps.assertExecutionOwned?.();
     } catch (error) {
@@ -1110,6 +1378,7 @@ export class RelayedSession {
       throw error;
     } finally {
       await this.closeMcpFacade();
+      if (!nativeCompletion) this.stopPreview(reason);
       this.completedSettlementInProgress = false;
       // The completed receipt is not qualified handoff. Keep the channel's
       // retry owner even after its terminal report has been persisted.
@@ -1124,7 +1393,25 @@ export class RelayedSession {
   private async closeMcpFacade(): Promise<void> {
     const facade = this.mcpFacade;
     this.mcpFacade = null;
-    await facade?.close();
+    const tools = this.previewTools;
+    this.previewTools = null;
+    const resultTools = this.resultTools;
+    this.resultTools = null;
+    this.structuredTurn = null;
+    const gateway = this.browserGateway;
+    this.browserGateway = null;
+    const outputDir = this.browserOutputDir;
+    this.browserOutputDir = null;
+    await Promise.all([facade?.close(), tools?.close(), resultTools?.close(), gateway?.close(),
+      outputDir ? rm(outputDir, { recursive: true, force: true }).catch(() => undefined) : undefined]);
+  }
+
+  /** The session's preview goes with the session (not with a completed turn). */
+  private stopPreview(reason: string): void {
+    const sessionId = this.previewSessionId;
+    if (sessionId === null || !this.deps.preview) return;
+    this.deps.preview.forget?.(sessionId);
+    void this.deps.preview.stop(sessionId, reason).catch(error => this.logger.warn({ event: "preview.stop_failed", assignmentId: this.assignment.id, err: error }, "session preview could not be stopped"));
   }
 
   get isClosed(): boolean {
@@ -1138,7 +1425,7 @@ export class RelayedSession {
    * hand over; any other owner keeps its reservation.
    */
   releaseCompletedChannel(): void {
-    if (!this.closed || this.closeTask === null || this.completedSettlementInProgress || this.recoveryStopping || this.deps.deploymentKind !== "native_connector") {
+    if (!this.closed || this.closeTask === null || this.completedSettlementInProgress || this.recoveryStopping) {
       throw new RemoteInstanceError("assignment_conflict", "The conversation's previous turn still owns its session channel.");
     }
     this.releaseChannel?.();

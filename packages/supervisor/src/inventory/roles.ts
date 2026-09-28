@@ -19,7 +19,6 @@ export interface RoleBinding {
 }
 
 export interface RoleCapabilityInputs {
-  browserToolAvailable: boolean;
   /**
    * The git version this machine reports, or `null` when git is not on PATH.
    * The `onboard` role reads repositories and moves bytes with the machine's
@@ -39,9 +38,7 @@ export function agentSatisfiesRole(agent: ConnectedAgentView, role: RuntimeRole,
     case "assistant":
       return true;
     case "qa":
-      // Code validation and adversarial review require only the ready ACP
-      // agent. Preview/UI assignments carry their browser requirement as a
-      // per-work capability and are rejected at placement when unavailable.
+      // Code validation and adversarial review require only the ready ACP agent.
       return true;
     case "ops":
       // The shared vocabulary is not proof of an installed operations carrier.

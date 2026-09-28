@@ -61,7 +61,7 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
   }
 
   openChannel(): void {
-    // Channels are implicit over HTTPS; session/preview channels are polled by channelId.
+    // Channels are implicit over HTTPS; session channels are polled by channelId.
   }
 
   closeChannel(): void {}
@@ -259,9 +259,8 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
           assertRecovery();
           return true;
         }
-        case "preview":
         case "support":
-          // Preview and support are relay-only streams; over HTTPS-only they stay closed.
+          // Support is a relay-only stream; over HTTPS-only it stays closed.
           return true;
         default:
           return true;

@@ -28,7 +28,7 @@ const retainedOwner = (pid: number): RetainedProcessOwner =>
   ({ version: 1, platform: "darwin", pid, processGroupId: pid, startToken: `start-${pid}`, commandDigest: "A".repeat(43) });
 const modelOptions = [{ id: "model", name: "Model", category: "model", type: "select", currentValue: "sonnet", options: [{ value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }] }];
 
-async function fixture(options: { limit?: number; ttlMs?: number } = {}) {
+async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number } = {}) {
   const root = await mkdtemp(join(tmpdir(), "execution-pool-")); roots.push(root);
   const owners: Owner[] = [];
   let sessions = 0;
@@ -59,6 +59,8 @@ async function fixture(options: { limit?: number; ttlMs?: number } = {}) {
     spawn, executionBridgeLimit: () => options.limit ?? 1,
     probe: async () => ({ kind: "signal" as const, fingerprint: "opaque-identity-fingerprint" }),
     ...(options.ttlMs === undefined ? {} : { idleExecutionBridgeTtlMs: options.ttlMs }),
+    ...(options.now ? { now: options.now } : {}),
+    ...(options.modelCapabilityTtlMs === undefined ? {} : { modelCapabilityTtlMs: options.modelCapabilityTtlMs }),
   });
   runtimes.push(runtime);
   await runtime.ensureBridge();
@@ -216,8 +218,8 @@ it("answers the model capability probe from the resident process and keeps it re
   expect(f.runtime.readiness().readiness).toBe("ready");
   const first = await f.runtime.sessions.create(f.input);
   await completeAndRelease(f, first.acpSessionRef);
-  await expect(f.runtime.discoverModelCapability("model")).resolves.toEqual({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
-  await expect(f.runtime.discoverModelCapability("model")).resolves.toEqual({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
+  await expect(f.runtime.discoverModelCapability("model")).resolves.toMatchObject({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
+  await expect(f.runtime.discoverModelCapability("model")).resolves.toMatchObject({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
   expect(f.spawn).toHaveBeenCalledTimes(2);
   const process = f.execution().bridge;
   expect(process.connection.newSession).toHaveBeenCalledTimes(2);
@@ -230,9 +232,21 @@ it("answers the model capability probe from the resident process and keeps it re
 it("spawns a throwaway probe process only when nothing is resident", async () => {
   const f = await fixture();
   await f.runtime.probe(false);
-  await expect(f.runtime.discoverModelCapability("model")).resolves.toEqual({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
+  await expect(f.runtime.discoverModelCapability("model")).resolves.toMatchObject({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
   expect(f.spawn).toHaveBeenCalledTimes(2);
   expect(f.owners[1]!.bridge.stop).toHaveBeenCalledOnce();
+});
+
+it("re-reads the offered models once the discovery TTL has passed (System One §6a, KM6)", async () => {
+  let now = Date.parse("2026-09-27T00:00:00Z");
+  const f = await fixture({ now: () => new Date(now), modelCapabilityTtlMs: 60_000 });
+  await f.runtime.probe(false);
+  await f.runtime.discoverModelCapability("model");
+  await f.runtime.discoverModelCapability("model");
+  expect(f.spawn).toHaveBeenCalledTimes(2);
+  now += 60_000;
+  await f.runtime.discoverModelCapability("model");
+  expect(f.spawn).toHaveBeenCalledTimes(3);
 });
 
 it("refuses a restart-only retained stop for an identity live under a current owner and yields an idle one", async () => {

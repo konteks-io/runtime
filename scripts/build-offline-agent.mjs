@@ -21,7 +21,7 @@ const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) =>
 if (!args.agent || !args.os || !args.architecture || !args.out || !args.profile || !args.approval || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{7,255}$/.test(args.approval)) throw new Error("offline agent packaging requires an explicit redistribution approval reference");
 const config = JSON.parse(readFileSync(args.config ?? "release/native-agent-builds.json", "utf8"));
 const selected = config.agents?.[args.agent];
-if (!selected || args.agent === "pi") throw new Error("agent is not approved for native offline distribution");
+if (!selected) throw new Error("agent is not approved for native offline distribution");
 if (process.version !== `v${config.nodeVersion}`) throw new Error(`offline bundles require Node ${config.nodeVersion}`);
 const work = mkdtempSync(join(tmpdir(), "konteks-agent-build-")), root = join(work, "root");
 try {
@@ -29,6 +29,9 @@ try {
   const packages = [...new Set([`${selected.bridge.package}@${selected.bridge.version}`, `${selected.tooling.package}@${selected.tooling.version}`])];
   const sharedCodex = args.agent === "codex" && args.os !== "windows";
   if (sharedCodex) packages.push("ws@8.21.3");
+  // The QA/validator browser (Playwright MCP) rides in the agents that can use it.
+  const browser = config.browser?.agents?.includes(args.agent) ? config.browser : null;
+  if (browser) packages.push(`${browser.package}@${browser.version}`);
   // Personal-profile agents (Claude Code) run the operator's installed CLI, so
   // their platform-native optional binaries are deliberately not vendored.
   execFileSync(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", "--omit=dev", ...(selected.tooling.personalProfile ? ["--omit=optional"] : []), "--prefix", root, ...packages], { stdio: "inherit" , shell });
@@ -37,6 +40,16 @@ try {
   cpSync(process.execPath, join(root, "bin", runtimeName));
   const bridgeEntry = packageBin(root, selected.bridge.package, selected.bridge.bin);
   const toolingEntry = packageBin(root, selected.tooling.package, selected.tooling.bin);
+  const browserEntry = browser ? packageBin(root, browser.package, browser.bin) : null;
+  if (browser) {
+    // The connector's launcher: pins the flags' boundary, hides the tools it
+    // never allows and installs Playwright's Chromium on first use (no Chrome).
+    mkdirSync(join(root, "konteks"), { recursive: true, mode: 0o700 });
+    for (const file of ["browser-mcp.js", "browser-launcher.js", "browser-tools.js"]) {
+      cpSync(new URL(`../packages/agent-runner/dist/bridge/${file}`, import.meta.url), join(root, "konteks", file));
+    }
+    writeFileSync(join(root, "konteks", "package.json"), '{"type":"module"}\n');
+  }
   if (args.agent === "claude-code") {
     mkdirSync(join(root, "konteks"), { recursive: true, mode: 0o700 });
     cpSync(new URL("./claude-instruction-scope.mjs", import.meta.url), join(root, "node_modules", "@agentclientprotocol", "claude-agent-acp", "dist", "konteks-instruction-scope.mjs"));
@@ -50,7 +63,7 @@ try {
     writeFileSync(join(root, "konteks", "claude-acp-provenance.json"), JSON.stringify(provenance));
   }
   if (sharedCodex) {
-    mkdirSync(join(root, "konteks"), { mode: 0o700 });
+    mkdirSync(join(root, "konteks"), { recursive: true, mode: 0o700 });
     const bridgePath = join(root, bridgeEntry);
     const patched = patchCodexAcpLiveUsers(readFileSync(bridgePath, "utf8"), selected.bridge.version);
     writeFileSync(bridgePath, patched.source);
@@ -69,6 +82,7 @@ try {
     bridge: { package: selected.bridge.package, version: selected.bridge.version, entrypoint: bridgeEntry, runtime: "node" },
     tooling: { package: selected.tooling.package, version: selected.tooling.version, entrypoint: toolingEntry, runtime: selected.tooling.personalProfile ? "native" : "node" },
     node: { version: config.nodeVersion, entrypoint: `bin/${runtimeName}` },
+    ...(browserEntry ? { browser: { package: browser.package, version: browser.version, entrypoint: browserEntry, launcher: "konteks/browser-mcp.js", runtime: "node" } } : {}),
     ...(sharedCodex ? { codexLocalProxy: { version: 1, entrypoint: "konteks/codex-local-proxy.js" } } : {}),
     files: files.map(({ path, digest, sizeBytes, executable }) => ({ path, digest, sizeBytes, executable })),
   };

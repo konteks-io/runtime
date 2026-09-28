@@ -12,7 +12,7 @@ import { nativePlatform } from "./service.js";
 import { commitFirstFiles, initializeRepository, inspectRepository, planFirstCommit, pushToManagedRemote, type FirstCommitPlan } from "./repository-inspect.js";
 import { enrollmentStagingStatus, releaseStaged, spawnEnrollmentStaging, type StagingStatus } from "./enrollment-staging.js";
 import { readOnboardState, writeOnboardState, type OnboardState } from "./onboard-state.js";
-import { ensureGraft, graftAlreadyWired, graftBuildSeconds, planGraft, readGraftRecord, wireGraft, type GraftTool } from "./graft.js";
+import { ensureGraft, graftAlreadyWired, planGraft, readGraftRecord, wireGraft, type GraftTool } from "./graft.js";
 import { deleteOwnerToken, OWNER_ACCESS_REVOKED, OwnerApiClient, readOwnerToken, writeOwnerToken } from "./owner-api.js";
 
 /**
@@ -145,7 +145,7 @@ export function isNo(answer: string): boolean {
 
 /** Every family whose local tooling this machine actually has (OS14). */
 export async function detectAgentFamilies(): Promise<string[]> {
-  const { resolveNativeClaudeExecutable, resolveNativeCodexHome } = await import(
+  const { locateNativeDsh, resolveNativeClaudeExecutable, resolveNativeCodexHome } = await import(
     "@konteks/remote-supervisor"
   );
   const families: string[] = [];
@@ -154,6 +154,10 @@ export async function detectAgentFamilies(): Promise<string[]> {
   }
   if (await resolveNativeCodexHome().then(() => true).catch(() => false)) {
     families.push("codex");
+  }
+  // A supported DeepSeek Harness and a Node that can run it (dsh-runtime-support CP5).
+  if (await locateNativeDsh().then(() => true).catch(() => false)) {
+    families.push("dsh");
   }
   return families;
 }
@@ -409,7 +413,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           // `assistant` is what a project-management turn places as, and
           // `onboard` is what the catalog work needs (OS14). Which agent
           // families exist here is recorded locally, not requested as a role.
-          requestedRoles: ["assistant", "onboard"],
+          requestedRoles: ["assistant", "onboard", "planner", "generator", "qa"],
           bundleVersion: release.manifest.bundleVersion,
           manifestDigest: release.manifest.digest,
         });
@@ -631,10 +635,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       if (unpacked.state !== "done") {
         let progress: string;
         if (unpacked.state === "running") {
-          const names = { "claude-code": "Claude Code", codex: "Codex" } as Record<string, string>;
           progress =
             unpacked.total > 0
-              ? `This machine is still unpacking its agent packages: ${unpacked.agent ? `${names[unpacked.agent] ?? unpacked.agent}, ` : ""}${Math.min(unpacked.done + 1, unpacked.total)} of ${unpacked.total}. This usually finishes within two minutes of the install.`
+              ? `This machine is still unpacking its agent packages: ${unpacked.agent ? `${agentName(unpacked.agent)}, ` : ""}${Math.min(unpacked.done + 1, unpacked.total)} of ${unpacked.total}. This usually finishes within two minutes of the install.`
               : "This machine is still unpacking its agent packages. This usually finishes within two minutes of the install.";
         } else {
           await staging.spawn(context.root);
@@ -656,7 +659,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       } as never);
       return {
         step: "start",
-        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next, which takes about half a minute.`,
+        note: `${announce}This machine is now ${state.decision === "create" ? "its" : `${joinedName}'s`} runtime; starting it next, which takes about a minute.`,
         // Registering and starting the service is the launcher's own command,
         // so the agent runs it rather than this process forking a service.
         run: { argv: ["konteks-remote", "start"] },
@@ -1081,7 +1084,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       await save({ step: "graft_setup", graftDecision: "accepted", graftRepository: repo });
       return {
         step: "graft",
-        note: `Setting up Graft: downloading it, then mapping ${state.repositoryName ?? "this repository"}. That usually takes under ${graftBuildSeconds(plan.files) + 30} seconds.`,
+        note: `Setting up Graft: downloading it, then mapping ${state.repositoryName ?? "this repository"}. This can take a minute or more; leave the command running and come back for the result.`,
         run: AGAIN,
       };
     }
@@ -1176,7 +1179,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       if (service?.administrativeStatus === "active") await save({ advertisedRoles: service.roles });
       const api = await ownerApi(supervisorData, coreUrl, enrollment, context);
       if (!(await api.hasExecutionProfile())) {
-        const ready = await api.setUpAgentsFromThisMachine(hostLabel());
+        const ready = await api.setUpAgentsFromThisMachine();
         if (!ready) {
           // What the machine can run is discovered by the runtime and accepted
           // on a later heartbeat, a minute or so after it starts, so an empty
@@ -1284,6 +1287,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         if (notLoggedIn.includes(family)) remedies.push(`${agentName(family)} is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login ${family}`);
         else if (!present.includes(family)) remedies.push(`To also run ${agentName(family)} work here: konteks-remote auth login ${family}`);
       }
+      // DeepSeek Harness is named only when it is here: its key is the one step left.
+      if (notLoggedIn.includes("dsh")) remedies.push(`${agentName("dsh")} is installed but has no DeepSeek API key here yet, so it will not run Konteks work. To add the key: konteks-remote auth login dsh`);
       // People know their agents by name, not by id (WS1-083).
       const presentNames = present.map(agentName);
       if (nativePlatform().os === "debian") {
@@ -1295,7 +1300,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         present.length === 0
           ? installed.length > 0
             ? `No coding agent is logged in here yet, so no Konteks work can run on this machine until one is (see below).`
-            : "No coding agent was found on this machine; install Claude Code or Codex and run konteks-remote auth login."
+            : "No coding agent was found on this machine; install Claude Code, Codex or DeepSeek Harness and run konteks-remote auth login."
           : advertised && advertised.length === 0
             ? `Your ${presentNames.join(" and ")} login is set up; the runtime will advertise it once its first heartbeat lands.`
             : `Your ${presentNames.join(" and ")} login will run Konteks work here.`;
@@ -1376,7 +1381,7 @@ function workspaceName(state: { workspaces?: Array<{ tenantId: string; displayNa
 
 /** An agent family as people name it. */
 export function agentName(family: string): string {
-  return ({ "claude-code": "Claude Code", codex: "Codex", opencode: "OpenCode", pi: "Pi" } as Record<string, string>)[family] ?? family;
+  return ({ "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness" } as Record<string, string>)[family] ?? family;
 }
 
 /**

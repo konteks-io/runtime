@@ -45,6 +45,13 @@ describe("native customer entry point", () => {
     await program.parseAsync(["auth", "login", "codex", "--organization"], { from: "user" });
     expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.login", agent: "codex", organization: true }));
   });
+  it("offers a read-only preview status, and no local preview switch", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["preview", "status"], { from: "user" });
+    expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "preview.status" }));
+    const preview = program.commands.find(command => command.name() === "preview");
+    expect(preview?.commands.map(command => command.name())).toEqual(["status"]);
+  });
   it("reports the installed release as its version, so it matches status after an update (W1-L4)", async () => {
     const root = await mkdtemp(join(tmpdir(), "konteks-version-"));
     try {
@@ -69,6 +76,20 @@ describe("native customer entry point", () => {
     const { program, actions } = fixture();
     await program.parseAsync(["--root", "/private/native-root", "agent", "add", "codex"], { from: "user" });
     expect(actions.addAgent).toHaveBeenCalledWith(expect.objectContaining({ root: "/private/native-root", agent: "codex" }));
+    // The person's own DeepSeek Harness is added the same way.
+    await program.parseAsync(["--root", "/private/native-root", "agent", "add", "dsh"], { from: "user" });
+    expect(actions.addAgent).toHaveBeenLastCalledWith(expect.objectContaining({ agent: "dsh" }));
     expect(actions.install).not.toHaveBeenCalled();
+  });
+  it.each(["pi", "opencode"])("refuses the retired %s agent with the shared sentence", async retired => {
+    const { program, actions } = fixture();
+    program.exitOverride();
+    for (const command of [program.commands.find(c => c.name() === "agent")!, ...program.commands.find(c => c.name() === "agent")!.commands]) command.exitOverride();
+    let stderr = "";
+    program.configureOutput({ writeErr: text => { stderr += text; } });
+    for (const command of program.commands.find(c => c.name() === "agent")!.commands) command.configureOutput({ writeErr: text => { stderr += text; } });
+    await expect(program.parseAsync(["--root", "/private/native-root", "agent", "add", retired], { from: "user" })).rejects.toThrow();
+    expect(stderr).toContain(`${retired} is no longer supported. Choose Claude Code, Codex or DeepSeek Harness on your computer.`);
+    expect(actions.addAgent).not.toHaveBeenCalled();
   });
 });

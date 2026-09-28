@@ -21,8 +21,8 @@ export default defineConfig({
       {
         test: {
           name: "characterization",
-          // Released images, pinned bridges, and Docker Compose behaviour.
-          // Opt-in: these need Docker and network access.
+          // Pinned bridges from an unpacked offline agent package and host
+          // daemon behaviour. Opt-in: these need installed agents or a Linux host.
           include: characterize ? ["packages/*/src/__characterization__/**/*.test.ts"] : [],
           testTimeout: 600_000,
           fileParallelism: false,

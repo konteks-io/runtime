@@ -117,8 +117,7 @@ async function fixture(options: { controller?: { acceptClaimed: ReturnType<typeo
     outbox,
     assignmentSender: sender,
     clock,
-    deploymentKind: "native_connector",
-    transport: { send: (message: OutboundMessage) => sent.push(message) },
+        transport: { send: (message: OutboundMessage) => sent.push(message) },
     instanceId: () => scope.instanceId,
     workspaceId: () => scope.workspaceId,
     runnerIncarnation: () => "process",
@@ -132,10 +131,9 @@ async function fixture(options: { controller?: { acceptClaimed: ReturnType<typeo
     maxPullItems: 1,
     acceptedKinds: () => ["search_generation"],
     advertisedRoles: () => ["assistant"],
-    browserToolAvailable: () => false,
     agents: () => [{ agentId: "codex", readiness: "ready", connectionState: "ready" }],
     instanceEvidencePolicy: () => "structured_only",
-    components: {},
+   
     runners: new Map([["codex", { createSession: vi.fn() } as never]]),
     ...(options.controller ? { searchController: options.controller } : {}),
   } as never);

@@ -12,11 +12,112 @@ artifacts, it must use this repository. Product/API identifiers such as
 stable protocol and user-facing names; do not rename them merely because the
 source repository is named `runtime`.
 
+The connector's file in a release folder is `konteks-connector(.exe)`
+(`NATIVE_CONNECTOR_FILE` in `packages/release/src/native.ts`), because people
+see it in their process list. Never hard-code a connector file name: resolve it
+with `resolveNativeConnectorExecutable`, which also accepts the pre-rename
+`connector` that older releases, older launchers and rollbacks leave behind.
+The manifest's `kind: "connector"` and the service label
+`dev.konteks.remote.<hash>` are protocol, not file names; do not rename them.
+
 Preserve the native-only architecture: this machine runs the connector, ACP
 bridges, local agents, and their local authentication. Harness, Validation
 Runtime, Assistant, and ai-manager remain cloud services. Reliability and
 performance are the primary design constraints. Prefer durable, bounded,
 observable recovery and simple ownership over extra coordination layers.
+
+The appliance (the Docker Compose remote instance with its gateway, browser
+tool, preview forwarder and runner images) is retired and deleted; the
+supervisor accepts only `SUPERVISOR_DEPLOYMENT_KIND=native_connector` and
+runners only `agent_local_subscription`. Do not reintroduce Compose, images,
+`gateway_keyed` or a local component server.
+
+Session previews are native (packages 7.0.0 `preview.dev_server`): the
+supervisor runs at most one dev server per session in that session's
+worktree (`packages/supervisor/src/preview/`), on a loopback port it picks,
+with an allow-listed environment, and serves the relay channel
+`preview:<sessionId>` through an in-process forwarder that may dial ONLY that
+port. Agents reach it through the connector-local `konteks-preview` MCP server
+(`preview_start`/`preview_status`/`preview_stop`, no arguments). The per-machine
+on/off switch is Core's (`PUT /api/remote-instances/:instanceId/preview`); do
+not add a local one. Do not restore the preview Compose service, the `preview`
+work kind or a separate forwarder process.
+
+The QA browser is Playwright MCP (`@playwright/mcp`, pinned in
+`release/native-agent-builds.json` `browser` and `BROWSER_MCP_PACKAGE` in
+`packages/release/src/browser.ts`; bump both together), bundled into the
+Claude Code and Codex offline agent packages with the connector's launcher
+(`packages/agent-runner/src/bridge/browser-{mcp,launcher,tools}.ts`, copied to
+`konteks/` in the package). `NativeRunner` adds it as a stdio ACP MCP server
+(`konteks-browser`) for every session that has a preview (`BROWSER_WORK_KINDS`
+= `PREVIEW_WORK_KINDS`: delivery, validation, qa and assistant_execution, which
+is how a QA-mode conversation runs); `RelayedSession` gives each such session a
+`PreviewBrowserGateway` (`preview/browser-gateway.ts`), the browser's HTTP
+proxy, which admits only that session's running preview origin. Chromium
+proxies loopback too (Playwright forces `<-loopback>`), so the gateway is the
+boundary; `--allowed-origins` is only a second layer (Playwright says it is
+not a security boundary). The gateway also admits origins Core issued for the
+session (`PreviewBrowserGateway.grant`): Core's answer to the QA tool
+`platform__quality-assurance__environment_open` carries
+`browserAccess: {sessionId, origins[{origin, expiresAt}]}` (a signed-in cloud
+preview, or a registered application), and `McpCapabilityFacade` reads it from
+that one tool's JSON answer as it relays it (`onBrowserAccess`; same session,
+http(s) origins only, external https only, expiry capped at a day) and hands
+it to the session's gateway. Never add another way to grant an origin: the
+agent must not be able to widen the list with its own input. A registered
+application's host must not resolve to this computer (the CONNECT dials the
+checked address). The launcher keeps `--allowed-origins` in step: before each
+tool call it reads `GET <gateway>/.konteks/browser-origins`
+(`KONTEKS_BROWSER_ORIGINS_URL`) and, when the set changed and nothing is in
+flight, restarts Playwright MCP with loopback plus those origins, replaying
+the agent's `initialize` (Playwright reads the flag once per context). Never pass `PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK`,
+never npx it at runtime, and never give it to dsh (its governance admits only
+`konteks-platform`/`konteks-preview`).
+
+Structured results go through a tool (`packages/supervisor/src/structured-result/`).
+Every session gets the connector-local `konteks-result` MCP server with one
+tool, `submit_result` (generic, permissive definition while no turn asks). A
+prompt whose LAST text block ends with agent-core's structured-output contract
+(`readStructuredOutputContract`: the `## Required structured output` heading
+and a fenced JSON Schema) binds that schema to the tool
+(`StructuredResultToolServer.bind`): the server sends
+`notifications/tools/list_changed` on the agent's event stream and waits up to
+2 s for a re-read (`toolDefinition: schema`, Claude Code); an agent that does
+not re-read (Codex 0.144, `toolDefinition: generic`, remembered per session)
+gets the schema in the prompt line instead. The contract block is replaced by
+one line (`RESULT_TOOL_LINE`). Calls are validated with Ajv (Ajv2020 for a
+draft 2020-12 schema), a mismatch answers with each problem's path, the first
+valid call wins. At the turn's `prompt_result`: the tool value
+(`source: tool`), else a valid fenced/JSON result in the agent's message text
+(`fence`), else ONE follow-up prompt in the same ACP session
+(`RESULT_FOLLOW_UP`, request id `<id>#konteks-result-follow-up`, never sent to
+Core; its usage is summed into the original completion) whose result is
+`follow_up`; the original request's completion then carries
+`structuredOutput: { source, value }` (packages 7.0.0, additive). Never move
+the schema into a `session/prompt` request field: the native operation permit
+signs the parsed request's digest and an older connector strips unknown
+fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
+
+Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
+person's own DeepSeek Harness (`dsh`). Pi and OpenCode are retired: every
+write or install refuses them with `retiredAgentMessage` from
+`@konteks/backstage-plugin-common`, while stored values stay readable (a
+`native-runtime.json` still listing them loads without them through
+`parseNativeRuntimeRecord`, with a logged warning).
+
+Every installed native agent reports the models it offers (System One §6a,
+KM6; `ModelCapabilitySnapshotProducer`): an agent whose release carries a
+reviewed signed mapping (`REVIEWED_NATIVE_MODEL_IDENTITIES`) reports under it,
+and every other one (or one whose mapping expired) under its fixed unsigned
+catalogue authority (`catalogueModelAuthority`, config `model`); Core resolves
+identity, tier and price from its own known-model catalogue. Each snapshot
+carries every option's value, name and group (`exactSelect` in
+`bridge/model-capability.ts`); malformed entries are skipped, and above 128
+values the known models come first (the current value is always kept) instead
+of the report failing. Discovery is re-read every
+`DEFAULT_MODEL_CAPABILITY_TTL_MS` (5 min) and at once on a sign-in change (the
+account fingerprint keys the cache). The signed mapping is no longer needed
+for a new model; keep it only for aliases that move.
 
 Before production changes, add or update a focused characterization test and
 observe its failure or baseline. Run focused tests serially; do not start

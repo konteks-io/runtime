@@ -16,7 +16,7 @@ describe("native session provenance title", () => {
       konteksSession: { version: 1, title: "[konteks] Review" },
       claudeCode: { options: { title: "[konteks] Review", settingSources: ["project"] } },
     });
-    expect(konteksSessionMetadata("Review", "opencode")).not.toHaveProperty("claudeCode");
+    expect(konteksSessionMetadata("Review", "codex")).not.toHaveProperty("claudeCode");
   });
 });
 

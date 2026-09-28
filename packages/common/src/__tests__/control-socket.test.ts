@@ -1,5 +1,5 @@
 import { connect } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
   ControlRequestSchema,
@@ -17,6 +17,48 @@ afterEach(async () => {
 const token = "t".repeat(32);
 
 describe("loopback control socket", () => {
+  it("notifies an active login when its authenticated client disconnects", async () => {
+    let started!: () => void;
+    const handled = new Promise<void>(resolve => { started = resolve; });
+    const disconnected = vi.fn();
+    const server = await startControlSocketServer({ token, port: 0, handler: async (request, emit) => {
+      if (request.op !== "auth.login") return {};
+      (emit as typeof emit & { signal: AbortSignal }).signal.addEventListener("abort", disconnected);
+      emit.event({ kind: "started", loginId: "l1", agentId: request.agentId });
+      started();
+      return { loginId: "l1" };
+    } });
+    servers.push(server);
+    const client = connect({ host: "127.0.0.1", port: server.port });
+    await new Promise<void>(resolve => client.once("connect", resolve));
+    client.write(`${JSON.stringify({ auth: token })}\n`);
+    client.write(`${JSON.stringify({ id: "login", request: { op: "auth.login", agentId: "codex", organization: false } })}\n`);
+    await handled;
+    client.destroy();
+    await vi.waitFor(() => expect(disconnected).toHaveBeenCalledOnce());
+  });
+  it("aborts an interactive login call and closes its socket", async () => {
+    let started!: () => void;
+    const handled = new Promise<void>(resolve => { started = resolve; });
+    const disconnected = vi.fn();
+    const server = await startControlSocketServer({ token, port: 0, handler: async (request, emit) => {
+      if (request.op !== "auth.login") return {};
+      emit.signal.addEventListener("abort", disconnected);
+      emit.event({ kind: "started", loginId: "l1", agentId: request.agentId });
+      started();
+      return { loginId: "l1" };
+    } });
+    servers.push(server);
+    const abort = new AbortController();
+    const login = controlCall({ token, port: server.port }, {
+      request: { op: "auth.login", agentId: "codex", organization: false },
+      schema: z.object({ loginId: z.string() }), signal: abort.signal,
+    });
+    await handled;
+    abort.abort();
+    await expect(login).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    await vi.waitFor(() => expect(disconnected).toHaveBeenCalledOnce());
+  });
   it("returns an unavailable error when the service has stopped, without an uncaught stream error", async () => {
     const server = await startControlSocketServer({ token, port: 0, handler: async () => ({}) });
     await server.close();
@@ -141,7 +183,7 @@ describe("loopback control socket", () => {
       token,
       port: 0,
       handler: async () => {
-        throw new RemoteInstanceError("gateway_unavailable", "gateway is down", {
+        throw new RemoteInstanceError("agent_unavailable", "agent is down", {
           recoveryActions: [{ kind: "run_doctor" }],
         });
       },
@@ -150,9 +192,21 @@ describe("loopback control socket", () => {
     await expect(
       controlCall(
         { token, port: server.port },
-        { request: { op: "gateway.key.clear", agentId: "codex" }, schema: z.unknown() },
+        { request: { op: "auth.logout", agentId: "codex" }, schema: z.unknown() },
       ),
-    ).rejects.toMatchObject({ message: "gateway_unavailable: gateway is down" });
+    ).rejects.toMatchObject({ message: "agent_unavailable: agent is down" });
+  });
+
+  it("rejects a request outside the closed protocol at once instead of waiting for a timeout", async () => {
+    const handler = vi.fn(async () => ({}));
+    const server = await startControlSocketServer({ token, port: 0, handler });
+    servers.push(server);
+    const started = Date.now();
+    await expect(
+      controlCall({ token, port: server.port, timeoutMs: 10_000 }, { request: { op: "exec", command: "id" } as never, schema: z.unknown() }),
+    ).rejects.toThrow(/control_request_invalid/);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("the protocol is closed: no exec or free-form config field parses", () => {
@@ -162,9 +216,11 @@ describe("loopback control socket", () => {
       expect(ControlRequestSchema.safeParse({ op, url: "https://evil.example/manifest.json" }).success).toBe(false);
     }
     expect(ControlRequestSchema.safeParse({ op: "status", extra: 1 }).success).toBe(false);
-    expect(
-      ControlRequestSchema.safeParse({ op: "gateway.key.set", agentId: "Codex Bad", key: "k".repeat(16) })
-        .success,
-    ).toBe(false);
+    expect(ControlRequestSchema.safeParse({ op: "auth.logout", agentId: "Codex Bad" }).success).toBe(false);
+    // The retired appliance's BYOK gateway operations are gone.
+    expect(ControlRequestSchema.safeParse({ op: "gateway.key.set", agentId: "codex", key: "k".repeat(16) }).success).toBe(false);
+    // Relay previews left the protocol: no local port is ever exposed.
+    expect(ControlRequestSchema.safeParse({ op: "preview.enable", port: 3000 }).success).toBe(false);
+    expect(ControlRequestSchema.safeParse({ op: "preview.disable" }).success).toBe(false);
   });
 });

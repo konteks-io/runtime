@@ -31,6 +31,8 @@ import type { RelayDurableState } from "../relay/channel-mux.js";
  *   heartbeat.json       monotonic heartbeat sequence
  *   cursors.json         legacy durable receive cursors (migration fallback)
  *   relay-state.json     atomic cursors, allocation floors, and unacked relay frames
+ *   last-exit.json       last controlled nonzero exit classification and timestamp
+ *   shutdown-progress.json  last reached native shutdown phase and timestamp
  *   control.token        loopback control-socket token
  *   journal/             assignment recovery journal, pending requests, decisions, erase
  *   outbox/              durable outbox
@@ -102,9 +104,10 @@ export const DEFAULT_CONFIG: ConfigRecord["configuration"] = {
   logLevel: "info",
   updateChannel: "stable",
   evidenceUpload: "structured_only",
-  gateway: { capEnforcementStage: "observe", egressAllowlistRevision: "" },
   permissionResponderDeadlineSeconds: 300,
   humanDeferralAllowed: true,
+  deploymentKind: "native_connector",
+  roleBindings: [],
 };
 
 const CursorsSchema = z.record(z.string(), z.object({ to_core: z.number().int().nonnegative(), to_runtime: z.number().int().nonnegative(),
@@ -122,6 +125,27 @@ const RelayDurableStateSchema = z.object({
 }).strict();
 
 const HeartbeatSeqSchema = z.object({ sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict();
+
+export const ControlledExitReasonSchema = z.enum([
+  "liveness_lost", "uncaught_exception", "unhandled_rejection", "startup_failed", "shutdown_step_failed", "other",
+]);
+export type ControlledExitReason = z.infer<typeof ControlledExitReasonSchema>;
+export const LastExitSchema = z.object({
+  schemaVersion: z.literal(1),
+  reason: ControlledExitReasonSchema,
+  occurredAt: z.string().datetime(),
+}).strict();
+export type LastExit = z.infer<typeof LastExitSchema>;
+
+/** Diagnostic progress only. The shutdown-complete receipt remains the sole
+ * attestation that every native shutdown step finished. */
+export const ShutdownProgressSchema = z.object({
+  schemaVersion: z.literal(1),
+  phase: z.enum(["supervisor_prelude", "work_drain", "preview_close", "runner_stop", "codex_owner_stop", "state_close", "control_close", "receipt"]),
+  state: z.enum(["entered", "completed"]),
+  observedAt: z.string().datetime(),
+}).strict();
+export type ShutdownProgress = z.infer<typeof ShutdownProgressSchema>;
 
 export class SupervisorStore {
   private heartbeatWrites: Promise<void> = Promise.resolve();
@@ -163,6 +187,39 @@ export class SupervisorStore {
 
   private async writeJson(name: string, value: unknown): Promise<void> {
     await this.mutate(() => writeSecretFile(this.path(name), `${JSON.stringify(value)}\n`));
+  }
+
+  /** Replaces the single private record before a controlled nonzero exit. */
+  async recordLastExit(reason: ControlledExitReason, occurredAt = new Date().toISOString()): Promise<void> {
+    await this.writeJson("last-exit.json", LastExitSchema.parse({ schemaVersion: 1, reason, occurredAt }));
+  }
+
+  /** Readable after the service has stopped, without its control socket. */
+  async lastExit(): Promise<LastExit | null> {
+    const path = this.path("last-exit.json");
+    try {
+      await assertRestrictedMode(path);
+    } catch (error) {
+      if (isFsErrorWithCode(error, "ENOENT")) return null;
+      throw error;
+    }
+    return this.readJson("last-exit.json", LastExitSchema);
+  }
+
+  /** One restricted, bounded marker for the last reached shutdown boundary. */
+  async recordShutdownProgress(phase: ShutdownProgress["phase"], state: ShutdownProgress["state"], observedAt = new Date().toISOString()): Promise<void> {
+    await this.writeJson("shutdown-progress.json", ShutdownProgressSchema.parse({ schemaVersion: 1, phase, state, observedAt }));
+  }
+
+  async shutdownProgress(): Promise<ShutdownProgress | null> {
+    const path = this.path("shutdown-progress.json");
+    try {
+      await assertRestrictedMode(path);
+    } catch (error) {
+      if (isFsErrorWithCode(error, "ENOENT")) return null;
+      throw error;
+    }
+    return this.readJson("shutdown-progress.json", ShutdownProgressSchema);
   }
 
   /** The machine key, or null when there is none on disk. */

@@ -24,7 +24,11 @@ export function reportPayloadDigest(report: { [key: string]: JsonValue }): strin
 
 /** Keyed hash used for the opaque `authIdentityFingerprint` (D111). */
 export function keyedFingerprint(key: Uint8Array, identitySignal: string): string {
-  return createHmac("sha256", key).update(identitySignal).digest("base64url");
+  const digest = createHmac("sha256", key).update(identitySignal).digest("base64url");
+  // Wire snapshot identities must start with an alphanumeric character.
+  // Preserve already-valid fingerprints so an update does not change their
+  // existing agent identity; disambiguate the rare base64url '_'/'-' prefix.
+  return /^[A-Za-z0-9]/.test(digest) ? digest : `f${digest}`;
 }
 
 export function constantTimeEquals(a: string, b: string): boolean {

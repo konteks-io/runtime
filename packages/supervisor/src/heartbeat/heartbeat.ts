@@ -1,5 +1,5 @@
 import { HeartbeatMessageSchema, REMOTE_INSTANCE_PROOF_AUDIENCE, RemoteInstanceError, signInstanceProof, type AgentModelOfferedValuesSnapshot, type Clock, type HeartbeatMessage, type HeartbeatResult, type InstanceKeyPair, type JsonValue, type Logger, createLogger } from "@konteks/remote-common";
-import type { InventoryCollector } from "../inventory/collector.js";
+import type { InventorySource } from "../inventory/snapshot.js";
 import { computeUtilization, deriveAdvertisedRoles, type RoleBinding } from "../inventory/roles.js";
 import type { SupervisorStore } from "../state/store.js";
 import type { CoreClient } from "../core/client.js";
@@ -23,7 +23,7 @@ export interface HeartbeatOptions {
   captureLeaseFence?: () => () => void;
   withLeaseAcquisition?: LeaseAcquisition;
   onFailure: (error: unknown) => Promise<void>;
-  inventory: Pick<InventoryCollector, "collect">;
+  inventory: InventorySource;
   onInventory?: (agents: HeartbeatMessage["agents"]) => void;
   roleBindings: () => RoleBinding[];
   activeAssignmentIds: () => string[];
@@ -208,7 +208,7 @@ export class HeartbeatPublisher {
     const snapshot = await this.options.inventory.collect();
     assertCurrent();
     this.options.onInventory?.(snapshot.agents);
-    const roles = deriveAdvertisedRoles(this.options.roleBindings(), snapshot.agents, { browserToolAvailable: snapshot.browserToolAvailable, gitVersion: snapshot.gitVersion });
+    const roles = deriveAdvertisedRoles(this.options.roleBindings(), snapshot.agents, { gitVersion: snapshot.gitVersion });
     this.lastRoles = roles;
     const requiredHealthy = snapshot.components.every((component) => component.healthStatus === "healthy" || component.healthStatus === "degraded");
     const utilization = computeUtilization({

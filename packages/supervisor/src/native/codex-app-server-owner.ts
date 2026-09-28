@@ -2,9 +2,10 @@ import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, realpath, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { promisify } from "node:util";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
   RemoteInstanceError,
+  isProcessGroupAlive,
   spawnPiped,
   stopProcessGroupLeaderFirst,
   type PipedChildProcess,
@@ -14,8 +15,12 @@ import {
   resolveBridgeFamily,
   resolveToolingCommand,
   verifyNativeRunnerPackage,
+  assertCodexThreadsIdle,
+  codexLoadedThreadStatuses,
   type RunnerConfig,
 } from "@konteks/remote-agent-runner";
+import { resolveNativeCodexSocket } from "./installation.js";
+import { resolveNativeCodexHome } from "./codex-home.js";
 
 const DEFAULT_RESTART_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000, 10_000] as const;
 
@@ -23,6 +28,8 @@ export interface NativeCodexAppServerOwnerOptions {
   config: RunnerConfig;
   spawn?: typeof spawnPiped;
   stop?: typeof stopProcessGroupLeaderFirst;
+  /** Exact child group check after bounded stop; tests can model a surviving group. */
+  groupAlive?: typeof isProcessGroupAlive;
   prepareSocket?: typeof prepareCodexSocket;
   socketAvailable?: (socketPath: string) => Promise<boolean>;
   adoptedPollMs?: number;
@@ -33,6 +40,8 @@ export interface NativeCodexAppServerOwnerOptions {
   onRestartFailure?: (error: unknown) => void;
   /** Who holds the shared socket; tests replace the lsof/ps lookup. */
   socketHolder?: (socketPath: string) => Promise<CodexSocketHolder | null>;
+  /** Fail closed unless every loaded thread in the shared owner is idle. */
+  assertIdleThreads?: (socketPath: string) => Promise<void>;
   /** Stop a stale server's process group; tests replace the signals. */
   stopHolder?: (pid: number) => Promise<void>;
   onStaleReplaced?: (event: { pid: number; staleRelease: string; currentRelease: string }) => void;
@@ -40,12 +49,26 @@ export interface NativeCodexAppServerOwnerOptions {
 
 export interface CodexSocketHolder { pid: number; command: string }
 
+/** rc.6 upgrade path: prove the still-running release owns the private socket before reading it. */
+export async function assertLegacyCodexOwnerIdle(input: { root: string; releaseId: string; codexHome?: string; codexSocket?: string }): Promise<void> {
+  const home = await resolveNativeCodexHome(input.codexHome === undefined ? process.env : { CODEX_HOME: input.codexHome });
+  const socket = await resolveNativeCodexSocket(input.root, home, input.codexSocket);
+  const holder = await findCodexSocketHolder(socket).catch(() => null);
+  const release = holder && releaseOf(holder.command);
+  if (!holder || !release || release.releasesDir !== `${join(input.root, "releases")}/` || release.release !== input.releaseId ||
+      !holder.command.includes(`--listen unix://${socket}`)) {
+    throw unavailable("The previous Codex service owner could not be verified for maintenance.");
+  }
+  await assertCodexThreadsIdle(socket);
+}
+
 /**
  * One supervisor-owned Codex app-server shared by every local ACP bridge.
  * Bridge/session restarts only replace clients; they never own this process.
  */
 export class NativeCodexAppServerOwner {
   private child: PipedChildProcess | null = null;
+  private adoptedHolder: CodexSocketHolder | null = null;
   private startPromise: Promise<void> | null = null;
   private restartTimer: NodeJS.Timeout | null = null;
   private stableTimer: NodeJS.Timeout | null = null;
@@ -93,6 +116,29 @@ export class NativeCodexAppServerOwner {
     process.once("exit", this.exitReaper);
   }
 
+  /** Called while the launcher drain is still cancellable, before service stop. */
+  async preflightMaintenance(): Promise<void> {
+    await this.startPromise;
+    if (this.stopping) throw unavailable("The shared Codex owner is stopping.");
+    if (this.child || this.adoptedHolder) {
+      await (this.options.assertIdleThreads ?? assertCodexThreadsIdle)(this.options.config.RUNNER_NATIVE_CODEX_SOCKET!);
+    }
+  }
+
+  async inspectLegacyThread(reference: string): Promise<{ unloaded: boolean; ownerGeneration: string }> {
+    await this.startPromise;
+    if (this.stopping || (!this.child && !this.adoptedHolder)) throw unavailable("The shared Codex owner is unavailable.");
+    const socket = this.options.config.RUNNER_NATIVE_CODEX_SOCKET!;
+    const before = await lstat(socket);
+    const pid = this.child?.pid ?? this.adoptedHolder?.pid;
+    if (!before.isSocket() || !pid) throw unavailable("The shared Codex owner identity is unavailable.");
+    const unloaded = !(await codexLoadedThreadStatuses(socket)).has(reference);
+    const after = await lstat(socket);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.birthtimeMs !== after.birthtimeMs ||
+        pid !== (this.child?.pid ?? this.adoptedHolder?.pid)) throw unavailable("The shared Codex owner changed during legacy admission.");
+    return { unloaded, ownerGeneration: `${pid}:${before.dev}:${before.ino}:${before.birthtimeMs}` };
+  }
+
   async stop(): Promise<void> {
     this.shutdownRequested();
     this.stopping = true;
@@ -104,12 +150,53 @@ export class NativeCodexAppServerOwner {
     this.stableTimer = null;
     this.adoptedTimer = null;
     await this.startPromise?.catch(() => undefined);
-    const child = this.child;
-    this.child = null;
-    if (child) await (this.options.stop ?? stopProcessGroupLeaderFirst)({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
-    await (this.options.cleanupSocket ?? cleanupCodexSocket)(this.options.config.RUNNER_NATIVE_CODEX_SOCKET!);
+    try { await this.stopOwnedProcess(); }
+    catch (error) {
+      // A maintenance refusal must not leave the exit reaper armed: the
+      // connector may exit after reporting the failed stop to the launcher.
+      if (this.exitReaper) process.removeListener("exit", this.exitReaper);
+      this.exitReaper = null;
+      throw error;
+    }
     if (this.exitReaper) process.removeListener("exit", this.exitReaper);
     this.exitReaper = null;
+  }
+
+  /** Called only after the runner has fenced and stopped every Codex execution owner. */
+  async refreshAfterLogin(): Promise<void> {
+    if (this.stopping) throw unavailable("The shared Codex owner is stopping.");
+    await this.startPromise;
+    this.generation++;
+    if (this.adoptedTimer) clearInterval(this.adoptedTimer);
+    if (this.stableTimer) clearTimeout(this.stableTimer);
+    if (this.restartTimer) clearTimeout(this.restartTimer);
+    this.adoptedTimer = this.stableTimer = this.restartTimer = null;
+    await this.stopOwnedProcess();
+    this.startPromise = null;
+    await this.start();
+  }
+
+  private async stopOwnedProcess(): Promise<void> {
+    const child = this.child;
+    const adopted = this.adoptedHolder;
+    const socketPath = this.options.config.RUNNER_NATIVE_CODEX_SOCKET!;
+    if (adopted) {
+      const current = await (this.options.socketHolder ?? findCodexSocketHolder)(socketPath).catch(() => null);
+      if (!current || current.pid !== adopted.pid || current.command !== adopted.command) {
+        throw unavailable("The adopted Codex owner changed; refusing to stop another process.");
+      }
+    }
+    if (child || adopted) await (this.options.assertIdleThreads ?? assertCodexThreadsIdle)(socketPath);
+    if (child) {
+      await (this.options.stop ?? stopProcessGroupLeaderFirst)({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
+      if ((this.options.groupAlive ?? isProcessGroupAlive)(child)) {
+        throw unavailable("The signed Codex app-server process group did not finish stopping.");
+      }
+    }
+    else if (adopted) await (this.options.stopHolder ?? stopProcessGroup)(adopted.pid);
+    this.child = null;
+    this.adoptedHolder = null;
+    if (child || adopted) await (this.options.cleanupSocket ?? cleanupCodexSocket)(socketPath);
   }
 
   private async spawnAndAwaitReady(): Promise<void> {
@@ -118,11 +205,13 @@ export class NativeCodexAppServerOwner {
     const socketPath = config.RUNNER_NATIVE_CODEX_SOCKET!;
     const codexHome = config.RUNNER_NATIVE_CODEX_HOME!;
     await (this.options.verifyPackage ?? verifyNativeRunnerPackage)(config);
-    let socketMode = await (this.options.prepareSocket ?? prepareCodexSocket)(socketPath);
+    const root = dirname(dirname(config.RUNNER_CREDENTIAL_DIR));
+    const defaultSocket = await resolveNativeCodexSocket(root, codexHome);
+    let socketMode = await (this.options.prepareSocket ?? prepareCodexSocket)(socketPath, socketPath === defaultSocket);
     if (this.stopping || generation !== this.generation) throw unavailable("The shared Codex owner stopped during startup.");
     const family = resolveBridgeFamily("codex");
     const command = resolveToolingCommand(config, family, ["codex", "app-server", "--listen", `unix://${socketPath}`]);
-    if (socketMode === "adopt" && await this.replaceStaleRelease(socketPath, command.command)) socketMode = "spawn";
+    if (socketMode === "adopt") socketMode = await this.classifyExistingHolder(socketPath, command.command);
     if (this.stopping || generation !== this.generation) throw unavailable("The shared Codex owner stopped during startup.");
     if (socketMode === "adopt") {
       this.watchAdoptedSocket(socketPath, generation);
@@ -172,16 +261,23 @@ export class NativeCodexAppServerOwner {
    * server is stopped and a fresh one reads the current sign-in. A holder
    * that is not one of this connector's releases is never touched.
    */
-  private async replaceStaleRelease(socketPath: string, currentCommand: string): Promise<boolean> {
+  private async classifyExistingHolder(socketPath: string, currentCommand: string): Promise<"spawn" | "adopt"> {
     const current = releaseOf(currentCommand);
-    if (!current) return false;
+    if (!current) throw unavailable("The signed Codex owner could not prove its release.");
     const holder = await (this.options.socketHolder ?? findCodexSocketHolder)(socketPath).catch(() => null);
     const stale = holder ? releaseOf(holder.command) : null;
-    if (!holder || !stale || stale.releasesDir !== current.releasesDir || stale.release === current.release) return false;
+    if (!holder || !stale || stale.releasesDir !== current.releasesDir || !holder.command.includes(`--listen unix://${socketPath}`)) {
+      throw unavailable("The Codex socket is held by another or unverified process.");
+    }
+    if (stale.release === current.release) {
+      this.adoptedHolder = holder;
+      return "adopt";
+    }
+    await (this.options.assertIdleThreads ?? assertCodexThreadsIdle)(socketPath);
     await (this.options.stopHolder ?? stopProcessGroup)(holder.pid);
     await (this.options.cleanupSocket ?? cleanupCodexSocket)(socketPath);
     this.options.onStaleReplaced?.({ pid: holder.pid, staleRelease: stale.release, currentRelease: current.release });
-    return true;
+    return "spawn";
   }
 
   /** A healthy same-user socket is local-user authority and can survive a
@@ -195,7 +291,19 @@ export class NativeCodexAppServerOwner {
         if (available || this.stopping || generation !== this.generation) return;
         if (this.adoptedTimer) clearInterval(this.adoptedTimer);
         this.adoptedTimer = null;
-        this.spawnAndAwaitReady().catch(error => {
+        const adopted = this.adoptedHolder;
+        this.adoptedHolder = null;
+        void (async () => {
+          if (adopted) {
+            const current = await (this.options.socketHolder ?? findCodexSocketHolder)(socketPath).catch(() => null);
+            if (this.stopping || generation !== this.generation) return;
+            if (current?.pid === adopted.pid && current.command === adopted.command) {
+              await (this.options.stopHolder ?? stopProcessGroup)(adopted.pid);
+              await (this.options.cleanupSocket ?? cleanupCodexSocket)(socketPath);
+            }
+          }
+          if (!this.stopping && generation === this.generation) await this.spawnAndAwaitReady();
+        })().catch(error => {
           this.options.onRestartFailure?.(error);
           if (!this.stopping) this.onExitRetry();
         });
@@ -236,7 +344,7 @@ export class NativeCodexAppServerOwner {
   }
 }
 
-export async function prepareCodexSocket(socketPath: string): Promise<"spawn" | "adopt"> {
+export async function prepareCodexSocket(socketPath: string, allowStaleCleanup = false): Promise<"spawn" | "adopt"> {
   validatePath(socketPath);
   const directory = dirname(socketPath);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -251,6 +359,7 @@ export async function prepareCodexSocket(socketPath: string): Promise<"spawn" | 
   if (!existing) return "spawn";
   if (!existing.isSocket() || !privateOwner(existing)) throw unavailable("The shared Codex socket path is not a private local-user socket.");
   if (await canConnect(socketPath)) return "adopt";
+  if (!allowStaleCleanup) throw unavailable("An explicit Codex socket is stale; refusing to remove an unproven holder's socket.");
   await unlink(socketPath);
   return "spawn";
 }
@@ -322,5 +431,9 @@ async function stopProcessGroup(pid: number): Promise<void> {
   // The server runs in its own group (detached spawn); end the group, as a stop does.
   try { process.kill(-pid, "SIGTERM"); } catch { try { process.kill(pid, "SIGTERM"); } catch { return; } }
   for (let waited = 0; waited < 5_000 && alive(); waited += 100) await pause(100);
-  if (alive()) { try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } }
+  if (alive()) {
+    try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } }
+    for (let waited = 0; waited < 2_000 && alive(); waited += 100) await pause(100);
+  }
+  if (alive()) throw unavailable("The adopted Codex app-server did not finish stopping.");
 }

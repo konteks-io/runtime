@@ -199,7 +199,7 @@ describe("session manager (D98 bootstrap)", () => {
     expect(calls.setSessionConfigOption?.[0]).toMatchObject({ sessionId: "bridge-old", configId: "model", value: "approved" });
     expect(await store.get("acp-prior")).toBe("bridge-old");
   });
-  it.each(["codex", "claude-code", "opencode"])("marks new %s sessions without renaming resumed sessions", async agentId => {
+  it.each(["codex", "claude-code", "dsh"])("marks new %s sessions without renaming resumed sessions", async agentId => {
     const { bridge, calls } = fakeBridge();
     const store = new InMemorySessionRefStore();
     const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: store });
