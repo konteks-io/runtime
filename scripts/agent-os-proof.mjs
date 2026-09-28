@@ -313,9 +313,15 @@ async function konteksSession(runner, events, name, repo, sessionConfig) {
 
 /** The runner as a session sees it, recording each answer and quarantine. */
 function runnerPort(runner) {
-  const events = { current: null, answers: [], quarantines: [], port: null };
+  const events = { current: null, answers: [], quarantines: [], port: null, bypassOwner: false };
   events.port = new Proxy(runner, { get(target, key) {
     if (key === "answer") return async (ref, id, response) => { events.answers.push({ id, response }); return target.answer(ref, id, response); };
+    // Harness only, after the connector refused (see OWNER_GAP): the same
+    // session without the durable process-owner record.
+    if (key === "createSession" && events.bypassOwner) return async input => {
+      const { context, readinessDeadlineAt, cwd, mcpServers, sessionConfig, sessionLabel } = input;
+      return target.runtime.sessions.create({ context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig ? { sessionConfig } : {}), ...(sessionLabel ? { sessionLabel } : {}) });
+    };
     if (key === "quarantine") return async reason => { events.quarantines.push(reason); return target.quarantine(reason); };
     const value = target[key];
     return typeof value === "function" ? value.bind(target) : value;
@@ -345,6 +351,62 @@ function agentProcessEnvironments(markers) {
   return found;
 }
 
+/** Why locating failed, in detail the connector's own refusal leaves out on purpose. */
+async function locateDiagnosis(error) {
+  if (AGENT === "dsh" && /Node/.test(String(error?.message))) {
+    // The person's Node must be theirs (or root's) and not group/world writable.
+    const { realpathSync, statSync } = await import("node:fs");
+    const candidates = [...new Set(S.personNodeCandidates(process.env))].slice(0, 12);
+    return { nodes: candidates.map(candidate => {
+      try { const real = realpathSync(candidate); const info = statSync(real); return { candidate: scrub(candidate), real: scrub(real), uid: info.uid, mode: (info.mode & 0o777).toString(8), version: versionOf(real, ["--version"]) }; }
+      catch { return null; }
+    }).filter(Boolean), processUid: process.getuid?.() };
+  }
+  if (!host && args.package && error?.code === "bundle_untrusted") {
+    // Re-extract with the system tar and compare every file with the signed profile.
+    const { createHash } = await import("node:crypto");
+    const { lstatSync, readFileSync: read } = await import("node:fs");
+    const profile = JSON.parse(readFileSync(resolve(args.package.replace(/\.tgz$/, ".profile.json")), "utf8"));
+    const target = join(WORK, "diagnose");
+    rmSync(target, { recursive: true, force: true });
+    mkdirSync(target, { recursive: true });
+    exec("tar", ["-xzf", resolve(args.package), "-C", target]);
+    const problems = [];
+    let longest = 0;
+    for (const file of profile.files) {
+      const path = join(WORK, "releases", "proof", "agents", AGENT, ...file.path.split("/"));
+      longest = Math.max(longest, path.length);
+      try {
+        const extracted = join(target, ...file.path.split("/"));
+        const info = lstatSync(extracted);
+        const digest = `sha256:${createHash("sha256").update(read(extracted)).digest("hex")}`;
+        if (!info.isFile() || info.size !== file.sizeBytes || digest !== file.digest) problems.push({ path: file.path, size: info.size, expected: file.sizeBytes, digestMatches: digest === file.digest });
+      } catch (failure) { problems.push({ path: file.path, error: String(failure.code ?? failure.message) }); }
+      if (problems.length >= 8) break;
+    }
+    return { files: profile.files.length, problems, longestInstalledPath: longest };
+  }
+  return {};
+}
+
+/**
+ * The connector opens an execution session only with a durable owner record
+ * for its process (retained-process-owner.ts), which exists on macOS only:
+ * on Linux and Windows every session is refused. The probe reports that, then
+ * opens the same session without the record so the agent and the policy are
+ * still proven on this OS.
+ */
+const OWNER_GAP = /durable execution-process owner/;
+async function openSession(runner, events, name, repo, sessionConfig) {
+  if (process.env.KONTEKS_PROOF_SKIP_OWNER === "1") events.bypassOwner = true; // exercise the harness path on macOS
+  try { return { session: await konteksSession(runner, events, name, repo, sessionConfig), refused: null }; }
+  catch (error) {
+    if (!OWNER_GAP.test(String(error?.message))) throw error;
+    events.bypassOwner = true;
+    return { session: await konteksSession(runner, events, `${name}-harness`, repo, sessionConfig), refused: error };
+  }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 try {
   // 1. locate
@@ -354,7 +416,7 @@ try {
     result.install = { kind: installed.kind, executable: scrub(installed.executable), ...installed.extra };
     check("locate", { status: "pass", expected: "the connector finds a supported installation", observed: `${AGENT} ${installed.version} (${installed.kind}) in ${installed.ms} ms` });
   } catch (error) {
-    check("locate", { status: "fail", expected: "the connector finds a supported installation", observed: `${error.code ?? "error"}: ${error.message}`, detail: error.details ?? error.diagnostic });
+    check("locate", { status: "fail", expected: "the connector finds a supported installation", observed: `${error.code ?? "error"}: ${error.message}`, detail: { diagnostic: error.diagnostic, ...(await locateDiagnosis(error).catch(failure => ({ diagnosisFailed: String(failure?.message ?? failure) }))) } });
     finish();
   }
 
@@ -454,20 +516,35 @@ try {
     catch (error) { check("self_check", { status: "fail", expected: "the signed offline package re-verifies file by file", observed: `${error.code ?? "error"}: ${error.message}` }); }
   }
 
-  let konteks = null;
-  started = Date.now();
-  try {
-    konteks = await konteksSession(governedRunner, events, "governed", repo, AGENT === "opencode" ? { model: "konteksprobe/m" } : undefined);
-    check("session_new", { status: "pass", expected: "a Konteks session (session/new) in the hostile working copy", observed: `session ${konteks.ref ? "created" : "missing"} in ${Date.now() - started} ms` });
-  } catch (error) {
-    check("session_new", { status: "fail", expected: "a Konteks session (session/new) in the hostile working copy", observed: `${error.code ?? "error"}: ${error.message}` });
-  }
   const discovery = [];
   try {
     const offered = await governedRunner.discoverModelCapability("model");
     discovery.push(`scripted runner: ${offered.offeredValues.length} offered, current ${offered.currentValue ?? "none"}`);
     result.scriptedModels = { offered: offered.offeredValues.length, current: offered.currentValue ?? null, sample: offered.offeredValues.slice(0, 8) };
   } catch (error) { discovery.push(`scripted runner: ${error.code ?? "error"}: ${error.message}`); }
+
+  let konteks = null;
+  started = Date.now();
+  const scriptedConfig = AGENT === "opencode" ? { model: "konteksprobe/m" } : undefined;
+  for (let attempt = 1; attempt <= 3 && !konteks; attempt += 1) {
+    try {
+      const opened = await openSession(governedRunner, events, attempt === 1 ? "governed" : `governed-${attempt}`, repo, scriptedConfig);
+      konteks = opened.session;
+      if (opened.refused) {
+        check("session_new", { status: "fail", expected: "a Konteks session (session/new) in the hostile working copy", observed: `the connector refuses every session on ${process.platform}: ${opened.refused.code ?? "error"}: ${opened.refused.message} (a durable execution-process owner exists on macOS only); the governance probe below ran on the same session without that record` });
+        note(`session_new refused by the connector on ${process.platform} (no durable execution-process owner); governance ran on a harness session without it`);
+      } else {
+        check("session_new", { status: "pass", expected: "a Konteks session (session/new) in the hostile working copy", observed: `session ${konteks.ref ? "created" : "missing"} in ${Date.now() - started} ms${attempt > 1 ? ` (attempt ${attempt})` : ""}` });
+      }
+    } catch (error) {
+      // OpenCode loads a config provider's SDK on first use; a session made before it is ready cannot confirm the model.
+      const retry = attempt < 3 && /did not confirm the admitted session configuration/.test(String(error?.message));
+      note(`session attempt ${attempt}: ${error.code ?? "error"}: ${error.message}${retry ? "; retrying in 10 s" : ""}`);
+      if (retry) { await new Promise(resolve => setTimeout(resolve, 10_000)); continue; }
+      check("session_new", { status: "fail", expected: "a Konteks session (session/new) in the hostile working copy", observed: `${error.code ?? "error"}: ${error.message}; ${discovery.join("; ")}${result.scriptedModels ? `; offered ${JSON.stringify(result.scriptedModels.sample)}` : ""}` });
+      break;
+    }
+  }
 
   if (konteks) {
     const turns = {};
@@ -584,7 +661,8 @@ try {
       const realRepo = hostileRepository("real");
       const sessionConfig = AGENT === "opencode" ? { model: OPENCODE_FREE_MODEL } : undefined;
       try {
-        const session = await konteksSession(realRunner, realEvents, "real", realRepo, sessionConfig);
+        const { session, refused } = await openSession(realRunner, realEvents, "real", realRepo, sessionConfig);
+        if (refused) note("the real turn ran on a harness session: the connector refuses sessions on this OS (session_new)");
         const turn = await session.turn("real", "Reply with exactly the word KONTEKS-OK and nothing else. Do not use any tools.", { timeoutMs: 240_000 });
         const ok = turn.done?.kind === "acp_result" && /KONTEKS-OK/.test(turn.reply);
         check("real_turn", { status: ok ? "pass" : "fail", required: true, expected: "one real turn on a real model answers", observed: `${turn.done?.kind ?? (turn.timedOut ? "timeout" : "closed")} ${turn.done?.result?.stopReason ?? turn.done?.error?.class ?? ""} in ${(turn.ms / 1000).toFixed(1)}s; reply ${JSON.stringify(turn.reply.trim().slice(0, 80))}; via ${AGENT === "opencode" ? `${OPENCODE_FREE_MODEL} (no credential)` : credentialChannel}`, detail: turn.done?.kind === "acp_error" ? turn.done.error : undefined });

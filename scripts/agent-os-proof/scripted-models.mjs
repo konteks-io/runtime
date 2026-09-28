@@ -69,40 +69,53 @@ export async function startScriptedModels(options) {
   }
 
   /** Decide the answer: a tool call for the first call of a step with tools, text otherwise. */
-  function decide(protocol, step, tools, afterTool, resultText) {
-    if (step && afterTool && resultText !== undefined) {
-      const list = toolResults.get(step) ?? [];
-      list.push(resultText);
-      toolResults.set(step, list);
-    }
+  /** Every tool call this model issued, by call id → its step; each result is recorded once, wherever it appears in the history. */
+  const issued = new Map();
+  const recorded = new Set();
+  function record(id, text) {
+    const step = issued.get(id);
+    if (step === undefined || recorded.has(id)) return;
+    recorded.add(id);
+    toolResults.set(step, [...(toolResults.get(step) ?? []), text]);
+  }
+  function harvest(protocol, body) {
+    if (protocol === "chat") for (const message of body.messages ?? []) { if (message?.role === "tool") record(message.tool_call_id, textOf(message.content)); }
+    if (protocol === "anthropic") for (const message of body.messages ?? []) for (const block of Array.isArray(message?.content) ? message.content : []) { if (block?.type === "tool_result") record(block.tool_use_id, textOf(block.content)); }
+    if (protocol === "responses") for (const item of body.input ?? []) { if (typeof item?.type === "string" && item.type.endsWith("_output")) record(item.call_id, typeof item.output === "string" ? item.output : textOf(item.output?.content ?? item.output)); }
+  }
+
+  function decide(protocol, step, tools, afterTool) {
     const intent = step ? options.intents.get(step) : undefined;
     calls.push({ protocol, step, tools: tools.map(tool => tool.name), afterTool });
     if (!intent || intent.type === "text" || afterTool || tools.length === 0 || (served.get(step) ?? 0) > 0) return { text: `DONE ${step ?? ""}`.trim() };
     const call = toolCall(intent, tools, options.windows === true);
     if (!call) { log(`scripted model: step ${step} found no tool for ${intent.type} among ${tools.map(tool => tool.name).join(",")}`); return { text: `NO TOOL ${step}` }; }
     served.set(step, 1);
+    call.id = `${protocol === "anthropic" ? "toolu" : "call"}_konteks_${callId()}`;
+    issued.set(call.id, step);
     log(`scripted model (${protocol}) step ${step}: ${call.name}(${JSON.stringify(call.input).slice(0, 240)})`);
     return { call };
   }
 
   // ── OpenAI chat completions ───────────────────────────────────────────────
   function chatCompletions(res, body) {
+    harvest("chat", body);
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const texts = messages.filter(message => message.role === "user").map(message => textOf(message.content));
     const last = messages.at(-1);
     const tools = (body.tools ?? []).map(tool => ({ name: tool.function?.name, schema: tool.function?.parameters, kind: "function" })).filter(tool => tool.name);
-    const answer = decide("chat", stepOf(texts), tools, last?.role === "tool", last?.role === "tool" ? textOf(last.content) : undefined);
+    const answer = decide("chat", stepOf(texts), tools, last?.role === "tool");
     const chunk = (delta, finish = null, extra = {}) => `data: ${JSON.stringify({ id: "konteks-probe", object: "chat.completion.chunk", created: 0, model: body.model ?? "konteks-probe", choices: [{ index: 0, delta, finish_reason: finish }], ...extra })}\n\n`;
     const usage = { usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } };
     if (body.stream === false) {
       const message = answer.call
-        ? { role: "assistant", content: null, tool_calls: [{ id: callId(), type: "function", function: { name: answer.call.name, arguments: JSON.stringify(answer.call.input) } }] }
+        ? { role: "assistant", content: null, tool_calls: [{ id: answer.call.id, type: "function", function: { name: answer.call.name, arguments: JSON.stringify(answer.call.input) } }] }
         : { role: "assistant", content: answer.text };
       return json(res, { id: "konteks-probe", object: "chat.completion", created: 0, model: body.model, choices: [{ index: 0, message, finish_reason: answer.call ? "tool_calls" : "stop" }], ...usage });
     }
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
     if (answer.call) {
-      res.write(chunk({ role: "assistant", content: null, tool_calls: [{ index: 0, id: callId(), type: "function", function: { name: answer.call.name, arguments: JSON.stringify(answer.call.input) } }] }));
+      res.write(chunk({ role: "assistant", content: null, tool_calls: [{ index: 0, id: answer.call.id, type: "function", function: { name: answer.call.name, arguments: JSON.stringify(answer.call.input) } }] }));
       res.write(chunk({}, "tool_calls", usage));
     } else {
       res.write(chunk({ role: "assistant", content: answer.text }));
@@ -113,6 +126,7 @@ export async function startScriptedModels(options) {
 
   // ── Anthropic Messages ────────────────────────────────────────────────────
   function anthropicMessages(res, body) {
+    harvest("anthropic", body);
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const texts = messages.filter(message => message.role === "user").map(message => textOf(message.content, block => block.type === "text"));
     const last = messages.at(-1);
@@ -122,7 +136,7 @@ export async function startScriptedModels(options) {
     const answer = decide("anthropic", stepOf(texts), tools, afterTool, afterTool ? results.map(block => textOf(block.content)).join("\n") : undefined);
     const id = `msg_${callId()}`;
     const model = body.model ?? "konteks-probe";
-    const content = answer.call ? [{ type: "tool_use", id: `toolu_${callId()}`, name: answer.call.name, input: answer.call.input }] : [{ type: "text", text: answer.text }];
+    const content = answer.call ? [{ type: "tool_use", id: answer.call.id, name: answer.call.name, input: answer.call.input }] : [{ type: "text", text: answer.text }];
     const stopReason = answer.call ? "tool_use" : "end_turn";
     if (body.stream !== true) {
       return json(res, { id, type: "message", role: "assistant", model, content, stop_reason: stopReason, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } });
@@ -146,6 +160,7 @@ export async function startScriptedModels(options) {
 
   // ── OpenAI Responses ──────────────────────────────────────────────────────
   function responses(res, body) {
+    harvest("responses", body);
     const input = Array.isArray(body.input) ? body.input : [];
     const texts = input.filter(item => item?.role === "user").map(item => textOf(item.content));
     const last = input.at(-1);
@@ -170,9 +185,9 @@ export async function startScriptedModels(options) {
     const outputText = afterTool ? (typeof last.output === "string" ? last.output : textOf(last.output?.content ?? last.output)) : undefined;
     const answer = decide("responses", step, tools.filter(tool => tool.kind !== "tool_search"), afterTool, outputText);
     let item;
-    if (answer.call?.kind === "custom") item = { type: "custom_tool_call", id: `ctc_${callId()}`, call_id: `call_${callId()}`, name: answer.call.name, input: answer.call.input, status: "completed" };
-    else if (answer.call?.kind === "local_shell") item = { type: "local_shell_call", id: `lsh_${callId()}`, call_id: `call_${callId()}`, status: "completed", action: { type: "exec", command: answer.call.input.command, env: {} } };
-    else if (answer.call) item = { type: "function_call", id: `fc_${callId()}`, call_id: `call_${callId()}`, name: answer.call.name, ...(answer.call.namespace ? { namespace: answer.call.namespace } : {}), arguments: JSON.stringify(answer.call.input), status: "completed" };
+    if (answer.call?.kind === "custom") item = { type: "custom_tool_call", id: `ctc_${callId()}`, call_id: answer.call.id, name: answer.call.name, input: answer.call.input, status: "completed" };
+    else if (answer.call?.kind === "local_shell") item = { type: "local_shell_call", id: `lsh_${callId()}`, call_id: answer.call.id, status: "completed", action: { type: "exec", command: answer.call.input.command, env: {} } };
+    else if (answer.call) item = { type: "function_call", id: `fc_${callId()}`, call_id: answer.call.id, name: answer.call.name, ...(answer.call.namespace ? { namespace: answer.call.namespace } : {}), arguments: JSON.stringify(answer.call.input), status: "completed" };
     else item = { type: "message", id: `msg_${callId()}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: answer.text, annotations: [] }] };
     return streamResponse(res, body, item);
   }

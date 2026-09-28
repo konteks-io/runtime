@@ -101,7 +101,17 @@ jobs:
       - name: Install DeepSeek Harness (npx, as its homepage says)
         if: matrix.agent == 'dsh'
         shell: bash
-        run: npx -y "@deepseek-ai/dsh@$DSH_VERSION" --version
+        run: |
+          npx -y "@deepseek-ai/dsh@$DSH_VERSION" --version
+          # The connector looks for npx's copy in npm's cache; the runners move
+          # that cache (npmrc), so name it the way a person's npm_config_cache would.
+          echo "npm_config_cache=$(npm config get cache)" >> "$GITHUB_ENV"
+          # dsh runs on the person's own Node, which the connector takes only
+          # when no other user can write it; the runner's tool cache is
+          # group-writable, a person's own install is not.
+          node_bin="$(node -p process.execPath)"
+          ls -l "$node_bin"
+          if [ "$RUNNER_OS" != "Windows" ]; then chmod go-w "$node_bin"; ls -l "$node_bin"; fi
       - name: Install OpenCode 2 (its homepage installer)
         if: matrix.agent == 'opencode' && runner.os != 'Windows'
         shell: bash
