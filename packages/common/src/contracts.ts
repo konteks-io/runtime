@@ -220,6 +220,12 @@ export {
   remoteMoneyBasisFor,
   type RemoteMoneyBasis,
   REMOTE_OPENCODE_FREE_MODELS_CAPABILITY,
+  // The Core wire-contract version signed into the desired configuration
+  // (antigravity CP6): this build reads `coreContractVersion` and advertises
+  // the capability that asks Core for it.
+  REMOTE_CORE_CONTRACT_CAPABILITY,
+  REMOTE_CORE_CONTRACT_VERSION,
+  coreContractAtLeast,
   EXECUTION_REVISION_CONTROL_SCHEMA_VERSION,
   EXECUTION_REVISION_CONTROL_CAPABILITY,
   EXECUTION_REVISION_CONTROL_MAX_DELIVERY_MS,

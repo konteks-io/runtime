@@ -138,16 +138,12 @@ export function openCodeRunnerCapabilities(input: { installed: boolean; relayRea
  * (antigravity CP3): while the relay can carry a site-started login and this
  * machine can open a browser, `agent-login-antigravity-v1` with one
  * capability per released sign-in (Gemini Enterprise; personal Google
- * sign-in is held back, A10). It also advertises the free-models switch
- * capability OpenCode introduced: Core puts that switch in every desired
- * configuration for a connector that advertises it, and its presence is the
- * only way this connector learns Core takes 7.1.0 fields (pay-per-use turns,
- * a credential's reason, the download state). With no OpenCode here the
- * switch itself changes nothing.
+ * sign-in is held back, A10). Nothing otherwise: whether Core takes 7.1
+ * fields is the generic `core-contract-version-v1` signal (inventory.ts).
  */
 export function antigravityRunnerCapabilities(input: { installed: boolean; relayReady: boolean; options: readonly AgentLoginOptionId[]; desktop: boolean }): string[] {
   if (!input.installed) return [];
-  const capabilities: string[] = [REMOTE_OPENCODE_FREE_MODELS_CAPABILITY];
+  const capabilities: string[] = [];
   if (!input.relayReady || !input.desktop) return capabilities;
   const options = input.options.filter((id): id is AntigravityLoginOptionId => id in ANTIGRAVITY_LOGIN_OPTIONS && ANTIGRAVITY_LOGIN_OPTIONS[id as AntigravityLoginOptionId].released);
   if (options.length > 0) capabilities.push(REMOTE_AGENT_LOGIN_ANTIGRAVITY_CAPABILITY, ...options.map(antigravityLoginOptionCapability));

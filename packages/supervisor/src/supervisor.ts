@@ -28,6 +28,7 @@ import {
   type SupervisorStatus,
   type PreviewStatusReport,
   type RuntimeAgentLoginDeliveryRequest,
+  coreContractAtLeast,
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { chromeInstalled, type RunnerConfig } from "@konteks/remote-agent-runner";
@@ -2070,13 +2071,17 @@ export class Supervisor {
 
   /**
    * Core's host-agent settings from an applied desired configuration: OpenCode
-   * Zen's free models (absent = off, O6) and whether Core takes pay-per-use
-   * turns and route billing. A 7.1.0 Core puts `openCodeFreeModelsEnabled` in
-   * every revision for a connector that advertises the switch; its presence
-   * is that signal (CP3 prep). A change drops OpenCode's model snapshots.
+   * Zen's free models (absent = off, O6) and whether Core takes 7.1 fields
+   * (pay-per-use turns and route billing, an offered option's billing,
+   * `hostAgentDownload`, a credential's and a site sign-in's `no_license`).
+   * The latter is the Core wire-contract version Core signs into every
+   * revision for a connector advertising `core-contract-version-v1`
+   * (inventory.ts); no fallback on the free-models field, which no released
+   * Core ever sent (antigravity CP6). A change drops OpenCode's model
+   * snapshots.
    */
   private applyHostSettings(configuration: ConfigRecord["configuration"]): void {
-    const settings = { openCodeFreeModels: configuration.openCodeFreeModelsEnabled === true, coreAcceptsRouteBilling: configuration.openCodeFreeModelsEnabled !== undefined };
+    const settings = { openCodeFreeModels: configuration.openCodeFreeModelsEnabled === true, coreAcceptsRouteBilling: coreContractAtLeast(configuration.coreContractVersion, "7.1") };
     const changed = this.hostSettings.openCodeFreeModels !== settings.openCodeFreeModels || this.hostSettings.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling;
     this.hostSettings = settings;
     for (const runner of this.runners.values()) {

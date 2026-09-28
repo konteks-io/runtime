@@ -115,12 +115,12 @@ describe("Google Antigravity's Gemini Enterprise sign-in from the site (antigrav
     expect(other.reports.at(-1)).toMatchObject({ failure: "login_failed" });
   });
 
-  it("is advertised only with the relay up and a browser here, never personal Google sign-in, and always tells Core this connector reads its 7.1.0 switch", () => {
+  it("is advertised only with the relay up and a browser here, never personal Google sign-in, and never borrows OpenCode's free-models switch", () => {
     expect(antigravityRunnerCapabilities({ installed: false, relayReady: true, options: ["gemini-enterprise"], desktop: true })).toEqual([]);
-    expect(antigravityRunnerCapabilities({ installed: true, relayReady: false, options: ["gemini-enterprise"], desktop: true })).toEqual(["opencode-free-models-v1"]);
-    expect(antigravityRunnerCapabilities({ installed: true, relayReady: true, options: ["gemini-enterprise"], desktop: false })).toEqual(["opencode-free-models-v1"]);
+    expect(antigravityRunnerCapabilities({ installed: true, relayReady: false, options: ["gemini-enterprise"], desktop: true })).toEqual([]);
+    expect(antigravityRunnerCapabilities({ installed: true, relayReady: true, options: ["gemini-enterprise"], desktop: false })).toEqual([]);
     expect(antigravityRunnerCapabilities({ installed: true, relayReady: true, options: ["gemini-enterprise", "google-account", "gitlab"], desktop: true }))
-      .toEqual(["opencode-free-models-v1", "agent-login-antigravity-v1", "agent-login-antigravity:gemini-enterprise"]);
+      .toEqual(["agent-login-antigravity-v1", "agent-login-antigravity:gemini-enterprise"]);
   });
 
   it("bills its offered models by how Google is signed in: the credential in use, listed first among the ready ones", () => {
