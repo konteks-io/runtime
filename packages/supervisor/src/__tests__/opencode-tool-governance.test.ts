@@ -111,6 +111,31 @@ describe("OpenCode tool governance", () => {
     }
   });
 
+  it("admits the connector's QA browser through Code Mode only on a session given it, never its hidden tools (O8)", () => {
+    const browserContext = { cwd: WC, servers: new Set([...SERVERS, "konteks-browser"]), browserTools: true };
+    const governance = new OpenCodeToolGovernance();
+    const block = (id: string, source: string, ctx: { cwd: string; servers: ReadonlySet<string>; browserTools?: boolean }) => {
+      governance.observe(call(id, "execute"), WC);
+      governance.observe(input(id, { code: source }), WC);
+      return governance.decide(ask(id, "other", "execute", { code: source }), ctx);
+    };
+    const navigate = 'const page = await tools["konteks-browser"].browser_navigate({ url: "http://127.0.0.1:43100/" });\nreturn page;';
+    expect(block("b1", navigate, browserContext)).toEqual({ kind: "allow" });
+    // What ran is what was approved: no trip.
+    expect(governance.observe(done("b1", "completed", { metadata: { toolCalls: [{ tool: "konteks-browser.browser_navigate", status: "completed" }] } }), WC)).toBeNull();
+    // A session without the browser (its gateway) cannot call it, even if the name is known.
+    expect(block("b2", navigate, { ...browserContext, browserTools: false })).toMatchObject({ kind: "deny", reason: "the browser tool browser_navigate is not allowed in this session" });
+    expect(block("b3", navigate, context)).toMatchObject({ kind: "deny" });
+    // The launcher hides the unsafe and network tools; a block naming one is refused.
+    for (const tool of ["browser_run_code_unsafe", "browser_route", "browser_network_state_set"]) {
+      expect(block(`b-${tool}`, `await tools["konteks-browser"].${tool}({});`, browserContext)).toMatchObject({ kind: "deny" });
+    }
+    // OpenCode's own built-in browser stays out (denied in the config), and a call to it trips.
+    expect(block("b4", 'await tools.browser.navigate({ url: "https://example.com" });', browserContext)).toMatchObject({ kind: "deny" });
+    expect(block("b5", navigate, browserContext)).toEqual({ kind: "allow" });
+    expect(governance.observe(done("b5", "completed", { metadata: { toolCalls: [{ tool: "browser.navigate", status: "completed" }] } }), WC)).toMatchObject({ toolCallId: "b5" });
+  });
+
   it("refuses an uncorrelated request, an unknown tool, a kind that does not match, and a .env read", () => {
     const { governance } = governed();
     expect(governance.decide(ask("ghost", "execute", "echo", { command: "echo" }), context)).toEqual({ kind: "deny", reason: "no tool call precedes this permission request" });

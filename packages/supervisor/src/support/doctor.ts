@@ -24,8 +24,13 @@ export interface DoctorInputs {
   coreSignatureConfigured: boolean;
   /** Session previews: whether the capability is advertised, how many run, and the last failure's time. */
   preview?: { advertised: boolean; running: number; lastFailureAt: string | null };
-  /** The QA browser: the bundled Playwright MCP version, the agents that carry it, and whether Chrome is installed. */
-  browser?: { version: string | null; agents: string[]; chrome: boolean };
+  /**
+   * The QA browser (a connector capability, O8): its Playwright MCP version,
+   * the agents whose sessions get it, whether Chrome is installed, the
+   * package it comes from and the Node it runs on, or the plain reason there
+   * is none.
+   */
+  browser?: { version: string | null; agents: string[]; chrome: boolean; packageAgent?: string; nodeSource?: "agent_package" | "person"; unavailable?: string };
 }
 
 export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
@@ -65,12 +70,14 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
         : `preview capability advertised; ${running} preview(s) running${lastFailureAt ? `; the last preview failed to start at ${lastFailureAt} (see konteks-remote preview status)` : ""}` });
   }
   if (inputs.browser) {
-    const { version, agents, chrome } = inputs.browser;
+    const { version, agents, chrome, packageAgent, nodeSource, unavailable } = inputs.browser;
+    const packageName = packageAgent === "claude-code" ? "Claude Code" : packageAgent === "codex" ? "Codex" : null;
+    const node = nodeSource === "person" ? "your own Node" : packageName ? `the Node in the ${packageName} package` : null;
     push({ id: "browser", title: "QA browser",
       status: version === null ? "warn" : "pass",
       detail: version === null
-        ? "no connected agent carries the QA browser (Claude Code or Codex does), so QA and validator sessions check work without opening it"
-        : `Playwright MCP ${version} for ${agents.join(", ")}; ${chrome ? "uses the installed Google Chrome" : "no Google Chrome, so Playwright's Chromium is installed on first use"}; reaches only the session's preview` });
+        ? unavailable ?? "no QA browser on this computer, so QA and validator sessions check work without opening one"
+        : `Playwright MCP ${version} for ${agents.join(", ")}${node ? `; runs on ${node}` : ""}; ${chrome ? "uses the installed Google Chrome" : "no Google Chrome, so Playwright's Chromium is installed on first use"}; reaches only the session's preview` });
   }
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };

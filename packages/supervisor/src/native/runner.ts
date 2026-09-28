@@ -1,7 +1,7 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
-import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServer, bundledBrowserVersion, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
+import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServer, runnerBrowserVersion, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
 import { OpenCodeLoginOptionIdSchema, RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { RunnerHostSettings, RunnerLoginRequest, RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 import type { checkDshKonteksProfile } from "./dsh-profile-check.js";
@@ -61,9 +61,13 @@ export class NativeRunner implements RunnerPort {
   private stopPromise: Promise<void> | null = null;
   private unsubscribe: (() => void) | null = null;
 
-  /** The browser (Playwright MCP) version this agent's package carries; null for DeepSeek Harness or an older package. */
+  /**
+   * The browser (Playwright MCP) version this agent's sessions get: its own
+   * package's, or the connector's (O8) for an agent without one; null when
+   * the connector has no browser.
+   */
   browserVersion(): string | null {
-    return bundledBrowserVersion(this.options.config);
+    return runnerBrowserVersion(this.options.config);
   }
 
   constructor(private readonly options: NativeRunnerOptions) {
@@ -169,8 +173,9 @@ export class NativeRunner implements RunnerPort {
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
     const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, browser } = parsed.data;
-    // The session's browser is a stdio MCP server the agent launches from its
-    // own package; composed here, where the package paths are known.
+    // The session's browser is a stdio MCP server the agent launches (its own
+    // package's, or the connector's for an agent without one); composed here,
+    // where the paths are known.
     const browserServer = browser === undefined ? null : browserMcpServer(this.options.config, browser);
     const mcpServers = browserServer === null ? parsed.data.mcpServers : [...parsed.data.mcpServers, browserServer];
     const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),

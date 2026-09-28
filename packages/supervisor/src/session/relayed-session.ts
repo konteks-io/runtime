@@ -24,7 +24,7 @@ import {
   type SessionToCoreMessage,
   type SessionToRuntimeMessage,
 } from "@konteks/remote-common";
-import type { RunnerEvent } from "@konteks/remote-agent-runner";
+import { BROWSER_MCP_SERVER_NAME, type RunnerEvent } from "@konteks/remote-agent-runner";
 import type { RunnerPort } from "../runner-port.js";
 import type { SupervisorJournal } from "../state/journal.js";
 import type { TransportManager } from "../transport/relay-transport.js";
@@ -209,7 +209,7 @@ export class RelayedSession {
   private resultTools: StructuredResultToolServer | null = null;
   /** The turn that asked for a structured result, while it (or its one follow-up) runs. */
   private structuredTurn: StructuredTurnState | null = null;
-  /** The QA browser's gateway (Claude Code and Codex validation, QA and delivery sessions) and its output folder. */
+  /** The QA browser's gateway (validation, QA, delivery and conversation sessions of any agent, O8) and its output folder. */
   private browserGateway: PreviewBrowserGateway | null = null;
   private browserOutputDir: string | null = null;
   /** The logical session whose preview this session's agent drives. */
@@ -349,8 +349,9 @@ export class RelayedSession {
     if (preview && PREVIEW_WORK_KINDS.has(this.assignment.kind)) {
       const sessionId = binding.sessionId;
       const cwd = prepared.cwd;
-      // The session's browser: only for an agent whose package carries one
-      // (Claude Code, Codex; never DeepSeek Harness), reaching only this
+      // The session's browser: the connector's (O8), for every agent when the
+      // connector has one (Claude Code and Codex run their own package's,
+      // DeepSeek Harness and OpenCode the connector's), reaching only this
       // session's running preview through its own gateway.
       const browserVersion = this.deps.runner.browserVersion?.() ?? null;
       if (browserVersion !== null && BROWSER_WORK_KINDS.has(this.assignment.kind) && preview.origin && preview.browsersPath) {
@@ -457,7 +458,9 @@ export class RelayedSession {
         this.deps.assertExecutionOwned?.();
       },
     } : undefined;
-    this.sessionServers = new Set(mcpServers.map(server => server.name));
+    // The browser is a stdio server the runner adds; OpenCode's Code Mode
+    // gate and its tools line need its name too.
+    this.sessionServers = new Set([...mcpServers.map(server => server.name), ...(browser ? [BROWSER_MCP_SERVER_NAME] : [])]);
     const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession({
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),

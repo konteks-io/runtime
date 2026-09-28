@@ -1,6 +1,25 @@
+import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { RemoteNativeArtifactSchema } from "@konteks/remote-common";
 import { NativeAgentPackageProfileSchema } from "@konteks/remote-release";
+
+const absolutePath = z.string().min(1).max(4096).refine(value => isAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value));
+
+/**
+ * The QA browser (Playwright MCP) as a connector capability (O8): the
+ * pinned package and the connector's launcher inside an installed Claude
+ * Code or Codex package (`packageAgent`), run on `node`, which is that
+ * package's own Node or, when none is usable, the person's own (`nodeSource`).
+ */
+export const RunnerBrowserSchema = z.object({
+  version: z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/),
+  packageAgent: z.enum(["claude-code", "codex"]),
+  nodeSource: z.enum(["agent_package", "person"]),
+  node: absolutePath,
+  launcher: absolutePath,
+  entrypoint: absolutePath,
+}).strict();
+export type RunnerBrowser = z.infer<typeof RunnerBrowserSchema>;
 
 /**
  * Runner configuration. One in-process runner per agent family; everything
@@ -34,6 +53,13 @@ export const RunnerConfigSchema = z
     /** Native installer-only signed package facts; never loaded from an assignment. */
     RUNNER_NATIVE_PACKAGE_PROFILE: NativeAgentPackageProfileSchema.optional(),
     RUNNER_NATIVE_PACKAGE_ARTIFACT: RemoteNativeArtifactSchema.optional(),
+    /**
+     * The connector's QA browser for an agent whose own package carries none
+     * (DeepSeek Harness, OpenCode): resolved by the supervisor from an
+     * installed Claude Code or Codex package and a usable Node (O8). Never
+     * loaded from an assignment.
+     */
+    RUNNER_BROWSER: RunnerBrowserSchema.optional(),
     RUNNER_INITIALIZE_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
     /** Hard deadline for each state-changing ACP session bootstrap request. */
     RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),

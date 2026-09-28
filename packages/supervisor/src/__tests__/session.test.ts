@@ -309,7 +309,7 @@ describe("relayed session (D98/D113/D114)", () => {
     });
   });
 
-  describe("QA browser (Claude Code and Codex)", () => {
+  describe("QA browser (a connector capability: every agent, O8)", () => {
     function access(origin: () => string | null) {
       const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
       return { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(), forget: vi.fn(),
@@ -347,7 +347,7 @@ describe("relayed session (D98/D113/D114)", () => {
       upstream.close();
     });
 
-    it("gives a conversation turn (a QA-mode chat) the browser too, but not planning or an agent without one (DeepSeek Harness)", async () => {
+    it("gives a conversation turn (a QA-mode chat) the browser too, but not planning or an agent on a connector without one", async () => {
       const assistant = await build({ preview: access(() => null) });
       (assistant.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
       await assistant.session.bootstrap();
@@ -358,11 +358,53 @@ describe("relayed session (D98/D113/D114)", () => {
       await planning.session.bootstrap();
       expect((planning.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
       await planning.session.close("cancelled");
-      const dsh = await build({ preview: access(() => null) }, { ...assignment, kind: "validation", agentRoute: { ...assignment.agentRoute, agentId: "dsh" } } as RemoteWorkAssignment);
-      (dsh.runner as { browserVersion?: () => string | null }).browserVersion = () => null;
-      await dsh.session.bootstrap();
-      expect((dsh.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
-      await dsh.session.close("cancelled");
+      const none = await build({ preview: access(() => null) }, { ...assignment, kind: "validation", agentRoute: { ...assignment.agentRoute, agentId: "dsh" } } as RemoteWorkAssignment);
+      (none.runner as { browserVersion?: () => string | null }).browserVersion = () => null;
+      await none.session.bootstrap();
+      expect((none.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
+      await none.session.close("cancelled");
+    });
+
+    it("gives DeepSeek Harness and OpenCode the connector's browser, behind the same gateway, and lets them use it (O8)", async () => {
+      const upstream = createServer((_req, res) => res.end("the preview"));
+      await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+      const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+      const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+      for (const agentId of ["dsh", "opencode"] as const) {
+        const f = await build({ preview: access(() => origin), policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) },
+          { ...assignment, kind: "qa", agentRoute: { requiredRole: "qa", agentId } } as RemoteWorkAssignment);
+        (f.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+        await f.session.bootstrap();
+        const input = f.runnerCalls[0]?.[1][0] as { browser?: { proxyUrl: string } };
+        expect(input.browser, agentId).toMatchObject({ proxyUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), browsersPath: "/private/native/browsers" });
+        // The gateway confines it exactly as for Claude Code and Codex.
+        await expect(viaProxy(input.browser!.proxyUrl, `${origin}/`)).resolves.toEqual({ status: 200, body: "the preview" });
+        expect((await viaProxy(input.browser!.proxyUrl, "http://127.0.0.1:1/")).status).toBe(403);
+        const update = (value: Record<string, unknown>) => f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+        const ask = (requestId: string, toolCallId: string, kind: string, title: string, rawInput: Record<string, unknown>) =>
+          f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId, kind, title, rawInput }, options } });
+        const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId ?? "none";
+        if (agentId === "dsh") {
+          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+            await update({ sessionUpdate: "tool_call", toolCallId: id, title: `mcp__konteks-browser__${tool}`, kind: "other", status: "in_progress", rawInput: { url: origin } });
+            await ask(`p-${id}`, id, "other", `mcp__konteks-browser__${tool}`, {});
+          }
+        } else {
+          // OpenCode reaches it through Code Mode, and its tools line names it.
+          await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Check the page." }] } });
+          const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+          expect(forwarded[0]!.text).toContain("`konteks-browser`");
+          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+            const code = `const page = await tools["konteks-browser"].${tool}({ url: "${origin}/" });\nreturn page;`;
+            await update({ sessionUpdate: "tool_call", toolCallId: id, title: "execute", kind: "other", status: "pending", locations: [], rawInput: {} });
+            await update({ sessionUpdate: "tool_call_update", toolCallId: id, status: "in_progress", rawInput: { code } });
+            await ask(`p-${id}`, id, "other", "execute", { code });
+          }
+        }
+        expect({ agentId, navigate: answer("p-n"), unsafe: answer("p-u") }).toEqual({ agentId, navigate: "once", unsafe: "reject" });
+        await f.session.close("cancelled");
+      }
+      upstream.close();
     });
   });
 

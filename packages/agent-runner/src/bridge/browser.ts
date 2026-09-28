@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { McpServerStdio } from "@agentclientprotocol/sdk";
 import { BROWSER_MCP_PACKAGE } from "@konteks/remote-release";
-import type { RunnerConfig } from "../config.js";
+import type { RunnerBrowser, RunnerConfig } from "../config.js";
 import { BROWSER_MCP_SERVER_NAME, BROWSER_ORIGINS_ENV, BROWSER_ORIGINS_PATH } from "./browser-tools.js";
 
 export { BROWSER_MCP_SERVER_NAME, BROWSER_DENIED_TOOLS, BROWSER_ORIGINS_ENV, BROWSER_ORIGINS_PATH, browserToolFromTitle, isDeniedBrowserTool } from "./browser-tools.js";
@@ -39,31 +39,57 @@ export function chromeInstalled(exists: (path: string) => boolean = existsSync, 
   return chromeCandidates(platform, env).some(path => exists(path));
 }
 
-/** The browser version this runner's agent package carries, or null when it carries none (DeepSeek Harness, older packages). */
-export function bundledBrowserVersion(config: RunnerConfig): string | null {
-  const browser = config.RUNNER_NATIVE_PACKAGE_PROFILE?.browser;
-  return browser && browser.version === BROWSER_MCP_PACKAGE.version ? browser.version : null;
+/**
+ * The browser this runner's own agent package carries (Claude Code, Codex),
+ * run on that package's own Node; null for a package without one (an older
+ * package) or an agent with no package (DeepSeek Harness, OpenCode).
+ */
+export function packageBrowser(config: RunnerConfig): RunnerBrowser | null {
+  const profile = config.RUNNER_NATIVE_PACKAGE_PROFILE;
+  const browser = profile?.browser;
+  if (!profile?.node || !browser || browser.version !== BROWSER_MCP_PACKAGE.version) return null;
+  const path = (entry: string) => join(config.RUNNER_BRIDGE_PREFIX, ...entry.split("/"));
+  return { version: browser.version, packageAgent: profile.agentId, nodeSource: "agent_package",
+    node: path(profile.node.entrypoint), launcher: path(browser.launcher), entrypoint: path(browser.entrypoint) };
 }
 
 /**
- * The ACP stdio MCP server entry for the session's browser, or null when this
- * agent's package has none. Headless, an in-memory profile, every request
- * through the session's gateway (Chromium sends loopback through a proxy too,
- * so the gateway sees all of it), loopback origins only, no service workers,
- * no page-registered tools. Installed Chrome when present, else Playwright's
- * Chromium (installed by the launcher on first use).
+ * The QA browser a session of this runner gets (O8: a connector capability,
+ * not an agent package feature). Claude Code and Codex keep the one in their
+ * own package; any other agent gets the one the supervisor resolved for the
+ * connector (`RUNNER_BROWSER`); null when the connector has none.
+ */
+export function runnerBrowser(config: RunnerConfig): RunnerBrowser | null {
+  const own = packageBrowser(config);
+  if (own) return own;
+  const shared = config.RUNNER_BROWSER;
+  return shared && shared.version === BROWSER_MCP_PACKAGE.version ? shared : null;
+}
+
+/** The browser (Playwright MCP) version this runner's sessions get, or null when the connector has none. */
+export function runnerBrowserVersion(config: RunnerConfig): string | null {
+  return runnerBrowser(config)?.version ?? null;
+}
+
+/**
+ * The ACP stdio MCP server entry for the session's browser, or null when the
+ * connector has none. The agent launches it: the resolved Node runs the
+ * connector's launcher, which runs Playwright MCP. Headless, an in-memory
+ * profile, every request through the session's gateway (Chromium sends
+ * loopback through a proxy too, so the gateway sees all of it), loopback
+ * origins only, no service workers, no page-registered tools. Installed
+ * Chrome when present, else Playwright's Chromium (installed by the launcher
+ * on first use).
  */
 export function browserMcpServer(config: RunnerConfig, request: BrowserSessionRequest, deps: { chrome?: () => boolean } = {}): McpServerStdio | null {
-  const profile = config.RUNNER_NATIVE_PACKAGE_PROFILE;
-  const browser = profile?.browser;
-  if (!profile?.node || !browser || bundledBrowserVersion(config) === null) return null;
-  const path = (entry: string) => join(config.RUNNER_BRIDGE_PREFIX, ...entry.split("/"));
+  const browser = runnerBrowser(config);
+  if (browser === null) return null;
   const chrome = (deps.chrome ?? chromeInstalled)();
   return {
     name: BROWSER_MCP_SERVER_NAME,
-    command: path(profile.node.entrypoint),
+    command: browser.node,
     args: [
-      path(browser.launcher), path(browser.entrypoint),
+      browser.launcher, browser.entrypoint,
       "--headless", "--isolated",
       "--browser", chrome ? "chrome" : "chromium",
       "--proxy-server", request.proxyUrl,

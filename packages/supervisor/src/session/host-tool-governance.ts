@@ -50,6 +50,6 @@ export function hostToolGovernance(agentId: string): HostToolGovernance | null {
     bypassDiagnostic: "dsh_tool_governance_bypassed",
     quarantineMessage: "DeepSeek Harness ran a tool without asking Konteks first. Update or reinstall DeepSeek Harness, then restart the connector.",
     observe: update => dsh.observe(update),
-    decide: (request, context) => dsh.decide(request, context.cwd),
+    decide: (request, context) => dsh.decide(request, context.cwd, { browserTools: context.browserTools === true }),
   };
 }

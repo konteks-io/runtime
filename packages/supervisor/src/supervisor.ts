@@ -64,6 +64,7 @@ import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
+import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
 import { NativeInputClient } from "./native/input-client.js";
 import { NativeOutputClient } from "./native/output-client.js";
 import { createRetainedDeliveryOutputRecovery } from "./native/output-recovery.js";
@@ -135,6 +136,8 @@ export interface SupervisorOptions {
     repositoryCacheRoot?: string;
     prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void | "unavailable" | "skipped" | "wired">;
     runtimeOptions?: NativeRunnerOptions["runtimeOptions"];
+    /** The connector's QA browser (O8); resolved from the runners' packages and the person's Node when absent (tests pass it). */
+    browser?: ConnectorBrowserStatus;
     /** Test/embedding seam for the independently supervised shared Codex owner. */
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;
     /** Self-update policy; absent means the connector only reports `update_required`. */
@@ -209,6 +212,8 @@ export class Supervisor {
   readonly runners = new Map<string, RunnerPort>();
   private readonly nativeRunners: NativeRunner[] = [];
   private nativeCodexOwner: NativeCodexAppServerOwner | null = null;
+  /** The QA browser every agent's sessions get (O8), or why this connector has none. */
+  private connectorBrowser: ConnectorBrowserStatus = { available: false, reason: "no_package", message: "" };
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private stopping = false;
@@ -358,7 +363,16 @@ export class Supervisor {
       config: sharedCodex,
       onRestartFailure: error => this.logger.warn({ err: error }, "shared Codex app-server restart failed; retrying"),
     });
-    for (const config of this.options.native!.runners) {
+    // The QA browser is the connector's, not an agent package's (O8): every
+    // agent's sessions get it when an installed Claude Code or Codex package
+    // carries it and some Node can run it.
+    this.connectorBrowser = this.options.native!.browser ?? await resolveConnectorBrowser(this.options.native!.runners);
+    if (this.connectorBrowser.available) {
+      this.logger.info({ event: "browser.connector_ready", packageAgent: this.connectorBrowser.browser.packageAgent, nodeSource: this.connectorBrowser.browser.nodeSource }, "the QA browser is available to every agent on this computer");
+    } else {
+      this.logger.warn({ event: "browser.connector_unavailable", reason: this.connectorBrowser.reason }, this.connectorBrowser.message);
+    }
+    for (const config of withConnectorBrowser(this.options.native!.runners, this.connectorBrowser)) {
       const runner = new NativeRunner({ instanceId: identity!.instanceId, config,
         ...(config.RUNNER_AGENT_ID === "codex" && this.nativeCodexOwner ? { afterSuccessfulLogin: () => this.nativeCodexOwner!.refreshAfterLogin() } : {}),
         executionBridgeLimit: () => Math.min(4, this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT ?? 4),
@@ -377,7 +391,7 @@ export class Supervisor {
       // A site-started login needs a native install with a Codex runner (WS1-115).
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
-      additionalCapabilities: () => this.openCodeCapabilities(),
+      additionalCapabilities: () => [...this.openCodeCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : [])],
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
       cancellationDeliveryReady: () => {
@@ -1679,17 +1693,28 @@ export class Supervisor {
     this.previewViewerStarts.delete(sessionId);
   }
 
-  /** Which agents can drive the QA browser (Playwright MCP) and whether it uses Chrome or Playwright's Chromium. */
-  private browserReport(): { version: string | null; agents: string[]; chrome: boolean } {
+  /**
+   * Every agent's sessions get the QA browser (O8) while the connector has
+   * one and previews can run (a session is given the browser with its
+   * preview); Core may then place QA on any of them.
+   */
+  private browserToolReady(): boolean {
+    return this.connectorBrowser.available && this.previewCapable();
+  }
+
+  /** Which agents drive the QA browser (Playwright MCP), on which Node, whether it uses Chrome or Playwright's Chromium, or why there is none. */
+  private browserReport(): { version: string | null; agents: string[]; chrome: boolean; packageAgent?: string; nodeSource?: "agent_package" | "person"; unavailable?: string } {
     const agents: string[] = [];
     let version: string | null = null;
     for (const [agentId, runner] of this.runners) {
-      const bundled = runner.browserVersion?.() ?? null;
-      if (bundled === null) continue;
+      const offered = runner.browserVersion?.() ?? null;
+      if (offered === null) continue;
       agents.push(agentId);
-      version ??= bundled;
+      version ??= offered;
     }
-    return { version, agents: agents.sort(), chrome: chromeInstalled() };
+    const browser = this.connectorBrowser;
+    return { version, agents: agents.sort(), chrome: chromeInstalled(),
+      ...(browser.available ? { packageAgent: browser.browser.packageAgent, nodeSource: browser.browser.nodeSource } : version === null && browser.message ? { unavailable: browser.message } : {}) };
   }
 
   private previewCapable(): boolean {

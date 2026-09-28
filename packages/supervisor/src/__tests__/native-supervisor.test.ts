@@ -16,6 +16,7 @@ import { submitReadiness } from "../provisioning/activation.js";
 import { REMOTE_INSTANCE_PROTOCOL_VERSION, SystemClock } from "@konteks/remote-common";
 import { LEASE_AUDIENCE, type CoreClient } from "../core/client.js";
 import { decodeLeaseClaims, leaseRecordFromClaims } from "../lease/lease.js";
+import { BROWSER_NO_PACKAGE_MESSAGE } from "../native/browser-capability.js";
 
 let root: string;
 const supervisors: Supervisor[] = [];
@@ -413,6 +414,33 @@ describe("native Supervisor composition", () => {
     expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("preview.dev_server");
     const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string }> };
     expect(doctor.checks.find(check => check.id === "preview")).toMatchObject({ status: "warn" });
+  });
+
+  it("offers the connector's QA browser to its agents and advertises browser_tool while previews can run (O8)", async () => {
+    const f = await fixture();
+    const browser = { version: "0.0.82", packageAgent: "claude-code" as const, nodeSource: "person" as const, node: "/usr/local/bin/node", launcher: "/pkg/konteks/browser-mcp.js", entrypoint: "/pkg/node_modules/@playwright/mcp/cli.js" };
+    const supervisor = new Supervisor(f.config, { native: { ...f.options.native, browser: { available: true, browser } } });
+    supervisors.push(supervisor);
+    await supervisor.start();
+    // The fixture's Codex package carries no browser: it gets the connector's.
+    expect(supervisor.runners.get("codex")?.browserVersion?.()).toBe("0.0.82");
+    expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("browser_tool");
+    (supervisor as unknown as { previewCapable: () => boolean }).previewCapable = () => true;
+    expect((await supervisor.inventory.collect()).components[0]?.capabilities).toContain("browser_tool");
+    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
+    expect(doctor.checks.find(check => check.id === "browser")).toMatchObject({ status: "pass", detail: expect.stringMatching(/^Playwright MCP 0\.0\.82 for codex; runs on your own Node;/) });
+  });
+
+  it("has no QA browser without a package or Node that can run it, and says so in doctor (O8)", async () => {
+    const none = await fixture();
+    const without = new Supervisor(none.config, { native: { ...none.options.native, browser: { available: false, reason: "no_package", message: BROWSER_NO_PACKAGE_MESSAGE } } });
+    supervisors.push(without);
+    await without.start();
+    (without as unknown as { previewCapable: () => boolean }).previewCapable = () => true;
+    expect(without.runners.get("codex")?.browserVersion?.()).toBeNull();
+    expect((await without.inventory.collect()).components[0]?.capabilities).not.toContain("browser_tool");
+    const report = await without.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
+    expect(report.checks.find(check => check.id === "browser")).toMatchObject({ status: "warn", detail: BROWSER_NO_PACKAGE_MESSAGE });
   });
 
   it("tells the local operator which release Konteks accepts for this machine (WS1-093)", async () => {

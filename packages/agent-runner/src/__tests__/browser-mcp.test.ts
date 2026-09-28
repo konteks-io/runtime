@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BROWSER_MCP_PACKAGE, NativeAgentPackageProfileSchema } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { RunnerConfigSchema } from "../config.js";
-import { BROWSER_ALLOWED_ORIGINS, BROWSER_MCP_SERVER_NAME, browserMcpServer, browserToolFromTitle, bundledBrowserVersion, chromeCandidates, isDeniedBrowserTool } from "../bridge/browser.js";
+import { BROWSER_ALLOWED_ORIGINS, BROWSER_MCP_SERVER_NAME, browserMcpServer, browserToolFromTitle, chromeCandidates, isDeniedBrowserTool, runnerBrowser, runnerBrowserVersion } from "../bridge/browser.js";
 import { launcherEnvironment, sanitizeOrigins, startBrowserLauncher, withAllowedOrigins } from "../bridge/browser-launcher.js";
 
 const digest = `sha256:${"a".repeat(64)}`;
@@ -33,7 +33,7 @@ describe("the QA browser MCP server", () => {
 
   it("is composed as a stdio server run by the package's Node through the connector's launcher, confined to the gateway", () => {
     const config = { ...RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_BRIDGE_PREFIX: "/pkg" }), RUNNER_NATIVE_PACKAGE_PROFILE: withBrowser() };
-    expect(bundledBrowserVersion(config)).toBe("0.0.82");
+    expect(runnerBrowserVersion(config)).toBe("0.0.82");
     const chrome = browserMcpServer(config, request, { chrome: () => true })!;
     expect(chrome).toMatchObject({ name: BROWSER_MCP_SERVER_NAME, command: "/pkg/bin/node" });
     expect(chrome.args.slice(0, 2)).toEqual(["/pkg/konteks/browser-mcp.js", "/pkg/node_modules/@playwright/mcp/cli.js"]);
@@ -54,17 +54,43 @@ describe("the QA browser MCP server", () => {
     expect(chromium.env).toContainEqual({ name: "KONTEKS_BROWSER_INSTALL", value: "chromium" });
   });
 
-  it("is absent for an agent whose package carries none (DeepSeek Harness, older packages)", () => {
+  it("is absent while the connector has none (a host agent with no connector browser, an older package)", () => {
     const dsh = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "dsh" });
-    expect(bundledBrowserVersion(dsh)).toBeNull();
+    expect(runnerBrowserVersion(dsh)).toBeNull();
     expect(browserMcpServer(dsh, request)).toBeNull();
     const older = { ...RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex" }), RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture().profile };
     expect(browserMcpServer(older as never, request)).toBeNull();
   });
 
+  it("is the connector's for DeepSeek Harness and OpenCode: the same server, run on the Node the connector resolved (O8)", () => {
+    const shared = { version: "0.0.82", packageAgent: "claude-code" as const, nodeSource: "person" as const,
+      node: "/usr/local/bin/node", launcher: "/pkg/claude/konteks/browser-mcp.js", entrypoint: "/pkg/claude/node_modules/@playwright/mcp/cli.js" };
+    for (const agent of ["dsh", "opencode"] as const) {
+      const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: agent, RUNNER_BROWSER: shared });
+      expect(runnerBrowserVersion(config)).toBe("0.0.82");
+      const server = browserMcpServer(config, request, { chrome: () => true })!;
+      expect(server).toMatchObject({ name: "konteks-browser", command: "/usr/local/bin/node" });
+      expect(server.args.slice(0, 2)).toEqual([shared.launcher, shared.entrypoint]);
+      // Exactly the flags and environment Claude Code and Codex get.
+      const own = browserMcpServer({ ...RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_BRIDGE_PREFIX: "/pkg" }), RUNNER_NATIVE_PACKAGE_PROFILE: withBrowser() }, request, { chrome: () => true })!;
+      expect(server.args.slice(2)).toEqual(own.args.slice(2));
+      expect(server.env).toEqual(own.env);
+    }
+    // Claude Code and Codex keep their own package's browser, whatever the connector's is.
+    const codex = { ...RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_BRIDGE_PREFIX: "/pkg" }), RUNNER_NATIVE_PACKAGE_PROFILE: withBrowser(), RUNNER_BROWSER: shared };
+    expect(runnerBrowser(codex)).toMatchObject({ node: "/pkg/bin/node", packageAgent: "codex", nodeSource: "agent_package" });
+    // A connector browser at another version than the release pins is never run.
+    expect(browserMcpServer(RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "opencode", RUNNER_BROWSER: { ...shared, version: "0.0.1" } }), request)).toBeNull();
+    // It is never taken from anything but absolute, clean paths.
+    expect(() => RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "dsh", RUNNER_BROWSER: { ...shared, node: "node" } })).toThrow();
+    expect(() => RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "dsh", RUNNER_BROWSER: { ...shared, extra: true } })).toThrow();
+  });
+
   it("names its tools in permission titles and refuses the unsafe ones", () => {
     expect(browserToolFromTitle("mcp__konteks-browser__browser_click")).toBe("browser_click");
     expect(browserToolFromTitle("konteks-browser.browser_snapshot")).toBe("browser_snapshot");
+    // OpenCode's permission name for a Code Mode MCP tool.
+    expect(browserToolFromTitle("konteks-browser_browser_click")).toBe("browser_click");
     expect(browserToolFromTitle("mcp__konteks-preview__preview_start")).toBeNull();
     expect(browserToolFromTitle("mcp__konteks-browser-tool__navigate")).toBeNull();
     expect(isDeniedBrowserTool("browser_run_code_unsafe")).toBe(true);
