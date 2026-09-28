@@ -1,4 +1,5 @@
 import { mkdir, readFile } from "node:fs/promises";
+import type { InitializeResponse } from "@agentclientprotocol/sdk";
 import { join } from "node:path";
 import { RemoteInstanceError, createLogger, writeSecretFile, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type OpenCodeLoginOptionId, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
@@ -160,6 +161,10 @@ export class AgentRuntime {
   private credentials: ConnectedAgentCredential[] | undefined;
   /** The reviewed sign-ins the site may start here (OpenCode), read once the runtime started. */
   private siteLoginOptionIds: readonly OpenCodeLoginOptionId[] = [];
+  /** Stops an idle control process (`processLimits.controlIdleMs`). */
+  private controlIdleTimer: NodeJS.Timeout | null = null;
+  /** What the control process answered before it was stopped for being idle; readiness keeps reading it. */
+  private parkedInitializeResult: InitializeResponse | null = null;
 
   constructor(private readonly options: AgentRuntimeOptions) {
     this.events = options.events ?? new RunnerEventBus();
@@ -181,10 +186,14 @@ export class AgentRuntime {
       ...(this.perWorkingCopy ? { beforePrompt: (bridge: BridgeProcess) => this.workingCopyBindings.get(bridge)?.beforePrompt() } : {}),
       ...(this.host?.refusedSessionModes ? { refusedModes: this.host.refusedSessionModes } : {}),
       ...(this.host?.offersModel ? { modelAllowed: (value: string) => this.host!.offersModel!(value, this.hostSettings) } : {}),
+      ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
+      ...(this.host?.verifySession ? { verifySession: (response: { configOptions?: unknown; modes?: unknown }) => this.host!.verifySession!(response) } : {}),
+      ...(this.host?.promptPrelude ? { promptPrelude: (session: { cwd: string; sessionKey: string }) => this.host!.promptPrelude!(options.config, session) } : {}),
+      ...(this.host?.agentErrorText ? { agentErrorText: (text: string) => this.host!.agentErrorText!(text) } : {}),
       usageLabel: modelValue => this.usageLabel(modelValue),
       events: this.events,
       refStore: new FileSessionRefStore(join(options.config.RUNNER_CREDENTIAL_DIR, "session-refs.json")),
-      bootstrapTimeoutMs: options.config.RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS,
+      bootstrapTimeoutMs: this.sessionBootstrapTimeoutMs(),
       now: this.now,
       logger: this.logger,
       onAuthRequired: () => {
@@ -246,19 +255,71 @@ export class AgentRuntime {
     // A finalized reference no longer owns its process; the idle slot does.
     try { await this.discardIdleExecutionBridge("runtime_stop"); } catch (error) { errors.push(error); }
     this.sessions.closeAll("closed");
+    this.clearControlIdleStop();
     await this.bridge?.stop();
     this.bridge = null;
     this.connectionState = "exited";
+    await this.sweepLeftovers();
     if (errors.length) throw new AggregateError(errors, "Native execution owners could not all be stopped.");
   }
 
-  private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+  /** The runner's session bootstrap deadline, or the agent's own when longer (Antigravity on Gemini Enterprise). */
+  private sessionBootstrapTimeoutMs(): number {
+    return Math.max(this.options.config.RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS, this.host?.sessionBootstrapTimeoutMs ?? 0);
+  }
+
+  /** After every process of this runner stopped: what a host agent's programs left behind (Antigravity's harness). */
+  private async sweepLeftovers(): Promise<void> {
+    if (!this.host?.sweepLeftovers) return;
+    try { await this.host.sweepLeftovers(this.options.config); }
+    catch (error) { this.logger.warn({ agentId: this.family.agentId, errorCode: error instanceof RemoteInstanceError ? error.code : "sweep_failed" }, "processes the agent left behind could not all be stopped"); }
+  }
+
+  /** Execution processes that may live at once: the supervisor's ceiling, and the agent's own when lower (Antigravity: two, A12). */
+  private executionLimit(): number | undefined {
     const limit = this.options.executionBridgeLimit?.();
+    const own = this.host?.processLimits?.executionProcesses;
+    return typeof limit === "number" && typeof own === "number" ? Math.min(limit, own) : limit;
+  }
+
+  private heldExecutionOwners(): number {
+    let held = 0;
+    for (const owner of this.executionBridges.values()) if (!owner.finalized) held += 1;
+    return held;
+  }
+
+  private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+    const queueMs = this.host?.processLimits?.queueMs;
+    return queueMs === undefined ? this.reserveExecutionBridge(ref, lifecycle, cwd) : this.queueForExecutionBridge(ref, Date.now() + queueMs, lifecycle, cwd);
+  }
+
+  /**
+   * An agent with its own process ceiling (Antigravity) waits for a free
+   * execution process instead of being refused at once: a session finishing
+   * or its resident process being taken frees one. Past the wait it is
+   * refused plainly; nothing was reserved.
+   */
+  private async queueForExecutionBridge(ref: string, until: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+    for (let logged = false; ; logged = true) {
+      const limit = this.executionLimit();
+      if (this.stopping || this.authRequired || this.activeLogin !== null || this.executionBridges.has(ref) || typeof limit !== "number" || this.heldExecutionOwners() < limit) {
+        return this.reserveExecutionBridge(ref, lifecycle, cwd);
+      }
+      if (Date.now() >= until) {
+        throw new RemoteInstanceError("temporarily_unavailable", `${this.family.displayName} is already running ${limit} sessions on this computer. Try again when one of them finishes.`, { diagnostic: "execution_processes_busy" });
+      }
+      if (!logged) this.logger.info({ agentId: this.family.agentId, limit }, "a session waits for a free execution process");
+      lifecycle?.assertCurrent();
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }
+
+  private reserveExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+    const limit = this.executionLimit();
     if (this.authRequired) return Promise.reject(new RemoteInstanceError("agent_auth_required", "Sign in to the selected local agent.", { recoveryActions: [{ kind: "login_agent", agentId: this.family.agentId }] }));
     if (this.activeLogin !== null) return Promise.reject(new RemoteInstanceError("temporarily_unavailable", "The local agent is signing in."));
     // Only unfinalized owners hold capacity; retained keys still refuse reuse.
-    let held = 0;
-    for (const owner of this.executionBridges.values()) if (!owner.finalized) held += 1;
+    const held = this.heldExecutionOwners();
     if (this.stopping || typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || held >= limit || this.executionBridges.has(ref)) {
       return Promise.reject(new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization."));
     }
@@ -309,6 +370,7 @@ export class AgentRuntime {
         return ownerPersistence;
       },
       ...(this.options.executionSpawnProcess ? { spawnProcess: this.options.executionSpawnProcess } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line) } : {}),
       // Callback authority is the initialized process object, which a later
       // reference reuses as-is: the session manager resolves every update,
       // permission, elicitation and exit to the sessions bound to exactly it.
@@ -600,7 +662,10 @@ export class AgentRuntime {
 
   private idleExecutionBridgeTtlMs(): number {
     const configured = this.options.idleExecutionBridgeTtlMs;
-    return typeof configured === "number" && Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS;
+    const ttl = typeof configured === "number" && Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS;
+    // A heavy agent (Antigravity, about 350 MB a process) keeps its resident process for less.
+    const own = this.host?.processLimits?.idleExecutionMs;
+    return typeof own === "number" ? Math.min(ttl, own) : ttl;
   }
 
   /** Cheap liveness: our own child's observed exit and the login it was started under. */
@@ -662,7 +727,7 @@ export class AgentRuntime {
       family: this.family,
       authMode: this.options.config.RUNNER_AUTH_MODE,
       connectionState: this.connectionState,
-      initializeResult: this.bridge?.initializeResult ?? null,
+      initializeResult: this.bridge?.initializeResult ?? this.parkedInitializeResult,
       scope: this.authRequired ? { ...this.scope, authIdentityFingerprint: null, scopeAttestedAt: null } : this.scope,
       identity: this.authRequired ? "logged_out" : this.identity,
       ...(this.credentials === undefined ? {} : { credentials: this.authRequired ? this.credentials.map(credential => ({ ...credential, state: "needs_sign_in" as const })) : this.credentials }),
@@ -700,12 +765,14 @@ export class AgentRuntime {
       workspaceRoot: this.options.config.RUNNER_WORKSPACE_DIR,
       spec: this.spec,
       initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
-      sessionTimeoutMs: this.options.config.RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS,
+      sessionTimeoutMs: this.sessionBootstrapTimeoutMs(),
       clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
       logger: this.logger,
       ...(this.options.retrySleep ? { retrySleep: this.options.retrySleep } : {}),
       ...(this.options.retryRandom ? { retryRandom: this.options.retryRandom } : {}),
       ...(this.options.spawn ? { spawn: this.options.spawn } : {}),
+      ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line) } : {}),
     };
     // The periodic probe used to spawn and initialize its own throwaway
     // process. An idle resident bridge answers the same `session/new` without
@@ -764,8 +831,10 @@ export class AgentRuntime {
       try { await this.stopExecutionBridge(ref); } catch (error) { errors.push(error); }
     }
     try { await this.discardIdleExecutionBridge("runtime_stop"); } catch (error) { errors.push(error); }
+    this.clearControlIdleStop();
     await this.bridge?.stop();
     this.bridge = null;
+    await this.sweepLeftovers();
     if (errors.length) this.logger.warn({ errors: errors.length }, "some bridges did not stop cleanly during quarantine");
   }
 
@@ -789,6 +858,37 @@ export class AgentRuntime {
     if (this.quarantined !== null) throw new RemoteInstanceError("agent_unavailable", this.quarantined);
   }
 
+  /**
+   * An agent with its own process limits (Antigravity) stops its control
+   * process after `controlIdleMs` with nothing to do: it serves readiness and
+   * sign-in only, sessions run in execution processes, and one costs about
+   * 350 MB. Readiness keeps the `initialize` it answered; the next sign-in or
+   * sign-out starts it again.
+   */
+  private scheduleControlIdleStop(): void {
+    const idleMs = this.host?.processLimits?.controlIdleMs;
+    this.clearControlIdleStop();
+    if (idleMs === undefined || this.stopping) return;
+    this.controlIdleTimer = setTimeout(() => void this.parkControlBridge().catch(error => this.logger.warn({ agentId: this.family.agentId, err: error }, "the idle control process could not be stopped")), idleMs);
+    this.controlIdleTimer.unref();
+  }
+
+  private clearControlIdleStop(): void {
+    if (this.controlIdleTimer) clearTimeout(this.controlIdleTimer);
+    this.controlIdleTimer = null;
+  }
+
+  private async parkControlBridge(): Promise<void> {
+    this.controlIdleTimer = null;
+    const bridge = this.bridge;
+    if (!bridge || bridge.exited || this.stopping || this.activeLogin !== null || this.bridgeStart !== null || this.connectionState !== "ready") return;
+    this.parkedInitializeResult = bridge.initializeResult;
+    // Detach first: its exit is then not read as the agent going away.
+    this.bridge = null;
+    this.logger.info({ agentId: this.family.agentId }, "stopping the idle control process");
+    await bridge.stop();
+  }
+
   async ensureBridge(): Promise<void> {
     this.assertNotQuarantined();
     if (this.stopping) return;
@@ -801,8 +901,13 @@ export class AgentRuntime {
   }
 
   private async startBridge(): Promise<void> {
-    this.connectionState = "starting";
-    this.publishReadiness();
+    this.clearControlIdleStop();
+    // A control process stopped for being idle comes back without the agent reading as unavailable meanwhile.
+    const resuming = this.parkedInitializeResult !== null && this.connectionState === "ready";
+    if (!resuming) {
+      this.connectionState = "starting";
+      this.publishReadiness();
+    }
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       // Callback authority belongs to this spawn, never whichever bridge
       // happens to be current when a deferred callback arrives.
@@ -841,10 +946,12 @@ export class AgentRuntime {
           throw new RemoteInstanceError("agent_unavailable", "Bridge exited during initialization.", { retryable: true });
         }
         this.bridge = candidate;
+        this.parkedInitializeResult = null;
         this.connectionState = "ready";
         this.logger.info({ agentId: this.family.agentId, attempt,
           bridgeInitializeDurationMs: Date.now() - initializeStartedAt }, "runner control bridge initialized");
         this.publishReadiness();
+        this.scheduleControlIdleStop();
         return;
       } catch (error) {
         let stopConfirmed = provisional === null;
@@ -875,6 +982,7 @@ export class AgentRuntime {
         await (this.options.retrySleep ?? (delay => new Promise(resolve => setTimeout(resolve, delay))))(delayMs);
       }
     }
+    this.parkedInitializeResult = null;
     this.connectionState = "failed";
     this.publishReadiness();
   }

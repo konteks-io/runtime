@@ -21,6 +21,10 @@ export interface DiscoverBridgeModelCapabilityOptions {
   logger?: Logger;
   retrySleep?: (delayMs: number) => Promise<void>;
   retryRandom?: () => number;
+  /** The agent's own `session/new` `_meta` (Antigravity's tool filter). */
+  sessionMeta?: Readonly<Record<string, unknown>>;
+  /** The agent's reading of its stderr (`HostAgentRunnerAdapter.stderrFailure`): a discovery that needs the person fails at once. */
+  stderrFailure?: SpawnBridgeOptions["stderrFailure"];
 }
 
 /** One offered value as the agent presents it: display name and group (dsh groups by provider). */
@@ -99,6 +103,7 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
               onCreateElicitation: rejectDiscoveryRequest,
               onExit: () => undefined,
             },
+            ...(options.stderrFailure ? { stderrFailure: options.stderrFailure } : {}),
           };
           spawned = bridge = await (options.spawn ?? spawnBridge)(spawnOptions);
           bridgeAcquired = true;
@@ -110,8 +115,9 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
           timer.unref();
         });
         const created = await Promise.race([
-          bridge.connection.newSession({ cwd, mcpServers: [], _meta: konteksSessionMetadata("Model capability check", options.spec.family.agentId) }),
+          bridge.connection.newSession({ cwd, mcpServers: [], _meta: { ...konteksSessionMetadata("Model capability check", options.spec.family.agentId), ...options.sessionMeta } }),
           deadline,
+          ...(bridge.failure ? [bridge.failure] : []),
         ]);
         sessionCreated = true;
         const matches = (created.configOptions ?? []).filter(option => option.id === options.configId);

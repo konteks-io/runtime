@@ -54,6 +54,11 @@ export interface BridgeProcess extends BridgeStopOwner {
   readonly initializeResult: InitializeResponse;
   readonly exited: boolean;
   readonly stderrTail: () => string[];
+  /**
+   * Rejects once the agent printed a line its host adapter reads as "cannot
+   * go on without the person" (`stderrFailure`); never settles otherwise.
+   */
+  readonly failure?: Promise<never>;
   stop(): Promise<void>;
 }
 
@@ -68,6 +73,8 @@ export interface SpawnBridgeOptions {
   /** Captured synchronously after spawn, before ACP initialization can fail.
    * This is an exact retryable stop handle, not qualified quiescence evidence. */
   onProcessOwner?: (owner: BridgeStopOwner) => void | Promise<void>;
+  /** A host agent's reading of its stderr lines (`HostAgentRunnerAdapter.stderrFailure`). */
+  stderrFailure?: (line: string) => RemoteInstanceError | null;
 }
 
 export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgeProcess> {
@@ -91,6 +98,11 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
   const observeInstructionScope = instructionScopeObserver(scope => {
     logger.info({ event: "agent.instruction_scope", agentId: options.spec.family.agentId, bridgePid: child.pid, source: "bridge_report", ...scope }, "agent instruction scope applied");
   });
+  let failWith: ((error: RemoteInstanceError) => void) | null = null;
+  const failure = options.stderrFailure ? new Promise<never>((_resolve, reject) => { failWith = reject; }) : undefined;
+  // Observed through races only; never an unhandled rejection of its own.
+  void failure?.catch(() => undefined);
+  let partial = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {
     if (options.spec.family.agentId === "claude-code") observeInstructionScope(chunk);
@@ -98,6 +110,20 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
       if (!line) continue;
       stderrLines.push(line.slice(0, 512));
       if (stderrLines.length > STDERR_TAIL_MAX_LINES) stderrLines.shift();
+    }
+    if (options.stderrFailure && failWith) {
+      const lines = (partial + chunk).split(/\r?\n/);
+      partial = (lines.pop() ?? "").slice(-4_096);
+      for (const line of lines) {
+        const refusal = line ? options.stderrFailure(line.slice(0, 4_096)) : null;
+        if (refusal && failWith) {
+          const fail: (error: RemoteInstanceError) => void = failWith;
+          failWith = null;
+          logger.warn({ agentId: options.spec.family.agentId, errorCode: refusal.code, diagnostic: refusal.diagnostic }, "the agent cannot go on without the person");
+          fail(refusal);
+          break;
+        }
+      }
     }
   });
   let exited = false;
@@ -193,6 +219,7 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
       return exited;
     },
     stderrTail: () => [...stderrLines],
+    ...(failure ? { failure } : {}),
     stop: processOwner.stop,
   };
 }
@@ -254,6 +281,42 @@ function openCodeProviderError(error: RequestError): BridgeErrorClass | null {
   return { code: error.code, class: "provider_failure", message: "The provider could not handle this request.", retryable: false };
 }
 
+/**
+ * Google Antigravity's ACP server (antigravity-acp 1.2.1, `server.py`,
+ * `admin_controls_manager.py`) names its sign-in, licence and organisation
+ * failures by `data.reason`: `-32000` with `ge_license_failed`,
+ * `ge_license_cancelled`, `ge_license_superseded`, `ge_auth_failed` or
+ * `onboarding_failed`; `-32001` with `admin_controls_permission_denied` or
+ * `admin_controls_verification_failed` when the organisation's Gemini
+ * Enterprise settings could not be read (the session is blocked). Its own
+ * text names paths and projects, so none of it reaches the person: fixed
+ * plain lines only. A licensed account whose project has the Business AI
+ * Code API switched off reads "no license" (CP0 part 2), so the licence line
+ * names that API and the command that turns it on.
+ */
+export const ANTIGRAVITY_LICENCE_REASON = "Gemini Enterprise found no licence for this Google Cloud project. Turn on the Business AI Code API with `gcloud services enable businessaicode.googleapis.com --project <project id>`, then sign in again with `konteks-remote auth login antigravity`.";
+export const ANTIGRAVITY_ADMIN_SETTINGS_REASON = "Your organisation's Gemini Enterprise settings could not be checked. Sign in again or ask your Google Cloud admin.";
+const ANTIGRAVITY_SIGN_IN_AGAIN = "Google Antigravity needs to sign in again. Run `konteks-remote auth login antigravity`.";
+
+function antigravityError(error: RequestError): BridgeErrorClass | null {
+  const data = error.data as { reason?: unknown } | null | undefined;
+  const reason = data !== null && typeof data === "object" && typeof data.reason === "string" ? data.reason : undefined;
+  const text = error.message.slice(0, 2_048);
+  const auth = (message: string): BridgeErrorClass => ({ code: error.code, class: "agent_auth_required", message, retryable: false });
+  if (reason === "admin_controls_permission_denied" || reason === "admin_controls_verification_failed") return auth(ANTIGRAVITY_ADMIN_SETTINGS_REASON);
+  if (reason === "ge_license_failed") {
+    // No answer from Google at all, or a server error there: nothing was learned about the licence.
+    if (/failed to reach the backend|\(HTTP 5\d\d\)/i.test(text)) {
+      return { code: error.code, class: "provider_failure", message: "Google Antigravity could not reach Gemini Enterprise. Try again shortly.", retryable: true };
+    }
+    if (/setup incomplete/i.test(text)) return auth("Gemini Enterprise needs a Google Cloud project and location. Sign in again with `konteks-remote auth login antigravity`.");
+    return auth(ANTIGRAVITY_LICENCE_REASON);
+  }
+  if (reason === "ge_license_cancelled" || reason === "ge_license_superseded") return auth("The Gemini Enterprise licence was not chosen. Sign in again with `konteks-remote auth login antigravity`.");
+  if (reason === "ge_auth_failed" || reason === "onboarding_failed") return auth(ANTIGRAVITY_SIGN_IN_AGAIN);
+  return null;
+}
+
 function signInLapsed(data: unknown): boolean {
   if (data === undefined || data === null) return false;
   let text: string;
@@ -269,7 +332,7 @@ export function classifyBridgeError(error: unknown): {
   retryable: boolean;
 } {
   if (error instanceof RequestError) {
-    const openCode = openCodeProviderError(error);
+    const openCode = openCodeProviderError(error) ?? antigravityError(error);
     if (openCode) return openCode;
     const message = error.message.slice(0, 1_024);
     if (error.code === -32000 || /auth/i.test(message) || signInLapsed(error.data) || DSH_KEY_MISSING.test(message)) {

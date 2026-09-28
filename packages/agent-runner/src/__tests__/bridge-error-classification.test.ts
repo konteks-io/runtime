@@ -88,3 +88,46 @@ describe("OpenCode 2 turn failures (JSON-RPC -32603 with data.errorName, CP0-v2)
     expect(classifyBridgeError(new RequestError(-32602, "session not found: ses_1", { sessionId: "ses_1" }))).toMatchObject({ class: "invalid_params" });
   });
 });
+
+describe("Google Antigravity's sign-in, licence and organisation failures (antigravity-acp 1.2.1)", () => {
+  // Shapes from the server's own sources (server.py, admin_controls_manager.py) and CP0 part 2.
+  const licence = "Gemini Enterprise found no licence for this Google Cloud project. Turn on the Business AI Code API with `gcloud services enable businessaicode.googleapis.com --project <project id>`, then sign in again with `konteks-remote auth login antigravity`.";
+
+  it("a missing licence names the Business AI Code API and the command that turns it on, never Google's text", () => {
+    const error = new RequestError(-32000, "No valid Gemini Enterprise license for the configured project 'gemini-enterprise-qa-25d3' / location 'global'. Verify gcp.project and gcp.location in /Users/p/.gemini/antigravity-acp/settings.json, or contact your Google Cloud administrator to confirm your license.", { reason: "ge_license_failed" });
+    const classified = classifyBridgeError(error);
+    expect(classified).toEqual({ code: -32000, class: "agent_auth_required", message: licence, retryable: false });
+    expect(classified.message).not.toMatch(/gemini-enterprise-qa-25d3|settings\.json|\/Users/);
+    // A licence check refused by Google (401/403) reads the same.
+    expect(classifyBridgeError(new RequestError(-32000, "Gemini Enterprise license resolution failed (HTTP 403): denied", { reason: "ge_license_failed" })).message).toBe(licence);
+  });
+
+  it("an unreachable or failing licence service is a retryable provider failure", () => {
+    for (const message of ["Gemini Enterprise license resolution failed to reach the backend: timed out", "Gemini Enterprise license resolution failed (HTTP 503): unavailable"]) {
+      expect(classifyBridgeError(new RequestError(-32000, message, { reason: "ge_license_failed" })), message)
+        .toEqual({ code: -32000, class: "provider_failure", message: "Google Antigravity could not reach Gemini Enterprise. Try again shortly.", retryable: true });
+    }
+  });
+
+  it("an incomplete setup, a licence not chosen and a failed sign-in each need a sign-in, in plain words", () => {
+    expect(classifyBridgeError(new RequestError(-32000, "Gemini Enterprise setup incomplete: no Google Cloud project or location configured. Add gcp.project…", { reason: "ge_license_failed" })).message)
+      .toBe("Gemini Enterprise needs a Google Cloud project and location. Sign in again with `konteks-remote auth login antigravity`.");
+    for (const reason of ["ge_license_cancelled", "ge_license_superseded"]) {
+      expect(classifyBridgeError(new RequestError(-32000, "License selection was cancelled. Sign in again to choose a license.", { reason }))).toMatchObject({ class: "agent_auth_required", message: "The Gemini Enterprise licence was not chosen. Sign in again with `konteks-remote auth login antigravity`." });
+    }
+    for (const reason of ["ge_auth_failed", "onboarding_failed"]) {
+      expect(classifyBridgeError(new RequestError(-32000, "Gemini Enterprise sign-in failed: invalid_grant", { reason }))).toMatchObject({ class: "agent_auth_required", message: "Google Antigravity needs to sign in again. Run `konteks-remote auth login antigravity`." });
+    }
+  });
+
+  it("organisation settings that could not be checked block the session as a sign-in problem (-32001)", () => {
+    for (const reason of ["admin_controls_permission_denied", "admin_controls_verification_failed"]) {
+      expect(classifyBridgeError(new RequestError(-32001, "Unable to verify enterprise administrator controls due to missing IAM permissions (PERMISSION_DENIED). Please verify your GCP IAM roles on project gemini-enterprise-qa-25d3…", { reason })))
+        .toEqual({ code: -32001, class: "agent_auth_required", message: "Your organisation's Gemini Enterprise settings could not be checked. Sign in again or ask your Google Cloud admin.", retryable: false });
+    }
+  });
+
+  it("no settings selected is the usual sign-in required", () => {
+    expect(classifyBridgeError(new RequestError(-32000, "Authentication required", { message: "No authentication method selected. …" }))).toMatchObject({ class: "agent_auth_required", message: "agent authentication required" });
+  });
+});

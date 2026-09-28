@@ -1,4 +1,5 @@
-import type { Logger, OpenCodeLoginOptionId } from "@konteks/remote-common";
+import type { ContentBlock } from "@agentclientprotocol/sdk";
+import type { Logger, OpenCodeLoginOptionId, RemoteInstanceError } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import type { RunnerEventBus } from "../events.js";
@@ -64,6 +65,83 @@ export interface HostAgentRunnerAdapter {
    * an admitted session configuration, and dropped from what is reported.
    */
   readonly refusedSessionModes?: { readonly modeIds: readonly string[]; readonly message: string };
+  /**
+   * Extra `_meta` every `session/new`, `session/load` and `session/resume` of
+   * this agent carries, model discovery's included (Antigravity: its built-in
+   * tool filter, which a persisted session could otherwise override).
+   */
+  readonly sessionMeta?: Readonly<Record<string, unknown>>;
+  /**
+   * The configuration a new, loaded or resumed session reports, checked before
+   * the session reads ready (Antigravity: a `model` select, and the `default`
+   * mode). Throws a plain refusal when the agent drifted.
+   */
+  verifySession?(response: { configOptions?: unknown; modes?: unknown }): void;
+  /**
+   * Content the connector puts in front of a prompt, or null when there is
+   * none (Antigravity: the working copy's `AGENTS.md`, which its server never
+   * loads, A9). `delivered` is called once that prompt reached the agent.
+   */
+  promptPrelude?(config: RunnerConfig, session: HostPromptSession): Promise<HostPromptPrelude | null>;
+  /**
+   * How many processes of this agent may live at once and for how long an
+   * unused one is kept (Antigravity: about 350 MB per process pair, A12).
+   * Absent: the runtime's own limits.
+   */
+  readonly processLimits?: HostProcessLimits;
+  /**
+   * A line the agent printed on stderr that means it cannot go on without the
+   * person (Antigravity: a sign-in or licence page it would open on this
+   * computer); the refusal ends that process's current bootstrap or turn.
+   */
+  stderrFailure?(line: string): RemoteInstanceError | null;
+  /**
+   * A message the agent sent as its own reply that is really a failure
+   * (Antigravity reports quota and model errors as text and ends the turn): the
+   * plain classification, and the text is never forwarded. Null: a reply.
+   */
+  agentErrorText?(text: string): HostTurnError | null;
+  /**
+   * The least time one session bootstrap call (`session/new`, load, resume,
+   * a configuration) may take before its process is recycled, when longer
+   * than the runner's own (Antigravity on Gemini Enterprise checks the
+   * organisation's settings with Google first: 3 to 7 s live).
+   */
+  readonly sessionBootstrapTimeoutMs?: number;
+  /** After every process of this runner was stopped: stop anything it left behind (Antigravity: its harness child). */
+  sweepLeftovers?(config: RunnerConfig): Promise<void>;
+}
+
+/** Which session a prompt prelude is for. */
+export interface HostPromptSession {
+  /** The session's working copy (absolute). */
+  cwd: string;
+  /** The agent's own session id, stable across load and resume; never leaves the runner. */
+  sessionKey: string;
+}
+
+export interface HostPromptPrelude {
+  blocks: ContentBlock[];
+  /** The prompt carrying `blocks` was answered: remember what was delivered. */
+  delivered(): Promise<void>;
+}
+
+export interface HostProcessLimits {
+  /** Execution processes (one per session) alive at once. */
+  executionProcesses: number;
+  /** How long a session waits for a free execution process before it is refused. */
+  queueMs: number;
+  /** How long a finished session's process stays resident for the next one. */
+  idleExecutionMs: number;
+  /** How long the control process stays up with nothing to do; it starts again when needed. */
+  controlIdleMs: number;
+}
+
+/** A failure the agent reported as reply text, classified for the person. */
+export interface HostTurnError {
+  class: "provider_failure" | "agent_auth_required";
+  message: string;
+  retryable: boolean;
 }
 
 /** One execution process's hold on its working copy (`bindWorkingCopy`). */

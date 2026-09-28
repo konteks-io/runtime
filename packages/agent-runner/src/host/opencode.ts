@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { copyFile, lstat, mkdir, readlink, realpath, rm, stat, symlink } from "node:fs/promises";
-import { isAbsolute, posix, relative, resolve, win32 } from "node:path";
+import { copyFile, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises";
+import { isAbsolute, posix, resolve, win32 } from "node:path";
 import { RemoteInstanceError, keyedFingerprint, readOrCreateSecretFile } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import type { HostAgentRunnerAdapter, HostWorkingCopyBinding } from "./host-agent.js";
 import { allowListEnvironment, HOST_INHERITED_VARIABLES } from "./allow-list-environment.js";
+import { instructionsInside } from "./working-copy-instructions.js";
 import {
   isOpenCodeFreeModel,
   listOpenCodeCredentials,
@@ -238,19 +239,6 @@ export async function syncOpenCodeInstructions(configHome: string, workingCopy: 
     if (!["EPERM", "EACCES", "ENOTSUP", "EINVAL", "UNKNOWN"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
     await copyFile(source, target);
     return "copy";
-  }
-}
-
-/** The real path of `<workingCopy>/AGENTS.md` when it is a regular file inside the working copy; else null. */
-async function instructionsInside(workingCopy: string): Promise<string | null> {
-  try {
-    const root = await realpath(workingCopy);
-    const file = await realpath(posixOrWin(workingCopy).join(workingCopy, "AGENTS.md"));
-    const inside = relative(root, file);
-    if (inside === "" || inside.startsWith("..") || isAbsolute(inside)) return null;
-    return (await stat(file)).isFile() ? file : null;
-  } catch {
-    return null;
   }
 }
 
