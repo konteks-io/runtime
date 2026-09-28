@@ -13,7 +13,14 @@ workspaces link the sibling `../packages` sources (`file:../packages/...`,
 restored after every merge from `main`, as in Core and the App); `main` and
 public exports use the 7.1.0 tarballs in `vendor/` (`export-public.mjs` reads
 `konteksContracts`). To refresh `vendor/`, `npm pack` from packages and keep
-`konteksContracts` at that version; never regenerate the whole lockfile. Host-installed
+`konteksContracts` at that version; never regenerate the whole lockfile. CI
+(`ci.yaml`, `release.yaml`, `agent-os-proof.yaml`) runs
+`scripts/ci-vendored-contracts.mjs` before `npm ci`, so the sibling links
+need no switching for a pull request. `agent-os-proof.yaml` (CP0-X) proves
+every agent on every OS through the connector's own code
+(`scripts/agent-os-proof.mjs`, a scripted model in
+`scripts/agent-os-proof/`); results per OS and agent are in
+opencode-runtime-support `proof/os-matrix.md`. Host-installed
 agents go through per-agent host adapters; OpenCode 2 is offered (CP6:
 install, enrollment detection, `agent add opencode`, onboarding remedies,
 Graft, a doctor line; a host agent missing or unsupported at load is left out

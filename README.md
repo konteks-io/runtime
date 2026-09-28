@@ -342,9 +342,31 @@ npm test
 ```
 
 The shared Konteks contract packages are vendored under `vendor/` as built
-tarballs. Releases are produced by the `release` workflow on a `v*` tag; see
+tarballs. A development branch may link a sibling contracts checkout instead;
+CI then points those links at `vendor/` first
+(`scripts/ci-vendored-contracts.mjs`, never committed). Releases are produced
+by the `release` workflow on a `v*` tag; see
 `.github/workflows/release.yaml` for the platform matrix and the signing
 inputs.
+
+### Every agent on every OS
+
+The `agent-os-proof` workflow runs each agent (Claude Code, Codex, DeepSeek
+Harness, OpenCode) on macOS, Linux (x64 and arm64) and Windows, installed the
+way its own docs say, through the connector's own code
+(`scripts/agent-os-proof.mjs`): finding it, its private home, the start
+self-check, ACP `initialize` and `session/new`, model discovery, and a
+governance probe driven by a scripted model (no credential needed): an
+allowed command, the agent's environment, a write inside and outside the
+working copy, `git push`, `sudo` (on Windows an elevation), the Konteks result
+tool, all in a repository that carries every agent's own "ask nothing" config.
+Fake credentials set in the job (`GITHUB_TOKEN`, provider keys) must never
+reach an agent process. One real turn runs when a key is set as a repository
+secret (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`; OpenCode
+uses Zen's free model and needs none); otherwise it is reported as not proven.
+Run one agent locally with
+`node scripts/agent-os-proof.mjs --agent opencode --out result.json` after
+`npm run build`.
 
 ## License
 
