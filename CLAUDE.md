@@ -8,11 +8,12 @@ Customer-visible file names are in AGENTS.md: resolve the connector with
 `resolveNativeConnectorExecutable`, never a literal `connector`.
 The runtime is native-only (the appliance is retired and deleted) and runs
 Claude Code, Codex and DeepSeek Harness; Pi is retired (see AGENTS.md for how
-stored values stay readable). Packages 7.1.0 are vendored as tarballs under
-`vendor/` (root `file:vendor/...tgz`, workspaces pinned to the version; CI's
-`npm ci` needs them): to re-vendor, `npm pack` from packages, update the
-version and integrity lines, extract into `node_modules/@konteks/*`; never
-regenerate the whole lockfile. Host-installed
+stored values stay readable). On the development branch the
+workspaces link the sibling `../packages` sources (`file:../packages/...`,
+restored after every merge from `main`, as in Core and the App); `main` and
+public exports use the 7.1.0 tarballs in `vendor/` (`export-public.mjs` reads
+`konteksContracts`). To refresh `vendor/`, `npm pack` from packages and keep
+`konteksContracts` at that version; never regenerate the whole lockfile. Host-installed
 agents go through per-agent host adapters; OpenCode 2 is registered and
 detected but gated (not offered until CP6); its runner spawns with the
 locked config, one process per working copy, after a start self-check, and
