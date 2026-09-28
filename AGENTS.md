@@ -235,9 +235,11 @@ CP6 no longer OpenCode's free-models capability: the 7.1 signal is the
 generic `core-contract-version-v1`), puts the credential in use's
 billing on offered Gemini models (`antigravityOptionBilling`) and
 `hostAgentDownload` on the connected agent (`native/antigravity-download.ts`,
-7.1 Core only; an Antigravity that cannot start is still reported with it, and
-one `agent add` is downloading in the launcher reads `downloading` from the
-growing staging file). CP4 (governance, below) is built. CP6 (offered,
+7.1 Core only; an Antigravity that cannot start is still reported with it,
+one the installation does not list is reported as an unavailable agent reading
+`not_downloaded` (the site's "Not added" card with the add command, A20) where
+this release pins a copy, and one `agent add` is downloading in the launcher
+reads `downloading` from the growing staging file; never a capability). CP4 (governance, below) is built. CP6 (offered,
 `antigravityInstallAdapter.offered = true`): `install --agents …,antigravity`
 and `agent add antigravity` refuse a computer without a pin first
 (`assertFetchable`), then ask `consentText` verbatim (launcher

@@ -325,6 +325,10 @@ downloads a copy that no longer matches Google's release. Onboarding never
 finds it on its own (the Antigravity app and the `agy` CLI are other
 products); with no other agent it offers it in one line.
 
+Until you add it, Konteks shows it as "Not added" with that command
+(Customize, Runtimes), and "Downloading" while `agent add` fetches it;
+`konteks-remote agents` says the same.
+
 Updates: when a Konteks update pins a newer Google Antigravity, the connector
 downloads it in the background on your first yes, checks it, runs its start
 check, switches to it and deletes the old version; if that fails, the old
