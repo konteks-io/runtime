@@ -116,14 +116,13 @@ signs the parsed request's digest and an older connector strips unknown
 fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
-person's own DeepSeek Harness (`dsh`); the person's own OpenCode 2
-(`opencode`) is registered but not offered yet (below). Pi is retired: every
-write or install refuses it with `retiredAgentMessage` from
-`@konteks/backstage-plugin-common`, while stored values stay readable (a
-`native-runtime.json` still listing it loads without it through
-`parseNativeRuntimeRecord`, with a logged warning). Since packages 7.1.0
-`opencode` is no longer a retired id; until it is offered a stored record,
-`install --agents` and `agent add` drop or refuse it as not offered.
+person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered
+since opencode-runtime-support CP6). Pi is retired: every write or install
+refuses it with `retiredAgentMessage` from `@konteks/backstage-plugin-common`,
+while stored values stay readable (a `native-runtime.json` still listing it
+loads without it through `parseNativeRuntimeRecord`, with a logged warning).
+Since packages 7.1.0 `opencode` is no longer a retired id: a pre-7.0.0 record
+naming the old bundled OpenCode reads as the person's own OpenCode 2 (O13).
 
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never
@@ -134,11 +133,26 @@ version) and an install-side `HostAgentInstallAdapter`
 (`packages/supervisor/src/native/host-agents.ts`: locate, install-record
 fields, re-verify on every load, start self-check, `offered`). A host agent
 whose adapter is not `offered` is refused on install and `agent add`, never
-detected at enrollment, and dropped from a stored record like a retired one.
-OpenCode 2 is registered (binary launch mode, `>=2.0.18 <3.0.0`) and located
-by `opencode-installation.ts`, but NOT offered (`openCodeInstallAdapter.offered`
-stays false until opencode-runtime-support CP6, after CP3's sign-in); its runner
-refuses to sign in until CP3. Every
+detected at enrollment, and dropped from a stored record like a retired one
+(both are offered today). A listed host agent the load cannot find or verify
+(`prerequisite_missing` from its locator: removed, OpenCode 1 over it, out of
+range) does not fail `loadNativeInstallation`: it is returned in
+`unavailableAgents` with a `relocate()` (`nativeHostRunnerConfig`), and the
+supervisor parks it with `NativeAgentRetry`, building its runner when a retry
+re-locates it (`parkUnavailableHostAgent`); OpenCode's `runnerSettings` also
+searches again when its recorded executable no longer verifies. OpenCode 2 is
+registered (binary launch mode, `>=2.0.18 <3.0.0`) and located by
+`opencode-installation.ts`; `openCodeInstallKind` names how it was installed
+for doctor (never the path), and doctor's `opencode` check
+(`support/doctor.ts`, fed by `Supervisor.openCodeDoctor` and
+`NativeRunner.hostInstallation`) reports version, install, self-check,
+credential labels, free models and the QA browser, or the plain reason it is
+left out (diagnostic ids only; no path or link). Onboarding
+(`launcher/native/onboard.ts`) detects it (`detectAgentFamilies`), names
+OpenCode 1 with the homepage command (`detectOpenCodeProblem`), asks for
+`auth login opencode [--reuse]` (`personalOpenCodeDataExists`, existence
+only), and says `agent add` or `doctor` when an installed host agent is not
+running. Every
 OpenCode execution, `--version` and `debug` included, gets the allow-list
 environment of `openCodeEnvironment` (never `GITHUB_TOKEN`, `GH_TOKEN` or any
 other credential or inherited `OPENCODE_*` variable) plus Konteks' own

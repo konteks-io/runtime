@@ -7,15 +7,17 @@ The hardening policy is mandatory for all maintenance work.
 Customer-visible file names are in AGENTS.md: resolve the connector with
 `resolveNativeConnectorExecutable`, never a literal `connector`.
 The runtime is native-only (the appliance is retired and deleted) and runs
-Claude Code, Codex and DeepSeek Harness; Pi is retired (see AGENTS.md for how
+Claude Code, Codex, DeepSeek Harness and OpenCode 2; Pi is retired (see AGENTS.md for how
 stored values stay readable). On the development branch the
 workspaces link the sibling `../packages` sources (`file:../packages/...`,
 restored after every merge from `main`, as in Core and the App); `main` and
 public exports use the 7.1.0 tarballs in `vendor/` (`export-public.mjs` reads
 `konteksContracts`). To refresh `vendor/`, `npm pack` from packages and keep
 `konteksContracts` at that version; never regenerate the whole lockfile. Host-installed
-agents go through per-agent host adapters; OpenCode 2 is registered and
-detected but gated (not offered until CP6); its runner spawns with the
+agents go through per-agent host adapters; OpenCode 2 is offered (CP6:
+install, enrollment detection, `agent add opencode`, onboarding remedies,
+Graft, a doctor line; a host agent missing or unsupported at load is left out
+and retried, never fatal to the connector); its runner spawns with the
 locked config, one process per working copy, after a start self-check, and
 its sessions are governed like dsh's (CP4: request rebuilding, the Code Mode
 gate, never `allow_always`, the tripwire and quarantine, plan mode refused;

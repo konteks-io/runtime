@@ -7,11 +7,12 @@ not build or deploy the connector from that checkout.
 
 `konteks-remote` is the Konteks native runtime connector. It installs on a
 developer's or team's own machine, runs the coding agents that are already
-installed there (Claude Code, Codex, DeepSeek Harness) under their
-own subscriptions or keys, and connects them to a Konteks workspace over an
-outbound, authenticated channel. No Docker, no local databases. The only
-provider key on the host is a DeepSeek API key, if you use DeepSeek Harness,
-kept in the connector's private folder.
+installed there (Claude Code, Codex, DeepSeek Harness, OpenCode 2) under
+their own subscriptions or keys, and connects them to a Konteks workspace over
+an outbound, authenticated channel. No Docker, no local databases. The only
+provider keys on the host are the ones you give DeepSeek Harness or OpenCode
+(a DeepSeek key; any provider's key OpenCode supports), kept in the
+connector's private folder.
 
 ## Install
 
@@ -39,7 +40,7 @@ rather than piped into `sh`. It ends by printing the first onboarding step as
 JSON; each later step comes from `konteks-remote onboard --json`.
 
 Once the folder is a repository, onboarding offers Graft, a map of the code
-that Claude Code, Codex and DeepSeek Harness read before they search. On a yes the connector
+that Claude Code, Codex, DeepSeek Harness and OpenCode read before they search. On a yes the connector
 downloads the release's Graft package, checks it against the digest the
 installer recorded from the signed checksums, and unpacks it in `~/.graft`
 with its own copy of Node, so it needs no Node on the laptop and keeps working
@@ -78,7 +79,7 @@ Supported platforms: macOS 13+ (Apple silicon and Intel), Windows 10/11
 konteks-remote status          # cloud readiness, lease, agents
 konteks-remote auth login codex
 konteks-remote auth login dsh  # asks for your DeepSeek API key, without echo
-konteks-remote auth login opencode  # once OpenCode is offered: pick a provider, then its link and code, or its API key without echo
+konteks-remote auth login opencode  # pick a provider, then its link and code, or its API key without echo
 konteks-remote agents
 konteks-remote doctor
 konteks-remote preview status  # this computer's live session previews (read-only)
@@ -245,25 +246,57 @@ only in the connector's private folder. If it cannot start (an unsupported
 version, say), it is left out and retried in the background with the reason in
 the connector log; your other agents keep working.
 
-Pi and the old bundled OpenCode are no longer supported: `install --agents`
-and `agent add` refuse them, and an installation that still lists one keeps
-working without it (the connector log says it was skipped). OpenCode 2 (your
-own install, `curl -fsSL https://opencode.ai/v2/install | bash`) is being added
-the same way as DeepSeek Harness: the connector can already find and
-version-check it (2.0.18 up to, not including, 3.0.0; `OPENCODE_EXECUTABLE`
-for other layouts). Its tool calls already go through the same policy as the
-other agents (shell commands, edits inside the working copy only, its code
-blocks limited to calls to Konteks' own tools, plan mode refused, and any
-call that skips the check takes OpenCode out of service on that computer).
-Signing it in works like the other agents: `konteks-remote auth login
-opencode` lists what your OpenCode offers (subscriptions first: OpenCode
-Console, ChatGPT, GitHub Copilot, SuperGrok, GitLab, Poe) and relays the link
-and code, or takes an API key without echo and types it into OpenCode's own
-prompt; `--provider` and `--method` pick directly, `--reuse` shows which
-providers your own OpenCode uses so you can sign in to the same ones here, and
-`auth logout opencode [--provider X]` signs out. Zen's free models are used
-only when you switch them on in Konteks. It is not offered yet: it cannot be
-installed or run until the launcher checkpoint lands.
+### OpenCode
+
+OpenCode 2 (`opencode`) runs from your own install too, never from the
+release. Supported versions are 2.0.18 up to, not including, 3.0.0: the line
+OpenCode's homepage installs. OpenCode 1 (npm `opencode-ai`, brew
+`anomalyco/tap/opencode`) is refused by name. Install it, then add it and sign
+it in:
+
+```sh
+curl -fsSL https://opencode.ai/v2/install | bash   # Windows: npm install -g @opencode/cli
+konteks-remote agent add opencode
+konteks-remote auth login opencode
+```
+
+The connector finds it on `PATH` (`opencode2` before `opencode`), in the
+homepage installer's `~/.opencode/bin`, npm's global folders, Homebrew, scoop
+or Chocolatey (`OPENCODE_EXECUTABLE` for any other layout), reads its version,
+and before every start proves with `opencode debug agents` that the Konteks
+settings are in force: every tool call asks first, repository config is
+ignored, and its plan mode is off. Its tool calls go through the same policy
+as the other agents (shell commands, edits inside the working copy only, its
+code blocks limited to calls to Konteks' own tools; any call that skips the
+check takes OpenCode out of service on that computer).
+
+Sign-in works like the other agents: `auth login opencode` lists what your
+OpenCode offers (subscriptions first: OpenCode Console, ChatGPT, GitHub
+Copilot, SuperGrok, GitLab, Poe) and relays the link and code, or takes an API
+key without echo and types it into OpenCode's own prompt; `--provider` and
+`--method` pick directly, `--reuse` shows which providers your own OpenCode
+uses so you can sign in to the same ones here, and `auth logout opencode
+[--provider X]` signs out. Subscription sign-ins can also be started from the
+site. Zen's free models are used only when you switch them on in Konteks.
+
+OpenCode runs with a scrubbed environment: every OpenCode command the
+connector starts (sessions, `--version`, `debug`, `auth`) gets only what it
+needs (PATH, locale, temp folders, proxy settings, a private home under the
+connector's folder) and never your `GITHUB_TOKEN`, `GH_TOKEN`, provider keys,
+`AWS_*`, `AZURE_*`, Google credentials or inherited `OPENCODE_*` variables.
+Your own OpenCode home, sign-ins and background service are never touched.
+
+If OpenCode cannot start, or is removed or replaced by an unsupported version,
+it is left out and retried in the background (it is found again if you
+reinstall it another way); your other agents keep working, and `doctor` says
+why. `doctor` also shows its version, how it was installed, the settings check,
+what it is signed in with (labels only), whether free models are on and
+whether its sessions get the QA browser.
+
+Pi is no longer supported: `install --agents` and `agent add` refuse it, and
+an installation that still lists it keeps working without it (the connector
+log says it was skipped). An installation from before 7.0.0 that listed the
+old bundled OpenCode now reads it as your own OpenCode 2.
 The Docker Compose remote
 instance is retired; the connector on your own computer is the only way to
 run Konteks agents.

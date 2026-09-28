@@ -1,7 +1,7 @@
 # Connect this machine to Konteks
 
-Paste the block below into Claude Code or Codex, in a repository you care
-about. Your agent will run two commands and then relay a few short questions.
+Paste the block below into Claude Code, Codex or OpenCode, in a repository
+you care about. Your agent will run two commands and then relay a few short questions.
 
 ```
 Run these two commands and then follow the JSON the second one prints.
@@ -52,8 +52,34 @@ and picks up at the repository step.
   single use, and it expires in ten minutes.
 - Your agent is a relay. It is never given a Konteks URL or credential, and
   the only command it is ever asked to run is `konteks-remote`.
-- The Claude Code or Codex login you already have is what runs Konteks work on
-  this machine. You are not asked to set up a provider.
+- The Claude Code or Codex login you already have, or the sign-in of your own
+  OpenCode or DeepSeek Harness, is what runs Konteks work on this machine. You
+  are not asked to set up a provider.
+
+## Agents
+
+Konteks runs the coding agents already on this machine: Claude Code, Codex,
+DeepSeek Harness and OpenCode 2. Onboarding finds the ones installed and says
+what each still needs.
+
+OpenCode 2 is the version OpenCode's homepage installs; OpenCode 1 is not
+supported. To add it, in your own terminal:
+
+```
+curl -fsSL https://opencode.ai/v2/install | bash
+konteks-remote agent add opencode
+konteks-remote auth login opencode
+```
+
+The last command lists what your OpenCode can sign in to (a subscription such
+as ChatGPT, GitHub Copilot or OpenCode Console, or any provider's API key,
+typed without echo). If you already use OpenCode, add `--reuse` to start from
+the providers it is signed in to. On Windows, install it with
+`npm install -g @opencode/cli`.
+
+OpenCode runs in a scrubbed environment: Konteks gives it a private home and
+only the settings it needs, never your `GITHUB_TOKEN`, provider keys or other
+credentials from your shell, and never touches your own OpenCode sign-ins.
 
 ## Platforms
 
