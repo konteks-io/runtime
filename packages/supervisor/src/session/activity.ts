@@ -1,5 +1,7 @@
 import { isSecretKey, redactText } from "@konteks/remote-common";
 import { DSH_TOOL_KINDS } from "./dsh-tool-governance.js";
+import { KONTEKS_CODE_MODE_SERVERS, parseKonteksCodeModeBlock } from "./opencode-code-mode.js";
+import { OPENCODE_TOOL_KINDS, openCodeToolName } from "./opencode-tool-governance.js";
 
 const TOOL_TITLE_PLACEHOLDER = /^(?:other|tool|unknown[ _-]?tool)$/i;
 const ACP_TOOL_KINDS = new Set([
@@ -51,6 +53,7 @@ export function canonicalizeAcpToolActivity(
     return value;
   }
   if (dialectId === "dsh") return canonicalizeDshToolActivity(candidate, prior);
+  if (dialectId === "opencode") return canonicalizeOpenCodeToolActivity(candidate, prior);
   if (dialectId !== "claude-code") return value;
   const meta = candidate._meta;
   const rawTool = meta !== null && typeof meta === "object" && !Array.isArray(meta)
@@ -120,6 +123,52 @@ function canonicalizeDshToolActivity(candidate: Record<string, unknown>, prior: 
     ...candidate,
     ...(name !== undefined && typeof candidate.name !== "string" ? { name } : {}),
     ...(kind !== undefined && (currentKind === undefined || currentKind === "other") ? { kind } : {}),
+  };
+}
+
+/** OpenCode's Code Mode, named so policy and people never read it as a shell command. */
+export const OPENCODE_CODE_MODE_NAME = "code_mode";
+
+/**
+ * OpenCode 2 names its tool only in a call's first `tool_call` title (later
+ * updates retitle it with the command or the path), so that name and its ACP
+ * kind are carried forward. A Code Mode block (`execute`) is shown as the
+ * Konteks tool it calls (`submit_result`, `platform__harness__plan_get`), read
+ * from its code with the same parser that approves it; any other block reads
+ * "Code Mode". An arbitrary title still never becomes a name.
+ */
+function canonicalizeOpenCodeToolActivity(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+  const toolCallId = typeof candidate.toolCallId === "string" ? candidate.toolCallId : "";
+  let name = prior?.name;
+  let kind = prior?.kind;
+  let title = prior?.title;
+  if (candidate.sessionUpdate === "tool_call" && prior === undefined) {
+    const tool = openCodeToolName(toolCallId, candidate.title, candidate._meta);
+    if (tool !== undefined && Object.hasOwn(OPENCODE_TOOL_KINDS, tool)) {
+      name = tool === "execute" ? OPENCODE_CODE_MODE_NAME : tool;
+      kind = OPENCODE_TOOL_KINDS[tool];
+      if (tool === "execute") title = "Code Mode";
+    }
+  }
+  const code = (candidate.rawInput as { code?: unknown } | undefined)?.code;
+  if ((name === OPENCODE_CODE_MODE_NAME || kind === "other") && typeof code === "string") {
+    const block = parseKonteksCodeModeBlock(code, KONTEKS_CODE_MODE_SERVERS);
+    if (block.ok) {
+      const tools = [...new Set(block.calls.map(call => call.tool))];
+      name = tools[0];
+      title = tools.join(", ");
+      kind = "other";
+    }
+  }
+  if (name === undefined && kind === undefined) return candidate;
+  const currentKind = typeof candidate.kind === "string" ? candidate.kind : undefined;
+  const currentTitle = typeof candidate.title === "string" ? candidate.title.trim() : undefined;
+  return {
+    ...candidate,
+    ...(name !== undefined ? { name } : {}),
+    ...(kind !== undefined && (currentKind === undefined || currentKind === "other") ? { kind } : {}),
+    // Code Mode's own title is always `execute`; show what it runs instead.
+    ...(title !== undefined && (currentTitle === undefined || currentTitle === "execute" || kind === "other") ? { title } : {}),
   };
 }
 

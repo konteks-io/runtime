@@ -33,6 +33,7 @@
     "@konteks/remote-common": "*",
     "@konteks/remote-release": "*",
     "@konteks/remote-sysmon": "*",
+    "acorn": "8.18.0",
     "ajv": "^8.20.0",
     "pino": "^9.5.0",
     "ws": "^8.18.0",

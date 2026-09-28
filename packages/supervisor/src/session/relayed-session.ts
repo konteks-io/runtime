@@ -44,15 +44,16 @@ import {
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
-import { DshToolGovernance } from "./dsh-tool-governance.js";
+import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
+import { openCodeKonteksToolsLine, openCodeResultToolReference } from "./opencode-prompt.js";
 import { compileResultSchema as compileTurnValidator, StructuredResultToolServer, toolInputSchema } from "../structured-result/result-tool-server.js";
 import {
   findStructuredContract,
   followUpRequestId,
   MAX_STRUCTURED_TURN_TEXT,
   parseFencedResult,
-  RESULT_FOLLOW_UP,
-  RESULT_TOOL_LINE,
+  resultFollowUp,
+  resultToolLine,
   resultToolLineWithSchema,
   rewriteStructuredPrompt,
   sumPromptUsage,
@@ -189,8 +190,12 @@ export class RelayedSession {
   private readonly lastChunkText = new Map<string, { text: string; inPath: boolean }>();
   /** Safe tool identity carried from `tool_call` to sparse terminal updates. */
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
-  /** Rebuilds DeepSeek Harness permission requests and trips on an unasked tool (dsh-tool-governance.ts). */
-  private readonly dshGovernance: DshToolGovernance | null;
+  /** Rebuilds a host agent's permission requests and trips on an unapproved tool (host-tool-governance.ts: DeepSeek Harness, OpenCode). */
+  private readonly toolGovernance: HostToolGovernance | null;
+  /** The MCP servers this session gave its agent (the only Code Mode namespaces an OpenCode block may call). */
+  private sessionServers: ReadonlySet<string> = new Set();
+  /** An OpenCode session is told once how Konteks runs its tools (in its first prompt). */
+  private toolFormTold = false;
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
   private readonly executionGate: NativeExecutionGate | null;
@@ -212,7 +217,7 @@ export class RelayedSession {
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
 
   constructor(readonly assignment: RemoteWorkAssignment, private readonly deps: RelayedSessionDeps) {
-    this.dshGovernance = assignment.agentRoute.agentId === "dsh" ? new DshToolGovernance() : null;
+    this.toolGovernance = hostToolGovernance(assignment.agentRoute.agentId);
     // Bound only after input preparation proves Core's claim-bound session.
     this.boundChannelId = null;
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
@@ -452,6 +457,7 @@ export class RelayedSession {
         this.deps.assertExecutionOwned?.();
       },
     } : undefined;
+    this.sessionServers = new Set(mcpServers.map(server => server.name));
     const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession({
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
@@ -736,7 +742,7 @@ export class RelayedSession {
           if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
           const instructions = this.preparedInputs?.skillInstructions;
           const params = instructions ? { ...request.params, prompt: [{ type: "text" as const, text: instructions }, ...request.params.prompt] } : request.params;
-          const prompt = await this.prepareStructuredPrompt(request.id, params.prompt);
+          const prompt = await this.prepareAgentPrompt(request.id, params.prompt);
           try { await this.deps.runner.prompt(ref, request.id, { ...params, prompt }); }
           catch (error) { this.endStructuredTurn(request.id); throw error; }
         }
@@ -827,7 +833,7 @@ export class RelayedSession {
       if (message.method === "session/prompt") {
         try {
           const current = params as typeof message.params;
-          const prompt = await this.prepareStructuredPrompt(message.id, current.prompt);
+          const prompt = await this.prepareAgentPrompt(message.id, current.prompt);
           await this.deps.runner.prompt(ref, message.id, { ...current, prompt });
         }
         catch (error) {
@@ -918,9 +924,9 @@ export class RelayedSession {
         // A working agent keeps its preview from stopping as idle.
         if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
         this.observeStructuredText((event.params as { update?: unknown } | null)?.update);
-        const bypass = this.dshGovernance?.observe((event.params as { update?: unknown } | null)?.update) ?? null;
+        const bypass = this.toolGovernance?.observe((event.params as { update?: unknown } | null)?.update, this.sessionCwd()) ?? null;
         await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
-        if (bypass) await this.onDshGovernanceBypass(bypass);
+        if (bypass) await this.onToolGovernanceBypass(bypass);
         return;
       }
       case "prompt_result": {
@@ -1028,8 +1034,26 @@ export class RelayedSession {
       return prompt;
     }
     this.structuredTurn = { requestId, validate: compileTurnValidator(contract.schema), definition, text: "", followUp: null };
-    const line = definition === "schema" ? RESULT_TOOL_LINE : resultToolLineWithSchema(contract.schema, toolInputSchema(contract.schema).wrapped);
+    const call = this.resultToolCall();
+    const line = definition === "schema" ? resultToolLine(call) : resultToolLineWithSchema(contract.schema, toolInputSchema(contract.schema).wrapped, call);
     return rewriteStructuredPrompt(prompt, contract, line);
+  }
+
+  /**
+   * The prompt the agent receives: the structured-result rewrite, and for an
+   * OpenCode session's first prompt, the one line saying how Konteks runs its
+   * tools (Code Mode, opencode-code-mode.ts).
+   */
+  private async prepareAgentPrompt<B extends PromptBlock>(requestId: string, prompt: B[]): Promise<B[]> {
+    const prepared = await this.prepareStructuredPrompt(requestId, prompt);
+    if (this.assignment.agentRoute.agentId !== "opencode" || this.toolFormTold) return prepared;
+    this.toolFormTold = true;
+    return [{ type: "text", text: openCodeKonteksToolsLine(this.sessionServers) } as unknown as B, ...prepared];
+  }
+
+  /** How this session's agent is told to call the result tool; undefined for the plain tool name. */
+  private resultToolCall(): string | undefined {
+    return this.assignment.agentRoute.agentId === "opencode" ? `\`${openCodeResultToolReference}\`` : undefined;
   }
 
   /** The turn never reached the agent (or was refused): forget it and put the tool back. */
@@ -1083,7 +1107,7 @@ export class RelayedSession {
     turn.text = "";
     this.logger.info({ event: "structured_result.follow_up", ...context }, "structured turn ended without a result; asking once more");
     try {
-      await this.deps.runner.prompt(this.acpSessionRef, followUpId, { prompt: [{ type: "text", text: RESULT_FOLLOW_UP }] });
+      await this.deps.runner.prompt(this.acpSessionRef, followUpId, { prompt: [{ type: "text", text: resultFollowUp(this.resultToolCall()) }] });
     } catch {
       this.endStructuredTurn(followUpId);
       return { requestId, result };
@@ -1113,16 +1137,19 @@ export class RelayedSession {
   private async onPermissionRequest(requestId: string, params: RequestPermissionRequest): Promise<void> {
     const ref = this.acpSessionRef;
     if (ref === null) return;
-    if (this.dshGovernance) {
-      // dsh asks with only a tool call id; judge the call it names, or refuse.
-      const verdict = this.dshGovernance.decide(params, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`);
+    if (this.toolGovernance) {
+      // A host agent is never answered "always", by policy or by a person:
+      // OpenCode would store it and stop asking.
+      params = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
+      // A host agent's request is judged by the call it names, or refused.
+      const verdict = this.toolGovernance.decide(params, { cwd: this.sessionCwd(), servers: this.sessionServers, browserTools: this.browserGateway !== null });
       if (verdict.kind !== "evaluate") {
         if (this.closed) return;
         this.deps.assertExecutionOwned?.();
-        const kind = verdict.kind === "allow" ? "allow_once" : "reject_once";
-        const optionId = params.options.find(option => option.kind === kind)?.optionId;
+        const optionId = params.options.find(option => option.kind === (verdict.kind === "allow" ? "allow_once" : "reject_once"))?.optionId;
         if (verdict.kind === "deny") {
-          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId, reason: verdict.reason }, "DeepSeek Harness tool call refused by policy");
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId, reason: verdict.reason.slice(0, 512) },
+            `${this.toolGovernance.agentName} tool call refused by policy`);
         }
         return void (await this.deps.runner.answer(ref, requestId, optionId === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
       }
@@ -1149,17 +1176,25 @@ export class RelayedSession {
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: params.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
   }
 
+  /** The working copy the session's agent runs in. */
+  private sessionCwd(): string {
+    return this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`;
+  }
+
   /**
-   * The Konteks ask hook did not run for a gated dsh tool that has now
-   * completed: stop the turn and take dsh out of service until the connector
-   * restarts, so at most one call ever runs unjudged.
+   * A host agent ran a gated tool without Konteks' approval (dsh's ask hook
+   * did not run; OpenCode ran a call it never asked for, or a Code Mode call
+   * nobody approved): stop the turn and take the agent out of service until
+   * the connector restarts, so at most one call ever runs unjudged. The
+   * other agents keep running.
    */
-  private async onDshGovernanceBypass(bypass: { toolCallId: string; title: string }): Promise<void> {
+  private async onToolGovernanceBypass(bypass: HostToolBypass): Promise<void> {
+    const governance = this.toolGovernance!;
     const ref = this.acpSessionRef;
-    this.logger.error({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: bypass.toolCallId, tool: bypass.title.slice(0, 128), diagnostic: "dsh_tool_governance_bypassed" },
-      "DeepSeek Harness ran a gated tool without asking; stopping the turn and taking it out of service");
+    this.logger.error({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: bypass.toolCallId, tool: bypass.title.slice(0, 128), diagnostic: governance.bypassDiagnostic },
+      `${governance.agentName} ran a gated tool without approval; stopping the turn and taking it out of service`);
     if (ref !== null) await this.deps.runner.cancel(ref).catch(error => this.logger.warn({ err: error }, "cancel after a governance bypass failed"));
-    await this.deps.runner.quarantine?.("DeepSeek Harness ran a tool without asking Konteks first. Update or reinstall DeepSeek Harness, then restart the connector.")
+    await this.deps.runner.quarantine?.(governance.quarantineMessage)
       .catch(error => this.logger.warn({ err: error }, "quarantine after a governance bypass failed"));
     await this.close("agent_exited");
   }

@@ -14,15 +14,27 @@ import type { ResultToolDefinition } from "./result-tool-server.js";
  * re-read its tools), the line carries the schema instead; the tool still
  * validates and corrects.
  */
-export const RESULT_TOOL_LINE = `When you are finished, call \`${STRUCTURED_RESULT_TOOL_NAME}\` once with your result.`;
+export const RESULT_TOOL_LINE = resultToolLine();
+
+/**
+ * The tool line for an agent that calls tools in its own form (OpenCode's
+ * Code Mode: `await tools["konteks-result"].submit_result({ ... })`).
+ */
+export function resultToolLine(call = `\`${STRUCTURED_RESULT_TOOL_NAME}\``): string {
+  return `When you are finished, call ${call} once with your result.`;
+}
 
 /** The one follow-up prompt, sent when the turn ended with neither a valid call nor a valid fenced result. */
-export const RESULT_FOLLOW_UP = `You did not call \`${STRUCTURED_RESULT_TOOL_NAME}\` with a valid result. Call it now, once, with your whole result.`;
+export const RESULT_FOLLOW_UP = resultFollowUp();
 
-export function resultToolLineWithSchema(schema: Record<string, unknown>, wrapped: boolean): string {
+export function resultFollowUp(call = `\`${STRUCTURED_RESULT_TOOL_NAME}\``): string {
+  return `You did not call ${call} with a valid result. Call it now, once, with your whole result.`;
+}
+
+export function resultToolLineWithSchema(schema: Record<string, unknown>, wrapped: boolean, call = `the \`${STRUCTURED_RESULT_TOOL_NAME}\` tool`): string {
   const where = wrapped ? "with your whole result in its `result` argument" : "with your whole result as its arguments (one JSON object)";
   return [
-    `When you are finished, call the \`${STRUCTURED_RESULT_TOOL_NAME}\` tool once ${where}. The result must validate against this JSON Schema; if the tool answers with problems, fix exactly those and call it again.`,
+    `When you are finished, call ${call} once ${where}. The result must validate against this JSON Schema; if the tool answers with problems, fix exactly those and call it again.`,
     "",
     "```json",
     JSON.stringify(schema, null, 2),

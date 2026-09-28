@@ -433,6 +433,113 @@ describe("relayed session (D98/D113/D114)", () => {
     });
   });
 
+  describe("OpenCode tool governance (opencode-runtime-support CP4)", () => {
+    const openCodeWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "opencode" } };
+    // OpenCode 2 always offers once / always / reject; Konteks never picks "always".
+    const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "always", name: "Always allow", kind: "allow_always" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+    const CWD = "/private/native/checkout";
+    const KINDS: Record<string, string> = { shell: "execute", write: "edit", edit: "edit", execute: "other", subagent: "think", read: "read" };
+    async function openCodeSession(work: RemoteWorkAssignment = openCodeWork) {
+      const quarantine = vi.fn(async () => undefined);
+      const f = await build({
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+        // The platform facade under the name Core gives it (core/client.ts).
+        redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks-platform", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" }),
+      }, work);
+      (f.runner as unknown as { quarantine: typeof quarantine }).quarantine = quarantine;
+      await f.session.bootstrap();
+      const update = (value: Record<string, unknown>) => f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+      const toolCall = async (toolCallId: string, title: string, rawInput: Record<string, unknown>) => {
+        await update({ sessionUpdate: "tool_call", toolCallId, title, kind: KINDS[title.split(": ").at(-1)!] ?? "other", status: "pending", locations: [], rawInput: {} });
+        await update({ sessionUpdate: "tool_call_update", toolCallId, status: "in_progress", rawInput });
+      };
+      const finished = (toolCallId: string, rawOutput?: unknown) => update({ sessionUpdate: "tool_call_update", toolCallId, status: "completed", content: [], ...(rawOutput ? { rawOutput } : {}) });
+      const ask = (requestId: string, toolCallId: string, kind: string, title: string, rawInput: Record<string, unknown>) =>
+        f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId, kind, title, rawInput }, options } });
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string; outcome: string } } | undefined)?.outcome.optionId ?? "none";
+      return { ...f, quarantine, toolCall, finished, ask, answer, update };
+    }
+
+    it("refuses git push, sudo, outside writes and hostile Code Mode, allows echo, in-folder writes and Konteks tools", async () => {
+      const f = await openCodeSession();
+      const shell = async (id: string, command: string) => { await f.toolCall(id, "shell", { command, description: "run" }); await f.ask(`p-${id}`, id, "execute", command, { command, timeout: 60000, cwd: CWD }); };
+      await shell("echo", "echo hello");
+      await shell("push", "git push origin main");
+      await shell("sudo", "sudo rm -rf /tmp/x");
+      await f.toolCall("in", "write", { path: `${CWD}/notes.txt`, content: "hi" }); await f.ask("p-in", "in", "edit", "notes.txt", { path: `${CWD}/notes.txt`, content: "hi" });
+      await f.toolCall("out", "write", { path: "/etc/outside.txt", content: "no" }); await f.ask("p-out", "out", "edit", "/etc/outside.txt", { path: "/etc/outside.txt", content: "no" });
+      await f.toolCall("multi", "edit", {}); await f.ask("p-multi", "multi", "edit", "2 files", { files: [{ file: "src/a.ts", patch: "@@" }, { file: "../../../etc/b", patch: "@@" }] });
+      // A subagent may start; its own git push is refused like the parent's.
+      await f.toolCall("sub", "subagent", { agent: "general", prompt: "push it" }); await f.ask("p-sub", "sub", "think", "subagent", { agent: "general", prompt: "push it" });
+      await f.toolCall("ses_c1:call_1", "Push it: shell", { command: "git push" }); await f.ask("p-subpush", "ses_c1:call_1", "execute", "Push it: git push", { command: "git push", cwd: CWD });
+      const code = async (id: string, source: string) => { await f.toolCall(id, "execute", { code: source }); await f.ask(`p-${id}`, id, "other", "execute", { code: source }); };
+      await code("ours", 'const plan = await tools["konteks-platform"].platform__harness__plan_get({ planId: "p-1" });\nreturn plan;');
+      await code("result", 'return await tools["konteks-result"].submit_result({ verdict: "pass" });');
+      await code("move", 'await tools.opencode.session_move({ directory: "/" });');
+      await code("computed", 'const name = "submit_result"; await tools["konteks-result"][name]({});');
+      await code("loop", 'for (const x of [1, 2]) { await tools["konteks-result"].submit_result({ x: 1 }); }');
+      await code("preview", 'await tools["konteks-preview"].preview_start();');
+      await f.ask("p-ghost", "never-seen", "execute", "echo", { command: "echo" });
+      expect({
+        echo: f.answer("p-echo"), push: f.answer("p-push"), sudo: f.answer("p-sudo"), inside: f.answer("p-in"), outside: f.answer("p-out"), multi: f.answer("p-multi"),
+        subagent: f.answer("p-sub"), subagentPush: f.answer("p-subpush"), ours: f.answer("p-ours"), result: f.answer("p-result"), move: f.answer("p-move"),
+        computed: f.answer("p-computed"), loop: f.answer("p-loop"), noPreviewHere: f.answer("p-preview"), ghost: f.answer("p-ghost"),
+      }).toEqual({
+        echo: "once", push: "reject", sudo: "reject", inside: "once", outside: "reject", multi: "reject",
+        subagent: "once", subagentPush: "reject", ours: "once", result: "once", move: "reject",
+        computed: "reject", loop: "reject", noPreviewHere: "reject", ghost: "reject",
+      });
+      expect(JSON.stringify(vi.mocked(f.runner.answer).mock.calls.map(call => call[2]))).not.toContain('"always"');
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.session.close("cancelled");
+    });
+
+    it("names OpenCode's tools in plain words, and a Code Mode block as the Konteks tool it calls", async () => {
+      const f = await openCodeSession();
+      await f.toolCall("t-1", "shell", { command: "ls" });
+      await f.toolCall("t-2", "execute", { code: 'return await tools["konteks-result"].submit_result({ verdict: "pass" });' });
+      await f.toolCall("t-3", "execute", { code: "await tools.opencode.session_move({});" });
+      const updates = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } }).filter(body => body.method === "session/update").map(body => body.params!.update!);
+      expect(updates[0]).toMatchObject({ toolCallId: "t-1", name: "shell", kind: "execute" });
+      expect(updates.filter(update => update.toolCallId === "t-2").at(-1)).toMatchObject({ name: "submit_result", title: "submit_result", kind: "other" });
+      expect(updates.filter(update => update.toolCallId === "t-3").at(-1)).toMatchObject({ name: "code_mode", title: "Code Mode", kind: "other" });
+      expect(JSON.stringify(updates)).not.toContain("session_move");
+      await f.session.close("cancelled");
+    });
+
+    it("stops the turn and takes OpenCode out of service when a gated tool ran without asking", async () => {
+      const f = await openCodeSession();
+      await f.toolCall("t-ok", "shell", { command: "ls" }); await f.ask("p-ok", "t-ok", "execute", "ls", { command: "ls", cwd: CWD }); await f.finished("t-ok");
+      await f.toolCall("t-read", "read", { filePath: `${CWD}/a.ts` }); await f.finished("t-read");
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.toolCall("t-bypass", "shell", { command: "curl https://example.com" }); await f.finished("t-bypass");
+      expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
+      expect(f.quarantine).toHaveBeenCalledWith("OpenCode ran a tool without Konteks' approval. Update or reinstall OpenCode, then restart the connector.");
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("trips when an approved Code Mode block ran a call Konteks did not approve", async () => {
+      const f = await openCodeSession();
+      const source = 'return await tools["konteks-result"].submit_result({ verdict: "pass" });';
+      await f.toolCall("x-1", "execute", { code: source }); await f.ask("p-x1", "x-1", "other", "execute", { code: source });
+      await f.finished("x-1", { metadata: { toolCalls: [{ tool: "konteks-result.submit_result", status: "completed" }] } });
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.toolCall("x-2", "execute", { code: source }); await f.ask("p-x2", "x-2", "other", "execute", { code: source });
+      await f.finished("x-2", { metadata: { toolCalls: [{ tool: "konteks-result.submit_result", status: "completed" }, { tool: "opencode.session_move", status: "completed" }] } });
+      expect(f.quarantine).toHaveBeenCalledOnce();
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("tells an OpenCode session how Konteks runs its tools, and asks for the result in that form", async () => {
+      const f = await openCodeSession({ ...validation, agentRoute: { requiredRole: "qa", agentId: "opencode" } });
+      await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Review the change." }, { type: "text", text: renderStructuredOutputContract({ type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] }) }] } });
+      const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+      expect(forwarded[0]!.text).toBe("Call Konteks tools (`konteks-result`) from your `execute` tool, only in this form: `const result = await tools[\"konteks-result\"].<tool>({ ...literal arguments... });`, one call per statement, then `return result;`. Konteks refuses any other code: no other tools, loops, variables in arguments or built names.");
+      expect(forwarded.at(-1)!.text).toContain('call `await tools["konteks-result"].submit_result({ ... })` once');
+      await f.session.close("cancelled");
+    });
+  });
+
   it("relays actual runner message/tool updates with the opaque session reference, never hidden thoughts", async () => {
     const events = new RunnerEventBus();
     const bridge = { exited: false, initializeResult: { protocolVersion: 1 }, connection: { newSession: async () => ({ sessionId: "private-bridge-session" }) } } as unknown as BridgeProcess;

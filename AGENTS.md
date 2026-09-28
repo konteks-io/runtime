@@ -116,8 +116,9 @@ fields, re-verify on every load, start self-check, `offered`). A host agent
 whose adapter is not `offered` is refused on install and `agent add`, never
 detected at enrollment, and dropped from a stored record like a retired one.
 OpenCode 2 is registered (binary launch mode, `>=2.0.18 <3.0.0`) and located
-by `opencode-installation.ts`, but NOT offered until its security checkpoint
-(opencode-runtime-support CP4); its runner refuses to sign in until CP3. Every
+by `opencode-installation.ts`, but NOT offered (`openCodeInstallAdapter.offered`
+stays false until opencode-runtime-support CP6, after CP3's sign-in); its runner
+refuses to sign in until CP3. Every
 OpenCode execution, `--version` and `debug` included, gets the allow-list
 environment of `openCodeEnvironment` (never `GITHUB_TOKEN`, `GH_TOKEN` or any
 other credential or inherited `OPENCODE_*` variable) plus Konteks' own
@@ -140,6 +141,40 @@ stayed unchanged for 5 s), and stopping any background service of the
 private home before and after (only processes whose environment names it;
 the person's own service is never touched). Drift reads
 `opencode_unsupported_installation`.
+
+OpenCode's tool governance (CP4) is the runtime's own, as dsh's: every
+`session/request_permission` of an OpenCode or dsh session goes through
+`hostToolGovernance` (`supervisor/src/session/host-tool-governance.ts`) and
+then the unchanged `EvaluatorPolicyResponder` + `createWorkspaceToolPolicy()`.
+`OpenCodeToolGovernance` (`opencode-tool-governance.ts`) names the tool from
+the call's FIRST `tool_call` title (a subagent's `<childSessionId>:<callId>`
+calls, titled `<subagent>: <tool>`, are judged the same), requires the
+request's input to match what the call reported, and rebuilds it: shell →
+the command (and a shell folder outside the working copy is refused);
+edit/write/patch → every `files[].file`/path resolved against the working copy,
+all inside it; `.env` reads refused; subagents and todo lists allowed; web
+fetches as for Claude/Codex; uncorrelated, unknown or mismatched → refused.
+MCP tools are reachable only through Code Mode (`execute`), which runs a whole
+code block after one ask: `opencode-code-mode.ts` parses it with acorn (a
+supervisor dependency, MIT) and approves only `[const|let x =] await
+tools["<server>"].<tool>(<literal args>)` statements and a final `return`,
+for this session's own MCP server names; `rawOutput.metadata.toolCalls` must
+then list only approved calls (an unasked `tools.search` lookup is fine).
+`allow_always` is never offered to policy or a person (OpenCode would store it
+in its database and stop asking). The tripwire (`observe`) fires on a gated
+tool that completes unasked, an unapproved Code Mode call, or an unasked read
+of `.env` or outside the working copy: the turn is cancelled and
+`runner.quarantine` takes OpenCode out of service on this connector (the other
+agents keep running). `canonicalizeAcpToolActivity` names OpenCode tools from
+the first title and a Code Mode block as the Konteks tool it calls. An OpenCode
+session's first prompt carries one line with the accepted form
+(`opencode-prompt.ts`), and its result-tool lines name
+`await tools["konteks-result"].submit_result({ ... })`. The runner refuses
+OpenCode's `plan` mode (`HostAgentRunnerAdapter.refusedSessionModes`: on
+`set_mode`, `set_config_option`, an admitted session configuration, and in
+what is reported), the locked config denies Code Mode's built-in browser
+(`browser.*`, checked by the self-check), and every bridge client answers
+`fs/*` and `terminal/*` with "method not found".
 
 Every installed native agent reports the models it offers (System One §6a,
 KM6; `ModelCapabilitySnapshotProducer`): an agent whose release carries a
