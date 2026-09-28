@@ -194,8 +194,7 @@ export function openCodeOptionBilling(agent: Pick<ConnectedAgentView, "agentId" 
   const slash = value.indexOf("/");
   if (slash <= 0) return undefined;
   const providerId = value.slice(0, slash).toLowerCase();
-  // The cast only bridges packages' optional `billing` (declared without `| undefined`) under exactOptionalPropertyTypes.
-  const credential = credentialKindFor(agent.credentials as Parameters<typeof credentialKindFor>[0], providerId);
+  const credential = credentialKindFor(agent.credentials, providerId);
   return classifyAgentBilling({ agentId: "opencode", providerId, ...(credential ? { credential } : {}) });
 }
 
