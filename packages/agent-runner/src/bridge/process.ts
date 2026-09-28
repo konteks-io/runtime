@@ -139,9 +139,18 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
     sessionUpdate: (params) => options.handlers.onSessionUpdate(params),
     requestPermission: (params) => options.handlers.onRequestPermission(params),
     createElicitation: (params) => options.handlers.onCreateElicitation(params),
-    // No fs/terminal capabilities are offered: the agent operates inside the
-    // component's container boundary through its own tools, never through the
-    // runner acting on its behalf.
+    // No fs/terminal capabilities are offered: the agent operates inside its
+    // working copy through its own tools, which Konteks governs, never through
+    // the runner acting on its behalf. An agent that calls them anyway gets
+    // "method not found" (the SDK would otherwise answer a write with an empty
+    // success and a read with nothing).
+    readTextFile: async () => { throw RequestError.methodNotFound("fs/read_text_file"); },
+    writeTextFile: async () => { throw RequestError.methodNotFound("fs/write_text_file"); },
+    createTerminal: async () => { throw RequestError.methodNotFound("terminal/create"); },
+    terminalOutput: async () => { throw RequestError.methodNotFound("terminal/output"); },
+    releaseTerminal: async () => { throw RequestError.methodNotFound("terminal/release"); },
+    waitForTerminalExit: async () => { throw RequestError.methodNotFound("terminal/wait_for_exit"); },
+    killTerminal: async () => { throw RequestError.methodNotFound("terminal/kill"); },
   };
   const stream = ndJsonStream(
     Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,

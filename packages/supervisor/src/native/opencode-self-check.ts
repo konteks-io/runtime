@@ -164,6 +164,7 @@ const PROBES: ReadonlyArray<readonly [string, string, OpenCodePermissionRule["ef
   ["read", ".env", "ask", "reading .env"],
   ["read", "config/.env.local", "ask", "reading .env.local"],
   ["external_directory", "/etc/passwd", "deny", "a folder outside the working copy"],
+  ["browser.navigate", "https://example.com", "deny", "the built-in browser"],
 ];
 
 function readRules(value: unknown): OpenCodePermissionRule[] | null {

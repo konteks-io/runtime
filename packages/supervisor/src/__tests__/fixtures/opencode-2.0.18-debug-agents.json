@@ -104,6 +104,11 @@
         "action": "external_directory",
         "resource": "*",
         "effect": "deny"
+      },
+      {
+        "action": "browser.*",
+        "resource": "*",
+        "effect": "deny"
       }
     ]
   },
@@ -205,6 +210,11 @@
       },
       {
         "action": "external_directory",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "browser.*",
         "resource": "*",
         "effect": "deny"
       }
@@ -385,6 +395,11 @@
         "action": "external_directory",
         "resource": "*",
         "effect": "deny"
+      },
+      {
+        "action": "browser.*",
+        "resource": "*",
+        "effect": "deny"
       }
     ]
   },
@@ -498,6 +513,11 @@
         "action": "external_directory",
         "resource": "*",
         "effect": "deny"
+      },
+      {
+        "action": "browser.*",
+        "resource": "*",
+        "effect": "deny"
       }
     ]
   },
@@ -604,6 +624,11 @@
       },
       {
         "action": "external_directory",
+        "resource": "*",
+        "effect": "deny"
+      },
+      {
+        "action": "browser.*",
         "resource": "*",
         "effect": "deny"
       }

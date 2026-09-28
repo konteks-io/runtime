@@ -54,6 +54,12 @@ export interface HostAgentRunnerAdapter {
   hostVersion(config: RunnerConfig): string | undefined;
   /** Whether a turn reports billing token usage (false when the agent sends none). */
   readonly tokenUsageObservable: boolean;
+  /**
+   * Session modes Konteks never lets this agent enter, with the plain line a
+   * refusal carries: refused on `set_mode` and `set_config_option`, refused in
+   * an admitted session configuration, and dropped from what is reported.
+   */
+  readonly refusedSessionModes?: { readonly modeIds: readonly string[]; readonly message: string };
 }
 
 /** One execution process's hold on its working copy (`bindWorkingCopy`). */

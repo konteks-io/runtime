@@ -144,6 +144,7 @@ describe("the Konteks OpenCode configuration", () => {
         { action: "grep", resource: "*", effect: "allow" },
         { action: "todowrite", resource: "*", effect: "allow" },
         { action: "external_directory", resource: "*", effect: "deny" },
+        { action: "browser.*", resource: "*", effect: "deny" },
       ],
       share: "disabled", update: "disable", snapshots: false, lsp: false, formatter: false, plugins: [],
       agents: { title: { disabled: true }, plan: { disabled: true } },
@@ -164,6 +165,9 @@ describe("the Konteks OpenCode configuration", () => {
     expect(openCodePermissionDecision(resolved, "read", ".env.production")).toBe("ask");
     expect(openCodePermissionDecision(resolved, "read", ".env.example")).toBe("allow");
     expect(openCodePermissionDecision(resolved, "external_directory", "/etc/passwd")).toBe("deny");
+    // Code Mode's built-in browser is removed from the catalogue; Konteks' own browser server is another namespace.
+    expect(openCodePermissionDecision(resolved, "browser.navigate", "https://example.com")).toBe("deny");
+    expect(openCodePermissionDecision(resolved, "konteks-browser.browser_click", "*")).toBe("ask");
     expect(openCodePermissionDecision([{ action: "read", resource: "a.(b)", effect: "deny" }], "read", "a.(b)")).toBe("deny");
     expect(openCodePermissionDecision([{ action: "read", resource: "a.(b)", effect: "deny" }], "read", "aX(b)")).toBeUndefined();
   });

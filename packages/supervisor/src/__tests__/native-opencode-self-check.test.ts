@@ -78,9 +78,10 @@ describe("the OpenCode start self-check", () => {
   const drifted = (change: (list: Agent[]) => void) => { const list = agents(); change(list); return JSON.stringify(list); };
   it.each([
     ["a rule after ours", drifted(list => list[0]!.permissions.push({ action: "bash", resource: "*", effect: "allow" })), /build: the Konteks rules are not last.*shell command is allow/],
-    ["our catch-all ask missing", drifted(list => { for (const agent of list) agent.permissions = agent.permissions.filter((rule, index, all) => !(index === all.length - 10 && rule.action === "*")); }), /the Konteks rules are not last.*shell command is allow/],
+    ["our catch-all ask missing", drifted(list => { for (const agent of list) agent.permissions = agent.permissions.filter((rule, index, all) => !(index === all.length - 11 && rule.action === "*")); }), /the Konteks rules are not last.*shell command is allow/],
     [".env no longer gated", drifted(list => { for (const agent of list) agent.permissions = agent.permissions.filter(rule => !(rule.resource === "*.env" && rule.effect === "ask")); }), /reading \.env is allow/],
     ["outside folders not denied", drifted(list => { for (const agent of list) agent.permissions.push({ action: "external_directory", resource: "*", effect: "allow" }); }), /folder outside the working copy is allow/],
+    ["the built-in browser back", drifted(list => { for (const agent of list) agent.permissions.push({ action: "browser.*", resource: "*", effect: "allow" }); }), /built-in browser is allow/],
     ["plan back", drifted(list => list.push({ id: "plan", permissions: [] } as Agent)), /agent plan is not switched off/],
     ["title back", drifted(list => list.push({ id: "title", permissions: [] } as Agent)), /agent title is not switched off/],
     ["no build agent", drifted(list => list.splice(list.findIndex(agent => agent.id === "build"), 1)), /build agent is missing/],

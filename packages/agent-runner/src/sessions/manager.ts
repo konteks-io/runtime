@@ -109,6 +109,12 @@ export interface SessionManagerOptions {
   logger?: Logger;
   /** Auth failures must invalidate a prior identity probe before new work is admitted. */
   onAuthRequired?: () => void;
+  /**
+   * Session modes this agent must never enter (OpenCode's `plan`): refused on
+   * `set_mode`, on `set_config_option` for `mode` and in an admitted session
+   * configuration, and dropped from the configuration the agent reports.
+   */
+  refusedModes?: { readonly modeIds: readonly string[]; readonly message: string };
 }
 
 export interface SessionRefStore {
@@ -272,6 +278,7 @@ export class SessionManager {
   }
 
   private async createOwned(args: CreateSessionArgs, ref: string, loadFromRef?: string): Promise<CreatedSession> {
+    this.assertAdmittedModes(args.sessionConfig);
     if (this.sessions.has(ref) || this.creatingRefs.has(ref)) throw new RemoteInstanceError("recovery_required", "session reference already has a local owner");
     this.creatingRefs.add(ref);
     try {
@@ -527,6 +534,7 @@ export class SessionManager {
     // it). The successor's fence is installed and asserted below, and the
     // durable generation transfer in beforeCreate is what actually fences
     // the reference.
+    this.assertAdmittedModes(args.sessionConfig);
     await args.lifecycle?.beforeCreate(ref);
     // beforeCreate fsyncs the generation transfer. Install the successor fence
     // synchronously before the first provider-facing continuation operation.
@@ -712,6 +720,7 @@ export class SessionManager {
 
   setMode(acpSessionRef: string, requestId: string, params: Omit<SetSessionModeRequest, "sessionId">): void {
     const record = this.require(acpSessionRef);
+    if (this.refusesMode(params.modeId)) return this.refuseMode(record, acpSessionRef, requestId, "session/set_mode");
     const operation = this.requireBridge(record)
       .connection.setSessionMode({ ...params, sessionId: record.bridgeSessionId })
       .then((result) => this.options.events.publish({ kind: "set_mode_result", acpSessionRef, requestId, result }))
@@ -724,14 +733,55 @@ export class SessionManager {
 
   setConfigOption(acpSessionRef: string, requestId: string, params: Omit<SetSessionConfigOptionRequest, "sessionId">): void {
     const record = this.require(acpSessionRef);
+    if (params.configId === "mode" && this.refusesMode((params as { value?: unknown }).value)) {
+      return this.refuseMode(record, acpSessionRef, requestId, "session/set_config_option");
+    }
     const operation = this.requireBridge(record)
       .connection.setSessionConfigOption({ ...params, sessionId: record.bridgeSessionId } as SetSessionConfigOptionRequest)
-      .then((result) => this.options.events.publish({ kind: "set_config_option_result", acpSessionRef, requestId, result }))
+      .then((result) => this.options.events.publish({ kind: "set_config_option_result", acpSessionRef, requestId,
+        result: { ...result, configOptions: this.withoutRefusedModes(result.configOptions) } }))
       .catch((error: unknown) => {
         this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/set_config_option", ...classifyBridgeError(error) });
         throw error;
       });
     this.track(record, operation);
+  }
+
+  private refusesMode(modeId: unknown): boolean {
+    return typeof modeId === "string" && (this.options.refusedModes?.modeIds.includes(modeId) ?? false);
+  }
+
+  /** A mode this agent must never enter was named in an admitted session configuration. */
+  private assertAdmittedModes(sessionConfig: Record<string, string> | undefined): void {
+    if (sessionConfig && this.refusesMode(sessionConfig.mode)) {
+      throw new RemoteInstanceError("permission_denied", this.options.refusedModes!.message);
+    }
+  }
+
+  /** Refuse a mode change before it reaches the agent; answered like the agent's own invalid-params error. */
+  private refuseMode(record: SessionRecord, acpSessionRef: string, requestId: string, method: "session/set_mode" | "session/set_config_option"): void {
+    this.logger.warn({ assignmentId: record.context.assignmentId, attempt: record.context.attempt, method }, "refused a session mode this agent never runs in");
+    const message = this.options.refusedModes!.message;
+    this.track(record, Promise.resolve().then(() => this.options.events.publish({
+      kind: "request_error", acpSessionRef, requestId, method, code: -32602, class: "invalid_params", message, retryable: false,
+    })));
+  }
+
+  /** The agent's configuration as Konteks reports it: a refused mode is never offered. */
+  private withoutRefusedModes<T>(configOptions: T): T {
+    const refused = this.options.refusedModes?.modeIds;
+    if (!refused || !Array.isArray(configOptions)) return configOptions;
+    return configOptions.map((option: unknown) => {
+      const value = option as { id?: unknown; type?: unknown; options?: unknown };
+      if (value?.id !== "mode" || value.type !== "select" || !Array.isArray(value.options)) return option;
+      const keep = (entry: unknown) => !refused.includes((entry as { value?: unknown })?.value as string);
+      const options = (value.options as unknown[]).flatMap((entry) => {
+        const group = entry as { options?: unknown };
+        if (Array.isArray(group?.options)) return [{ ...group, options: group.options.filter(keep) }];
+        return keep(entry) ? [entry] : [];
+      });
+      return { ...value, options };
+    }) as T;
   }
 
   /** Bridge → supervisor: session/update notifications keyed by our opaque ref. */
@@ -746,7 +796,10 @@ export class SessionManager {
     }
     // Never forward a provider-supplied transport field. Only the qualified
     // bridge correlation extension is translated, under this session owner.
-    const { nativeObservation: _untrusted, ...update } = params.update as typeof params.update & { nativeObservation?: unknown };
+    const { nativeObservation: _untrusted, ...reported } = params.update as typeof params.update & { nativeObservation?: unknown };
+    const update = reported.sessionUpdate === "config_option_update"
+      ? { ...reported, configOptions: this.withoutRefusedModes(reported.configOptions) }
+      : reported;
     const native = AcpNativeObservationSchema.safeParse(update._meta?.konteksNativeObservation);
     const messageChunk = update.sessionUpdate === "user_message_chunk" || update.sessionUpdate === "agent_message_chunk";
     const observation = messageChunk && native.success ? this.attributeNativeTurn(record, update.sessionUpdate, native.data) : undefined;

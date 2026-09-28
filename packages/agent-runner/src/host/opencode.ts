@@ -130,8 +130,9 @@ export interface OpenCodePermissionRule {
  * rule and puts its own defaults before ours (CP0-v2, verified with `opencode
  * debug agents`), so the leading `* ask` overrides every default, and the
  * `.env` rows are restated after our `read` allow, which would otherwise
- * re-open them. The start self-check asserts these rows end every agent's
- * resolved list.
+ * re-open them. `external_directory` and the built-in browser are denied
+ * outright (no request reaches Konteks). The start self-check asserts these
+ * rows end every agent's resolved list.
  */
 export const OPENCODE_KONTEKS_PERMISSIONS: readonly OpenCodePermissionRule[] = Object.freeze([
   { action: "*", resource: "*", effect: "ask" },
@@ -144,6 +145,9 @@ export const OPENCODE_KONTEKS_PERMISSIONS: readonly OpenCodePermissionRule[] = O
   { action: "grep", resource: "*", effect: "allow" },
   { action: "todowrite", resource: "*", effect: "allow" },
   { action: "external_directory", resource: "*", effect: "deny" },
+  // Code Mode's catalogue carries a built-in browser (`tools.browser.*`) that
+  // reaches any site; a deny removes it from the catalogue (CP0 part 2).
+  { action: "browser.*", resource: "*", effect: "deny" },
 ].map(rule => Object.freeze(rule as OpenCodePermissionRule)));
 
 /** Agents the Konteks configuration switches off (`plan` runs shell unasked; `title` spends a model call per session). */
@@ -370,4 +374,7 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   hostVersion: config => config.RUNNER_BRIDGE_VERSION !== "unknown" ? config.RUNNER_BRIDGE_VERSION : undefined,
   // OpenCode returns usage with each prompt response (CP0-v2).
   tokenUsageObservable: true,
+  // ACP still offers `plan` with the plan agent switched off, accepts it, and
+  // a prompt in that mode hangs (CP2); plan mode also runs shell unasked.
+  refusedSessionModes: { modeIds: ["plan"], message: "OpenCode's plan mode is not available on Konteks." },
 };
