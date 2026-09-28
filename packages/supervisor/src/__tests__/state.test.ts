@@ -56,6 +56,21 @@ describe("supervisor store", () => {
     expect(await readFile(path, "utf8")).not.toContain("liveness_lost");
   });
 
+  it("replaces shutdown progress with one private phase-only record", async () => {
+    const store = new SupervisorStore(dir);
+    await store.recordShutdownProgress("work_drain", "entered", "2026-09-28T01:00:00.000Z");
+    await store.recordShutdownProgress("codex_owner_stop", "entered", "2026-09-28T01:01:00.000Z");
+
+    expect(await new SupervisorStore(dir).shutdownProgress()).toEqual({
+      schemaVersion: 1, phase: "codex_owner_stop", state: "entered", observedAt: "2026-09-28T01:01:00.000Z",
+    });
+    const path = store.path("shutdown-progress.json");
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    const contents = await readFile(path, "utf8");
+    expect(contents).not.toContain("work_drain");
+    expect(Object.keys(JSON.parse(contents))).toEqual(["schemaVersion", "phase", "state", "observedAt"]);
+  });
+
   it("creates the instance key once with restricted mode and reloads the same key", async () => {
     const store = new SupervisorStore(dir);
     await store.init();

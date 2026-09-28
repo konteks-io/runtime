@@ -2,7 +2,7 @@ import { startControlSocketServer, type ControlSocketServer } from "@konteks/rem
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createDaemon, type CreateDaemonOptions, type Daemon, type DaemonStep } from "../daemon.js";
-import { SupervisorStore } from "../state/store.js";
+import { SupervisorStore, type ShutdownProgress } from "../state/store.js";
 import { Supervisor, type SupervisorOptions } from "../supervisor.js";
 import { loadNativeInstallation, type NativeInstallationOptions } from "./installation.js";
 import { fetchNativeReleaseManifest, resolveNativeConnectorExecutable } from "@konteks/remote-release";
@@ -31,15 +31,29 @@ export function nativeShutdownSteps(
   supervisor: () => Pick<Supervisor, "stop"> | undefined,
   control: () => Pick<ControlSocketServer, "close"> | undefined,
   writeReceipt: () => Promise<void> = async () => undefined,
+  recordProgress: (phase: ShutdownProgress["phase"], state: ShutdownProgress["state"]) => Promise<void> = async () => undefined,
 ): DaemonStep[] {
   let supervisorStopped = false;
   let controlClosed = false;
+  const note = async (phase: ShutdownProgress["phase"], state: ShutdownProgress["state"]): Promise<void> => {
+    // Progress is advisory; failures cannot suppress cleanup or attest completion.
+    await recordProgress(phase, state).catch(() => undefined);
+  };
   return [
     { name: "stopNativeSupervisor", run: async () => { await supervisor()?.stop(); supervisorStopped = true; } },
-    { name: "closeNativeControl", run: async () => { await control()?.close(); controlClosed = true; } },
+    { name: "closeNativeControl", run: async () => {
+      // The daemon still closes control after a failed supervisor stop; preserve
+      // the earlier blocked/failed supervisor phase for diagnosis in that case.
+      if (supervisorStopped) await note("control_close", "entered");
+      await control()?.close();
+      controlClosed = true;
+      if (supervisorStopped) await note("control_close", "completed");
+    } },
     { name: "recordNativeShutdown", run: async () => {
       if (!supervisorStopped || !controlClosed) throw new Error("Native shutdown cleanup did not complete; no shutdown receipt was written.");
+      await note("receipt", "entered");
       await writeReceipt();
+      await note("receipt", "completed");
     } },
   ];
 }
@@ -91,8 +105,12 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         onUnexpectedError: (error, operation) => supervisor?.logger.error({ err: error, operation }, "control operation failed"),
       });
     },
-    shutdownSteps: () => nativeShutdownSteps(() => supervisor, () => control, () =>
-      writeSecretFile(join(options.root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), randomUUID())),
+    shutdownSteps: () => nativeShutdownSteps(
+      () => supervisor,
+      () => control,
+      () => writeSecretFile(join(options.root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), randomUUID()),
+      (phase, state) => exitStore.recordShutdownProgress(phase, state),
+    ),
   });
   return daemon;
 }

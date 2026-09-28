@@ -83,7 +83,7 @@ import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "./session/workspace-tool-policy.js";
 import { SupervisorJournal } from "./state/journal.js";
 import { DurableOutbox } from "./state/outbox.js";
-import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord } from "./state/store.js";
+import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
 import { buildSupportBundle } from "./support/bundle.js";
 import { runDoctor } from "./support/doctor.js";
 import { HttpsFallbackTransport } from "./transport/https-fallback.js";
@@ -149,6 +149,7 @@ export class Supervisor {
   readonly logger: Logger;
   readonly clock = new SystemClock();
   readonly store: SupervisorStore;
+  private readonly shutdownProgressStore: SupervisorStore;
   readonly journal: SupervisorJournal;
   readonly outbox: DurableOutbox;
   readonly lease: LeaseState;
@@ -257,6 +258,8 @@ export class Supervisor {
       this.nativeOwnership.assertOwned();
     });
     this.store = new SupervisorStore(config.SUPERVISOR_DATA_DIR, this.stateMutations.run);
+    // Keep diagnostics outside the mutation queue that shutdown itself waits to close.
+    this.shutdownProgressStore = new SupervisorStore(config.SUPERVISOR_DATA_DIR);
     this.journal = new SupervisorJournal(this.store.path("journal"), this.stateMutations.run);
     this.outbox = new DurableOutbox(this.store.path("outbox"), this.stateMutations.run);
     this.lease = new LeaseState(this.clock);
@@ -2030,6 +2033,14 @@ export class Supervisor {
   }
 
   private async stopImpl(): Promise<void> {
+    const note = async (phase: ShutdownProgress["phase"], state: ShutdownProgress["state"]): Promise<void> => {
+      // Diagnostics must never prevent cleanup or change the shutdown receipt.
+      if (!this.options.native) return;
+      await this.shutdownProgressStore.recordShutdownProgress(phase, state).catch((err: unknown) => {
+        this.logger.warn({ err }, "shutdown progress could not be recorded");
+      });
+    };
+    await note("supervisor_prelude", "entered");
     await this.startPromise?.catch(() => undefined);
     await this.activeLoopStarting;
     if (this.pullTimer) clearInterval(this.pullTimer);
@@ -2051,11 +2062,20 @@ export class Supervisor {
     await this.leaseAcquisition;
     await this.leaseMutation;
     await this.leaseLossCleanup;
+    await note("supervisor_prelude", "completed");
+    await note("work_drain", "entered");
     await this.work?.drainSessions("drain");
+    await note("work_drain", "completed");
+    await note("preview_close", "entered");
     await this.previews.close();
+    await note("preview_close", "completed");
     this.previewChannel?.dispose();
+    await note("runner_stop", "entered");
     for (const runner of this.nativeRunners) await runner.stop();
+    await note("runner_stop", "completed");
+    await note("codex_owner_stop", "entered");
     await this.nativeCodexOwner?.stop();
+    await note("codex_owner_stop", "completed");
     if (this.codexRetryTimer) clearTimeout(this.codexRetryTimer);
     this.codexRetryTimer = null;
     this.parkedCodex = null;
@@ -2064,6 +2084,7 @@ export class Supervisor {
     this.parkedRunners.clear();
     for (const runner of this.runners.values()) runner.stopEvents();
     this.transport?.stop();
+    await note("state_close", "entered");
     await this.stateMutations.close();
     this.nativeOwnership?.release();
   }
