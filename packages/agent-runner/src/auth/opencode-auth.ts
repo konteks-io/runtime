@@ -284,6 +284,8 @@ export interface OpenCodeLoginOptions {
   run?: OpenCodeRun;
   spawn?: typeof spawnPiped;
   personal?: OpenCodePersonalHome;
+  /** Before the first command: create the private home (its folders are the commands' working folder). */
+  prepare?: () => Promise<void>;
 }
 
 const REUSE_OFFERED_FILE = "reuse-offered";
@@ -361,6 +363,7 @@ export function startOpenCodeLogin(options: OpenCodeLoginOptions): LoginFlow {
   timer.unref();
 
   const begin = async () => {
+    await options.prepare?.();
     integrations = await listOpenCodeIntegrations(options.context, options.run);
     if (request.loginOption !== undefined) {
       const option = OPENCODE_LOGIN_OPTIONS[request.loginOption];

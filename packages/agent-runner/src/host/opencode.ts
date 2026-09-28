@@ -348,6 +348,19 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
  * repository config is in reach and `--standalone` keeps its private server
  * to itself (it exits with the command; no background service is started).
  */
+export async function preparedOpenCodeCommandContext(config: RunnerConfig): Promise<OpenCodeCommandContext> {
+  const context = openCodeCommandContext(config);
+  await prepareOpenCodeHome(config);
+  return context;
+}
+
+/** The private folders every OpenCode process of this runner uses (0700); the control config never carries a working copy's instructions. */
+async function prepareOpenCodeHome(config: RunnerConfig): Promise<void> {
+  const paths = openCodeRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
+  for (const folder of [paths.home, paths.data, paths.state, paths.cache, paths.configs, paths.controlConfig]) await mkdir(folder, { recursive: true, mode: 0o700 });
+  await rm((process.platform === "win32" ? win32 : posix).join(paths.controlConfig, "opencode", "AGENTS.md"), { recursive: true, force: true });
+}
+
 export function openCodeCommandContext(config: RunnerConfig): OpenCodeCommandContext {
   const located = config.RUNNER_NATIVE_OPENCODE_BINARY;
   if (located === undefined || !isAbsolute(located) || CONTROL.test(located)) {
@@ -390,10 +403,7 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
     if (located === undefined || !isAbsolute(located) || CONTROL.test(located)) {
       throw new RemoteInstanceError("agent_unavailable", "An OpenCode runner requires the person's installed OpenCode 2 at an absolute local path.");
     }
-    const paths = openCodeRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
-    for (const folder of [paths.home, paths.data, paths.state, paths.cache, paths.configs, paths.controlConfig]) await mkdir(folder, { recursive: true, mode: 0o700 });
-    // The control process never carries a working copy's instructions.
-    await rm((process.platform === "win32" ? win32 : posix).join(paths.controlConfig, "opencode", "AGENTS.md"), { recursive: true, force: true });
+    await prepareOpenCodeHome(config);
   },
   bindWorkingCopy: async (config, family, workingCopy) => {
     binary(config, family);
@@ -405,25 +415,25 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   startLogin: ({ config, events, logger, loginId, request }) => {
     const context = openCodeCommandContext(config);
     const paths = openCodeRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
-    return startOpenCodeLogin({ context, events, logger, stateDir: paths.root, timeoutMs: config.RUNNER_LOGIN_TIMEOUT_MS,
+    return startOpenCodeLogin({ context, events, logger, stateDir: paths.root, timeoutMs: config.RUNNER_LOGIN_TIMEOUT_MS, prepare: () => prepareOpenCodeHome(config),
       ...(loginId === undefined ? {} : { loginId }), ...(request === undefined ? {} : { request }),
       personal: personalOpenCodeHome({ binary: context.binary, scratchDir: (process.platform === "win32" ? win32 : posix).join(paths.root, "personal-list"),
         allowList: home => openCodeEnvironment({ home }) }) });
   },
-  logout: async (config, request) => { await openCodeLogout(openCodeCommandContext(config), request?.provider); },
+  logout: async (config, request) => { await openCodeLogout(await preparedOpenCodeCommandContext(config), request?.provider); },
   loginFailedMessage: "OpenCode did not finish signing in",
   async identity(config, settings) {
     // What OpenCode's own `auth list` reports in the private home: provider,
     // method and credential id, never a secret. With nothing signed in, Zen's
     // free models make it ready only when the person switched them on (O6).
-    const stored = await listOpenCodeCredentials(openCodeCommandContext(config));
+    const stored = await listOpenCodeCredentials(await preparedOpenCodeCommandContext(config));
     const credentials = openCodeCredentialViews(stored);
     const material = openCodeIdentityMaterial(stored, settings.openCodeFreeModels);
     if (material === null) return { kind: "logged_out", credentials };
     const key = await readOrCreateSecretFile({ bytes: 32, dataDir: config.RUNNER_CREDENTIAL_DIR, encoding: "base64url", fileName: FINGERPRINT_KEY_FILE });
     return { kind: "signal", fingerprint: keyedFingerprint(Buffer.from(key, "base64url"), material), credentials };
   },
-  siteLoginOptions: async config => openCodeSiteLoginOptions(await listOpenCodeIntegrations(openCodeCommandContext(config))),
+  siteLoginOptions: async config => openCodeSiteLoginOptions(await listOpenCodeIntegrations(await preparedOpenCodeCommandContext(config))),
   offersModel: (value, settings) => settings.openCodeFreeModels || !isOpenCodeFreeModel(value),
   hostVersion: config => config.RUNNER_BRIDGE_VERSION !== "unknown" ? config.RUNNER_BRIDGE_VERSION : undefined,
   // OpenCode returns usage with each prompt response (CP0-v2).

@@ -147,6 +147,9 @@ describe("what the private home is signed in to", () => {
     expect(await openCodeRunnerAdapter.identity!(f.config, { ...off, openCodeFreeModels: true })).toEqual(signedIn);
     const calls = await f.calls();
     expect(calls.map(call => call.args)).toEqual(Array(4).fill(["auth", "list", "--standalone", "--format", "json"]));
+    // A runner whose private home does not exist yet creates it first (it is the commands' working folder).
+    const fresh = RunnerConfigSchema.parse({ ...f.config, RUNNER_CREDENTIAL_DIR: join(f.root, "fresh-credentials") });
+    await expect(openCodeRunnerAdapter.identity!(fresh, off)).resolves.toEqual({ kind: "logged_out", credentials: [] });
     for (const call of calls) {
       expect(call.env.HOME).toBe(f.paths.home);
       expect(call.env.XDG_DATA_HOME).toBe(f.paths.data);
