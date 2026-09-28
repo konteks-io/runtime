@@ -2,13 +2,22 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
 import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServer, bundledBrowserVersion, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
-import { RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
-import type { RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
+import { OpenCodeLoginOptionIdSchema, RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
+import type { RunnerHostSettings, RunnerLoginRequest, RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 import type { checkDshKonteksProfile } from "./dsh-profile-check.js";
 import type { checkOpenCodeKonteksConfig } from "./opencode-self-check.js";
 import { hostAgentInstallAdapter } from "./host-agents.js";
 
 const idSchema = z.string().min(1).max(128);
+const loginRequestSchema = z.object({
+  provider: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).optional(),
+  method: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).optional(),
+  loginOption: OpenCodeLoginOptionIdSchema.optional(),
+  reuse: z.boolean().optional(),
+}).strict();
+function withoutUndefined<T extends object>(value: T): { [K in keyof T]: Exclude<T[K], undefined> } {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as { [K in keyof T]: Exclude<T[K], undefined> };
+}
 const inputSchema = z.object({
   context: SessionContextSchema,
   readinessDeadlineAt: z.string().datetime({ offset: true }),
@@ -268,12 +277,22 @@ export class NativeRunner implements RunnerPort {
     return { delivered: this.runtime.sessions.answer(ref, id, response) };
   }
 
-  async login(organization: boolean, loginId: string, personal = false) {
+  async login(organization: boolean, loginId: string, personal = false, request?: RunnerLoginRequest) {
     this.requireStarted();
     if (typeof organization !== "boolean" || typeof personal !== "boolean" || !idSchema.safeParse(loginId).success) throw invalid();
+    const parsed = request === undefined ? undefined : loginRequestSchema.safeParse(request);
+    if (parsed && !parsed.success) throw invalid();
     await verifyNativeRunnerPackage(this.options.config);
     this.requireStarted();
-    return { loginId: this.runtime.startLogin({ organization, loginId, personal }).loginId };
+    return { loginId: this.runtime.startLogin({ organization, loginId, personal, ...(parsed?.data ? { request: withoutUndefined(parsed.data) } : {}) }).loginId };
+  }
+
+  async applyHostSettings(settings: RunnerHostSettings): Promise<void> {
+    await this.runtime.applyHostSettings({ openCodeFreeModels: settings.openCodeFreeModels === true, coreAcceptsRouteBilling: settings.coreAcceptsRouteBilling === true });
+  }
+
+  siteLoginOptions() {
+    return this.started && !this.stopping ? this.runtime.siteLoginOptions() : [];
   }
 
   async loginInput(loginId: string, text: string) {
@@ -288,7 +307,14 @@ export class NativeRunner implements RunnerPort {
     return { cancelled: await this.runtime.loginCancel(loginId) };
   }
 
-  async logout() { this.requireStarted(); await verifyNativeRunnerPackage(this.options.config); this.requireStarted(); return this.runtime.logout(); }
+  async logout(request?: RunnerLoginRequest) {
+    this.requireStarted();
+    const parsed = request === undefined ? undefined : loginRequestSchema.safeParse(request);
+    if (parsed && !parsed.success) throw invalid();
+    await verifyNativeRunnerPackage(this.options.config);
+    this.requireStarted();
+    return this.runtime.logout(parsed?.data ? withoutUndefined(parsed.data) : undefined);
+  }
   async probe() { this.requireStarted(); return this.runtime.probe(false); }
 }
 

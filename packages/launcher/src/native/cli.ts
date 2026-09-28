@@ -20,7 +20,7 @@ export interface NativeCliActions {
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
-  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; title?: string; keyRef?: string }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; title?: string; keyRef?: string }): Promise<void>;
 }
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
@@ -44,6 +44,16 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   };
   const id = (value: string): string => {
     if (!/^[A-Za-z0-9._-]{8,128}$/.test(value)) throw new InvalidArgumentError("activation id must be an opaque identifier; the code is prompted securely");
+    return value;
+  };
+  // Signing in and out also reaches OpenCode, which `install` and `agent add`
+  // do not offer yet (CP6): a connector without it answers that it has none.
+  const authAgent = (value: string): string => {
+    if (value === "opencode") return value;
+    return agent(value);
+  };
+  const providerId = (value: string): string => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) throw new InvalidArgumentError("expected an id such as deepseek or chatgpt-headless");
     return value;
   };
   const agent = (value: string): NativeAgentId => {
@@ -88,9 +98,14 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .action(async () => actions.control({ ...context(), operation: "preview.status" }));
   const auth = program.command("auth").description("official local agent subscription authentication");
   auth.command("status").argument("[agent]", "agent family", agent).action(async (value?: string) => actions.control({ ...context(), operation: "auth.status", ...(value ? { agent: value } : {}) }));
-  auth.command("login").argument("<agent>", "agent family", agent).option("--organization", "attest that the account is organization-owned", false)
-    .action(async (value: string, options: { organization: boolean }) => actions.control({ ...context(), operation: "auth.login", agent: value, organization: options.organization }));
-  auth.command("logout").argument("<agent>", "agent family", agent).action(async (value: string) => actions.control({ ...context(), operation: "auth.logout", agent: value }));
+  auth.command("login").argument("<agent>", "agent family", authAgent).option("--organization", "attest that the account is organization-owned", false)
+    .option("--provider <id>", "OpenCode: the provider to sign in to (asked when omitted)", providerId)
+    .option("--method <id>", "OpenCode: the provider's sign-in method, or key for an API key", providerId)
+    .option("--reuse", "OpenCode: see which providers your own OpenCode uses, to sign in to the same ones", false)
+    .action(async (value: string, options: { organization: boolean; provider?: string; method?: string; reuse: boolean }) => actions.control({ ...context(), operation: "auth.login", agent: value, organization: options.organization,
+      ...(options.provider ? { provider: options.provider } : {}), ...(options.method ? { method: options.method } : {}), ...(options.reuse ? { reuse: true } : {}) }));
+  auth.command("logout").argument("<agent>", "agent family", authAgent).option("--provider <id>", "OpenCode: sign out of one provider only", providerId)
+    .action(async (value: string, options: { provider?: string }) => actions.control({ ...context(), operation: "auth.logout", agent: value, ...(options.provider ? { provider: options.provider } : {}) }));
   program.command("update").description("stage the newest signed native release, drain, swap the user service and verify it; rolls back on a failed health gate")
     .option("--check", "report the available release without installing anything", false)
     .option("--unattended", "launched by the connector itself; recorded as such in the update ledger", false)

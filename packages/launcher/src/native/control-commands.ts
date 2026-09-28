@@ -2,7 +2,7 @@ import { z } from "zod";
 import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlLoginEvent } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
 import type { Output } from "../output.js";
-import { confirm, promptSecret } from "../prompt.js";
+import { confirm, promptLine, promptSecret } from "../prompt.js";
 
 /**
  * The launcher's control-socket commands for the installed native connector
@@ -17,6 +17,8 @@ export interface ControlContext {
   /** Test hooks. */
   confirm?: (question: string) => Promise<boolean>;
   promptSecret?: (label: string) => Promise<string>;
+  /** Test hook: a choice typed in the open. */
+  promptLine?: (label: string) => Promise<string>;
 }
 
 const AgentsSchema = z.object({ agents: z.array(z.record(z.string(), z.unknown())), roles: z.array(z.string()), roleBindings: z.array(z.record(z.string(), z.unknown())) }).strict();
@@ -77,9 +79,10 @@ export async function authStatus(context: ControlContext, agentId?: string): Pro
  * pasted input is read from the terminal and forwarded without echo when the
  * tool asks for a secret. `--organization` records the operator's attestation.
  */
-export async function authLogin(context: ControlContext, agentId: string, organization: boolean): Promise<void> {
+export async function authLogin(context: ControlContext, agentId: string, organization: boolean, which: { provider?: string; method?: string; reuse?: boolean } = {}): Promise<void> {
   const ask = context.confirm ?? ((question: string) => confirm(question, context.input ? { input: context.input } : {}));
   const secret = context.promptSecret ?? ((label: string) => promptSecret({ label, minLength: 1, ...(context.input ? { input: context.input } : {}) }));
+  const line = context.promptLine ?? ((label: string) => promptLine(label, context.input ? { input: context.input } : {}));
   if (organization) {
     const ok = await ask(`Attest that the ${agentId} account you are about to log in is owned by your organization and may serve colleagues' work?`);
     if (!ok) throw new RemoteInstanceError("ownership_promotion_denied", "organization attestation declined; log in without --organization for a personal account");
@@ -99,7 +102,9 @@ export async function authLogin(context: ControlContext, agentId: string, organi
         context.output.line(`open this URL to sign in: ${event.url}${event.userCode ? `\nenter code: ${event.userCode}` : ""}`);
         return;
       case "prompt":
-        void secret(event.label)
+        // A choice (OpenCode's provider) is typed in the open; anything else,
+        // an API key included, with the hidden prompt, never echoed.
+        void (event.visible === true && !event.secret ? line(event.label) : secret(event.label))
           .then((text) => context.control.call({ op: "auth.input", loginId: event.loginId, text }, z.unknown()))
           .catch((error: unknown) => { promptError = error; interrupted.abort(); });
         return;
@@ -112,7 +117,7 @@ export async function authLogin(context: ControlContext, agentId: string, organi
     }
   };
   try {
-    await context.control.call({ op: "auth.login", agentId, organization }, z.object({ loginId: z.string() }), { onEvent, signal: interrupted.signal, timeoutMs: 20 * 60_000 });
+    await context.control.call({ op: "auth.login", agentId, organization, ...which }, z.object({ loginId: z.string() }), { onEvent, signal: interrupted.signal, timeoutMs: 20 * 60_000 });
   } catch (error) {
     if (promptError !== null) throw promptError;
     throw error;
@@ -123,10 +128,10 @@ export async function authLogin(context: ControlContext, agentId: string, organi
   }
 }
 
-export async function authLogout(context: ControlContext, agentId: string): Promise<void> {
-  const value = await context.control.call({ op: "auth.logout", agentId }, z.record(z.string(), z.unknown()));
+export async function authLogout(context: ControlContext, agentId: string, provider?: string): Promise<void> {
+  const value = await context.control.call({ op: "auth.logout", agentId, ...(provider ? { provider } : {}) }, z.record(z.string(), z.unknown()));
   context.output.result(value);
-  context.output.line(`logged out ${agentId}; readiness ${String(value.readiness)}`);
+  context.output.line(`logged out ${agentId}${provider ? ` from ${provider}` : ""}; readiness ${String(value.readiness)}`);
 }
 
 /**

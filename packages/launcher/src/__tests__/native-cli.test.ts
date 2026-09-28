@@ -44,6 +44,11 @@ describe("native customer entry point", () => {
     const { program, actions } = fixture();
     await program.parseAsync(["auth", "login", "codex", "--organization"], { from: "user" });
     expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.login", agent: "codex", organization: true }));
+    // OpenCode names which sign-in (CP3); it is not installable yet, but its sign-in commands parse.
+    await program.parseAsync(["auth", "login", "opencode", "--provider", "deepseek", "--method", "key", "--reuse"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.login", agent: "opencode", organization: false, provider: "deepseek", method: "key", reuse: true }));
+    await program.parseAsync(["auth", "logout", "opencode", "--provider", "openai"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.logout", agent: "opencode", provider: "openai" }));
   });
   it("offers a read-only preview status, and no local preview switch", async () => {
     const { program, actions } = fixture();

@@ -38,6 +38,24 @@ export interface DiscoveredBridgeModelCapability {
   offeredOptions: DiscoveredModelOption[];
 }
 
+/**
+ * What may be offered under the agent's settings (OpenCode: Zen's free models
+ * only when the person switched them on, O6). A hidden current value gives way
+ * to the first offered one; nothing left to offer reads as needing a sign-in.
+ */
+export function offerableModelCapability(capability: DiscoveredBridgeModelCapability, offers: (value: string) => boolean, family: { agentId: string; displayName: string }): DiscoveredBridgeModelCapability {
+  const keep = capability.offeredValues.map(value => offers(value));
+  const offeredValues = capability.offeredValues.filter((_, index) => keep[index]);
+  if (offeredValues.length === 0) {
+    throw new RemoteInstanceError("agent_auth_required", `${family.displayName} has no model it may use here: sign it in, or switch on its free models.`, { recoveryActions: [{ kind: "login_agent", agentId: family.agentId }] });
+  }
+  return {
+    currentValue: offeredValues.includes(capability.currentValue) ? capability.currentValue : offeredValues[0]!,
+    offeredValues,
+    offeredOptions: capability.offeredOptions.filter((_, index) => keep[index]),
+  };
+}
+
 /** The most values one snapshot may carry (the Core wire bound). */
 export const MAX_OFFERED_MODEL_VALUES = 128;
 

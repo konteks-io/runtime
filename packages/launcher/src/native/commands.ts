@@ -430,8 +430,9 @@ export const nativeCliActions: NativeCliActions = {
       case "support": return supportBundle(context);
       case "preview.status": return previewStatus(context);
       case "auth.status": return authStatus(context, input.agent);
-      case "auth.login": return authLogin(context, input.agent!, input.organization ?? false);
-      case "auth.logout": return authLogout(context, input.agent!);
+      case "auth.login": return authLogin(context, input.agent!, input.organization ?? false, {
+        ...(input.provider ? { provider: input.provider } : {}), ...(input.method ? { method: input.method } : {}), ...(input.reuse ? { reuse: true } : {}) });
+      case "auth.logout": return authLogout(context, input.agent!, input.provider);
       case "git.key.add": return gitKeyAdd(context, input.title);
       case "git.key.list": return gitKeyList(context);
       case "git.key.remove": return gitKeyRemove(context, input.keyRef!);

@@ -1,10 +1,25 @@
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readlink, realpath, rm, stat, symlink } from "node:fs/promises";
 import { isAbsolute, posix, relative, resolve, win32 } from "node:path";
-import { RemoteInstanceError } from "@konteks/remote-common";
+import { RemoteInstanceError, keyedFingerprint, readOrCreateSecretFile } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import type { HostAgentRunnerAdapter, HostWorkingCopyBinding } from "./host-agent.js";
+import {
+  isOpenCodeFreeModel,
+  listOpenCodeCredentials,
+  listOpenCodeIntegrations,
+  openCodeCredentialViews,
+  openCodeIdentityMaterial,
+  openCodeLogout,
+  openCodeSiteLoginOptions,
+  personalOpenCodeHome,
+  startOpenCodeLogin,
+  type OpenCodeCommandContext,
+} from "../auth/opencode-auth.js";
+
+/** Same file as `FINGERPRINT_KEY_FILE` in auth/identity.ts (kept literal to avoid an import cycle). */
+const FINGERPRINT_KEY_FILE = "fingerprint.key";
 
 /**
  * The person's own OpenCode 2 (opencode-runtime-support). OpenCode signs in
@@ -326,9 +341,20 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
   };
 }
 
-function notYet(): RemoteInstanceError {
-  // Sign-in and sign-out arrive in CP3; fail closed until then.
-  return new RemoteInstanceError("agent_unavailable", "OpenCode cannot run Konteks work on this computer yet.");
+/**
+ * How the connector runs OpenCode's own `auth` and `api` commands: the
+ * located binary, the control process's environment (allow-list, locked
+ * config, private home) and the private home as the working folder, so no
+ * repository config is in reach and `--standalone` keeps its private server
+ * to itself (it exits with the command; no background service is started).
+ */
+export function openCodeCommandContext(config: RunnerConfig): OpenCodeCommandContext {
+  const located = config.RUNNER_NATIVE_OPENCODE_BINARY;
+  if (located === undefined || !isAbsolute(located) || CONTROL.test(located)) {
+    throw new RemoteInstanceError("agent_unavailable", "An OpenCode runner requires the person's installed OpenCode 2 at an absolute local path.");
+  }
+  const paths = openCodeRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
+  return { binary: located, env: openCodeProcessEnvironment(config.RUNNER_CREDENTIAL_DIR, paths.controlConfig), cwd: paths.home };
 }
 
 /** The located OpenCode binary of an OpenCode runner; refuses anything else. */
@@ -347,8 +373,8 @@ function binary(config: RunnerConfig, family: AgentBridgeFamily): string {
  * every OpenCode process of this runner (sign-ins and sessions). The control
  * process (discovery, sign-in) uses a config folder with no instructions;
  * each execution process gets its working copy's own (`bindWorkingCopy`).
- * Offering it to anyone is gated on the install side until CP4
- * (`openCodeInstallAdapter.offered`); sign-in and sign-out arrive in CP3.
+ * Offering it to anyone is gated on the install side until CP6
+ * (`openCodeInstallAdapter.offered`).
  */
 export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   agentId: "opencode",
@@ -373,10 +399,32 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
     binary(config, family);
     return bindOpenCodeWorkingCopy(config.RUNNER_CREDENTIAL_DIR, workingCopy);
   },
-  startLogin: () => { throw notYet(); },
-  logout: async () => { throw notYet(); },
+  // O2: OpenCode's own `auth login`, driven and relayed (link and code for a
+  // subscription, OpenCode's own key prompt for an API key); O10's one-time
+  // offer to repeat the person's own OpenCode sign-ins.
+  startLogin: ({ config, events, logger, loginId, request }) => {
+    const context = openCodeCommandContext(config);
+    const paths = openCodeRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
+    return startOpenCodeLogin({ context, events, logger, stateDir: paths.root, timeoutMs: config.RUNNER_LOGIN_TIMEOUT_MS,
+      ...(loginId === undefined ? {} : { loginId }), ...(request === undefined ? {} : { request }),
+      personal: personalOpenCodeHome({ binary: context.binary, scratchDir: (process.platform === "win32" ? win32 : posix).join(paths.root, "personal-list"),
+        allowList: home => openCodeEnvironment({ home }) }) });
+  },
+  logout: async (config, request) => { await openCodeLogout(openCodeCommandContext(config), request?.provider); },
   loginFailedMessage: "OpenCode did not finish signing in",
-  identity: async () => ({ kind: "logged_out" }),
+  async identity(config, settings) {
+    // What OpenCode's own `auth list` reports in the private home: provider,
+    // method and credential id, never a secret. With nothing signed in, Zen's
+    // free models make it ready only when the person switched them on (O6).
+    const stored = await listOpenCodeCredentials(openCodeCommandContext(config));
+    const credentials = openCodeCredentialViews(stored);
+    const material = openCodeIdentityMaterial(stored, settings.openCodeFreeModels);
+    if (material === null) return { kind: "logged_out", credentials };
+    const key = await readOrCreateSecretFile({ bytes: 32, dataDir: config.RUNNER_CREDENTIAL_DIR, encoding: "base64url", fileName: FINGERPRINT_KEY_FILE });
+    return { kind: "signal", fingerprint: keyedFingerprint(Buffer.from(key, "base64url"), material), credentials };
+  },
+  siteLoginOptions: async config => openCodeSiteLoginOptions(await listOpenCodeIntegrations(openCodeCommandContext(config))),
+  offersModel: (value, settings) => settings.openCodeFreeModels || !isOpenCodeFreeModel(value),
   hostVersion: config => config.RUNNER_BRIDGE_VERSION !== "unknown" ? config.RUNNER_BRIDGE_VERSION : undefined,
   // OpenCode returns usage with each prompt response (CP0-v2).
   tokenUsageObservable: true,

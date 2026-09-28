@@ -1,4 +1,18 @@
-import type { ConnectedAgentView, RemoteSessionLabel, RetainedProcessOwner } from "@konteks/remote-common";
+import type { ConnectedAgentView, OpenCodeLoginOptionId, RemoteSessionLabel, RetainedProcessOwner } from "@konteks/remote-common";
+
+/** Which sign-in to start or remove, for an agent with several (OpenCode). */
+export interface RunnerLoginRequest {
+  provider?: string;
+  method?: string;
+  loginOption?: OpenCodeLoginOptionId;
+  reuse?: boolean;
+}
+
+/** Core's settings for host agents on this computer (from the applied desired configuration). */
+export interface RunnerHostSettings {
+  openCodeFreeModels: boolean;
+  coreAcceptsRouteBilling: boolean;
+}
 
 export interface RunnerSessionInput {
   context: { instanceId: string; assignmentId: string; attempt: number; agentId: string };
@@ -63,10 +77,14 @@ export interface RunnerPort {
   setConfigOption(ref: string, id: string, params: unknown): Promise<unknown>;
   answer(ref: string, id: string, response: unknown): Promise<{ delivered: boolean }>;
   /** `personal`: the person asked for their own device login on this machine (WS1-115). */
-  login(organization: boolean, loginId: string, personal?: boolean): Promise<{ loginId: string }>;
+  login(organization: boolean, loginId: string, personal?: boolean, request?: RunnerLoginRequest): Promise<{ loginId: string }>;
   loginInput(loginId: string, text: string): Promise<unknown>;
   loginCancel(loginId: string): Promise<unknown>;
-  logout(): Promise<ConnectedAgentView>;
+  logout(request?: RunnerLoginRequest): Promise<ConnectedAgentView>;
+  /** Apply Core's host-agent settings (OpenCode's free models, route billing). */
+  applyHostSettings?(settings: RunnerHostSettings): Promise<void>;
+  /** The reviewed sign-ins the site may start for this agent here (OpenCode); empty for the others. */
+  siteLoginOptions?(): readonly OpenCodeLoginOptionId[];
   /** Take the agent out of service until the connector restarts (a governance bypass). */
   quarantine?(reason: string): Promise<void>;
   probe(): Promise<ConnectedAgentView>;

@@ -20,6 +20,8 @@ export const CONTROL_SOCKET_DEFAULT_PORT = 41800;
 export const CONTROL_TOKEN_FILE_NAME = "control.token";
 
 const agentIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/);
+const providerIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+const methodIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
 
 export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("status") }).strict(),
@@ -30,13 +32,18 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
       op: z.literal("auth.login"),
       agentId: agentIdSchema,
       organization: z.boolean(),
+      // Which sign-in, for an agent that offers several (OpenCode: its
+      // integration id and method id; `reuse` repeats the person's own).
+      provider: providerIdSchema.optional(),
+      method: methodIdSchema.optional(),
+      reuse: z.boolean().optional(),
     })
     .strict(),
   z
     .object({ op: z.literal("auth.input"), loginId: z.string().min(1), text: z.string().max(8_192) })
     .strict(),
   z.object({ op: z.literal("auth.cancel"), loginId: z.string().min(1) }).strict(),
-  z.object({ op: z.literal("auth.logout"), agentId: agentIdSchema }).strict(),
+  z.object({ op: z.literal("auth.logout"), agentId: agentIdSchema, provider: providerIdSchema.optional() }).strict(),
   // Managed-git key registration (ON16). Nothing here carries key material:
   // the private half is generated on the machine and never crosses this hop,
   // not even to be shown to the person who ran the command.
@@ -108,6 +115,8 @@ export const ControlLoginEventSchema = z.discriminatedUnion("kind", [
       loginId: z.string(),
       label: z.string().max(256),
       secret: z.boolean(),
+      /** A choice typed in the open (OpenCode's provider pick); otherwise the launcher reads it hidden. */
+      visible: z.literal(true).optional(),
     })
     .strict(),
   z.object({ kind: z.literal("completed"), loginId: z.string(), readiness: z.string() }).strict(),

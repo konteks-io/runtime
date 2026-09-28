@@ -102,7 +102,7 @@ describe("the OpenCode runner adapter", () => {
     expect(() => resolveBridgeSpawnSpec(config({ RUNNER_NATIVE_DSH_NODE: "/usr/bin/node" }))).toThrow(/DeepSeek Harness/);
   });
 
-  it("prepares the private home before spawning, and fails closed on sign-in until CP3", async () => {
+  it("prepares the private home before spawning, and signs in only a located OpenCode", async () => {
     const root = await mkdtemp(join(tmpdir(), "opencode-prepare-")); roots.push(root);
     const runner = config({ RUNNER_CREDENTIAL_DIR: join(root, "credentials") });
     const paths = openCodeRuntimePaths(runner.RUNNER_CREDENTIAL_DIR);
@@ -113,9 +113,11 @@ describe("the OpenCode runner adapter", () => {
     // The control process (discovery, sign-in) never carries a working copy's instructions.
     await expect(lstat(join(paths.controlConfig, "opencode", "AGENTS.md"))).rejects.toThrow();
     await expect(openCodeRunnerAdapter.prepareToSpawn(config({ RUNNER_NATIVE_OPENCODE_BINARY: undefined }))).rejects.toMatchObject({ code: "agent_unavailable" });
-    expect(() => openCodeRunnerAdapter.startLogin!({ config: runner, events: {} as never, logger: { info: () => undefined } })).toThrow(/cannot run Konteks work/);
-    await expect(openCodeRunnerAdapter.logout!(runner)).rejects.toMatchObject({ code: "agent_unavailable" });
-    await expect(openCodeRunnerAdapter.identity!(runner)).resolves.toEqual({ kind: "logged_out" });
+    // CP3: sign-in, sign-out and identity run OpenCode's own `auth` (opencode-login.test.ts); never without the located binary.
+    const unlocated = config({ RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_NATIVE_OPENCODE_BINARY: undefined });
+    expect(() => openCodeRunnerAdapter.startLogin!({ config: unlocated, events: {} as never, logger: { info: () => undefined, warn: () => undefined } })).toThrow(/installed OpenCode 2/);
+    await expect(openCodeRunnerAdapter.logout!(unlocated)).rejects.toMatchObject({ code: "agent_unavailable" });
+    await expect(openCodeRunnerAdapter.identity!(unlocated, { openCodeFreeModels: false, coreAcceptsRouteBilling: false })).rejects.toMatchObject({ code: "agent_unavailable" });
   });
 
   it("reports its verified version and billing usage like the bundled agents", () => {

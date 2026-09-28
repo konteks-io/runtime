@@ -81,9 +81,26 @@ interface SessionRecord {
   assertCurrent?: () => void;
   /** Native turns started by a connector-sent prompt (bounded, oldest evicted). */
   connectorTurns?: Set<string>;
+  /** The session's current `model` value, as the agent last reported it. */
+  modelValue?: string;
+  /** The session's cumulative cost in USD as the agent last reported it (`usage_update.cost`); unknown until reported or a new session. */
+  sessionCostUsd?: number;
+  /** `sessionCostUsd` when the running turn started; its cost is the difference (O7). */
+  turnCostStartUsd?: number;
+  /** The agent reported a cost since the last turn ended: without one, a turn's cost is unknown, never zero. */
+  costReported?: boolean;
 }
 
+/**
+ * How a turn's usage is labelled (O7): a subscription turn, or a pay-per-use
+ * turn naming the provider (and model) it reached. Null: not reported at all.
+ */
+export type TurnUsageLabel =
+  | { moneyBasis: "unavailable_local_subscription" }
+  | { moneyBasis: "pay_per_use"; provider: string; model?: string };
+
 const MAX_CONNECTOR_TURNS = 256;
+const REFUSED_MODEL_MESSAGE = "That model is not available to this agent here. OpenCode Zen's free models are switched off for this computer.";
 type AcpNativeObservation = z.infer<typeof AcpNativeObservationSchema>;
 
 export interface SessionManagerOptions {
@@ -115,6 +132,33 @@ export interface SessionManagerOptions {
    * configuration, and dropped from the configuration the agent reports.
    */
   refusedModes?: { readonly modeIds: readonly string[]; readonly message: string };
+  /**
+   * Whether a model value may be used (OpenCode: Zen's free models only when
+   * switched on, O6). A session that would start on a model it may not use is
+   * moved to the first one it may, before ready; asking for one is refused.
+   */
+  modelAllowed?: (value: string) => boolean;
+  /** How each turn's usage is labelled from the session's model; absent: every turn is a subscription turn. */
+  usageLabel?: (modelValue: string | undefined) => TurnUsageLabel | null;
+}
+
+/** The current value of a session's `model` select, from any ACP configuration list. */
+function currentModel(configOptions: unknown): string | undefined {
+  if (!Array.isArray(configOptions)) return undefined;
+  const option = configOptions.find((entry: unknown) => (entry as { id?: unknown })?.id === "model" && (entry as { type?: unknown }).type === "select") as { currentValue?: unknown } | undefined;
+  return typeof option?.currentValue === "string" ? option.currentValue : undefined;
+}
+
+/** Every value of a session's `model` select, grouped or flat, in order. */
+function modelValues(configOptions: unknown): string[] {
+  if (!Array.isArray(configOptions)) return [];
+  const option = configOptions.find((entry: unknown) => (entry as { id?: unknown })?.id === "model" && (entry as { type?: unknown }).type === "select") as { options?: unknown } | undefined;
+  if (!Array.isArray(option?.options)) return [];
+  return (option.options as unknown[]).flatMap(entry => {
+    const group = entry as { options?: unknown; value?: unknown };
+    const values = Array.isArray(group.options) ? group.options as Array<{ value?: unknown }> : [group];
+    return values.map(value => value.value).filter((value): value is string => typeof value === "string");
+  });
 }
 
 export interface SessionRefStore {
@@ -366,6 +410,8 @@ export class SessionManager {
     const capabilities = { forkSession: caps?.sessionCapabilities?.fork != null, sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null };
     let bridgeSessionId: string | null = null;
     let resumed = false;
+    let bootstrapConfig: unknown;
+    let newSession = false;
     // The Claude SDK persists its deferred-tool registry in the provider
     // transcript. Loading that transcript after a process restart can retain a
     // former assignment's smaller or expired MCP view even though ACP receives
@@ -391,11 +437,11 @@ export class SessionManager {
         if (agentCaps?.sessionCapabilities?.resume != null) {
           // Session identity is retained, assignment tool authority is not.
           // Send even an empty list rather than retaining prior MCP bindings.
-          await this.boundedBootstrap("session_resume", args, bridge,
-            bridge.connection.resumeSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers }), bootstrapAttempt);
+          bootstrapConfig = (await this.boundedBootstrap("session_resume", args, bridge,
+            bridge.connection.resumeSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers }), bootstrapAttempt) as { configOptions?: unknown } | null)?.configOptions;
         } else {
-          await this.boundedBootstrap("session_load", args, bridge,
-            bridge.connection.loadSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers }), bootstrapAttempt);
+          bootstrapConfig = (await this.boundedBootstrap("session_load", args, bridge,
+            bridge.connection.loadSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers }), bootstrapAttempt) as { configOptions?: unknown } | null)?.configOptions;
         }
         bridgeSessionId = prior;
         resumed = true;
@@ -409,7 +455,7 @@ export class SessionManager {
       }
     }
     if (bridgeSessionId === null) {
-      let created: { sessionId: string };
+      let created: { sessionId: string; configOptions?: unknown };
       try {
         created = await this.boundedBootstrap("session_new", args, bridge,
           bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId) }), bootstrapAttempt);
@@ -423,10 +469,15 @@ export class SessionManager {
       }
       bridgeSessionId = created.sessionId;
       reserveBridgeId(bridgeSessionId);
+      bootstrapConfig = created.configOptions;
+      newSession = true;
     }
     if (this.sessions.has(acpSessionRef) || this.byBridgeId.has(bridgeSessionId)) throw new RemoteInstanceError("recovery_required", "bridge session already has a local owner");
     // Retain the actual live owner before any fallible persistence/continuation.
-    const record: SessionRecord = { bridge, acpSessionRef, bridgeSessionId, context: args.context, pendingClientRequests: new Map(), activeTurns: 0, operations: new Set(), operationFailed: false, completedTurn: false, continuationSealed: false, recoveryStopping: false, recoveryStop: null, ...(args.lifecycle ? { assertCurrent: args.lifecycle.assertCurrent } : {}) };
+    const record: SessionRecord = { bridge, acpSessionRef, bridgeSessionId, context: args.context, pendingClientRequests: new Map(), activeTurns: 0, operations: new Set(), operationFailed: false, completedTurn: false, continuationSealed: false, recoveryStopping: false, recoveryStop: null, ...(args.lifecycle ? { assertCurrent: args.lifecycle.assertCurrent } : {}),
+      ...(currentModel(bootstrapConfig) === undefined ? {} : { modelValue: currentModel(bootstrapConfig)! }),
+      // A new session has spent nothing; a resumed one's total is unknown until the agent reports it.
+      ...(newSession ? { sessionCostUsd: 0 } : {}) };
     this.sessions.set(acpSessionRef, record);
     this.byBridgeId.set(bridgeSessionId, record);
     this.requireBridge(record);
@@ -438,13 +489,28 @@ export class SessionManager {
     // admitted requirement, never a best-effort hint. Do not publish ready
     // until the bridge explicitly echoes each selected value.
     const confirmed = new Map<string, string>();
-    for (const [configId, value] of Object.entries(args.sessionConfig ?? {})) {
+    const sessionConfig = { ...(args.sessionConfig ?? {}) };
+    // A session that would start on a model it may not use (OpenCode Zen's
+    // free models switched off) is moved to the first one it may, as an
+    // admitted requirement confirmed below; with none, it never becomes ready.
+    if (this.options.modelAllowed && sessionConfig.model === undefined && record.modelValue !== undefined && !this.options.modelAllowed(record.modelValue)) {
+      const allowed = modelValues(bootstrapConfig).find(value => this.options.modelAllowed!(value));
+      if (allowed === undefined) {
+        record.recoveryStopping = true;
+        record.operationFailed = true;
+        throw new RemoteInstanceError("agent_auth_required", "The agent has no model it may use here: sign it in, or switch on its free models.", { recoveryActions: [{ kind: "login_agent", agentId: args.context.agentId }] });
+      }
+      sessionConfig.model = allowed;
+    }
+    for (const [configId, value] of Object.entries(sessionConfig)) {
       this.requireBridge(record);
       args.lifecycle?.assertCurrent();
       try {
         const result = await this.boundedBootstrap("session_config", args, bridge,
           bridge.connection.setSessionConfigOption({ sessionId: bridgeSessionId, configId, value }), bootstrapAttempt);
         confirmed.set(configId, value);
+        const reportedModel = currentModel(result.configOptions);
+        if (reportedModel !== undefined) record.modelValue = reportedModel;
         // ACP returns the full configuration. Later selections must not reset
         // an earlier requirement (for example, changing effort resets model).
         for (const [selectedId, selectedValue] of confirmed) {
@@ -693,12 +759,15 @@ export class SessionManager {
     }
     record.completedTurn = false;
     record.activeTurns += 1;
+    // The last turn's end is this turn's start, so a cost the agent reports
+    // after a turn's response is counted with the next turn, never lost.
+    if (record.turnCostStartUsd === undefined && record.sessionCostUsd !== undefined) record.turnCostStartUsd = record.sessionCostUsd;
     const send = () => bridge.connection.prompt({ ...params, sessionId: record.bridgeSessionId });
     const prepared = this.options.beforePrompt?.(bridge);
     const operation = (prepared ? prepared.then(send) : send())
       .then((result) => {
         record.completedTurn = result.stopReason === "end_turn";
-        if (result.usage) this.publishUsage(record, result.usage);
+        if (result.usage) this.publishUsage(record, result.usage, true);
         this.options.events.publish({ kind: "prompt_result", acpSessionRef, requestId, result });
       })
       .catch((error: unknown) => {
@@ -736,10 +805,17 @@ export class SessionManager {
     if (params.configId === "mode" && this.refusesMode((params as { value?: unknown }).value)) {
       return this.refuseMode(record, acpSessionRef, requestId, "session/set_config_option");
     }
+    if (params.configId === "model" && this.refusesModel((params as { value?: unknown }).value)) {
+      return this.refuseMode(record, acpSessionRef, requestId, "session/set_config_option", REFUSED_MODEL_MESSAGE);
+    }
     const operation = this.requireBridge(record)
       .connection.setSessionConfigOption({ ...params, sessionId: record.bridgeSessionId } as SetSessionConfigOptionRequest)
-      .then((result) => this.options.events.publish({ kind: "set_config_option_result", acpSessionRef, requestId,
-        result: { ...result, configOptions: this.withoutRefusedModes(result.configOptions) } }))
+      .then((result) => {
+        const reportedModel = currentModel(result.configOptions);
+        if (reportedModel !== undefined) record.modelValue = reportedModel;
+        this.options.events.publish({ kind: "set_config_option_result", acpSessionRef, requestId,
+          result: { ...result, configOptions: this.withoutRefusedModes(result.configOptions) } });
+      })
       .catch((error: unknown) => {
         this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/set_config_option", ...classifyBridgeError(error) });
         throw error;
@@ -756,12 +832,19 @@ export class SessionManager {
     if (sessionConfig && this.refusesMode(sessionConfig.mode)) {
       throw new RemoteInstanceError("permission_denied", this.options.refusedModes!.message);
     }
+    if (sessionConfig?.model !== undefined && this.refusesModel(sessionConfig.model)) {
+      throw new RemoteInstanceError("permission_denied", REFUSED_MODEL_MESSAGE);
+    }
+  }
+
+  private refusesModel(value: unknown): boolean {
+    return typeof value === "string" && this.options.modelAllowed !== undefined && !this.options.modelAllowed(value);
   }
 
   /** Refuse a mode change before it reaches the agent; answered like the agent's own invalid-params error. */
-  private refuseMode(record: SessionRecord, acpSessionRef: string, requestId: string, method: "session/set_mode" | "session/set_config_option"): void {
-    this.logger.warn({ assignmentId: record.context.assignmentId, attempt: record.context.attempt, method }, "refused a session mode this agent never runs in");
-    const message = this.options.refusedModes!.message;
+  private refuseMode(record: SessionRecord, acpSessionRef: string, requestId: string, method: "session/set_mode" | "session/set_config_option", refusal?: string): void {
+    this.logger.warn({ assignmentId: record.context.assignmentId, attempt: record.context.attempt, method }, refusal ? "refused a model this agent may not use here" : "refused a session mode this agent never runs in");
+    const message = refusal ?? this.options.refusedModes!.message;
     this.track(record, Promise.resolve().then(() => this.options.events.publish({
       kind: "request_error", acpSessionRef, requestId, method, code: -32602, class: "invalid_params", message, retryable: false,
     })));
@@ -791,8 +874,18 @@ export class SessionManager {
     // Thought chunks are not public activity (A4 D132).
     if (params.update.sessionUpdate === "agent_thought_chunk") return;
     if (params.update.sessionUpdate === "usage_update") {
-      const usage = params.update as unknown as Partial<Usage>;
+      const usage = params.update as unknown as Partial<Usage> & { cost?: { amount?: unknown; currency?: unknown } | null };
+      // OpenCode reports the session's running cost here (O7); a turn's is the difference.
+      const cost = usage.cost;
+      if (cost && cost.currency === "USD" && typeof cost.amount === "number" && Number.isFinite(cost.amount) && cost.amount >= 0) {
+        record.sessionCostUsd = cost.amount;
+        record.costReported = true;
+      }
       if (typeof usage.totalTokens === "number") this.publishUsage(record, usage as Usage);
+    }
+    if (params.update.sessionUpdate === "config_option_update") {
+      const reportedModel = currentModel((params.update as { configOptions?: unknown }).configOptions);
+      if (reportedModel !== undefined) record.modelValue = reportedModel;
     }
     // Never forward a provider-supplied transport field. Only the qualified
     // bridge correlation extension is translated, under this session owner.
@@ -890,8 +983,12 @@ export class SessionManager {
     });
   }
 
-  private publishUsage(record: SessionRecord, usage: Usage): void {
-    const observation: AgentTurnUsageObservation = {
+  private publishUsage(record: SessionRecord, usage: Usage, turnEnded = false): void {
+    const label = this.options.usageLabel ? this.options.usageLabel(record.modelValue) : { moneyBasis: "unavailable_local_subscription" as const };
+    // A turn Konteks cannot label honestly (pay-per-use on an older Core, or
+    // an unknown provider) is not reported, never reported as a subscription.
+    if (label === null) return;
+    const base = {
       instanceId: record.context.instanceId,
       assignmentId: record.context.assignmentId,
       attempt: record.context.attempt,
@@ -899,9 +996,21 @@ export class SessionManager {
       totalTokens: usage.totalTokens,
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
-      moneyBasis: "unavailable_local_subscription",
       observedAt: this.now().toISOString(),
     };
+    let observation: AgentTurnUsageObservation;
+    if (label.moneyBasis === "pay_per_use") {
+      const start = record.turnCostStartUsd, end = record.sessionCostUsd;
+      const micros = turnEnded && record.costReported === true && start !== undefined && end !== undefined && end >= start ? Math.round((end - start) * 1_000_000) : undefined;
+      observation = { ...base, moneyBasis: "pay_per_use", provider: label.provider, ...(label.model ? { model: label.model } : {}),
+        ...(micros !== undefined && micros <= 1_000_000_000_000 ? { reportedCost: { currency: "USD", amountMicros: micros } } : {}) };
+    } else {
+      observation = { ...base, moneyBasis: "unavailable_local_subscription" };
+    }
+    if (turnEnded) {
+      if (record.sessionCostUsd !== undefined) record.turnCostStartUsd = record.sessionCostUsd;
+      record.costReported = false;
+    }
     if (usage.thoughtTokens != null) observation.thoughtTokens = usage.thoughtTokens;
     if (usage.cachedReadTokens != null) observation.cacheReadTokens = usage.cachedReadTokens;
     const cachedWrite = (usage as { cachedWriteTokens?: number | null }).cachedWriteTokens;

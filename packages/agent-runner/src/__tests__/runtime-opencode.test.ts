@@ -34,7 +34,7 @@ async function fixture(options: { limit?: boolean } = {}) {
       initializeResult: { protocolVersion: 1, agentCapabilities: {} }, stderrTail: () => [],
       connection: { newSession: vi.fn(async () => ({ sessionId: `oc-${spawned.length}`, configOptions: [MODELS] })), prompt, cancel: vi.fn(async () => undefined),
         setSessionMode: vi.fn(async () => ({})),
-        setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => ({ configOptions: [MODELS, { ...MODES, ...(configId === "mode" ? { currentValue: value } : {}) }] })) } as never,
+        setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => ({ configOptions: [{ ...MODELS, ...(configId === "model" ? { currentValue: value } : {}) }, { ...MODES, ...(configId === "mode" ? { currentValue: value } : {}) }] })) } as never,
       stop: vi.fn(async () => { if (!exited) { exited = true; input.handlers.onExit({ code: 0, signal: null }); } }),
     };
     spawned.push({ env: input.spec.env, linked, bridge });
@@ -105,13 +105,45 @@ it("re-checks the working copy's instructions before each prompt", async () => {
   await expect(lstat(link)).rejects.toThrow();
 });
 
-it("discovers models on a control process, never a working copy's", async () => {
+it("discovers models on a control process, never a working copy's, and offers Zen's free models only when switched on (O6)", async () => {
   const f = await fixture();
   await f.runtime.start();
   const result = await f.runtime.discoverModelCapability("model");
-  expect(result.currentValue).toBe("opencode/muse-spark-1.3-contributor-free");
-  expect(result.offeredValues).toEqual(["opencode/muse-spark-1.3-contributor-free", "anthropic/claude-sonnet-4-5"]);
+  // Free models off (the default): hidden, and never reported as current.
+  expect(result.currentValue).toBe("anthropic/claude-sonnet-4-5");
+  expect(result.offeredValues).toEqual(["anthropic/claude-sonnet-4-5"]);
   expect(f.spawned.at(-1)!.env.XDG_CONFIG_HOME).toBe(f.paths.controlConfig);
+  await f.runtime.applyHostSettings({ openCodeFreeModels: true, coreAcceptsRouteBilling: true });
+  const on = await f.runtime.discoverModelCapability("model");
+  expect(on.currentValue).toBe("opencode/muse-spark-1.3-contributor-free");
+  expect(on.offeredValues).toEqual(["opencode/muse-spark-1.3-contributor-free", "anthropic/claude-sonnet-4-5"]);
+});
+
+it("moves a new session off a free model while they are switched off", async () => {
+  const f = await fixture();
+  await f.runtime.start();
+  await f.session(await f.workingCopy("repo-free"));
+  const set = (f.spawned[1]!.bridge.connection as unknown as { setSessionConfigOption: ReturnType<typeof vi.fn> }).setSessionConfigOption;
+  expect(set).toHaveBeenCalledWith(expect.objectContaining({ configId: "model", value: "anthropic/claude-sonnet-4-5" }));
+});
+
+it("reports OpenCode's credentials with readiness, needing a sign-in when nothing is ready and free models are off", async () => {
+  const f = await fixture();
+  let probe: (settings: { openCodeFreeModels: boolean }) => unknown = () => ({ kind: "logged_out", credentials: [] });
+  const runtime = new AgentRuntime({ config: f.config, spawn: f.spawn, executionBridgeLimit: () => 4,
+    probe: async (_config, _family, _env, _deps, settings) => probe(settings as { openCodeFreeModels: boolean }) as never });
+  runtimes.push(runtime);
+  await runtime.start();
+  expect(runtime.readiness()).toMatchObject({ readiness: "not_configured", recoveryAction: "login_locally", credentials: [] });
+  // Free models switched on: ready with nothing signed in.
+  probe = settings => settings.openCodeFreeModels ? { kind: "signal", fingerprint: "fp-free-models-0123", credentials: [] } : { kind: "logged_out", credentials: [] };
+  await runtime.applyHostSettings({ openCodeFreeModels: true, coreAcceptsRouteBilling: true });
+  expect(runtime.readiness()).toMatchObject({ readiness: "ready", credentials: [] });
+  expect(runtime.readiness()).not.toHaveProperty("recoveryAction");
+  const console = { providerId: "opencode", label: "OpenCode Console account", kind: "sign_in", method: "device", billing: "pay_per_use", state: "ready" };
+  probe = () => ({ kind: "signal", fingerprint: "fp-console-0123456789", credentials: [console] });
+  await runtime.probe(false);
+  expect(runtime.readiness()).toMatchObject({ readiness: "ready", credentials: [console] });
 });
 
 it("refuses to run OpenCode sessions on the control process", async () => {
@@ -127,6 +159,8 @@ it("never lets OpenCode into plan mode, and never reports plan as a choice", asy
   const created = await f.session(a);
   const connection = f.spawned[1]!.bridge.connection as unknown as { setSessionMode: ReturnType<typeof vi.fn>; setSessionConfigOption: ReturnType<typeof vi.fn> };
   const refusal = { kind: "request_error", code: -32602, class: "invalid_params", message: "OpenCode's plan mode is not available on Konteks.", retryable: false };
+  // (The session was moved off the fixture's free default model at creation.)
+  connection.setSessionConfigOption.mockClear();
 
   f.runtime.sessions.setMode(created.acpSessionRef, "m1", { modeId: "plan" });
   f.runtime.sessions.setConfigOption(created.acpSessionRef, "m2", { configId: "mode", value: "plan" } as never);

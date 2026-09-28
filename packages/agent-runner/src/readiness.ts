@@ -1,5 +1,5 @@
 import type { InitializeResponse } from "@agentclientprotocol/sdk";
-import { ConnectedAgentViewSchema, type ConnectedAgentView } from "@konteks/remote-common";
+import { ConnectedAgentViewSchema, type ConnectedAgentCredential, type ConnectedAgentView } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { AgentScopeState } from "./auth/scope-store.js";
 import { hostAgentRunnerAdapter } from "./host/registry.js";
@@ -26,6 +26,8 @@ export interface ReadinessInputs {
   initializeResult: InitializeResponse | null;
   scope: AgentScopeState;
   identity: "signal" | "logged_out" | "no_official_signal" | "unknown";
+  /** What an agent with several sign-ins holds (OpenCode's `auth list`): provider, kind, billing, state; never a secret. */
+  credentials?: readonly ConnectedAgentCredential[];
   bridgeVersionCompatible: boolean;
   /** The verified installed version of a host-installed agent; never an ACP bridge version. */
   hostAgentVersion?: string;
@@ -53,6 +55,7 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
     },
   };
   if (inputs.family.hostInstall !== undefined && inputs.hostAgentVersion) view.hostAgentVersion = inputs.hostAgentVersion;
+  if (inputs.credentials !== undefined) view.credentials = inputs.credentials.map(credential => ({ ...credential }));
   if (inputs.scope.authIdentityFingerprint !== null) view.authIdentityFingerprint = inputs.scope.authIdentityFingerprint;
   if (inputs.scope.scopeAttestedAt !== null) view.scopeAttestedAt = inputs.scope.scopeAttestedAt;
   if (inputs.lastProbeAt !== null) view.lastProbeAt = inputs.lastProbeAt;

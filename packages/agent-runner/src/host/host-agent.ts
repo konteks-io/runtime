@@ -1,4 +1,4 @@
-import type { Logger } from "@konteks/remote-common";
+import type { Logger, OpenCodeLoginOptionId } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import type { RunnerEventBus } from "../events.js";
@@ -45,11 +45,15 @@ export interface HostAgentRunnerAdapter {
   /** A runtime-owned sign-in, used instead of the family's official login tooling when present. */
   startLogin?(options: HostAgentLoginOptions): LoginFlow;
   /** A runtime-owned sign-out, used instead of the family's official logout tooling when present. */
-  logout?(config: RunnerConfig): Promise<void>;
+  logout?(config: RunnerConfig, request?: HostLoginRequest): Promise<void>;
   /** Plain line shown when this agent's sign-in did not complete. */
   readonly loginFailedMessage?: string;
-  /** The identity signal (D111) when it is not an official tooling command. */
-  identity?(config: RunnerConfig): Promise<IdentityProbe>;
+  /** The identity signal (D111) when it is not an official tooling command; may carry the credentials it read. */
+  identity?(config: RunnerConfig, settings: HostAgentSettings): Promise<IdentityProbe>;
+  /** The reviewed sign-ins the site may start for this agent, as its installation offers them (OpenCode). */
+  siteLoginOptions?(config: RunnerConfig): Promise<readonly OpenCodeLoginOptionId[]>;
+  /** Whether a model value may be offered under `settings` (OpenCode: Zen's free models only when switched on, O6). */
+  offersModel?(value: string, settings: HostAgentSettings): boolean;
   /** The verified installed version to report with readiness, when known. */
   hostVersion(config: RunnerConfig): string | undefined;
   /** Whether a turn reports billing token usage (false when the agent sends none). */
@@ -75,6 +79,36 @@ export interface HostWorkingCopyBinding {
 export interface HostAgentLoginOptions {
   config: RunnerConfig;
   events: RunnerEventBus;
-  logger: Pick<Logger, "info">;
+  logger: Pick<Logger, "info" | "warn">;
   loginId?: string;
+  request?: HostLoginRequest;
 }
+
+/** Which sign-in the person (or the site) asked for; only agents with several sign-ins read it. */
+export interface HostLoginRequest {
+  /** The provider to sign in to (OpenCode's integration id). */
+  provider?: string;
+  /** The provider's sign-in method (OpenCode's method id, or `key`). */
+  method?: string;
+  /** The reviewed sign-in the site started (OpenCode). */
+  loginOption?: OpenCodeLoginOptionId;
+  /** Offer to repeat the sign-ins of the person's own installation (OpenCode O10). */
+  reuse?: boolean;
+}
+
+/**
+ * What Core's desired configuration and the Core contract say about host
+ * agents on this computer. Applied by the supervisor; absent fields are off.
+ */
+export interface HostAgentSettings {
+  /** The person switched on OpenCode Zen's free models for this computer (O6). */
+  openCodeFreeModels: boolean;
+  /**
+   * Core takes pay-per-use turns and route billing on offered options (a 7.1.0
+   * Core: it sends the free-models field to a connector that advertises it).
+   * Until then a pay-per-use turn is not reported at all, never mislabelled.
+   */
+  coreAcceptsRouteBilling: boolean;
+}
+
+export const DEFAULT_HOST_AGENT_SETTINGS: HostAgentSettings = Object.freeze({ openCodeFreeModels: false, coreAcceptsRouteBilling: false });

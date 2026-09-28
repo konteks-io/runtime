@@ -63,6 +63,28 @@ describe("native control commands", () => {
     await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "agent_auth_required" });
     expect(f.text()).not.toContain("pasted-secret-value");
   });
+  it("asks OpenCode's provider choice in the open and its key hidden, and passes the chosen sign-in on (CP3)", async () => {
+    const f = fake();
+    const typed: string[] = [];
+    const hidden: string[] = [];
+    f.context.promptLine = async label => { typed.push(label); return "deepseek"; };
+    f.context.promptSecret = async label => { hidden.push(label); return "sk-typed-key-never-shown"; };
+    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
+      f.calls.push(request);
+      if (request.op !== "auth.login") return schema.parse({});
+      options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "Number or provider id", secret: false, visible: true });
+      options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "DeepSeek API key", secret: true });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
+      return schema.parse({ loginId: "l1" });
+    }) as typeof f.context.control.call;
+    await authLogin(f.context, "opencode", false, { provider: "deepseek", method: "key", reuse: true });
+    expect(typed).toEqual(["Number or provider id"]);
+    expect(hidden).toEqual(["DeepSeek API key"]);
+    expect(f.calls[0]).toEqual({ op: "auth.login", agentId: "opencode", organization: false, provider: "deepseek", method: "key", reuse: true });
+    expect(f.calls.slice(1)).toEqual([{ op: "auth.input", loginId: "l1", text: "deepseek" }, { op: "auth.input", loginId: "l1", text: "sk-typed-key-never-shown" }]);
+    expect(f.text()).not.toContain("sk-typed-key-never-shown");
+  });
   it("ends the login connection when the hidden prompt is interrupted", async () => {
     const f = fake();
     let signal: AbortSignal | undefined;

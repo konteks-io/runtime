@@ -1,19 +1,20 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { RemoteInstanceError, createLogger, writeSecretFile, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
+import { RemoteInstanceError, createLogger, writeSecretFile, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type OpenCodeLoginOptionId, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import { fallbackLoginIdentity, probeIdentity, type IdentityProbe } from "./auth/identity.js";
 import { runLogout, startLoginFlow, type LoginFlow } from "./auth/login-flow.js";
 import { hostAgentRunnerAdapter } from "./host/registry.js";
-import type { HostAgentRunnerAdapter, HostWorkingCopyBinding } from "./host/host-agent.js";
+import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentRunnerAdapter, type HostAgentSettings, type HostLoginRequest, type HostWorkingCopyBinding } from "./host/host-agent.js";
 import { AgentScopeStore, applyIdentityObservation, type AgentScopeState } from "./auth/scope-store.js";
 import { classifyBridgeError, spawnBridge, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
-import { discoverBridgeModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
+import { discoverBridgeModelCapability, offerableModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
 import { resolveBridgeSpawnSpec, verifyNativeRunnerPackage, type BridgeSpawnSpec } from "./bridge/spec.js";
 import type { RunnerConfig } from "./config.js";
 import { RunnerEventBus } from "./events.js";
 import { projectReadiness } from "./readiness.js";
-import { SessionManager, type SessionRefStore } from "./sessions/manager.js";
+import { SessionManager, type SessionRefStore, type TurnUsageLabel } from "./sessions/manager.js";
+import { turnUsageLabel } from "./sessions/usage-label.js";
 
 /**
  * The runner's lifecycle owner: a control/login bridge, optional bounded native
@@ -153,6 +154,12 @@ export class AgentRuntime {
   private readonly perWorkingCopy: boolean;
   /** What each such process holds on its working copy, released when it exits. */
   private readonly workingCopyBindings = new WeakMap<BridgeProcess, HostWorkingCopyBinding>();
+  /** Core's settings for host agents on this computer (free models, route billing). */
+  private hostSettings: HostAgentSettings = DEFAULT_HOST_AGENT_SETTINGS;
+  /** The credentials the last identity probe read (OpenCode's `auth list`); never a secret. */
+  private credentials: ConnectedAgentCredential[] | undefined;
+  /** The reviewed sign-ins the site may start here (OpenCode), read once the runtime started. */
+  private siteLoginOptionIds: readonly OpenCodeLoginOptionId[] = [];
 
   constructor(private readonly options: AgentRuntimeOptions) {
     this.events = options.events ?? new RunnerEventBus();
@@ -173,6 +180,8 @@ export class AgentRuntime {
       ...(options.executionBridgeLimit ? { replaceBridge: (ref: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle, cwd) } : {}),
       ...(this.perWorkingCopy ? { beforePrompt: (bridge: BridgeProcess) => this.workingCopyBindings.get(bridge)?.beforePrompt() } : {}),
       ...(this.host?.refusedSessionModes ? { refusedModes: this.host.refusedSessionModes } : {}),
+      ...(this.host?.offersModel ? { modelAllowed: (value: string) => this.host!.offersModel!(value, this.hostSettings) } : {}),
+      usageLabel: modelValue => this.usageLabel(modelValue),
       events: this.events,
       refStore: new FileSessionRefStore(join(options.config.RUNNER_CREDENTIAL_DIR, "session-refs.json")),
       bootstrapTimeoutMs: options.config.RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS,
@@ -191,6 +200,39 @@ export class AgentRuntime {
     this.scope = await this.scopeStore.read();
     await this.ensureBridge();
     await this.probe(false);
+    void this.refreshSiteLoginOptions();
+  }
+
+  /** The reviewed sign-ins the site may start on this machine (OpenCode); empty for every other agent. */
+  siteLoginOptions(): readonly OpenCodeLoginOptionId[] {
+    return this.siteLoginOptionIds;
+  }
+
+  private async refreshSiteLoginOptions(): Promise<void> {
+    if (!this.host?.siteLoginOptions) return;
+    try {
+      this.siteLoginOptionIds = [...await this.host.siteLoginOptions(this.options.config)];
+    } catch (error) {
+      this.logger.warn({ errorCode: error instanceof RemoteInstanceError ? error.code : "sign_in_options_failed" }, "the agent's sign-in options could not be read");
+    }
+  }
+
+  /**
+   * Core's settings for host agents on this computer, from each applied
+   * desired configuration. Switching OpenCode's free models changes what it
+   * offers and, with nothing signed in, whether it is ready: re-probe.
+   */
+  async applyHostSettings(settings: HostAgentSettings): Promise<void> {
+    const previous = this.hostSettings;
+    this.hostSettings = Object.freeze({ ...settings });
+    if (previous.openCodeFreeModels === settings.openCodeFreeModels || !this.host?.offersModel) return;
+    this.modelCapabilities.clear();
+    if (this.connectionState !== "unavailable" && !this.stopping) await this.probe(false);
+  }
+
+  /** How one turn's usage is labelled (O7): sessions/usage-label.ts. */
+  private usageLabel(modelValue: string | undefined): TurnUsageLabel | null {
+    return turnUsageLabel({ agentId: this.family.agentId, modelValue, credentials: this.credentials, coreAcceptsRouteBilling: this.hostSettings.coreAcceptsRouteBilling });
   }
 
   async stop(): Promise<void> {
@@ -623,6 +665,7 @@ export class AgentRuntime {
       initializeResult: this.bridge?.initializeResult ?? null,
       scope: this.authRequired ? { ...this.scope, authIdentityFingerprint: null, scopeAttestedAt: null } : this.scope,
       identity: this.authRequired ? "logged_out" : this.identity,
+      ...(this.credentials === undefined ? {} : { credentials: this.authRequired ? this.credentials.map(credential => ({ ...credential, state: "needs_sign_in" as const })) : this.credentials }),
       bridgeVersionCompatible: true,
       ...(this.hostVersion() === undefined ? {} : { hostAgentVersion: this.hostVersion()! }),
       lastProbeAt: this.lastProbeAt,
@@ -694,7 +737,11 @@ export class AgentRuntime {
       if (oldest) this.modelCapabilities.delete(oldest);
     }
     this.modelCapabilities.set(cacheKey, { at: nowMs, pending });
-    try { return structuredClone(await pending); }
+    try {
+      const offers = this.host?.offersModel;
+      const capability = structuredClone(await pending);
+      return offers ? offerableModelCapability(capability, value => offers(value, this.hostSettings), this.family) : capability;
+    }
     catch (error) {
       if (this.modelCapabilities.get(cacheKey)?.pending === pending) this.modelCapabilities.delete(cacheKey);
       throw error;
@@ -841,12 +888,13 @@ export class AgentRuntime {
     let result: IdentityProbe;
     try {
       await this.prepareToSpawn();
-      result = await (this.options.probe ?? probeIdentity)(this.options.config, this.family, this.spec.env);
+      result = await (this.options.probe ?? probeIdentity)(this.options.config, this.family, this.spec.env, {}, this.hostSettings);
     } catch (error) {
       this.logger.warn({ err: error }, "identity probe failed");
       result = { kind: "logged_out" };
     }
     this.identity = result.kind;
+    if (result.kind !== "no_official_signal" && result.credentials !== undefined) this.credentials = result.credentials;
     if (isLogin && (result.kind === "signal" || result.kind === "no_official_signal")) this.authRequired = false;
     const at = this.now().toISOString();
     this.lastProbeAt = at;
@@ -866,7 +914,7 @@ export class AgentRuntime {
   }
 
   /** Starts the official login flow; completion re-probes readiness and applies the attestation. */
-  startLogin(args: { organization: boolean; loginId?: string; personal?: boolean }): LoginFlow {
+  startLogin(args: { organization: boolean; loginId?: string; personal?: boolean; request?: HostLoginRequest }): LoginFlow {
     // The person asking for their own login on their own machine (the site's
     // Log in, or `konteks-remote auth login` they ran) is not Konteks changing
     // their login behind their back (WS1-115).
@@ -883,7 +931,7 @@ export class AgentRuntime {
     const host = hostAgentRunnerAdapter(this.family.agentId);
     const flow = host?.startLogin
       ? host.startLogin({ config: this.options.config, events: this.events, logger: this.logger,
-        ...(args.loginId === undefined ? {} : { loginId: args.loginId }) })
+        ...(args.loginId === undefined ? {} : { loginId: args.loginId }), ...(args.request === undefined ? {} : { request: args.request }) })
       : startLoginFlow({
         config: this.options.config,
         family: this.family,
@@ -938,14 +986,21 @@ export class AgentRuntime {
     return true;
   }
 
-  async logout(): Promise<ConnectedAgentView> {
+  async logout(request?: HostLoginRequest): Promise<ConnectedAgentView> {
     this.assertConnectorOwnedAuthentication();
     this.connectionState = "starting";
     this.publishReadiness();
     const stopping = this.stopExecutionForAuthChange().then(() => null, error => error);
     const host = hostAgentRunnerAdapter(this.family.agentId);
-    if (host?.logout) await host.logout(this.options.config);
-    else await runLogout({ config: this.options.config, family: this.family, env: this.spec.env });
+    // A refused sign-out (OpenCode: not signed in to that provider) still
+    // brings the agent back before the refusal is returned.
+    let logoutError: unknown = null;
+    try {
+      if (host?.logout) await host.logout(this.options.config, request);
+      else await runLogout({ config: this.options.config, family: this.family, env: this.spec.env });
+    } catch (error) {
+      logoutError = error;
+    }
     const stopError = await stopping;
     await this.bridge?.stop();
     this.bridge = null;
@@ -956,6 +1011,7 @@ export class AgentRuntime {
     }
     await this.ensureBridge();
     const view = await this.probe(false);
+    if (logoutError !== null) throw logoutError;
     return view;
   }
 

@@ -18,3 +18,5 @@ export * from "./auth/identity.js";
 export * from "./auth/login-flow.js";
 export * from "./auth/dsh-key.js";
 export * from "./auth/host-cache-import.js";
+export * from "./sessions/usage-label.js";
+export * from "./auth/opencode-auth.js";
