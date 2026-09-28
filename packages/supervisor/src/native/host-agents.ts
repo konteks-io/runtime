@@ -7,6 +7,7 @@ import { checkDshKonteksProfile } from "./dsh-profile-check.js";
 import { locateNativeOpenCode, resolveNativeOpenCodeInstallation, verifyNativeOpenCodeBinary } from "./opencode-installation.js";
 import { checkOpenCodeKonteksConfig } from "./opencode-self-check.js";
 import { ANTIGRAVITY_CONSENT_TEXT, fetchNativeAntigravity, locateNativeAntigravity, verifyNativeAntigravityFolder, verifyNativeAntigravityRecord, type AntigravityInstallDeps } from "./antigravity-installation.js";
+import { checkAntigravityServer } from "./antigravity-self-check.js";
 
 /** The runner settings a host adapter derives from an install record (merged into `RunnerConfigSchema`). */
 export type HostAgentRunnerSettings = Partial<RunnerConfig> & { RUNNER_BRIDGE_PREFIX: string; RUNNER_BRIDGE_VERSION: string };
@@ -17,6 +18,8 @@ export interface HostAgentSelfCheckDeps {
   openCodeSelfCheck?: typeof checkOpenCodeKonteksConfig;
   /** Antigravity's fetch and integrity checks (a fixture pin and signature check). */
   antigravity?: AntigravityInstallDeps;
+  /** Antigravity's `initialize` start check. */
+  antigravitySelfCheck?: typeof checkAntigravityServer;
 }
 
 /** The connector's own install root (`native-runtime.json` lives there); a fetched agent is kept under `<root>/agents/<id>/`. */
@@ -130,14 +133,15 @@ export const openCodeInstallAdapter: HostAgentInstallAdapter = {
 };
 
 /**
- * Google Antigravity (antigravity-runtime-support CP1): the first FETCHED
- * host agent. Nothing is located on the person's machine: `fetch` downloads
- * Google's pinned zip into `<root>/agents/antigravity/` on the person's yes,
- * `locate` and every load re-verify that copy against the release's pin
- * (sizes, sha256, Google's signature), and the start check verifies it again.
+ * Google Antigravity (antigravity-runtime-support CP1, CP2): the first
+ * FETCHED host agent. Nothing is located on the person's machine: `fetch`
+ * downloads Google's pinned zip into `<root>/agents/antigravity/` on the
+ * person's yes, `locate` and every load re-verify that copy against the
+ * release's pin (sizes, sha256, Google's signature), and the start check
+ * verifies it again, then proves its `initialize` (antigravity-self-check.ts).
  * NOT offered until its security checkpoint (CP4) and sign-in (CP3): refused
- * on install and `agent add`, never detected at enrollment, dropped from a
- * stored record, and its runner refuses to start.
+ * on install and `agent add`, never detected at enrollment, and dropped from
+ * a stored record, so no connector builds its runner yet.
  */
 export const antigravityInstallAdapter: HostAgentInstallAdapter = {
   agentId: "antigravity",
@@ -153,14 +157,15 @@ export const antigravityInstallAdapter: HostAgentInstallAdapter = {
     return { RUNNER_NATIVE_ANTIGRAVITY_ROOT: installation.root, RUNNER_BRIDGE_PREFIX: installation.root, RUNNER_BRIDGE_VERSION: installation.version };
   },
   fetch: request => fetchNativeAntigravity(request),
-  // Integrity on every start (A16), then the gate: the `initialize` self-check arrives in CP2.
+  // Integrity on every start (A16), then one `initialize` in the private home
+  // proves the server answers as the one Konteks governs (A3, CP2).
   async selfCheck(config, deps = {}) {
     const folder = config.RUNNER_NATIVE_ANTIGRAVITY_ROOT;
     if (!folder) throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity has not been downloaded to this computer.", { diagnostic: "antigravity_not_fetched" });
     // `<root>/agents/antigravity/<version>-<platform>` → `<root>`.
     const verified = await verifyNativeAntigravityFolder(dirname(dirname(dirname(folder))), deps.antigravity);
     if (verified.root !== folder) throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity on this computer does not match Google's release.", { diagnostic: "antigravity_unsafe_install" });
-    throw new RemoteInstanceError("agent_unavailable", "Google Antigravity cannot run Konteks work on this computer yet.");
+    await (deps.antigravitySelfCheck ?? checkAntigravityServer)({ config });
   },
 };
 

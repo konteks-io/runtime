@@ -6,6 +6,7 @@ import { OpenCodeLoginOptionIdSchema, RemoteInstanceError, RemoteSessionLabelSch
 import type { RunnerHostSettings, RunnerLoginRequest, RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 import type { checkDshKonteksProfile } from "./dsh-profile-check.js";
 import type { checkOpenCodeKonteksConfig } from "./opencode-self-check.js";
+import type { checkAntigravityServer } from "./antigravity-self-check.js";
 import { hostAgentInstallAdapter } from "./host-agents.js";
 
 const idSchema = z.string().min(1).max(128);
@@ -49,6 +50,8 @@ export interface NativeRunnerOptions {
   dshProfileCheck?: typeof checkDshKonteksProfile;
   /** The OpenCode locked-config self-check; replaced only in tests. */
   openCodeSelfCheck?: typeof checkOpenCodeKonteksConfig;
+  /** The Google Antigravity `initialize` start check; replaced only in tests. */
+  antigravitySelfCheck?: typeof checkAntigravityServer;
 }
 
 /** Host-only runtime adapter. It never starts the legacy runner HTTP/WS API. */
@@ -119,6 +122,7 @@ export class NativeRunner implements RunnerPort {
       await host.selfCheck(this.options.config, {
         ...(this.options.dshProfileCheck ? { dshProfileCheck: this.options.dshProfileCheck } : {}),
         ...(this.options.openCodeSelfCheck ? { openCodeSelfCheck: this.options.openCodeSelfCheck } : {}),
+        ...(this.options.antigravitySelfCheck ? { antigravitySelfCheck: this.options.antigravitySelfCheck } : {}),
       });
       this.hostSelfCheck = "passed";
     } catch (error) {

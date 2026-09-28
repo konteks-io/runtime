@@ -236,8 +236,10 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     const folder = fields.antigravityRoot!;
     const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "workspaces", "antigravity"),
       RUNNER_BRIDGE_PREFIX: folder, RUNNER_BRIDGE_VERSION: "1.2.1", RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder });
-    // Verified, then the gate: it may not run Konteks work before CP4.
-    await expect(antigravityInstallAdapter.selfCheck(config, { antigravity: deps(pin) })).rejects.toMatchObject({ code: "agent_unavailable", message: "Google Antigravity cannot run Konteks work on this computer yet." });
+    // Verified, then the `initialize` start check (CP2) runs on that exact folder.
+    const initialize = vi.fn(async () => undefined);
+    await antigravityInstallAdapter.selfCheck(config, { antigravity: deps(pin), antigravitySelfCheck: initialize });
+    expect(initialize).toHaveBeenCalledWith({ config });
     const calls = signature.mock.calls.length;
     await verifyNativeAntigravityFolder(root, deps(pin));
     expect(signature.mock.calls.length).toBe(calls);
@@ -249,7 +251,8 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     await handle.write(Buffer.from([HARNESS[7]! ^ 0x01]), 0, 1, 7);
     await handle.close();
     await utimes(harness, before.atime, before.mtime);
-    await expect(antigravityInstallAdapter.selfCheck(config, { antigravity: deps(pin) })).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_unsafe_install" });
+    await expect(antigravityInstallAdapter.selfCheck(config, { antigravity: deps(pin), antigravitySelfCheck: initialize })).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_unsafe_install" });
+    expect(initialize).toHaveBeenCalledOnce();
     await expect(verifyNativeAntigravityRecord(fields, root, deps(pin))).rejects.toMatchObject({ diagnostic: "antigravity_unsafe_install" });
     // A fresh fetch replaces the copy that no longer verifies.
     await expect(fetchNativeAntigravity({ root, consent: true }, deps(pin))).resolves.toEqual(fields);
@@ -372,7 +375,7 @@ describe("the zip reader and the signature check", () => {
   });
 });
 
-describe("the Antigravity install adapter (gated until CP4)", () => {
+describe("the Antigravity install adapter (not offered until CP4)", () => {
   it("is registered, fetched, not offered, and refuses without the connector's folder", async () => {
     expect(hostAgentInstallAdapter("antigravity")).toBe(antigravityInstallAdapter);
     expect(antigravityInstallAdapter.offered).toBe(false);
