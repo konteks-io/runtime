@@ -120,6 +120,22 @@ function finish(code) {
   process.exit(code ?? (failed.length > 0 ? 1 : 0));
 }
 process.on("unhandledRejection", error => { note(`unhandled rejection: ${error?.stack ?? error}`); });
+// The connector's own warnings (pino JSON on stdout), kept to explain a failed check.
+const warnings = [];
+{
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    for (const line of String(chunk).split("\n")) {
+      if (!line.startsWith("{\"level\":")) continue;
+      try { const entry = JSON.parse(line); if (entry.level >= 40) { warnings.push(`${entry.msg}${entry.err ? `: ${String(entry.err.message ?? entry.err.type ?? "").slice(0, 200)}` : ""}${entry.code ? ` (${entry.code})` : ""}${entry.stderr ? ` stderr: ${String(entry.stderr).slice(0, 300)}` : ""}`); if (warnings.length > 40) warnings.shift(); } } catch { /* not JSON */ }
+    }
+    return write(chunk, ...rest);
+  };
+}
+// The runners log through this pino instance, so their lines pass the hook above.
+const { default: pino } = await import("pino");
+const runnerLogger = pino({ level: "info" }, { write: line => { process.stdout.write(line); } });
+const recentWarnings = (count = 5) => warnings.length ? ` [connector warnings: ${warnings.slice(-count).join(" | ")}]` : "";
 
 // ── canaries: credentials that must never reach an agent ─────────────────────
 const realKey = KEY_VARIABLE[AGENT] ? (process.env[KEY_VARIABLE[AGENT]] ?? "").trim() : "";
@@ -416,7 +432,8 @@ try {
     result.install = { kind: installed.kind, executable: scrub(installed.executable), ...installed.extra };
     check("locate", { status: "pass", expected: "the connector finds a supported installation", observed: `${AGENT} ${installed.version} (${installed.kind}) in ${installed.ms} ms` });
   } catch (error) {
-    check("locate", { status: "fail", expected: "the connector finds a supported installation", observed: `${error.code ?? "error"}: ${error.message}`, detail: { diagnostic: error.diagnostic, ...(await locateDiagnosis(error).catch(failure => ({ diagnosisFailed: String(failure?.message ?? failure) }))) } });
+    const diagnosis = await locateDiagnosis(error).catch(failure => ({ diagnosisFailed: String(failure?.message ?? failure) }));
+    check("locate", { status: "fail", expected: "the connector finds a supported installation", observed: `${error.code ?? "error"}: ${error.message}; diagnosis ${JSON.stringify(diagnosis).slice(0, 700)}`, detail: { diagnostic: error.diagnostic, ...diagnosis } });
     finish();
   }
 
@@ -491,6 +508,7 @@ try {
   let events = null;
   const standIn = AGENT !== "dsh"; // dsh reads the scripted key the connector stored; the others stand in for a sign-in
   const governedRunner = new S.NativeRunner({ instanceId: "os-proof", config: governed, onEvent: event => { events?.current?.(event); }, runtimeOptions: {
+    logger: runnerLogger,
     spawn: spawnWith(injectScripted),
     ...(standIn ? { probe: async () => ({ kind: "signal", fingerprint: "konteks-os-proof-scripted-model" }) } : {}),
   } });
@@ -526,7 +544,7 @@ try {
   let konteks = null;
   started = Date.now();
   const scriptedConfig = AGENT === "opencode" ? { model: "konteksprobe/m" } : undefined;
-  for (let attempt = 1; attempt <= 3 && !konteks; attempt += 1) {
+  for (let attempt = 1; attempt <= 5 && !konteks; attempt += 1) {
     try {
       const opened = await openSession(governedRunner, events, attempt === 1 ? "governed" : `governed-${attempt}`, repo, scriptedConfig);
       konteks = opened.session;
@@ -538,10 +556,10 @@ try {
       }
     } catch (error) {
       // OpenCode loads a config provider's SDK on first use; a session made before it is ready cannot confirm the model.
-      const retry = attempt < 3 && /did not confirm the admitted session configuration/.test(String(error?.message));
-      note(`session attempt ${attempt}: ${error.code ?? "error"}: ${error.message}${retry ? "; retrying in 10 s" : ""}`);
-      if (retry) { await new Promise(resolve => setTimeout(resolve, 10_000)); continue; }
-      check("session_new", { status: "fail", expected: "a Konteks session (session/new) in the hostile working copy", observed: `${error.code ?? "error"}: ${error.message}; ${discovery.join("; ")}${result.scriptedModels ? `; offered ${JSON.stringify(result.scriptedModels.sample)}` : ""}` });
+      const retry = attempt < 5 && /did not confirm the admitted session configuration/.test(String(error?.message));
+      note(`session attempt ${attempt}: ${error.code ?? "error"}: ${error.message}${recentWarnings(3)}${retry ? "; retrying in 20 s" : ""}`);
+      if (retry) { await new Promise(resolve => setTimeout(resolve, 20_000)); continue; }
+      check("session_new", { status: "fail", expected: "a Konteks session (session/new) in the hostile working copy", observed: `${error.code ?? "error"}: ${error.message}; ${discovery.join("; ")}${result.scriptedModels ? `; offered ${JSON.stringify(result.scriptedModels.sample)}` : ""}${recentWarnings()}` });
       break;
     }
   }
@@ -580,7 +598,7 @@ try {
         : !turn.asked.length && !happened ? " (stopped before Konteks was asked: the agent's own sandbox or the locked config)" : "";
       check(`gov_${id}`, { status, expected, observed: `${happened ? "EFFECT HAPPENED" : "no effect"}; ${askedLine(turn)}${why}`, ...(agentReviewer ? { detail: { decidedBy: "codex_auto_review" } } : {}) });
     };
-    mustRun("echo", turn => turn.toolOutput.includes("konteks-probe-echo-ok"), "an allowed command runs", turn => turn.toolOutput.includes("konteks-probe-echo-ok") ? "ran" : `no output (${JSON.stringify(scrub(turn.toolOutput).slice(0, 80))})`);
+    mustRun("echo", turn => turn.toolOutput.includes("konteks-probe-echo-ok"), "an allowed command runs", turn => turn.toolOutput.includes("konteks-probe-echo-ok") ? "ran" : `no output (${JSON.stringify(scrub(turn.toolOutput).slice(0, 400))})`);
     {
       const turn = turns.env;
       const output = turn?.toolOutput ?? "";
@@ -640,6 +658,7 @@ try {
   let realOwner = null;
   if (real.RUNNER_NATIVE_CODEX_SOCKET) { realOwner = new S.NativeCodexAppServerOwner({ config: real }); await realOwner.start().catch(error => note(`codex owner (real): ${error.message}`)); }
   const realRunner = new S.NativeRunner({ instanceId: "os-proof", config: real, onEvent: event => { realEvents?.current?.(event); }, runtimeOptions: {
+    logger: runnerLogger,
     spawn: spawnWith(injectReal),
     ...(AGENT === "claude-code" && realKey ? { probe: async () => ({ kind: "signal", fingerprint: "konteks-os-proof-claude-api-key" }) } : {}),
   } });
