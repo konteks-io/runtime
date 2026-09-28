@@ -7,12 +7,13 @@ not build or deploy the connector from that checkout.
 
 `konteks-remote` is the Konteks native runtime connector. It installs on a
 developer's or team's own machine, runs the coding agents that are already
-installed there (Claude Code, Codex, DeepSeek Harness, OpenCode 2) under
+installed there (Claude Code, Codex, DeepSeek Harness, OpenCode 2), and
+Google Antigravity, which it downloads from Google after you say yes, under
 their own subscriptions or keys, and connects them to a Konteks workspace over
 an outbound, authenticated channel. No Docker, no local databases. The only
-provider keys on the host are the ones you give DeepSeek Harness or OpenCode
-(a DeepSeek key; any provider's key OpenCode supports), kept in the
-connector's private folder.
+provider keys on the host are the ones you give DeepSeek Harness, OpenCode or
+Google Antigravity (a DeepSeek key; any provider's key OpenCode supports; a
+Gemini API key), kept in the connector's private folder.
 
 ## Install
 
@@ -172,7 +173,7 @@ in the prompt and the agent answers with a fenced JSON block, as before.
 Sessions that have a preview (the validator, QA-mode and other
 conversations, and the executor; not planning) also get a headless browser
 on the session's preview, whichever agent runs them (Claude Code, Codex,
-DeepSeek Harness or OpenCode): the browser belongs to the connector, not to
+DeepSeek Harness, OpenCode or Google Antigravity): the browser belongs to the connector, not to
 one agent. It is Microsoft's Playwright MCP (`@playwright/mcp` 0.0.82, pinned
 in `release/native-agent-builds.json` and carried inside the Claude Code and
 Codex agent packages). Claude Code and Codex run their own copy; the other
@@ -293,14 +294,45 @@ why. `doctor` also shows its version, how it was installed, the settings check,
 what it is signed in with (labels only), whether free models are on and
 whether its sessions get the QA browser.
 
-### Google Antigravity (not available yet)
+### Google Antigravity
 
-Google Antigravity (`antigravity`) will be the fifth agent. Nobody installs
-it: after you say yes, the connector downloads Google's official Antigravity
-ACP server (never the `agy` CLI) from Google's server, checks it against the
-exact version, sizes, hashes and Google signature this Konteks release pins,
-keeps it in the connector's own folder, and checks it again before every
-start. It runs with a scrubbed environment and a private home: never your
+Google Antigravity (`antigravity`) is the fifth agent. Nobody installs it:
+add it and sign it in on the computer.
+
+```sh
+konteks-remote agent add antigravity      # asks before downloading from Google
+konteks-remote auth login antigravity     # a Gemini API key or Gemini Enterprise
+```
+
+`agent add antigravity` (or `install --agents ...,antigravity`) shows this
+question and downloads only on your yes (`--yes` is that yes given up front,
+by you; without a terminal and without `--yes` nothing is downloaded):
+
+> Konteks will download Google Antigravity from Google's server
+> (dl.google.com, about 110 MB, 400 MB on disk), check Google's signature, and
+> keep it updated with Konteks updates. Google's terms apply to its use
+> (antigravity.google/terms). Download it now? [y/N]
+
+The connector then downloads Google's official Antigravity ACP server (never
+the `agy` CLI, and never a copy the Antigravity app or an editor downloaded)
+while the connector keeps running, checks it against the exact version, sizes,
+hashes and Google signature this Konteks release pins, keeps it in the
+connector's own folder, and checks it again before every start. It needs about
+1.5 GB free to download. Only macOS on Apple silicon is supported for now;
+elsewhere the command says "Google Antigravity is not available for this
+computer yet." before asking anything. Running `agent add antigravity` again
+downloads a copy that no longer matches Google's release. Onboarding never
+finds it on its own (the Antigravity app and the `agy` CLI are other
+products); with no other agent it offers it in one line.
+
+Updates: when a Konteks update pins a newer Google Antigravity, the connector
+downloads it in the background on your first yes, checks it, runs its start
+check, switches to it and deletes the old version; if that fails, the old
+folder stays, it is tried again, and `doctor` says why.
+`konteks-remote agent remove antigravity` asks once, stops the connector,
+signs Antigravity out, deletes its download and its sign-ins on this computer,
+and starts the connector again; your other agents are untouched. Uninstalling
+the connector removes it too. It runs with a scrubbed environment and a private home: never your
 `GITHUB_TOKEN`, Gemini or Google Cloud variables, provider keys, `~/.gemini`,
 the Antigravity app or your macOS keychain. Before it starts, the connector
 checks that the server answers as the version it knows. Every session keeps
@@ -339,8 +371,18 @@ restart the connector; on Gemini Enterprise that usually means your
 organisation's Terminal auto-execution setting is not Require review, and the
 message says so. Its `/plan` and `/logout` commands are not available.
 
-It is not offered yet: `install --agents` and `agent add` refuse it until the
-download and onboarding steps are finished.
+Behind a proxy, both the download and the Gemini API key relay honour
+`HTTPS_PROXY` (or `ALL_PROXY`) and `NO_PROXY` from the connector's own
+environment.
+
+`doctor` shows its version (pinned by this Konteks release), that it was
+downloaded from Google with its signature checked, the start check, what it is
+signed in with (labels only, never the project or a key, and the Business AI
+Code API command when Google found no licence), the disk it uses, and whether
+its sessions get the QA browser; after an unasked command on Gemini Enterprise
+it names the "Terminal auto-execution: Require review" setting, and when your
+organisation's MCP Servers setting dropped Konteks' tools it says "Konteks
+tools unavailable: turn on MCP Servers in Gemini Enterprise settings".
 
 Pi is no longer supported: `install --agents` and `agent add` refuse it, and
 an installation that still lists it keeps working without it (the connector

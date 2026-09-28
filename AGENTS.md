@@ -117,8 +117,8 @@ fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered
-since opencode-runtime-support CP6); Google Antigravity (`antigravity`) is
-registered, fetched and signs in, but is not offered yet (below). Pi is retired: every write or install
+since opencode-runtime-support CP6), and Google Antigravity (`antigravity`,
+fetched by the connector on the person's yes, offered since its CP6, below). Pi is retired: every write or install
 refuses it with `retiredAgentMessage` from `@konteks/backstage-plugin-common`,
 while stored values stay readable (a `native-runtime.json` still listing it
 loads without it through `parseNativeRuntimeRecord`, with a logged warning).
@@ -230,16 +230,53 @@ supervisor starts the site's Gemini Enterprise sign-in from an intent's
 `loginOption: gemini-enterprise` + `gcp` (`native/site-login.ts`: Google's
 link only, `no_license` to a 7.1.0 Core, `login_failed` to an older one),
 advertises `agent-login-antigravity-v1` +
-`agent-login-antigravity:gemini-enterprise` (relay up and a desktop) and the
-free-models capability (the 7.1.0 Core signal), puts the credential in use's
+`agent-login-antigravity:gemini-enterprise` (relay up and a desktop; since
+CP6 no longer OpenCode's free-models capability: the 7.1 signal is the
+generic `core-contract-version-v1`), puts the credential in use's
 billing on offered Gemini models (`antigravityOptionBilling`) and
 `hostAgentDownload` on the connected agent (`native/antigravity-download.ts`,
-7.1.0 Core only; an Antigravity that cannot start is still reported with
-it). CP4 (governance, below) is built; it is still NOT offered
-(`antigravityInstallAdapter.offered = false`) until CP6 (launcher, onboarding,
-updates): install and `agent add` refuse it (its `auth` commands take it),
-enrollment never detects it, a stored record drops it, so no connector builds
-its runner yet.
+7.1 Core only; an Antigravity that cannot start is still reported with it, and
+one `agent add` is downloading in the launcher reads `downloading` from the
+growing staging file). CP4 (governance, below) is built. CP6 (offered,
+`antigravityInstallAdapter.offered = true`): `install --agents …,antigravity`
+and `agent add antigravity` refuse a computer without a pin first
+(`assertFetchable`), then ask `consentText` verbatim (launcher
+`native/consent.ts`: a terminal answer, or `--yes` given by the person; a
+relaying agent never adds it), fetch while the service keeps running
+(`fetchHostAgent` in `native/install.ts`, before `runNativeAgentAdd` drains and
+stops it) and record it with no release or reactivation; a listed copy that no
+longer verifies is fetched and recorded again by the same command.
+Enrollment never detects it (it is fetched, not found) and refuses it in
+`install --enroll --agents`. Updates (A17, `native/antigravity-update.ts`): a
+load whose record lists Antigravity with another version or a missing folder
+parks it with `updating` and a `relocate` that fetches this release's pin on
+the person's first yes, runs the start check on it, writes the two record
+fields under the installer's lock (deferred to a later start when an
+installer holds it) and prunes the other versions; the supervisor starts that
+retry at once (`NativeAgentRetry.park(…, { firstDelayMs: 0 })`). Removal
+(A18): `agent remove antigravity [--yes]` (launcher `runNativeAgentRemove` →
+`removeNativeAgent`) asks once, drains and stops the service, signs out on a
+process of its own (`signOutNativeAntigravity`: the adapter's `logout`, ACP
+`logout` + token and key removed), drops it from the record, then deletes every
+version, `<credentials>/antigravity` and `<workspaces>/antigravity`
+(`deleteNativeAntigravity`); only a fetched agent is removable this way.
+Onboarding: `agentName` "Google Antigravity", never detected, a listed one is a
+host family (not signed in → both `auth login antigravity` forms with the
+Business AI Code API command; not started → doctor), and one line offers it to
+a person with no agent. Graft wires it as `agents` (the connector delivers
+AGENTS.md, A9). `doctor` (`support/doctor.ts` `antigravity`,
+`Supervisor.antigravityDoctor`): pinned version, "downloaded from Google,
+signature checked", the start check, credentials by label with the no-licence
+remedy, the A21 "Terminal auto-execution: Require review" line after a
+quarantine (`NativeRunner.quarantineReason`), "Konteks tools unavailable: turn
+on MCP Servers in Gemini Enterprise settings" when a Gemini Enterprise session
+had its MCP servers dropped (`observeAntigravityAdminLine` on execution
+stderr → `<credentials>/antigravity/antigravity/admin-controls.json`, cleared
+by an Enterprise sign-in or sign-out or an allowlist keeping ours), disk used,
+the QA browser, or why it is left out (not fetched, updating, unsafe copy, no
+disk, no pin for this computer). The relay honours `HTTPS_PROXY`/`ALL_PROXY`
+and `NO_PROXY` for Google (`openHttpsProxyTunnel`, remote-common
+`https-proxy.ts`, shared with the download).
 
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never
@@ -427,8 +464,12 @@ start. A turn's money basis follows how its route's provider bills
 carry the `usage_update.cost` delta (USD micros; unknown, never zero, when
 none was reported); subscription turns stay `unavailable_local_subscription`;
 dsh's key turns are pay-per-use. Pay-per-use turns and offered-option
-`billing` go only to a 7.1.0 Core, recognised by the presence of
-`openCodeFreeModelsEnabled` in its desired configuration. With an OpenCode
+`billing` go only to a 7.1 Core, recognised by the Core wire-contract version
+Core signs into the desired configuration (`coreContractVersion`, read with
+`coreContractAtLeast(…, "7.1")` in `Supervisor.applyHostSettings`) for a
+connector advertising `core-contract-version-v1`, which the `agent_runner`
+component always does (`native/inventory.ts`); no fallback on
+`openCodeFreeModelsEnabled`, OpenCode's own switch. With an OpenCode
 Console sign-in in the private home, `acp`'s session catalogue is the
 account's (plan listed, a config-declared provider absent) while the
 permission rules, the project lock and `debug agents`' resolved agents stay

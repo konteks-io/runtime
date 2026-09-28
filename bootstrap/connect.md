@@ -48,10 +48,13 @@ before them says so.
   to Konteks yourself; each step tells you the next one.
 - If `konteks-remote` is not found, use the full path the install printed.
 - A `done` summary may name a command for the person's own agents, such as
-  `konteks-remote auth login opencode` or OpenCode 2's install command
-  (`curl -fsSL https://opencode.ai/v2/install | bash`). Show it to the person
-  as written; they run it in their own terminal, because it can ask them for a
-  sign-in or a key. Do not run it for them.
+  `konteks-remote auth login opencode`, OpenCode 2's install command
+  (`curl -fsSL https://opencode.ai/v2/install | bash`),
+  `konteks-remote agent add antigravity` or
+  `konteks-remote auth login antigravity`. Show it to the person as written;
+  they run it in their own terminal, because it can ask them for a sign-in, a
+  key or their yes to a download. Do not run it for them, and never answer the
+  download question or add `--yes` for them.
 - If a command fails outright, show the person its message as it is and stop.
 
 macOS and Linux only. On Windows, the person creates an activation in the

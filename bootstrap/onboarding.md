@@ -59,7 +59,8 @@ and picks up at the repository step.
 ## Agents
 
 Konteks runs the coding agents already on this machine: Claude Code, Codex,
-DeepSeek Harness and OpenCode 2. Onboarding finds the ones installed and says
+DeepSeek Harness and OpenCode 2, and Google Antigravity, which it downloads
+from Google after you say yes. Onboarding finds the ones installed and says
 what each still needs.
 
 OpenCode 2 is the version OpenCode's homepage installs; OpenCode 1 is not
@@ -80,6 +81,26 @@ the providers it is signed in to. On Windows, install it with
 OpenCode runs in a scrubbed environment: Konteks gives it a private home and
 only the settings it needs, never your `GITHUB_TOKEN`, provider keys or other
 credentials from your shell, and never touches your own OpenCode sign-ins.
+
+Google Antigravity (for Gemini) is not found on the machine: Konteks downloads
+Google's own copy after you say yes, so onboarding only offers it, in one line,
+when no other agent is here. To add it, in your own terminal:
+
+```
+konteks-remote agent add antigravity
+konteks-remote auth login antigravity --api-key
+```
+
+The first command asks before it downloads anything from Google (about
+110 MB, 400 MB on disk). Sign in with a Gemini API key (typed without echo),
+or with Gemini Enterprise:
+`konteks-remote auth login antigravity --enterprise --project <your Google Cloud project ID> --location global`
+(the project needs Google's Business AI Code API:
+`gcloud services enable businessaicode.googleapis.com --project <your Google Cloud project ID>`,
+and your Google Cloud admin must set Terminal auto-execution to Require
+review). It runs in the same scrubbed environment, never touches `~/.gemini`,
+the Antigravity app or your keychain, and
+`konteks-remote agent remove antigravity` takes it off again.
 
 ## Platforms
 

@@ -6,9 +6,9 @@ import { RemoteInstanceError } from "@konteks/remote-common";
  * `konteks-remote agent add antigravity` and `install --agents …,antigravity`
  * show the line exactly as written (it ends "[y/N]") and download only on an
  * explicit yes. In a terminal the person answers it; `--yes` is that answer
- * given up front (the person read the line, for example relayed by their own
- * coding agent), and the line is still shown. Anything else, a closed input
- * included, is no.
+ * given up front by the person (a relaying coding agent never adds it for
+ * them, bootstrap/connect.md), and the line is still shown. Anything else, a
+ * closed input included, is no.
  */
 export type FetchConsent = (agentId: string, text: string) => Promise<boolean>;
 
