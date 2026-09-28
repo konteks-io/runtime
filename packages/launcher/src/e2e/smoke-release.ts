@@ -10,7 +10,7 @@ import {
   type AgentModelCapabilityMapping,
   type RemoteNativeArtifact,
 } from "@konteks/remote-common";
-import { HOST_AGENT_BRIDGES, installOfflineAgentPackage, reviewedNativeModelIdentities, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
+import { EmbeddedReleaseRootSchema, HOST_AGENT_BRIDGES, installOfflineAgentPackage, reviewedNativeModelIdentities, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RemoteSignedBundleManifest } from "@konteks/remote-common";
 
 export interface E2ESmokeReleaseOptions {
@@ -161,10 +161,40 @@ async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directo
   const manifest = signNativeReleaseManifest({
     bundleVersion, protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [connectorArtifact, ...agentArtifacts], modelCapabilityMappings: mappings, expiresAt: expiresAt.toISOString(),
   }, { keyId, privateKey });
-  const root: EmbeddedReleaseRoot = { keyId, publicKeyJwk: createPublicKey(privateKey).export({ format: "jwk" }) } as EmbeddedReleaseRoot;
+  const control = await localControlAuthority(options.directory);
+  const root: EmbeddedReleaseRoot = EmbeddedReleaseRootSchema.parse({
+    keyId, publicKeyJwk: createPublicKey(privateKey).export({ format: "jwk" }),
+    ...(control ? { coreControlKeys: [control] } : {}),
+  });
   await writeFile(join(options.directory, "release-roots.json"), JSON.stringify({ roots: [root] }), { mode: 0o600 });
   await writeFile(join(options.directory, "native-manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
   return { root, manifest, artifactFiles: { connector: connectorPath, agent: agentFiles[agentArtifacts[0]!.agentId!]!, agents: agentFiles } };
+}
+
+async function localControlAuthority(
+  directory: string,
+): Promise<{ keyId: string; publicKeyJwk: EmbeddedReleaseRoot["publicKeyJwk"] } | null> {
+  const path = join(dirname(directory), "private", "native-control-public.json");
+  const info = await lstat(path).catch((error) => {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")
+      return null;
+    throw error;
+  });
+  if (!info) return null;
+  if (
+    !info.isFile() ||
+    info.nlink !== 1 ||
+    info.size > 4096 ||
+    (process.platform !== "win32" && (info.mode & 0o077) !== 0)
+  )
+    fail();
+  try {
+    const key = EmbeddedReleaseRootSchema.parse(JSON.parse(await readFile(path, "utf8")));
+    if (key.keyId !== "e2e-local-native-control-1" || key.coreControlKeys !== undefined) fail();
+    return { keyId: key.keyId, publicKeyJwk: key.publicKeyJwk };
+  } catch {
+    return fail();
+  }
 }
 
 /**
@@ -236,7 +266,27 @@ async function shaFile(path: string): Promise<`sha256:${string}`> {
   return `sha256:${hash.digest("hex")}`;
 }
 
-function fakeTooling(): string { return `#!/usr/bin/env node\nif (process.argv.slice(2).join(" ") === "login status") process.stdout.write(JSON.stringify({ account: "konteks-e2e-fake-official-codex" }) + "\\n"); else process.exitCode = 2;\n`; }
+function fakeTooling(): string {
+  return `#!/usr/bin/env node
+const command = process.argv.slice(2).join(" ");
+if (command === "app-server") {
+  const readline = require("node:readline");
+  readline.createInterface({ input: process.stdin }).on("line", line => {
+    let request;
+    try { request = JSON.parse(line); } catch { return; }
+    if (request.id === 1 && request.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: 1, result: { protocolVersion: "e2e" } }) + "\\n");
+    } else if (request.id === 2 && request.method === "account/read") {
+      process.stdout.write(JSON.stringify({ id: 2, result: { account: { type: "chatgpt", email: "codex@e2e.konteks.test" } } }) + "\\n");
+    }
+  });
+} else if (command === "login status") {
+  process.stdout.write(JSON.stringify({ account: "konteks-e2e-fake-official-codex" }) + "\\n");
+} else {
+  process.exitCode = 2;
+}
+`;
+}
 function fakeBridge(): string { return `#!/usr/bin/env node
 const readline = require("node:readline");
 let sessions = 0;

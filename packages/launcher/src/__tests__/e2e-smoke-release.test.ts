@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,70 @@ import { RunnerConfigSchema, resolveBridgeSpawnSpec, spawnBridge } from "@kontek
 import { prepareE2ERealRelease, prepareE2ESmokeRelease } from "../e2e/smoke-release.js";
 
 describe("signed E2E ACP releases", () => {
+  it("keeps the private E2E Core control authority in a freshly prepared release root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-control-root-"));
+    try {
+      const directory = join(root, ".runtime", "native-cloud");
+      const privateDir = join(root, ".runtime", "private");
+      await mkdir(privateDir, { recursive: true, mode: 0o700 });
+      const control = {
+        keyId: "e2e-local-native-control-1",
+        publicKeyJwk: generateKeyPairSync("ed25519").publicKey.export({ format: "jwk" }),
+      };
+      await writeFile(join(privateDir, "native-control-public.json"), JSON.stringify(control), {
+        mode: 0o600,
+      });
+      const prepared = await prepareE2ESmokeRelease({
+        gate: "1",
+        directory,
+        origin: "https://127.0.0.1:7443",
+        platform: { os: "macos", architecture: "arm64" },
+      });
+      expect(prepared.root.coreControlKeys).toEqual([control]);
+      const saved = JSON.parse(await readFile(join(directory, "release-roots.json"), "utf8"));
+      expect(saved.roots[0].coreControlKeys).toEqual([control]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("answers the Codex account probe with a deterministic E2E identity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-codex-account-"));
+    try {
+      const prepared = await prepareE2ESmokeRelease({
+        gate: "1",
+        directory: join(root, ".runtime", "native-cloud"),
+        origin: "https://127.0.0.1:7443",
+        platform: { os: "macos", architecture: "arm64" },
+      });
+      const artifact = prepared.manifest.nativeArtifacts?.find((item) => item.agentId === "codex");
+      const prefix = join(root, "installed-agent");
+      await installOfflineAgentPackage(prepared.artifactFiles.agent, prefix, artifact!);
+      const replies = execFileSync(join(prefix, "bin", "codex"), ["app-server"], {
+        encoding: "utf8",
+        input: [
+          JSON.stringify({
+            method: "initialize",
+            id: 1,
+            params: { clientInfo: { name: "konteks_identity_probe", version: "0.1.0" } },
+          }),
+          JSON.stringify({ method: "initialized", params: {} }),
+          JSON.stringify({ method: "account/read", id: 2, params: { refreshToken: false } }),
+          "",
+        ].join("\n"),
+      })
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(replies).toEqual([
+        { id: 1, result: expect.any(Object) },
+        { id: 2, result: { account: { type: "chatgpt", email: "codex@e2e.konteks.test" } } },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("installs and executes one Codex-shaped ACP bridge through the normal verified package boundary", async () => {
     const root = await mkdtemp(join(tmpdir(), "konteks-e2e-smoke-release-"));
     try {
