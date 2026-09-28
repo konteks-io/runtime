@@ -24,9 +24,6 @@ import {
   type RelayRuntimeHandshakeResult,
   type SupervisorStatus,
   type PreviewStatusReport,
-  AGENT_LOGIN_METHOD,
-  AgentLoginUserCodeSchema,
-  agentLoginUrlAllowed,
   type RuntimeAgentLoginDeliveryRequest,
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
@@ -64,8 +61,9 @@ import { ChannelMux } from "./relay/channel-mux.js";
 import { RelayClient } from "./relay/relay-client.js";
 import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
-import { ModelCapabilitySnapshotProducer } from "./native/model-capability-snapshot.js";
+import { ModelCapabilitySnapshotProducer, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
+import { openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
 import { NativeInputClient } from "./native/input-client.js";
 import { NativeOutputClient } from "./native/output-client.js";
 import { createRetainedDeliveryOutputRecovery } from "./native/output-recovery.js";
@@ -165,6 +163,7 @@ export class Supervisor {
   private manifestDigest = "";
   /** Core's desired configuration; native, with no roles, until Core sends one. */
   private configuration: ConfigRecord["configuration"] = DEFAULT_CONFIG;
+  private hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: false };
   private roleBindings: RoleBinding[] = [];
   private draining = false;
   private drainReason: string | null = null;
@@ -378,6 +377,7 @@ export class Supervisor {
       // A site-started login needs a native install with a Codex runner (WS1-115).
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
+      additionalCapabilities: () => this.openCodeCapabilities(),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
       cancellationDeliveryReady: () => {
@@ -407,6 +407,9 @@ export class Supervisor {
         if (!runner) throw new RemoteInstanceError("agent_unavailable", "Reviewed model mapping has no installed native runner.");
         return runner.discoverModelCapability(configId);
       },
+      // OpenCode's routes bill by provider and credential (O7, O11); only a
+      // 7.1.0 Core takes the field (the shape is strict and digested).
+      optionBilling: (agentId, value, agent) => (this.hostSettings.coreAcceptsRouteBilling && agentId === "opencode" ? openCodeOptionBilling(agent, value) : undefined),
     });
 
     this.mux = new ChannelMux({
@@ -685,6 +688,7 @@ export class Supervisor {
       onConfigurationApplied: (configuration) => {
         this.configuration = configuration;
         this.roleBindings = (configuration.roleBindings ?? []).map(binding => ({ role: binding.role, agentPreference: [...binding.agentPreference] }));
+        this.applyHostSettings(configuration);
       },
       localCapacity: () => Math.max(1, (this.lastSnapshot?.agents.filter((agent) => agent.readiness === "ready").length ?? 1) * 4),
       onDrain: async (directive) => this.beginDrain(directive.reason, directive.drainDeadline ?? null),
@@ -1764,8 +1768,11 @@ export class Supervisor {
             void runner.loginCancel(loginId).catch(error => this.logger.warn({ err: error }, "orphaned local login cancellation failed"));
           }, { once: true });
           // The person ran this on their own machine: their own login (WS1-115).
+          const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }),
+            ...(request.reuse === undefined ? {} : { reuse: request.reuse }) };
           try {
-            await runner.login(request.organization, loginId, true);
+            if (Object.keys(which).length > 0) await runner.login(request.organization, loginId, true, which);
+            else await runner.login(request.organization, loginId, true);
             if (emit.signal.aborted) {
               await runner.loginCancel(loginId);
               throw new RemoteInstanceError("temporarily_unavailable", "login caller disconnected");
@@ -1792,7 +1799,7 @@ export class Supervisor {
           return {};
         }
         case "auth.logout":
-          return this.requireRunner(request.agentId).logout();
+          return request.provider === undefined ? this.requireRunner(request.agentId).logout() : this.requireRunner(request.agentId).logout({ provider: request.provider });
         case "git.key.add": {
           const store = this.gitKeys();
           const key = await store.add(request.title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);
@@ -1916,8 +1923,11 @@ export class Supervisor {
     if (!instanceId || intent.instanceId !== instanceId || intent.tenantId !== this.workspaceId) {
       throw new RemoteInstanceError("recovery_required", "This agent login is for another runtime");
     }
+    // An OpenCode login names its sign-in option; every report echoes it.
+    const loginOption = intent.agentId === "opencode" ? intent.loginOption : undefined;
     const report = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) =>
-      this.core.reportAgentLogin(instanceId, value).catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
+      this.core.reportAgentLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as Parameters<CoreClient["reportAgentLogin"]>[1])
+        .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
     if (intent.action === "cancel") {
       const login = this.activeLogins.get(intent.loginId);
       if (login) {
@@ -1933,58 +1943,52 @@ export class Supervisor {
       await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
       return;
     }
-    // Claude Code finishes in a browser it opens on this machine: nothing to
-    // show but the page itself, and a code it asks for is never relayed.
-    const browser = AGENT_LOGIN_METHOD[intent.agentId] === "machine_browser";
-    let url: string | undefined;
-    let code: string | undefined;
-    let over = false;
-    const finish = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) => {
-      if (over) return;
-      over = true;
-      this.activeLogins.delete(intent.loginId);
-      void report(value);
-    };
-    const awaiting = () => {
-      if (over || (!url && !browser)) return;
-      void report({ loginId: intent.loginId, agentId: intent.agentId, state: "awaiting_person", ...(url ? { verificationUrl: url } : {}), ...(code && !browser ? { userCode: code } : {}) });
-    };
-    this.activeLogins.set(intent.loginId, {
-      agentId: intent.agentId,
-      emit: event => {
-        if (event.kind === "open_url") {
-          if (!agentLoginUrlAllowed(intent.agentId, event.url)) return;
-          url = event.url;
-          if (event.userCode && AgentLoginUserCodeSchema.safeParse(event.userCode).success) code = event.userCode;
-          awaiting();
-        } else if (event.kind === "display" && !browser) {
-          // The code may come on its own line after the link.
-          const found = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/.exec(event.text)?.[1];
-          if (found && found !== code) {
-            code = found;
-            awaiting();
-          }
-        } else if (event.kind === "prompt") {
-          // The browser's own callback completes Claude Code's login.
-          if (browser) return;
-          void runner.loginCancel(intent.loginId).catch(() => undefined);
-          finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "login_failed" });
-        } else if (event.kind === "completed") {
-          finish({ loginId: intent.loginId, agentId: intent.agentId, state: "succeeded" });
-          // Ready shows on the site now, not at the next heartbeat.
-          if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed"));
-        } else if (event.kind === "failed") {
-          finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "login_failed" });
-        }
-      },
+    // A sign-in this machine does not offer (any more) is not started.
+    if (loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(loginOption)) {
+      await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
+      return;
+    }
+    const relay = siteLoginRelay({ loginId: intent.loginId, agentId: intent.agentId, ...(loginOption === undefined ? {} : { loginOption }),
+      report: value => { void report(value); },
+      cancel: () => { void runner.loginCancel(intent.loginId).catch(() => undefined); },
+      onFinished: () => { this.activeLogins.delete(intent.loginId); },
+      // Ready shows on the site now, not at the next heartbeat.
+      onSucceeded: () => { if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed")); },
     });
+    this.activeLogins.set(intent.loginId, { agentId: intent.agentId, emit: event => relay.emit(event) });
     try {
-      await runner.login(false, intent.loginId, true);
-      if (browser) awaiting();
+      if (loginOption === undefined) await runner.login(false, intent.loginId, true);
+      else await runner.login(false, intent.loginId, true, { loginOption });
+      relay.started();
     } catch (error) {
       const busy = error instanceof RemoteInstanceError && /already in progress/i.test(error.message);
-      finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: busy ? "already_in_progress" : "unavailable" });
+      relay.fail(busy ? "already_in_progress" : "unavailable");
     }
+  }
+
+  /**
+   * Core's host-agent settings from an applied desired configuration: OpenCode
+   * Zen's free models (absent = off, O6) and whether Core takes pay-per-use
+   * turns and route billing. A 7.1.0 Core puts `openCodeFreeModelsEnabled` in
+   * every revision for a connector that advertises the switch; its presence
+   * is that signal (CP3 prep). A change drops OpenCode's model snapshots.
+   */
+  private applyHostSettings(configuration: ConfigRecord["configuration"]): void {
+    const settings = { openCodeFreeModels: configuration.openCodeFreeModelsEnabled === true, coreAcceptsRouteBilling: configuration.openCodeFreeModelsEnabled !== undefined };
+    const changed = this.hostSettings.openCodeFreeModels !== settings.openCodeFreeModels || this.hostSettings.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling;
+    this.hostSettings = settings;
+    for (const runner of this.runners.values()) {
+      if (!runner.applyHostSettings) continue;
+      void runner.applyHostSettings(settings).catch(error => this.logger.warn({ err: error, agentId: runner.agentId }, "host agent settings not applied"));
+      if (changed) this.modelCapabilities?.invalidateAgent(runner.agentId);
+    }
+  }
+
+  /** What this connector advertises for OpenCode: the free-models switch, and the sign-ins the site may start here. */
+  private openCodeCapabilities(): string[] {
+    const runner = this.runners.get("opencode");
+    return openCodeRunnerCapabilities({ installed: runner !== undefined, relayReady: !this.stopping && this.relay !== null && this.relay !== undefined,
+      options: runner?.siteLoginOptions?.() ?? [], desktop: machineHasDesktop() });
   }
 
   private requireRunner(agentId: string): RunnerPort {
@@ -2102,14 +2106,14 @@ function flattenKeys(value: Record<string, unknown>, prefix = ""): string[] {
   return keys;
 }
 
-function mapLoginEvent(loginId: string, event: { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined }): ControlLoginEvent {
+function mapLoginEvent(loginId: string, event: { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; visible?: true | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined }): ControlLoginEvent {
   switch (event.type) {
     case "display":
       return { kind: "display", loginId, text: event.text ?? "" };
     case "open_url":
       return { kind: "open_url", loginId, url: event.url ?? "", ...(event.userCode ? { userCode: event.userCode } : {}) };
     case "prompt":
-      return { kind: "prompt", loginId, label: event.label ?? "", secret: event.secret ?? true };
+      return { kind: "prompt", loginId, label: event.label ?? "", secret: event.secret ?? true, ...(event.visible === true && event.secret === false ? { visible: true as const } : {}) };
     case "completed":
       return { kind: "completed", loginId, readiness: event.readiness ?? "unknown" };
     default:

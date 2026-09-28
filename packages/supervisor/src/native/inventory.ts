@@ -24,6 +24,8 @@ export interface NativeInventoryOptions {
   agentLoginReady?: () => boolean;
   /** ...and Claude Code's, which needs a browser this machine can open. */
   agentLoginBrowserReady?: () => boolean;
+  /** Further agent capabilities (OpenCode: its free-models switch and the sign-ins the site may start). */
+  additionalCapabilities?: () => readonly string[];
   /**
    * This connector can serve session previews over the relay
    * (`preview.dev_server`). Core offers the `preview` attach scope, and the
@@ -97,6 +99,7 @@ export class NativeInventoryCollector {
     if (this.options.cancellationDeliveryReady?.()) capabilities.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
     if (this.options.agentLoginReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_CAPABILITY);
     if (this.options.agentLoginBrowserReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);
+    for (const capability of this.options.additionalCapabilities?.() ?? []) if (!capabilities.includes(capability)) capabilities.push(capability);
     // The onboard role is git on THIS machine, not a signed-in agent: the
     // capabilities are advertised whenever git answers, and withheld the moment
     // it does not (OB6 §1).

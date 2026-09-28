@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isNativeAgentRuntimeId } from "@konteks/backstage-plugin-common";
+import { classifyAgentBilling, credentialKindFor } from "@konteks/backstage-plugin-common/known-models";
 import {
   AgentModelOfferedValuesSnapshotSchema,
   catalogueModelAuthority,
@@ -31,7 +32,7 @@ interface OfferedAuthority {
 interface DiscoveredOffer {
   currentValue: string;
   offeredValues: string[];
-  offeredOptions?: Array<{ value: string; name?: string; group?: string; groupName?: string }>;
+  offeredOptions?: Array<{ value: string; name?: string; group?: string; groupName?: string; billing?: "subscription" | "pay_per_use" }>;
 }
 
 export interface ModelCapabilitySnapshotProducerOptions {
@@ -43,6 +44,12 @@ export interface ModelCapabilitySnapshotProducerOptions {
   /** Installed native agents; each one without a current signed mapping reports under its catalogue authority. */
   catalogueAgents?: () => readonly string[];
   discover: (agentId: string, configId: string) => Promise<DiscoveredOffer>;
+  /**
+   * How one offered value is billed on this machine (OpenCode: by route
+   * provider and the credential that serves it; CP3). Undefined leaves the
+   * option unlabelled, which an older Core requires.
+   */
+  optionBilling?: (agentId: string, value: string, agent: ConnectedAgentView) => "subscription" | "pay_per_use" | undefined;
   newId?: () => string;
   ttlMs?: number;
   /** Renew asynchronously before expiry so heartbeat publication never gaps. */
@@ -138,6 +145,13 @@ export class ModelCapabilitySnapshotProducer {
       const expires = resolved.expiresAt ? Math.min(parseRfc3339(resolved.expiresAt), ttlEnd) : ttlEnd;
       if (expires <= now) return;
       const snapshotRevision = (this.revisions.get(id) ?? 0) + 1;
+      const offeredOptions = this.options.optionBilling
+        ? (observed.offeredOptions?.length ? observed.offeredOptions : observed.offeredValues.map(value => ({ value }))).map(option => {
+          const billing = this.options.optionBilling!(resolved.agentId, option.value, currentAgent);
+          return billing === undefined ? option : { ...option, billing };
+        })
+        : observed.offeredOptions;
+      const labelled = offeredOptions?.some(option => "billing" in option) ? offeredOptions : observed.offeredOptions;
       const body = {
         version: 1 as const, snapshotId: (this.options.newId ?? randomUUID)(), snapshotRevision,
         instanceId: this.options.instanceId(), agentId: resolved.agentId,
@@ -146,7 +160,7 @@ export class ModelCapabilitySnapshotProducer {
         mappingId: resolved.mappingId, mappingRevision: resolved.mappingRevision,
         mappingDigest: resolved.mappingDigest, configId: resolved.configId,
         currentValue: observed.currentValue, offeredValues: observed.offeredValues,
-        ...(observed.offeredOptions?.length ? { offeredOptions: observed.offeredOptions } : {}),
+        ...(labelled?.length ? { offeredOptions: labelled } : {}),
         observedAt: new Date(now).toISOString(), expiresAt: new Date(expires).toISOString(),
       };
       const snapshot = AgentModelOfferedValuesSnapshotSchema.parse({ ...body, snapshotDigest: computeAgentModelOfferedValuesSnapshotDigest(body) });
@@ -167,6 +181,21 @@ export class ModelCapabilitySnapshotProducer {
     return JSON.stringify([manifestId, value.mappingId, value.mappingRevision, value.mappingDigest,
       agent.authIdentityFingerprint, this.options.runnerIncarnation(), this.agentEpochs.get(value.agentId) ?? 0]);
   }
+}
+
+/**
+ * How one offered OpenCode value is billed on this machine (CP3, O7/O11):
+ * its route provider (`openai` in `openai/gpt-5.5`) and the credential kind
+ * the agent reports for that provider. Undefined for every other agent (Core
+ * classifies those by agent) and for a value without a provider.
+ */
+export function openCodeOptionBilling(agent: Pick<ConnectedAgentView, "agentId" | "credentials">, value: string): "subscription" | "pay_per_use" | undefined {
+  if (agent.agentId !== "opencode") return undefined;
+  const slash = value.indexOf("/");
+  if (slash <= 0) return undefined;
+  const providerId = value.slice(0, slash).toLowerCase();
+  const credential = credentialKindFor(agent.credentials, providerId);
+  return classifyAgentBilling({ agentId: "opencode", providerId, ...(credential ? { credential } : {}) });
 }
 
 function eligible(agent: ConnectedAgentView | undefined): agent is ConnectedAgentView & { authIdentityFingerprint: string } {
