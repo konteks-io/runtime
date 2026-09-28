@@ -15,6 +15,8 @@ const TOOL_CONTROL: Record<AgentBridgeFamily["agentId"], ConnectedAgentView["acp
   codex: "approve",
   // Every non-read-only dsh tool asks through the Konteks hook (dsh-profile.ts).
   dsh: "approve",
+  // Every gated OpenCode tool asks through the locked Konteks config (CP2/CP4).
+  opencode: "approve",
 };
 
 export interface ReadinessInputs {

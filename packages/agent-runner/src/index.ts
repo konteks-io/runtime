@@ -9,6 +9,7 @@ export * from "./bridge/dsh-profile.js";
 export * from "./host/host-agent.js";
 export * from "./host/registry.js";
 export * from "./host/dsh.js";
+export * from "./host/opencode.js";
 export * from "./bridge/browser.js";
 export * from "./bridge/codex-thread-inventory.js";
 export * from "./sessions/manager.js";

@@ -99,11 +99,28 @@ signs the parsed request's digest and an older connector strips unknown
 fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
-person's own DeepSeek Harness (`dsh`). Pi and OpenCode are retired: every
-write or install refuses them with `retiredAgentMessage` from
+person's own DeepSeek Harness (`dsh`). Pi and the old bundled OpenCode are
+retired: every write or install refuses them with `retiredAgentMessage` from
 `@konteks/backstage-plugin-common`, while stored values stay readable (a
 `native-runtime.json` still listing them loads without them through
 `parseNativeRuntimeRecord`, with a logged warning).
+
+Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
+`packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never
+get a branch of their own in generic code. Each has a runner-side
+`HostAgentRunnerAdapter` (`packages/agent-runner/src/host/`: launch, private
+home and environment, overlay/config writer, sign-in, identity, reported
+version) and an install-side `HostAgentInstallAdapter`
+(`packages/supervisor/src/native/host-agents.ts`: locate, install-record
+fields, re-verify on every load, start self-check, `offered`). A host agent
+whose adapter is not `offered` is refused on install and `agent add`, never
+detected at enrollment, and dropped from a stored record like a retired one.
+OpenCode 2 is registered (binary launch mode, `>=2.0.18 <3.0.0`) and located
+by `opencode-installation.ts`, but NOT offered until its security checkpoint
+(opencode-runtime-support CP4); its runner refuses to spawn or sign in until
+then. Every OpenCode execution, `--version` included, gets the allow-list
+environment of `openCodeEnvironment` (never `GITHUB_TOKEN`, `GH_TOKEN` or any
+other credential or inherited `OPENCODE_*` variable).
 
 Every installed native agent reports the models it offers (System One §6a,
 KM6; `ModelCapabilitySnapshotProducer`): an agent whose release carries a

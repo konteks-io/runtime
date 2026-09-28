@@ -1,8 +1,10 @@
 import { RemoteInstanceError } from "@konteks/remote-common";
+import { dirname } from "node:path";
 import { dshRuntimePaths, type RunnerConfig } from "@konteks/remote-agent-runner";
 import type { NativeRuntimeRecord } from "./installation.js";
 import { locateNativeDsh, resolveNativeDshInstallation, resolveNativeDshNode, verifyNativeDshRoot } from "./dsh-installation.js";
 import { checkDshKonteksProfile } from "./dsh-profile-check.js";
+import { locateNativeOpenCode, resolveNativeOpenCodeInstallation, verifyNativeOpenCodeBinary } from "./opencode-installation.js";
 
 /** The runner settings a host adapter derives from an install record (merged into `RunnerConfigSchema`). */
 export type HostAgentRunnerSettings = Partial<RunnerConfig> & { RUNNER_BRIDGE_PREFIX: string; RUNNER_BRIDGE_VERSION: string };
@@ -64,8 +66,29 @@ export const dshInstallAdapter: HostAgentInstallAdapter = {
   },
 };
 
+/**
+ * The person's own OpenCode 2 (opencode-runtime-support CP1): found, version
+ * checked and recorded like dsh, but NOT offered until its security
+ * checkpoint (CP4) lifts the gate: until then it is refused on install, never
+ * detected at enrollment, skipped when a stored record lists it, and its
+ * runner refuses to start.
+ */
+export const openCodeInstallAdapter: HostAgentInstallAdapter = {
+  agentId: "opencode",
+  offered: false,
+  locate: env => locateNativeOpenCode(env),
+  async runnerSettings(record) {
+    const opencode = record.opencodeBinary === undefined ? await resolveNativeOpenCodeInstallation() : await verifyNativeOpenCodeBinary(record.opencodeBinary);
+    return { RUNNER_NATIVE_OPENCODE_BINARY: opencode.binary, RUNNER_BRIDGE_PREFIX: dirname(opencode.binary), RUNNER_BRIDGE_VERSION: opencode.version };
+  },
+  // The locked-config self-check (`opencode debug agents` in the private home) arrives in CP2.
+  async selfCheck() {
+    throw new RemoteInstanceError("agent_unavailable", "OpenCode cannot run Konteks work on this computer yet.");
+  },
+};
+
 /** Every host-installed agent's install adapter, one per `HOST_AGENT_BRIDGES` family. */
-export const HOST_AGENT_INSTALL_ADAPTERS: readonly HostAgentInstallAdapter[] = Object.freeze([dshInstallAdapter]);
+export const HOST_AGENT_INSTALL_ADAPTERS: readonly HostAgentInstallAdapter[] = Object.freeze([dshInstallAdapter, openCodeInstallAdapter]);
 
 /** The install adapter of a host-installed agent id, if any. */
 export function hostAgentInstallAdapter(agentId: string): HostAgentInstallAdapter | undefined {

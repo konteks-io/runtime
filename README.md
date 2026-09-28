@@ -233,9 +233,14 @@ only in the connector's private folder. If it cannot start (an unsupported
 version, say), it is left out and retried in the background with the reason in
 the connector log; your other agents keep working.
 
-Pi and OpenCode are no longer supported: `install --agents` and `agent add`
-refuse them, and an installation that still lists one keeps working without
-it (the connector log says it was skipped). The Docker Compose remote
+Pi and the old bundled OpenCode are no longer supported: `install --agents`
+and `agent add` refuse them, and an installation that still lists one keeps
+working without it (the connector log says it was skipped). OpenCode 2 (your
+own install, `curl -fsSL https://opencode.ai/v2/install | bash`) is being added
+the same way as DeepSeek Harness: the connector can already find and
+version-check it (2.0.18 up to, not including, 3.0.0; `OPENCODE_EXECUTABLE`
+for other layouts), but it is not offered yet and cannot be installed or run
+until its security review is done. The Docker Compose remote
 instance is retired; the connector on your own computer is the only way to
 run Konteks agents.
 

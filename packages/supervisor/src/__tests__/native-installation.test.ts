@@ -10,6 +10,8 @@ import { bundleManifestSigningBytes, computeBundleManifestDigest, controlCall, S
 import type { BridgeProcess } from "@konteks/remote-agent-runner";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
+import { nativeAgentOffered, openCodeInstallAdapter } from "../native/host-agents.js";
+import { OPENCODE_MIN_BINARY_BYTES } from "../native/opencode-installation.js";
 import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, previewTuning, resolveNativeCodexSocket } from "../native/installation.js";
 import { verifyInstalledNativeBridges } from "../native/installed.js";
 import { createNativeService } from "../native/service.js";
@@ -205,8 +207,41 @@ describe("closed native runtime installation", () => {
     expect(loaded.retiredAgents).toEqual(["opencode", "pi"]);
     expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
     // Tolerant reading only: a new record naming a retired agent is refused.
-    expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["codex", "opencode"] }).success).toBe(false);
+    expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["codex", "pi"] }).success).toBe(false);
     expect(parseNativeRuntimeRecord({ ...f.record, agents: ["pi", "codex"] }).record.agents).toEqual(["codex"]);
+  });
+  it.runIf(process.platform !== "win32")("records the person's OpenCode 2 and re-verifies it on load, but skips it while it is not offered (CP1 gate)", async () => {
+    const f = await fixture();
+    // `npm install -g @opencode/cli`: the package places a native executable.
+    const pkg = join(root, "person-npm", "lib", "node_modules", "@opencode", "cli");
+    const binary = join(pkg, "bin", "opencode.exe");
+    await mkdir(join(pkg, "bin"), { recursive: true });
+    const body = Buffer.alloc(OPENCODE_MIN_BINARY_BYTES + 16);
+    Buffer.from([0xcf, 0xfa, 0xed, 0xfe]).copy(body);
+    await writeFile(binary, body, { mode: 0o755 });
+    const packageJson = (version: string) => writeFile(join(pkg, "package.json"), JSON.stringify({ name: "@opencode/cli", version, bin: { opencode: "./bin/opencode.exe" } }));
+    await packageJson("2.0.18");
+    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "opencode"], opencodeBinary: binary, opencodeVersion: "2.0.18" });
+    // The loader's re-verification: the recorded executable, its version read again.
+    await expect(openCodeInstallAdapter.runnerSettings(record)).resolves.toEqual({
+      RUNNER_NATIVE_OPENCODE_BINARY: binary, RUNNER_BRIDGE_PREFIX: join(pkg, "bin"), RUNNER_BRIDGE_VERSION: "2.0.18",
+    });
+    vi.stubEnv("OPENCODE_EXECUTABLE", binary);
+    await expect(openCodeInstallAdapter.locate()).resolves.toEqual({ opencodeBinary: binary, opencodeVersion: "2.0.18" });
+    await packageJson("1.18.33");
+    await expect(openCodeInstallAdapter.runnerSettings(record)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_unsupported_version" });
+    await packageJson("2.0.18");
+    // The gate: not offered, so a stored record naming it loads without it, and a runner refuses to start.
+    expect(openCodeInstallAdapter.offered).toBe(false);
+    expect(nativeAgentOffered("opencode")).toBe(false);
+    expect(nativeAgentOffered("dsh")).toBe(true);
+    expect(nativeAgentOffered("codex")).toBe(true);
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
+    const loaded = await loadNativeInstallation(root, f.options);
+    expect(loaded.record.agents).toEqual(["codex"]);
+    expect(loaded.retiredAgents).toEqual(["opencode"]);
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
+    await expect(openCodeInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "agent_unavailable" });
   });
   it.each([{ releaseId: "../outside" }, { agents: ["codex", "codex"] }, { coreUrl: "http://core.example" }, { coreUrl: "https://user:password@core.example" }, { relayUrl: "ws://relay.example" }, { gatewayKey: "forbidden" }, { environment: { NODE_OPTIONS: "--require untrusted" } }, { deploymentKind: "appliance" }, { command: "/bin/sh" }])("rejects unsafe or unimplemented install fields", async patch => {
     const f = await fixture();

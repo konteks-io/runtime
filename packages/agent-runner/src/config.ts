@@ -9,7 +9,7 @@ import { NativeAgentPackageProfileSchema } from "@konteks/remote-release";
  */
 export const RunnerConfigSchema = z
   .object({
-    RUNNER_AGENT_ID: z.enum(["claude-code", "codex", "dsh"]),
+    RUNNER_AGENT_ID: z.enum(["claude-code", "codex", "dsh", "opencode"]),
     /** Private credential volume; becomes HOME/XDG for the bridge and its official tooling. */
     RUNNER_CREDENTIAL_DIR: z.string().min(1).default("/credentials"),
     /** Local operator's Codex profile, resolved by native installation only. Never supplied by an assignment. */
@@ -22,11 +22,13 @@ export const RunnerConfigSchema = z
     /** Its `bin.dsh` launcher inside that root, and the person's Node that runs it. */
     RUNNER_NATIVE_DSH_ENTRY: z.string().min(1).optional(),
     RUNNER_NATIVE_DSH_NODE: z.string().min(1).optional(),
+    /** The person's own installed OpenCode 2 executable (a native binary), resolved by native installation only. */
+    RUNNER_NATIVE_OPENCODE_BINARY: z.string().min(1).optional(),
     /** Execution roots for session `cwd` (component checkouts are mounted beneath it). */
     RUNNER_WORKSPACE_DIR: z.string().min(1).default("/workspace"),
     /** Agents run under the person's own local login (or, for DeepSeek Harness, their own key). */
     RUNNER_AUTH_MODE: z.literal("agent_local_subscription").default("agent_local_subscription"),
-    /** Installed offline agent package prefix (or the person's own DeepSeek Harness root). */
+    /** Installed offline agent package prefix (or the person's own DeepSeek Harness root, or OpenCode's folder). */
     RUNNER_BRIDGE_PREFIX: z.string().min(1).default("/opt/konteks/bridges"),
     RUNNER_BRIDGE_VERSION: z.string().min(1).default("unknown"),
     /** Native installer-only signed package facts; never loaded from an assignment. */

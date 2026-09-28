@@ -11,7 +11,7 @@
  * exact version.
  */
 export interface AgentBridgeFamily {
-  agentId: "claude-code" | "codex" | "dsh";
+  agentId: "claude-code" | "codex" | "dsh" | "opencode";
   displayName: string;
   package: string;
   version: string;
@@ -29,16 +29,27 @@ export interface AgentBridgeFamily {
   /**
    * Present only for an agent that speaks ACP itself and is used from the
    * person's own installation: nothing of it is bundled or signed, so `version`
-   * is the lowest tested version and `command` is the arguments after the
-   * package's own `bin` entry, which the runtime's bundled Node runs.
+   * is the lowest tested version and `command` is the arguments after what is
+   * launched (see `launch`).
    */
   hostInstall?: {
+    /**
+     * How the located installation is started:
+     * - `node`: the package's `bin` entry is a script run by the person's own
+     *   Node (the connector is a single-executable app and cannot run it);
+     * - `binary`: a native executable, run directly, no Node involved.
+     */
+    launch: "node" | "binary";
     /** The package's `bin` name whose entry is launched (never a shell shim). */
     bin: string;
+    /** Command names looked up on PATH, in preference order (default: `bin`). */
+    pathNames?: readonly string[];
     /** Accepted versions: at least `min`, with a release core below `belowCore`. */
     versions: { min: string; belowCore: string };
-    /** The one command a person runs to install a supported version. */
+    /** The one command a person runs to install a supported version (macOS and Linux, and Windows unless below). */
     installCommand: string;
+    /** The Windows install command, when it differs. */
+    windowsInstallCommand?: string;
   };
 }
 
@@ -92,10 +103,33 @@ export const HOST_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.freeze([
     tooling: { login: [], logout: [] },
     acpProtocol: { min: 1, max: 1 },
     hostInstall: {
+      launch: "node",
       bin: "dsh",
       // 0.1.5-rc.3 is npm `latest`, what `npx @deepseek-ai/dsh` installs; 0.1.7-rc.2 is `next`.
       versions: { min: "0.1.5-rc.3", belowCore: "0.1.8" },
       installCommand: "npm install -g @deepseek-ai/dsh@0.1.7-rc.2",
+    },
+  },
+  {
+    // OpenCode 2, the line OpenCode's homepage installs (opencode-runtime-support
+    // O3). Its npm package only places a native binary; there is no Node entry.
+    // Not offered until its security checkpoint (supervisor host-agents.ts).
+    agentId: "opencode",
+    displayName: "OpenCode",
+    package: "@opencode/cli",
+    version: "2.0.18",
+    command: ["acp"],
+    // Sign-in runs through OpenCode's own `auth login` in the private home (CP3).
+    tooling: { login: [], logout: [] },
+    acpProtocol: { min: 1, max: 1 },
+    hostInstall: {
+      launch: "binary",
+      bin: "opencode",
+      // OpenCode 1 also claims `opencode`; OpenCode 2 installs `opencode2` beside it.
+      pathNames: ["opencode2", "opencode"],
+      versions: { min: "2.0.18", belowCore: "3.0.0" },
+      installCommand: "curl -fsSL https://opencode.ai/v2/install | bash",
+      windowsInstallCommand: "npm install -g @opencode/cli",
     },
   },
 ]);
@@ -139,6 +173,11 @@ export function hostAgentFamily(agentId: string): HostAgentFamily {
   const family = findAgentBridge(agentId);
   if (!family?.hostInstall) throw new Error(`the ${agentId} host-agent family is not registered`);
   return family as HostAgentFamily;
+}
+
+/** The command that installs a supported version of a host-installed agent on `platform`. */
+export function hostInstallCommand(family: HostAgentFamily, platform: NodeJS.Platform): string {
+  return platform === "win32" ? family.hostInstall.windowsInstallCommand ?? family.hostInstall.installCommand : family.hostInstall.installCommand;
 }
 
 /** Whether an agent family is used from the person's own installation (nothing of it in the release). */

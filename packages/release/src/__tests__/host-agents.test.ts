@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HOST_AGENT_BRIDGES, SUPPORTED_AGENT_BRIDGES, compareAgentVersions, findAgentBridge, hostAgentVersionSupported } from "../bridges.js";
+import { HOST_AGENT_BRIDGES, SUPPORTED_AGENT_BRIDGES, compareAgentVersions, findAgentBridge, hostAgentFamily, hostAgentVersionSupported, hostInstallCommand, isHostAgentId } from "../bridges.js";
 
 describe("host-installed agent families", () => {
   it("registers DeepSeek Harness as a host-installed family, outside the signed bundled matrix", () => {
@@ -8,7 +8,8 @@ describe("host-installed agent families", () => {
     expect(dsh?.package).toBe("@deepseek-ai/dsh");
     expect(dsh?.hostInstall?.bin).toBe("dsh");
     expect(dsh?.command).toEqual(["--profile", "acp"]);
-    expect(HOST_AGENT_BRIDGES.map(bridge => bridge.agentId)).toEqual(["dsh"]);
+    expect(HOST_AGENT_BRIDGES.map(bridge => bridge.agentId)).toEqual(["dsh", "opencode"]);
+    expect(dsh?.hostInstall?.launch).toBe("node");
     // The bundled matrix feeds the signed manifest and the release build; a
     // host-installed agent has no artifact and must never appear there.
     expect(SUPPORTED_AGENT_BRIDGES.some(bridge => bridge.agentId === "dsh")).toBe(false);
@@ -40,5 +41,25 @@ describe("host-installed agent families", () => {
     expect(hostAgentVersionSupported(dsh, "0.1.8")).toBe(false);
     expect(hostAgentVersionSupported(dsh, "not-a-version")).toBe(false);
     expect(hostAgentVersionSupported(findAgentBridge("codex")!, "1.10.0")).toBe(false);
+  });
+
+  it("registers OpenCode 2 as a host-installed native binary, never in the signed bundled matrix", () => {
+    const opencode = hostAgentFamily("opencode");
+    expect(opencode).toMatchObject({ displayName: "OpenCode", package: "@opencode/cli", command: ["acp"] });
+    expect(opencode.hostInstall).toMatchObject({ launch: "binary", bin: "opencode", pathNames: ["opencode2", "opencode"], versions: { min: "2.0.18", belowCore: "3.0.0" } });
+    expect(isHostAgentId("opencode")).toBe(true);
+    expect(SUPPORTED_AGENT_BRIDGES.some(bridge => bridge.agentId === "opencode")).toBe(false);
+    // The homepage's command, and npm's on Windows (the homepage installer needs Git Bash there).
+    expect(hostInstallCommand(opencode, "darwin")).toBe("curl -fsSL https://opencode.ai/v2/install | bash");
+    expect(hostInstallCommand(opencode, "linux")).toBe("curl -fsSL https://opencode.ai/v2/install | bash");
+    expect(hostInstallCommand(opencode, "win32")).toBe("npm install -g @opencode/cli");
+    expect(hostInstallCommand(hostAgentFamily("dsh"), "win32")).toBe("npm install -g @deepseek-ai/dsh@0.1.7-rc.2");
+    expect(() => hostAgentFamily("codex")).toThrow(/not registered/);
+  });
+
+  it("accepts OpenCode 2 from 2.0.18 and refuses OpenCode 1, 3 and dev builds", () => {
+    const opencode = findAgentBridge("opencode")!;
+    for (const version of ["2.0.18", "2.0.19", "2.5.0", "2.99.1"]) expect(hostAgentVersionSupported(opencode, version), version).toBe(true);
+    for (const version of ["2.0.17", "1.18.33", "1.2.0", "3.0.0", "3.0.0-beta.1", "0.0.0-beta-17236"]) expect(hostAgentVersionSupported(opencode, version), version).toBe(false);
   });
 });

@@ -14,7 +14,7 @@ import { verifyInstalledNativeBridges } from "./installed.js";
 import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
 import { resolveNativeClaudeExecutable } from "./claude-executable.js";
-import { hostAgentInstallAdapter } from "./host-agents.js";
+import { hostAgentInstallAdapter, nativeAgentOffered } from "./host-agents.js";
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
 function endpoint(protocol: "https:" | "wss:") {
@@ -24,8 +24,11 @@ function endpoint(protocol: "https:" | "wss:") {
   });
 }
 
-/** The agents a native runtime runs: Claude Code, Codex and the person's own DeepSeek Harness. */
-export const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh"] as const;
+/**
+ * The agents a native runtime knows: Claude Code, Codex, and the person's own
+ * DeepSeek Harness and OpenCode 2 (OpenCode not offered yet: host-agents.ts).
+ */
+export const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode"] as const;
 
 /** Installer-owned metadata, not an environment file or arbitrary process configuration. */
 export const NativeRuntimeRecordSchema = z.object({
@@ -48,6 +51,9 @@ export const NativeRuntimeRecordSchema = z.object({
   dshRoot: z.string().min(1).max(4096).optional(),
   /** The person's Node that runs it (the connector cannot run another script). */
   dshNode: z.string().min(1).max(4096).optional(),
+  /** The person's own installed OpenCode 2 executable, and the version it had when recorded (re-read on every load). */
+  opencodeBinary: z.string().min(1).max(4096).optional(),
+  opencodeVersion: z.string().min(1).max(128).optional(),
 }).strict();
 export type NativeRuntimeRecord = z.infer<typeof NativeRuntimeRecordSchema>;
 
@@ -80,16 +86,22 @@ export async function resolveNativeCodexSocket(root: string, codexHome: string, 
 }
 
 /**
- * Read a stored record. One written before 7.0.0 may still list Pi or
- * OpenCode: those agents are no longer run, so they are dropped (and reported
- * back for a warning) instead of failing the whole installation. Every write
- * still goes through the strict schema, which refuses them.
+ * Read a stored record. One written before 7.0.0 may still list Pi or the
+ * old bundled OpenCode: those agents are not run, so they are dropped (and
+ * reported back for a warning) instead of failing the whole installation. A
+ * host agent that is not offered yet (OpenCode 2 until its security
+ * checkpoint) is dropped the same way, so an old record naming `opencode`
+ * keeps loading exactly as before. The strict schema refuses a retired id
+ * that is not a native agent (Pi); the installer refuses the rest.
  */
 export function parseNativeRuntimeRecord(value: unknown): { record: NativeRuntimeRecord; retiredAgents: string[] } {
   const agents = (value as { agents?: unknown } | null)?.agents;
   if (!Array.isArray(agents)) return { record: NativeRuntimeRecordSchema.parse(value), retiredAgents: [] };
-  const retiredAgents = agents.filter((agent): agent is string => typeof agent === "string" && isRetiredAgentId(agent));
-  const kept = agents.filter(agent => !(typeof agent === "string" && isRetiredAgentId(agent)));
+  const known = (agent: string) => (NATIVE_AGENT_IDS as readonly string[]).includes(agent);
+  const dropped = (agent: unknown): agent is string => typeof agent === "string"
+    && (known(agent) ? !nativeAgentOffered(agent) : isRetiredAgentId(agent));
+  const retiredAgents = agents.filter(dropped);
+  const kept = agents.filter(agent => !dropped(agent));
   return { record: NativeRuntimeRecordSchema.parse({ ...(value as object), agents: kept }), retiredAgents };
 }
 

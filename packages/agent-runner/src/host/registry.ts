@@ -3,9 +3,10 @@ import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import type { HostAgentRunnerAdapter } from "./host-agent.js";
 import { dshRunnerAdapter } from "./dsh.js";
+import { openCodeRunnerAdapter } from "./opencode.js";
 
 /** Every host-installed agent's runner adapter, one per `HOST_AGENT_BRIDGES` family. */
-export const HOST_AGENT_RUNNER_ADAPTERS: readonly HostAgentRunnerAdapter[] = Object.freeze([dshRunnerAdapter]);
+export const HOST_AGENT_RUNNER_ADAPTERS: readonly HostAgentRunnerAdapter[] = Object.freeze([dshRunnerAdapter, openCodeRunnerAdapter]);
 
 /** The runner adapter of a host-installed agent id, if any. */
 export function hostAgentRunnerAdapter(agentId: string): HostAgentRunnerAdapter | undefined {

@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
-import { acquireNativeRootLock, loadNativeInstallation, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, restoreNativeRecord } from "../native/install.js";
+import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
+import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, restoreNativeRecord } from "../native/install.js";
 import { startNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
@@ -402,6 +402,24 @@ describe("native install composition", () => {
     await expect(addNativeAgent({ root: f.root, agentId: retired, output: f.options.output } as never)).rejects.toMatchObject({ code: "agent_unavailable" });
     expect(f.activate).not.toHaveBeenCalled();
     expect(f.options.deps.fetchFn).not.toHaveBeenCalled();
+  });
+  it("keeps OpenCode 2 gated until its security checkpoint: installed, it is still never detected, installed or added", async () => {
+    const f = await fixture();
+    const exe = join(f.root, "person-opencode", "opencode");
+    await mkdir(join(exe, ".."), { recursive: true });
+    const body = Buffer.alloc(OPENCODE_MIN_BINARY_BYTES + 16);
+    Buffer.from([0xcf, 0xfa, 0xed, 0xfe]).copy(body);
+    await writeFile(exe, body, { mode: 0o755 });
+    await writeFile(join(f.root, "person-opencode", "package.json"), "{}");
+    vi.stubEnv("OPENCODE_EXECUTABLE", exe);
+    vi.stubEnv("DSH_EXECUTABLE", join(f.root, "no-dsh"));
+    expect(hostAgentInstallAdapter("opencode")?.offered).toBe(false);
+    const enrolled = await recordNativeEnrollment({ root: f.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", deps: f.options.deps as never });
+    expect(enrolled.agents).toContain("codex");
+    expect(enrolled.agents).not.toContain("opencode");
+    f.options.agents = ["codex", "opencode"];
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "agent_unavailable" });
+    expect(f.activate).not.toHaveBeenCalled();
   });
   it("rechecks the connector executable before OS service execution", async () => {
     const f = await fixture();
