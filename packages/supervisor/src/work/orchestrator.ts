@@ -697,7 +697,12 @@ export class WorkOrchestrator {
     const restoreReference = reference === undefined && assignment.source.kind === "conversation" ? assignment.source.acpSessionRef : undefined;
     const logicalSessionId = assignment.source.kind === "conversation" ? assignment.source.sessionId
       : assignment.source.kind === "harness_delivery" ? assignment.source.executionSessionId : undefined;
-    let retainedReference = logicalSessionId && (this.channelOwners.get(`session:${logicalSessionId}`)?.acpSessionRef ?? restoreReference);
+    // A conversation may have a live local predecessor but still request a
+    // fresh turn. Only Core's exact requested reference may carry its old MCP
+    // transport into bootstrap; takeover can otherwise stop that predecessor.
+    let retainedReference = logicalSessionId && (assignment.source.kind === "conversation"
+      ? restoreReference
+      : this.channelOwners.get(`session:${logicalSessionId}`)?.acpSessionRef ?? restoreReference);
     if (!retainedReference && assignment.source.kind === "harness_delivery") {
       try { retainedReference = this.deps.journal.execution.liveContinuation(assignment)?.acpSessionRef; }
       catch (error) { if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error; }
