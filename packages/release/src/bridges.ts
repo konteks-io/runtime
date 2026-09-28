@@ -37,10 +37,14 @@ export interface AgentBridgeFamily {
      * How the located installation is started:
      * - `node`: the package's `bin` entry is a script run by the person's own
      *   Node (the connector is a single-executable app and cannot run it);
-     * - `binary`: a native executable, run directly, no Node involved.
+     * - `binary`: a native executable, run directly, no Node involved;
+     * - `fetched`: nothing the person installs: on the person's yes the
+     *   connector downloads the vendor's own release archive, pinned by this
+     *   runtime release (`fetched-agents.json`: URL, sizes, sha256, signer),
+     *   into its own data folder, and re-verifies it before every start.
      */
-    launch: "node" | "binary";
-    /** The package's `bin` name whose entry is launched (never a shell shim). */
+    launch: "node" | "binary" | "fetched";
+    /** The package's `bin` name whose entry is launched (never a shell shim); for a fetched agent, the executable's name in the archive. */
     bin: string;
     /** Command names looked up on PATH, in preference order (default: `bin`). */
     pathNames?: readonly string[];
@@ -175,9 +179,19 @@ export function hostAgentFamily(agentId: string): HostAgentFamily {
   return family as HostAgentFamily;
 }
 
-/** The command that installs a supported version of a host-installed agent on `platform`. */
+/**
+ * The command that installs a supported version of a host-installed agent on
+ * `platform`. A fetched agent is never installed by the person: the connector
+ * fetches it (`konteks-remote agent add <id>`, which asks first).
+ */
 export function hostInstallCommand(family: HostAgentFamily, platform: NodeJS.Platform): string {
+  if (family.hostInstall.launch === "fetched") return `konteks-remote agent add ${family.agentId}`;
   return platform === "win32" ? family.hostInstall.windowsInstallCommand ?? family.hostInstall.installCommand : family.hostInstall.installCommand;
+}
+
+/** Whether a host-installed agent is one the connector fetches itself (on the person's yes), not one the person installed. */
+export function isFetchedAgentId(agentId: string): boolean {
+  return findAgentBridge(agentId)?.hostInstall?.launch === "fetched";
 }
 
 /** Whether an agent family is used from the person's own installation (nothing of it in the release). */

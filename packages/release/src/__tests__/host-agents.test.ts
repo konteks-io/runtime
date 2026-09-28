@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HOST_AGENT_BRIDGES, SUPPORTED_AGENT_BRIDGES, compareAgentVersions, findAgentBridge, hostAgentFamily, hostAgentVersionSupported, hostInstallCommand, isHostAgentId } from "../bridges.js";
+import { HOST_AGENT_BRIDGES, SUPPORTED_AGENT_BRIDGES, compareAgentVersions, findAgentBridge, hostAgentFamily, hostAgentVersionSupported, hostInstallCommand, isFetchedAgentId, isHostAgentId, type HostAgentFamily } from "../bridges.js";
 
 describe("host-installed agent families", () => {
   it("registers DeepSeek Harness as a host-installed family, outside the signed bundled matrix", () => {
@@ -61,5 +61,13 @@ describe("host-installed agent families", () => {
     const opencode = findAgentBridge("opencode")!;
     for (const version of ["2.0.18", "2.0.19", "2.5.0", "2.99.1"]) expect(hostAgentVersionSupported(opencode, version), version).toBe(true);
     for (const version of ["2.0.17", "1.18.33", "1.2.0", "3.0.0", "3.0.0-beta.1", "0.0.0-beta-17236"]) expect(hostAgentVersionSupported(opencode, version), version).toBe(false);
+  });
+
+  it("names `agent add` as the install command of a fetched agent, whatever its record says", () => {
+    const fetched = { ...hostAgentFamily("opencode"), agentId: "opencode", hostInstall: { ...hostAgentFamily("opencode").hostInstall, launch: "fetched" as const } } as HostAgentFamily;
+    for (const platform of ["darwin", "linux", "win32"] as const) expect(hostInstallCommand(fetched, platform)).toBe("konteks-remote agent add opencode");
+    expect(isFetchedAgentId("opencode")).toBe(false);
+    expect(isFetchedAgentId("dsh")).toBe(false);
+    expect(isFetchedAgentId("codex")).toBe(false);
   });
 });

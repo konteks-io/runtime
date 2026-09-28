@@ -7,6 +7,7 @@ export * from "./bridge/process.js";
 export * from "./bridge/model-capability.js";
 export * from "./bridge/dsh-profile.js";
 export * from "./host/host-agent.js";
+export * from "./host/allow-list-environment.js";
 export * from "./host/registry.js";
 export * from "./host/dsh.js";
 export * from "./host/opencode.js";

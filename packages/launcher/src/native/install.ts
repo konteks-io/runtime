@@ -73,7 +73,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     // Agents the person installed themselves (DeepSeek Harness, OpenCode 2):
     // located and version-checked now, never downloaded, so an unsupported
     // one (OpenCode 1, say) is refused before an activation is used up.
-    const hosted = await locateHostAgents(agents);
+    const hosted = await locateHostAgents(agents, root);
     const bundled = agents.filter(agent => !isHostAgentId(agent));
     const fetchFn = options.deps?.fetchFn ?? fetch;
     const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
@@ -260,7 +260,7 @@ export async function recordNativeEnrollment(options: {
       if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
       // Agents the person installed themselves (DeepSeek Harness, OpenCode 2), when offered.
       for (const host of HOST_AGENT_INSTALL_ADAPTERS) {
-        if (host.offered && await host.locate().then(() => true).catch(() => false)) detected.push(host.agentId);
+        if (host.offered && await host.locate(undefined, { root }).then(() => true).catch(() => false)) detected.push(host.agentId);
       }
     }
     // None is required (OS14): a machine with no detectable family still
@@ -413,7 +413,7 @@ export async function completeNativeEnrollment(root: string, identity: { instanc
     const located = new Set<string>();
     for (const agent of prepared.agents) {
       const host = hostAgentInstallAdapter(agent);
-      const fields = host?.offered ? await host.locate().catch(() => undefined) : undefined;
+      const fields = host?.offered ? await host.locate(undefined, { root }).catch(() => undefined) : undefined;
       if (fields) { Object.assign(hosted, fields); located.add(agent); }
     }
     const agents = prepared.agents.filter(agent => (agent === "codex" ? codexHome !== undefined : agent === "claude-code" ? claudeExecutable !== undefined : hostAgentInstallAdapter(agent) ? located.has(agent) : true));
@@ -532,7 +532,7 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
 async function addHostAgent(root: string, previous: NativeRuntimeRecord, options: NativeAgentAddOptions, deps: { roots: readonly EmbeddedReleaseRoot[]; platform: NativePlatform }, lock: ReturnType<typeof acquireNativeRootLock>): Promise<NativeRuntimeRecord> {
   const host = hostAgentInstallAdapter(options.agentId);
   if (!host?.offered) throw notOffered(options.agentId);
-  const located = await host.locate();
+  const located = await host.locate(undefined, { root });
   await privateDirectory(join(root, "credentials", options.agentId));
   await privateDirectory(join(root, "workspaces", options.agentId));
   const successor = NativeRuntimeRecordSchema.parse({ ...previous, agents: [...previous.agents, options.agentId], ...located });
@@ -612,11 +612,11 @@ function refuseRetiredAgents(agents: readonly string[]): void {
 function notOffered(agentId: string) { return new RemoteInstanceError("agent_unavailable", `${agentId} cannot be added on this computer yet.`); }
 
 /** Locate every host-installed agent in `agents`; the install-record fields they need. */
-async function locateHostAgents(agents: readonly string[]): Promise<Partial<NativeRuntimeRecord>> {
+async function locateHostAgents(agents: readonly string[], root: string): Promise<Partial<NativeRuntimeRecord>> {
   const fields: Partial<NativeRuntimeRecord> = {};
   for (const agent of agents) {
     const host = hostAgentInstallAdapter(agent);
-    if (host) Object.assign(fields, await host.locate());
+    if (host) Object.assign(fields, await host.locate(undefined, { root }));
   }
   return fields;
 }

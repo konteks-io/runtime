@@ -16,13 +16,25 @@ export interface HostAgentSelfCheckDeps {
   openCodeSelfCheck?: typeof checkOpenCodeKonteksConfig;
 }
 
+/** The connector's own install root (`native-runtime.json` lives there); a fetched agent is kept under `<root>/agents/<id>/`. */
+export interface HostAgentInstallContext {
+  root: string;
+}
+
+/** What a fetched agent's `fetch` needs: where, and the person's answer to its consent line. */
+export interface HostAgentFetchRequest extends HostAgentInstallContext {
+  /** The person's answer to `consentText`. Anything but an explicit yes (`true`) downloads nothing. */
+  consent: boolean;
+}
+
 /**
  * The install side of an agent used from the person's own installation
- * (DeepSeek Harness, OpenCode): find it, keep what the install record needs,
- * re-verify that record on every load, and prove the Konteks overlay or config
- * is in force before the runner starts. The runner side (spawn, private home,
- * environment, sign-in, identity) is `HostAgentRunnerAdapter` in
- * `@konteks/remote-agent-runner`.
+ * (DeepSeek Harness, OpenCode) or fetched by the connector on the person's
+ * yes (`hostInstall.launch: "fetched"`): find it, keep what the install
+ * record needs, re-verify that record on every load, and prove the Konteks
+ * overlay or config is in force before the runner starts. The runner side
+ * (spawn, private home, environment, sign-in, identity) is
+ * `HostAgentRunnerAdapter` in `@konteks/remote-agent-runner`.
  */
 export interface HostAgentInstallAdapter {
   readonly agentId: string;
@@ -33,10 +45,22 @@ export interface HostAgentInstallAdapter {
    * record lists it.
    */
   readonly offered: boolean;
-  /** Locate the person's installation now; the install-record fields to keep. Operator configuration only. */
-  locate(env?: NodeJS.ProcessEnv): Promise<Partial<NativeRuntimeRecord>>;
+  /**
+   * Locate the installation now; the install-record fields to keep. Operator
+   * configuration only. A fetched agent looks in the connector's own folder
+   * (`context.root`) and never downloads anything here.
+   */
+  locate(env?: NodeJS.ProcessEnv, context?: HostAgentInstallContext): Promise<Partial<NativeRuntimeRecord>>;
   /** Re-locate or re-verify the recorded installation (every load); the runner settings for it. */
-  runnerSettings(record: NativeRuntimeRecord): Promise<HostAgentRunnerSettings>;
+  runnerSettings(record: NativeRuntimeRecord, context?: HostAgentInstallContext): Promise<HostAgentRunnerSettings>;
+  /** A fetched agent only: the plain line the person answers before anything is downloaded. */
+  readonly consentText?: string;
+  /**
+   * A fetched agent only, used by the launcher: download the pinned release
+   * on the person's yes, verify it, and keep it in the connector's own folder;
+   * the install-record fields to keep. Refuses without consent.
+   */
+  fetch?(request: HostAgentFetchRequest): Promise<Partial<NativeRuntimeRecord>>;
   /** Before the runner starts: the Konteks overlay or config is proven in force in this exact installation. */
   selfCheck(config: RunnerConfig, deps?: HostAgentSelfCheckDeps): Promise<void>;
 }

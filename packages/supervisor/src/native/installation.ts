@@ -249,7 +249,7 @@ export async function nativeHostRunnerConfig(root: string, record: NativeRuntime
   return RunnerConfigSchema.parse({
     RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
     RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
-    ...await host.runnerSettings(record),
+    ...await host.runnerSettings(record, { root }),
   });
 }
 

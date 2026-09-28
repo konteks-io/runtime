@@ -5,6 +5,7 @@ import { RemoteInstanceError, keyedFingerprint, readOrCreateSecretFile } from "@
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import type { HostAgentRunnerAdapter, HostWorkingCopyBinding } from "./host-agent.js";
+import { allowListEnvironment, HOST_INHERITED_VARIABLES } from "./allow-list-environment.js";
 import {
   isOpenCodeFreeModel,
   listOpenCodeCredentials,
@@ -31,22 +32,9 @@ const FINGERPRINT_KEY_FILE = "fingerprint.key";
  * `OPENCODE_*`. What OpenCode keeps lives in a private home the connector owns.
  */
 
-/** Inherited variables OpenCode may see (compared case-insensitively on Windows). */
-export const OPENCODE_INHERITED_VARIABLES: readonly string[] = Object.freeze([
-  "PATH",
-  // Locale and time zone.
-  "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY", "TZ",
-  // Temporary files.
-  "TMPDIR", "TEMP", "TMP",
-  // The person's network: proxies and extra CA trust (a path).
-  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy", "NODE_EXTRA_CA_CERTS",
-]);
+/** Inherited variables OpenCode may see (compared case-insensitively on Windows): the host-agent allow-list. */
+export const OPENCODE_INHERITED_VARIABLES: readonly string[] = HOST_INHERITED_VARIABLES;
 
-/** Windows system variables a native program needs to start and reach the network; none carries a credential. */
-const WINDOWS_SYSTEM_VARIABLES: readonly string[] = ["SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT"];
-
-/** A name that looks like it carries a credential is never passed, whatever put it there. */
-const CREDENTIAL_NAME = /TOKEN|SECRET|PASSW(OR)?D|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|AUTH|SESSION|COOKIE/i;
 const CONTROL = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
 /** Where an OpenCode runner keeps its private state, all inside its credential directory. */
@@ -87,44 +75,16 @@ export interface OpenCodeEnvironmentOptions {
  * variables, the private home, our own `OPENCODE_*` settings, and nothing else.
  */
 export function openCodeEnvironment(options: OpenCodeEnvironmentOptions): NodeJS.ProcessEnv {
-  const platform = options.platform ?? process.platform;
-  const inherited = options.inherited ?? process.env;
-  const windows = platform === "win32";
-  const allowed = new Set([...OPENCODE_INHERITED_VARIABLES, ...(windows ? WINDOWS_SYSTEM_VARIABLES : [])].map(name => (windows ? name.toUpperCase() : name)));
-  const env: NodeJS.ProcessEnv = {};
-  for (const [name, value] of Object.entries(inherited)) {
-    if (value === undefined || !allowed.has(windows ? name.toUpperCase() : name) || value.includes("\u0000")) continue;
-    env[name] = value;
-  }
-  // A shell for OpenCode's own shell tool: a path, only when absolute.
-  if (inherited.SHELL && isAbsolute(inherited.SHELL) && !CONTROL.test(inherited.SHELL)) env.SHELL = inherited.SHELL;
-  const extraCa = env.NODE_EXTRA_CA_CERTS;
-  if (extraCa !== undefined && (!isAbsolute(extraCa) || CONTROL.test(extraCa))) throw new RemoteInstanceError("agent_unavailable", "Native additional CA certificate path must be absolute.");
   const { home, data, state, cache, config } = options.home;
-  for (const path of [home, data, state, cache, config]) {
-    if (!isAbsolute(path) || CONTROL.test(path)) throw new RemoteInstanceError("agent_unavailable", "The OpenCode home must be an absolute local path.");
-  }
-  env.HOME = home;
-  env.XDG_DATA_HOME = data;
-  env.XDG_STATE_HOME = state;
-  env.XDG_CACHE_HOME = cache;
-  env.XDG_CONFIG_HOME = config;
-  if (windows) {
-    env.USERPROFILE = home;
-    env.APPDATA = win32.join(home, "AppData", "Roaming");
-    env.LOCALAPPDATA = win32.join(home, "AppData", "Local");
-  }
-  env.NO_COLOR = "1";
-  env.TERM = "dumb";
-  for (const [name, value] of Object.entries(options.settings ?? {})) {
-    if (!/^OPENCODE_[A-Z0-9_]+$/.test(name) || value.includes("\u0000")) throw new RemoteInstanceError("agent_unavailable", `not an OpenCode setting: ${name}`);
-    env[name] = value;
-  }
-  // Last line of defence: the allow-list above can never be widened into a credential.
-  for (const name of Object.keys(env)) {
-    if (CREDENTIAL_NAME.test(name)) delete env[name];
-  }
-  return env;
+  return allowListEnvironment({
+    agentName: "OpenCode",
+    paths: { HOME: home, XDG_DATA_HOME: data, XDG_STATE_HOME: state, XDG_CACHE_HOME: cache, XDG_CONFIG_HOME: config },
+    windowsProfile: home,
+    settingName: /^OPENCODE_[A-Z0-9_]+$/,
+    ...(options.settings === undefined ? {} : { settings: options.settings }),
+    ...(options.inherited === undefined ? {} : { inherited: options.inherited }),
+    ...(options.platform === undefined ? {} : { platform: options.platform }),
+  });
 }
 
 /** The environment for one short OpenCode command (`--version`) run in a throwaway private home. */
