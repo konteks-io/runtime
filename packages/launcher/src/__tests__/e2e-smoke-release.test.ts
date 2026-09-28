@@ -151,6 +151,35 @@ describe("signed E2E ACP releases", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  it("uses a staged organization SKILL.md in the deterministic planning probe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-skill-probe-"));
+    try {
+      const prepared = await prepareE2ESmokeRelease({ gate: "1", directory: join(root, ".runtime", "native-cloud"), origin: "https://127.0.0.1:7443", platform: { os: "macos", architecture: "arm64" } });
+      const artifact = prepared.manifest.nativeArtifacts?.find(item => item.agentId === "codex");
+      const prefix = join(root, "installed-agent");
+      await installOfflineAgentPackage(prepared.artifactFiles.agent, prefix, artifact!);
+      const skillFile = join(root, "workspaces", "codex", "skills", `skills-${"a".repeat(64)}`, "org-55a94c78-20be-4869-958e-34ecdc8f2674", "SKILL.md");
+      await mkdir(join(skillFile, ".."), { recursive: true });
+      await writeFile(skillFile, "---\nname: native-runtime-skill-probe-20260928\n---\nNATIVE_SKILL_RUNTIME_20260928_OK\n");
+      const input = [
+        JSON.stringify({ method: "initialize", id: 1, params: {} }),
+        JSON.stringify({ method: "session/new", id: 2, params: { cwd: root, mcpServers: [] } }),
+        JSON.stringify({ method: "session/prompt", id: 3, params: { sessionId: "e2e-session-1", prompt: [
+          { type: "text", text: `Required organization skills\n${JSON.stringify({ name: "org-55a94c78-20be-4869-958e-34ecdc8f2674", skillFile })}` },
+          { type: "text", text: "Planning input:\n{}\n\nFrozen assignment inputs:\n{}" },
+        ] } }),
+        "",
+      ].join("\n");
+      const replies = execFileSync(join(prefix, "bridge", "fake-codex-acp"), [], { encoding: "utf8", input }).trim().split("\n").map(line => JSON.parse(line));
+      const chunk = replies.find(reply => reply.method === "session/update");
+      expect(JSON.parse(chunk.params.update.content.text).tasks[0].validation).toContain("NATIVE_SKILL_RUNTIME_20260928_OK");
+      await writeFile(skillFile, "---\nname: native-runtime-skill-probe-20260928\n---\nmarker removed\n");
+      const withoutMarker = execFileSync(join(prefix, "bridge", "fake-codex-acp"), [], { encoding: "utf8", input }).trim().split("\n").map(line => JSON.parse(line));
+      const secondChunk = withoutMarker.find(reply => reply.method === "session/update");
+      expect(JSON.parse(secondChunk.params.update.content.text).tasks[0].validation).not.toContain("NATIVE_SKILL_RUNTIME_20260928_OK");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("cannot prepare a fixture without the explicit gate or on a production origin", async () => {
     const directory = join(tmpdir(), "konteks-e2e-smoke-forbidden", ".runtime", "native-cloud");
     await expect(prepareE2ESmokeRelease({ gate: "0", directory, origin: "https://127.0.0.1:7443", platform: { os: "macos", architecture: "arm64" } })).rejects.toThrow(/E2E smoke release/i);

@@ -288,6 +288,7 @@ if (command === "app-server") {
 `;
 }
 function fakeBridge(): string { return `#!/usr/bin/env node
+const fs = require("node:fs");
 const readline = require("node:readline");
 let sessions = 0;
 const output = value => process.stdout.write(JSON.stringify(value) + "\\n");
@@ -306,11 +307,26 @@ const planningProposal = request => {
       if (typeof candidate === "string" && candidate.length > 0) repositoryUrl = candidate;
     } catch { /* deterministic fallback remains schema-valid */ }
   }
+  let skillValidation = "";
+  for (const line of text.split("\\n")) {
+    if (!line.startsWith("{")) continue;
+    try {
+      const record = JSON.parse(line);
+      const skillFile = record && record.skillFile;
+      if (typeof record.name !== "string" || !record.name.startsWith("org-") || typeof skillFile !== "string"
+        || !skillFile.includes("/workspaces/codex/skills/skills-") || !skillFile.includes("/org-")
+        || !skillFile.endsWith("/SKILL.md")) continue;
+      const body = fs.readFileSync(skillFile, "utf8");
+      if (body.includes("name: native-runtime-skill-probe-20260928") && body.includes("NATIVE_SKILL_RUNTIME_20260928_OK")) {
+        skillValidation = " NATIVE_SKILL_RUNTIME_20260928_OK";
+      }
+    } catch { /* a missing or invalid skill cannot satisfy the probe */ }
+  }
   return JSON.stringify({ tasks: [{
     name: "native-smoke",
     repositoryUrl,
     goal: "test: prove native ACP planning transport",
-    validation: "The native planning smoke reaches terminal settlement.",
+    validation: "The native planning smoke reaches terminal settlement." + skillValidation,
     dependsOn: [],
     acceptanceCriteria: [{
       id: "AC-1",
