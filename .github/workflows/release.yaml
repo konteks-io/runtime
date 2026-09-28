@@ -29,6 +29,11 @@ jobs:
         with:
           node-version: 22.23.2
           architecture: ${{ matrix.node_arch }}
+      - name: Point the contract links at vendor/ (the dev branch links ../packages, absent here)
+        shell: bash
+        run: |
+          node scripts/ci-vendored-contracts.mjs
+          npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
       - name: Install (shared contracts are vendored under vendor/)
         run: npm ci --ignore-scripts --legacy-peer-deps
       - name: Build the connector executable and its installer package
@@ -68,6 +73,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22.23.2
+      - name: Point the contract links at vendor/ (the dev branch links ../packages, absent here)
+        shell: bash
+        run: |
+          node scripts/ci-vendored-contracts.mjs
+          npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
       - name: Install (shared contracts are vendored under vendor/)
         run: npm ci --ignore-scripts --legacy-peer-deps
       - name: Build the release tooling (it shares the connector's verification code)
