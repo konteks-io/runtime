@@ -32,13 +32,17 @@ request for a session with nothing running starts it (`PreviewChannel`
 registered with `SessionPreviewAccess.permit`, answering 503
 `STARTING_MESSAGE` ("Starting preview…", which Core turns into a refreshing
 page); `startedBy` records agent or viewer.
-Claude Code and Codex sessions with a preview (validator, QA-mode and other
-conversations, executor) get a headless browser
-(Playwright MCP, `konteks-browser`, bundled in their agent packages) whose
-every request goes through the session's `PreviewBrowserGateway`, which
-admits only that session's running preview plus the origins Core's
-`environment_open` answer grants it (read by the session's MCP facade; see
-AGENTS.md); dsh gets none.
+Sessions with a preview (validator, QA-mode and other conversations,
+executor) of ANY agent get a headless browser (Playwright MCP,
+`konteks-browser`): a connector capability (O8,
+`native/browser-capability.ts`), the copy bundled in an installed Claude Code
+or Codex package run on that package's Node or else the person's own (Node
+20+); Claude Code and Codex keep their own copy, dsh and OpenCode get
+`RUNNER_BROWSER`. Every request goes through the session's
+`PreviewBrowserGateway`, which admits only that session's running preview
+plus the origins Core's `environment_open` answer grants it (read by the
+session's MCP facade; see AGENTS.md). No package or no Node: no browser, a
+plain doctor line, and no `browser_tool` capability.
 Every session also gets the `konteks-result` MCP server (`submit_result`,
 `packages/supervisor/src/structured-result/`): a prompt ending with the
 structured-output contract binds its schema to the tool, the connector

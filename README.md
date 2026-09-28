@@ -168,14 +168,21 @@ in the prompt and the agent answers with a fenced JSON block, as before.
 
 ### A browser for QA
 
-Claude Code and Codex sessions that have a preview (the validator, QA-mode
-and other conversations, and the executor; not planning) also get a headless browser
-on the session's preview: Microsoft's Playwright MCP (`@playwright/mcp`
-0.0.82, pinned in `release/native-agent-builds.json` and carried inside the
-Claude Code and Codex agent packages, run on their own Node). Its tools
+Sessions that have a preview (the validator, QA-mode and other
+conversations, and the executor; not planning) also get a headless browser
+on the session's preview, whichever agent runs them (Claude Code, Codex,
+DeepSeek Harness or OpenCode): the browser belongs to the connector, not to
+one agent. It is Microsoft's Playwright MCP (`@playwright/mcp` 0.0.82, pinned
+in `release/native-agent-builds.json` and carried inside the Claude Code and
+Codex agent packages). Claude Code and Codex run their own copy; the other
+agents run the copy in an installed Claude Code (or else Codex) package, on
+that package's Node, or on your own Node (20 or newer, the one DeepSeek
+Harness uses first) when the package's cannot run. Its tools
 (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`,
 `browser_take_screenshot`, `browser_verify_*`, …) appear as the
-`konteks-browser` MCP server. There is nothing to set up:
+`konteks-browser` MCP server (OpenCode calls them from its Code Mode as
+`tools["konteks-browser"].browser_navigate({ ... })`). There is nothing to
+set up:
 
 - it uses Google Chrome when it is installed, headless with a throwaway
   in-memory profile (never your own); without Chrome it installs
@@ -198,11 +205,15 @@ Claude Code and Codex agent packages, run on their own Node). Its tools
   (the browser restarts once, before the call that opens the new address);
 - the tools that could run code outside the page or rewrite its traffic
   (`browser_run_code_unsafe`, `browser_route`, …) are hidden and refused;
-- DeepSeek Harness sessions get no browser (dsh carries no agent package to
-  run it in).
+- a computer with neither a Claude Code nor a Codex package installed, or
+  with no Node that can run the browser, has no browser: sessions there check
+  work without opening one, the connector does not advertise `browser_tool`
+  (so Konteks can keep QA elsewhere), and `doctor` says why in one line
+  ("Add one with `konteks-remote agent add claude-code`", or "Install Node
+  from https://nodejs.org").
 
-`doctor` reports the browser's version, which agents carry it, and whether it
-uses Chrome or Playwright's Chromium.
+`doctor` reports the browser's version, which agents get it, which Node it
+runs on, and whether it uses Chrome or Playwright's Chromium.
 
 To stop offering previews from a computer, switch previews off for that
 runtime in Konteks (Customize → Runtimes); it is on by default. Konteks and

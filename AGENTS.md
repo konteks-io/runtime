@@ -48,7 +48,18 @@ The QA browser is Playwright MCP (`@playwright/mcp`, pinned in
 `packages/release/src/browser.ts`; bump both together), bundled into the
 Claude Code and Codex offline agent packages with the connector's launcher
 (`packages/agent-runner/src/bridge/browser-{mcp,launcher,tools}.ts`, copied to
-`konteks/` in the package). `NativeRunner` adds it as a stdio ACP MCP server
+`konteks/` in the package). It is a connector capability (opencode O8), not
+an agent feature: `resolveConnectorBrowser` (`supervisor/src/native/browser-capability.ts`)
+runs once at supervisor start and takes the copy in an installed Claude Code
+(first) or Codex package, on that package's Node, then the other package's,
+then the person's own Node (`locatePersonNode` in `dsh-installation.ts`: the
+Node dsh already runs on, PATH, the usual places; Node 20+ for Playwright);
+`withConnectorBrowser` hands it as `RUNNER_BROWSER` to every runner whose own
+package has none (dsh, OpenCode), and Claude Code and Codex keep their own
+(`runnerBrowser`: own package first). No package or no Node: no browser for
+anyone, a plain doctor line, and no `browser_tool` capability (the component
+advertises it while the browser exists and previews can run). `NativeRunner`
+adds it as a stdio ACP MCP server
 (`konteks-browser`) for every session that has a preview (`BROWSER_WORK_KINDS`
 = `PREVIEW_WORK_KINDS`: delivery, validation, qa and assistant_execution, which
 is how a QA-mode conversation runs); `RelayedSession` gives each such session a
@@ -71,8 +82,14 @@ tool call it reads `GET <gateway>/.konteks/browser-origins`
 (`KONTEKS_BROWSER_ORIGINS_URL`) and, when the set changed and nothing is in
 flight, restarts Playwright MCP with loopback plus those origins, replaying
 the agent's `initialize` (Playwright reads the flag once per context). Never pass `PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK`,
-never npx it at runtime, and never give it to dsh (its governance admits only
-`konteks-platform`/`konteks-preview`).
+and never npx it at runtime. dsh's governance admits `mcp__konteks-browser__*`
+only on a session given the browser and never a hidden tool
+(`isDeniedBrowserTool`); OpenCode reaches it through Code Mode
+(`tools["konteks-browser"].<tool>(…)`: `RelayedSession` adds the name to the
+session's servers so the gate and the tools line know it), and OpenCode's own
+built-in browser stays denied (`browser`). The gateway's CONNECT and upgrade
+sockets get an `error` listener before anything else: Chrome resets refused
+ones, and an unhandled reset ends the connector process.
 
 Structured results go through a tool (`packages/supervisor/src/structured-result/`).
 Every session gets the connector-local `konteks-result` MCP server with one
