@@ -47,8 +47,10 @@ export interface OpenCodeSelfCheckOptions {
   credentialDir: string;
   run?: OpenCodeCommandRunner;
   services?: OpenCodeServiceControl;
-  /** How long `debug agents` may take to list the agents (the service loads them after it starts). */
+  /** How long `debug agents` may take to show the configured agents (the service loads them after it starts). */
   deadlineMs?: number;
+  /** How long an unchanged listing that is not in force is read before it counts as drift. */
+  settledMs?: number;
   platform?: NodeJS.Platform;
   /** Passes remembered per (binary, version, file); replaced only in tests. */
   cache?: Map<string, true>;
@@ -83,7 +85,7 @@ export async function checkOpenCodeKonteksConfig(options: OpenCodeSelfCheckOptio
   let agents: unknown;
   await stopServices();
   try {
-    agents = await listAgents(run, options.binary, env, paths.home, options.deadlineMs ?? 20_000);
+    agents = await listAgents(run, options.binary, env, paths.home, options.deadlineMs ?? 20_000, options.settledMs ?? SETTLED_MS);
   } finally {
     await stopServices();
   }
@@ -97,9 +99,18 @@ export async function checkOpenCodeKonteksConfig(options: OpenCodeSelfCheckOptio
   cache.set(key, true);
 }
 
-/** The service loads its agents after it answers: an empty list right after a start is retried until the deadline. */
-async function listAgents(run: OpenCodeCommandRunner, binary: string, env: NodeJS.ProcessEnv, cwd: string, deadlineMs: number): Promise<unknown> {
+/**
+ * A freshly started service first lists no agents, then OpenCode's DEFAULT
+ * agents (plan and title included, none of our rules) for about a second,
+ * and only then the agents resolved with our configuration (2.0.18, live
+ * 2026-09-28). So the listing is read until it is in force, or until it has
+ * stayed the same for `SETTLED_MS` (a real drift), or until the deadline.
+ */
+const SETTLED_MS = 5_000;
+
+async function listAgents(run: OpenCodeCommandRunner, binary: string, env: NodeJS.ProcessEnv, cwd: string, deadlineMs: number, settledMs: number): Promise<unknown> {
   const until = Date.now() + deadlineMs;
+  let last: { text: string; since: number } | null = null;
   for (;;) {
     const result = await run(binary, ["debug", "agents"], { env, cwd, timeoutMs: Math.max(1_000, Math.min(15_000, until - Date.now())) });
     if (result.code !== 0) {
@@ -108,7 +119,12 @@ async function listAgents(run: OpenCodeCommandRunner, binary: string, env: NodeJ
     }
     let parsed: unknown;
     try { parsed = JSON.parse(result.stdout); } catch { return result.stdout; }
-    if (!Array.isArray(parsed) || parsed.length > 0 || Date.now() >= until) return parsed;
+    const now = Date.now();
+    const loaded = !Array.isArray(parsed) || parsed.length > 0;
+    if (loaded && openCodeAgentsDrift(parsed).length === 0) return parsed;
+    const text = JSON.stringify(parsed);
+    if (!last || last.text !== text) last = { text, since: now };
+    if (now >= until || (loaded && now - last.since >= settledMs)) return parsed;
     await new Promise(resolve => setTimeout(resolve, 250));
   }
 }

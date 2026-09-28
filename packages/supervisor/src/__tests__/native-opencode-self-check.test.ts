@@ -33,7 +33,7 @@ async function fixture(outputs: string[]) {
     stop: vi.fn(async (pids: number[]) => { events.push(`kill ${pids.join(",")}`); leftovers.length = 0; }),
   };
   const credentialDir = join(root, "credentials");
-  const check = (cache = new Map<string, true>()) => checkOpenCodeKonteksConfig({ binary, version: "2.0.18", credentialDir, run, services, cache, deadlineMs: 2_000 });
+  const check = (cache = new Map<string, true>()) => checkOpenCodeKonteksConfig({ binary, version: "2.0.18", credentialDir, run, services, cache, deadlineMs: 3_000, settledMs: 400 });
   return { root, binary, credentialDir, run, calls, events, services, check, paths: openCodeRuntimePaths(credentialDir) };
 }
 
@@ -55,10 +55,13 @@ describe("the OpenCode start self-check", () => {
     expect(f.events).toEqual(["service stop", "scan", "kill 4242", "debug agents", "service stop", "scan"]);
   });
 
-  it("retries while the freshly started service has not loaded its agents yet", async () => {
-    const f = await fixture(["[]\n", "[]\n", CAPTURED]);
+  it("waits while the freshly started service lists no agents, then OpenCode's defaults, before our configuration applies", async () => {
+    // The live 2.0.18 timeline: [] at 0.3 s, defaults (plan and title, none of our rules) until 1.5 s, then ours.
+    const defaults = agents().map(agent => ({ ...agent, permissions: agent.permissions.slice(0, -OPENCODE_KONTEKS_PERMISSIONS.length) }));
+    defaults.push({ id: "plan", permissions: [] }, { id: "title", permissions: [] });
+    const f = await fixture(["[]\n", JSON.stringify(defaults), JSON.stringify(defaults), CAPTURED]);
     await f.check();
-    expect(f.calls.filter(call => call.args[0] === "debug")).toHaveLength(3);
+    expect(f.calls.filter(call => call.args[0] === "debug")).toHaveLength(4);
   });
 
   it("remembers a pass per binary, version and file, and checks again when the file changes", async () => {

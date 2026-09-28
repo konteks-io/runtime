@@ -134,7 +134,9 @@ servers are process-wide in OpenCode). The control process (discovery,
 sign-in) uses `config/control`, which carries no instructions. Runner start
 runs `opencode-self-check.ts`: `opencode debug agents` in the private home on
 a private service port, asserting every agent ends with the Konteks rules and
-that `plan`/`title` are off, and stopping any background service of the
+that `plan`/`title` are off (a fresh service first lists OpenCode's default
+agents for about a second, so the listing is read until it is in force or has
+stayed unchanged for 5 s), and stopping any background service of the
 private home before and after (only processes whose environment names it;
 the person's own service is never touched). Drift reads
 `opencode_unsupported_installation`.
