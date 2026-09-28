@@ -20,7 +20,9 @@ need no switching for a pull request. `agent-os-proof.yaml` (CP0-X) proves
 every agent on every OS through the connector's own code
 (`scripts/agent-os-proof.mjs`, a scripted model in
 `scripts/agent-os-proof/`); results per OS and agent are in
-opencode-runtime-support `proof/os-matrix.md`. Host-installed
+opencode-runtime-support `proof/os-matrix.md` (at CP0-X: sessions are
+refused on Linux and Windows, no durable execution-process owner there; Codex
+escalations go to Codex's own auto-reviewer, not the policy). Host-installed
 agents go through per-agent host adapters; OpenCode 2 is offered (CP6:
 install, enrollment detection, `agent add opencode`, onboarding remedies,
 Graft, a doctor line; a host agent missing or unsupported at load is left out
