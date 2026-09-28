@@ -293,6 +293,19 @@ why. `doctor` also shows its version, how it was installed, the settings check,
 what it is signed in with (labels only), whether free models are on and
 whether its sessions get the QA browser.
 
+### Google Antigravity (not available yet)
+
+Google Antigravity (`antigravity`) will be the fifth agent. Nobody installs
+it: after you say yes, the connector downloads Google's official Antigravity
+ACP server (never the `agy` CLI) from Google's server, checks it against the
+exact version, sizes, hashes and Google signature this Konteks release pins,
+keeps it in the connector's own folder, and checks it again before every
+start. It runs with a scrubbed environment and a private home: never your
+`GITHUB_TOKEN`, Gemini or Google Cloud variables, provider keys, `~/.gemini`,
+the Antigravity app or your macOS keychain. It is not offered yet: `install
+--agents` and `agent add` refuse it until its sign-in and permission checks
+are finished.
+
 Pi is no longer supported: `install --agents` and `agent add` refuse it, and
 an installation that still lists it keeps working without it (the connector
 log says it was skipped). An installation from before 7.0.0 that listed the

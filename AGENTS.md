@@ -117,12 +117,48 @@ fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered
-since opencode-runtime-support CP6). Pi is retired: every write or install
+since opencode-runtime-support CP6); Google Antigravity (`antigravity`) is
+registered and fetched but not offered yet (below). Pi is retired: every write or install
 refuses it with `retiredAgentMessage` from `@konteks/backstage-plugin-common`,
 while stored values stay readable (a `native-runtime.json` still listing it
 loads without it through `parseNativeRuntimeRecord`, with a logged warning).
 Since packages 7.1.0 `opencode` is no longer a retired id: a pre-7.0.0 record
 naming the old bundled OpenCode reads as the person's own OpenCode 2 (O13).
+
+Google Antigravity (`antigravity`, antigravity-runtime-support) is the first
+FETCHED host agent (`hostInstall.launch: "fetched"`): nobody installs it; on
+the person's yes (`HostAgentInstallAdapter.consentText` / `fetch`) the
+connector downloads Google's official `antigravity-acp` zip from the URL this
+release pins in `packages/release/src/fetched-agents.json` (per platform: URL,
+zip size and sha256, every unpacked file's size and sha256, the registry's
+command and arguments, the signer; bundled into the connector executable, so
+only a runtime release changes a pin; only `darwin-arm64` is pinned so far)
+into `<root>/agents/antigravity/<version>-<platform>/` (folders 0700, files
+0755, never on PATH, never under `credentials/`). `native/fetched-archive.ts`
+is the generic half (HTTPS download of exactly the pinned bytes with proxy
+variables through a CONNECT tunnel, a zip reader that refuses zip64, spanned
+or encrypted archives, absolute or `..` paths, links and duplicates, `codesign
+-R` with the pinned Team ID / Authenticode, free disk);
+`native/antigravity-installation.ts` the Antigravity half (consent line A20,
+1.5 GB free or refused, staging in the connector folder, one rename into
+place, re-verification on `locate`, every load and every start with hashes
+cached per file identity; diagnostics `antigravity_not_fetched`,
+`antigravity_unsupported_version`, `antigravity_unsafe_install`,
+`antigravity_no_disk_space`, `antigravity_unsupported_platform`; remove and
+prune). `locate` and `runnerSettings` take the connector root
+(`HostAgentInstallContext`); the install record keeps `antigravityVersion` and
+`antigravityRoot`; the runner gets `RUNNER_NATIVE_ANTIGRAVITY_ROOT`. Every
+Antigravity execution gets `antigravityEnvironment` (agent-runner
+`host/antigravity.ts`, on the shared `allowListEnvironment` of
+`host/allow-list-environment.ts` that OpenCode uses too): the host-agent
+allow-list, `HOME`/`GEMINI_HOME` in `<credentials>/antigravity/antigravity/home`,
+`AGY_ACP_FORCE_FILE_STORAGE=1`, and (API key, CP3) only a loopback
+`GOOGLE_GEMINI_BASE_URL`; never `GEMINI_*`, `GOOGLE_*`, `CLOUDSDK_*`, other
+`AGY_*`/`ANTIGRAVITY_*`, `GITHUB_TOKEN`/`GH_TOKEN` or provider keys. It is NOT
+offered (`antigravityInstallAdapter.offered = false`) until its CP3 and CP4:
+the CLI does not list it, install and `agent add` refuse it, enrollment never
+detects it, a stored record drops it, and its runner refuses to spawn, sign in
+or start (after re-verifying the copy).
 
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never

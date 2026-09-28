@@ -23,7 +23,11 @@ every agent on every OS through the connector's own code
 opencode-runtime-support `proof/os-matrix.md` (at CP0-X: sessions are
 refused on Linux and Windows, no durable execution-process owner there; Codex
 escalations go to Codex's own auto-reviewer, not the policy). Host-installed
-agents go through per-agent host adapters; OpenCode 2 is offered (CP6:
+agents go through per-agent host adapters (Google Antigravity is the first
+FETCHED one: the connector downloads Google's zip pinned in
+`release/src/fetched-agents.json` on the person's yes and re-verifies it
+before every start; registered but not offered until its CP3/CP4, see
+AGENTS.md); OpenCode 2 is offered (CP6:
 install, enrollment detection, `agent add opencode`, onboarding remedies,
 Graft, a doctor line; a host agent missing or unsupported at load is left out
 and retried, never fatal to the connector); its runner spawns with the
