@@ -20,6 +20,9 @@ import type { PolicyEvaluator, ToolPolicyContext, ToolPolicyEvaluation } from "@
 export const DEFAULT_BASH_BLOCKLIST: readonly string[] = [
   "nc ", "netcat", "ssh ", "telnet", "nslookup", "dig ", "sudo ", "su ", "mkfs", "dd if=", "/dev/",
   "rm -rf /", "chmod 777 /", "git commit", "git push", "git tag", "gh pr create",
+  // Windows elevation, sudo's counterpart (agent OS proof, CP0-X):
+  // `Start-Process … -Verb RunAs`, `-Verb:RunAs`, `runas /user:…`, gsudo.
+  "runas", "verb:runas", "gsudo",
 ];
 
 const FILE_CHANGE_KINDS = new Set(["edit", "delete", "move"]);
