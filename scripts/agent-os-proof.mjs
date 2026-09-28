@@ -50,6 +50,8 @@ const dist = path => import(pathToFileURL(join(ROOT, "packages", ...path.split("
 const AGENTS = ["claude-code", "codex", "dsh", "opencode"];
 const KEY_VARIABLE = { "claude-code": "ANTHROPIC_API_KEY", codex: "OPENAI_API_KEY", dsh: "DEEPSEEK_API_KEY" };
 const OPENCODE_FREE_MODEL = "opencode/muse-spark-1.3-contributor-free";
+// Offered by OpenCode's Zen provider with no sign-in and free models off; the governed runner points Zen at the scripted model.
+const OPENCODE_SCRIPTED_MODEL = process.env.KONTEKS_PROOF_OPENCODE_MODEL ?? "opencode/big-pickle";
 // The Codex model name the scripted provider answers as; Codex picks its tool set by model family.
 // A family Codex knows (gpt-5.5): the tool set real users get (apply_patch, MCP tools behind tool_search).
 const CODEX_SCRIPTED_MODEL = process.env.KONTEKS_PROOF_CODEX_MODEL ?? "gpt-5.5";
@@ -386,7 +388,8 @@ async function locateDiagnosis(error) {
     const target = join(WORK, "diagnose");
     rmSync(target, { recursive: true, force: true });
     mkdirSync(target, { recursive: true });
-    exec("tar", ["-xzf", resolve(args.package), "-C", target]);
+    // Windows: the system bsdtar (Git's GNU tar reads "D:" as a remote host).
+    exec(WINDOWS ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar", ["-xzf", resolve(args.package), "-C", target]);
     const problems = [];
     let longest = 0;
     for (const file of profile.files) {
@@ -486,7 +489,10 @@ try {
     const env = { ...spec.env };
     if (AGENT === "opencode") {
       const locked = JSON.parse(env.OPENCODE_CONFIG_CONTENT);
-      env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ ...locked, provider: { konteksprobe: { npm: "@ai-sdk/openai-compatible", name: "Konteks probe", options: { baseURL: `${scripted.origin}/v1`, apiKey: "scripted" }, models: { m: { name: "Konteks probe", tool_call: true, limit: { context: 100000, output: 4000 } } } } } });
+      // OpenCode's own Zen provider, pointed at the scripted model: a model it
+      // offers with no sign-in (no provider SDK to load, which a config-only
+      // provider needs and Windows did not finish in time).
+      env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ ...locked, provider: { opencode: { options: { baseURL: `${scripted.origin}/v1`, apiKey: "scripted" } } } });
     } else if (AGENT === "claude-code") {
       Object.assign(env, { ANTHROPIC_BASE_URL: scripted.origin, ANTHROPIC_API_KEY: "konteks-scripted-model-key", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" });
     } else if (AGENT === "dsh") {
@@ -543,7 +549,7 @@ try {
 
   let konteks = null;
   started = Date.now();
-  const scriptedConfig = AGENT === "opencode" ? { model: "konteksprobe/m" } : undefined;
+  const scriptedConfig = AGENT === "opencode" ? { model: OPENCODE_SCRIPTED_MODEL } : undefined;
   for (let attempt = 1; attempt <= 5 && !konteks; attempt += 1) {
     try {
       const opened = await openSession(governedRunner, events, attempt === 1 ? "governed" : `governed-${attempt}`, repo, scriptedConfig);
