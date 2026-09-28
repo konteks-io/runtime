@@ -78,6 +78,7 @@ Supported platforms: macOS 13+ (Apple silicon and Intel), Windows 10/11
 konteks-remote status          # cloud readiness, lease, agents
 konteks-remote auth login codex
 konteks-remote auth login dsh  # asks for your DeepSeek API key, without echo
+konteks-remote auth login opencode  # once OpenCode is offered: pick a provider, then its link and code, or its API key without echo
 konteks-remote agents
 konteks-remote doctor
 konteks-remote preview status  # this computer's live session previews (read-only)
@@ -242,8 +243,16 @@ version-check it (2.0.18 up to, not including, 3.0.0; `OPENCODE_EXECUTABLE`
 for other layouts). Its tool calls already go through the same policy as the
 other agents (shell commands, edits inside the working copy only, its code
 blocks limited to calls to Konteks' own tools, plan mode refused, and any
-call that skips the check takes OpenCode out of service on that computer),
-but it is not offered yet: it cannot be installed or run until sign-in lands.
+call that skips the check takes OpenCode out of service on that computer).
+Signing it in works like the other agents: `konteks-remote auth login
+opencode` lists what your OpenCode offers (subscriptions first: OpenCode
+Console, ChatGPT, GitHub Copilot, SuperGrok, GitLab, Poe) and relays the link
+and code, or takes an API key without echo and types it into OpenCode's own
+prompt; `--provider` and `--method` pick directly, `--reuse` shows which
+providers your own OpenCode uses so you can sign in to the same ones here, and
+`auth logout opencode [--provider X]` signs out. Zen's free models are used
+only when you switch them on in Konteks. It is not offered yet: it cannot be
+installed or run until the launcher checkpoint lands.
 The Docker Compose remote
 instance is retired; the connector on your own computer is the only way to
 run Konteks agents.

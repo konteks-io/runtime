@@ -99,11 +99,14 @@ signs the parsed request's digest and an older connector strips unknown
 fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
-person's own DeepSeek Harness (`dsh`). Pi and the old bundled OpenCode are
-retired: every write or install refuses them with `retiredAgentMessage` from
+person's own DeepSeek Harness (`dsh`); the person's own OpenCode 2
+(`opencode`) is registered but not offered yet (below). Pi is retired: every
+write or install refuses it with `retiredAgentMessage` from
 `@konteks/backstage-plugin-common`, while stored values stay readable (a
-`native-runtime.json` still listing them loads without them through
-`parseNativeRuntimeRecord`, with a logged warning).
+`native-runtime.json` still listing it loads without it through
+`parseNativeRuntimeRecord`, with a logged warning). Since packages 7.1.0
+`opencode` is no longer a retired id; until it is offered a stored record,
+`install --agents` and `agent add` drop or refuse it as not offered.
 
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never
@@ -183,6 +186,55 @@ the catalogue, and the self-check asserts both. Code Mode's `fetch` also
 runs unasked and cannot be removed short of denying `execute` (which would
 drop every MCP tool): it is treated as the web fetch the policy allows every
 agent and never trips; this is the one thing Konteks cannot judge beforehand.
+
+OpenCode's sign-ins (CP3) are OpenCode's own commands, run by
+`auth/opencode-auth.ts` in the private home with the allow-list environment
+and the private home as working folder (`openCodeCommandContext`); the
+connector never opens OpenCode's database. `opencode api --standalone
+integration.list` says what can be signed in (methods and their forms; a
+field with no default and no choice leaves that method to the person's own
+OpenCode); `opencode auth list --standalone --format json` says what is.
+`konteks-remote auth login opencode [--provider X] [--method Y] [--reuse]`
+asks for the provider in the open (a `prompt` event with `visible: true`,
+read by `promptLine`; the reviewed subscriptions first), then runs `opencode
+auth login <provider> --method <id> [--answer k=v] --standalone`: a
+subscription's link and device code are relayed (`splitTerminalOutput` turns
+OpenCode's in-place redraws into lines); an API key is asked for with the
+launcher's hidden prompt and typed into OpenCode's OWN key prompt on a
+pseudo-terminal (`openCodePtyCommand`: `script(1)` behind `cat |`, macOS and
+Linux; Windows refuses key entry for now), never an argument, environment
+variable, event or log line, and any output line carrying it is dropped.
+OpenCode 2.0.18 stores a key without checking it. `--reuse` (and a one-time
+offer, remembered in `<credentials>/opencode/reuse-offered`) lists the
+person's own OpenCode sign-ins through its own `auth list` after a yes; 2.0.18
+has no export, so they sign in again here. `auth logout opencode [--provider
+X]` runs `auth logout <provider> <credential id>` per credential. The site
+starts only the reviewed device or machine-browser options
+(`OPENCODE_LOGIN_OPTIONS`; the intent's `loginOption`, echoed in every report,
+`native/site-login.ts`); the connector advertises `agent-login-opencode-v1`
+plus `agent-login-opencode:<option>` per option its OpenCode offers (browser
+ones only with a desktop) and `opencode-free-models-v1`.
+
+OpenCode's identity is a keyed fingerprint over (provider, method, credential
+id) from `auth list`; the connected agent reports `credentials[]` (plain
+label, `sign_in`/`api_key`, method, `billing` from `classifyAgentBilling`,
+state; `needs_sign_in` after a turn's auth failure). With nothing signed in it
+reads "Needs sign-in" unless Core's desired configuration switches on Zen's
+free models (`openCodeFreeModelsEnabled`, applied to runners as
+`HostAgentSettings`). While off, `opencode/*-free` models are not offered,
+never reported as current, refused as a choice and moved off at session
+start. A turn's money basis follows how its route's provider bills
+(`sessions/usage-label.ts`): pay-per-use turns name provider and model and
+carry the `usage_update.cost` delta (USD micros; unknown, never zero, when
+none was reported); subscription turns stay `unavailable_local_subscription`;
+dsh's key turns are pay-per-use. Pay-per-use turns and offered-option
+`billing` go only to a 7.1.0 Core, recognised by the presence of
+`openCodeFreeModelsEnabled` in its desired configuration. With an OpenCode
+Console sign-in in the private home, `acp`'s session catalogue is the
+account's (plan listed, a config-declared provider absent) while the
+permission rules, the project lock and `debug agents`' resolved agents stay
+ours; Konteks declares no providers in config and refuses plan itself
+(opencode-runtime-support proof/CP3.md).
 
 Every installed native agent reports the models it offers (System One §6a,
 KM6; `ModelCapabilitySnapshotProducer`): an agent whose release carries a

@@ -7,14 +7,22 @@ The hardening policy is mandatory for all maintenance work.
 Customer-visible file names are in AGENTS.md: resolve the connector with
 `resolveNativeConnectorExecutable`, never a literal `connector`.
 The runtime is native-only (the appliance is retired and deleted) and runs
-Claude Code, Codex and DeepSeek Harness; Pi and the old bundled OpenCode are
-retired (see AGENTS.md for how stored values stay readable). Host-installed
+Claude Code, Codex and DeepSeek Harness; Pi is retired (see AGENTS.md for how
+stored values stay readable). Packages 7.1.0 are vendored as tarballs under
+`vendor/` (root `file:vendor/...tgz`, workspaces pinned to the version; CI's
+`npm ci` needs them): to re-vendor, `npm pack` from packages, update the
+version and integrity lines, extract into `node_modules/@konteks/*`; never
+regenerate the whole lockfile. Host-installed
 agents go through per-agent host adapters; OpenCode 2 is registered and
 detected but gated (not offered until CP6); its runner spawns with the
 locked config, one process per working copy, after a start self-check, and
 its sessions are governed like dsh's (CP4: request rebuilding, the Code Mode
 gate, never `allow_always`, the tripwire and quarantine, plan mode refused;
-AGENTS.md).
+AGENTS.md). CP3: it signs in through OpenCode's own `auth` commands
+(`auth/opencode-auth.ts`: provider pick in the open, link and code relayed,
+an API key typed into OpenCode's own prompt on a pty, never an argument or
+log), reports `credentials[]`, honours Core's free-models switch, and labels
+each turn's money by its provider's billing (`sessions/usage-label.ts`).
 Session previews run in the supervisor (`packages/supervisor/src/preview/`):
 one supervised dev server per session, forwarded only to its own loopback
 port; the per-machine switch is Core's (see AGENTS.md). A viewer's first
