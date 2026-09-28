@@ -32,6 +32,12 @@ export interface NativeInventoryOptions {
    * relay opens `preview:<sessionId>`, only for a connector that says so.
    */
   previewReady?: () => boolean;
+  /**
+   * What the connector adds to the agents it reports, beside each runner's own
+   * view (Google Antigravity's download state, and its entry while no runner
+   * of it can start). Never changes readiness or capabilities.
+   */
+  decorateAgents?: (agents: ConnectedAgentView[]) => Promise<ConnectedAgentView[]>;
   /** The machine's git probe (OB6 §1); omitted, the runtime is not `onboard`. */
   gitVersion?: () => Promise<string | null>;
   now?: () => Date;
@@ -108,11 +114,12 @@ export class NativeInventoryCollector {
     // an older one rejects the field, so Core sends it only on this signal.
     if (agents.some(agent => agent.readiness === "ready" && agent.connectionState === "ready")) capabilities.push(REMOTE_SESSION_LABEL_CAPABILITY);
     if (this.options.previewReady?.()) capabilities.push(REMOTE_PREVIEW_CAPABILITY);
+    const reported = this.options.decorateAgents ? await this.options.decorateAgents(structuredClone(agents)).catch(() => agents) : agents;
     return {
       components: [{ kind: "agent_runner", version: this.options.bundleVersion,
         healthStatus: healthyRunners === 0 ? "unhealthy" : healthyRunners === results.length ? "healthy" : "degraded",
         capabilities, lastProbeAt: at }],
-      agents,
+      agents: reported,
       hostPressure: metrics ? hostPressureRatio(metrics) : 1,
       activeSessions,
       activeTurns,

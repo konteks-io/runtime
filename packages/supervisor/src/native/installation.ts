@@ -175,7 +175,8 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
           runners.push(await nativeHostRunnerConfig(canonicalRoot, record, agent));
         } catch (error) {
           if (!hostAgentUnavailable(error)) throw error;
-          unavailableAgents.push({ agentId: agent, error, relocate: () => nativeHostRunnerConfig(canonicalRoot, record, agent) });
+          unavailableAgents.push({ agentId: agent, error, relocate: () => nativeHostRunnerConfig(canonicalRoot, record, agent),
+            ...(agent === "antigravity" ? { fetched: { ...(record.antigravityVersion === undefined ? {} : { antigravityVersion: record.antigravityVersion }), ...(record.antigravityRoot === undefined ? {} : { antigravityRoot: record.antigravityRoot }) } } : {}) });
         }
         continue;
       }
@@ -234,6 +235,8 @@ export interface NativeUnavailableAgent {
   agentId: string;
   error: RemoteInstanceError;
   relocate: () => Promise<RunnerConfig>;
+  /** Google Antigravity: the copy the install record names (its download state reads it). */
+  fetched?: Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot">;
 }
 
 /** The locators' refusals (not found, unsupported version, unsafe install): the person can fix these, the connector runs on. */

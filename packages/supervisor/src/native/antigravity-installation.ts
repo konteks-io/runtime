@@ -242,10 +242,13 @@ export async function fetchNativeAntigravity(request: { root: string; consent: b
   const free = await (deps.freeBytes ?? freeDiskBytes)(folders.base);
   if (free < ANTIGRAVITY_MIN_FREE_BYTES) throw refuse("antigravity_no_disk_space");
   const staging = await mkdtemp(join(folders.base, ".fetch-"));
+  const progress = { receivedBytes: 0, sizeBytes: pin.platform.archive.size };
+  fetchesUnderWay.set(request.root, progress);
   try {
     const archive = join(staging, "archive.zip");
     const unpacked = join(staging, "unpacked");
-    await downloadPinnedFile({ url: pin.platform.url, destination: archive, expected: pin.platform.archive, ...deps.download });
+    await downloadPinnedFile({ url: pin.platform.url, destination: archive, expected: pin.platform.archive, ...deps.download,
+      onProgress: received => { progress.receivedBytes = received; } });
     const entries = await readZipEntries(archive);
     const pinned = new Map(pin.platform.files.map(file => [file.path, file]));
     if (entries.length !== pinned.size || entries.some(entry => !pinned.has(entry.path))) throw new FetchedArchiveError("unsafe_archive", "the archive does not hold exactly the pinned files");
@@ -272,8 +275,18 @@ export async function fetchNativeAntigravity(request: { root: string; consent: b
     const diagnostic: Diagnostic = error instanceof FetchedArchiveError && error.reason === "download_failed" ? "antigravity_not_fetched" : "antigravity_unsafe_install";
     throw refuse(diagnostic, error);
   } finally {
+    if (fetchesUnderWay.get(request.root) === progress) fetchesUnderWay.delete(request.root);
     await rm(staging, { recursive: true, force: true });
   }
+}
+
+/** Fetches running in this process, by connector root: what the site's "Downloading" line shows. */
+const fetchesUnderWay = new Map<string, { receivedBytes: number; sizeBytes: number }>();
+
+/** The running fetch into `root`, if any: bytes received of the pinned zip's size. */
+export function antigravityFetchProgress(root: string): { receivedBytes: number; sizeBytes: number } | undefined {
+  const running = fetchesUnderWay.get(root);
+  return running ? { ...running } : undefined;
 }
 
 /**

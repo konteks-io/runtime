@@ -39,6 +39,8 @@ export interface FetchedDownloadOptions {
   env?: NodeJS.ProcessEnv;
   /** Refused after this long without a byte (default 60 s). */
   idleTimeoutMs?: number;
+  /** Told the bytes received so far as they arrive (the site's download line). */
+  onProgress?: (receivedBytes: number) => void;
 }
 
 const MAX_REDIRECTS = 5;
@@ -69,6 +71,7 @@ export async function downloadPinnedFile(options: FetchedDownloadOptions): Promi
         if (size > options.expected.size) throw new FetchedArchiveError("size_mismatch", "the download is larger than the pin");
         hash.update(chunk);
         await handle.write(chunk);
+        options.onProgress?.(size);
       }
     } catch (error) {
       if (error instanceof FetchedArchiveError) throw error;

@@ -2,12 +2,13 @@ import { ObservationDelivery } from "./control/observation-delivery.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   REMOTE_INSTANCE_PROTOCOL_VERSION,
   PlanningControllerTerminalDirectiveSchema,
   RemoteInstanceError,
-  OpenCodeLoginOptionIdSchema,
+  AgentLoginGcpSchema,
+  AgentLoginOptionIdSchema,
   SystemClock,
   createLogger,
   parseRfc3339,
@@ -16,6 +17,7 @@ import {
   type ControlAck,
   type ControlHandler,
   type ControlLoginEvent,
+  type ConnectedAgentView,
   type HeartbeatResult,
   type InstanceKeyPair,
   type JsonValue,
@@ -63,9 +65,10 @@ import { ChannelMux } from "./relay/channel-mux.js";
 import { RelayClient } from "./relay/relay-client.js";
 import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
-import { ModelCapabilitySnapshotProducer, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
+import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
-import { openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
+import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
+import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
 import { NativeInputClient } from "./native/input-client.js";
 import { NativeOutputClient } from "./native/output-client.js";
@@ -394,7 +397,8 @@ export class Supervisor {
       // A site-started login needs a native install with a Codex runner (WS1-115).
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
-      additionalCapabilities: () => [...this.openCodeCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : [])],
+      additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : [])],
+      decorateAgents: agents => this.withAntigravityDownload(agents),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
       cancellationDeliveryReady: () => {
@@ -426,7 +430,8 @@ export class Supervisor {
       },
       // OpenCode's routes bill by provider and credential (O7, O11); only a
       // 7.1.0 Core takes the field (the shape is strict and digested).
-      optionBilling: (agentId, value, agent) => (this.hostSettings.coreAcceptsRouteBilling && agentId === "opencode" ? openCodeOptionBilling(agent, value) : undefined),
+      optionBilling: (agentId, value, agent) => (!this.hostSettings.coreAcceptsRouteBilling ? undefined
+        : agentId === "opencode" ? openCodeOptionBilling(agent, value) : agentId === "antigravity" ? antigravityOptionBilling(agent) : undefined),
     });
 
     this.mux = new ChannelMux({
@@ -1847,7 +1852,9 @@ export class Supervisor {
           }, { once: true });
           // The person ran this on their own machine: their own login (WS1-115).
           const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }),
-            ...(request.reuse === undefined ? {} : { reuse: request.reuse }) };
+            ...(request.reuse === undefined ? {} : { reuse: request.reuse }),
+            // Gemini Enterprise's project and location, both or neither (the runner checks them again).
+            ...(request.project !== undefined && request.location !== undefined ? { gcp: AgentLoginGcpSchema.parse({ project: request.project, location: request.location }) } : {}) };
           try {
             if (Object.keys(which).length > 0) await runner.login(request.organization, loginId, true, which);
             else await runner.login(request.organization, loginId, true);
@@ -1876,8 +1883,10 @@ export class Supervisor {
           login.emit({ kind: "failed", loginId: request.loginId, code: "login_cancelled", message: "login cancelled" });
           return {};
         }
-        case "auth.logout":
-          return request.provider === undefined ? this.requireRunner(request.agentId).logout() : this.requireRunner(request.agentId).logout({ provider: request.provider });
+        case "auth.logout": {
+          const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }) };
+          return Object.keys(which).length === 0 ? this.requireRunner(request.agentId).logout() : this.requireRunner(request.agentId).logout(which);
+        }
         case "git.key.add": {
           const store = this.gitKeys();
           const key = await store.add(request.title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);
@@ -2001,20 +2010,20 @@ export class Supervisor {
     if (!instanceId || intent.instanceId !== instanceId || intent.tenantId !== this.workspaceId) {
       throw new RemoteInstanceError("recovery_required", "This agent login is for another runtime");
     }
-    // Google Antigravity's site sign-in (packages already carry its intent)
-    // arrives with antigravity-runtime-support CP3: until then it reads
-    // unavailable, and nothing starts.
-    if (intent.agentId !== "codex" && intent.agentId !== "claude-code" && intent.agentId !== "opencode") {
+    if (intent.agentId !== "codex" && intent.agentId !== "claude-code" && intent.agentId !== "opencode" && intent.agentId !== "antigravity") {
       if (intent.action !== "cancel") {
         await this.core.reportAgentLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as Parameters<CoreClient["reportAgentLogin"]>[1])
           .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
       }
       return;
     }
-    // An OpenCode login names its sign-in option; every report echoes it. An
-    // option of another agent is never started for OpenCode.
-    const requestedOption = intent.agentId === "opencode" && intent.loginOption !== undefined ? OpenCodeLoginOptionIdSchema.safeParse(intent.loginOption) : undefined;
+    // An OpenCode or Antigravity login names its sign-in option; every report
+    // echoes it. Another agent's option is never started (the runner offers
+    // only its own). Gemini Enterprise carries its Google Cloud project.
+    const optionAgent = intent.agentId === "opencode" || intent.agentId === "antigravity";
+    const requestedOption = optionAgent && intent.loginOption !== undefined ? AgentLoginOptionIdSchema.safeParse(intent.loginOption) : undefined;
     const loginOption = requestedOption?.success ? requestedOption.data : undefined;
+    const gcp = intent.agentId === "antigravity" && loginOption === "gemini-enterprise" && intent.gcp !== undefined ? intent.gcp : undefined;
     const report = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) =>
       this.core.reportAgentLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as Parameters<CoreClient["reportAgentLogin"]>[1])
         .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
@@ -2033,12 +2042,15 @@ export class Supervisor {
       await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
       return;
     }
-    // A sign-in this machine does not offer (any more) is not started.
-    if ((requestedOption !== undefined && !requestedOption.success) || (loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(loginOption))) {
+    // A sign-in this machine does not offer (any more) is not started; nor a
+    // Gemini Enterprise sign-in without its project.
+    if ((requestedOption !== undefined && !requestedOption.success) || (loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(loginOption))
+        || (intent.agentId === "antigravity" && (loginOption === undefined || (loginOption === "gemini-enterprise" && gcp === undefined)))) {
       await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
       return;
     }
     const relay = siteLoginRelay({ loginId: intent.loginId, agentId: intent.agentId, ...(loginOption === undefined ? {} : { loginOption }),
+      coreAcceptsNoLicense: this.hostSettings.coreAcceptsRouteBilling,
       report: value => { void report(value); },
       cancel: () => { void runner.loginCancel(intent.loginId).catch(() => undefined); },
       onFinished: () => { this.activeLogins.delete(intent.loginId); },
@@ -2048,7 +2060,7 @@ export class Supervisor {
     this.activeLogins.set(intent.loginId, { agentId: intent.agentId, emit: event => relay.emit(event) });
     try {
       if (loginOption === undefined) await runner.login(false, intent.loginId, true);
-      else await runner.login(false, intent.loginId, true, { loginOption });
+      else await runner.login(false, intent.loginId, true, { loginOption, ...(gcp ? { gcp } : {}) });
       relay.started();
     } catch (error) {
       const busy = error instanceof RemoteInstanceError && /already in progress/i.test(error.message);
@@ -2078,6 +2090,33 @@ export class Supervisor {
   private openCodeCapabilities(): string[] {
     const runner = this.runners.get("opencode");
     return openCodeRunnerCapabilities({ installed: runner !== undefined, relayReady: !this.stopping && this.relay !== null && this.relay !== undefined,
+      options: runner?.siteLoginOptions?.() ?? [], desktop: machineHasDesktop() });
+  }
+
+  /**
+   * Google Antigravity's download state on its connected agent (CP3 prep),
+   * only to a Core that takes it (a 7.1.0 Core; the view is strict there).
+   * While no runner of it can start (not downloaded, or its copy fails the
+   * start checks) it is reported as an unavailable agent carrying that state,
+   * so the site can say what to do.
+   */
+  private async withAntigravityDownload(agents: ConnectedAgentView[]): Promise<ConnectedAgentView[]> {
+    const native = this.options.native;
+    if (!native || !this.hostSettings.coreAcceptsRouteBilling) return agents;
+    const config = native.runners.find(runner => runner.RUNNER_AGENT_ID === "antigravity");
+    const unavailable = native.unavailableAgents?.find(entry => entry.agentId === "antigravity");
+    if (!config && !unavailable) return agents;
+    const record = config?.RUNNER_NATIVE_ANTIGRAVITY_ROOT !== undefined
+      ? { antigravityVersion: config.RUNNER_BRIDGE_VERSION, antigravityRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT }
+      : unavailable?.fetched;
+    const download = await antigravityDownloadState(dirname(this.config.SUPERVISOR_DATA_DIR), record).catch(() => undefined);
+    return download ? withAntigravityDownload(agents, download) : agents;
+  }
+
+  /** What this connector advertises for Google Antigravity: its Gemini Enterprise sign-in from the site (CP3). */
+  private antigravityCapabilities(): string[] {
+    const runner = this.runners.get("antigravity");
+    return antigravityRunnerCapabilities({ installed: runner !== undefined, relayReady: !this.stopping && this.relay !== null && this.relay !== undefined,
       options: runner?.siteLoginOptions?.() ?? [], desktop: machineHasDesktop() });
   }
 
@@ -2218,7 +2257,7 @@ function flattenKeys(value: Record<string, unknown>, prefix = ""): string[] {
   return keys;
 }
 
-function mapLoginEvent(loginId: string, event: { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; visible?: true | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined }): ControlLoginEvent {
+function mapLoginEvent(loginId: string, event: { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; visible?: true | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined; reason?: "no_license" | undefined }): ControlLoginEvent {
   switch (event.type) {
     case "display":
       return { kind: "display", loginId, text: event.text ?? "" };
@@ -2229,6 +2268,6 @@ function mapLoginEvent(loginId: string, event: { type: string; text?: string | u
     case "completed":
       return { kind: "completed", loginId, readiness: event.readiness ?? "unknown" };
     default:
-      return { kind: "failed", loginId, code: event.code ?? "agent_auth_required", message: event.message ?? "login failed" };
+      return { kind: "failed", loginId, code: event.code ?? "agent_auth_required", message: event.message ?? "login failed", ...(event.reason === "no_license" ? { reason: "no_license" as const } : {}) };
   }
 }

@@ -15,6 +15,8 @@ import {
   verifyNativeAntigravityFolder, verifyNativeAntigravityRecord, type AntigravityInstallDeps, type AntigravityPin,
 } from "../native/antigravity-installation.js";
 import { proxyFor, readZipEntries, safeArchivePath, verifyFetchedSignature } from "../native/fetched-archive.js";
+import { antigravityDownloadState } from "../native/antigravity-download.js";
+import { HostAgentDownloadSchema } from "@konteks/remote-common";
 import { antigravityInstallAdapter, hostAgentInstallAdapter, nativeAgentOffered } from "../native/host-agents.js";
 
 const posix = process.platform !== "win32";
@@ -276,6 +278,37 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     const fields = await fetchNativeAntigravity({ root, consent: true }, deps(pin));
     await expect(verifyNativeAntigravityRecord({ ...fields, antigravityVersion: "1.1.1" }, root, deps(pin))).rejects.toMatchObject({ diagnostic: "antigravity_unsupported_version" });
     await expect(verifyNativeAntigravityRecord({ ...fields, antigravityRoot: join(root, "elsewhere") }, root, deps(pin))).rejects.toMatchObject({ diagnostic: "antigravity_unsafe_install" });
+  });
+
+  it("says on the connected agent where the download stands, as the site reads it (CP3 prep)", async () => {
+    await fresh();
+    const pin = pinFor(GOOD, "/slow.zip");
+    routes.set("/slow.zip", res => {
+      res.writeHead(200, { "content-type": "application/zip", "content-length": GOOD.length });
+      res.write(GOOD.subarray(0, GOOD.length >> 1), () => setTimeout(() => res.end(GOOD.subarray(GOOD.length >> 1)), 600));
+    });
+    expect(await antigravityDownloadState(root, undefined, deps(pin))).toEqual({ state: "not_downloaded", sizeBytes: GOOD.length });
+    const fetching = fetchNativeAntigravity({ root, consent: true }, deps(pin));
+    await vi.waitFor(async () => expect(await antigravityDownloadState(root, undefined, deps(pin))).toMatchObject({ state: "downloading", sizeBytes: GOOD.length }), { timeout: 3_000, interval: 10 });
+    const during = await antigravityDownloadState(root, undefined, deps(pin));
+    expect(during!.receivedBytes).toBeGreaterThan(0);
+    expect(during!.receivedBytes).toBeLessThan(GOOD.length);
+    const fields = await fetching;
+    expect(await antigravityDownloadState(root, fields, deps(pin))).toEqual({ state: "ready" });
+    // A newer pin already fetched while the record still names the old copy: an update waits (A17).
+    expect(await antigravityDownloadState(root, { ...fields, antigravityVersion: "1.2.0" }, deps(pin))).toEqual({ state: "update_available", availableVersion: "1.2.1" });
+    // The record names a folder that is not the pinned one, or the copy stopped matching Google's release.
+    expect(await antigravityDownloadState(root, { ...fields, antigravityRoot: join(root, "elsewhere") }, deps(pin))).toEqual({ state: "integrity_failed" });
+    await chmod(join(fields.antigravityRoot!, "agy_acp_server.par"), 0o777);
+    expect(await antigravityDownloadState(root, fields, deps(pin))).toEqual({ state: "integrity_failed" });
+    expect(await antigravityDownloadState(root, { ...fields, antigravityVersion: "1.2.0" }, deps(pin))).toEqual({ state: "integrity_failed" });
+    await rm(fields.antigravityRoot!, { recursive: true, force: true });
+    expect(await antigravityDownloadState(root, fields, deps(pin))).toEqual({ state: "not_downloaded", sizeBytes: GOOD.length });
+    // Every state is one packages' view takes, and none names a path.
+    for (const state of [during, { state: "ready" }, { state: "update_available", availableVersion: "1.2.1" }]) {
+      expect(HostAgentDownloadSchema.safeParse(state).success).toBe(true);
+      expect(JSON.stringify(state)).not.toContain(root);
+    }
   });
 
   it("honours the proxy variables through a CONNECT tunnel, and NO_PROXY", async () => {

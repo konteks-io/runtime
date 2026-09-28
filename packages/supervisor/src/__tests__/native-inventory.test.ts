@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { advertisesPreview, type ConnectedAgentView } from "@konteks/remote-common";
 import { NativeInventoryCollector, machineHasDesktop } from "../native/inventory.js";
+import { withAntigravityDownload } from "../native/antigravity-download.js";
 import { deriveAdvertisedRoles } from "../inventory/roles.js";
 
 const agent: ConnectedAgentView = { agentId: "codex", displayName: "Codex", connectionState: "ready", authMode: "agent_local_subscription", accountScope: "personal", readiness: "ready", tokenUsageObservable: true, acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" } };
@@ -128,4 +129,23 @@ describe("native host inventory (A4 D133)", () => {
     f.inventory.agents()[0]!.acpCapabilities.toolControl = "none";
     expect(f.inventory.agents()[0]).toEqual(agent);
   });
+
+  it("adds Google Antigravity's download state to what it reports, never to readiness or capabilities (antigravity CP3 prep)", async () => {
+    const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 0, activeTurns: 0 } }));
+    let decorate = async (agents: ConnectedAgentView[]) => withAntigravityDownload(agents, { state: "not_downloaded", sizeBytes: 111_725_488 });
+    const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0",
+      decorateAgents: agents => decorate(agents) });
+    const snapshot = await inventory.collect();
+    expect(snapshot.agents).toEqual([agent, expect.objectContaining({ agentId: "antigravity", displayName: "Google Antigravity", readiness: "unavailable", connectionState: "unavailable",
+      hostAgentDownload: { state: "not_downloaded", sizeBytes: 111_725_488 } })]);
+    expect(snapshot.components[0]?.capabilities).toEqual(["agent:codex", "session-label-v1"]);
+    expect(inventory.agents()).toEqual([agent]);
+    // On the agent's own view when its runner reports one.
+    const running = withAntigravityDownload([{ ...agent, agentId: "antigravity", displayName: "Google Antigravity" }], { state: "ready" });
+    expect(running).toEqual([{ ...agent, agentId: "antigravity", displayName: "Google Antigravity", hostAgentDownload: { state: "ready" } }]);
+    // A decoration that fails never costs the heartbeat its agents.
+    decorate = async () => { throw new Error("disk gone"); };
+    expect((await inventory.collect()).agents).toEqual([agent]);
+  });
 });
+

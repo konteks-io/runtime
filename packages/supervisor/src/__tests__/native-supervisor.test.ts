@@ -82,6 +82,46 @@ describe("native Supervisor composition", () => {
     expect(roster.agents[0]?.readiness).toBe("ready");
     expect((supervisor as unknown as { lastSnapshot: { agents: Array<{ readiness: string }> } }).lastSnapshot.agents[0]?.readiness).toBe("ready");
   });
+  it("starts Google Antigravity's Gemini Enterprise sign-in from the site with its project, and says no_license only to a 7.1.0 Core (antigravity CP3)", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    type Report = Record<string, unknown>;
+    const internals = supervisor as unknown as { runners: Map<string, unknown>; core: { reportAgentLogin: (instanceId: string, report: Report) => Promise<unknown> };
+      hostSettings: { openCodeFreeModels: boolean; coreAcceptsRouteBilling: boolean }; activeLogins: Map<string, { emit(event: unknown): void }>;
+      onAgentLogin(request: unknown, verifier: unknown): Promise<void> };
+    const reports: Report[] = [];
+    vi.spyOn(internals.core, "reportAgentLogin").mockImplementation(async (_instanceId, report) => { reports.push(report); return {}; });
+    const login = vi.fn(async (_organization: boolean, loginId: string) => ({ loginId }));
+    internals.runners.set("antigravity", { agentId: "antigravity", login, loginCancel: vi.fn(async () => ({})), siteLoginOptions: () => ["gemini-enterprise"], startEvents: vi.fn(), stopEvents: vi.fn() });
+    const verifier = { verifyAgentLoginDelivery: () => true };
+    const gcp = { project: "gemini-enterprise-qa-25d3", location: "global" };
+    const intent = { loginId: "login-agy-1", tenantId: "tenant", instanceId: "instance", agentId: "antigravity", action: "start", loginOption: "gemini-enterprise", gcp };
+    const google = "https://accounts.google.com/o/oauth2/v2/auth?client_id=x.apps.googleusercontent.com";
+    for (const [coreAccepts, loginId, failure] of [[true, "login-agy-1", "no_license"], [false, "login-agy-2", "login_failed"]] as const) {
+      internals.hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: coreAccepts };
+      await internals.onAgentLogin({ intent: { ...intent, loginId } }, verifier);
+      expect(login).toHaveBeenLastCalledWith(false, loginId, true, { loginOption: "gemini-enterprise", gcp });
+      expect(reports.at(-1)).toEqual({ loginId, agentId: "antigravity", loginOption: "gemini-enterprise", state: "awaiting_person" });
+      internals.activeLogins.get(loginId)!.emit({ kind: "open_url", loginId, url: "http://127.0.0.1:50694/" });
+      internals.activeLogins.get(loginId)!.emit({ kind: "open_url", loginId, url: google });
+      expect(reports.at(-1)).toEqual({ loginId, agentId: "antigravity", loginOption: "gemini-enterprise", state: "awaiting_person", verificationUrl: google });
+      internals.activeLogins.get(loginId)!.emit({ kind: "failed", loginId, code: "agent_auth_required", message: "Google Antigravity did not finish signing in", reason: "no_license" });
+      expect(reports.at(-1)).toEqual({ loginId, agentId: "antigravity", loginOption: "gemini-enterprise", state: "failed", failure });
+    }
+    expect(JSON.stringify(reports)).not.toContain("gemini-enterprise-qa-25d3");
+    // No project, or personal Google sign-in (held back, A10): refused, never started.
+    const calls = login.mock.calls.length;
+    await internals.onAgentLogin({ intent: { ...intent, loginId: "login-agy-3", gcp: undefined } }, verifier);
+    await internals.onAgentLogin({ intent: { ...intent, loginId: "login-agy-4", loginOption: "google-account", gcp: undefined } }, verifier);
+    expect(login.mock.calls.length).toBe(calls);
+    expect(reports.slice(-2)).toEqual([
+      { loginId: "login-agy-3", agentId: "antigravity", loginOption: "gemini-enterprise", state: "failed", failure: "unavailable" },
+      { loginId: "login-agy-4", agentId: "antigravity", loginOption: "google-account", state: "failed", failure: "unavailable" },
+    ]);
+    internals.runners.delete("antigravity");
+  });
+
   it("cancels a local login when its control caller disconnects", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);

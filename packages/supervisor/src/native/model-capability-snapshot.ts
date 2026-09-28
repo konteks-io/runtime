@@ -198,6 +198,18 @@ export function openCodeOptionBilling(agent: Pick<ConnectedAgentView, "agentId" 
   return classifyAgentBilling({ agentId: "opencode", providerId, ...(credential ? { credential } : {}) });
 }
 
+/**
+ * How Google Antigravity's offered models are billed (antigravity CP3): by how
+ * Google is signed in, i.e. the credential in use, which the connector lists
+ * first among the ready ones (Gemini Enterprise: a subscription, or
+ * pay-per-use for its Pay-as-you-go edition; a Gemini API key: pay-per-use).
+ * Undefined for every other agent and with nothing ready.
+ */
+export function antigravityOptionBilling(agent: Pick<ConnectedAgentView, "agentId" | "credentials">): "subscription" | "pay_per_use" | undefined {
+  if (agent.agentId !== "antigravity") return undefined;
+  return agent.credentials?.find(credential => credential.state === "ready" && credential.providerId === "google")?.billing;
+}
+
 function eligible(agent: ConnectedAgentView | undefined): agent is ConnectedAgentView & { authIdentityFingerprint: string } {
   return agent?.authMode === "agent_local_subscription" && agent.readiness === "ready" && agent.connectionState === "ready" && typeof agent.authIdentityFingerprint === "string" && agent.authIdentityFingerprint.length > 0;
 }
