@@ -4,8 +4,7 @@ import { RemoteInstanceError, createLogger, writeSecretFile, type ConnectedAgent
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import { fallbackLoginIdentity, probeIdentity, type IdentityProbe } from "./auth/identity.js";
 import { runLogout, startLoginFlow, type LoginFlow } from "./auth/login-flow.js";
-import { removeDshApiKey, startDshKeyLogin } from "./auth/dsh-key.js";
-import { dshRuntimePaths, writeDshKonteksProfile } from "./bridge/dsh-profile.js";
+import { hostAgentRunnerAdapter } from "./host/registry.js";
 import { AgentScopeStore, applyIdentityObservation, type AgentScopeState } from "./auth/scope-store.js";
 import { classifyBridgeError, spawnBridge, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
 import { discoverBridgeModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
@@ -582,8 +581,7 @@ export class AgentRuntime {
       scope: this.authRequired ? { ...this.scope, authIdentityFingerprint: null, scopeAttestedAt: null } : this.scope,
       identity: this.authRequired ? "logged_out" : this.identity,
       bridgeVersionCompatible: true,
-      ...(this.family.agentId === "dsh" && this.options.config.RUNNER_BRIDGE_VERSION !== "unknown"
-        ? { hostAgentVersion: this.options.config.RUNNER_BRIDGE_VERSION } : {}),
+      ...(this.hostVersion() === undefined ? {} : { hostAgentVersion: this.hostVersion()! }),
       lastProbeAt: this.lastProbeAt,
     });
   }
@@ -682,14 +680,19 @@ export class AgentRuntime {
   }
 
   /**
-   * Before any bridge process starts: re-verify a bundled package, or rewrite
-   * the Konteks overlay a host-installed DeepSeek Harness boots from. Every
-   * dsh process reads those files at boot, so a changed copy heals on the next
-   * spawn instead of leaving it unguarded (CP3 live proof, phase 2).
+   * Before any bridge process starts: re-verify a bundled package, or let a
+   * host-installed agent's adapter write the Konteks overlay or config it boots
+   * from. Every dsh process reads those files at boot, so a changed copy heals
+   * on the next spawn instead of leaving it unguarded (CP3 live proof, phase 2).
    */
   private async prepareToSpawn(logger?: Pick<Logger, "info">): Promise<void> {
     await verifyNativeRunnerPackage(this.options.config, logger);
-    if (this.family.hostInstall !== undefined) await writeDshKonteksProfile(dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).konteksDir);
+    await hostAgentRunnerAdapter(this.family.agentId)?.prepareToSpawn(this.options.config);
+  }
+
+  /** The verified installed version of a host-installed agent, when known. */
+  private hostVersion(): string | undefined {
+    return hostAgentRunnerAdapter(this.family.agentId)?.hostVersion(this.options.config);
   }
 
   private assertNotQuarantined(): void {
@@ -832,10 +835,11 @@ export class AgentRuntime {
       throw new RemoteInstanceError("temporarily_unavailable", "Finish or recover active Codex sessions before signing in again.");
     }
     const previousConnectionState = this.connectionState;
-    // DeepSeek Harness has no login command: the runtime asks for the API key
-    // itself, checks it with DeepSeek and stores it in its dsh home.
-    const flow = this.family.agentId === "dsh"
-      ? startDshKeyLogin({ credentialsFile: dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).credentialsFile, events: this.events, logger: this.logger,
+    // A host-installed agent may own its sign-in (DeepSeek Harness has no
+    // login command: the runtime asks for the API key itself).
+    const host = hostAgentRunnerAdapter(this.family.agentId);
+    const flow = host?.startLogin
+      ? host.startLogin({ config: this.options.config, events: this.events, logger: this.logger,
         ...(args.loginId === undefined ? {} : { loginId: args.loginId }) })
       : startLoginFlow({
         config: this.options.config,
@@ -854,7 +858,7 @@ export class AgentRuntime {
       if (code !== 0) {
         this.activeLogin = null;
         this.connectionState = previousConnectionState;
-        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: this.family.agentId === "dsh" ? "the DeepSeek API key was not saved" : "official login tooling did not complete" } });
+        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: host?.loginFailedMessage ?? "official login tooling did not complete" } });
         await this.probe(false);
         return;
       }
@@ -896,7 +900,8 @@ export class AgentRuntime {
     this.connectionState = "starting";
     this.publishReadiness();
     const stopping = this.stopExecutionForAuthChange().then(() => null, error => error);
-    if (this.family.agentId === "dsh") await removeDshApiKey(dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).credentialsFile);
+    const host = hostAgentRunnerAdapter(this.family.agentId);
+    if (host?.logout) await host.logout(this.options.config);
     else await runLogout({ config: this.options.config, family: this.family, env: this.spec.env });
     const stopError = await stopping;
     await this.bridge?.stop();

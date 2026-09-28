@@ -131,6 +131,16 @@ export function compareAgentVersions(left: string, right: string): number {
   return 0;
 }
 
+/** A host-installed agent family, with its install facts guaranteed present. */
+export type HostAgentFamily = AgentBridgeFamily & { hostInstall: NonNullable<AgentBridgeFamily["hostInstall"]> };
+
+/** The registered host-installed family for an agent id; throws when there is none. */
+export function hostAgentFamily(agentId: string): HostAgentFamily {
+  const family = findAgentBridge(agentId);
+  if (!family?.hostInstall) throw new Error(`the ${agentId} host-agent family is not registered`);
+  return family as HostAgentFamily;
+}
+
 /** Whether an agent family is used from the person's own installation (nothing of it in the release). */
 export function isHostAgentId(agentId: string): boolean {
   return findAgentBridge(agentId)?.hostInstall !== undefined;

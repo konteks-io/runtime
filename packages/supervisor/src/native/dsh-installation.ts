@@ -4,7 +4,7 @@ import { access, lstat, readdir, readFile, realpath, stat } from "node:fs/promis
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
-import { compareAgentVersions, findAgentBridge, hostAgentVersionSupported, type AgentBridgeFamily } from "@konteks/remote-release";
+import { compareAgentVersions, hostAgentFamily, hostAgentVersionSupported, type HostAgentFamily } from "@konteks/remote-release";
 
 /** The person's own installed DeepSeek Harness, as the runtime will launch it. */
 export interface NativeDshInstallation {
@@ -18,11 +18,7 @@ export interface NativeDshInstallation {
 type Refusal = { diagnostic: "dsh_not_found" | "dsh_unsupported_version" | "dsh_unsafe_install" | "dsh_node_unsupported"; message: string };
 const PRIORITY: Record<Refusal["diagnostic"], number> = { dsh_not_found: 0, dsh_unsafe_install: 1, dsh_unsupported_version: 2, dsh_node_unsupported: 3 };
 
-function family(): AgentBridgeFamily & { hostInstall: NonNullable<AgentBridgeFamily["hostInstall"]> } {
-  const dsh = findAgentBridge("dsh");
-  if (!dsh?.hostInstall) throw new Error("the dsh host-agent family is not registered");
-  return dsh as AgentBridgeFamily & { hostInstall: NonNullable<AgentBridgeFamily["hostInstall"]> };
-}
+const family = (): HostAgentFamily => hostAgentFamily("dsh");
 
 function refuse(refusal: Refusal): RemoteInstanceError {
   return new RemoteInstanceError("prerequisite_missing", refusal.message, { diagnostic: refusal.diagnostic, recoveryActions: [{ kind: "install_backend", agentId: "dsh" }] });

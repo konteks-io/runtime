@@ -14,7 +14,7 @@ import { verifyInstalledNativeBridges } from "./installed.js";
 import { NativeGitToolSchema, verifyNativeGitTool } from "./git-workspace.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
 import { resolveNativeClaudeExecutable } from "./claude-executable.js";
-import { resolveNativeDshInstallation, resolveNativeDshNode, verifyNativeDshRoot } from "./dsh-installation.js";
+import { hostAgentInstallAdapter } from "./host-agents.js";
 
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
 function endpoint(protocol: "https:" | "wss:") {
@@ -135,22 +135,22 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
     if (exchangeRecord.manifestDigest !== exchange.manifest.digest) throw invalid();
     if (release.manifest.bundleVersion !== record.bundleVersion) throw invalid();
     const runners = [];
-    // A host-installed agent (the person's own DeepSeek Harness) has no signed
-    // artifact: it is re-located and re-verified here on every load instead.
+    // A host-installed agent (the person's own DeepSeek Harness or OpenCode)
+    // has no signed artifact: its adapter re-locates and re-verifies it here
+    // on every load instead.
     const bundled = record.agents.filter(agent => findAgentBridge(agent)?.hostInstall === undefined);
     const artifacts = selectNativeArtifacts(release, { ...options.platform, agentIds: bundled });
     for (const agent of record.agents) {
       if (!bundled.includes(agent)) {
+        const host = hostAgentInstallAdapter(agent);
+        if (!host) throw invalid();
         const credentials = join(root, "credentials", agent);
         const workspace = join(root, "workspaces", agent);
         for (const path of [credentials, workspace]) await directory(path);
-        const dsh = record.dshRoot === undefined ? await resolveNativeDshInstallation() : await verifyNativeDshRoot(record.dshRoot);
-        const node = await resolveNativeDshNode(dsh, record.dshNode === undefined ? process.env : { DSH_NODE: record.dshNode });
         runners.push(RunnerConfigSchema.parse({
           RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
           RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
-          RUNNER_NATIVE_DSH_ROOT: dsh.root, RUNNER_NATIVE_DSH_ENTRY: dsh.entry, RUNNER_NATIVE_DSH_NODE: node,
-          RUNNER_BRIDGE_PREFIX: dsh.root, RUNNER_BRIDGE_VERSION: dsh.version,
+          ...await host.runnerSettings(record),
         }));
         continue;
       }

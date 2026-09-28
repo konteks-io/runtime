@@ -2,6 +2,7 @@ import type { InitializeResponse } from "@agentclientprotocol/sdk";
 import { ConnectedAgentViewSchema, type ConnectedAgentView } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { AgentScopeState } from "./auth/scope-store.js";
+import { hostAgentRunnerAdapter } from "./host/registry.js";
 
 /**
  * The sanitized `ConnectedAgentView` this runner publishes. It is computed
@@ -24,7 +25,7 @@ export interface ReadinessInputs {
   scope: AgentScopeState;
   identity: "signal" | "logged_out" | "no_official_signal" | "unknown";
   bridgeVersionCompatible: boolean;
-  /** The verified installed DSH version; never an ACP bridge version. */
+  /** The verified installed version of a host-installed agent; never an ACP bridge version. */
   hostAgentVersion?: string;
   lastProbeAt: string | null;
 }
@@ -39,9 +40,9 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
     authMode: inputs.authMode,
     accountScope: inputs.scope.accountScope,
     readiness,
-    // DeepSeek Harness returns no usage with a turn; its usage_update is
-    // context occupancy, not billing tokens (dsh-runtime-support D4).
-    tokenUsageObservable: inputs.family.agentId !== "dsh",
+    // A host agent may send no billing usage with a turn (DeepSeek Harness:
+    // its usage_update is context occupancy, dsh-runtime-support D4).
+    tokenUsageObservable: hostAgentRunnerAdapter(inputs.family.agentId)?.tokenUsageObservable ?? true,
     acpCapabilities: {
       sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
       forkSession: caps?.sessionCapabilities?.fork != null,
@@ -49,7 +50,7 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
       toolControl: TOOL_CONTROL[inputs.family.agentId],
     },
   };
-  if (inputs.family.agentId === "dsh" && inputs.hostAgentVersion) view.hostAgentVersion = inputs.hostAgentVersion;
+  if (inputs.family.hostInstall !== undefined && inputs.hostAgentVersion) view.hostAgentVersion = inputs.hostAgentVersion;
   if (inputs.scope.authIdentityFingerprint !== null) view.authIdentityFingerprint = inputs.scope.authIdentityFingerprint;
   if (inputs.scope.scopeAttestedAt !== null) view.scopeAttestedAt = inputs.scope.scopeAttestedAt;
   if (inputs.lastProbeAt !== null) view.lastProbeAt = inputs.lastProbeAt;

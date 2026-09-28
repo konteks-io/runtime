@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { acquireNativeRootLock, compareSemver, loadNativeInstallation, locateNativeDsh, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, compareSemver, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
 import type { Output } from "../output.js";
@@ -70,8 +70,9 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     // activation and leave a partly installed, unstartable connector.
     const codexHome = agents.includes("codex") ? await resolveNativeCodexHome() : undefined;
     const claudeExecutable = agents.includes("claude-code") ? await resolveNativeClaudeExecutable() : undefined;
-    // The person's own DeepSeek Harness: located and version-checked now, never downloaded.
-    const dsh = agents.includes("dsh") ? await locateNativeDsh() : undefined;
+    // Agents the person installed themselves (DeepSeek Harness): located and
+    // version-checked now, never downloaded.
+    const hosted = await locateHostAgents(agents);
     const bundled = agents.filter(agent => !isHostAgentId(agent));
     const fetchFn = options.deps?.fetchFn ?? fetch;
     const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
@@ -103,7 +104,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     const releaseDirectory = join(root, "releases", releaseId);
     await rename(staged.directory, releaseDirectory);
     const git = options.deps?.git === undefined ? await discoverGit() : options.deps.git;
-    const record = NativeRuntimeRecordSchema.parse({ ...draft, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...(dsh ?? {}), ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
+    const record = NativeRuntimeRecordSchema.parse({ ...draft, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...hosted, ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
     lock.assertOwned();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
     await loadNativeInstallation(root, { roots, platform });
@@ -256,7 +257,10 @@ export async function recordNativeEnrollment(options: {
     else {
       if (await resolveNativeClaudeExecutable().then(() => true).catch(() => false)) detected.push("claude-code");
       if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
-      if (await locateNativeDsh().then(() => true).catch(() => false)) detected.push("dsh");
+      // Agents the person installed themselves, once offered (a gated one is never detected).
+      for (const host of HOST_AGENT_INSTALL_ADAPTERS) {
+        if (host.offered && await host.locate().then(() => true).catch(() => false)) detected.push(host.agentId);
+      }
     }
     // None is required (OS14): a machine with no detectable family still
     // enrolls, and the closing summary says how to add one.
@@ -403,15 +407,22 @@ export async function completeNativeEnrollment(root: string, identity: { instanc
     if (release.manifest.digest !== prepared.manifestDigest) throw invalid();
     const codexHome = prepared.agents.includes("codex") ? await resolveNativeCodexHome().catch(() => undefined) : undefined;
     const claudeExecutable = prepared.agents.includes("claude-code") ? await resolveNativeClaudeExecutable().catch(() => undefined) : undefined;
-    const dsh = prepared.agents.includes("dsh") ? await locateNativeDsh().catch(() => undefined) : undefined;
-    const agents = prepared.agents.filter(agent => (agent === "codex" ? codexHome !== undefined : agent === "claude-code" ? claudeExecutable !== undefined : agent === "dsh" ? dsh !== undefined : true));
+    // A host-installed agent that has gone missing since detection is dropped, like a missing profile.
+    const hosted: Partial<NativeRuntimeRecord> = {};
+    const located = new Set<string>();
+    for (const agent of prepared.agents) {
+      const host = hostAgentInstallAdapter(agent);
+      const fields = host?.offered ? await host.locate().catch(() => undefined) : undefined;
+      if (fields) { Object.assign(hosted, fields); located.add(agent); }
+    }
+    const agents = prepared.agents.filter(agent => (agent === "codex" ? codexHome !== undefined : agent === "claude-code" ? claudeExecutable !== undefined : hostAgentInstallAdapter(agent) ? located.has(agent) : true));
     const git = deps.git === undefined ? await discoverGit() : deps.git;
     const record = NativeRuntimeRecordSchema.parse({
       schemaVersion: 1, deploymentKind: "native_connector",
       instanceId: identity.instanceId, workspaceId: identity.workspaceId,
       releaseId: prepared.releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest,
       coreUrl: prepared.coreUrl, relayUrl: prepared.relayUrl, agents, controlPort: prepared.controlPort,
-      ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...(dsh ?? {}), ...(git ? { git: await verifyNativeGitTool(git) } : {}),
+      ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...hosted, ...(git ? { git: await verifyNativeGitTool(git) } : {}),
     });
     lock.assertOwned();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
@@ -513,14 +524,17 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
 
 /**
  * An agent the person installed themselves (DeepSeek Harness) adds no files to
- * the release: locate it, record it, give it private folders, and prove the
- * installation still loads, restoring the previous record if it does not.
+ * the release: its host adapter locates it, the record keeps what it found,
+ * it gets private folders, and the installation must still load, restoring
+ * the previous record if it does not.
  */
 async function addHostAgent(root: string, previous: NativeRuntimeRecord, options: NativeAgentAddOptions, deps: { roots: readonly EmbeddedReleaseRoot[]; platform: NativePlatform }, lock: ReturnType<typeof acquireNativeRootLock>): Promise<NativeRuntimeRecord> {
-  const dsh = await locateNativeDsh();
+  const host = hostAgentInstallAdapter(options.agentId);
+  if (!host?.offered) throw notOffered(options.agentId);
+  const located = await host.locate();
   await privateDirectory(join(root, "credentials", options.agentId));
   await privateDirectory(join(root, "workspaces", options.agentId));
-  const successor = NativeRuntimeRecordSchema.parse({ ...previous, agents: [...previous.agents, options.agentId], ...dsh });
+  const successor = NativeRuntimeRecordSchema.parse({ ...previous, agents: [...previous.agents, options.agentId], ...located });
   try {
     lock.assertOwned();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(successor));
@@ -580,10 +594,27 @@ async function discoverGit(): Promise<NativeRuntimeRecord["git"] | null> {
   return null;
 }
 function invalid() { return new RemoteInstanceError("install_state_corrupt", "Native installation cannot be completed; existing identity and credentials were preserved."); }
-/** Pi and OpenCode are retired (7.0.0): refused on install with the one shared sentence. */
+/**
+ * Pi and OpenCode are retired (7.0.0): refused on install with the one shared
+ * sentence. A host agent that is not offered yet (OpenCode 2 until its
+ * security checkpoint) is refused too, whatever the shared list says.
+ */
 function refuseRetiredAgents(agents: readonly string[]): void {
   const retired = agents.find(agent => isRetiredAgentId(agent));
   if (retired !== undefined) throw new RemoteInstanceError("agent_unavailable", retiredAgentMessage(retired));
+  const gated = agents.find(agent => !nativeAgentOffered(agent));
+  if (gated !== undefined) throw notOffered(gated);
+}
+function notOffered(agentId: string) { return new RemoteInstanceError("agent_unavailable", `${agentId} cannot be added on this computer yet.`); }
+
+/** Locate every host-installed agent in `agents`; the install-record fields they need. */
+async function locateHostAgents(agents: readonly string[]): Promise<Partial<NativeRuntimeRecord>> {
+  const fields: Partial<NativeRuntimeRecord> = {};
+  for (const agent of agents) {
+    const host = hostAgentInstallAdapter(agent);
+    if (host) Object.assign(fields, await host.locate());
+  }
+  return fields;
 }
 
 /** Read only the private installer record for status/stop, even when a release has expired. */

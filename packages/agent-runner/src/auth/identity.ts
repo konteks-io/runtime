@@ -1,11 +1,10 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { keyedFingerprint, readOrCreateSecretFile, runCommand } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import { resolveToolingCommand } from "../bridge/spec.js";
 import { readCodexAccount } from "./codex-account.js";
-import { readDshApiKey } from "./dsh-key.js";
-import { dshRuntimePaths } from "../bridge/dsh-profile.js";
+import { hostAgentRunnerAdapter } from "../host/registry.js";
 
 /**
  * The opaque `authIdentityFingerprint` (D111): a keyed hash of the identity
@@ -33,14 +32,10 @@ export async function probeIdentity(
   env: NodeJS.ProcessEnv,
   deps: IdentityProbeDeps = {},
 ): Promise<IdentityProbe> {
-  if (family.agentId === "dsh") {
-    // DeepSeek Harness has no login: the identity is the API key the runtime
-    // stored in its own dsh home (dsh-key.ts). Only a hash of it is keyed here.
-    const apiKey = await readDshApiKey(dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR).credentialsFile);
-    if (apiKey === null) return { kind: "logged_out" };
-    const key = await readOrCreateSecretFile({ bytes: 32, dataDir: config.RUNNER_CREDENTIAL_DIR, encoding: "base64url", fileName: FINGERPRINT_KEY_FILE });
-    return { kind: "signal", fingerprint: keyedFingerprint(Buffer.from(key, "base64url"), `dsh\n${createHash("sha256").update(apiKey).digest("hex")}`) };
-  }
+  // A host-installed agent without official identity tooling (DeepSeek
+  // Harness: a keyed hash of the API key the runtime stored) answers itself.
+  const host = hostAgentRunnerAdapter(family.agentId);
+  if (host?.identity) return host.identity(config);
   if (!family.tooling.identitySignal) return { kind: "no_official_signal" };
   const key = await readOrCreateSecretFile({ bytes: 32, dataDir: config.RUNNER_CREDENTIAL_DIR, encoding: "base64url", fileName: FINGERPRINT_KEY_FILE });
   if (family.agentId === "codex") {
