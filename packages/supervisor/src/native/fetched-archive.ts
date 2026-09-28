@@ -2,11 +2,12 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
 import { chmod, mkdir, open, statfs } from "node:fs/promises";
-import { request as httpRequest, type ClientRequest, type IncomingMessage } from "node:http";
+import type { ClientRequest, IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { dirname, isAbsolute, join } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 import * as zlib from "node:zlib";
+import { httpsProxyFor, openHttpsProxyTunnel } from "@konteks/remote-common";
 import type { FetchedAgentSigner } from "@konteks/remote-release";
 
 /**
@@ -123,41 +124,12 @@ async function get(url: URL, options: FetchedDownloadOptions, redirectsLeft: num
 
 /** The proxy for an https URL from the standard variables, unless `NO_PROXY` covers its host. */
 export function proxyFor(url: URL, env: NodeJS.ProcessEnv): URL | null {
-  const value = env.HTTPS_PROXY ?? env.https_proxy ?? env.ALL_PROXY ?? env.all_proxy;
-  if (!value) return null;
-  const noProxy = (env.NO_PROXY ?? env.no_proxy ?? "").split(/[\s,]+/).map(entry => entry.trim().toLowerCase()).filter(Boolean);
-  const host = url.hostname.toLowerCase();
-  for (const entry of noProxy) {
-    if (entry === "*") return null;
-    const bare = entry.replace(/:\d+$/, "").replace(/^\*?\./, "");
-    if (host === bare || host.endsWith(`.${bare}`)) return null;
-  }
-  let proxy: URL;
-  try { proxy = new URL(value.includes("://") ? value : `http://${value}`); } catch { throw new FetchedArchiveError("download_failed", "the proxy setting is not a URL"); }
-  if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new FetchedArchiveError("download_failed", "only http and https proxies are supported");
-  return proxy;
+  try { return httpsProxyFor(url, env); } catch (error) { throw new FetchedArchiveError("download_failed", error instanceof Error ? error.message : "the proxy setting is not usable", { cause: error }); }
 }
 
 /** An HTTP CONNECT tunnel to `target` through `proxy`; the TLS session to the target runs inside it. */
 async function tunnel(proxy: URL, target: URL, idle: number): Promise<import("node:net").Socket> {
-  const authority = `${target.hostname}:${target.port || 443}`;
-  const headers: Record<string, string> = { host: authority };
-  if (proxy.username) headers["proxy-authorization"] = `Basic ${Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64")}`;
-  const requestFn = proxy.protocol === "https:" ? httpsRequest : httpRequest;
-  return new Promise((resolve, reject) => {
-    const req = requestFn({ host: proxy.hostname, port: proxy.port || (proxy.protocol === "https:" ? 443 : 80), method: "CONNECT", path: authority, headers, agent: false });
-    req.setTimeout(idle, () => req.destroy(new Error("the proxy did not answer")));
-    req.on("connect", (response: IncomingMessage, socket) => {
-      if (response.statusCode !== 200) {
-        socket.destroy();
-        reject(new FetchedArchiveError("download_failed", `the proxy refused the connection (${response.statusCode})`));
-        return;
-      }
-      resolve(socket);
-    });
-    req.on("error", error => reject(new FetchedArchiveError("download_failed", "the proxy could not be reached", { cause: error })));
-    req.end();
-  });
+  try { return await openHttpsProxyTunnel(proxy, target, idle); } catch (error) { throw new FetchedArchiveError("download_failed", error instanceof Error ? error.message : "the proxy could not be reached", { cause: error }); }
 }
 
 /** One file entry of a zip, as its central directory and local header describe it. */

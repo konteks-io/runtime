@@ -2,8 +2,9 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { request as httpRequest } from "node:http";
-import type { AddressInfo } from "node:net";
-import type { Logger } from "@konteks/remote-common";
+import type { AddressInfo, Socket } from "node:net";
+import { connect as tlsConnect } from "node:tls";
+import { httpsProxyFor, openHttpsProxyTunnel, type Logger } from "@konteks/remote-common";
 
 /**
  * The Gemini API key relay (antigravity-runtime-support A7, CP3). One relay per
@@ -21,7 +22,11 @@ import type { Logger } from "@konteks/remote-common";
  *   `:countTokens`), streaming the answer back as it comes;
  * - it reads Google's `usageMetadata` from each answer and records the tokens
  *   and the real model name, because the server itself reports no usage
- *   (CP0 B11); the runner prices a turn from them (A8).
+ *   (CP0 B11); the runner prices a turn from them (A8);
+ * - behind a proxy (`HTTPS_PROXY`/`ALL_PROXY`, `NO_PROXY`, from the
+ *   connector's own environment, never the agent's) it reaches Google
+ *   through a CONNECT tunnel with its own TLS session, as the download does
+ *   (CP6); a proxy it cannot use is a plain 502, never a direct connection.
  * No request or answer body, header, token or key is ever logged.
  */
 
@@ -96,6 +101,13 @@ export interface AntigravityRelayOptions {
   upstream?: GeminiRelayUpstream;
   /** Largest request body forwarded (default 64 MiB: prompts may carry images). */
   maxRequestBytes?: number;
+  /**
+   * Where the proxy variables are read from (default: the connector's own
+   * environment). `HTTPS_PROXY`/`ALL_PROXY` with `NO_PROXY` are honoured for
+   * Google's endpoint through an HTTP CONNECT tunnel (antigravity CP6), like
+   * the download; the TLS session to Google runs inside it.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface AntigravityRelay {
@@ -230,41 +242,67 @@ export async function startAntigravityRelay(options: AntigravityRelayOptions): P
     headers["accept-encoding"] = "identity";
     const path = `${upstream.pathname.replace(/\/$/, "")}${target.pathname}${query.size > 0 ? `?${query.toString()}` : ""}`;
     const send = secure ? httpsRequest : httpRequest;
-    const outgoing = send({
-      protocol: upstream.protocol, hostname: upstream.hostname, port: upstream.port || (secure ? 443 : 80), method: request.method, path, headers,
-      ...(options.upstream?.ca === undefined ? {} : { ca: options.upstream.ca }),
-    }, answer => {
-      const status = answer.statusCode ?? 502;
-      const forward: Record<string, string> = {};
-      for (const name of FORWARDED_RESPONSE_HEADERS) {
-        const value = answer.headers[name];
-        if (typeof value === "string") forward[name] = value;
-      }
-      response.writeHead(status, forward);
-      const counted = status >= 200 && status < 300 && route.model !== undefined && (route.action === "generateContent" || route.action === "streamGenerateContent");
-      const reader = counted ? new UsageReader(route.action === "streamGenerateContent") : null;
-      answer.on("data", (chunk: Buffer) => { reader?.push(chunk); response.write(chunk); });
-      answer.on("end", () => {
-        const usage = reader?.finish();
-        if (usage && route.model) meter.record(route.model, usage);
-        response.end();
+    const forward = (tunnel?: Socket): void => {
+      const outgoing = send({
+        protocol: upstream.protocol, hostname: upstream.hostname, port: upstream.port || (secure ? 443 : 80), method: request.method, path, headers,
+        ...(options.upstream?.ca === undefined ? {} : { ca: options.upstream.ca }),
+        // Through the proxy: our own TLS session to Google inside the tunnel.
+        ...(tunnel === undefined ? {} : {
+          agent: false,
+          createConnection: () => tlsConnect({ socket: tunnel, servername: upstream.hostname, ...(options.upstream?.ca === undefined ? {} : { ca: options.upstream.ca }) }),
+        }),
+      }, answer => {
+        const status = answer.statusCode ?? 502;
+        const forwarded: Record<string, string> = {};
+        for (const name of FORWARDED_RESPONSE_HEADERS) {
+          const value = answer.headers[name];
+          if (typeof value === "string") forwarded[name] = value;
+        }
+        response.writeHead(status, forwarded);
+        const counted = status >= 200 && status < 300 && route.model !== undefined && (route.action === "generateContent" || route.action === "streamGenerateContent");
+        const reader = counted ? new UsageReader(route.action === "streamGenerateContent") : null;
+        answer.on("data", (chunk: Buffer) => { reader?.push(chunk); response.write(chunk); });
+        answer.on("end", () => {
+          const usage = reader?.finish();
+          if (usage && route.model) meter.record(route.model, usage);
+          response.end();
+        });
+        answer.on("error", () => response.destroy());
       });
-      answer.on("error", () => response.destroy());
+      outgoing.setTimeout(10 * 60_000, () => outgoing.destroy(new Error("Google stopped answering")));
+      outgoing.on("error", () => {
+        options.logger?.warn({ event: "antigravity.relay.upstream_failed" }, "the Gemini API key relay could not reach Google");
+        refuse(response, 502, "The Konteks relay could not reach Google.");
+      });
+      let received = 0;
+      request.on("data", (chunk: Buffer) => {
+        received += chunk.byteLength;
+        if (received > maxRequestBytes) { outgoing.destroy(); request.destroy(); return; }
+        outgoing.write(chunk);
+      });
+      request.on("end", () => outgoing.end());
+      request.on("error", () => outgoing.destroy());
+      response.on("close", () => { if (!response.writableFinished) outgoing.destroy(); });
+    };
+    let proxy: URL | null;
+    try { proxy = secure ? httpsProxyFor(upstream, options.env ?? process.env) : null; } catch {
+      request.resume();
+      options.logger?.warn({ event: "antigravity.relay.proxy_invalid" }, "the proxy setting is not usable for the Gemini API key relay");
+      refuse(response, 502, "The Konteks relay could not reach Google through the proxy.");
+      return;
+    }
+    if (proxy === null) { forward(); return; }
+    // The body waits while the tunnel opens.
+    request.pause();
+    openHttpsProxyTunnel(proxy, upstream, 60_000).then(tunnel => {
+      if (response.writableEnded || response.destroyed) { tunnel.destroy(); return; }
+      forward(tunnel);
+      request.resume();
+    }, () => {
+      request.resume();
+      options.logger?.warn({ event: "antigravity.relay.proxy_failed" }, "the Gemini API key relay could not reach Google through the proxy");
+      refuse(response, 502, "The Konteks relay could not reach Google through the proxy.");
     });
-    outgoing.setTimeout(10 * 60_000, () => outgoing.destroy(new Error("Google stopped answering")));
-    outgoing.on("error", () => {
-      options.logger?.warn({ event: "antigravity.relay.upstream_failed" }, "the Gemini API key relay could not reach Google");
-      refuse(response, 502, "The Konteks relay could not reach Google.");
-    });
-    let received = 0;
-    request.on("data", (chunk: Buffer) => {
-      received += chunk.byteLength;
-      if (received > maxRequestBytes) { outgoing.destroy(); request.destroy(); return; }
-      outgoing.write(chunk);
-    });
-    request.on("end", () => outgoing.end());
-    request.on("error", () => outgoing.destroy());
-    response.on("close", () => { if (!response.writableFinished) outgoing.destroy(); });
   };
 
   const server: Server = createServer(handle);

@@ -1,5 +1,10 @@
+import { execFileSync } from "node:child_process";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer, request, type IncomingHttpHeaders, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { createServer as createHttpsServer } from "node:https";
+import { connect as netConnect, type AddressInfo, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { GEMINI_API_ORIGIN, geminiRelayRoute, startAntigravityRelay, type AntigravityRelay } from "../host/antigravity-relay.js";
 import { geminiMeasuredTurn } from "../sessions/usage-label.js";
@@ -163,6 +168,73 @@ describe("the Gemini API key relay (A7)", () => {
     expect(lines.length).toBeGreaterThan(0);
     const logged = JSON.stringify(lines);
     for (const secret of [KEY, relay.token, "prompt"]) expect(logged).not.toContain(secret);
+  });
+});
+
+const haveOpenssl = (() => { try { execFileSync("openssl", ["version"], { stdio: "ignore" }); return true; } catch { return false; } })();
+
+describe("the relay behind a proxy (antigravity CP6)", () => {
+  it.runIf(haveOpenssl)("reaches Google through HTTPS_PROXY's CONNECT tunnel with its own TLS session, and straight when NO_PROXY covers the host", async () => {
+    const certDir = await mkdtemp(join(tmpdir(), "agy-relay-cert-"));
+    const sockets: Socket[] = [];
+    try {
+      execFileSync("openssl", ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", join(certDir, "key.pem"), "-out", join(certDir, "cert.pem"),
+        "-days", "2", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"], { stdio: "ignore" });
+      const cert = await readFile(join(certDir, "cert.pem"), "utf8");
+      const seen: Array<{ url?: string; key?: string }> = [];
+      const google = createHttpsServer({ key: await readFile(join(certDir, "key.pem")), cert }, (req, res) => {
+        seen.push({ url: req.url, key: req.headers["x-goog-api-key"] as string | undefined });
+        req.resume();
+        req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ candidates: [], usageMetadata: { promptTokenCount: 3, candidatesTokenCount: 1, totalTokenCount: 4 } })); });
+      });
+      servers.push(google as unknown as Server);
+      await new Promise<void>(resolve => google.listen(0, "127.0.0.1", resolve));
+      const port = (google.address() as AddressInfo).port;
+      const connects: string[] = [];
+      const proxy = createServer();
+      proxy.on("connect", (req, client: Socket, head) => {
+        connects.push(req.url ?? "");
+        const [, target] = (req.url ?? "").split(":");
+        const upstream = netConnect(Number(target), "127.0.0.1", () => {
+          client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          upstream.write(head);
+          upstream.pipe(client);
+          client.pipe(upstream);
+        });
+        sockets.push(client, upstream);
+        upstream.on("error", () => client.destroy());
+      });
+      servers.push(proxy);
+      await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+      const proxyUrl = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+      const origin = `https://localhost:${port}`;
+
+      const proxied = await startAntigravityRelay({ key: KEY, upstream: { origin, ca: cert }, env: { HTTPS_PROXY: proxyUrl } });
+      relays.push(proxied);
+      const body = JSON.stringify({ contents: [{ parts: [{ text: "hi" }] }] });
+      const answer = await call(proxied, "/v1beta/models/gemini-3.8-flash:generateContent", { headers: { "x-goog-api-key": proxied.token, "content-type": "application/json" }, body });
+      expect(answer.status).toBe(200);
+      expect(connects).toEqual([`localhost:${port}`]);
+      expect(seen).toEqual([{ url: "/v1beta/models/gemini-3.8-flash:generateContent", key: KEY }]);
+      expect(proxied.meter.since(0)).toEqual([expect.objectContaining({ model: "gemini-3.8-flash", usage: expect.objectContaining({ promptTokenCount: 3 }) })]);
+
+      const direct = await startAntigravityRelay({ key: KEY, upstream: { origin, ca: cert }, env: { HTTPS_PROXY: proxyUrl, NO_PROXY: "localhost" } });
+      relays.push(direct);
+      expect((await call(direct, "/v1beta/models/gemini-3.8-flash:countTokens", { headers: { "x-goog-api-key": direct.token }, body })).status).toBe(200);
+      expect(connects).toHaveLength(1);
+      expect(seen).toHaveLength(2);
+
+      // A proxy that cannot be reached is a plain 502, never a direct connection.
+      const dead = await startAntigravityRelay({ key: KEY, upstream: { origin, ca: cert }, env: { HTTPS_PROXY: "http://127.0.0.1:9" } });
+      relays.push(dead);
+      const refused = await call(dead, "/v1beta/models/gemini-3.8-flash:generateContent", { headers: { "x-goog-api-key": dead.token }, body });
+      expect(refused.status).toBe(502);
+      expect(refused.body).toContain("through the proxy");
+      expect(seen).toHaveLength(2);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await rm(certDir, { recursive: true, force: true });
+    }
   });
 });
 
