@@ -62,9 +62,22 @@ export async function agents(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "agents" }, AgentsSchema);
   context.output.result(value);
   for (const agent of value.agents as Array<Record<string, string>>) {
-    context.output.line(`${agent.agentId}: ${agent.readiness} (${agent.authMode}, scope ${agent.accountScope})${agent.recoveryAction ? ` — ${agent.recoveryAction}` : ""}`);
+    context.output.line(`${agent.agentId}: ${agent.readiness} (${agent.authMode}, scope ${agent.accountScope})${agent.recoveryAction ? ` — ${agent.recoveryAction}` : ""}${downloadNote(agent)}`);
   }
   context.output.line(`advertised roles: ${value.roles.join(", ") || "(none)"}`);
+}
+
+/** A fetched agent's download state (Google Antigravity), in words, with the command that changes it. */
+function downloadNote(agent: Record<string, unknown>): string {
+  const state = (agent.hostAgentDownload as { state?: unknown } | undefined)?.state;
+  const add = `konteks-remote agent add ${String(agent.agentId)}`;
+  switch (state) {
+    case "not_downloaded": return ` — not downloaded (${add})`;
+    case "downloading": return " — downloading from Google";
+    case "update_available": return " — a newer version is downloaded and used from the next start";
+    case "integrity_failed": return ` — does not match Google's release (${add})`;
+    default: return "";
+  }
 }
 
 export async function authStatus(context: ControlContext, agentId?: string): Promise<void> {

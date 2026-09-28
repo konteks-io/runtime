@@ -70,7 +70,7 @@ import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOpti
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
-import { antigravityDiskBytes, antigravityFetchUnderWay, antigravityPin } from "./native/antigravity-installation.js";
+import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
 import { NativeInputClient } from "./native/input-client.js";
 import { NativeOutputClient } from "./native/output-client.js";
@@ -2113,13 +2113,12 @@ export class Supervisor {
     if (!native || !this.hostSettings.coreAcceptsRouteBilling) return agents;
     const root = dirname(this.config.SUPERVISOR_DATA_DIR);
     const record = this.antigravityRecordFields();
-    if (record === null) {
-      // Not added yet, but `agent add antigravity` is downloading it in the
-      // launcher (the service keeps running meanwhile): say so on the site.
-      const running = await antigravityFetchUnderWay(root).catch(() => undefined);
-      return running ? withAntigravityDownload(agents, { state: "downloading", ...running }) : agents;
-    }
-    const download = await antigravityDownloadState(root, record).catch(() => undefined);
+    // Not added (the installation does not list it): the site's add card
+    // shows "Not added" with the one command (A20), or the download while
+    // `agent add antigravity` fetches it in the launcher (the service keeps
+    // running meanwhile). Nothing where Google publishes no copy for this
+    // computer.
+    const download = await antigravityDownloadState(root, record ?? undefined).catch(() => undefined);
     return download ? withAntigravityDownload(agents, download) : agents;
   }
 

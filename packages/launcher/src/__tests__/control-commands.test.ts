@@ -1,7 +1,7 @@
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { RemoteInstanceError, type ControlRequest, type SupervisorStatus } from "@konteks/remote-common";
-import { authLogin, previewStatus, status, type ControlContext } from "../native/control-commands.js";
+import { agents, authLogin, previewStatus, status, type ControlContext } from "../native/control-commands.js";
 import { createOutput } from "../output.js";
 
 const supervisorStatus: SupervisorStatus = {
@@ -126,6 +126,22 @@ describe("native control commands", () => {
     expect(f.text()).toContain("sess-1: running at http://127.0.0.1:43100 (a viewer is connected)");
     expect(f.text()).toContain("command: npm run dev — Inferred from package.json.");
     expect(f.text()).toContain("Customize → Runtimes");
+  });
+
+  it("names Google Antigravity's download state in the agent list, with the command that changes it (antigravity CP6)", async () => {
+    let text = "";
+    const sink = new Writable({ write(chunk, _encoding, done) { text += chunk.toString(); done(); } });
+    const view = (state: string) => ({ agentId: "antigravity", readiness: "unavailable", authMode: "agent_local_subscription", accountScope: "personal", hostAgentDownload: { state } });
+    const context = { output: createOutput({ json: false, stdout: sink, stderr: sink }), control: { call: async <T,>(_request: ControlRequest, schema: { parse: (value: unknown) => T }) => schema.parse({
+      agents: [view("not_downloaded"), view("downloading"), view("integrity_failed"), { ...view("ready"), readiness: "ready" }, { agentId: "codex", readiness: "ready", authMode: "agent_local_subscription", accountScope: "personal" }], roles: [], roleBindings: [] }) } } as never;
+    await agents(context);
+    expect(text.split("\n").slice(0, 5)).toEqual([
+      "antigravity: unavailable (agent_local_subscription, scope personal) — not downloaded (konteks-remote agent add antigravity)",
+      "antigravity: unavailable (agent_local_subscription, scope personal) — downloading from Google",
+      "antigravity: unavailable (agent_local_subscription, scope personal) — does not match Google's release (konteks-remote agent add antigravity)",
+      "antigravity: ready (agent_local_subscription, scope personal)",
+      "codex: ready (agent_local_subscription, scope personal)",
+    ]);
   });
 
   it("reads a connector status with a running preview", async () => {

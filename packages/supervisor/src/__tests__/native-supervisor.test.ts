@@ -1,5 +1,5 @@
 import { createHash, sign } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "node:net";
@@ -592,6 +592,25 @@ describe("native Supervisor composition", () => {
       const check = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
       expect(check).toMatchObject({ status: "fail", recoveryActions: [{ kind: "install_backend", agentId: "antigravity" }] });
       expect(check!.detail).toContain("is not running Konteks work: the downloaded copy does not match Google's release, so it never runs (konteks-remote agent add antigravity downloads it again); it is tried again in the background, and the other agents keep running");
+    });
+
+    it("shows the site's add card as Not added, then the launcher's download as it grows, only to a 7.1 Core (A20)", async () => {
+      const f = await fixture();
+      const supervisor = new Supervisor(f.config, f.options);
+      supervisors.push(supervisor);
+      await supervisor.start();
+      const internals = supervisor as unknown as { hostSettings: { openCodeFreeModels: boolean; coreAcceptsRouteBilling: boolean } };
+      const reported = async () => (await supervisor.inventory.collect()).agents.find(agent => agent.agentId === "antigravity");
+      expect(await reported()).toBeUndefined();
+      internals.hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: true };
+      if (`${process.platform}-${process.arch}` !== "darwin-arm64") { expect(await reported()).toBeUndefined(); return; }
+      expect(await reported()).toMatchObject({ readiness: "unavailable", hostAgentDownload: { state: "not_downloaded", sizeBytes: 111_725_488 } });
+      const staging = join(root, "agents", "antigravity", ".fetch-launcher");
+      await mkdir(staging, { recursive: true, mode: 0o700 });
+      await writeFile(join(staging, "archive.zip"), Buffer.alloc(4_096));
+      expect(await reported()).toMatchObject({ hostAgentDownload: { state: "downloading", receivedBytes: 4_096, sizeBytes: 111_725_488 } });
+      // Never an agent to place work on.
+      expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("agent:antigravity");
     });
 
     it("fetches an update's new pin at once on the first yes, and joins when it is switched to (A17)", async () => {
