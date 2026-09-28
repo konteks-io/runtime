@@ -1,4 +1,11 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ClientSideConnection } from "@agentclientprotocol/sdk";
+import { RemoteInstanceError } from "@konteks/remote-common";
+import { RunnerConfigSchema, type BridgeProcess } from "@konteks/remote-agent-runner";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NativeRunner } from "../native/runner.js";
 import { NativeAgentRetry, startNativeAgents } from "../native/start-native-agents.js";
 
 /** One agent that cannot start must not take the runtime down (WS1-018, dsh-runtime-support CP5). */
@@ -69,5 +76,49 @@ describe("NativeAgentRetry", () => {
     await vi.advanceTimersByTimeAsync(60 * 60_000);
     expect(later).not.toHaveBeenCalled();
     expect(retry.parked()).toEqual([]);
+  });
+});
+
+/** The person's own OpenCode (opencode-runtime-support CP6): parked like any agent, the others run. */
+describe("an OpenCode that cannot start", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("is left out when its settings check fails, the rest start, and a background retry brings it back", async () => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(join(tmpdir(), "native-start-opencode-"));
+    try {
+      const config = RunnerConfigSchema.parse({
+        RUNNER_AGENT_ID: "opencode", RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_WORKSPACE_DIR: join(root, "work"),
+        RUNNER_BRIDGE_PREFIX: "/opt/opencode/bin", RUNNER_NATIVE_OPENCODE_BINARY: "/opt/opencode/bin/opencode", RUNNER_BRIDGE_VERSION: "2.0.18",
+      });
+      const drift = new RemoteInstanceError("prerequisite_missing", "Unsupported OpenCode installation", { diagnostic: "opencode_unsupported_installation" });
+      let checks = 0;
+      const spawn = vi.fn(async (): Promise<BridgeProcess> => ({ connection: {} as ClientSideConnection, initializeResult: { protocolVersion: 1 }, exited: false, stderrTail: () => [], stop: vi.fn(async () => undefined) }));
+      const opencode = new NativeRunner({ instanceId: "instance", config, onEvent: () => undefined,
+        openCodeSelfCheck: async () => { checks += 1; if (checks === 1) throw drift; },
+        runtimeOptions: { spawn, probe: async () => ({ kind: "logged_out" }) } });
+      const claude = { agentId: "claude-code", start: vi.fn(async () => undefined) };
+      const result = await startNativeAgents({ codexOwner: null, runners: [claude, opencode] });
+      expect(result.started).toEqual([claude]);
+      expect(result.failed).toEqual([opencode]);
+      expect(result.unavailable).toEqual([{ agentId: "opencode", reason: "Unsupported OpenCode installation" }]);
+      expect(spawn).not.toHaveBeenCalled();
+      expect(opencode.hostInstallation()).toEqual({ version: "2.0.18", executable: "/opt/opencode/bin/opencode", selfCheck: "failed" });
+      const onStarted = vi.fn();
+      const retry = new NativeAgentRetry({ onStarted, onGaveUp: vi.fn(), log: () => undefined });
+      retry.park("opencode", () => opencode.start());
+      await vi.advanceTimersByTimeAsync(60_000);
+      // The retry fired; its start does real file work (the private home).
+      vi.useRealTimers();
+      await vi.waitFor(() => expect(onStarted).toHaveBeenCalledWith("opencode"));
+      expect(checks).toBe(2);
+      expect(opencode.hostInstallation()?.selfCheck).toBe("passed");
+      await expect(opencode.readiness()).resolves.toMatchObject({ agent: { agentId: "opencode" } });
+      retry.stop();
+      await opencode.stop();
+    } finally {
+      vi.useRealTimers();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    }
   });
 });

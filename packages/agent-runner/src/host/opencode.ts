@@ -386,8 +386,7 @@ function binary(config: RunnerConfig, family: AgentBridgeFamily): string {
  * every OpenCode process of this runner (sign-ins and sessions). The control
  * process (discovery, sign-in) uses a config folder with no instructions;
  * each execution process gets its working copy's own (`bindWorkingCopy`).
- * Offering it to anyone is gated on the install side until CP6
- * (`openCodeInstallAdapter.offered`).
+ * Offered on the install side since CP6 (`openCodeInstallAdapter.offered`).
  */
 export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   agentId: "opencode",

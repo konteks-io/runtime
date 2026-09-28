@@ -6,7 +6,7 @@ import { isAbsolute, join, parse, resolve } from "node:path";
 import { z } from "zod";
 import { isRetiredAgentId } from "@konteks/backstage-plugin-common";
 import { RemoteInstanceError } from "@konteks/remote-common";
-import { RunnerConfigSchema } from "@konteks/remote-agent-runner";
+import { RunnerConfigSchema, type RunnerConfig } from "@konteks/remote-agent-runner";
 import { EmbeddedReleaseRootSchema, findAgentBridge, selectNativeArtifacts, verifyNativeRelease, verifyOfflineAgentPackage, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { SupervisorConfigSchema } from "../config.js";
 import { IdentitySchema, ManifestRecordSchema } from "../state/store.js";
@@ -26,7 +26,7 @@ function endpoint(protocol: "https:" | "wss:") {
 
 /**
  * The agents a native runtime knows: Claude Code, Codex, and the person's own
- * DeepSeek Harness and OpenCode 2 (OpenCode not offered yet: host-agents.ts).
+ * DeepSeek Harness and OpenCode 2 (host-agents.ts).
  */
 export const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode"] as const;
 
@@ -89,10 +89,10 @@ export async function resolveNativeCodexSocket(root: string, codexHome: string, 
  * Read a stored record. One written before 7.0.0 may still list Pi or the
  * old bundled OpenCode: those agents are not run, so they are dropped (and
  * reported back for a warning) instead of failing the whole installation. A
- * host agent that is not offered yet (OpenCode 2 until its security
- * checkpoint) is dropped the same way, so an old record naming `opencode`
- * keeps loading exactly as before. The strict schema refuses a retired id
- * that is not a native agent (Pi); the installer refuses the rest.
+ * host agent that is not offered is dropped the same way (none today: since
+ * opencode-runtime-support CP6 an old record naming `opencode` reads as the
+ * person's own OpenCode 2, O13). The strict schema refuses a retired id that
+ * is not a native agent (Pi); the installer refuses the rest.
  */
 export function parseNativeRuntimeRecord(value: unknown): { record: NativeRuntimeRecord; retiredAgents: string[] } {
   const agents = (value as { agents?: unknown } | null)?.agents;
@@ -147,9 +147,12 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
     if (exchangeRecord.manifestDigest !== exchange.manifest.digest) throw invalid();
     if (release.manifest.bundleVersion !== record.bundleVersion) throw invalid();
     const runners = [];
+    const unavailableAgents: NativeUnavailableAgent[] = [];
     // A host-installed agent (the person's own DeepSeek Harness or OpenCode)
     // has no signed artifact: its adapter re-locates and re-verifies it here
-    // on every load instead.
+    // on every load instead. One the person removed or moved out of the
+    // supported range is left out (and retried by the supervisor), never a
+    // reason to stop the other agents.
     const bundled = record.agents.filter(agent => findAgentBridge(agent)?.hostInstall === undefined);
     const artifacts = selectNativeArtifacts(release, { ...options.platform, agentIds: bundled });
     for (const agent of record.agents) {
@@ -159,11 +162,13 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
         const credentials = join(root, "credentials", agent);
         const workspace = join(root, "workspaces", agent);
         for (const path of [credentials, workspace]) await directory(path);
-        runners.push(RunnerConfigSchema.parse({
-          RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
-          RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
-          ...await host.runnerSettings(record),
-        }));
+        const canonicalRoot = root;
+        try {
+          runners.push(await nativeHostRunnerConfig(canonicalRoot, record, agent));
+        } catch (error) {
+          if (!hostAgentUnavailable(error)) throw error;
+          unavailableAgents.push({ agentId: agent, error, relocate: () => nativeHostRunnerConfig(canonicalRoot, record, agent) });
+        }
         continue;
       }
       const prefix = join(releaseDir, "agents", agent);
@@ -209,11 +214,43 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
       // and only a valid whole number is taken; anything else keeps the default.
       ...previewTuning(options.env ?? process.env),
     });
-    return { record, config, runners, roots, release, retiredAgents };
+    return { record, config, runners, roots, release, retiredAgents, unavailableAgents };
   } catch (error) {
     if (error instanceof RemoteInstanceError) throw error;
     throw invalid();
   }
+}
+
+/** A listed host agent the load could not find or verify; `relocate` tries again (supervisor retry). */
+export interface NativeUnavailableAgent {
+  agentId: string;
+  error: RemoteInstanceError;
+  relocate: () => Promise<RunnerConfig>;
+}
+
+/** The locators' refusals (not found, unsupported version, unsafe install): the person can fix these, the connector runs on. */
+function hostAgentUnavailable(error: unknown): error is RemoteInstanceError {
+  return error instanceof RemoteInstanceError && error.code === "prerequisite_missing";
+}
+
+/**
+ * A host agent's runner configuration from the record: its private folders
+ * (checked again) and the settings its adapter re-locates and re-verifies.
+ */
+export async function nativeHostRunnerConfig(root: string, record: NativeRuntimeRecord, agent: string): Promise<RunnerConfig> {
+  const host = hostAgentInstallAdapter(agent);
+  if (!host || !record.agents.includes(agent as NativeRuntimeRecord["agents"][number])) throw invalid();
+  const credentials = join(root, "credentials", agent);
+  const workspace = join(root, "workspaces", agent);
+  for (const path of [credentials, workspace]) {
+    const info = await lstat(path);
+    if (!info.isDirectory() || !privateOwner(info)) throw invalid();
+  }
+  return RunnerConfigSchema.parse({
+    RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
+    RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
+    ...await host.runnerSettings(record),
+  });
 }
 
 /** `SUPERVISOR_PREVIEW_IDLE_MINUTES` (1–1440) and `SUPERVISOR_PREVIEW_MAX_RUNNING` (1–16), when valid. */

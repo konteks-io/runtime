@@ -113,7 +113,7 @@ export const HOST_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.freeze([
   {
     // OpenCode 2, the line OpenCode's homepage installs (opencode-runtime-support
     // O3). Its npm package only places a native binary; there is no Node entry.
-    // Not offered until its security checkpoint (supervisor host-agents.ts).
+    // Offered since opencode-runtime-support CP6 (supervisor host-agents.ts).
     agentId: "opencode",
     displayName: "OpenCode",
     package: "@opencode/cli",

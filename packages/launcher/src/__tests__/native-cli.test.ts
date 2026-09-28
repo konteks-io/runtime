@@ -97,16 +97,18 @@ describe("native customer entry point", () => {
     expect(stderr).toContain(`${retired} is no longer supported. Choose Claude Code, Codex, DeepSeek Harness or OpenCode on your computer.`);
     expect(actions.addAgent).not.toHaveBeenCalled();
   });
-  it("does not add OpenCode yet (offered from CP6), and never with the retired sentence", async () => {
+  it("adds, installs, signs in and out the person's own OpenCode 2, and its help names it (CP6)", async () => {
     const { program, actions } = fixture();
-    program.exitOverride();
-    for (const command of [program.commands.find(c => c.name() === "agent")!, ...program.commands.find(c => c.name() === "agent")!.commands]) command.exitOverride();
-    let stderr = "";
-    program.configureOutput({ writeErr: text => { stderr += text; } });
-    for (const command of program.commands.find(c => c.name() === "agent")!.commands) command.configureOutput({ writeErr: text => { stderr += text; } });
-    await expect(program.parseAsync(["--root", "/private/native-root", "agent", "add", "opencode"], { from: "user" })).rejects.toThrow();
-    expect(stderr).toContain("unsupported agent family");
-    expect(stderr).not.toContain("no longer supported");
-    expect(actions.addAgent).not.toHaveBeenCalled();
+    await program.parseAsync(["--root", "/private/native-root", "agent", "add", "opencode"], { from: "user" });
+    expect(actions.addAgent).toHaveBeenCalledWith(expect.objectContaining({ agent: "opencode" }));
+    await program.parseAsync(["--root", "/private/native-root", "install", "--enroll", "--agents", "codex,opencode"], { from: "user" });
+    expect(actions.install).toHaveBeenCalledWith(expect.objectContaining({ enroll: true, agents: ["codex", "opencode"] }));
+    await program.parseAsync(["--root", "/private/native-root", "auth", "status", "opencode"], { from: "user" });
+    expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.status", agent: "opencode" }));
+    await program.parseAsync(["--root", "/private/native-root", "auth", "login", "opencode", "--reuse"], { from: "user" });
+    expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.login", agent: "opencode", reuse: true }));
+    const agent = program.commands.find(c => c.name() === "agent")!.commands.find(c => c.name() === "add")!;
+    expect(agent.helpInformation()).toContain("dsh or opencode");
+    expect(program.commands.find(c => c.name() === "install")!.helpInformation()).toContain("claude-code, codex, dsh, opencode");
   });
 });

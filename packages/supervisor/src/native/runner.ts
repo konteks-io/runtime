@@ -114,10 +114,30 @@ export class NativeRunner implements RunnerPort {
    */
   private async checkHostAgent(): Promise<void> {
     const host = hostAgentInstallAdapter(this.options.config.RUNNER_AGENT_ID);
-    await host?.selfCheck(this.options.config, {
-      ...(this.options.dshProfileCheck ? { dshProfileCheck: this.options.dshProfileCheck } : {}),
-      ...(this.options.openCodeSelfCheck ? { openCodeSelfCheck: this.options.openCodeSelfCheck } : {}),
-    });
+    if (!host) return;
+    try {
+      await host.selfCheck(this.options.config, {
+        ...(this.options.dshProfileCheck ? { dshProfileCheck: this.options.dshProfileCheck } : {}),
+        ...(this.options.openCodeSelfCheck ? { openCodeSelfCheck: this.options.openCodeSelfCheck } : {}),
+      });
+      this.hostSelfCheck = "passed";
+    } catch (error) {
+      this.hostSelfCheck = "failed";
+      throw error;
+    }
+  }
+
+  private hostSelfCheck: "passed" | "failed" | "not_run" = "not_run";
+
+  /**
+   * The person's own installation this host-agent runner runs (doctor): its
+   * version, its executable, and how the last start self-check went. Null for
+   * an agent from a release package.
+   */
+  hostInstallation(): { version: string; executable: string | null; selfCheck: "passed" | "failed" | "not_run" } | null {
+    const config = this.options.config;
+    if (!hostAgentInstallAdapter(config.RUNNER_AGENT_ID)) return null;
+    return { version: config.RUNNER_BRIDGE_VERSION, executable: config.RUNNER_NATIVE_OPENCODE_BINARY ?? config.RUNNER_NATIVE_DSH_ENTRY ?? null, selfCheck: this.hostSelfCheck };
   }
 
   stop(): Promise<void> {

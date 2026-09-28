@@ -31,6 +31,62 @@ export interface DoctorInputs {
    * is none.
    */
   browser?: { version: string | null; agents: string[]; chrome: boolean; packageAgent?: string; nodeSource?: "agent_package" | "person"; unavailable?: string };
+  /**
+   * The person's own OpenCode 2, when this installation lists it (opencode
+   * CP6): the version and how it was installed, the start self-check, whether
+   * it runs or is left out (and why, as a diagnostic id), what it is signed in
+   * with (labels and states only), Core's free-models switch, and whether its
+   * sessions get the QA browser.
+   */
+  openCode?: OpenCodeDoctorInputs;
+}
+
+export interface OpenCodeDoctorInputs {
+  state: "running" | "retrying" | "given_up";
+  version: string | null;
+  installKind: string | null;
+  selfCheck: "passed" | "failed" | "not_run";
+  /** The refusal's diagnostic id when it is left out (`opencode_unsupported_version`, …). */
+  failure?: string | undefined;
+  credentials: Array<{ label: string; state: string }>;
+  freeModels: boolean;
+  browser: boolean;
+}
+
+/** Why OpenCode is left out, in words and without a path or a link (doctor output). */
+const OPENCODE_FAILURES: Record<string, string> = {
+  opencode_not_found: "OpenCode 2 is no longer installed where this computer found it; install it again from opencode.ai",
+  opencode_unsupported_version: "the installed OpenCode is a version Konteks does not support (OpenCode 1, for example); install OpenCode 2 from opencode.ai",
+  opencode_unsafe_install: "its installation can be changed by other users; reinstall it for this user only",
+  opencode_unsupported_installation: "this OpenCode does not keep the Konteks settings; install a supported OpenCode 2 from opencode.ai",
+  opencode_self_check_failed: "its Konteks settings check could not run",
+};
+
+function openCodeCheck(input: OpenCodeDoctorInputs): Omit<DoctorCheck, "recoveryActions"> & { recoveryActions?: DoctorCheck["recoveryActions"] } {
+  const how = input.installKind === null ? "" : input.installKind === "another location" ? ", installed in a custom location" : input.installKind === "homepage installer" ? ", installed with OpenCode's homepage installer" : `, installed with ${input.installKind}`;
+  const version = input.version ? `OpenCode ${input.version}${how}` : "OpenCode";
+  if (input.state !== "running") {
+    const why = (input.failure && OPENCODE_FAILURES[input.failure]) ?? "it could not start (the connector log says why)";
+    const next = input.state === "retrying" ? "it is tried again in the background, and the other agents keep running" : "it is no longer retried; restart the connector once it is fixed";
+    return { id: "opencode", title: "OpenCode", status: "fail", detail: `${version} is not running Konteks work: ${why}; ${next}`, recoveryActions: [{ kind: "install_backend", agentId: "opencode" }] };
+  }
+  const ready = input.credentials.filter(credential => credential.state === "ready");
+  const signIns = input.credentials.length === 0
+    ? "not signed in to any provider (konteks-remote auth login opencode)"
+    : `signed in with ${input.credentials.map(credential => credential.state === "ready" ? credential.label : `${credential.label} (needs sign-in)`).join(", ")}`;
+  const usable = ready.length > 0 || input.freeModels;
+  return {
+    id: "opencode", title: "OpenCode",
+    status: usable ? "pass" : "warn",
+    detail: [
+      version,
+      input.selfCheck === "passed" ? "Konteks settings check passed" : "Konteks settings not checked yet",
+      signIns,
+      input.freeModels ? "OpenCode Zen free models on" : "OpenCode Zen free models off",
+      input.browser ? "its sessions get the QA browser" : "no QA browser for its sessions",
+    ].join("; "),
+    ...(usable ? {} : { recoveryActions: [{ kind: "login_agent", agentId: "opencode" }] }),
+  };
 }
 
 export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
@@ -79,6 +135,7 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
         ? unavailable ?? "no QA browser on this computer, so QA and validator sessions check work without opening one"
         : `Playwright MCP ${version} for ${agents.join(", ")}${node ? `; runs on ${node}` : ""}; ${chrome ? "uses the installed Google Chrome" : "no Google Chrome, so Playwright's Chromium is installed on first use"}; reaches only the session's preview` });
   }
+  if (inputs.openCode) push(openCodeCheck(inputs.openCode));
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };
 }

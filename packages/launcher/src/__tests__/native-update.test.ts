@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture, resolveNativeConnectorExecutable } from "@konteks/remote-release";
-import { loadNativeInstallation, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
 import { earlierFailure, earlierFailureNote, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
@@ -16,8 +16,18 @@ import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fix
 const roots: string[] = [];
 afterEach(async () => { vi.unstubAllEnvs(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
-async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0" }: { oldVersion?: string; nextVersion?: string } = {}) {
+async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0", openCode = false }: { oldVersion?: string; nextVersion?: string; openCode?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "native-cli-update-")); roots.push(root);
+  if (openCode) {
+    // The person's own OpenCode 2 as npm installs it (never run: its version is in package.json).
+    const pkg = join(root, "person-opencode", "lib", "node_modules", "@opencode", "cli");
+    await mkdir(join(pkg, "bin"), { recursive: true });
+    const body = Buffer.alloc(OPENCODE_MIN_BINARY_BYTES + 16);
+    Buffer.from([0xcf, 0xfa, 0xed, 0xfe]).copy(body);
+    await writeFile(join(pkg, "bin", "opencode.exe"), body, { mode: 0o755 });
+    await writeFile(join(pkg, "package.json"), JSON.stringify({ name: "@opencode/cli", version: "2.0.18" }));
+    vi.stubEnv("OPENCODE_EXECUTABLE", join(pkg, "bin", "opencode.exe"));
+  }
   const claudeTool = join(root, "operator-claude");
   await writeFile(claudeTool, "claude-not-executed", { mode: 0o700 });
   vi.stubEnv("CLAUDE_CODE_EXECUTABLE", claudeTool);
@@ -44,7 +54,7 @@ async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0" }: { oldVer
   });
   const fetchFn = vi.fn(async (url: string) => new Response(url === claude.artifact.url ? claude.archive : url === next.artifact.url ? next.bytes : old.bytes));
   const output = createOutput({ json: true });
-  const installed = await installNative({ root, activationId: "activation-123", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", agents: ["claude-code"], output, deps: { roots: trust, platform, manifest: oldManifest, activate, fetchFn, git: null } } as never);
+  const installed = await installNative({ root, activationId: "activation-123", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", agents: openCode ? ["claude-code", "opencode"] : ["claude-code"], output, deps: { roots: trust, platform, manifest: oldManifest, activate, fetchFn, git: null } } as never);
   await writeFile(join(root, "credentials", "claude-code", "keep"), "credential-owned-by-agent");
   const deps = { roots: trust, platform, fetchFn };
   return { root, output, trust, platform, manifest, oldManifest, fetchFn, installed, deps };
@@ -67,6 +77,18 @@ describe("native update staging and commit", () => {
     expect(lines[0]).toMatch(/minute/i);
     expect(lines[0]).toMatch(/leave.*running|return.*result/i);
     expect(lines.at(-1)).toContain("staged");
+  });
+
+  it.runIf(process.platform !== "win32")("restages only bundled agents: the person's own OpenCode keeps running from their install across an update (opencode CP6)", async () => {
+    const f = await fixture({ openCode: true });
+    const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } });
+    if (staged.status !== "staged") throw new Error("unreachable");
+    expect(await readdir(join(staged.directory, "agents"))).toEqual(["claude-code"]);
+    const successor = await commitNativeUpdate({ root: f.root, releaseId: staged.releaseId, output: f.output, deps: f.deps });
+    expect(successor).toMatchObject({ agents: ["claude-code", "opencode"], opencodeVersion: "2.0.18" });
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["claude-code", "opencode"]);
+    expect(f.fetchFn.mock.calls.map(call => String(call[0])).some(url => /opencode/i.test(url))).toBe(false);
   });
 
   it("stages a strictly newer signed release beside the running one and commits it, keeping the previous directory", async () => {
@@ -262,6 +284,18 @@ describe("native update transaction", () => {
       const inner = control(root, record);
       return { call: async (request: { op: string }, ...rest: unknown[]) => request.op === "agents"
         ? { agents: record.agents.filter(agentId => agentId !== "dsh").map(agentId => ({ agentId, readiness: "ready" })) }
+        : (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest) } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+  });
+  it("does not hold an update back for the person's own OpenCode when it is left out, and restages only bundled agents (opencode CP6)", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "dsh", "opencode"] } });
+    const control = h.deps.control;
+    // OpenCode could not start (OpenCode 1 installed over it, say) and dsh is probing: neither holds the update back.
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => request.op === "agents"
+        ? { agents: [{ agentId: "claude-code", readiness: "ready" }, { agentId: "dsh", readiness: "probing" }] }
         : (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest) } as never;
     };
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });

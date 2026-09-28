@@ -70,8 +70,9 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     // activation and leave a partly installed, unstartable connector.
     const codexHome = agents.includes("codex") ? await resolveNativeCodexHome() : undefined;
     const claudeExecutable = agents.includes("claude-code") ? await resolveNativeClaudeExecutable() : undefined;
-    // Agents the person installed themselves (DeepSeek Harness): located and
-    // version-checked now, never downloaded.
+    // Agents the person installed themselves (DeepSeek Harness, OpenCode 2):
+    // located and version-checked now, never downloaded, so an unsupported
+    // one (OpenCode 1, say) is refused before an activation is used up.
     const hosted = await locateHostAgents(agents);
     const bundled = agents.filter(agent => !isHostAgentId(agent));
     const fetchFn = options.deps?.fetchFn ?? fetch;
@@ -257,7 +258,7 @@ export async function recordNativeEnrollment(options: {
     else {
       if (await resolveNativeClaudeExecutable().then(() => true).catch(() => false)) detected.push("claude-code");
       if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
-      // Agents the person installed themselves, once offered (a gated one is never detected).
+      // Agents the person installed themselves (DeepSeek Harness, OpenCode 2), when offered.
       for (const host of HOST_AGENT_INSTALL_ADAPTERS) {
         if (host.offered && await host.locate().then(() => true).catch(() => false)) detected.push(host.agentId);
       }
@@ -523,7 +524,7 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
 }
 
 /**
- * An agent the person installed themselves (DeepSeek Harness) adds no files to
+ * An agent the person installed themselves (DeepSeek Harness, OpenCode 2) adds no files to
  * the release: its host adapter locates it, the record keeps what it found,
  * it gets private folders, and the installation must still load, restoring
  * the previous record if it does not.
@@ -595,9 +596,10 @@ async function discoverGit(): Promise<NativeRuntimeRecord["git"] | null> {
 }
 function invalid() { return new RemoteInstanceError("install_state_corrupt", "Native installation cannot be completed; existing identity and credentials were preserved."); }
 /**
- * Pi and OpenCode are retired (7.0.0): refused on install with the one shared
- * sentence. A host agent that is not offered yet (OpenCode 2 until its
- * security checkpoint) is refused too, whatever the shared list says.
+ * Retired agents (Pi, Cline) are refused on install with the one shared
+ * sentence. A host agent that is not offered is refused too, whatever the
+ * shared list says (none today: OpenCode 2 is offered since
+ * opencode-runtime-support CP6).
  */
 function refuseRetiredAgents(agents: readonly string[]): void {
   const retired = agents.find(agent => isRetiredAgentId(agent));

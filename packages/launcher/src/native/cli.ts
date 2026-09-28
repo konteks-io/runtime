@@ -5,8 +5,12 @@ import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin
 import { nativePaths, nativePlatform } from "./service.js";
 import { createOutput, type Output } from "../output.js";
 
-/** The agents a native runtime runs (Pi and OpenCode are retired). */
-const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh"] as const;
+/**
+ * The agents a native runtime runs: Claude Code and Codex from signed
+ * packages, and the person's own DeepSeek Harness and OpenCode 2 (Pi is
+ * retired; OpenCode 2 is the host agent, not the old bundled one).
+ */
+const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode"] as const;
 type NativeAgentId = (typeof NATIVE_AGENT_IDS)[number];
 
 export interface NativeCommandContext { root: string; output: Output }
@@ -46,12 +50,6 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     if (!/^[A-Za-z0-9._-]{8,128}$/.test(value)) throw new InvalidArgumentError("activation id must be an opaque identifier; the code is prompted securely");
     return value;
   };
-  // Signing in and out also reaches OpenCode, which `install` and `agent add`
-  // do not offer yet (CP6): a connector without it answers that it has none.
-  const authAgent = (value: string): string => {
-    if (value === "opencode") return value;
-    return agent(value);
-  };
   const providerId = (value: string): string => {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) throw new InvalidArgumentError("expected an id such as deepseek or chatgpt-headless");
     return value;
@@ -68,7 +66,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
     .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")
-    .option("--agents <ids>", "agent families: claude-code, codex, dsh (default: claude-code,codex)", value => value.split(",").map(part => agent(part.trim())))
+    .option("--agents <ids>", "agent families: claude-code, codex, dsh, opencode (default: claude-code,codex)", value => value.split(",").map(part => agent(part.trim())))
     .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
       if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
@@ -87,8 +85,8 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   program.command("start").description("start the installed native user service").action(async () => actions.start(context()));
   program.command("stop").description("stop the native user service, preserving identity and local work").action(async () => actions.stop(context()));
   const agentLifecycle = program.command("agent").description("manage agents installed on this native runtime");
-  agentLifecycle.command("add").description("add one signed offline agent package without reactivation")
-    .argument("<agent>", "agent family", agent)
+  agentLifecycle.command("add").description("add one agent without reactivation: a signed package for Claude Code or Codex, or your own DeepSeek Harness or OpenCode 2 install (nothing downloaded)")
+    .argument("<agent>", "agent family: claude-code, codex, dsh or opencode", agent)
     .action(async (value: NativeAgentId) => actions.addAgent({ ...context(), agent: value }));
   for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).action(async () => actions.control({ ...context(), operation }));
   // Read-only. Whether this computer serves previews is switched per machine
@@ -98,13 +96,13 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .action(async () => actions.control({ ...context(), operation: "preview.status" }));
   const auth = program.command("auth").description("official local agent subscription authentication");
   auth.command("status").argument("[agent]", "agent family", agent).action(async (value?: string) => actions.control({ ...context(), operation: "auth.status", ...(value ? { agent: value } : {}) }));
-  auth.command("login").argument("<agent>", "agent family", authAgent).option("--organization", "attest that the account is organization-owned", false)
+  auth.command("login").argument("<agent>", "agent family: claude-code, codex, dsh or opencode", agent).option("--organization", "attest that the account is organization-owned", false)
     .option("--provider <id>", "OpenCode: the provider to sign in to (asked when omitted)", providerId)
     .option("--method <id>", "OpenCode: the provider's sign-in method, or key for an API key", providerId)
     .option("--reuse", "OpenCode: see which providers your own OpenCode uses, to sign in to the same ones", false)
     .action(async (value: string, options: { organization: boolean; provider?: string; method?: string; reuse: boolean }) => actions.control({ ...context(), operation: "auth.login", agent: value, organization: options.organization,
       ...(options.provider ? { provider: options.provider } : {}), ...(options.method ? { method: options.method } : {}), ...(options.reuse ? { reuse: true } : {}) }));
-  auth.command("logout").argument("<agent>", "agent family", authAgent).option("--provider <id>", "OpenCode: sign out of one provider only", providerId)
+  auth.command("logout").argument("<agent>", "agent family", agent).option("--provider <id>", "OpenCode: sign out of one provider only", providerId)
     .action(async (value: string, options: { provider?: string }) => actions.control({ ...context(), operation: "auth.logout", agent: value, ...(options.provider ? { provider: options.provider } : {}) }));
   program.command("update").description("stage the newest signed native release, drain, swap the user service and verify it; rolls back on a failed health gate")
     .option("--check", "report the available release without installing anything", false)

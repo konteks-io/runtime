@@ -86,6 +86,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         onRetired: () => { void daemon.shutdown("retired", 0).catch(() => undefined); },
         native: {
           trustedRoots: installation.roots, runners: installation.runners,
+          ...(installation.unavailableAgents.length > 0 ? { unavailableAgents: installation.unavailableAgents } : {}),
           repositoryCacheRoot: join(options.root, "repositories"),
           ...(update ? { update } : {}),
           ...(installation.record.git ? { git: installation.record.git } : {}),
@@ -95,7 +96,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         },
       });
       if (installation.retiredAgents.length > 0) {
-        supervisor.logger.warn({ retiredAgents: installation.retiredAgents }, "this installation still lists agents Konteks no longer runs; they are skipped (Claude Code, Codex and DeepSeek Harness are supported)");
+        supervisor.logger.warn({ retiredAgents: installation.retiredAgents }, "this installation still lists agents Konteks no longer runs; they are skipped (Claude Code, Codex, DeepSeek Harness and OpenCode 2 are supported)");
       }
       await supervisor.start();
       control = await startControlSocketServer({

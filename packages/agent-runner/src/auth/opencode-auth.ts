@@ -583,13 +583,7 @@ export function splitTerminalOutput(chunk: string): string[] {
 
 /** The person's own OpenCode (their HOME, their XDG folders), read only through `auth list` (O10). */
 export function personalOpenCodeHome(options: { binary: string; scratchDir: string; allowList: (home: { home: string; data: string; state: string; cache: string; config: string }) => NodeJS.ProcessEnv; run?: OpenCodeRun; inherited?: NodeJS.ProcessEnv }): OpenCodePersonalHome {
-  const inherited = options.inherited ?? process.env;
-  const home = inherited.HOME && isAbsolute(inherited.HOME) ? inherited.HOME : homedir();
-  const xdg = (name: string, fallback: string) => {
-    const value = inherited[name];
-    return value && isAbsolute(value) ? value : join(home, fallback);
-  };
-  const folders = { home, data: xdg("XDG_DATA_HOME", join(".local", "share")), state: xdg("XDG_STATE_HOME", join(".local", "state")), cache: xdg("XDG_CACHE_HOME", ".cache"), config: xdg("XDG_CONFIG_HOME", ".config") };
+  const folders = personalOpenCodeFolders(options.inherited ?? process.env);
   return {
     exists: () => existsSync(join(folders.data, "opencode", "opencode.db")),
     async list() {
@@ -600,6 +594,25 @@ export function personalOpenCodeHome(options: { binary: string; scratchDir: stri
       return listOpenCodeCredentials({ binary: options.binary, env, cwd: options.scratchDir }, options.run);
     },
   };
+}
+
+/** The person's own OpenCode folders (their HOME and XDG folders, as OpenCode resolves them). */
+function personalOpenCodeFolders(inherited: NodeJS.ProcessEnv): { home: string; data: string; state: string; cache: string; config: string } {
+  const home = inherited.HOME && isAbsolute(inherited.HOME) ? inherited.HOME : homedir();
+  const xdg = (name: string, fallback: string) => {
+    const value = inherited[name];
+    return value && isAbsolute(value) ? value : join(home, fallback);
+  };
+  return { home, data: xdg("XDG_DATA_HOME", join(".local", "share")), state: xdg("XDG_STATE_HOME", join(".local", "state")), cache: xdg("XDG_CACHE_HOME", ".cache"), config: xdg("XDG_CONFIG_HOME", ".config") };
+}
+
+/**
+ * Whether the person's own OpenCode keeps data (and so, likely, sign-ins) on
+ * this machine: the database file's existence only, nothing read (O10). Used
+ * by onboarding to name `auth login opencode --reuse`.
+ */
+export function personalOpenCodeDataExists(inherited: NodeJS.ProcessEnv = process.env): boolean {
+  return existsSync(join(personalOpenCodeFolders(inherited).data, "opencode", "opencode.db"));
 }
 
 /** Read back whether the one-time reuse offer was made (tests). */

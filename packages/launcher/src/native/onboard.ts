@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, NATIVE_MANIFEST_URL, verifyNativeRelease } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, hostAgentFamily, hostInstallCommand, NATIVE_MANIFEST_URL, verifyNativeRelease } from "@konteks/remote-release";
 import { z } from "zod";
 import { CoreResponseError, RemoteInstanceError, SupervisorStatusSchema, SystemClock } from "@konteks/remote-common";
 import { NativeEnrollment, SupervisorStore } from "@konteks/remote-supervisor";
@@ -72,6 +72,12 @@ export interface OnboardContext {
     families?: () => Promise<string[]>;
     /** Each installed agent's readiness as the running service reports it, or null when it cannot say. */
     agentReadiness?: (root: string) => Promise<Record<string, string> | null>;
+    /** The agents this installation lists (its record), or null when there is none yet. */
+    recordedAgents?: (root: string) => Promise<string[] | null>;
+    /** An OpenCode found here that cannot run (OpenCode 1): the remedy line, or null. */
+    openCodeProblem?: () => Promise<string | null>;
+    /** Whether the person's own OpenCode holds sign-ins (existence only), for `auth login opencode --reuse`. */
+    personalOpenCode?: () => Promise<boolean>;
     /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
     waitForReady?: (root: string, until?: "ready" | "answering") => Promise<{ administrativeStatus: string; roles: string[] } | null>;
     /** Graft, injectable for tests (W1-G1). */
@@ -145,7 +151,7 @@ export function isNo(answer: string): boolean {
 
 /** Every family whose local tooling this machine actually has (OS14). */
 export async function detectAgentFamilies(): Promise<string[]> {
-  const { locateNativeDsh, resolveNativeClaudeExecutable, resolveNativeCodexHome } = await import(
+  const { locateNativeDsh, locateNativeOpenCode, resolveNativeClaudeExecutable, resolveNativeCodexHome } = await import(
     "@konteks/remote-supervisor"
   );
   const families: string[] = [];
@@ -159,7 +165,30 @@ export async function detectAgentFamilies(): Promise<string[]> {
   if (await locateNativeDsh().then(() => true).catch(() => false)) {
     families.push("dsh");
   }
+  // The person's own OpenCode 2 (opencode-runtime-support CP6); OpenCode 1 is not a family here.
+  if (await locateNativeOpenCode().then(() => true).catch(() => false)) {
+    families.push("opencode");
+  }
   return families;
+}
+
+/**
+ * What the person's own OpenCode needs before it can run Konteks work, beyond
+ * a sign-in: an OpenCode 1 (or a version out of range) found here is named,
+ * with OpenCode 2's install command; null when there is nothing to say.
+ */
+export async function detectOpenCodeProblem(): Promise<string | null> {
+  const { locateNativeOpenCode } = await import("@konteks/remote-supervisor");
+  return locateNativeOpenCode().then(() => null, (error: unknown) => {
+    if (!(error instanceof RemoteInstanceError) || error.diagnostic !== "opencode_unsupported_version") return null;
+    return error.message.replace(/,? then retry\.$/, ", then add it here: konteks-remote agent add opencode");
+  });
+}
+
+/** Whether the person has their own OpenCode data (signed in with their own OpenCode), checked by existence only. */
+async function personalOpenCodeData(): Promise<boolean> {
+  const { personalOpenCodeDataExists } = await import("@konteks/remote-supervisor");
+  return personalOpenCodeDataExists();
 }
 
 /** Readiness per agent from the running service; a tooling check alone cannot tell a login apart from an install. */
@@ -1280,15 +1309,38 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const installed = await families();
       // Installed is not logged in: name only the agents that can run work (pass 28).
       const readiness = await (context.deps?.agentReadiness ?? readAgentReadiness)(context.root).catch(() => null);
+      // An agent the person installed themselves (DeepSeek Harness, OpenCode)
+      // runs only once the connector lists it and it started: when the service
+      // answers without it, say which of the two is missing (opencode CP6).
+      const recorded = readiness === null ? null : await (context.deps?.recordedAgents ?? recordedNativeAgents)(context.root).catch(() => null);
+      const hostMissing = installed.filter(family => HOST_FAMILIES.has(family) && readiness !== null && readiness[family] === undefined);
       const notLoggedIn = installed.filter(family => readiness?.[family] !== undefined && !UNSETTLED_READINESS.has(readiness[family]!));
-      const present = installed.filter(family => !notLoggedIn.includes(family));
+      const present = installed.filter(family => !notLoggedIn.includes(family) && !hostMissing.includes(family));
       const remedies: string[] = [];
       for (const family of ["claude-code", "codex"]) {
         if (notLoggedIn.includes(family)) remedies.push(`${agentName(family)} is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login ${family}`);
         else if (!present.includes(family)) remedies.push(`To also run ${agentName(family)} work here: konteks-remote auth login ${family}`);
       }
-      // DeepSeek Harness is named only when it is here: its key is the one step left.
+      // DeepSeek Harness and OpenCode are named only when they are here: nobody is told to install them.
+      for (const family of hostMissing) {
+        remedies.push(recorded?.includes(family)
+          ? `${agentName(family)} is added here but could not start, so it will not run Konteks work yet. To see why: konteks-remote doctor`
+          : `${agentName(family)} is installed on this machine but not added to Konteks here yet. To add it: konteks-remote agent add ${family}`);
+      }
       if (notLoggedIn.includes("dsh")) remedies.push(`${agentName("dsh")} is installed but has no DeepSeek API key here yet, so it will not run Konteks work. To add the key: konteks-remote auth login dsh`);
+      if (notLoggedIn.includes("opencode")) {
+        const reuse = await (context.deps?.personalOpenCode ?? personalOpenCodeData)().catch(() => false);
+        remedies.push(reuse
+          ? `${agentName("opencode")} is installed but not signed in to any provider here yet, so it will not run Konteks work. To sign it in, starting from the providers your own OpenCode already uses: konteks-remote auth login opencode --reuse`
+          : `${agentName("opencode")} is installed but not signed in to any provider here yet, so it will not run Konteks work. To sign it in with a subscription or an API key: konteks-remote auth login opencode`);
+      }
+      // An OpenCode 1 found here is named with OpenCode 2's install command.
+      if (!installed.includes("opencode")) {
+        const problem = await (context.deps?.openCodeProblem ?? detectOpenCodeProblem)().catch(() => null);
+        if (problem) remedies.push(problem);
+        // With no agent at all, OpenCode's own install command is one way in.
+        else if (installed.length === 0) remedies.push(`To run OpenCode work here: install it with \`${hostInstallCommand(hostAgentFamily("opencode"), process.platform)}\`, then: konteks-remote agent add opencode`);
+      }
       // People know their agents by name, not by id (WS1-083).
       const presentNames = present.map(agentName);
       if (nativePlatform().os === "debian") {
@@ -1300,7 +1352,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         present.length === 0
           ? installed.length > 0
             ? `No coding agent is logged in here yet, so no Konteks work can run on this machine until one is (see below).`
-            : "No coding agent was found on this machine; install Claude Code, Codex or DeepSeek Harness and run konteks-remote auth login."
+            : "No coding agent was found on this machine; install Claude Code, Codex, DeepSeek Harness or OpenCode and run konteks-remote auth login."
           : advertised && advertised.length === 0
             ? `Your ${presentNames.join(" and ")} login is set up; the runtime will advertise it once its first heartbeat lands.`
             : `Your ${presentNames.join(" and ")} login will run Konteks work here.`;
@@ -1381,7 +1433,15 @@ function workspaceName(state: { workspaces?: Array<{ tenantId: string; displayNa
 
 /** An agent family as people name it. */
 export function agentName(family: string): string {
-  return ({ "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness" } as Record<string, string>)[family] ?? family;
+  return ({ "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness", opencode: "OpenCode" } as Record<string, string>)[family] ?? family;
+}
+
+/** Agents the person installs themselves; the connector never downloads them. */
+const HOST_FAMILIES = new Set(["dsh", "opencode"]);
+
+async function recordedNativeAgents(root: string): Promise<string[] | null> {
+  const record = await readNativeRecord(root).catch(() => null);
+  return record ? [...record.agents] : null;
 }
 
 /**

@@ -60,6 +60,21 @@ async function personDsh(root: string, version = "0.1.7-rc.2") {
   return { pkg: await realpath(pkg), node: await realpath(join(prefix, "bin", "node")) };
 }
 
+/**
+ * The person's own OpenCode as npm installs it: a native-looking executable
+ * (Mach-O magic, never run) with the package's version beside it.
+ */
+async function personOpenCode(root: string, version = "2.0.18", name = "@opencode/cli") {
+  const pkg = join(root, "person-opencode", "lib", "node_modules", ...name.split("/"));
+  await mkdir(join(pkg, "bin"), { recursive: true });
+  const body = Buffer.alloc(OPENCODE_MIN_BINARY_BYTES + 16);
+  Buffer.from([0xcf, 0xfa, 0xed, 0xfe]).copy(body);
+  await writeFile(join(pkg, "bin", "opencode.exe"), body, { mode: 0o755 });
+  await writeFile(join(pkg, "package.json"), JSON.stringify({ name, version }));
+  vi.stubEnv("OPENCODE_EXECUTABLE", join(pkg, "bin", "opencode.exe"));
+  return { binary: await realpath(join(pkg, "bin", "opencode.exe")) };
+}
+
 describe("native install composition", () => {
   it("moves a stopped installation off a port owned by another process without changing durable identity or work", async () => {
     const f = await fixture();
@@ -397,8 +412,6 @@ describe("native install composition", () => {
   });
   it.each([
     ["pi", "pi is no longer supported. Choose Claude Code, Codex, DeepSeek Harness or OpenCode on your computer."],
-    // Un-retired in packages 7.1.0 as the host OpenCode 2, but not offered until CP6.
-    ["opencode", "opencode cannot be added on this computer yet."],
   ])("refuses %s before activation or downloads", async (retired, message) => {
     const f = await fixture();
     f.options.agents = ["codex", retired];
@@ -407,23 +420,65 @@ describe("native install composition", () => {
     expect(f.activate).not.toHaveBeenCalled();
     expect(f.options.deps.fetchFn).not.toHaveBeenCalled();
   });
-  it("keeps OpenCode 2 gated until its security checkpoint: installed, it is still never detected, installed or added", async () => {
+  it.runIf(process.platform !== "win32")("installs the person's own OpenCode 2 beside bundled agents, with no package of it, and enrollment detects it (CP6)", async () => {
     const f = await fixture();
-    const exe = join(f.root, "person-opencode", "opencode");
-    await mkdir(join(exe, ".."), { recursive: true });
-    const body = Buffer.alloc(OPENCODE_MIN_BINARY_BYTES + 16);
-    Buffer.from([0xcf, 0xfa, 0xed, 0xfe]).copy(body);
-    await writeFile(exe, body, { mode: 0o755 });
-    await writeFile(join(f.root, "person-opencode", "package.json"), "{}");
-    vi.stubEnv("OPENCODE_EXECUTABLE", exe);
+    const opencode = await personOpenCode(f.root);
     vi.stubEnv("DSH_EXECUTABLE", join(f.root, "no-dsh"));
-    expect(hostAgentInstallAdapter("opencode")?.offered).toBe(false);
-    const enrolled = await recordNativeEnrollment({ root: f.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", deps: f.options.deps as never });
-    expect(enrolled.agents).toContain("codex");
-    expect(enrolled.agents).not.toContain("opencode");
-    f.options.agents = ["codex", "opencode"];
-    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "agent_unavailable" });
+    expect(hostAgentInstallAdapter("opencode")?.offered).toBe(true);
+    const g = await fixture();
+    const enrolled = await recordNativeEnrollment({ root: g.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", deps: g.options.deps as never });
+    expect(enrolled.agents).toEqual(expect.arrayContaining(["codex", "opencode"]));
+    await installNative({ ...f.options, agents: ["codex", "opencode"] } as never);
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.record).toMatchObject({ agents: ["codex", "opencode"], opencodeBinary: opencode.binary, opencodeVersion: "2.0.18" });
+    expect(loaded.runners.find(runner => runner.RUNNER_AGENT_ID === "opencode")).toMatchObject({ RUNNER_NATIVE_OPENCODE_BINARY: opencode.binary, RUNNER_BRIDGE_VERSION: "2.0.18" });
+    expect(loaded.unavailableAgents).toEqual([]);
+    expect(await readdir(join(f.root, "releases", loaded.record.releaseId, "agents"))).toEqual(["codex"]);
+    expect(await readdir(join(f.root, "credentials"))).toEqual(expect.arrayContaining(["codex", "opencode"]));
+    // Nothing of OpenCode was downloaded: only the connector and Codex's package.
+    expect(f.fetchFn.mock.calls.map(call => String(call[0])).some(url => /opencode/i.test(url))).toBe(false);
+  });
+  it.runIf(process.platform !== "win32")("refuses OpenCode 1, by name and with OpenCode 2's install command, before any activation is used", async () => {
+    const f = await fixture();
+    await personOpenCode(f.root, "1.18.33", "opencode-ai");
+    const refusal = await installNative({ ...f.options, agents: ["codex", "opencode"] } as never).catch(error => error);
+    expect(refusal).toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_unsupported_version" });
+    expect(refusal.message).toBe("OpenCode 1 is not supported (found 1.18.33): install OpenCode 2 with `curl -fsSL https://opencode.ai/v2/install | bash`, then retry.");
     expect(f.activate).not.toHaveBeenCalled();
+    // And a 2.x outside the supported range the same way.
+    await personOpenCode(join(f.root, "three"), "3.0.0");
+    await expect(installNative({ ...f.options, agents: ["codex", "opencode"] } as never)).rejects.toMatchObject({ diagnostic: "opencode_unsupported_version" });
+    expect(f.activate).not.toHaveBeenCalled();
+  });
+  it.runIf(process.platform !== "win32")("adds OpenCode to an installed runtime without a new release or reactivation, and refuses OpenCode 1 there too", async () => {
+    const f = await fixture();
+    const first = await installNative(f.options as never);
+    await personOpenCode(f.root, "1.18.33", "opencode-ai");
+    await expect(addNativeAgent({ root: f.root, agentId: "opencode", output: createOutput({ json: true }), deps: { roots: f.trust, platform: f.platform, fetchFn: f.fetchFn } } as never))
+      .rejects.toMatchObject({ diagnostic: "opencode_unsupported_version" });
+    expect(await readNativeRecord(f.root)).toEqual(first);
+    const opencode = await personOpenCode(join(f.root, "two"));
+    const fetches = f.fetchFn.mock.calls.length;
+    const added = await addNativeAgent({ root: f.root, agentId: "opencode", output: createOutput({ json: true }), deps: { roots: f.trust, platform: f.platform, fetchFn: f.fetchFn } } as never);
+    expect(added).toMatchObject({ agents: ["codex", "opencode"], releaseId: first.releaseId, opencodeBinary: opencode.binary, opencodeVersion: "2.0.18" });
+    expect(f.fetchFn.mock.calls.length).toBe(fetches);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex", "opencode"]);
+    await expect(addNativeAgent({ root: f.root, agentId: "opencode", output: createOutput({ json: true }), deps: { roots: f.trust, platform: f.platform } } as never)).resolves.toMatchObject({ agents: ["codex", "opencode"] });
+  });
+  it.runIf(process.platform !== "win32")("keeps loading when the person's OpenCode went away or became OpenCode 1: OpenCode is left out with the reason, Codex runs (CP6)", async () => {
+    const f = await fixture();
+    await personOpenCode(f.root);
+    await installNative({ ...f.options, agents: ["codex", "opencode"] } as never);
+    await rm(join(f.root, "person-opencode"), { recursive: true, force: true });
+    await personOpenCode(join(f.root, "later"), "1.18.33", "opencode-ai");
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
+    expect(loaded.unavailableAgents.map(entry => [entry.agentId, entry.error.diagnostic])).toEqual([["opencode", "opencode_not_found"]]);
+    // Once OpenCode 2 is back (installed another way), the retry finds it again with no `agent add`.
+    const back = await personOpenCode(join(f.root, "again"));
+    await expect(loaded.unavailableAgents[0]!.relocate()).resolves.toMatchObject({ RUNNER_AGENT_ID: "opencode", RUNNER_NATIVE_OPENCODE_BINARY: back.binary, RUNNER_BRIDGE_VERSION: "2.0.18" });
   });
   it("rechecks the connector executable before OS service execution", async () => {
     const f = await fixture();

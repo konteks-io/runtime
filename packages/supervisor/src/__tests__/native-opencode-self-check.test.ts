@@ -116,12 +116,12 @@ describe("the OpenCode start self-check", () => {
 });
 
 describe("the OpenCode install adapter", () => {
-  it("runs the self-check at runner start with the runner's binary, version and private home, and stays not offered", async () => {
+  it("runs the self-check at runner start with the runner's binary, version and private home, and is offered (CP6)", async () => {
     const check = vi.fn(async () => undefined);
     const config = { RUNNER_NATIVE_OPENCODE_BINARY: "/opt/opencode/bin/opencode", RUNNER_BRIDGE_VERSION: "2.0.18", RUNNER_CREDENTIAL_DIR: "/cred" } as RunnerConfig;
     await openCodeInstallAdapter.selfCheck(config, { openCodeSelfCheck: check });
     expect(check).toHaveBeenCalledWith({ binary: "/opt/opencode/bin/opencode", version: "2.0.18", credentialDir: "/cred" });
     await expect(openCodeInstallAdapter.selfCheck({ ...config, RUNNER_NATIVE_OPENCODE_BINARY: undefined }, { openCodeSelfCheck: check })).rejects.toMatchObject({ diagnostic: "opencode_not_found" });
-    expect(openCodeInstallAdapter.offered).toBe(false);
+    expect(openCodeInstallAdapter.offered).toBe(true);
   });
 });

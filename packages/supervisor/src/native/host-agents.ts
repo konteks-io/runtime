@@ -69,19 +69,26 @@ export const dshInstallAdapter: HostAgentInstallAdapter = {
 };
 
 /**
- * The person's own OpenCode 2 (opencode-runtime-support CP1, CP2): found,
+ * The person's own OpenCode 2 (opencode-runtime-support CP1-CP6): found,
  * version checked and recorded like dsh, and proven at runner start to run
- * with the locked Konteks configuration (`opencode debug agents`). NOT
- * offered until its security checkpoint (CP4) lifts the gate: until then it
- * is refused on install, never detected at enrollment and skipped when a
- * stored record lists it, so no connector builds an OpenCode runner.
+ * with the locked Konteks configuration (`opencode debug agents`). Offered
+ * since CP6, once its tool governance (CP4) and sign-in (CP3) were in:
+ * installs, enrollment detection, `agent add opencode` and stored records
+ * take it like DeepSeek Harness.
  */
 export const openCodeInstallAdapter: HostAgentInstallAdapter = {
   agentId: "opencode",
-  offered: false,
+  offered: true,
   locate: env => locateNativeOpenCode(env),
+  // The recorded executable first. When it no longer verifies (the person
+  // reinstalled OpenCode 2 another way, or replaced it), the documented
+  // places are searched again, so a fix needs no `agent add`; with nothing
+  // found the recorded refusal stands.
   async runnerSettings(record) {
-    const opencode = record.opencodeBinary === undefined ? await resolveNativeOpenCodeInstallation() : await verifyNativeOpenCodeBinary(record.opencodeBinary);
+    const recorded = record.opencodeBinary;
+    const opencode = recorded === undefined
+      ? await resolveNativeOpenCodeInstallation()
+      : await verifyNativeOpenCodeBinary(recorded).catch(async (error: unknown) => resolveNativeOpenCodeInstallation().catch(() => { throw error; }));
     return { RUNNER_NATIVE_OPENCODE_BINARY: opencode.binary, RUNNER_BRIDGE_PREFIX: dirname(opencode.binary), RUNNER_BRIDGE_VERSION: opencode.version };
   },
   // A release that stops honouring the locked configuration never spawns.

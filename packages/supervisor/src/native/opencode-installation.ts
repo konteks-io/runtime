@@ -295,3 +295,21 @@ export async function openCodeVersionOutput(binary: string): Promise<string | nu
     await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
   }
 }
+
+/** How the person installed the OpenCode the connector runs, in words for doctor (never the path). */
+export type OpenCodeInstallKind = "homepage installer" | "npm" | "Homebrew" | "scoop" | "Chocolatey" | "another location";
+
+/** Read from the canonical executable path the locator returned (so a shim already points at its target). */
+export function openCodeInstallKind(binary: string): OpenCodeInstallKind {
+  const path = binary.replace(/\\/g, "/");
+  const lower = path.toLowerCase();
+  if (/\/node_modules\/@opencode\/cli\/bin\//.test(path)) return "npm";
+  if (/\/\.opencode\/bin\//.test(path)) return "homepage installer";
+  if (/\/cellar\//.test(lower) || lower.startsWith("/opt/homebrew/") || lower.includes("/.linuxbrew/")) return "Homebrew";
+  if (lower.includes("/scoop/")) return "scoop";
+  if (lower.includes("/chocolatey/")) return "Chocolatey";
+  return "another location";
+}
+
+/** For the launcher's onboarding remedies (it depends on the supervisor, not the agent-runner). */
+export { personalOpenCodeDataExists } from "@konteks/remote-agent-runner";

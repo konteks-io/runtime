@@ -2,7 +2,7 @@ import { chmod, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { OPENCODE_MIN_BINARY_BYTES, openCodeVersionOutput, parseOpenCodeVersion, resolveNativeOpenCodeInstallation, verifyNativeOpenCodeBinary } from "../native/opencode-installation.js";
+import { OPENCODE_MIN_BINARY_BYTES, openCodeInstallKind, openCodeVersionOutput, parseOpenCodeVersion, personalOpenCodeDataExists, resolveNativeOpenCodeInstallation, verifyNativeOpenCodeBinary } from "../native/opencode-installation.js";
 
 const posix = process.platform !== "win32";
 const V2 = "curl -fsSL https://opencode.ai/v2/install | bash";
@@ -248,5 +248,30 @@ describe("the one OpenCode command detection runs", () => {
     for (const name of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]) expect(seen[name], name).toContain(scratch);
     const after = (await readdir(tmpdir())).filter(name => name.startsWith("konteks-opencode-") && !before.has(name));
     expect(after).toEqual([]);
+  });
+});
+
+describe("OpenCode for doctor and onboarding (CP6)", () => {
+  it("names how OpenCode was installed from its canonical executable, never the path", () => {
+    expect(openCodeInstallKind("/Users/a/.nvm/versions/node/v22.23.2/lib/node_modules/@opencode/cli/bin/opencode.exe")).toBe("npm");
+    expect(openCodeInstallKind("C:\\Users\\a\\AppData\\Roaming\\npm\\node_modules\\@opencode\\cli\\bin\\opencode.exe")).toBe("npm");
+    expect(openCodeInstallKind("/Users/a/.opencode/bin/opencode")).toBe("homepage installer");
+    expect(openCodeInstallKind("/opt/homebrew/Cellar/opencode-v2/2.0.18/bin/opencode")).toBe("Homebrew");
+    expect(openCodeInstallKind("/home/a/.linuxbrew/Cellar/opencode/2.0.18/bin/opencode")).toBe("Homebrew");
+    expect(openCodeInstallKind("C:\\Users\\a\\scoop\\apps\\opencode\\current\\opencode.exe")).toBe("scoop");
+    expect(openCodeInstallKind("C:\\ProgramData\\chocolatey\\lib\\opencode\\tools\\opencode.exe")).toBe("Chocolatey");
+    expect(openCodeInstallKind("/srv/tools/opencode")).toBe("another location");
+  });
+  it("says whether the person has their own OpenCode data by the database file's existence only", async () => {
+    const home = await mkdtemp(join(tmpdir(), "opencode-personal-"));
+    try {
+      expect(personalOpenCodeDataExists({ HOME: home })).toBe(false);
+      await mkdir(join(home, ".local", "share", "opencode"), { recursive: true });
+      await writeFile(join(home, ".local", "share", "opencode", "opencode.db"), "");
+      expect(personalOpenCodeDataExists({ HOME: home })).toBe(true);
+      expect(personalOpenCodeDataExists({ HOME: home, XDG_DATA_HOME: join(home, "elsewhere") })).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 });

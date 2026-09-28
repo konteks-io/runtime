@@ -17,6 +17,7 @@ import { REMOTE_INSTANCE_PROTOCOL_VERSION, SystemClock } from "@konteks/remote-c
 import { LEASE_AUDIENCE, type CoreClient } from "../core/client.js";
 import { decodeLeaseClaims, leaseRecordFromClaims } from "../lease/lease.js";
 import { BROWSER_NO_PACKAGE_MESSAGE } from "../native/browser-capability.js";
+import { openCodeInstallAdapter } from "../native/host-agents.js";
 
 let root: string;
 const supervisors: Supervisor[] = [];
@@ -441,6 +442,63 @@ describe("native Supervisor composition", () => {
     expect((await without.inventory.collect()).components[0]?.capabilities).not.toContain("browser_tool");
     const report = await without.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
     expect(report.checks.find(check => check.id === "browser")).toMatchObject({ status: "warn", detail: BROWSER_NO_PACKAGE_MESSAGE });
+  });
+
+  describe("the person's own OpenCode (opencode-runtime-support CP6)", () => {
+    const openCodeConfig = () => RunnerConfigSchema.parse({
+      RUNNER_AGENT_ID: "opencode", RUNNER_CREDENTIAL_DIR: join(root, "opencode-credentials"), RUNNER_WORKSPACE_DIR: join(root, "opencode-work"),
+      RUNNER_BRIDGE_PREFIX: "/Users/person/.nvm/versions/node/v22/lib/node_modules/@opencode/cli/bin",
+      RUNNER_NATIVE_OPENCODE_BINARY: "/Users/person/.nvm/versions/node/v22/lib/node_modules/@opencode/cli/bin/opencode.exe", RUNNER_BRIDGE_VERSION: "2.0.18",
+    });
+    const browser = { version: "0.0.82", packageAgent: "claude-code" as const, nodeSource: "person" as const, node: "/usr/local/bin/node", launcher: "/pkg/konteks/browser-mcp.js", entrypoint: "/pkg/node_modules/@playwright/mcp/cli.js" };
+    const doctorOf = async (supervisor: Supervisor) => (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
+
+    it("runs beside Codex, and doctor names its version, install, settings check, sign-ins, free models and browser without a path", async () => {
+      const f = await fixture();
+      vi.spyOn(openCodeInstallAdapter, "selfCheck").mockResolvedValue(undefined);
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, runners: [...f.options.native.runners, openCodeConfig()], browser: { available: true, browser } } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex", "opencode"]);
+      const check = (await doctorOf(supervisor)).find(entry => entry.id === "opencode");
+      expect(check).toMatchObject({ title: "OpenCode", status: "warn", recoveryActions: [{ kind: "login_agent", agentId: "opencode" }] });
+      expect(check!.detail).toBe("OpenCode 2.0.18, installed with npm; Konteks settings check passed; not signed in to any provider (konteks-remote auth login opencode); OpenCode Zen free models off; its sessions get the QA browser");
+    });
+
+    it("is left out and retried when its settings check fails, while Codex keeps running; doctor says why", async () => {
+      const f = await fixture();
+      vi.spyOn(openCodeInstallAdapter, "selfCheck").mockRejectedValue(new RemoteInstanceError("prerequisite_missing", "Unsupported OpenCode installation: OpenCode 2.0.18 does not keep the Konteks settings (x). Install a supported version with `curl -fsSL https://opencode.ai/v2/install | bash`, then retry.", { diagnostic: "opencode_unsupported_installation" }));
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, runners: [...f.options.native.runners, openCodeConfig()] } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex"]);
+      expect((await supervisor.inventory.collect()).agents.map(agent => agent.agentId)).toEqual(["codex"]);
+      const check = (await doctorOf(supervisor)).find(entry => entry.id === "opencode");
+      expect(check).toMatchObject({ status: "fail", recoveryActions: [{ kind: "install_backend", agentId: "opencode" }] });
+      expect(check!.detail).toBe("OpenCode 2.0.18, installed with npm is not running Konteks work: this OpenCode does not keep the Konteks settings; install a supported OpenCode 2 from opencode.ai; it is tried again in the background, and the other agents keep running");
+    });
+
+    it("is left out when the installation could not find it at load, and joins once a retry re-locates it", async () => {
+      const f = await fixture();
+      vi.spyOn(openCodeInstallAdapter, "selfCheck").mockResolvedValue(undefined);
+      const relocate = vi.fn()
+        .mockRejectedValueOnce(new RemoteInstanceError("prerequisite_missing", "OpenCode 1 is not supported (found 1.18.33)", { diagnostic: "opencode_unsupported_version" }))
+        .mockResolvedValue(openCodeConfig());
+      const unavailableAgents = [{ agentId: "opencode", error: new RemoteInstanceError("prerequisite_missing", "OpenCode 1 is not supported (found 1.18.33)", { diagnostic: "opencode_unsupported_version" }), relocate }];
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, unavailableAgents } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex"]);
+      expect((await doctorOf(supervisor)).find(entry => entry.id === "opencode")).toMatchObject({ status: "fail", detail: "OpenCode is not running Konteks work: the installed OpenCode is a version Konteks does not support (OpenCode 1, for example); install OpenCode 2 from opencode.ai; it is tried again in the background, and the other agents keep running" });
+      const retry = (supervisor as unknown as { nativeAgentRetry: { retry(agentId: string): Promise<void>; parked(): string[] } }).nativeAgentRetry;
+      await retry.retry("opencode");
+      expect(retry.parked()).toEqual(["opencode"]);
+      await retry.retry("opencode");
+      expect(relocate).toHaveBeenCalledTimes(2);
+      expect(retry.parked()).toEqual([]);
+      expect([...supervisor.runners.keys()]).toEqual(["codex", "opencode"]);
+      expect((await doctorOf(supervisor)).find(entry => entry.id === "opencode")).toMatchObject({ status: "warn", detail: expect.stringMatching(/^OpenCode 2\.0\.18, installed with npm; Konteks settings check passed;/) });
+    });
   });
 
   it("tells the local operator which release Konteks accepts for this machine (WS1-093)", async () => {

@@ -28,6 +28,7 @@ import {
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { chromeInstalled, type RunnerConfig } from "@konteks/remote-agent-runner";
+import type { NativeUnavailableAgent } from "./native/installation.js";
 import { SignalSampler } from "@konteks/remote-sysmon";
 import { loadSupervisorConfig, type SupervisorConfig } from "./config.js";
 import { CoreClient, LEASE_AUDIENCE } from "./core/client.js";
@@ -84,7 +85,8 @@ import { SupervisorJournal } from "./state/journal.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
 import { buildSupportBundle } from "./support/bundle.js";
-import { runDoctor } from "./support/doctor.js";
+import { runDoctor, type OpenCodeDoctorInputs } from "./support/doctor.js";
+import { openCodeInstallKind } from "./native/opencode-installation.js";
 import { HttpsFallbackTransport } from "./transport/https-fallback.js";
 import { RecoveryAuthority } from "./transport/recovery-authority.js";
 import { AssignmentSender } from "./work/assignment-sender.js";
@@ -136,6 +138,8 @@ export interface SupervisorOptions {
     repositoryCacheRoot?: string;
     prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void | "unavailable" | "skipped" | "wired">;
     runtimeOptions?: NativeRunnerOptions["runtimeOptions"];
+    /** Host agents the installation lists but could not find or verify at load; left out and retried (opencode CP6). */
+    unavailableAgents?: NativeUnavailableAgent[];
     /** The connector's QA browser (O8); resolved from the runners' packages and the person's Node when absent (tests pass it). */
     browser?: ConnectorBrowserStatus;
     /** Test/embedding seam for the independently supervised shared Codex owner. */
@@ -372,11 +376,9 @@ export class Supervisor {
     } else {
       this.logger.warn({ event: "browser.connector_unavailable", reason: this.connectorBrowser.reason }, this.connectorBrowser.message);
     }
+    this.nativeRunnerInstanceId = identity!.instanceId;
     for (const config of withConnectorBrowser(this.options.native!.runners, this.connectorBrowser)) {
-      const runner = new NativeRunner({ instanceId: identity!.instanceId, config,
-        ...(config.RUNNER_AGENT_ID === "codex" && this.nativeCodexOwner ? { afterSuccessfulLogin: () => this.nativeCodexOwner!.refreshAfterLogin() } : {}),
-        executionBridgeLimit: () => Math.min(4, this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT ?? 4),
-        onEvent: event => { void this.onRunnerEvent(config.RUNNER_AGENT_ID, event).catch(error => this.logger.warn({ err: error }, "native runner event failed")); }, ...(this.options.native!.runtimeOptions ? { runtimeOptions: this.options.native!.runtimeOptions } : {}) });
+      const runner = this.createNativeRunner(config);
       this.nativeRunners.push(runner);
       this.runners.set(runner.agentId, runner);
     }
@@ -951,7 +953,10 @@ export class Supervisor {
     const agents = await startNativeAgents({
       codexOwner: this.nativeCodexOwner,
       runners: this.nativeRunners,
-      onUnavailable: (agentId, error) => this.logger.error({ err: error, agentId }, "agent could not start; the runtime continues without it"),
+      onUnavailable: (agentId, error) => {
+        this.agentStartFailures.set(agentId, error);
+        this.logger.error({ err: error, agentId }, "agent could not start; the runtime continues without it");
+      },
     });
     if (this.nativeCodexOwner && !agents.codexOwnerStarted) {
       // Codex is left out rather than taking every other agent down with it:
@@ -969,6 +974,7 @@ export class Supervisor {
     // Any other agent that could not start is left out the same way and
     // retried in the background, so one agent never takes the rest down.
     for (const runner of agents.failed) this.parkNativeRunner(runner);
+    for (const entry of this.options.native!.unavailableAgents ?? []) this.parkUnavailableHostAgent(entry);
     this.lastSnapshot = await this.inventory.collect();
     if (this.stopping) return;
     if (this.instanceId && this.administrativeStatus !== "provisioning") {
@@ -987,24 +993,70 @@ export class Supervisor {
     }
   }
 
+  private nativeRunnerInstanceId = "";
+
+  private createNativeRunner(config: RunnerConfig): NativeRunner {
+    return new NativeRunner({ instanceId: this.nativeRunnerInstanceId, config,
+      ...(config.RUNNER_AGENT_ID === "codex" && this.nativeCodexOwner ? { afterSuccessfulLogin: () => this.nativeCodexOwner!.refreshAfterLogin() } : {}),
+      executionBridgeLimit: () => Math.min(4, this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT ?? 4),
+      onEvent: event => { void this.onRunnerEvent(config.RUNNER_AGENT_ID, event).catch(error => this.logger.warn({ err: error }, "native runner event failed")); }, ...(this.options.native!.runtimeOptions ? { runtimeOptions: this.options.native!.runtimeOptions } : {}) });
+  }
+
+  /**
+   * A host agent (the person's own DeepSeek Harness or OpenCode) that the
+   * installation could not find or verify at load (removed, or upgraded out
+   * of the supported range) is left out like an agent that failed to start:
+   * the connector runs the others, and a background retry re-locates it and
+   * builds its runner once it is back.
+   */
+  private parkUnavailableHostAgent(entry: NativeUnavailableAgent): void {
+    this.agentStartFailures.set(entry.agentId, entry.error);
+    this.logger.error({ err: entry.error, agentId: entry.agentId }, "agent could not be found or verified; the runtime continues without it");
+    this.nativeAgentRetry.park(entry.agentId, async () => {
+      const [config] = withConnectorBrowser([await entry.relocate()], this.connectorBrowser);
+      const runner = this.createNativeRunner(config!);
+      try {
+        await runner.start();
+      } catch (error) {
+        await runner.stop().catch(() => undefined);
+        throw error;
+      }
+      this.parkedRunners.set(entry.agentId, runner);
+    });
+  }
+
+  /** The last reason each left-out agent could not start (doctor), cleared when it starts. */
+  private readonly agentStartFailures = new Map<string, unknown>();
+
   private readonly nativeAgentRetry = new NativeAgentRetry({
     onStarted: async agentId => {
       const runner = this.parkedRunners.get(agentId);
       this.parkedRunners.delete(agentId);
+      this.agentStartFailures.delete(agentId);
       if (!runner || this.stopping) return;
       this.nativeRunners.push(runner);
       this.runners.set(runner.agentId, runner);
+      // Core's settings may have changed while it was left out.
+      void runner.applyHostSettings(this.hostSettings).catch(error => this.logger.warn({ err: error, agentId }, "host agent settings not applied"));
       // The next heartbeat advertises it; nothing waits for this.
       this.lastSnapshot = await this.inventory.collect().catch(() => this.lastSnapshot);
       this.logger.info({ agentId }, "agent started on a later try; it is advertised again");
     },
     onGaveUp: (agentId, error) => {
+      const runner = this.parkedRunners.get(agentId);
       this.parkedRunners.delete(agentId);
+      if (runner) this.gaveUpRunners.set(agentId, runner);
+      this.agentStartFailures.set(agentId, error);
       this.logger.error({ err: error, agentId }, "agent still could not start after ten tries; restart the connector once it is fixed");
     },
-    log: (agentId, attempt, error) => this.logger.warn({ err: error, agentId, attempt }, "agent still could not start; trying again later"),
+    log: (agentId, attempt, error) => {
+      this.agentStartFailures.set(agentId, error);
+      this.logger.warn({ err: error, agentId, attempt }, "agent still could not start; trying again later");
+    },
   });
   private readonly parkedRunners = new Map<string, NativeRunner>();
+  /** Runners the retry gave up on after ten tries; kept only so doctor can still say why. */
+  private readonly gaveUpRunners = new Map<string, NativeRunner>();
 
   /** Leave one runner out of advertising and placement until a retry starts it. */
   private parkNativeRunner(runner: NativeRunner): void {
@@ -2024,6 +2076,7 @@ export class Supervisor {
 
   private async doctor() {
     const snapshot = this.lastSnapshot ?? (await this.inventory.collect());
+    const openCode = this.openCodeDoctor(snapshot.agents);
     return runDoctor({
       now: () => this.clock.nowIso(),
       dataDir: this.config.SUPERVISOR_DATA_DIR,
@@ -2043,7 +2096,28 @@ export class Supervisor {
       coreSignatureConfigured: this.roots.some((root) => (root.coreControlKeys ?? []).length > 0),
       preview: { advertised: this.previewCapable(), running: this.previews.health().running, lastFailureAt: this.previews.health().lastFailure?.at ?? null },
       browser: this.browserReport(),
+      ...(openCode ? { openCode } : {}),
     });
+  }
+
+  /** The OpenCode doctor line's facts, when this installation lists OpenCode (running, retried or given up). */
+  private openCodeDoctor(agents: Array<{ agentId: string; credentials?: Array<{ label: string; state: string }> | undefined }>): OpenCodeDoctorInputs | undefined {
+    const running = this.nativeRunners.find(runner => runner.agentId === "opencode" && this.runners.get("opencode") === runner);
+    const retrying = this.nativeAgentRetry.parked().includes("opencode");
+    const gaveUp = this.gaveUpRunners.get("opencode");
+    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has("opencode")) return undefined;
+    const installation = (running ?? this.parkedRunners.get("opencode") ?? gaveUp)?.hostInstallation() ?? null;
+    const failure = this.agentStartFailures.get("opencode");
+    return {
+      state: running ? "running" : retrying ? "retrying" : "given_up",
+      version: installation?.version ?? null,
+      installKind: installation?.executable ? openCodeInstallKind(installation.executable) : null,
+      selfCheck: installation?.selfCheck ?? "not_run",
+      failure: failure instanceof RemoteInstanceError ? failure.diagnostic : undefined,
+      credentials: (agents.find(agent => agent.agentId === "opencode")?.credentials ?? []).map(credential => ({ label: credential.label, state: credential.state })),
+      freeModels: this.hostSettings.openCodeFreeModels,
+      browser: running ? running.browserVersion() !== null : this.connectorBrowser.available,
+    };
   }
 
   stop(): Promise<void> {
