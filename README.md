@@ -307,8 +307,29 @@ checks that the server answers as the version it knows. Every session keeps
 subagents and image tools off, stays in the mode that asks before commands and
 edits, and gets your repository's `AGENTS.md` in its first prompt (Google's
 server does not read it). At most two Antigravity sessions run at once on a
-computer. It is not offered yet: `install --agents` and `agent add` refuse it
-until its sign-in and permission checks are finished.
+computer.
+
+Sign it in on the computer with `konteks-remote auth login antigravity`:
+
+- **Gemini API key** (`--api-key`): paste a key from
+  https://aistudio.google.com/apikey into the hidden prompt. Konteks checks it
+  with Google and keeps it only on this computer; Google Antigravity itself
+  never sees it (a relay on this computer adds it to each request to Google).
+  Google bills its use to your key; Konteks shows each turn's cost estimated at
+  Google's list price.
+- **Gemini Enterprise** (`--enterprise --project <project id> [--location
+  global|us|eu]`, or from Konteks: Customize, Runtimes, Google Antigravity):
+  sign in with Google in the browser on this computer, then confirm your
+  licence on the page that follows. Your Google Cloud admin must set Terminal
+  auto-execution to Require review. If Google finds no licence for the
+  project, turn on the Business AI Code API
+  (`gcloud services enable businessaicode.googleapis.com --project <project id>`)
+  and sign in again.
+
+Signing in with a personal Google account is not offered.
+`konteks-remote auth logout antigravity [--api-key | --enterprise]` signs out.
+It is not offered yet: `install --agents` and `agent add` refuse it until its
+permission checks are finished.
 
 Pi is no longer supported: `install --agents` and `agent add` refuse it, and
 an installation that still lists it keeps working without it (the connector

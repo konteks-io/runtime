@@ -29,7 +29,10 @@ FETCHED one: the connector downloads Google's zip pinned in
 before every start, then proves its `initialize`; CP2: it spawns from a
 private home with its tool filter on every session, `default` mode only, the
 working copy's AGENTS.md in the first prompt and at most two processes;
-registered but not offered until its CP3/CP4, see AGENTS.md); OpenCode 2 is offered (CP6:
+CP3: it signs in with a Gemini API key held by the connector and relayed per
+process on loopback (`host/antigravity-relay.ts`, turns priced at the list
+price) or with Gemini Enterprise over ACP `authenticate` (`auth/antigravity-auth.ts`,
+also from the site); registered but not offered until its CP4, see AGENTS.md); OpenCode 2 is offered (CP6:
 install, enrollment detection, `agent add opencode`, onboarding remedies,
 Graft, a doctor line; a host agent missing or unsupported at load is left out
 and retried, never fatal to the connector); its runner spawns with the

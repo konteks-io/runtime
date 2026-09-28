@@ -118,7 +118,7 @@ fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered
 since opencode-runtime-support CP6); Google Antigravity (`antigravity`) is
-registered and fetched but not offered yet (below). Pi is retired: every write or install
+registered, fetched and signs in, but is not offered yet (below). Pi is retired: every write or install
 refuses it with `retiredAgentMessage` from `@konteks/backstage-plugin-common`,
 while stored values stay readable (a `native-runtime.json` still listing it
 loads without it through `parseNativeRuntimeRecord`, with a logged warning).
@@ -183,11 +183,62 @@ sign-in methods and no gateway, MCP over http, load/resume, embedded context;
 drift is `antigravity_unsupported_version`. These seams are generic
 `HostAgentRunnerAdapter` fields (`sessionMeta`, `verifySession`,
 `promptPrelude`, `processLimits`, `stderrFailure`, `agentErrorText`,
-`sweepLeftovers`, `sessionBootstrapTimeoutMs`). It is NOT offered
-(`antigravityInstallAdapter.offered = false`) until its CP3 and CP4: the CLI
-does not list it, install and `agent add` refuse it, enrollment never detects
-it, a stored record drops it, so no connector builds its runner; its runner
-still refuses to sign in or out (CP3) and reads signed out.
+`sweepLeftovers`, `sessionBootstrapTimeoutMs`, and CP3's `wrapSpawn`,
+`measureTurn`). CP3 (sign-in, agent-runner `auth/antigravity-auth.ts`):
+`auth login antigravity [--api-key | --enterprise --project P --location L]`
+(a numbered choice in the open without either). A **Gemini API key** is read
+with the launcher's hidden prompt, checked with Google's free model list and
+kept 0600 at `<credentials>/antigravity/antigravity/relay/gemini-api-key`
+(outside the home; never an argument, environment variable, event or log
+line). Every process spawned while the key is the method in use
+(`antigravitySpawn`, the adapter's `wrapSpawn`: control, execution and
+discovery alike) gets its own relay (`host/antigravity-relay.ts`: 127.0.0.1,
+random port and token, only `/{v1,v1beta,v1alpha}/models[/<id>[:generateContent|
+:streamGenerateContent|:countTokens]]` forwarded to
+`https://generativelanguage.googleapis.com` with the real key, answers
+streamed through, `usageMetadata` counted per model; bodies, headers, key and
+token never logged) as `GOOGLE_GEMINI_BASE_URL`, and the relay token through
+ACP `authenticate {methodId: gemini-api-key, _meta: {"api-key": token}}`.
+`measureTurn` reads the relay's span per turn; the session manager reports it
+as `pay_per_use`, provider `google`, the path's model, and
+`reportedCost` = list-price estimate (`costSource: list_price_estimate`,
+`pricingSnapshotId`) only to a 7.1.0 Core (`coreAcceptsRouteBilling`), even
+for a failed turn. **Gemini Enterprise** runs ACP `authenticate
+oauth-business` on a process of its own (`runGoogleSignIn`, spawned with the
+runtime's plain spawn, cwd the private home, `settings.json` held by
+`holdAntigravityHomeForSignIn` so nothing rewrites it meanwhile), reads the
+server's stderr (`onStderrLine`: the `accounts.google.com` link is relayed as
+`open_url`, the loopback licence picker never is; "has no available license";
+"sign-in resolved … user_tier="), requires the token file in the private home
+(the file store), and writes `sign-in.json` `{method, gcp, tier}` from the
+project the server wrote back after its picker. A failed attempt that found
+no licence ends with `reason: "no_license"` (runner event, control event,
+site report) and marks the record `licence: "none"`; so does a session that
+logs it (`antigravityStderrFailure(line, credentialDir)`). Personal Google
+sign-in (`oauth-personal`) exists only behind packages'
+`ANTIGRAVITY_LOGIN_OPTIONS['google-account'].released` (off): refused, never
+advertised. Identity (`antigravityIdentity`): a keyed hash of the method in
+use (+ project, location, tier); `credentials[]` active first: Enterprise
+(`google`, `sign_in`, `oauth-business`, label `geminiEnterpriseCredentialLabel`,
+billing `classifyAgentBilling` with the tier, `needs_sign_in` without its
+token, `reason: no_license` only to a 7.1.0 Core) and the key (`api_key`,
+`pay_per_use`); nothing in use ready → `not_configured` + `login_locally`;
+`tokenUsageObservable` true only on the key. `auth logout antigravity
+[--api-key | --enterprise]` runs ACP `logout` where the server offers it,
+removes the Enterprise token file and/or the key, keeps the project. The
+supervisor starts the site's Gemini Enterprise sign-in from an intent's
+`loginOption: gemini-enterprise` + `gcp` (`native/site-login.ts`: Google's
+link only, `no_license` to a 7.1.0 Core, `login_failed` to an older one),
+advertises `agent-login-antigravity-v1` +
+`agent-login-antigravity:gemini-enterprise` (relay up and a desktop) and the
+free-models capability (the 7.1.0 Core signal), puts the credential in use's
+billing on offered Gemini models (`antigravityOptionBilling`) and
+`hostAgentDownload` on the connected agent (`native/antigravity-download.ts`,
+7.1.0 Core only; an Antigravity that cannot start is still reported with
+it). It is NOT offered (`antigravityInstallAdapter.offered = false`) until
+CP4: install and `agent add` refuse it (its `auth` commands take it),
+enrollment never detects it, a stored record drops it, so no connector builds
+its runner yet.
 
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never
