@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, readFile, realpath, rename, rm } from "node:fs/pro
 import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
-import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
@@ -545,7 +545,9 @@ async function addHostAgent(root: string, previous: NativeRuntimeRecord, options
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(previous));
     throw error;
   }
-  options.output.line(`${options.agentId} added from this machine's own installation; no release was downloaded and nothing else changed.`);
+  const name = findAgentBridge(options.agentId)?.displayName ?? options.agentId;
+  const version = located.opencodeVersion;
+  options.output.line(`${name}${version ? ` ${version}` : ""} added from this machine's own installation; no release was downloaded and nothing else changed. To sign it in here: konteks-remote auth login ${options.agentId}`);
   return successor;
 }
 

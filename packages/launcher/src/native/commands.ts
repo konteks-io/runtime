@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { EMBEDDED_RELEASE_ROOTS, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { createNativeService, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle } from "./control-commands.js";
@@ -225,7 +225,7 @@ const productionAgentAddDeps: NativeAgentAddDeps = {
 export async function runNativeAgentAdd(input: NativeCommandContext & { agent: string }, deps: NativeAgentAddDeps = productionAgentAddDeps): Promise<void> {
   const previous = await deps.readRecord(input.root);
   if (previous.agents.includes(input.agent as NativeRuntimeRecord["agents"][number])) {
-    input.output.line(`${input.agent} is already installed; no restart is needed.`);
+    input.output.line(`${findAgentBridge(input.agent)?.displayName ?? input.agent} is already installed; no restart is needed.`);
     return;
   }
   const definition = await deps.serviceDefinition(input.root);
