@@ -25,10 +25,11 @@ function endpoint(protocol: "https:" | "wss:") {
 }
 
 /**
- * The agents a native runtime knows: Claude Code, Codex, and the person's own
- * DeepSeek Harness and OpenCode 2 (host-agents.ts).
+ * The agents a native runtime knows: Claude Code, Codex, the person's own
+ * DeepSeek Harness and OpenCode 2, and Google Antigravity, which the
+ * connector fetches itself (host-agents.ts; not offered yet).
  */
-export const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode"] as const;
+export const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode", "antigravity"] as const;
 
 /** Installer-owned metadata, not an environment file or arbitrary process configuration. */
 export const NativeRuntimeRecordSchema = z.object({
@@ -54,6 +55,13 @@ export const NativeRuntimeRecordSchema = z.object({
   /** The person's own installed OpenCode 2 executable, and the version it had when recorded (re-read on every load). */
   opencodeBinary: z.string().min(1).max(4096).optional(),
   opencodeVersion: z.string().min(1).max(128).optional(),
+  /**
+   * The Google Antigravity server the connector fetched: the pinned version
+   * and its folder under `<root>/agents/antigravity/` (re-verified against
+   * the release's pin on every load; never shown on the site or in doctor).
+   */
+  antigravityVersion: z.string().min(1).max(128).optional(),
+  antigravityRoot: z.string().min(1).max(4096).optional(),
 }).strict();
 export type NativeRuntimeRecord = z.infer<typeof NativeRuntimeRecordSchema>;
 

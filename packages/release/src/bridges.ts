@@ -11,7 +11,7 @@
  * exact version.
  */
 export interface AgentBridgeFamily {
-  agentId: "claude-code" | "codex" | "dsh" | "opencode";
+  agentId: "claude-code" | "codex" | "dsh" | "opencode" | "antigravity";
   displayName: string;
   package: string;
   version: string;
@@ -134,6 +134,30 @@ export const HOST_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.freeze([
       versions: { min: "2.0.18", belowCore: "3.0.0" },
       installCommand: "curl -fsSL https://opencode.ai/v2/install | bash",
       windowsInstallCommand: "npm install -g @opencode/cli",
+    },
+  },
+  {
+    // Google's official Antigravity ACP server (antigravity-runtime-support
+    // A1), never the `agy` CLI. Nobody installs it: on the person's yes the
+    // connector fetches Google's zip pinned in fetched-agents.json (A2, A15)
+    // into its own folder and verifies it before every start (A16). Not
+    // offered until its security checkpoint (CP4) and sign-in (CP3).
+    agentId: "antigravity",
+    displayName: "Google Antigravity",
+    package: "antigravity-acp",
+    version: "1.2.1",
+    // The arguments come from the pin (the registry's `args`, per platform).
+    command: [],
+    // Sign-in runs through ACP `authenticate` with a key or Gemini Enterprise (CP3).
+    tooling: { login: [], logout: [] },
+    acpProtocol: { min: 1, max: 1 },
+    hostInstall: {
+      launch: "fetched",
+      bin: "agy_acp_server",
+      // What the start self-check and the canary accept (A3); the connector
+      // only ever runs the one version its release pins.
+      versions: { min: "1.2.1", belowCore: "1.3.0" },
+      installCommand: "konteks-remote agent add antigravity",
     },
   },
 ]);

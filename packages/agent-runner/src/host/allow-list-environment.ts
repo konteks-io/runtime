@@ -1,4 +1,4 @@
-import { isAbsolute, win32 } from "node:path";
+import { posix, win32 } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
 
 /**
@@ -54,6 +54,8 @@ export function allowListEnvironment(options: AllowListEnvironmentOptions): Node
   const platform = options.platform ?? process.platform;
   const inherited = options.inherited ?? process.env;
   const windows = platform === "win32";
+  // The target platform's own rule (a Windows home is `C:\\…`), so a simulated platform checks like the real one.
+  const isAbsolute = (windows ? win32 : posix).isAbsolute;
   const allowed = new Set([...HOST_INHERITED_VARIABLES, ...(windows ? WINDOWS_SYSTEM_VARIABLES : [])].map(name => (windows ? name.toUpperCase() : name)));
   const env: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(inherited)) {

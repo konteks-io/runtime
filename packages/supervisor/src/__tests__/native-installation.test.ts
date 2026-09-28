@@ -10,7 +10,7 @@ import { bundleManifestSigningBytes, computeBundleManifestDigest, controlCall, S
 import type { BridgeProcess } from "@konteks/remote-agent-runner";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
-import { nativeAgentOffered, openCodeInstallAdapter } from "../native/host-agents.js";
+import { antigravityInstallAdapter, nativeAgentOffered, openCodeInstallAdapter } from "../native/host-agents.js";
 import { OPENCODE_MIN_BINARY_BYTES } from "../native/opencode-installation.js";
 import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, previewTuning, resolveNativeCodexSocket } from "../native/installation.js";
 import { verifyInstalledNativeBridges } from "../native/installed.js";
@@ -262,6 +262,25 @@ describe("closed native runtime installation", () => {
     await expect(downgraded.unavailableAgents[0]!.relocate()).resolves.toMatchObject({ RUNNER_AGENT_ID: "opencode", RUNNER_BRIDGE_VERSION: "2.0.18" });
     // A runner built directly still proves the locked configuration first.
     await expect(openCodeInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_not_found" });
+  });
+  it("records Google Antigravity's fetched copy, re-verifies it through its adapter, and skips it while it is not offered (CP1 gate)", async () => {
+    const f = await fixture();
+    const folder = join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
+    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "antigravity"], antigravityVersion: "1.2.1", antigravityRoot: folder });
+    expect(record).toMatchObject({ antigravityVersion: "1.2.1", antigravityRoot: folder });
+    expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, antigravityRoot: "" }).success).toBe(false);
+    // The loader's re-verification runs against the connector's own folder: nothing was fetched here.
+    await expect(antigravityInstallAdapter.runnerSettings(record, { root })).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: expect.stringMatching(/^antigravity_(not_fetched|unsupported_platform)$/) });
+    expect(antigravityInstallAdapter.offered).toBe(false);
+    expect(nativeAgentOffered("antigravity")).toBe(false);
+    for (const dir of ["credentials", "workspaces"]) await mkdir(join(root, dir, "antigravity"), { recursive: true, mode: 0o700 });
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
+    const loaded = await loadNativeInstallation(root, f.options);
+    expect(loaded.record.agents).toEqual(["codex"]);
+    expect(loaded.retiredAgents).toEqual(["antigravity"]);
+    expect(loaded.unavailableAgents).toEqual([]);
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
+    await expect(antigravityInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_not_fetched" });
   });
   it.each([{ releaseId: "../outside" }, { agents: ["codex", "codex"] }, { coreUrl: "http://core.example" }, { coreUrl: "https://user:password@core.example" }, { relayUrl: "ws://relay.example" }, { gatewayKey: "forbidden" }, { environment: { NODE_OPTIONS: "--require untrusted" } }, { deploymentKind: "appliance" }, { command: "/bin/sh" }])("rejects unsafe or unimplemented install fields", async patch => {
     const f = await fixture();

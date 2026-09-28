@@ -17,6 +17,9 @@ const TOOL_CONTROL: Record<AgentBridgeFamily["agentId"], ConnectedAgentView["acp
   dsh: "approve",
   // Every gated OpenCode tool asks through the locked Konteks config (CP2/CP4).
   opencode: "approve",
+  // Every Antigravity tool that is not a read asks by default; mode stays
+  // `default` and its permission requests reach the Konteks policy (CP4).
+  antigravity: "approve",
 };
 
 export interface ReadinessInputs {

@@ -4,9 +4,10 @@ import type { RunnerConfig } from "../config.js";
 import type { HostAgentRunnerAdapter } from "./host-agent.js";
 import { dshRunnerAdapter } from "./dsh.js";
 import { openCodeRunnerAdapter } from "./opencode.js";
+import { antigravityRunnerAdapter } from "./antigravity.js";
 
 /** Every host-installed agent's runner adapter, one per `HOST_AGENT_BRIDGES` family. */
-export const HOST_AGENT_RUNNER_ADAPTERS: readonly HostAgentRunnerAdapter[] = Object.freeze([dshRunnerAdapter, openCodeRunnerAdapter]);
+export const HOST_AGENT_RUNNER_ADAPTERS: readonly HostAgentRunnerAdapter[] = Object.freeze([dshRunnerAdapter, openCodeRunnerAdapter, antigravityRunnerAdapter]);
 
 /** The runner adapter of a host-installed agent id, if any. */
 export function hostAgentRunnerAdapter(agentId: string): HostAgentRunnerAdapter | undefined {

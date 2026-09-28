@@ -11,6 +11,7 @@ export * from "./host/allow-list-environment.js";
 export * from "./host/registry.js";
 export * from "./host/dsh.js";
 export * from "./host/opencode.js";
+export * from "./host/antigravity.js";
 export * from "./bridge/browser.js";
 export * from "./bridge/codex-thread-inventory.js";
 export * from "./sessions/manager.js";

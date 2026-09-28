@@ -28,7 +28,7 @@ export type RunnerBrowser = z.infer<typeof RunnerBrowserSchema>;
  */
 export const RunnerConfigSchema = z
   .object({
-    RUNNER_AGENT_ID: z.enum(["claude-code", "codex", "dsh", "opencode"]),
+    RUNNER_AGENT_ID: z.enum(["claude-code", "codex", "dsh", "opencode", "antigravity"]),
     /** Private credential volume; becomes HOME/XDG for the bridge and its official tooling. */
     RUNNER_CREDENTIAL_DIR: z.string().min(1).default("/credentials"),
     /** Local operator's Codex profile, resolved by native installation only. Never supplied by an assignment. */
@@ -43,11 +43,17 @@ export const RunnerConfigSchema = z
     RUNNER_NATIVE_DSH_NODE: z.string().min(1).optional(),
     /** The person's own installed OpenCode 2 executable (a native binary), resolved by native installation only. */
     RUNNER_NATIVE_OPENCODE_BINARY: z.string().min(1).optional(),
+    /**
+     * The verified folder of the Google Antigravity ACP server the connector
+     * fetched (`<root>/agents/antigravity/<version>-<platform>`), resolved and
+     * re-verified against the release's pin by native installation only.
+     */
+    RUNNER_NATIVE_ANTIGRAVITY_ROOT: z.string().min(1).optional(),
     /** Execution roots for session `cwd` (component checkouts are mounted beneath it). */
     RUNNER_WORKSPACE_DIR: z.string().min(1).default("/workspace"),
     /** Agents run under the person's own local login (or, for DeepSeek Harness, their own key). */
     RUNNER_AUTH_MODE: z.literal("agent_local_subscription").default("agent_local_subscription"),
-    /** Installed offline agent package prefix (or the person's own DeepSeek Harness root, or OpenCode's folder). */
+    /** Installed offline agent package prefix (or the person's own DeepSeek Harness root, OpenCode's folder, or the fetched Antigravity folder). */
     RUNNER_BRIDGE_PREFIX: z.string().min(1).default("/opt/konteks/bridges"),
     RUNNER_BRIDGE_VERSION: z.string().min(1).default("unknown"),
     /** Native installer-only signed package facts; never loaded from an assignment. */

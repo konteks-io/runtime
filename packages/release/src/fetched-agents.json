@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "agents": [
+    {
+      "agentId": "antigravity",
+      "source": "https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json",
+      "registryId": "antigravity-acp",
+      "version": "1.2.1",
+      "terms": "https://antigravity.google/terms",
+      "platforms": {
+        "darwin-arm64": {
+          "url": "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.2.1-darwin-arm64.zip",
+          "archive": {
+            "format": "zip",
+            "size": 111725488,
+            "sha256": "0fab9938812e6b32b3b543e65e4f3a0025ceef755413db13542d9a9b81ea803c"
+          },
+          "command": "agy_acp_server.par",
+          "args": [],
+          "files": [
+            {
+              "path": "agy_acp_server.par",
+              "size": 276920768,
+              "sha256": "c93c86c0f505fcdf8b13c695bed26d306141ef5446189d591397074d324db34e"
+            },
+            {
+              "path": "localharness_external",
+              "size": 120663872,
+              "sha256": "1b8a2b712ca312c9769e425b800bfbcceec4770f19736404474d1e8e50d65456"
+            }
+          ],
+          "signer": { "kind": "apple_team_id", "teamId": "EQHXZ8M8AV" }
+        }
+      }
+    }
+  ]
+}

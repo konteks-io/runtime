@@ -421,6 +421,27 @@ describe("native install composition", () => {
     expect(f.activate).not.toHaveBeenCalled();
     expect(f.options.deps.fetchFn).not.toHaveBeenCalled();
   });
+  it("keeps Google Antigravity gated until its security checkpoint: never detected, installed, added or fetched", async () => {
+    const f = await fixture();
+    const adapter = hostAgentInstallAdapter("antigravity")!;
+    expect(adapter.offered).toBe(false);
+    const fetch = vi.spyOn(adapter, "fetch");
+    const locate = vi.spyOn(adapter, "locate");
+    vi.stubEnv("DSH_EXECUTABLE", join(f.root, "no-dsh"));
+    vi.stubEnv("OPENCODE_EXECUTABLE", join(f.root, "no-opencode"));
+    const g = await fixture();
+    const enrolled = await recordNativeEnrollment({ root: g.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", deps: g.options.deps as never });
+    expect(enrolled.agents).not.toContain("antigravity");
+    f.options.agents = ["codex", "antigravity"];
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "agent_unavailable", message: "antigravity cannot be added on this computer yet." });
+    await expect(addNativeAgent({ root: f.root, agentId: "antigravity", output: f.options.output } as never)).rejects.toMatchObject({ code: "agent_unavailable" });
+    expect(f.activate).not.toHaveBeenCalled();
+    expect(f.options.deps.fetchFn).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(locate).not.toHaveBeenCalled();
+    fetch.mockRestore();
+    locate.mockRestore();
+  });
   it.runIf(process.platform !== "win32")("installs the person's own OpenCode 2 beside bundled agents, with no package of it, and enrollment detects it (CP6)", async () => {
     const f = await fixture();
     const opencode = await personOpenCode(f.root);

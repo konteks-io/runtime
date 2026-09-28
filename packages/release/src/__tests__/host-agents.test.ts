@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { FETCHED_AGENT_PINS, fetchedAgentFolderName, fetchedAgentPin, fetchedAgentPlatformKey, fetchedAgentPlatformPin } from "../fetched-agents.js";
 import { HOST_AGENT_BRIDGES, SUPPORTED_AGENT_BRIDGES, compareAgentVersions, findAgentBridge, hostAgentFamily, hostAgentVersionSupported, hostInstallCommand, isFetchedAgentId, isHostAgentId, type HostAgentFamily } from "../bridges.js";
 
 describe("host-installed agent families", () => {
@@ -8,7 +9,7 @@ describe("host-installed agent families", () => {
     expect(dsh?.package).toBe("@deepseek-ai/dsh");
     expect(dsh?.hostInstall?.bin).toBe("dsh");
     expect(dsh?.command).toEqual(["--profile", "acp"]);
-    expect(HOST_AGENT_BRIDGES.map(bridge => bridge.agentId)).toEqual(["dsh", "opencode"]);
+    expect(HOST_AGENT_BRIDGES.map(bridge => bridge.agentId)).toEqual(["dsh", "opencode", "antigravity"]);
     expect(dsh?.hostInstall?.launch).toBe("node");
     // The bundled matrix feeds the signed manifest and the release build; a
     // host-installed agent has no artifact and must never appear there.
@@ -69,5 +70,41 @@ describe("host-installed agent families", () => {
     expect(isFetchedAgentId("opencode")).toBe(false);
     expect(isFetchedAgentId("dsh")).toBe(false);
     expect(isFetchedAgentId("codex")).toBe(false);
+  });
+
+  it("registers Google Antigravity as a fetched host agent, never bundled, with Google's release pinned (A1, A3, A15)", () => {
+    const antigravity = hostAgentFamily("antigravity");
+    expect(antigravity).toMatchObject({ displayName: "Google Antigravity", package: "antigravity-acp", version: "1.2.1", command: [] });
+    expect(antigravity.hostInstall).toMatchObject({ launch: "fetched", versions: { min: "1.2.1", belowCore: "1.3.0" } });
+    expect(isHostAgentId("antigravity")).toBe(true);
+    expect(isFetchedAgentId("antigravity")).toBe(true);
+    expect(SUPPORTED_AGENT_BRIDGES.some(bridge => bridge.agentId === "antigravity")).toBe(false);
+    for (const platform of ["darwin", "linux", "win32"] as const) expect(hostInstallCommand(antigravity, platform)).toBe("konteks-remote agent add antigravity");
+    for (const version of ["1.2.1", "1.2.12"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(true);
+    for (const version of ["1.1.1", "1.3.0", "1.3.0-rc.1", "2.0.0"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(false);
+    // The pin: only macOS arm64 is proven (A11); the connector never follows the registry itself.
+    expect(FETCHED_AGENT_PINS.map(pin => pin.agentId)).toEqual(["antigravity"]);
+    const pin = fetchedAgentPin("antigravity")!;
+    expect(pin).toMatchObject({ registryId: "antigravity-acp", version: "1.2.1", terms: "https://antigravity.google/terms" });
+    expect(hostAgentVersionSupported(antigravity, pin.version)).toBe(true);
+    expect(Object.keys(pin.platforms)).toEqual(["darwin-arm64"]);
+    expect(fetchedAgentPlatformPin("antigravity", "darwin-arm64")).toEqual({
+      url: "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-1.2.1-darwin-arm64.zip",
+      archive: { format: "zip", size: 111725488, sha256: "0fab9938812e6b32b3b543e65e4f3a0025ceef755413db13542d9a9b81ea803c" },
+      command: "agy_acp_server.par", args: [],
+      files: [
+        { path: "agy_acp_server.par", size: 276920768, sha256: "c93c86c0f505fcdf8b13c695bed26d306141ef5446189d591397074d324db34e" },
+        { path: "localharness_external", size: 120663872, sha256: "1b8a2b712ca312c9769e425b800bfbcceec4770f19736404474d1e8e50d65456" },
+      ],
+      signer: { kind: "apple_team_id", teamId: "EQHXZ8M8AV" },
+    });
+    expect(fetchedAgentPlatformPin("antigravity", "linux-x64")).toBeUndefined();
+    expect(fetchedAgentPlatformPin("antigravity", null)).toBeUndefined();
+    expect(fetchedAgentPlatformPin("opencode", "darwin-arm64")).toBeUndefined();
+    expect(fetchedAgentFolderName(pin, "darwin-arm64")).toBe("1.2.1-darwin-arm64");
+    expect(fetchedAgentPlatformKey("darwin", "arm64")).toBe("darwin-arm64");
+    expect(fetchedAgentPlatformKey("win32", "x64")).toBe("win32-x64");
+    expect(fetchedAgentPlatformKey("freebsd", "x64")).toBeNull();
+    expect(Object.isFrozen(pin.platforms["darwin-arm64"]!.files[0])).toBe(true);
   });
 });
