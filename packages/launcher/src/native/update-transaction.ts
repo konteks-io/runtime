@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
 import { isHostAgentId } from "@konteks/remote-release";
-import { NATIVE_SHUTDOWN_RECEIPT_FILE, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
+import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
@@ -30,6 +30,8 @@ export interface NativeUpdateTransactionDeps {
   now: () => number;
   /** A fresh receipt is written only after this connector's shutdown steps succeed. */
   readStopReceipt?: (root: string) => Promise<string | null>;
+  /** Verify a running older connector's private Codex owner when it lacks preflight control. */
+  legacyCodexPreflight?: (root: string, previous: NativeRuntimeRecord) => Promise<void>;
   /** How often the OS has started the service and its last exit code; null where it cannot say. */
   serviceExits?: (definition: NativeServiceDefinition) => Promise<{ runs: number; lastExitCode: number | null } | null>;
   drainDeadlineMs?: number;
@@ -51,6 +53,7 @@ export type NativeUpdateOutcome =
 
 const DrainStatusSchema = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
 const AgentsSchema = z.object({ agents: z.array(z.object({ agentId: z.string(), readiness: z.string() }).passthrough()) }).passthrough();
+const CodexMaintenanceSchema = z.object({ idle: z.literal(true) }).strict();
 
 export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTransactionDeps["serviceDefinition"]; execute: NativeUpdateTransactionDeps["execute"]; start: NativeUpdateTransactionDeps["start"]; serviceExits: NonNullable<NativeUpdateTransactionDeps["serviceExits"]> }): NativeUpdateTransactionDeps {
   return {
@@ -67,6 +70,9 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
     }),
+    legacyCodexPreflight: (root, previous) => assertLegacyCodexOwnerIdle({ root, releaseId: previous.releaseId,
+      ...(previous.codexHome ? { codexHome: previous.codexHome } : {}),
+      ...(previous.codexSocket ? { codexSocket: previous.codexSocket } : {}) }),
   };
 }
 
@@ -114,6 +120,20 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     const failingBefore = wasRunning ? await failingDoctorChecks(control).catch(() => new Set<string>()) : new Set<string>();
     if (wasRunning) {
       await drain(input, control, deps);
+      if (previous.agents.includes("codex")) {
+        try { await control.call({ op: "codex.maintenance.preflight" }, CodexMaintenanceSchema); }
+        catch (error) {
+          const unsupported = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" &&
+            error.message === "control_request_invalid: request does not match the closed control protocol";
+          try {
+            if (!unsupported || !deps.legacyCodexPreflight) throw error;
+            await deps.legacyCodexPreflight(input.root, previous);
+          } catch (failure) {
+            await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
+            throw failure;
+          }
+        }
+      }
       const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
       if (await deps.execute(definition.stop) !== 0) {
         await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);

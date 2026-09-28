@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, realpath, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { promisify } from "node:util";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
   RemoteInstanceError,
   isProcessGroupAlive,
@@ -15,9 +15,12 @@ import {
   resolveBridgeFamily,
   resolveToolingCommand,
   verifyNativeRunnerPackage,
+  assertCodexThreadsIdle,
+  codexLoadedThreadStatuses,
   type RunnerConfig,
 } from "@konteks/remote-agent-runner";
 import { resolveNativeCodexSocket } from "./installation.js";
+import { resolveNativeCodexHome } from "./codex-home.js";
 
 const DEFAULT_RESTART_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000, 10_000] as const;
 
@@ -37,12 +40,27 @@ export interface NativeCodexAppServerOwnerOptions {
   onRestartFailure?: (error: unknown) => void;
   /** Who holds the shared socket; tests replace the lsof/ps lookup. */
   socketHolder?: (socketPath: string) => Promise<CodexSocketHolder | null>;
+  /** Fail closed unless every loaded thread in the shared owner is idle. */
+  assertIdleThreads?: (socketPath: string) => Promise<void>;
   /** Stop a stale server's process group; tests replace the signals. */
   stopHolder?: (pid: number) => Promise<void>;
   onStaleReplaced?: (event: { pid: number; staleRelease: string; currentRelease: string }) => void;
 }
 
 export interface CodexSocketHolder { pid: number; command: string }
+
+/** rc.6 upgrade path: prove the still-running release owns the private socket before reading it. */
+export async function assertLegacyCodexOwnerIdle(input: { root: string; releaseId: string; codexHome?: string; codexSocket?: string }): Promise<void> {
+  const home = await resolveNativeCodexHome(input.codexHome === undefined ? process.env : { CODEX_HOME: input.codexHome });
+  const socket = await resolveNativeCodexSocket(input.root, home, input.codexSocket);
+  const holder = await findCodexSocketHolder(socket).catch(() => null);
+  const release = holder && releaseOf(holder.command);
+  if (!holder || !release || release.releasesDir !== `${join(input.root, "releases")}/` || release.release !== input.releaseId ||
+      !holder.command.includes(`--listen unix://${socket}`)) {
+    throw unavailable("The previous Codex service owner could not be verified for maintenance.");
+  }
+  await assertCodexThreadsIdle(socket);
+}
 
 /**
  * One supervisor-owned Codex app-server shared by every local ACP bridge.
@@ -98,6 +116,29 @@ export class NativeCodexAppServerOwner {
     process.once("exit", this.exitReaper);
   }
 
+  /** Called while the launcher drain is still cancellable, before service stop. */
+  async preflightMaintenance(): Promise<void> {
+    await this.startPromise;
+    if (this.stopping) throw unavailable("The shared Codex owner is stopping.");
+    if (this.child || this.adoptedHolder) {
+      await (this.options.assertIdleThreads ?? assertCodexThreadsIdle)(this.options.config.RUNNER_NATIVE_CODEX_SOCKET!);
+    }
+  }
+
+  async inspectLegacyThread(reference: string): Promise<{ unloaded: boolean; ownerGeneration: string }> {
+    await this.startPromise;
+    if (this.stopping || (!this.child && !this.adoptedHolder)) throw unavailable("The shared Codex owner is unavailable.");
+    const socket = this.options.config.RUNNER_NATIVE_CODEX_SOCKET!;
+    const before = await lstat(socket);
+    const pid = this.child?.pid ?? this.adoptedHolder?.pid;
+    if (!before.isSocket() || !pid) throw unavailable("The shared Codex owner identity is unavailable.");
+    const unloaded = !(await codexLoadedThreadStatuses(socket)).has(reference);
+    const after = await lstat(socket);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.birthtimeMs !== after.birthtimeMs ||
+        pid !== (this.child?.pid ?? this.adoptedHolder?.pid)) throw unavailable("The shared Codex owner changed during legacy admission.");
+    return { unloaded, ownerGeneration: `${pid}:${before.dev}:${before.ino}:${before.birthtimeMs}` };
+  }
+
   async stop(): Promise<void> {
     this.shutdownRequested();
     this.stopping = true;
@@ -109,7 +150,14 @@ export class NativeCodexAppServerOwner {
     this.stableTimer = null;
     this.adoptedTimer = null;
     await this.startPromise?.catch(() => undefined);
-    await this.stopOwnedProcess();
+    try { await this.stopOwnedProcess(); }
+    catch (error) {
+      // A maintenance refusal must not leave the exit reaper armed: the
+      // connector may exit after reporting the failed stop to the launcher.
+      if (this.exitReaper) process.removeListener("exit", this.exitReaper);
+      this.exitReaper = null;
+      throw error;
+    }
     if (this.exitReaper) process.removeListener("exit", this.exitReaper);
     this.exitReaper = null;
   }
@@ -138,6 +186,7 @@ export class NativeCodexAppServerOwner {
         throw unavailable("The adopted Codex owner changed; refusing to stop another process.");
       }
     }
+    if (child || adopted) await (this.options.assertIdleThreads ?? assertCodexThreadsIdle)(socketPath);
     if (child) {
       await (this.options.stop ?? stopProcessGroupLeaderFirst)({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
       if ((this.options.groupAlive ?? isProcessGroupAlive)(child)) {
@@ -224,6 +273,7 @@ export class NativeCodexAppServerOwner {
       this.adoptedHolder = holder;
       return "adopt";
     }
+    await (this.options.assertIdleThreads ?? assertCodexThreadsIdle)(socketPath);
     await (this.options.stopHolder ?? stopProcessGroup)(holder.pid);
     await (this.options.cleanupSocket ?? cleanupCodexSocket)(socketPath);
     this.options.onStaleReplaced?.({ pid: holder.pid, staleRelease: stale.release, currentRelease: current.release });

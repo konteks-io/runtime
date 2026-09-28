@@ -120,6 +120,8 @@ export interface OrchestratorDeps {
   maxPullItems: number;
   runners: Map<string, RunnerPort>;
   sessionDeps: (assignment: RemoteWorkAssignment, runner: RunnerPort) => Omit<RelayedSessionDeps, "onClosed" | "onUsage">;
+  /** Shared-owner status check for an old Codex reference lacking a transport descriptor. */
+  inspectLegacyCodexThread?: (reference: string) => Promise<{ unloaded: boolean; ownerGeneration: string }>;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
   searchController?: SearchControllerBoundary;
   /** Present on a runtime tagged `onboard`; absent, both kinds are refused. */
@@ -139,6 +141,9 @@ export class WorkOrchestrator {
   private readonly dispatching = new Map<string, Promise<void>>();
   /** Long bridge/materialization work after the durable execution-open handoff. */
   private readonly bootstrapping = new Map<string, Promise<void>>();
+  private readonly legacyCodexClaims = new Map<string, string>();
+  /** Once a legacy load is admitted, its result may be uncertain even if bootstrap fails. */
+  private readonly legacyCodexConsumed = new Set<string>();
   private readonly recoveryStops = new Map<string, Promise<void>>();
   private readonly recoveryFences = new Set<string>();
   private recoveryEvidenceRetry: Promise<void> | null = null;
@@ -690,8 +695,35 @@ export class WorkOrchestrator {
     const runner = this.deps.runners.get(assignment.agentRoute.agentId);
     if (!runner) throw new Error("no runner for the placed agent");
     const restoreReference = reference === undefined && assignment.source.kind === "conversation" ? assignment.source.acpSessionRef : undefined;
+    const logicalSessionId = assignment.source.kind === "conversation" ? assignment.source.sessionId
+      : assignment.source.kind === "harness_delivery" ? assignment.source.executionSessionId : undefined;
+    let retainedReference = logicalSessionId && (this.channelOwners.get(`session:${logicalSessionId}`)?.acpSessionRef ?? restoreReference);
+    if (!retainedReference && assignment.source.kind === "harness_delivery") {
+      try { retainedReference = this.deps.journal.execution.liveContinuation(assignment)?.acpSessionRef; }
+      catch (error) { if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error; }
+    }
+    const mcpLocalTransport = retainedReference && logicalSessionId
+      ? this.deps.journal.execution.mcpLocalTransportForReference(retainedReference, logicalSessionId, assignment.agentRoute.agentId)
+      : undefined;
     const session = new RelayedSession(assignment, {
       ...this.deps.sessionDeps(assignment, runner),
+      ...(mcpLocalTransport ? { mcpLocalTransport } : {}),
+      ...(mcpLocalTransport && retainedReference ? { mcpLocalTransportReference: retainedReference } : {}),
+      assertLegacyCodexThreadUnloaded: async legacyReference => {
+        const claimant = this.legacyCodexClaims.get(legacyReference);
+        if (claimant && claimant !== key) return false;
+        this.legacyCodexClaims.set(legacyReference, key);
+        try {
+          const inspection = await this.deps.inspectLegacyCodexThread?.(legacyReference);
+          if (!inspection?.unloaded || !inspection.ownerGeneration) return false;
+          const scopedReference = `${inspection.ownerGeneration}:${legacyReference}`;
+          if (this.legacyCodexConsumed.has(scopedReference) || this.deps.journal.execution.legacyCodexLoadPreviouslyAdmitted(legacyReference, inspection.ownerGeneration, admission!.executionGeneration)) return false;
+          await this.deps.journal.execution.bindLegacyCodexAdmission(admission!, legacyReference, inspection.ownerGeneration, assertExecutionOwned);
+          this.legacyCodexConsumed.add(scopedReference);
+          return true;
+        }
+        catch { return false; }
+      },
       assertExecutionOwned,
       assertRecoveryOwned,
       ...(assignment.kind === "planning" ? {
@@ -735,6 +767,10 @@ export class WorkOrchestrator {
         await this.deps.journal.execution.replaceBootstrapProcessOwner(admission!, previous, replacement, assertExecutionOwned);
         assertExecutionOwned();
       },
+      recordMcpLocalTransport: async identity => {
+        assertExecutionOwned();
+        await this.deps.journal.execution.bindMcpLocalTransport(admission!, identity, assertExecutionOwned);
+      },
       reserveChannel: (channelId, owner) => {
         if (this.channelOwners.has(channelId)) throw new Error("the logical session channel already has a local owner");
         this.channelOwners.set(channelId, owner);
@@ -753,7 +789,10 @@ export class WorkOrchestrator {
     const bootstrap = this.bootstrapRelayedSession(session, assignment, entry, admission, assertAuthority, assertExecutionOwned);
     this.bootstrapping.set(key, bootstrap);
     void bootstrap.catch(error => this.handleDispatchFailure(assignment, entry, assertAuthority, error))
-      .finally(() => { if (this.bootstrapping.get(key) === bootstrap) this.bootstrapping.delete(key); });
+      .finally(() => {
+        if (this.bootstrapping.get(key) === bootstrap) this.bootstrapping.delete(key);
+        for (const [legacyReference, claimant] of this.legacyCodexClaims) if (claimant === key) this.legacyCodexClaims.delete(legacyReference);
+      });
   }
 
   /** Refuse before input preparation, then recheck at activation to close races. */

@@ -162,6 +162,21 @@ describe("relayed session (D98/D113/D114)", () => {
     return { session, sent, runner, runnerCalls, journal, closed, transport };
   }
 
+  it.each([false, true])("admits a legacy Codex reference only when the pinned owner proves it unloaded (unloaded=%s)", async unloaded => {
+    const assertLegacyCodexThreadUnloaded = vi.fn(async () => unloaded);
+    const f = await build({ restoreReference: "legacy-acp-ref", assertLegacyCodexThreadUnloaded });
+    try {
+      if (unloaded) {
+        await f.session.bootstrap();
+        expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ restoreAcpSessionRef: "legacy-acp-ref" }), undefined);
+      } else {
+        await expect(f.session.bootstrap()).rejects.toMatchObject({ code: "recovery_required" });
+        expect(f.runner.createSession).not.toHaveBeenCalled();
+      }
+      expect(assertLegacyCodexThreadUnloaded).toHaveBeenCalledWith("legacy-acp-ref");
+    } finally { await f.session.close("cancelled"); }
+  });
+
   it("bootstraps with the redeemed token in mcpServers and announces session_ready", async () => {
     const { session, sent, runnerCalls, journal } = await build();
     await session.bootstrap();
@@ -176,6 +191,75 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(sent[0]?.body).toMatchObject({ kind: "session_ready", assignmentId: "asg", acpSessionRef: "acp-1", resumed: false, agentId: "codex" });
     expect(JSON.stringify(journal.assignments.all())).not.toContain("cap-token");
     await session.close("cancelled");
+  });
+
+  it.each(["live", "restored"] as const)("keeps a %s Codex thread's MCP transport bound to only the current fenced turn", async continuation => {
+    const seen: string[] = [];
+    let holdNext = false;
+    let inFlightStarted!: () => void;
+    let releaseInFlight!: () => void;
+    const inFlightSeen = new Promise<void>(resolve => { inFlightStarted = resolve; });
+    const inFlightRelease = new Promise<void>(resolve => { releaseInFlight = resolve; });
+    const upstream = createServer((request, response) => {
+      seen.push(request.headers.authorization ?? "");
+      const finish = () => {
+        response.setHeader("content-type", "application/json");
+        response.end('{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}');
+      };
+      if (holdNext) {
+        holdNext = false;
+        inFlightStarted();
+        void inFlightRelease.then(finish);
+      } else finish();
+    });
+    await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("missing upstream address");
+    const upstreamUrl = `http://127.0.0.1:${address.port}/mcp`;
+    const capability = (bearer: string) => ({ mcpServer: { name: "konteks", url: upstreamUrl,
+      headers: [{ name: "authorization", value: `Bearer ${bearer}` }] }, expiresAt: "2026-09-07T00:00:00Z" });
+    const call = (entry: { url: string; headers: Array<{ name: string; value: string }> }) =>
+      fetch(entry.url, { method: "POST", headers: { ...Object.fromEntries(entry.headers.map(header => [header.name, header.value])), "content-type": "application/json" },
+        body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' });
+    let first: Awaited<ReturnType<typeof build>> | undefined;
+    let second: Awaited<ReturnType<typeof build>> | undefined;
+    try {
+      first = await build({ redeemCapabilityToken: async () => capability("turn-A"), recordCompletedSettlement: async () => undefined });
+      vi.mocked(first.runner.closeSession).mockResolvedValue({ completion: "native_continuation_ready" });
+      await first.session.bootstrap();
+      const firstEntry = (first.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ url: string; headers: Array<{ name: string; value: string }> }> }).mcpServers[0]!;
+      expect((await call(firstEntry)).status).toBe(200);
+      expect(seen).toEqual(["Bearer turn-A"]);
+
+      // Hold a request admitted under A across the ownership handoff.
+      holdNext = true;
+      const inFlight = call(firstEntry).catch(() => undefined);
+      await inFlightSeen;
+
+      // A completed owner has no authority while the provider thread remains loaded.
+      await first.session.close("completed");
+      const betweenTurns = await call(firstEntry).then(response => response.status, () => "connection_refused" as const);
+      expect([503, "connection_refused"]).toContain(betweenTurns);
+      expect(seen).toEqual(["Bearer turn-A", "Bearer turn-A"]);
+
+      const nextAssignment = { ...assignment, id: "asg-B", attempt: 2, source: { ...assignment.source, turnRef: "turn-B" } } as RemoteWorkAssignment;
+      second = await build({ redeemCapabilityToken: async () => capability("turn-B"),
+        mcpLocalTransport: { port: Number(new URL(firstEntry.url).port), credential: firstEntry.headers[0]!.value.slice("Bearer ".length) },
+        activateExecution: async () => continuation === "live" ? { continueReference: "acp-1" } : { restoreReference: "acp-1" } }, nextAssignment);
+      vi.mocked(second.runner.createSession).mockResolvedValue({ acpSessionRef: "acp-1", resumed: true, capabilities: { forkSession: false, sessionResume: true } });
+      await second.session.bootstrap();
+      // Codex app-server can accept thread/resume yet ignore the new MCP config
+      // for a loaded thread. The provider therefore keeps calling firstEntry.
+      expect((await call(firstEntry)).status).toBe(200);
+      releaseInFlight();
+      await inFlight;
+      expect(seen).toEqual(["Bearer turn-A", "Bearer turn-A", "Bearer turn-B"]);
+    } finally {
+      releaseInFlight();
+      await second?.session.close("cancelled");
+      await first?.session.close("cancelled");
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
   });
 
   describe("preview tools (native preview)", () => {
@@ -411,7 +495,7 @@ describe("relayed session (D98/D113/D114)", () => {
       },
       reserveChannel: () => () => undefined,
       activateExecution,
-    });
+    }, { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } });
 
     await session.bootstrap();
 
@@ -477,7 +561,7 @@ describe("relayed session (D98/D113/D114)", () => {
       reserveChannel: () => () => undefined,
       restoreReference: "durable-restart-ref",
       activateExecution: async () => ({ continueReference: "live-ref" }),
-    });
+    }, { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } });
 
     await session.bootstrap();
 

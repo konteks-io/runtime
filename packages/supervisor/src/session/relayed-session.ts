@@ -32,7 +32,7 @@ import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeEli
 import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
 import type { PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
-import { McpCapabilityFacade } from "../mcp/capability-facade.js";
+import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
 import { BROWSER_WORK_KINDS, PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
@@ -87,6 +87,13 @@ export interface RelayedSessionDeps {
   instanceId: string;
   /** Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory. */
   redeemCapabilityToken: (assignment: RemoteWorkAssignment) => Promise<CapabilityTokenIssue>;
+  /** Retained local address/header for the same provider thread, never Core delegation. */
+  mcpLocalTransport?: McpLocalTransportIdentity;
+  mcpLocalTransportReference?: string;
+  /** Persist the local transport identity before the provider sees its MCP config. */
+  recordMcpLocalTransport?: (identity: McpLocalTransportIdentity) => Promise<void>;
+  /** Legacy first load only: the owner must prove this reference absent. */
+  assertLegacyCodexThreadUnloaded?: (reference: string) => Promise<boolean>;
   /** The runner's workspace folder: the confinement root the tool policy judges against. */
   workspaceRoot: string;
   /** Verified local inputs (workspace, skills, binding) for the claimed assignment. */
@@ -310,6 +317,8 @@ export class RelayedSession {
       this.deps.assertExecutionOwned?.();
       const facade = new McpCapabilityFacade({
         initial: issue,
+        ...(this.deps.mcpLocalTransport ? { localTransport: this.deps.mcpLocalTransport } : {}),
+        initiallyInactive: true,
         renew: () => {
           this.deps.assertExecutionOwned?.();
           if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
@@ -386,6 +395,10 @@ export class RelayedSession {
       : undefined;
     this.deps.assertExecutionOwned?.();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+    if (this.mcpFacade && this.deps.recordMcpLocalTransport) {
+      await this.bootstrapStage("mcp_transport_identity", () => this.deps.recordMcpLocalTransport!(this.mcpFacade!.localTransportIdentity()));
+      this.deps.assertExecutionOwned?.();
+    }
     if (this.boundChannelId !== null && this.deps.reserveChannel) {
       this.releaseChannel = this.deps.reserveChannel(this.boundChannelId, this);
     }
@@ -397,6 +410,18 @@ export class RelayedSession {
     const restoreRef = priorRef === undefined
       ? activation?.restoreReference ?? this.deps.restoreReference
       : undefined;
+    if (this.deps.mcpLocalTransportReference && priorRef !== this.deps.mcpLocalTransportReference && restoreRef !== this.deps.mcpLocalTransportReference) {
+      throw new RemoteInstanceError("recovery_required", "The retained MCP transport does not belong to the chosen provider session.",
+        { diagnostic: "mcp_transport_reference_mismatch" });
+    }
+    if (this.assignment.agentRoute.agentId === "codex" && this.assignment.agentRoute.mcpCapabilityTokenRef &&
+        (priorRef || restoreRef) && !this.deps.mcpLocalTransport) {
+      const legacyReference = priorRef ?? restoreRef!;
+      const unloaded = await this.deps.assertLegacyCodexThreadUnloaded?.(legacyReference).catch(() => false);
+      if (!unloaded) throw new RemoteInstanceError("recovery_required", "The retained Codex thread cannot safely refresh its local MCP transport.",
+        { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
+    }
+    this.mcpFacade?.enable();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     this.deps.assertExecutionOwned?.();
     let reservedRef: string | undefined;

@@ -33,9 +33,15 @@ export interface BrowserAccessGrant {
   origins: Array<{ origin: string; expiresAt: string }>;
 }
 
+/** Local transport continuity only. This credential never grants Core authority. */
+export interface McpLocalTransportIdentity { port: number; credential: string }
+
 export interface McpCapabilityFacadeOptions {
   initial: CapabilityTokenIssue;
   renew: () => Promise<CapabilityTokenIssue>;
+  localTransport?: McpLocalTransportIdentity;
+  /** Bind the retained socket before ownership transfer, but deny it until the transfer commits. */
+  initiallyInactive?: boolean;
   context: { assignmentId: string; attempt: number; sessionId: string };
   logger?: Logger;
   now?: () => number;
@@ -60,18 +66,21 @@ export interface McpCapabilityFacadeOptions {
 export class McpCapabilityFacade {
   private readonly logger: Logger;
   private readonly now: () => number;
-  private readonly localCredential = randomBytes(32).toString("base64url");
+  private readonly localCredential: string;
   private readonly activeRequests = new Set<AbortController>();
   private issue: CapabilityTokenIssue;
   private server: Server | null = null;
   private refreshTask: Promise<CapabilityTokenIssue> | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
   private closed = false;
+  private active: boolean;
   private refreshFailures = 0;
   private renewalDeadline: number | null = null;
 
   constructor(private readonly options: McpCapabilityFacadeOptions) {
     this.issue = options.initial;
+    this.localCredential = options.localTransport?.credential ?? randomBytes(32).toString("base64url");
+    this.active = !options.initiallyInactive;
     this.logger = options.logger ?? createLogger({ name: "mcp-capability-facade" });
     this.now = options.now ?? Date.now;
   }
@@ -87,7 +96,7 @@ export class McpCapabilityFacade {
       const onListening = () => { server.off("error", onError); resolve(); };
       server.once("error", onError);
       server.once("listening", onListening);
-      server.listen(0, "127.0.0.1");
+      server.listen(this.options.localTransport?.port ?? 0, "127.0.0.1");
     });
     const address = server.address();
     if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The local MCP facade did not bind a TCP port.");
@@ -101,9 +110,21 @@ export class McpCapabilityFacade {
     };
   }
 
+  localTransportIdentity(): McpLocalTransportIdentity {
+    const address = this.server?.address();
+    if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The local MCP facade has no bound transport.");
+    return { port: address.port, credential: this.localCredential };
+  }
+
+  enable(): void {
+    if (this.closed || !this.server) throw new RemoteInstanceError("execution_fenced", "The local MCP facade is unavailable.");
+    this.active = true;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.active = false;
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     this.refreshTimer = null;
     for (const controller of this.activeRequests) controller.abort();
@@ -122,6 +143,7 @@ export class McpCapabilityFacade {
     response.setHeader("Cache-Control", "no-store");
     if (this.closed) return this.fail(response, 503, "facade_closed");
     if (!this.authorized(request.headers.authorization)) return this.fail(response, 401, "invalid_local_credential");
+    if (!this.active) return this.fail(response, 503, "assignment_not_active");
     if (request.method !== "POST") {
       response.setHeader("Allow", "POST");
       return this.fail(response, 405, "method_not_allowed");
@@ -169,6 +191,7 @@ export class McpCapabilityFacade {
       issue = this.issue;
       this.logger.warn({ event: "mcp_capability.refresh_deferred", ...this.options.context, expiresAt: issue.expiresAt }, "MCP request is using the still-live capability after refresh exhaustion");
     }
+    if (this.closed || !this.active) throw new RemoteInstanceError("execution_fenced", "The local MCP facade lost its assignment.");
     const upstream = new URL(issue.mcpServer.url);
     const local = new URL(request.url ?? "/mcp", "http://127.0.0.1");
     upstream.search = local.search;

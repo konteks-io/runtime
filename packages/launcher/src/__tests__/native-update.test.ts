@@ -191,6 +191,57 @@ describe("native update transaction", () => {
     expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "applied"]);
     expect(h.currentRecord().releaseId).toBe("release-next");
   });
+  it("cancels an update drain before service stop when Codex idle preflight cannot prove safety", async () => {
+    const h = harness({ previous: { ...previous, agents: ["codex"] } });
+    const originalControl = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = originalControl(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        if (request.op === "codex.maintenance.preflight") {
+          h.calls.push(`control:${request.op}@${record.releaseId}`);
+          throw new RemoteInstanceError("active_work", "Codex has an active or unreadable loaded thread");
+        }
+        return (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+      } } as never;
+    };
+
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "active_work" });
+    expect(h.calls).toContain("control:codex.maintenance.preflight@release-prev");
+    expect(h.calls).toContain("control:drain.cancel@release-prev");
+    expect(h.calls).not.toContain("stop");
+    expect(h.calls).not.toContain("commit");
+    expect(h.calls).not.toContain("start");
+    expect(h.currentRecord().releaseId).toBe("release-prev");
+    expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "failed"]);
+  });
+  it.each([false, true])("uses a verified private-socket inventory when the previous connector lacks the new preflight op (idle=%s)", async idle => {
+    const h = harness({ previous: { ...previous, agents: ["codex"] } });
+    const originalControl = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = originalControl(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        if (request.op === "codex.maintenance.preflight") {
+          h.calls.push(`control:${request.op}@${record.releaseId}`);
+          throw new RemoteInstanceError("temporarily_unavailable", "control_request_invalid: request does not match the closed control protocol");
+        }
+        return (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+      } } as never;
+    };
+    const legacyCodexPreflight = vi.fn(async () => {
+      h.calls.push("legacy-codex-inventory");
+      if (!idle) throw new RemoteInstanceError("active_work", "old owner has an active thread");
+    });
+    h.deps.legacyCodexPreflight = legacyCodexPreflight;
+    if (idle) await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated" });
+    else await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "active_work" });
+    expect(legacyCodexPreflight).toHaveBeenCalledWith("/root", expect.objectContaining({ releaseId: "release-prev" }));
+    expect(h.calls.indexOf("legacy-codex-inventory")).toBeLessThan(h.calls.indexOf(idle ? "stop" : "control:drain.cancel@release-prev"));
+    if (!idle) {
+      expect(h.calls).not.toContain("stop");
+      expect(h.calls).not.toContain("commit");
+      expect(h.currentRecord().releaseId).toBe("release-prev");
+    }
+  });
   it("waits for the old connector's new cleanup receipt before committing a signed update", async () => {
     const h = harness({ previous });
     let receipt = "prior-stop";

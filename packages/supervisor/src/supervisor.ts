@@ -747,6 +747,7 @@ export class Supervisor {
       searchController: new DurableSearchAssignmentCarrier(this.journal, this.clock),
       onboardCarrier: this.onboardCarrier(),
       runners: this.runners,
+      inspectLegacyCodexThread: reference => this.nativeCodexOwner?.inspectLegacyThread(reference) ?? Promise.reject(new RemoteInstanceError("agent_unavailable", "The shared Codex owner is unavailable.")),
       sessionDeps: (assignment, runner) => ({
         clock: this.clock,
         journal: this.journal,
@@ -1817,6 +1818,13 @@ export class Supervisor {
           return { activeAssignments: await this.beginDrain(request.reason, null) };
         case "drain.status":
           return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
+        case "codex.maintenance.preflight": {
+          if (!this.draining || this.drainReason !== "update" || this.work.activeCount() !== 0 || this.stopping) {
+            throw new RemoteInstanceError("active_work", "The update drain has not settled for Codex maintenance.");
+          }
+          await this.nativeCodexOwner?.preflightMaintenance();
+          return { idle: true };
+        }
         case "drain.cancel": {
           // Only a locally requested drain is reversible; a Core directive with a
           // deadline stays in force until Core lifts it.

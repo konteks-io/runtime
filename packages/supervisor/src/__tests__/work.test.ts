@@ -925,15 +925,16 @@ describe("work orchestrator claim validation", () => {
     expect(journal.assignments.get("asg-1:1")?.state).toBe("claimed");
   });
 
-  async function nativeSessions(register: (target: RemoteWorkAssignment) => Promise<void>, recoveryAuthority = () => "accepted-A") {
+  async function nativeSessions(register: (target: RemoteWorkAssignment) => Promise<void>, recoveryAuthority = () => "accepted-A", inspectLegacyCodexThread?: (reference: string) => Promise<{ unloaded: boolean; ownerGeneration: string }>) {
     const runner = {
       createSession: vi.fn(async (input: { context: { assignmentId: string }; acpSessionRef?: string; restoreAcpSessionRef?: string }, lifecycle?: RunnerSessionLifecycle) => { const ref = input.acpSessionRef ?? `acp:${input.context.assignmentId}`; await lifecycle?.beforeCreate(ref); lifecycle?.assertCurrent(); return { acpSessionRef: ref, resumed: input.acpSessionRef !== undefined || input.restoreAcpSessionRef !== undefined, capabilities: { forkSession: false, sessionResume: true } }; }),
       prompt: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined),
     } as unknown as RunnerPort;
     const f = await orchestrator({ recoveryAuthority, components: {}, runners: new Map([["codex", runner]]),
+      ...(inspectLegacyCodexThread ? { inspectLegacyCodexThread } : {}),
       advertisedRoles: () => ["generator", "assistant"],
       roleBindings: () => [{ role: "generator", agentPreference: ["codex"] }, { role: "assistant", agentPreference: ["codex"] }],
-      sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => { throw new Error("not needed"); }, workspaceRoot: "/native",         prepareInputs: async () => ({ binding: { workspaceId: target.workspaceId, assignmentId: target.id, attempt: target.attempt, instanceId: target.instanceId, sessionId: "cloud-session" }, cwd: "/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
+      sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer fixture" }] }, expiresAt: "2026-09-07T00:00:00Z" }), workspaceRoot: "/native",         prepareInputs: async () => ({ binding: { workspaceId: target.workspaceId, assignmentId: target.id, attempt: target.attempt, instanceId: target.instanceId, sessionId: "cloud-session" }, cwd: "/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
         registerReady: async (_assignment, binding, acpSessionRef) => {
           await register(target);
           const claim = f.journal.assignments.get(`${target.id}:${target.attempt}`)!;
@@ -1030,6 +1031,40 @@ describe("work orchestrator claim validation", () => {
     expect(f.runner.createSession.mock.calls[0]?.[0]).not.toHaveProperty("acpSessionRef");
     expect(f.journal.execution.execution(f.journal.execution.admission("restarted", 1)!)).toMatchObject({ acpSessionRef: "acp:restarted" });
     expect(f.sent).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "session_ready", acpSessionRef: "acp:restarted", resumed: true }) }));
+  });
+
+  it("does not re-admit a legacy Codex reference after its first load result becomes uncertain", async () => {
+    const unloaded = vi.fn(async () => ({ unloaded: true, ownerGeneration: "owner-A" }));
+    const f = await nativeSessions(async () => undefined, () => "accepted-A", unloaded);
+    const source = { kind: "conversation", portability: "portable_before_claim", sessionId: "cloud-session", turnRef: "legacy-turn", acpSessionRef: "legacy-ref" } as const;
+    const agentRoute = { requiredRole: "assistant", agentId: "codex", mcpCapabilityTokenRef: "legacy-capability" } as const;
+    vi.mocked(f.runner.createSession).mockRejectedValueOnce(new Error("provider load outcome unknown"));
+    await (await f.claim("legacy-first", { kind: "assistant_execution", source, agentRoute }))();
+    expect(unloaded).toHaveBeenCalledOnce();
+    expect(f.runner.createSession).toHaveBeenCalledOnce();
+    const reopened = new SupervisorJournal(dir);
+    await reopened.load();
+    expect(reopened.execution.legacyCodexLoadPreviouslyAdmitted("legacy-ref", "owner-A", "other-generation")).toBe(true);
+    expect(reopened.execution.legacyCodexLoadPreviouslyAdmitted("legacy-ref", "owner-B", "other-generation")).toBe(false);
+
+    await (await f.claim("legacy-second", { kind: "assistant_execution", source: { ...source, turnRef: "retry" }, agentRoute }))();
+    expect(unloaded).toHaveBeenCalledTimes(2);
+    expect(f.runner.createSession).toHaveBeenCalledOnce();
+  });
+
+  it("allows the same legacy history after a refused pre-dispatch load and a safe owner transition", async () => {
+    let unloaded = false;
+    let ownerGeneration = "owner-A";
+    const inspect = vi.fn(async () => ({ unloaded, ownerGeneration }));
+    const f = await nativeSessions(async () => undefined, () => "accepted-A", inspect);
+    const source = { kind: "conversation", portability: "portable_before_claim", sessionId: "cloud-session", turnRef: "legacy-turn", acpSessionRef: "legacy-ref" } as const;
+    const agentRoute = { requiredRole: "assistant", agentId: "codex", mcpCapabilityTokenRef: "legacy-capability" } as const;
+    await (await f.claim("legacy-loaded", { kind: "assistant_execution", source, agentRoute }))();
+    expect(f.runner.createSession).not.toHaveBeenCalled();
+    unloaded = true; ownerGeneration = "owner-B"; // maintenance replaced the old app-server
+    await (await f.claim("legacy-cold", { kind: "assistant_execution", source: { ...source, turnRef: "cold-retry" }, agentRoute }))();
+    expect(inspect).toHaveBeenCalledTimes(2);
+    expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ restoreAcpSessionRef: "legacy-ref" }), expect.anything());
   });
 
   it.each(["readiness_cancel", "readiness_close", "disposal_cancel", "disposal_close"])("authority movement during %s cleanup retains final ownership", async phase => {

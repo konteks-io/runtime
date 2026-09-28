@@ -7,6 +7,7 @@ export * from "./bridge/process.js";
 export * from "./bridge/model-capability.js";
 export * from "./bridge/dsh-profile.js";
 export * from "./bridge/browser.js";
+export * from "./bridge/codex-thread-inventory.js";
 export * from "./sessions/manager.js";
 export * from "./auth/scope-store.js";
 export * from "./auth/identity.js";

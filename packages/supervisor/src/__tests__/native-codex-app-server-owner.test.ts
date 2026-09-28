@@ -8,6 +8,9 @@ import { NativeCodexAppServerOwner } from "../native/codex-app-server-owner.js";
 vi.mock("@konteks/remote-common", async importOriginal => ({
   ...await importOriginal<object>(), isProcessGroupAlive: vi.fn(() => false),
 }));
+vi.mock("@konteks/remote-agent-runner", async importOriginal => ({
+  ...await importOriginal<object>(), assertCodexThreadsIdle: vi.fn(async () => undefined),
+}));
 
 function child(): PipedChildProcess {
   const process = new EventEmitter() as PipedChildProcess;
@@ -48,6 +51,37 @@ function fixture() {
 }
 
 describe("native shared Codex app-server owner", () => {
+  it.each(["active", "unknown"])("keeps the exact owner alive when loaded-thread inventory is %s", async state => {
+    const f = fixture();
+    const assertIdleThreads = vi.fn(async (): Promise<void> => { throw new Error(`thread inventory ${state}`); });
+    const owner = new NativeCodexAppServerOwner({
+      config, spawn: f.spawn, stop: f.stop, prepareSocket: f.prepareSocket,
+      waitUntilReady: f.waitUntilReady, cleanupSocket: f.cleanupSocket,
+      verifyPackage: f.verifyPackage, assertIdleThreads,
+    });
+    await owner.start();
+    await expect(owner.stop()).rejects.toThrow(`thread inventory ${state}`);
+    expect(assertIdleThreads).toHaveBeenCalledWith(config.RUNNER_NATIVE_CODEX_SOCKET);
+    expect(f.stop).not.toHaveBeenCalled();
+    expect(f.cleanupSocket).not.toHaveBeenCalled();
+    assertIdleThreads.mockImplementation(async () => undefined);
+    await owner.stop();
+  });
+
+  it("stops an exact owner only after the loaded-thread idle inventory succeeds", async () => {
+    const f = fixture();
+    const assertIdleThreads = vi.fn(async () => undefined);
+    const owner = new NativeCodexAppServerOwner({
+      config, spawn: f.spawn, stop: f.stop, prepareSocket: f.prepareSocket,
+      waitUntilReady: f.waitUntilReady, cleanupSocket: f.cleanupSocket,
+      verifyPackage: f.verifyPackage, assertIdleThreads,
+    });
+    await owner.start();
+    await owner.stop();
+    expect(assertIdleThreads).toHaveBeenCalledWith(config.RUNNER_NATIVE_CODEX_SOCKET);
+    expect(assertIdleThreads.mock.invocationCallOrder[0]).toBeLessThan(f.stop.mock.invocationCallOrder[0]!);
+  });
+
   it("refuses to attest shutdown while the exact owned process group remains alive", async () => {
     const f = fixture();
     let groupAlive = true;
@@ -197,6 +231,25 @@ describe("native shared Codex app-server owner", () => {
     expect(f.spawn).toHaveBeenCalledOnce();
     expect(onStaleReplaced).toHaveBeenCalledWith(expect.objectContaining({ staleRelease: "release-old", currentRelease: "release-new" }));
     await owner.stop();
+  });
+
+  it("does not replace a stale-release owner while its loaded threads are active or unverified", async () => {
+    const releases = "/operator/connector/releases/";
+    const f = fixture();
+    const stopHolder = vi.fn(async () => undefined);
+    const assertIdleThreads = vi.fn(async () => { throw new Error("loaded turn active"); });
+    const owner = new NativeCodexAppServerOwner({
+      config: { ...config, RUNNER_BRIDGE_PREFIX: `${releases}release-new/agents/codex` } as RunnerConfig,
+      spawn: f.spawn, stop: f.stop, prepareSocket: vi.fn(async () => "adopt" as const), waitUntilReady: f.waitUntilReady,
+      cleanupSocket: f.cleanupSocket, verifyPackage: f.verifyPackage,
+      socketHolder: vi.fn(async () => ({ pid: 4411, command: `${releases}release-old/agents/codex/node_modules/@openai/codex/bin/codex app-server --listen unix://${config.RUNNER_NATIVE_CODEX_SOCKET}` })),
+      stopHolder, assertIdleThreads,
+    });
+    await expect(owner.start()).rejects.toThrow("loaded turn active");
+    expect(assertIdleThreads).toHaveBeenCalledWith(config.RUNNER_NATIVE_CODEX_SOCKET);
+    expect(stopHolder).not.toHaveBeenCalled();
+    expect(f.cleanupSocket).not.toHaveBeenCalled();
+    expect(f.spawn).not.toHaveBeenCalled();
   });
 
   it("adopts only its own release's server and refuses a foreign or unprovable holder without cleanup", async () => {

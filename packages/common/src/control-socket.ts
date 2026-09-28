@@ -45,6 +45,8 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("git.key.remove"), keyRef: z.string().trim().min(1).max(200) }).strict(),
   z.object({ op: z.literal("drain"), reason: z.enum(["user", "update", "remove"]) }).strict(),
   z.object({ op: z.literal("drain.status") }).strict(),
+  /** Verify the shared Codex owner before a cancellable update drain becomes service stop. */
+  z.object({ op: z.literal("codex.maintenance.preflight") }).strict(),
   /** Clears a launcher-initiated drain that will not be followed by a stop (e.g. an aborted update). */
   z.object({ op: z.literal("drain.cancel") }).strict(),
   z.object({ op: z.literal("doctor") }).strict(),
