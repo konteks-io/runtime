@@ -21,3 +21,18 @@ test("offline inventory preserves native dependency execution without making dat
     assert.match(binary.digest, /^sha256:[a-f0-9]{64}$/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("offline inventory built on Windows marks programs by extension, which has no execute bit", async () => {
+  const root = mkdtempSync(join(tmpdir(), "offline-inventory-win-"));
+  try {
+    writeFileSync(join(root, "claude.exe"), "native executable");
+    writeFileSync(join(root, "cli.js"), "data");
+    chmodSync(join(root, "claude.exe"), 0o644);
+    chmodSync(join(root, "cli.js"), 0o644);
+    const [program, script] = await inventoryOfflineFiles(root, ["claude.exe", "cli.js"], "node.exe", "win32");
+    assert.equal(program.executable, true);
+    assert.equal(script.executable, false);
+    const [unix] = await inventoryOfflineFiles(root, ["claude.exe"], "node", "linux");
+    assert.equal(unix.executable, false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
