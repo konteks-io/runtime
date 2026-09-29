@@ -1,8 +1,8 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer } from "../native/on-computer.js";
+import { canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, removeOnComputerWatch, writeOnComputerWatch } from "../native/on-computer.js";
 
 describe("a step the site brings to the front on this computer (on-computer)", () => {
   const dirs: string[] = [];
@@ -60,6 +60,16 @@ describe("a step the site brings to the front on this computer (on-computer)", (
     expect(onComputerDone("not_added", "added")).toBe(false);
     expect(onComputerDone("needs_sign_in", "ready")).toBe(false);
     expect(onComputerDone("ready")).toBe(true);
+  });
+
+  it("keeps a waiting step across a restart (adding an agent restarts the connector), and drops a damaged one", async () => {
+    const data = await mkdtemp(join(tmpdir(), "on-computer-")); dirs.push(data);
+    const watch = { instanceId: "i-1", loginId: "login-9", agentId: "antigravity" as const, until: "added" as const, deadline: 123 };
+    await writeOnComputerWatch(data, watch);
+    await writeFile(join(data, "on-computer", "bad.watch.json"), "{not json");
+    expect(await readOnComputerWatches(data)).toEqual([watch]);
+    await removeOnComputerWatch(data, "login-9");
+    expect(await readOnComputerWatches(data)).toEqual([]);
   });
 
   it("is offered only where a window can come to the front", () => {

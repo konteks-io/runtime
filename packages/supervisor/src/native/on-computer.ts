@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { OnComputerStep } from "@konteks/remote-common";
 
@@ -137,4 +137,44 @@ const NOT_YET_ADDED = new Set(["not_installed", "unsupported_version", "installe
 export function onComputerDone(state: string | undefined, until: OnComputerPlan["until"] = "ready"): boolean {
   if (state === undefined) return false;
   return until === "added" ? !NOT_YET_ADDED.has(state) : state === "ready";
+}
+
+/** A site-started step still waiting on the person, kept across a restart of the connector. */
+export interface OnComputerWatch {
+  instanceId: string;
+  loginId: string;
+  agentId: OnComputerAgent;
+  until: OnComputerPlan["until"];
+  /** Epoch milliseconds after which the step has run out of time. */
+  deadline: number;
+}
+
+const watchDir = (dataDir: string) => join(dataDir, "on-computer");
+const watchFile = (dataDir: string, loginId: string) => join(watchDir(dataDir), `${loginId}.watch.json`);
+
+export async function writeOnComputerWatch(dataDir: string, watch: OnComputerWatch): Promise<void> {
+  await mkdir(watchDir(dataDir), { recursive: true, mode: 0o700 });
+  await writeFile(watchFile(dataDir, watch.loginId), JSON.stringify(watch), { mode: 0o600 });
+}
+
+export async function removeOnComputerWatch(dataDir: string, loginId: string): Promise<void> {
+  await rm(watchFile(dataDir, loginId), { force: true });
+}
+
+/** Every kept step that is still well-formed; a damaged file is dropped. */
+export async function readOnComputerWatches(dataDir: string): Promise<OnComputerWatch[]> {
+  const names = await readdir(watchDir(dataDir)).catch(() => [] as string[]);
+  const watches: OnComputerWatch[] = [];
+  for (const name of names.filter(entry => entry.endsWith(".watch.json"))) {
+    try {
+      const value = JSON.parse(await readFile(join(watchDir(dataDir), name), "utf8")) as Partial<OnComputerWatch>;
+      if (typeof value.instanceId === "string" && typeof value.loginId === "string" && (ON_COMPUTER_AGENTS as readonly string[]).includes(value.agentId as string)
+        && (value.until === "ready" || value.until === "added") && typeof value.deadline === "number") {
+        watches.push(value as OnComputerWatch);
+        continue;
+      }
+    } catch { /* dropped below */ }
+    await rm(join(watchDir(dataDir), name), { force: true });
+  }
+  return watches;
 }

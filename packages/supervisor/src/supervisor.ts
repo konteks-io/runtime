@@ -72,7 +72,7 @@ import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
-import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, type OnComputerAgent } from "./native/on-computer.js";
+import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, removeOnComputerWatch, writeOnComputerWatch, type OnComputerAgent, type OnComputerWatch } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
@@ -1325,6 +1325,7 @@ export class Supervisor {
     if (this.stopping) return;
     this.requireRecoveryAuthority();
     this.activeLoopStarted = true;
+    void this.resumeOnComputerWatches().catch(error => this.logger.warn({ err: error }, "on-computer steps not resumed"));
     this.transport.start();
     this.planningDirectivePoller?.start();
     this.transport.resumeAfterRecovery();
@@ -2115,19 +2116,10 @@ export class Supervisor {
    * the window is the person's to close.
    */
   private async startOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent, action: "start" | "cancel"): Promise<void> {
-    type Report = Parameters<CoreClient["reportAgentLogin"]>[1];
-    const report = (value: Omit<Report, "loginId" | "agentId" | "loginOption">) =>
-      this.core.reportAgentLogin(instanceId, { loginId, agentId, loginOption: ON_COMPUTER_LOGIN_OPTION, ...value } as Report)
-        .catch(error => this.logger.warn({ err: error, loginId }, "agent login report not delivered"));
-    const stop = () => {
-      const watch = this.onComputerWatches.get(loginId);
-      if (watch) clearInterval(watch);
-      this.onComputerWatches.delete(loginId);
-    };
-    if (action === "cancel") { stop(); return; }
+    const report = this.onComputerReporter(instanceId, loginId, agentId);
+    if (action === "cancel") { await this.stopOnComputerWatch(loginId); return; }
     if (this.onComputerWatches.has(loginId)) return;
-    const stateOf = () => this.supportedAgents(this.lastSnapshot?.agents ?? [])?.find(entry => entry.agentId === agentId);
-    const facts = stateOf();
+    const facts = this.onComputerFacts(agentId);
     if (!facts) { await report({ state: "failed", failure: "unavailable" }); return; }
     if (onComputerDone(facts.state)) { await report({ state: "succeeded" }); return; }
     const plan = planOnComputer({ agentId, state: facts.state, ...(facts.installCommand ? { installCommand: facts.installCommand } : {}), ...(facts.windowsInstallCommand ? { windowsInstallCommand: facts.windowsInstallCommand } : {}) }, process.platform);
@@ -2142,20 +2134,59 @@ export class Supervisor {
       return;
     }
     await report({ state: "awaiting_person", step: plan.step });
-    const deadline = Date.now() + ON_COMPUTER_WATCH_MS;
-    const watch = setInterval(() => {
-      const now = stateOf();
-      if (now && onComputerDone(now.state, plan.until)) {
-        stop();
+    const watch: OnComputerWatch = { instanceId, loginId, agentId, until: plan.until, deadline: Date.now() + ON_COMPUTER_WATCH_MS };
+    // Kept on disk: adding an agent restarts this connector, and the step must
+    // still end (and say so on the site) in the connector that comes back.
+    await writeOnComputerWatch(this.config.SUPERVISOR_DATA_DIR, watch).catch(error => this.logger.warn({ err: error, loginId }, "on-computer step not kept across a restart"));
+    this.watchOnComputer(watch);
+  }
+
+  private onComputerReporter(instanceId: string, loginId: string, agentId: OnComputerAgent) {
+    type Report = Parameters<CoreClient["reportAgentLogin"]>[1];
+    return (value: Omit<Report, "loginId" | "agentId" | "loginOption">) =>
+      this.core.reportAgentLogin(instanceId, { loginId, agentId, loginOption: ON_COMPUTER_LOGIN_OPTION, ...value } as Report)
+        .catch(error => this.logger.warn({ err: error, loginId }, "agent login report not delivered"));
+  }
+
+  private onComputerFacts(agentId: OnComputerAgent) {
+    return this.supportedAgents(this.lastSnapshot?.agents ?? [])?.find(entry => entry.agentId === agentId);
+  }
+
+  /** Looks every few seconds whether the step's agent reads ready (or, for an add, added); says so once, or that it ran out of time. */
+  private watchOnComputer(watch: OnComputerWatch): void {
+    const report = this.onComputerReporter(watch.instanceId, watch.loginId, watch.agentId);
+    const tick = () => {
+      const now = this.onComputerFacts(watch.agentId);
+      if (now && onComputerDone(now.state, watch.until)) {
+        void this.stopOnComputerWatch(watch.loginId);
         void report({ state: "succeeded" });
         if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after an on-computer step failed"));
-      } else if (Date.now() > deadline) {
-        stop();
+      } else if (Date.now() > watch.deadline) {
+        void this.stopOnComputerWatch(watch.loginId);
         void report({ state: "failed", failure: "timed_out" });
       }
-    }, ON_COMPUTER_POLL_MS);
-    watch.unref?.();
-    this.onComputerWatches.set(loginId, watch);
+    };
+    const timer = setInterval(tick, ON_COMPUTER_POLL_MS);
+    timer.unref?.();
+    this.onComputerWatches.set(watch.loginId, timer);
+  }
+
+  private async stopOnComputerWatch(loginId: string): Promise<void> {
+    const timer = this.onComputerWatches.get(loginId);
+    if (timer) clearInterval(timer);
+    this.onComputerWatches.delete(loginId);
+    await removeOnComputerWatch(this.config.SUPERVISOR_DATA_DIR, loginId).catch(() => undefined);
+  }
+
+  /** Steps an earlier run of this connector left waiting (it restarted to add an agent): watched again until they end. */
+  private async resumeOnComputerWatches(): Promise<void> {
+    const instanceId = this.instanceId;
+    if (!instanceId) return;
+    for (const watch of await readOnComputerWatches(this.config.SUPERVISOR_DATA_DIR).catch(() => [])) {
+      if (watch.instanceId !== instanceId || this.onComputerWatches.has(watch.loginId)) continue;
+      this.logger.info({ event: "on_computer.resumed", loginId: watch.loginId, agentId: watch.agentId }, "site-started step watched again after a restart");
+      this.watchOnComputer(watch);
+    }
   }
 
   /** Whether this computer can bring a site-started step to the front: a desktop (or a stand-in's spool) and a relay to hear it. */
