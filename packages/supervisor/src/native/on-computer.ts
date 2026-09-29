@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { OnComputerStep } from "@konteks/remote-common";
 
 /** The agents a person can set up on this computer from the site (`on-computer`). */
@@ -66,7 +67,7 @@ export function planOnComputer(agent: OnComputerAgentFacts, platform: NodeJS.Pla
  * on this connector, never another on the same computer), says in one line
  * what it is doing, runs the steps, and ends with what to do next.
  */
-export function onComputerScript(plan: OnComputerPlan, context: { agentId: OnComputerAgent; root: string; platform: NodeJS.Platform }): string {
+export function onComputerScript(plan: OnComputerPlan, context: { agentId: OnComputerAgent; root: string; platform: NodeJS.Platform; prelude?: string }): string {
   const name = NAMES[context.agentId];
   const intro = `Konteks is setting up ${name} on this computer. Answer below; your answers stay on this computer.`;
   const done = plan.until === "added"
@@ -88,6 +89,7 @@ export function onComputerScript(plan: OnComputerPlan, context: { agentId: OnCom
   const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
   return [
     "#!/bin/sh",
+    ...(context.prelude ? [`. ${quote(context.prelude)}`] : []),
     `export KONTEKS_ROOT=${quote(context.root)}`,
     `PATH=${quote(join(context.root, "bin"))}:"$PATH"; export PATH`,
     `echo ${quote(intro)}`,
@@ -101,25 +103,39 @@ export interface OnComputerOpenDeps {
 }
 
 /**
+ * A stand-in laptop's own terminal settings (its HOME, CA and PATH): the
+ * `env.sh` beside its home, when its connector lives in the macOS default
+ * place under that home. A window that loads it acts on the stand-in only,
+ * never on the real computer it runs on.
+ */
+export function standInTerminalEnv(root: string, exists: (file: string) => boolean = existsSync): string | undefined {
+  const suffix = join("Library", "Application Support", "konteks-remote");
+  if (!root.endsWith(suffix)) return undefined;
+  const file = join(dirname(root.slice(0, -suffix.length).replace(/\/+$/, "")), "env.sh");
+  return exists(file) ? file : undefined;
+}
+
+/**
  * Brings the step to the front on this computer: macOS opens it in Terminal,
  * Linux in the desktop's terminal, Windows in PowerShell. A stand-in laptop
  * (`KONTEKS_E2E_NATIVE_CONNECTOR`) only leaves the script in its spool
  * (`KONTEKS_E2E_ON_COMPUTER_SPOOL`, else its own folder) for the tester, who
  * plays the person at it. Returns the script's path.
  */
-export async function openOnComputer(input: { loginId: string; script: string; dataDir: string; platform: NodeJS.Platform; env?: NodeJS.ProcessEnv }, deps: OnComputerOpenDeps = {}): Promise<string> {
+export async function openOnComputer(input: { loginId: string; script: string; dataDir: string; platform: NodeJS.Platform; env?: NodeJS.ProcessEnv; confined?: boolean }, deps: OnComputerOpenDeps = {}): Promise<OnComputerOpened> {
   const env = input.env ?? process.env;
-  // A stand-in laptop never brings a window up on the real desktop of the
-  // computer it runs on (its tester's own screen, 09-29): it leaves the script
-  // in its spool, or in its own folder, for the tester to run as the person.
+  // A stand-in laptop opens a real window only when the script loads the
+  // stand-in's own terminal settings (`confined`), so nothing it runs touches
+  // the real computer's home (09-29). With a spool (the controller's serve)
+  // or without those settings it leaves the script for the tester instead.
   const standIn = env.KONTEKS_E2E_NATIVE_CONNECTOR === "1";
-  const spool = standIn ? env.KONTEKS_E2E_ON_COMPUTER_SPOOL ?? join(input.dataDir, "on-computer") : undefined;
+  const spool = standIn && (env.KONTEKS_E2E_ON_COMPUTER_SPOOL || !input.confined) ? env.KONTEKS_E2E_ON_COMPUTER_SPOOL || join(input.dataDir, "on-computer") : undefined;
   const directory = spool ?? join(input.dataDir, "on-computer");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const file = join(directory, `${input.loginId}.${input.platform === "win32" ? "ps1" : "command"}`);
   await writeFile(file, input.script, { mode: 0o700 });
   await chmod(file, 0o700);
-  if (spool) return file;
+  if (spool) return { file, opened: false };
   const run = deps.spawn ?? ((command: string, args: string[]) => {
     const child = spawn(command, args, { detached: true, stdio: "ignore" });
     child.on("error", () => undefined);
@@ -128,7 +144,13 @@ export async function openOnComputer(input: { loginId: string; script: string; d
   if (input.platform === "darwin") run("open", ["-a", "Terminal", file]);
   else if (input.platform === "win32") run("cmd.exe", ["/c", "start", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", file]);
   else run("x-terminal-emulator", ["-e", "sh", file]);
-  return file;
+  return { file, opened: true };
+}
+
+export interface OnComputerOpened {
+  file: string;
+  /** Whether a window came up; false when the script was only left for a stand-in's tester. */
+  opened: boolean;
 }
 
 /** Whether this computer can bring a window to the front for the person (a desktop), or a stand-in spools it. */

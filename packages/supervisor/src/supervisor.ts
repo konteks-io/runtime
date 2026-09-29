@@ -72,7 +72,7 @@ import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
-import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, removeOnComputerWatch, writeOnComputerWatch, type OnComputerAgent, type OnComputerWatch } from "./native/on-computer.js";
+import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerWatch } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
@@ -2125,9 +2125,12 @@ export class Supervisor {
     const plan = planOnComputer({ agentId, state: facts.state, ...(facts.installCommand ? { installCommand: facts.installCommand } : {}), ...(facts.windowsInstallCommand ? { windowsInstallCommand: facts.windowsInstallCommand } : {}) }, process.platform);
     if (!plan) { await report({ state: "failed", failure: "unavailable" }); return; }
     const root = dirname(this.config.SUPERVISOR_DATA_DIR);
+    // A stand-in laptop's window loads the stand-in's own terminal settings.
+    const prelude = process.env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" ? standInTerminalEnv(root) : undefined;
     try {
-      const file = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform });
-      this.logger.info({ event: "on_computer.opened", loginId, agentId, step: plan.step, file }, "site-started step brought to the front on this computer");
+      const { file, opened } = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform, ...(prelude ? { prelude } : {}) }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform, confined: prelude !== undefined });
+      this.logger.info({ event: opened ? "on_computer.opened" : "on_computer.left_for_tester", loginId, agentId, step: plan.step, file },
+        opened ? "site-started step brought to the front on this computer" : "site-started step left in the stand-in's folder; no window opened");
     } catch (error) {
       this.logger.warn({ err: error, loginId, agentId }, "site-started step could not be opened on this computer");
       await report({ state: "failed", failure: "unavailable" });

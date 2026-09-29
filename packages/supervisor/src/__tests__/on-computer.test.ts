@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, removeOnComputerWatch, writeOnComputerWatch } from "../native/on-computer.js";
+import { canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch } from "../native/on-computer.js";
 
 describe("a step the site brings to the front on this computer (on-computer)", () => {
   const dirs: string[] = [];
@@ -39,24 +39,40 @@ describe("a step the site brings to the front on this computer (on-computer)", (
   it("opens it in Terminal on a Mac, and only leaves it in a stand-in laptop's spool", async () => {
     const data = await mkdtemp(join(tmpdir(), "on-computer-")); dirs.push(data);
     const spawn = vi.fn();
-    const file = await openOnComputer({ loginId: "login-1", script: "#!/bin/sh\necho hi\n", dataDir: data, platform: "darwin", env: {} }, { spawn });
+    const { file, opened } = await openOnComputer({ loginId: "login-1", script: "#!/bin/sh\necho hi\n", dataDir: data, platform: "darwin", env: {} }, { spawn });
+    expect(opened).toBe(true);
     expect(file).toBe(join(data, "on-computer", "login-1.command"));
     expect((await stat(file)).mode & 0o777).toBe(0o700);
     expect(spawn).toHaveBeenCalledWith("open", ["-a", "Terminal", file]);
 
     const spool = join(data, "spool");
     const spooled = vi.fn();
-    const inSpool = await openOnComputer({ loginId: "login-2", script: "#!/bin/sh\n", dataDir: data, platform: "darwin", env: { KONTEKS_E2E_NATIVE_CONNECTOR: "1", KONTEKS_E2E_ON_COMPUTER_SPOOL: spool } }, { spawn: spooled });
+    const { file: inSpool, opened: spooledOpened } = await openOnComputer({ loginId: "login-2", script: "#!/bin/sh\n", dataDir: data, platform: "darwin", env: { KONTEKS_E2E_NATIVE_CONNECTOR: "1", KONTEKS_E2E_ON_COMPUTER_SPOOL: spool } }, { spawn: spooled });
     expect(inSpool).toBe(join(spool, "login-2.command"));
+    expect(spooledOpened).toBe(false);
     expect(await readFile(inSpool, "utf8")).toBe("#!/bin/sh\n");
     expect(spooled).not.toHaveBeenCalled();
-    // A stand-in whose service carries no spool (an OS service) still never opens a real window.
-    const ownFolder = await openOnComputer({ loginId: "login-4", script: "#!/bin/sh\n", dataDir: data, platform: "darwin", env: { KONTEKS_E2E_NATIVE_CONNECTOR: "1" } }, { spawn: spooled });
+    // A stand-in without its own terminal settings never opens a real window.
+    const { file: ownFolder } = await openOnComputer({ loginId: "login-4", script: "#!/bin/sh\n", dataDir: data, platform: "darwin", env: { KONTEKS_E2E_NATIVE_CONNECTOR: "1" } }, { spawn: spooled });
     expect(ownFolder).toBe(join(data, "on-computer", "login-4.command"));
     expect(spooled).not.toHaveBeenCalled();
+    // One whose script loads them (an OS service, no spool) opens the window like a real laptop.
+    const confined = await openOnComputer({ loginId: "login-5", script: "#!/bin/sh\n", dataDir: data, platform: "darwin", env: { KONTEKS_E2E_NATIVE_CONNECTOR: "1" }, confined: true }, { spawn: spooled });
+    expect(confined.opened).toBe(true);
+    expect(spooled).toHaveBeenCalledWith("open", ["-a", "Terminal", join(data, "on-computer", "login-5.command")]);
+    spooled.mockClear();
     // A spool is honoured only on a stand-in laptop.
     await openOnComputer({ loginId: "login-3", script: "x", dataDir: data, platform: "win32", env: { KONTEKS_E2E_ON_COMPUTER_SPOOL: spool } }, { spawn: spooled });
     expect(spooled).toHaveBeenCalledWith("cmd.exe", ["/c", "start", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", join(data, "on-computer", "login-3.ps1")]);
+  });
+
+  it("finds a stand-in laptop's own terminal settings and loads them first", () => {
+    const root = "/v/no-remote/home/Library/Application Support/konteks-remote";
+    expect(standInTerminalEnv(root, file => file === "/v/no-remote/env.sh")).toBe("/v/no-remote/env.sh");
+    expect(standInTerminalEnv(root, () => false)).toBeUndefined();
+    expect(standInTerminalEnv("/opt/konteks", () => true)).toBeUndefined();
+    const script = onComputerScript({ step: "add", commands: ["konteks-remote agent add antigravity"], until: "added" }, { agentId: "antigravity", root, platform: "darwin", prelude: "/v/no-remote/env.sh" });
+    expect(script.split("\n").slice(0, 3)).toEqual(["#!/bin/sh", ". '/v/no-remote/env.sh'", `export KONTEKS_ROOT='${root}'`]);
   });
 
   it("ends an add-only step once the agent is added, any other once it is ready", () => {
