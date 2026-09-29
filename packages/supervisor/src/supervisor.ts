@@ -60,6 +60,7 @@ import { OnboardWorkCarrier, type OnboardWorkAssignment } from "./onboard/carrie
 import type { PlatformMcpEntry } from "./work/workload.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
+import { PreviewWorktreePermits } from "./preview/worktree-permits.js";
 import { PreviewChannel } from "./preview/preview-channel.js";
 import { PreviewProcessManager, PreviewProcessRegistry } from "./preview/process-manager.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
@@ -236,8 +237,8 @@ export class Supervisor {
   /** Each session's supervised preview dev server (at most one per session). */
   readonly previews: PreviewProcessManager;
   private readonly previewRegistry: PreviewProcessRegistry;
-  /** Worktrees a viewer may start a preview in, by session (while the session lasts). */
-  private readonly previewWorktrees = new Map<string, string>();
+  /** Worktrees a viewer may start a preview in, by session; kept across releases and restarts while the worktree exists. */
+  private readonly previewWorktrees: PreviewWorktreePermits;
   /** When a viewer last started each session's preview (to pace retries after a failure). */
   private readonly previewViewerStarts = new Map<string, number>();
   broker!: PermissionBroker;
@@ -303,6 +304,7 @@ export class Supervisor {
     this.outbox = new DurableOutbox(this.store.path("outbox"), this.stateMutations.run);
     this.lease = new LeaseState(this.clock);
     this.previewRegistry = new PreviewProcessRegistry(join(config.SUPERVISOR_DATA_DIR, "preview-processes.json"));
+    this.previewWorktrees = new PreviewWorktreePermits(join(config.SUPERVISOR_DATA_DIR, "preview-worktrees.json"));
     this.previews = new PreviewProcessManager({
       idleMs: config.SUPERVISOR_PREVIEW_IDLE_MINUTES * 60_000,
       maxRunning: config.SUPERVISOR_PREVIEW_MAX_RUNNING,
@@ -760,7 +762,9 @@ export class Supervisor {
     this.work = new WorkOrchestrator({
       verifyCancellation: directive => verifier.verify(directive, directive.signature),
       onSessionReleased: sessionId => {
-        this.forgetPreviewWorktree(sessionId);
+        // The dev server stops with the session; its worktree stays openable
+        // by a viewer while it exists (a delivery's preview after the delivery).
+        this.previewViewerStarts.delete(sessionId);
         void this.previews.stop(sessionId, "session_released");
       },
       ...(this.assignmentSender ? { assignmentSender: this.assignmentSender } : {}),
