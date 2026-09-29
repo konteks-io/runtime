@@ -210,6 +210,10 @@ export {
   GeminiEnterpriseLocationSchema,
   GEMINI_ENTERPRISE_LOCATIONS,
   type AgentLoginFailure,
+  // A step the connector brings to the front on the computer for a site-started action.
+  REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
+  ON_COMPUTER_LOGIN_OPTION,
+  type OnComputerStep,
   // A connected agent's credentials (CP3) and the money basis of a turn (O7).
   ConnectedAgentCredentialSchema,
   type ConnectedAgentCredential,

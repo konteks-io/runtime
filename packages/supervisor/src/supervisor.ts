@@ -9,6 +9,8 @@ import {
   RemoteInstanceError,
   AgentLoginGcpSchema,
   AgentLoginOptionIdSchema,
+  ON_COMPUTER_LOGIN_OPTION,
+  REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
   SystemClock,
   createLogger,
   parseRfc3339,
@@ -70,6 +72,7 @@ import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
+import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, type OnComputerAgent } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
@@ -129,6 +132,10 @@ const PREVIEW_VIEWER_RETRY_MS = 60_000;
 const IDLE_SESSION_RELEASE_MS = 30 * 60_000;
 const IDLE_SESSION_SWEEP_MS = 5 * 60_000;
 const LIVENESS_CHECK_MS = 30_000;
+/** How long a site-started step waits on the person at the window on this computer (Core keeps it 30 minutes). */
+const ON_COMPUTER_WATCH_MS = 30 * 60_000;
+/** How often the connector looks whether that step's agent reads ready. */
+const ON_COMPUTER_POLL_MS = 5_000;
 const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
 
 export interface SupervisorOptions {
@@ -276,6 +283,8 @@ export class Supervisor {
   private livenessQuietWarned = false;
   private pendingHeartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeLogins = new Map<string, { agentId: string; emit: (event: ControlLoginEvent) => void }>();
+  /** Site-started steps waiting on the person at a window on this computer, by login id. */
+  private readonly onComputerWatches = new Map<string, NodeJS.Timeout>();
 
   constructor(config: SupervisorConfig = loadSupervisorConfig(), private readonly options: SupervisorOptions = {}) {
     this.config = config;
@@ -417,7 +426,7 @@ export class Supervisor {
       // A site-started login needs a native install with a Codex runner (WS1-115).
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
-      additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : [])],
+      additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : [])],
       decorateAgents: agents => this.withAntigravityDownload(agents),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
@@ -2035,6 +2044,10 @@ export class Supervisor {
     if (!instanceId || intent.instanceId !== instanceId || intent.tenantId !== this.workspaceId) {
       throw new RemoteInstanceError("recovery_required", "This agent login is for another runtime");
     }
+    if (intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId)) {
+      await this.startOnComputer(instanceId, intent.loginId, intent.agentId as OnComputerAgent, intent.action);
+      return;
+    }
     if (intent.agentId !== "codex" && intent.agentId !== "claude-code" && intent.agentId !== "opencode" && intent.agentId !== "antigravity") {
       if (intent.action !== "cancel") {
         await this.core.reportAgentLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as Parameters<CoreClient["reportAgentLogin"]>[1])
@@ -2091,6 +2104,64 @@ export class Supervisor {
       const busy = error instanceof RemoteInstanceError && /already in progress/i.test(error.message);
       relay.fail(busy ? "already_in_progress" : "unavailable");
     }
+  }
+
+  /**
+   * A step the person asked for on the site, brought to the front here
+   * (on-computer): from where the agent stands, a window on this computer runs
+   * its install, its add and its sign-in at the connector's own prompt, and
+   * the person answers there. Core hears that it waits on them (with the step),
+   * then that it worked once the agent reads ready. A cancel stops the watch;
+   * the window is the person's to close.
+   */
+  private async startOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent, action: "start" | "cancel"): Promise<void> {
+    type Report = Parameters<CoreClient["reportAgentLogin"]>[1];
+    const report = (value: Omit<Report, "loginId" | "agentId" | "loginOption">) =>
+      this.core.reportAgentLogin(instanceId, { loginId, agentId, loginOption: ON_COMPUTER_LOGIN_OPTION, ...value } as Report)
+        .catch(error => this.logger.warn({ err: error, loginId }, "agent login report not delivered"));
+    const stop = () => {
+      const watch = this.onComputerWatches.get(loginId);
+      if (watch) clearInterval(watch);
+      this.onComputerWatches.delete(loginId);
+    };
+    if (action === "cancel") { stop(); return; }
+    if (this.onComputerWatches.has(loginId)) return;
+    const stateOf = () => this.supportedAgents(this.lastSnapshot?.agents ?? [])?.find(entry => entry.agentId === agentId);
+    const facts = stateOf();
+    if (!facts) { await report({ state: "failed", failure: "unavailable" }); return; }
+    if (onComputerDone(facts.state)) { await report({ state: "succeeded" }); return; }
+    const plan = planOnComputer({ agentId, state: facts.state, ...(facts.installCommand ? { installCommand: facts.installCommand } : {}), ...(facts.windowsInstallCommand ? { windowsInstallCommand: facts.windowsInstallCommand } : {}) }, process.platform);
+    if (!plan) { await report({ state: "failed", failure: "unavailable" }); return; }
+    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
+    try {
+      const file = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform });
+      this.logger.info({ event: "on_computer.opened", loginId, agentId, step: plan.step, file }, "site-started step brought to the front on this computer");
+    } catch (error) {
+      this.logger.warn({ err: error, loginId, agentId }, "site-started step could not be opened on this computer");
+      await report({ state: "failed", failure: "unavailable" });
+      return;
+    }
+    await report({ state: "awaiting_person", step: plan.step });
+    const deadline = Date.now() + ON_COMPUTER_WATCH_MS;
+    const watch = setInterval(() => {
+      const now = stateOf();
+      if (now && onComputerDone(now.state)) {
+        stop();
+        void report({ state: "succeeded" });
+        if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after an on-computer step failed"));
+      } else if (Date.now() > deadline) {
+        stop();
+        void report({ state: "failed", failure: "timed_out" });
+      }
+    }, ON_COMPUTER_POLL_MS);
+    watch.unref?.();
+    this.onComputerWatches.set(loginId, watch);
+  }
+
+  /** Whether this computer can bring a site-started step to the front: a desktop (or a stand-in's spool) and a relay to hear it. */
+  private onComputerCapabilities(): string[] {
+    const relayReady = !this.stopping && this.relay !== null && this.relay !== undefined;
+    return relayReady && this.options.native && canOpenOnComputer(machineHasDesktop()) ? [REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY] : [];
   }
 
   /**
@@ -2310,6 +2381,8 @@ export class Supervisor {
     await this.startPromise?.catch(() => undefined);
     await this.activeLoopStarting;
     if (this.pullTimer) clearInterval(this.pullTimer);
+    for (const watch of this.onComputerWatches.values()) clearInterval(watch);
+    this.onComputerWatches.clear();
     if (this.reaperTimer) clearInterval(this.reaperTimer);
     if (this.livenessTimer) clearInterval(this.livenessTimer);
     this.livenessTimer = null;
