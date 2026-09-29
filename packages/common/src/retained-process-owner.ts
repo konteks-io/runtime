@@ -128,8 +128,11 @@ export function readWindowsProcessIdentity(
   if (!second || first.ProcessId !== pid || second.ProcessId !== pid ||
       first.CreationDate !== second.CreationDate || first.CommandLine !== second.CommandLine ||
       first.ExecutablePath !== second.ExecutablePath) return null;
-  const command = `${first.ExecutablePath ?? ""}\0${first.CommandLine ?? ""}`;
-  if (!first.CreationDate.trim() || command === "\0") return null;
+  if (!first.CreationDate.trim()) return null;
+  // Windows may withhold Path for a same-user process. Unlike POSIX it cannot
+  // replace a running process image with exec(), so PID + kernel creation time
+  // remains the authoritative identity; the path is additional evidence only.
+  const command = `${first.ExecutablePath ?? ""}\0${first.CommandLine ?? ""}\0${first.CreationDate}`;
   return { pid, processGroupId: pid, startToken: first.CreationDate,
     commandDigest: createHash("sha256").update(command).digest("base64url") };
 }

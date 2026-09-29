@@ -62,6 +62,13 @@ describe("retained Windows process owner", () => {
     expect(readWindowsProcessIdentity(123, () => observations.shift() ?? null)).toBeNull();
   });
 
+  it("uses kernel creation identity when Windows withholds the executable path", () => {
+    const hidden = { ...record, ExecutablePath: "", CommandLine: "" };
+    expect(readWindowsProcessIdentity(123, () => hidden)).toMatchObject({
+      pid: 123, startToken: record.CreationDate, commandDigest: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+    });
+  });
+
   it("terminates only the matched process tree and confirms it is gone", async () => {
     const observations: Array<ProcessIdentity | null> = [windowsIdentity, windowsIdentity, null];
     const terminateTree = vi.fn();
