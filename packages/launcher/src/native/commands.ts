@@ -84,7 +84,7 @@ export async function waitWhileStarting(
 }
 
 /** Operations that act through the running connector, and so wait for one that is starting. */
-const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
+const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
 
 const productionNativeStopDeps: NativeStopDeps = {
   definition: serviceDefinition,
