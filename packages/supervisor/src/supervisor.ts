@@ -1242,7 +1242,10 @@ export class Supervisor {
     if (this.recoveryRetryTimer) clearTimeout(this.recoveryRetryTimer);
     this.recoveryRetryTimer = null;
     const operation = this.startActiveLoopImpl().catch(error => {
-      this.logger.warn({ err: error }, "startup recovery remains pending");
+      // The logger keeps no stack, and every local-history refusal says the same
+      // sentence: name where it came from, or a stuck recovery is undiagnosable.
+      const at = error instanceof Error ? error.stack?.split("\n").slice(1, 6).map(line => line.trim().replace(/^at /, "")).join(" < ") : undefined;
+      this.logger.warn({ err: error, ...(at ? { at } : {}) }, "startup recovery remains pending");
       const record = this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation);
       const terminal = record && record.state !== "pending" && record.state !== "applied";
       const denied = this.administrativeStatus === "revoked" || (error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch", "reconciliation_replay", "resume_deadline_expired"].includes(error.code));

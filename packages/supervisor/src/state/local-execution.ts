@@ -498,7 +498,8 @@ export class LocalExecutionJournal {
   async markAcpSettled(admission: LocalAdmission, ref: string, at: string, assertCurrent: () => void): Promise<void> {
     await this.transition(admission, assertCurrent, existing => {
       if (!existing || existing.phase === "opened" || existing.acpSessionRef !== ref || existing.referenceFence !== admission.executionGeneration || this.references.get(ref) !== admission.executionGeneration) throw conflict();
-      return existing.phase === "acp_settled" ? existing : { ...existing, phase: "acp_settled", acpSettledAt: at };
+      // An interrupted execution is past settlement; it never goes back.
+      return existing.phase === "acp_settled" || existing.phase === "interrupted_unqualified" ? existing : { ...existing, phase: "acp_settled", acpSettledAt: at };
     });
   }
 
@@ -507,8 +508,11 @@ export class LocalExecutionJournal {
       // `acp_settled` is a predecessor's live recovery that settled the ACP turn but
       // could not certify quiescence. After restart only the retained process can
       // still be proven gone; refusing it here left startup recovery wedged forever.
-      if (!existing || (existing.phase !== "stopping" && existing.phase !== "acp_settled" && existing.phase !== "process_stopped") || !existing.processOwner) throw conflict();
-      return existing.phase === "process_stopped" ? existing : { ...existing, phase: "process_stopped", processStoppedAt: at };
+      // `interrupted_unqualified` already proved it gone: a later recovery (Core's
+      // cancel after a restart) finds it there, and refusing that kept the
+      // computer offline for good (WS1-166).
+      if (!existing || (existing.phase !== "stopping" && existing.phase !== "acp_settled" && existing.phase !== "process_stopped" && existing.phase !== "interrupted_unqualified") || !existing.processOwner) throw conflict();
+      return existing.phase === "process_stopped" || existing.phase === "interrupted_unqualified" ? existing : { ...existing, phase: "process_stopped", processStoppedAt: at };
     });
   }
 
