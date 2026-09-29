@@ -78,9 +78,17 @@ Antigravity get `RUNNER_BROWSER`. Every request goes through the session's
 plus the origins Core's `environment_open` answer grants it (read by the
 session's MCP facade; see AGENTS.md). No package or no Node: no browser, a
 plain doctor line, and no `browser_tool` capability.
-Every session also gets the `konteks-result` MCP server (`submit_result`,
+Every Konteks session (not a direct one) also gets the `konteks-result` MCP server (`submit_result`,
 `packages/supervisor/src/structured-result/`): a prompt ending with the
 structured-output contract binds its schema to the tool, the connector
 validates the agent's call, falls back to a fenced result and then one
 follow-up prompt, and returns `structuredOutput: { source, value }` with the
 prompt completion (see AGENTS.md).
+Runtime view (runtime-view CP2, see AGENTS.md): the heartbeat carries each
+connected agent's learnt slash commands (`availableCommands`,
+`availableCommandsLearntAt`, kept per agent in
+`<RUNNER_CREDENTIAL_DIR>/available-commands.json`) and `supportedAgents` for all
+five agents (`native/supported-agents.ts`), both only to a 7.1 Core; the
+supervisor takes `direct` work (a person's own chat, `work/continued-session.ts`:
+no preamble, no Konteks MCP servers, policy root = the session folder); the
+release ships `commands.json` from `release/connector-commands.json`.

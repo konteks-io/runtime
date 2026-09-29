@@ -92,7 +92,7 @@ sockets get an `error` listener before anything else: Chrome resets refused
 ones, and an unhandled reset ends the connector process.
 
 Structured results go through a tool (`packages/supervisor/src/structured-result/`).
-Every session gets the connector-local `konteks-result` MCP server with one
+Every session (except a person's direct session, below) gets the connector-local `konteks-result` MCP server with one
 tool, `submit_result` (generic, permissive definition while no turn asks). A
 prompt whose LAST text block ends with agent-core's structured-output contract
 (`readStructuredOutputContract`: the `## Required structured output` heading
@@ -491,6 +491,55 @@ of the report failing. Discovery is re-read every
 `DEFAULT_MODEL_CAPABILITY_TTL_MS` (5 min) and at once on a sign-in change (the
 account fingerprint keys the cache). The signed mapping is no longer needed
 for a new model; keep it only for aliases that move.
+
+The runtime view (runtime-view CP2, packages 7.1.0 fold-in). **Learnt slash
+commands (R19):** the runner's `SessionManager` hands every
+`available_commands_update` to `onAvailableCommands` (and still forwards it on
+the session stream unchanged); `AvailableCommandsStore`
+(`agent-runner/src/sessions/available-commands.ts`) keeps the latest per agent,
+normalized with packages' `normalizeAvailableCommands` minus the adapter's
+`refusedPromptCommands` (Antigravity's `plan`, `logout`), in
+`<RUNNER_CREDENTIAL_DIR>/available-commands.json` (0600, re-dated at most
+hourly when unchanged, a refused name dropped again on load), and the
+connected agent reports it as `availableCommands` + `availableCommandsLearntAt`
+only while `coreAcceptsRouteBilling` (a 7.1 Core). **Supported agents (R21):**
+`native/supported-agents.ts` projects all five agents on every heartbeat
+(`supportedAgents`, only to a 7.1 Core, left out until the first detection
+ended): a listed agent from its runner (`ready`; `needs_sign_in`, or
+`sign_in_expired` when `NativeRunner.signInLost()` says a turn's auth failed or
+a held credential needs signing in again; else `failed`) or from why it is
+left out (`*_not_found` → `not_installed`, `*_unsupported_version` →
+`unsupported_version` with the version the refusal names,
+`antigravity_not_fetched` → `not_added`, `antigravity_unsupported_platform` →
+`not_supported_on_this_os`, else `failed`); an agent the installation does not
+list from `NotAddedAgentsDetector`, the locators onboarding uses (Claude's
+executable and Codex's profile by file checks, dsh's package manifest,
+OpenCode's manifest or one scrubbed `--version`, Antigravity's pin), run in
+the background on the agent retry cadence (a minute, doubling to fifteen, back
+to a minute on a change), never on the heartbeat path; `supportedRange` from
+`bridges.ts`, install commands from `bridges.ts` (host agents) or the official
+installers (Claude Code, Codex). **Direct work (R11, R13, R14, R16):** `direct`
+is in `ALL_KINDS`, asked for in the pull only from a 7.1 Core.
+`work/continued-session.ts` names what a direct prompt shares with an
+Assistant turn (`continuedSession`: logical session, turn, `acpSessionRef`
+continuation; `isNativeTurn`: Core's per-operation permits, one prompt per
+assignment, closed at `end_turn`) and what sets it apart
+(`isDirectAssignment`): `RelayedSession` puts no skills line or OpenCode /
+Antigravity tools line before the person's text, redeems no platform
+capability even when named, mounts no preview, browser or `konteks-result`
+tool (a direct turn ends on `end_turn`), loads the agent's own transcript on a
+restore, and judges file changes against the session's own folder
+(`policyRoot()`; Konteks's own kinds keep the workspace root); the input
+preparer stages no organization skill (`prepareDirectSessionInputs`), refuses
+a repository selection and uses the session's stable private folder.
+Host-agent governance, the blocked-command list, refused modes and commands
+and sign-in declines are unchanged. **Connector commands (R20):**
+`release/connector-commands.json` (checked against `createNativeProgram` by
+`launcher/src/__tests__/connector-commands.test.ts`: every command, argument
+and option exists, and every command a person runs is listed) is written with
+the release version as `commands.json` by `release-assets.mjs commands`,
+shipped by the release job and required by `verify`. There is no
+`preview enable/disable` command: that switch is Core's.
 
 Before production changes, add or update a focused characterization test and
 observe its failure or baseline. Run focused tests serially; do not start

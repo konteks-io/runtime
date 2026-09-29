@@ -90,6 +90,32 @@ konteks-remote stop | start
 konteks-remote uninstall       # finish running work, remove this runtime from its workspace, delete the connector
 ```
 
+Each release also publishes `commands.json`, these commands with one plain
+line each and the systems they run on (from `release/connector-commands.json`,
+checked against the launcher's real command table), so the runtime's page in
+Konteks lists exactly what the installed connector has.
+
+### What the runtime page shows
+
+The connector tells Konteks, on each heartbeat, every supported agent's real
+state on this computer (ready, needs sign-in, sign-in expired, not installed,
+unsupported version, installed but not added, not added, failed, or not
+supported on this system), with the version it found, the supported range and
+the install command. Agents it does not run are looked up the way onboarding
+does, in the background (a minute, doubling to fifteen), never by running an
+agent with your credentials. It also reports each agent's slash commands, the
+latest list the agent announced in a session here (kept in the agent's own
+connector folder across restarts; commands Konteks refuses, such as Google
+Antigravity's `/plan` and `/logout`, are left out).
+
+A **direct session** (New session on the runtime's page) is a plain chat with
+one of your agents on this computer: each prompt runs in the session's own
+private, empty folder, with no Konteks instructions, skills or tools in front
+of your text, so a leading `/command` reaches the agent as typed. The usual
+safety rules stay: blocked commands (`git push`, `sudo`, …) are refused,
+file changes outside the session's folder are refused, sign-in requests are
+declined, and whatever the policy leaves to you is asked in the chat.
+
 ### Live previews
 
 A session's agent can run a live preview of its work: a dev server started
