@@ -34,6 +34,7 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
   let sessions = 0;
   const spawn = vi.fn(async (input: SpawnBridgeOptions) => {
     const pid = 1000 + owners.length;
+    const selectedConfig = new Map<string, string>();
     const bridge: ExecutionBridge = {
       exited: false,
       initializeResult: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { close: {} } } },
@@ -45,6 +46,13 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
         prompt: vi.fn(async () => ({ stopReason: "end_turn" })),
         cancel: vi.fn(async () => undefined),
         closeSession: vi.fn(async () => ({})),
+        setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => {
+          selectedConfig.set(configId, value);
+          return { configOptions: [...selectedConfig].map(([id, currentValue]) => ({
+            id, name: id, type: "select" as const, currentValue,
+            options: [{ value: currentValue, name: currentValue }],
+          })) };
+        }),
       } as never,
       // A real stop handle resolves only once the process is observed exited.
       stop: vi.fn(async () => { Object.defineProperty(bridge, "exited", { value: true }); }),

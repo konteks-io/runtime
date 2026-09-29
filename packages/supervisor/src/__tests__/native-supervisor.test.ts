@@ -664,7 +664,11 @@ describe("native Supervisor composition", () => {
       expect(updating).toMatchObject({ status: "fail" });
       if (pinned) expect(updating!.detail).toContain("this connector release runs 1.2.1, which is being downloaded from Google and checked before it is used");
       finish!();
-      await vi.waitFor(() => expect([...supervisor.runners.keys()]).toEqual(["codex", "antigravity"]));
+      // The zero-delay background retry still yields through the host event
+      // loop. Give a loaded cross-platform CI runner room to publish the
+      // successfully checked runner rather than treating scheduler latency as
+      // a product failure.
+      await vi.waitFor(() => expect([...supervisor.runners.keys()]).toEqual(["codex", "antigravity"]), { timeout: 5_000 });
       expect((await doctorOf(supervisor)).find(entry => entry.id === "antigravity")).toMatchObject({ status: "warn", detail: expect.stringContaining("start check passed") });
     });
   });
