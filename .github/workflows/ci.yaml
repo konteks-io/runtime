@@ -46,5 +46,7 @@ jobs:
           npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
       - name: Install (shared contracts are vendored under vendor/)
         run: npm ci --ignore-scripts --legacy-peer-deps
+      - name: Build workspace packages
+        run: npm run build
       - name: Verify Windows service, process ownership, and signed local release
         run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/e2e-smoke-release.test.ts
