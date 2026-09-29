@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Server } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, canonicalize, computeBundleManifestDigest, jcsDigest, writeSecretFile, RemoteInstanceError, type RemoteWorkAssignment } from "@konteks/remote-common";
-import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
+import { buildReleaseFixture, fetchedAgentPlatformPin, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { RunnerConfigSchema, type BridgeProcess } from "@konteks/remote-agent-runner";
 import { Supervisor } from "../supervisor.js";
@@ -557,7 +557,7 @@ describe("native Supervisor composition", () => {
     });
   });
 
-  describe("Google Antigravity (antigravity CP6)", () => {
+  describe.runIf(fetchedAgentPlatformPin("antigravity") !== null)("Google Antigravity (antigravity CP6)", () => {
     const folder = () => join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
     const antigravityConfig = () => RunnerConfigSchema.parse({
       RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "antigravity-work"),

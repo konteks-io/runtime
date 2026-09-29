@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ClientSideConnection } from "@agentclientprotocol/sdk";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { RunnerConfigSchema, type BridgeProcess } from "@konteks/remote-agent-runner";
+import { fetchedAgentPlatformPin } from "@konteks/remote-release";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeRunner } from "../native/runner.js";
 import { NativeAgentRetry, startNativeAgents } from "../native/start-native-agents.js";
@@ -124,7 +125,7 @@ describe("an OpenCode that cannot start", () => {
 });
 
 /** Google Antigravity (antigravity CP6): a copy that fails its start check is parked like any agent, the others run. */
-describe("a Google Antigravity that cannot start", () => {
+describe.runIf(fetchedAgentPlatformPin("antigravity") !== null)("a Google Antigravity that cannot start", () => {
   afterEach(() => vi.useRealTimers());
 
   it("is left out when its start check fails, the rest start, and a background retry brings it back", async () => {

@@ -10,7 +10,13 @@ const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 const context = { instanceId: "i", assignmentId: "a", attempt: 1, agentId: "codex" };
 function bridge(): BridgeProcess {
-  return { connection: { newSession: vi.fn(async () => ({ sessionId: "same-private-id" })) } as never,
+  const selected = new Map<string, string>();
+  return { connection: { newSession: vi.fn(async () => ({ sessionId: "same-private-id" })),
+    setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => {
+      selected.set(configId, value);
+      return { configOptions: [...selected].map(([id, currentValue]) => ({ id, name: id, type: "select" as const,
+        currentValue, options: [{ value: currentValue, name: currentValue }] })) };
+    }) } as never,
     initializeResult: { protocolVersion: 1 }, exited: false, stderrTail: () => [], stop: vi.fn(async () => undefined) };
 }
 async function runtime(spawn: (input: SpawnBridgeOptions) => Promise<BridgeProcess>) {
