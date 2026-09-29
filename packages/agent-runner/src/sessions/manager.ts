@@ -1009,8 +1009,8 @@ export class SessionManager {
     // The agent's commands are the agent's, not one session's: OpenCode
     // announces them while it is still creating the session, before its reply
     // registers the session here, and dropping that left OpenCode's commands
-    // unknown for good (WS1-176). Learnt from this manager's live bridge only.
-    if (params.update.sessionUpdate === "available_commands_update" && bridge && bridge === this.options.bridge() && !bridge.exited) {
+    // unknown for good (WS1-176). Learnt from any live bridge of this agent (the session may be on its bootstrap bridge).
+    if (params.update.sessionUpdate === "available_commands_update" && bridge && !bridge.exited) {
       try { this.options.onAvailableCommands?.(params.update); } catch { /* never stops the stream */ }
     }
     const record = this.byBridgeId.get(params.sessionId);
