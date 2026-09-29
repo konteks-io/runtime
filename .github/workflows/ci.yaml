@@ -52,3 +52,5 @@ jobs:
         run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-update.test.ts
       - name: Verify signed Windows local release
         run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/e2e-smoke-release.test.ts -t "adds a real Windows connector and Codex package to the signed local release"
+      - name: Verify organization Skill staging on Windows
+        run: npx vitest run --maxWorkers=1 packages/supervisor/src/__tests__/skill-staging.test.ts -t "retains digest-bound executable metadata on Windows instead of guessing it from stat"
