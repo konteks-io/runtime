@@ -867,7 +867,11 @@ export class AgentRuntime {
       await this.options.afterSuccessfulLogin?.();
       await this.ensureBridge();
       const view = await this.probe(true, args.organization);
-      this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "completed", readiness: view.readiness } });
+      if (view.readiness === "ready") {
+        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "completed", readiness: view.readiness } });
+      } else {
+        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: "official login returned without an authenticated local account; retry sign-in on this machine" } });
+      }
       this.activeLogin = null;
     }).catch(error => {
       this.activeLogin = null;
