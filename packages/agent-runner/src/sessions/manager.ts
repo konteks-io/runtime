@@ -1006,6 +1006,13 @@ export class SessionManager {
 
   /** Bridge → supervisor: session/update notifications keyed by our opaque ref. */
   onSessionUpdate(params: SessionNotification, bridge = this.options.bridge()): void {
+    // The agent's commands are the agent's, not one session's: OpenCode
+    // announces them while it is still creating the session, before its reply
+    // registers the session here, and dropping that left OpenCode's commands
+    // unknown for good (WS1-176). Learnt from this manager's live bridge only.
+    if (params.update.sessionUpdate === "available_commands_update" && bridge && bridge === this.options.bridge() && !bridge.exited) {
+      try { this.options.onAvailableCommands?.(params.update); } catch { /* never stops the stream */ }
+    }
     const record = this.byBridgeId.get(params.sessionId);
     if (!record || record.bridge !== bridge || bridge.exited || record.recoveryStopping) return;
     // Thought chunks are not public activity (A4 D132).
@@ -1027,9 +1034,6 @@ export class SessionManager {
         record.costReported = true;
       }
       if (typeof usage.totalTokens === "number") this.publishUsage(record, usage as Usage);
-    }
-    if (params.update.sessionUpdate === "available_commands_update") {
-      try { this.options.onAvailableCommands?.(params.update); } catch { /* never stops the stream */ }
     }
     if (params.update.sessionUpdate === "config_option_update") {
       const reportedModel = currentModel((params.update as { configOptions?: unknown }).configOptions);

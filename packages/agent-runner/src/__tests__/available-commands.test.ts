@@ -94,6 +94,18 @@ describe("learnt slash commands (runtime-view R19)", () => {
     expect(published).toEqual([expect.objectContaining({ kind: "session_update", params: expect.objectContaining({ update: commands }) })]);
   });
 
+  it("learns commands an agent announces while it is still creating the session (WS1-176)", async () => {
+    const seen: unknown[] = [];
+    let manager!: SessionManager;
+    const commands = update([{ name: "init", description: "Create AGENTS.md" }]);
+    // OpenCode sends its commands before its session/new reply arrives.
+    const connection = { newSession: vi.fn(async () => { manager.onSessionUpdate({ sessionId: "bridge-s1", update: commands } as never); return { sessionId: "bridge-s1" }; }) } as unknown as ClientSideConnection;
+    const bridge = { connection, initializeResult: { protocolVersion: 1, agentCapabilities: {} }, exited: false, stderrTail: () => [], stop: vi.fn(async () => undefined) } as unknown as BridgeProcess;
+    manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore(), onAvailableCommands: value => { seen.push(value); } });
+    await manager.create({ context: { instanceId: "inst", assignmentId: "asg", attempt: 1, agentId: "opencode" }, cwd: "/w", mcpServers: [] });
+    expect(seen).toEqual([commands]);
+  });
+
   it("rides on the connected agent with when it was learnt", () => {
     const family = SUPPORTED_AGENT_BRIDGES.find(entry => entry.agentId === "claude-code")!;
     const view = projectReadiness({
