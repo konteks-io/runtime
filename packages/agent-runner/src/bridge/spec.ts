@@ -20,6 +20,9 @@ export interface BridgeSpawnSpec {
   cwd: string;
 }
 
+/** How long Claude Code waits for a Konteks MCP server's tools at session start (its `MCP_TIMEOUT`). */
+export const CLAUDE_MCP_STARTUP_TIMEOUT_MS = "180000";
+
 export function resolveBridgeFamily(agentId: string): AgentBridgeFamily {
   const family = findAgentBridge(agentId);
   if (!family) {
@@ -71,6 +74,11 @@ export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamil
     env.LOGNAME = operator.username;
     if (process.env.SHELL && isAbsolute(process.env.SHELL)) env.SHELL = process.env.SHELL;
     for (const name of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "CI"] as const) delete env[name];
+    // Claude Code drops an MCP server whose tool list takes longer than its
+    // 30 s default, for the whole session: one slow start on a loaded machine
+    // left a planning turn with none of Konteks's tools (WS1-152). A slow list
+    // should delay the tools, never take them away.
+    env.MCP_TIMEOUT = CLAUDE_MCP_STARTUP_TIMEOUT_MS;
   }
   if (config.RUNNER_NATIVE_CODEX_SOCKET !== undefined) {
     if (!config.RUNNER_NATIVE_CODEX_HOME || !profile?.codexLocalProxy || profile.os === "windows" ||
