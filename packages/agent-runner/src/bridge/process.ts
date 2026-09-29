@@ -146,7 +146,19 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
     if ((process.platform === "darwin" || process.platform === "linux" || process.platform === "win32") && child.pid !== undefined) retainedProcessOwner = captureRetainedProcessOwner(child.pid);
   } catch (error) {
     await stopProcessGroupLeaderFirst({ child, timeoutMs: 2_000, killGraceMs: 1_000 });
-    throw error;
+    // Identity capture can transiently miss a just-spawned process on a cold
+    // Windows PowerShell host. A fresh spawn is safe only after this exact
+    // candidate's leader exit and process-group absence are both observed.
+    // Otherwise retain the recovery-required refusal: retrying beside an
+    // unowned process would weaken the durable ownership fence.
+    const leaderExited = exited || child.exitCode !== null || child.signalCode !== null;
+    if (!leaderExited || isProcessGroupAlive(child)) throw error;
+    throw new RemoteInstanceError("agent_unavailable", "Bridge process identity capture was temporarily unavailable.", {
+      cause: error,
+      diagnostic: "bridge_process_identity_capture_failed",
+      retryable: true,
+      recoveryActions: [{ kind: "run_doctor" }],
+    });
   }
   const processOwner: BridgeStopOwner = {
     get exited() { return exited; },
