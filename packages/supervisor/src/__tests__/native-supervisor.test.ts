@@ -557,7 +557,7 @@ describe("native Supervisor composition", () => {
     });
   });
 
-  describe.runIf(fetchedAgentPlatformPin("antigravity") !== null)("Google Antigravity (antigravity CP6)", () => {
+  describe.runIf(fetchedAgentPlatformPin("antigravity") !== undefined)("Google Antigravity (antigravity CP6)", () => {
     const folder = () => join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
     const antigravityConfig = () => RunnerConfigSchema.parse({
       RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "antigravity-work"),

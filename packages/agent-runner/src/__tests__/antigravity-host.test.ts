@@ -140,7 +140,7 @@ describe("the Antigravity runner adapter", () => {
     expect(() => resolveBridgeSpawnSpec(config({ RUNNER_NATIVE_DSH_NODE: "/usr/bin/node" }))).toThrow(/DeepSeek Harness/);
   });
 
-  it.runIf(fetchedAgentPlatformPin("antigravity") !== null)("signs in only from the fetched copy, refuses personal Google sign-in (A10), and reads signed out with nothing held (CP3)", async () => {
+  it.runIf(fetchedAgentPlatformPin("antigravity") !== undefined)("signs in only from the fetched copy, refuses personal Google sign-in (A10), and reads signed out with nothing held (CP3)", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "agy-adapter-")));
     try {
       const runner = config({ RUNNER_CREDENTIAL_DIR: join(root, "credentials") });

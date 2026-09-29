@@ -125,7 +125,7 @@ describe("an OpenCode that cannot start", () => {
 });
 
 /** Google Antigravity (antigravity CP6): a copy that fails its start check is parked like any agent, the others run. */
-describe.runIf(fetchedAgentPlatformPin("antigravity") !== null)("a Google Antigravity that cannot start", () => {
+describe.runIf(fetchedAgentPlatformPin("antigravity") !== undefined)("a Google Antigravity that cannot start", () => {
   afterEach(() => vi.useRealTimers());
 
   it("is left out when its start check fails, the rest start, and a background retry brings it back", async () => {
