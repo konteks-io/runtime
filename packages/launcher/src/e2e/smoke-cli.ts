@@ -8,7 +8,7 @@ import { addNativeAgent, installNative, readNativeRecord } from "../native/insta
 import { nativePlatform } from "../native/service.js";
 import { prepareDeliveryGraft } from "../native/graft.js";
 import { loadE2EInstallAuthority } from "./authority.js";
-import { prepareE2ERealRelease, prepareE2ESmokeRelease, reissueE2ERelease } from "./smoke-release.js";
+import { extendE2ESmokeRelease, prepareE2ERealRelease, prepareE2ESmokeRelease, reissueE2ERelease } from "./smoke-release.js";
 
 const program = new Command("konteks-remote-e2e-smoke").description("E2E-only signed native connector smoke preparation");
 const gated = () => {
@@ -25,6 +25,19 @@ program.command("prepare")
     const platform = nativePlatform();
     if (platform.os === "windows") throw new InvalidArgumentError("the source-driven E2E smoke currently runs on macOS or Debian; Windows uses the signed matrix proof");
     const prepared = await prepareE2ESmokeRelease({ gate: process.env.KONTEKS_E2E_NATIVE_CONNECTOR, directory: resolve(directory), origin, platform: { os: platform.os, architecture: platform.architecture } });
+    createOutput({ json: true }).result({ manifestDigest: prepared.manifest.digest, signer: prepared.root.keyId, directory: resolve(directory) });
+  });
+program.command("extend")
+  .description("add this machine's platform to an existing private E2E release")
+  .requiredOption("--directory <path>", "controller-owned .runtime/native-cloud directory")
+  .requiredOption("--bundle-version <version>", "new local release version")
+  .requiredOption("--target <os/architecture>", "additional E2E target, for example debian/arm64")
+  .option("--origin <url>", "fixed local TLS edge", "https://127.0.0.1:7443")
+  .action(async ({ directory, bundleVersion, target, origin }: { directory: string; bundleVersion: string; target: string; origin: string }) => {
+    gated();
+    if (target !== "debian/amd64" && target !== "debian/arm64") throw new InvalidArgumentError("additional E2E target must be debian/amd64 or debian/arm64");
+    const architecture = target.endsWith("/arm64") ? "arm64" : "amd64";
+    const prepared = await extendE2ESmokeRelease({ gate: process.env.KONTEKS_E2E_NATIVE_CONNECTOR, directory: resolve(directory), origin, bundleVersion, platform: { os: "debian", architecture } });
     createOutput({ json: true }).result({ manifestDigest: prepared.manifest.digest, signer: prepared.root.keyId, directory: resolve(directory) });
   });
 program.command("reissue")

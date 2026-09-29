@@ -7,9 +7,40 @@ import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { installOfflineAgentPackage, NativeAgentPackageProfileSchema, verifyNativeRelease } from "@konteks/remote-release";
 import { RunnerConfigSchema, resolveBridgeSpawnSpec, spawnBridge } from "@konteks/remote-agent-runner";
-import { prepareE2ERealRelease, prepareE2ESmokeRelease } from "../e2e/smoke-release.js";
+import { extendE2ESmokeRelease, prepareE2ERealRelease, prepareE2ESmokeRelease } from "../e2e/smoke-release.js";
 
 describe("signed E2E ACP releases", () => {
+  it("adds a second machine platform without losing the original signed artifacts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-two-platforms-"));
+    try {
+      const directory = join(root, ".runtime", "native-cloud");
+      const mac = await prepareE2ESmokeRelease({
+        gate: "1", directory, origin: "https://127.0.0.1:7443",
+        platform: { os: "macos", architecture: "arm64" },
+      });
+      const linux = await extendE2ESmokeRelease({
+        gate: "1", directory, origin: "https://127.0.0.1:7443",
+        platform: { os: "debian", architecture: "arm64" },
+        bundleVersion: "0.1.1-e2e",
+      });
+      const release = verifyNativeRelease(linux.manifest, [mac.root]);
+      expect(release.manifest.nativeArtifacts).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "connector", os: "macos", architecture: "arm64" }),
+        expect.objectContaining({ kind: "agent_bridge", agentId: "codex", os: "macos", architecture: "arm64" }),
+        expect.objectContaining({ kind: "connector", os: "debian", architecture: "arm64" }),
+        expect.objectContaining({ kind: "agent_bridge", agentId: "codex", os: "debian", architecture: "arm64" }),
+      ]));
+      expect(linux.manifest.modelCapabilityMappings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ bridgeProfileRef: "e2e-fake-codex-acp-debian-arm64" }),
+      ]));
+      const linuxArtifact = release.manifest.nativeArtifacts?.find(item => item.agentId === "codex" && item.os === "debian");
+      const profile = await installOfflineAgentPackage(join(directory, "codex-debian-arm64.tgz"), join(root, "linux-agent"), linuxArtifact!);
+      expect(profile.os).toBe("debian");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the private E2E Core control authority in a freshly prepared release root", async () => {
     const root = await mkdtemp(join(tmpdir(), "konteks-e2e-control-root-"));
     try {

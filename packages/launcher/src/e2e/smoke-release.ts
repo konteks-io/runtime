@@ -10,7 +10,7 @@ import {
   type AgentModelCapabilityMapping,
   type RemoteNativeArtifact,
 } from "@konteks/remote-common";
-import { EmbeddedReleaseRootSchema, HOST_AGENT_BRIDGES, installOfflineAgentPackage, reviewedNativeModelIdentities, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
+import { EmbeddedReleaseRootSchema, HOST_AGENT_BRIDGES, installOfflineAgentPackage, reviewedNativeModelIdentities, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, verifyNativeRelease, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RemoteSignedBundleManifest } from "@konteks/remote-common";
 
 export interface E2ESmokeReleaseOptions {
@@ -27,30 +27,95 @@ export interface E2ERealReleaseOptions extends Omit<E2ESmokeReleaseOptions, "gat
   profilePath: string | readonly string[];
 }
 
-/** Prepare one host-only, signed fake-Codex release for local E2E. */
-export async function prepareE2ESmokeRelease(options: E2ESmokeReleaseOptions) {
-  releaseBoundary(options);
-  const origin = localOrigin(options.origin);
-  await mkdir(options.directory, { recursive: true, mode: 0o700 });
+export interface E2EAdditionalPlatformOptions extends E2ESmokeReleaseOptions {
+  bundleVersion: string;
+}
+
+function fakeCodexArchive(platform: E2ESmokeReleaseOptions["platform"]): { archive: Buffer; profileBytes: Buffer } {
   const tooling = Buffer.from(fakeTooling(), "utf8"), bridge = Buffer.from(fakeBridge(), "utf8");
   const files = [
     { path: "bin/codex", bytes: tooling, executable: true },
     { path: "bridge/fake-codex-acp", bytes: bridge, executable: true },
   ];
   const profile: NativeAgentPackageProfile = NativeAgentPackageProfileSchema.parse({
-    schemaVersion: 1, agentId: "codex", os: options.platform.os, architecture: options.platform.architecture,
+    schemaVersion: 1, agentId: "codex", os: platform.os, architecture: platform.architecture,
     bridge: { package: "@agentclientprotocol/codex-acp", version: "1.10.0", entrypoint: "bridge/fake-codex-acp", runtime: "native" },
     tooling: { package: "@openai/codex", version: "0.153.3", entrypoint: "bin/codex", runtime: "native" },
     files: files.map(file => ({ path: file.path, digest: sha(file.bytes), sizeBytes: file.bytes.length, executable: file.executable })),
   });
   const profileBytes = Buffer.from(JSON.stringify(profile));
-  const archive = gzipSync(tar([{ path: "konteks-agent.json", bytes: profileBytes }, ...files]), { level: 9 });
+  return { profileBytes, archive: gzipSync(tar([{ path: "konteks-agent.json", bytes: profileBytes }, ...files]), { level: 9 }) };
+}
+
+/** Prepare one host-only, signed fake-Codex release for local E2E. */
+export async function prepareE2ESmokeRelease(options: E2ESmokeReleaseOptions) {
+  releaseBoundary(options);
+  const origin = localOrigin(options.origin);
+  await mkdir(options.directory, { recursive: true, mode: 0o700 });
+  const { archive, profileBytes } = fakeCodexArchive(options.platform);
   const connector = Buffer.from("KONTEKS_E2E_SOURCE_CONNECTOR_ONLY\n");
   const connectorPath = join(options.directory, "connector"), codexPath = join(options.directory, "codex.tgz");
   await writeFile(connectorPath, connector, { mode: 0o700 });
   await writeFile(codexPath, archive, { mode: 0o600 });
   const codexArtifact: RemoteNativeArtifact = { id: "e2e-fake-codex-acp", kind: "agent_bridge", format: "offline_agent_tgz", agentId: "codex", ...options.platform, url: `${origin}/__e2e/native/codex.tgz`, digest: sha(archive), profileDigest: sha(profileBytes), sizeBytes: archive.length };
   return writeSignedRelease(options, origin, connector, [codexArtifact], connectorPath, { codex: codexPath });
+}
+
+/** Add an isolated second-machine target to the existing local release. */
+export async function extendE2ESmokeRelease(options: E2EAdditionalPlatformOptions) {
+  releaseBoundary(options);
+  const origin = localOrigin(options.origin);
+  const roots = EmbeddedReleaseRootSchema.array().parse(JSON.parse(await readFile(join(options.directory, "release-roots.json"), "utf8")).roots);
+  const previous = verifyNativeRelease(JSON.parse(await readFile(join(options.directory, "native-manifest.json"), "utf8")), roots).manifest;
+  if (previous.nativeArtifacts?.some(artifact => artifact.os === options.platform.os && artifact.architecture === options.platform.architecture)
+    || previous.nativeArtifacts?.some(artifact => new URL(artifact.url).origin !== origin)
+    || options.bundleVersion === previous.bundleVersion) fail();
+  const privateKey = await e2eSigningKey(options.directory);
+  const root = roots.find(candidate => candidate.keyId === "e2e-local-native-release-1");
+  if (!root || createPublicKey(privateKey).export({ format: "jwk" }).x !== root.publicKeyJwk.x) fail();
+
+  const suffix = `${options.platform.os}-${options.platform.architecture}`;
+  const connector = Buffer.from("KONTEKS_E2E_SOURCE_CONNECTOR_ONLY\n");
+  const { archive, profileBytes } = fakeCodexArchive(options.platform);
+  const connectorName = `connector-${suffix}`, agentName = `codex-${suffix}.tgz`;
+  const connectorArtifact: RemoteNativeArtifact = {
+    id: `e2e-source-connector-${suffix}`, kind: "connector", format: "executable", ...options.platform,
+    url: `${origin}/__e2e/native/${connectorName}`, digest: sha(connector), sizeBytes: connector.length,
+  };
+  const agentArtifact: RemoteNativeArtifact = {
+    id: `e2e-fake-codex-acp-${suffix}`, kind: "agent_bridge", format: "offline_agent_tgz", agentId: "codex", ...options.platform,
+    url: `${origin}/__e2e/native/${agentName}`, digest: sha(archive), profileDigest: sha(profileBytes), sizeBytes: archive.length,
+  };
+  const issuedAt = new Date(), expiresAt = new Date(issuedAt.getTime() + 370 * 24 * 60 * 60 * 1000);
+  const mappingBody = {
+    version: 1 as const, mappingId: `e2e-codex-${suffix}-model`, mappingRevision: 1,
+    bridgeProfileRef: agentArtifact.id, bridgeArtifactDigest: agentArtifact.digest,
+    configId: "model", optionType: "select" as const,
+    modelIdentities: [{ value: "e2e-model", canonicalProviderId: "e2e", canonicalModelId: "e2e-model" }],
+    issuedAt: issuedAt.toISOString(), expiresAt: expiresAt.toISOString(),
+  };
+  const mappingUnsigned = { ...mappingBody, mappingDigest: computeAgentModelCapabilityMappingDigest(mappingBody) };
+  const mappingPlaceholder: AgentModelCapabilityMapping = {
+    ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId: root.keyId, value: "AA" },
+  };
+  const mapping: AgentModelCapabilityMapping = {
+    ...mappingUnsigned,
+    signature: { algorithm: "Ed25519", keyId: root.keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(mappingPlaceholder), privateKey).toString("base64url") },
+  };
+  const { digest: _digest, signature: _signature, ...unsigned } = previous;
+  const manifest = signNativeReleaseManifest({
+    ...unsigned, bundleVersion: options.bundleVersion,
+    nativeArtifacts: [...(previous.nativeArtifacts ?? []), connectorArtifact, agentArtifact],
+    modelCapabilityMappings: [...(previous.modelCapabilityMappings ?? []), mapping],
+  }, { keyId: root.keyId, privateKey });
+  await writeFile(join(options.directory, connectorName), connector, { flag: "wx", mode: 0o700 });
+  await writeFile(join(options.directory, agentName), archive, { flag: "wx", mode: 0o600 });
+  const scratch = await mkdtemp(join(options.directory, ".manifest-"));
+  try {
+    await writeFile(join(scratch, "native-manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
+    await rename(join(scratch, "native-manifest.json"), join(options.directory, "native-manifest.json"));
+  } finally { await rm(scratch, { recursive: true, force: true }); }
+  return { root, manifest, artifactFiles: { connector: join(options.directory, connectorName), agent: join(options.directory, agentName) } };
 }
 
 /** Prepare a signed local release from a separately built, complete Codex or Claude Code package. */
