@@ -82,6 +82,9 @@ describe("output", () => {
       expect(describeAction({ kind, agentId: "codex" }).length).toBeGreaterThan(0);
     }
     expect(describeAction({ kind: "login_agent", agentId: "codex" })).toContain("auth login codex");
+    // No container backend on a native connector: the person's own agent install is named (opencode CP6).
+    expect(describeAction({ kind: "install_backend", agentId: "opencode" })).toBe("install a supported OpenCode 2 as the message says, then run the command again");
+    expect(describeAction({ kind: "install_backend" })).not.toContain("container");
     expect(describeAction({ kind: "unknown_kind" })).toBe("");
   });
 });

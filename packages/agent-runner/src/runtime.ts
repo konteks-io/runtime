@@ -1,19 +1,22 @@
 import { mkdir, readFile } from "node:fs/promises";
+import type { InitializeResponse } from "@agentclientprotocol/sdk";
 import { join } from "node:path";
-import { RemoteInstanceError, createLogger, writeSecretFile, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
+import { RemoteInstanceError, createLogger, writeSecretFile, type AgentLoginOptionId, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import { fallbackLoginIdentity, probeIdentity, type IdentityProbe } from "./auth/identity.js";
 import { runLogout, startLoginFlow, type LoginFlow } from "./auth/login-flow.js";
-import { removeDshApiKey, startDshKeyLogin } from "./auth/dsh-key.js";
-import { dshRuntimePaths, writeDshKonteksProfile } from "./bridge/dsh-profile.js";
+import { hostAgentRunnerAdapter } from "./host/registry.js";
+import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentRunnerAdapter, type HostAgentSettings, type HostLoginRequest, type HostSpawn, type HostWorkingCopyBinding } from "./host/host-agent.js";
 import { AgentScopeStore, applyIdentityObservation, type AgentScopeState } from "./auth/scope-store.js";
 import { classifyBridgeError, spawnBridge, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
-import { discoverBridgeModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
+import { discoverBridgeModelCapability, offerableModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
 import { resolveBridgeSpawnSpec, verifyNativeRunnerPackage, type BridgeSpawnSpec } from "./bridge/spec.js";
 import type { RunnerConfig } from "./config.js";
 import { RunnerEventBus } from "./events.js";
 import { projectReadiness } from "./readiness.js";
-import { SessionManager, type SessionRefStore } from "./sessions/manager.js";
+import { SessionManager, type SessionRefStore, type TurnUsageLabel } from "./sessions/manager.js";
+import { AVAILABLE_COMMANDS_FILE, AvailableCommandsStore } from "./sessions/available-commands.js";
+import { turnUsageLabel } from "./sessions/usage-label.js";
 
 /**
  * The runner's lifecycle owner: a control/login bridge, optional bounded native
@@ -147,6 +150,28 @@ export class AgentRuntime {
   private stopping = false;
   /** Set when the agent broke a governance guarantee; no bridge starts again in this process. */
   private quarantined: string | null = null;
+  /** A host-installed agent's adapter (DeepSeek Harness, OpenCode); null for a bundled agent. */
+  private readonly host: HostAgentRunnerAdapter | null;
+  /** Each execution process of this agent serves one working copy and is never reused by another session (OpenCode). */
+  private readonly perWorkingCopy: boolean;
+  /** What each such process holds on its working copy, released when it exits. */
+  private readonly workingCopyBindings = new WeakMap<BridgeProcess, HostWorkingCopyBinding>();
+  /** Core's settings for host agents on this computer (free models, route billing). */
+  private hostSettings: HostAgentSettings = DEFAULT_HOST_AGENT_SETTINGS;
+  /** The credentials the last identity probe read (OpenCode's `auth list`); never a secret. */
+  private credentials: ConnectedAgentCredential[] | undefined;
+  /** The reviewed sign-ins the site may start here (OpenCode), read once the runtime started. */
+  private siteLoginOptionIds: readonly AgentLoginOptionId[] = [];
+  /** Whether turns report billing usage under the current sign-in, when the agent's identity says (Antigravity's key relay). */
+  private tokenUsageObservable: boolean | undefined;
+  /** How every process of this agent is spawned: the runtime's own, or its adapter's around it (Antigravity's key relay). */
+  private readonly spawnProcess: HostSpawn;
+  /** Stops an idle control process (`processLimits.controlIdleMs`). */
+  private controlIdleTimer: NodeJS.Timeout | null = null;
+  /** What the control process answered before it was stopped for being idle; readiness keeps reading it. */
+  private parkedInitializeResult: InitializeResponse | null = null;
+  /** The slash commands this agent announced on this computer (runtime-view R19), kept across restarts. */
+  private readonly availableCommands: AvailableCommandsStore;
 
   constructor(private readonly options: AgentRuntimeOptions) {
     this.events = options.events ?? new RunnerEventBus();
@@ -154,19 +179,54 @@ export class AgentRuntime {
     this.now = options.now ?? (() => new Date());
     this.spec = resolveBridgeSpawnSpec(options.config);
     this.family = this.spec.family;
+    this.host = hostAgentRunnerAdapter(this.family.agentId) ?? null;
+    this.perWorkingCopy = this.host?.bindWorkingCopy !== undefined;
+    const spawn = options.spawn ?? spawnBridge;
+    this.spawnProcess = this.host?.wrapSpawn ? this.host.wrapSpawn(options.config, spawn) : spawn;
+    if (this.perWorkingCopy && !options.executionBridgeLimit) {
+      // Its control process has no working copy, so it never runs a session.
+      throw new RemoteInstanceError("agent_unavailable", `${this.family.displayName} runs every session in a process of its own working copy.`);
+    }
     this.scopeStore = new AgentScopeStore(options.config.RUNNER_CREDENTIAL_DIR);
+    this.availableCommands = new AvailableCommandsStore(join(options.config.RUNNER_CREDENTIAL_DIR, AVAILABLE_COMMANDS_FILE),
+      this.host?.refusedPromptCommands?.commands ?? [], this.logger);
+    const codexGovernance = this.family.agentId === "codex" ? {
+      defaultSessionConfig: { mode: "read-only" } as const,
+      refusedModes: {
+        modeIds: ["agent", "agent-full-access"] as const,
+        message: "Codex runs in Ask for approval mode on Konteks so workspace policy decides every sensitive action.",
+      },
+    } : null;
     this.sessions = new SessionManager({
       bridge: () => this.bridge,
-      ...(options.executionBridgeLimit ? { createBridge: (ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"]) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle) } : {}),
-      ...(options.executionBridgeLimit ? { replaceBridge: (ref: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"]) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle) } : {}),
+      ...(options.executionBridgeLimit ? { createBridge: (ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle, cwd) } : {}),
+      ...(options.executionBridgeLimit ? { replaceBridge: (ref: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle, cwd) } : {}),
+      ...(this.perWorkingCopy ? { beforePrompt: (bridge: BridgeProcess) => this.workingCopyBindings.get(bridge)?.beforePrompt() } : {}),
+      ...(codexGovernance ? { defaultSessionConfig: codexGovernance.defaultSessionConfig, refusedModes: codexGovernance.refusedModes }
+        : this.host?.refusedSessionModes ? { refusedModes: this.host.refusedSessionModes } : {}),
+      ...(this.host?.refusedPromptCommands ? { refusedPromptCommands: this.host.refusedPromptCommands } : {}),
+      ...(this.host?.offersModel ? { modelAllowed: (value: string) => this.host!.offersModel!(value, this.hostSettings) } : {}),
+      ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
+      ...(this.host?.verifySession ? { verifySession: (response: { configOptions?: unknown; modes?: unknown }) => this.host!.verifySession!(response) } : {}),
+      ...(this.host?.promptPrelude ? { promptPrelude: (session: { cwd: string; sessionKey: string }) => this.host!.promptPrelude!(options.config, session) } : {}),
+      ...(this.host?.agentErrorText ? { agentErrorText: (text: string) => this.host!.agentErrorText!(text) } : {}),
+      // A turn measured outside the agent is pay-per-use: only a Core that takes it gets it.
+      ...(this.host?.measureTurn ? { measureTurn: (bridge: BridgeProcess) => {
+        const read = this.host!.measureTurn!(bridge);
+        return read ? () => (this.hostSettings.coreAcceptsRouteBilling ? read() : null) : null;
+      } } : {}),
+      usageLabel: modelValue => this.usageLabel(modelValue),
+      onAvailableCommands: update => this.availableCommands.learn(update, this.now()),
       events: this.events,
       refStore: new FileSessionRefStore(join(options.config.RUNNER_CREDENTIAL_DIR, "session-refs.json")),
-      bootstrapTimeoutMs: options.config.RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS,
+      bootstrapTimeoutMs: this.sessionBootstrapTimeoutMs(),
       now: this.now,
       logger: this.logger,
       onAuthRequired: () => {
         this.authRequired = true;
         this.publishReadiness();
+        // A host agent's credentials may now say why (Antigravity: no licence found).
+        if (this.host?.identity && !this.stopping) void this.probe(false).catch(() => undefined);
       },
     });
   }
@@ -175,8 +235,45 @@ export class AgentRuntime {
     await mkdir(this.options.config.RUNNER_CREDENTIAL_DIR, { recursive: true, mode: 0o700 });
     await mkdir(this.options.config.RUNNER_WORKSPACE_DIR, { recursive: true });
     this.scope = await this.scopeStore.read();
+    await this.availableCommands.load();
     await this.ensureBridge();
     await this.probe(false);
+    void this.refreshSiteLoginOptions();
+  }
+
+  /** The reviewed sign-ins the site may start on this machine (OpenCode); empty for every other agent. */
+  siteLoginOptions(): readonly AgentLoginOptionId[] {
+    return this.siteLoginOptionIds;
+  }
+
+  private async refreshSiteLoginOptions(): Promise<void> {
+    if (!this.host?.siteLoginOptions) return;
+    try {
+      this.siteLoginOptionIds = [...await this.host.siteLoginOptions(this.options.config)];
+    } catch (error) {
+      this.logger.warn({ errorCode: error instanceof RemoteInstanceError ? error.code : "sign_in_options_failed" }, "the agent's sign-in options could not be read");
+    }
+  }
+
+  /**
+   * Core's settings for host agents on this computer, from each applied
+   * desired configuration. Switching OpenCode's free models changes what it
+   * offers and, with nothing signed in, whether it is ready: re-probe.
+   */
+  async applyHostSettings(settings: HostAgentSettings): Promise<void> {
+    const previous = this.hostSettings;
+    this.hostSettings = Object.freeze({ ...settings });
+    const freeModelsChanged = previous.openCodeFreeModels !== settings.openCodeFreeModels && this.host?.offersModel !== undefined;
+    // What a host agent's credentials say depends on what Core takes (Antigravity's no-licence reason).
+    const coreChanged = previous.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling && this.host?.identity !== undefined;
+    if (!freeModelsChanged && !coreChanged) return;
+    if (freeModelsChanged) this.modelCapabilities.clear();
+    if (this.connectionState !== "unavailable" && !this.stopping) await this.probe(false);
+  }
+
+  /** How one turn's usage is labelled (O7): sessions/usage-label.ts. */
+  private usageLabel(modelValue: string | undefined): TurnUsageLabel | null {
+    return turnUsageLabel({ agentId: this.family.agentId, modelValue, credentials: this.credentials, coreAcceptsRouteBilling: this.hostSettings.coreAcceptsRouteBilling });
   }
 
   async stop(): Promise<void> {
@@ -190,19 +287,71 @@ export class AgentRuntime {
     // A finalized reference no longer owns its process; the idle slot does.
     try { await this.discardIdleExecutionBridge("runtime_stop"); } catch (error) { errors.push(error); }
     this.sessions.closeAll("closed");
+    this.clearControlIdleStop();
     await this.bridge?.stop();
     this.bridge = null;
     this.connectionState = "exited";
+    await this.sweepLeftovers();
     if (errors.length) throw new AggregateError(errors, "Native execution owners could not all be stopped.");
   }
 
-  private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"]): Promise<BridgeProcess> {
+  /** The runner's session bootstrap deadline, or the agent's own when longer (Antigravity on Gemini Enterprise). */
+  private sessionBootstrapTimeoutMs(): number {
+    return Math.max(this.options.config.RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS, this.host?.sessionBootstrapTimeoutMs ?? 0);
+  }
+
+  /** After every process of this runner stopped: what a host agent's programs left behind (Antigravity's harness). */
+  private async sweepLeftovers(): Promise<void> {
+    if (!this.host?.sweepLeftovers) return;
+    try { await this.host.sweepLeftovers(this.options.config); }
+    catch (error) { this.logger.warn({ agentId: this.family.agentId, errorCode: error instanceof RemoteInstanceError ? error.code : "sweep_failed" }, "processes the agent left behind could not all be stopped"); }
+  }
+
+  /** Execution processes that may live at once: the supervisor's ceiling, and the agent's own when lower (Antigravity: two, A12). */
+  private executionLimit(): number | undefined {
     const limit = this.options.executionBridgeLimit?.();
+    const own = this.host?.processLimits?.executionProcesses;
+    return typeof limit === "number" && typeof own === "number" ? Math.min(limit, own) : limit;
+  }
+
+  private heldExecutionOwners(): number {
+    let held = 0;
+    for (const owner of this.executionBridges.values()) if (!owner.finalized) held += 1;
+    return held;
+  }
+
+  private createExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+    const queueMs = this.host?.processLimits?.queueMs;
+    return queueMs === undefined ? this.reserveExecutionBridge(ref, lifecycle, cwd) : this.queueForExecutionBridge(ref, Date.now() + queueMs, lifecycle, cwd);
+  }
+
+  /**
+   * An agent with its own process ceiling (Antigravity) waits for a free
+   * execution process instead of being refused at once: a session finishing
+   * or its resident process being taken frees one. Past the wait it is
+   * refused plainly; nothing was reserved.
+   */
+  private async queueForExecutionBridge(ref: string, until: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+    for (let logged = false; ; logged = true) {
+      const limit = this.executionLimit();
+      if (this.stopping || this.authRequired || this.activeLogin !== null || this.executionBridges.has(ref) || typeof limit !== "number" || this.heldExecutionOwners() < limit) {
+        return this.reserveExecutionBridge(ref, lifecycle, cwd);
+      }
+      if (Date.now() >= until) {
+        throw new RemoteInstanceError("temporarily_unavailable", `${this.family.displayName} is already running ${limit} sessions on this computer. Try again when one of them finishes.`, { diagnostic: "execution_processes_busy" });
+      }
+      if (!logged) this.logger.info({ agentId: this.family.agentId, limit }, "a session waits for a free execution process");
+      lifecycle?.assertCurrent();
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }
+
+  private reserveExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+    const limit = this.executionLimit();
     if (this.authRequired) return Promise.reject(new RemoteInstanceError("agent_auth_required", "Sign in to the selected local agent.", { recoveryActions: [{ kind: "login_agent", agentId: this.family.agentId }] }));
     if (this.activeLogin !== null) return Promise.reject(new RemoteInstanceError("temporarily_unavailable", "The local agent is signing in."));
     // Only unfinalized owners hold capacity; retained keys still refuse reuse.
-    let held = 0;
-    for (const owner of this.executionBridges.values()) if (!owner.finalized) held += 1;
+    const held = this.heldExecutionOwners();
     if (this.stopping || typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || held >= limit || this.executionBridges.has(ref)) {
       return Promise.reject(new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization."));
     }
@@ -212,8 +361,8 @@ export class AgentRuntime {
       if (this.stopping || this.executionBridges.get(ref)!.stopping) throw new RemoteInstanceError("agent_unavailable", "Native execution owner is stopping.");
       // A resident process costs this reference one `session/new`; only when
       // none is idle does it pay the spawn plus ACP `initialize`.
-      const idle = this.takeIdleExecutionBridge();
-      return idle ? this.adoptIdleExecutionBridge(ref, idle, lifecycle) : this.spawnExecutionBridge(ref, lifecycle);
+      const idle = this.perWorkingCopy ? null : this.takeIdleExecutionBridge();
+      return idle ? this.adoptIdleExecutionBridge(ref, idle, lifecycle) : this.spawnExecutionBridge(ref, lifecycle, cwd);
     });
     // Reserve the bounded owner before any executable await. Even a rejected
     // bootstrap retains its slot; no missing handle is interpreted as stopped.
@@ -221,13 +370,30 @@ export class AgentRuntime {
     return bridge;
   }
 
-  private async spawnExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"]): Promise<BridgeProcess> {
+  /**
+   * The spawn spec of one execution process: the runtime's own, or for an
+   * agent whose process serves one working copy (OpenCode), the environment
+   * its adapter prepared for exactly `cwd`, held until that process exits.
+   */
+  private async executionSpec(cwd: string | undefined): Promise<{ spec: BridgeSpawnSpec; binding: HostWorkingCopyBinding | null }> {
+    if (!this.perWorkingCopy) return { spec: this.spec, binding: null };
+    if (cwd === undefined) throw new RemoteInstanceError("agent_unavailable", `${this.family.displayName} needs the session's working copy before it starts.`);
+    const binding = await this.host!.bindWorkingCopy!(this.options.config, this.family, cwd);
+    return { spec: { ...this.spec, env: binding.env }, binding };
+  }
+
+  private releaseWorkingCopy(binding: HostWorkingCopyBinding | null): void {
+    if (binding) void binding.release().catch(error => this.logger.warn({ agentId: this.family.agentId, err: error }, "working copy preparation could not be removed"));
+  }
+
+  private async spawnExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
     const record = this.executionBridges.get(ref)!;
     let owner: BridgeProcess | null = null;
     let exitedDuringStart = false;
     let ownerPersistence: Promise<void> = Promise.resolve();
-    const candidate = await (this.options.spawn ?? spawnBridge)({
-      spec: this.spec, initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
+    const { spec, binding } = await this.executionSpec(cwd);
+    const candidate = await this.spawnProcess({
+      spec, initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
       clientVersion: this.options.config.RUNNER_BRIDGE_VERSION, logger: this.logger,
       onProcessOwner: process => {
         record.process = process;
@@ -236,6 +402,7 @@ export class AgentRuntime {
         return ownerPersistence;
       },
       ...(this.options.executionSpawnProcess ? { spawnProcess: this.options.executionSpawnProcess } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line, this.options.config) } : {}),
       // Callback authority is the initialized process object, which a later
       // reference reuses as-is: the session manager resolves every update,
       // permission, elicitation and exit to the sessions bound to exactly it.
@@ -244,6 +411,7 @@ export class AgentRuntime {
         onRequestPermission: params => this.sessions.onRequestPermission(params, owner),
         onCreateElicitation: params => this.sessions.onCreateElicitation(params, owner),
         onExit: () => {
+          this.releaseWorkingCopy(binding);
           if (!owner) { exitedDuringStart = true; return; }
           this.sessions.closeAll("agent_exited", owner);
           this.observeExecutionExit(owner);
@@ -251,7 +419,12 @@ export class AgentRuntime {
           // automatically respawn an uncertain execution generation.
         },
       },
+    }).catch((error: unknown) => {
+      // A process that never started never exits: undo its preparation here.
+      this.releaseWorkingCopy(binding);
+      throw error;
     });
+    if (binding) this.workingCopyBindings.set(candidate, binding);
     await ownerPersistence;
     owner = candidate;
     record.process = candidate;
@@ -275,8 +448,9 @@ export class AgentRuntime {
     previous: BridgeProcess,
     bootstrapAttempt: number,
     lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"],
+    cwd?: string,
   ): Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }> {
-    return this.acquireBootstrapExecutionBridge(ref, bootstrapAttempt, previous, lifecycle);
+    return this.acquireBootstrapExecutionBridge(ref, bootstrapAttempt, previous, lifecycle, cwd);
   }
 
   /** Spawn/initialize belongs to the same four-attempt bootstrap budget as the
@@ -287,6 +461,7 @@ export class AgentRuntime {
     firstAttempt: number,
     previous: BridgeProcess | undefined,
     lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"],
+    cwd?: string,
   ): Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }> {
     let durablePrevious: RetainedProcessOwner | undefined;
     if (previous) {
@@ -322,7 +497,7 @@ export class AgentRuntime {
       } : undefined;
       const initializeStartedAt = Date.now();
       try {
-        const bridge = await this.createExecutionBridge(ref, attemptLifecycle);
+        const bridge = await this.createExecutionBridge(ref, attemptLifecycle, cwd);
         this.logger.info({
           agentId: this.family.agentId,
           acpSessionRef: ref,
@@ -506,6 +681,9 @@ export class AgentRuntime {
   private parkIdle(bridge: BridgeProcess, durable: BridgeStopOwner): boolean {
     // A later reference must record this process's durable owner; without a
     // captured identity there is nothing to record, so the process stops.
+    // A process serving one working copy (OpenCode) keeps that copy's
+    // instructions and its sessions' MCP servers, so no other session reuses it.
+    if (this.perWorkingCopy) return false;
     if (this.stopping || bridge.exited || durable.retainedProcessOwner === undefined || this.idleExecutionBridge !== null || this.sessions.sessionsBoundTo(bridge) !== 0) return false;
     const entry: IdleExecutionBridge = { bridge, durable, authEpoch: this.authEpoch, expiry: setTimeout(() => void this.expireIdleExecutionBridge(entry), this.idleExecutionBridgeTtlMs()) };
     entry.expiry.unref();
@@ -516,7 +694,10 @@ export class AgentRuntime {
 
   private idleExecutionBridgeTtlMs(): number {
     const configured = this.options.idleExecutionBridgeTtlMs;
-    return typeof configured === "number" && Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS;
+    const ttl = typeof configured === "number" && Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS;
+    // A heavy agent (Antigravity, about 350 MB a process) keeps its resident process for less.
+    const own = this.host?.processLimits?.idleExecutionMs;
+    return typeof own === "number" ? Math.min(ttl, own) : ttl;
   }
 
   /** Cheap liveness: our own child's observed exit and the login it was started under. */
@@ -578,14 +759,26 @@ export class AgentRuntime {
       family: this.family,
       authMode: this.options.config.RUNNER_AUTH_MODE,
       connectionState: this.connectionState,
-      initializeResult: this.bridge?.initializeResult ?? null,
+      initializeResult: this.bridge?.initializeResult ?? this.parkedInitializeResult,
       scope: this.authRequired ? { ...this.scope, authIdentityFingerprint: null, scopeAttestedAt: null } : this.scope,
       identity: this.authRequired ? "logged_out" : this.identity,
+      ...(this.credentials === undefined ? {} : { credentials: this.authRequired ? this.credentials.map(credential => ({ ...credential, state: "needs_sign_in" as const })) : this.credentials }),
       bridgeVersionCompatible: true,
-      ...(this.family.agentId === "dsh" && this.options.config.RUNNER_BRIDGE_VERSION !== "unknown"
-        ? { hostAgentVersion: this.options.config.RUNNER_BRIDGE_VERSION } : {}),
+      ...(this.hostVersion() === undefined ? {} : { hostAgentVersion: this.hostVersion()! }),
+      ...(this.tokenUsageObservable === undefined ? {} : { tokenUsageObservable: this.tokenUsageObservable }),
+      // Only to a Core that takes 7.1 fields: an older Core's heartbeat is strict.
+      ...(this.hostSettings.coreAcceptsRouteBilling && this.availableCommands.current() ? { availableCommands: this.availableCommands.current()! } : {}),
       lastProbeAt: this.lastProbeAt,
     });
+  }
+
+  /**
+   * Whether this agent was signed in and the sign-in no longer works: a turn
+   * failed on it, or a credential it holds needs signing in again (runtime-view
+   * R21 `sign_in_expired`, as opposed to never signed in).
+   */
+  signInLost(): boolean {
+    return this.authRequired || (this.credentials?.some(credential => credential.state === "needs_sign_in") ?? false);
   }
 
   utilization(): { activeSessions: number; activeTurns: number } {
@@ -616,12 +809,14 @@ export class AgentRuntime {
       workspaceRoot: this.options.config.RUNNER_WORKSPACE_DIR,
       spec: this.spec,
       initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
-      sessionTimeoutMs: this.options.config.RUNNER_SESSION_BOOTSTRAP_TIMEOUT_MS,
+      sessionTimeoutMs: this.sessionBootstrapTimeoutMs(),
       clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
       logger: this.logger,
       ...(this.options.retrySleep ? { retrySleep: this.options.retrySleep } : {}),
       ...(this.options.retryRandom ? { retryRandom: this.options.retryRandom } : {}),
-      ...(this.options.spawn ? { spawn: this.options.spawn } : {}),
+      spawn: this.spawnProcess,
+      ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line, this.options.config) } : {}),
     };
     // The periodic probe used to spawn and initialize its own throwaway
     // process. An idle resident bridge answers the same `session/new` without
@@ -653,7 +848,11 @@ export class AgentRuntime {
       if (oldest) this.modelCapabilities.delete(oldest);
     }
     this.modelCapabilities.set(cacheKey, { at: nowMs, pending });
-    try { return structuredClone(await pending); }
+    try {
+      const offers = this.host?.offersModel;
+      const capability = structuredClone(await pending);
+      return offers ? offerableModelCapability(capability, value => offers(value, this.hostSettings), this.family) : capability;
+    }
     catch (error) {
       if (this.modelCapabilities.get(cacheKey)?.pending === pending) this.modelCapabilities.delete(cacheKey);
       throw error;
@@ -666,6 +865,11 @@ export class AgentRuntime {
    * bridge, refuse new ones and read as unavailable. Used when DeepSeek
    * Harness ran a gated tool without asking (dsh-tool-governance.ts).
    */
+  /** Why this agent was taken out of service (the tripwire's line), or null (doctor). */
+  quarantineReason(): string | null {
+    return this.quarantined;
+  }
+
   async quarantine(reason: string): Promise<void> {
     this.quarantined = reason;
     this.logger.error({ event: "agent.quarantined", agentId: this.family.agentId }, "agent taken out of service");
@@ -676,24 +880,62 @@ export class AgentRuntime {
       try { await this.stopExecutionBridge(ref); } catch (error) { errors.push(error); }
     }
     try { await this.discardIdleExecutionBridge("runtime_stop"); } catch (error) { errors.push(error); }
+    this.clearControlIdleStop();
     await this.bridge?.stop();
     this.bridge = null;
+    await this.sweepLeftovers();
     if (errors.length) this.logger.warn({ errors: errors.length }, "some bridges did not stop cleanly during quarantine");
   }
 
   /**
-   * Before any bridge process starts: re-verify a bundled package, or rewrite
-   * the Konteks overlay a host-installed DeepSeek Harness boots from. Every
-   * dsh process reads those files at boot, so a changed copy heals on the next
-   * spawn instead of leaving it unguarded (CP3 live proof, phase 2).
+   * Before any bridge process starts: re-verify a bundled package, or let a
+   * host-installed agent's adapter write the Konteks overlay or config it boots
+   * from. Every dsh process reads those files at boot, so a changed copy heals
+   * on the next spawn instead of leaving it unguarded (CP3 live proof, phase 2).
    */
   private async prepareToSpawn(logger?: Pick<Logger, "info">): Promise<void> {
     await verifyNativeRunnerPackage(this.options.config, logger);
-    if (this.family.hostInstall !== undefined) await writeDshKonteksProfile(dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).konteksDir);
+    await this.host?.prepareToSpawn(this.options.config);
+  }
+
+  /** The verified installed version of a host-installed agent, when known. */
+  private hostVersion(): string | undefined {
+    return hostAgentRunnerAdapter(this.family.agentId)?.hostVersion(this.options.config);
   }
 
   private assertNotQuarantined(): void {
     if (this.quarantined !== null) throw new RemoteInstanceError("agent_unavailable", this.quarantined);
+  }
+
+  /**
+   * An agent with its own process limits (Antigravity) stops its control
+   * process after `controlIdleMs` with nothing to do: it serves readiness and
+   * sign-in only, sessions run in execution processes, and one costs about
+   * 350 MB. Readiness keeps the `initialize` it answered; the next sign-in or
+   * sign-out starts it again.
+   */
+  private scheduleControlIdleStop(): void {
+    const idleMs = this.host?.processLimits?.controlIdleMs;
+    this.clearControlIdleStop();
+    if (idleMs === undefined || this.stopping) return;
+    this.controlIdleTimer = setTimeout(() => void this.parkControlBridge().catch(error => this.logger.warn({ agentId: this.family.agentId, err: error }, "the idle control process could not be stopped")), idleMs);
+    this.controlIdleTimer.unref();
+  }
+
+  private clearControlIdleStop(): void {
+    if (this.controlIdleTimer) clearTimeout(this.controlIdleTimer);
+    this.controlIdleTimer = null;
+  }
+
+  private async parkControlBridge(): Promise<void> {
+    this.controlIdleTimer = null;
+    const bridge = this.bridge;
+    if (!bridge || bridge.exited || this.stopping || this.activeLogin !== null || this.bridgeStart !== null || this.connectionState !== "ready") return;
+    this.parkedInitializeResult = bridge.initializeResult;
+    // Detach first: its exit is then not read as the agent going away.
+    this.bridge = null;
+    this.logger.info({ agentId: this.family.agentId }, "stopping the idle control process");
+    await bridge.stop();
   }
 
   async ensureBridge(): Promise<void> {
@@ -708,8 +950,13 @@ export class AgentRuntime {
   }
 
   private async startBridge(): Promise<void> {
-    this.connectionState = "starting";
-    this.publishReadiness();
+    this.clearControlIdleStop();
+    // A control process stopped for being idle comes back without the agent reading as unavailable meanwhile.
+    const resuming = this.parkedInitializeResult !== null && this.connectionState === "ready";
+    if (!resuming) {
+      this.connectionState = "starting";
+      this.publishReadiness();
+    }
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       // Callback authority belongs to this spawn, never whichever bridge
       // happens to be current when a deferred callback arrives.
@@ -720,7 +967,7 @@ export class AgentRuntime {
       try {
         await this.prepareToSpawn(this.logger);
         if (this.stopping) return;
-        const candidate = await (this.options.spawn ?? spawnBridge)({
+        const candidate = await this.spawnProcess({
           spec: this.spec,
           initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
           clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
@@ -748,10 +995,12 @@ export class AgentRuntime {
           throw new RemoteInstanceError("agent_unavailable", "Bridge exited during initialization.", { retryable: true });
         }
         this.bridge = candidate;
+        this.parkedInitializeResult = null;
         this.connectionState = "ready";
         this.logger.info({ agentId: this.family.agentId, attempt,
           bridgeInitializeDurationMs: Date.now() - initializeStartedAt }, "runner control bridge initialized");
         this.publishReadiness();
+        this.scheduleControlIdleStop();
         return;
       } catch (error) {
         let stopConfirmed = provisional === null;
@@ -772,7 +1021,8 @@ export class AgentRuntime {
         const exhausted = !retryable || attempt === 4;
         this.logger.warn({ agentId: this.family.agentId, attempt, maxAttempts: 4,
           bridgeInitializeDurationMs: Date.now() - initializeStartedAt, stopConfirmed, retryable, exhausted,
-          errorClass: classified.class, errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_initialize_failed" },
+          errorClass: classified.class, errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_initialize_failed",
+          diagnostic: error instanceof RemoteInstanceError ? error.diagnostic : undefined },
         "runner control bridge startup attempt failed");
         if (exhausted) break;
         const exponentialMs = 500 * (2 ** (attempt - 1));
@@ -782,6 +1032,7 @@ export class AgentRuntime {
         await (this.options.retrySleep ?? (delay => new Promise(resolve => setTimeout(resolve, delay))))(delayMs);
       }
     }
+    this.parkedInitializeResult = null;
     this.connectionState = "failed";
     this.publishReadiness();
   }
@@ -795,12 +1046,14 @@ export class AgentRuntime {
     let result: IdentityProbe;
     try {
       await this.prepareToSpawn();
-      result = await (this.options.probe ?? probeIdentity)(this.options.config, this.family, this.spec.env);
+      result = await (this.options.probe ?? probeIdentity)(this.options.config, this.family, this.spec.env, {}, this.hostSettings);
     } catch (error) {
       this.logger.warn({ err: error }, "identity probe failed");
       result = { kind: "logged_out" };
     }
     this.identity = result.kind;
+    if (result.kind !== "no_official_signal" && result.credentials !== undefined) this.credentials = result.credentials;
+    if (this.host?.identity) this.tokenUsageObservable = result.kind === "signal" ? result.tokenUsageObservable : undefined;
     if (isLogin && (result.kind === "signal" || result.kind === "no_official_signal")) this.authRequired = false;
     const at = this.now().toISOString();
     this.lastProbeAt = at;
@@ -820,7 +1073,7 @@ export class AgentRuntime {
   }
 
   /** Starts the official login flow; completion re-probes readiness and applies the attestation. */
-  startLogin(args: { organization: boolean; loginId?: string; personal?: boolean }): LoginFlow {
+  startLogin(args: { organization: boolean; loginId?: string; personal?: boolean; request?: HostLoginRequest }): LoginFlow {
     // The person asking for their own login on their own machine (the site's
     // Log in, or `konteks-remote auth login` they ran) is not Konteks changing
     // their login behind their back (WS1-115).
@@ -832,11 +1085,12 @@ export class AgentRuntime {
       throw new RemoteInstanceError("temporarily_unavailable", "Finish or recover active Codex sessions before signing in again.");
     }
     const previousConnectionState = this.connectionState;
-    // DeepSeek Harness has no login command: the runtime asks for the API key
-    // itself, checks it with DeepSeek and stores it in its dsh home.
-    const flow = this.family.agentId === "dsh"
-      ? startDshKeyLogin({ credentialsFile: dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).credentialsFile, events: this.events, logger: this.logger,
-        ...(args.loginId === undefined ? {} : { loginId: args.loginId }) })
+    // A host-installed agent may own its sign-in (DeepSeek Harness has no
+    // login command: the runtime asks for the API key itself).
+    const host = hostAgentRunnerAdapter(this.family.agentId);
+    const flow = host?.startLogin
+      ? host.startLogin({ config: this.options.config, events: this.events, logger: this.logger, spawn: this.options.spawn ?? spawnBridge,
+        ...(args.loginId === undefined ? {} : { loginId: args.loginId }), ...(args.request === undefined ? {} : { request: args.request }) })
       : startLoginFlow({
         config: this.options.config,
         family: this.family,
@@ -850,11 +1104,11 @@ export class AgentRuntime {
       this.connectionState = "starting";
       this.publishReadiness();
     }
-    void flow.done.then(async ({ code }) => {
+    void flow.done.then(async ({ code, reason }) => {
       if (code !== 0) {
         this.activeLogin = null;
         this.connectionState = previousConnectionState;
-        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: this.family.agentId === "dsh" ? "the DeepSeek API key was not saved" : "official login tooling did not complete" } });
+        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: host?.loginFailedMessage ?? "official login tooling did not complete", ...(reason ? { reason } : {}) } });
         await this.probe(false);
         return;
       }
@@ -895,13 +1149,21 @@ export class AgentRuntime {
     return true;
   }
 
-  async logout(): Promise<ConnectedAgentView> {
+  async logout(request?: HostLoginRequest): Promise<ConnectedAgentView> {
     this.assertConnectorOwnedAuthentication();
     this.connectionState = "starting";
     this.publishReadiness();
     const stopping = this.stopExecutionForAuthChange().then(() => null, error => error);
-    if (this.family.agentId === "dsh") await removeDshApiKey(dshRuntimePaths(this.options.config.RUNNER_CREDENTIAL_DIR).credentialsFile);
-    else await runLogout({ config: this.options.config, family: this.family, env: this.spec.env });
+    const host = hostAgentRunnerAdapter(this.family.agentId);
+    // A refused sign-out (OpenCode: not signed in to that provider) still
+    // brings the agent back before the refusal is returned.
+    let logoutError: unknown = null;
+    try {
+      if (host?.logout) await host.logout(this.options.config, request, this.options.spawn ?? spawnBridge);
+      else await runLogout({ config: this.options.config, family: this.family, env: this.spec.env });
+    } catch (error) {
+      logoutError = error;
+    }
     const stopError = await stopping;
     await this.bridge?.stop();
     this.bridge = null;
@@ -912,6 +1174,7 @@ export class AgentRuntime {
     }
     await this.ensureBridge();
     const view = await this.probe(false);
+    if (logoutError !== null) throw logoutError;
     return view;
   }
 

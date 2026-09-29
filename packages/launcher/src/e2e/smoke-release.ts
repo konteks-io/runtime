@@ -205,7 +205,9 @@ async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directo
   };
   // A host-installed agent (the person's own DeepSeek Harness) ships no
   // artifact; its reviewed mapping names the agent and the versions this
-  // runtime supports, with the same canonical identities Core routes on.
+  // runtime supports, with the same canonical identities Core routes on. An
+  // agent with no reviewed identities (OpenCode) reports under its catalogue
+  // authority instead, as in a production release (release/src/native.ts).
   const hostMappingFor = (family: (typeof HOST_AGENT_BRIDGES)[number]): AgentModelCapabilityMapping => {
     const mappingBody = {
       version: 1 as const,
@@ -222,7 +224,7 @@ async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directo
     const mappingPlaceholder: AgentModelCapabilityMapping = { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: "AA" } };
     return { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(mappingPlaceholder), privateKey).toString("base64url") } };
   };
-  const mappings = [...agentArtifacts.map(mappingFor), ...HOST_AGENT_BRIDGES.filter(family => family.hostInstall).map(hostMappingFor)];
+  const mappings = [...agentArtifacts.map(mappingFor), ...HOST_AGENT_BRIDGES.filter(family => family.hostInstall && reviewedNativeModelIdentities(family.agentId)).map(hostMappingFor)];
   const manifest = signNativeReleaseManifest({
     bundleVersion, protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [connectorArtifact, ...agentArtifacts], modelCapabilityMappings: mappings, expiresAt: expiresAt.toISOString(),
   }, { keyId, privateKey });

@@ -1,6 +1,7 @@
 import { RemoteExecutionReadyResultSchema, RemoteInstanceError, RemoteTransferBindingSchema, type Clock, type RemoteTransferBinding, type RemoteWorkAssignment } from "@konteks/remote-common";
 import type { CoreClient } from "../core/client.js";
 import type { JournalEntry, SupervisorJournal } from "../state/journal.js";
+import { continuedSession } from "../work/continued-session.js";
 
 interface NativeReadyOptions {
   clock: Clock;
@@ -19,7 +20,7 @@ export function createNativeReadyRegistrar(options: NativeReadyOptions) {
   return async (assignment: RemoteWorkAssignment, expected: RemoteTransferBinding, acpSessionRef: string) => {
     const binding = RemoteTransferBindingSchema.parse(expected);
     if (assignment.workspaceId !== options.workspaceId || assignment.instanceId !== options.instanceId || binding.workspaceId !== options.workspaceId || binding.instanceId !== options.instanceId ||
-        binding.assignmentId !== assignment.id || binding.attempt !== assignment.attempt || (assignment.source.kind === "conversation" && binding.sessionId !== assignment.source.sessionId)) throw unavailable();
+        binding.assignmentId !== assignment.id || binding.attempt !== assignment.attempt || (continuedSession(assignment.source) !== null && binding.sessionId !== continuedSession(assignment.source)!.sessionId)) throw unavailable();
     const key = `${assignment.id}:${assignment.attempt}`;
     const checked = (entry: JournalEntry | undefined): JournalEntry => {
       options.assertActive();

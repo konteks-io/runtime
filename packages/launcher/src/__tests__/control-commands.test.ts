@@ -1,7 +1,7 @@
 import { Writable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { RemoteInstanceError, type ControlRequest, type SupervisorStatus } from "@konteks/remote-common";
-import { authLogin, previewStatus, status, type ControlContext } from "../native/control-commands.js";
+import { agents, authLogin, previewStatus, status, type ControlContext } from "../native/control-commands.js";
 import { createOutput } from "../output.js";
 
 const supervisorStatus: SupervisorStatus = {
@@ -60,8 +60,63 @@ function fake(options: { json?: boolean; confirm?: boolean; loginFailure?: boole
 describe("native control commands", () => {
   it("fails the command when the supervisor reports a failed login", async () => {
     const f = fake({ loginFailure: true });
-    await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "agent_auth_required" });
+    await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "agent_auth_required", message: "the DeepSeek API key was not saved" });
     expect(f.text()).not.toContain("pasted-secret-value");
+  });
+  it("names the agent when a sign-in finishes, with no internal start line (WS1-153)", async () => {
+    const f = fake();
+    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
+      if (request.op !== "auth.login") return schema.parse({});
+      options?.onEvent?.({ kind: "started", loginId: "l1", agentId: "dsh" });
+      options?.onEvent?.({ kind: "display", loginId: "l1", text: "Key saved." });
+      options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
+      return schema.parse({ loginId: "l1" });
+    }) as typeof f.context.control.call;
+    await authLogin(f.context, "dsh", false);
+    expect(f.text()).toBe("Key saved.\nDeepSeek Harness is ready.\n");
+  });
+  it("asks OpenCode's provider choice in the open and its key hidden, and passes the chosen sign-in on (CP3)", async () => {
+    const f = fake();
+    const typed: string[] = [];
+    const hidden: string[] = [];
+    f.context.promptLine = async label => { typed.push(label); return "deepseek"; };
+    f.context.promptSecret = async label => { hidden.push(label); return "sk-typed-key-never-shown"; };
+    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
+      f.calls.push(request);
+      if (request.op !== "auth.login") return schema.parse({});
+      options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "Number or provider id", secret: false, visible: true });
+      options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "DeepSeek API key", secret: true });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
+      return schema.parse({ loginId: "l1" });
+    }) as typeof f.context.control.call;
+    await authLogin(f.context, "opencode", false, { provider: "deepseek", method: "key", reuse: true });
+    expect(typed).toEqual(["Number or provider id"]);
+    expect(hidden).toEqual(["DeepSeek API key"]);
+    expect(f.calls[0]).toEqual({ op: "auth.login", agentId: "opencode", organization: false, provider: "deepseek", method: "key", reuse: true });
+    expect(f.calls.slice(1)).toEqual([{ op: "auth.input", loginId: "l1", text: "deepseek" }, { op: "auth.input", loginId: "l1", text: "sk-typed-key-never-shown" }]);
+    expect(f.text()).not.toContain("sk-typed-key-never-shown");
+  });
+  it("passes Google Antigravity's Gemini Enterprise project and location on, and its key only through the hidden prompt (antigravity CP3)", async () => {
+    const f = fake();
+    const hidden: string[] = [];
+    f.context.promptSecret = async label => { hidden.push(label); return "AIzaSyTYPED-never-shown-000000000000"; };
+    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
+      f.calls.push(request);
+      if (request.op !== "auth.login") return schema.parse({});
+      if (request.method === "gemini-api-key") options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "Gemini API key", secret: true });
+      else options?.onEvent?.({ kind: "open_url", loginId: "l1", url: "https://accounts.google.com/o/oauth2/v2/auth?client_id=x" });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
+      return schema.parse({ loginId: "l1" });
+    }) as typeof f.context.control.call;
+    await authLogin(f.context, "antigravity", false, { method: "oauth-business", project: "gemini-enterprise-qa-25d3", location: "global" });
+    expect(f.calls[0]).toEqual({ op: "auth.login", agentId: "antigravity", organization: false, method: "oauth-business", project: "gemini-enterprise-qa-25d3", location: "global" });
+    expect(f.text()).toContain("open this URL to sign in: https://accounts.google.com/");
+    await authLogin(f.context, "antigravity", false, { method: "gemini-api-key" });
+    expect(hidden).toEqual(["Gemini API key"]);
+    expect(f.calls.at(-1)).toEqual({ op: "auth.input", loginId: "l1", text: "AIzaSyTYPED-never-shown-000000000000" });
+    expect(f.text()).not.toContain("AIzaSyTYPED");
   });
   it("ends the login connection when the hidden prompt is interrupted", async () => {
     const f = fake();
@@ -83,6 +138,22 @@ describe("native control commands", () => {
     expect(f.text()).toContain("sess-1: running at http://127.0.0.1:43100 (a viewer is connected)");
     expect(f.text()).toContain("command: npm run dev — Inferred from package.json.");
     expect(f.text()).toContain("Customize → Runtimes");
+  });
+
+  it("names Google Antigravity's download state in the agent list, with the command that changes it (antigravity CP6)", async () => {
+    let text = "";
+    const sink = new Writable({ write(chunk, _encoding, done) { text += chunk.toString(); done(); } });
+    const view = (state: string) => ({ agentId: "antigravity", readiness: "unavailable", authMode: "agent_local_subscription", accountScope: "personal", hostAgentDownload: { state } });
+    const context = { output: createOutput({ json: false, stdout: sink, stderr: sink }), control: { call: async <T,>(_request: ControlRequest, schema: { parse: (value: unknown) => T }) => schema.parse({
+      agents: [view("not_downloaded"), view("downloading"), view("integrity_failed"), { ...view("ready"), readiness: "ready" }, { agentId: "codex", readiness: "ready", authMode: "agent_local_subscription", accountScope: "personal" }], roles: [], roleBindings: [] }) } } as never;
+    await agents(context);
+    expect(text.split("\n").slice(0, 5)).toEqual([
+      "antigravity: unavailable (agent_local_subscription, scope personal) — not downloaded (konteks-remote agent add antigravity)",
+      "antigravity: unavailable (agent_local_subscription, scope personal) — downloading from Google",
+      "antigravity: unavailable (agent_local_subscription, scope personal) — does not match Google's release (konteks-remote agent add antigravity)",
+      "antigravity: ready (agent_local_subscription, scope personal)",
+      "codex: ready (agent_local_subscription, scope personal)",
+    ]);
   });
 
   it("reads a connector status with a running preview", async () => {

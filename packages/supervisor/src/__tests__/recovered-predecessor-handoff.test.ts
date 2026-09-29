@@ -200,3 +200,19 @@ it("keeps a retired process's observation pending when Core refuses it for anoth
   expect(f.journal.recoveryEvidence.all()).toMatchObject([{ delivery: "pending", lastFailureCode: "reconciliation_replay" }]);
   await expect(f.internal.takeOverCompletedChannel(conversation(f.next), f.next, current)).rejects.toMatchObject({ code: "recovery_required" });
 });
+
+it("lets a later recovery stop an execution an earlier one already interrupted, without moving it back (WS1-166)", async () => {
+  const journal = new SupervisorJournal(dir); await journal.load();
+  const stopped = admission("stopped");
+  await admit(journal, stopped, conversation(stopped));
+  await journal.execution.open(stopped, current, stopped.openedAt);
+  await journal.execution.bindReference(stopped, "stopped-ref", current);
+  await journal.execution.bindProcessOwner(stopped, processOwner, current);
+  await fenceAndStop(journal, stopped, "stopped-ref");
+  const before = journal.execution.execution(stopped);
+  expect(before?.phase).toBe("interrupted_unqualified");
+  // Core's cancel after a restart runs the same stop sequence again: it used to be
+  // refused here on every retry, and the computer never came back online.
+  await fenceAndStop(journal, stopped, "stopped-ref");
+  expect(journal.execution.execution(stopped)).toEqual(before);
+});

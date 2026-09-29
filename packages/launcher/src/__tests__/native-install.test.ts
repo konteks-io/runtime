@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
-import { acquireNativeRootLock, loadNativeInstallation, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, restoreNativeRecord } from "../native/install.js";
+import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
+import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
 import { startNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
@@ -58,6 +58,21 @@ async function personDsh(root: string, version = "0.1.7-rc.2") {
   vi.stubEnv("DSH_EXECUTABLE", await realpath(pkg));
   vi.stubEnv("DSH_NODE", await realpath(join(prefix, "bin", "node")));
   return { pkg: await realpath(pkg), node: await realpath(join(prefix, "bin", "node")) };
+}
+
+/**
+ * The person's own OpenCode as npm installs it: a native-looking executable
+ * (Mach-O magic, never run) with the package's version beside it.
+ */
+async function personOpenCode(root: string, version = "2.0.18", name = "@opencode/cli") {
+  const pkg = join(root, "person-opencode", "lib", "node_modules", ...name.split("/"));
+  await mkdir(join(pkg, "bin"), { recursive: true });
+  const body = Buffer.alloc(OPENCODE_MIN_BINARY_BYTES + 16);
+  Buffer.from([0xcf, 0xfa, 0xed, 0xfe]).copy(body);
+  await writeFile(join(pkg, "bin", "opencode.exe"), body, { mode: 0o755 });
+  await writeFile(join(pkg, "package.json"), JSON.stringify({ name, version }));
+  vi.stubEnv("OPENCODE_EXECUTABLE", join(pkg, "bin", "opencode.exe"));
+  return { binary: await realpath(join(pkg, "bin", "opencode.exe")) };
 }
 
 describe("native install composition", () => {
@@ -205,7 +220,7 @@ describe("native install composition", () => {
       expect(lines.join("\n")).toMatch(
         new RegExp(`Control port ${taken} is occupied by another local process`),
       );
-      expect(lines.join("\n")).toContain("Native user service started");
+      expect(lines.join("\n")).toContain("Konteks is starting on this computer");
       expect((await readNativeRecord(f.root)).controlPort).not.toBe(taken);
     } finally {
       await new Promise<void>((resolve, reject) =>
@@ -395,13 +410,150 @@ describe("native install composition", () => {
     await expect(installNative(f.options as never)).rejects.toThrow();
     expect(f.activate).not.toHaveBeenCalled();
   });
-  it.each(["pi", "opencode"])("refuses the retired %s agent before activation or downloads", async retired => {
+  it.each([
+    // The agent list is packages' (7.1.0 names four; the Antigravity minor adds Google Antigravity).
+    ["pi", expect.stringMatching(/^pi is no longer supported\. Choose Claude Code, Codex, DeepSeek Harness(,| or) OpenCode( or Google Antigravity)? on your computer\.$/)],
+  ])("refuses %s before activation or downloads", async (retired, message) => {
     const f = await fixture();
     f.options.agents = ["codex", retired];
-    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "agent_unavailable", message: `${retired} is no longer supported. Choose Claude Code, Codex or DeepSeek Harness on your computer.` });
+    await expect(installNative(f.options as never)).rejects.toMatchObject({ code: "agent_unavailable", message });
     await expect(addNativeAgent({ root: f.root, agentId: retired, output: f.options.output } as never)).rejects.toMatchObject({ code: "agent_unavailable" });
     expect(f.activate).not.toHaveBeenCalled();
     expect(f.options.deps.fetchFn).not.toHaveBeenCalled();
+  });
+  it("never detects Google Antigravity at enrollment, and adds it there only after onboarding (antigravity CP6)", async () => {
+    const adapter = hostAgentInstallAdapter("antigravity")!;
+    expect(adapter.offered).toBe(true);
+    const locate = vi.spyOn(adapter, "locate").mockResolvedValue({ antigravityVersion: "1.2.1", antigravityRoot: "/nowhere" });
+    const fetch = vi.spyOn(adapter, "fetch");
+    try {
+      vi.stubEnv("DSH_EXECUTABLE", "/no-dsh");
+      vi.stubEnv("OPENCODE_EXECUTABLE", "/no-opencode");
+      const g = await fixture();
+      const enrolled = await recordNativeEnrollment({ root: g.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", deps: g.options.deps as never });
+      expect(enrolled.agents).not.toContain("antigravity");
+      const h = await fixture();
+      await expect(recordNativeEnrollment({ root: h.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", agents: ["codex", "antigravity"], deps: h.options.deps as never }))
+        .rejects.toMatchObject({ code: "agent_unavailable", message: "Google Antigravity is added after onboarding, once you agree to its download: konteks-remote agent add antigravity" });
+      expect(fetch).not.toHaveBeenCalled();
+    } finally { locate.mockRestore(); fetch.mockRestore(); }
+  });
+  it("installs, adds and removes Google Antigravity only on the person's yes, never consuming an activation on a no (antigravity CP6)", async () => {
+    const f = await fixture();
+    const adapter = hostAgentInstallAdapter("antigravity")!;
+    const folder = join(f.root, "agents", "antigravity", "1.2.1-darwin-arm64");
+    const fields = { antigravityVersion: "1.2.1", antigravityRoot: folder };
+    let fetched = false;
+    const spies = [
+      vi.spyOn(adapter, "assertFetchable").mockImplementation(() => undefined),
+      vi.spyOn(adapter, "locate").mockImplementation(async () => { if (!fetched) throw new Error("not fetched"); return fields; }),
+      vi.spyOn(adapter, "fetch").mockImplementation(async request => { expect(request).toEqual({ root: f.root, consent: true }); fetched = true; await mkdir(folder, { recursive: true, mode: 0o700 }); return fields; }),
+      vi.spyOn(adapter, "runnerSettings").mockImplementation(async record => {
+        if (record.antigravityRoot !== folder || !fetched) throw new Error("does not verify");
+        return { RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder, RUNNER_BRIDGE_PREFIX: folder, RUNNER_BRIDGE_VERSION: "1.2.1" };
+      }),
+    ];
+    try {
+      const asked: string[] = [];
+      f.options.agents = ["codex", "antigravity"];
+      // No: nothing downloaded, nothing activated.
+      await expect(installNative({ ...f.options, deps: { ...f.options.deps, consent: async (_agent: string, text: string) => { asked.push(text); return false; } } } as never))
+        .rejects.toMatchObject({ code: "agent_unavailable", message: "Nothing was downloaded: Google Antigravity was not added." });
+      expect(asked).toEqual([adapter.consentText]);
+      expect(adapter.fetch).not.toHaveBeenCalled();
+      expect(f.activate).not.toHaveBeenCalled();
+      // Yes: fetched before the activation, recorded beside Codex.
+      const installed = await installNative({ ...f.options, deps: { ...f.options.deps, consent: async () => true } } as never);
+      expect(installed).toMatchObject({ agents: ["codex", "antigravity"], ...fields });
+      expect(f.activate).toHaveBeenCalledTimes(1);
+      const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+      expect(loaded.runners.find(runner => runner.RUNNER_AGENT_ID === "antigravity")).toMatchObject({ RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder, RUNNER_BRIDGE_VERSION: "1.2.1" });
+      expect(await readdir(join(f.root, "releases", loaded.record.releaseId, "agents"))).toEqual(["codex"]);
+      // Removed: signed out first, dropped from the record, its folders gone, Codex untouched.
+      const signOut = vi.fn(async () => true);
+      const lines: string[] = [];
+      const output = { ...f.options.output, line: (text: string) => { lines.push(text); } };
+      await writeFile(join(f.root, "credentials", "antigravity", "sign-in.json"), "{}");
+      const removed = await removeNativeAgent({ root: f.root, agentId: "antigravity", output, deps: { roots: f.trust, platform: f.platform, signOut } });
+      expect(signOut).toHaveBeenCalledWith(f.root, expect.objectContaining({ agents: ["codex", "antigravity"] }));
+      expect(removed.agents).toEqual(["codex"]);
+      expect(removed).not.toHaveProperty("antigravityVersion");
+      expect(removed).not.toHaveProperty("antigravityRoot");
+      expect(await readNativeRecord(f.root)).toEqual(removed);
+      expect(await readdir(join(f.root, "credentials"))).toEqual(["codex"]);
+      expect(await readdir(join(f.root, "workspaces"))).toEqual(["codex"]);
+      await expect(readdir(join(f.root, "agents", "antigravity"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(lines.at(-1)).toBe("Google Antigravity removed from this computer: signed out, its download and its sign-ins here were deleted. Nothing else changed.");
+      // Added back without reactivation or a release, once it is fetched again.
+      fetched = true;
+      await mkdir(folder, { recursive: true, mode: 0o700 });
+      const added = await addNativeAgent({ root: f.root, agentId: "antigravity", output, deps: { roots: f.trust, platform: f.platform } });
+      expect(added).toMatchObject({ agents: ["codex", "antigravity"], ...fields, releaseId: removed.releaseId });
+      expect(lines.at(-1)).toBe("Google Antigravity 1.2.1 added: downloaded from Google and its signature checked; nothing else changed. To sign it in here with a Gemini API key: konteks-remote auth login antigravity --api-key. With Gemini Enterprise: konteks-remote auth login antigravity --enterprise --project <project id>");
+      expect(f.activate).toHaveBeenCalledTimes(1);
+      // Only Google Antigravity is removed this way.
+      await expect(removeNativeAgent({ root: f.root, agentId: "codex", output, deps: { roots: f.trust, platform: f.platform, signOut } })).rejects.toMatchObject({ code: "agent_unavailable" });
+    } finally { for (const spy of spies) spy.mockRestore(); }
+  });
+  it.runIf(process.platform !== "win32")("installs the person's own OpenCode 2 beside bundled agents, with no package of it, and enrollment detects it (CP6)", async () => {
+    const f = await fixture();
+    const opencode = await personOpenCode(f.root);
+    vi.stubEnv("DSH_EXECUTABLE", join(f.root, "no-dsh"));
+    expect(hostAgentInstallAdapter("opencode")?.offered).toBe(true);
+    const g = await fixture();
+    const enrolled = await recordNativeEnrollment({ root: g.root, coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", deps: g.options.deps as never });
+    expect(enrolled.agents).toEqual(expect.arrayContaining(["codex", "opencode"]));
+    await installNative({ ...f.options, agents: ["codex", "opencode"] } as never);
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.record).toMatchObject({ agents: ["codex", "opencode"], opencodeBinary: opencode.binary, opencodeVersion: "2.0.18" });
+    expect(loaded.runners.find(runner => runner.RUNNER_AGENT_ID === "opencode")).toMatchObject({ RUNNER_NATIVE_OPENCODE_BINARY: opencode.binary, RUNNER_BRIDGE_VERSION: "2.0.18" });
+    expect(loaded.unavailableAgents).toEqual([]);
+    expect(await readdir(join(f.root, "releases", loaded.record.releaseId, "agents"))).toEqual(["codex"]);
+    expect(await readdir(join(f.root, "credentials"))).toEqual(expect.arrayContaining(["codex", "opencode"]));
+    // Nothing of OpenCode was downloaded: only the connector and Codex's package.
+    expect(f.fetchFn.mock.calls.map(call => String(call[0])).some(url => /opencode/i.test(url))).toBe(false);
+  });
+  it.runIf(process.platform !== "win32")("refuses OpenCode 1, by name and with OpenCode 2's install command, before any activation is used", async () => {
+    const f = await fixture();
+    await personOpenCode(f.root, "1.18.33", "opencode-ai");
+    const refusal = await installNative({ ...f.options, agents: ["codex", "opencode"] } as never).catch(error => error);
+    expect(refusal).toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_unsupported_version" });
+    expect(refusal.message).toBe("OpenCode 1 is not supported (found 1.18.33): install OpenCode 2 with `curl -fsSL https://opencode.ai/v2/install | bash`, then retry.");
+    expect(f.activate).not.toHaveBeenCalled();
+    // And a 2.x outside the supported range the same way.
+    await personOpenCode(join(f.root, "three"), "3.0.0");
+    await expect(installNative({ ...f.options, agents: ["codex", "opencode"] } as never)).rejects.toMatchObject({ diagnostic: "opencode_unsupported_version" });
+    expect(f.activate).not.toHaveBeenCalled();
+  });
+  it.runIf(process.platform !== "win32")("adds OpenCode to an installed runtime without a new release or reactivation, and refuses OpenCode 1 there too", async () => {
+    const f = await fixture();
+    const first = await installNative(f.options as never);
+    await personOpenCode(f.root, "1.18.33", "opencode-ai");
+    await expect(addNativeAgent({ root: f.root, agentId: "opencode", output: createOutput({ json: true }), deps: { roots: f.trust, platform: f.platform, fetchFn: f.fetchFn } } as never))
+      .rejects.toMatchObject({ diagnostic: "opencode_unsupported_version" });
+    expect(await readNativeRecord(f.root)).toEqual(first);
+    const opencode = await personOpenCode(join(f.root, "two"));
+    const fetches = f.fetchFn.mock.calls.length;
+    const added = await addNativeAgent({ root: f.root, agentId: "opencode", output: createOutput({ json: true }), deps: { roots: f.trust, platform: f.platform, fetchFn: f.fetchFn } } as never);
+    expect(added).toMatchObject({ agents: ["codex", "opencode"], releaseId: first.releaseId, opencodeBinary: opencode.binary, opencodeVersion: "2.0.18" });
+    expect(f.fetchFn.mock.calls.length).toBe(fetches);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex", "opencode"]);
+    await expect(addNativeAgent({ root: f.root, agentId: "opencode", output: createOutput({ json: true }), deps: { roots: f.trust, platform: f.platform } } as never)).resolves.toMatchObject({ agents: ["codex", "opencode"] });
+  });
+  it.runIf(process.platform !== "win32")("keeps loading when the person's OpenCode went away or became OpenCode 1: OpenCode is left out with the reason, Codex runs (CP6)", async () => {
+    const f = await fixture();
+    await personOpenCode(f.root);
+    await installNative({ ...f.options, agents: ["codex", "opencode"] } as never);
+    await rm(join(f.root, "person-opencode"), { recursive: true, force: true });
+    await personOpenCode(join(f.root, "later"), "1.18.33", "opencode-ai");
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
+    expect(loaded.unavailableAgents.map(entry => [entry.agentId, entry.error.diagnostic])).toEqual([["opencode", "opencode_not_found"]]);
+    // Once OpenCode 2 is back (installed another way), the retry finds it again with no `agent add`.
+    const back = await personOpenCode(join(f.root, "again"));
+    await expect(loaded.unavailableAgents[0]!.relocate()).resolves.toMatchObject({ RUNNER_AGENT_ID: "opencode", RUNNER_NATIVE_OPENCODE_BINARY: back.binary, RUNNER_BRIDGE_VERSION: "2.0.18" });
   });
   it("rechecks the connector executable before OS service execution", async () => {
     const f = await fixture();

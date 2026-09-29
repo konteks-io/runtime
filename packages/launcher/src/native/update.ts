@@ -48,7 +48,7 @@ export async function stageNativeUpdate(options: { root: string; output: Output;
     const check = await checkNativeUpdate({ root, ...(options.deps ? { deps: options.deps } : {}) });
     if (check.status === "current") return check;
     const { current, release } = check;
-    // The person's own DeepSeek Harness is not in any release; only bundled agents are restaged.
+    // The person's own DeepSeek Harness and OpenCode are not in any release; only bundled agents are restaged.
     const agents = current.agents.filter(agent => !isHostAgentId(agent));
     const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: agents });
     if (artifacts.some(artifact => artifact.kind === "connector" ? artifact.format !== "executable" : artifact.format !== "offline_agent_tgz")) {

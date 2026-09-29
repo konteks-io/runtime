@@ -33,11 +33,13 @@ export function isDeniedBrowserTool(name: string): boolean {
 
 /**
  * The browser tool an ACP permission title names, if any: Claude Code's
- * `mcp__konteks-browser__browser_click`, or `konteks-browser.browser_click`
- * / `konteks-browser__browser_click` / `konteks-browser/browser_click`.
+ * and DeepSeek Harness's `mcp__konteks-browser__browser_click`, or
+ * `konteks-browser.browser_click` (OpenCode's Code Mode call) /
+ * `konteks-browser_browser_click` (its permission name) /
+ * `konteks-browser__browser_click` / `konteks-browser/browser_click`.
  */
 export function browserToolFromTitle(title: string | null | undefined): string | null {
   if (!title) return null;
-  const match = /^(?:mcp__)?konteks-browser(?:__|\.|\/|:)([A-Za-z0-9_-]+)/.exec(title.trim());
+  const match = /^(?:mcp__)?konteks-browser(?:__|_|\.|\/|:)([A-Za-z0-9_-]+)/.exec(title.trim());
   return match ? match[1]! : null;
 }

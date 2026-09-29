@@ -24,7 +24,7 @@ import {
   type SessionToCoreMessage,
   type SessionToRuntimeMessage,
 } from "@konteks/remote-common";
-import type { RunnerEvent } from "@konteks/remote-agent-runner";
+import { BROWSER_MCP_SERVER_NAME, type RunnerEvent } from "@konteks/remote-agent-runner";
 import type { RunnerPort } from "../runner-port.js";
 import type { SupervisorJournal } from "../state/journal.js";
 import type { TransportManager } from "../transport/relay-transport.js";
@@ -44,15 +44,18 @@ import {
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
-import { DshToolGovernance } from "./dsh-tool-governance.js";
+import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
+import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
+import { antigravityKonteksToolsLine, antigravityResultToolReference } from "./antigravity-prompt.js";
+import { openCodeKonteksToolsLine, openCodeResultToolReference } from "./opencode-prompt.js";
 import { compileResultSchema as compileTurnValidator, StructuredResultToolServer, toolInputSchema } from "../structured-result/result-tool-server.js";
 import {
   findStructuredContract,
   followUpRequestId,
   MAX_STRUCTURED_TURN_TEXT,
   parseFencedResult,
-  RESULT_FOLLOW_UP,
-  RESULT_TOOL_LINE,
+  resultFollowUp,
+  resultToolLine,
   resultToolLineWithSchema,
   rewriteStructuredPrompt,
   sumPromptUsage,
@@ -142,6 +145,8 @@ export interface RelayedSessionDeps {
   /** Rechecked immediately before a local prompt crosses into the bridge. */
   assertPromptAllowed?: () => void;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
+  /** A turn started or ended: the computer's busy state changed (WS1-179). */
+  onTurnActivity?: () => void;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
   /**
    * This machine's preview dev servers. Present, the session's agent gets the
@@ -189,8 +194,14 @@ export class RelayedSession {
   private readonly lastChunkText = new Map<string, { text: string; inPath: boolean }>();
   /** Safe tool identity carried from `tool_call` to sparse terminal updates. */
   private readonly toolActivityIdentity = new Map<string, CanonicalAcpToolIdentity>();
-  /** Rebuilds DeepSeek Harness permission requests and trips on an unasked tool (dsh-tool-governance.ts). */
-  private readonly dshGovernance: DshToolGovernance | null;
+  /** Rebuilds a host agent's permission requests and trips on an unapproved tool (host-tool-governance.ts: DeepSeek Harness, OpenCode). */
+  private readonly toolGovernance: HostToolGovernance | null;
+  /** The MCP servers this session gave its agent (the only Code Mode namespaces an OpenCode block may call, the only servers Antigravity may reach). */
+  private sessionServers: ReadonlySet<string> = new Set();
+  /** A governed permission request's tool call and options, until Konteks answers it. */
+  private readonly governedPermissions = new Map<string, { toolCallId: string; options: RequestPermissionRequest["options"] }>();
+  /** An OpenCode or Antigravity session is told once how Konteks runs its tools (in its first prompt). */
+  private toolFormTold = false;
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
   private readonly executionGate: NativeExecutionGate | null;
@@ -204,7 +215,7 @@ export class RelayedSession {
   private resultTools: StructuredResultToolServer | null = null;
   /** The turn that asked for a structured result, while it (or its one follow-up) runs. */
   private structuredTurn: StructuredTurnState | null = null;
-  /** The QA browser's gateway (Claude Code and Codex validation, QA and delivery sessions) and its output folder. */
+  /** The QA browser's gateway (validation, QA, delivery and conversation sessions of any agent, O8) and its output folder. */
   private browserGateway: PreviewBrowserGateway | null = null;
   private browserOutputDir: string | null = null;
   /** The logical session whose preview this session's agent drives. */
@@ -212,11 +223,11 @@ export class RelayedSession {
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
 
   constructor(readonly assignment: RemoteWorkAssignment, private readonly deps: RelayedSessionDeps) {
-    this.dshGovernance = assignment.agentRoute.agentId === "dsh" ? new DshToolGovernance() : null;
+    this.toolGovernance = hostToolGovernance(assignment.agentRoute.agentId);
     // Bound only after input preparation proves Core's claim-bound session.
     this.boundChannelId = null;
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
-    this.executionGate = (assignment.kind === "assistant_execution" || assignment.source.kind === "harness_delivery") && deps.executionAuthority
+    this.executionGate = isNativeTurn(assignment) && deps.executionAuthority
       ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, logger: this.logger, journal: deps.journal, clock: deps.clock,
         assertOwned: () => {
           if (!deps.assertExecutionOwned) throw new RemoteInstanceError("execution_fenced", "Execution ownership is unavailable.");
@@ -287,6 +298,11 @@ export class RelayedSession {
         code: known ? error.code : "unexpected_error",
         retryable: known ? error.retryable : false,
         ...(known && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+        // An unknown error still names its class and, for an agent's JSON-RPC
+        // refusal, its numeric code: no message text, but enough to tell
+        // "method not found" from "invalid params" (WS1-168).
+        ...(!known && error instanceof Error ? { errorName: error.name } : {}),
+        ...(!known && typeof (error as { code?: unknown } | null)?.code === "number" ? { rpcCode: (error as { code: number }).code } : {}),
       }, "native session bootstrap stage failed");
       throw error;
     }
@@ -303,7 +319,7 @@ export class RelayedSession {
     if (!parsedBinding.success) throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
     const binding = parsedBinding.data;
     if (binding.workspaceId !== this.assignment.workspaceId || binding.assignmentId !== this.assignment.id || binding.attempt !== this.assignment.attempt || binding.instanceId !== this.assignment.instanceId || binding.instanceId !== this.deps.instanceId ||
-        (this.assignment.source.kind === "conversation" && binding.sessionId !== this.assignment.source.sessionId) || !isAbsolute(prepared.cwd) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(prepared.cwd)) {
+        (continuedSession(this.assignment.source) !== null && binding.sessionId !== continuedSession(this.assignment.source)!.sessionId) || !isAbsolute(prepared.cwd) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(prepared.cwd)) {
       throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
     }
     this.preparedInputs = prepared;
@@ -312,7 +328,11 @@ export class RelayedSession {
     this.boundChannelId = `session:${binding.sessionId}`;
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     const mcpServers: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }> = [];
-    if (this.assignment.agentRoute.mcpCapabilityTokenRef) {
+    // A direct session is the person's own agent with nothing of Konteks in
+    // it (runtime-view R11, R14): no platform tools even when a capability
+    // is named, no preview or browser (not a preview kind), no result tool.
+    const direct = isDirectAssignment(this.assignment);
+    if (this.assignment.agentRoute.mcpCapabilityTokenRef && !direct) {
       const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
       this.deps.assertExecutionOwned?.();
       const facade = new McpCapabilityFacade({
@@ -344,8 +364,9 @@ export class RelayedSession {
     if (preview && PREVIEW_WORK_KINDS.has(this.assignment.kind)) {
       const sessionId = binding.sessionId;
       const cwd = prepared.cwd;
-      // The session's browser: only for an agent whose package carries one
-      // (Claude Code, Codex; never DeepSeek Harness), reaching only this
+      // The session's browser: the connector's (O8), for every agent when the
+      // connector has one (Claude Code and Codex run their own package's,
+      // DeepSeek Harness and OpenCode the connector's), reaching only this
       // session's running preview through its own gateway.
       const browserVersion = this.deps.runner.browserVersion?.() ?? null;
       if (browserVersion !== null && BROWSER_WORK_KINDS.has(this.assignment.kind) && preview.origin && preview.browsersPath) {
@@ -373,11 +394,14 @@ export class RelayedSession {
       preview.permit?.(sessionId, cwd);
       mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
     }
-    // The turn result tool: every session gets it, so a turn that asks for a
-    // structured result can be answered through a validated tool call.
-    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
-    this.resultTools = resultTools;
-    mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
+    // The turn result tool: every Konteks session gets it, so a turn that asks
+    // for a structured result can be answered through a validated tool call.
+    // A direct turn asks for none: it ends on the agent's own end_turn.
+    if (!direct) {
+      const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+      this.resultTools = resultTools;
+      mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
+    }
     // Optional tool wiring (Graft) ran alongside redemption and the facade.
     // The agent must find it in place, and the ownership commit below must
     // stay a short step from runner adoption, so settle it here. It never
@@ -452,6 +476,9 @@ export class RelayedSession {
         this.deps.assertExecutionOwned?.();
       },
     } : undefined;
+    // The browser is a stdio server the runner adds; OpenCode's Code Mode
+    // gate and its tools line need its name too.
+    this.sessionServers = new Set([...mcpServers.map(server => server.name), ...(browser ? [BROWSER_MCP_SERVER_NAME] : [])]);
     const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession({
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
@@ -460,6 +487,8 @@ export class RelayedSession {
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
       ...(restoreRef ? { restoreAcpSessionRef: restoreRef } : {}),
+      // A conversation's context is Konteks's to restage; a direct session's is
+      // only the agent's own transcript, so that one is loaded.
       ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
       ...(this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
       ...(browser ? { browser } : {}),
@@ -686,7 +715,7 @@ export class RelayedSession {
     const channelId = this.boundChannelId;
     if (this.closed || this.acpSessionRef === null || channelId === null || !this.channelOpened) return;
     this.deps.assertExecutionOwned?.();
-    if (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery") {
+    if (isNativeTurn(this.assignment)) {
       // Prepared Harness delivery must never fall back to bare ACP. The gate
       // must independently support its workload authority before dispatch.
       if (!this.executionGate) throw new RemoteInstanceError("execution_authority_unavailable", "Native execution admission is unavailable.");
@@ -734,11 +763,12 @@ export class RelayedSession {
           this.deps.assertExecutionOwned?.();
           this.deps.assertPromptAllowed?.();
           if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
-          const instructions = this.preparedInputs?.skillInstructions;
+          const instructions = this.promptInstructions();
           const params = instructions ? { ...request.params, prompt: [{ type: "text" as const, text: instructions }, ...request.params.prompt] } : request.params;
-          const prompt = await this.prepareStructuredPrompt(request.id, params.prompt);
+          const prompt = await this.prepareAgentPrompt(request.id, params.prompt);
           try { await this.deps.runner.prompt(ref, request.id, { ...params, prompt }); }
           catch (error) { this.endStructuredTurn(request.id); throw error; }
+          this.deps.onTurnActivity?.();
         }
         else if (request.method === "session/set_mode") await this.deps.runner.setMode(ref, request.id, request.params);
         else await this.deps.runner.setConfigOption(ref, request.id, request.params);
@@ -793,7 +823,7 @@ export class RelayedSession {
         try { await this.preparedInputs?.beforePrompt(); }
         catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
         this.deps.assertPromptAllowed?.();
-        const instructions = this.preparedInputs?.skillInstructions;
+        const instructions = this.promptInstructions();
         params = instructions ? { ...message.params, prompt: [{ type: "text" as const, text: instructions }, ...message.params.prompt] } : message.params;
       }
       if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
@@ -808,7 +838,7 @@ export class RelayedSession {
         ? { kind: "acp_error", id: message.id, method: message.method, error: classify(error) } : undefined;
       await gate.denyBeforeDispatch(operation.key, completion);
       const terminalTurnFailure =
-        (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery") &&
+        isNativeTurn(this.assignment) &&
         message.kind === "acp" &&
         message.method === "session/prompt" &&
         completion?.kind === "acp_error";
@@ -827,8 +857,9 @@ export class RelayedSession {
       if (message.method === "session/prompt") {
         try {
           const current = params as typeof message.params;
-          const prompt = await this.prepareStructuredPrompt(message.id, current.prompt);
+          const prompt = await this.prepareAgentPrompt(message.id, current.prompt);
           await this.deps.runner.prompt(ref, message.id, { ...current, prompt });
+          this.deps.onTurnActivity?.();
         }
         catch (error) {
           this.endStructuredTurn(message.id);
@@ -863,6 +894,7 @@ export class RelayedSession {
     const answer = message.kind === "acp_result" ? message.result : message.method === "elicitation/create" ? { action: "cancel" } : { outcome: { outcome: "cancelled" } };
     const verdict = this.deps.broker.answer(ref, message.id, answer);
     if (!verdict.ok) throw new RemoteInstanceError("operation_conflict", "The pending human answer is no longer admissible.");
+    this.notePermissionAnswer(message.id, answer);
     const delivered = await this.deps.runner.answer(ref, message.id, answer);
     if (!delivered.delivered) throw new RemoteInstanceError("operation_interrupted", "Answer delivery is unproven.");
     await gate.complete(operation.key);
@@ -918,9 +950,9 @@ export class RelayedSession {
         // A working agent keeps its preview from stopping as idle.
         if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
         this.observeStructuredText((event.params as { update?: unknown } | null)?.update);
-        const bypass = this.dshGovernance?.observe((event.params as { update?: unknown } | null)?.update) ?? null;
+        const bypass = this.toolGovernance?.observe((event.params as { update?: unknown } | null)?.update, this.sessionCwd()) ?? null;
         await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
-        if (bypass) await this.onDshGovernanceBypass(bypass);
+        if (bypass) await this.onToolGovernanceBypass(bypass);
         return;
       }
       case "prompt_result": {
@@ -944,9 +976,9 @@ export class RelayedSession {
             return;
           }
         }
+        if (event.method === "session/prompt") this.deps.onTurnActivity?.();
         const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
-        if (accepted && event.method === "session/prompt" &&
-            (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery")) {
+        if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
           // Say why before the close: its SIGTERM on the bridge was the only
           // trace of a Codex sign-in that could not refresh (WS2-141).
           this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable },
@@ -978,6 +1010,7 @@ export class RelayedSession {
 
   /** A prompt's completion (with any structured result already attached) goes to its holder. */
   private async onPromptResult(requestId: string, result: Record<string, unknown>): Promise<void> {
+    this.deps.onTurnActivity?.();
     if (this.assignment.kind === "delivery" && this.assignment.source.kind === "harness_delivery") {
       if (!this.preparedInputs?.acceptDeliveryOutput) {
         throw new RemoteInstanceError("capability_unavailable", "Generated delivery output cannot be accepted without current delivery authority.");
@@ -991,8 +1024,7 @@ export class RelayedSession {
     // session_exited leaks a claimed assignment and blocks the next turn.
     // Close this assignment, not the shared native server or its history.
     const stopReason = (result as { stopReason?: string })?.stopReason;
-    const nativeTurn = accepted &&
-      (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery");
+    const nativeTurn = accepted && isNativeTurn(this.assignment);
     if (nativeTurn && stopReason === "end_turn") await this.close("completed");
     else if (nativeTurn && typeof stopReason === "string" && !this.closed) {
       // A turn that ends any other way has still ENDED: a rejected tool
@@ -1028,8 +1060,32 @@ export class RelayedSession {
       return prompt;
     }
     this.structuredTurn = { requestId, validate: compileTurnValidator(contract.schema), definition, text: "", followUp: null };
-    const line = definition === "schema" ? RESULT_TOOL_LINE : resultToolLineWithSchema(contract.schema, toolInputSchema(contract.schema).wrapped);
+    const call = this.resultToolCall();
+    const line = definition === "schema" ? resultToolLine(call) : resultToolLineWithSchema(contract.schema, toolInputSchema(contract.schema).wrapped, call);
     return rewriteStructuredPrompt(prompt, contract, line);
+  }
+
+  /**
+   * The prompt the agent receives: the structured-result rewrite, and for an
+   * OpenCode or Google Antigravity session's first prompt, the one line
+   * saying how Konteks runs its tools (OpenCode's Code Mode,
+   * opencode-code-mode.ts; Antigravity's `call_mcp_tool`, antigravity-prompt.ts).
+   */
+  private async prepareAgentPrompt<B extends PromptBlock>(requestId: string, prompt: B[]): Promise<B[]> {
+    const prepared = await this.prepareStructuredPrompt(requestId, prompt);
+    const agentId = this.assignment.agentRoute.agentId;
+    // A direct session has no Konteks tools to tell its agent about.
+    if ((agentId !== "opencode" && agentId !== "antigravity") || this.toolFormTold || isDirectAssignment(this.assignment)) return prepared;
+    this.toolFormTold = true;
+    const line = agentId === "opencode" ? openCodeKonteksToolsLine(this.sessionServers) : antigravityKonteksToolsLine(this.sessionServers);
+    return [{ type: "text", text: line } as unknown as B, ...prepared];
+  }
+
+  /** How this session's agent is told to call the result tool; undefined for the plain tool name. */
+  private resultToolCall(): string | undefined {
+    const agentId = this.assignment.agentRoute.agentId;
+    if (agentId === "antigravity") return antigravityResultToolReference;
+    return agentId === "opencode" ? `\`${openCodeResultToolReference}\`` : undefined;
   }
 
   /** The turn never reached the agent (or was refused): forget it and put the tool back. */
@@ -1083,7 +1139,7 @@ export class RelayedSession {
     turn.text = "";
     this.logger.info({ event: "structured_result.follow_up", ...context }, "structured turn ended without a result; asking once more");
     try {
-      await this.deps.runner.prompt(this.acpSessionRef, followUpId, { prompt: [{ type: "text", text: RESULT_FOLLOW_UP }] });
+      await this.deps.runner.prompt(this.acpSessionRef, followUpId, { prompt: [{ type: "text", text: resultFollowUp(this.resultToolCall()) }] });
     } catch {
       this.endStructuredTurn(followUpId);
       return { requestId, result };
@@ -1113,26 +1169,31 @@ export class RelayedSession {
   private async onPermissionRequest(requestId: string, params: RequestPermissionRequest): Promise<void> {
     const ref = this.acpSessionRef;
     if (ref === null) return;
-    if (this.dshGovernance) {
-      // dsh asks with only a tool call id; judge the call it names, or refuse.
-      const verdict = this.dshGovernance.decide(params, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`);
+    if (this.toolGovernance) {
+      // A host agent is never answered "always", by policy or by a person:
+      // OpenCode would store it and stop asking; Antigravity would stop asking
+      // for that command in this workspace.
+      params = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
+      this.governedPermissions.set(requestId, { toolCallId: params.toolCall.toolCallId, options: params.options });
+      // A host agent's request is judged by the call it names, or refused.
+      const verdict = this.toolGovernance.decide(params, { cwd: this.sessionCwd(), servers: this.sessionServers, browserTools: this.browserGateway !== null });
       if (verdict.kind !== "evaluate") {
         if (this.closed) return;
         this.deps.assertExecutionOwned?.();
-        const kind = verdict.kind === "allow" ? "allow_once" : "reject_once";
-        const optionId = params.options.find(option => option.kind === kind)?.optionId;
+        const optionId = params.options.find(option => option.kind === (verdict.kind === "allow" ? "allow_once" : "reject_once"))?.optionId;
         if (verdict.kind === "deny") {
-          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId, reason: verdict.reason }, "DeepSeek Harness tool call refused by policy");
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId, reason: verdict.reason.slice(0, 512) },
+            `${this.toolGovernance.agentName} tool call refused by policy`);
         }
-        return void (await this.deps.runner.answer(ref, requestId, optionId === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
+        return void (await this.answerPermission(ref, requestId, optionId === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
       }
       params = verdict.request;
     }
-    const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.deps.workspaceRoot,
+    const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
       browserTools: this.browserGateway !== null });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
-    if (decision.kind === "allow") return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
+    if (decision.kind === "allow") return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
     // A refused tool ends the agent's turn on Claude Code; the log named
     // nothing about it, so a turn that stopped at a build command read as a
     // hung agent. Bounded, sanitized title only.
@@ -1140,26 +1201,74 @@ export class RelayedSession {
       title: sanitizePermissionRequest(params).params.title, decision: decision.kind,
       humanDeferralAllowed: this.assignment.policy.humanDeferralAllowed }, "tool permission not allowed by policy");
     if (decision.kind === "deny") {
-      return void (await this.deps.runner.answer(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
+      return void (await this.answerPermission(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
     }
-    if (!this.assignment.policy.humanDeferralAllowed) return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "cancelled" } }));
+    if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
     const sanitized = sanitizePermissionRequest(params);
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
-    if (!pending) return void (await this.deps.runner.answer(ref, requestId, { outcome: { outcome: "cancelled" } }));
+    if (!pending) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: params.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
   }
 
+  /** Answer a permission request, telling a host agent's governance what was decided (Antigravity pairs its own reports with it). */
+  private async answerPermission(ref: string, requestId: string, response: { outcome: { outcome: string; optionId?: string } }): Promise<void> {
+    this.notePermissionAnswer(requestId, response);
+    await this.deps.runner.answer(ref, requestId, response);
+  }
+
+  private notePermissionAnswer(requestId: string, response: unknown): void {
+    const governed = this.governedPermissions.get(requestId);
+    if (!governed) return;
+    this.governedPermissions.delete(requestId);
+    const outcome = (response as { outcome?: { outcome?: unknown; optionId?: unknown } } | null)?.outcome;
+    const option = outcome?.outcome === "selected" ? governed.options.find(candidate => candidate.optionId === outcome.optionId) : undefined;
+    this.toolGovernance?.answered?.(governed.toolCallId, option?.kind === "allow_once");
+  }
+
+  /** The working copy the session's agent runs in. */
   /**
-   * The Konteks ask hook did not run for a gated dsh tool that has now
-   * completed: stop the turn and take dsh out of service until the connector
-   * restarts, so at most one call ever runs unjudged.
+   * The folder the tool policy judges file changes against: the runner's
+   * workspace, except for a direct session, whose agent may change files only
+   * in its own private session folder, never another session's (runtime-view
+   * R13). Kept to direct sessions: Konteks's own kinds are proven against the
+   * workspace root today, and their tighter root is a change of its own.
    */
-  private async onDshGovernanceBypass(bypass: { toolCallId: string; title: string }): Promise<void> {
+  private policyRoot(): string {
+    return isDirectAssignment(this.assignment) ? this.sessionCwd() : this.deps.workspaceRoot;
+  }
+
+  /** What goes in front of the person's text: the staged skills line; nothing for a direct session, so a leading `/command` stays first (R11). */
+  private promptInstructions(): string | undefined {
+    return isDirectAssignment(this.assignment) ? undefined : this.preparedInputs?.skillInstructions || undefined;
+  }
+
+  private sessionCwd(): string {
+    return this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`;
+  }
+
+  /**
+   * A host agent ran a gated tool without Konteks' approval (dsh's ask hook
+   * did not run; OpenCode ran a call it never asked for, or a Code Mode call
+   * nobody approved): stop the turn and take the agent out of service until
+   * the connector restarts, so at most one call ever runs unjudged. The
+   * other agents keep running.
+   */
+  private async onToolGovernanceBypass(bypass: HostToolBypass): Promise<void> {
+    const governance = this.toolGovernance!;
     const ref = this.acpSessionRef;
-    this.logger.error({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: bypass.toolCallId, tool: bypass.title.slice(0, 128), diagnostic: "dsh_tool_governance_bypassed" },
-      "DeepSeek Harness ran a gated tool without asking; stopping the turn and taking it out of service");
+    this.logger.error({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: bypass.toolCallId, tool: bypass.title.slice(0, 128), diagnostic: governance.bypassDiagnostic },
+      `${governance.agentName} ran a gated tool without approval; stopping the turn and taking it out of service`);
+    // The line names what to fix: for Antigravity on Gemini Enterprise, a
+    // command that never asked is the organisation's admin setting (A21).
+    let credentialMethod: string | undefined;
+    if (governance.quarantineMessageFor) {
+      // The connector lists the credential in use first.
+      try { credentialMethod = (await this.deps.runner.readiness()).agent.credentials?.[0]?.method; }
+      catch { credentialMethod = undefined; }
+    }
+    const message = governance.quarantineMessageFor?.(bypass, credentialMethod) ?? governance.quarantineMessage;
     if (ref !== null) await this.deps.runner.cancel(ref).catch(error => this.logger.warn({ err: error }, "cancel after a governance bypass failed"));
-    await this.deps.runner.quarantine?.("DeepSeek Harness ran a tool without asking Konteks first. Update or reinstall DeepSeek Harness, then restart the connector.")
+    await this.deps.runner.quarantine?.(message)
       .catch(error => this.logger.warn({ err: error }, "quarantine after a governance bypass failed"));
     await this.close("agent_exited");
   }
@@ -1196,8 +1305,8 @@ export class RelayedSession {
       const source = this.assignment.source;
       // Core threads a request onto the assignment's own session: the
       // conversation, a native delivery's execution session, else the assignment.
-      const sessionId = source.kind === "conversation" ? source.sessionId
-        : source.kind === "harness_delivery" ? source.executionSessionId : this.assignment.id;
+      const sessionId = continuedSession(source)?.sessionId
+        ?? (source.kind === "harness_delivery" ? source.executionSessionId : this.assignment.id);
       registered = await registerDeferral(this.deps.registerDeferral, deferredPermissionBody({ ...args, sessionId }), { logger: this.logger });
       if (!registered) return null;
       if (this.closed) return null;

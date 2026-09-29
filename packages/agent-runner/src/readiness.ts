@@ -1,7 +1,8 @@
 import type { InitializeResponse } from "@agentclientprotocol/sdk";
-import { ConnectedAgentViewSchema, type ConnectedAgentView } from "@konteks/remote-common";
+import { ConnectedAgentViewSchema, type AvailableCommand, type ConnectedAgentCredential, type ConnectedAgentView } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { AgentScopeState } from "./auth/scope-store.js";
+import { hostAgentRunnerAdapter } from "./host/registry.js";
 
 /**
  * The sanitized `ConnectedAgentView` this runner publishes. It is computed
@@ -14,6 +15,11 @@ const TOOL_CONTROL: Record<AgentBridgeFamily["agentId"], ConnectedAgentView["acp
   codex: "approve",
   // Every non-read-only dsh tool asks through the Konteks hook (dsh-profile.ts).
   dsh: "approve",
+  // Every gated OpenCode tool asks through the locked Konteks config (CP2/CP4).
+  opencode: "approve",
+  // Every Antigravity tool that is not a read asks by default; mode stays
+  // `default` and its permission requests reach the Konteks policy (CP4).
+  antigravity: "approve",
 };
 
 export interface ReadinessInputs {
@@ -23,9 +29,15 @@ export interface ReadinessInputs {
   initializeResult: InitializeResponse | null;
   scope: AgentScopeState;
   identity: "signal" | "logged_out" | "no_official_signal" | "unknown";
+  /** What an agent with several sign-ins holds (OpenCode's `auth list`): provider, kind, billing, state; never a secret. */
+  credentials?: readonly ConnectedAgentCredential[];
   bridgeVersionCompatible: boolean;
-  /** The verified installed DSH version; never an ACP bridge version. */
+  /** The verified installed version of a host-installed agent; never an ACP bridge version. */
   hostAgentVersion?: string;
+  /** Whether turns report billing usage under the current sign-in, when the agent says (Antigravity: only on its key relay). */
+  tokenUsageObservable?: boolean;
+  /** The slash commands this agent announced on this computer and when (runtime-view R19). */
+  availableCommands?: { readonly commands: readonly AvailableCommand[]; readonly learntAt: string };
   lastProbeAt: string | null;
 }
 
@@ -39,9 +51,9 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
     authMode: inputs.authMode,
     accountScope: inputs.scope.accountScope,
     readiness,
-    // DeepSeek Harness returns no usage with a turn; its usage_update is
-    // context occupancy, not billing tokens (dsh-runtime-support D4).
-    tokenUsageObservable: inputs.family.agentId !== "dsh",
+    // A host agent may send no billing usage with a turn (DeepSeek Harness:
+    // its usage_update is context occupancy, dsh-runtime-support D4).
+    tokenUsageObservable: inputs.tokenUsageObservable ?? hostAgentRunnerAdapter(inputs.family.agentId)?.tokenUsageObservable ?? true,
     acpCapabilities: {
       sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
       forkSession: caps?.sessionCapabilities?.fork != null,
@@ -49,10 +61,15 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
       toolControl: TOOL_CONTROL[inputs.family.agentId],
     },
   };
-  if (inputs.family.agentId === "dsh" && inputs.hostAgentVersion) view.hostAgentVersion = inputs.hostAgentVersion;
+  if (inputs.family.hostInstall !== undefined && inputs.hostAgentVersion) view.hostAgentVersion = inputs.hostAgentVersion;
+  if (inputs.credentials !== undefined) view.credentials = inputs.credentials.map(credential => ({ ...credential }));
   if (inputs.scope.authIdentityFingerprint !== null) view.authIdentityFingerprint = inputs.scope.authIdentityFingerprint;
   if (inputs.scope.scopeAttestedAt !== null) view.scopeAttestedAt = inputs.scope.scopeAttestedAt;
   if (inputs.lastProbeAt !== null) view.lastProbeAt = inputs.lastProbeAt;
+  if (inputs.availableCommands !== undefined) {
+    view.availableCommands = inputs.availableCommands.commands.map(command => ({ ...command }));
+    view.availableCommandsLearntAt = inputs.availableCommands.learntAt;
+  }
   const recovery = deriveRecoveryAction(inputs, readiness);
   if (recovery) view.recoveryAction = recovery;
   return ConnectedAgentViewSchema.parse(view);

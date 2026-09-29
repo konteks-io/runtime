@@ -21,6 +21,10 @@ export interface DiscoverBridgeModelCapabilityOptions {
   logger?: Logger;
   retrySleep?: (delayMs: number) => Promise<void>;
   retryRandom?: () => number;
+  /** The agent's own `session/new` `_meta` (Antigravity's tool filter). */
+  sessionMeta?: Readonly<Record<string, unknown>>;
+  /** The agent's reading of its stderr (`HostAgentRunnerAdapter.stderrFailure`): a discovery that needs the person fails at once. */
+  stderrFailure?: SpawnBridgeOptions["stderrFailure"];
 }
 
 /** One offered value as the agent presents it: display name and group (dsh groups by provider). */
@@ -36,6 +40,24 @@ export interface DiscoveredBridgeModelCapability {
   offeredValues: string[];
   /** Parallel to `offeredValues`: same values, same order. */
   offeredOptions: DiscoveredModelOption[];
+}
+
+/**
+ * What may be offered under the agent's settings (OpenCode: Zen's free models
+ * only when the person switched them on, O6). A hidden current value gives way
+ * to the first offered one; nothing left to offer reads as needing a sign-in.
+ */
+export function offerableModelCapability(capability: DiscoveredBridgeModelCapability, offers: (value: string) => boolean, family: { agentId: string; displayName: string }): DiscoveredBridgeModelCapability {
+  const keep = capability.offeredValues.map(value => offers(value));
+  const offeredValues = capability.offeredValues.filter((_, index) => keep[index]);
+  if (offeredValues.length === 0) {
+    throw new RemoteInstanceError("agent_auth_required", `${family.displayName} has no model it may use here: sign it in, or switch on its free models.`, { recoveryActions: [{ kind: "login_agent", agentId: family.agentId }] });
+  }
+  return {
+    currentValue: offeredValues.includes(capability.currentValue) ? capability.currentValue : offeredValues[0]!,
+    offeredValues,
+    offeredOptions: capability.offeredOptions.filter((_, index) => keep[index]),
+  };
 }
 
 /** The most values one snapshot may carry (the Core wire bound). */
@@ -81,6 +103,7 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
               onCreateElicitation: rejectDiscoveryRequest,
               onExit: () => undefined,
             },
+            ...(options.stderrFailure ? { stderrFailure: options.stderrFailure } : {}),
           };
           spawned = bridge = await (options.spawn ?? spawnBridge)(spawnOptions);
           bridgeAcquired = true;
@@ -92,8 +115,9 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
           timer.unref();
         });
         const created = await Promise.race([
-          bridge.connection.newSession({ cwd, mcpServers: [], _meta: konteksSessionMetadata("Model capability check", options.spec.family.agentId) }),
+          bridge.connection.newSession({ cwd, mcpServers: [], _meta: { ...konteksSessionMetadata("Model capability check", options.spec.family.agentId), ...options.sessionMeta } }),
           deadline,
+          ...(bridge.failure ? [bridge.failure] : []),
         ]);
         sessionCreated = true;
         const matches = (created.configOptions ?? []).filter(option => option.id === options.configId);

@@ -184,6 +184,52 @@ export {
   RuntimeAgentLoginReportSchema,
   AgentLoginUserCodeSchema,
   agentLoginUrlAllowed,
+  // OpenCode's sign-ins the site may start (opencode-runtime-support CP3/CP7).
+  REMOTE_AGENT_LOGIN_OPENCODE_CAPABILITY,
+  OPENCODE_LOGIN_OPTIONS,
+  OPENCODE_LOGIN_OPTION_IDS,
+  OpenCodeLoginOptionIdSchema,
+  type OpenCodeLoginOptionId,
+  type OpenCodeLoginOption,
+  openCodeLoginOptionFor,
+  openCodeLoginOptionCapability,
+  OpenCodeLoginUserCodeSchema,
+  agentLoginMethod,
+  // Google Antigravity's sign-ins (antigravity-runtime-support CP3): Gemini
+  // Enterprise from the site with its Google Cloud project; any agent's option.
+  REMOTE_AGENT_LOGIN_ANTIGRAVITY_CAPABILITY,
+  ANTIGRAVITY_LOGIN_OPTIONS,
+  AntigravityLoginOptionIdSchema,
+  type AntigravityLoginOptionId,
+  antigravityLoginOptionCapability,
+  AgentLoginOptionIdSchema,
+  type AgentLoginOptionId,
+  AgentLoginGcpSchema,
+  type AgentLoginGcp,
+  GoogleCloudProjectIdSchema,
+  GeminiEnterpriseLocationSchema,
+  GEMINI_ENTERPRISE_LOCATIONS,
+  type AgentLoginFailure,
+  // A step the connector brings to the front on the computer for a site-started action.
+  REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
+  ON_COMPUTER_LOGIN_OPTION,
+  type OnComputerStep,
+  // A connected agent's credentials (CP3) and the money basis of a turn (O7).
+  ConnectedAgentCredentialSchema,
+  type ConnectedAgentCredential,
+  MAX_CONNECTED_AGENT_CREDENTIALS,
+  // A fetched host agent's download state (Antigravity CP3 prep).
+  HostAgentDownloadSchema,
+  type HostAgentDownload,
+  remoteMoneyBasisFor,
+  type RemoteMoneyBasis,
+  REMOTE_OPENCODE_FREE_MODELS_CAPABILITY,
+  // The Core wire-contract version signed into the desired configuration
+  // (antigravity CP6): this build reads `coreContractVersion` and advertises
+  // the capability that asks Core for it.
+  REMOTE_CORE_CONTRACT_CAPABILITY,
+  REMOTE_CORE_CONTRACT_VERSION,
+  coreContractAtLeast,
   EXECUTION_REVISION_CONTROL_SCHEMA_VERSION,
   EXECUTION_REVISION_CONTROL_CAPABILITY,
   EXECUTION_REVISION_CONTROL_MAX_DELIVERY_MS,
@@ -451,3 +497,33 @@ export type {
   PreviewHeaderRejection,
   PreviewPathRejection,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
+
+/**
+ * The runtime view (runtime-view CP1, packages 7.1.0 fold-in): the `direct`
+ * work kind a person's own chat on this computer arrives as, the slash
+ * commands each agent announced here (R19), the real state of every
+ * supported agent (R21), and the connector commands manifest shipped with
+ * the release (R20).
+ */
+export {
+  DIRECT_WORK_KIND,
+  isDirectWorkKind,
+  AVAILABLE_COMMAND_LIMITS,
+  AvailableCommandListSchema,
+  normalizeAvailableCommands,
+  SUPPORTED_AGENT_STATES,
+  SupportedAgentEntrySchema,
+  SupportedAgentListSchema,
+  RUNTIME_PLATFORM_OSES,
+  ConnectorCommandsManifestSchema,
+  connectorCommandsFor,
+} from "@konteks/backstage-plugin-common";
+export type {
+  AvailableCommand,
+  RawAvailableCommand,
+  SupportedAgentState,
+  SupportedAgentEntry,
+  RuntimePlatformOs,
+  ConnectorCommand,
+  ConnectorCommandsManifest,
+} from "@konteks/backstage-plugin-common";

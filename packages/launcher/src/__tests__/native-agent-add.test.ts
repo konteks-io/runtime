@@ -2,8 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { acquireNativeRootLock } from "@konteks/remote-supervisor";
-import { runNativeAgentAdd } from "../native/commands.js";
+import { acquireNativeRootLock, antigravityInstallAdapter, ANTIGRAVITY_CONSENT_TEXT } from "@konteks/remote-supervisor";
+import { runNativeAgentAdd, runNativeAgentRemove } from "../native/commands.js";
+import { fetchHostAgent } from "../native/install.js";
+import { terminalFetchConsent } from "../native/consent.js";
+import { PassThrough } from "node:stream";
 import { createOutput } from "../output.js";
 
 const roots: string[] = [];
@@ -124,5 +127,105 @@ describe("native agent-add ownership lifecycle", () => {
     expect(f.restore).toHaveBeenCalledOnce();
     expect(f.start).toHaveBeenCalledTimes(2);
     expect(f.calls.indexOf("restore")).toBeLessThan(f.calls.lastIndexOf("start"));
+  });
+});
+
+describe("Google Antigravity's add and remove (antigravity CP6)", () => {
+  const quiet = () => { const lines: string[] = []; return { lines, output: { ...createOutput({ json: false, stdout: { write: () => true } as never }), line: (text: string) => { lines.push(text); } } }; };
+
+  it("asks the consent line and downloads while the service keeps running, then stops, adds and restarts", async () => {
+    const f = await fixture();
+    f.owner.release();
+    const asked: string[] = [];
+    const fetchAgent = vi.fn(async (host, root: string, consent) => {
+      f.calls.push("fetch");
+      expect(await consent!(host.agentId, host.consentText!)).toBe(true);
+      expect(root).toBe(f.root);
+      return {};
+    }) as unknown as typeof fetchHostAgent;
+    await runNativeAgentAdd({ root: f.root, agent: "antigravity", output: quiet().output }, { ...f.deps, fetchAgent, consent: async (_agent: string, text: string) => { asked.push(text); return true; } } as never);
+    expect(asked).toEqual([ANTIGRAVITY_CONSENT_TEXT]);
+    expect(f.calls.indexOf("fetch")).toBeLessThan(f.calls.indexOf("drain"));
+    expect(f.calls).toEqual(expect.arrayContaining(["fetch", "drain", "stop", "add", "start"]));
+  });
+
+  it("changes and stops nothing when the person says no, or the download fails", async () => {
+    for (const failure of ["no", "download"] as const) {
+      const f = await fixture();
+      f.owner.release();
+      const fetchAgent = vi.fn(async (host, root: string, consent) => {
+        if (failure === "no") return fetchHostAgent(host, root, consent);
+        throw new Error("the download server could not be reached");
+      }) as unknown as typeof fetchHostAgent;
+      const located = vi.spyOn(antigravityInstallAdapter, "locate").mockRejectedValue(new Error("not fetched"));
+      const fetched = vi.spyOn(antigravityInstallAdapter, "fetch");
+      const pinned = vi.spyOn(antigravityInstallAdapter, "assertFetchable").mockImplementation(() => undefined);
+      try {
+        await expect(runNativeAgentAdd({ root: f.root, agent: "antigravity", output: quiet().output }, { ...f.deps, fetchAgent, consent: async () => false } as never))
+          .rejects.toThrow(failure === "no" ? /Nothing was downloaded: Google Antigravity was not added\./ : /could not be reached/);
+        expect(fetched).not.toHaveBeenCalled();
+        expect(f.calls).toEqual([]);
+        expect(f.add).not.toHaveBeenCalled();
+      } finally { located.mockRestore(); fetched.mockRestore(); pinned.mockRestore(); }
+    }
+  });
+
+  it("says already installed for a listed copy that verifies, and fetches a listed copy that no longer does", async () => {
+    const f = await fixture();
+    f.owner.release();
+    const listed = { instanceId: "instance", releaseId: "release-one", controlPort: 41800, agents: ["codex", "antigravity"] } as never;
+    const settings = vi.spyOn(antigravityInstallAdapter, "runnerSettings").mockResolvedValue({ RUNNER_BRIDGE_PREFIX: "/x", RUNNER_BRIDGE_VERSION: "1.2.1" });
+    const fetchAgent = vi.fn(async () => { f.calls.push("fetch"); return {}; }) as unknown as typeof fetchHostAgent;
+    try {
+      const first = quiet();
+      await runNativeAgentAdd({ root: f.root, agent: "antigravity", output: first.output }, { ...f.deps, readRecord: async () => listed, fetchAgent, consent: async () => true } as never);
+      expect(first.lines).toEqual(["Google Antigravity is already installed; no restart is needed."]);
+      expect(f.calls).toEqual([]);
+      settings.mockRejectedValue(new Error("does not match Google's release"));
+      await runNativeAgentAdd({ root: f.root, agent: "antigravity", output: quiet().output }, { ...f.deps, readRecord: async () => listed, fetchAgent, consent: async () => true } as never);
+      expect(f.calls).toEqual(expect.arrayContaining(["fetch", "stop", "add", "start"]));
+    } finally { settings.mockRestore(); }
+  });
+
+  it("shows the consent line verbatim and reads a yes in a terminal, takes --yes as the answer, and refuses without a terminal", async () => {
+    const lines: string[] = [];
+    const input = new PassThrough();
+    const shown: string[] = [];
+    const output = new PassThrough();
+    output.on("data", chunk => shown.push(String(chunk)));
+    const asking = terminalFetchConsent({ line: text => lines.push(text), input, output });
+    const answer = asking("antigravity", ANTIGRAVITY_CONSENT_TEXT);
+    input.write("y\n");
+    await expect(answer).resolves.toBe(true);
+    expect(shown.join("")).toBe(`${ANTIGRAVITY_CONSENT_TEXT} `);
+    const declining = terminalFetchConsent({ line: text => lines.push(text), input: (() => { const empty = new PassThrough(); empty.end("\n"); return empty; })(), output: new PassThrough() });
+    await expect(declining("antigravity", ANTIGRAVITY_CONSENT_TEXT)).resolves.toBe(false);
+    await expect(terminalFetchConsent({ yes: true, line: text => lines.push(text) })("antigravity", ANTIGRAVITY_CONSENT_TEXT)).resolves.toBe(true);
+    expect(lines).toEqual([ANTIGRAVITY_CONSENT_TEXT, "Answered yes with --yes."]);
+    if (process.stdin.isTTY !== true) {
+      await expect(terminalFetchConsent({ line: text => lines.push(text) })("antigravity", ANTIGRAVITY_CONSENT_TEXT)).rejects.toMatchObject({ code: "agent_unavailable", message: expect.stringMatching(/--yes/) });
+      expect(lines.at(-1)).toBe(ANTIGRAVITY_CONSENT_TEXT);
+    }
+  });
+
+  it("removes it after one yes: drains, stops, removes, restarts; a no or another agent changes nothing", async () => {
+    const f = await fixture();
+    f.owner.release();
+    const listed = { instanceId: "instance", releaseId: "release-one", controlPort: 41800, agents: ["codex", "antigravity"] } as never;
+    const remove = vi.fn(async () => { f.calls.push("remove"); return { instanceId: "instance", agents: ["codex"] } as never; });
+    const base = { ...f.deps, readRecord: async () => listed, remove };
+    const declined = quiet();
+    await runNativeAgentRemove({ root: f.root, agent: "antigravity", output: declined.output }, { ...base, confirm: async () => false } as never);
+    expect(declined.lines).toEqual(["Nothing was removed; Google Antigravity is still added here."]);
+    expect(f.calls).toEqual([]);
+    await expect(runNativeAgentRemove({ root: f.root, agent: "codex", output: quiet().output }, { ...base, confirm: async () => true } as never))
+      .rejects.toMatchObject({ code: "agent_unavailable", message: expect.stringMatching(/Only Google Antigravity, which Konteks downloads, can: konteks-remote agent remove antigravity/) });
+    expect(f.calls).toEqual([]);
+    const questions: string[] = [];
+    await runNativeAgentRemove({ root: f.root, agent: "antigravity", output: quiet().output }, { ...base, confirm: async (question: string) => { questions.push(question); return true; } } as never);
+    expect(questions).toEqual([expect.stringMatching(/^Remove Google Antigravity from this computer\? Konteks signs it out, deletes its download and its sign-ins here/)]);
+    expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf("stop"));
+    expect(f.calls.indexOf("stop")).toBeLessThan(f.calls.indexOf("remove"));
+    expect(f.calls.indexOf("remove")).toBeLessThan(f.calls.indexOf("start"));
   });
 });

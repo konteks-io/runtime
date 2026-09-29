@@ -69,6 +69,99 @@ describe("doctor and support bundle", () => {
     expect(assertDoctorHasNoSecrets(chrome)).toBeUndefined();
   });
 
+  it("reports the person's own OpenCode: version, install, settings check, sign-ins by label, free models, browser, or why it is left out (opencode CP6)", async () => {
+    const base = {
+      now: () => "2026-09-06T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
+      relay: { state: "connected", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: true, components: [], agents: [],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true,
+    };
+    const running = { state: "running" as const, version: "2.0.18", installKind: "homepage installer", selfCheck: "passed" as const, freeModels: false, browser: true };
+    const signedIn = await runDoctor({ ...base, openCode: { ...running, credentials: [{ label: "OpenCode Console account", state: "ready" }, { label: "OpenAI key", state: "needs_sign_in" }] } });
+    expect(signedIn.checks.find(check => check.id === "opencode")).toMatchObject({ status: "pass", recoveryActions: [],
+      detail: "OpenCode 2.0.18, installed with OpenCode's homepage installer; Konteks settings check passed; signed in with OpenCode Console account, OpenAI key (needs sign-in); OpenCode Zen free models off; its sessions get the QA browser" });
+    expect(assertDoctorHasNoSecrets(signedIn)).toBeUndefined();
+    // Nothing signed in, but Core's free-models switch on: it runs on Zen's free models.
+    const free = await runDoctor({ ...base, openCode: { ...running, installKind: "another location", credentials: [], freeModels: true, browser: false } });
+    expect(free.checks.find(check => check.id === "opencode")).toMatchObject({ status: "pass",
+      detail: "OpenCode 2.0.18, installed in a custom location; Konteks settings check passed; not signed in to any provider (konteks-remote auth login opencode); OpenCode Zen free models on; no QA browser for its sessions" });
+    for (const [failure, words] of [
+      ["opencode_not_found", "no longer installed where this computer found it"],
+      ["opencode_unsupported_version", "a version Konteks does not support"],
+      ["opencode_unsafe_install", "can be changed by other users"],
+      ["opencode_unsupported_installation", "does not keep the Konteks settings"],
+      ["opencode_self_check_failed", "settings check could not run"],
+      [undefined, "the connector log says why"],
+    ] as const) {
+      const left = await runDoctor({ ...base, openCode: { ...running, state: "retrying", selfCheck: "failed", failure, credentials: [] } });
+      const check = left.checks.find(entry => entry.id === "opencode");
+      expect(check).toMatchObject({ status: "fail", recoveryActions: [{ kind: "install_backend", agentId: "opencode" }] });
+      expect(check?.detail).toContain(words);
+      expect(check?.detail).toContain("tried again in the background");
+      expect(assertDoctorHasNoSecrets(left)).toBeUndefined();
+    }
+    const gaveUp = await runDoctor({ ...base, openCode: { ...running, state: "given_up", version: null, installKind: null, selfCheck: "not_run", failure: "opencode_not_found", credentials: [] } });
+    expect(gaveUp.checks.find(check => check.id === "opencode")?.detail).toBe("OpenCode is not running Konteks work: OpenCode 2 is no longer installed where this computer found it; install it again from opencode.ai; it is no longer retried; restart the connector once it is fixed");
+    // Not listed: no line at all.
+    expect((await runDoctor(base)).checks.find(check => check.id === "opencode")).toBeUndefined();
+  });
+
+  it("reports Google Antigravity: pinned version, Google's signature, sign-ins with the no-licence remedy, MCP Servers off, Require review, disk, browser, or why it is left out (antigravity CP6)", async () => {
+    const base = {
+      now: () => "2026-09-29T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
+      relay: { state: "connected", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: true, components: [], agents: [],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true,
+    };
+    const enterprise = { label: "Gemini Enterprise Plus", state: "ready", method: "oauth-business" };
+    const key = { label: "Gemini API key", state: "needs_sign_in", method: "gemini-api-key" };
+    const running = { state: "running" as const, pinnedVersion: "1.2.1", download: "ready" as const, selfCheck: "passed" as const, updating: false,
+      credentials: [enterprise, key], quarantine: null, mcpServersOffAt: null, diskBytes: 397_584_640, browser: true };
+    const check = async (antigravity: Record<string, unknown>) => {
+      const report = await runDoctor({ ...base, antigravity: { ...running, ...antigravity } as never });
+      expect(assertDoctorHasNoSecrets(report)).toBeUndefined();
+      return report.checks.find(entry => entry.id === "antigravity")!;
+    };
+    expect(await check({})).toMatchObject({ status: "pass", title: "Google Antigravity", recoveryActions: [],
+      detail: "Google Antigravity 1.2.1, downloaded from Google, signature checked; start check passed; signed in with Gemini Enterprise Plus, Gemini API key (needs sign-in); 398 MB on disk; its sessions get the QA browser" });
+    // No sign-in at all: both commands; no licence: the Business AI Code API, never the project.
+    expect(await check({ credentials: [], browser: false })).toMatchObject({ status: "warn", recoveryActions: [{ kind: "login_agent", agentId: "antigravity" }],
+      detail: expect.stringContaining("not signed in (konteks-remote auth login antigravity --api-key, or --enterprise --project <project id>); 398 MB on disk; no QA browser for its sessions") });
+    const noLicence = await check({ credentials: [{ ...enterprise, state: "needs_sign_in", reason: "no_license" }] });
+    expect(noLicence.status).toBe("warn");
+    expect(noLicence.detail).toContain("Gemini Enterprise Plus (no licence found: turn on the Business AI Code API with `gcloud services enable businessaicode.googleapis.com --project <project id>`, then sign in again with konteks-remote auth login antigravity --enterprise)");
+    // The organisation's MCP Servers off, while Gemini Enterprise is in use: a warning with the setting.
+    const mcpOff = await check({ mcpServersOffAt: "2026-09-29T01:02:03.000Z" });
+    expect(mcpOff.status).toBe("warn");
+    expect(mcpOff.detail).toContain("Konteks tools unavailable: turn on MCP Servers in Gemini Enterprise settings");
+    expect((await check({ mcpServersOffAt: "2026-09-29T01:02:03.000Z", credentials: [{ ...key, state: "ready" }] })).detail).not.toContain("MCP Servers");
+    // A21: the Require review line.
+    const a21 = await check({ quarantine: "Your organisation's Gemini Enterprise settings let Antigravity run commands without asking. Ask your Google Cloud admin to set Terminal auto-execution to Require review, then restart the connector." });
+    expect(a21.status).toBe("fail");
+    expect(a21.detail).toContain("Needs your organisation's Require review setting");
+    expect(a21.detail).toContain('"Terminal auto-execution: Require review"');
+    expect((await check({ quarantine: "Google Antigravity ran a tool without Konteks' approval. Update the connector, then restart it." })).detail)
+      .toBe("Google Antigravity 1.2.1 was taken out of service: Google Antigravity ran a tool without Konteks' approval. Update the connector, then restart it.");
+    // An update's new copy is downloaded; used from the next start.
+    expect((await check({ download: "update_available" })).detail).toContain("a newer version is downloaded and is used from the next start");
+    for (const [failure, words, action] of [
+      ["antigravity_not_fetched", "not downloaded to this computer (konteks-remote agent add antigravity downloads it after you say yes)", "install_backend"],
+      ["antigravity_unsafe_install", "does not match Google's release, so it never runs", "install_backend"],
+      ["antigravity_no_disk_space", "about 1.2 GB free", "free_disk"],
+      ["antigravity_unsupported_platform", "Google publishes no copy of it for this computer yet", undefined],
+      ["antigravity_self_check_failed", "its start check could not run", "install_backend"],
+    ] as const) {
+      const left = await check({ state: "retrying", selfCheck: "failed", failure, credentials: [], download: undefined, diskBytes: null });
+      expect(left.status).toBe("fail");
+      expect(left.detail).toContain(words);
+      expect(left.detail).toContain("tried again in the background");
+      expect(left.recoveryActions).toEqual(action ? [{ kind: action, ...(action === "install_backend" || action === "free_disk" ? { agentId: "antigravity" } : {}) }] : []);
+    }
+    // After `konteks-remote update` carried a new pin: being fetched, checked, then used.
+    expect((await check({ state: "retrying", failure: "antigravity_unsupported_version", updating: true, pinnedVersion: "1.2.4", credentials: [] })).detail)
+      .toBe("Google Antigravity 1.2.4 is not running Konteks work: this connector release runs 1.2.4, which is being downloaded from Google and checked before it is used; it is tried again in the background, and the other agents keep running");
+    // Not listed: no line at all.
+    expect((await runDoctor(base)).checks.find(entry => entry.id === "antigravity")).toBeUndefined();
+  });
+
   it("the support bundle carries config keys without values, is redacted, chunked, and secret-scanned", () => {
     const bundle = buildSupportBundle({
       bundleVersion: "1.0.0",

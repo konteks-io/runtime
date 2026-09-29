@@ -1,11 +1,11 @@
-import { createHash, randomBytes } from "node:crypto";
-import { keyedFingerprint, readOrCreateSecretFile, runCommand } from "@konteks/remote-common";
+import { randomBytes } from "node:crypto";
+import { keyedFingerprint, readOrCreateSecretFile, runCommand, type ConnectedAgentCredential } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import { resolveToolingCommand } from "../bridge/spec.js";
 import { readCodexAccount } from "./codex-account.js";
-import { readDshApiKey } from "./dsh-key.js";
-import { dshRuntimePaths } from "../bridge/dsh-profile.js";
+import { hostAgentRunnerAdapter } from "../host/registry.js";
+import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentSettings } from "../host/host-agent.js";
 
 /**
  * The opaque `authIdentityFingerprint` (D111): a keyed hash of the identity
@@ -18,8 +18,10 @@ import { dshRuntimePaths } from "../bridge/dsh-profile.js";
 export const FINGERPRINT_KEY_FILE = "fingerprint.key";
 
 export type IdentityProbe =
-  | { kind: "signal"; fingerprint: string }
-  | { kind: "logged_out" }
+  // `credentials`: what an agent with several sign-ins reported (OpenCode's `auth list`), no secret.
+  // `tokenUsageObservable`: whether turns under this identity report billing usage (Antigravity: only through its key relay).
+  | { kind: "signal"; fingerprint: string; credentials?: ConnectedAgentCredential[]; tokenUsageObservable?: boolean }
+  | { kind: "logged_out"; credentials?: ConnectedAgentCredential[] }
   | { kind: "no_official_signal" };
 
 export interface IdentityProbeDeps {
@@ -32,15 +34,12 @@ export async function probeIdentity(
   family: AgentBridgeFamily,
   env: NodeJS.ProcessEnv,
   deps: IdentityProbeDeps = {},
+  settings: HostAgentSettings = DEFAULT_HOST_AGENT_SETTINGS,
 ): Promise<IdentityProbe> {
-  if (family.agentId === "dsh") {
-    // DeepSeek Harness has no login: the identity is the API key the runtime
-    // stored in its own dsh home (dsh-key.ts). Only a hash of it is keyed here.
-    const apiKey = await readDshApiKey(dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR).credentialsFile);
-    if (apiKey === null) return { kind: "logged_out" };
-    const key = await readOrCreateSecretFile({ bytes: 32, dataDir: config.RUNNER_CREDENTIAL_DIR, encoding: "base64url", fileName: FINGERPRINT_KEY_FILE });
-    return { kind: "signal", fingerprint: keyedFingerprint(Buffer.from(key, "base64url"), `dsh\n${createHash("sha256").update(apiKey).digest("hex")}`) };
-  }
+  // A host-installed agent answers itself: DeepSeek Harness with a keyed hash
+  // of the API key the runtime stored, OpenCode from its own `auth list`.
+  const host = hostAgentRunnerAdapter(family.agentId);
+  if (host?.identity) return host.identity(config, settings);
   if (!family.tooling.identitySignal) return { kind: "no_official_signal" };
   const key = await readOrCreateSecretFile({ bytes: 32, dataDir: config.RUNNER_CREDENTIAL_DIR, encoding: "base64url", fileName: FINGERPRINT_KEY_FILE });
   if (family.agentId === "codex") {

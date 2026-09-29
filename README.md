@@ -7,11 +7,13 @@ not build or deploy the connector from that checkout.
 
 `konteks-remote` is the Konteks native runtime connector. It installs on a
 developer's or team's own machine, runs the coding agents that are already
-installed there (Claude Code, Codex, DeepSeek Harness) under their
-own subscriptions or keys, and connects them to a Konteks workspace over an
-outbound, authenticated channel. No Docker, no local databases. The only
-provider key on the host is a DeepSeek API key, if you use DeepSeek Harness,
-kept in the connector's private folder.
+installed there (Claude Code, Codex, DeepSeek Harness, OpenCode 2), and
+Google Antigravity, which it downloads from Google after you say yes, under
+their own subscriptions or keys, and connects them to a Konteks workspace over
+an outbound, authenticated channel. No Docker, no local databases. The only
+provider keys on the host are the ones you give DeepSeek Harness, OpenCode or
+Google Antigravity (a DeepSeek key; any provider's key OpenCode supports; a
+Gemini API key), kept in the connector's private folder.
 
 ## Install
 
@@ -39,7 +41,7 @@ rather than piped into `sh`. It ends by printing the first onboarding step as
 JSON; each later step comes from `konteks-remote onboard --json`.
 
 Once the folder is a repository, onboarding offers Graft, a map of the code
-that Claude Code, Codex and DeepSeek Harness read before they search. On a yes the connector
+that Claude Code, Codex, DeepSeek Harness and OpenCode read before they search. On a yes the connector
 downloads the release's Graft package, checks it against the digest the
 installer recorded from the signed checksums, and unpacks it in `~/.graft`
 with its own copy of Node, so it needs no Node on the laptop and keeps working
@@ -78,6 +80,7 @@ Supported platforms: macOS 13+ (Apple silicon and Intel), Windows 10/11
 konteks-remote status          # cloud readiness, lease, agents
 konteks-remote auth login codex
 konteks-remote auth login dsh  # asks for your DeepSeek API key, without echo
+konteks-remote auth login opencode  # pick a provider, then its link and code, or its API key without echo
 konteks-remote agents
 konteks-remote doctor
 konteks-remote preview status  # this computer's live session previews (read-only)
@@ -86,6 +89,33 @@ konteks-remote update          # stage, drain, swap, verify; rolls back on failu
 konteks-remote stop | start
 konteks-remote uninstall       # finish running work, remove this runtime from its workspace, delete the connector
 ```
+
+The connector tells Konteks these commands, with one plain line each and the
+systems they run on (`packages/release/src/connector-commands.json`, checked
+against the launcher's real command table and built into the connector), so
+the runtime's page lists exactly what the installed connector has. Each
+release also publishes them as `commands.json`.
+
+### What the runtime page shows
+
+The connector tells Konteks, on each heartbeat, every supported agent's real
+state on this computer (ready, needs sign-in, sign-in expired, not installed,
+unsupported version, installed but not added, not added, failed, or not
+supported on this system), with the version it found, the supported range and
+the install command. Agents it does not run are looked up the way onboarding
+does, in the background (a minute, doubling to fifteen), never by running an
+agent with your credentials. It also reports each agent's slash commands, the
+latest list the agent announced in a session here (kept in the agent's own
+connector folder across restarts; commands Konteks refuses, such as Google
+Antigravity's `/plan` and `/logout`, are left out).
+
+A **direct session** (New session on the runtime's page) is a plain chat with
+one of your agents on this computer: each prompt runs in the session's own
+private, empty folder, with no Konteks instructions, skills or tools in front
+of your text, so a leading `/command` reaches the agent as typed. The usual
+safety rules stay: blocked commands (`git push`, `sudo`, …) are refused,
+file changes outside the session's folder are refused, sign-in requests are
+declined, and whatever the policy leaves to you is asked in the chat.
 
 ### Live previews
 
@@ -167,14 +197,21 @@ in the prompt and the agent answers with a fenced JSON block, as before.
 
 ### A browser for QA
 
-Claude Code and Codex sessions that have a preview (the validator, QA-mode
-and other conversations, and the executor; not planning) also get a headless browser
-on the session's preview: Microsoft's Playwright MCP (`@playwright/mcp`
-0.0.82, pinned in `release/native-agent-builds.json` and carried inside the
-Claude Code and Codex agent packages, run on their own Node). Its tools
+Sessions that have a preview (the validator, QA-mode and other
+conversations, and the executor; not planning) also get a headless browser
+on the session's preview, whichever agent runs them (Claude Code, Codex,
+DeepSeek Harness, OpenCode or Google Antigravity): the browser belongs to the connector, not to
+one agent. It is Microsoft's Playwright MCP (`@playwright/mcp` 0.0.82, pinned
+in `release/native-agent-builds.json` and carried inside the Claude Code and
+Codex agent packages). Claude Code and Codex run their own copy; the other
+agents run the copy in an installed Claude Code (or else Codex) package, on
+that package's Node, or on your own Node (20 or newer, the one DeepSeek
+Harness uses first) when the package's cannot run. Its tools
 (`browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`,
 `browser_take_screenshot`, `browser_verify_*`, …) appear as the
-`konteks-browser` MCP server. There is nothing to set up:
+`konteks-browser` MCP server (OpenCode calls them from its Code Mode as
+`tools["konteks-browser"].browser_navigate({ ... })`). There is nothing to
+set up:
 
 - it uses Google Chrome when it is installed, headless with a throwaway
   in-memory profile (never your own); without Chrome it installs
@@ -197,11 +234,15 @@ Claude Code and Codex agent packages, run on their own Node). Its tools
   (the browser restarts once, before the call that opens the new address);
 - the tools that could run code outside the page or rewrite its traffic
   (`browser_run_code_unsafe`, `browser_route`, …) are hidden and refused;
-- DeepSeek Harness sessions get no browser (dsh carries no agent package to
-  run it in).
+- a computer with neither a Claude Code nor a Codex package installed, or
+  with no Node that can run the browser, has no browser: sessions there check
+  work without opening one, the connector does not advertise `browser_tool`
+  (so Konteks can keep QA elsewhere), and `doctor` says why in one line
+  ("Add one with `konteks-remote agent add claude-code`", or "Install Node
+  from https://nodejs.org").
 
-`doctor` reports the browser's version, which agents carry it, and whether it
-uses Chrome or Playwright's Chromium.
+`doctor` reports the browser's version, which agents get it, which Node it
+runs on, and whether it uses Chrome or Playwright's Chromium.
 
 To stop offering previews from a computer, switch previews off for that
 runtime in Konteks (Customize → Runtimes); it is on by default. Konteks and
@@ -233,9 +274,152 @@ only in the connector's private folder. If it cannot start (an unsupported
 version, say), it is left out and retried in the background with the reason in
 the connector log; your other agents keep working.
 
-Pi and OpenCode are no longer supported: `install --agents` and `agent add`
-refuse them, and an installation that still lists one keeps working without
-it (the connector log says it was skipped). The Docker Compose remote
+### OpenCode
+
+OpenCode 2 (`opencode`) runs from your own install too, never from the
+release. Supported versions are 2.0.18 up to, not including, 3.0.0: the line
+OpenCode's homepage installs. OpenCode 1 (npm `opencode-ai`, brew
+`anomalyco/tap/opencode`) is refused by name. Install it, then add it and sign
+it in:
+
+```sh
+curl -fsSL https://opencode.ai/v2/install | bash   # Windows: npm install -g @opencode/cli
+konteks-remote agent add opencode
+konteks-remote auth login opencode
+```
+
+The connector finds it on `PATH` (`opencode2` before `opencode`), in the
+homepage installer's `~/.opencode/bin`, npm's global folders, Homebrew, scoop
+or Chocolatey (`OPENCODE_EXECUTABLE` for any other layout), reads its version,
+and before every start proves with `opencode debug agents` that the Konteks
+settings are in force: every tool call asks first, repository config is
+ignored, and its plan mode is off. Its tool calls go through the same policy
+as the other agents (shell commands, edits inside the working copy only, its
+code blocks limited to calls to Konteks' own tools; any call that skips the
+check takes OpenCode out of service on that computer).
+
+Sign-in works like the other agents: `auth login opencode` lists what your
+OpenCode offers (subscriptions first: OpenCode Console, ChatGPT, GitHub
+Copilot, SuperGrok, GitLab, Poe) and relays the link and code, or takes an API
+key without echo and types it into OpenCode's own prompt; `--provider` and
+`--method` pick directly, `--reuse` shows which providers your own OpenCode
+uses so you can sign in to the same ones here, and `auth logout opencode
+[--provider X]` signs out. Subscription sign-ins can also be started from the
+site. Zen's free models are used only when you switch them on in Konteks.
+
+OpenCode runs with a scrubbed environment: every OpenCode command the
+connector starts (sessions, `--version`, `debug`, `auth`) gets only what it
+needs (PATH, locale, temp folders, proxy settings, a private home under the
+connector's folder) and never your `GITHUB_TOKEN`, `GH_TOKEN`, provider keys,
+`AWS_*`, `AZURE_*`, Google credentials or inherited `OPENCODE_*` variables.
+Your own OpenCode home, sign-ins and background service are never touched.
+
+If OpenCode cannot start, or is removed or replaced by an unsupported version,
+it is left out and retried in the background (it is found again if you
+reinstall it another way); your other agents keep working, and `doctor` says
+why. `doctor` also shows its version, how it was installed, the settings check,
+what it is signed in with (labels only), whether free models are on and
+whether its sessions get the QA browser.
+
+### Google Antigravity
+
+Google Antigravity (`antigravity`) is the fifth agent. Nobody installs it:
+add it and sign it in on the computer.
+
+```sh
+konteks-remote agent add antigravity      # asks before downloading from Google
+konteks-remote auth login antigravity     # a Gemini API key or Gemini Enterprise
+```
+
+`agent add antigravity` (or `install --agents ...,antigravity`) shows this
+question and downloads only on your yes (`--yes` is that yes given up front,
+by you; without a terminal and without `--yes` nothing is downloaded):
+
+> Konteks will download Google Antigravity from Google's server
+> (dl.google.com, about 110 MB, 400 MB on disk), check Google's signature, and
+> keep it updated with Konteks updates. Google's terms apply to its use
+> (antigravity.google/terms). Download it now? [y/N]
+
+The connector then downloads Google's official Antigravity ACP server (never
+the `agy` CLI, and never a copy the Antigravity app or an editor downloaded)
+while the connector keeps running, checks it against the exact version, sizes,
+hashes and Google signature this Konteks release pins, keeps it in the
+connector's own folder, and checks it again before every start. It needs about
+1.5 GB free to download. Only macOS on Apple silicon is supported for now;
+elsewhere the command says "Google Antigravity is not available for this
+computer yet." before asking anything. Running `agent add antigravity` again
+downloads a copy that no longer matches Google's release. Onboarding never
+finds it on its own (the Antigravity app and the `agy` CLI are other
+products); with no other agent it offers it in one line.
+
+Until you add it, Konteks shows it as "Not added" with that command
+(Customize, Runtimes), and "Downloading" while `agent add` fetches it;
+`konteks-remote agents` says the same.
+
+Updates: when a Konteks update pins a newer Google Antigravity, the connector
+downloads it in the background on your first yes, checks it, runs its start
+check, switches to it and deletes the old version; if that fails, the old
+folder stays, it is tried again, and `doctor` says why.
+`konteks-remote agent remove antigravity` asks once, stops the connector,
+signs Antigravity out, deletes its download and its sign-ins on this computer,
+and starts the connector again; your other agents are untouched. Uninstalling
+the connector removes it too. It runs with a scrubbed environment and a private home: never your
+`GITHUB_TOKEN`, Gemini or Google Cloud variables, provider keys, `~/.gemini`,
+the Antigravity app or your macOS keychain. Before it starts, the connector
+checks that the server answers as the version it knows. Every session keeps
+subagents and image tools off, stays in the mode that asks before commands and
+edits, and gets your repository's `AGENTS.md` in its first prompt (Google's
+server does not read it). At most two Antigravity sessions run at once on a
+computer.
+
+Sign it in on the computer with `konteks-remote auth login antigravity`:
+
+- **Gemini API key** (`--api-key`): paste a key from
+  https://aistudio.google.com/apikey into the hidden prompt. Konteks checks it
+  with Google and keeps it only on this computer; Google Antigravity itself
+  never sees it (a relay on this computer adds it to each request to Google).
+  Google bills its use to your key; Konteks shows each turn's cost estimated at
+  Google's list price.
+- **Gemini Enterprise** (`--enterprise --project <project id> [--location
+  global|us|eu]`, or from Konteks: Customize, Runtimes, Google Antigravity):
+  sign in with Google in the browser on this computer, then confirm your
+  licence on the page that follows. Your Google Cloud admin must set Terminal
+  auto-execution to Require review. If Google finds no licence for the
+  project, turn on the Business AI Code API
+  (`gcloud services enable businessaicode.googleapis.com --project <project id>`)
+  and sign in again.
+
+Signing in with a personal Google account is not offered.
+`konteks-remote auth logout antigravity [--api-key | --enterprise]` signs out.
+
+Every command, file change, web fetch and tool call it asks for goes through
+the same Konteks checks as the other agents: no `git push` or `sudo`, no
+changes outside the working copy, only Konteks' own tools, never "always
+allow". Your repository cannot switch its hooks on (Konteks always answers
+"Don't trust"), and subagents stay off. If Antigravity ever runs something
+without asking, the connector stops it and takes it out of service until you
+restart the connector; on Gemini Enterprise that usually means your
+organisation's Terminal auto-execution setting is not Require review, and the
+message says so. Its `/plan` and `/logout` commands are not available.
+
+Behind a proxy, both the download and the Gemini API key relay honour
+`HTTPS_PROXY` (or `ALL_PROXY`) and `NO_PROXY` from the connector's own
+environment.
+
+`doctor` shows its version (pinned by this Konteks release), that it was
+downloaded from Google with its signature checked, the start check, what it is
+signed in with (labels only, never the project or a key, and the Business AI
+Code API command when Google found no licence), the disk it uses, and whether
+its sessions get the QA browser; after an unasked command on Gemini Enterprise
+it names the "Terminal auto-execution: Require review" setting, and when your
+organisation's MCP Servers setting dropped Konteks' tools it says "Konteks
+tools unavailable: turn on MCP Servers in Gemini Enterprise settings".
+
+Pi is no longer supported: `install --agents` and `agent add` refuse it, and
+an installation that still lists it keeps working without it (the connector
+log says it was skipped). An installation from before 7.0.0 that listed the
+old bundled OpenCode now reads it as your own OpenCode 2.
+The Docker Compose remote
 instance is retired; the connector on your own computer is the only way to
 run Konteks agents.
 
@@ -280,9 +464,31 @@ npm test
 ```
 
 The shared Konteks contract packages are vendored under `vendor/` as built
-tarballs. Releases are produced by the `release` workflow on a `v*` tag; see
+tarballs. A development branch may link a sibling contracts checkout instead;
+CI then points those links at `vendor/` first
+(`scripts/ci-vendored-contracts.mjs`, never committed). Releases are produced
+by the `release` workflow on a `v*` tag; see
 `.github/workflows/release.yaml` for the platform matrix and the signing
 inputs.
+
+### Every agent on every OS
+
+The `agent-os-proof` workflow runs each agent (Claude Code, Codex, DeepSeek
+Harness, OpenCode) on macOS, Linux (x64 and arm64) and Windows, installed the
+way its own docs say, through the connector's own code
+(`scripts/agent-os-proof.mjs`): finding it, its private home, the start
+self-check, ACP `initialize` and `session/new`, model discovery, and a
+governance probe driven by a scripted model (no credential needed): an
+allowed command, the agent's environment, a write inside and outside the
+working copy, `git push`, `sudo` (on Windows an elevation), the Konteks result
+tool, all in a repository that carries every agent's own "ask nothing" config.
+Fake credentials set in the job (`GITHUB_TOKEN`, provider keys) must never
+reach an agent process. One real turn runs when a key is set as a repository
+secret (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`; OpenCode
+uses Zen's free model and needs none); otherwise it is reported as not proven.
+Run one agent locally with
+`node scripts/agent-os-proof.mjs --agent opencode --out result.json` after
+`npm run build`.
 
 ## License
 

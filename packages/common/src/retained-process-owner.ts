@@ -14,7 +14,7 @@ export interface ProcessIdentity {
  * never establishes tool/MCP quiescence or permits execution-slot release. */
 export interface RetainedProcessOwner extends ProcessIdentity {
   version: 1;
-  platform: "darwin" | "linux";
+  platform: "darwin" | "linux" | "win32";
 }
 
 interface CaptureOptions {
@@ -28,13 +28,23 @@ interface StopOptions extends CaptureOptions {
   pause?: (ms: number) => Promise<void>;
   termTimeoutMs?: number;
   killTimeoutMs?: number;
+  terminateTree?: (pid: number, force: boolean) => void;
+  treeAlive?: (pid: number) => boolean;
+}
+
+interface WindowsProcessRecord {
+  ProcessId: number;
+  ParentProcessId: number;
+  CreationDate: string;
+  CommandLine: string | null;
+  ExecutablePath: string | null;
 }
 
 export function captureRetainedProcessOwner(pid: number, options: CaptureOptions = {}): RetainedProcessOwner {
   const platform = options.platform ?? process.platform;
-  if (platform !== "darwin" && platform !== "linux") throw new RemoteInstanceError("recovery_required", `Durable execution-process rehydration is not available on ${platform}.`);
+  if (platform !== "darwin" && platform !== "linux" && platform !== "win32") throw new RemoteInstanceError("recovery_required", `Durable execution-process rehydration is not available on ${platform}.`);
   if (!Number.isSafeInteger(pid) || pid <= 1) throw invalidOwner("Bridge PID is invalid.");
-  const identity = (options.readIdentity ?? (platform === "darwin" ? readDarwinProcessIdentity : readLinuxProcessIdentity))(pid);
+  const identity = (options.readIdentity ?? identityReader(platform))(pid);
   if (!identity) throw invalidOwner("Bridge process identity cannot be captured.");
   if (identity.pid !== pid || identity.processGroupId !== pid) throw invalidOwner("Bridge is not its exact process-group leader.");
   return { version: 1, platform, ...identity };
@@ -42,8 +52,9 @@ export function captureRetainedProcessOwner(pid: number, options: CaptureOptions
 
 export async function stopRetainedProcessOwner(owner: RetainedProcessOwner, options: StopOptions = {}): Promise<void> {
   const platform = options.platform ?? process.platform;
-  if ((platform !== "darwin" && platform !== "linux") || owner.platform !== platform) throw invalidOwner(`Durable execution-process rehydration is not available on ${platform}.`);
-  const read = options.readIdentity ?? (platform === "darwin" ? readDarwinProcessIdentity : readLinuxProcessIdentity);
+  if ((platform !== "darwin" && platform !== "linux" && platform !== "win32") || owner.platform !== platform) throw invalidOwner(`Durable execution-process rehydration is not available on ${platform}.`);
+  const read = options.readIdentity ?? identityReader(platform);
+  if (platform === "win32") return stopWindowsProcessOwner(owner, read, options);
   const observed = read(owner.pid);
   const signal = options.signal ?? ((pid, value) => process.kill(pid, value));
   const groupAlive = options.groupAlive ?? ((pgid) => {
@@ -66,6 +77,10 @@ export async function stopRetainedProcessOwner(owner: RetainedProcessOwner, opti
   try { signal(-owner.processGroupId, "SIGKILL"); } catch { /* verified below */ }
   if (await waitUntilStopped(owner, read, groupAlive, pause, options.killTimeoutMs ?? 2_000)) return;
   throw invalidOwner("Retained bridge process-group exit remains unconfirmed.");
+}
+
+function identityReader(platform: "darwin" | "linux" | "win32"): (pid: number) => ProcessIdentity | null {
+  return platform === "darwin" ? readDarwinProcessIdentity : platform === "linux" ? readLinuxProcessIdentity : readWindowsProcessIdentity;
 }
 
 export function readDarwinProcessIdentity(pid: number): ProcessIdentity | null {
@@ -97,6 +112,93 @@ export function readLinuxProcessIdentity(
       !second || first.processGroupId !== second.processGroupId || first.startTicks !== second.startTicks) return null;
   return { pid, processGroupId: first.processGroupId, startToken: `${bootId}:${first.startTicks}`,
     commandDigest: createHash("sha256").update(command).digest("base64url") };
+}
+
+/** Windows has no POSIX process groups. A detached bridge is fenced by the
+ * kernel-reported creation instant plus its executable identity, and
+ * is stopped with taskkill's descendant-tree semantics. Reading twice keeps a
+ * PID replacement from mixing fields across two processes. */
+export function readWindowsProcessIdentity(
+  pid: number,
+  query?: (pid: number) => WindowsProcessRecord | null,
+): ProcessIdentity | null {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  const [first, second] = query ? [query(pid), query(pid)] : queryWindowsProcessPair(pid);
+  if (!first) return null;
+  if (!second || first.ProcessId !== pid || second.ProcessId !== pid ||
+      first.CreationDate !== second.CreationDate ||
+      (first.CommandLine && second.CommandLine && first.CommandLine !== second.CommandLine) ||
+      (first.ExecutablePath && second.ExecutablePath && first.ExecutablePath !== second.ExecutablePath)) return null;
+  if (!first.CreationDate.trim()) return null;
+  // Windows may reveal Path/CommandLine only after the process has started.
+  // Unlike POSIX it cannot replace a running process image with exec(), so PID
+  // + kernel creation time is the stable authority. Optional process details
+  // may disprove a capture when both reads expose conflicting values, but must
+  // not make a durable owner change merely because they become visible later.
+  const command = `${pid}\0${first.CreationDate}`;
+  return { pid, processGroupId: pid, startToken: first.CreationDate,
+    commandDigest: createHash("sha256").update(command).digest("base64url") };
+}
+
+function queryWindowsProcessPair(pid: number): [WindowsProcessRecord | null, WindowsProcessRecord | null] {
+  if (process.platform !== "win32") return [null, null];
+  // One PowerShell host takes both observations. Get-Process reads the kernel
+  // creation time directly; Get-CimInstance has a multi-second cold start and
+  // made the first bridge race its owner-capture timeout on healthy machines.
+  const script = `$items=@(); for($i=0;$i -lt 2;$i++){ $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($null -ne $p){ $items += [pscustomobject]@{ProcessId=[int]$p.Id;ParentProcessId=0;CreationDate=[string]$p.StartTime.ToUniversalTime().Ticks;CommandLine='';ExecutablePath=[string]$p.Path} } }; ConvertTo-Json -InputObject @($items) -Compress`;
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
+    { encoding: "utf8", windowsHide: true, timeout: 5_000, maxBuffer: 64 * 1024 });
+  if (result.status !== 0 || !result.stdout.trim()) return [null, null];
+  try {
+    const values = JSON.parse(result.stdout) as Array<Partial<WindowsProcessRecord>>;
+    if (!Array.isArray(values) || values.length !== 2 || values.some(value =>
+      !Number.isSafeInteger(value.ProcessId) || !Number.isSafeInteger(value.ParentProcessId) ||
+      typeof value.CreationDate !== "string" || typeof value.CommandLine !== "string" || typeof value.ExecutablePath !== "string")) return [null, null];
+    return values as [WindowsProcessRecord, WindowsProcessRecord];
+  } catch { return [null, null]; }
+}
+
+async function stopWindowsProcessOwner(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, options: StopOptions): Promise<void> {
+  const observed = read(owner.pid);
+  const treeAlive = options.treeAlive ?? windowsProcessTreeAlive;
+  if (!observed) {
+    if (treeAlive(owner.pid)) throw invalidOwner("Retained bridge leader is absent while its process tree survives; absence is not stop proof.");
+    return;
+  }
+  if (!sameIdentity(owner, observed)) throw invalidOwner("Retained bridge identity changed; refusing to terminate a reused process identity.");
+  const terminate = options.terminateTree ?? terminateWindowsProcessTree;
+  const pause = options.pause ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  terminate(owner.pid, false);
+  if (await waitUntilWindowsTreeStopped(owner, read, treeAlive, pause, options.termTimeoutMs ?? 5_000)) return;
+  terminate(owner.pid, true);
+  if (await waitUntilWindowsTreeStopped(owner, read, treeAlive, pause, options.killTimeoutMs ?? 2_000)) return;
+  throw invalidOwner("Retained bridge process-tree exit remains unconfirmed.");
+}
+
+function terminateWindowsProcessTree(pid: number, force: boolean): void {
+  const result = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", ...(force ? ["/F"] : [])],
+    { encoding: "utf8", windowsHide: true, timeout: 5_000, maxBuffer: 64 * 1024 });
+  // A raced exit is accepted only by the independent observation below.
+  if (result.error && (result.error as NodeJS.ErrnoException).code !== "ESRCH") throw result.error;
+}
+
+function windowsProcessTreeAlive(pid: number): boolean {
+  if (process.platform !== "win32") return false;
+  const script = `$all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId); $seen=@(${pid}); do { $before=$seen.Count; $seen += @($all | Where-Object { $seen -contains $_.ParentProcessId } | ForEach-Object ProcessId); $seen=@($seen | Select-Object -Unique) } while ($seen.Count -gt $before); if ($seen.Count -gt 1 -or ($all | Where-Object ProcessId -eq ${pid})) { exit 0 } else { exit 1 }`;
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
+    { windowsHide: true, timeout: 3_000, stdio: "ignore" });
+  return result.status === 0;
+}
+
+async function waitUntilWindowsTreeStopped(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, treeAlive: (pid: number) => boolean, pause: (ms: number) => Promise<void>, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const current = read(owner.pid);
+    if (current && !sameIdentity(owner, current)) throw invalidOwner("Retained bridge identity changed while stopping.");
+    if (!current && !treeAlive(owner.pid)) return true;
+    await pause(Math.min(50, Math.max(0, deadline - Date.now())));
+  } while (Date.now() <= deadline);
+  return false;
 }
 
 function parseLinuxStat(bytes: Buffer | null, pid: number): { processGroupId: number; startTicks: string } | null {

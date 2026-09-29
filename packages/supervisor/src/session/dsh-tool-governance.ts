@@ -1,6 +1,6 @@
 import { isAbsolute, resolve } from "node:path";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
-import { DSH_READ_ONLY_TOOLS } from "@konteks/remote-agent-runner";
+import { BROWSER_MCP_SERVER_NAME, DSH_READ_ONLY_TOOLS, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
 
 /**
  * Permission parity for DeepSeek Harness (dsh-runtime-support CP3).
@@ -35,6 +35,13 @@ const READ_ONLY = new Set(DSH_READ_ONLY_TOOLS);
  * (`submit_result`, which only records a value on this computer).
  */
 const KONTEKS_MCP = /^mcp__konteks-(platform|preview|result)__[A-Za-z0-9_-]+$/;
+/**
+ * The QA browser (O8: a connector capability, so dsh gets it too), allowed
+ * only on a session given it and never for a tool the launcher hides
+ * (`browser_run_code_unsafe`, the route tools): its gateway confines it to
+ * the session's preview and the origins Core opened.
+ */
+const BROWSER_MCP = new RegExp(`^mcp__${BROWSER_MCP_SERVER_NAME}__([A-Za-z0-9_-]+)$`);
 const SANDBOX_WITHIN_WORKSPACE = new Set(["read-only", "workspace-write"]);
 
 /** ACP kinds for dsh's own tools, for activity; never a policy grant by itself. */
@@ -83,7 +90,7 @@ export class DshToolGovernance {
     return null;
   }
 
-  decide(request: RequestPermissionRequest, cwd: string): DshPermissionDecision {
+  decide(request: RequestPermissionRequest, cwd: string, options: { browserTools?: boolean } = {}): DshPermissionDecision {
     const toolCallId = request.toolCall.toolCallId;
     this.asked.add(toolCallId);
     const observed = this.calls.get(toolCallId);
@@ -94,6 +101,10 @@ export class DshToolGovernance {
       return { kind: "deny", reason: "a wider sandbox than workspace-write is never granted" };
     }
     if (READ_ONLY.has(title) || KONTEKS_MCP.test(title)) return { kind: "allow" };
+    const browserTool = BROWSER_MCP.exec(title)?.[1];
+    if (browserTool !== undefined) {
+      return options.browserTools === true && !isDeniedBrowserTool(browserTool) ? { kind: "allow" } : { kind: "deny", reason: `the browser tool ${browserTool} is not allowed in this session` };
+    }
     if (EXECUTE.has(title)) {
       const command = rawInput.command;
       if (typeof command !== "string" || command.trim().length === 0) return { kind: "deny", reason: `${title} call has no command to judge` };

@@ -77,5 +77,15 @@ describe("the connector's command blocklist", () => {
     expect(blockedCommandPattern("rm -rf /", DEFAULT_BASH_BLOCKLIST)).toBe("rm -rf /");
     expect(blockedCommandPattern("cd x && rm -rf /*", DEFAULT_BASH_BLOCKLIST)).toBe("rm -rf /");
   });
+
+  it("refuses Windows elevation like sudo, and leaves look-alikes alone", () => {
+    expect(blockedCommandPattern("powershell -NoProfile -Command \"Start-Process -Verb RunAs -Wait -FilePath cmd.exe\"", DEFAULT_BASH_BLOCKLIST)).toBe("runas");
+    expect(blockedCommandPattern("Start-Process pwsh -Verb:RunAs", DEFAULT_BASH_BLOCKLIST)).toBe("verb:runas");
+    expect(blockedCommandPattern("runas /user:Administrator cmd", DEFAULT_BASH_BLOCKLIST)).toBe("runas");
+    expect(blockedCommandPattern("gsudo net stop wuauserv", DEFAULT_BASH_BLOCKLIST)).toBe("gsudo");
+    expect(blockedCommandPattern("sudo -n true", DEFAULT_BASH_BLOCKLIST)).toBe("sudo ");
+    expect(blockedCommandPattern("type runas.txt", DEFAULT_BASH_BLOCKLIST)).toBeNull();
+    expect(blockedCommandPattern("npm run assemble", DEFAULT_BASH_BLOCKLIST)).toBeNull();
+  });
 });
 

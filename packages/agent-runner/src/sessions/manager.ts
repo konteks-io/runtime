@@ -16,7 +16,9 @@ import { AcpNativeObservationSchema, RemoteInstanceError, type AgentTurnUsageObs
 import type { BridgeProcess } from "../bridge/process.js";
 import { classifyBridgeError } from "../bridge/process.js";
 import type { RunnerEventBus } from "../events.js";
+import type { HostPromptPrelude, HostPromptSession, HostTurnError } from "../host/host-agent.js";
 import { konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
+import type { MeasuredTurn } from "./usage-label.js";
 
 /**
  * ACP sessions inside this runner. The supervisor creates them as a
@@ -81,17 +83,44 @@ interface SessionRecord {
   assertCurrent?: () => void;
   /** Native turns started by a connector-sent prompt (bounded, oldest evicted). */
   connectorTurns?: Set<string>;
+  /** The session's current `model` value, as the agent last reported it. */
+  modelValue?: string;
+  /** The session's cumulative cost in USD as the agent last reported it (`usage_update.cost`); unknown until reported or a new session. */
+  sessionCostUsd?: number;
+  /** `sessionCostUsd` when the running turn started; its cost is the difference (O7). */
+  turnCostStartUsd?: number;
+  /** The agent reported a cost since the last turn ended: without one, a turn's cost is unknown, never zero. */
+  costReported?: boolean;
+  /** The session's working copy, as the last create or continuation named it. */
+  cwd: string;
+  /** A failure the agent sent as its reply during the running turn (`agentErrorText`); reported instead of a result. */
+  turnError?: HostTurnError;
 }
 
+/**
+ * How a turn's usage is labelled (O7): a subscription turn, or a pay-per-use
+ * turn naming the provider (and model) it reached. Null: not reported at all.
+ */
+export type TurnUsageLabel =
+  | { moneyBasis: "unavailable_local_subscription" }
+  | { moneyBasis: "pay_per_use"; provider: string; model?: string };
+
 const MAX_CONNECTOR_TURNS = 256;
+const REFUSED_MODEL_MESSAGE = "That model is not available to this agent here. OpenCode Zen's free models are switched off for this computer.";
 type AcpNativeObservation = z.infer<typeof AcpNativeObservationSchema>;
 
 export interface SessionManagerOptions {
   bridge: () => BridgeProcess | null;
   /** Native execution allocator; called only after the durable ref reservation. */
-  createBridge?: (acpSessionRef: string, lifecycle?: CreateSessionArgs["lifecycle"]) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
+  createBridge?: (acpSessionRef: string, lifecycle?: CreateSessionArgs["lifecycle"], cwd?: string) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
   /** Bootstrap-only allocator. The previous bridge is already confirmed stopped. */
-  replaceBridge?: (acpSessionRef: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: CreateSessionArgs["lifecycle"]) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
+  replaceBridge?: (acpSessionRef: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: CreateSessionArgs["lifecycle"], cwd?: string) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
+  /**
+   * Before each prompt on a bridge: the agent's own preparation (OpenCode
+   * re-checks, and on Windows refreshes, its working copy's instructions).
+   * Returns nothing when there is none, so the prompt is sent at once.
+   */
+  beforePrompt?: (bridge: BridgeProcess) => Promise<void> | undefined;
   events: RunnerEventBus;
   /** Durable map acpSessionRef → bridge session id inside the credential volume (survives restart). */
   refStore: SessionRefStore;
@@ -103,11 +132,76 @@ export interface SessionManagerOptions {
   logger?: Logger;
   /** Auth failures must invalidate a prior identity probe before new work is admitted. */
   onAuthRequired?: () => void;
+  /** Required session selections applied to new, restored and live-continued
+   * sessions before any caller selections (Codex: Konteks-governed approval
+   * mode). Callers may repeat the same value, but refusedModes prevents them
+   * from selecting a mode outside that boundary. */
+  defaultSessionConfig?: Readonly<Record<string, string>>;
+  /**
+   * Session modes this agent must never enter (OpenCode's `plan`): refused on
+   * `set_mode`, on `set_config_option` for `mode` and in an admitted session
+   * configuration, and dropped from the configuration the agent reports.
+   */
+  refusedModes?: { readonly modeIds: readonly string[]; readonly message: string };
+  /** Slash commands this agent is never sent (Antigravity's `/plan`, `/logout`): such a prompt is refused before it reaches the agent. */
+  refusedPromptCommands?: { readonly commands: readonly string[]; readonly message: string };
+  /**
+   * Whether a model value may be used (OpenCode: Zen's free models only when
+   * switched on, O6). A session that would start on a model it may not use is
+   * moved to the first one it may, before ready; asking for one is refused.
+   */
+  modelAllowed?: (value: string) => boolean;
+  /** How each turn's usage is labelled from the session's model; absent: every turn is a subscription turn. */
+  usageLabel?: (modelValue: string | undefined) => TurnUsageLabel | null;
+  /** Extra `_meta` on every `session/new`, `session/load` and `session/resume` (Antigravity's tool filter). */
+  sessionMeta?: Readonly<Record<string, unknown>>;
+  /** Checks what a new, loaded or resumed session reports before it reads ready; throws on drift. */
+  verifySession?: (response: { configOptions?: unknown; modes?: unknown }) => void;
+  /** Content put in front of a prompt (Antigravity: the working copy's AGENTS.md, A9). */
+  promptPrelude?: (session: HostPromptSession) => Promise<HostPromptPrelude | null>;
+  /** A reply text that is really the agent's failure report; never forwarded, reported as the turn's error. */
+  agentErrorText?: (text: string) => HostTurnError | null;
+  /**
+   * A turn measured outside the agent (Antigravity's Gemini API key relay):
+   * called as a turn starts on `bridge`; the returned function reads the turn
+   * once it ended, or null when it must not be reported (an older Core).
+   */
+  measureTurn?: (bridge: BridgeProcess) => (() => MeasuredTurn | null) | null;
+  /**
+   * Every `available_commands_update` of a session (runtime-view R19): the
+   * runtime keeps the latest per agent. The update is still forwarded on the
+   * session stream unchanged.
+   */
+  onAvailableCommands?: (update: unknown) => void;
+}
+
+/** The current value of a session's `model` select, from any ACP configuration list. */
+function currentModel(configOptions: unknown): string | undefined {
+  if (!Array.isArray(configOptions)) return undefined;
+  const option = configOptions.find((entry: unknown) => (entry as { id?: unknown })?.id === "model" && (entry as { type?: unknown }).type === "select") as { currentValue?: unknown } | undefined;
+  return typeof option?.currentValue === "string" ? option.currentValue : undefined;
+}
+
+/** Every value of a session's `model` select, grouped or flat, in order. */
+function modelValues(configOptions: unknown): string[] {
+  if (!Array.isArray(configOptions)) return [];
+  const option = configOptions.find((entry: unknown) => (entry as { id?: unknown })?.id === "model" && (entry as { type?: unknown }).type === "select") as { options?: unknown } | undefined;
+  if (!Array.isArray(option?.options)) return [];
+  return (option.options as unknown[]).flatMap(entry => {
+    const group = entry as { options?: unknown; value?: unknown };
+    const values = Array.isArray(group.options) ? group.options as Array<{ value?: unknown }> : [group];
+    return values.map(value => value.value).filter((value): value is string => typeof value === "string");
+  });
 }
 
 export interface SessionRefStore {
   get(acpSessionRef: string): Promise<string | null>;
   put(acpSessionRef: string, bridgeSessionId: string): Promise<void>;
+}
+
+/** A JSON-RPC "invalid params" refusal from the agent (ACP RequestError -32602). */
+function isInvalidParams(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === -32602;
 }
 
 export class InMemorySessionRefStore implements SessionRefStore {
@@ -193,9 +287,18 @@ export class SessionManager {
       timer = setTimeout(() => reject(deadlineMarker), timeoutMs);
       timer.unref();
     });
+    // The agent said it cannot go on without the person (a sign-in or licence
+    // page it would open): stop waiting, stop that process, say why.
+    const failureMarker = Symbol(`${stage}_failure`);
+    let failureError: unknown;
+    const failed = bridge.failure?.catch((error: unknown) => { failureError = error; throw failureMarker; });
     try {
-      return await Promise.race([operation, deadline]);
+      return await Promise.race([operation, deadline, ...(failed ? [failed] : [])]);
     } catch (error) {
+      if (error === failureMarker) {
+        await bridge.stop().catch((stopError: unknown) => this.logger.warn({ stage, err: classifyBridgeError(stopError).class }, "a bridge that needs the person could not be stopped"));
+        throw failureError;
+      }
       if (error !== deadlineMarker) throw error;
 
       let bridgeRecycled = false;
@@ -243,16 +346,16 @@ export class SessionManager {
   }
 
   capabilities(): { forkSession: boolean; sessionResume: boolean } {
-    const bridge = this.options.bridge();
-    const caps = bridge?.initializeResult.agentCapabilities;
-    return {
-      forkSession: caps?.sessionCapabilities?.fork != null,
-      sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
-    };
+    return capabilitiesOf(this.options.bridge());
+  }
+
+  /** `_meta` for `session/load` and `session/resume`: the agent's own (a persisted tool filter is overridden there). */
+  private reopenMeta(): { _meta?: Record<string, unknown> } {
+    return this.options.sessionMeta ? { _meta: { ...this.options.sessionMeta } } : {};
   }
 
   async create(args: CreateSessionArgs): Promise<CreatedSession> {
-    args = { ...args, ...(args.sessionConfig ? { sessionConfig: { ...args.sessionConfig } } : {}) };
+    args = this.withDefaultSessionConfig(args);
     const ref = args.acpSessionRef ?? `acp-${randomUUID()}`;
     return this.createOwned(args, ref, args.acpSessionRef);
   }
@@ -261,18 +364,19 @@ export class SessionManager {
    * execution reference. The source ref remains fenced to its old generation;
    * only its private provider-session mapping is read. */
   async restore(args: CreateSessionArgs, sourceRef: string): Promise<CreatedSession> {
-    args = { ...args, ...(args.sessionConfig ? { sessionConfig: { ...args.sessionConfig } } : {}) };
+    args = this.withDefaultSessionConfig(args);
     return this.createOwned(args, `acp-${randomUUID()}`, sourceRef);
   }
 
   private async createOwned(args: CreateSessionArgs, ref: string, loadFromRef?: string): Promise<CreatedSession> {
+    this.assertAdmittedModes(args.sessionConfig);
     if (this.sessions.has(ref) || this.creatingRefs.has(ref)) throw new RemoteInstanceError("recovery_required", "session reference already has a local owner");
     this.creatingRefs.add(ref);
     try {
       args.lifecycle?.assertCurrent();
       await args.lifecycle?.beforeCreate(ref);
       args.lifecycle?.assertCurrent();
-      const initial = this.options.createBridge ? await this.options.createBridge(ref, args.lifecycle) : { bridge: this.requireBridge(), bootstrapAttempt: 1 };
+      const initial = this.options.createBridge ? await this.options.createBridge(ref, args.lifecycle, args.cwd) : { bridge: this.requireBridge(), bootstrapAttempt: 1 };
       let bridge = initial.bridge;
       for (let bootstrapAttempt = initial.bootstrapAttempt; bootstrapAttempt <= 4; bootstrapAttempt += 1) {
         let reservedBridgeId: string | null = null;
@@ -326,7 +430,7 @@ export class SessionManager {
           await this.bootstrapRetrySleep(delayMs);
           args.lifecycle?.assertCurrent();
           const recoveredFromAttempt = bootstrapAttempt;
-          const replacement = await this.options.replaceBridge(ref, bridge, bootstrapAttempt + 1, args.lifecycle);
+          const replacement = await this.options.replaceBridge(ref, bridge, bootstrapAttempt + 1, args.lifecycle, args.cwd);
           bridge = replacement.bridge;
           // Fresh-process initialization failures consume logical attempts too.
           // The loop increment below advances to the attempt returned here.
@@ -353,6 +457,8 @@ export class SessionManager {
     const capabilities = { forkSession: caps?.sessionCapabilities?.fork != null, sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null };
     let bridgeSessionId: string | null = null;
     let resumed = false;
+    let bootstrapConfig: unknown;
+    let newSession = false;
     // The Claude SDK persists its deferred-tool registry in the provider
     // transcript. Loading that transcript after a process restart can retain a
     // former assignment's smaller or expired MCP view even though ACP receives
@@ -378,16 +484,16 @@ export class SessionManager {
         if (agentCaps?.sessionCapabilities?.resume != null) {
           // Session identity is retained, assignment tool authority is not.
           // Send even an empty list rather than retaining prior MCP bindings.
-          await this.boundedBootstrap("session_resume", args, bridge,
-            bridge.connection.resumeSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers }), bootstrapAttempt);
+          bootstrapConfig = (await this.boundedBootstrap("session_resume", args, bridge,
+            bridge.connection.resumeSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
         } else {
-          await this.boundedBootstrap("session_load", args, bridge,
-            bridge.connection.loadSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers }), bootstrapAttempt);
+          bootstrapConfig = (await this.boundedBootstrap("session_load", args, bridge,
+            bridge.connection.loadSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
         }
         bridgeSessionId = prior;
         resumed = true;
       } catch (error) {
-        if (error instanceof RemoteInstanceError && error.retryable) throw error;
+        if (error instanceof RemoteInstanceError && (error.retryable || error.code === "agent_auth_required")) throw error;
         this.logger.warn({ err: classifyBridgeError(error).class }, "session load failed; agent_session_lost");
         throw new RemoteInstanceError("recovery_required", "agent_session_lost: bridge refused to load the prior session", {
           recoveryActions: [{ kind: "retry" }],
@@ -396,10 +502,10 @@ export class SessionManager {
       }
     }
     if (bridgeSessionId === null) {
-      let created: { sessionId: string };
+      let created: { sessionId: string; configOptions?: unknown; modes?: unknown };
       try {
         created = await this.boundedBootstrap("session_new", args, bridge,
-          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId) }), bootstrapAttempt);
+          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: { ...konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId), ...this.options.sessionMeta } }), bootstrapAttempt);
       } catch (error) {
         if (error instanceof RemoteInstanceError && error.retryable) throw error;
         const classified = classifyBridgeError(error);
@@ -410,10 +516,17 @@ export class SessionManager {
       }
       bridgeSessionId = created.sessionId;
       reserveBridgeId(bridgeSessionId);
+      bootstrapConfig = created;
+      newSession = true;
     }
+    const bootstrapResponse = (bootstrapConfig ?? {}) as { configOptions?: unknown; modes?: unknown };
+    bootstrapConfig = bootstrapResponse.configOptions;
     if (this.sessions.has(acpSessionRef) || this.byBridgeId.has(bridgeSessionId)) throw new RemoteInstanceError("recovery_required", "bridge session already has a local owner");
     // Retain the actual live owner before any fallible persistence/continuation.
-    const record: SessionRecord = { bridge, acpSessionRef, bridgeSessionId, context: args.context, pendingClientRequests: new Map(), activeTurns: 0, operations: new Set(), operationFailed: false, completedTurn: false, continuationSealed: false, recoveryStopping: false, recoveryStop: null, ...(args.lifecycle ? { assertCurrent: args.lifecycle.assertCurrent } : {}) };
+    const record: SessionRecord = { bridge, acpSessionRef, bridgeSessionId, context: args.context, cwd: args.cwd, pendingClientRequests: new Map(), activeTurns: 0, operations: new Set(), operationFailed: false, completedTurn: false, continuationSealed: false, recoveryStopping: false, recoveryStop: null, ...(args.lifecycle ? { assertCurrent: args.lifecycle.assertCurrent } : {}),
+      ...(currentModel(bootstrapConfig) === undefined ? {} : { modelValue: currentModel(bootstrapConfig)! }),
+      // A new session has spent nothing; a resumed one's total is unknown until the agent reports it.
+      ...(newSession ? { sessionCostUsd: 0 } : {}) };
     this.sessions.set(acpSessionRef, record);
     this.byBridgeId.set(bridgeSessionId, record);
     this.requireBridge(record);
@@ -421,17 +534,42 @@ export class SessionManager {
     await this.options.refStore.put(acpSessionRef, bridgeSessionId);
     this.requireBridge(record);
     args.lifecycle?.assertCurrent();
+    // An agent that drifted from what Konteks governs (Antigravity: no model
+    // choice, or a mode other than `default`) never reads ready.
+    if (this.options.verifySession) {
+      try { this.options.verifySession(bootstrapResponse); }
+      catch (error) {
+        record.recoveryStopping = true;
+        record.operationFailed = true;
+        throw error;
+      }
+    }
     // A resumed session can retain stale defaults too. Configuration is an
     // admitted requirement, never a best-effort hint. Do not publish ready
     // until the bridge explicitly echoes each selected value.
     const confirmed = new Map<string, string>();
-    for (const [configId, value] of Object.entries(args.sessionConfig ?? {})) {
+    const sessionConfig = { ...(args.sessionConfig ?? {}) };
+    // A session that would start on a model it may not use (OpenCode Zen's
+    // free models switched off) is moved to the first one it may, as an
+    // admitted requirement confirmed below; with none, it never becomes ready.
+    if (this.options.modelAllowed && sessionConfig.model === undefined && record.modelValue !== undefined && !this.options.modelAllowed(record.modelValue)) {
+      const allowed = modelValues(bootstrapConfig).find(value => this.options.modelAllowed!(value));
+      if (allowed === undefined) {
+        record.recoveryStopping = true;
+        record.operationFailed = true;
+        throw new RemoteInstanceError("agent_auth_required", "The agent has no model it may use here: sign it in, or switch on its free models.", { recoveryActions: [{ kind: "login_agent", agentId: args.context.agentId }] });
+      }
+      sessionConfig.model = allowed;
+    }
+    for (const [configId, value] of Object.entries(sessionConfig)) {
       this.requireBridge(record);
       args.lifecycle?.assertCurrent();
       try {
         const result = await this.boundedBootstrap("session_config", args, bridge,
           bridge.connection.setSessionConfigOption({ sessionId: bridgeSessionId, configId, value }), bootstrapAttempt);
         confirmed.set(configId, value);
+        const reportedModel = currentModel(result.configOptions);
+        if (reportedModel !== undefined) record.modelValue = reportedModel;
         // ACP returns the full configuration. Later selections must not reset
         // an earlier requirement (for example, changing effort resets model).
         for (const [selectedId, selectedValue] of confirmed) {
@@ -507,6 +645,7 @@ export class SessionManager {
    * its generation fence, then refresh ACP MCP/config authority before ready.
    */
   async continueLive(args: CreateSessionArgs): Promise<CreatedSession> {
+    args = this.withDefaultSessionConfig(args);
     const ref = args.acpSessionRef;
     if (!ref) throw new RemoteInstanceError("recovery_required", "Live continuation requires its predecessor session reference.", { diagnostic: "continuation_reference_missing" });
     const record = this.sessions.get(ref);
@@ -521,10 +660,12 @@ export class SessionManager {
     // it). The successor's fence is installed and asserted below, and the
     // durable generation transfer in beforeCreate is what actually fences
     // the reference.
+    this.assertAdmittedModes(args.sessionConfig);
     await args.lifecycle?.beforeCreate(ref);
     // beforeCreate fsyncs the generation transfer. Install the successor fence
     // synchronously before the first provider-facing continuation operation.
     record.context = args.context;
+    record.cwd = args.cwd;
     if (args.lifecycle) record.assertCurrent = args.lifecycle.assertCurrent;
     else delete record.assertCurrent;
     record.completedTurn = false;
@@ -532,13 +673,29 @@ export class SessionManager {
     record.assertCurrent?.();
     try {
       const caps = bridge.initializeResult.agentCapabilities;
+      let refreshed: { configOptions?: unknown; modes?: unknown } | null | undefined;
       if (caps?.sessionCapabilities?.resume != null) {
-        await bridge.connection.resumeSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers });
+        const resume = () => bridge.connection.resumeSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() });
+        try {
+          refreshed = await resume();
+        } catch (error) {
+          // An agent that will not resume a session it still holds open
+          // (DeepSeek Harness: "session is already active", -32602) is closed
+          // and resumed from its own saved conversation: nothing is lost and
+          // the new turn's tools still apply (WS1-168). Every second prompt
+          // in a direct session failed before this.
+          if (!(isInvalidParams(error) && caps.sessionCapabilities.close != null)) throw error;
+          this.logger.info({ agentId: record.context.agentId }, "agent keeps its open session; closing and resuming it to continue");
+          await bridge.connection.closeSession({ sessionId: record.bridgeSessionId });
+          record.assertCurrent?.();
+          refreshed = await resume();
+        }
       } else if (caps?.loadSession === true) {
-        await bridge.connection.loadSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers });
+        refreshed = await bridge.connection.loadSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() });
       } else {
         throw new RemoteInstanceError("recovery_required", "Agent cannot refresh a live session's authority.", { diagnostic: "agent_cannot_refresh_authority" });
       }
+      this.options.verifySession?.(refreshed ?? {});
       record.assertCurrent?.();
       for (const [configId, value] of Object.entries(args.sessionConfig ?? {})) {
         const result = await bridge.connection.setSessionConfigOption({ sessionId: record.bridgeSessionId, configId, value });
@@ -546,7 +703,7 @@ export class SessionManager {
         if (matches.length !== 1 || matches[0]?.type !== "select" || matches[0].currentValue !== value) throw new Error("session configuration acknowledgement mismatch");
         record.assertCurrent?.();
       }
-      return { acpSessionRef: ref, resumed: true, capabilities: this.capabilities() };
+      return { acpSessionRef: ref, resumed: true, capabilities: capabilitiesOf(bridge) };
     } catch (error) {
       record.operationFailed = true;
       record.recoveryStopping = true;
@@ -677,18 +834,70 @@ export class SessionManager {
     if (record.activeTurns > 0) {
       throw new RemoteInstanceError("operation_conflict", "Another prompt is already running on this session.");
     }
+    const command = this.refusedPromptCommand(params.prompt);
+    if (command !== undefined) {
+      this.logger.warn({ assignmentId: record.context.assignmentId, attempt: record.context.attempt, command }, "refused a prompt that starts with one of the agent's own commands");
+      this.track(record, Promise.resolve().then(() => this.options.events.publish({
+        kind: "request_error", acpSessionRef, requestId, method: "session/prompt", code: -32602, class: "invalid_params", message: this.options.refusedPromptCommands!.message, retryable: false,
+      })));
+      return;
+    }
     record.completedTurn = false;
     record.activeTurns += 1;
-    const operation = bridge.connection
-      .prompt({ ...params, sessionId: record.bridgeSessionId })
+    // The last turn's end is this turn's start, so a cost the agent reports
+    // after a turn's response is counted with the next turn, never lost.
+    if (record.turnCostStartUsd === undefined && record.sessionCostUsd !== undefined) record.turnCostStartUsd = record.sessionCostUsd;
+    delete record.turnError;
+    // Tokens counted outside the agent (a relay): the span starts now.
+    const measured = this.options.measureTurn?.(bridge) ?? null;
+    const publishMeasured = () => {
+      const turn = measured?.();
+      if (turn) this.publishMeasuredUsage(record, turn);
+    };
+    const send = async () => {
+      // The agent's own preparation of this prompt (Antigravity: its working
+      // copy's AGENTS.md, which its server never loads, A9).
+      const prelude = this.options.promptPrelude ? await this.options.promptPrelude({ cwd: record.cwd, sessionKey: record.bridgeSessionId }) : null;
+      const answer = bridge.connection.prompt({ ...params, ...(prelude ? { prompt: [...prelude.blocks, ...params.prompt] } : {}), sessionId: record.bridgeSessionId });
+      let result: Awaited<typeof answer>;
+      if (bridge.failure) {
+        // The agent cannot finish without the person (a sign-in page it would
+        // open): end the turn now and say why, instead of waiting on it.
+        const failed = bridge.failure.catch((error: unknown) => {
+          void bridge.connection.cancel({ sessionId: record.bridgeSessionId }).catch(() => undefined);
+          throw error;
+        });
+        result = await Promise.race([answer, failed]);
+      } else {
+        result = await answer;
+      }
+      if (prelude) await prelude.delivered().catch((error: unknown) => this.logger.warn({ err: error instanceof Error ? error.message : "write_failed" }, "what the session was given could not be remembered"));
+      return result;
+    };
+    const prepared = this.options.beforePrompt?.(bridge);
+    const operation = (prepared ? prepared.then(send) : send())
       .then((result) => {
+        const turnError = record.turnError;
+        delete record.turnError;
+        if (turnError) {
+          // The agent reported a failure as its reply (quota, a model it may
+          // not use): a failed turn, in plain words, never a result.
+          record.completedTurn = false;
+          if (turnError.class === "agent_auth_required") this.options.onAuthRequired?.();
+          // What the key paid for is reported even when the turn failed.
+          publishMeasured();
+          this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/prompt", code: -32603, ...turnError });
+          return;
+        }
         record.completedTurn = result.stopReason === "end_turn";
-        if (result.usage) this.publishUsage(record, result.usage);
+        if (result.usage) this.publishUsage(record, result.usage, true);
+        else publishMeasured();
         this.options.events.publish({ kind: "prompt_result", acpSessionRef, requestId, result });
       })
       .catch((error: unknown) => {
         const classified = classifyBridgeError(error);
         if (classified.class === "agent_auth_required") this.options.onAuthRequired?.();
+        publishMeasured();
         this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/prompt", ...classified });
         throw error;
       })
@@ -705,6 +914,7 @@ export class SessionManager {
 
   setMode(acpSessionRef: string, requestId: string, params: Omit<SetSessionModeRequest, "sessionId">): void {
     const record = this.require(acpSessionRef);
+    if (this.refusesMode(params.modeId)) return this.refuseMode(record, acpSessionRef, requestId, "session/set_mode");
     const operation = this.requireBridge(record)
       .connection.setSessionMode({ ...params, sessionId: record.bridgeSessionId })
       .then((result) => this.options.events.publish({ kind: "set_mode_result", acpSessionRef, requestId, result }))
@@ -717,9 +927,20 @@ export class SessionManager {
 
   setConfigOption(acpSessionRef: string, requestId: string, params: Omit<SetSessionConfigOptionRequest, "sessionId">): void {
     const record = this.require(acpSessionRef);
+    if (params.configId === "mode" && this.refusesMode((params as { value?: unknown }).value)) {
+      return this.refuseMode(record, acpSessionRef, requestId, "session/set_config_option");
+    }
+    if (params.configId === "model" && this.refusesModel((params as { value?: unknown }).value)) {
+      return this.refuseMode(record, acpSessionRef, requestId, "session/set_config_option", REFUSED_MODEL_MESSAGE);
+    }
     const operation = this.requireBridge(record)
       .connection.setSessionConfigOption({ ...params, sessionId: record.bridgeSessionId } as SetSessionConfigOptionRequest)
-      .then((result) => this.options.events.publish({ kind: "set_config_option_result", acpSessionRef, requestId, result }))
+      .then((result) => {
+        const reportedModel = currentModel(result.configOptions);
+        if (reportedModel !== undefined) record.modelValue = reportedModel;
+        this.options.events.publish({ kind: "set_config_option_result", acpSessionRef, requestId,
+          result: { ...result, configOptions: this.withoutRefusedModes(result.configOptions) } });
+      })
       .catch((error: unknown) => {
         this.options.events.publish({ kind: "request_error", acpSessionRef, requestId, method: "session/set_config_option", ...classifyBridgeError(error) });
         throw error;
@@ -727,19 +948,115 @@ export class SessionManager {
     this.track(record, operation);
   }
 
+  /**
+   * The refused slash command a prompt starts with, if any: any text block, or
+   * the text blocks joined (the server reads `/logout` from the whole prompt).
+   */
+  private refusedPromptCommand(prompt: readonly unknown[]): string | undefined {
+    const commands = this.options.refusedPromptCommands?.commands;
+    if (!commands || commands.length === 0) return undefined;
+    const texts = prompt.flatMap(block => {
+      const value = block as { type?: unknown; text?: unknown } | null;
+      return value?.type === "text" && typeof value.text === "string" ? [value.text] : [];
+    });
+    for (const candidate of [...texts, texts.join("")]) {
+      const match = /^\/([A-Za-z][\w-]*)(?=\s|$)/.exec(candidate.trimStart());
+      if (match && commands.includes(match[1]!.toLowerCase())) return match[1]!.toLowerCase();
+    }
+    return undefined;
+  }
+
+  private refusesMode(modeId: unknown): boolean {
+    return typeof modeId === "string" && (this.options.refusedModes?.modeIds.includes(modeId) ?? false);
+  }
+
+  /** One immutable policy baseline for every provider-session entry path. */
+  private withDefaultSessionConfig(args: CreateSessionArgs): CreateSessionArgs {
+    const sessionConfig = { ...(this.options.defaultSessionConfig ?? {}), ...(args.sessionConfig ?? {}) };
+    return { ...args, ...(Object.keys(sessionConfig).length ? { sessionConfig } : {}) };
+  }
+
+  /** A mode this agent must never enter was named in an admitted session configuration. */
+  private assertAdmittedModes(sessionConfig: Record<string, string> | undefined): void {
+    if (sessionConfig && this.refusesMode(sessionConfig.mode)) {
+      throw new RemoteInstanceError("permission_denied", this.options.refusedModes!.message);
+    }
+    if (sessionConfig?.model !== undefined && this.refusesModel(sessionConfig.model)) {
+      throw new RemoteInstanceError("permission_denied", REFUSED_MODEL_MESSAGE);
+    }
+  }
+
+  private refusesModel(value: unknown): boolean {
+    return typeof value === "string" && this.options.modelAllowed !== undefined && !this.options.modelAllowed(value);
+  }
+
+  /** Refuse a mode change before it reaches the agent; answered like the agent's own invalid-params error. */
+  private refuseMode(record: SessionRecord, acpSessionRef: string, requestId: string, method: "session/set_mode" | "session/set_config_option", refusal?: string): void {
+    this.logger.warn({ assignmentId: record.context.assignmentId, attempt: record.context.attempt, method }, refusal ? "refused a model this agent may not use here" : "refused a session mode this agent never runs in");
+    const message = refusal ?? this.options.refusedModes!.message;
+    this.track(record, Promise.resolve().then(() => this.options.events.publish({
+      kind: "request_error", acpSessionRef, requestId, method, code: -32602, class: "invalid_params", message, retryable: false,
+    })));
+  }
+
+  /** The agent's configuration as Konteks reports it: a refused mode is never offered. */
+  private withoutRefusedModes<T>(configOptions: T): T {
+    const refused = this.options.refusedModes?.modeIds;
+    if (!refused || !Array.isArray(configOptions)) return configOptions;
+    return configOptions.map((option: unknown) => {
+      const value = option as { id?: unknown; type?: unknown; options?: unknown };
+      if (value?.id !== "mode" || value.type !== "select" || !Array.isArray(value.options)) return option;
+      const keep = (entry: unknown) => !refused.includes((entry as { value?: unknown })?.value as string);
+      const options = (value.options as unknown[]).flatMap((entry) => {
+        const group = entry as { options?: unknown };
+        if (Array.isArray(group?.options)) return [{ ...group, options: group.options.filter(keep) }];
+        return keep(entry) ? [entry] : [];
+      });
+      return { ...value, options };
+    }) as T;
+  }
+
   /** Bridge → supervisor: session/update notifications keyed by our opaque ref. */
   onSessionUpdate(params: SessionNotification, bridge = this.options.bridge()): void {
+    // The agent's commands are the agent's, not one session's: OpenCode
+    // announces them while it is still creating the session, before its reply
+    // registers the session here, and dropping that left OpenCode's commands
+    // unknown for good (WS1-176). Learnt from any live bridge of this agent (the session may be on its bootstrap bridge).
+    if (params.update.sessionUpdate === "available_commands_update" && bridge && !bridge.exited) {
+      try { this.options.onAvailableCommands?.(params.update); } catch { /* never stops the stream */ }
+    }
     const record = this.byBridgeId.get(params.sessionId);
     if (!record || record.bridge !== bridge || bridge.exited || record.recoveryStopping) return;
     // Thought chunks are not public activity (A4 D132).
     if (params.update.sessionUpdate === "agent_thought_chunk") return;
+    if (params.update.sessionUpdate === "agent_message_chunk" && this.options.agentErrorText && record.activeTurns > 0) {
+      const content = (params.update as { content?: { type?: unknown; text?: unknown } }).content;
+      const turnError = content?.type === "text" && typeof content.text === "string" ? this.options.agentErrorText(content.text) : null;
+      if (turnError) {
+        record.turnError = turnError;
+        return;
+      }
+    }
     if (params.update.sessionUpdate === "usage_update") {
-      const usage = params.update as unknown as Partial<Usage>;
+      const usage = params.update as unknown as Partial<Usage> & { cost?: { amount?: unknown; currency?: unknown } | null };
+      // OpenCode reports the session's running cost here (O7); a turn's is the difference.
+      const cost = usage.cost;
+      if (cost && cost.currency === "USD" && typeof cost.amount === "number" && Number.isFinite(cost.amount) && cost.amount >= 0) {
+        record.sessionCostUsd = cost.amount;
+        record.costReported = true;
+      }
       if (typeof usage.totalTokens === "number") this.publishUsage(record, usage as Usage);
+    }
+    if (params.update.sessionUpdate === "config_option_update") {
+      const reportedModel = currentModel((params.update as { configOptions?: unknown }).configOptions);
+      if (reportedModel !== undefined) record.modelValue = reportedModel;
     }
     // Never forward a provider-supplied transport field. Only the qualified
     // bridge correlation extension is translated, under this session owner.
-    const { nativeObservation: _untrusted, ...update } = params.update as typeof params.update & { nativeObservation?: unknown };
+    const { nativeObservation: _untrusted, ...reported } = params.update as typeof params.update & { nativeObservation?: unknown };
+    const update = reported.sessionUpdate === "config_option_update"
+      ? { ...reported, configOptions: this.withoutRefusedModes(reported.configOptions) }
+      : reported;
     const native = AcpNativeObservationSchema.safeParse(update._meta?.konteksNativeObservation);
     const messageChunk = update.sessionUpdate === "user_message_chunk" || update.sessionUpdate === "agent_message_chunk";
     const observation = messageChunk && native.success ? this.attributeNativeTurn(record, update.sessionUpdate, native.data) : undefined;
@@ -830,8 +1147,36 @@ export class SessionManager {
     });
   }
 
-  private publishUsage(record: SessionRecord, usage: Usage): void {
+  /**
+   * A turn measured outside the agent: pay-per-use on the person's own key,
+   * with the list-price estimate when every model it used has a price (A8).
+   */
+  private publishMeasuredUsage(record: SessionRecord, turn: MeasuredTurn): void {
     const observation: AgentTurnUsageObservation = {
+      instanceId: record.context.instanceId,
+      assignmentId: record.context.assignmentId,
+      attempt: record.context.attempt,
+      agentId: record.context.agentId,
+      totalTokens: turn.totalTokens,
+      inputTokens: turn.inputTokens,
+      outputTokens: turn.outputTokens,
+      thoughtTokens: turn.thoughtTokens,
+      cacheReadTokens: turn.cacheReadTokens,
+      observedAt: this.now().toISOString(),
+      moneyBasis: "pay_per_use",
+      provider: turn.provider,
+      model: turn.model,
+      ...(turn.estimate ? { reportedCost: { currency: "USD", amountMicros: turn.estimate.amountMicros }, costSource: "list_price_estimate" as const, pricingSnapshotId: turn.estimate.pricingSnapshotId } : {}),
+    };
+    this.options.events.publish({ kind: "usage_observation", acpSessionRef: record.acpSessionRef, observation });
+  }
+
+  private publishUsage(record: SessionRecord, usage: Usage, turnEnded = false): void {
+    const label = this.options.usageLabel ? this.options.usageLabel(record.modelValue) : { moneyBasis: "unavailable_local_subscription" as const };
+    // A turn Konteks cannot label honestly (pay-per-use on an older Core, or
+    // an unknown provider) is not reported, never reported as a subscription.
+    if (label === null) return;
+    const base = {
       instanceId: record.context.instanceId,
       assignmentId: record.context.assignmentId,
       attempt: record.context.attempt,
@@ -839,15 +1184,35 @@ export class SessionManager {
       totalTokens: usage.totalTokens,
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
-      moneyBasis: "unavailable_local_subscription",
       observedAt: this.now().toISOString(),
     };
+    let observation: AgentTurnUsageObservation;
+    if (label.moneyBasis === "pay_per_use") {
+      const start = record.turnCostStartUsd, end = record.sessionCostUsd;
+      const micros = turnEnded && record.costReported === true && start !== undefined && end !== undefined && end >= start ? Math.round((end - start) * 1_000_000) : undefined;
+      observation = { ...base, moneyBasis: "pay_per_use", provider: label.provider, ...(label.model ? { model: label.model } : {}),
+        ...(micros !== undefined && micros <= 1_000_000_000_000 ? { reportedCost: { currency: "USD", amountMicros: micros } } : {}) };
+    } else {
+      observation = { ...base, moneyBasis: "unavailable_local_subscription" };
+    }
+    if (turnEnded) {
+      if (record.sessionCostUsd !== undefined) record.turnCostStartUsd = record.sessionCostUsd;
+      record.costReported = false;
+    }
     if (usage.thoughtTokens != null) observation.thoughtTokens = usage.thoughtTokens;
     if (usage.cachedReadTokens != null) observation.cacheReadTokens = usage.cachedReadTokens;
     const cachedWrite = (usage as { cachedWriteTokens?: number | null }).cachedWriteTokens;
     if (cachedWrite != null) observation.cacheWriteTokens = cachedWrite;
     this.options.events.publish({ kind: "usage_observation", acpSessionRef: record.acpSessionRef, observation });
   }
+}
+
+function capabilitiesOf(bridge: BridgeProcess | null): { forkSession: boolean; sessionResume: boolean } {
+  const caps = bridge?.initializeResult.agentCapabilities;
+  return {
+    forkSession: caps?.sessionCapabilities?.fork != null,
+    sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
+  };
 }
 
 /** The bridge session id is runner-local; strip it before anything leaves the runner. */

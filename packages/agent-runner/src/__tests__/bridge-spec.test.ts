@@ -37,6 +37,8 @@ describe("bridge spawn spec", () => {
     expect(env.USER).toBe(userInfo().username);
     expect(env.XDG_CONFIG_HOME).toBeUndefined();
     expect(env.CI).toBeUndefined();
+    // A slow Konteks tool list delays the tools; Claude Code's 30 s default dropped them (WS1-152).
+    expect(env.MCP_TIMEOUT).toBe("180000");
     expect(resolveToolingCommand(native, family, family.tooling.identitySignal!)).toEqual({ command: "/operator/.local/bin/claude", args: ["auth", "status", "--json"] });
     expect(() => bridgeEnvironment({ ...native, RUNNER_AUTH_MODE: "gateway_keyed" }, family)).toThrow(/native personal Claude/);
     expect(() => bridgeEnvironment({ ...config, RUNNER_NATIVE_CLAUDE_EXECUTABLE: "/operator/.local/bin/claude" }, family)).toThrow(/native personal Claude/);

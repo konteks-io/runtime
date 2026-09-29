@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 /**
  * The connector's launcher for the QA browser's MCP server (Playwright MCP),
- * run by the agent (Claude Code or Codex) over stdio from the agent package's
- * own Node: `node konteks/browser-mcp.js <playwright-mcp cli.js> <flags...>`.
+ * run by the session's agent (any of them: the browser is a connector
+ * capability, O8) over stdio on the Node the connector resolved, normally
+ * the one inside the Claude Code or Codex package that carries it:
+ * `node konteks/browser-mcp.js <playwright-mcp cli.js> <flags...>`.
  * See browser-launcher.ts.
  */
 import { startBrowserLauncher } from "./browser-launcher.js";

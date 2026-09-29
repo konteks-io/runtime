@@ -57,9 +57,12 @@ export const RunnerEventSchema = z.discriminatedUnion("kind", [
       event: z.discriminatedUnion("type", [
         z.object({ type: z.literal("display"), text: z.string().max(16_384) }).strict(),
         z.object({ type: z.literal("open_url"), url: z.string().url(), userCode: z.string().max(64).optional() }).strict(),
-        z.object({ type: z.literal("prompt"), label: z.string().max(256), secret: z.boolean() }).strict(),
+        // `visible`: a choice the person types in the open (OpenCode's provider
+        // pick); everything else is read with the launcher's hidden prompt.
+        z.object({ type: z.literal("prompt"), label: z.string().max(256), secret: z.boolean(), visible: z.literal(true).optional() }).strict(),
         z.object({ type: z.literal("completed"), readiness: z.string() }).strict(),
-        z.object({ type: z.literal("failed"), code: z.string(), message: z.string().max(1_024) }).strict(),
+        // `reason`: a failure the site words itself (Gemini Enterprise found no licence).
+        z.object({ type: z.literal("failed"), code: z.string(), message: z.string().max(1_024), reason: z.literal("no_license").optional() }).strict(),
       ]),
     })
     .strict(),

@@ -10,7 +10,7 @@ const SeedSchema = z.object({ enrollmentId: id, activationId: id, keyDigest: dig
 const BindingSchema = SeedSchema.extend({ instanceId: id, workspaceId: id, exchangeNonce: id }).strict();
 const scope = { instanceId: id, workspaceId: id };
 const AdmissionSchema = LocalAdmissionSchema;
-const RetainedProcessOwnerSchema = z.object({ version: z.literal(1), platform: z.enum(["darwin", "linux"]), pid: z.number().int().positive(), processGroupId: z.number().int().positive(), startToken: id, commandDigest: digest }).strict();
+const RetainedProcessOwnerSchema = z.object({ version: z.literal(1), platform: z.enum(["darwin", "linux", "win32"]), pid: z.number().int().positive(), processGroupId: z.number().int().positive(), startToken: id, commandDigest: digest }).strict();
 const McpLocalTransportIdentitySchema = z.object({ port: z.number().int().min(1).max(65535), credential: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict();
 const LegacyCodexAdmissionSchema = z.object({ reference: id, ownerGeneration: id }).strict();
 const LiveContinuationTransferSchema = z.object({ predecessor: AdmissionSchema, successor: AdmissionSchema,
@@ -498,7 +498,8 @@ export class LocalExecutionJournal {
   async markAcpSettled(admission: LocalAdmission, ref: string, at: string, assertCurrent: () => void): Promise<void> {
     await this.transition(admission, assertCurrent, existing => {
       if (!existing || existing.phase === "opened" || existing.acpSessionRef !== ref || existing.referenceFence !== admission.executionGeneration || this.references.get(ref) !== admission.executionGeneration) throw conflict();
-      return existing.phase === "acp_settled" ? existing : { ...existing, phase: "acp_settled", acpSettledAt: at };
+      // An interrupted execution is past settlement; it never goes back.
+      return existing.phase === "acp_settled" || existing.phase === "interrupted_unqualified" ? existing : { ...existing, phase: "acp_settled", acpSettledAt: at };
     });
   }
 
@@ -507,8 +508,11 @@ export class LocalExecutionJournal {
       // `acp_settled` is a predecessor's live recovery that settled the ACP turn but
       // could not certify quiescence. After restart only the retained process can
       // still be proven gone; refusing it here left startup recovery wedged forever.
-      if (!existing || (existing.phase !== "stopping" && existing.phase !== "acp_settled" && existing.phase !== "process_stopped") || !existing.processOwner) throw conflict();
-      return existing.phase === "process_stopped" ? existing : { ...existing, phase: "process_stopped", processStoppedAt: at };
+      // `interrupted_unqualified` already proved it gone: a later recovery (Core's
+      // cancel after a restart) finds it there, and refusing that kept the
+      // computer offline for good (WS1-166).
+      if (!existing || (existing.phase !== "stopping" && existing.phase !== "acp_settled" && existing.phase !== "process_stopped" && existing.phase !== "interrupted_unqualified") || !existing.processOwner) throw conflict();
+      return existing.phase === "process_stopped" || existing.phase === "interrupted_unqualified" ? existing : { ...existing, phase: "process_stopped", processStoppedAt: at };
     });
   }
 
@@ -801,7 +805,7 @@ function bytes(value: LocalAdmissionStart): number { return Buffer.byteLength(ca
 function conflict(): RemoteInstanceError { return new RemoteInstanceError("recovery_required", "Local execution history cannot prove this admission or absence.", { diagnostic: "local_execution_unprovable" }); }
 
 function logicalSessionId(assignment: RemoteWorkAssignment): string | undefined {
-  return assignment.source.kind === "conversation"
+  return assignment.source.kind === "conversation" || assignment.source.kind === "direct_session"
     ? assignment.source.sessionId
     : assignment.source.kind === "harness_delivery"
       ? assignment.source.executionSessionId
@@ -815,6 +819,11 @@ function sameLiveSession(predecessor: RemoteWorkAssignment, successor: RemoteWor
       predecessor.agentRoute.sessionConfig?.model !== successor.agentRoute.sessionConfig?.model) return false;
   if (predecessor.source.kind === "conversation" && successor.source.kind === "conversation") {
     return predecessor.source.sessionId === successor.source.sessionId && successor.source.acpSessionRef === acpSessionRef;
+  }
+  // A direct session's next prompt (runtime-view R11): the same session on the same computer.
+  if (predecessor.source.kind === "direct_session" && successor.source.kind === "direct_session") {
+    return predecessor.source.sessionId === successor.source.sessionId && predecessor.source.ownerInstanceId === successor.source.ownerInstanceId &&
+      successor.source.acpSessionRef === acpSessionRef;
   }
   if (predecessor.source.kind !== "harness_delivery" || successor.source.kind !== "harness_delivery") return false;
   if (predecessor.source.executionSessionId !== successor.source.executionSessionId ||

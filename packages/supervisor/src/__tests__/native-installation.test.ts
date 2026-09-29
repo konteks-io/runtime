@@ -10,6 +10,8 @@ import { bundleManifestSigningBytes, computeBundleManifestDigest, controlCall, S
 import type { BridgeProcess } from "@konteks/remote-agent-runner";
 import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
+import { antigravityInstallAdapter, nativeAgentOffered, openCodeInstallAdapter } from "../native/host-agents.js";
+import { OPENCODE_MIN_BINARY_BYTES } from "../native/opencode-installation.js";
 import { loadNativeInstallation, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, previewTuning, resolveNativeCodexSocket } from "../native/installation.js";
 import { verifyInstalledNativeBridges } from "../native/installed.js";
 import { createNativeService } from "../native/service.js";
@@ -188,25 +190,102 @@ describe("closed native runtime installation", () => {
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["dsh"], dshRoot: supported, dshNode: node }));
     const hostOnly = await loadNativeInstallation(root, f.options);
     await expect(verifyInstalledNativeBridges(hostOnly.release, hostOnly.runners, f.options.platform)).resolves.toBeUndefined();
-    // An upgrade out of the tested range stops the load with the install hint, never a silent run.
+    // An upgrade out of the tested range never runs silently: dsh is left out
+    // with the install hint (retried by the supervisor), and Codex still loads
+    // (opencode-runtime-support CP6 start isolation).
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: await dsh("0.1.8"), dshNode: node }));
-    await expect(loadNativeInstallation(root, f.options)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "dsh_unsupported_version" });
+    const outOfRange = await loadNativeInstallation(root, f.options);
+    expect(outOfRange.runners.map(entry => entry.RUNNER_AGENT_ID)).toEqual(["codex"]);
+    expect(outOfRange.unavailableAgents.map(entry => [entry.agentId, entry.error.code, entry.error.diagnostic])).toEqual([["dsh", "prerequisite_missing", "dsh_unsupported_version"]]);
     await writeFile(f.executable, "tampered");
     await expect(verifyInstalledNativeBridges(loaded.release, loaded.runners, f.options.platform)).rejects.toMatchObject({ code: "bundle_untrusted" });
     await rm(f.executable);
     await expect(verifyInstalledNativeBridges(loaded.release, loaded.runners, f.options.platform)).rejects.toMatchObject({ code: "bundle_untrusted" });
     expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["claude-code", "codex", "dsh"] }).success).toBe(true);
   });
-  it("still loads a record written before 7.0.0 that lists Pi or OpenCode, without them", async () => {
+  it("still loads a record written before 7.0.0 that lists Pi or the old OpenCode: Pi is dropped, OpenCode reads as the person's own OpenCode 2 (O13)", async () => {
     const f = await fixture();
+    // The old bundled OpenCode had its private folders; no OpenCode 2 is installed here.
+    for (const dir of ["credentials", "workspaces"]) await mkdir(join(root, dir, "opencode"), { recursive: true, mode: 0o700 });
+    vi.stubEnv("OPENCODE_EXECUTABLE", join(root, "no-opencode-here"));
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "opencode", "pi"] }));
     const loaded = await loadNativeInstallation(root, f.options);
-    expect(loaded.record.agents).toEqual(["codex"]);
-    expect(loaded.retiredAgents).toEqual(["opencode", "pi"]);
+    expect(loaded.record.agents).toEqual(["codex", "opencode"]);
+    expect(loaded.retiredAgents).toEqual(["pi"]);
+    // Not installed: left out with the reason, never a reason to stop Codex.
     expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
+    expect(loaded.unavailableAgents.map(entry => [entry.agentId, entry.error.code, entry.error.diagnostic])).toEqual([["opencode", "prerequisite_missing", "opencode_not_found"]]);
     // Tolerant reading only: a new record naming a retired agent is refused.
-    expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["codex", "opencode"] }).success).toBe(false);
+    expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["codex", "pi"] }).success).toBe(false);
     expect(parseNativeRuntimeRecord({ ...f.record, agents: ["pi", "codex"] }).record.agents).toEqual(["codex"]);
+  });
+  it.runIf(process.platform !== "win32")("records the person's OpenCode 2, re-verifies it on load and runs it (offered since CP6)", async () => {
+    const f = await fixture();
+    // `npm install -g @opencode/cli`: the package places a native executable.
+    const pkg = join(root, "person-npm", "lib", "node_modules", "@opencode", "cli");
+    const binary = join(pkg, "bin", "opencode.exe");
+    await mkdir(join(pkg, "bin"), { recursive: true });
+    const body = Buffer.alloc(OPENCODE_MIN_BINARY_BYTES + 16);
+    Buffer.from([0xcf, 0xfa, 0xed, 0xfe]).copy(body);
+    await writeFile(binary, body, { mode: 0o755 });
+    const packageJson = (version: string) => writeFile(join(pkg, "package.json"), JSON.stringify({ name: "@opencode/cli", version, bin: { opencode: "./bin/opencode.exe" } }));
+    await packageJson("2.0.18");
+    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "opencode"], opencodeBinary: binary, opencodeVersion: "2.0.18" });
+    // The loader's re-verification: the recorded executable, its version read again.
+    await expect(openCodeInstallAdapter.runnerSettings(record)).resolves.toEqual({
+      RUNNER_NATIVE_OPENCODE_BINARY: binary, RUNNER_BRIDGE_PREFIX: join(pkg, "bin"), RUNNER_BRIDGE_VERSION: "2.0.18",
+    });
+    vi.stubEnv("OPENCODE_EXECUTABLE", binary);
+    await expect(openCodeInstallAdapter.locate()).resolves.toEqual({ opencodeBinary: binary, opencodeVersion: "2.0.18" });
+    await packageJson("1.18.33");
+    await expect(openCodeInstallAdapter.runnerSettings(record)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_unsupported_version" });
+    await packageJson("2.0.18");
+    // The gate is lifted (CP6): a stored record naming it builds its runner.
+    expect(openCodeInstallAdapter.offered).toBe(true);
+    expect(nativeAgentOffered("opencode")).toBe(true);
+    expect(nativeAgentOffered("dsh")).toBe(true);
+    expect(nativeAgentOffered("codex")).toBe(true);
+    for (const dir of ["credentials", "workspaces"]) await mkdir(join(root, dir, "opencode"), { recursive: true, mode: 0o700 });
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
+    const loaded = await loadNativeInstallation(root, f.options);
+    expect(loaded.record.agents).toEqual(["codex", "opencode"]);
+    expect(loaded.retiredAgents).toEqual([]);
+    expect(loaded.unavailableAgents).toEqual([]);
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex", "opencode"]);
+    expect(loaded.runners[1]).toMatchObject({ RUNNER_NATIVE_OPENCODE_BINARY: binary, RUNNER_BRIDGE_VERSION: "2.0.18", RUNNER_CREDENTIAL_DIR: join(await realpath(root), "credentials", "opencode") });
+    // Replaced by OpenCode 1 in place: the connector still loads, OpenCode is left out with the reason.
+    await packageJson("1.18.33");
+    const downgraded = await loadNativeInstallation(root, f.options);
+    expect(downgraded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
+    expect(downgraded.unavailableAgents.map(entry => entry.error.diagnostic)).toEqual(["opencode_unsupported_version"]);
+    await packageJson("2.0.18");
+    await expect(downgraded.unavailableAgents[0]!.relocate()).resolves.toMatchObject({ RUNNER_AGENT_ID: "opencode", RUNNER_BRIDGE_VERSION: "2.0.18" });
+    // A runner built directly still proves the locked configuration first.
+    await expect(openCodeInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_not_found" });
+  });
+  it("records Google Antigravity's fetched copy, re-verifies it through its adapter, and leaves a missing copy out to be fetched again on the first yes (CP6)", async () => {
+    const f = await fixture();
+    const folder = join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
+    const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "antigravity"], antigravityVersion: "1.2.1", antigravityRoot: folder });
+    expect(record).toMatchObject({ antigravityVersion: "1.2.1", antigravityRoot: folder });
+    expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, antigravityRoot: "" }).success).toBe(false);
+    // The loader's re-verification runs against the connector's own folder: nothing was fetched here.
+    await expect(antigravityInstallAdapter.runnerSettings(record, { root })).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: expect.stringMatching(/^antigravity_(not_fetched|unsupported_platform)$/) });
+    expect(antigravityInstallAdapter.offered).toBe(true);
+    expect(nativeAgentOffered("antigravity")).toBe(true);
+    for (const dir of ["credentials", "workspaces"]) await mkdir(join(root, dir, "antigravity"), { recursive: true, mode: 0o700 });
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
+    const loaded = await loadNativeInstallation(root, f.options);
+    // Kept, never fatal: Codex loads, Antigravity waits for its copy.
+    expect(loaded.record.agents).toEqual(["codex", "antigravity"]);
+    expect(loaded.retiredAgents).toEqual([]);
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
+    expect(loaded.unavailableAgents).toEqual([expect.objectContaining({ agentId: "antigravity", fetched: { antigravityVersion: "1.2.1", antigravityRoot: folder } })]);
+    const [entry] = loaded.unavailableAgents;
+    // Where this release pins a copy, the missing one is fetched again at once (A17: the first yes covers it).
+    if (entry!.error.diagnostic === "antigravity_not_fetched") expect(entry!.updating).toBe(true);
+    else expect(entry!.updating).toBeUndefined();
+    await expect(antigravityInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_not_fetched" });
   });
   it.each([{ releaseId: "../outside" }, { agents: ["codex", "codex"] }, { coreUrl: "http://core.example" }, { coreUrl: "https://user:password@core.example" }, { relayUrl: "ws://relay.example" }, { gatewayKey: "forbidden" }, { environment: { NODE_OPTIONS: "--require untrusted" } }, { deploymentKind: "appliance" }, { command: "/bin/sh" }])("rejects unsafe or unimplemented install fields", async patch => {
     const f = await fixture();

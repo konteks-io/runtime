@@ -1,5 +1,6 @@
 import { createServer, request as httpRequest, type Server } from "node:http";
 import { connect, createServer as createTcpServer, type AddressInfo } from "node:net";
+import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { BROWSER_ORIGINS_PATH, NO_PREVIEW_MESSAGE, PreviewBrowserGateway } from "../preview/browser-gateway.js";
 
@@ -83,6 +84,17 @@ describe("the QA browser's gateway", () => {
     await expect(tunnel(g.proxyUrl, authority)).resolves.toContain("200 Connection Established");
     await expect(tunnel(g.proxyUrl, "example.com:443")).resolves.toContain("403 Refused");
     expect(g.gw.counters.tunnels).toBe(1);
+  });
+
+  it("survives a browser resetting a refused CONNECT or upgrade socket (found live in O8: Chrome resets them)", async () => {
+    const g = await gateway(() => "http://127.0.0.1:43100");
+    const handlers = g.gw as unknown as { onConnect(request: unknown, socket: PassThrough, head: Buffer): void; onUpgrade(request: unknown, socket: PassThrough, head: Buffer): void };
+    for (const [name, request] of [["onConnect", { url: "accounts.google.com:443" }], ["onUpgrade", { url: "http://example.com/socket", rawHeaders: [], method: "GET" }]] as const) {
+      const socket = new PassThrough();
+      handlers[name](request, socket, Buffer.alloc(0));
+      // Without a listener this would throw (an unhandled 'error' ends the connector process).
+      expect(() => socket.emit("error", Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })), name).not.toThrow();
+    }
   });
 
   it("refuses everything once closed", async () => {

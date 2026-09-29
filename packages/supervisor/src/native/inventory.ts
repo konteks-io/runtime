@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ConnectedAgentViewSchema, REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
+import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY, REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
 import type { InventorySnapshot } from "../inventory/snapshot.js";
 import type { RunnerPort } from "../runner-port.js";
@@ -24,12 +24,20 @@ export interface NativeInventoryOptions {
   agentLoginReady?: () => boolean;
   /** ...and Claude Code's, which needs a browser this machine can open. */
   agentLoginBrowserReady?: () => boolean;
+  /** Further agent capabilities (OpenCode: its free-models switch and the sign-ins the site may start). */
+  additionalCapabilities?: () => readonly string[];
   /**
    * This connector can serve session previews over the relay
    * (`preview.dev_server`). Core offers the `preview` attach scope, and the
    * relay opens `preview:<sessionId>`, only for a connector that says so.
    */
   previewReady?: () => boolean;
+  /**
+   * What the connector adds to the agents it reports, beside each runner's own
+   * view (Google Antigravity's download state, and its entry while no runner
+   * of it can start). Never changes readiness or capabilities.
+   */
+  decorateAgents?: (agents: ConnectedAgentView[]) => Promise<ConnectedAgentView[]>;
   /** The machine's git probe (OB6 §1); omitted, the runtime is not `onboard`. */
   gitVersion?: () => Promise<string | null>;
   now?: () => Date;
@@ -97,6 +105,7 @@ export class NativeInventoryCollector {
     if (this.options.cancellationDeliveryReady?.()) capabilities.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
     if (this.options.agentLoginReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_CAPABILITY);
     if (this.options.agentLoginBrowserReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);
+    for (const capability of this.options.additionalCapabilities?.() ?? []) if (!capabilities.includes(capability)) capabilities.push(capability);
     // The onboard role is git on THIS machine, not a signed-in agent: the
     // capabilities are advertised whenever git answers, and withheld the moment
     // it does not (OB6 §1).
@@ -104,12 +113,19 @@ export class NativeInventoryCollector {
     // This build names the person's coding sessions from Core's display label;
     // an older one rejects the field, so Core sends it only on this signal.
     if (agents.some(agent => agent.readiness === "ready" && agent.connectionState === "ready")) capabilities.push(REMOTE_SESSION_LABEL_CAPABILITY);
+    // Always, whatever agents are installed: this build reads the Core
+    // wire-contract version (`coreContractVersion`) Core signs into the desired
+    // configuration of a connector that asks for it, and takes Core's 7.1
+    // fields (pay-per-use turns, the download state, a credential's reason)
+    // from it (antigravity CP6).
+    capabilities.push(REMOTE_CORE_CONTRACT_CAPABILITY);
     if (this.options.previewReady?.()) capabilities.push(REMOTE_PREVIEW_CAPABILITY);
+    const reported = this.options.decorateAgents ? await this.options.decorateAgents(structuredClone(agents)).catch(() => agents) : agents;
     return {
       components: [{ kind: "agent_runner", version: this.options.bundleVersion,
         healthStatus: healthyRunners === 0 ? "unhealthy" : healthyRunners === results.length ? "healthy" : "degraded",
         capabilities, lastProbeAt: at }],
-      agents,
+      agents: reported,
       hostPressure: metrics ? hostPressureRatio(metrics) : 1,
       activeSessions,
       activeTurns,

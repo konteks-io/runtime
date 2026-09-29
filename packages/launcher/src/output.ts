@@ -42,6 +42,8 @@ export function createOutput(options: { json: boolean; stdout?: NodeJS.WritableS
   };
 }
 
+const AGENT_NAMES: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness", opencode: "OpenCode 2", antigravity: "Google Antigravity" };
+
 export function describeAction(action: { kind: string; agentId?: string | undefined }): string {
   switch (action.kind) {
     case "retry":
@@ -55,7 +57,13 @@ export function describeAction(action: { kind: string; agentId?: string | undefi
     case "free_disk":
       return "free disk space and retry";
     case "install_backend":
-      return "install and start the supported container backend, then retry";
+      // The native connector has no container backend: this names the agent
+      // install the message asks for (the person's own DeepSeek Harness or
+      // OpenCode; Google Antigravity is downloaded by the connector itself).
+      if (action.agentId === "antigravity") return "run `konteks-remote agent add antigravity`, which downloads Google's copy again after you say yes";
+      return action.agentId
+        ? `install a supported ${AGENT_NAMES[action.agentId] ?? action.agentId} as the message says, then run the command again`
+        : "install what the message names, then run the command again";
     case "new_activation":
       return "create a new activation in the Konteks App or MCP and rerun install";
     case "contact_support":

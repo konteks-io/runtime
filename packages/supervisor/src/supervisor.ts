@@ -2,11 +2,15 @@ import { ObservationDelivery } from "./control/observation-delivery.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   REMOTE_INSTANCE_PROTOCOL_VERSION,
   PlanningControllerTerminalDirectiveSchema,
   RemoteInstanceError,
+  AgentLoginGcpSchema,
+  AgentLoginOptionIdSchema,
+  ON_COMPUTER_LOGIN_OPTION,
+  REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
   SystemClock,
   createLogger,
   parseRfc3339,
@@ -15,6 +19,8 @@ import {
   type ControlAck,
   type ControlHandler,
   type ControlLoginEvent,
+  type ConnectedAgentView,
+  type ConnectorCommandsManifest,
   type HeartbeatResult,
   type InstanceKeyPair,
   type JsonValue,
@@ -24,13 +30,12 @@ import {
   type RelayRuntimeHandshakeResult,
   type SupervisorStatus,
   type PreviewStatusReport,
-  AGENT_LOGIN_METHOD,
-  AgentLoginUserCodeSchema,
-  agentLoginUrlAllowed,
   type RuntimeAgentLoginDeliveryRequest,
+  coreContractAtLeast,
 } from "@konteks/remote-common";
-import { EmbeddedReleaseRootSchema, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { chromeInstalled, type RunnerConfig } from "@konteks/remote-agent-runner";
+import { EmbeddedReleaseRootSchema, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { chromeInstalled, readAntigravityAdminObservation, type RunnerConfig } from "@konteks/remote-agent-runner";
+import type { NativeRuntimeRecord, NativeUnavailableAgent } from "./native/installation.js";
 import { SignalSampler } from "@konteks/remote-sysmon";
 import { loadSupervisorConfig, type SupervisorConfig } from "./config.js";
 import { CoreClient, LEASE_AUDIENCE } from "./core/client.js";
@@ -64,8 +69,13 @@ import { ChannelMux } from "./relay/channel-mux.js";
 import { RelayClient } from "./relay/relay-client.js";
 import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
-import { ModelCapabilitySnapshotProducer } from "./native/model-capability-snapshot.js";
+import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
+import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
+import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerWatch } from "./native/on-computer.js";
+import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
+import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
+import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
 import { NativeInputClient } from "./native/input-client.js";
 import { NativeOutputClient } from "./native/output-client.js";
 import { createRetainedDeliveryOutputRecovery } from "./native/output-recovery.js";
@@ -76,6 +86,7 @@ import { verifyInstalledNativeBridges } from "./native/installed.js";
 import { acquireNativeRootLock, type NativeRootLock } from "./native/root-lock.js";
 import { NativeCodexAppServerOwner, type NativeCodexAppServerOwnerOptions } from "./native/codex-app-server-owner.js";
 import { NativeAgentRetry, startNativeAgents } from "./native/start-native-agents.js";
+import { NotAddedAgentsDetector, SUPPORTED_AGENT_IDS, projectSupportedAgents, type AddedAgentFacts } from "./native/supported-agents.js";
 import { StateMutationGate } from "./state/mutation-gate.js";
 import type { RelayedSessionDeps } from "./session/relayed-session.js";
 import { PermissionBroker } from "./session/permissions.js";
@@ -85,7 +96,8 @@ import { SupervisorJournal } from "./state/journal.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
 import { buildSupportBundle } from "./support/bundle.js";
-import { runDoctor } from "./support/doctor.js";
+import { runDoctor, type AntigravityDoctorInputs, type OpenCodeDoctorInputs } from "./support/doctor.js";
+import { openCodeInstallKind } from "./native/opencode-installation.js";
 import { HttpsFallbackTransport } from "./transport/https-fallback.js";
 import { RecoveryAuthority } from "./transport/recovery-authority.js";
 import { AssignmentSender } from "./work/assignment-sender.js";
@@ -106,7 +118,10 @@ import { evaluateHeartbeatLiveness } from "./heartbeat/liveness.js";
 // composed below, so its two kinds are accepted too. Leaving them out meant
 // Core never offered a discovery run's evidence work, and grouping evidence
 // was never read.
-const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation"];
+// `direct` (runtime-view R11): a person's own chat on this computer. Only a
+// Core that knows it places it; a Core built before it refuses a pull naming
+// it, so it is asked for only once Core signs 7.1 (see acceptedKinds below).
+const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation", "direct"];
 
 /** How long preview_start waits for the dev server before answering "still starting". */
 const PREVIEW_START_WAIT_MS = 45_000;
@@ -117,6 +132,12 @@ const PREVIEW_VIEWER_RETRY_MS = 60_000;
 const IDLE_SESSION_RELEASE_MS = 30 * 60_000;
 const IDLE_SESSION_SWEEP_MS = 5 * 60_000;
 const LIVENESS_CHECK_MS = 30_000;
+/** How long a site-started step waits on the person at the window on this computer (Core keeps it 30 minutes). */
+const ON_COMPUTER_WATCH_MS = 30 * 60_000;
+/** How often the connector looks whether that step's agent reads ready. */
+const ON_COMPUTER_POLL_MS = 5_000;
+/** A turn's start or end is told to Core this soon, not at the next 30 s heartbeat (WS1-179). */
+const TURN_ACTIVITY_HEARTBEAT_MS = 500;
 const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
 
 export interface SupervisorOptions {
@@ -137,6 +158,10 @@ export interface SupervisorOptions {
     repositoryCacheRoot?: string;
     prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void | "unavailable" | "skipped" | "wired">;
     runtimeOptions?: NativeRunnerOptions["runtimeOptions"];
+    /** Host agents the installation lists but could not find or verify at load; left out and retried (opencode CP6). */
+    unavailableAgents?: NativeUnavailableAgent[];
+    /** The connector's QA browser (O8); resolved from the runners' packages and the person's Node when absent (tests pass it). */
+    browser?: ConnectorBrowserStatus;
     /** Test/embedding seam for the independently supervised shared Codex owner. */
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;
     /** Self-update policy; absent means the connector only reports `update_required`. */
@@ -165,6 +190,7 @@ export class Supervisor {
   private manifestDigest = "";
   /** Core's desired configuration; native, with no roles, until Core sends one. */
   private configuration: ConfigRecord["configuration"] = DEFAULT_CONFIG;
+  private hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: false };
   private roleBindings: RoleBinding[] = [];
   private draining = false;
   private drainReason: string | null = null;
@@ -172,6 +198,14 @@ export class Supervisor {
   private drainDeadline: string | null = null;
   private pendingRevocation = false;
   private lastSnapshot: InventorySnapshot | null = null;
+  /** This release's `konteks-remote` commands at its bundle version (runtime-view R20), built once; null when the table or version does not parse. */
+  private connectorCommandsCache: { manifest: ConnectorCommandsManifest | null } | null = null;
+  private connectorCommands(): ConnectorCommandsManifest | undefined {
+    this.connectorCommandsCache ??= { manifest: connectorCommandsManifest(this.config.SUPERVISOR_BUNDLE_VERSION) };
+    return this.connectorCommandsCache.manifest ?? undefined;
+  }
+  /** The cached detection of supported agents the installation does not list (runtime-view R21). */
+  private notAddedAgents: NotAddedAgentsDetector | null = null;
   /**
    * The machine's own git (OB6 §5). It is a field rather than a dependency
    * because every onboard lane — role advertisement, the evidence collector
@@ -210,6 +244,8 @@ export class Supervisor {
   readonly runners = new Map<string, RunnerPort>();
   private readonly nativeRunners: NativeRunner[] = [];
   private nativeCodexOwner: NativeCodexAppServerOwner | null = null;
+  /** The QA browser every agent's sessions get (O8), or why this connector has none. */
+  private connectorBrowser: ConnectorBrowserStatus = { available: false, reason: "no_package", message: "" };
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private stopping = false;
@@ -249,6 +285,9 @@ export class Supervisor {
   private livenessQuietWarned = false;
   private pendingHeartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeLogins = new Map<string, { agentId: string; emit: (event: ControlLoginEvent) => void }>();
+  /** Site-started steps waiting on the person at a window on this computer, by login id. */
+  private readonly onComputerWatches = new Map<string, NodeJS.Timeout>();
+  private turnActivityTimer: NodeJS.Timeout | null = null;
 
   constructor(config: SupervisorConfig = loadSupervisorConfig(), private readonly options: SupervisorOptions = {}) {
     this.config = config;
@@ -359,14 +398,26 @@ export class Supervisor {
       config: sharedCodex,
       onRestartFailure: error => this.logger.warn({ err: error }, "shared Codex app-server restart failed; retrying"),
     });
-    for (const config of this.options.native!.runners) {
-      const runner = new NativeRunner({ instanceId: identity!.instanceId, config,
-        ...(config.RUNNER_AGENT_ID === "codex" && this.nativeCodexOwner ? { afterSuccessfulLogin: () => this.nativeCodexOwner!.refreshAfterLogin() } : {}),
-        executionBridgeLimit: () => Math.min(4, this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT ?? 4),
-        onEvent: event => { void this.onRunnerEvent(config.RUNNER_AGENT_ID, event).catch(error => this.logger.warn({ err: error }, "native runner event failed")); }, ...(this.options.native!.runtimeOptions ? { runtimeOptions: this.options.native!.runtimeOptions } : {}) });
+    // The QA browser is the connector's, not an agent package's (O8): every
+    // agent's sessions get it when an installed Claude Code or Codex package
+    // carries it and some Node can run it.
+    this.connectorBrowser = this.options.native!.browser ?? await resolveConnectorBrowser(this.options.native!.runners);
+    if (this.connectorBrowser.available) {
+      this.logger.info({ event: "browser.connector_ready", packageAgent: this.connectorBrowser.browser.packageAgent, nodeSource: this.connectorBrowser.browser.nodeSource }, "the QA browser is available to every agent on this computer");
+    } else {
+      this.logger.warn({ event: "browser.connector_unavailable", reason: this.connectorBrowser.reason }, this.connectorBrowser.message);
+    }
+    this.nativeRunnerInstanceId = identity!.instanceId;
+    for (const config of withConnectorBrowser(this.options.native!.runners, this.connectorBrowser)) {
+      const runner = this.createNativeRunner(config);
       this.nativeRunners.push(runner);
       this.runners.set(runner.agentId, runner);
     }
+    // Supported agents the installation does not list: detected now, in the
+    // background, so the first heartbeat can already say where they stand.
+    const recorded = this.recordedAgentIds();
+    this.notAddedAgents = new NotAddedAgentsDetector({ agentIds: SUPPORTED_AGENT_IDS.filter(agentId => !recorded.has(agentId)) });
+    void this.notAddedAgents.refreshIfDue().catch(() => undefined);
     this.inventory = new NativeInventoryCollector({ runners: this.runners, sampler: new SignalSampler(this.config.SUPERVISOR_DATA_DIR), bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       gitVersion: () => this.git.version(),
       executionPermitsReady: () => {
@@ -378,6 +429,8 @@ export class Supervisor {
       // A site-started login needs a native install with a Codex runner (WS1-115).
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
+      additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : [])],
+      decorateAgents: agents => this.withAntigravityDownload(agents),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
       cancellationDeliveryReady: () => {
@@ -407,6 +460,10 @@ export class Supervisor {
         if (!runner) throw new RemoteInstanceError("agent_unavailable", "Reviewed model mapping has no installed native runner.");
         return runner.discoverModelCapability(configId);
       },
+      // OpenCode's routes bill by provider and credential (O7, O11); only a
+      // 7.1.0 Core takes the field (the shape is strict and digested).
+      optionBilling: (agentId, value, agent) => (!this.hostSettings.coreAcceptsRouteBilling ? undefined
+        : agentId === "opencode" ? openCodeOptionBilling(agent, value) : agentId === "antigravity" ? antigravityOptionBilling(agent) : undefined),
     });
 
     this.mux = new ChannelMux({
@@ -685,6 +742,7 @@ export class Supervisor {
       onConfigurationApplied: (configuration) => {
         this.configuration = configuration;
         this.roleBindings = (configuration.roleBindings ?? []).map(binding => ({ role: binding.role, agentPreference: [...binding.agentPreference] }));
+        this.applyHostSettings(configuration);
       },
       localCapacity: () => Math.max(1, (this.lastSnapshot?.agents.filter((agent) => agent.readiness === "ready").length ?? 1) * 4),
       onDrain: async (directive) => this.beginDrain(directive.reason, directive.drainDeadline ?? null),
@@ -722,7 +780,7 @@ export class Supervisor {
       roleBindings: () => this.roleBindings,
       advertisedRoles: () => deriveAdvertisedRoles(this.roleBindings, this.lastSnapshot?.agents ?? [], this.roleCapabilityInputs()),
       roleCapabilityInputs: () => this.roleCapabilityInputs(),
-      acceptedKinds: () => ALL_KINDS,
+      acceptedKinds: () => this.hostSettings.coreAcceptsRouteBilling ? ALL_KINDS : ALL_KINDS.filter(kind => kind !== "direct"),
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
       draining: () => this.draining,
       reconciliationComplete: () => this.reconciliation.isComplete,
@@ -756,6 +814,7 @@ export class Supervisor {
         journal: this.journal,
         transport: this.transport,
         runner,
+        onTurnActivity: () => this.nudgeHeartbeat(),
         preview: this.sessionPreviewAccess(),
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
         broker: this.broker,
@@ -921,6 +980,9 @@ export class Supervisor {
       roleBindings: () => this.roleBindings,
       activeAssignmentIds: () => this.work.activeAssignmentIds(),
       modelCapabilitySnapshots: () => this.modelCapabilities?.snapshots() ?? [],
+      supportedAgents: agents => this.supportedAgents(agents),
+      // The commands this release carries (runtime-view R20), only to a Core that takes 7.1 fields.
+      connectorCommands: () => (this.hostSettings.coreAcceptsRouteBilling ? this.connectorCommands() : undefined),
       configRevision: () => this.control.configRevision,
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       softMaxConcurrent: () => this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT,
@@ -933,7 +995,10 @@ export class Supervisor {
     const agents = await startNativeAgents({
       codexOwner: this.nativeCodexOwner,
       runners: this.nativeRunners,
-      onUnavailable: (agentId, error) => this.logger.error({ err: error, agentId }, "agent could not start; the runtime continues without it"),
+      onUnavailable: (agentId, error) => {
+        this.agentStartFailures.set(agentId, error);
+        this.logger.error({ err: error, agentId }, "agent could not start; the runtime continues without it");
+      },
     });
     if (this.nativeCodexOwner && !agents.codexOwnerStarted) {
       // Codex is left out rather than taking every other agent down with it:
@@ -951,6 +1016,7 @@ export class Supervisor {
     // Any other agent that could not start is left out the same way and
     // retried in the background, so one agent never takes the rest down.
     for (const runner of agents.failed) this.parkNativeRunner(runner);
+    for (const entry of this.options.native!.unavailableAgents ?? []) this.parkUnavailableHostAgent(entry);
     this.lastSnapshot = await this.inventory.collect();
     if (this.stopping) return;
     if (this.instanceId && this.administrativeStatus !== "provisioning") {
@@ -969,24 +1035,72 @@ export class Supervisor {
     }
   }
 
+  private nativeRunnerInstanceId = "";
+
+  private createNativeRunner(config: RunnerConfig): NativeRunner {
+    return new NativeRunner({ instanceId: this.nativeRunnerInstanceId, config,
+      ...(config.RUNNER_AGENT_ID === "codex" && this.nativeCodexOwner ? { afterSuccessfulLogin: () => this.nativeCodexOwner!.refreshAfterLogin() } : {}),
+      executionBridgeLimit: () => Math.min(4, this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT ?? 4),
+      onEvent: event => { void this.onRunnerEvent(config.RUNNER_AGENT_ID, event).catch(error => this.logger.warn({ err: error }, "native runner event failed")); }, ...(this.options.native!.runtimeOptions ? { runtimeOptions: this.options.native!.runtimeOptions } : {}) });
+  }
+
+  /**
+   * A host agent (the person's own DeepSeek Harness or OpenCode) that the
+   * installation could not find or verify at load (removed, or upgraded out
+   * of the supported range) is left out like an agent that failed to start:
+   * the connector runs the others, and a background retry re-locates it and
+   * builds its runner once it is back.
+   */
+  private parkUnavailableHostAgent(entry: NativeUnavailableAgent): void {
+    this.agentStartFailures.set(entry.agentId, entry.error);
+    this.logger.error({ err: entry.error, agentId: entry.agentId }, "agent could not be found or verified; the runtime continues without it");
+    // Google Antigravity's update (A17): its `relocate` fetches this release's
+    // pin, checks it and switches to it, starting now rather than in a minute.
+    this.nativeAgentRetry.park(entry.agentId, async () => {
+      const [config] = withConnectorBrowser([await entry.relocate()], this.connectorBrowser);
+      const runner = this.createNativeRunner(config!);
+      try {
+        await runner.start();
+      } catch (error) {
+        await runner.stop().catch(() => undefined);
+        throw error;
+      }
+      this.parkedRunners.set(entry.agentId, runner);
+    }, entry.updating ? { firstDelayMs: 0 } : {});
+  }
+
+  /** The last reason each left-out agent could not start (doctor), cleared when it starts. */
+  private readonly agentStartFailures = new Map<string, unknown>();
+
   private readonly nativeAgentRetry = new NativeAgentRetry({
     onStarted: async agentId => {
       const runner = this.parkedRunners.get(agentId);
       this.parkedRunners.delete(agentId);
+      this.agentStartFailures.delete(agentId);
       if (!runner || this.stopping) return;
       this.nativeRunners.push(runner);
       this.runners.set(runner.agentId, runner);
+      // Core's settings may have changed while it was left out.
+      void runner.applyHostSettings(this.hostSettings).catch(error => this.logger.warn({ err: error, agentId }, "host agent settings not applied"));
       // The next heartbeat advertises it; nothing waits for this.
       this.lastSnapshot = await this.inventory.collect().catch(() => this.lastSnapshot);
       this.logger.info({ agentId }, "agent started on a later try; it is advertised again");
     },
     onGaveUp: (agentId, error) => {
+      const runner = this.parkedRunners.get(agentId);
       this.parkedRunners.delete(agentId);
+      if (runner) this.gaveUpRunners.set(agentId, runner);
+      this.agentStartFailures.set(agentId, error);
       this.logger.error({ err: error, agentId }, "agent still could not start after ten tries; restart the connector once it is fixed");
     },
-    log: (agentId, attempt, error) => this.logger.warn({ err: error, agentId, attempt }, "agent still could not start; trying again later"),
+    log: (agentId, attempt, error) => {
+      this.agentStartFailures.set(agentId, error);
+      this.logger.warn({ err: error, agentId, attempt }, "agent still could not start; trying again later");
+    },
   });
   private readonly parkedRunners = new Map<string, NativeRunner>();
+  /** Runners the retry gave up on after ten tries; kept only so doctor can still say why. */
+  private readonly gaveUpRunners = new Map<string, NativeRunner>();
 
   /** Leave one runner out of advertising and placement until a retry starts it. */
   private parkNativeRunner(runner: NativeRunner): void {
@@ -1132,7 +1246,10 @@ export class Supervisor {
     if (this.recoveryRetryTimer) clearTimeout(this.recoveryRetryTimer);
     this.recoveryRetryTimer = null;
     const operation = this.startActiveLoopImpl().catch(error => {
-      this.logger.warn({ err: error }, "startup recovery remains pending");
+      // The logger keeps no stack, and every local-history refusal says the same
+      // sentence: name where it came from, or a stuck recovery is undiagnosable.
+      const at = error instanceof Error ? error.stack?.split("\n").slice(1, 6).map(line => line.trim().replace(/^at /, "")).join(" < ") : undefined;
+      this.logger.warn({ err: error, ...(at ? { at } : {}) }, "startup recovery remains pending");
       const record = this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation);
       const terminal = record && record.state !== "pending" && record.state !== "applied";
       const denied = this.administrativeStatus === "revoked" || (error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch", "reconciliation_replay", "resume_deadline_expired"].includes(error.code));
@@ -1215,6 +1332,7 @@ export class Supervisor {
     if (this.stopping) return;
     this.requireRecoveryAuthority();
     this.activeLoopStarted = true;
+    void this.resumeOnComputerWatches().catch(error => this.logger.warn({ err: error }, "on-computer steps not resumed"));
     this.transport.start();
     this.planningDirectivePoller?.start();
     this.transport.resumeAfterRecovery();
@@ -1675,17 +1793,28 @@ export class Supervisor {
     this.previewViewerStarts.delete(sessionId);
   }
 
-  /** Which agents can drive the QA browser (Playwright MCP) and whether it uses Chrome or Playwright's Chromium. */
-  private browserReport(): { version: string | null; agents: string[]; chrome: boolean } {
+  /**
+   * Every agent's sessions get the QA browser (O8) while the connector has
+   * one and previews can run (a session is given the browser with its
+   * preview); Core may then place QA on any of them.
+   */
+  private browserToolReady(): boolean {
+    return this.connectorBrowser.available && this.previewCapable();
+  }
+
+  /** Which agents drive the QA browser (Playwright MCP), on which Node, whether it uses Chrome or Playwright's Chromium, or why there is none. */
+  private browserReport(): { version: string | null; agents: string[]; chrome: boolean; packageAgent?: string; nodeSource?: "agent_package" | "person"; unavailable?: string } {
     const agents: string[] = [];
     let version: string | null = null;
     for (const [agentId, runner] of this.runners) {
-      const bundled = runner.browserVersion?.() ?? null;
-      if (bundled === null) continue;
+      const offered = runner.browserVersion?.() ?? null;
+      if (offered === null) continue;
       agents.push(agentId);
-      version ??= bundled;
+      version ??= offered;
     }
-    return { version, agents: agents.sort(), chrome: chromeInstalled() };
+    const browser = this.connectorBrowser;
+    return { version, agents: agents.sort(), chrome: chromeInstalled(),
+      ...(browser.available ? { packageAgent: browser.browser.packageAgent, nodeSource: browser.browser.nodeSource } : version === null && browser.message ? { unavailable: browser.message } : {}) };
   }
 
   private previewCapable(): boolean {
@@ -1764,8 +1893,13 @@ export class Supervisor {
             void runner.loginCancel(loginId).catch(error => this.logger.warn({ err: error }, "orphaned local login cancellation failed"));
           }, { once: true });
           // The person ran this on their own machine: their own login (WS1-115).
+          const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }),
+            ...(request.reuse === undefined ? {} : { reuse: request.reuse }),
+            // Gemini Enterprise's project and location, both or neither (the runner checks them again).
+            ...(request.project !== undefined && request.location !== undefined ? { gcp: AgentLoginGcpSchema.parse({ project: request.project, location: request.location }) } : {}) };
           try {
-            await runner.login(request.organization, loginId, true);
+            if (Object.keys(which).length > 0) await runner.login(request.organization, loginId, true, which);
+            else await runner.login(request.organization, loginId, true);
             if (emit.signal.aborted) {
               await runner.loginCancel(loginId);
               throw new RemoteInstanceError("temporarily_unavailable", "login caller disconnected");
@@ -1791,8 +1925,10 @@ export class Supervisor {
           login.emit({ kind: "failed", loginId: request.loginId, code: "login_cancelled", message: "login cancelled" });
           return {};
         }
-        case "auth.logout":
-          return this.requireRunner(request.agentId).logout();
+        case "auth.logout": {
+          const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }) };
+          return Object.keys(which).length === 0 ? this.requireRunner(request.agentId).logout() : this.requireRunner(request.agentId).logout(which);
+        }
         case "git.key.add": {
           const store = this.gitKeys();
           const key = await store.add(request.title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);
@@ -1916,8 +2052,27 @@ export class Supervisor {
     if (!instanceId || intent.instanceId !== instanceId || intent.tenantId !== this.workspaceId) {
       throw new RemoteInstanceError("recovery_required", "This agent login is for another runtime");
     }
+    if (intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId)) {
+      await this.startOnComputer(instanceId, intent.loginId, intent.agentId as OnComputerAgent, intent.action);
+      return;
+    }
+    if (intent.agentId !== "codex" && intent.agentId !== "claude-code" && intent.agentId !== "opencode" && intent.agentId !== "antigravity") {
+      if (intent.action !== "cancel") {
+        await this.core.reportAgentLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as Parameters<CoreClient["reportAgentLogin"]>[1])
+          .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
+      }
+      return;
+    }
+    // An OpenCode or Antigravity login names its sign-in option; every report
+    // echoes it. Another agent's option is never started (the runner offers
+    // only its own). Gemini Enterprise carries its Google Cloud project.
+    const optionAgent = intent.agentId === "opencode" || intent.agentId === "antigravity";
+    const requestedOption = optionAgent && intent.loginOption !== undefined ? AgentLoginOptionIdSchema.safeParse(intent.loginOption) : undefined;
+    const loginOption = requestedOption?.success ? requestedOption.data : undefined;
+    const gcp = intent.agentId === "antigravity" && loginOption === "gemini-enterprise" && intent.gcp !== undefined ? intent.gcp : undefined;
     const report = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) =>
-      this.core.reportAgentLogin(instanceId, value).catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
+      this.core.reportAgentLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as Parameters<CoreClient["reportAgentLogin"]>[1])
+        .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
     if (intent.action === "cancel") {
       const login = this.activeLogins.get(intent.loginId);
       if (login) {
@@ -1933,58 +2088,241 @@ export class Supervisor {
       await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
       return;
     }
-    // Claude Code finishes in a browser it opens on this machine: nothing to
-    // show but the page itself, and a code it asks for is never relayed.
-    const browser = AGENT_LOGIN_METHOD[intent.agentId] === "machine_browser";
-    let url: string | undefined;
-    let code: string | undefined;
-    let over = false;
-    const finish = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) => {
-      if (over) return;
-      over = true;
-      this.activeLogins.delete(intent.loginId);
-      void report(value);
-    };
-    const awaiting = () => {
-      if (over || (!url && !browser)) return;
-      void report({ loginId: intent.loginId, agentId: intent.agentId, state: "awaiting_person", ...(url ? { verificationUrl: url } : {}), ...(code && !browser ? { userCode: code } : {}) });
-    };
-    this.activeLogins.set(intent.loginId, {
-      agentId: intent.agentId,
-      emit: event => {
-        if (event.kind === "open_url") {
-          if (!agentLoginUrlAllowed(intent.agentId, event.url)) return;
-          url = event.url;
-          if (event.userCode && AgentLoginUserCodeSchema.safeParse(event.userCode).success) code = event.userCode;
-          awaiting();
-        } else if (event.kind === "display" && !browser) {
-          // The code may come on its own line after the link.
-          const found = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/.exec(event.text)?.[1];
-          if (found && found !== code) {
-            code = found;
-            awaiting();
-          }
-        } else if (event.kind === "prompt") {
-          // The browser's own callback completes Claude Code's login.
-          if (browser) return;
-          void runner.loginCancel(intent.loginId).catch(() => undefined);
-          finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "login_failed" });
-        } else if (event.kind === "completed") {
-          finish({ loginId: intent.loginId, agentId: intent.agentId, state: "succeeded" });
-          // Ready shows on the site now, not at the next heartbeat.
-          if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed"));
-        } else if (event.kind === "failed") {
-          finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "login_failed" });
-        }
-      },
+    // A sign-in this machine does not offer (any more) is not started; nor a
+    // Gemini Enterprise sign-in without its project.
+    if ((requestedOption !== undefined && !requestedOption.success) || (loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(loginOption))
+        || (intent.agentId === "antigravity" && (loginOption === undefined || (loginOption === "gemini-enterprise" && gcp === undefined)))) {
+      await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
+      return;
+    }
+    const relay = siteLoginRelay({ loginId: intent.loginId, agentId: intent.agentId, ...(loginOption === undefined ? {} : { loginOption }),
+      coreAcceptsNoLicense: this.hostSettings.coreAcceptsRouteBilling,
+      report: value => { void report(value); },
+      cancel: () => { void runner.loginCancel(intent.loginId).catch(() => undefined); },
+      onFinished: () => { this.activeLogins.delete(intent.loginId); },
+      // Ready shows on the site now, not at the next heartbeat.
+      onSucceeded: () => { if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed")); },
     });
+    this.activeLogins.set(intent.loginId, { agentId: intent.agentId, emit: event => relay.emit(event) });
     try {
-      await runner.login(false, intent.loginId, true);
-      if (browser) awaiting();
+      if (loginOption === undefined) await runner.login(false, intent.loginId, true);
+      else await runner.login(false, intent.loginId, true, { loginOption, ...(gcp ? { gcp } : {}) });
+      relay.started();
     } catch (error) {
       const busy = error instanceof RemoteInstanceError && /already in progress/i.test(error.message);
-      finish({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: busy ? "already_in_progress" : "unavailable" });
+      relay.fail(busy ? "already_in_progress" : "unavailable");
     }
+  }
+
+  /**
+   * A step the person asked for on the site, brought to the front here
+   * (on-computer): from where the agent stands, a window on this computer runs
+   * its install, its add and its sign-in at the connector's own prompt, and
+   * the person answers there. Core hears that it waits on them (with the step),
+   * then that it worked once the agent reads ready. A cancel stops the watch;
+   * the window is the person's to close.
+   */
+  private async startOnComputer(instanceId: string, loginId: string, agentId: OnComputerAgent, action: "start" | "cancel"): Promise<void> {
+    const report = this.onComputerReporter(instanceId, loginId, agentId);
+    if (action === "cancel") { await this.stopOnComputerWatch(loginId); return; }
+    if (this.onComputerWatches.has(loginId)) return;
+    const facts = this.onComputerFacts(agentId);
+    if (!facts) { await report({ state: "failed", failure: "unavailable" }); return; }
+    if (onComputerDone(facts.state)) { await report({ state: "succeeded" }); return; }
+    const plan = planOnComputer({ agentId, state: facts.state, ...(facts.installCommand ? { installCommand: facts.installCommand } : {}), ...(facts.windowsInstallCommand ? { windowsInstallCommand: facts.windowsInstallCommand } : {}) }, process.platform);
+    if (!plan) { await report({ state: "failed", failure: "unavailable" }); return; }
+    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
+    // A stand-in laptop's window loads the stand-in's own terminal settings.
+    const prelude = process.env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" ? standInTerminalEnv(root) : undefined;
+    try {
+      const { file, opened } = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform, ...(prelude ? { prelude } : {}) }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform, confined: prelude !== undefined });
+      this.logger.info({ event: opened ? "on_computer.opened" : "on_computer.left_for_tester", loginId, agentId, step: plan.step, file },
+        opened ? "site-started step brought to the front on this computer" : "site-started step left in the stand-in's folder; no window opened");
+    } catch (error) {
+      this.logger.warn({ err: error, loginId, agentId }, "site-started step could not be opened on this computer");
+      await report({ state: "failed", failure: "unavailable" });
+      return;
+    }
+    await report({ state: "awaiting_person", step: plan.step });
+    const watch: OnComputerWatch = { instanceId, loginId, agentId, until: plan.until, deadline: Date.now() + ON_COMPUTER_WATCH_MS };
+    // Kept on disk: adding an agent restarts this connector, and the step must
+    // still end (and say so on the site) in the connector that comes back.
+    await writeOnComputerWatch(this.config.SUPERVISOR_DATA_DIR, watch).catch(error => this.logger.warn({ err: error, loginId }, "on-computer step not kept across a restart"));
+    this.watchOnComputer(watch);
+  }
+
+  private onComputerReporter(instanceId: string, loginId: string, agentId: OnComputerAgent) {
+    type Report = Parameters<CoreClient["reportAgentLogin"]>[1];
+    return (value: Omit<Report, "loginId" | "agentId" | "loginOption">) =>
+      this.core.reportAgentLogin(instanceId, { loginId, agentId, loginOption: ON_COMPUTER_LOGIN_OPTION, ...value } as Report)
+        .catch(error => this.logger.warn({ err: error, loginId }, "agent login report not delivered"));
+  }
+
+  private onComputerFacts(agentId: OnComputerAgent) {
+    return this.supportedAgents(this.lastSnapshot?.agents ?? [])?.find(entry => entry.agentId === agentId);
+  }
+
+  /**
+   * A turn started or ended: publish a heartbeat shortly (once for a burst), so
+   * the runtime's busy bar and counter move with the work. A short turn used
+   * to fall between two 30 s heartbeats and never showed at all (WS1-179).
+   */
+  private nudgeHeartbeat(): void {
+    if (!this.activeLoopStarted || this.stopping || this.turnActivityTimer) return;
+    this.turnActivityTimer = setTimeout(() => {
+      this.turnActivityTimer = null;
+      if (!this.activeLoopStarted || this.stopping) return;
+      void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after a turn change failed"));
+    }, TURN_ACTIVITY_HEARTBEAT_MS);
+    this.turnActivityTimer.unref();
+  }
+
+  /** Looks every few seconds whether the step's agent reads ready (or, for an add, added); says so once, or that it ran out of time. */
+  private watchOnComputer(watch: OnComputerWatch): void {
+    const report = this.onComputerReporter(watch.instanceId, watch.loginId, watch.agentId);
+    const tick = () => {
+      const now = this.onComputerFacts(watch.agentId);
+      if (now && onComputerDone(now.state, watch.until)) {
+        void this.stopOnComputerWatch(watch.loginId);
+        void report({ state: "succeeded" });
+        if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after an on-computer step failed"));
+      } else if (Date.now() > watch.deadline) {
+        void this.stopOnComputerWatch(watch.loginId);
+        void report({ state: "failed", failure: "timed_out" });
+      }
+    };
+    const timer = setInterval(tick, ON_COMPUTER_POLL_MS);
+    timer.unref?.();
+    this.onComputerWatches.set(watch.loginId, timer);
+  }
+
+  private async stopOnComputerWatch(loginId: string): Promise<void> {
+    const timer = this.onComputerWatches.get(loginId);
+    if (timer) clearInterval(timer);
+    this.onComputerWatches.delete(loginId);
+    await removeOnComputerWatch(this.config.SUPERVISOR_DATA_DIR, loginId).catch(() => undefined);
+  }
+
+  /** Steps an earlier run of this connector left waiting (it restarted to add an agent): watched again until they end. */
+  private async resumeOnComputerWatches(): Promise<void> {
+    const instanceId = this.instanceId;
+    if (!instanceId) return;
+    for (const watch of await readOnComputerWatches(this.config.SUPERVISOR_DATA_DIR).catch(() => [])) {
+      if (watch.instanceId !== instanceId || this.onComputerWatches.has(watch.loginId)) continue;
+      this.logger.info({ event: "on_computer.resumed", loginId: watch.loginId, agentId: watch.agentId }, "site-started step watched again after a restart");
+      this.watchOnComputer(watch);
+    }
+  }
+
+  /** Whether this computer can bring a site-started step to the front: a desktop (or a stand-in's spool) and a relay to hear it. */
+  private onComputerCapabilities(): string[] {
+    const relayReady = !this.stopping && this.relay !== null && this.relay !== undefined;
+    return relayReady && this.options.native && canOpenOnComputer(machineHasDesktop()) ? [REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY] : [];
+  }
+
+  /**
+   * Core's host-agent settings from an applied desired configuration: OpenCode
+   * Zen's free models (absent = off, O6) and whether Core takes 7.1 fields
+   * (pay-per-use turns and route billing, an offered option's billing,
+   * `hostAgentDownload`, a credential's and a site sign-in's `no_license`).
+   * The latter is the Core wire-contract version Core signs into every
+   * revision for a connector advertising `core-contract-version-v1`
+   * (inventory.ts); no fallback on the free-models field, which no released
+   * Core ever sent (antigravity CP6). A change drops OpenCode's model
+   * snapshots.
+   */
+  private applyHostSettings(configuration: ConfigRecord["configuration"]): void {
+    const settings = { openCodeFreeModels: configuration.openCodeFreeModelsEnabled === true, coreAcceptsRouteBilling: coreContractAtLeast(configuration.coreContractVersion, "7.1") };
+    const changed = this.hostSettings.openCodeFreeModels !== settings.openCodeFreeModels || this.hostSettings.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling;
+    this.hostSettings = settings;
+    for (const runner of this.runners.values()) {
+      if (!runner.applyHostSettings) continue;
+      void runner.applyHostSettings(settings).catch(error => this.logger.warn({ err: error, agentId: runner.agentId }, "host agent settings not applied"));
+      if (changed) this.modelCapabilities?.invalidateAgent(runner.agentId);
+    }
+  }
+
+  /** The agents this installation lists: its runners and the host agents left out at load. */
+  private recordedAgentIds(): Set<string> {
+    const native = this.options.native;
+    return new Set([...(native?.runners ?? []).map(config => config.RUNNER_AGENT_ID), ...(native?.unavailableAgents ?? []).map(entry => entry.agentId)]);
+  }
+
+  /**
+   * Every supported agent's real state on this computer (runtime-view R21),
+   * only to a Core that takes 7.1 fields (the heartbeat is strict there). A
+   * listed agent from its runner, or from why it is left out; the others
+   * from the cached detection, re-run in the background on the agent retry
+   * cadence, never on this path. Nothing until that detection first ended.
+   */
+  private supportedAgents(agents: readonly ConnectedAgentView[]) {
+    const detector = this.notAddedAgents;
+    if (!this.options.native || !detector || !this.hostSettings.coreAcceptsRouteBilling) return undefined;
+    void detector.refreshIfDue().catch(() => undefined);
+    if (!detector.detectedOnce()) return undefined;
+    const added = new Map<string, AddedAgentFacts>();
+    for (const agentId of this.recordedAgentIds()) {
+      const live = this.nativeRunners.find(runner => runner.agentId === agentId && this.runners.get(agentId) === runner);
+      const view = live ? agents.find(agent => agent.agentId === agentId) : undefined;
+      const version = (live ?? this.parkedRunners.get(agentId) ?? this.gaveUpRunners.get(agentId))?.hostInstallation()?.version;
+      added.set(agentId, live && view
+        ? { view, signInLost: live.signInLost(), ...(version ? { version } : {}) }
+        : { failure: this.agentStartFailures.get(agentId), ...(version ? { version } : {}) });
+    }
+    return projectSupportedAgents({ added, notAdded: detector.current() });
+  }
+
+  /** What this connector advertises for OpenCode: the free-models switch, and the sign-ins the site may start here. */
+  private openCodeCapabilities(): string[] {
+    const runner = this.runners.get("opencode");
+    return openCodeRunnerCapabilities({ installed: runner !== undefined, relayReady: !this.stopping && this.relay !== null && this.relay !== undefined,
+      options: runner?.siteLoginOptions?.() ?? [], desktop: machineHasDesktop() });
+  }
+
+  /**
+   * Google Antigravity's download state on its connected agent (CP3 prep),
+   * only to a Core that takes it (a 7.1.0 Core; the view is strict there).
+   * While no runner of it can start (not downloaded, or its copy fails the
+   * start checks) it is reported as an unavailable agent carrying that state,
+   * so the site can say what to do.
+   */
+  private async withAntigravityDownload(agents: ConnectedAgentView[]): Promise<ConnectedAgentView[]> {
+    const native = this.options.native;
+    if (!native || !this.hostSettings.coreAcceptsRouteBilling) return agents;
+    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
+    const record = this.antigravityRecordFields();
+    // Not added (the installation does not list it): the site's add card
+    // shows "Not added" with the one command (A20), or the download while
+    // `agent add antigravity` fetches it in the launcher (the service keeps
+    // running meanwhile). Nothing where Google publishes no copy for this
+    // computer.
+    const download = await antigravityDownloadState(root, record ?? undefined).catch(() => undefined);
+    return download ? withAntigravityDownload(agents, download) : agents;
+  }
+
+  /**
+   * The copy of Google Antigravity this installation runs or names: a live
+   * runner's (after an update switched it, too), else the load's; null when
+   * the installation does not list it.
+   */
+  private antigravityRecordFields(): Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot"> | null {
+    const native = this.options.native;
+    if (!native) return null;
+    const runner = this.nativeRunners.find(candidate => candidate.agentId === "antigravity") ?? this.parkedRunners.get("antigravity") ?? this.gaveUpRunners.get("antigravity");
+    const live = runner?.hostInstallation();
+    if (live?.fetchedRoot !== undefined) return { antigravityVersion: live.version, antigravityRoot: live.fetchedRoot };
+    const unavailable = native.unavailableAgents?.find(entry => entry.agentId === "antigravity");
+    if (unavailable) return unavailable.fetched ?? {};
+    const config = native.runners.find(candidate => candidate.RUNNER_AGENT_ID === "antigravity");
+    if (config?.RUNNER_NATIVE_ANTIGRAVITY_ROOT !== undefined) return { antigravityVersion: config.RUNNER_BRIDGE_VERSION, antigravityRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT };
+    return null;
+  }
+
+  /** What this connector advertises for Google Antigravity: its Gemini Enterprise sign-in from the site (CP3). */
+  private antigravityCapabilities(): string[] {
+    const runner = this.runners.get("antigravity");
+    return antigravityRunnerCapabilities({ installed: runner !== undefined, relayReady: !this.stopping && this.relay !== null && this.relay !== undefined,
+      options: runner?.siteLoginOptions?.() ?? [], desktop: machineHasDesktop() });
   }
 
   private requireRunner(agentId: string): RunnerPort {
@@ -1995,6 +2333,8 @@ export class Supervisor {
 
   private async doctor() {
     const snapshot = this.lastSnapshot ?? (await this.inventory.collect());
+    const openCode = this.openCodeDoctor(snapshot.agents);
+    const antigravity = await this.antigravityDoctor(snapshot.agents).catch(() => undefined);
     return runDoctor({
       now: () => this.clock.nowIso(),
       dataDir: this.config.SUPERVISOR_DATA_DIR,
@@ -2014,7 +2354,60 @@ export class Supervisor {
       coreSignatureConfigured: this.roots.some((root) => (root.coreControlKeys ?? []).length > 0),
       preview: { advertised: this.previewCapable(), running: this.previews.health().running, lastFailureAt: this.previews.health().lastFailure?.at ?? null },
       browser: this.browserReport(),
+      ...(openCode ? { openCode } : {}),
+      ...(antigravity ? { antigravity } : {}),
     });
+  }
+
+  /** The Google Antigravity doctor line's facts, when this installation lists it (running, updating, retried or given up). */
+  private async antigravityDoctor(agents: Array<{ agentId: string; credentials?: Array<{ label: string; state: string; method?: string | undefined; reason?: string | undefined }> | undefined }>): Promise<AntigravityDoctorInputs | undefined> {
+    const running = this.nativeRunners.find(runner => runner.agentId === "antigravity" && this.runners.get("antigravity") === runner);
+    const retrying = this.nativeAgentRetry.parked().includes("antigravity");
+    const gaveUp = this.gaveUpRunners.get("antigravity");
+    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has("antigravity")) return undefined;
+    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
+    let pin: ReturnType<typeof antigravityPin> | null = null;
+    try { pin = antigravityPin(); } catch { pin = null; }
+    const installation = (running ?? this.parkedRunners.get("antigravity") ?? gaveUp)?.hostInstallation() ?? null;
+    const record = this.antigravityRecordFields();
+    const download = record === null ? undefined : (await antigravityDownloadState(root, record).catch(() => undefined))?.state;
+    const failure = this.agentStartFailures.get("antigravity");
+    const updating = retrying && this.options.native?.unavailableAgents?.some(entry => entry.agentId === "antigravity" && entry.updating === true) === true;
+    const observation = await readAntigravityAdminObservation(join(root, "credentials", "antigravity")).catch(() => null);
+    return {
+      state: running ? "running" : retrying ? "retrying" : "given_up",
+      pinnedVersion: pin?.version ?? null,
+      ...(download === undefined ? {} : { download }),
+      selfCheck: installation?.selfCheck ?? "not_run",
+      failure: failure instanceof RemoteInstanceError ? failure.diagnostic : undefined,
+      updating,
+      credentials: (agents.find(agent => agent.agentId === "antigravity")?.credentials ?? [])
+        .map(credential => ({ label: credential.label, state: credential.state, method: credential.method, reason: credential.reason })),
+      quarantine: running?.quarantineReason() ?? null,
+      mcpServersOffAt: observation?.mcpServersOffAt ?? null,
+      diskBytes: pin && (download === "ready" || download === "update_available") ? antigravityDiskBytes(pin) : null,
+      browser: running ? running.browserVersion() !== null : this.connectorBrowser.available,
+    };
+  }
+
+  /** The OpenCode doctor line's facts, when this installation lists OpenCode (running, retried or given up). */
+  private openCodeDoctor(agents: Array<{ agentId: string; credentials?: Array<{ label: string; state: string }> | undefined }>): OpenCodeDoctorInputs | undefined {
+    const running = this.nativeRunners.find(runner => runner.agentId === "opencode" && this.runners.get("opencode") === runner);
+    const retrying = this.nativeAgentRetry.parked().includes("opencode");
+    const gaveUp = this.gaveUpRunners.get("opencode");
+    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has("opencode")) return undefined;
+    const installation = (running ?? this.parkedRunners.get("opencode") ?? gaveUp)?.hostInstallation() ?? null;
+    const failure = this.agentStartFailures.get("opencode");
+    return {
+      state: running ? "running" : retrying ? "retrying" : "given_up",
+      version: installation?.version ?? null,
+      installKind: installation?.executable ? openCodeInstallKind(installation.executable) : null,
+      selfCheck: installation?.selfCheck ?? "not_run",
+      failure: failure instanceof RemoteInstanceError ? failure.diagnostic : undefined,
+      credentials: (agents.find(agent => agent.agentId === "opencode")?.credentials ?? []).map(credential => ({ label: credential.label, state: credential.state })),
+      freeModels: this.hostSettings.openCodeFreeModels,
+      browser: running ? running.browserVersion() !== null : this.connectorBrowser.available,
+    };
   }
 
   stop(): Promise<void> {
@@ -2044,6 +2437,10 @@ export class Supervisor {
     await this.startPromise?.catch(() => undefined);
     await this.activeLoopStarting;
     if (this.pullTimer) clearInterval(this.pullTimer);
+    for (const watch of this.onComputerWatches.values()) clearInterval(watch);
+    this.onComputerWatches.clear();
+    if (this.turnActivityTimer) clearTimeout(this.turnActivityTimer);
+    this.turnActivityTimer = null;
     if (this.reaperTimer) clearInterval(this.reaperTimer);
     if (this.livenessTimer) clearInterval(this.livenessTimer);
     this.livenessTimer = null;
@@ -2102,17 +2499,17 @@ function flattenKeys(value: Record<string, unknown>, prefix = ""): string[] {
   return keys;
 }
 
-function mapLoginEvent(loginId: string, event: { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined }): ControlLoginEvent {
+function mapLoginEvent(loginId: string, event: { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; visible?: true | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined; reason?: "no_license" | undefined }): ControlLoginEvent {
   switch (event.type) {
     case "display":
       return { kind: "display", loginId, text: event.text ?? "" };
     case "open_url":
       return { kind: "open_url", loginId, url: event.url ?? "", ...(event.userCode ? { userCode: event.userCode } : {}) };
     case "prompt":
-      return { kind: "prompt", loginId, label: event.label ?? "", secret: event.secret ?? true };
+      return { kind: "prompt", loginId, label: event.label ?? "", secret: event.secret ?? true, ...(event.visible === true && event.secret === false ? { visible: true as const } : {}) };
     case "completed":
       return { kind: "completed", loginId, readiness: event.readiness ?? "unknown" };
     default:
-      return { kind: "failed", loginId, code: event.code ?? "agent_auth_required", message: event.message ?? "login failed" };
+      return { kind: "failed", loginId, code: event.code ?? "agent_auth_required", message: event.message ?? "login failed", ...(event.reason === "no_license" ? { reason: "no_license" as const } : {}) };
   }
 }

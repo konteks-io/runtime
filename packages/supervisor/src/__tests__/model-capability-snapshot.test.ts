@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { FixedClock, catalogueModelAuthority, computeAgentModelCapabilityMappingDigest, keyedFingerprint } from "@konteks/remote-common";
-import { ModelCapabilitySnapshotProducer } from "../native/model-capability-snapshot.js";
+import { ModelCapabilitySnapshotProducer, openCodeOptionBilling } from "../native/model-capability-snapshot.js";
 
 const clock = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
 const body = { version: 1 as const, mappingId: "mapping", mappingRevision: 1, bridgeProfileRef: "claude-profile", bridgeArtifactDigest: `sha256:${"a".repeat(64)}`, configId: "exact-model-id", optionType: "select" as const, issuedAt: "2026-09-01T00:00:00Z", expiresAt: "2026-09-07T00:00:00Z" };
@@ -54,8 +54,8 @@ describe("authenticated model offered-values snapshot producer", () => {
       configId,
     }));
     const producer = new ModelCapabilitySnapshotProducer({ clock, instanceId: () => "instance", runnerIncarnation: () => "process", manifestId: () => "manifest",
-      mappings: () => [{ agentId: "claude-code", mapping }], catalogueAgents: () => ["claude-code", "codex", "opencode"], discover, newId: () => "snapshot" });
-    await producer.refresh([ready, codex, { ...ready, agentId: "opencode" }]);
+      mappings: () => [{ agentId: "claude-code", mapping }], catalogueAgents: () => ["claude-code", "codex", "pi"], discover, newId: () => "snapshot" });
+    await producer.refresh([ready, codex, { ...ready, agentId: "pi" }]);
     // claude-code keeps its signed mapping; codex reports under its catalogue authority; a retired agent never does.
     expect(discover.mock.calls.map(call => call[0]).sort()).toEqual(["claude-code", "codex"]);
     expect(discover).toHaveBeenCalledWith("codex", "model");
@@ -91,5 +91,32 @@ describe("authenticated model offered-values snapshot producer", () => {
     expect(producer.snapshots()).toEqual([expect.objectContaining({ agentId: "dsh",
       mappingId: "catalogue-dsh-models", authIdentityFingerprint: dsh.authIdentityFingerprint,
       offeredValues: [currentValue] })]);
+  });
+
+  it("labels each offered OpenCode route with how it is billed here, only when asked to (a 7.1.0 Core, CP3)", async () => {
+    const own = new FixedClock(Date.parse("2026-09-28T00:00:00Z"));
+    const opencode = { ...ready, agentId: "opencode", displayName: "OpenCode", authIdentityFingerprint: "identity-oc",
+      credentials: [{ providerId: "openai", label: "ChatGPT Plus or Pro", kind: "sign_in" as const, state: "ready" as const }, { providerId: "opencode", label: "OpenCode Console account", kind: "sign_in" as const, state: "ready" as const }] };
+    const values = ["openai/gpt-5.5", "opencode/claude-sonnet-5", "deepseek/deepseek-v4-pro", "github-copilot/claude-sonnet-4.5"];
+    const discover = vi.fn(async () => ({ currentValue: values[0]!, offeredValues: values, offeredOptions: values.map(value => ({ value, name: value })) }));
+    let accepts = true;
+    const producer = new ModelCapabilitySnapshotProducer({ clock: own, instanceId: () => "instance", runnerIncarnation: () => "process", manifestId: () => "manifest",
+      mappings: () => [], catalogueAgents: () => ["opencode"], discover, newId: () => "snapshot",
+      optionBilling: (agentId, value, agent) => (accepts ? openCodeOptionBilling({ agentId, ...(agent.credentials ? { credentials: agent.credentials } : {}) }, value) : undefined) });
+    await producer.refresh([opencode]);
+    expect(producer.snapshots()[0]!.offeredOptions).toEqual([
+      { value: "openai/gpt-5.5", name: "openai/gpt-5.5", billing: "subscription" },
+      { value: "opencode/claude-sonnet-5", name: "opencode/claude-sonnet-5", billing: "pay_per_use" },
+      { value: "deepseek/deepseek-v4-pro", name: "deepseek/deepseek-v4-pro", billing: "pay_per_use" },
+      { value: "github-copilot/claude-sonnet-4.5", name: "github-copilot/claude-sonnet-4.5", billing: "subscription" },
+    ]);
+    // An older Core refuses the field: nothing is labelled.
+    accepts = false;
+    producer.invalidateAgent("opencode");
+    await producer.refresh([opencode]);
+    expect(JSON.stringify(producer.snapshots())).not.toContain("billing");
+    expect(openCodeOptionBilling({ agentId: "codex" }, "gpt-5.5")).toBeUndefined();
+    expect(openCodeOptionBilling({ agentId: "opencode" }, "no-provider")).toBeUndefined();
+    expect(openCodeOptionBilling({ agentId: "opencode", credentials: [{ providerId: "openai", label: "OpenAI key", kind: "api_key", state: "ready" }] }, "openai/gpt-5.5")).toBe("pay_per_use");
   });
 });

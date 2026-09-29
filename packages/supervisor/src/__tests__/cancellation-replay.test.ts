@@ -17,7 +17,10 @@ const delivery = { kind: "validation" as const, agentRoute: { requiredRole: "qa"
   source: { kind: "harness_delivery" as const, portability: "instance_bound" as const, ownerInstanceId: "instance",
     executionSessionId: "session", repositoryId: "https://git.example.com/acme/store",
     modelBinding: { canonicalProviderId: "openai", canonicalModelId: "model" }, turn: { invocationId: "qa-run", dispatchGeneration: 0 } } };
-async function fixture(count = 1, work: typeof conversation | typeof delivery = conversation) {
+// A direct session's turn (WS1-172): Core's cancel settles it the same way.
+const direct = { kind: "direct" as const, agentRoute: { requiredRole: "assistant" as const, agentId: "codex" },
+  source: { kind: "direct_session" as const, portability: "instance_bound" as const, ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
+async function fixture(count = 1, work: typeof conversation | typeof delivery | typeof direct = conversation) {
   const journal = new SupervisorJournal(dir); await journal.load();
   const seed = { enrollmentId: "enrollment", activationId: "activation", keyDigest: "a".repeat(43), createdAt: now };
   await journal.execution.seedEnrollment(seed);
@@ -60,6 +63,13 @@ it("cancels a claimed, unprompted delivery turn through its signed cancel instea
   await f.journal.assignments.put({ ...entry, reports: { ...entry.reports, terminalSequence: 1 } });
   f.replay.tick(); await f.replay.settle(); expect(f.cancelDelivery).toHaveBeenCalledTimes(2);
   expect(f.journal.cancellations.pending()).toHaveLength(1);
+});
+
+it("answers a direct session turn's signed cancel with its cancelled terminal, never a recovery fence (WS1-172)", async () => {
+  const f = await fixture(1, direct);
+  f.replay.tick(); await f.replay.settle();
+  expect(f.cancelDelivery).toHaveBeenCalledOnce();
+  expect(f.stop).not.toHaveBeenCalled();
 });
 
 it("refuses a delivery cancellation that names another role session", async () => {

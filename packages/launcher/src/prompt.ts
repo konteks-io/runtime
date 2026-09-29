@@ -47,6 +47,22 @@ export async function promptSecret(options: SecretPromptOptions): Promise<string
   return trimmed;
 }
 
+/** One line typed in the open (a choice from a list, never a secret). */
+export async function promptLine(label: string, options: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream } = {}): Promise<string> {
+  const input = options.input ?? process.stdin;
+  const output = options.output ?? process.stderr;
+  const rl = createInterface({ input, output, terminal: false });
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      let answered = false;
+      rl.once("close", () => { if (!answered) reject(new RemoteInstanceError("temporarily_unavailable", `${label} entry was interrupted`)); });
+      rl.question(`${label}: `, answer => { answered = true; resolve(answer.trim()); });
+    });
+  } finally {
+    rl.close();
+  }
+}
+
 /** A plain yes/no confirmation for privileged or destructive steps. Never defaults to yes. */
 export async function confirm(question: string, options: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream } = {}): Promise<boolean> {
   const input = options.input ?? process.stdin;

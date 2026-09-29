@@ -42,8 +42,8 @@ export interface SessionPreviewAccess {
 export const PREVIEW_WORK_KINDS: ReadonlySet<string> = new Set(["delivery", "validation", "qa", "assistant_execution"]);
 
 /**
- * Work kinds whose agent also gets a browser on the preview (Claude Code and
- * Codex): every kind that has a preview. The validator checks the work in its
+ * Work kinds whose agent also gets a browser on the preview (any agent while
+ * the connector has the browser, O8): every kind that has a preview. The validator checks the work in its
  * UI; a QA-mode conversation is an `assistant_execution` turn whose agent
  * exercises the preview and reports the run (`run_submit`); the executor and
  * an ordinary chat can look at what they build. The browser reaches only the

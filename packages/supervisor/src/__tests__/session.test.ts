@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -309,7 +309,7 @@ describe("relayed session (D98/D113/D114)", () => {
     });
   });
 
-  describe("QA browser (Claude Code and Codex)", () => {
+  describe("QA browser (a connector capability: every agent, O8)", () => {
     function access(origin: () => string | null) {
       const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
       return { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(), forget: vi.fn(),
@@ -347,7 +347,7 @@ describe("relayed session (D98/D113/D114)", () => {
       upstream.close();
     });
 
-    it("gives a conversation turn (a QA-mode chat) the browser too, but not planning or an agent without one (DeepSeek Harness)", async () => {
+    it("gives a conversation turn (a QA-mode chat) the browser too, but not planning or an agent on a connector without one", async () => {
       const assistant = await build({ preview: access(() => null) });
       (assistant.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
       await assistant.session.bootstrap();
@@ -358,11 +358,53 @@ describe("relayed session (D98/D113/D114)", () => {
       await planning.session.bootstrap();
       expect((planning.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
       await planning.session.close("cancelled");
-      const dsh = await build({ preview: access(() => null) }, { ...assignment, kind: "validation", agentRoute: { ...assignment.agentRoute, agentId: "dsh" } } as RemoteWorkAssignment);
-      (dsh.runner as { browserVersion?: () => string | null }).browserVersion = () => null;
-      await dsh.session.bootstrap();
-      expect((dsh.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
-      await dsh.session.close("cancelled");
+      const none = await build({ preview: access(() => null) }, { ...assignment, kind: "validation", agentRoute: { ...assignment.agentRoute, agentId: "dsh" } } as RemoteWorkAssignment);
+      (none.runner as { browserVersion?: () => string | null }).browserVersion = () => null;
+      await none.session.bootstrap();
+      expect((none.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeUndefined();
+      await none.session.close("cancelled");
+    });
+
+    it("gives DeepSeek Harness and OpenCode the connector's browser, behind the same gateway, and lets them use it (O8)", async () => {
+      const upstream = createServer((_req, res) => res.end("the preview"));
+      await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+      const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+      const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+      for (const agentId of ["dsh", "opencode"] as const) {
+        const f = await build({ preview: access(() => origin), policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) },
+          { ...assignment, kind: "qa", agentRoute: { requiredRole: "qa", agentId } } as RemoteWorkAssignment);
+        (f.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+        await f.session.bootstrap();
+        const input = f.runnerCalls[0]?.[1][0] as { browser?: { proxyUrl: string } };
+        expect(input.browser, agentId).toMatchObject({ proxyUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), browsersPath: "/private/native/browsers" });
+        // The gateway confines it exactly as for Claude Code and Codex.
+        await expect(viaProxy(input.browser!.proxyUrl, `${origin}/`)).resolves.toEqual({ status: 200, body: "the preview" });
+        expect((await viaProxy(input.browser!.proxyUrl, "http://127.0.0.1:1/")).status).toBe(403);
+        const update = (value: Record<string, unknown>) => f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+        const ask = (requestId: string, toolCallId: string, kind: string, title: string, rawInput: Record<string, unknown>) =>
+          f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId, kind, title, rawInput }, options } });
+        const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId ?? "none";
+        if (agentId === "dsh") {
+          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+            await update({ sessionUpdate: "tool_call", toolCallId: id, title: `mcp__konteks-browser__${tool}`, kind: "other", status: "in_progress", rawInput: { url: origin } });
+            await ask(`p-${id}`, id, "other", `mcp__konteks-browser__${tool}`, {});
+          }
+        } else {
+          // OpenCode reaches it through Code Mode, and its tools line names it.
+          await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Check the page." }] } });
+          const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+          expect(forwarded[0]!.text).toContain("`konteks-browser`");
+          for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+            const code = `const page = await tools["konteks-browser"].${tool}({ url: "${origin}/" });\nreturn page;`;
+            await update({ sessionUpdate: "tool_call", toolCallId: id, title: "execute", kind: "other", status: "pending", locations: [], rawInput: {} });
+            await update({ sessionUpdate: "tool_call_update", toolCallId: id, status: "in_progress", rawInput: { code } });
+            await ask(`p-${id}`, id, "other", "execute", { code });
+          }
+        }
+        expect({ agentId, navigate: answer("p-n"), unsafe: answer("p-u") }).toEqual({ agentId, navigate: "once", unsafe: "reject" });
+        await f.session.close("cancelled");
+      }
+      upstream.close();
     });
   });
 
@@ -377,6 +419,65 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(f.closed).toEqual(["relay_replay_gap"]);
     await f.session.close("relay_replay_gap");
     expect(f.closed).toHaveLength(1);
+  });
+
+  describe("a person's direct session (runtime-view R11, R13, R14)", () => {
+    const directWork: RemoteWorkAssignment = { ...assignment, kind: "direct",
+      agentRoute: { requiredRole: "assistant", agentId: "claude-code", mcpCapabilityTokenRef: "ref-1" },
+      source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "inst", sessionId: "s", turnRef: "turn-2", acpSessionRef: "acp-0" } };
+    const options = [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+
+    it("gives the agent nothing of Konteks: no platform tools even when named, no result tool, no preview; it continues its own transcript", async () => {
+      const redeemCapabilityToken = vi.fn(async () => { throw new Error("a direct session never redeems platform tools"); });
+      const preview = { start: vi.fn(), stop: vi.fn(), status: vi.fn(), touch: vi.fn(), permit: vi.fn() };
+      const f = await build({ redeemCapabilityToken, preview: preview as never, activateExecution: async () => ({ restoreReference: "acp-0" }) }, directWork);
+      try {
+        await f.session.bootstrap();
+        expect(redeemCapabilityToken).not.toHaveBeenCalled();
+        expect(preview.permit).not.toHaveBeenCalled();
+        const created = f.runnerCalls[0]?.[1][0] as { mcpServers: unknown[]; restoreAcpSessionRef?: string; freshProviderSessionOnRestore?: boolean; browser?: unknown };
+        expect(created.mcpServers).toEqual([]);
+        expect(created.browser).toBeUndefined();
+        // The agent's own transcript is loaded: Konteks restages nothing for it.
+        expect(created.restoreAcpSessionRef).toBe("acp-0");
+        expect(created.freshProviderSessionOnRestore).toBeUndefined();
+        expect(f.sent[0]?.body).toMatchObject({ kind: "session_ready", assignmentId: "asg", agentId: "claude-code" });
+      } finally { await f.session.close("cancelled"); }
+    });
+
+    it("judges file changes against its own session folder, never another session's; blocked commands stay blocked", async () => {
+      const own = join(dir, "session-own", "source"), other = join(dir, "session-other", "source");
+      await mkdir(own, { recursive: true }); await mkdir(other, { recursive: true });
+      const prepareInputs = async (target: RemoteWorkAssignment) => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+        cwd: own, skillInstructions: "", beforePrompt: async () => undefined });
+      const decide = async (work: RemoteWorkAssignment) => {
+        const f = await build({ workspaceRoot: dir, prepareInputs, policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false) }, work);
+        try {
+          await f.session.bootstrap();
+          const ask = (requestId: string, toolCall: Record<string, unknown>) => f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId: requestId, ...toolCall }, options } } as never);
+          await ask("inside", { kind: "edit", title: "Write notes", rawInput: { file_path: join(own, "notes.txt") } });
+          await ask("relative", { kind: "edit", title: "Write notes", rawInput: { file_path: "notes.txt" } });
+          await ask("other", { kind: "edit", title: "Write elsewhere", rawInput: { file_path: join(other, "x.txt") } });
+          await ask("push", { kind: "execute", title: "git push", rawInput: { command: "git push origin main" } });
+          const answer = (id: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === id)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
+          return { inside: answer("inside"), relative: answer("relative"), other: answer("other"), push: answer("push") };
+        } finally { await f.session.close("cancelled"); }
+      };
+      expect(await decide(directWork)).toEqual({ inside: "allow", relative: "allow", other: "reject", push: "reject" });
+      // Konteks's own conversations keep the workspace root (unchanged here).
+      expect((await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).other).toBe("allow");
+    });
+
+    it("threads a question it defers to a person onto the direct session", async () => {
+      const registered: DeferredPermissionBody[] = [];
+      const f = await build({ registerDeferral: async body => { registered.push(body); return null as never; } }, directWork);
+      try {
+        await f.session.bootstrap();
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "q", params: { sessionId: "acp-1", toolCall: { toolCallId: "q", kind: "fetch", title: "Fetch a page" }, options } } as never);
+        await vi.waitFor(() => expect(registered).toHaveLength(1));
+        expect(registered[0]).toMatchObject({ sessionId: "s", assignmentId: "asg" });
+      } finally { await f.session.close("cancelled"); }
+    });
   });
 
   describe("DeepSeek Harness tool governance (dsh-runtime-support CP3)", () => {
@@ -430,6 +531,263 @@ describe("relayed session (D98/D113/D114)", () => {
       expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
       expect(f.quarantine).toHaveBeenCalledWith(expect.stringMatching(/without asking/));
       expect(f.closed).toEqual(["agent_exited"]);
+    });
+  });
+
+  describe("OpenCode tool governance (opencode-runtime-support CP4)", () => {
+    const openCodeWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "opencode" } };
+    // OpenCode 2 always offers once / always / reject; Konteks never picks "always".
+    const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "always", name: "Always allow", kind: "allow_always" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+    const CWD = "/private/native/checkout";
+    const KINDS: Record<string, string> = { shell: "execute", write: "edit", edit: "edit", execute: "other", subagent: "think", read: "read" };
+    async function openCodeSession(work: RemoteWorkAssignment = openCodeWork) {
+      const quarantine = vi.fn(async () => undefined);
+      const f = await build({
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+        // The platform facade under the name Core gives it (core/client.ts).
+        redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks-platform", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" }),
+      }, work);
+      (f.runner as unknown as { quarantine: typeof quarantine }).quarantine = quarantine;
+      await f.session.bootstrap();
+      const update = (value: Record<string, unknown>) => f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+      const toolCall = async (toolCallId: string, title: string, rawInput: Record<string, unknown>) => {
+        await update({ sessionUpdate: "tool_call", toolCallId, title, kind: KINDS[title.split(": ").at(-1)!] ?? "other", status: "pending", locations: [], rawInput: {} });
+        await update({ sessionUpdate: "tool_call_update", toolCallId, status: "in_progress", rawInput });
+      };
+      const finished = (toolCallId: string, rawOutput?: unknown) => update({ sessionUpdate: "tool_call_update", toolCallId, status: "completed", content: [], ...(rawOutput ? { rawOutput } : {}) });
+      const ask = (requestId: string, toolCallId: string, kind: string, title: string, rawInput: Record<string, unknown>) =>
+        f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId, kind, title, rawInput }, options } });
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string; outcome: string } } | undefined)?.outcome.optionId ?? "none";
+      return { ...f, quarantine, toolCall, finished, ask, answer, update };
+    }
+
+    it("refuses git push, sudo, outside writes and hostile Code Mode, allows echo, in-folder writes and Konteks tools", async () => {
+      const f = await openCodeSession();
+      const shell = async (id: string, command: string) => { await f.toolCall(id, "shell", { command, description: "run" }); await f.ask(`p-${id}`, id, "execute", command, { command, timeout: 60000, cwd: CWD }); };
+      await shell("echo", "echo hello");
+      await shell("push", "git push origin main");
+      await shell("sudo", "sudo rm -rf /tmp/x");
+      await f.toolCall("in", "write", { path: `${CWD}/notes.txt`, content: "hi" }); await f.ask("p-in", "in", "edit", "notes.txt", { path: `${CWD}/notes.txt`, content: "hi" });
+      await f.toolCall("out", "write", { path: "/etc/outside.txt", content: "no" }); await f.ask("p-out", "out", "edit", "/etc/outside.txt", { path: "/etc/outside.txt", content: "no" });
+      await f.toolCall("multi", "edit", {}); await f.ask("p-multi", "multi", "edit", "2 files", { files: [{ file: "src/a.ts", patch: "@@" }, { file: "../../../etc/b", patch: "@@" }] });
+      // A subagent may start; its own git push is refused like the parent's.
+      await f.toolCall("sub", "subagent", { agent: "general", prompt: "push it" }); await f.ask("p-sub", "sub", "think", "subagent", { agent: "general", prompt: "push it" });
+      await f.toolCall("ses_c1:call_1", "Push it: shell", { command: "git push" }); await f.ask("p-subpush", "ses_c1:call_1", "execute", "Push it: git push", { command: "git push", cwd: CWD });
+      const code = async (id: string, source: string) => { await f.toolCall(id, "execute", { code: source }); await f.ask(`p-${id}`, id, "other", "execute", { code: source }); };
+      await code("ours", 'const plan = await tools["konteks-platform"].platform__harness__plan_get({ planId: "p-1" });\nreturn plan;');
+      await code("result", 'return await tools["konteks-result"].submit_result({ verdict: "pass" });');
+      await code("move", 'await tools.opencode.session_move({ directory: "/" });');
+      await code("computed", 'const name = "submit_result"; await tools["konteks-result"][name]({});');
+      await code("loop", 'for (const x of [1, 2]) { await tools["konteks-result"].submit_result({ x: 1 }); }');
+      await code("preview", 'await tools["konteks-preview"].preview_start();');
+      await f.ask("p-ghost", "never-seen", "execute", "echo", { command: "echo" });
+      expect({
+        echo: f.answer("p-echo"), push: f.answer("p-push"), sudo: f.answer("p-sudo"), inside: f.answer("p-in"), outside: f.answer("p-out"), multi: f.answer("p-multi"),
+        subagent: f.answer("p-sub"), subagentPush: f.answer("p-subpush"), ours: f.answer("p-ours"), result: f.answer("p-result"), move: f.answer("p-move"),
+        computed: f.answer("p-computed"), loop: f.answer("p-loop"), noPreviewHere: f.answer("p-preview"), ghost: f.answer("p-ghost"),
+      }).toEqual({
+        echo: "once", push: "reject", sudo: "reject", inside: "once", outside: "reject", multi: "reject",
+        subagent: "once", subagentPush: "reject", ours: "once", result: "once", move: "reject",
+        computed: "reject", loop: "reject", noPreviewHere: "reject", ghost: "reject",
+      });
+      expect(JSON.stringify(vi.mocked(f.runner.answer).mock.calls.map(call => call[2]))).not.toContain('"always"');
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.session.close("cancelled");
+    });
+
+    it("names OpenCode's tools in plain words, and a Code Mode block as the Konteks tool it calls", async () => {
+      const f = await openCodeSession();
+      await f.toolCall("t-1", "shell", { command: "ls" });
+      await f.toolCall("t-2", "execute", { code: 'return await tools["konteks-result"].submit_result({ verdict: "pass" });' });
+      await f.toolCall("t-3", "execute", { code: "await tools.opencode.session_move({});" });
+      const updates = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } }).filter(body => body.method === "session/update").map(body => body.params!.update!);
+      expect(updates[0]).toMatchObject({ toolCallId: "t-1", name: "shell", kind: "execute" });
+      expect(updates.filter(update => update.toolCallId === "t-2").at(-1)).toMatchObject({ name: "submit_result", title: "submit_result", kind: "other" });
+      expect(updates.filter(update => update.toolCallId === "t-3").at(-1)).toMatchObject({ name: "code_mode", title: "Code Mode", kind: "other" });
+      expect(JSON.stringify(updates)).not.toContain("session_move");
+      await f.session.close("cancelled");
+    });
+
+    it("stops the turn and takes OpenCode out of service when a gated tool ran without asking", async () => {
+      const f = await openCodeSession();
+      await f.toolCall("t-ok", "shell", { command: "ls" }); await f.ask("p-ok", "t-ok", "execute", "ls", { command: "ls", cwd: CWD }); await f.finished("t-ok");
+      await f.toolCall("t-read", "read", { filePath: `${CWD}/a.ts` }); await f.finished("t-read");
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.toolCall("t-bypass", "shell", { command: "curl https://example.com" }); await f.finished("t-bypass");
+      expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
+      expect(f.quarantine).toHaveBeenCalledWith("OpenCode ran a tool without Konteks' approval. Update or reinstall OpenCode, then restart the connector.");
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("trips when an approved Code Mode block ran a call Konteks did not approve", async () => {
+      const f = await openCodeSession();
+      const source = 'return await tools["konteks-result"].submit_result({ verdict: "pass" });';
+      await f.toolCall("x-1", "execute", { code: source }); await f.ask("p-x1", "x-1", "other", "execute", { code: source });
+      await f.finished("x-1", { metadata: { toolCalls: [{ tool: "konteks-result.submit_result", status: "completed" }] } });
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.toolCall("x-2", "execute", { code: source }); await f.ask("p-x2", "x-2", "other", "execute", { code: source });
+      await f.finished("x-2", { metadata: { toolCalls: [{ tool: "konteks-result.submit_result", status: "completed" }, { tool: "opencode.session_move", status: "completed" }] } });
+      expect(f.quarantine).toHaveBeenCalledOnce();
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("tells an OpenCode session how Konteks runs its tools, and asks for the result in that form", async () => {
+      const f = await openCodeSession({ ...validation, agentRoute: { requiredRole: "qa", agentId: "opencode" } });
+      await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Review the change." }, { type: "text", text: renderStructuredOutputContract({ type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] }) }] } });
+      const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+      expect(forwarded[0]!.text).toBe("Call Konteks tools (`konteks-result`) from your `execute` tool, only in this form: `const result = await tools[\"konteks-result\"].<tool>({ ...literal arguments... });`, one call per statement, then `return result;`. Konteks refuses any other code: no other tools, loops, variables in arguments or built names.");
+      expect(forwarded.at(-1)!.text).toContain('call `await tools["konteks-result"].submit_result({ ... })` once');
+      await f.session.close("cancelled");
+    });
+  });
+
+  describe("Google Antigravity tool governance (antigravity-runtime-support CP4)", () => {
+    const agyWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "antigravity" } };
+    // antigravity-acp 1.2.1 with an API key offers allow_always too; Gemini Enterprise only once / reject.
+    const options = [{ optionId: "allow_always", name: "Allow Always (risky)", kind: "allow_always" }, { optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }];
+    const CWD = "/private/native/checkout";
+    const SESSION = "7f941318-42d2-4710-9eca-c791fbc0770a";
+    async function agySession(work: RemoteWorkAssignment = agyWork, credentialMethod?: string) {
+      const quarantine = vi.fn(async () => undefined);
+      const f = await build({
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true),
+        redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks-platform", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer cap-token" }] }, expiresAt: "2026-09-07T00:00:00Z" }),
+      }, work);
+      (f.runner as unknown as { quarantine: typeof quarantine }).quarantine = quarantine;
+      (f.runner as unknown as { readiness: () => Promise<unknown> }).readiness = async () => ({
+        agent: { agentId: "antigravity", credentials: credentialMethod === undefined ? [] : [{ providerId: "google", label: "x", kind: credentialMethod === "gemini-api-key" ? "api_key" : "sign_in", method: credentialMethod, state: "ready" }] },
+        utilization: { activeSessions: 1, activeTurns: 1 },
+      });
+      await f.session.bootstrap();
+      const update = (value: Record<string, unknown>) => f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+      /** The call as the server reports it, then its request with the same title, kind and input. */
+      const asked = async (requestId: string, call: Record<string, unknown>) => {
+        await update({ sessionUpdate: "tool_call", status: "pending", ...call });
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { ...call, status: "pending" }, options } as never });
+      };
+      const command = (id: string, line: string, cwd = CWD) => ({ toolCallId: id, title: line, kind: "execute", rawInput: { CommandLine: line, Cwd: cwd, WaitMsBeforeAsync: 5000 } });
+      const createFile = (id: string, path: string) => ({ toolCallId: id, title: "Run create_file?", kind: "edit", rawInput: { CodeContent: "hi", Description: "probe", Overwrite: true, TargetFile: path }, locations: [{ path }], content: [{ path, newText: "hi", type: "diff" }] });
+      const mcp = (id: string, server: string, tool: string) => ({ toolCallId: id, title: `${server}_${tool}`, kind: "other", rawInput: { arguments: {} }, _meta: { mcp: { server, tool }, is_mcp_tool_call: true } });
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string; outcome: string } } | undefined)?.outcome.optionId ?? "none";
+      return { ...f, quarantine, update, asked, command, createFile, mcp, answer };
+    }
+
+    it("refuses git push, sudo, outside writes, other MCP servers, subagents and the trust question; allows echo, in-folder writes and our tools; never allow_always", async () => {
+      const f = await agySession();
+      await f.asked("p-echo", f.command("c-echo", "echo hello"));
+      await f.asked("p-push", f.command("c-push", "git push origin HEAD:probe-push"));
+      await f.asked("p-sudo", f.command("c-sudo", "sudo rm -rf /tmp/x"));
+      await f.asked("p-cwd", f.command("c-cwd", "ls", "/etc"));
+      await f.asked("p-in", f.createFile("e-in", `${CWD}/inside.txt`));
+      await f.asked("p-out", f.createFile("e-out", "/private/native/outside.txt"));
+      await f.asked("p-result", f.mcp("m-result", "konteks-result", "submit_result"));
+      await f.asked("p-platform", f.mcp("m-platform", "konteks-platform", "platform__harness__plan_get"));
+      // A hostile repository's `.agents/mcp_config.json` server, had it loaded.
+      await f.asked("p-repo", f.mcp("m-repo", "repo-tools", "exfiltrate"));
+      // A hostile repository's `.agents/hooks.json`: the server first asks whether to trust it.
+      await f.asked("p-trust", { toolCallId: "interaction_9cf7b4aa", title: "Do you trust the authors of this workspace to execute automated agent hooks?", rawInput: {} });
+      await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "p-ghost", params: { sessionId: "acp-1", toolCall: f.command("never-seen", "echo"), options } as never });
+      expect({
+        echo: f.answer("p-echo"), push: f.answer("p-push"), sudo: f.answer("p-sudo"), cwd: f.answer("p-cwd"), inside: f.answer("p-in"), outside: f.answer("p-out"),
+        result: f.answer("p-result"), platform: f.answer("p-platform"), repo: f.answer("p-repo"), trust: f.answer("p-trust"), ghost: f.answer("p-ghost"),
+      }).toEqual({
+        echo: "allow", push: "deny", sudo: "deny", cwd: "deny", inside: "allow", outside: "deny",
+        result: "allow", platform: "allow", repo: "deny", trust: "deny", ghost: "deny",
+      });
+      expect(JSON.stringify(vi.mocked(f.runner.answer).mock.calls.map(call => call[2]))).not.toContain("allow_always");
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.session.close("cancelled");
+    });
+
+    it("pairs Gemini Enterprise's approved create_file with the Running edit_file that writes it, and trips on one nobody allowed", async () => {
+      const f = await agySession(agyWork, "oauth-business");
+      const path = `${CWD}/inside.txt`;
+      await f.asked("p-1", f.createFile("67f8e438", path));
+      expect(f.answer("p-1")).toBe("allow");
+      await f.update({ sessionUpdate: "tool_call", toolCallId: `${SESSION}:2`, title: "Running edit_file", kind: "edit", status: "in_progress", rawInput: { file_path: path }, locations: [{ path }] });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: `${SESSION}:2`, status: "completed" });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: "67f8e438", status: "failed", rawOutput: "Tool call was approved but never executed." });
+      expect(f.quarantine).not.toHaveBeenCalled();
+      await f.update({ sessionUpdate: "tool_call", toolCallId: `${SESSION}:3`, title: "Running edit_file", kind: "edit", status: "in_progress", rawInput: { file_path: `${CWD}/other.txt` }, locations: [{ path: `${CWD}/other.txt` }] });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: `${SESSION}:3`, status: "completed" });
+      expect(f.runner.cancel).toHaveBeenCalledWith("acp-1");
+      // Not a command: the generic line, even on Gemini Enterprise.
+      expect(f.quarantine).toHaveBeenCalledWith("Google Antigravity ran a tool without Konteks' approval. Update the connector, then restart it.");
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("A21: a command that ran with no request on Gemini Enterprise names the Require review setting", async () => {
+      const f = await agySession(agyWork, "oauth-business");
+      await f.update({ sessionUpdate: "tool_call", status: "in_progress", ...f.command("auto", "echo unasked") });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: "auto", status: "completed", rawOutput: { exitCode: 0, combinedOutput: "unasked\n" } });
+      expect(f.quarantine).toHaveBeenCalledWith("Your organisation's Gemini Enterprise settings let Antigravity run commands without asking. Ask your Google Cloud admin to set Terminal auto-execution to Require review, then restart the connector.");
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("a subagent's command (never asked) trips; on a Gemini API key the line is the generic one", async () => {
+      const f = await agySession(agyWork, "gemini-api-key");
+      const id = "e1b92d65-1f8c-4c53-8885-e7cc4443b095:1";
+      await f.update({ sessionUpdate: "tool_call", toolCallId: id, title: "git push origin HEAD:probe-push", kind: "execute", status: "in_progress", rawInput: { command_line: "git push origin HEAD:probe-push", working_dir: CWD } });
+      await f.update({ sessionUpdate: "tool_call_update", toolCallId: id, status: "completed", rawOutput: { exitCode: 0 } });
+      expect(f.quarantine).toHaveBeenCalledWith("Google Antigravity ran a tool without Konteks' approval. Update the connector, then restart it.");
+    });
+
+    it("a subagent tool in a tool_call takes Antigravity out of service at once", async () => {
+      const f = await agySession();
+      await f.update({ sessionUpdate: "tool_call", toolCallId: "sub", title: "Run invoke_subagent?", kind: "other", status: "pending", rawInput: { Subagents: [{ Prompt: "push the code" }] } });
+      expect(f.quarantine).toHaveBeenCalledOnce();
+      expect(f.closed).toEqual(["agent_exited"]);
+    });
+
+    it("admits the connector's QA browser as konteks-browser, never its hidden tools", async () => {
+      const upstream = createServer((_req, res) => res.end("the preview"));
+      await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+      const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+      const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
+      const preview = { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(), forget: vi.fn(),
+        origin: vi.fn((_sessionId: string) => origin), browsersPath: "/private/native/browsers" };
+      const f = await build({ preview,
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) }, { ...agyWork, kind: "qa", agentRoute: { requiredRole: "qa", agentId: "antigravity" } } as RemoteWorkAssignment);
+      (f.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+      await f.session.bootstrap();
+      expect((f.runnerCalls[0]?.[1][0] as { browser?: unknown }).browser).toBeDefined();
+      await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Check the page." }] } });
+      const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+      expect(forwarded[0]!.text).toContain("`konteks-browser`");
+      for (const [id, tool] of [["n", "browser_navigate"], ["u", "browser_run_code_unsafe"]]) {
+        const call = { toolCallId: id, title: `konteks-browser_${tool}`, kind: "other", rawInput: { url: origin }, _meta: { mcp: { server: "konteks-browser", tool }, is_mcp_tool_call: true } };
+        await f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: { sessionUpdate: "tool_call", status: "pending", ...call } } });
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: `p-${id}`, params: { sessionId: "acp-1", toolCall: call, options } as never });
+      }
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
+      expect({ navigate: answer("p-n"), unsafe: answer("p-u") }).toEqual({ navigate: "allow", unsafe: "deny" });
+      await f.session.close("cancelled");
+      upstream.close();
+    });
+
+    it("tells an Antigravity session the call_mcp_tool form with its own servers, and asks for the result that way", async () => {
+      const f = await agySession({ ...validation, agentRoute: { requiredRole: "qa", agentId: "antigravity", mcpCapabilityTokenRef: "ref-1" } } as RemoteWorkAssignment);
+      await f.session.onToRuntime({ kind: "acp", method: "session/prompt", id: "p1", params: { sessionId: "acp-1", prompt: [{ type: "text", text: "Review the change." }, { type: "text", text: renderStructuredOutputContract({ type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] }) }] } });
+      const forwarded = (vi.mocked(f.runner.prompt).mock.calls[0]![2] as { prompt: Array<{ text: string }> }).prompt;
+      expect(forwarded[0]!.text).toBe("Call Konteks tools through your `call_mcp_tool` tool: `ServerName` is the server (`konteks-platform`, `konteks-result`), `ToolName` is the tool's name exactly as listed, and its parameters go in `Arguments` (for example `ServerName` `konteks-platform`). Konteks refuses every other MCP server, subagents and commands outside this working copy.");
+      expect(forwarded.at(-1)!.text).toContain("call `submit_result` through your `call_mcp_tool` tool (`ServerName` `konteks-result`, `ToolName` `submit_result`, its arguments in `Arguments`) once");
+      // Only the first prompt carries the line.
+      await f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "end_turn" } } as never);
+      await f.session.close("cancelled");
+    });
+
+    it("names Antigravity's tools in plain words and an MCP call as the Konteks tool it calls", async () => {
+      const f = await agySession();
+      await f.update({ sessionUpdate: "tool_call", status: "pending", ...f.createFile("t-1", `${CWD}/a.txt`) });
+      await f.update({ sessionUpdate: "tool_call", status: "pending", ...f.mcp("t-2", "konteks-platform", "platform__harness__plan_get") });
+      await f.update({ sessionUpdate: "tool_call", status: "in_progress", toolCallId: `${SESSION}:1`, title: "Running list_directory", kind: "search", rawInput: { directory_path: CWD } });
+      await f.update({ sessionUpdate: "tool_call", status: "pending", ...f.command("t-3", "npm test") });
+      const updates = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } }).filter(body => body.method === "session/update").map(body => body.params!.update!);
+      expect(updates.find(update => update.toolCallId === "t-1")).toMatchObject({ name: "create_file", kind: "edit", title: "Create file" });
+      expect(updates.find(update => update.toolCallId === "t-2")).toMatchObject({ name: "platform__harness__plan_get", kind: "other", title: "platform__harness__plan_get" });
+      expect(updates.find(update => update.toolCallId === `${SESSION}:1`)).toMatchObject({ name: "list_directory", kind: "search", title: "List folder" });
+      expect(updates.find(update => update.toolCallId === "t-3")).toMatchObject({ name: "run_command", kind: "execute", title: "npm test" });
+      await f.session.close("cancelled");
     });
   });
 
@@ -620,6 +978,26 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(closed).toEqual(["agent_exited"]);
     expect(runner.closeSession).toHaveBeenCalledWith("acp-1");
     expect(sent.at(-1)?.body).toMatchObject({ kind: "session_closed", assignmentId: "asg", reason: "agent_exited" });
+  });
+
+  it("says when a turn ends, so the computer's busy state reaches Core at once (WS1-179)", async () => {
+    const onTurnActivity = vi.fn();
+    const { session, runner, journal } = await build({
+      onTurnActivity,
+      reserveChannel: () => vi.fn(),
+      reserveExecutionReference: async () => undefined,
+      recordExecutionProcessOwner: async () => undefined,
+      prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
+    });
+    vi.mocked(runner.createSession).mockImplementation(async (_input, lifecycle) => {
+      await lifecycle!.beforeCreate("acp-1");
+      lifecycle!.assertCurrent();
+      return { acpSessionRef: "acp-1", resumed: false, capabilities: { forkSession: false, sessionResume: true } };
+    });
+    await session.bootstrap();
+    await journal.pendingRequests.put({ acpSessionRef: "acp-1", id: "p1", method: "session/prompt", direction: "received", openedAt: clock.nowIso(), closedAt: null, deadlineAt: null, requestDigest: null });
+    await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "cancelled" } });
+    expect(onTurnActivity).toHaveBeenCalled();
   });
 
   it("uses the verified logical session channel across native assignment attempts and retains replay on close", async () => {

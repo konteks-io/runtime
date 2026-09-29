@@ -8,6 +8,7 @@ import { loadNativeInstallation, type NativeInstallationOptions } from "./instal
 import { fetchNativeReleaseManifest, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { launchNativeUpdater } from "./update-launch.js";
 import { readNativeUpdateLedger } from "./update-ledger.js";
+import { startConnectorLogKeeper } from "./connector-log.js";
 import { writeSecretFile } from "@konteks/remote-common";
 
 export const NATIVE_SHUTDOWN_RECEIPT_FILE = "shutdown-complete";
@@ -62,6 +63,7 @@ export function nativeShutdownSteps(
 export function createNativeService(options: NativeServiceOptions): Daemon {
   let supervisor: Supervisor | undefined;
   let control: ControlSocketServer | undefined;
+  let stopLogKeeper: (() => void) | undefined;
   const exitStore = new SupervisorStore(join(options.root, "supervisor"));
   // The liveness callback reads `daemon` only after createDaemon has returned.
   const daemon: Daemon = createDaemon({
@@ -70,6 +72,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
     ...(options.exitProcess ? { exitProcess: options.exitProcess } : {}),
     recordNonzeroExit: reason => exitStore.recordLastExit(reason),
     onStart: async () => {
+      stopLogKeeper = startConnectorLogKeeper(options.root);
       const installation = await loadNativeInstallation(options.root, options);
       // The connector of the release now serving: `konteks-connector`, or `connector` in a release from before the rename.
       const executable = await resolveNativeConnectorExecutable(join(options.root, "releases", installation.record.releaseId), options.platform.os);
@@ -86,6 +89,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         onRetired: () => { void daemon.shutdown("retired", 0).catch(() => undefined); },
         native: {
           trustedRoots: installation.roots, runners: installation.runners,
+          ...(installation.unavailableAgents.length > 0 ? { unavailableAgents: installation.unavailableAgents } : {}),
           repositoryCacheRoot: join(options.root, "repositories"),
           ...(update ? { update } : {}),
           ...(installation.record.git ? { git: installation.record.git } : {}),
@@ -95,7 +99,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         },
       });
       if (installation.retiredAgents.length > 0) {
-        supervisor.logger.warn({ retiredAgents: installation.retiredAgents }, "this installation still lists agents Konteks no longer runs; they are skipped (Claude Code, Codex and DeepSeek Harness are supported)");
+        supervisor.logger.warn({ retiredAgents: installation.retiredAgents }, "this installation still lists agents Konteks no longer runs; they are skipped (Claude Code, Codex, DeepSeek Harness and OpenCode 2 are supported)");
       }
       await supervisor.start();
       control = await startControlSocketServer({
@@ -106,7 +110,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
       });
     },
     shutdownSteps: () => nativeShutdownSteps(
-      () => supervisor,
+      () => { stopLogKeeper?.(); return supervisor; },
       () => control,
       () => writeSecretFile(join(options.root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), randomUUID()),
       (phase, state) => exitStore.recordShutdownProgress(phase, state),

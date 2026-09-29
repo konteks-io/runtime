@@ -1,11 +1,11 @@
 import { createHash, sign } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Server } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, canonicalize, computeBundleManifestDigest, jcsDigest, writeSecretFile, RemoteInstanceError, type RemoteWorkAssignment } from "@konteks/remote-common";
-import { buildReleaseFixture, installOfflineAgentPackage } from "@konteks/remote-release";
+import { buildReleaseFixture, fetchedAgentPlatformPin, installOfflineAgentPackage } from "@konteks/remote-release";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { RunnerConfigSchema, type BridgeProcess } from "@konteks/remote-agent-runner";
 import { Supervisor } from "../supervisor.js";
@@ -16,6 +16,10 @@ import { submitReadiness } from "../provisioning/activation.js";
 import { REMOTE_INSTANCE_PROTOCOL_VERSION, SystemClock } from "@konteks/remote-common";
 import { LEASE_AUDIENCE, type CoreClient } from "../core/client.js";
 import { decodeLeaseClaims, leaseRecordFromClaims } from "../lease/lease.js";
+import { BROWSER_NO_PACKAGE_MESSAGE } from "../native/browser-capability.js";
+import { antigravityInstallAdapter, openCodeInstallAdapter } from "../native/host-agents.js";
+import { ANTIGRAVITY_ENTERPRISE_QUARANTINE_MESSAGE } from "../session/antigravity-tool-governance.js";
+import { NotAddedAgentsDetector, SUPPORTED_AGENT_IDS } from "../native/supported-agents.js";
 
 let root: string;
 const supervisors: Supervisor[] = [];
@@ -80,6 +84,60 @@ describe("native Supervisor composition", () => {
     expect(roster.agents[0]?.readiness).toBe("ready");
     expect((supervisor as unknown as { lastSnapshot: { agents: Array<{ readiness: string }> } }).lastSnapshot.agents[0]?.readiness).toBe("ready");
   });
+  it("starts Google Antigravity's Gemini Enterprise sign-in from the site with its project, and says no_license only to a 7.1.0 Core (antigravity CP3)", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    type Report = Record<string, unknown>;
+    const internals = supervisor as unknown as { runners: Map<string, unknown>; core: { reportAgentLogin: (instanceId: string, report: Report) => Promise<unknown> };
+      hostSettings: { openCodeFreeModels: boolean; coreAcceptsRouteBilling: boolean }; activeLogins: Map<string, { emit(event: unknown): void }>;
+      onAgentLogin(request: unknown, verifier: unknown): Promise<void> };
+    const reports: Report[] = [];
+    vi.spyOn(internals.core, "reportAgentLogin").mockImplementation(async (_instanceId, report) => { reports.push(report); return {}; });
+    const login = vi.fn(async (_organization: boolean, loginId: string) => ({ loginId }));
+    internals.runners.set("antigravity", { agentId: "antigravity", login, loginCancel: vi.fn(async () => ({})), siteLoginOptions: () => ["gemini-enterprise"], startEvents: vi.fn(), stopEvents: vi.fn() });
+    const verifier = { verifyAgentLoginDelivery: () => true };
+    const gcp = { project: "gemini-enterprise-qa-25d3", location: "global" };
+    const intent = { loginId: "login-agy-1", tenantId: "tenant", instanceId: "instance", agentId: "antigravity", action: "start", loginOption: "gemini-enterprise", gcp };
+    const google = "https://accounts.google.com/o/oauth2/v2/auth?client_id=x.apps.googleusercontent.com";
+    for (const [coreAccepts, loginId, failure] of [[true, "login-agy-1", "no_license"], [false, "login-agy-2", "login_failed"]] as const) {
+      internals.hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: coreAccepts };
+      await internals.onAgentLogin({ intent: { ...intent, loginId } }, verifier);
+      expect(login).toHaveBeenLastCalledWith(false, loginId, true, { loginOption: "gemini-enterprise", gcp });
+      expect(reports.at(-1)).toEqual({ loginId, agentId: "antigravity", loginOption: "gemini-enterprise", state: "awaiting_person" });
+      internals.activeLogins.get(loginId)!.emit({ kind: "open_url", loginId, url: "http://127.0.0.1:50694/" });
+      internals.activeLogins.get(loginId)!.emit({ kind: "open_url", loginId, url: google });
+      expect(reports.at(-1)).toEqual({ loginId, agentId: "antigravity", loginOption: "gemini-enterprise", state: "awaiting_person", verificationUrl: google });
+      internals.activeLogins.get(loginId)!.emit({ kind: "failed", loginId, code: "agent_auth_required", message: "Google Antigravity did not finish signing in", reason: "no_license" });
+      expect(reports.at(-1)).toEqual({ loginId, agentId: "antigravity", loginOption: "gemini-enterprise", state: "failed", failure });
+    }
+    expect(JSON.stringify(reports)).not.toContain("gemini-enterprise-qa-25d3");
+    // No project, or personal Google sign-in (held back, A10): refused, never started.
+    const calls = login.mock.calls.length;
+    await internals.onAgentLogin({ intent: { ...intent, loginId: "login-agy-3", gcp: undefined } }, verifier);
+    await internals.onAgentLogin({ intent: { ...intent, loginId: "login-agy-4", loginOption: "google-account", gcp: undefined } }, verifier);
+    expect(login.mock.calls.length).toBe(calls);
+    expect(reports.slice(-2)).toEqual([
+      { loginId: "login-agy-3", agentId: "antigravity", loginOption: "gemini-enterprise", state: "failed", failure: "unavailable" },
+      { loginId: "login-agy-4", agentId: "antigravity", loginOption: "google-account", state: "failed", failure: "unavailable" },
+    ]);
+    internals.runners.delete("antigravity");
+  });
+
+  it("takes Core's 7.1 fields from the signed contract version alone, never from OpenCode's free-models switch (antigravity CP6)", async () => {
+    const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    const internals = supervisor as unknown as { hostSettings: { openCodeFreeModels: boolean; coreAcceptsRouteBilling: boolean }; applyHostSettings(configuration: Record<string, unknown>): void };
+    const apply = (configuration: Record<string, unknown>) => { internals.applyHostSettings(configuration); return { ...internals.hostSettings }; };
+    expect(apply({ coreContractVersion: "7.1" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: true });
+    expect(apply({ coreContractVersion: "7.2", openCodeFreeModelsEnabled: true })).toEqual({ openCodeFreeModels: true, coreAcceptsRouteBilling: true });
+    expect(apply({ openCodeFreeModelsEnabled: true })).toEqual({ openCodeFreeModels: true, coreAcceptsRouteBilling: false });
+    expect(apply({ openCodeFreeModelsEnabled: false })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: false });
+    expect(apply({ coreContractVersion: "7.0" })).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: false });
+    expect(apply({})).toEqual({ openCodeFreeModels: false, coreAcceptsRouteBilling: false });
+  });
+
   it("cancels a local login when its control caller disconnects", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);
@@ -413,6 +471,206 @@ describe("native Supervisor composition", () => {
     expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("preview.dev_server");
     const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string }> };
     expect(doctor.checks.find(check => check.id === "preview")).toMatchObject({ status: "warn" });
+  });
+
+  it("offers the connector's QA browser to its agents and advertises browser_tool while previews can run (O8)", async () => {
+    const f = await fixture();
+    const browser = { version: "0.0.82", packageAgent: "claude-code" as const, nodeSource: "person" as const, node: "/usr/local/bin/node", launcher: "/pkg/konteks/browser-mcp.js", entrypoint: "/pkg/node_modules/@playwright/mcp/cli.js" };
+    const supervisor = new Supervisor(f.config, { native: { ...f.options.native, browser: { available: true, browser } } });
+    supervisors.push(supervisor);
+    await supervisor.start();
+    // The fixture's Codex package carries no browser: it gets the connector's.
+    expect(supervisor.runners.get("codex")?.browserVersion?.()).toBe("0.0.82");
+    expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("browser_tool");
+    (supervisor as unknown as { previewCapable: () => boolean }).previewCapable = () => true;
+    expect((await supervisor.inventory.collect()).components[0]?.capabilities).toContain("browser_tool");
+    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
+    expect(doctor.checks.find(check => check.id === "browser")).toMatchObject({ status: "pass", detail: expect.stringMatching(/^Playwright MCP 0\.0\.82 for codex; runs on your own Node;/) });
+  });
+
+  it("has no QA browser without a package or Node that can run it, and says so in doctor (O8)", async () => {
+    const none = await fixture();
+    const without = new Supervisor(none.config, { native: { ...none.options.native, browser: { available: false, reason: "no_package", message: BROWSER_NO_PACKAGE_MESSAGE } } });
+    supervisors.push(without);
+    await without.start();
+    (without as unknown as { previewCapable: () => boolean }).previewCapable = () => true;
+    expect(without.runners.get("codex")?.browserVersion?.()).toBeNull();
+    expect((await without.inventory.collect()).components[0]?.capabilities).not.toContain("browser_tool");
+    const report = await without.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
+    expect(report.checks.find(check => check.id === "browser")).toMatchObject({ status: "warn", detail: BROWSER_NO_PACKAGE_MESSAGE });
+  });
+
+  describe("the person's own OpenCode (opencode-runtime-support CP6)", () => {
+    const openCodeConfig = () => RunnerConfigSchema.parse({
+      RUNNER_AGENT_ID: "opencode", RUNNER_CREDENTIAL_DIR: join(root, "opencode-credentials"), RUNNER_WORKSPACE_DIR: join(root, "opencode-work"),
+      RUNNER_BRIDGE_PREFIX: "/Users/person/.nvm/versions/node/v22/lib/node_modules/@opencode/cli/bin",
+      RUNNER_NATIVE_OPENCODE_BINARY: "/Users/person/.nvm/versions/node/v22/lib/node_modules/@opencode/cli/bin/opencode.exe", RUNNER_BRIDGE_VERSION: "2.0.18",
+    });
+    const browser = { version: "0.0.82", packageAgent: "claude-code" as const, nodeSource: "person" as const, node: "/usr/local/bin/node", launcher: "/pkg/konteks/browser-mcp.js", entrypoint: "/pkg/node_modules/@playwright/mcp/cli.js" };
+    const doctorOf = async (supervisor: Supervisor) => (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
+
+    it("runs beside Codex, and doctor names its version, install, settings check, sign-ins, free models and browser without a path", async () => {
+      const f = await fixture();
+      vi.spyOn(openCodeInstallAdapter, "selfCheck").mockResolvedValue(undefined);
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, runners: [...f.options.native.runners, openCodeConfig()], browser: { available: true, browser } } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex", "opencode"]);
+      const check = (await doctorOf(supervisor)).find(entry => entry.id === "opencode");
+      expect(check).toMatchObject({ title: "OpenCode", status: "warn", recoveryActions: [{ kind: "login_agent", agentId: "opencode" }] });
+      expect(check!.detail).toBe("OpenCode 2.0.18, installed with npm; Konteks settings check passed; not signed in to any provider (konteks-remote auth login opencode); OpenCode Zen free models off; its sessions get the QA browser");
+    });
+
+    it("is left out and retried when its settings check fails, while Codex keeps running; doctor says why", async () => {
+      const f = await fixture();
+      vi.spyOn(openCodeInstallAdapter, "selfCheck").mockRejectedValue(new RemoteInstanceError("prerequisite_missing", "Unsupported OpenCode installation: OpenCode 2.0.18 does not keep the Konteks settings (x). Install a supported version with `curl -fsSL https://opencode.ai/v2/install | bash`, then retry.", { diagnostic: "opencode_unsupported_installation" }));
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, runners: [...f.options.native.runners, openCodeConfig()] } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex"]);
+      expect((await supervisor.inventory.collect()).agents.map(agent => agent.agentId)).toEqual(["codex"]);
+      const check = (await doctorOf(supervisor)).find(entry => entry.id === "opencode");
+      expect(check).toMatchObject({ status: "fail", recoveryActions: [{ kind: "install_backend", agentId: "opencode" }] });
+      expect(check!.detail).toBe("OpenCode 2.0.18, installed with npm is not running Konteks work: this OpenCode does not keep the Konteks settings; install a supported OpenCode 2 from opencode.ai; it is tried again in the background, and the other agents keep running");
+    });
+
+    it("is left out when the installation could not find it at load, and joins once a retry re-locates it", async () => {
+      const f = await fixture();
+      vi.spyOn(openCodeInstallAdapter, "selfCheck").mockResolvedValue(undefined);
+      const relocate = vi.fn()
+        .mockRejectedValueOnce(new RemoteInstanceError("prerequisite_missing", "OpenCode 1 is not supported (found 1.18.33)", { diagnostic: "opencode_unsupported_version" }))
+        .mockResolvedValue(openCodeConfig());
+      const unavailableAgents = [{ agentId: "opencode", error: new RemoteInstanceError("prerequisite_missing", "OpenCode 1 is not supported (found 1.18.33)", { diagnostic: "opencode_unsupported_version" }), relocate }];
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, unavailableAgents } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex"]);
+      expect((await doctorOf(supervisor)).find(entry => entry.id === "opencode")).toMatchObject({ status: "fail", detail: "OpenCode is not running Konteks work: the installed OpenCode is a version Konteks does not support (OpenCode 1, for example); install OpenCode 2 from opencode.ai; it is tried again in the background, and the other agents keep running" });
+      const retry = (supervisor as unknown as { nativeAgentRetry: { retry(agentId: string): Promise<void>; parked(): string[] } }).nativeAgentRetry;
+      await retry.retry("opencode");
+      expect(retry.parked()).toEqual(["opencode"]);
+      await retry.retry("opencode");
+      expect(relocate).toHaveBeenCalledTimes(2);
+      expect(retry.parked()).toEqual([]);
+      expect([...supervisor.runners.keys()]).toEqual(["codex", "opencode"]);
+      expect((await doctorOf(supervisor)).find(entry => entry.id === "opencode")).toMatchObject({ status: "warn", detail: expect.stringMatching(/^OpenCode 2\.0\.18, installed with npm; Konteks settings check passed;/) });
+    });
+  });
+
+  describe.runIf(fetchedAgentPlatformPin("antigravity") !== undefined)("Google Antigravity (antigravity CP6)", () => {
+    const folder = () => join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
+    const antigravityConfig = () => RunnerConfigSchema.parse({
+      RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "antigravity-work"),
+      RUNNER_BRIDGE_PREFIX: folder(), RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder(), RUNNER_BRIDGE_VERSION: "1.2.1",
+    });
+    const doctorOf = async (supervisor: Supervisor) => (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
+
+    it("runs beside Codex; doctor names it, its start check and sign-in commands without a path, and the Require review line after an A21 quarantine", async () => {
+      const f = await fixture();
+      vi.spyOn(antigravityInstallAdapter, "selfCheck").mockResolvedValue(undefined);
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, runners: [...f.options.native.runners, antigravityConfig()] } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex", "antigravity"]);
+      const check = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
+      expect(check).toMatchObject({ title: "Google Antigravity", status: "warn", recoveryActions: [{ kind: "login_agent", agentId: "antigravity" }] });
+      expect(check!.detail).toContain("start check passed; not signed in (konteks-remote auth login antigravity --api-key, or --enterprise --project <project id>)");
+      expect(check!.detail).not.toContain(root);
+      const runner = supervisor.runners.get("antigravity") as unknown as { quarantine(reason: string): Promise<void> };
+      await runner.quarantine(ANTIGRAVITY_ENTERPRISE_QUARANTINE_MESSAGE);
+      const quarantined = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
+      expect(quarantined).toMatchObject({ status: "fail" });
+      expect(quarantined!.detail).toContain('Needs your organisation\'s Require review setting: in Gemini Enterprise, Settings, AI developer tools, set "Terminal auto-execution: Require review"');
+    });
+
+    it("is left out when its start check fails, while Codex keeps running; doctor says why", async () => {
+      const f = await fixture();
+      vi.spyOn(antigravityInstallAdapter, "selfCheck").mockRejectedValue(new RemoteInstanceError("prerequisite_missing", "Google Antigravity on this computer does not match Google's release.", { diagnostic: "antigravity_unsafe_install" }));
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, runners: [...f.options.native.runners, antigravityConfig()] } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      expect([...supervisor.runners.keys()]).toEqual(["codex"]);
+      const check = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
+      expect(check).toMatchObject({ status: "fail", recoveryActions: [{ kind: "install_backend", agentId: "antigravity" }] });
+      expect(check!.detail).toContain("is not running Konteks work: the downloaded copy does not match Google's release, so it never runs (konteks-remote agent add antigravity downloads it again); it is tried again in the background, and the other agents keep running");
+    });
+
+    it("shows the site's add card as Not added, then the launcher's download as it grows, only to a 7.1 Core (A20)", async () => {
+      const f = await fixture();
+      const supervisor = new Supervisor(f.config, f.options);
+      supervisors.push(supervisor);
+      await supervisor.start();
+      const internals = supervisor as unknown as { hostSettings: { openCodeFreeModels: boolean; coreAcceptsRouteBilling: boolean } };
+      const reported = async () => (await supervisor.inventory.collect()).agents.find(agent => agent.agentId === "antigravity");
+      expect(await reported()).toBeUndefined();
+      internals.hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: true };
+      if (`${process.platform}-${process.arch}` !== "darwin-arm64") { expect(await reported()).toBeUndefined(); return; }
+      expect(await reported()).toMatchObject({ readiness: "unavailable", hostAgentDownload: { state: "not_downloaded", sizeBytes: 111_725_488 } });
+      const staging = join(root, "agents", "antigravity", ".fetch-launcher");
+      await mkdir(staging, { recursive: true, mode: 0o700 });
+      await writeFile(join(staging, "archive.zip"), Buffer.alloc(4_096));
+      expect(await reported()).toMatchObject({ hostAgentDownload: { state: "downloading", receivedBytes: 4_096, sizeBytes: 111_725_488 } });
+      // Never an agent to place work on.
+      expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("agent:antigravity");
+    });
+
+    it("reports all five supported agents' states only to a 7.1 Core, once the not-added ones were detected (runtime-view R21)", async () => {
+      const f = await fixture();
+      const supervisor = new Supervisor(f.config, f.options);
+      supervisors.push(supervisor);
+      await supervisor.start();
+      const internals = supervisor as unknown as {
+        hostSettings: { openCodeFreeModels: boolean; coreAcceptsRouteBilling: boolean };
+        notAddedAgents: NotAddedAgentsDetector;
+        supportedAgents(agents: unknown[]): Array<{ agentId: string; state: string; installCommand?: string }> | undefined;
+      };
+      // Detection without touching this computer's own agents.
+      internals.notAddedAgents = new NotAddedAgentsDetector({ agentIds: ["claude-code", "dsh", "opencode", "antigravity"], deps: {
+        claude: async () => "/usr/local/bin/claude", dsh: async () => { throw new RemoteInstanceError("prerequisite_missing", "not installed", { diagnostic: "dsh_not_found" }); },
+        opencode: async () => ({ version: "2.0.18" }), antigravityPinned: () => true } });
+      const agents = (await supervisor.inventory.collect()).agents;
+      expect(internals.supportedAgents(agents)).toBeUndefined();
+      // The release's connector commands ride the heartbeat only to a 7.1 Core too (R20).
+      const commands = () => (supervisor.heartbeat as unknown as { options: { connectorCommands: () => { version: string; commands: unknown[] } | undefined } }).options.connectorCommands();
+      expect(commands()).toBeUndefined();
+      internals.hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: true };
+      expect(commands()).toMatchObject({ version: "1.0.0", commands: expect.arrayContaining([expect.objectContaining({ id: "status" })]) });
+      expect(internals.supportedAgents(agents)).toBeUndefined();
+      await internals.notAddedAgents.refreshIfDue();
+      const reported = internals.supportedAgents(agents)!;
+      expect(reported.map(entry => entry.agentId)).toEqual([...SUPPORTED_AGENT_IDS]);
+      const codexView = agents.find(agent => (agent as { agentId: string }).agentId === "codex") as { readiness: string; connectionState: string };
+      const codexState = codexView.readiness === "ready" && codexView.connectionState === "ready" ? "ready" : codexView.readiness === "not_configured" ? "needs_sign_in" : "failed";
+      expect(reported.map(entry => [entry.agentId, entry.state])).toEqual([
+        ["claude-code", "installed_not_added"], ["codex", codexState], ["dsh", "not_installed"], ["opencode", "installed_not_added"], ["antigravity", "not_added"],
+      ]);
+    });
+
+    it("fetches an update's new pin at once on the first yes, and joins when it is switched to (A17)", async () => {
+      const f = await fixture();
+      vi.spyOn(antigravityInstallAdapter, "selfCheck").mockResolvedValue(undefined);
+      let finish: (() => void) | undefined;
+      const relocate = vi.fn(() => new Promise<ReturnType<typeof antigravityConfig>>(resolve => { finish = () => resolve(antigravityConfig()); }));
+      const error = new RemoteInstanceError("prerequisite_missing", "Google Antigravity on this computer is not the version this connector runs.", { diagnostic: "antigravity_unsupported_version" });
+      const unavailableAgents = [{ agentId: "antigravity", error, relocate, updating: true, fetched: { antigravityVersion: "1.1.1", antigravityRoot: join(root, "agents", "antigravity", "1.1.1-darwin-arm64") } }];
+      const supervisor = new Supervisor(f.config, { native: { ...f.options.native, unavailableAgents } });
+      supervisors.push(supervisor);
+      await supervisor.start();
+      // Started now, not in a minute.
+      await vi.waitFor(() => expect(relocate).toHaveBeenCalledTimes(1));
+      expect([...supervisor.runners.keys()]).toEqual(["codex"]);
+      const pinned = `${process.platform}-${process.arch}` === "darwin-arm64";
+      const updating = (await doctorOf(supervisor)).find(entry => entry.id === "antigravity");
+      expect(updating).toMatchObject({ status: "fail" });
+      if (pinned) expect(updating!.detail).toContain("this connector release runs 1.2.1, which is being downloaded from Google and checked before it is used");
+      finish!();
+      // The zero-delay background retry still yields through the host event
+      // loop. Give a loaded cross-platform CI runner room to publish the
+      // successfully checked runner rather than treating scheduler latency as
+      // a product failure.
+      await vi.waitFor(() => expect([...supervisor.runners.keys()]).toEqual(["codex", "antigravity"]), { timeout: 5_000 });
+      expect((await doctorOf(supervisor)).find(entry => entry.id === "antigravity")).toMatchObject({ status: "warn", detail: expect.stringContaining("start check passed") });
+    });
   });
 
   it("tells the local operator which release Konteks accepts for this machine (WS1-093)", async () => {

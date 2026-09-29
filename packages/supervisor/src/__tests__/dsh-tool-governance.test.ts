@@ -57,8 +57,25 @@ describe("DeepSeek Harness tool governance", () => {
     expect(governance.decide(ask("m8"), CWD)).toMatchObject({ kind: "deny" });
     expect(governance.decide(ask("r1"), CWD)).toEqual({ kind: "allow" });
     // The retired browser tool is never mounted, so a server using its name is not Konteks'.
-    // DeepSeek Harness gets no QA browser (it carries no package to run it), so its name is refused too.
+    // The QA browser is allowed only on a session given it (below); without it, refused.
     for (const id of ["m2", "m3", "m6", "j1", "p1"]) expect(governance.decide(ask(id), CWD), id).toMatchObject({ kind: "deny" });
+  });
+
+  it("allows the connector's QA browser on a session given it, never its hidden tools (O8)", () => {
+    const governance = new DshToolGovernance();
+    governance.observe(call("n1", "mcp__konteks-browser__browser_navigate", { url: "http://127.0.0.1:43100/" }));
+    governance.observe(call("n2", "mcp__konteks-browser__browser_snapshot", {}));
+    governance.observe(call("u1", "mcp__konteks-browser__browser_run_code_unsafe", { code: "process.exit()" }));
+    governance.observe(call("u2", "mcp__konteks-browser__browser_route", { pattern: "**" }));
+    governance.observe(call("t1", "mcp__konteks-browser-tool__navigate", { url: "http://localhost" }));
+    governance.observe(call("n3", "mcp__konteks-browser__browser_navigate", { url: "http://127.0.0.1:43100/" }));
+    expect(governance.decide(ask("n1"), CWD, { browserTools: true })).toEqual({ kind: "allow" });
+    expect(governance.decide(ask("n2"), CWD, { browserTools: true })).toEqual({ kind: "allow" });
+    for (const id of ["u1", "u2", "t1"]) expect(governance.decide(ask(id), CWD, { browserTools: true }), id).toMatchObject({ kind: "deny" });
+    expect(governance.decide(ask("n3"), CWD, { browserTools: false })).toEqual({ kind: "deny", reason: "the browser tool browser_navigate is not allowed in this session" });
+    // A browser call is gated: completing without asking trips like any other.
+    governance.observe(call("n4", "mcp__konteks-browser__browser_click", { ref: "e1" }));
+    expect(governance.observe({ sessionUpdate: "tool_call_update", toolCallId: "n4", status: "completed" })).toEqual({ toolCallId: "n4", title: "mcp__konteks-browser__browser_click" });
   });
 
   it("denies a request with no tool call behind it, or with nothing to judge", () => {

@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
+
+/** The connector's own log in `<root>/logs`, where the OS keeps none (macOS); the supervisor keeps it small. */
+export const CONNECTOR_LOG_FILE = "connector.log";
 /** The host operating systems a native connector runs on. */
 export type HostOs = "macos" | "windows" | "debian";
 
@@ -94,9 +97,13 @@ export function nativeServiceDefinition(input: {
     if (!Number.isSafeInteger(input.uid) || input.uid! < 1) throw new Error("a non-root user uid is required for the native launch agent");
     const file = path.join(input.home, "Library", "LaunchAgents", `${label}.plist`);
     const domain = `gui/${input.uid}`;
+    // launchd keeps nothing a service prints: without a file the connector's
+    // log, which doctor points to, did not exist (WS1-163). The connector
+    // keeps the file small itself (connector-log.ts).
+    const logFile = path.join(normalizedRoot, "logs", CONNECTOR_LOG_FILE);
     return {
       label, path: file, requiresLinger: false,
-      contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>Umask</key><integer>63</integer>\n</dict></plist>\n`,
+      contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>${xml(logFile)}</string>\n<key>StandardErrorPath</key><string>${xml(logFile)}</string>\n</dict></plist>\n`,
       install: [],
       start: { command: "launchctl", args: ["bootstrap", domain, file] },
       stop: { command: "launchctl", args: ["bootout", `${domain}/${label}`] },

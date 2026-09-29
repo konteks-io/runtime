@@ -18,6 +18,7 @@ import { StateMutationGate } from "../state/mutation-gate.js";
 import { testGitCommand, testGitTool } from "./native-git-fixture.js";
 
 const roots: string[] = [];
+const realRoot = async (path: string) => (await import("node:fs/promises")).realpath(path);
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
@@ -310,6 +311,37 @@ describe("native authorized input composition", () => {
     expect(await readdir(prepared.cwd)).toEqual([]);
     await prepared.beforePrompt();
   });
+  it("gives a direct session its own empty private folder, stages no skill and puts nothing before the prompt (runtime-view R11, R13)", async () => {
+    const f = await fixture({});
+    const direct: RemoteWorkAssignment = { ...assignment, kind: "direct",
+      source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
+    const prepared = await createNativeInputPreparer(f.options)(direct);
+    expect(prepared.skillInstructions).toBe("");
+    expect(await readdir(prepared.cwd)).toEqual([]);
+    // The session's folder, stable across its prompts: the same one a later prompt gets.
+    expect(prepared.cwd.startsWith(join(await realRoot(f.root), "session-"))).toBe(true);
+    // No organization skill was fetched or staged.
+    expect(f.fetchFn.mock.calls.some(([, init]) => String(init?.body ?? "").includes('"skill"'))).toBe(false);
+    await prepared.beforePrompt();
+    const again = await createNativeInputPreparer(f.options)({ ...direct, id: "assignment" });
+    expect(again.cwd).toBe(prepared.cwd);
+  });
+  it("keeps what the agent wrote in a direct session's folder when the next turn brings newer inputs (WS1-170)", async () => {
+    const f = await fixture({ "README.md": "from Core" });
+    const direct: RemoteWorkAssignment = { ...assignment, kind: "direct",
+      source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
+    const first = await createNativeInputPreparer(f.options)(direct);
+    await writeFile(join(first.cwd, "notes.md"), "hello from Konteks");
+    // The next prompt is a new claim, so a new signed selection.
+    f.selection.claimId = "claim-2";
+    f.options.claimId = () => "claim-2";
+    const second = await createNativeInputPreparer(f.options)(direct);
+    expect(second.cwd).toBe(first.cwd);
+    expect(await readFile(join(second.cwd, "notes.md"), "utf8")).toBe("hello from Konteks");
+    expect(await readFile(join(second.cwd, "README.md"), "utf8")).toBe("from Core");
+    await second.beforePrompt();
+  });
+
   it("renews the authorization window without replacing files or the selection", async () => {
     const f = await fixture(),
       prepared = await createNativeInputPreparer(f.options)(assignment);

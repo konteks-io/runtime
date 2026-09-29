@@ -1,0 +1,173 @@
+name: agent-os-proof
+# Every agent proven on every OS (opencode-runtime-support CP0-X): each job
+# installs one agent the way its own docs say on that OS, builds the runtime
+# and runs scripts/agent-os-proof.mjs, which drives the CONNECTOR's own code
+# (locators, spawn spec and private home, self-check, ACP initialize,
+# session/new, model discovery, the tool policy) against the real agent. A
+# scripted model drives the governance probe without any credential; a real
+# turn runs when a credential exists (OpenCode: Zen's free model, none
+# needed), otherwise it is reported "not proven". An agent is enabled on an OS
+# only when its job there passes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [chore/quality-assurance]
+    paths:
+      - "packages/agent-runner/**"
+      - "packages/supervisor/**"
+      - "packages/release/**"
+      - "packages/common/**"
+      - "release/native-agent-builds.json"
+      - "scripts/agent-os-proof.mjs"
+      - "scripts/agent-os-proof/**"
+      - "scripts/build-offline-agent.mjs"
+      - "scripts/claude-acp-settings-patch.mjs"
+      - "scripts/claude-instruction-scope.mjs"
+      - "scripts/codex-acp-live-user-patch.mjs"
+      - "scripts/ci-vendored-contracts.mjs"
+      - "vendor/**"
+      - ".github/workflows/agent-os-proof.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-os-proof-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    name: ${{ matrix.agent }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, ubuntu-24.04-arm, windows-2022]
+        agent: [claude-code, codex, dsh, opencode]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      # Canaries: fake credentials the probe proves never reach an agent
+      # process (the job's real token is never exported to the environment).
+      GITHUB_TOKEN: ghp_KonteksOsProofFakeTokenNeverForAgents01
+      GH_TOKEN: gho_KonteksOsProofFakeTokenNeverForAgents02
+      KONTEKS_PROOF_OS: ${{ matrix.os }}
+      DSH_VERSION: 0.1.7-rc.2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - name: Point the contract links at vendor/ (the dev branch links ../packages, absent here)
+        shell: bash
+        run: |
+          node scripts/ci-vendored-contracts.mjs
+          npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+      - name: Install the runtime
+        run: npm ci --ignore-scripts --legacy-peer-deps
+      - name: Build the runtime
+        run: npm run build
+      - name: Platform
+        id: platform
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in macOS) os=macos ;; Linux) os=debian ;; Windows) os=windows ;; esac
+          case "$RUNNER_ARCH" in X64) arch=amd64 ;; ARM64) arch=arm64 ;; esac
+          echo "os=$os" >> "$GITHUB_OUTPUT"
+          echo "arch=$arch" >> "$GITHUB_OUTPUT"
+
+      # Ubuntu 24.04 enables a blanket AppArmor user-namespace restriction.
+      # Codex's own workspace sandbox is bubblewrap-based, so the ephemeral
+      # proof VM must allow that sandbox to start; otherwise the proof measures
+      # the runner image's AppArmor default rather than our approval boundary.
+      # This changes only the disposable CI machine and skips no assertion.
+      - name: Allow the native agent sandbox on the ephemeral Linux proof runner
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      # ── install the agent the way its own docs say ────────────────────────
+      - name: Install Claude Code (its installer)
+        if: matrix.agent == 'claude-code' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install Claude Code (its Windows installer)
+        if: matrix.agent == 'claude-code' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://claude.ai/install.ps1 | iex
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.local\bin"
+      - name: Build the agent's offline package, as the release does
+        if: matrix.agent == 'claude-code' || matrix.agent == 'codex'
+        shell: bash
+        run: |
+          node scripts/build-offline-agent.mjs --agent "${{ matrix.agent }}" --os "${{ steps.platform.outputs.os }}" --architecture "${{ steps.platform.outputs.arch }}" \
+            --approval konteks-agent-os-proof-ci-only --out "$RUNNER_TEMP/agent.tgz" --profile "$RUNNER_TEMP/agent.profile.json"
+          node scripts/native-artifact-index.mjs --file "$RUNNER_TEMP/agent.tgz" --profile "$RUNNER_TEMP/agent.profile.json" \
+            --id "${{ matrix.agent }}-${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}" --kind agent_bridge --format offline_agent_tgz \
+            --agent "${{ matrix.agent }}" --os "${{ steps.platform.outputs.os }}" --architecture "${{ steps.platform.outputs.arch }}" \
+            --url "https://example.invalid/agent-os-proof/${{ matrix.agent }}.tgz" --out "$RUNNER_TEMP/agent.artifact.json"
+      - name: Install DeepSeek Harness (npx, as its homepage says)
+        if: matrix.agent == 'dsh'
+        shell: bash
+        run: |
+          npx -y "@deepseek-ai/dsh@$DSH_VERSION" --version
+          # The connector looks for npx's copy in npm's cache; the runners move
+          # that cache (npmrc), so name it the way a person's npm_config_cache would.
+          echo "npm_config_cache=$(npm config get cache)" >> "$GITHUB_ENV"
+          # dsh runs on the person's own Node, which the connector takes only
+          # when no other user can write it; the runner's tool cache is
+          # group-writable, a person's own install is not.
+          node_bin="$(node -p process.execPath)"
+          ls -l "$node_bin"
+          if [ "$RUNNER_OS" != "Windows" ]; then chmod go-w "$node_bin"; ls -l "$node_bin"; fi
+      - name: Install OpenCode 2 (its homepage installer)
+        if: matrix.agent == 'opencode' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL https://opencode.ai/v2/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+      - name: Install OpenCode 2 (npm, the Windows install)
+        if: matrix.agent == 'opencode' && runner.os == 'Windows'
+        shell: pwsh
+        run: npm install -g @opencode/cli
+
+      # ── the proof ──────────────────────────────────────────────────────────
+      - name: Run the agent OS proof
+        shell: bash
+        env:
+          # Each key reaches only its own agent's job; the probe moves it aside
+          # and uses it only in the job's private home.
+          ANTHROPIC_API_KEY: ${{ matrix.agent == 'claude-code' && secrets.ANTHROPIC_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ matrix.agent == 'codex' && secrets.OPENAI_API_KEY || '' }}
+          DEEPSEEK_API_KEY: ${{ matrix.agent == 'dsh' && secrets.DEEPSEEK_API_KEY || '' }}
+        run: |
+          package=()
+          if [ -f "$RUNNER_TEMP/agent.tgz" ]; then package=(--package "$RUNNER_TEMP/agent.tgz" --artifact "$RUNNER_TEMP/agent.artifact.json"); fi
+          node scripts/agent-os-proof.mjs --agent "${{ matrix.agent }}" --out "agent-os-proof/${{ matrix.agent }}-${{ matrix.os }}.json" --work "$RUNNER_TEMP/os-proof" "${package[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-os-proof-${{ matrix.agent }}-${{ matrix.os }}
+          path: agent-os-proof/
+          if-no-files-found: warn
+
+  summary:
+    needs: proof
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: agent-os-proof-*
+          path: results
+      - name: Table and verdict
+        run: node scripts/agent-os-proof/summary.mjs --dir results --out "$GITHUB_STEP_SUMMARY"

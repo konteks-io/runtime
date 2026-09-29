@@ -4,7 +4,7 @@ import { access, lstat, readdir, readFile, realpath, stat } from "node:fs/promis
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
-import { compareAgentVersions, findAgentBridge, hostAgentVersionSupported, type AgentBridgeFamily } from "@konteks/remote-release";
+import { compareAgentVersions, hostAgentFamily, hostAgentVersionSupported, type HostAgentFamily } from "@konteks/remote-release";
 
 /** The person's own installed DeepSeek Harness, as the runtime will launch it. */
 export interface NativeDshInstallation {
@@ -18,11 +18,7 @@ export interface NativeDshInstallation {
 type Refusal = { diagnostic: "dsh_not_found" | "dsh_unsupported_version" | "dsh_unsafe_install" | "dsh_node_unsupported"; message: string };
 const PRIORITY: Record<Refusal["diagnostic"], number> = { dsh_not_found: 0, dsh_unsafe_install: 1, dsh_unsupported_version: 2, dsh_node_unsupported: 3 };
 
-function family(): AgentBridgeFamily & { hostInstall: NonNullable<AgentBridgeFamily["hostInstall"]> } {
-  const dsh = findAgentBridge("dsh");
-  if (!dsh?.hostInstall) throw new Error("the dsh host-agent family is not registered");
-  return dsh as AgentBridgeFamily & { hostInstall: NonNullable<AgentBridgeFamily["hostInstall"]> };
-}
+const family = (): HostAgentFamily => hostAgentFamily("dsh");
 
 function refuse(refusal: Refusal): RemoteInstanceError {
   return new RemoteInstanceError("prerequisite_missing", refusal.message, { diagnostic: refusal.diagnostic, recoveryActions: [{ kind: "install_backend", agentId: "dsh" }] });
@@ -202,21 +198,47 @@ export async function resolveNativeDshNode(
   deps: { version?: (node: string) => Promise<string | null> } = {},
 ): Promise<string> {
   const binary = platform === "win32" ? "node.exe" : "node";
-  const candidates: string[] = [];
+  let candidates: string[];
   if (env.DSH_NODE !== undefined) {
     if (!isAbsolute(env.DSH_NODE) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(env.DSH_NODE)) throw refuse(nodeUnsupported(null));
-    candidates.push(env.DSH_NODE);
+    candidates = [env.DSH_NODE];
   } else {
     // <prefix>/lib/node_modules/@deepseek-ai/dsh -> <prefix>/bin/node (npm, nvm, Homebrew);
     // <nodejs>\node_modules\@deepseek-ai\dsh -> <nodejs>\node.exe (Windows installer prefix).
-    candidates.push(platform === "win32" ? resolve(installation.root, "..", "..", "..", binary) : resolve(installation.root, "..", "..", "..", "..", "bin", binary));
-    for (const directory of (env.PATH ?? "").split(platform === "win32" ? ";" : ":")) if (directory && isAbsolute(directory)) candidates.push(join(directory, binary));
-    if (platform === "win32") {
-      for (const programs of [env.ProgramFiles, env["ProgramFiles(x86)"]]) if (programs && isAbsolute(programs)) candidates.push(join(programs, "nodejs", binary));
-    } else {
-      candidates.push("/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node");
-    }
+    candidates = [platform === "win32" ? resolve(installation.root, "..", "..", "..", binary) : resolve(installation.root, "..", "..", "..", "..", "bin", binary),
+      ...personNodeCandidates(env, platform)];
   }
+  const found = await locatePersonNode(candidates, nodeSupported, platform, deps);
+  if (found.node !== null) return found.node;
+  throw refuse(nodeUnsupported(found.seen));
+}
+
+/** Where a person's own Node usually is: every PATH folder, then the usual install locations. */
+export function personNodeCandidates(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string[] {
+  const binary = platform === "win32" ? "node.exe" : "node";
+  const candidates: string[] = [];
+  for (const directory of (env.PATH ?? "").split(platform === "win32" ? ";" : ":")) if (directory && isAbsolute(directory)) candidates.push(join(directory, binary));
+  if (platform === "win32") {
+    for (const programs of [env.ProgramFiles, env["ProgramFiles(x86)"]]) if (programs && isAbsolute(programs)) candidates.push(join(programs, "nodejs", binary));
+  } else {
+    candidates.push("/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node");
+  }
+  return candidates;
+}
+
+/**
+ * The first candidate that is a safely owned executable (the person's or
+ * root's, not group or world writable) reporting a version `supported`
+ * accepts; `seen` is the first version reported by one that did not qualify.
+ * `node --version` is the only thing run. Shared by DeepSeek Harness and the
+ * connector's QA browser (O8).
+ */
+export async function locatePersonNode(
+  candidates: readonly string[],
+  supported: (reported: string) => boolean,
+  platform: NodeJS.Platform = process.platform,
+  deps: { version?: (node: string) => Promise<string | null> } = {},
+): Promise<{ node: string; version: string } | { node: null; seen: string | null }> {
   const version = deps.version ?? nodeVersion;
   let seen: string | null = null;
   for (const candidate of [...new Set(candidates)]) {
@@ -234,10 +256,10 @@ export async function resolveNativeDshNode(
       continue;
     }
     const reported = await version(node).catch(() => null);
-    if (reported !== null && nodeSupported(reported)) return node;
+    if (reported !== null && supported(reported)) return { node, version: reported.trim() };
     seen ??= reported;
   }
-  throw refuse(nodeUnsupported(seen));
+  return { node: null, seen };
 }
 
 function nodeSupported(reported: string): boolean {

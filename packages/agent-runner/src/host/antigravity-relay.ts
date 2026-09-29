@@ -1,0 +1,329 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { request as httpRequest } from "node:http";
+import type { AddressInfo, Socket } from "node:net";
+import { connect as tlsConnect } from "node:tls";
+import { httpsProxyFor, openHttpsProxyTunnel, type Logger } from "@konteks/remote-common";
+
+/**
+ * The Gemini API key relay (antigravity-runtime-support A7, CP3). One relay per
+ * Google Antigravity process that signs in with a Gemini API key, living in
+ * the runner:
+ * - it listens on 127.0.0.1 only, on a random port, and the server reaches it
+ *   through `GOOGLE_GEMINI_BASE_URL`;
+ * - the server holds only a random per-process token (sent to it through ACP
+ *   `authenticate` `_meta["api-key"]`, never the environment), which is all a
+ *   command in the agent's shell could ever find; the relay refuses anything
+ *   without that token;
+ * - the relay swaps the token for the person's real key and forwards only to
+ *   `https://generativelanguage.googleapis.com`, only on the Gemini model
+ *   paths (`models`, `:generateContent`, `:streamGenerateContent`,
+ *   `:countTokens`), streaming the answer back as it comes;
+ * - it reads Google's `usageMetadata` from each answer and records the tokens
+ *   and the real model name, because the server itself reports no usage
+ *   (CP0 B11); the runner prices a turn from them (A8);
+ * - behind a proxy (`HTTPS_PROXY`/`ALL_PROXY`, `NO_PROXY`, from the
+ *   connector's own environment, never the agent's) it reaches Google
+ *   through a CONNECT tunnel with its own TLS session, as the download does
+ *   (CP6); a proxy it cannot use is a plain 502, never a direct connection.
+ * No request or answer body, header, token or key is ever logged.
+ */
+
+export const GEMINI_API_ORIGIN = "https://generativelanguage.googleapis.com";
+
+/** Gemini's `usageMetadata` fields the relay keeps (tokens only). */
+export interface GeminiUsage {
+  promptTokenCount: number;
+  candidatesTokenCount: number;
+  thoughtsTokenCount: number;
+  cachedContentTokenCount: number;
+  toolUsePromptTokenCount: number;
+  totalTokenCount: number;
+}
+
+/** What one model answered in a span of requests. */
+export interface GeminiModelUsage {
+  /** The model id in the request path (`gemini-3.8-flash`), as Google was asked for it. */
+  model: string;
+  usage: GeminiUsage;
+  requests: number;
+}
+
+const USAGE_FIELDS = ["promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount", "cachedContentTokenCount", "toolUsePromptTokenCount", "totalTokenCount"] as const;
+const emptyUsage = (): GeminiUsage => ({ promptTokenCount: 0, candidatesTokenCount: 0, thoughtsTokenCount: 0, cachedContentTokenCount: 0, toolUsePromptTokenCount: 0, totalTokenCount: 0 });
+
+/**
+ * Every answered model request of one relay, in order. A turn marks where it
+ * started and reads what came after; one Antigravity process runs one session
+ * at a time (A12), so that span is the turn's.
+ */
+export class GeminiUsageMeter {
+  private readonly entries: Array<{ model: string; usage: GeminiUsage }> = [];
+  private dropped = 0;
+
+  record(model: string, usage: GeminiUsage): void {
+    this.entries.push({ model, usage });
+    // Bounded: a relay lives as long as its process; old spans are never read again.
+    if (this.entries.length > 4_096) { this.entries.shift(); this.dropped += 1; }
+  }
+
+  /** The position a later `since` counts from. */
+  mark(): number {
+    return this.dropped + this.entries.length;
+  }
+
+  /** Usage per model recorded after `mark`, largest first; empty when none. */
+  since(mark: number): GeminiModelUsage[] {
+    const start = Math.max(0, mark - this.dropped);
+    const byModel = new Map<string, GeminiModelUsage>();
+    for (const entry of this.entries.slice(start)) {
+      const current = byModel.get(entry.model) ?? { model: entry.model, usage: emptyUsage(), requests: 0 };
+      for (const field of USAGE_FIELDS) current.usage[field] += entry.usage[field];
+      current.requests += 1;
+      byModel.set(entry.model, current);
+    }
+    return [...byModel.values()].sort((a, b) => b.usage.totalTokenCount - a.usage.totalTokenCount);
+  }
+}
+
+/** Where the relay forwards; only tests (a fake Google on loopback) replace it. */
+export interface GeminiRelayUpstream {
+  origin: string;
+  ca?: string | Buffer;
+}
+
+export interface AntigravityRelayOptions {
+  /** The person's Gemini API key (read from the connector's store, never from the environment). */
+  key: string;
+  logger?: Pick<Logger, "info" | "warn">;
+  /** Test seam only: a fake Google endpoint. */
+  upstream?: GeminiRelayUpstream;
+  /** Largest request body forwarded (default 64 MiB: prompts may carry images). */
+  maxRequestBytes?: number;
+  /**
+   * Where the proxy variables are read from (default: the connector's own
+   * environment). `HTTPS_PROXY`/`ALL_PROXY` with `NO_PROXY` are honoured for
+   * Google's endpoint through an HTTP CONNECT tunnel (antigravity CP6), like
+   * the download; the TLS session to Google runs inside it.
+   */
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface AntigravityRelay {
+  /** `http://127.0.0.1:<port>`: the server's `GOOGLE_GEMINI_BASE_URL`. */
+  readonly url: string;
+  /** The per-process token the server sends as its key; never the real key. */
+  readonly token: string;
+  readonly meter: GeminiUsageMeter;
+  close(): Promise<void>;
+}
+
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const ACTIONS = new Set(["generateContent", "streamGenerateContent", "countTokens"]);
+const VERSIONS = new Set(["v1", "v1beta", "v1alpha"]);
+const FORWARDED_QUERY = new Set(["alt", "pageSize", "pageToken"]);
+const FORWARDED_REQUEST_HEADERS = ["content-type", "accept", "user-agent", "x-goog-api-client", "content-length"];
+const FORWARDED_RESPONSE_HEADERS = ["content-type", "content-length", "cache-control", "retry-after", "x-goog-api-client"];
+/** Answers this large are passed on but not read for usage (a JSON answer is parsed whole). */
+const MAX_PARSED_BYTES = 16 * 1024 * 1024;
+
+/** A Gemini API path the relay forwards, with the model it names and the action, or null for anything else. */
+export function geminiRelayRoute(method: string | undefined, pathname: string): { model?: string; action?: string } | null {
+  const parts = pathname.split("/");
+  if (parts[0] !== "" || !VERSIONS.has(parts[1] ?? "") || parts[2] !== "models") return null;
+  if (parts.length === 3) return method === "GET" ? {} : null;
+  if (parts.length !== 4 || !parts[3]) return null;
+  const [model, action, ...rest] = decodeURIComponentSafe(parts[3]).split(":");
+  if (rest.length > 0 || !model || !MODEL_ID.test(model)) return null;
+  if (action === undefined) return method === "GET" ? { model } : null;
+  return method === "POST" && ACTIONS.has(action) ? { model, action } : null;
+}
+
+function decodeURIComponentSafe(value: string): string {
+  try { return decodeURIComponent(value); } catch { return ""; }
+}
+
+function tokenMatches(presented: string | undefined, token: Buffer): boolean {
+  if (typeof presented !== "string") return false;
+  const candidate = Buffer.from(presented);
+  return candidate.length === token.length && timingSafeEqual(candidate, token);
+}
+
+function refuse(response: ServerResponse, status: number, message: string): void {
+  if (response.headersSent) { response.destroy(); return; }
+  const body = JSON.stringify({ error: { code: status, message, status: status === 401 ? "UNAUTHENTICATED" : status === 404 ? "NOT_FOUND" : status === 413 ? "INVALID_ARGUMENT" : "UNAVAILABLE" } });
+  response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+  response.end(body);
+}
+
+/**
+ * Reads Gemini's `usageMetadata` out of an answer as it streams past: every
+ * `data:` event of a server-sent stream, or the whole JSON body. A streamed
+ * answer repeats running totals, so each field keeps its largest value.
+ */
+class UsageReader {
+  private readonly usage = emptyUsage();
+  private seen = false;
+  private pending = "";
+  private bytes = 0;
+  private readonly chunks: Buffer[] = [];
+  private overflow = false;
+
+  constructor(private readonly streamed: boolean) {}
+
+  push(chunk: Buffer): void {
+    if (this.overflow) return;
+    this.bytes += chunk.byteLength;
+    if (this.bytes > MAX_PARSED_BYTES) { this.overflow = true; this.chunks.length = 0; this.pending = ""; return; }
+    if (!this.streamed) { this.chunks.push(chunk); return; }
+    const lines = (this.pending + chunk.toString("utf8")).split(/\r?\n/);
+    this.pending = lines.pop() ?? "";
+    for (const line of lines) this.line(line);
+  }
+
+  finish(): GeminiUsage | null {
+    if (!this.overflow) {
+      if (this.streamed) { if (this.pending) this.line(this.pending); }
+      else this.parse(Buffer.concat(this.chunks).toString("utf8"));
+    }
+    return this.seen ? this.usage : null;
+  }
+
+  private line(line: string): void {
+    if (line.startsWith("data:")) this.parse(line.slice(5).trim());
+  }
+
+  private parse(text: string): void {
+    if (!text) return;
+    let value: unknown;
+    try { value = JSON.parse(text); } catch { return; }
+    for (const item of Array.isArray(value) ? value : [value]) {
+      const metadata = (item as { usageMetadata?: unknown } | null)?.usageMetadata;
+      if (!metadata || typeof metadata !== "object") continue;
+      this.seen = true;
+      for (const field of USAGE_FIELDS) {
+        const count = (metadata as Record<string, unknown>)[field];
+        if (typeof count === "number" && Number.isSafeInteger(count) && count >= 0) this.usage[field] = Math.max(this.usage[field], count);
+      }
+    }
+  }
+}
+
+/** Start one relay on 127.0.0.1 with a fresh random port and token. */
+export async function startAntigravityRelay(options: AntigravityRelayOptions): Promise<AntigravityRelay> {
+  const token = randomBytes(32).toString("base64url");
+  const tokenBytes = Buffer.from(token);
+  const meter = new GeminiUsageMeter();
+  const upstream = new URL(options.upstream?.origin ?? GEMINI_API_ORIGIN);
+  const secure = upstream.protocol === "https:";
+  if (!options.upstream && upstream.origin !== GEMINI_API_ORIGIN) throw new Error("the relay forwards to Google only");
+  const maxRequestBytes = options.maxRequestBytes ?? 64 * 1024 * 1024;
+
+  const handle = (request: IncomingMessage, response: ServerResponse): void => {
+    let target: URL;
+    try { target = new URL(request.url ?? "/", "http://127.0.0.1"); } catch { refuse(response, 404, "Not a Gemini API path."); request.resume(); return; }
+    const presented = request.headers["x-goog-api-key"];
+    const key = typeof presented === "string" ? presented : target.searchParams.get("key") ?? undefined;
+    if (!tokenMatches(key, tokenBytes)) { request.resume(); refuse(response, 401, "The Konteks relay refused a request without this process's token."); return; }
+    const route = geminiRelayRoute(request.method, target.pathname);
+    if (route === null) { request.resume(); refuse(response, 404, "The Konteks relay forwards only Gemini model requests."); return; }
+    const declared = Number(request.headers["content-length"] ?? 0);
+    if (Number.isFinite(declared) && declared > maxRequestBytes) { request.resume(); refuse(response, 413, "The request is too large for the Konteks relay."); return; }
+
+    const query = new URLSearchParams();
+    for (const [name, value] of target.searchParams) if (FORWARDED_QUERY.has(name)) query.append(name, value);
+    const headers: Record<string, string> = { "x-goog-api-key": options.key };
+    for (const name of FORWARDED_REQUEST_HEADERS) {
+      const value = request.headers[name];
+      if (typeof value === "string") headers[name] = value;
+    }
+    // Plain bytes back, so the answer can be read for usage as it passes.
+    headers["accept-encoding"] = "identity";
+    const path = `${upstream.pathname.replace(/\/$/, "")}${target.pathname}${query.size > 0 ? `?${query.toString()}` : ""}`;
+    const send = secure ? httpsRequest : httpRequest;
+    const forward = (tunnel?: Socket): void => {
+      const outgoing = send({
+        protocol: upstream.protocol, hostname: upstream.hostname, port: upstream.port || (secure ? 443 : 80), method: request.method, path, headers,
+        ...(options.upstream?.ca === undefined ? {} : { ca: options.upstream.ca }),
+        // Through the proxy: our own TLS session to Google inside the tunnel.
+        ...(tunnel === undefined ? {} : {
+          agent: false,
+          createConnection: () => tlsConnect({ socket: tunnel, servername: upstream.hostname, ...(options.upstream?.ca === undefined ? {} : { ca: options.upstream.ca }) }),
+        }),
+      }, answer => {
+        const status = answer.statusCode ?? 502;
+        const forwarded: Record<string, string> = {};
+        for (const name of FORWARDED_RESPONSE_HEADERS) {
+          const value = answer.headers[name];
+          if (typeof value === "string") forwarded[name] = value;
+        }
+        response.writeHead(status, forwarded);
+        const counted = status >= 200 && status < 300 && route.model !== undefined && (route.action === "generateContent" || route.action === "streamGenerateContent");
+        const reader = counted ? new UsageReader(route.action === "streamGenerateContent") : null;
+        answer.on("data", (chunk: Buffer) => { reader?.push(chunk); response.write(chunk); });
+        answer.on("end", () => {
+          const usage = reader?.finish();
+          if (usage && route.model) meter.record(route.model, usage);
+          response.end();
+        });
+        answer.on("error", () => response.destroy());
+      });
+      outgoing.setTimeout(10 * 60_000, () => outgoing.destroy(new Error("Google stopped answering")));
+      outgoing.on("error", () => {
+        options.logger?.warn({ event: "antigravity.relay.upstream_failed" }, "the Gemini API key relay could not reach Google");
+        refuse(response, 502, "The Konteks relay could not reach Google.");
+      });
+      let received = 0;
+      request.on("data", (chunk: Buffer) => {
+        received += chunk.byteLength;
+        if (received > maxRequestBytes) { outgoing.destroy(); request.destroy(); return; }
+        outgoing.write(chunk);
+      });
+      request.on("end", () => outgoing.end());
+      request.on("error", () => outgoing.destroy());
+      response.on("close", () => { if (!response.writableFinished) outgoing.destroy(); });
+    };
+    let proxy: URL | null;
+    try { proxy = secure ? httpsProxyFor(upstream, options.env ?? process.env) : null; } catch {
+      request.resume();
+      options.logger?.warn({ event: "antigravity.relay.proxy_invalid" }, "the proxy setting is not usable for the Gemini API key relay");
+      refuse(response, 502, "The Konteks relay could not reach Google through the proxy.");
+      return;
+    }
+    if (proxy === null) { forward(); return; }
+    // The body waits while the tunnel opens.
+    request.pause();
+    openHttpsProxyTunnel(proxy, upstream, 60_000).then(tunnel => {
+      if (response.writableEnded || response.destroyed) { tunnel.destroy(); return; }
+      forward(tunnel);
+      request.resume();
+    }, () => {
+      request.resume();
+      options.logger?.warn({ event: "antigravity.relay.proxy_failed" }, "the Gemini API key relay could not reach Google through the proxy");
+      refuse(response, 502, "The Konteks relay could not reach Google through the proxy.");
+    });
+  };
+
+  const server: Server = createServer(handle);
+  server.keepAliveTimeout = 5_000;
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, () => { server.off("error", reject); resolve(); });
+  });
+  server.unref();
+  const port = (server.address() as AddressInfo).port;
+  let closing: Promise<void> | null = null;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    token,
+    meter,
+    close: () => {
+      closing ??= new Promise<void>(resolve => {
+        server.close(() => resolve());
+        server.closeAllConnections();
+      });
+      return closing;
+    },
+  };
+}

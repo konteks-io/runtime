@@ -1,12 +1,25 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
-import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServer, bundledBrowserVersion, dshRuntimePaths, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
-import { RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
-import type { RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
-import { checkDshKonteksProfile } from "./dsh-profile-check.js";
+import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServer, runnerBrowserVersion, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
+import { AgentLoginGcpSchema, AgentLoginOptionIdSchema, RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
+import type { RunnerHostSettings, RunnerLoginRequest, RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
+import type { checkDshKonteksProfile } from "./dsh-profile-check.js";
+import type { checkOpenCodeKonteksConfig } from "./opencode-self-check.js";
+import type { checkAntigravityServer } from "./antigravity-self-check.js";
+import { hostAgentInstallAdapter } from "./host-agents.js";
 
 const idSchema = z.string().min(1).max(128);
+const loginRequestSchema = z.object({
+  provider: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).optional(),
+  method: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).optional(),
+  loginOption: AgentLoginOptionIdSchema.optional(),
+  reuse: z.boolean().optional(),
+  gcp: AgentLoginGcpSchema.optional(),
+}).strict();
+function withoutUndefined<T extends object>(value: T): { [K in keyof T]: Exclude<T[K], undefined> } {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as { [K in keyof T]: Exclude<T[K], undefined> };
+}
 const inputSchema = z.object({
   context: SessionContextSchema,
   readinessDeadlineAt: z.string().datetime({ offset: true }),
@@ -36,6 +49,10 @@ export interface NativeRunnerOptions {
   afterSuccessfulLogin?: () => Promise<void>;
   /** The DeepSeek Harness overlay self-check; replaced only in tests. */
   dshProfileCheck?: typeof checkDshKonteksProfile;
+  /** The OpenCode locked-config self-check; replaced only in tests. */
+  openCodeSelfCheck?: typeof checkOpenCodeKonteksConfig;
+  /** The Google Antigravity `initialize` start check; replaced only in tests. */
+  antigravitySelfCheck?: typeof checkAntigravityServer;
 }
 
 /** Host-only runtime adapter. It never starts the legacy runner HTTP/WS API. */
@@ -48,9 +65,13 @@ export class NativeRunner implements RunnerPort {
   private stopPromise: Promise<void> | null = null;
   private unsubscribe: (() => void) | null = null;
 
-  /** The browser (Playwright MCP) version this agent's package carries; null for DeepSeek Harness or an older package. */
+  /**
+   * The browser (Playwright MCP) version this agent's sessions get: its own
+   * package's, or the connector's (O8) for an agent without one; null when
+   * the connector has no browser.
+   */
   browserVersion(): string | null {
-    return bundledBrowserVersion(this.options.config);
+    return runnerBrowserVersion(this.options.config);
   }
 
   constructor(private readonly options: NativeRunnerOptions) {
@@ -72,7 +93,7 @@ export class NativeRunner implements RunnerPort {
     if (this.stopping) return Promise.reject(unavailable());
     if (this.startPromise === null) {
       const starting = Promise.resolve().then(async () => {
-        await this.checkDshProfile();
+        await this.checkHostAgent();
         this.startEvents();
         await this.runtime.start();
         this.started = !this.stopping;
@@ -90,22 +111,41 @@ export class NativeRunner implements RunnerPort {
   }
 
   /**
-   * The person's own DeepSeek Harness runs only once the Konteks overlay is
-   * proven in force in that exact installation (dsh-profile-check.ts): a dsh
-   * upgrade that stops a patch applying, the ask hook included, never spawns.
+   * An agent used from the person's own installation runs only once its host
+   * adapter proved the Konteks overlay or config in force in that exact
+   * installation (for dsh, dsh-profile-check.ts): an upgrade that stops it
+   * applying, the ask hook included, never spawns.
    */
-  private async checkDshProfile(): Promise<void> {
-    const config = this.options.config;
-    if (config.RUNNER_AGENT_ID !== "dsh") return;
-    const { dshHome, konteksDir } = dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR);
-    if (!config.RUNNER_NATIVE_DSH_ROOT || !config.RUNNER_NATIVE_DSH_ENTRY || !config.RUNNER_NATIVE_DSH_NODE) {
-      throw new RemoteInstanceError("prerequisite_missing", "DeepSeek Harness was not located on this machine.", { diagnostic: "dsh_not_found" });
+  private async checkHostAgent(): Promise<void> {
+    const host = hostAgentInstallAdapter(this.options.config.RUNNER_AGENT_ID);
+    if (!host) return;
+    try {
+      await host.selfCheck(this.options.config, {
+        ...(this.options.dshProfileCheck ? { dshProfileCheck: this.options.dshProfileCheck } : {}),
+        ...(this.options.openCodeSelfCheck ? { openCodeSelfCheck: this.options.openCodeSelfCheck } : {}),
+        ...(this.options.antigravitySelfCheck ? { antigravitySelfCheck: this.options.antigravitySelfCheck } : {}),
+      });
+      this.hostSelfCheck = "passed";
+    } catch (error) {
+      this.hostSelfCheck = "failed";
+      throw error;
     }
-    await (this.options.dshProfileCheck ?? checkDshKonteksProfile)({
-      node: config.RUNNER_NATIVE_DSH_NODE,
-      installation: { root: config.RUNNER_NATIVE_DSH_ROOT, entry: config.RUNNER_NATIVE_DSH_ENTRY, version: config.RUNNER_BRIDGE_VERSION },
-      dshHome, konteksDir,
-    });
+  }
+
+  private hostSelfCheck: "passed" | "failed" | "not_run" = "not_run";
+
+  /**
+   * The person's own installation this host-agent runner runs (doctor): its
+   * version, its executable, and how the last start self-check went. Null for
+   * an agent from a release package.
+   */
+  hostInstallation(): { version: string; executable: string | null; fetchedRoot?: string; selfCheck: "passed" | "failed" | "not_run" } | null {
+    const config = this.options.config;
+    if (!hostAgentInstallAdapter(config.RUNNER_AGENT_ID)) return null;
+    return { version: config.RUNNER_BRIDGE_VERSION, executable: config.RUNNER_NATIVE_OPENCODE_BINARY ?? config.RUNNER_NATIVE_DSH_ENTRY ?? null,
+      // A fetched agent's own folder (Google Antigravity), for its download state; never shown.
+      ...(config.RUNNER_NATIVE_ANTIGRAVITY_ROOT === undefined ? {} : { fetchedRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT }),
+      selfCheck: this.hostSelfCheck };
   }
 
   stop(): Promise<void> {
@@ -117,6 +157,16 @@ export class NativeRunner implements RunnerPort {
       this.stopEvents();
     });
     return this.stopPromise;
+  }
+
+  /** Why this agent was taken out of service, or null (doctor). */
+  /** The agent was signed in and the sign-in no longer works (runtime-view R21). */
+  signInLost(): boolean {
+    return this.runtime.signInLost();
+  }
+
+  quarantineReason(): string | null {
+    return this.runtime.quarantineReason();
   }
 
   async quarantine(reason: string): Promise<void> {
@@ -161,8 +211,9 @@ export class NativeRunner implements RunnerPort {
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
     const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, browser } = parsed.data;
-    // The session's browser is a stdio MCP server the agent launches from its
-    // own package; composed here, where the package paths are known.
+    // The session's browser is a stdio MCP server the agent launches (its own
+    // package's, or the connector's for an agent without one); composed here,
+    // where the paths are known.
     const browserServer = browser === undefined ? null : browserMcpServer(this.options.config, browser);
     const mcpServers = browserServer === null ? parsed.data.mcpServers : [...parsed.data.mcpServers, browserServer];
     const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
@@ -269,12 +320,22 @@ export class NativeRunner implements RunnerPort {
     return { delivered: this.runtime.sessions.answer(ref, id, response) };
   }
 
-  async login(organization: boolean, loginId: string, personal = false) {
+  async login(organization: boolean, loginId: string, personal = false, request?: RunnerLoginRequest) {
     this.requireStarted();
     if (typeof organization !== "boolean" || typeof personal !== "boolean" || !idSchema.safeParse(loginId).success) throw invalid();
+    const parsed = request === undefined ? undefined : loginRequestSchema.safeParse(request);
+    if (parsed && !parsed.success) throw invalid();
     await verifyNativeRunnerPackage(this.options.config);
     this.requireStarted();
-    return { loginId: this.runtime.startLogin({ organization, loginId, personal }).loginId };
+    return { loginId: this.runtime.startLogin({ organization, loginId, personal, ...(parsed?.data ? { request: withoutUndefined(parsed.data) } : {}) }).loginId };
+  }
+
+  async applyHostSettings(settings: RunnerHostSettings): Promise<void> {
+    await this.runtime.applyHostSettings({ openCodeFreeModels: settings.openCodeFreeModels === true, coreAcceptsRouteBilling: settings.coreAcceptsRouteBilling === true });
+  }
+
+  siteLoginOptions() {
+    return this.started && !this.stopping ? this.runtime.siteLoginOptions() : [];
   }
 
   async loginInput(loginId: string, text: string) {
@@ -289,7 +350,14 @@ export class NativeRunner implements RunnerPort {
     return { cancelled: await this.runtime.loginCancel(loginId) };
   }
 
-  async logout() { this.requireStarted(); await verifyNativeRunnerPackage(this.options.config); this.requireStarted(); return this.runtime.logout(); }
+  async logout(request?: RunnerLoginRequest) {
+    this.requireStarted();
+    const parsed = request === undefined ? undefined : loginRequestSchema.safeParse(request);
+    if (parsed && !parsed.success) throw invalid();
+    await verifyNativeRunnerPackage(this.options.config);
+    this.requireStarted();
+    return this.runtime.logout(parsed?.data ? withoutUndefined(parsed.data) : undefined);
+  }
   async probe() { this.requireStarted(); return this.runtime.probe(false); }
 }
 

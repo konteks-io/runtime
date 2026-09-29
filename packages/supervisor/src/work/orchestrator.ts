@@ -49,6 +49,7 @@ import type { AssignmentSender } from "./assignment-sender.js";
 import { coreChannelId } from "../relay/channel-ids.js";
 import { isSearchAssignment, type SearchControllerBoundary } from "./search-assignment-carrier.js";
 import { isOnboardWorkAssignment, onboardTerminalResult, type OnboardWorkAssignment, type OnboardWorkCarrier } from "../onboard/carrier.js";
+import { continuedSession } from "./continued-session.js";
 
 /**
  * Pull → claim → dispatch → report. Core owns admission and placement; the
@@ -620,7 +621,7 @@ export class WorkOrchestrator {
       ...(error instanceof RemoteInstanceError
         ? (error.diagnostic !== undefined ? { detail: error.diagnostic } : {})
         : dispatchErrorIdentity(error)),
-      sessionContinuation: assignment.source.kind === "conversation" && assignment.source.acpSessionRef !== undefined,
+      sessionContinuation: continuedSession(assignment.source)?.acpSessionRef !== undefined,
     }, "dispatch failed; reporting");
     if (assignment.kind === "planning" || isSearchAssignment(assignment)) {
       await this.deps.journal.assignments.update(`${assignment.id}:${assignment.attempt}`, latest => {
@@ -694,13 +695,15 @@ export class WorkOrchestrator {
     if (this.sessions.has(key)) throw new Error("the assignment already has a local session owner");
     const runner = this.deps.runners.get(assignment.agentRoute.agentId);
     if (!runner) throw new Error("no runner for the placed agent");
-    const restoreReference = reference === undefined && assignment.source.kind === "conversation" ? assignment.source.acpSessionRef : undefined;
-    const logicalSessionId = assignment.source.kind === "conversation" ? assignment.source.sessionId
+    // A conversation turn or a direct session prompt continues its session (runtime-view R11).
+    const continued = continuedSession(assignment.source);
+    const restoreReference = reference === undefined && continued ? continued.acpSessionRef : undefined;
+    const logicalSessionId = continued ? continued.sessionId
       : assignment.source.kind === "harness_delivery" ? assignment.source.executionSessionId : undefined;
     // A conversation may have a live local predecessor but still request a
     // fresh turn. Only Core's exact requested reference may carry its old MCP
     // transport into bootstrap; takeover can otherwise stop that predecessor.
-    let retainedReference = logicalSessionId && (assignment.source.kind === "conversation"
+    let retainedReference = logicalSessionId && (continued
       ? restoreReference
       : this.channelOwners.get(`session:${logicalSessionId}`)?.acpSessionRef ?? restoreReference);
     if (!retainedReference && assignment.source.kind === "harness_delivery") {
@@ -803,8 +806,9 @@ export class WorkOrchestrator {
   /** Refuse before input preparation, then recheck at activation to close races. */
   private assertNoRecoveringPredecessor(assignment: RemoteWorkAssignment): void {
     const source = assignment.source;
-    if (source.kind !== "conversation" && source.kind !== "harness_delivery") return;
-    const sessionId = source.kind === "conversation" ? source.sessionId : source.executionSessionId;
+    const continued = continuedSession(source);
+    if (!continued && source.kind !== "harness_delivery") return;
+    const sessionId = source.kind === "harness_delivery" ? source.executionSessionId : continued!.sessionId;
     const channelId = `session:${sessionId}`;
     const predecessor = this.channelOwners.get(channelId);
     if (!predecessor) return;
@@ -872,8 +876,9 @@ export class WorkOrchestrator {
   /** The fenced executions a turn of this logical session would wait on. */
   private recoveringPredecessors(assignment: RemoteWorkAssignment): LocalAdmission[] {
     const source = assignment.source;
-    if (source.kind !== "conversation" && source.kind !== "harness_delivery") return [];
-    const sessionId = source.kind === "conversation" ? source.sessionId : source.executionSessionId;
+    const continued = continuedSession(source);
+    if (!continued && source.kind !== "harness_delivery") return [];
+    const sessionId = source.kind === "harness_delivery" ? source.executionSessionId : continued!.sessionId;
     const owner = this.channelOwners.get(`session:${sessionId}`);
     const candidates = [
       owner && this.deps.journal.execution.admission(owner.assignment.id, owner.assignment.attempt),
@@ -913,8 +918,9 @@ export class WorkOrchestrator {
   private async takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined> {
     this.assertNoRecoveringPredecessor(assignment);
     const source = assignment.source;
-    if (source.kind !== "conversation" && source.kind !== "harness_delivery") return undefined;
-    const logicalSessionId = source.kind === "conversation" ? source.sessionId : source.executionSessionId;
+    const continued = continuedSession(source);
+    if (!continued && source.kind !== "harness_delivery") return undefined;
+    const logicalSessionId = source.kind === "harness_delivery" ? source.executionSessionId : continued!.sessionId;
     const channelId = `session:${logicalSessionId}`;
     const predecessor = this.channelOwners.get(channelId);
     if (!predecessor) {
@@ -922,7 +928,7 @@ export class WorkOrchestrator {
       // reference and the runner's credential-volume mapping survive, so the
       // later bootstrap must attempt ACP session/load. The runner fails closed
       // with agent_session_lost if either the mapping or provider state is gone.
-      if (source.kind === "conversation" && source.acpSessionRef !== undefined) this.logger.info({ assignmentId: assignment.id, attempt: assignment.attempt, stage: "channel_handoff", outcome: "restore_session" },
+      if (continued && continued.acpSessionRef !== undefined) this.logger.info({ assignmentId: assignment.id, attempt: assignment.attempt, stage: "channel_handoff", outcome: "restore_session" },
         "the conversation's previous session is not live here; restoring it from the durable ACP reference");
       if (source.kind === "harness_delivery") {
         const pendingRestore = this.deps.journal.execution.pendingRestore(admission, assignment);
@@ -1033,7 +1039,7 @@ export class WorkOrchestrator {
       predecessor.releaseCompletedChannel();
       if (this.sessions.get(key) === predecessor) this.sessions.delete(key);
     };
-    if ((source.kind === "harness_delivery" || source.acpSessionRef === ref) && prior.agentId === admission.agentId) {
+    if ((source.kind === "harness_delivery" || continued?.acpSessionRef === ref) && prior.agentId === admission.agentId) {
       try {
         await this.deps.journal.execution.transferLiveContinuation({ predecessor: prior, successor: admission, sessionId: logicalSessionId,
           acpSessionRef: ref, processOwner, continuedAt: this.deps.clock.nowIso() }, assertPredecessor);

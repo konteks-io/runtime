@@ -47,6 +47,10 @@ before them says so.
 - Run nothing else for this and call no other address. Do not compose requests
   to Konteks yourself; each step tells you the next one.
 - If `konteks-remote` is not found, use the full path the install printed.
+- A `done` summary may name commands for the person's own agents, such as a
+  sign-in. Show them as written: the person runs them in their own terminal,
+  because they can ask for a sign-in, a key or a yes to a download. Do not run
+  them, answer their questions or add `--yes`.
 - If a command fails outright, show the person its message as it is and stop.
 
 macOS and Linux only. On Windows, the person creates an activation in the

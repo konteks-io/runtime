@@ -109,6 +109,13 @@ describe("streamed activity redaction", () => {
     expect(redactStream(["a https://example.test/x b"])).toBe("a https://example.test/x b");
   });
 
+  it("leaves a bare root slash and Markdown around it alone (WS1-175)", () => {
+    expect(redactStream(["**sudo ls /** — didn't run"])).toBe("**sudo ls /** — didn't run");
+    expect(redactStream(["**sudo ls /", "** — didn't run"])).toBe("**sudo ls /** — didn't run");
+    expect(redactStream(["run ls / now"])).toBe("run ls / now");
+    expect(redactStream(["**read /Users/other/a.txt**"])).toBe("**read [local-path]**");
+  });
+
   it("keeps a URL scheme split across chunks intact", () => {
     const url = "https://gitea.sev-2.com/toopay/orders-api";
     expect(redactStream(["https", "://gitea.sev-2.com/toopay/orders-api"])).toBe(url);

@@ -2,7 +2,8 @@ import { z } from "zod";
 import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlLoginEvent } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
 import type { Output } from "../output.js";
-import { confirm, promptSecret } from "../prompt.js";
+import { confirm, promptLine, promptSecret } from "../prompt.js";
+import { agentName } from "./agent-name.js";
 
 /**
  * The launcher's control-socket commands for the installed native connector
@@ -17,6 +18,8 @@ export interface ControlContext {
   /** Test hooks. */
   confirm?: (question: string) => Promise<boolean>;
   promptSecret?: (label: string) => Promise<string>;
+  /** Test hook: a choice typed in the open. */
+  promptLine?: (label: string) => Promise<string>;
 }
 
 const AgentsSchema = z.object({ agents: z.array(z.record(z.string(), z.unknown())), roles: z.array(z.string()), roleBindings: z.array(z.record(z.string(), z.unknown())) }).strict();
@@ -60,9 +63,22 @@ export async function agents(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "agents" }, AgentsSchema);
   context.output.result(value);
   for (const agent of value.agents as Array<Record<string, string>>) {
-    context.output.line(`${agent.agentId}: ${agent.readiness} (${agent.authMode}, scope ${agent.accountScope})${agent.recoveryAction ? ` — ${agent.recoveryAction}` : ""}`);
+    context.output.line(`${agent.agentId}: ${agent.readiness} (${agent.authMode}, scope ${agent.accountScope})${agent.recoveryAction ? ` — ${agent.recoveryAction}` : ""}${downloadNote(agent)}`);
   }
   context.output.line(`advertised roles: ${value.roles.join(", ") || "(none)"}`);
+}
+
+/** A fetched agent's download state (Google Antigravity), in words, with the command that changes it. */
+function downloadNote(agent: Record<string, unknown>): string {
+  const state = (agent.hostAgentDownload as { state?: unknown } | undefined)?.state;
+  const add = `konteks-remote agent add ${String(agent.agentId)}`;
+  switch (state) {
+    case "not_downloaded": return ` — not downloaded (${add})`;
+    case "downloading": return " — downloading from Google";
+    case "update_available": return " — a newer version is downloaded and used from the next start";
+    case "integrity_failed": return ` — does not match Google's release (${add})`;
+    default: return "";
+  }
 }
 
 export async function authStatus(context: ControlContext, agentId?: string): Promise<void> {
@@ -77,9 +93,10 @@ export async function authStatus(context: ControlContext, agentId?: string): Pro
  * pasted input is read from the terminal and forwarded without echo when the
  * tool asks for a secret. `--organization` records the operator's attestation.
  */
-export async function authLogin(context: ControlContext, agentId: string, organization: boolean): Promise<void> {
+export async function authLogin(context: ControlContext, agentId: string, organization: boolean, which: { provider?: string; method?: string; reuse?: boolean; project?: string; location?: string } = {}): Promise<void> {
   const ask = context.confirm ?? ((question: string) => confirm(question, context.input ? { input: context.input } : {}));
   const secret = context.promptSecret ?? ((label: string) => promptSecret({ label, minLength: 1, ...(context.input ? { input: context.input } : {}) }));
+  const line = context.promptLine ?? ((label: string) => promptLine(label, context.input ? { input: context.input } : {}));
   if (organization) {
     const ok = await ask(`Attest that the ${agentId} account you are about to log in is owned by your organization and may serve colleagues' work?`);
     if (!ok) throw new RemoteInstanceError("ownership_promotion_denied", "organization attestation declined; log in without --organization for a personal account");
@@ -90,7 +107,8 @@ export async function authLogin(context: ControlContext, agentId: string, organi
   const onEvent = (event: ControlLoginEvent): void => {
     switch (event.kind) {
       case "started":
-        context.output.line(`login started for ${event.agentId}; follow the prompts from the agent's official tooling`);
+        // The flow's own lines say what to do next; a "login started" line
+        // landed on the key prompt and named tooling DeepSeek Harness has not (WS1-153).
         return;
       case "display":
         context.output.line(event.text);
@@ -99,12 +117,16 @@ export async function authLogin(context: ControlContext, agentId: string, organi
         context.output.line(`open this URL to sign in: ${event.url}${event.userCode ? `\nenter code: ${event.userCode}` : ""}`);
         return;
       case "prompt":
-        void secret(event.label)
+        // A choice (OpenCode's provider) is typed in the open; anything else,
+        // an API key included, with the hidden prompt, never echoed.
+        void (event.visible === true && !event.secret ? line(event.label) : secret(event.label))
           .then((text) => context.control.call({ op: "auth.input", loginId: event.loginId, text }, z.unknown()))
           .catch((error: unknown) => { promptError = error; interrupted.abort(); });
         return;
       case "completed":
-        context.output.line(`login complete: ${agentId} is ${event.readiness}${organization ? " (organization scope attested)" : ""}`);
+        context.output.line(event.readiness === "ready"
+          ? `${agentName(agentId)} is ready${organization ? " for your organization" : ""}.`
+          : `${agentName(agentId)} is signed in but not ready yet; konteks-remote doctor says why.`);
         return;
       case "failed":
         loginFailure = event;
@@ -112,21 +134,21 @@ export async function authLogin(context: ControlContext, agentId: string, organi
     }
   };
   try {
-    await context.control.call({ op: "auth.login", agentId, organization }, z.object({ loginId: z.string() }), { onEvent, signal: interrupted.signal, timeoutMs: 20 * 60_000 });
+    await context.control.call({ op: "auth.login", agentId, organization, ...which }, z.object({ loginId: z.string() }), { onEvent, signal: interrupted.signal, timeoutMs: 20 * 60_000 });
   } catch (error) {
     if (promptError !== null) throw promptError;
     throw error;
   }
   if (loginFailure !== null) {
     const failure: Extract<ControlLoginEvent, { kind: "failed" }> = loginFailure;
-    throw new RemoteInstanceError("agent_auth_required", `login failed (${failure.code}): ${failure.message}`);
+    throw new RemoteInstanceError("agent_auth_required", failure.message);
   }
 }
 
-export async function authLogout(context: ControlContext, agentId: string): Promise<void> {
-  const value = await context.control.call({ op: "auth.logout", agentId }, z.record(z.string(), z.unknown()));
+export async function authLogout(context: ControlContext, agentId: string, provider?: string, method?: string): Promise<void> {
+  const value = await context.control.call({ op: "auth.logout", agentId, ...(provider ? { provider } : {}), ...(method ? { method } : {}) }, z.record(z.string(), z.unknown()));
   context.output.result(value);
-  context.output.line(`logged out ${agentId}; readiness ${String(value.readiness)}`);
+  context.output.line(`${agentName(agentId)} is signed out${provider ? ` of ${provider}` : ""} on this computer${value.readiness === "ready" ? "; its other sign-ins stay" : ""}.`);
 }
 
 /**

@@ -19,9 +19,11 @@ import {
   type RemoteWorkAssignment,
 } from "@konteks/remote-common";
 import {
+  prepareDirectSessionInputs,
   prepareOrganizationSkillSession,
   type PreparedSessionInputs,
 } from "../skills/session-inputs.js";
+import { continuedSession, isDirectAssignment } from "../work/continued-session.js";
 import type { NativeInputClient } from "./input-client.js";
 import type { NativeOutputClient } from "./output-client.js";
 import { captureNativeDeliveryOutput } from "./output-capture.js";
@@ -108,6 +110,45 @@ async function writePrivate(path: string, bytes: Buffer, mode = 0o600): Promise<
     await handle.close();
   }
 }
+/**
+ * Writes one of Core's input files into a folder the agent also writes to:
+ * every directory on the way must be a real directory (never a link the
+ * agent planted), and the file itself is replaced by a rename, so a link at
+ * its path is replaced rather than followed.
+ */
+async function overlayPrivate(base: string, parts: string[], bytes: Buffer, mode = 0o600): Promise<void> {
+  let directory = base;
+  for (const part of parts.slice(0, -1)) {
+    if (part === "" || part === "." || part === "..") throw unavailable();
+    directory = join(directory, part);
+    try {
+      const stat = await lstat(directory);
+      if (!stat.isDirectory()) throw unavailable();
+    } catch (error) {
+      if (!isFsErrorWithCode(error, "ENOENT")) throw error;
+      await mkdir(directory, { mode: 0o700 });
+    }
+  }
+  const name = parts.at(-1);
+  if (!name || name === "." || name === "..") throw unavailable();
+  const target = join(directory, name);
+  const existing = await lstat(target).catch((error: unknown) => { if (isFsErrorWithCode(error, "ENOENT")) return null; throw error; });
+  if (existing?.isDirectory()) throw unavailable();
+  await replacePrivate(target, bytes, mode);
+}
+
+/** Replaces a file through a sibling temporary file and a rename. */
+async function replacePrivate(path: string, bytes: Buffer, mode = 0o600): Promise<void> {
+  const temporary = join(dirname(path), `.konteks-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
+  await writePrivate(temporary, bytes, mode);
+  try {
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
 async function syncDirectory(path: string): Promise<void> {
   if (process.platform === "win32") return;
   const handle = await open(path, "r");
@@ -198,9 +239,18 @@ async function sourceWorkspace(
       // A different selection under the SAME claim is a substitution inside
       // one turn, not newer inputs: refuse, and leave local work untouched.
       if (receipt.claimId === selection.claimId) throw unavailable();
+      // A later turn of the same session: Core's newer inputs are laid over
+      // the folder and the agent's own files stay. Rebuilding it deleted
+      // everything the agent wrote in earlier turns (WS1-170).
+      const tree = await fetchSource();
+      if (tree.entries.some((entry) => entry.path.split("/").some((part) => /^(?:\.git|git~[0-9]+)$/i.test(part)))) throw unavailable();
       await sameDirectory(root, rootStat);
-      await rm(destination, { recursive: true, force: true });
-      exists = false;
+      await sameDirectory(destination);
+      for (const entry of tree.entries) {
+        await overlayPrivate(cwd, entry.path.split("/"), Buffer.from(entry.contentBase64, "base64"), entry.mode);
+      }
+      await replacePrivate(join(destination, "receipt.json"), Buffer.from(JSON.stringify(expected)));
+      await syncDirectory(destination);
     }
   }
   if (!exists) {
@@ -333,6 +383,10 @@ export function createNativeInputPreparer(
           envelope = await client.prepare(current, claimId, digest);
           if (options.claimId(current) !== claimId) throw unavailable();
         };
+        // A direct session works in its own empty private folder only
+        // (runtime-view R13); a repository for it is a later decision (R24).
+        const direct = isDirectAssignment(current);
+        if (direct && selection.repository) throw unavailable();
         stage = "private_root";
         const root = await privateRoot(options.root);
         stage = "source_workspace";
@@ -395,7 +449,7 @@ export function createNativeInputPreparer(
               root,
               envelope,
               () => client.read(current, claimId, envelope, selection.source.transferId),
-              current.source.kind !== "conversation",
+              continuedSession(current.source) === null,
               options.git,
             ).then(workspace => {
               logStage("worktree", Date.now() - stageStartedAt);
@@ -403,7 +457,9 @@ export function createNativeInputPreparer(
             });
         stage = "organization_skills";
         stageStartedAt = Date.now();
-        const prepared = await prepareOrganizationSkillSession({
+        // No skills and no instructions for a direct session (R11): the
+        // person's text reaches the agent as typed.
+        const prepared = direct ? await prepareDirectSessionInputs({ cwd: source.cwd, binding: selection.binding }) : await prepareOrganizationSkillSession({
           cwd: source.cwd,
           scratchRoot: join(root, "skills"),
           catalog: selection.skills,
@@ -525,7 +581,7 @@ export function createNativeInputPreparer(
         return {
           ...prepared,
           skillInstructions:
-            current.source.kind === "conversation"
+            continuedSession(current.source) !== null
               ? prepared.skillInstructions
               : [
                   selectedRepository

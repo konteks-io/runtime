@@ -16,13 +16,20 @@ afterEach(async () => { await Promise.all(runners.map(runner => runner.stop()));
 function fixture(options: { loggedOut?: boolean; startGate?: Promise<void> } = {}) {
   const events: RunnerEvent[] = [];
   let handlers!: SpawnBridgeOptions["handlers"];
+  const selectedConfig = new Map<string, string>();
   const connection = {
     newSession: vi.fn(async () => ({ sessionId: "bridge-private" })),
     loadSession: vi.fn(async () => ({})),
     prompt: vi.fn(async () => ({ stopReason: "end_turn" })),
     cancel: vi.fn(async () => undefined),
     setSessionMode: vi.fn(async () => ({})),
-    setSessionConfigOption: vi.fn(async () => ({ configOptions: [] })),
+    setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => {
+      selectedConfig.set(configId, value);
+      return { configOptions: [...selectedConfig].map(([id, currentValue]) => ({
+        id, name: id, type: "select" as const, currentValue,
+        options: [{ value: currentValue, name: currentValue }],
+      })) };
+    }),
   };
   const bridge: BridgeProcess = { connection: connection as unknown as ClientSideConnection, initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true } }, exited: false, stderrTail: () => [], stop: vi.fn(async () => undefined) };
   const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_WORKSPACE_DIR: join(root, "work"), RUNNER_BRIDGE_PREFIX: join(root, "bridges") });

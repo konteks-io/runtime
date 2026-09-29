@@ -292,7 +292,7 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
       // version answering here is the wrong executable, not a transition.
       if (status.version.bundle !== successor.bundleVersion) throw new RemoteInstanceError("update_required", `the service answering reports ${status.version.bundle}, not ${successor.bundleVersion}`);
       const probed = await control.call({ op: "agents" }, AgentsSchema, { timeoutMs: 5_000 });
-      // A host-installed agent (the person's own DeepSeek Harness) depends on
+      // A host-installed agent (the person's own DeepSeek Harness or OpenCode) depends on
       // their install, not on this release: it never holds an update back.
       const settled = successor.agents.filter(agentId => !isHostAgentId(agentId)).every(agentId => probed.agents.some(agent => agent.agentId === agentId && agent.readiness !== "unknown" && agent.readiness !== "probing"));
       if (settled) break;
