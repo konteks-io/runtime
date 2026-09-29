@@ -110,6 +110,45 @@ async function writePrivate(path: string, bytes: Buffer, mode = 0o600): Promise<
     await handle.close();
   }
 }
+/**
+ * Writes one of Core's input files into a folder the agent also writes to:
+ * every directory on the way must be a real directory (never a link the
+ * agent planted), and the file itself is replaced by a rename, so a link at
+ * its path is replaced rather than followed.
+ */
+async function overlayPrivate(base: string, parts: string[], bytes: Buffer, mode = 0o600): Promise<void> {
+  let directory = base;
+  for (const part of parts.slice(0, -1)) {
+    if (part === "" || part === "." || part === "..") throw unavailable();
+    directory = join(directory, part);
+    try {
+      const stat = await lstat(directory);
+      if (!stat.isDirectory()) throw unavailable();
+    } catch (error) {
+      if (!isFsErrorWithCode(error, "ENOENT")) throw error;
+      await mkdir(directory, { mode: 0o700 });
+    }
+  }
+  const name = parts.at(-1);
+  if (!name || name === "." || name === "..") throw unavailable();
+  const target = join(directory, name);
+  const existing = await lstat(target).catch((error: unknown) => { if (isFsErrorWithCode(error, "ENOENT")) return null; throw error; });
+  if (existing?.isDirectory()) throw unavailable();
+  await replacePrivate(target, bytes, mode);
+}
+
+/** Replaces a file through a sibling temporary file and a rename. */
+async function replacePrivate(path: string, bytes: Buffer, mode = 0o600): Promise<void> {
+  const temporary = join(dirname(path), `.konteks-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
+  await writePrivate(temporary, bytes, mode);
+  try {
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
 async function syncDirectory(path: string): Promise<void> {
   if (process.platform === "win32") return;
   const handle = await open(path, "r");
@@ -200,9 +239,18 @@ async function sourceWorkspace(
       // A different selection under the SAME claim is a substitution inside
       // one turn, not newer inputs: refuse, and leave local work untouched.
       if (receipt.claimId === selection.claimId) throw unavailable();
+      // A later turn of the same session: Core's newer inputs are laid over
+      // the folder and the agent's own files stay. Rebuilding it deleted
+      // everything the agent wrote in earlier turns (WS1-170).
+      const tree = await fetchSource();
+      if (tree.entries.some((entry) => entry.path.split("/").some((part) => /^(?:\.git|git~[0-9]+)$/i.test(part)))) throw unavailable();
       await sameDirectory(root, rootStat);
-      await rm(destination, { recursive: true, force: true });
-      exists = false;
+      await sameDirectory(destination);
+      for (const entry of tree.entries) {
+        await overlayPrivate(cwd, entry.path.split("/"), Buffer.from(entry.contentBase64, "base64"), entry.mode);
+      }
+      await replacePrivate(join(destination, "receipt.json"), Buffer.from(JSON.stringify(expected)));
+      await syncDirectory(destination);
     }
   }
   if (!exists) {

@@ -326,6 +326,22 @@ describe("native authorized input composition", () => {
     const again = await createNativeInputPreparer(f.options)({ ...direct, id: "assignment" });
     expect(again.cwd).toBe(prepared.cwd);
   });
+  it("keeps what the agent wrote in a direct session's folder when the next turn brings newer inputs (WS1-170)", async () => {
+    const f = await fixture({ "README.md": "from Core" });
+    const direct: RemoteWorkAssignment = { ...assignment, kind: "direct",
+      source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
+    const first = await createNativeInputPreparer(f.options)(direct);
+    await writeFile(join(first.cwd, "notes.md"), "hello from Konteks");
+    // The next prompt is a new claim, so a new signed selection.
+    f.selection.claimId = "claim-2";
+    f.options.claimId = () => "claim-2";
+    const second = await createNativeInputPreparer(f.options)(direct);
+    expect(second.cwd).toBe(first.cwd);
+    expect(await readFile(join(second.cwd, "notes.md"), "utf8")).toBe("hello from Konteks");
+    expect(await readFile(join(second.cwd, "README.md"), "utf8")).toBe("from Core");
+    await second.beforePrompt();
+  });
+
   it("renews the authorization window without replacing files or the selection", async () => {
     const f = await fixture(),
       prepared = await createNativeInputPreparer(f.options)(assignment);
