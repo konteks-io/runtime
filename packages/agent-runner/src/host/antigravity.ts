@@ -12,7 +12,7 @@ import type { HostAgentRunnerAdapter, HostPromptPrelude, HostPromptSession, Host
 import { geminiMeasuredTurn } from "../sessions/usage-label.js";
 import { startAntigravityRelay, type AntigravityRelay, type GeminiRelayUpstream } from "./antigravity-relay.js";
 import {
-  antigravityIdentity, antigravityLogout, markNoLicence, readAntigravityApiKey, startAntigravityLogin, type GoogleSignInProcess,
+  antigravityIdentity, antigravityLoginChoice, antigravityLogout, markNoLicence, readAntigravityApiKey, startAntigravityLogin, type GoogleSignInProcess,
 } from "../auth/antigravity-auth.js";
 import { allowListEnvironment } from "./allow-list-environment.js";
 import { privateHomeProcesses, type PrivateHomeProcesses } from "./process-sweep.js";
@@ -568,6 +568,10 @@ export const antigravityRunnerAdapter: HostAgentRunnerAdapter = {
   // CP3: a Gemini API key typed on this computer, or Gemini Enterprise
   // through Google's own sign-in on this computer (from here or the site).
   startLogin: ({ config, events, logger, loginId, request, spawn }) => {
+    // Request policy is platform-independent. Refuse a held-back or foreign
+    // sign-in before checking whether this host has an Antigravity build, so
+    // the same unsafe request never receives a different answer by OS.
+    antigravityLoginChoice(request);
     fetched(config, findAgentBridge("antigravity")!);
     return startAntigravityLogin({ credentialDir: config.RUNNER_CREDENTIAL_DIR, events, logger, process: signInProcess(config, spawn),
       timeoutMs: config.RUNNER_LOGIN_TIMEOUT_MS, ...(loginId === undefined ? {} : { loginId }), ...(request === undefined ? {} : { request }) });

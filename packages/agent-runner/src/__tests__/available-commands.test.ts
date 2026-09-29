@@ -125,7 +125,10 @@ describe("learnt slash commands (runtime-view R19)", () => {
     const handlers: Array<Parameters<NonNullable<ConstructorParameters<typeof AgentRuntime>[0]["spawn"]>>[0]["handlers"]> = [];
     const spawn = async (input: { handlers: (typeof handlers)[number] }) => {
       handlers.push(input.handlers);
-      return { connection: { newSession: vi.fn(async () => ({ sessionId: "private-1" })) } as never,
+      return { connection: { newSession: vi.fn(async () => ({ sessionId: "private-1" })),
+        setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => ({ configOptions: [
+          { id: configId, name: configId, type: "select" as const, currentValue: value, options: [{ value, name: value }] },
+        ] })) } as never,
         initializeResult: { protocolVersion: 1 }, exited: false, stderrTail: () => [], stop: vi.fn(async () => undefined) } as BridgeProcess;
     };
     const make = () => new AgentRuntime({ config: RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: root, RUNNER_WORKSPACE_DIR: root }),

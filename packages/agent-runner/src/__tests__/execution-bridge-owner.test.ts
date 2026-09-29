@@ -12,6 +12,16 @@ import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fix
 vi.mock("../auth/login-flow.js", () => ({ runLogout: vi.fn(async () => ({ code: 0 })), startLoginFlow: vi.fn() }));
 
 const roots: string[] = [], runtimes: AgentRuntime[] = [];
+const acknowledgeConfig = () => {
+  const selected = new Map<string, string>();
+  return vi.fn(async ({ configId, value }: { configId: string; value: string }) => {
+    selected.set(configId, value);
+    return { configOptions: [...selected].map(([id, currentValue]) => ({
+      id, name: id, type: "select" as const, currentValue,
+      options: [{ value: currentValue, name: currentValue }],
+    })) };
+  });
+};
 it("does not change the normal local Codex login through connector auth actions", async () => {
   const spawn = vi.fn();
   const runtime = new AgentRuntime({ config: RunnerConfigSchema.parse({
@@ -57,7 +67,7 @@ async function fixture(limit = 2, executionSpawnProcess?: SpawnBridgeOptions["sp
   const spawn = vi.fn(async (input: SpawnBridgeOptions) => {
     const sessionId = `private-${owners.length}`;
     const bridge: BridgeProcess = { exited: false, initializeResult: { protocolVersion: 1 }, stderrTail: () => [],
-      connection: { newSession: vi.fn(async () => ({ sessionId })), prompt: vi.fn(async () => ({ stopReason: "end_turn" })), cancel: vi.fn(async () => undefined) } as never,
+      connection: { newSession: vi.fn(async () => ({ sessionId })), prompt: vi.fn(async () => ({ stopReason: "end_turn" })), cancel: vi.fn(async () => undefined), setSessionConfigOption: acknowledgeConfig() } as never,
       stop: vi.fn(async () => undefined) };
     owners.push({ bridge, handlers: input.handlers }); return bridge;
   });
@@ -125,7 +135,7 @@ it("replaces a timed-out pre-ready owner with a freshly initialized bridge in th
     let exited = false;
     const bridge: BridgeProcess = {
       get exited() { return exited; }, retainedProcessOwner: owner(pid), initializeResult: { protocolVersion: 1 }, stderrTail: () => [],
-      connection: { newSession: hangs ? vi.fn(() => new Promise<never>(() => undefined)) : vi.fn(async () => ({ sessionId: `private-${pid}` })) } as never,
+      connection: { newSession: hangs ? vi.fn(() => new Promise<never>(() => undefined)) : vi.fn(async () => ({ sessionId: `private-${pid}` })), setSessionConfigOption: acknowledgeConfig() } as never,
       stop: vi.fn(async () => { exited = true; }),
     };
     return bridge;
@@ -162,7 +172,7 @@ it("consumes a bootstrap attempt when fresh bridge initialization fails and neve
   let exited = false;
   const recovered: BridgeProcess = {
     get exited() { return exited; }, retainedProcessOwner: retained(602), initializeResult: { protocolVersion: 1 }, stderrTail: () => [],
-    connection: { newSession: vi.fn(async () => ({ sessionId: "recovered" })) } as never,
+    connection: { newSession: vi.fn(async () => ({ sessionId: "recovered" })), setSessionConfigOption: acknowledgeConfig() } as never,
     stop: vi.fn(async () => { exited = true; }),
   };
   f.spawn.mockImplementationOnce(async input => { await input.onProcessOwner?.(recovered); f.owners.push({ bridge: recovered, handlers: input.handlers }); return recovered; });
