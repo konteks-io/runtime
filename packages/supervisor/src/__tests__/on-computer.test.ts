@@ -50,6 +50,10 @@ describe("a step the site brings to the front on this computer (on-computer)", (
     expect(inSpool).toBe(join(spool, "login-2.command"));
     expect(await readFile(inSpool, "utf8")).toBe("#!/bin/sh\n");
     expect(spooled).not.toHaveBeenCalled();
+    // A stand-in whose service carries no spool (an OS service) still never opens a real window.
+    const ownFolder = await openOnComputer({ loginId: "login-4", script: "#!/bin/sh\n", dataDir: data, platform: "darwin", env: { KONTEKS_E2E_NATIVE_CONNECTOR: "1" } }, { spawn: spooled });
+    expect(ownFolder).toBe(join(data, "on-computer", "login-4.command"));
+    expect(spooled).not.toHaveBeenCalled();
     // A spool is honoured only on a stand-in laptop.
     await openOnComputer({ loginId: "login-3", script: "x", dataDir: data, platform: "win32", env: { KONTEKS_E2E_ON_COMPUTER_SPOOL: spool } }, { spawn: spooled });
     expect(spooled).toHaveBeenCalledWith("cmd.exe", ["/c", "start", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", join(data, "on-computer", "login-3.ps1")]);
@@ -76,5 +80,6 @@ describe("a step the site brings to the front on this computer (on-computer)", (
     expect(canOpenOnComputer(true, {})).toBe(true);
     expect(canOpenOnComputer(false, {})).toBe(false);
     expect(canOpenOnComputer(false, { KONTEKS_E2E_NATIVE_CONNECTOR: "1", KONTEKS_E2E_ON_COMPUTER_SPOOL: "/tmp/spool" })).toBe(true);
+    expect(canOpenOnComputer(false, { KONTEKS_E2E_NATIVE_CONNECTOR: "1" })).toBe(true);
   });
 });

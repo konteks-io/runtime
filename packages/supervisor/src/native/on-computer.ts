@@ -103,12 +103,17 @@ export interface OnComputerOpenDeps {
 /**
  * Brings the step to the front on this computer: macOS opens it in Terminal,
  * Linux in the desktop's terminal, Windows in PowerShell. A stand-in laptop
- * (`KONTEKS_E2E_ON_COMPUTER_SPOOL`) only leaves the script in its spool for
- * the tester, who plays the person at it. Returns the script's path.
+ * (`KONTEKS_E2E_NATIVE_CONNECTOR`) only leaves the script in its spool
+ * (`KONTEKS_E2E_ON_COMPUTER_SPOOL`, else its own folder) for the tester, who
+ * plays the person at it. Returns the script's path.
  */
 export async function openOnComputer(input: { loginId: string; script: string; dataDir: string; platform: NodeJS.Platform; env?: NodeJS.ProcessEnv }, deps: OnComputerOpenDeps = {}): Promise<string> {
   const env = input.env ?? process.env;
-  const spool = env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" ? env.KONTEKS_E2E_ON_COMPUTER_SPOOL : undefined;
+  // A stand-in laptop never brings a window up on the real desktop of the
+  // computer it runs on (its tester's own screen, 09-29): it leaves the script
+  // in its spool, or in its own folder, for the tester to run as the person.
+  const standIn = env.KONTEKS_E2E_NATIVE_CONNECTOR === "1";
+  const spool = standIn ? env.KONTEKS_E2E_ON_COMPUTER_SPOOL ?? join(input.dataDir, "on-computer") : undefined;
   const directory = spool ?? join(input.dataDir, "on-computer");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const file = join(directory, `${input.loginId}.${input.platform === "win32" ? "ps1" : "command"}`);
@@ -128,7 +133,7 @@ export async function openOnComputer(input: { loginId: string; script: string; d
 
 /** Whether this computer can bring a window to the front for the person (a desktop), or a stand-in spools it. */
 export function canOpenOnComputer(hasDesktop: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
-  return hasDesktop || (env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" && Boolean(env.KONTEKS_E2E_ON_COMPUTER_SPOOL));
+  return hasDesktop || env.KONTEKS_E2E_NATIVE_CONNECTOR === "1";
 }
 
 const NOT_YET_ADDED = new Set(["not_installed", "unsupported_version", "installed_not_added", "not_added"]);
