@@ -105,7 +105,7 @@ const QUERY_KEYS = ["Query", "query"] as const;
  */
 const PRIVATE_HOME_IN_COMMAND = [
   /(^|[^\w$])\$\{?(?:HOME|GEMINI_HOME|USERPROFILE)\b/,
-  /(^|[\s'"=:(<>|;&])~(?=[\/\s'"]|$)/,
+  /(^|[\s'"=:(<>|;&])~(?=[/\s'"]|$)/,
   /\.gemini\b/,
   /antigravity-acp|acp_(?:business_)?token|trusted_workspaces/,
 ];

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* global process, setTimeout, fetch */
 // A stand-in for Google's antigravity-acp server (tests only): ACP over stdio
 // (newline-delimited JSON-RPC), the sign-in lines the real 1.2.1 server prints
 // on stderr (recorded in antigravity-runtime-support proof/enterprise), and

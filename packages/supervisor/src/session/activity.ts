@@ -256,7 +256,7 @@ export interface ActivityTextOptions {
   continuesPath?: boolean;
 }
 
-const PATH_TOKEN_START = /^(?:\/(?![\/*])|[A-Za-z]:(?:[\\/]|$)|\\\\)/;
+const PATH_TOKEN_START = /^(?:\/(?![/*])|[A-Za-z]:(?:[\\/]|$)|\\\\)/;
 const TOKEN_DELIMITER = /[\s"'<>`)\]}=(]/;
 
 /**
