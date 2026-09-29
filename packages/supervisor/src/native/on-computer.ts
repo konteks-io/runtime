@@ -21,6 +21,8 @@ export interface OnComputerPlan {
   step: OnComputerStep;
   /** The commands the window runs, in order, each only after the one before succeeded. */
   commands: string[];
+  /** What ends the step: the agent ready, or (when its sign-in is done on the site) only added. */
+  until: "ready" | "added";
 }
 
 /**
@@ -33,20 +35,27 @@ export interface OnComputerPlan {
 export function planOnComputer(agent: OnComputerAgentFacts, platform: NodeJS.Platform): OnComputerPlan | null {
   const add = `konteks-remote agent add ${agent.agentId}`;
   const signIn = `konteks-remote auth login ${agent.agentId}`;
+  // Google Antigravity signs in with Gemini Enterprise from the site, which
+  // carries the project and location to the connector: its window only adds
+  // it (the yes to Google's download is given there), and the step ends once
+  // it is added. The others sign in right after, at the connector's prompt.
+  const siteSignIn = agent.agentId === "antigravity";
+  const after = (commands: string[]): Pick<OnComputerPlan, "commands" | "until"> =>
+    siteSignIn ? { commands, until: "added" } : { commands: [...commands, signIn], until: "ready" };
   switch (agent.state) {
     case "not_installed":
     case "unsupported_version": {
       const install = platform === "win32" ? agent.windowsInstallCommand ?? agent.installCommand : agent.installCommand;
       // Google Antigravity is never installed by the person: Konteks adds it (downloads it from Google).
-      if (!install || install === add) return { step: "add", commands: [add, signIn] };
-      return { step: "install", commands: [install, add, signIn] };
+      if (!install || install === add) return { step: "add", ...after([add]) };
+      return { step: "install", ...after([install, add]) };
     }
     case "installed_not_added":
     case "not_added":
-      return { step: "add", commands: [add, signIn] };
+      return { step: "add", ...after([add]) };
     case "needs_sign_in":
     case "sign_in_expired":
-      return { step: "sign_in", commands: [signIn] };
+      return siteSignIn ? null : { step: "sign_in", commands: [signIn], until: "ready" };
     default:
       return null;
   }
@@ -60,7 +69,9 @@ export function planOnComputer(agent: OnComputerAgentFacts, platform: NodeJS.Pla
 export function onComputerScript(plan: OnComputerPlan, context: { agentId: OnComputerAgent; root: string; platform: NodeJS.Platform }): string {
   const name = NAMES[context.agentId];
   const intro = `Konteks is setting up ${name} on this computer. Answer below; your answers stay on this computer.`;
-  const done = `${name} is set up. You can close this window; Konteks shows it on the site.`;
+  const done = plan.until === "added"
+    ? `${name} is added. You can close this window and sign it in on the Konteks site.`
+    : `${name} is set up. You can close this window; Konteks shows it on the site.`;
   const failed = "That did not finish. You can close this window and try again from Konteks.";
   if (context.platform === "win32") {
     const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
@@ -120,7 +131,10 @@ export function canOpenOnComputer(hasDesktop: boolean, env: NodeJS.ProcessEnv = 
   return hasDesktop || (env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" && Boolean(env.KONTEKS_E2E_ON_COMPUTER_SPOOL));
 }
 
-/** The agent's state that ends a step: signed in and ready. */
-export function onComputerDone(state: string | undefined): boolean {
-  return state === "ready";
+const NOT_YET_ADDED = new Set(["not_installed", "unsupported_version", "installed_not_added", "not_added"]);
+
+/** Whether the agent's state ends the step: ready, or for an add-only step, added at all. */
+export function onComputerDone(state: string | undefined, until: OnComputerPlan["until"] = "ready"): boolean {
+  if (state === undefined) return false;
+  return until === "added" ? !NOT_YET_ADDED.has(state) : state === "ready";
 }

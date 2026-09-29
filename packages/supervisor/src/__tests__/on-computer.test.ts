@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canOpenOnComputer, onComputerScript, openOnComputer, planOnComputer } from "../native/on-computer.js";
+import { canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer } from "../native/on-computer.js";
 
 describe("a step the site brings to the front on this computer (on-computer)", () => {
   const dirs: string[] = [];
@@ -11,26 +11,29 @@ describe("a step the site brings to the front on this computer (on-computer)", (
   it("starts where the agent stands: install, then add, then sign in; nothing for a ready one", () => {
     const install = "curl -fsSL https://opencode.ai/v2/install | bash";
     expect(planOnComputer({ agentId: "opencode", state: "not_installed", installCommand: install }, "darwin"))
-      .toEqual({ step: "install", commands: [install, "konteks-remote agent add opencode", "konteks-remote auth login opencode"] });
+      .toEqual({ step: "install", commands: [install, "konteks-remote agent add opencode", "konteks-remote auth login opencode"], until: "ready" });
     expect(planOnComputer({ agentId: "dsh", state: "installed_not_added" }, "darwin"))
-      .toEqual({ step: "add", commands: ["konteks-remote agent add dsh", "konteks-remote auth login dsh"] });
-    // Google Antigravity is added (downloaded from Google), never installed by the person.
+      .toEqual({ step: "add", commands: ["konteks-remote agent add dsh", "konteks-remote auth login dsh"], until: "ready" });
+    // Google Antigravity is added (downloaded from Google), never installed by the person, and
+    // signs in with Gemini Enterprise on the site, which carries its project and location.
     expect(planOnComputer({ agentId: "antigravity", state: "not_added", installCommand: "konteks-remote agent add antigravity" }, "darwin"))
-      .toEqual({ step: "add", commands: ["konteks-remote agent add antigravity", "konteks-remote auth login antigravity"] });
-    expect(planOnComputer({ agentId: "dsh", state: "needs_sign_in" }, "linux")).toEqual({ step: "sign_in", commands: ["konteks-remote auth login dsh"] });
+      .toEqual({ step: "add", commands: ["konteks-remote agent add antigravity"], until: "added" });
+    expect(planOnComputer({ agentId: "antigravity", state: "needs_sign_in" }, "darwin")).toBeNull();
+    expect(planOnComputer({ agentId: "dsh", state: "needs_sign_in" }, "linux")).toEqual({ step: "sign_in", commands: ["konteks-remote auth login dsh"], until: "ready" });
     expect(planOnComputer({ agentId: "opencode", state: "not_installed", installCommand: "a", windowsInstallCommand: "b" }, "win32")?.commands[0]).toBe("b");
     expect(planOnComputer({ agentId: "dsh", state: "ready" }, "darwin")).toBeNull();
   });
 
   it("acts on this connector only, says in one line what it does, and ends with what to do next", () => {
-    const script = onComputerScript({ step: "sign_in", commands: ["konteks-remote auth login dsh"] }, { agentId: "dsh", root: "/Users/p/Library/Application Support/konteks-remote", platform: "darwin" });
+    const script = onComputerScript({ step: "sign_in", commands: ["konteks-remote auth login dsh"], until: "ready" }, { agentId: "dsh", root: "/Users/p/Library/Application Support/konteks-remote", platform: "darwin" });
     expect(script).toContain("export KONTEKS_ROOT='/Users/p/Library/Application Support/konteks-remote'");
     expect(script).toContain("Konteks is setting up DeepSeek Harness on this computer.");
     expect(script).toContain("if konteks-remote auth login dsh; then");
     expect(script).toContain("DeepSeek Harness is set up. You can close this window");
-    const windows = onComputerScript({ step: "add", commands: ["konteks-remote agent add antigravity", "konteks-remote auth login antigravity"] }, { agentId: "antigravity", root: "C:\\Users\\p\\konteks", platform: "win32" });
+    const windows = onComputerScript({ step: "add", commands: ["konteks-remote agent add antigravity"], until: "added" }, { agentId: "antigravity", root: "C:\\Users\\p\\konteks", platform: "win32" });
     expect(windows).toContain("$env:KONTEKS_ROOT = 'C:\\Users\\p\\konteks'");
-    expect(windows).toContain("if ($ok) { konteks-remote auth login antigravity; $ok = $? }");
+    expect(windows).toContain("if ($ok) { konteks-remote agent add antigravity; $ok = $? }");
+    expect(windows).toContain("sign it in on the Konteks site");
   });
 
   it("opens it in Terminal on a Mac, and only leaves it in a stand-in laptop's spool", async () => {
@@ -50,6 +53,13 @@ describe("a step the site brings to the front on this computer (on-computer)", (
     // A spool is honoured only on a stand-in laptop.
     await openOnComputer({ loginId: "login-3", script: "x", dataDir: data, platform: "win32", env: { KONTEKS_E2E_ON_COMPUTER_SPOOL: spool } }, { spawn: spooled });
     expect(spooled).toHaveBeenCalledWith("cmd.exe", ["/c", "start", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", join(data, "on-computer", "login-3.ps1")]);
+  });
+
+  it("ends an add-only step once the agent is added, any other once it is ready", () => {
+    expect(onComputerDone("needs_sign_in", "added")).toBe(true);
+    expect(onComputerDone("not_added", "added")).toBe(false);
+    expect(onComputerDone("needs_sign_in", "ready")).toBe(false);
+    expect(onComputerDone("ready")).toBe(true);
   });
 
   it("is offered only where a window can come to the front", () => {

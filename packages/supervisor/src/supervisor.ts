@@ -2145,7 +2145,7 @@ export class Supervisor {
     const deadline = Date.now() + ON_COMPUTER_WATCH_MS;
     const watch = setInterval(() => {
       const now = stateOf();
-      if (now && onComputerDone(now.state)) {
+      if (now && onComputerDone(now.state, plan.until)) {
         stop();
         void report({ state: "succeeded" });
         if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after an on-computer step failed"));
