@@ -19,7 +19,9 @@ describe("native customer entry point", () => {
   });
   it("offers an uninstall an agent can find in --help (W1-L2)", async () => {
     const { program, actions } = fixture();
-    expect(program.helpInformation()).toMatch(/uninstall\s+remove Konteks from this machine/);
+    expect(program.helpInformation()).toMatch(/uninstall\s+remove Konteks from this computer/);
+    // Every command a person runs says in plain words what it does (WS1-158).
+    expect(program.helpInformation()).toMatch(/status\s+show whether this computer is connected/);
     await program.parseAsync(["--json", "uninstall"], { from: "user" });
     expect(actions.uninstall).toHaveBeenCalledWith(expect.objectContaining({ root: expect.any(String) }));
   });

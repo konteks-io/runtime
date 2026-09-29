@@ -31,7 +31,7 @@ export interface NativeCliActions {
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
 export function createNativeProgram(actions: NativeCliActions): Command {
-  const program = new Command("konteks-remote").description("Konteks native agent connector")
+  const program = new Command("konteks-remote").description("Konteks on this computer: connect it, run its agents, keep it updated")
     .option("--root <path>", "private user-scoped installation root")
     .option("--json", "machine-readable output", false)
     .option("-V, --version", "print the release installed on this machine");
@@ -69,7 +69,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     if (!["global", "us", "eu"].includes(value)) throw new InvalidArgumentError("expected global, us or eu");
     return value;
   };
-  program.command("install").description("activate, verify and install the native connector, then start its user service")
+  program.command("install").description("install the connector with a one-time code from Konteks, then start it")
     .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
     // Agent-first onboarding (onboarding-simplified OS3): no activation, no
     // prompt, no TTY. The install stops short of an identity; `onboard` binds.
@@ -91,10 +91,10 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   // The background half of `install --enroll`; `onboard` waits for it.
   program.command("stage-enrollment", { hidden: true }).description("unpack the agent packages an enrollment install recorded")
     .action(async () => actions.stageEnrollment(context()));
-  program.command("serve").description("run the native connector in the foreground (used by the background service)").action(async () => actions.serve(context()));
-  program.command("start").description("start the installed native user service").action(async () => actions.start(context()));
-  program.command("stop").description("stop the native user service, preserving identity and local work").action(async () => actions.stop(context()));
-  const agentLifecycle = program.command("agent").description("manage agents installed on this native runtime");
+  program.command("serve").description("run the connector in this terminal (the background service uses this)").action(async () => actions.serve(context()));
+  program.command("start").description("start the connector's background service").action(async () => actions.start(context()));
+  program.command("stop").description("stop the connector's background service; this computer and its work are kept").action(async () => actions.stop(context()));
+  const agentLifecycle = program.command("agent").description("add or remove agents on this computer");
   agentLifecycle.command("add").description("add one agent without reactivation: a signed package for Claude Code or Codex, your own DeepSeek Harness or OpenCode 2 install (nothing downloaded), or Google Antigravity, downloaded from Google (dl.google.com, about 110 MB) after you say yes")
     .argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", agent)
     .option("--yes", "Google Antigravity: you read the download question and agree (it is asked otherwise)", false)
@@ -106,13 +106,19 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .argument("<agent>", "antigravity", agent)
     .option("--yes", "you agree to the removal (it is asked otherwise)", false)
     .action(async (value: NativeAgentId, options: { yes: boolean }) => actions.removeAgent({ ...context(), agent: value, ...(options.yes ? { yes: true } : {}) }));
-  for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).action(async () => actions.control({ ...context(), operation }));
+  const CONTROL_HELP = {
+    status: "show whether this computer is connected to Konteks and ready for work",
+    agents: "list the agents on this computer and whether each one is ready",
+    doctor: "check the connector and every agent, and say what to fix",
+    support: "collect a support bundle to share with Konteks support",
+  } as const;
+  for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).description(CONTROL_HELP[operation]).action(async () => actions.control({ ...context(), operation }));
   // Read-only. Whether this computer serves previews is switched per machine
   // in Konteks (Customize → Runtimes), never here.
   const preview = program.command("preview").description("live previews of sessions' work, served from this computer");
-  preview.command("status").description("list this computer's session previews: state, loopback URL, command and why it stopped")
+  preview.command("status").description("list this computer's session previews and why any of them stopped")
     .action(async () => actions.control({ ...context(), operation: "preview.status" }));
-  const auth = program.command("auth").description("official local agent subscription authentication");
+  const auth = program.command("auth").description("sign agents in and out on this computer");
   auth.command("status").argument("[agent]", "agent family", agent).action(async (value?: string) => actions.control({ ...context(), operation: "auth.status", ...(value ? { agent: value } : {}) }));
   auth.command("login").argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", agent).option("--organization", "attest that the account is organization-owned", false)
     .option("--provider <id>", "OpenCode: the provider to sign in to (asked when omitted)", providerId)
@@ -140,23 +146,23 @@ export function createNativeProgram(actions: NativeCliActions): Command {
       const method = options.apiKey ? "gemini-api-key" : options.enterprise ? "oauth-business" : undefined;
       await actions.control({ ...context(), operation: "auth.logout", agent: value, ...(options.provider ? { provider: options.provider } : {}), ...(method ? { method } : {}) });
     });
-  program.command("update").description("stage the newest signed native release, drain, swap the user service and verify it; rolls back on a failed health gate")
+  program.command("update").description("install the newest connector release and restart; running work finishes first, and a failed start goes back")
     .option("--check", "report the available release without installing anything", false)
     .option("--unattended", "launched by the connector itself; recorded as such in the update ledger", false)
     .action(async (options: { check: boolean; unattended: boolean }) => actions.update({ ...context(), ...options }));
   // ON16: managed-git key registration is a command on the trusted machine,
   // because the private half must never leave it. The App shows this command.
-  const git = program.command("git").description("managed Konteks git access for this runtime");
-  const key = git.command("key").description("the SSH key this runtime uses for managed repositories");
-  key.command("add").description("generate or reuse this runtime's key and register its public half")
+  const git = program.command("git").description("this computer's key for Konteks-managed repositories");
+  const key = git.command("key").description("the SSH key this computer uses for Konteks-managed repositories");
+  key.command("add").description("create this computer's key and register it with Konteks")
     .option("--title <title>", "how the key is labelled in Konteks")
     .action(async (options: { title?: string }) => actions.control({ ...context(), operation: "git.key.add", ...(options.title ? { title: options.title } : {}) }));
-  key.command("list").description("keys registered for this runtime").action(async () => actions.control({ ...context(), operation: "git.key.list" }));
+  key.command("list").description("list the keys registered for this computer").action(async () => actions.control({ ...context(), operation: "git.key.list" }));
   key.command("remove").description("revoke one registered key").argument("<keyRef>", "key reference from `git key list`")
     .action(async (keyRef: string) => actions.control({ ...context(), operation: "git.key.remove", keyRef }));
   // W1-L2: a person asks their agent to remove Konteks, in plain words; the
   // description is what the agent finds in `--help`.
-  program.command("uninstall").description("remove Konteks from this machine: finish running work, remove this runtime from your workspace, stop the background service and delete the connector's folder; your repositories and your coding agents' logins are left untouched")
+  program.command("uninstall").description("remove Konteks from this computer after running work finishes; your repositories and your agents' own sign-ins stay")
     .action(async () => actions.uninstall(context()));
   return program;
 }
