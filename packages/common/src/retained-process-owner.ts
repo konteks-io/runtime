@@ -120,12 +120,11 @@ export function readLinuxProcessIdentity(
  * PID replacement from mixing fields across two processes. */
 export function readWindowsProcessIdentity(
   pid: number,
-  query: (pid: number) => WindowsProcessRecord | null = queryWindowsProcess,
+  query?: (pid: number) => WindowsProcessRecord | null,
 ): ProcessIdentity | null {
   if (!Number.isSafeInteger(pid) || pid <= 1) return null;
-  const first = query(pid);
+  const [first, second] = query ? [query(pid), query(pid)] : queryWindowsProcessPair(pid);
   if (!first) return null;
-  const second = query(pid);
   if (!second || first.ProcessId !== pid || second.ProcessId !== pid ||
       first.CreationDate !== second.CreationDate || first.CommandLine !== second.CommandLine ||
       first.ExecutablePath !== second.ExecutablePath) return null;
@@ -135,20 +134,21 @@ export function readWindowsProcessIdentity(
     commandDigest: createHash("sha256").update(command).digest("base64url") };
 }
 
-function queryWindowsProcess(pid: number): WindowsProcessRecord | null {
-  if (process.platform !== "win32") return null;
-  const script = `$p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $p) { $p | Select-Object ProcessId,ParentProcessId,CreationDate,CommandLine,ExecutablePath | ConvertTo-Json -Compress }`;
+function queryWindowsProcessPair(pid: number): [WindowsProcessRecord | null, WindowsProcessRecord | null] {
+  if (process.platform !== "win32") return [null, null];
+  // One PowerShell host takes both observations. Starting two cold hosts made
+  // the first Windows bridge race a 2s timeout on otherwise healthy machines.
+  const script = `$items=@(); for($i=0;$i -lt 2;$i++){ $p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if($null -ne $p){ $items += [pscustomobject]@{ProcessId=[int]$p.ProcessId;ParentProcessId=[int]$p.ParentProcessId;CreationDate=[string]$p.CreationDate.ToUniversalTime().Ticks;CommandLine=[string]$p.CommandLine;ExecutablePath=[string]$p.ExecutablePath} } }; ConvertTo-Json -InputObject @($items) -Compress`;
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
-    { encoding: "utf8", windowsHide: true, timeout: 2_000, maxBuffer: 64 * 1024 });
-  if (result.status !== 0 || !result.stdout.trim()) return null;
+    { encoding: "utf8", windowsHide: true, timeout: 5_000, maxBuffer: 64 * 1024 });
+  if (result.status !== 0 || !result.stdout.trim()) return [null, null];
   try {
-    const value = JSON.parse(result.stdout) as Partial<WindowsProcessRecord>;
-    if (!Number.isSafeInteger(value.ProcessId) || !Number.isSafeInteger(value.ParentProcessId) ||
-        typeof value.CreationDate !== "string" ||
-        (value.CommandLine !== null && typeof value.CommandLine !== "string") ||
-        (value.ExecutablePath !== null && typeof value.ExecutablePath !== "string")) return null;
-    return value as WindowsProcessRecord;
-  } catch { return null; }
+    const values = JSON.parse(result.stdout) as Array<Partial<WindowsProcessRecord>>;
+    if (!Array.isArray(values) || values.length !== 2 || values.some(value =>
+      !Number.isSafeInteger(value.ProcessId) || !Number.isSafeInteger(value.ParentProcessId) ||
+      typeof value.CreationDate !== "string" || typeof value.CommandLine !== "string" || typeof value.ExecutablePath !== "string")) return [null, null];
+    return values as [WindowsProcessRecord, WindowsProcessRecord];
+  } catch { return [null, null]; }
 }
 
 async function stopWindowsProcessOwner(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, options: StopOptions): Promise<void> {
