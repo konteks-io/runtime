@@ -8,12 +8,17 @@
  *   stage   — per platform job: package the offline agents, lay out the
  *             connector executable, installer package and descriptors.
  *   collect — release job: merge every platform's staging directory.
+ *   commands — release job: `commands.json`, the konteks-remote commands a
+ *             person runs on a connected computer for this release
+ *             (release/connector-commands.json plus the version; runtime-view
+ *             R20). The site reads it from this release's assets, so the
+ *             page never lists a command the installed connector lacks.
  *   verify  — release job: every manifest artifact is present with its exact bytes.
  *   notes   — release job: human-readable release notes from the manifest.
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const [command, ...rest] = process.argv.slice(2);
@@ -63,6 +68,15 @@ switch (command) {
     console.log(`collected ${seen.size} files`);
     break;
   }
+  case "commands": {
+    if (!args.tag || !args.out) fail("commands requires --tag vX.Y.Z --out path");
+    if (!/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(args.tag)) fail("tag must be vX.Y.Z");
+    const { commands } = JSON.parse(readFileSync(args.table ?? join("release", "connector-commands.json"), "utf8"));
+    checkCommands(commands);
+    writeFileSync(args.out, `${JSON.stringify({ version: args.tag.slice(1), commands }, null, 2)}\n`);
+    console.log(`wrote ${commands.length} connector commands for ${args.tag} to ${args.out}`);
+    break;
+  }
   case "verify": {
     if (!args.manifest || !args.dir) fail("verify requires --manifest --dir");
     const manifest = JSON.parse(readFileSync(args.manifest, "utf8"));
@@ -78,7 +92,10 @@ switch (command) {
       const path = join(args.dir, name);
       if (!existsSync(path) || createHash("sha256").update(readFileSync(path)).digest("hex") !== digest) fail(`checksum manifest entry ${name} does not match a present file`);
     }
-    for (const required of ["native-manifest.json", "SHA256SUMS", "SHA256SUMS.sig", "release-signing.pub", "install.sh", "install.ps1", "onboarding.md", "connect.md"]) if (!existsSync(join(args.dir, required))) fail(`release is missing ${required}`);
+    for (const required of ["native-manifest.json", "SHA256SUMS", "SHA256SUMS.sig", "release-signing.pub", "install.sh", "install.ps1", "onboarding.md", "connect.md", "commands.json"]) if (!existsSync(join(args.dir, required))) fail(`release is missing ${required}`);
+    const shipped = JSON.parse(readFileSync(join(args.dir, "commands.json"), "utf8"));
+    if (shipped.version !== manifest.bundleVersion) fail(`commands.json names ${shipped.version}, not this release's ${manifest.bundleVersion}`);
+    checkCommands(shipped.commands);
     if (!readFileSync(join(args.dir, "install.sh"), "utf8").match(/BAKED_EXECUTABLE_SUMS="[0-9a-f]{64}  konteks-remote-/)) fail("install.sh was not baked with this release's executable digests");
     console.log(`verified ${manifest.nativeArtifacts.length} manifest artifacts and ${sums.length} package checksums`);
     break;
@@ -96,7 +113,20 @@ switch (command) {
     break;
   }
   default:
-    fail("usage: release-assets.mjs stage|collect|verify|notes ...");
+    fail("usage: release-assets.mjs stage|collect|commands|verify|notes ...");
+}
+
+/** The shape `ConnectorCommandsManifestSchema` takes (packages 7.1.0), checked without the package so the release job needs no install. */
+function checkCommands(commands) {
+  if (!Array.isArray(commands) || commands.length === 0 || commands.length > 64) fail("connector commands must be 1 to 64 entries");
+  const ids = new Set();
+  for (const entry of commands) {
+    if (!entry || typeof entry.id !== "string" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(entry.id) || ids.has(entry.id)) fail(`connector command id ${JSON.stringify(entry?.id)} is invalid or repeated`);
+    ids.add(entry.id);
+    if (typeof entry.command !== "string" || !entry.command.startsWith("konteks-remote") || entry.command.length > 512 || /[\u0000-\u001f\u007f]/.test(entry.command)) fail(`connector command ${entry.id} is not one konteks-remote line`);
+    if (typeof entry.description !== "string" || entry.description.length === 0 || entry.description.length > 200 || /[\u0000-\u001f\u007f]/.test(entry.description)) fail(`connector command ${entry.id} needs one plain line`);
+    if (!Array.isArray(entry.os) || entry.os.length === 0 || new Set(entry.os).size !== entry.os.length || entry.os.some(os => !["macos", "windows", "debian"].includes(os))) fail(`connector command ${entry.id} names unknown systems`);
+  }
 }
 
 function walk(directory) { return readdirSync(directory).flatMap(name => { const path = join(directory, name); return statSync(path).isDirectory() ? walk(path) : [path]; }); }
