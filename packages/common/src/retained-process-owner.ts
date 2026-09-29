@@ -126,13 +126,16 @@ export function readWindowsProcessIdentity(
   const [first, second] = query ? [query(pid), query(pid)] : queryWindowsProcessPair(pid);
   if (!first) return null;
   if (!second || first.ProcessId !== pid || second.ProcessId !== pid ||
-      first.CreationDate !== second.CreationDate || first.CommandLine !== second.CommandLine ||
-      first.ExecutablePath !== second.ExecutablePath) return null;
+      first.CreationDate !== second.CreationDate ||
+      (first.CommandLine && second.CommandLine && first.CommandLine !== second.CommandLine) ||
+      (first.ExecutablePath && second.ExecutablePath && first.ExecutablePath !== second.ExecutablePath)) return null;
   if (!first.CreationDate.trim()) return null;
-  // Windows may withhold Path for a same-user process. Unlike POSIX it cannot
-  // replace a running process image with exec(), so PID + kernel creation time
-  // remains the authoritative identity; the path is additional evidence only.
-  const command = `${first.ExecutablePath ?? ""}\0${first.CommandLine ?? ""}\0${first.CreationDate}`;
+  // Windows may reveal Path/CommandLine only after the process has started.
+  // Unlike POSIX it cannot replace a running process image with exec(), so PID
+  // + kernel creation time is the stable authority. Optional process details
+  // may disprove a capture when both reads expose conflicting values, but must
+  // not make a durable owner change merely because they become visible later.
+  const command = `${pid}\0${first.CreationDate}`;
   return { pid, processGroupId: pid, startToken: first.CreationDate,
     commandDigest: createHash("sha256").update(command).digest("base64url") };
 }

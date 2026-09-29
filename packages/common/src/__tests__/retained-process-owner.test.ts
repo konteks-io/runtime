@@ -69,6 +69,21 @@ describe("retained Windows process owner", () => {
     });
   });
 
+  it("keeps the durable identity stable when Windows reveals optional process details later", () => {
+    const observations = [
+      { ...record, ExecutablePath: "", CommandLine: "" },
+      record,
+    ];
+    const initiallyHidden = readWindowsProcessIdentity(123, () => observations.shift() ?? null);
+    const fullyVisible = readWindowsProcessIdentity(123, () => record);
+    expect(initiallyHidden).toEqual(fullyVisible);
+  });
+
+  it("refuses conflicting process details when both Windows observations expose them", () => {
+    const observations = [record, { ...record, ExecutablePath: "C:\\other\\node.exe" }];
+    expect(readWindowsProcessIdentity(123, () => observations.shift() ?? null)).toBeNull();
+  });
+
   it("terminates only the matched process tree and confirms it is gone", async () => {
     const observations: Array<ProcessIdentity | null> = [windowsIdentity, windowsIdentity, null];
     const terminateTree = vi.fn();

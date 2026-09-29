@@ -1021,7 +1021,8 @@ export class AgentRuntime {
         const exhausted = !retryable || attempt === 4;
         this.logger.warn({ agentId: this.family.agentId, attempt, maxAttempts: 4,
           bridgeInitializeDurationMs: Date.now() - initializeStartedAt, stopConfirmed, retryable, exhausted,
-          errorClass: classified.class, errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_initialize_failed" },
+          errorClass: classified.class, errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_initialize_failed",
+          diagnostic: error instanceof RemoteInstanceError ? error.diagnostic : undefined },
         "runner control bridge startup attempt failed");
         if (exhausted) break;
         const exponentialMs = 500 * (2 ** (attempt - 1));
