@@ -73,21 +73,21 @@ export async function stopNativeConnector(input: NativeCommandContext, deps: Nat
   const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
   const initialStatus = await deps.execute(definition.status);
   if (initialStatus !== 0) {
-    if (initialStatus !== null && stoppedCodes.includes(initialStatus)) throw new RemoteInstanceError("temporarily_unavailable", "The native service is already stopped; this invocation cannot attest an earlier owned-process cleanup. Inspect only this installation before changing its release.");
-    throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation is running; no stop was attempted.");
+    if (initialStatus !== null && stoppedCodes.includes(initialStatus)) throw new RemoteInstanceError("temporarily_unavailable", "Konteks is already stopped on this computer.");
+    throw new RemoteInstanceError("temporarily_unavailable", "Konteks could not tell whether it is running on this computer, so nothing was stopped; konteks-remote doctor says why.");
   }
   const previousReceipt = await deps.readReceipt(input.root);
-  if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native user service could not be stopped; inspect its OS service status.");
-  input.output.line("Service manager accepted stop; waiting for this connector's owned-process cleanup…");
+  if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "Konteks could not be stopped on this computer; konteks-remote doctor says why.");
+  input.output.line("Stopping Konteks on this computer…");
   const deadline = deps.now() + (deps.deadlineMs ?? 30_000);
   for (;;) {
     const receipt = await deps.readReceipt(input.root);
     const status = await deps.execute(definition.status);
     if (receipt !== null && receipt !== previousReceipt && status !== null && stoppedCodes.includes(status)) break;
-    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The service manager stopped this connector, but its owned process cleanup is unconfirmed. Inspect only this installation before changing its release.");
+    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "Konteks stopped, but its agents may still be closing. Wait a moment, then check with konteks-remote status.");
     await deps.sleep(deps.pollMs ?? 250);
   }
-  input.output.line("Native service stopped; identity, credentials and local work are preserved.");
+  input.output.line("Konteks is stopped on this computer. Your sign-ins and work are kept; konteks-remote start starts it again.");
 }
 /** The real start path with narrow hooks for collision and stopped-service tests. */
 export async function startNativeConnector(
@@ -134,7 +134,7 @@ export async function startNativeConnector(
       );
     }
     input.output.line(
-      "Native user service is already running; use status to inspect cloud readiness.",
+      "Konteks is already running on this computer; konteks-remote status shows how it is doing.",
     );
     return;
   }
@@ -160,7 +160,7 @@ export async function startNativeConnector(
   });
   if (started === "already_running") {
     input.output.line(
-      "Native user service is already running; use status to inspect cloud readiness.",
+      "Konteks is already running on this computer; konteks-remote status shows how it is doing.",
     );
     return;
   }
@@ -173,7 +173,7 @@ export async function startNativeConnector(
   // only "started" invited a second and third `start` against a service that
   // was already coming up.
   input.output.line(
-    "Native user service started. It takes about a minute after a fresh install before it is ready for work; agent login and cloud readiness are reported separately by status.",
+    "Konteks is starting on this computer and is ready for work within a minute; konteks-remote status shows how it is doing.",
   );
 }
 
