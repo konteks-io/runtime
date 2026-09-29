@@ -115,7 +115,7 @@ export function readLinuxProcessIdentity(
 }
 
 /** Windows has no POSIX process groups. A detached bridge is fenced by the
- * kernel-reported creation instant plus its executable/command identity, and
+ * kernel-reported creation instant plus its executable identity, and
  * is stopped with taskkill's descendant-tree semantics. Reading twice keeps a
  * PID replacement from mixing fields across two processes. */
 export function readWindowsProcessIdentity(
@@ -136,9 +136,10 @@ export function readWindowsProcessIdentity(
 
 function queryWindowsProcessPair(pid: number): [WindowsProcessRecord | null, WindowsProcessRecord | null] {
   if (process.platform !== "win32") return [null, null];
-  // One PowerShell host takes both observations. Starting two cold hosts made
-  // the first Windows bridge race a 2s timeout on otherwise healthy machines.
-  const script = `$items=@(); for($i=0;$i -lt 2;$i++){ $p=Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if($null -ne $p){ $items += [pscustomobject]@{ProcessId=[int]$p.ProcessId;ParentProcessId=[int]$p.ParentProcessId;CreationDate=[string]$p.CreationDate.ToUniversalTime().Ticks;CommandLine=[string]$p.CommandLine;ExecutablePath=[string]$p.ExecutablePath} } }; ConvertTo-Json -InputObject @($items) -Compress`;
+  // One PowerShell host takes both observations. Get-Process reads the kernel
+  // creation time directly; Get-CimInstance has a multi-second cold start and
+  // made the first bridge race its owner-capture timeout on healthy machines.
+  const script = `$items=@(); for($i=0;$i -lt 2;$i++){ $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($null -ne $p){ $items += [pscustomobject]@{ProcessId=[int]$p.Id;ParentProcessId=0;CreationDate=[string]$p.StartTime.ToUniversalTime().Ticks;CommandLine='';ExecutablePath=[string]$p.Path} } }; ConvertTo-Json -InputObject @($items) -Compress`;
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
     { encoding: "utf8", windowsHide: true, timeout: 5_000, maxBuffer: 64 * 1024 });
   if (result.status !== 0 || !result.stdout.trim()) return [null, null];
