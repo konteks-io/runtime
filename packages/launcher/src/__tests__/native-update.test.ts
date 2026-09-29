@@ -335,7 +335,7 @@ describe("native update transaction", () => {
       h.deps.serviceDefinition = async () => definitionFor(h.currentRecord());
       // The harness's control socket follows the task: /End stops what serves, a start serves the record.
       h.deps.execute = async command => { const code = await scheduler(command); if (command.args[0] === "/End") await harnessExecute({ command: "stop", args: [] }); return code; };
-      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, contents); } }); await harnessStart(input); };
+      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, typeof contents === "string" ? contents : Buffer.from(contents).subarray(2).toString("utf16le")); } }); await harnessStart(input); };
       return task;
     }
 

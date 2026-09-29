@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,4 +57,16 @@ posixOnly("restricted secret files", () => {
     await writeSecretFile(path, "two");
     expect((await stat(path)).mode & 0o777).toBe(0o600);
   });
+});
+
+it("preserves binary service definitions through atomic writes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "kr-service-"));
+  try {
+    const path = join(dir, "service.xml");
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('<?xml version="1.0" encoding="UTF-16"?>', "utf16le")]);
+    await writeSecretFile(path, bytes);
+    expect(await readFile(path)).toEqual(bytes);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

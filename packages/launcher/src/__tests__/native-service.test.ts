@@ -55,6 +55,7 @@ describe("native background service definitions", () => {
     const root = 'C:\\Users\\Test User\\AppData\\Local\\konteks-remote';
     const service = nativeServiceDefinition({ os: 'windows', home: 'C:\\Users\\Test User', root, executable: `${root}\\bin\\konteks-remote.exe`, userId: 'S-1-5-21-123-456-789-1001' });
     expect(service.contents).toContain('<LogonType>InteractiveToken</LogonType>');
+    expect(service.contents).toContain('encoding="UTF-16"');
     expect(service.contents).toContain('<RunLevel>LeastPrivilege</RunLevel>');
     expect(service.contents).toContain('<UserId>S-1-5-21-123-456-789-1001</UserId>');
     expect(service.contents).toContain('<Arguments>serve --root &quot;C:\\Users\\Test User\\AppData\\Local\\konteks-remote&quot;</Arguments>');
@@ -73,7 +74,10 @@ describe("native background service definitions", () => {
     const execute = vi.fn(async (command: NativeServiceCommand) => { calls.push(command); return command === next.status ? 1 : 0; });
     const write = vi.fn(async () => undefined);
     await expect(startNativeServiceDefinition(next, { execute, write })).resolves.toBe('started');
-    expect(write).toHaveBeenCalledWith(next.path, expect.stringContaining(`<Command>${root}\\releases\\release-next\\konteks-connector.exe</Command>`));
+    const bytes = write.mock.calls[0]?.[1];
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(Buffer.from(bytes!).subarray(0, 2)).toEqual(Buffer.from([0xff, 0xfe]));
+    expect(Buffer.from(bytes!).subarray(2).toString('utf16le')).toContain(`<Command>${root}\\releases\\release-next\\konteks-connector.exe</Command>`);
     expect(calls).toEqual([next.status, ...next.install, next.start]);
     // Only a running service is left alone.
     const running = vi.fn(async () => 0), untouched = vi.fn(async () => undefined);
