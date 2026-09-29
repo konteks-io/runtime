@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GENERIC_RESULT_TOOL,
   STRUCTURED_RESULT_MCP_SERVER_NAME,
@@ -91,16 +91,19 @@ describe("turn result tool (loopback MCP)", () => {
 
   it("announces the schema to an agent that re-reads its tools, and shows it as the input schema", async () => {
     const { list, openStream, server: tool } = await started();
-    let relisted: Promise<unknown> | undefined;
-    await openStream(() => { relisted = list(); });
+    const relists: Array<Promise<unknown>> = [];
+    await openStream(() => { relists.push(list()); });
     expect(await tool.bind(VERDICT)).toBe("schema");
-    await relisted;
+    await vi.waitFor(() => expect(relists).toHaveLength(1));
+    await relists[0];
     const [bound] = await list();
     const { $schema: _draft, ...shape } = VERDICT;
     expect(bound).toMatchObject({ name: "submit_result", inputSchema: shape });
     expect(bound!.inputSchema).not.toHaveProperty("$schema");
     // The turn ended: the next list is generic again.
     tool.unbind();
+    await vi.waitFor(() => expect(relists).toHaveLength(2));
+    await relists[1];
     expect(await list()).toEqual([GENERIC_RESULT_TOOL]);
   });
 

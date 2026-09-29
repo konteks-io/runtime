@@ -289,16 +289,29 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
   it("says on the connected agent where the download stands, as the site reads it (CP3 prep)", async () => {
     await fresh();
     const pin = pinFor(GOOD, "/slow.zip");
+    let releaseSecondHalf!: () => void;
+    const secondHalfMayFinish = new Promise<void>(resolve => { releaseSecondHalf = resolve; });
     routes.set("/slow.zip", res => {
       res.writeHead(200, { "content-type": "application/zip", "content-length": GOOD.length });
-      res.write(GOOD.subarray(0, GOOD.length >> 1), () => setTimeout(() => res.end(GOOD.subarray(GOOD.length >> 1)), 600));
+      res.write(GOOD.subarray(0, GOOD.length >> 1), () => {
+        void secondHalfMayFinish.then(() => res.end(GOOD.subarray(GOOD.length >> 1)));
+      });
     });
     expect(await antigravityDownloadState(root, undefined, deps(pin))).toEqual({ state: "not_downloaded", sizeBytes: GOOD.length });
     const fetching = fetchNativeAntigravity({ root, consent: true }, deps(pin));
-    await vi.waitFor(async () => expect(await antigravityDownloadState(root, undefined, deps(pin))).toMatchObject({ state: "downloading", sizeBytes: GOOD.length }), { timeout: 3_000, interval: 10 });
-    const during = await antigravityDownloadState(root, undefined, deps(pin));
-    expect(during!.receivedBytes).toBeGreaterThan(0);
-    expect(during!.receivedBytes).toBeLessThan(GOOD.length);
+    let during: Awaited<ReturnType<typeof antigravityDownloadState>>;
+    try {
+      await vi.waitFor(async () => {
+        const state = await antigravityDownloadState(root, undefined, deps(pin));
+        expect(state).toMatchObject({ state: "downloading", sizeBytes: GOOD.length });
+        expect(state!.receivedBytes).toBeGreaterThan(0);
+      }, { timeout: 3_000, interval: 10 });
+      during = await antigravityDownloadState(root, undefined, deps(pin));
+      expect(during!.receivedBytes).toBeGreaterThan(0);
+      expect(during!.receivedBytes).toBeLessThan(GOOD.length);
+    } finally {
+      releaseSecondHalf();
+    }
     const fields = await fetching;
     expect(await antigravityDownloadState(root, fields, deps(pin))).toEqual({ state: "ready" });
     // A newer pin already fetched while the record still names the old copy: an update waits (A17).
