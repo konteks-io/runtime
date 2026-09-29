@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
-import { captureRetainedProcessOwner, readLinuxProcessIdentity, stopRetainedProcessOwner, type ProcessIdentity } from "../retained-process-owner.js";
+import { captureRetainedProcessOwner, readLinuxProcessIdentity, readWindowsProcessIdentity, stopRetainedProcessOwner, type ProcessIdentity } from "../retained-process-owner.js";
 
 const identity: ProcessIdentity = { pid: 123, processGroupId: 123, startToken: "Thu Sep 11 10:00:00 2026", commandDigest: "A".repeat(43) };
 
@@ -9,11 +9,6 @@ describe("retained macOS process owner", () => {
     expect(captureRetainedProcessOwner(123, { platform: "darwin", readIdentity: () => identity })).toEqual({ version: 1, platform: "darwin", ...identity });
     expect(() => captureRetainedProcessOwner(123, { platform: "darwin", readIdentity: () => null })).toThrow("cannot be captured");
     expect(() => captureRetainedProcessOwner(123, { platform: "darwin", readIdentity: () => ({ ...identity, processGroupId: 9 }) })).toThrow("process-group leader");
-  });
-
-  it("leaves Windows rehydration explicitly unsupported", () => {
-    const platform = "win32";
-    expect(() => captureRetainedProcessOwner(123, { platform, readIdentity: () => identity })).toThrow("not available");
   });
 
   it("requires a positive exact identity match before signaling", async () => {
@@ -47,6 +42,46 @@ describe("retained macOS process owner", () => {
       signal, pause: async () => undefined, termTimeoutMs: 10, killTimeoutMs: 10,
     })).resolves.toBeUndefined();
     expect(signal).toHaveBeenCalledWith(123, "SIGTERM");
+  });
+});
+
+describe("retained Windows process owner", () => {
+  const record = { ProcessId: 123, ParentProcessId: 50, CreationDate: "20260929131122.123456+420",
+    CommandLine: "node bridge.mjs --stdio", ExecutablePath: "C:\\Program Files\\nodejs\\node.exe" };
+  const windowsIdentity = readWindowsProcessIdentity(123, () => record)!;
+
+  it("captures a creation-bound command identity for the detached tree root", () => {
+    expect(windowsIdentity).toMatchObject({ pid: 123, processGroupId: 123, startToken: record.CreationDate });
+    expect(windowsIdentity.commandDigest).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(captureRetainedProcessOwner(123, { platform: "win32", readIdentity: () => windowsIdentity }))
+      .toEqual({ version: 1, platform: "win32", ...windowsIdentity });
+  });
+
+  it("refuses a PID that changes between the two identity observations", () => {
+    const observations = [record, { ...record, CreationDate: "replacement" }];
+    expect(readWindowsProcessIdentity(123, () => observations.shift() ?? null)).toBeNull();
+  });
+
+  it("terminates only the matched process tree and confirms it is gone", async () => {
+    const observations: Array<ProcessIdentity | null> = [windowsIdentity, windowsIdentity, null];
+    const terminateTree = vi.fn();
+    await expect(stopRetainedProcessOwner({ version: 1, platform: "win32", ...windowsIdentity }, {
+      platform: "win32", readIdentity: () => observations.shift() ?? null, treeAlive: () => false,
+      terminateTree, pause: async () => undefined, termTimeoutMs: 10,
+    })).resolves.toBeUndefined();
+    expect(terminateTree).toHaveBeenCalledWith(123, false);
+  });
+
+  it("refuses a reused PID or an ownerless surviving tree", async () => {
+    const terminateTree = vi.fn();
+    await expect(stopRetainedProcessOwner({ version: 1, platform: "win32", ...windowsIdentity }, {
+      platform: "win32", readIdentity: () => ({ ...windowsIdentity, startToken: "replacement" }),
+      treeAlive: () => true, terminateTree,
+    })).rejects.toThrow("identity changed");
+    await expect(stopRetainedProcessOwner({ version: 1, platform: "win32", ...windowsIdentity }, {
+      platform: "win32", readIdentity: () => null, treeAlive: () => true, terminateTree,
+    })).rejects.toThrow("process tree survives");
+    expect(terminateTree).not.toHaveBeenCalled();
   });
 });
 
