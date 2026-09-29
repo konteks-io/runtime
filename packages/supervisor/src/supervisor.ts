@@ -136,6 +136,8 @@ const LIVENESS_CHECK_MS = 30_000;
 const ON_COMPUTER_WATCH_MS = 30 * 60_000;
 /** How often the connector looks whether that step's agent reads ready. */
 const ON_COMPUTER_POLL_MS = 5_000;
+/** A turn's start or end is told to Core this soon, not at the next 30 s heartbeat (WS1-179). */
+const TURN_ACTIVITY_HEARTBEAT_MS = 500;
 const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
 
 export interface SupervisorOptions {
@@ -285,6 +287,7 @@ export class Supervisor {
   private readonly activeLogins = new Map<string, { agentId: string; emit: (event: ControlLoginEvent) => void }>();
   /** Site-started steps waiting on the person at a window on this computer, by login id. */
   private readonly onComputerWatches = new Map<string, NodeJS.Timeout>();
+  private turnActivityTimer: NodeJS.Timeout | null = null;
 
   constructor(config: SupervisorConfig = loadSupervisorConfig(), private readonly options: SupervisorOptions = {}) {
     this.config = config;
@@ -811,6 +814,7 @@ export class Supervisor {
         journal: this.journal,
         transport: this.transport,
         runner,
+        onTurnActivity: () => this.nudgeHeartbeat(),
         preview: this.sessionPreviewAccess(),
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
         broker: this.broker,
@@ -2158,6 +2162,21 @@ export class Supervisor {
     return this.supportedAgents(this.lastSnapshot?.agents ?? [])?.find(entry => entry.agentId === agentId);
   }
 
+  /**
+   * A turn started or ended: publish a heartbeat shortly (once for a burst), so
+   * the runtime's busy bar and counter move with the work. A short turn used
+   * to fall between two 30 s heartbeats and never showed at all (WS1-179).
+   */
+  private nudgeHeartbeat(): void {
+    if (!this.activeLoopStarted || this.stopping || this.turnActivityTimer) return;
+    this.turnActivityTimer = setTimeout(() => {
+      this.turnActivityTimer = null;
+      if (!this.activeLoopStarted || this.stopping) return;
+      void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after a turn change failed"));
+    }, TURN_ACTIVITY_HEARTBEAT_MS);
+    this.turnActivityTimer.unref();
+  }
+
   /** Looks every few seconds whether the step's agent reads ready (or, for an add, added); says so once, or that it ran out of time. */
   private watchOnComputer(watch: OnComputerWatch): void {
     const report = this.onComputerReporter(watch.instanceId, watch.loginId, watch.agentId);
@@ -2420,6 +2439,8 @@ export class Supervisor {
     if (this.pullTimer) clearInterval(this.pullTimer);
     for (const watch of this.onComputerWatches.values()) clearInterval(watch);
     this.onComputerWatches.clear();
+    if (this.turnActivityTimer) clearTimeout(this.turnActivityTimer);
+    this.turnActivityTimer = null;
     if (this.reaperTimer) clearInterval(this.reaperTimer);
     if (this.livenessTimer) clearInterval(this.livenessTimer);
     this.livenessTimer = null;

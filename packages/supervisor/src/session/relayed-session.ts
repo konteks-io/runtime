@@ -145,6 +145,8 @@ export interface RelayedSessionDeps {
   /** Rechecked immediately before a local prompt crosses into the bridge. */
   assertPromptAllowed?: () => void;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
+  /** A turn started or ended: the computer's busy state changed (WS1-179). */
+  onTurnActivity?: () => void;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
   /**
    * This machine's preview dev servers. Present, the session's agent gets the
@@ -766,6 +768,7 @@ export class RelayedSession {
           const prompt = await this.prepareAgentPrompt(request.id, params.prompt);
           try { await this.deps.runner.prompt(ref, request.id, { ...params, prompt }); }
           catch (error) { this.endStructuredTurn(request.id); throw error; }
+          this.deps.onTurnActivity?.();
         }
         else if (request.method === "session/set_mode") await this.deps.runner.setMode(ref, request.id, request.params);
         else await this.deps.runner.setConfigOption(ref, request.id, request.params);
@@ -856,6 +859,7 @@ export class RelayedSession {
           const current = params as typeof message.params;
           const prompt = await this.prepareAgentPrompt(message.id, current.prompt);
           await this.deps.runner.prompt(ref, message.id, { ...current, prompt });
+          this.deps.onTurnActivity?.();
         }
         catch (error) {
           this.endStructuredTurn(message.id);
@@ -972,6 +976,7 @@ export class RelayedSession {
             return;
           }
         }
+        if (event.method === "session/prompt") this.deps.onTurnActivity?.();
         const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
         if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
           // Say why before the close: its SIGTERM on the bridge was the only
@@ -1005,6 +1010,7 @@ export class RelayedSession {
 
   /** A prompt's completion (with any structured result already attached) goes to its holder. */
   private async onPromptResult(requestId: string, result: Record<string, unknown>): Promise<void> {
+    this.deps.onTurnActivity?.();
     if (this.assignment.kind === "delivery" && this.assignment.source.kind === "harness_delivery") {
       if (!this.preparedInputs?.acceptDeliveryOutput) {
         throw new RemoteInstanceError("capability_unavailable", "Generated delivery output cannot be accepted without current delivery authority.");

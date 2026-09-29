@@ -980,6 +980,26 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(sent.at(-1)?.body).toMatchObject({ kind: "session_closed", assignmentId: "asg", reason: "agent_exited" });
   });
 
+  it("says when a turn ends, so the computer's busy state reaches Core at once (WS1-179)", async () => {
+    const onTurnActivity = vi.fn();
+    const { session, runner, journal } = await build({
+      onTurnActivity,
+      reserveChannel: () => vi.fn(),
+      reserveExecutionReference: async () => undefined,
+      recordExecutionProcessOwner: async () => undefined,
+      prepareInputs: async () => ({ binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
+    });
+    vi.mocked(runner.createSession).mockImplementation(async (_input, lifecycle) => {
+      await lifecycle!.beforeCreate("acp-1");
+      lifecycle!.assertCurrent();
+      return { acpSessionRef: "acp-1", resumed: false, capabilities: { forkSession: false, sessionResume: true } };
+    });
+    await session.bootstrap();
+    await journal.pendingRequests.put({ acpSessionRef: "acp-1", id: "p1", method: "session/prompt", direction: "received", openedAt: clock.nowIso(), closedAt: null, deadlineAt: null, requestDigest: null });
+    await session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp-1", requestId: "p1", result: { stopReason: "cancelled" } });
+    expect(onTurnActivity).toHaveBeenCalled();
+  });
+
   it("uses the verified logical session channel across native assignment attempts and retains replay on close", async () => {
     for (const attempt of [1, 2]) {
       const work = { ...assignment, id: `asg-${attempt}`, attempt };
