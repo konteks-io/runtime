@@ -10,7 +10,7 @@
  *   collect — release job: merge every platform's staging directory.
  *   commands — release job: `commands.json`, the konteks-remote commands a
  *             person runs on a connected computer for this release
- *             (release/connector-commands.json plus the version; runtime-view
+ *             (packages/release/src/connector-commands.json plus the version; runtime-view
  *             R20). The site reads it from this release's assets, so the
  *             page never lists a command the installed connector lacks.
  *   verify  — release job: every manifest artifact is present with its exact bytes.
@@ -71,7 +71,7 @@ switch (command) {
   case "commands": {
     if (!args.tag || !args.out) fail("commands requires --tag vX.Y.Z --out path");
     if (!/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(args.tag)) fail("tag must be vX.Y.Z");
-    const { commands } = JSON.parse(readFileSync(args.table ?? join("release", "connector-commands.json"), "utf8"));
+    const { commands } = JSON.parse(readFileSync(args.table ?? join("packages", "release", "src", "connector-commands.json"), "utf8"));
     checkCommands(commands);
     writeFileSync(args.out, `${JSON.stringify({ version: args.tag.slice(1), commands }, null, 2)}\n`);
     console.log(`wrote ${commands.length} connector commands for ${args.tag} to ${args.out}`);

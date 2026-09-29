@@ -630,7 +630,11 @@ describe("native Supervisor composition", () => {
         opencode: async () => ({ version: "2.0.18" }), antigravityPinned: () => true } });
       const agents = (await supervisor.inventory.collect()).agents;
       expect(internals.supportedAgents(agents)).toBeUndefined();
+      // The release's connector commands ride the heartbeat only to a 7.1 Core too (R20).
+      const commands = () => (supervisor.heartbeat as unknown as { options: { connectorCommands: () => { version: string; commands: unknown[] } | undefined } }).options.connectorCommands();
+      expect(commands()).toBeUndefined();
       internals.hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: true };
+      expect(commands()).toMatchObject({ version: "1.0.0", commands: expect.arrayContaining([expect.objectContaining({ id: "status" })]) });
       expect(internals.supportedAgents(agents)).toBeUndefined();
       await internals.notAddedAgents.refreshIfDue();
       const reported = internals.supportedAgents(agents)!;

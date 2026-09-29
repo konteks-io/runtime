@@ -18,6 +18,7 @@ import {
   type ControlHandler,
   type ControlLoginEvent,
   type ConnectedAgentView,
+  type ConnectorCommandsManifest,
   type HeartbeatResult,
   type InstanceKeyPair,
   type JsonValue,
@@ -30,7 +31,7 @@ import {
   type RuntimeAgentLoginDeliveryRequest,
   coreContractAtLeast,
 } from "@konteks/remote-common";
-import { EmbeddedReleaseRootSchema, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EmbeddedReleaseRootSchema, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { chromeInstalled, readAntigravityAdminObservation, type RunnerConfig } from "@konteks/remote-agent-runner";
 import type { NativeRuntimeRecord, NativeUnavailableAgent } from "./native/installation.js";
 import { SignalSampler } from "@konteks/remote-sysmon";
@@ -188,6 +189,12 @@ export class Supervisor {
   private drainDeadline: string | null = null;
   private pendingRevocation = false;
   private lastSnapshot: InventorySnapshot | null = null;
+  /** This release's `konteks-remote` commands at its bundle version (runtime-view R20), built once; null when the table or version does not parse. */
+  private connectorCommandsCache: { manifest: ConnectorCommandsManifest | null } | null = null;
+  private connectorCommands(): ConnectorCommandsManifest | undefined {
+    this.connectorCommandsCache ??= { manifest: connectorCommandsManifest(this.config.SUPERVISOR_BUNDLE_VERSION) };
+    return this.connectorCommandsCache.manifest ?? undefined;
+  }
   /** The cached detection of supported agents the installation does not list (runtime-view R21). */
   private notAddedAgents: NotAddedAgentsDetector | null = null;
   /**
@@ -961,6 +968,8 @@ export class Supervisor {
       activeAssignmentIds: () => this.work.activeAssignmentIds(),
       modelCapabilitySnapshots: () => this.modelCapabilities?.snapshots() ?? [],
       supportedAgents: agents => this.supportedAgents(agents),
+      // The commands this release carries (runtime-view R20), only to a Core that takes 7.1 fields.
+      connectorCommands: () => (this.hostSettings.coreAcceptsRouteBilling ? this.connectorCommands() : undefined),
       configRevision: () => this.control.configRevision,
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       softMaxConcurrent: () => this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT,

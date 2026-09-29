@@ -534,11 +534,17 @@ preparer stages no organization skill (`prepareDirectSessionInputs`), refuses
 a repository selection and uses the session's stable private folder.
 Host-agent governance, the blocked-command list, refused modes and commands
 and sign-in declines are unchanged. **Connector commands (R20):**
-`release/connector-commands.json` (checked against `createNativeProgram` by
-`launcher/src/__tests__/connector-commands.test.ts`: every command, argument
-and option exists, and every command a person runs is listed) is written with
-the release version as `commands.json` by `release-assets.mjs commands`,
-shipped by the release job and required by `verify`. There is no
+`packages/release/src/connector-commands.json` (checked against
+`createNativeProgram` by `launcher/src/__tests__/connector-commands.test.ts`:
+every command, argument and option exists, and every command a person runs is
+listed) travels inside the connector executable; `connectorCommandsManifest`
+(`release/src/connector-commands.ts`) gives it the installed bundle version
+(null, so left out, when it would not parse), and the heartbeat carries it as
+`connectorCommands` (only to a 7.1 Core) on the first heartbeat Core accepts
+from each runner incarnation and again only when it changes (Core keeps the
+latest). It is also written with the release version as `commands.json` by
+`release-assets.mjs commands`, shipped by the release job and required by
+`verify`. There is no
 `preview enable/disable` command: that switch is Core's.
 
 Before production changes, add or update a focused characterization test and

@@ -11,7 +11,7 @@ import { createNativeProgram } from "../native/cli.js";
  * never name a command, option or argument the launcher does not have, and
  * every command a person runs on the computer is listed.
  */
-const table = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..", "release", "connector-commands.json"), "utf8")) as { commands: unknown[] };
+const table = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "release", "src", "connector-commands.json"), "utf8")) as { commands: unknown[] };
 
 /** Commands a person does not run from the page: the service's own, the first install (the site hands it out with a code), and key revocation (needs a reference from `git key list`). */
 const NOT_LISTED = new Set(["install", "onboard", "stage-enrollment", "serve", "git key remove"]);
@@ -69,5 +69,17 @@ describe("connector commands shipped with the release (runtime-view R20)", () =>
     // And lists every command a person runs here.
     const missing = leaves(root).filter(path => !listed.has(path) && !NOT_LISTED.has(path));
     expect(missing).toEqual([]);
+  });
+});
+
+describe("the commands the connector reports on its heartbeat (runtime-view R20)", () => {
+  it("are this release's table at the installed bundle version, or nothing when they would not parse", async () => {
+    const { connectorCommandsManifest, CONNECTOR_COMMANDS_TABLE } = await import("@konteks/remote-release");
+    const manifest = connectorCommandsManifest("0.4.1");
+    expect(manifest).toEqual({ version: "0.4.1", commands: ConnectorCommandsManifestSchema.parse({ version: "0.4.1", ...table }).commands });
+    expect(CONNECTOR_COMMANDS_TABLE.commands).toHaveLength(table.commands.length);
+    expect(connectorCommandsManifest("not a version!")).toBeNull();
+    expect(connectorCommandsManifest("0.4.1", { commands: [{ id: "BAD" }] })).toBeNull();
+    expect(connectorCommandsManifest("0.4.1", undefined)).toEqual(manifest);
   });
 });

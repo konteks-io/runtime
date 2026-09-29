@@ -91,4 +91,6 @@ connected agent's learnt slash commands (`availableCommands`,
 five agents (`native/supported-agents.ts`), both only to a 7.1 Core; the
 supervisor takes `direct` work (a person's own chat, `work/continued-session.ts`:
 no preamble, no Konteks MCP servers, policy root = the session folder); the
-release ships `commands.json` from `release/connector-commands.json`.
+connector reports its own commands (`packages/release/src/connector-commands.json`)
+as the heartbeat's `connectorCommands` (7.1 Core only, first heartbeat of each
+incarnation and on change) and the release ships them as `commands.json`.

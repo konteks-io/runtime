@@ -1,4 +1,4 @@
-import { HeartbeatMessageSchema, REMOTE_INSTANCE_PROOF_AUDIENCE, RemoteInstanceError, signInstanceProof, type AgentModelOfferedValuesSnapshot, type Clock, type HeartbeatMessage, type SupportedAgentEntry, type HeartbeatResult, type InstanceKeyPair, type JsonValue, type Logger, createLogger } from "@konteks/remote-common";
+import { HeartbeatMessageSchema, REMOTE_INSTANCE_PROOF_AUDIENCE, RemoteInstanceError, signInstanceProof, type AgentModelOfferedValuesSnapshot, type Clock, type HeartbeatMessage, type SupportedAgentEntry, type ConnectorCommandsManifest, type HeartbeatResult, type InstanceKeyPair, type JsonValue, type Logger, createLogger } from "@konteks/remote-common";
 import type { InventorySource } from "../inventory/snapshot.js";
 import { computeUtilization, deriveAdvertisedRoles, type RoleBinding } from "../inventory/roles.js";
 import type { SupervisorStore } from "../state/store.js";
@@ -34,6 +34,13 @@ export interface HeartbeatOptions {
    * older Core, or nothing detected yet). Never throws the heartbeat away.
    */
   supportedAgents?: (agents: HeartbeatMessage["agents"]) => readonly SupportedAgentEntry[] | undefined;
+  /**
+   * The `konteks-remote` commands this installed release has (runtime-view
+   * R20); undefined to leave it out (an older Core, or no table). Sent on the
+   * first heartbeat Core accepts from each runner incarnation and again only
+   * when it changes: Core keeps the latest value it received.
+   */
+  connectorCommands?: () => ConnectorCommandsManifest | undefined;
   configRevision: () => number;
   bundleVersion: string;
   softMaxConcurrent: () => number | undefined;
@@ -62,6 +69,8 @@ export class HeartbeatPublisher {
   private timer: NodeJS.Timeout | null = null;
   private readonly logger: Logger;
   private lastRoles: string[] = [];
+  /** `<runnerIncarnation>\0<manifest JSON>` of the connector commands Core last accepted. */
+  private sentConnectorCommands: string | null = null;
   private running = false;
   private stopped = false;
   private started: Promise<void> | null = null;
@@ -228,6 +237,15 @@ export class HeartbeatPublisher {
     try { supportedAgents = this.options.supportedAgents?.(snapshot.agents); } catch (error) {
       this.logger.warn({ err: error }, "supported agents not reported on this heartbeat");
     }
+    let connectorCommands: ConnectorCommandsManifest | undefined;
+    let connectorCommandsKey: string | null = null;
+    try {
+      const commands = this.options.connectorCommands?.();
+      const key = commands ? `${runnerIncarnation}\u0000${JSON.stringify(commands)}` : null;
+      if (commands && key !== this.sentConnectorCommands) { connectorCommands = commands; connectorCommandsKey = key; }
+    } catch (error) {
+      this.logger.warn({ err: error }, "connector commands not reported on this heartbeat");
+    }
     this.stage = "sequence";
     const sequence = await this.options.store.allocateHeartbeatSequence();
     assertCurrent();
@@ -246,6 +264,7 @@ export class HeartbeatPublisher {
       bundleVersion: this.options.bundleVersion,
       ...(this.options.modelCapabilitySnapshots ? { modelCapabilitySnapshots: this.options.modelCapabilitySnapshots() } : {}),
       ...(supportedAgents ? { supportedAgents } : {}),
+      ...(connectorCommands ? { connectorCommands } : {}),
     });
     // The wire carries a top-level `signature` and no `proof` envelope, but the
     // bytes signed are the instance proof's: binding the audience, the
@@ -258,6 +277,8 @@ export class HeartbeatPublisher {
     );
     this.stage = "request";
     const result = await this.options.core.heartbeat({ ...message, signature });
+    // Core took them; later heartbeats of this incarnation leave them out until they change.
+    if (connectorCommandsKey !== null) this.sentConnectorCommands = connectorCommandsKey;
     // Preserve ordinary shutdown's no-adoption behavior; a pending refresh must
     // reject rather than let its caller infer that recovery connectivity is ready.
     if (!pending && !this.running) return message;

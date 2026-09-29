@@ -90,10 +90,11 @@ konteks-remote stop | start
 konteks-remote uninstall       # finish running work, remove this runtime from its workspace, delete the connector
 ```
 
-Each release also publishes `commands.json`, these commands with one plain
-line each and the systems they run on (from `release/connector-commands.json`,
-checked against the launcher's real command table), so the runtime's page in
-Konteks lists exactly what the installed connector has.
+The connector tells Konteks these commands, with one plain line each and the
+systems they run on (`packages/release/src/connector-commands.json`, checked
+against the launcher's real command table and built into the connector), so
+the runtime's page lists exactly what the installed connector has. Each
+release also publishes them as `commands.json`.
 
 ### What the runtime page shows
 
