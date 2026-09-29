@@ -60,8 +60,20 @@ function fake(options: { json?: boolean; confirm?: boolean; loginFailure?: boole
 describe("native control commands", () => {
   it("fails the command when the supervisor reports a failed login", async () => {
     const f = fake({ loginFailure: true });
-    await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "agent_auth_required" });
+    await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "agent_auth_required", message: "the DeepSeek API key was not saved" });
     expect(f.text()).not.toContain("pasted-secret-value");
+  });
+  it("names the agent when a sign-in finishes, with no internal start line (WS1-153)", async () => {
+    const f = fake();
+    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
+      if (request.op !== "auth.login") return schema.parse({});
+      options?.onEvent?.({ kind: "started", loginId: "l1", agentId: "dsh" });
+      options?.onEvent?.({ kind: "display", loginId: "l1", text: "Key saved." });
+      options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
+      return schema.parse({ loginId: "l1" });
+    }) as typeof f.context.control.call;
+    await authLogin(f.context, "dsh", false);
+    expect(f.text()).toBe("Key saved.\nDeepSeek Harness is ready.\n");
   });
   it("asks OpenCode's provider choice in the open and its key hidden, and passes the chosen sign-in on (CP3)", async () => {
     const f = fake();

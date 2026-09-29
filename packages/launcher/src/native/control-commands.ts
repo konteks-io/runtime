@@ -3,6 +3,7 @@ import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, Sup
 import type { SupervisorControl } from "../control.js";
 import type { Output } from "../output.js";
 import { confirm, promptLine, promptSecret } from "../prompt.js";
+import { agentName } from "./agent-name.js";
 
 /**
  * The launcher's control-socket commands for the installed native connector
@@ -106,7 +107,8 @@ export async function authLogin(context: ControlContext, agentId: string, organi
   const onEvent = (event: ControlLoginEvent): void => {
     switch (event.kind) {
       case "started":
-        context.output.line(`login started for ${event.agentId}; follow the prompts from the agent's official tooling`);
+        // The flow's own lines say what to do next; a "login started" line
+        // landed on the key prompt and named tooling DeepSeek Harness has not (WS1-153).
         return;
       case "display":
         context.output.line(event.text);
@@ -122,7 +124,9 @@ export async function authLogin(context: ControlContext, agentId: string, organi
           .catch((error: unknown) => { promptError = error; interrupted.abort(); });
         return;
       case "completed":
-        context.output.line(`login complete: ${agentId} is ${event.readiness}${organization ? " (organization scope attested)" : ""}`);
+        context.output.line(event.readiness === "ready"
+          ? `${agentName(agentId)} is ready${organization ? " for your organization" : ""}.`
+          : `${agentName(agentId)} is signed in but not ready yet; konteks-remote doctor says why.`);
         return;
       case "failed":
         loginFailure = event;
@@ -137,14 +141,14 @@ export async function authLogin(context: ControlContext, agentId: string, organi
   }
   if (loginFailure !== null) {
     const failure: Extract<ControlLoginEvent, { kind: "failed" }> = loginFailure;
-    throw new RemoteInstanceError("agent_auth_required", `login failed (${failure.code}): ${failure.message}`);
+    throw new RemoteInstanceError("agent_auth_required", failure.message);
   }
 }
 
 export async function authLogout(context: ControlContext, agentId: string, provider?: string, method?: string): Promise<void> {
   const value = await context.control.call({ op: "auth.logout", agentId, ...(provider ? { provider } : {}), ...(method ? { method } : {}) }, z.record(z.string(), z.unknown()));
   context.output.result(value);
-  context.output.line(`logged out ${agentId}${provider ? ` from ${provider}` : method ? ` (${method})` : ""}; readiness ${String(value.readiness)}`);
+  context.output.line(`${agentName(agentId)} is signed out${provider ? ` of ${provider}` : ""} on this computer${value.readiness === "ready" ? "; its other sign-ins stay" : ""}.`);
 }
 
 /**

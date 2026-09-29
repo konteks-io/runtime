@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename } from "node:fs/promises";
+import { agentName } from "./agent-name.js";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, hostAgentFamily, hostInstallCommand, NATIVE_MANIFEST_URL, verifyNativeRelease } from "@konteks/remote-release";
@@ -1440,10 +1441,7 @@ function workspaceName(state: { workspaces?: Array<{ tenantId: string; displayNa
   return state.workspaces?.find(entry => entry.tenantId === tenantId)?.displayName ?? tenantId;
 }
 
-/** An agent family as people name it. */
-export function agentName(family: string): string {
-  return ({ "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness", opencode: "OpenCode", antigravity: "Google Antigravity" } as Record<string, string>)[family] ?? family;
-}
+export { agentName } from "./agent-name.js";
 
 /**
  * Agents the connector does not ship: the person's own DeepSeek Harness and
