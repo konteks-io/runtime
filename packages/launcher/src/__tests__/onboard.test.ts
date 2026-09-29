@@ -1112,7 +1112,9 @@ describe("onboard", () => {
     const result = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "login_required" }) });
     expect(result.done?.summary).toContain("Your Claude Code login will run Konteks work here.");
     expect(result.done?.summary).not.toContain("claude-code and codex");
-    expect(result.done?.remedies).toContain("Codex is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login codex");
+    expect(result.done?.remedies).toContain("Codex needs you to sign in here: konteks-remote auth login codex");
+    // WS1-151: the summary names the agents that run work; a list of ids beside it read "Agents ready: claude-code".
+    expect(result.done).not.toHaveProperty("agents");
     // A service still probing is not evidence of a missing login.
     const probing = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "probing" }) });
     expect(probing.done?.summary).toContain("Your Claude Code and Codex login will run Konteks work here.");
@@ -1120,7 +1122,7 @@ describe("onboard", () => {
   it("names DeepSeek Harness by name, and asks for its API key only when it is here without one", async () => {
     await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
     const keyless = await step({ families: async () => ["claude-code", "dsh"], agentReadiness: async () => ({ "claude-code": "ready", dsh: "not_configured" }) });
-    expect(keyless.done?.remedies).toContain("DeepSeek Harness is installed but has no DeepSeek API key here yet, so it will not run Konteks work. To add the key: konteks-remote auth login dsh");
+    expect(keyless.done?.remedies).toContain("DeepSeek Harness needs your DeepSeek API key: konteks-remote auth login dsh");
     const ready = await step({ families: async () => ["dsh"], agentReadiness: async () => ({ dsh: "ready" }) });
     expect(ready.done?.summary).toContain("Your DeepSeek Harness login will run Konteks work here.");
     // Nobody without it is told to install it.
@@ -1130,18 +1132,18 @@ describe("onboard", () => {
   it("names OpenCode by name, asks for a sign-in only when it is here without one, and offers --reuse when the person has their own (opencode CP6)", async () => {
     await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
     const unsigned = await step({ families: async () => ["claude-code", "opencode"], agentReadiness: async () => ({ "claude-code": "ready", opencode: "not_configured" }) });
-    expect(unsigned.done?.remedies).toContain("OpenCode is installed but not signed in to any provider here yet, so it will not run Konteks work. To sign it in with a subscription or an API key: konteks-remote auth login opencode");
+    expect(unsigned.done?.remedies).toContain("OpenCode needs a subscription or an API key: konteks-remote auth login opencode");
     expect(unsigned.done?.summary).toContain("Your Claude Code login will run Konteks work here.");
     const reuse = await step({ families: async () => ["opencode"], agentReadiness: async () => ({ opencode: "not_configured" }), personalOpenCode: async () => true });
-    expect(reuse.done?.remedies).toContain("OpenCode is installed but not signed in to any provider here yet, so it will not run Konteks work. To sign it in, starting from the providers your own OpenCode already uses: konteks-remote auth login opencode --reuse");
+    expect(reuse.done?.remedies).toContain("OpenCode needs a sign-in, starting from the providers your own OpenCode uses: konteks-remote auth login opencode --reuse");
     const ready = await step({ families: async () => ["codex", "opencode"], agentReadiness: async () => ({ codex: "ready", opencode: "ready" }) });
     expect(ready.done?.summary).toContain("Your Codex and OpenCode login will run Konteks work here.");
     // Installed after onboarding: the connector does not list it yet; listed but parked: doctor says why.
     const notAdded = await step({ families: async () => ["claude-code", "opencode"], agentReadiness: async () => ({ "claude-code": "ready" }), recordedAgents: async () => ["claude-code"] });
-    expect(notAdded.done?.remedies).toContain("OpenCode is installed on this machine but not added to Konteks here yet. To add it: konteks-remote agent add opencode");
+    expect(notAdded.done?.remedies).toContain("OpenCode is on this computer but not added yet: konteks-remote agent add opencode");
     expect(notAdded.done?.summary).toContain("Your Claude Code login will run Konteks work here.");
     const parked = await step({ families: async () => ["claude-code", "opencode"], agentReadiness: async () => ({ "claude-code": "ready" }), recordedAgents: async () => ["claude-code", "opencode"] });
-    expect(parked.done?.remedies).toContain("OpenCode is added here but could not start, so it will not run Konteks work yet. To see why: konteks-remote doctor");
+    expect(parked.done?.remedies).toContain("OpenCode could not start here; to see why: konteks-remote doctor");
     // OpenCode 1 here: named, with OpenCode 2's install command.
     const v1 = "OpenCode 1 is not supported (found 1.18.33): install OpenCode 2 with `curl -fsSL https://opencode.ai/v2/install | bash`, then add it here: konteks-remote agent add opencode";
     const old = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }), openCodeProblem: async () => v1 });
@@ -1164,14 +1166,14 @@ describe("onboard", () => {
     expect(JSON.stringify(other.done)).not.toContain("Antigravity");
     // Added, not signed in: both sign-ins, with the Business AI Code API for Enterprise.
     const unsigned = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready", antigravity: "not_configured" }), recordedAgents: async () => ["claude-code", "antigravity"] });
-    expect(unsigned.done?.remedies).toContain("Google Antigravity is added but not signed in here yet, so it will not run Konteks work. To sign it in with a Gemini API key: konteks-remote auth login antigravity --api-key. With Gemini Enterprise: konteks-remote auth login antigravity --enterprise --project <your Google Cloud project ID> --location global (the project needs Google's Business AI Code API: gcloud services enable businessaicode.googleapis.com --project <your Google Cloud project ID>).");
+    expect(unsigned.done?.remedies).toContain("Google Antigravity needs a Gemini API key or Gemini Enterprise sign-in: konteks-remote auth login antigravity");
     expect(unsigned.done?.remedies).not.toContain(offer);
     // Added and ready: named by name with the others.
     const ready = await step({ families: async () => ["codex"], agentReadiness: async () => ({ codex: "ready", antigravity: "ready" }), recordedAgents: async () => ["codex", "antigravity"] });
     expect(ready.done?.summary).toContain("Your Codex and Google Antigravity login will run Konteks work here.");
     // Added but left out (not downloaded, or its copy failed its checks): doctor says why.
     const parked = await step({ families: async () => [], agentReadiness: async () => ({}), recordedAgents: async () => ["antigravity"] });
-    expect(parked.done?.remedies).toContain("Google Antigravity is added here but could not start, so it will not run Konteks work yet. To see why: konteks-remote doctor");
+    expect(parked.done?.remedies).toContain("Google Antigravity could not start here; to see why: konteks-remote doctor");
     expect(await detectAgentFamilies()).not.toContain("antigravity");
     expect(agentName("antigravity")).toBe("Google Antigravity");
   });

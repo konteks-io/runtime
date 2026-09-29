@@ -39,7 +39,6 @@ export interface OnboardStep {
   done?: {
     summary: string;
     links: { site: string; system?: string; initiative?: string };
-    agents?: string[];
     remedies?: string[];
   };
 }
@@ -1325,22 +1324,22 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const present = installed.filter(family => !notLoggedIn.includes(family) && !hostMissing.includes(family));
       const remedies: string[] = [];
       for (const family of ["claude-code", "codex"]) {
-        if (notLoggedIn.includes(family)) remedies.push(`${agentName(family)} is installed but not logged in here, so it will not run Konteks work yet. To log it in: konteks-remote auth login ${family}`);
+        if (notLoggedIn.includes(family)) remedies.push(`${agentName(family)} needs you to sign in here: konteks-remote auth login ${family}`);
         else if (!present.includes(family)) remedies.push(`To also run ${agentName(family)} work here: konteks-remote auth login ${family}`);
       }
       // DeepSeek Harness and OpenCode are named only when they are here: nobody is told to install them.
       for (const family of hostMissing) {
         remedies.push(recorded?.includes(family)
-          ? `${agentName(family)} is added here but could not start, so it will not run Konteks work yet. To see why: konteks-remote doctor`
-          : `${agentName(family)} is installed on this machine but not added to Konteks here yet. To add it: konteks-remote agent add ${family}`);
+          ? `${agentName(family)} could not start here; to see why: konteks-remote doctor`
+          : `${agentName(family)} is on this computer but not added yet: konteks-remote agent add ${family}`);
       }
-      if (notLoggedIn.includes("antigravity")) remedies.push(`${agentName("antigravity")} is added but not signed in here yet, so it will not run Konteks work. To sign it in with a Gemini API key: konteks-remote auth login antigravity --api-key. With Gemini Enterprise: konteks-remote auth login antigravity --enterprise --project <your Google Cloud project ID> --location global (the project needs Google's Business AI Code API: gcloud services enable businessaicode.googleapis.com --project <your Google Cloud project ID>).`);
-      if (notLoggedIn.includes("dsh")) remedies.push(`${agentName("dsh")} is installed but has no DeepSeek API key here yet, so it will not run Konteks work. To add the key: konteks-remote auth login dsh`);
+      if (notLoggedIn.includes("antigravity")) remedies.push(`${agentName("antigravity")} needs a Gemini API key or Gemini Enterprise sign-in: konteks-remote auth login antigravity`);
+      if (notLoggedIn.includes("dsh")) remedies.push(`${agentName("dsh")} needs your DeepSeek API key: konteks-remote auth login dsh`);
       if (notLoggedIn.includes("opencode")) {
         const reuse = await (context.deps?.personalOpenCode ?? personalOpenCodeData)().catch(() => false);
         remedies.push(reuse
-          ? `${agentName("opencode")} is installed but not signed in to any provider here yet, so it will not run Konteks work. To sign it in, starting from the providers your own OpenCode already uses: konteks-remote auth login opencode --reuse`
-          : `${agentName("opencode")} is installed but not signed in to any provider here yet, so it will not run Konteks work. To sign it in with a subscription or an API key: konteks-remote auth login opencode`);
+          ? `${agentName("opencode")} needs a sign-in, starting from the providers your own OpenCode uses: konteks-remote auth login opencode --reuse`
+          : `${agentName("opencode")} needs a subscription or an API key: konteks-remote auth login opencode`);
       }
       // An OpenCode 1 found here is named with OpenCode 2's install command.
       if (!installed.includes("opencode")) {
@@ -1387,7 +1386,6 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
             .filter(Boolean)
             .join(" "),
           links: links(),
-          ...(present.length > 0 ? { agents: present } : {}),
           ...(remedies.length > 0 ? { remedies } : {}),
         },
       };
