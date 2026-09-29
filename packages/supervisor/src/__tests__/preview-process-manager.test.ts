@@ -59,6 +59,8 @@ describe("preview configuration: .konteks/preview.yaml, else a sensible inferred
     expect(await inferPreviewPlan(dir, files({ "bin/rails": "" }))).toMatchObject({ ok: true, plan: { command: "bin/rails server -b $HOST -p $PORT" } });
     expect(await inferPreviewPlan(dir, files({ "README.md": "" }))).toMatchObject({ ok: false, message: expect.stringContaining(".konteks/preview.yaml") });
     expect(await inferPreviewPlan(dir, files({ "package.json": JSON.stringify({ scripts: { build: "tsc" } }) }))).toMatchObject({ ok: false, message: expect.stringContaining("no dev, start or serve script") });
+    // A conversation's own folder (no project checkout) points the agent to the person's Open preview (09-29).
+    expect(await inferPreviewPlan(dir, files({ ".assistant/context.json": "{}", "CLAUDE.md": "" }))).toMatchObject({ ok: false, message: expect.stringContaining("Open preview at the top of this session") });
   });
 
   it("prefers the repository's serve block, ignores serve.port and keeps only literal, unreserved env", async () => {
