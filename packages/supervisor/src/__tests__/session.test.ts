@@ -1371,7 +1371,7 @@ describe("relayed session (D98/D113/D114)", () => {
         for (;;) {
           const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true }));
           if (done) return;
-          if (relists && new TextDecoder().decode(value).includes("list_changed")) void list();
+          if (relists && new TextDecoder().decode(value).includes("list_changed")) void list().catch(() => undefined);
         }
       })();
       const submit = (args: unknown) => post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "submit_result", arguments: args } });
