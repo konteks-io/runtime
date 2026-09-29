@@ -162,6 +162,12 @@ export interface SessionManagerOptions {
    * once it ended, or null when it must not be reported (an older Core).
    */
   measureTurn?: (bridge: BridgeProcess) => (() => MeasuredTurn | null) | null;
+  /**
+   * Every `available_commands_update` of a session (runtime-view R19): the
+   * runtime keeps the latest per agent. The update is still forwarded on the
+   * session stream unchanged.
+   */
+  onAvailableCommands?: (update: unknown) => void;
 }
 
 /** The current value of a session's `model` select, from any ACP configuration list. */
@@ -1002,6 +1008,9 @@ export class SessionManager {
         record.costReported = true;
       }
       if (typeof usage.totalTokens === "number") this.publishUsage(record, usage as Usage);
+    }
+    if (params.update.sessionUpdate === "available_commands_update") {
+      try { this.options.onAvailableCommands?.(params.update); } catch { /* never stops the stream */ }
     }
     if (params.update.sessionUpdate === "config_option_update") {
       const reportedModel = currentModel((params.update as { configOptions?: unknown }).configOptions);

@@ -15,6 +15,7 @@ import type { RunnerConfig } from "./config.js";
 import { RunnerEventBus } from "./events.js";
 import { projectReadiness } from "./readiness.js";
 import { SessionManager, type SessionRefStore, type TurnUsageLabel } from "./sessions/manager.js";
+import { AVAILABLE_COMMANDS_FILE, AvailableCommandsStore } from "./sessions/available-commands.js";
 import { turnUsageLabel } from "./sessions/usage-label.js";
 
 /**
@@ -169,6 +170,8 @@ export class AgentRuntime {
   private controlIdleTimer: NodeJS.Timeout | null = null;
   /** What the control process answered before it was stopped for being idle; readiness keeps reading it. */
   private parkedInitializeResult: InitializeResponse | null = null;
+  /** The slash commands this agent announced on this computer (runtime-view R19), kept across restarts. */
+  private readonly availableCommands: AvailableCommandsStore;
 
   constructor(private readonly options: AgentRuntimeOptions) {
     this.events = options.events ?? new RunnerEventBus();
@@ -185,6 +188,8 @@ export class AgentRuntime {
       throw new RemoteInstanceError("agent_unavailable", `${this.family.displayName} runs every session in a process of its own working copy.`);
     }
     this.scopeStore = new AgentScopeStore(options.config.RUNNER_CREDENTIAL_DIR);
+    this.availableCommands = new AvailableCommandsStore(join(options.config.RUNNER_CREDENTIAL_DIR, AVAILABLE_COMMANDS_FILE),
+      this.host?.refusedPromptCommands?.commands ?? [], this.logger);
     this.sessions = new SessionManager({
       bridge: () => this.bridge,
       ...(options.executionBridgeLimit ? { createBridge: (ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle, cwd) } : {}),
@@ -203,6 +208,7 @@ export class AgentRuntime {
         return read ? () => (this.hostSettings.coreAcceptsRouteBilling ? read() : null) : null;
       } } : {}),
       usageLabel: modelValue => this.usageLabel(modelValue),
+      onAvailableCommands: update => this.availableCommands.learn(update, this.now()),
       events: this.events,
       refStore: new FileSessionRefStore(join(options.config.RUNNER_CREDENTIAL_DIR, "session-refs.json")),
       bootstrapTimeoutMs: this.sessionBootstrapTimeoutMs(),
@@ -221,6 +227,7 @@ export class AgentRuntime {
     await mkdir(this.options.config.RUNNER_CREDENTIAL_DIR, { recursive: true, mode: 0o700 });
     await mkdir(this.options.config.RUNNER_WORKSPACE_DIR, { recursive: true });
     this.scope = await this.scopeStore.read();
+    await this.availableCommands.load();
     await this.ensureBridge();
     await this.probe(false);
     void this.refreshSiteLoginOptions();
@@ -751,6 +758,8 @@ export class AgentRuntime {
       bridgeVersionCompatible: true,
       ...(this.hostVersion() === undefined ? {} : { hostAgentVersion: this.hostVersion()! }),
       ...(this.tokenUsageObservable === undefined ? {} : { tokenUsageObservable: this.tokenUsageObservable }),
+      // Only to a Core that takes 7.1 fields: an older Core's heartbeat is strict.
+      ...(this.hostSettings.coreAcceptsRouteBilling && this.availableCommands.current() ? { availableCommands: this.availableCommands.current()! } : {}),
       lastProbeAt: this.lastProbeAt,
     });
   }

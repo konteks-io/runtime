@@ -493,3 +493,33 @@ export type {
   PreviewHeaderRejection,
   PreviewPathRejection,
 } from "@konteks/backstage-plugin-common/remote-instance-internal";
+
+/**
+ * The runtime view (runtime-view CP1, packages 7.1.0 fold-in): the `direct`
+ * work kind a person's own chat on this computer arrives as, the slash
+ * commands each agent announced here (R19), the real state of every
+ * supported agent (R21), and the connector commands manifest shipped with
+ * the release (R20).
+ */
+export {
+  DIRECT_WORK_KIND,
+  isDirectWorkKind,
+  AVAILABLE_COMMAND_LIMITS,
+  AvailableCommandListSchema,
+  normalizeAvailableCommands,
+  SUPPORTED_AGENT_STATES,
+  SupportedAgentEntrySchema,
+  SupportedAgentListSchema,
+  RUNTIME_PLATFORM_OSES,
+  ConnectorCommandsManifestSchema,
+  connectorCommandsFor,
+} from "@konteks/backstage-plugin-common";
+export type {
+  AvailableCommand,
+  RawAvailableCommand,
+  SupportedAgentState,
+  SupportedAgentEntry,
+  RuntimePlatformOs,
+  ConnectorCommand,
+  ConnectorCommandsManifest,
+} from "@konteks/backstage-plugin-common";

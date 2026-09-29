@@ -1,5 +1,5 @@
 import type { InitializeResponse } from "@agentclientprotocol/sdk";
-import { ConnectedAgentViewSchema, type ConnectedAgentCredential, type ConnectedAgentView } from "@konteks/remote-common";
+import { ConnectedAgentViewSchema, type AvailableCommand, type ConnectedAgentCredential, type ConnectedAgentView } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { AgentScopeState } from "./auth/scope-store.js";
 import { hostAgentRunnerAdapter } from "./host/registry.js";
@@ -36,6 +36,8 @@ export interface ReadinessInputs {
   hostAgentVersion?: string;
   /** Whether turns report billing usage under the current sign-in, when the agent says (Antigravity: only on its key relay). */
   tokenUsageObservable?: boolean;
+  /** The slash commands this agent announced on this computer and when (runtime-view R19). */
+  availableCommands?: { readonly commands: readonly AvailableCommand[]; readonly learntAt: string };
   lastProbeAt: string | null;
 }
 
@@ -64,6 +66,10 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
   if (inputs.scope.authIdentityFingerprint !== null) view.authIdentityFingerprint = inputs.scope.authIdentityFingerprint;
   if (inputs.scope.scopeAttestedAt !== null) view.scopeAttestedAt = inputs.scope.scopeAttestedAt;
   if (inputs.lastProbeAt !== null) view.lastProbeAt = inputs.lastProbeAt;
+  if (inputs.availableCommands !== undefined) {
+    view.availableCommands = inputs.availableCommands.commands.map(command => ({ ...command }));
+    view.availableCommandsLearntAt = inputs.availableCommands.learntAt;
+  }
   const recovery = deriveRecoveryAction(inputs, readiness);
   if (recovery) view.recoveryAction = recovery;
   return ConnectedAgentViewSchema.parse(view);
