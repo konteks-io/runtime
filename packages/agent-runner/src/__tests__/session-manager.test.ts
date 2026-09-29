@@ -69,6 +69,29 @@ describe("session manager (D98 bootstrap)", () => {
     expect(manager.activeSessions).toBe(1);
   });
 
+  it("closes and resumes a live session the agent will not resume while open, so the next prompt continues (WS1-168)", async () => {
+    let active = true;
+    const resumeSession = vi.fn(async () => {
+      if (active) throw RequestError.invalidParams(undefined, "session is already active: bridge-s1");
+      active = true;
+      return {};
+    });
+    const closeSession = vi.fn(async () => { active = false; return {}; });
+    const { bridge } = fakeBridge({ resumeSession, closeSession }, { agentCapabilities: { sessionCapabilities: { resume: {}, close: {} } } });
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+    const first = await manager.create({ context: { ...context, agentId: "dsh" }, cwd: "/w", mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    const continued = await manager.continueLive({ context: { ...context, agentId: "dsh", assignmentId: "asg-2" }, cwd: "/w", mcpServers: [], acpSessionRef: first.acpSessionRef,
+      lifecycle: { beforeCreate: async () => undefined, recordProcessOwner: async () => undefined, assertCurrent: () => undefined } });
+    expect(continued).toMatchObject({ acpSessionRef: first.acpSessionRef, resumed: true });
+    expect(closeSession).toHaveBeenCalledWith({ sessionId: "bridge-s1" });
+    expect(resumeSession).toHaveBeenCalledTimes(2);
+  });
+
   it("refuses and cancels work the agent starts on its own after a turn, so the next turn still continues (WS2-130)", async () => {
     const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
     const events = new RunnerEventBus();

@@ -194,6 +194,11 @@ export interface SessionRefStore {
   put(acpSessionRef: string, bridgeSessionId: string): Promise<void>;
 }
 
+/** A JSON-RPC "invalid params" refusal from the agent (ACP RequestError -32602). */
+function isInvalidParams(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === -32602;
+}
+
 export class InMemorySessionRefStore implements SessionRefStore {
   private readonly map = new Map<string, string>();
   async get(ref: string): Promise<string | null> {
@@ -664,7 +669,21 @@ export class SessionManager {
       const caps = bridge.initializeResult.agentCapabilities;
       let refreshed: { configOptions?: unknown; modes?: unknown } | null | undefined;
       if (caps?.sessionCapabilities?.resume != null) {
-        refreshed = await bridge.connection.resumeSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() });
+        const resume = () => bridge.connection.resumeSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() });
+        try {
+          refreshed = await resume();
+        } catch (error) {
+          // An agent that will not resume a session it still holds open
+          // (DeepSeek Harness: "session is already active", -32602) is closed
+          // and resumed from its own saved conversation: nothing is lost and
+          // the new turn's tools still apply (WS1-168). Every second prompt
+          // in a direct session failed before this.
+          if (!(isInvalidParams(error) && caps.sessionCapabilities.close != null)) throw error;
+          this.logger.info({ agentId: record.context.agentId }, "agent keeps its open session; closing and resuming it to continue");
+          await bridge.connection.closeSession({ sessionId: record.bridgeSessionId });
+          record.assertCurrent?.();
+          refreshed = await resume();
+        }
       } else if (caps?.loadSession === true) {
         refreshed = await bridge.connection.loadSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() });
       } else {

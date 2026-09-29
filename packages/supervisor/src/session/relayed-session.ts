@@ -296,6 +296,11 @@ export class RelayedSession {
         code: known ? error.code : "unexpected_error",
         retryable: known ? error.retryable : false,
         ...(known && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+        // An unknown error still names its class and, for an agent's JSON-RPC
+        // refusal, its numeric code: no message text, but enough to tell
+        // "method not found" from "invalid params" (WS1-168).
+        ...(!known && error instanceof Error ? { errorName: error.name } : {}),
+        ...(!known && typeof (error as { code?: unknown } | null)?.code === "number" ? { rpcCode: (error as { code: number }).code } : {}),
       }, "native session bootstrap stage failed");
       throw error;
     }
