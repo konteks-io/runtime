@@ -162,8 +162,10 @@ export async function writeOnComputerWatch(dataDir: string, watch: OnComputerWat
   await writeFile(watchFile(dataDir, watch.loginId), JSON.stringify(watch), { mode: 0o600 });
 }
 
+/** Ends a step here: its record and the script its window ran (an open window has already read it). */
 export async function removeOnComputerWatch(dataDir: string, loginId: string): Promise<void> {
-  await rm(watchFile(dataDir, loginId), { force: true });
+  await Promise.all([watchFile(dataDir, loginId), ...["command", "ps1"].map(ext => join(watchDir(dataDir), `${loginId}.${ext}`))]
+    .map(file => rm(file, { force: true })));
 }
 
 /** Every kept step that is still well-formed; a damaged file is dropped. */

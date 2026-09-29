@@ -71,9 +71,12 @@ describe("a step the site brings to the front on this computer (on-computer)", (
     const watch = { instanceId: "i-1", loginId: "login-9", agentId: "antigravity" as const, until: "added" as const, deadline: 123 };
     await writeOnComputerWatch(data, watch);
     await writeFile(join(data, "on-computer", "bad.watch.json"), "{not json");
+    await writeFile(join(data, "on-computer", "login-9.command"), "#!/bin/sh\n");
     expect(await readOnComputerWatches(data)).toEqual([watch]);
     await removeOnComputerWatch(data, "login-9");
     expect(await readOnComputerWatches(data)).toEqual([]);
+    // Its script goes with it.
+    await expect(stat(join(data, "on-computer", "login-9.command"))).rejects.toThrow();
   });
 
   it("is offered only where a window can come to the front", () => {

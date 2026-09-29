@@ -32,6 +32,9 @@ describe("native background service definitions", () => {
     expect(service.contents).toContain('<string>--root</string>');
     expect(service.start.command).toBe('launchctl');
     expect(service.start.args).toEqual(['bootstrap', 'gui/501', service.path]);
+    // launchd keeps nothing the connector prints unless the plist names a file (WS1-163).
+    expect(service.contents).toContain(`<key>StandardOutPath</key><string>${root}/logs/connector.log</string>`);
+    expect(service.contents).toContain(`<key>StandardErrorPath</key><string>${root}/logs/connector.log</string>`);
     expect(service.contents).not.toMatch(/Docker|docker|postgres|harness|validation-runtime|activationCode|TOKEN|PRIVATE KEY/);
   });
 
