@@ -76,6 +76,18 @@ it("admission remains a conflict after ordinary assignment pruning or process re
   expect(reopened.execution.admission("assignment", 1)).toEqual(admission);
 });
 
+it("persists a Linux execution-process owner across journal reload", async () => {
+  const journal = await fixture();
+  await journal.execution.admit(admission, () => undefined);
+  await journal.execution.open(admission, () => undefined, seed.createdAt);
+  await journal.execution.bindReference(admission, "acp-session", () => undefined);
+  const owner = { version: 1 as const, platform: "linux" as const, pid: 123, processGroupId: 123,
+    startToken: "boot-id:987654", commandDigest: "A".repeat(43) };
+  await journal.execution.bindProcessOwner(admission, owner, () => undefined);
+  const reopened = await fixture(false);
+  expect(reopened.execution.execution(admission)?.processOwner).toEqual(owner);
+});
+
 it("one serialized owner resolves concurrent admission versus absence without both winning", async () => {
   const journal = await fixture();
   const results = await Promise.allSettled([journal.execution.cancelAbsent(cancellation, () => undefined), journal.execution.admit(admission, () => undefined)]);

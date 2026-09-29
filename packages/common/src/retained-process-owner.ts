@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { RemoteInstanceError } from "./errors.js";
 
 export interface ProcessIdentity {
@@ -13,7 +14,7 @@ export interface ProcessIdentity {
  * never establishes tool/MCP quiescence or permits execution-slot release. */
 export interface RetainedProcessOwner extends ProcessIdentity {
   version: 1;
-  platform: "darwin";
+  platform: "darwin" | "linux";
 }
 
 interface CaptureOptions {
@@ -31,21 +32,24 @@ interface StopOptions extends CaptureOptions {
 
 export function captureRetainedProcessOwner(pid: number, options: CaptureOptions = {}): RetainedProcessOwner {
   const platform = options.platform ?? process.platform;
-  if (platform !== "darwin") throw new RemoteInstanceError("recovery_required", `Durable execution-process rehydration is not available on ${platform}.`);
+  if (platform !== "darwin" && platform !== "linux") throw new RemoteInstanceError("recovery_required", `Durable execution-process rehydration is not available on ${platform}.`);
   if (!Number.isSafeInteger(pid) || pid <= 1) throw invalidOwner("Bridge PID is invalid.");
-  const identity = (options.readIdentity ?? readDarwinProcessIdentity)(pid);
+  const identity = (options.readIdentity ?? (platform === "darwin" ? readDarwinProcessIdentity : readLinuxProcessIdentity))(pid);
   if (!identity) throw invalidOwner("Bridge process identity cannot be captured.");
   if (identity.pid !== pid || identity.processGroupId !== pid) throw invalidOwner("Bridge is not its exact process-group leader.");
-  return { version: 1, platform: "darwin", ...identity };
+  return { version: 1, platform, ...identity };
 }
 
 export async function stopRetainedProcessOwner(owner: RetainedProcessOwner, options: StopOptions = {}): Promise<void> {
   const platform = options.platform ?? process.platform;
-  if (platform !== "darwin" || owner.platform !== "darwin") throw invalidOwner(`Durable execution-process rehydration is not available on ${platform}.`);
-  const read = options.readIdentity ?? readDarwinProcessIdentity;
+  if ((platform !== "darwin" && platform !== "linux") || owner.platform !== platform) throw invalidOwner(`Durable execution-process rehydration is not available on ${platform}.`);
+  const read = options.readIdentity ?? (platform === "darwin" ? readDarwinProcessIdentity : readLinuxProcessIdentity);
   const observed = read(owner.pid);
   const signal = options.signal ?? ((pid, value) => process.kill(pid, value));
-  const groupAlive = options.groupAlive ?? ((pgid) => { try { process.kill(-pgid, 0); return true; } catch { return false; } });
+  const groupAlive = options.groupAlive ?? ((pgid) => {
+    try { process.kill(-pgid, 0); return true; }
+    catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+  });
   const pause = options.pause ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   if (!observed) {
     // The leader is gone. That alone is not stop proof — a descendant could
@@ -73,6 +77,42 @@ export function readDarwinProcessIdentity(pid: number): ProcessIdentity | null {
   const [, pidText, groupText, state, startToken, command] = match;
   if (state!.startsWith("Z")) return null;
   return { pid: Number(pidText), processGroupId: Number(groupText), startToken: startToken!, commandDigest: createHash("sha256").update(command!).digest("base64url") };
+}
+
+/** Linux PID reuse is fenced by the kernel's start ticks and boot identity.
+ * Read stat twice around cmdline so an exec or PID replacement cannot mix two
+ * different process identities into one durable owner. */
+export function readLinuxProcessIdentity(
+  pid: number,
+  readFile: (path: string) => Buffer | null = path => { try { return readFileSync(path); } catch { return null; } },
+): ProcessIdentity | null {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  const statPath = `/proc/${pid}/stat`;
+  const first = parseLinuxStat(readFile(statPath), pid);
+  if (!first) return null;
+  const command = readFile(`/proc/${pid}/cmdline`);
+  const bootId = readFile("/proc/sys/kernel/random/boot_id")?.toString("utf8").trim();
+  const second = parseLinuxStat(readFile(statPath), pid);
+  if (!command?.length || !bootId || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(bootId) ||
+      !second || first.processGroupId !== second.processGroupId || first.startTicks !== second.startTicks) return null;
+  return { pid, processGroupId: first.processGroupId, startToken: `${bootId}:${first.startTicks}`,
+    commandDigest: createHash("sha256").update(command).digest("base64url") };
+}
+
+function parseLinuxStat(bytes: Buffer | null, pid: number): { processGroupId: number; startTicks: string } | null {
+  if (!bytes) return null;
+  const stat = bytes.toString("utf8");
+  if (!stat.startsWith(`${pid} (`)) return null;
+  const end = stat.lastIndexOf(") ");
+  if (end < 0) return null;
+  // After comm: state (field 3), ppid (4), pgrp (5), ... starttime (22).
+  const fields = stat.slice(end + 2).trim().split(/\s+/);
+  const processGroupId = Number(fields[2]);
+  const startTicks = fields[19];
+  if (fields.length < 20 || fields[0] === "Z" || fields[0] === "X" ||
+      !Number.isSafeInteger(processGroupId) || processGroupId <= 1 ||
+      !startTicks || !/^\d+$/.test(startTicks) || BigInt(startTicks) === 0n) return null;
+  return { processGroupId, startTicks };
 }
 
 async function waitUntilStopped(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, groupAlive: (pgid: number) => boolean, pause: (ms: number) => Promise<void>, timeoutMs: number): Promise<boolean> {

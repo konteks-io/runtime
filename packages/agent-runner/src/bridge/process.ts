@@ -143,7 +143,7 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
   });
   let retainedProcessOwner: RetainedProcessOwner | undefined;
   try {
-    if (process.platform === "darwin" && child.pid !== undefined) retainedProcessOwner = captureRetainedProcessOwner(child.pid);
+    if ((process.platform === "darwin" || process.platform === "linux") && child.pid !== undefined) retainedProcessOwner = captureRetainedProcessOwner(child.pid);
   } catch (error) {
     await stopProcessGroupLeaderFirst({ child, timeoutMs: 2_000, killGraceMs: 1_000 });
     throw error;
