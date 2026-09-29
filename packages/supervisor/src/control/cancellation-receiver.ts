@@ -6,12 +6,13 @@ import type { CoreClient } from "../core/client.js";
 
 type StartedAssignment = NonNullable<ReturnType<LocalExecutionJournal["start"]>>["assignment"];
 
-/** The work a Core cancellation may name: an Assistant conversation turn, or
- * a native delivery turn of a repository-role Session whose cleanup Core owns
+/** The work a Core cancellation may name: an Assistant conversation turn, a
+ * person's direct session prompt (runtime-view R18), or a native delivery turn of a repository-role Session whose cleanup Core owns
  * (WS2-159). The session must be the assignment's own. */
 export function cancellationNamesAssignment(assignment: StartedAssignment, sessionId: string): boolean {
   const source = assignment.source;
   if (source.kind === "harness_delivery") return source.executionSessionId === sessionId;
+  if (assignment.kind === "direct" && source.kind === "direct_session") return source.sessionId === sessionId;
   return assignment.kind === "assistant_execution" && source.kind === "conversation" && source.sessionId === sessionId;
 }
 

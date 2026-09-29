@@ -19,9 +19,11 @@ import {
   type RemoteWorkAssignment,
 } from "@konteks/remote-common";
 import {
+  prepareDirectSessionInputs,
   prepareOrganizationSkillSession,
   type PreparedSessionInputs,
 } from "../skills/session-inputs.js";
+import { continuedSession, isDirectAssignment } from "../work/continued-session.js";
 import type { NativeInputClient } from "./input-client.js";
 import type { NativeOutputClient } from "./output-client.js";
 import { captureNativeDeliveryOutput } from "./output-capture.js";
@@ -333,6 +335,10 @@ export function createNativeInputPreparer(
           envelope = await client.prepare(current, claimId, digest);
           if (options.claimId(current) !== claimId) throw unavailable();
         };
+        // A direct session works in its own empty private folder only
+        // (runtime-view R13); a repository for it is a later decision (R24).
+        const direct = isDirectAssignment(current);
+        if (direct && selection.repository) throw unavailable();
         stage = "private_root";
         const root = await privateRoot(options.root);
         stage = "source_workspace";
@@ -395,7 +401,7 @@ export function createNativeInputPreparer(
               root,
               envelope,
               () => client.read(current, claimId, envelope, selection.source.transferId),
-              current.source.kind !== "conversation",
+              continuedSession(current.source) === null,
               options.git,
             ).then(workspace => {
               logStage("worktree", Date.now() - stageStartedAt);
@@ -403,7 +409,9 @@ export function createNativeInputPreparer(
             });
         stage = "organization_skills";
         stageStartedAt = Date.now();
-        const prepared = await prepareOrganizationSkillSession({
+        // No skills and no instructions for a direct session (R11): the
+        // person's text reaches the agent as typed.
+        const prepared = direct ? await prepareDirectSessionInputs({ cwd: source.cwd, binding: selection.binding }) : await prepareOrganizationSkillSession({
           cwd: source.cwd,
           scratchRoot: join(root, "skills"),
           catalog: selection.skills,
@@ -525,7 +533,7 @@ export function createNativeInputPreparer(
         return {
           ...prepared,
           skillInstructions:
-            current.source.kind === "conversation"
+            continuedSession(current.source) !== null
               ? prepared.skillInstructions
               : [
                   selectedRepository

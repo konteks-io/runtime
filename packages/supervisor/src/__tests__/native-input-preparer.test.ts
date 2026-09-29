@@ -18,6 +18,7 @@ import { StateMutationGate } from "../state/mutation-gate.js";
 import { testGitCommand, testGitTool } from "./native-git-fixture.js";
 
 const roots: string[] = [];
+const realRoot = async (path: string) => (await import("node:fs/promises")).realpath(path);
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
@@ -309,6 +310,21 @@ describe("native authorized input composition", () => {
     const prepared = await createNativeInputPreparer(f.options)(assignment);
     expect(await readdir(prepared.cwd)).toEqual([]);
     await prepared.beforePrompt();
+  });
+  it("gives a direct session its own empty private folder, stages no skill and puts nothing before the prompt (runtime-view R11, R13)", async () => {
+    const f = await fixture({});
+    const direct: RemoteWorkAssignment = { ...assignment, kind: "direct",
+      source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
+    const prepared = await createNativeInputPreparer(f.options)(direct);
+    expect(prepared.skillInstructions).toBe("");
+    expect(await readdir(prepared.cwd)).toEqual([]);
+    // The session's folder, stable across its prompts: the same one a later prompt gets.
+    expect(prepared.cwd.startsWith(join(await realRoot(f.root), "session-"))).toBe(true);
+    // No organization skill was fetched or staged.
+    expect(f.fetchFn.mock.calls.some(([, init]) => String(init?.body ?? "").includes('"skill"'))).toBe(false);
+    await prepared.beforePrompt();
+    const again = await createNativeInputPreparer(f.options)({ ...direct, id: "assignment" });
+    expect(again.cwd).toBe(prepared.cwd);
   });
   it("renews the authorization window without replacing files or the selection", async () => {
     const f = await fixture(),

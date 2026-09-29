@@ -44,6 +44,7 @@ import {
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
+import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
 import { antigravityKonteksToolsLine, antigravityResultToolReference } from "./antigravity-prompt.js";
 import { openCodeKonteksToolsLine, openCodeResultToolReference } from "./opencode-prompt.js";
@@ -224,7 +225,7 @@ export class RelayedSession {
     // Bound only after input preparation proves Core's claim-bound session.
     this.boundChannelId = null;
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
-    this.executionGate = (assignment.kind === "assistant_execution" || assignment.source.kind === "harness_delivery") && deps.executionAuthority
+    this.executionGate = isNativeTurn(assignment) && deps.executionAuthority
       ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, logger: this.logger, journal: deps.journal, clock: deps.clock,
         assertOwned: () => {
           if (!deps.assertExecutionOwned) throw new RemoteInstanceError("execution_fenced", "Execution ownership is unavailable.");
@@ -311,7 +312,7 @@ export class RelayedSession {
     if (!parsedBinding.success) throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
     const binding = parsedBinding.data;
     if (binding.workspaceId !== this.assignment.workspaceId || binding.assignmentId !== this.assignment.id || binding.attempt !== this.assignment.attempt || binding.instanceId !== this.assignment.instanceId || binding.instanceId !== this.deps.instanceId ||
-        (this.assignment.source.kind === "conversation" && binding.sessionId !== this.assignment.source.sessionId) || !isAbsolute(prepared.cwd) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(prepared.cwd)) {
+        (continuedSession(this.assignment.source) !== null && binding.sessionId !== continuedSession(this.assignment.source)!.sessionId) || !isAbsolute(prepared.cwd) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(prepared.cwd)) {
       throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
     }
     this.preparedInputs = prepared;
@@ -320,7 +321,11 @@ export class RelayedSession {
     this.boundChannelId = `session:${binding.sessionId}`;
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     const mcpServers: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }> = [];
-    if (this.assignment.agentRoute.mcpCapabilityTokenRef) {
+    // A direct session is the person's own agent with nothing of Konteks in
+    // it (runtime-view R11, R14): no platform tools even when a capability
+    // is named, no preview or browser (not a preview kind), no result tool.
+    const direct = isDirectAssignment(this.assignment);
+    if (this.assignment.agentRoute.mcpCapabilityTokenRef && !direct) {
       const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
       this.deps.assertExecutionOwned?.();
       const facade = new McpCapabilityFacade({
@@ -382,11 +387,14 @@ export class RelayedSession {
       preview.permit?.(sessionId, cwd);
       mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
     }
-    // The turn result tool: every session gets it, so a turn that asks for a
-    // structured result can be answered through a validated tool call.
-    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
-    this.resultTools = resultTools;
-    mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
+    // The turn result tool: every Konteks session gets it, so a turn that asks
+    // for a structured result can be answered through a validated tool call.
+    // A direct turn asks for none: it ends on the agent's own end_turn.
+    if (!direct) {
+      const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+      this.resultTools = resultTools;
+      mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
+    }
     // Optional tool wiring (Graft) ran alongside redemption and the facade.
     // The agent must find it in place, and the ownership commit below must
     // stay a short step from runner adoption, so settle it here. It never
@@ -472,6 +480,8 @@ export class RelayedSession {
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
       ...(restoreRef ? { restoreAcpSessionRef: restoreRef } : {}),
+      // A conversation's context is Konteks's to restage; a direct session's is
+      // only the agent's own transcript, so that one is loaded.
       ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
       ...(this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
       ...(browser ? { browser } : {}),
@@ -698,7 +708,7 @@ export class RelayedSession {
     const channelId = this.boundChannelId;
     if (this.closed || this.acpSessionRef === null || channelId === null || !this.channelOpened) return;
     this.deps.assertExecutionOwned?.();
-    if (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery") {
+    if (isNativeTurn(this.assignment)) {
       // Prepared Harness delivery must never fall back to bare ACP. The gate
       // must independently support its workload authority before dispatch.
       if (!this.executionGate) throw new RemoteInstanceError("execution_authority_unavailable", "Native execution admission is unavailable.");
@@ -746,7 +756,7 @@ export class RelayedSession {
           this.deps.assertExecutionOwned?.();
           this.deps.assertPromptAllowed?.();
           if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
-          const instructions = this.preparedInputs?.skillInstructions;
+          const instructions = this.promptInstructions();
           const params = instructions ? { ...request.params, prompt: [{ type: "text" as const, text: instructions }, ...request.params.prompt] } : request.params;
           const prompt = await this.prepareAgentPrompt(request.id, params.prompt);
           try { await this.deps.runner.prompt(ref, request.id, { ...params, prompt }); }
@@ -805,7 +815,7 @@ export class RelayedSession {
         try { await this.preparedInputs?.beforePrompt(); }
         catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
         this.deps.assertPromptAllowed?.();
-        const instructions = this.preparedInputs?.skillInstructions;
+        const instructions = this.promptInstructions();
         params = instructions ? { ...message.params, prompt: [{ type: "text" as const, text: instructions }, ...message.params.prompt] } : message.params;
       }
       if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
@@ -820,7 +830,7 @@ export class RelayedSession {
         ? { kind: "acp_error", id: message.id, method: message.method, error: classify(error) } : undefined;
       await gate.denyBeforeDispatch(operation.key, completion);
       const terminalTurnFailure =
-        (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery") &&
+        isNativeTurn(this.assignment) &&
         message.kind === "acp" &&
         message.method === "session/prompt" &&
         completion?.kind === "acp_error";
@@ -958,8 +968,7 @@ export class RelayedSession {
           }
         }
         const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
-        if (accepted && event.method === "session/prompt" &&
-            (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery")) {
+        if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
           // Say why before the close: its SIGTERM on the bridge was the only
           // trace of a Codex sign-in that could not refresh (WS2-141).
           this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable },
@@ -1004,8 +1013,7 @@ export class RelayedSession {
     // session_exited leaks a claimed assignment and blocks the next turn.
     // Close this assignment, not the shared native server or its history.
     const stopReason = (result as { stopReason?: string })?.stopReason;
-    const nativeTurn = accepted &&
-      (this.assignment.kind === "assistant_execution" || this.assignment.source.kind === "harness_delivery");
+    const nativeTurn = accepted && isNativeTurn(this.assignment);
     if (nativeTurn && stopReason === "end_turn") await this.close("completed");
     else if (nativeTurn && typeof stopReason === "string" && !this.closed) {
       // A turn that ends any other way has still ENDED: a rejected tool
@@ -1055,7 +1063,8 @@ export class RelayedSession {
   private async prepareAgentPrompt<B extends PromptBlock>(requestId: string, prompt: B[]): Promise<B[]> {
     const prepared = await this.prepareStructuredPrompt(requestId, prompt);
     const agentId = this.assignment.agentRoute.agentId;
-    if ((agentId !== "opencode" && agentId !== "antigravity") || this.toolFormTold) return prepared;
+    // A direct session has no Konteks tools to tell its agent about.
+    if ((agentId !== "opencode" && agentId !== "antigravity") || this.toolFormTold || isDirectAssignment(this.assignment)) return prepared;
     this.toolFormTold = true;
     const line = agentId === "opencode" ? openCodeKonteksToolsLine(this.sessionServers) : antigravityKonteksToolsLine(this.sessionServers);
     return [{ type: "text", text: line } as unknown as B, ...prepared];
@@ -1169,7 +1178,7 @@ export class RelayedSession {
       }
       params = verdict.request;
     }
-    const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.deps.workspaceRoot,
+    const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
       browserTools: this.browserGateway !== null });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
@@ -1206,6 +1215,22 @@ export class RelayedSession {
   }
 
   /** The working copy the session's agent runs in. */
+  /**
+   * The folder the tool policy judges file changes against: the runner's
+   * workspace, except for a direct session, whose agent may change files only
+   * in its own private session folder, never another session's (runtime-view
+   * R13). Kept to direct sessions: Konteks's own kinds are proven against the
+   * workspace root today, and their tighter root is a change of its own.
+   */
+  private policyRoot(): string {
+    return isDirectAssignment(this.assignment) ? this.sessionCwd() : this.deps.workspaceRoot;
+  }
+
+  /** What goes in front of the person's text: the staged skills line; nothing for a direct session, so a leading `/command` stays first (R11). */
+  private promptInstructions(): string | undefined {
+    return isDirectAssignment(this.assignment) ? undefined : this.preparedInputs?.skillInstructions || undefined;
+  }
+
   private sessionCwd(): string {
     return this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`;
   }
@@ -1269,8 +1294,8 @@ export class RelayedSession {
       const source = this.assignment.source;
       // Core threads a request onto the assignment's own session: the
       // conversation, a native delivery's execution session, else the assignment.
-      const sessionId = source.kind === "conversation" ? source.sessionId
-        : source.kind === "harness_delivery" ? source.executionSessionId : this.assignment.id;
+      const sessionId = continuedSession(source)?.sessionId
+        ?? (source.kind === "harness_delivery" ? source.executionSessionId : this.assignment.id);
       registered = await registerDeferral(this.deps.registerDeferral, deferredPermissionBody({ ...args, sessionId }), { logger: this.logger });
       if (!registered) return null;
       if (this.closed) return null;

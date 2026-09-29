@@ -114,7 +114,10 @@ import { evaluateHeartbeatLiveness } from "./heartbeat/liveness.js";
 // composed below, so its two kinds are accepted too. Leaving them out meant
 // Core never offered a discovery run's evidence work, and grouping evidence
 // was never read.
-const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation"];
+// `direct` (runtime-view R11): a person's own chat on this computer. Only a
+// Core that knows it places it; a Core built before it refuses a pull naming
+// it, so it is asked for only once Core signs 7.1 (see acceptedKinds below).
+const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation", "direct"];
 
 /** How long preview_start waits for the dev server before answering "still starting". */
 const PREVIEW_START_WAIT_MS = 45_000;
@@ -758,7 +761,7 @@ export class Supervisor {
       roleBindings: () => this.roleBindings,
       advertisedRoles: () => deriveAdvertisedRoles(this.roleBindings, this.lastSnapshot?.agents ?? [], this.roleCapabilityInputs()),
       roleCapabilityInputs: () => this.roleCapabilityInputs(),
-      acceptedKinds: () => ALL_KINDS,
+      acceptedKinds: () => this.hostSettings.coreAcceptsRouteBilling ? ALL_KINDS : ALL_KINDS.filter(kind => kind !== "direct"),
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
       draining: () => this.draining,
       reconciliationComplete: () => this.reconciliation.isComplete,

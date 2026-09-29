@@ -22,6 +22,7 @@ import {
 } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
+import { continuedSession } from "../work/continued-session.js";
 import { NATIVE_TRANSIENT_MAX_ATTEMPTS, logNativeRetryExhausted, transientHttpClassification, waitForNativeRetry,
   type NativeTransientClassification } from "./transient-retry.js";
 
@@ -185,8 +186,8 @@ export class NativeInputClient {
       binding.workspaceId !== assignment.workspaceId ||
       binding.assignmentId !== assignment.id ||
       binding.attempt !== assignment.attempt ||
-      (assignment.source.kind === "conversation" &&
-        binding.sessionId !== assignment.source.sessionId)
+      (continuedSession(assignment.source) !== null &&
+        binding.sessionId !== continuedSession(assignment.source)!.sessionId)
     )
       throw unavailable("envelope_binding_mismatch");
     if (
@@ -506,6 +507,7 @@ function sourceRevision(assignment: RemoteWorkAssignment): string | undefined {
     case "repository_snapshot":
       return assignment.source.revision;
     case "conversation":
+    case "direct_session":
       return undefined;
     case "ai_manager_search":
       return String(assignment.source.inputRevision);

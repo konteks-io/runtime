@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -419,6 +419,65 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(f.closed).toEqual(["relay_replay_gap"]);
     await f.session.close("relay_replay_gap");
     expect(f.closed).toHaveLength(1);
+  });
+
+  describe("a person's direct session (runtime-view R11, R13, R14)", () => {
+    const directWork: RemoteWorkAssignment = { ...assignment, kind: "direct",
+      agentRoute: { requiredRole: "assistant", agentId: "claude-code", mcpCapabilityTokenRef: "ref-1" },
+      source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "inst", sessionId: "s", turnRef: "turn-2", acpSessionRef: "acp-0" } };
+    const options = [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+
+    it("gives the agent nothing of Konteks: no platform tools even when named, no result tool, no preview; it continues its own transcript", async () => {
+      const redeemCapabilityToken = vi.fn(async () => { throw new Error("a direct session never redeems platform tools"); });
+      const preview = { start: vi.fn(), stop: vi.fn(), status: vi.fn(), touch: vi.fn(), permit: vi.fn() };
+      const f = await build({ redeemCapabilityToken, preview: preview as never, activateExecution: async () => ({ restoreReference: "acp-0" }) }, directWork);
+      try {
+        await f.session.bootstrap();
+        expect(redeemCapabilityToken).not.toHaveBeenCalled();
+        expect(preview.permit).not.toHaveBeenCalled();
+        const created = f.runnerCalls[0]?.[1][0] as { mcpServers: unknown[]; restoreAcpSessionRef?: string; freshProviderSessionOnRestore?: boolean; browser?: unknown };
+        expect(created.mcpServers).toEqual([]);
+        expect(created.browser).toBeUndefined();
+        // The agent's own transcript is loaded: Konteks restages nothing for it.
+        expect(created.restoreAcpSessionRef).toBe("acp-0");
+        expect(created.freshProviderSessionOnRestore).toBeUndefined();
+        expect(f.sent[0]?.body).toMatchObject({ kind: "session_ready", assignmentId: "asg", agentId: "claude-code" });
+      } finally { await f.session.close("cancelled"); }
+    });
+
+    it("judges file changes against its own session folder, never another session's; blocked commands stay blocked", async () => {
+      const own = join(dir, "session-own", "source"), other = join(dir, "session-other", "source");
+      await mkdir(own, { recursive: true }); await mkdir(other, { recursive: true });
+      const prepareInputs = async (target: RemoteWorkAssignment) => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+        cwd: own, skillInstructions: "", beforePrompt: async () => undefined });
+      const decide = async (work: RemoteWorkAssignment) => {
+        const f = await build({ workspaceRoot: dir, prepareInputs, policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false) }, work);
+        try {
+          await f.session.bootstrap();
+          const ask = (requestId: string, toolCall: Record<string, unknown>) => f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", toolCall: { toolCallId: requestId, ...toolCall }, options } } as never);
+          await ask("inside", { kind: "edit", title: "Write notes", rawInput: { file_path: join(own, "notes.txt") } });
+          await ask("relative", { kind: "edit", title: "Write notes", rawInput: { file_path: "notes.txt" } });
+          await ask("other", { kind: "edit", title: "Write elsewhere", rawInput: { file_path: join(other, "x.txt") } });
+          await ask("push", { kind: "execute", title: "git push", rawInput: { command: "git push origin main" } });
+          const answer = (id: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === id)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
+          return { inside: answer("inside"), relative: answer("relative"), other: answer("other"), push: answer("push") };
+        } finally { await f.session.close("cancelled"); }
+      };
+      expect(await decide(directWork)).toEqual({ inside: "allow", relative: "allow", other: "reject", push: "reject" });
+      // Konteks's own conversations keep the workspace root (unchanged here).
+      expect((await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).other).toBe("allow");
+    });
+
+    it("threads a question it defers to a person onto the direct session", async () => {
+      const registered: DeferredPermissionBody[] = [];
+      const f = await build({ registerDeferral: async body => { registered.push(body); return null as never; } }, directWork);
+      try {
+        await f.session.bootstrap();
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "q", params: { sessionId: "acp-1", toolCall: { toolCallId: "q", kind: "fetch", title: "Fetch a page" }, options } } as never);
+        await vi.waitFor(() => expect(registered).toHaveLength(1));
+        expect(registered[0]).toMatchObject({ sessionId: "s", assignmentId: "asg" });
+      } finally { await f.session.close("cancelled"); }
+    });
   });
 
   describe("DeepSeek Harness tool governance (dsh-runtime-support CP3)", () => {

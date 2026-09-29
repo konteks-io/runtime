@@ -801,7 +801,7 @@ function bytes(value: LocalAdmissionStart): number { return Buffer.byteLength(ca
 function conflict(): RemoteInstanceError { return new RemoteInstanceError("recovery_required", "Local execution history cannot prove this admission or absence.", { diagnostic: "local_execution_unprovable" }); }
 
 function logicalSessionId(assignment: RemoteWorkAssignment): string | undefined {
-  return assignment.source.kind === "conversation"
+  return assignment.source.kind === "conversation" || assignment.source.kind === "direct_session"
     ? assignment.source.sessionId
     : assignment.source.kind === "harness_delivery"
       ? assignment.source.executionSessionId
@@ -815,6 +815,11 @@ function sameLiveSession(predecessor: RemoteWorkAssignment, successor: RemoteWor
       predecessor.agentRoute.sessionConfig?.model !== successor.agentRoute.sessionConfig?.model) return false;
   if (predecessor.source.kind === "conversation" && successor.source.kind === "conversation") {
     return predecessor.source.sessionId === successor.source.sessionId && successor.source.acpSessionRef === acpSessionRef;
+  }
+  // A direct session's next prompt (runtime-view R11): the same session on the same computer.
+  if (predecessor.source.kind === "direct_session" && successor.source.kind === "direct_session") {
+    return predecessor.source.sessionId === successor.source.sessionId && predecessor.source.ownerInstanceId === successor.source.ownerInstanceId &&
+      successor.source.acpSessionRef === acpSessionRef;
   }
   if (predecessor.source.kind !== "harness_delivery" || successor.source.kind !== "harness_delivery") return false;
   if (predecessor.source.executionSessionId !== successor.source.executionSessionId ||
