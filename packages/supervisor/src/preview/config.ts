@@ -145,8 +145,10 @@ export async function inferPreviewPlan(cwd: string, deps: Required<PlanReadDeps>
 
 /** What a conversation's agent is told when asked for a preview it cannot run itself. */
 export const CONVERSATION_HAS_NO_APP = "This conversation has no copy of the project's code, so nothing runs here. "
-  + "When a delivery on this ticket built the app, the person sees it with Open preview at the top of this session, "
-  + "which starts it on this computer by itself: tell them that, in one sentence, instead of saying you cannot.";
+  + "When a delivery on this ticket built the app, Open preview at the top of the session shows it and starts it on this computer by itself.";
+
+/** Added only to the agent's tool answer: what to tell the person. */
+export const CONVERSATION_HAS_NO_APP_AGENT_NOTE = "Tell the person that, in one sentence, instead of saying you cannot.";
 
 async function detectPackageManager(cwd: string, pkg: PackageJson, deps: Required<PlanReadDeps>): Promise<{ manager: PackageManager; evidence: string }> {
   if (typeof pkg.packageManager === "string") {
