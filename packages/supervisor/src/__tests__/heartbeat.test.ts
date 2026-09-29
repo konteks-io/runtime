@@ -54,6 +54,22 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     await publisher.start(); const message = await publisher.publish();
     expect(message.modelCapabilitySnapshots).toEqual([snapshot]);
   });
+  it("carries every supported agent's state inside the signed body, and a failing projection never costs the heartbeat (runtime-view R21)", async () => {
+    const f = await fixture();
+    const supported = [{ agentId: "claude-code", state: "ready" as const }, { agentId: "antigravity", state: "not_added" as const, installCommand: "konteks-remote agent add antigravity" }];
+    f.options.supportedAgents = () => supported;
+    const publisher = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(publisher);
+    await publisher.start();
+    expect((await publisher.publish()).supportedAgents).toEqual(supported);
+    f.options.supportedAgents = () => { throw new Error("detection broke"); };
+    const failing = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(failing);
+    await failing.start();
+    expect((await failing.publish()).supportedAgents).toBeUndefined();
+    f.options.supportedAgents = () => undefined;
+    const older = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process" } as HeartbeatOptions); publishers.push(older);
+    await older.start();
+    expect(Object.keys(await older.publish())).not.toContain("supportedAgents");
+  });
   it("joins concurrent publishes and does not reuse a failed request's sequence", async () => {
     const f = await fixture(), gate = Promise.withResolvers<typeof f.result>();
     f.heartbeat.mockImplementationOnce(() => gate.promise);

@@ -1,4 +1,4 @@
-import { HeartbeatMessageSchema, REMOTE_INSTANCE_PROOF_AUDIENCE, RemoteInstanceError, signInstanceProof, type AgentModelOfferedValuesSnapshot, type Clock, type HeartbeatMessage, type HeartbeatResult, type InstanceKeyPair, type JsonValue, type Logger, createLogger } from "@konteks/remote-common";
+import { HeartbeatMessageSchema, REMOTE_INSTANCE_PROOF_AUDIENCE, RemoteInstanceError, signInstanceProof, type AgentModelOfferedValuesSnapshot, type Clock, type HeartbeatMessage, type SupportedAgentEntry, type HeartbeatResult, type InstanceKeyPair, type JsonValue, type Logger, createLogger } from "@konteks/remote-common";
 import type { InventorySource } from "../inventory/snapshot.js";
 import { computeUtilization, deriveAdvertisedRoles, type RoleBinding } from "../inventory/roles.js";
 import type { SupervisorStore } from "../state/store.js";
@@ -28,6 +28,12 @@ export interface HeartbeatOptions {
   roleBindings: () => RoleBinding[];
   activeAssignmentIds: () => string[];
   modelCapabilitySnapshots?: () => readonly AgentModelOfferedValuesSnapshot[];
+  /**
+   * Every supported agent's real state on this computer (runtime-view R21),
+   * from the agents just collected; undefined to leave the field out (an
+   * older Core, or nothing detected yet). Never throws the heartbeat away.
+   */
+  supportedAgents?: (agents: HeartbeatMessage["agents"]) => readonly SupportedAgentEntry[] | undefined;
   configRevision: () => number;
   bundleVersion: string;
   softMaxConcurrent: () => number | undefined;
@@ -218,6 +224,10 @@ export class HeartbeatPublisher {
       ...(this.options.softMaxConcurrent() === undefined ? {} : { softMaxConcurrent: this.options.softMaxConcurrent() as number }),
       acceptingWork: !pending && this.options.acceptingWork() && requiredHealthy,
     });
+    let supportedAgents: readonly SupportedAgentEntry[] | undefined;
+    try { supportedAgents = this.options.supportedAgents?.(snapshot.agents); } catch (error) {
+      this.logger.warn({ err: error }, "supported agents not reported on this heartbeat");
+    }
     this.stage = "sequence";
     const sequence = await this.options.store.allocateHeartbeatSequence();
     assertCurrent();
@@ -235,6 +245,7 @@ export class HeartbeatPublisher {
       configRevision: this.options.configRevision(),
       bundleVersion: this.options.bundleVersion,
       ...(this.options.modelCapabilitySnapshots ? { modelCapabilitySnapshots: this.options.modelCapabilitySnapshots() } : {}),
+      ...(supportedAgents ? { supportedAgents } : {}),
     });
     // The wire carries a top-level `signature` and no `proof` envelope, but the
     // bytes signed are the instance proof's: binding the audience, the

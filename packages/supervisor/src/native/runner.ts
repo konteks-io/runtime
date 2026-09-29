@@ -160,6 +160,11 @@ export class NativeRunner implements RunnerPort {
   }
 
   /** Why this agent was taken out of service, or null (doctor). */
+  /** The agent was signed in and the sign-in no longer works (runtime-view R21). */
+  signInLost(): boolean {
+    return this.runtime.signInLost();
+  }
+
   quarantineReason(): string | null {
     return this.runtime.quarantineReason();
   }

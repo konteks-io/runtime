@@ -82,6 +82,7 @@ import { verifyInstalledNativeBridges } from "./native/installed.js";
 import { acquireNativeRootLock, type NativeRootLock } from "./native/root-lock.js";
 import { NativeCodexAppServerOwner, type NativeCodexAppServerOwnerOptions } from "./native/codex-app-server-owner.js";
 import { NativeAgentRetry, startNativeAgents } from "./native/start-native-agents.js";
+import { NotAddedAgentsDetector, SUPPORTED_AGENT_IDS, projectSupportedAgents, type AddedAgentFacts } from "./native/supported-agents.js";
 import { StateMutationGate } from "./state/mutation-gate.js";
 import type { RelayedSessionDeps } from "./session/relayed-session.js";
 import { PermissionBroker } from "./session/permissions.js";
@@ -184,6 +185,8 @@ export class Supervisor {
   private drainDeadline: string | null = null;
   private pendingRevocation = false;
   private lastSnapshot: InventorySnapshot | null = null;
+  /** The cached detection of supported agents the installation does not list (runtime-view R21). */
+  private notAddedAgents: NotAddedAgentsDetector | null = null;
   /**
    * The machine's own git (OB6 §5). It is a field rather than a dependency
    * because every onboard lane — role advertisement, the evidence collector
@@ -388,6 +391,11 @@ export class Supervisor {
       this.nativeRunners.push(runner);
       this.runners.set(runner.agentId, runner);
     }
+    // Supported agents the installation does not list: detected now, in the
+    // background, so the first heartbeat can already say where they stand.
+    const recorded = this.recordedAgentIds();
+    this.notAddedAgents = new NotAddedAgentsDetector({ agentIds: SUPPORTED_AGENT_IDS.filter(agentId => !recorded.has(agentId)) });
+    void this.notAddedAgents.refreshIfDue().catch(() => undefined);
     this.inventory = new NativeInventoryCollector({ runners: this.runners, sampler: new SignalSampler(this.config.SUPERVISOR_DATA_DIR), bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       gitVersion: () => this.git.version(),
       executionPermitsReady: () => {
@@ -949,6 +957,7 @@ export class Supervisor {
       roleBindings: () => this.roleBindings,
       activeAssignmentIds: () => this.work.activeAssignmentIds(),
       modelCapabilitySnapshots: () => this.modelCapabilities?.snapshots() ?? [],
+      supportedAgents: agents => this.supportedAgents(agents),
       configRevision: () => this.control.configRevision,
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       softMaxConcurrent: () => this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT,
@@ -2092,6 +2101,36 @@ export class Supervisor {
       void runner.applyHostSettings(settings).catch(error => this.logger.warn({ err: error, agentId: runner.agentId }, "host agent settings not applied"));
       if (changed) this.modelCapabilities?.invalidateAgent(runner.agentId);
     }
+  }
+
+  /** The agents this installation lists: its runners and the host agents left out at load. */
+  private recordedAgentIds(): Set<string> {
+    const native = this.options.native;
+    return new Set([...(native?.runners ?? []).map(config => config.RUNNER_AGENT_ID), ...(native?.unavailableAgents ?? []).map(entry => entry.agentId)]);
+  }
+
+  /**
+   * Every supported agent's real state on this computer (runtime-view R21),
+   * only to a Core that takes 7.1 fields (the heartbeat is strict there). A
+   * listed agent from its runner, or from why it is left out; the others
+   * from the cached detection, re-run in the background on the agent retry
+   * cadence, never on this path. Nothing until that detection first ended.
+   */
+  private supportedAgents(agents: readonly ConnectedAgentView[]) {
+    const detector = this.notAddedAgents;
+    if (!this.options.native || !detector || !this.hostSettings.coreAcceptsRouteBilling) return undefined;
+    void detector.refreshIfDue().catch(() => undefined);
+    if (!detector.detectedOnce()) return undefined;
+    const added = new Map<string, AddedAgentFacts>();
+    for (const agentId of this.recordedAgentIds()) {
+      const live = this.nativeRunners.find(runner => runner.agentId === agentId && this.runners.get(agentId) === runner);
+      const view = live ? agents.find(agent => agent.agentId === agentId) : undefined;
+      const version = (live ?? this.parkedRunners.get(agentId) ?? this.gaveUpRunners.get(agentId))?.hostInstallation()?.version;
+      added.set(agentId, live && view
+        ? { view, signInLost: live.signInLost(), ...(version ? { version } : {}) }
+        : { failure: this.agentStartFailures.get(agentId), ...(version ? { version } : {}) });
+    }
+    return projectSupportedAgents({ added, notAdded: detector.current() });
   }
 
   /** What this connector advertises for OpenCode: the free-models switch, and the sign-ins the site may start here. */

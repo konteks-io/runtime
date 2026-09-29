@@ -764,6 +764,15 @@ export class AgentRuntime {
     });
   }
 
+  /**
+   * Whether this agent was signed in and the sign-in no longer works: a turn
+   * failed on it, or a credential it holds needs signing in again (runtime-view
+   * R21 `sign_in_expired`, as opposed to never signed in).
+   */
+  signInLost(): boolean {
+    return this.authRequired || (this.credentials?.some(credential => credential.state === "needs_sign_in") ?? false);
+  }
+
   utilization(): { activeSessions: number; activeTurns: number } {
     return { activeSessions: this.sessions.activeSessions, activeTurns: this.sessions.activeTurns };
   }

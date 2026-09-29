@@ -19,6 +19,7 @@ import { decodeLeaseClaims, leaseRecordFromClaims } from "../lease/lease.js";
 import { BROWSER_NO_PACKAGE_MESSAGE } from "../native/browser-capability.js";
 import { antigravityInstallAdapter, openCodeInstallAdapter } from "../native/host-agents.js";
 import { ANTIGRAVITY_ENTERPRISE_QUARANTINE_MESSAGE } from "../session/antigravity-tool-governance.js";
+import { NotAddedAgentsDetector, SUPPORTED_AGENT_IDS } from "../native/supported-agents.js";
 
 let root: string;
 const supervisors: Supervisor[] = [];
@@ -611,6 +612,34 @@ describe("native Supervisor composition", () => {
       expect(await reported()).toMatchObject({ hostAgentDownload: { state: "downloading", receivedBytes: 4_096, sizeBytes: 111_725_488 } });
       // Never an agent to place work on.
       expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("agent:antigravity");
+    });
+
+    it("reports all five supported agents' states only to a 7.1 Core, once the not-added ones were detected (runtime-view R21)", async () => {
+      const f = await fixture();
+      const supervisor = new Supervisor(f.config, f.options);
+      supervisors.push(supervisor);
+      await supervisor.start();
+      const internals = supervisor as unknown as {
+        hostSettings: { openCodeFreeModels: boolean; coreAcceptsRouteBilling: boolean };
+        notAddedAgents: NotAddedAgentsDetector;
+        supportedAgents(agents: unknown[]): Array<{ agentId: string; state: string; installCommand?: string }> | undefined;
+      };
+      // Detection without touching this computer's own agents.
+      internals.notAddedAgents = new NotAddedAgentsDetector({ agentIds: ["claude-code", "dsh", "opencode", "antigravity"], deps: {
+        claude: async () => "/usr/local/bin/claude", dsh: async () => { throw new RemoteInstanceError("prerequisite_missing", "not installed", { diagnostic: "dsh_not_found" }); },
+        opencode: async () => ({ version: "2.0.18" }), antigravityPinned: () => true } });
+      const agents = (await supervisor.inventory.collect()).agents;
+      expect(internals.supportedAgents(agents)).toBeUndefined();
+      internals.hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: true };
+      expect(internals.supportedAgents(agents)).toBeUndefined();
+      await internals.notAddedAgents.refreshIfDue();
+      const reported = internals.supportedAgents(agents)!;
+      expect(reported.map(entry => entry.agentId)).toEqual([...SUPPORTED_AGENT_IDS]);
+      const codexView = agents.find(agent => (agent as { agentId: string }).agentId === "codex") as { readiness: string; connectionState: string };
+      const codexState = codexView.readiness === "ready" && codexView.connectionState === "ready" ? "ready" : codexView.readiness === "not_configured" ? "needs_sign_in" : "failed";
+      expect(reported.map(entry => [entry.agentId, entry.state])).toEqual([
+        ["claude-code", "installed_not_added"], ["codex", codexState], ["dsh", "not_installed"], ["opencode", "installed_not_added"], ["antigravity", "not_added"],
+      ]);
     });
 
     it("fetches an update's new pin at once on the first yes, and joins when it is switched to (A17)", async () => {
