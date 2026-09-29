@@ -53,6 +53,39 @@ interface NativeStopDeps {
   pollMs?: number;
 }
 
+/** How long a command waits for a connector that is still starting (a fresh start takes about a minute). */
+const STARTING_WAIT_MS = 90_000;
+
+/**
+ * A command that needs the running connector, run while it is still coming up
+ * (right after `start`, or after `agent add` restarted it), waits for it and
+ * says so once, instead of failing with "cannot reach the supervisor control
+ * socket" (the setup window ran `auth login` straight after `agent add`,
+ * WS1-167). A stopped service is not waited for: the command's own error says so.
+ */
+export async function waitWhileStarting(
+  input: { control: Pick<SupervisorControl, "call">; output: { line(text: string): void } },
+  deps: { running: () => Promise<boolean>; sleep: (ms: number) => Promise<void>; now: () => number; waitMs?: number },
+): Promise<void> {
+  const deadline = deps.now() + (deps.waitMs ?? STARTING_WAIT_MS);
+  let said = false;
+  for (;;) {
+    try {
+      await input.control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 });
+      return;
+    } catch (error) {
+      if (!(error instanceof RemoteInstanceError) || error.code !== "control_socket_unavailable") return;
+      if (deps.now() >= deadline || !await deps.running()) return;
+      if (!said) input.output.line("Konteks is still starting on this computer; waiting for it…");
+      said = true;
+      await deps.sleep(2_000);
+    }
+  }
+}
+
+/** Operations that act through the running connector, and so wait for one that is starting. */
+const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
+
 const productionNativeStopDeps: NativeStopDeps = {
   definition: serviceDefinition,
   execute,
@@ -546,6 +579,13 @@ export const nativeCliActions: NativeCliActions = {
   control: async input => {
     const record = await readNativeRecord(input.root);
     const context = { output: input.output, control: new SupervisorControl({ supervisorData: join(input.root, "supervisor") }, record.controlPort) };
+    if (WAITS_FOR_CONNECTOR.has(input.operation)) {
+      await waitWhileStarting(context, {
+        running: async () => await execute((await serviceDefinition(input.root)).status) === 0,
+        sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+        now: Date.now,
+      });
+    }
     switch (input.operation) {
       case "status": return status(context);
       case "agents": return agents(context);
