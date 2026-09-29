@@ -256,7 +256,7 @@ export interface ActivityTextOptions {
   continuesPath?: boolean;
 }
 
-const PATH_TOKEN_START = /^(?:\/(?!\/)|[A-Za-z]:(?:[\\/]|$)|\\\\)/;
+const PATH_TOKEN_START = /^(?:\/(?![\/*])|[A-Za-z]:(?:[\\/]|$)|\\\\)/;
 const TOKEN_DELIMITER = /[\s"'<>`)\]}=(]/;
 
 /**
@@ -279,7 +279,7 @@ export function continuesAtBoundary(previous: string | undefined): boolean {
 
 function publicText(value: string, workspaceRoot: string, startsAtBoundary: boolean, continuesPath: boolean): string {
   let text = redactText(value);
-  if (continuesPath) text = text.replace(/^[^\s"'<>`)\]}]+/, "[local-path]");
+  if (continuesPath) text = text.replace(/^(?=[\w.~\\/-])[^\s"'<>`)\]}*]+/, "[local-path]");
   // A chunk opening `:/…` or `:\…` continues a drive path whose letter was
   // emitted in the previous chunk. `://` is excluded because that is a URL
   // scheme, and a chunk ending exactly at the separator defers rather than
@@ -302,6 +302,9 @@ function publicText(value: string, workspaceRoot: string, startsAtBoundary: bool
   const out = probe
     .replace(/\b[A-Za-z]:[\\/][^\s"'<>`)\]}]+/g, "[local-path]")
     .replace(/\\\\[^\s"'<>`)\]}]+/g, "[local-path]")
-    .replace(/(^|[\s"'=(])\/(?!\/)[^\s"'<>`)\]}]+/g, "$1[local-path]");
+    // A path starts with a path character after the slash, and `*` is never
+    // part of one: `sudo ls /**` (a root slash and Markdown bold) is not a
+    // private path, and redacting it broke the bold (WS1-175).
+    .replace(/(^|[\s"'=(])\/(?!\/)(?=[\w.~-])[^\s"'<>`)\]}*]+/g, "$1[local-path]");
   return startsAtBoundary ? out : out.slice(1);
 }
