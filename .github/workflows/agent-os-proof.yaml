@@ -75,6 +75,19 @@ jobs:
           echo "os=$os" >> "$GITHUB_OUTPUT"
           echo "arch=$arch" >> "$GITHUB_OUTPUT"
 
+      # Ubuntu 24.04 enables a blanket AppArmor user-namespace restriction.
+      # Codex's own workspace sandbox is bubblewrap-based, so the ephemeral
+      # proof VM must allow that sandbox to start; otherwise the proof measures
+      # the runner image's AppArmor default rather than our approval boundary.
+      # This changes only the disposable CI machine and skips no assertion.
+      - name: Allow the native agent sandbox on the ephemeral Linux proof runner
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       # ── install the agent the way its own docs say ────────────────────────
       - name: Install Claude Code (its installer)
         if: matrix.agent == 'claude-code' && runner.os != 'Windows'
