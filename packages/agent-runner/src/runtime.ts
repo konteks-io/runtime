@@ -190,12 +190,20 @@ export class AgentRuntime {
     this.scopeStore = new AgentScopeStore(options.config.RUNNER_CREDENTIAL_DIR);
     this.availableCommands = new AvailableCommandsStore(join(options.config.RUNNER_CREDENTIAL_DIR, AVAILABLE_COMMANDS_FILE),
       this.host?.refusedPromptCommands?.commands ?? [], this.logger);
+    const codexGovernance = this.family.agentId === "codex" ? {
+      defaultSessionConfig: { mode: "read-only" } as const,
+      refusedModes: {
+        modeIds: ["agent", "agent-full-access"] as const,
+        message: "Codex runs in Ask for approval mode on Konteks so workspace policy decides every sensitive action.",
+      },
+    } : null;
     this.sessions = new SessionManager({
       bridge: () => this.bridge,
       ...(options.executionBridgeLimit ? { createBridge: (ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle, cwd) } : {}),
       ...(options.executionBridgeLimit ? { replaceBridge: (ref: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle, cwd) } : {}),
       ...(this.perWorkingCopy ? { beforePrompt: (bridge: BridgeProcess) => this.workingCopyBindings.get(bridge)?.beforePrompt() } : {}),
-      ...(this.host?.refusedSessionModes ? { refusedModes: this.host.refusedSessionModes } : {}),
+      ...(codexGovernance ? { defaultSessionConfig: codexGovernance.defaultSessionConfig, refusedModes: codexGovernance.refusedModes }
+        : this.host?.refusedSessionModes ? { refusedModes: this.host.refusedSessionModes } : {}),
       ...(this.host?.refusedPromptCommands ? { refusedPromptCommands: this.host.refusedPromptCommands } : {}),
       ...(this.host?.offersModel ? { modelAllowed: (value: string) => this.host!.offersModel!(value, this.hostSettings) } : {}),
       ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),

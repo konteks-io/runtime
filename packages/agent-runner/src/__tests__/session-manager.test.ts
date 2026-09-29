@@ -50,6 +50,27 @@ async function nextEvent(bus: RunnerEventBus, kind: RunnerEvent["kind"]): Promis
 }
 
 describe("session manager (D98 bootstrap)", () => {
+  it("applies the governed session baseline to create and live continuation", async () => {
+    const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(),
+      defaultSessionConfig: { mode: "read-only" }, refusedModes: { modeIds: ["agent", "agent-full-access"], message: "governed mode required" } });
+    const first = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    expect(calls.setSessionConfigOption).toContainEqual({ sessionId: "bridge-s1", configId: "mode", value: "read-only" });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    await manager.continueLive({ context: { ...context, assignmentId: "asg-2" }, cwd: "/w", mcpServers: [], acpSessionRef: first.acpSessionRef,
+      lifecycle: { beforeCreate: async () => undefined, recordProcessOwner: async () => undefined, assertCurrent: () => undefined } });
+    expect(calls.setSessionConfigOption).toEqual(expect.arrayContaining([
+      { sessionId: "bridge-s1", configId: "mode", value: "read-only" },
+      { sessionId: "bridge-s1", configId: "mode", value: "read-only" },
+    ]));
+    await expect(manager.restore({ context, cwd: "/w", mcpServers: [], sessionConfig: { mode: "agent" } }, "prior"))
+      .rejects.toThrow("governed mode required");
+  });
+
   it("hands a settled live ACP session to the next turn with fresh MCP authority", async () => {
     const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
     const events = new RunnerEventBus();

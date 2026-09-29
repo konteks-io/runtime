@@ -132,6 +132,11 @@ export interface SessionManagerOptions {
   logger?: Logger;
   /** Auth failures must invalidate a prior identity probe before new work is admitted. */
   onAuthRequired?: () => void;
+  /** Required session selections applied to new, restored and live-continued
+   * sessions before any caller selections (Codex: Konteks-governed approval
+   * mode). Callers may repeat the same value, but refusedModes prevents them
+   * from selecting a mode outside that boundary. */
+  defaultSessionConfig?: Readonly<Record<string, string>>;
   /**
    * Session modes this agent must never enter (OpenCode's `plan`): refused on
    * `set_mode`, on `set_config_option` for `mode` and in an admitted session
@@ -350,7 +355,7 @@ export class SessionManager {
   }
 
   async create(args: CreateSessionArgs): Promise<CreatedSession> {
-    args = { ...args, ...(args.sessionConfig ? { sessionConfig: { ...args.sessionConfig } } : {}) };
+    args = this.withDefaultSessionConfig(args);
     const ref = args.acpSessionRef ?? `acp-${randomUUID()}`;
     return this.createOwned(args, ref, args.acpSessionRef);
   }
@@ -359,7 +364,7 @@ export class SessionManager {
    * execution reference. The source ref remains fenced to its old generation;
    * only its private provider-session mapping is read. */
   async restore(args: CreateSessionArgs, sourceRef: string): Promise<CreatedSession> {
-    args = { ...args, ...(args.sessionConfig ? { sessionConfig: { ...args.sessionConfig } } : {}) };
+    args = this.withDefaultSessionConfig(args);
     return this.createOwned(args, `acp-${randomUUID()}`, sourceRef);
   }
 
@@ -640,6 +645,7 @@ export class SessionManager {
    * its generation fence, then refresh ACP MCP/config authority before ready.
    */
   async continueLive(args: CreateSessionArgs): Promise<CreatedSession> {
+    args = this.withDefaultSessionConfig(args);
     const ref = args.acpSessionRef;
     if (!ref) throw new RemoteInstanceError("recovery_required", "Live continuation requires its predecessor session reference.", { diagnostic: "continuation_reference_missing" });
     const record = this.sessions.get(ref);
@@ -962,6 +968,12 @@ export class SessionManager {
 
   private refusesMode(modeId: unknown): boolean {
     return typeof modeId === "string" && (this.options.refusedModes?.modeIds.includes(modeId) ?? false);
+  }
+
+  /** One immutable policy baseline for every provider-session entry path. */
+  private withDefaultSessionConfig(args: CreateSessionArgs): CreateSessionArgs {
+    const sessionConfig = { ...(this.options.defaultSessionConfig ?? {}), ...(args.sessionConfig ?? {}) };
+    return { ...args, ...(Object.keys(sessionConfig).length ? { sessionConfig } : {}) };
   }
 
   /** A mode this agent must never enter was named in an admitted session configuration. */
