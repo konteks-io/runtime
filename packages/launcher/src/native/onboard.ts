@@ -683,7 +683,27 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         await save({ step: "start", workspaceAnnounced: true });
         return { step: "start", note: `${announce}${progress}`, run: AGAIN };
       }
-      await (context.deps?.complete ?? completeNativeEnrollment)(context.root, identity);
+      // The unpacking process records the release, then still holds the
+      // installer's lock for a moment while it finishes: completing then
+      // met "Another connector owns this native data directory" and showed
+      // it to the person (pass 2, 09-29). Wait for it to let go; if it still
+      // has not, say it is finishing and come back.
+      const complete = context.deps?.complete ?? completeNativeEnrollment;
+      const lockDeadline = Date.now() + (staging.waitMs ?? STAGING_WAIT_MS);
+      for (;;) {
+        try {
+          await complete(context.root, identity);
+          break;
+        } catch (error) {
+          const busy = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message);
+          if (!busy) throw error;
+          if (Date.now() >= lockDeadline) {
+            await save({ step: "start", workspaceAnnounced: true });
+            return { step: "start", note: `${announce}This machine is finishing unpacking its agent packages; this takes a few more seconds.`, run: AGAIN };
+          }
+          await new Promise(resolveWait => setTimeout(resolveWait, Math.min(1_000, Math.max(10, (staging.waitMs ?? STAGING_WAIT_MS) / 10))));
+        }
+      }
       await save({
         step: "inspect",
         instanceId: identity.instanceId,

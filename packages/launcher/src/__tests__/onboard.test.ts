@@ -1548,6 +1548,27 @@ describe("onboard", () => {
     vi.restoreAllMocks();
   });
 
+  it("waits for the unpacking to let go of its lock instead of showing the person a lock error (pass 2, 09-29)", async () => {
+    await writeOnboardState(root, { step: "start", decision: "join", workspaceAnnounced: true } as never);
+    const { SupervisorStore } = await import("@konteks/remote-supervisor");
+    const { RemoteInstanceError: Refusal } = await import("@konteks/remote-common");
+    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-9", workspaceId: "acme" } as never);
+    const owned = () => new Refusal("temporarily_unavailable", "Another connector owns this native data directory.");
+    let calls = 0;
+    const complete = vi.fn(async () => { calls += 1; if (calls < 3) throw owned(); return {} as never; });
+    const staging = { status: async () => ({ state: "done" as const }), spawn: vi.fn(), waitMs: 50 };
+    const started = await step({ complete, staging });
+    expect(complete).toHaveBeenCalledTimes(3);
+    expect(started.run?.argv).toEqual(["konteks-remote", "start"]);
+    expect(started.note).not.toContain("owns this native data directory");
+    // Still held when the wait ends: it says it is finishing and comes back, never the lock's words.
+    await writeOnboardState(root, { step: "start", decision: "join", workspaceAnnounced: true } as never);
+    const stuck = await step({ complete: vi.fn(async () => { throw owned(); }), staging: { ...staging, waitMs: 5 } });
+    expect(stuck.note).toContain("finishing unpacking its agent packages");
+    expect(stuck.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
+    vi.restoreAllMocks();
+  });
+
   it("starts the unpacking again when it stopped, and says so", async () => {
     await writeOnboardState(root, { step: "start", decision: "join", workspaceAnnounced: true } as never);
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
