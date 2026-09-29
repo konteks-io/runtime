@@ -16,10 +16,16 @@ export function cancellationNamesAssignment(assignment: StartedAssignment, sessi
   return assignment.kind === "assistant_execution" && source.kind === "conversation" && source.sessionId === sessionId;
 }
 
-/** A delivery turn stops through the ordinary signed cancel: its session
- * closes and reports a cancelled terminal, which is Core's stop proof. */
+/**
+ * A turn that stops through the ordinary signed cancel (its session closes and
+ * reports a cancelled terminal, which is Core's stop proof): a
+ * delivery turn (WS2-159) and a direct session's turn. A direct turn that was
+ * only stopped for recovery never reported, and Core's cancel left it
+ * unsettled here, so every later prompt in that session was refused as
+ * waiting on its predecessor (WS1-172).
+ */
 export function isDeliveryCancellation(assignment: StartedAssignment): boolean {
-  return assignment.source.kind === "harness_delivery";
+  return assignment.source.kind === "harness_delivery" || assignment.source.kind === "direct_session";
 }
 
 export interface CapturedCancellationConnection {
