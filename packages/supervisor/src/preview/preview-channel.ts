@@ -108,9 +108,12 @@ export class PreviewChannel {
   /** Relay reset or retirement of the channel: drop its streams and its mux state. */
   closeChannel(channelId: string): void {
     const forwarder = this.forwarders.get(channelId);
-    if (!forwarder) return;
-    this.forwarders.delete(channelId);
-    forwarder.dispose();
+    if (forwarder) {
+      this.forwarders.delete(channelId);
+      forwarder.dispose();
+    }
+    // Its counts go even when no viewer reached this process yet: a reset
+    // that left them kept the channel out of step with Core (W1-Z7).
     this.deps.transport.closeChannel(channelId);
   }
 

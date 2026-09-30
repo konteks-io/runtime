@@ -507,8 +507,16 @@ export class Supervisor {
       persistRelayState: (state) => this.store.saveRelayState(state),
     });
     const relayState = await this.store.relayState();
-    if (relayState) this.mux.restoreDurableState(relayState, (channelId) => channelOf(channelId));
-    else this.mux.restoreCursors(await this.store.cursors(), (channelId) => channelOf(channelId));
+    // A preview stream never outlives the process that served it, and Core
+    // opens every preview grant counting from zero: counts kept from the last
+    // process made the new one drop Core's first requests as duplicates and
+    // answer out of sequence after an update (W1-Z7). They start fresh.
+    const durableChannelOf = (channelId: string) => {
+      const channel = channelOf(channelId);
+      return channel === "preview" ? null : channel;
+    };
+    if (relayState) this.mux.restoreDurableState(relayState, durableChannelOf);
+    else this.mux.restoreCursors(await this.store.cursors(), durableChannelOf);
     if (this.instanceId) this.openCoreChannels(this.instanceId);
 
     const verifier = new CoreSignatureVerifier(this.roots);
