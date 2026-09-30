@@ -54,7 +54,7 @@ describe("onboard", () => {
       ...(answer !== undefined ? { answer } : {}),
       // No test reaches a real Core: a lookup nobody stubbed fails fast.
       // Nor the person's own OpenCode on this machine.
-      deps: { waitForReady: readyService, fetchFn: offline as never, openCodeProblem: async () => null, personalOpenCode: async () => false, ...extra },
+      deps: { waitForReady: readyService, fetchFn: offline as never, openCodeProblem: async () => null, dshProblem: async () => null, personalOpenCode: async () => false, ...extra },
     });
 
   it("asks for the email in its very first response on a machine that is not connected", async () => {
@@ -1247,6 +1247,10 @@ describe("onboard", () => {
     const v1 = "OpenCode 1 is not supported (found 1.18.33): install OpenCode 2 with `curl -fsSL https://opencode.ai/v2/install | bash`, then add it here: konteks-remote agent add opencode";
     const old = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }), openCodeProblem: async () => v1 });
     expect(old.done?.remedies).toContain(v1);
+    // An unsupported DeepSeek Harness here: named too, with a supported one's install command (W1-D4).
+    const dshOld = "DeepSeek Harness 0.1.3-alpha.2 is not a version Konteks supports (0.1.5-rc.3 up to, but not including, 0.1.8). Install it with `npm install -g @deepseek-ai/dsh@0.1.7-rc.2`, then add it here: konteks-remote agent add dsh";
+    const oldDsh = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }), dshProblem: async () => dshOld });
+    expect(oldDsh.done?.remedies).toContain(dshOld);
     // Nobody with another agent and no OpenCode is told to install it.
     const without = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }) });
     expect(JSON.stringify(without.done)).not.toContain("OpenCode");

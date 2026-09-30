@@ -76,6 +76,7 @@ export interface OnboardContext {
     recordedAgents?: (root: string) => Promise<string[] | null>;
     /** An OpenCode found here that cannot run (OpenCode 1): the remedy line, or null. */
     openCodeProblem?: () => Promise<string | null>;
+    dshProblem?: () => Promise<string | null>;
     /** Whether the person's own OpenCode holds sign-ins (existence only), for `auth login opencode --reuse`. */
     personalOpenCode?: () => Promise<boolean>;
     /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
@@ -198,6 +199,20 @@ export async function detectOpenCodeProblem(): Promise<string | null> {
   return locateNativeOpenCode().then(() => null, (error: unknown) => {
     if (!(error instanceof RemoteInstanceError) || error.diagnostic !== "opencode_unsupported_version") return null;
     return error.message.replace(/,? then retry\.$/, ", then add it here: konteks-remote agent add opencode");
+  });
+}
+
+/**
+ * A DeepSeek Harness here that Konteks cannot run, named with the command that
+ * installs one it can (W1-D4). Onboarding named an unsupported OpenCode but
+ * said nothing about an unsupported DeepSeek Harness, the person's other own
+ * install.
+ */
+export async function detectDshProblem(): Promise<string | null> {
+  const { resolveNativeDshInstallation } = await import("@konteks/remote-supervisor");
+  return resolveNativeDshInstallation().then(() => null, (error: unknown) => {
+    if (!(error instanceof RemoteInstanceError) || error.diagnostic !== "dsh_unsupported_version") return null;
+    return error.message.replace(/,? then retry\.$/, ", then add it here: konteks-remote agent add dsh");
   });
 }
 
@@ -1442,6 +1457,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         remedies.push(reuse
           ? `${agentName("opencode")} needs a sign-in, starting from the providers your own OpenCode uses: konteks-remote auth login opencode --reuse`
           : `${agentName("opencode")} needs a subscription or an API key: konteks-remote auth login opencode`);
+      }
+      // An unsupported DeepSeek Harness found here is named with a supported one's install command.
+      if (!installed.includes("dsh")) {
+        const problem = await (context.deps?.dshProblem ?? detectDshProblem)().catch(() => null);
+        if (problem) remedies.push(problem);
       }
       // An OpenCode 1 found here is named with OpenCode 2's install command.
       if (!installed.includes("opencode")) {
