@@ -225,9 +225,22 @@ export class NativeEnrollment {
   }
 
   async refreshOwnerToken(instanceId: string): Promise<OwnerTokenGrant> {
-    return this.withKey(key =>
-      this.post(ENROLLMENT_PATHS.token, { instanceId }, key, "enrollment_token", instanceId, OwnerTokenSchema),
-    );
+    const refresh = (key: { privateKey: unknown; publicKeyJwk: unknown }) =>
+      this.post(ENROLLMENT_PATHS.token, { instanceId }, key, "enrollment_token", instanceId, OwnerTokenSchema);
+    try {
+      return await this.withKey(refresh);
+    } catch (error) {
+      // A running connector owns the data directory. Refreshing the person's
+      // token changes nothing there; it only signs with the machine key that
+      // already exists, so read that key without the lock (09-30: every
+      // onboarding step after the token's first few minutes failed with
+      // "Another connector owns this native data directory" while the
+      // connector ran, looping on the System question).
+      if (!(error instanceof RemoteInstanceError) || !/owns this native data directory/.test(error.message)) throw error;
+      const key = await new SupervisorStore(this.options.dataDir).loadInstanceKey();
+      if (!key) throw error;
+      return refresh(key as never);
+    }
   }
 
   private async post<T>(
