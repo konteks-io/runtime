@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename } from "node:fs/promises";
 import { agentName } from "./agent-name.js";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -601,6 +601,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
     }
 
     case "start": {
+      const timing: Record<string, number> = {};
+      let mark = Date.now();
+      const phase = (name: string) => { const now = Date.now(); timing[name] = now - mark; mark = now; };
       // A bind that answered but whose record never got written is resumed
       // from the identity on disk rather than asked of Core again.
       const store = new SupervisorStore(supervisorData);
@@ -716,6 +719,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         });
         identity = bound.identity;
       }
+      phase("bind");
       const joinedName = workspaceName(state, identity.workspaceId);
       // A join was already said ("This machine will join X.", "Joining X.")
       // and "is now X's runtime" below says it once more; only a new
@@ -737,6 +741,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         await new Promise(resolveWait => setTimeout(resolveWait, Math.min(2_000, staging.waitMs ?? 2_000)));
         unpacked = await staging.status(context.root);
       }
+      phase("unpacking");
       if (unpacked.state !== "done") {
         let progress: string;
         if (unpacked.state === "running") {
@@ -764,6 +769,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       for (;;) {
         try {
           await complete(context.root, identity);
+          phase("complete");
+          await logStepTiming(context.root, "start", timing);
           break;
         } catch (error) {
           const busy = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message);
@@ -1717,4 +1724,14 @@ export async function onboardCoreUrl(root: string): Promise<string | undefined> 
   if (prepared && typeof prepared.coreUrl === "string") return prepared.coreUrl;
   const record = await readNativeRecord(root).catch(() => null);
   return record?.coreUrl;
+}
+
+/**
+ * One line per slow step, in the connector's own log folder: a join sat 98 s
+ * after "This machine will join …" with nothing to say where (W1-E1).
+ */
+async function logStepTiming(root: string, step: string, phases: Record<string, number>): Promise<void> {
+  const line = JSON.stringify({ at: new Date().toISOString(), step, ms: phases }) + "\n";
+  await mkdir(join(root, "logs"), { recursive: true, mode: 0o700 }).catch(() => undefined);
+  await appendFile(join(root, "logs", "onboard-timing.log"), line, { mode: 0o600 }).catch(() => undefined);
 }
