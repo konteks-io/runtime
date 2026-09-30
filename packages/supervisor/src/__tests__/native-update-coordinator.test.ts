@@ -110,6 +110,17 @@ describe("native update coordinator", () => {
     broken.launch.mockRejectedValueOnce(new Error("spawn EACCES"));
     await expect(broken.c.apply("operator")).rejects.toMatchObject({ code: "temporarily_unavailable" });
     expect(broken.c.status().lastError).toBe("spawn EACCES");
+    // A launch failure is not a channel failure: doctor's channel line stays clean.
+    expect(broken.c.channel().error).toBeNull();
+  });
+
+  it("remembers the channel's own read failure for doctor, and clears it on the next good read", async () => {
+    const { c, fetchManifest } = coordinator({ manifest: "newer" });
+    fetchManifest.mockRejectedValueOnce(new Error("The native release channel could not be read"));
+    await c.check();
+    expect(c.channel()).toMatchObject({ error: "The native release channel could not be read", available: null, lastCheckedAt: expect.any(String) });
+    await c.check();
+    expect(c.channel()).toMatchObject({ error: null, available: expect.any(String) });
   });
   it("clears its in-flight view when the launched transaction exits without replacing this process", async () => {
     let exit: ((code: number | null) => void) | undefined;

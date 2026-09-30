@@ -49,6 +49,23 @@ export interface DoctorInputs {
    * its sessions get the QA browser. Never a path, the project or a secret.
    */
   antigravity?: AntigravityDoctorInputs;
+  /**
+   * The release channel the unattended update reads: its host, whether a
+   * `KONTEKS_RELEASE_MANIFEST_URL` override replaces the public channel, and the
+   * last check's time, error and newer release (RCA 2026-09-30: a leftover
+   * override pointed a real connector at a dead local channel and only
+   * `update --check` said so).
+   */
+  updateChannel?: { host: string; override: boolean; lastCheckedAt: string | null; lastError: string | null; available: string | null };
+}
+
+function updateChannelCheck(channel: NonNullable<DoctorInputs["updateChannel"]>): Omit<DoctorCheck, "recoveryActions"> & { recoveryActions?: DoctorCheck["recoveryActions"] } {
+  const base = { id: "update-channel", title: "Release channel" };
+  const where = channel.override ? `override ${channel.host} (KONTEKS_RELEASE_MANIFEST_URL)` : channel.host;
+  if (channel.lastError) return { ...base, status: "fail", detail: `${where} could not be read: ${channel.lastError}; updates cannot arrive${channel.override ? ". Remove the override from this computer's service environment" : ""}`.slice(0, 1_024), recoveryActions: [{ kind: "run_doctor" }] };
+  if (channel.override) return { ...base, status: "warn", detail: `${where} replaces the public channel; updates come only from there` };
+  if (!channel.lastCheckedAt) return { ...base, status: "pass", detail: `${where}; not checked yet` };
+  return { ...base, status: "pass", detail: `${where}, checked ${channel.lastCheckedAt}${channel.available ? `; ${channel.available} available` : "; nothing newer"}` };
 }
 
 export interface AntigravityDoctorInputs {
@@ -237,6 +254,7 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   }
   if (inputs.openCode) push(openCodeCheck(inputs.openCode));
   if (inputs.antigravity) push(antigravityCheck(inputs.antigravity));
+  if (inputs.updateChannel) push(updateChannelCheck(inputs.updateChannel));
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };
 }

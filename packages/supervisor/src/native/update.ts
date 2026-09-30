@@ -48,6 +48,8 @@ export class NativeUpdateCoordinator {
   private available: { bundleVersion: string; manifestDigest: string } | null = null;
   private lastCheckedAt: string | null = null;
   private lastError: string | null = null;
+  /** The last channel read's failure only (never a launch failure), for `doctor`. */
+  private channelError: string | null = null;
   private inFlight: NonNullable<NativeUpdateStatus["inFlight"]> | null = null;
   private lastAttempt: NativeUpdateStatus["lastAttempt"] = null;
   private timer: NodeJS.Timeout | null = null;
@@ -90,14 +92,21 @@ export class NativeUpdateCoordinator {
       const newer = compareSemver(release.manifest.bundleVersion, this.options.currentBundleVersion) > 0;
       this.available = newer ? { bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest } : null;
       this.lastError = null;
+      this.channelError = null;
     } catch (error) {
       this.available = null;
       this.lastError = error instanceof Error ? error.message.slice(0, 1_024) : "manifest check failed";
+      this.channelError = this.lastError;
       this.options.logger.warn({ err: error }, "native update check failed");
     }
     this.lastCheckedAt = new Date(this.now()).toISOString();
     await this.refreshLedgerView();
     return this.status();
+  }
+
+  /** The release channel's last read, for `doctor`: when, and why it failed (null when it was read). */
+  channel(): { lastCheckedAt: string | null; error: string | null; available: string | null } {
+    return { lastCheckedAt: this.lastCheckedAt, error: this.channelError, available: this.available?.bundleVersion ?? null };
   }
 
   status(): NativeUpdateStatus {

@@ -33,7 +33,7 @@ import {
   type RuntimeAgentLoginDeliveryRequest,
   coreContractAtLeast,
 } from "@konteks/remote-common";
-import { EmbeddedReleaseRootSchema, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EmbeddedReleaseRootSchema, NATIVE_MANIFEST_URL, nativeManifestUrl, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { chromeInstalled, readAntigravityAdminObservation, type RunnerConfig } from "@konteks/remote-agent-runner";
 import type { NativeRuntimeRecord, NativeUnavailableAgent } from "./native/installation.js";
 import { SignalSampler } from "@konteks/remote-sysmon";
@@ -2378,7 +2378,23 @@ export class Supervisor {
       browser: this.browserReport(),
       ...(openCode ? { openCode } : {}),
       ...(antigravity ? { antigravity } : {}),
+      ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
     });
+  }
+
+  /** The unattended update's channel for `doctor`: host only, never the full URL. */
+  private updateChannelReport(): NonNullable<Parameters<typeof runDoctor>[0]["updateChannel"]> {
+    const update = this.updates!.channel();
+    let host: string;
+    let override = false;
+    try {
+      const url = new URL(nativeManifestUrl(process.env));
+      host = url.host;
+      override = url.toString() !== NATIVE_MANIFEST_URL;
+    } catch (error) {
+      return { host: "(invalid override)", override: true, lastCheckedAt: update.lastCheckedAt, lastError: error instanceof Error ? error.message : String(error), available: null };
+    }
+    return { host, override, lastCheckedAt: update.lastCheckedAt, lastError: update.error, available: update.available };
   }
 
   /** The Google Antigravity doctor line's facts, when this installation lists it (running, updating, retried or given up). */
