@@ -303,7 +303,11 @@ export async function commitFirstFiles(input: {
     const block = ["# Left out of the first commit by Konteks onboarding", ...missing].join("\n");
     await writeFile(ignore, `${current}${current && !current.endsWith("\n") ? "\n" : ""}${block}\n`);
   }
-  const paths = [...new Set([...input.plan.include, ".gitignore"])];
+  // A folder with nothing left out may have no .gitignore at all: naming it
+  // anyway failed the whole push with "pathspec '.gitignore' did not match
+  // any files" (W1-E1, a folder holding only a README).
+  const hasIgnore = missing.length > 0 || current !== "";
+  const paths = [...new Set([...input.plan.include, ...(hasIgnore ? [".gitignore"] : [])])];
   const added = await git(input.path, ["add", "--", ...paths], 60_000);
   if (added.code !== 0) return { ok: false, message: `Your files could not be added${reason(added)}.` };
   const committed = await git(input.path, [
