@@ -109,7 +109,7 @@ import { PlanningTerminalDirectiveProcessor } from "./work/planning-terminal-dir
 import { ControllerDirectivePoller } from "./work/controller-directive-poller.js";
 import { DurableSearchAssignmentCarrier } from "./work/search-assignment-carrier.js";
 import { NativeUpdateCoordinator, type NativeUpdateCoordinatorOptions } from "./native/update.js";
-import { evaluateHeartbeatLiveness } from "./heartbeat/liveness.js";
+import { evaluateHeartbeatLiveness, isCredentialRefusal, leaseLapseNeedsRestart } from "./heartbeat/liveness.js";
 
 /**
  * The composition root: wires state, transport, heartbeat, control, work,
@@ -140,6 +140,13 @@ const ON_COMPUTER_POLL_MS = 5_000;
 /** A turn's start or end is told to Core this soon, not at the next 30 s heartbeat (WS1-179). */
 const TURN_ACTIVITY_HEARTBEAT_MS = 500;
 const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
+/**
+ * How long Core may keep refusing this runtime's lapsed lease (Core answers,
+ * the lease is gone) before the service restarts into its startup reconnect,
+ * which proves the machine key and gets a fresh lease. Nothing renewed a lapsed
+ * lease in a running process (RCA 2026-09-30: offline 13 h, then 6 h).
+ */
+const LEASE_LAPSE_RESTART_MS = 2 * 60_000;
 
 export interface SupervisorOptions {
   /** Native only: called once when no heartbeat has been attempted for longer
@@ -286,6 +293,8 @@ export class Supervisor {
   private livenessTimer: NodeJS.Timeout | null = null;
   private livenessWatchingSince: number | null = null;
   private livenessQuietWarned = false;
+  /** Since when Core has refused this runtime's credential (401/403) without a success in between. */
+  private leaseRefusedSince: number | null = null;
   private pendingHeartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeLogins = new Map<string, { agentId: string; emit: (event: ControlLoginEvent) => void }>();
   /** Site-started steps waiting on the person at a window on this computer, by login id. */
@@ -1174,8 +1183,12 @@ export class Supervisor {
         await this.executionRevisionFenceReceipts.flush();
         if (this.stopping) return;
         const desired = await this.core.fetchDesiredConfiguration(this.instanceId!);
+        this.leaseRefusedSince = null;
         if (!this.stopping) await this.control.handle(desired);
       } catch (error) {
+        // Core answered and refused the credential: the lapsed-lease signal the
+        // liveness watchdog acts on. An unreachable Core is not a refusal.
+        if (isCredentialRefusal(error)) this.leaseRefusedSince ??= Date.now();
         this.logger.warn({ err: error }, "configuration refresh failed; retaining last applied policy");
       }
     })().finally(() => { this.configurationRefresh = null; });
@@ -1276,6 +1289,11 @@ export class Supervisor {
     return operation;
   }
 
+  private leaseLapseNeedsRestart(): boolean {
+    return leaseLapseNeedsRestart({ now: Date.now(), stopping: this.stopping, activeLoopStarted: this.activeLoopStarted, refusedSince: this.leaseRefusedSince,
+      leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus, thresholdMs: LEASE_LAPSE_RESTART_MS });
+  }
+
   /** From the first recovery cycle on, some heartbeat (pending or ordinary) is
    * always due. When none has even been attempted for longer than the
    * publisher's budget, every loop is stuck behind one promise; say so with
@@ -1285,6 +1303,15 @@ export class Supervisor {
     this.livenessWatchingSince = Date.now();
     this.livenessTimer = setInterval(() => {
       if (this.stopping || !this.livenessTimer) return;
+      if (this.leaseLapseNeedsRestart()) {
+        clearInterval(this.livenessTimer);
+        this.livenessTimer = null;
+        const detail = { reason: "lease_lapsed", leaseMode: this.lease.mode(), leaseExpiresAt: this.lease.current()?.expiresAt ?? null,
+          refusedForMs: Date.now() - (this.leaseRefusedSince ?? Date.now()), administrativeStatus: this.administrativeStatus };
+        this.logger.error(detail, "the lease lapsed and Core refuses it; restarting to reconnect with this machine's key");
+        this.options.onLivenessLost?.(detail);
+        return;
+      }
       const budgetMs = Math.max(LIVENESS_MIN_BUDGET_MS, this.heartbeat.livenessBudgetMs());
       const liveness = this.heartbeat.liveness();
       const verdict = evaluateHeartbeatLiveness({ now: Date.now(), watchingSince: this.livenessWatchingSince ?? Date.now(), liveness, budgetMs });
