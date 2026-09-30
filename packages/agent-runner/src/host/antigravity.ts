@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile, rm, stat } from "node:fs/promises";
 import { isAbsolute, posix, win32 } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -353,6 +354,17 @@ export function verifyAntigravitySession(response: { configOptions?: unknown; mo
  * (CP3) expects these lines.
  */
 export function antigravityStderrFailure(line: string, credentialDir?: string): RemoteInstanceError | null {
+  // The organisation dropped the Konteks servers this session asked for: no
+  // Konteks tool can run in it, so it ends now as an access error instead of
+  // a turn that cannot read its own discussion (WS1-196). The observation is
+  // written before this returns, so the identity read that follows sees it.
+  const dropped = MCP_DROPPED.exec(line);
+  if (dropped && Number(dropped[1]) > 0) {
+    if (credentialDir !== undefined) {
+      try { recordMcpServersOff(credentialDir, new Date()); } catch { /* doctor and readiness then miss it; the session still ends */ }
+    }
+    return new RemoteInstanceError("agent_unavailable", ANTIGRAVITY_MCP_SERVERS_OFF, { diagnostic: "antigravity_mcp_servers_off" });
+  }
   if (credentialDir !== undefined) void observeAntigravityAdminLine(line, credentialDir).catch(() => undefined);
   const auth = (message: string, diagnostic: string) => new RemoteInstanceError("agent_auth_required", message, { diagnostic, recoveryActions: [{ kind: "login_agent", agentId: "antigravity" }] });
   if (/has no available license/i.test(line)) {
@@ -372,14 +384,25 @@ export function antigravityStderrFailure(line: string, credentialDir?: string): 
  * logs "Admin MCP control active: dropping N client-requested custom MCP
  * server(s)" when it drops the servers a session asked for (every Konteks
  * session asks for `konteks-result` at least), or an allowlist that leaves
- * ours out. Then Konteks tools are unavailable and results come back through
- * the fenced fallback; doctor says so. An allowlist that keeps ours, a new
- * Gemini Enterprise sign-in or a sign-out clears it. Never a secret, never
+ * ours out. Then no Konteks tool can run: the session ends at once
+ * (`antigravityStderrFailure`), Antigravity reads unavailable with "contact
+ * your provider's admin" until it clears, and doctor says so. An allowlist
+ * that keeps ours, a new Gemini Enterprise sign-in or a sign-out clears it. Never a secret, never
  * the project.
  */
 export interface AntigravityAdminObservation {
   /** When a session last had the Konteks MCP servers dropped by the organisation's settings. */
   mcpServersOffAt: string;
+}
+
+/** Why an Antigravity session on Gemini Enterprise cannot run Konteks work while the organisation's MCP Servers setting is off. */
+export const ANTIGRAVITY_MCP_SERVERS_OFF = "Google Antigravity cannot use Konteks tools: MCP Servers is turned off in your Gemini Enterprise settings. Ask your admin to turn it on, or pick another agent in Customize → Models.";
+
+function recordMcpServersOff(credentialDir: string, at: Date): void {
+  const paths = antigravityRuntimePaths(credentialDir);
+  mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+  writeFileSync(paths.adminControls, `${JSON.stringify({ mcpServersOffAt: at.toISOString() } satisfies AntigravityAdminObservation)}\n`, { mode: 0o600 });
+  chmodSync(paths.adminControls, 0o600);
 }
 
 const MCP_DROPPED = /Admin MCP control active: dropping (\d+) client-requested custom MCP server/i;

@@ -34,6 +34,7 @@ import {
   renderAntigravitySettings,
   writeAntigravitySignIn,
   clearAntigravityAdminObservation,
+  readAntigravityAdminObservation,
   type AntigravitySignIn,
 } from "../host/antigravity.js";
 import type { LoginEvent, LoginFailureReason, LoginFlow } from "./login-flow.js";
@@ -528,7 +529,7 @@ export function antigravityActiveSignIn(held: AntigravityHeld): "gemini-api-key"
  * location and tier. Nothing ready: signed out, so readiness reads
  * `not_configured` with `login_locally`.
  */
-export async function antigravityIdentity(credentialDir: string, settings: Pick<HostAgentSettings, "coreAcceptsRouteBilling">): Promise<{ kind: "signal"; fingerprint: string; credentials: ConnectedAgentCredential[]; tokenUsageObservable: boolean } | { kind: "logged_out"; credentials: ConnectedAgentCredential[] }> {
+export async function antigravityIdentity(credentialDir: string, settings: Pick<HostAgentSettings, "coreAcceptsRouteBilling">): Promise<{ kind: "signal"; fingerprint: string; credentials: ConnectedAgentCredential[]; tokenUsageObservable: boolean; providerAdminBlocked?: boolean } | { kind: "logged_out"; credentials: ConnectedAgentCredential[] }> {
   const held = await antigravityHeld(credentialDir);
   const credentials = antigravityCredentialViews(held, settings);
   const active = antigravityActiveSignIn(held);
@@ -537,7 +538,10 @@ export async function antigravityIdentity(credentialDir: string, settings: Pick<
     ? "antigravity\ngemini-api-key"
     : `antigravity\noauth-business\n${held.record!.gcp!.project}\n${held.record!.gcp!.location}\n${held.record!.tier ?? ""}`;
   const key = await readOrCreateSecretFile({ bytes: 32, dataDir: credentialDir, encoding: "base64url", fileName: FINGERPRINT_KEY_FILE });
-  return { kind: "signal", fingerprint: keyedFingerprint(Buffer.from(key, "base64url"), material), credentials, tokenUsageObservable: active === "gemini-api-key" };
+  // The organisation's MCP Servers setting governs Gemini Enterprise only; a
+  // Gemini API key is not held back by it.
+  const blocked = active === "oauth-business" && await readAntigravityAdminObservation(credentialDir) !== null;
+  return { kind: "signal", fingerprint: keyedFingerprint(Buffer.from(key, "base64url"), material), credentials, tokenUsageObservable: active === "gemini-api-key", ...(blocked ? { providerAdminBlocked: true } : {}) };
 }
 
 // ── Sign-out ──────────────────────────────────────────────────────────────────

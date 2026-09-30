@@ -149,7 +149,10 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
         const exhausted = !retryable || attempt === 4;
         logger.warn({ agentId: options.spec.family.agentId, attempt, maxAttempts: 4, timeoutMs, stopConfirmed,
           retryable, exhausted, errorClass: classified.class,
-          errorCode: error instanceof RemoteInstanceError ? error.code : "model_discovery_failed" },
+          errorCode: error instanceof RemoteInstanceError ? error.code : "model_discovery_failed",
+          // What the agent said, so a failure that repeats can be told apart
+          // (WS1-216: Codex failed as "internal" every five minutes, unexplained).
+          acpCode: classified.code, reason: logReason(classified.message) },
         "ACP model capability discovery attempt failed");
         if (exhausted) {
           if (error instanceof RemoteInstanceError) throw error;
@@ -169,6 +172,12 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+}
+
+/** One line of an agent's error for the log: bounded, control characters and home folders taken out. */
+function logReason(message: string): string {
+  return [...message].filter(char => !isControl(char.codePointAt(0) ?? 0)).join("")
+    .replace(/\/(?:Users|home)\/[^/\s]+/g, "~").slice(0, 200);
 }
 
 function isControl(code: number): boolean {

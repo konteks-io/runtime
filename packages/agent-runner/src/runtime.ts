@@ -143,6 +143,8 @@ export class AgentRuntime {
   private lastProbeAt: string | null = null;
   private activeLogin: LoginFlow | null = null;
   private authRequired = false;
+  /** The provider's admin keeps Konteks tools out (the last identity probe said so). */
+  private providerAdminBlocked = false;
   /** ACP exposes model choices only through session/new. Cache the immutable
    * capability by authenticated identity for this runtime lifetime so status
    * polling cannot create a visible Codex thread on every refresh. */
@@ -402,7 +404,7 @@ export class AgentRuntime {
         return ownerPersistence;
       },
       ...(this.options.executionSpawnProcess ? { spawnProcess: this.options.executionSpawnProcess } : {}),
-      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line, this.options.config) } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.readStderrFailure(line) } : {}),
       // Callback authority is the initialized process object, which a later
       // reference reuses as-is: the session manager resolves every update,
       // permission, elicitation and exit to the sessions bound to exactly it.
@@ -766,6 +768,7 @@ export class AgentRuntime {
       bridgeVersionCompatible: true,
       ...(this.hostVersion() === undefined ? {} : { hostAgentVersion: this.hostVersion()! }),
       ...(this.tokenUsageObservable === undefined ? {} : { tokenUsageObservable: this.tokenUsageObservable }),
+      ...(this.providerAdminBlocked && !this.authRequired ? { providerAdminBlocked: true } : {}),
       // Only to a Core that takes 7.1 fields: an older Core's heartbeat is strict.
       ...(this.hostSettings.coreAcceptsRouteBilling && this.availableCommands.current() ? { availableCommands: this.availableCommands.current()! } : {}),
       lastProbeAt: this.lastProbeAt,
@@ -783,6 +786,31 @@ export class AgentRuntime {
 
   utilization(): { activeSessions: number; activeTurns: number } {
     return { activeSessions: this.sessions.activeSessions, activeTurns: this.sessions.activeTurns };
+  }
+
+  /**
+   * A host agent's stderr line that ends a session or a discovery at once (a
+   * sign-in it needs, an admin setting that keeps Konteks tools out): the
+   * identity is read again so readiness says so, not just the one failure.
+   */
+  private readStderrFailure(line: string): RemoteInstanceError | null {
+    const failure = this.host!.stderrFailure!(line, this.options.config);
+    if (failure && this.host?.identity && !this.stopping) void this.probe(false).catch(() => undefined);
+    return failure;
+  }
+
+  /**
+   * A discovery that failed for good may mean the agent's sign-in went away
+   * outside Konteks (its home cleared, a token revoked): read the identity
+   * again, so readiness stops saying ready while nothing can run (WS1-216).
+   */
+  private afterDiscoveryFailure(error: unknown): void {
+    if (this.stopping) return;
+    if (classifyBridgeError(error).class === "agent_auth_required") {
+      this.authRequired = true;
+      this.publishReadiness();
+    }
+    void this.probe(false).catch(() => undefined);
   }
 
   async discoverModelCapability(configId: string): Promise<DiscoveredBridgeModelCapability> {
@@ -816,7 +844,7 @@ export class AgentRuntime {
       ...(this.options.retryRandom ? { retryRandom: this.options.retryRandom } : {}),
       spawn: this.spawnProcess,
       ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
-      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.host!.stderrFailure!(line, this.options.config) } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.readStderrFailure(line) } : {}),
     };
     // The periodic probe used to spawn and initialize its own throwaway
     // process. An idle resident bridge answers the same `session/new` without
@@ -854,7 +882,10 @@ export class AgentRuntime {
       return offers ? offerableModelCapability(capability, value => offers(value, this.hostSettings), this.family) : capability;
     }
     catch (error) {
-      if (this.modelCapabilities.get(cacheKey)?.pending === pending) this.modelCapabilities.delete(cacheKey);
+      if (this.modelCapabilities.get(cacheKey)?.pending === pending) {
+        this.modelCapabilities.delete(cacheKey);
+        this.afterDiscoveryFailure(error);
+      }
       throw error;
     }
   }
@@ -1054,6 +1085,7 @@ export class AgentRuntime {
     this.identity = result.kind;
     if (result.kind !== "no_official_signal" && result.credentials !== undefined) this.credentials = result.credentials;
     if (this.host?.identity) this.tokenUsageObservable = result.kind === "signal" ? result.tokenUsageObservable : undefined;
+    this.providerAdminBlocked = result.kind === "signal" && result.providerAdminBlocked === true;
     if (isLogin && (result.kind === "signal" || result.kind === "no_official_signal")) this.authRequired = false;
     const at = this.now().toISOString();
     this.lastProbeAt = at;

@@ -14,6 +14,7 @@ import {
   readAntigravityApiKey, startAntigravityLogin, writeAntigravityApiKey, type GoogleSignInProcess,
 } from "../auth/antigravity-auth.js";
 import {
+  antigravityStderrFailure,
   antigravityProcessEnvironment, antigravityRunnerAdapter, antigravityRuntimePaths, antigravitySpawn, antigravityTokenFiles, prepareAntigravityHome, readAntigravitySignIn,
   setAntigravityRelayUpstreamForTests, writeAntigravitySignIn,
 } from "../host/antigravity.js";
@@ -202,6 +203,11 @@ describe("Gemini Enterprise (machine-browser sign-in over ACP)", () => {
     const identity = await antigravityIdentity(t.credentialDir, CORE_7_1);
     expect(identity).toMatchObject({ kind: "signal", tokenUsageObservable: false,
       credentials: [{ providerId: "google", label: "Gemini Enterprise Plus", kind: "sign_in", method: "oauth-business", billing: "subscription", state: "ready" }] });
+    expect(identity).not.toHaveProperty("providerAdminBlocked");
+    // A session that saw the organisation drop the Konteks servers: signed in,
+    // but held back until MCP Servers is on (WS1-196).
+    antigravityStderrFailure("I0929 server.py:2900] Admin MCP control active: dropping 2 client-requested custom MCP server(s) for this session.", t.credentialDir);
+    expect(await antigravityIdentity(t.credentialDir, CORE_7_1)).toMatchObject({ kind: "signal", providerAdminBlocked: true });
   });
 
   it("started from the site with the project and location, asks nothing on this machine", async () => {

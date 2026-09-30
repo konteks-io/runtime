@@ -366,9 +366,16 @@ describe("the organisation's MCP Servers setting as a Gemini Enterprise session 
       expect(await readAntigravityAdminObservation(credentialDir)).not.toBeNull();
       await clearAntigravityAdminObservation(credentialDir);
       expect(await readAntigravityAdminObservation(credentialDir)).toBeNull();
-      // Read from every execution process's stderr, beside the licence lines.
-      expect(stderrFailure("I0929 server.py:2900] Admin MCP control active: dropping 4 client-requested custom MCP server(s) for this session.", credentialDir)).toBeNull();
-      await vi.waitFor(async () => expect(await readAntigravityAdminObservation(credentialDir)).not.toBeNull());
+      // Read from every execution process's stderr, beside the licence lines:
+      // dropped servers end the session at once as an access error, recorded
+      // before it returns so the identity read that follows sees it (WS1-196).
+      expect(stderrFailure("I0929 server.py:2900] Admin MCP control active: dropping 4 client-requested custom MCP server(s) for this session.", credentialDir))
+        .toMatchObject({ code: "agent_unavailable", diagnostic: "antigravity_mcp_servers_off", message: expect.stringContaining("MCP Servers is turned off") });
+      expect(await readAntigravityAdminObservation(credentialDir)).not.toBeNull();
+      expect(((await stat(join(credentialDir, "antigravity", "admin-controls.json"))).mode & 0o077)).toBe(0);
+      await clearAntigravityAdminObservation(credentialDir);
+      expect(stderrFailure("I0929 server.py:2900] Admin MCP control active: dropping 0 client-requested custom MCP server(s) for this session.", credentialDir)).toBeNull();
+      expect(await readAntigravityAdminObservation(credentialDir)).toBeNull();
     } finally {
       await rm(credentialDir, { recursive: true, force: true });
     }
