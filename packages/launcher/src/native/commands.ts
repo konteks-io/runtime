@@ -587,7 +587,17 @@ export const nativeCliActions: NativeCliActions = {
       });
     }
     switch (input.operation) {
-      case "status": return status(context);
+      case "status": {
+        try {
+          return await status(context);
+        } catch (error) {
+          // A stopped connector is an answer, not an error (09-30).
+          if (!(error instanceof RemoteInstanceError) || error.code !== "control_socket_unavailable") throw error;
+          if (await execute((await serviceDefinition(input.root)).status) === 0) throw error;
+          input.output.line("Konteks is stopped on this computer. konteks-remote start starts it again.");
+          return;
+        }
+      }
       case "agents": return agents(context);
       case "doctor": if (!await doctor(context)) process.exitCode = 2; return;
       case "support": return supportBundle(context);
