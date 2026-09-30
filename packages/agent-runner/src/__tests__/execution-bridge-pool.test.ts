@@ -262,6 +262,7 @@ it("reads the identity again when a discovery fails for good, so readiness stops
   refuse = true;
   await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
   await vi.waitFor(() => expect(f.runtime.readiness()).toMatchObject({ readiness: "not_configured", recoveryAction: "login_locally" }));
+
 });
 
 it("re-reads the offered models once the discovery TTL has passed (System One §6a, KM6)", async () => {

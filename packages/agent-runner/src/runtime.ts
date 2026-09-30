@@ -810,7 +810,7 @@ export class AgentRuntime {
       this.authRequired = true;
       this.publishReadiness();
     }
-    void this.probe(false).catch(() => undefined);
+    void this.probe(false, false, { fresh: true }).catch(() => undefined);
   }
 
   async discoverModelCapability(configId: string): Promise<DiscoveredBridgeModelCapability> {
@@ -1073,11 +1073,15 @@ export class AgentRuntime {
    * `isLogin` marks the probe that follows `auth login`, which is when the
    * `--organization` attestation may be recorded.
    */
-  async probe(isLogin: boolean, organizationAttested = false): Promise<ConnectedAgentView> {
+  async probe(isLogin: boolean, organizationAttested = false, options: { fresh?: boolean } = {}): Promise<ConnectedAgentView> {
     let result: IdentityProbe;
     try {
       await this.prepareToSpawn();
-      result = await (this.options.probe ?? probeIdentity)(this.options.config, this.family, this.spec.env, {}, this.hostSettings);
+      // `fresh`: read the sign-in through a process of its own, not the shared
+      // Codex app-server, which keeps the sign-in it loaded at its start even
+      // after the files under it are gone (WS1-216).
+      const { RUNNER_NATIVE_CODEX_SOCKET: _shared, ...unshared } = this.options.config;
+      result = await (this.options.probe ?? probeIdentity)(options.fresh ? unshared : this.options.config, this.family, this.spec.env, {}, this.hostSettings);
     } catch (error) {
       this.logger.warn({ err: error }, "identity probe failed");
       result = { kind: "logged_out" };
