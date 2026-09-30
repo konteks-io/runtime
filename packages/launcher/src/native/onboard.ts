@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile, rename } from "node:fs/promises";
 import { agentName } from "./agent-name.js";
-import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
+import { homedir, hostname } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, hostAgentFamily, hostInstallCommand, NATIVE_MANIFEST_URL, verifyNativeRelease } from "@konteks/remote-release";
 import { z } from "zod";
@@ -1676,8 +1677,22 @@ async function registerGitKey(root: string): Promise<{ identityFile?: string; us
   };
 }
 
-function hostLabel(): string {
-  return `${homedir().split("/").pop() ?? "user"}@${nativePlatform().os}`;
+/**
+ * The computer's name as its person knows it, for "connected from …" on the
+ * site: macOS's Computer Name ("Sam's MacBook Air"), else the host name
+ * without ".local". The home folder and OS ("home@macos") meant nothing there.
+ */
+export function hostLabel(deps: { os?: string; computerName?: () => string; hostname?: () => string } = {}): string {
+  const os = deps.os ?? nativePlatform().os;
+  if (os === "macos") {
+    try {
+      const read = deps.computerName ?? (() => execFileSync("/usr/sbin/scutil", ["--get", "ComputerName"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }));
+      const named = read().trim();
+      if (named) return named.slice(0, 128);
+    } catch { /* the host name below */ }
+  }
+  const host = (deps.hostname ?? hostname)().trim().replace(/\.local$/i, "");
+  return (host || `${homedir().split("/").pop() ?? "user"}'s computer`).slice(0, 128);
 }
 
 /** The identity on disk when its key is gone; null for a machine that can still prove itself. */

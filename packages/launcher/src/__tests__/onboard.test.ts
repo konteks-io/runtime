@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { agentName, detectAgentFamilies, detectOpenCodeProblem, initiativeTitle, isNo, isYes, onboardFailureStep, runOnboard, runOnboardStep } from "../native/onboard.js";
+import { agentName, detectAgentFamilies, detectOpenCodeProblem, hostLabel, initiativeTitle, isNo, isYes, onboardFailureStep, runOnboard, runOnboardStep } from "../native/onboard.js";
 import { OPENCODE_MIN_BINARY_BYTES } from "@konteks/remote-supervisor";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { readOnboardState, writeOnboardState } from "../native/onboard-state.js";
@@ -1821,5 +1821,14 @@ describe("onboard", () => {
     const result = await step({}, "");
     expect(result.note).toBe("Ending here.");
     expect(await readOnboardState(root)).toMatchObject({ step: "done" });
+  });
+});
+
+describe("the computer's name the site says a System was connected from", () => {
+  it("is macOS's Computer Name, else the host name without .local, never the home folder and OS", () => {
+    expect(hostLabel({ os: "macos", computerName: () => "Sam's MacBook Air\n" })).toBe("Sam's MacBook Air");
+    expect(hostLabel({ os: "macos", computerName: () => { throw new Error("no scutil"); }, hostname: () => "sams-air.local" })).toBe("sams-air");
+    expect(hostLabel({ os: "debian", hostname: () => "build-box" })).toBe("build-box");
+    expect(hostLabel({ os: "debian", hostname: () => "build-box" })).not.toMatch(/@/);
   });
 });
