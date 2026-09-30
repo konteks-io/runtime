@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
@@ -234,6 +234,8 @@ interface NativeAgentAddDeps {
   consent?: FetchConsent;
   /** A fetched agent's download, while the service keeps running (tests replace it). */
   fetchAgent?: typeof fetchHostAgent;
+  /** The person's own install found and its version checked, before anything is stopped. */
+  locate?: (host: HostAgentInstallAdapter, root: string) => Promise<unknown>;
   serviceDefinition: (root: string) => Promise<NativeServiceDefinition>;
   execute: (command: NativeServiceCommand) => Promise<number | null>;
   control: (root: string, record: NativeRuntimeRecord) => Pick<SupervisorControl, "call">;
@@ -255,6 +257,7 @@ const productionAgentAddDeps: NativeAgentAddDeps = {
   add: addNativeAgent,
   restore: restoreNativeRecord,
   start: startNativeConnector,
+  locate: (host, root) => host.locate(undefined, { root }),
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   now: Date.now,
   platform: nativePlatform(),
@@ -281,6 +284,10 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
     const consent = deps.consent ?? terminalFetchConsent({ ...(input.yes === undefined ? {} : { yes: input.yes }), line: text => input.output.line(text) });
     await (deps.fetchAgent ?? fetchHostAgent)(host!, input.root, consent, input.output);
   }
+  // An install Konteks cannot run (DeepSeek Harness 0.2.0 on 09-30) is said
+  // before anything stops: the retry stopped the connector, then refused the
+  // version and left it stopped (W1-D3).
+  else if (host && deps.locate) await deps.locate(host, input.root);
   const definition = await deps.serviceDefinition(input.root);
   const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
   const initialStatus = await deps.execute(definition.status);
@@ -375,6 +382,7 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       }
     }
     if (wasRunning && !ownershipUnsettled) await deps.start(input).catch(() => undefined);
+    if (foreground) input.output.line("Konteks stopped to add the agent and stays stopped; konteks-remote start starts it again, in the background.");
     throw error;
   }
 }
