@@ -23,7 +23,7 @@
       },
       "tooling": {
         "package": "@openai/codex",
-        "version": "0.153.4",
+        "version": "0.159.0",
         "bin": "codex"
       }
     }

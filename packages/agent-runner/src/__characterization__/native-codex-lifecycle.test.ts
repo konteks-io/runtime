@@ -21,7 +21,7 @@ it.skipIf(!releaseRoot).each(modes)("characterizes the installed native Codex li
   const prefix = join(releaseRoot!, "agents", "codex");
   const profile = await verifyOfflineAgentPackage(prefix, artifacts[0]!);
   expect(profile.bridge.version).toBe("1.10.0");
-  expect(profile.tooling.version).toBe("0.153.4");
+  expect(profile.tooling.version).toBe("0.159.0");
   const root = await mkdtemp(join(tmpdir(), "native-codex-lifecycle-"));
   try {
     const credentialDir = join(root, "empty-credentials"), workspace = join(root, "empty-workspace");
