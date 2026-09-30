@@ -139,14 +139,25 @@ function leadsWith(words: Set<string>, answer: string): boolean {
   for (const word of words) if (answer.startsWith(`${word} `)) return true;
   return false;
 }
-export function isYes(answer: string): boolean {
-  const said = normalizeAnswer(answer);
+/** The answer's last sentence ("It already is my System, I think. Yes." ends in "yes", 09-30). */
+function lastSentence(answer: string): string {
+  const sentences = answer.split(/[.!?\n]+/).map(normalizeAnswer).filter(Boolean);
+  return sentences.at(-1) ?? "";
+}
+function yesIn(said: string): boolean {
   if (!leadsWith(AFFIRMATIVE, said)) return false;
   // "yes, but not now" and "please don't" are not a yes.
   return !NEGATION.test(said.replace(/^\S+\s?/, ""));
 }
+export function isYes(answer: string): boolean {
+  const said = normalizeAnswer(answer);
+  if (yesIn(said)) return true;
+  // A person who explains first and answers last still answered.
+  return !leadsWith(NEGATIVE, said) && yesIn(lastSentence(answer));
+}
 export function isNo(answer: string): boolean {
-  return leadsWith(NEGATIVE, normalizeAnswer(answer));
+  if (leadsWith(NEGATIVE, normalizeAnswer(answer))) return true;
+  return !yesIn(normalizeAnswer(answer)) && leadsWith(NEGATIVE, lastSentence(answer));
 }
 
 /**

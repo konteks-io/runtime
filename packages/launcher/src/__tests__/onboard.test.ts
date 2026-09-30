@@ -226,6 +226,11 @@ describe("onboard", () => {
     for (const said of ["yes, but not now", "please don't", "maybe", "acme-shop"]) {
       expect(isYes(said), said).toBe(false);
     }
+    // An answer given last, after a thought, still counts (09-30).
+    expect(isYes("It already is my System, I think. Yes.")).toBe(true);
+    expect(isNo("I thought about it. No.")).toBe(true);
+    expect(isYes("I thought about it. No.")).toBe(false);
+    expect(isYes("No. Well, maybe later. Yes.")).toBe(false);
   });
 
   it("asks a yes/no about the first System and accepts no without registering", async () => {
