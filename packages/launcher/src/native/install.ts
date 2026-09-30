@@ -91,7 +91,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     // it would erase the distinction between new enrollment and legacy history.
     for (const dir of ["releases", "credentials", "workspaces", "logs"]) await privateDirectory(join(root, dir));
     options.output.line("Connecting this computer to Konteks. Type the one-time code from the site.");
-    const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir: join(root, "supervisor"), coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode: options.deps?.readActivationCode ?? (() => promptSecret({ label: "Activation code", minLength: 8 })), fetchFn });
+    const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir: join(root, "supervisor"), coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode: options.deps?.readActivationCode ?? (() => promptSecret({ label: "One-time code", minLength: 8 })), fetchFn });
     lock.assertOwned();
     const identity = await new SupervisorStore(join(root, "supervisor")).identity();
     if (!identity || identity.instanceId !== activated.instanceId || activated.manifestDigest !== release.manifest.digest) throw invalid();
