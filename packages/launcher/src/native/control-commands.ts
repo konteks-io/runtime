@@ -50,7 +50,7 @@ export async function previewStatus(context: ControlContext): Promise<void> {
   context.output.line(value.capabilityAdvertised
     ? `Previews: served from this computer (at most ${value.maxRunning} at once, each stops after ${value.idleStopMinutes} idle minutes). Switch them off for this computer in Konteks: Customize → Runtimes.`
     : "Previews: not offered (this connector has no relay connection configured).");
-  if (value.previews.length === 0) context.output.line("No session preview has run since the connector started.");
+  if (value.previews.length === 0) context.output.line("No session preview is running now.");
   for (const preview of value.previews) {
     context.output.line(`${preview.sessionId}: ${preview.state}${preview.url ? ` at ${preview.url}` : ""}${preview.startedBy === "viewer" ? " (started by a viewer)" : ""}${preview.viewerConnected ? " (a viewer is connected)" : ""}`);
     if (preview.command) context.output.line(`  command: ${preview.command}${preview.explanation ? ` — ${preview.explanation}` : ""}`);
