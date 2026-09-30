@@ -170,20 +170,21 @@ export async function detectNotAddedAgent(agentId: SupportedAgentId, deps: NotAd
   }
 }
 
-/** First re-detection after a minute, then doubling up to fifteen minutes: the connector's agent retry cadence. */
-const FIRST_REDETECT_MS = 60_000;
-const MAX_REDETECT_MS = 15 * 60_000;
+/**
+ * Every minute. It is a look at a few folders and at most a `--version`, and
+ * a person who installs an agent expects to see it within about a minute; the
+ * doubling to fifteen minutes it had took seven after a while (W1-D4).
+ */
+const REDETECT_MS = 60_000;
 
 /**
  * The cached detection of agents the installation does not list, re-run in
- * the background on the agent retry cadence (a minute, doubling to fifteen;
- * back to a minute when something changed), never on the heartbeat's path:
- * `current()` is synchronous and a heartbeat only ever asks for a refresh.
+ * the background every minute, never on the heartbeat's path: `current()` is
+ * synchronous and a heartbeat only ever asks for a refresh.
  */
 export class NotAddedAgentsDetector {
   private detected = new Map<string, NotAddedAgentDetection>();
   private nextAt = 0;
-  private delayMs = FIRST_REDETECT_MS;
   private running: Promise<void> | null = null;
 
   constructor(private readonly options: {
@@ -209,10 +210,8 @@ export class NotAddedAgentsDetector {
     this.running = (async () => {
       const next = new Map<string, NotAddedAgentDetection>();
       for (const agentId of this.options.agentIds) next.set(agentId, await detectNotAddedAgent(agentId, this.options.deps).catch(() => ({ state: "failed" as const })));
-      const changed = JSON.stringify([...next]) !== JSON.stringify([...this.detected]);
       this.detected = next;
-      this.delayMs = changed ? FIRST_REDETECT_MS : Math.min(this.delayMs * 2, MAX_REDETECT_MS);
-      this.nextAt = (this.options.now ?? Date.now)() + this.delayMs;
+      this.nextAt = (this.options.now ?? Date.now)() + REDETECT_MS;
     })().finally(() => { this.running = null; });
     return this.running;
   }
