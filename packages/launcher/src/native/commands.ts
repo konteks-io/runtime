@@ -42,6 +42,26 @@ async function serviceDefinition(root: string) {
   return nativeServiceDefinition({ os: platform.os, home: homedir(), root, executable, uid: process.getuid?.(), ...(userId ? { userId } : {}) });
 }
 
+/**
+ * The release now serving rewrites its own service definition when the file on
+ * disk differs from what it renders. Whoever registered the service (an install
+ * launcher that is never replaced, or the previous release's updater) wrote it
+ * with its own renderer, so service-level changes such as the log file arrived
+ * one release late or never (RCA 2026-09-30). The OS reads the file at the next
+ * load, so the change applies from the next start. A definition that is absent
+ * (a foreground `serve`) is left alone.
+ */
+export async function refreshOwnServiceDefinition(
+  root: string,
+  deps: { definition: (root: string) => Promise<NativeServiceDefinition>; read: (path: string) => Promise<string>; write: (path: string, contents: string) => Promise<void> },
+): Promise<boolean> {
+  const definition = await deps.definition(root);
+  const current = await deps.read(definition.path).catch(() => null);
+  if (current === null || current === definition.contents) return false;
+  await deps.write(definition.path, definition.contents);
+  return true;
+}
+
 interface NativeStopDeps {
   definition: (root: string) => Promise<NativeServiceDefinition>;
   execute: typeof execute;
@@ -540,6 +560,9 @@ export const nativeCliActions: NativeCliActions = {
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now, platform: nativePlatform(),
   }),
   serve: async input => {
+    await refreshOwnServiceDefinition(input.root, { definition: serviceDefinition, read: path => readFile(path, "utf8"), write: writeSecretFile })
+      .then(rewritten => { if (rewritten) process.stderr.write("service definition rewritten by this release; it applies from the next start\n"); })
+      .catch(error => process.stderr.write(`service definition not refreshed: ${error instanceof Error ? error.message : String(error)}\n`));
     const service = createNativeService({ root: input.root, roots: EMBEDDED_RELEASE_ROOTS, platform: nativePlatform(),
       prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(input.root, cwd, agentId),
       exitProcess: code => process.exit(code) });
