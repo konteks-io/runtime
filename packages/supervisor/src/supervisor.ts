@@ -1995,6 +1995,12 @@ export class Supervisor {
           return this.requireUpdates().apply("operator");
         case "update.status":
           return this.requireUpdates().status();
+        case "update.channel": {
+          // Its own op, not a status field: launchers from older releases read
+          // `status` strictly and a user install never replaces its launcher.
+          const channel = this.updates ? this.updateChannelReport() : null;
+          return channel ? { host: channel.host, override: channel.override, lastCheckedAt: channel.lastCheckedAt, error: channel.lastError } : null;
+        }
         case "release.accepted": {
           if (!this.instanceId) return { bundleVersion: null };
           const accepted = await this.core.acceptedRelease(this.instanceId);

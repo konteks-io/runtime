@@ -69,6 +69,8 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   /** Ask the supervisor to launch the installer's transactional update in a separate process. */
   z.object({ op: z.literal("update.apply") }).strict(),
   z.object({ op: z.literal("update.status") }).strict(),
+  /** Where the unattended update reads releases (host only), an override, and the last read's failure (RCA 2026-09-30). */
+  z.object({ op: z.literal("update.channel") }).strict(),
   /** The release Konteks accepts for this machine, asked with this machine's lease (WS1-093). */
   z.object({ op: z.literal("release.accepted") }).strict(),
   z
@@ -533,6 +535,13 @@ export const PreviewStatusReportSchema = z
   })
   .strict();
 export type PreviewStatusReport = z.infer<typeof PreviewStatusReportSchema>;
+
+/** `update.channel`'s answer; null when this connector does not update itself. */
+export const UpdateChannelReportSchema = z
+  .object({ host: z.string(), override: z.boolean(), lastCheckedAt: z.string().nullable(), error: z.string().nullable() })
+  .strict()
+  .nullable();
+export type UpdateChannelReport = z.infer<typeof UpdateChannelReportSchema>;
 
 export const DoctorCheckSchema = z
   .object({
