@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PREVIEW_MCP_SERVER_NAME, PreviewMcpServer, describeStatus } from "../preview/mcp-server.js";
+import { CONVERSATION_HAS_NO_APP, CONVERSATION_HAS_NO_APP_AGENT_NOTE } from "../preview/config.js";
 import type { PreviewStatus } from "../preview/process-manager.js";
 
 const running: PreviewStatus = {
@@ -67,6 +68,9 @@ describe("session preview tools (loopback MCP)", () => {
 
   it("describes a starting preview with the next step", () => {
     expect(describeStatus({ ...running, state: "starting", phase: "install", url: null })).toContain("Still starting: call preview_status");
+    // Only the agent is told what to say when a conversation has no app of its own (09-30).
+    expect(describeStatus({ ...running, state: "failed", url: null, message: CONVERSATION_HAS_NO_APP })).toContain(CONVERSATION_HAS_NO_APP_AGENT_NOTE);
+    expect(CONVERSATION_HAS_NO_APP).not.toContain("Tell the person");
   });
 
   it("points a session that has the QA browser at it, and only then", () => {

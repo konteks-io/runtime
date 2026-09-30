@@ -60,6 +60,7 @@ import { OnboardWorkCarrier, type OnboardWorkAssignment } from "./onboard/carrie
 import type { PlatformMcpEntry } from "./work/workload.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
+import { PreviewWorktreePermits } from "./preview/worktree-permits.js";
 import { PreviewChannel } from "./preview/preview-channel.js";
 import { PreviewProcessManager, PreviewProcessRegistry } from "./preview/process-manager.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
@@ -147,6 +148,8 @@ export interface SupervisorOptions {
   onLivenessLost?: (detail: Record<string, unknown>) => void;
   /** This runtime was removed from its workspace (uninstall): end the whole process, not only the supervisor. */
   onRetired?: () => void;
+  /** A local `shutdown` request: end the process the way a signal would. */
+  onShutdownRequested?: () => void;
   native?: {
     /** Public trust provided by the verified native executable, never by writable install metadata. */
     trustedRoots: readonly EmbeddedReleaseRoot[];
@@ -236,8 +239,8 @@ export class Supervisor {
   /** Each session's supervised preview dev server (at most one per session). */
   readonly previews: PreviewProcessManager;
   private readonly previewRegistry: PreviewProcessRegistry;
-  /** Worktrees a viewer may start a preview in, by session (while the session lasts). */
-  private readonly previewWorktrees = new Map<string, string>();
+  /** Worktrees a viewer may start a preview in, by session; kept across releases and restarts while the worktree exists. */
+  private readonly previewWorktrees: PreviewWorktreePermits;
   /** When a viewer last started each session's preview (to pace retries after a failure). */
   private readonly previewViewerStarts = new Map<string, number>();
   broker!: PermissionBroker;
@@ -303,6 +306,7 @@ export class Supervisor {
     this.outbox = new DurableOutbox(this.store.path("outbox"), this.stateMutations.run);
     this.lease = new LeaseState(this.clock);
     this.previewRegistry = new PreviewProcessRegistry(join(config.SUPERVISOR_DATA_DIR, "preview-processes.json"));
+    this.previewWorktrees = new PreviewWorktreePermits(join(config.SUPERVISOR_DATA_DIR, "preview-worktrees.json"));
     this.previews = new PreviewProcessManager({
       idleMs: config.SUPERVISOR_PREVIEW_IDLE_MINUTES * 60_000,
       maxRunning: config.SUPERVISOR_PREVIEW_MAX_RUNNING,
@@ -503,8 +507,16 @@ export class Supervisor {
       persistRelayState: (state) => this.store.saveRelayState(state),
     });
     const relayState = await this.store.relayState();
-    if (relayState) this.mux.restoreDurableState(relayState, (channelId) => channelOf(channelId));
-    else this.mux.restoreCursors(await this.store.cursors(), (channelId) => channelOf(channelId));
+    // A preview stream never outlives the process that served it, and Core
+    // opens every preview grant counting from zero: counts kept from the last
+    // process made the new one drop Core's first requests as duplicates and
+    // answer out of sequence after an update (W1-Z7). They start fresh.
+    const durableChannelOf = (channelId: string) => {
+      const channel = channelOf(channelId);
+      return channel === "preview" ? null : channel;
+    };
+    if (relayState) this.mux.restoreDurableState(relayState, durableChannelOf);
+    else this.mux.restoreCursors(await this.store.cursors(), durableChannelOf);
     if (this.instanceId) this.openCoreChannels(this.instanceId);
 
     const verifier = new CoreSignatureVerifier(this.roots);
@@ -760,7 +772,9 @@ export class Supervisor {
     this.work = new WorkOrchestrator({
       verifyCancellation: directive => verifier.verify(directive, directive.signature),
       onSessionReleased: sessionId => {
-        this.forgetPreviewWorktree(sessionId);
+        // The dev server stops with the session; its worktree stays openable
+        // by a viewer while it exists (a delivery's preview after the delivery).
+        this.previewViewerStarts.delete(sessionId);
         void this.previews.stop(sessionId, "session_released");
       },
       ...(this.assignmentSender ? { assignmentSender: this.assignmentSender } : {}),
@@ -2012,6 +2026,14 @@ export class Supervisor {
         case "revoke.pending":
           this.pendingRevocation = true;
           return { pendingRevocation: true };
+        case "shutdown": {
+          // Answered first, then stopped, so the caller hears it was accepted.
+          setTimeout(() => {
+            if (this.options.onShutdownRequested) this.options.onShutdownRequested();
+            else void this.stop().catch(() => undefined);
+          }, 200).unref?.();
+          return { stopping: true };
+        }
         case "instance.retire": {
           if (!this.instanceId) throw new RemoteInstanceError("temporarily_unavailable", "This runtime is not activated, so there is nothing to remove from Konteks.");
           const result = await this.core.retire(this.instanceId);
@@ -2434,8 +2456,16 @@ export class Supervisor {
       });
     };
     await note("supervisor_prelude", "entered");
-    await this.startPromise?.catch(() => undefined);
-    await this.activeLoopStarting;
+    // A stop that hung here (09-30 15:23) left no clue which wait held it:
+    // every wait that takes longer than a few seconds is named in the log.
+    const waitFor = async (step: string, pending: Promise<unknown> | null | undefined): Promise<void> => {
+      if (!pending) return;
+      const slow = setTimeout(() => this.logger.warn({ event: "shutdown.waiting", step }, "shutdown is still waiting"), 5_000);
+      slow.unref?.();
+      try { await pending; } finally { clearTimeout(slow); }
+    };
+    await waitFor("start", this.startPromise?.catch(() => undefined));
+    await waitFor("active_loop_start", this.activeLoopStarting);
     if (this.pullTimer) clearInterval(this.pullTimer);
     for (const watch of this.onComputerWatches.values()) clearInterval(watch);
     this.onComputerWatches.clear();
@@ -2447,18 +2477,18 @@ export class Supervisor {
     this.updates?.stop();
     if (this.muxTimer) clearInterval(this.muxTimer);
     if (this.cancellationTimer) clearInterval(this.cancellationTimer);
-    await this.cancellationReplay?.stop();
+    await waitFor("cancellation_replay", this.cancellationReplay?.stop());
     if (this.configurationTimer) clearInterval(this.configurationTimer);
-    await this.configurationRefresh;
-    await this.observationDelivery?.stop();
-    await this.configurationAcks?.settle();
-    await this.executionRevisionFenceReceipts?.settle();
-    await this.planningDirectivePoller?.stop();
+    await waitFor("configuration_refresh", this.configurationRefresh);
+    await waitFor("observation_delivery", this.observationDelivery?.stop());
+    await waitFor("configuration_acks", this.configurationAcks?.settle());
+    await waitFor("fence_receipts", this.executionRevisionFenceReceipts?.settle());
+    await waitFor("planning_directives", this.planningDirectivePoller?.stop());
     this.heartbeat?.stop();
-    await this.heartbeat?.settle();
-    await this.leaseAcquisition;
-    await this.leaseMutation;
-    await this.leaseLossCleanup;
+    await waitFor("heartbeat", this.heartbeat?.settle());
+    await waitFor("lease_acquisition", this.leaseAcquisition);
+    await waitFor("lease_mutation", this.leaseMutation);
+    await waitFor("lease_loss_cleanup", this.leaseLossCleanup);
     await note("supervisor_prelude", "completed");
     await note("work_drain", "entered");
     await this.work?.drainSessions("drain");

@@ -36,6 +36,8 @@ export interface ReadinessInputs {
   hostAgentVersion?: string;
   /** Whether turns report billing usage under the current sign-in, when the agent says (Antigravity: only on its key relay). */
   tokenUsageObservable?: boolean;
+  /** Signed in, but the provider's admin keeps Konteks tools out (Antigravity with MCP Servers off): no Konteks work can run on it. */
+  providerAdminBlocked?: boolean;
   /** The slash commands this agent announced on this computer and when (runtime-view R19). */
   availableCommands?: { readonly commands: readonly AvailableCommand[]; readonly learntAt: string };
   lastProbeAt: string | null;
@@ -80,7 +82,7 @@ function deriveReadiness(inputs: ReadinessInputs): ConnectedAgentView["readiness
   if (inputs.connectionState !== "ready") return inputs.connectionState === "starting" ? "unavailable" : "unavailable";
   switch (inputs.identity) {
     case "signal":
-      return "ready";
+      return inputs.providerAdminBlocked ? "unavailable" : "ready";
     case "logged_out":
       return "not_configured";
     case "no_official_signal":
@@ -94,5 +96,6 @@ function deriveRecoveryAction(inputs: ReadinessInputs, readiness: ConnectedAgent
   if (!inputs.bridgeVersionCompatible) return "update_agent_bridge";
   if (readiness === "not_configured" || readiness === "reconnect_required") return "login_locally";
   if (inputs.connectionState === "failed") return "update_agent_bridge";
+  if (readiness === "unavailable" && inputs.providerAdminBlocked) return "contact_provider_admin";
   return undefined;
 }

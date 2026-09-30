@@ -1,8 +1,9 @@
-import { rm, stat } from "node:fs/promises";
+import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { join, parse, resolve } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 import { RemoteInstanceError } from "@konteks/remote-common";
+import { NATIVE_SHUTDOWN_RECEIPT_FILE } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { SupervisorControl } from "../control.js";
 import { readNativeRecord } from "./install.js";
@@ -21,6 +22,10 @@ export interface UninstallDeps {
   now(): number;
   /** Whether this machine was ever connected; the install record by default. */
   connected?(root: string): Promise<boolean>;
+  /** The connector's last shutdown receipt, if any. */
+  receipt?(): Promise<string | null>;
+  /** Whether the connector has finished shutting down since `before`: it no longer answers and wrote a new receipt. */
+  shutDown?(before: string | null): Promise<boolean>;
 }
 
 export interface UninstallResult {
@@ -33,6 +38,9 @@ export interface UninstallResult {
 
 const DRAIN_LIMIT_MS = 15 * 60_000;
 const POLL_MS = 5_000;
+/** A connector closes its agents and writes its receipt within seconds of being stopped. */
+const SHUTDOWN_WAIT_MS = 30_000;
+const REMOVE_ATTEMPTS = 5;
 
 /**
  * Remove Konteks from this machine (W1-L2): let running work finish, have
@@ -58,6 +66,7 @@ export async function uninstallNative(input: { root: string; output: Output }, d
 
   let runtime: UninstallResult["runtime"] = connected ? "not_told" : "never_connected";
   const control = connected ? await deps.control() : null;
+  const receiptBefore = control && deps.receipt ? await deps.receipt().catch(() => null) : null;
   if (control) {
     // Finish what is running before anything is revoked: a removal must never
     // cut an agent off mid-turn.
@@ -103,7 +112,14 @@ export async function uninstallNative(input: { root: string; output: Output }, d
     for (const command of service.remove) await deps.execute(command).catch(() => null);
     await rm(service.path, { force: true });
   }
-  await rm(root, { recursive: true, force: true });
+  // A stopped or retired connector still closes its agents and writes its
+  // receipt into this folder for a moment; deleting under it failed with
+  // ENOTEMPTY and left a folder behind (W1-Z6). Wait until it has let go.
+  if (control && deps.shutDown) {
+    const until = deps.now() + SHUTDOWN_WAIT_MS;
+    while (!(await deps.shutDown(receiptBefore).catch(() => false)) && deps.now() < until) await deps.sleep(500);
+  }
+  await removeFolder(root, deps);
 
   const kept = repositoryPath ? ` Your repository at ${repositoryPath} and your coding agents' logins were not touched.` : " Your repositories and your coding agents' logins were not touched.";
   if (runtime === "removed" || runtime === "already_removed") {
@@ -114,6 +130,31 @@ export async function uninstallNative(input: { root: string; output: Output }, d
     input.output.line(`Konteks is removed from this machine.${kept}`);
   }
   return { state: "uninstalled", runtime, root, ...(repositoryPath ? { repositoryPath } : {}) };
+}
+
+/**
+ * Delete the connector's folder, its program last: a removal that stops
+ * part way can then still be run again (W1-Z6: the program was gone and a
+ * folder was left). A write that lands during the delete is retried.
+ */
+async function removeFolder(root: string, deps: Pick<UninstallDeps, "sleep">): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const entries = await readdir(root).catch(() => [] as string[]);
+      for (const entry of entries.filter(name => name !== "bin")) await rm(join(root, entry), { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+      await rm(join(root, "bin"), { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+    } catch (error) {
+      if (attempt >= REMOVE_ATTEMPTS) {
+        throw new RemoteInstanceError("temporarily_unavailable", `Konteks is stopped on this machine, but its folder ${root} could not be deleted (${(error as Error).message}). Run konteks-remote uninstall again in a moment.`);
+      }
+    }
+    if (!(await stat(root).then(() => true).catch(() => false))) return;
+    if (attempt >= REMOVE_ATTEMPTS) {
+      throw new RemoteInstanceError("temporarily_unavailable", `Konteks is stopped on this machine, but something kept writing to its folder ${root}. Run konteks-remote uninstall again in a moment.`);
+    }
+    await deps.sleep(1_000);
+  }
 }
 
 /** Production dependencies: the connector's own control socket and OS service. */
@@ -132,7 +173,21 @@ export function productionUninstallDeps(input: {
     },
     serviceDefinition: () => input.serviceDefinition(input.root),
     execute: input.execute,
+    receipt: () => readReceipt(input.root),
+    shutDown: async before => {
+      const record = await readNativeRecord(input.root).catch(() => null);
+      if (record) {
+        const control = new SupervisorControl({ supervisorData: join(input.root, "supervisor") }, record.controlPort);
+        if (await control.call({ op: "drain.status" }, DrainStatusSchema, { timeoutMs: 1_000 }).then(() => true).catch(() => false)) return false;
+      }
+      const receipt = await readReceipt(input.root);
+      return receipt !== null && receipt !== before;
+    },
     sleep: ms => new Promise(done => setTimeout(done, ms)),
     now: () => Date.now(),
   };
+}
+
+function readReceipt(root: string): Promise<string | null> {
+  return readFile(join(root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), "utf8").catch(() => null);
 }

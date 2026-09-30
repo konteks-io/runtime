@@ -56,6 +56,21 @@ describe("first commit of a folder with files", () => {
     ]);
   });
 
+  it("commits a folder with nothing to leave out without adding a .gitignore (W1-E1)", async () => {
+    const notes = join(dir, "team-notes");
+    await mkdir(notes, { recursive: true });
+    await writeFile(join(notes, "README.md"), "# Team notes\n");
+    const plan = await planFirstCommit(notes);
+    expect(plan.leftOut).toEqual([]);
+    const initialized = await initializeRepository({
+      path: notes, branch: "main", authorName: "hello", authorEmail: "hello@konteks.io", remote: { url: remote }, keepFiles: true,
+    });
+    expect(initialized).toMatchObject({ ok: true });
+    const committed = await commitFirstFiles({ path: notes, plan, authorName: "hello", authorEmail: "hello@konteks.io", message: "Add team-notes" });
+    expect(committed).toEqual({ ok: true, message: 'Committed 1 file as "Add team-notes".' });
+    expect(git(notes, "status", "--porcelain")).toBe("");
+  });
+
   it("joins Konteks's history without touching the files, commits only the planned ones, and pushes them", async () => {
     const plan = await planFirstCommit(folder);
     const initialized = await initializeRepository({

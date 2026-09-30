@@ -87,6 +87,7 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
         // Uninstalled (W1-L2): nothing is left for this process to do, and its
         // folder is about to be deleted — end it, whatever runs it.
         onRetired: () => { void daemon.shutdown("retired", 0).catch(() => undefined); },
+        onShutdownRequested: () => { void daemon.shutdown("control", 0).catch(() => undefined); },
         native: {
           trustedRoots: installation.roots, runners: installation.runners,
           ...(installation.unavailableAgents.length > 0 ? { unavailableAgents: installation.unavailableAgents } : {}),

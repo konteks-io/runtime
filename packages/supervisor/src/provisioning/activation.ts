@@ -90,7 +90,9 @@ export async function runActivationExchange(args: ActivationExchangeArgs): Promi
     );
   } catch (error) {
     if (error instanceof CoreResponseError) {
-      throw new RemoteInstanceError(error.code, activationFailureMessage(error.wireCode), { recoveryActions: [{ kind: "new_activation" }], cause: error });
+      // The message says what to do next, so no second "create a new
+      // activation in the App or MCP" line follows it (W1-M3).
+      throw new RemoteInstanceError(error.code, activationFailureMessage(error.wireCode), { cause: error });
     }
     throw error;
   }
@@ -118,18 +120,20 @@ export async function runActivationExchange(args: ActivationExchangeArgs): Promi
   return { instanceId: result.instanceId, manifest: result.bundleManifest, manifestDigest, provisioningWindowExpiresAt: result.provisioningWindowExpiresAt };
 }
 
-function activationFailureMessage(code: string): string {
+const NEW_CODE = "Get a new one on the site (Customize → Runtimes → Connect a runtime) and paste the new command here.";
+
+export function activationFailureMessage(code: string): string {
   switch (code) {
     case "activation_expired":
-      return "the activation code has expired; create a new activation in App or MCP";
+      return `This code has expired. ${NEW_CODE}`;
     case "activation_consumed":
-      return "the activation was already used; create a new activation in App or MCP";
+      return `This code was already used. ${NEW_CODE}`;
     case "activation_invalid":
-      return "the activation code was not accepted";
+      return "That code was not accepted. Check it against the site and paste the command again; if it keeps failing, get a new code there (Customize → Runtimes → Connect a runtime).";
     case "limit_exceeded":
-      return "your plan's connected-runtime limit is reached; remove a runtime or upgrade";
+      return "This workspace's plan has no room for another computer. Remove one in Customize → Runtimes, or change plans in Settings → Plan.";
     default:
-      return `activation exchange failed (${code})`;
+      return `Konteks could not connect this computer (${code}). ${NEW_CODE}`;
   }
 }
 

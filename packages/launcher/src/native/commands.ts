@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
@@ -84,7 +84,7 @@ export async function waitWhileStarting(
 }
 
 /** Operations that act through the running connector, and so wait for one that is starting. */
-const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
+const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
 
 const productionNativeStopDeps: NativeStopDeps = {
   definition: serviceDefinition,
@@ -179,7 +179,7 @@ export async function startNativeConnector(
   });
   if (moved)
     input.output.line(
-      `Control port ${moved.previousPort} is occupied by another local process; this stopped connector now uses port ${moved.controlPort}. Its identity and local work are unchanged.`,
+      `Another program uses port ${moved.previousPort}, so Konteks uses port ${moved.controlPort} on this computer instead.`,
     );
   const started = await startNativeServiceDefinition(definition, {
     execute: command => command === definition.status ? serviceState().then(state => state === "running" ? 0 : stoppedCodes[0]!) : executeService(command),
@@ -234,6 +234,8 @@ interface NativeAgentAddDeps {
   consent?: FetchConsent;
   /** A fetched agent's download, while the service keeps running (tests replace it). */
   fetchAgent?: typeof fetchHostAgent;
+  /** The person's own install found and its version checked, before anything is stopped. */
+  locate?: (host: HostAgentInstallAdapter, root: string) => Promise<unknown>;
   serviceDefinition: (root: string) => Promise<NativeServiceDefinition>;
   execute: (command: NativeServiceCommand) => Promise<number | null>;
   control: (root: string, record: NativeRuntimeRecord) => Pick<SupervisorControl, "call">;
@@ -255,6 +257,7 @@ const productionAgentAddDeps: NativeAgentAddDeps = {
   add: addNativeAgent,
   restore: restoreNativeRecord,
   start: startNativeConnector,
+  locate: (host, root) => host.locate(undefined, { root }),
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   now: Date.now,
   platform: nativePlatform(),
@@ -281,11 +284,23 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
     const consent = deps.consent ?? terminalFetchConsent({ ...(input.yes === undefined ? {} : { yes: input.yes }), line: text => input.output.line(text) });
     await (deps.fetchAgent ?? fetchHostAgent)(host!, input.root, consent, input.output);
   }
+  // An install Konteks cannot run (DeepSeek Harness 0.2.0 on 09-30) is said
+  // before anything stops: the retry stopped the connector, then refused the
+  // version and left it stopped (W1-D3).
+  else if (host && deps.locate) await deps.locate(host, input.root);
   const definition = await deps.serviceDefinition(input.root);
   const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
   const initialStatus = await deps.execute(definition.status);
   if (initialStatus !== 0 && (initialStatus === null || !stoppedCodes.includes(initialStatus))) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation's service state. Inspect only this installation's service before adding an agent; identity and local work are unchanged.");
   const wasRunning = initialStatus === 0;
+  const drain = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
+  // A connector the service manager does not run (`konteks-remote serve` in a
+  // terminal) still owns this folder. Waiting for it to let go only timed out
+  // after 90 s with "Another connector owns this native data directory"
+  // (W1-D3): ask it to stop, the way a signal would, once its work is done.
+  const foreground = !wasRunning
+    ? await deps.control(input.root, previous).call({ op: "drain.status" }, drain, { timeoutMs: 2_000 }).then(() => true, () => false)
+    : false;
   let stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
   const wait = async () => deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
   const stopped = async () => {
@@ -294,9 +309,8 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
     if (code !== null && stoppedCodes.includes(code)) return true;
     throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation stopped; its identity and local work are unchanged.");
   };
-  if (wasRunning) {
+  if (wasRunning || foreground) {
     const control = deps.control(input.root, previous);
-    const drain = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
     await control.call({ op: "drain", reason: "update" }, z.unknown());
     const drainDeadline = deps.now() + 15 * 60_000;
     for (;;) {
@@ -306,11 +320,17 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       input.output.line(`waiting for ${state.activeAssignments} active assignment(s) before installing ${input.agent}…`);
       await deps.sleep(deps.pollMs ?? 5_000);
     }
-    if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
-    stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
-    while (!await stopped()) {
-      if (deps.now() >= stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping; its installed agents were not changed.");
-      await wait();
+    if (foreground) {
+      await control.call({ op: "shutdown" }, z.unknown());
+      input.output.line("Konteks is running in a terminal here, not as its background service; stopping it there to add the agent…");
+      stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+    } else {
+      if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
+      stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+      while (!await stopped()) {
+        if (deps.now() >= stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping; its installed agents were not changed.");
+        await wait();
+      }
     }
   }
   let successor: NativeRuntimeRecord | undefined;
@@ -333,6 +353,8 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       }
     }
     if (wasRunning) await deps.start(input);
+    // Its terminal is not this one, so it is not started again here.
+    if (foreground) input.output.line(`${findAgentBridge(input.agent)?.displayName ?? input.agent} is added. Konteks stopped to add it; konteks-remote start starts it again, in the background.`);
     input.output.result({ instanceId: successor.instanceId, agents: successor.agents, state: "installed" });
   } catch (error) {
     if (successor) {
@@ -360,6 +382,7 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       }
     }
     if (wasRunning && !ownershipUnsettled) await deps.start(input).catch(() => undefined);
+    if (foreground) input.output.line("Konteks stopped to add the agent and stays stopped; konteks-remote start starts it again, in the background.");
     throw error;
   }
 }
@@ -587,7 +610,17 @@ export const nativeCliActions: NativeCliActions = {
       });
     }
     switch (input.operation) {
-      case "status": return status(context);
+      case "status": {
+        try {
+          return await status(context);
+        } catch (error) {
+          // A stopped connector is an answer, not an error (09-30).
+          if (!(error instanceof RemoteInstanceError) || error.code !== "control_socket_unavailable") throw error;
+          if (await execute((await serviceDefinition(input.root)).status) === 0) throw error;
+          input.output.line("Konteks is stopped on this computer. konteks-remote start starts it again.");
+          return;
+        }
+      }
       case "agents": return agents(context);
       case "doctor": if (!await doctor(context)) process.exitCode = 2; return;
       case "support": return supportBundle(context);

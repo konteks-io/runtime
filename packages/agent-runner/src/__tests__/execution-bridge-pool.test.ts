@@ -5,6 +5,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { RetainedProcessOwner } from "@konteks/remote-common";
 import { AgentRuntime } from "../runtime.js";
 import { RunnerConfigSchema } from "../config.js";
+import type { IdentityProbe } from "../auth/identity.js";
 import type { BridgeProcess, SpawnBridgeOptions } from "../bridge/process.js";
 
 vi.mock("../auth/login-flow.js", () => ({ runLogout: vi.fn(async () => ({ code: 0 })), startLoginFlow: vi.fn() }));
@@ -28,7 +29,7 @@ const retainedOwner = (pid: number): RetainedProcessOwner =>
   ({ version: 1, platform: "darwin", pid, processGroupId: pid, startToken: `start-${pid}`, commandDigest: "A".repeat(43) });
 const modelOptions = [{ id: "model", name: "Model", category: "model", type: "select", currentValue: "sonnet", options: [{ value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }] }];
 
-async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number } = {}) {
+async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number; probe?: () => Promise<IdentityProbe>; newSessionFails?: () => boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "execution-pool-")); roots.push(root);
   const owners: Owner[] = [];
   let sessions = 0;
@@ -42,7 +43,9 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
       retainedProcessOwner: retainedOwner(pid),
       connection: {
         // A reused process hands out a fresh private id per `session/new`.
-        newSession: vi.fn(async () => { sessions += 1; return { sessionId: `private-${pid}-${sessions}`, configOptions: modelOptions }; }),
+        newSession: vi.fn(async () => {
+          if (options.newSessionFails?.()) throw new Error("session/new refused");
+          sessions += 1; return { sessionId: `private-${pid}-${sessions}`, configOptions: modelOptions }; }),
         prompt: vi.fn(async () => ({ stopReason: "end_turn" })),
         cancel: vi.fn(async () => undefined),
         closeSession: vi.fn(async () => ({})),
@@ -65,7 +68,7 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
   const runtime = new AgentRuntime({
     config: RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: root, RUNNER_WORKSPACE_DIR: root }),
     spawn, executionBridgeLimit: () => options.limit ?? 1,
-    probe: async () => ({ kind: "signal" as const, fingerprint: "opaque-identity-fingerprint" }),
+    probe: options.probe ?? (async () => ({ kind: "signal" as const, fingerprint: "opaque-identity-fingerprint" })),
     ...(options.ttlMs === undefined ? {} : { idleExecutionBridgeTtlMs: options.ttlMs }),
     ...(options.now ? { now: options.now } : {}),
     ...(options.modelCapabilityTtlMs === undefined ? {} : { modelCapabilityTtlMs: options.modelCapabilityTtlMs }),
@@ -243,6 +246,23 @@ it("spawns a throwaway probe process only when nothing is resident", async () =>
   await expect(f.runtime.discoverModelCapability("model")).resolves.toMatchObject({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] });
   expect(f.spawn).toHaveBeenCalledTimes(2);
   expect(f.owners[1]!.bridge.stop).toHaveBeenCalledOnce();
+});
+
+it("reads the identity again when a discovery fails for good, so readiness stops saying ready (WS1-216)", async () => {
+  let signedIn = true;
+  let refuse = false;
+  const f = await fixture({
+    probe: async () => signedIn ? { kind: "signal", fingerprint: "opaque-identity-fingerprint" } : { kind: "logged_out" },
+    newSessionFails: () => refuse,
+  });
+  await f.runtime.probe(false);
+  expect(f.runtime.readiness().readiness).toBe("ready");
+  // Its sign-in went away outside Konteks (its home cleared): every session is refused.
+  signedIn = false;
+  refuse = true;
+  await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
+  await vi.waitFor(() => expect(f.runtime.readiness()).toMatchObject({ readiness: "not_configured", recoveryAction: "login_locally" }));
+
 });
 
 it("re-reads the offered models once the discovery TTL has passed (System One §6a, KM6)", async () => {

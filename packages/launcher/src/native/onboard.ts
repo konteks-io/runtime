@@ -1,6 +1,7 @@
-import { mkdir, readFile, rename } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename } from "node:fs/promises";
 import { agentName } from "./agent-name.js";
-import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
+import { homedir, hostname } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, hostAgentFamily, hostInstallCommand, NATIVE_MANIFEST_URL, verifyNativeRelease } from "@konteks/remote-release";
 import { z } from "zod";
@@ -64,7 +65,7 @@ export interface OnboardContext {
     agentsWaitMs?: number;
     /** Register this runtime's managed-git key through the local service; answers where the key lives. */
     registerGitKey?: (root: string) => Promise<{ identityFile?: string; user?: string }>;
-    enrollment?: Pick<NativeEnrollment, "openIntent" | "sendChallenge" | "verifyCode" | "bind" | "refreshOwnerToken">;
+    enrollment?: Pick<NativeEnrollment, "openIntent" | "sendChallenge" | "verifyCode" | "bind" | "refreshOwnerToken" | "restoreAccess">;
     complete?: typeof completeNativeEnrollment;
     /** How long the System step waits for managed git still being set up, and how often it asks (WS1-048). */
     managedGitWaitMs?: number;
@@ -76,6 +77,7 @@ export interface OnboardContext {
     recordedAgents?: (root: string) => Promise<string[] | null>;
     /** An OpenCode found here that cannot run (OpenCode 1): the remedy line, or null. */
     openCodeProblem?: () => Promise<string | null>;
+    dshProblem?: () => Promise<string | null>;
     /** Whether the person's own OpenCode holds sign-ins (existence only), for `auth login opencode --reuse`. */
     personalOpenCode?: () => Promise<boolean>;
     /** Wait for the started service to become active; resolves to the roles it advertises, or null. */
@@ -107,7 +109,7 @@ const NEGATION = /\b(no|not|don'?t|do not|never|cancel|stop|wait)\b/;
 const ASKS_OTHER_EMAIL = /\b(different|another|other|wrong|change( the)?) (e-?mail|address)\b/i;
 const ASKS_NEW_CODE = /\b(new code|another code|resend|send (it |a code )?again|didn'?t (get|receive|arrive)|did not (get|receive|arrive)|no (code|email) (came|arrived))\b/i;
 const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
-const RECONNECT_ASK = { question: "Connect this machine again? It starts over with your email and a new code.", kind: "confirm" } as const;
+const RECONNECT_ASK = { question: "Give this machine your access again? Konteks sends a code to your email to check it is you.", kind: "confirm" } as const;
 /** How long, and how often, the agents step waits for the machine to advertise what it can run. */
 const AGENTS_WAIT_MS = 10_000;
 const AGENTS_WAIT_ATTEMPTS = 9;
@@ -139,14 +141,25 @@ function leadsWith(words: Set<string>, answer: string): boolean {
   for (const word of words) if (answer.startsWith(`${word} `)) return true;
   return false;
 }
-export function isYes(answer: string): boolean {
-  const said = normalizeAnswer(answer);
+/** The answer's last sentence ("It already is my System, I think. Yes." ends in "yes", 09-30). */
+function lastSentence(answer: string): string {
+  const sentences = answer.split(/[.!?\n]+/).map(normalizeAnswer).filter(Boolean);
+  return sentences.at(-1) ?? "";
+}
+function yesIn(said: string): boolean {
   if (!leadsWith(AFFIRMATIVE, said)) return false;
   // "yes, but not now" and "please don't" are not a yes.
   return !NEGATION.test(said.replace(/^\S+\s?/, ""));
 }
+export function isYes(answer: string): boolean {
+  const said = normalizeAnswer(answer);
+  if (yesIn(said)) return true;
+  // A person who explains first and answers last still answered.
+  return !leadsWith(NEGATIVE, said) && yesIn(lastSentence(answer));
+}
 export function isNo(answer: string): boolean {
-  return leadsWith(NEGATIVE, normalizeAnswer(answer));
+  if (leadsWith(NEGATIVE, normalizeAnswer(answer))) return true;
+  return !yesIn(normalizeAnswer(answer)) && leadsWith(NEGATIVE, lastSentence(answer));
 }
 
 /**
@@ -187,6 +200,20 @@ export async function detectOpenCodeProblem(): Promise<string | null> {
   return locateNativeOpenCode().then(() => null, (error: unknown) => {
     if (!(error instanceof RemoteInstanceError) || error.diagnostic !== "opencode_unsupported_version") return null;
     return error.message.replace(/,? then retry\.$/, ", then add it here: konteks-remote agent add opencode");
+  });
+}
+
+/**
+ * A DeepSeek Harness here that Konteks cannot run, named with the command that
+ * installs one it can (W1-D4). Onboarding named an unsupported OpenCode but
+ * said nothing about an unsupported DeepSeek Harness, the person's other own
+ * install.
+ */
+export async function detectDshProblem(): Promise<string | null> {
+  const { resolveNativeDshInstallation } = await import("@konteks/remote-supervisor");
+  return resolveNativeDshInstallation().then(() => null, (error: unknown) => {
+    if (!(error instanceof RemoteInstanceError) || error.diagnostic !== "dsh_unsupported_version") return null;
+    return error.message.replace(/,? then retry\.$/, ", then add it here: konteks-remote agent add dsh");
   });
 }
 
@@ -372,20 +399,26 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         await save({ step: "done", closing: true });
         return { step: "identity", done: { summary: "This machine stays disconnected from Konteks.", links: { site: siteUrl } } };
       }
-      // The revoked runtime can never act again; keep its record beside the
-      // install and enroll this machine afresh, as a new runtime.
-      const revoked = await new SupervisorStore(supervisorData).identity().catch(() => null);
-      if (revoked?.instanceId && revoked.instanceId !== "pending") await setAsideLostIdentity(context.root, revoked.instanceId);
+      // Revoking the access leaves the runtime connected and holding the
+      // plan's runtime: proving the address again gives this same runtime the
+      // access back (W1-Z4). Enrolling a second one was refused by the plan in
+      // the name of this very machine. Only when Konteks says the runtime is
+      // gone too does the email step connect it as a new one.
+      const current = await new SupervisorStore(supervisorData).identity().catch(() => null);
       const address = state.ownerEmail ?? state.email;
+      const same = current?.instanceId && current.instanceId !== "pending" ? current.instanceId : undefined;
+      // The same runtime keeps what it knew (its System, initiative, answers)
+      // and carries on where the revoke stopped it; only the code is new.
+      const { intentRef: _intent, emailMasked: _masked, attemptsRemaining: _attempts, decision: _decision, email: _email, retryAsked: _retry, closing: _closing, ...known } = state;
       await writeOnboardState(context.root, {
-        schemaVersion: 1,
+        ...(same ? known : { schemaVersion: 1, ...keptAnswers(state) }),
         step: "email",
         updatedAt: new Date().toISOString(),
         ...(address ? { resendTo: address } : {}),
-        ...keptAnswers(state),
+        ...(same ? { restores: same } : {}),
       } as never);
       return address
-        ? { step: "identity", note: "Starting over as a new runtime.", run: AGAIN }
+        ? { step: "identity", run: AGAIN }
         : { step: "identity", ask: { question: "What email address should this machine belong to?", kind: "email" } };
     }
     case "identity": {
@@ -393,15 +426,18 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       // being asked what it is (OS9).
       const identity = await new SupervisorStore(supervisorData).identity().catch(() => null);
       if (identity?.instanceId && identity.instanceId !== "pending") {
-        const stored = await readOwnerToken(supervisorData);
+        const stored = (await readOwnerToken(supervisorData)) ?? (await claimSiteAccess(supervisorData, enrollment));
         if (!stored) {
-          // Activated through the operator door: connected, but this machine
-          // holds no person's access to register a System with. The site does.
-          await save({ step: "done", instanceId: identity.instanceId, ...(identity.workspaceId ? { tenantId: identity.workspaceId } : {}) });
+          // Connected from the site by someone else, or for the whole
+          // organization: this machine acts for no one person here, so it
+          // offers nothing it could not do. The site is where Systems go.
+          await save({ step: "done", closing: true, instanceId: identity.instanceId, ...(identity.workspaceId ? { tenantId: identity.workspaceId } : {}) });
           return {
             step: "identity",
-            note: `This machine is already connected to ${identity.workspaceId ?? "a workspace"} through an activation; register Systems from the site.`,
-            run: AGAIN,
+            done: {
+              summary: `This computer is connected to ${identity.workspaceId ?? "a workspace"} from the site, not for one person, so it cannot add this folder itself. Add Systems on the site.`,
+              links: { site: siteUrl },
+            },
           };
         }
         await save({
@@ -442,15 +478,26 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               EMBEDDED_RELEASE_ROOTS,
               clock.now(),
             );
-        const opened = await enrollment.openIntent({
-          platform,
-          // `assistant` is what a project-management turn places as, and
-          // `onboard` is what the catalog work needs (OS14). Which agent
-          // families exist here is recorded locally, not requested as a role.
-          requestedRoles: ["assistant", "onboard", "planner", "generator", "qa"],
-          bundleVersion: release.manifest.bundleVersion,
-          manifestDigest: release.manifest.digest,
-        });
+        const open = () =>
+          enrollment.openIntent({
+            platform,
+            // `assistant` is what a project-management turn places as, and
+            // `onboard` is what the catalog work needs (OS14). Which agent
+            // families exist here is recorded locally, not requested as a role.
+            requestedRoles: ["assistant", "onboard", "planner", "generator", "qa"],
+            bundleVersion: release.manifest.bundleVersion,
+            manifestDigest: release.manifest.digest,
+          });
+        let opened = await open();
+        if (state.restores && opened.restoresInstanceId !== state.restores) {
+          // The runtime itself was revoked or removed as well: it can never
+          // act again. Keep its record beside the install and connect this
+          // machine as a new runtime, with a new key.
+          await setAsideLostIdentity(context.root, state.restores);
+          forgetRuntime(state);
+          await save({});
+          opened = await open();
+        }
         intentRef = opened.intentRef;
       }
       const sent = await enrollment.sendChallenge(intentRef, email);
@@ -520,6 +567,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         }
         throw error;
       }
+      if (state.restores) {
+        // The runtime already belongs to its workspace; there is nothing to choose.
+        await save({ step: "start", decision: verified.decision });
+        return { step: "code", note: "Your address is confirmed; giving this machine your access back.", run: AGAIN };
+      }
       if (verified.decision === "choose") {
         await save({ step: "workspace", decision: verified.decision, ...(verified.workspaces ? { workspaces: verified.workspaces } : {}) });
         return { step: "code", note: "That address belongs to more than one workspace.", run: AGAIN };
@@ -568,10 +620,51 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
     }
 
     case "start": {
+      const timing: Record<string, number> = {};
+      let mark = Date.now();
+      const phase = (name: string) => { const now = Date.now(); timing[name] = now - mark; mark = now; };
       // A bind that answered but whose record never got written is resumed
       // from the identity on disk rather than asked of Core again.
       const store = new SupervisorStore(supervisorData);
       const existing = await store.identity().catch(() => null);
+      if (state.restores && existing?.instanceId === state.restores && existing.workspaceId) {
+        let restored;
+        try {
+          restored = await enrollment.restoreAccess(state.intentRef!, { email: state.email! });
+        } catch (error) {
+          if (wireCode(error) !== "enrollment_invalid") throw error;
+          // The runtime was revoked while the code was on its way: connect
+          // this machine as a new one, which costs one more code.
+          await setAsideLostIdentity(context.root, state.restores);
+          const address = state.email;
+          forgetRuntime(state);
+          await save({ step: "email", ...(address ? { resendTo: address } : {}) } as never);
+          return {
+            step: "start",
+            note: "This machine's runtime was revoked in Customize → Runtimes too, so it connects again as a new runtime. Konteks will send a new code.",
+            run: AGAIN,
+          };
+        }
+        await writeOwnerToken(supervisorData, { ...restored.ownerToken, instanceId: restored.identity.instanceId });
+        // Back to the step the revoke interrupted; a finished machine looks at
+        // this folder again, as a new conversation there would.
+        const resume = !state.resumeStep || state.resumeStep === "done" || state.resumeStep === "reconnect" ? "inspect" : state.resumeStep;
+        await save({
+          step: resume,
+          ...(resume === "inspect" && state.systemEntityRef ? { revisit: true } : {}),
+          instanceId: restored.identity.instanceId,
+          tenantId: restored.identity.workspaceId,
+          restores: undefined,
+          resumeStep: undefined,
+          email: undefined,
+          ...(state.email ? { ownerEmail: state.email } : {}),
+        } as never);
+        return {
+          step: "start",
+          note: `Your access is back: this machine works for you in ${workspaceName(state, restored.identity.workspaceId)} again, as the same runtime.`,
+          run: AGAIN,
+        };
+      }
       let identity = existing && existing.instanceId !== "pending" && existing.workspaceId ? { instanceId: existing.instanceId, workspaceId: existing.workspaceId } : null;
       if (!identity) {
         const prepared = await readNativeEnrollment(context.root);
@@ -645,6 +738,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         });
         identity = bound.identity;
       }
+      phase("bind");
       const joinedName = workspaceName(state, identity.workspaceId);
       // A join was already said ("This machine will join X.", "Joining X.")
       // and "is now X's runtime" below says it once more; only a new
@@ -666,6 +760,7 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         await new Promise(resolveWait => setTimeout(resolveWait, Math.min(2_000, staging.waitMs ?? 2_000)));
         unpacked = await staging.status(context.root);
       }
+      phase("unpacking");
       if (unpacked.state !== "done") {
         let progress: string;
         if (unpacked.state === "running") {
@@ -693,6 +788,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       for (;;) {
         try {
           await complete(context.root, identity);
+          phase("complete");
+          await logStepTiming(context.root, "start", timing);
           break;
         } catch (error) {
           const busy = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message);
@@ -1362,6 +1459,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           ? `${agentName("opencode")} needs a sign-in, starting from the providers your own OpenCode uses: konteks-remote auth login opencode --reuse`
           : `${agentName("opencode")} needs a subscription or an API key: konteks-remote auth login opencode`);
       }
+      // An unsupported DeepSeek Harness found here is named with a supported one's install command.
+      if (!installed.includes("dsh")) {
+        const problem = await (context.deps?.dshProblem ?? detectDshProblem)().catch(() => null);
+        if (problem) remedies.push(problem);
+      }
       // An OpenCode 1 found here is named with OpenCode 2's install command.
       if (!installed.includes("opencode")) {
         const problem = await (context.deps?.openCodeProblem ?? detectOpenCodeProblem)().catch(() => null);
@@ -1450,6 +1552,16 @@ function joinedWorkspace(state: { decision?: string | undefined }): boolean {
  * What the person already answered about this machine and folder, kept when the
  * machine connects again as a new runtime: they are not asked twice (W1-G2).
  */
+/**
+ * A machine that becomes a new runtime keeps only the person's answers, as a
+ * machine that lost its key does; what the old runtime knew is not its own.
+ * The state is cleared in place, because every later save spreads it.
+ */
+function forgetRuntime(state: OnboardState): void {
+  const kept = new Set(["schemaVersion", "step", "updatedAt", "resendTo", "resendReason", ...Object.keys(keptAnswers(state))]);
+  for (const key of Object.keys(state)) if (!kept.has(key)) delete (state as Record<string, unknown>)[key];
+}
+
 function keptAnswers(state: { ownerEmail?: string | undefined; graftDecision?: string | undefined; graftRepository?: string | undefined }): Record<string, string> {
   return {
     ...(state.ownerEmail ? { ownerEmail: state.ownerEmail } : {}),
@@ -1506,6 +1618,7 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
     await writeOnboardState(context.root, {
       ...(state ?? { schemaVersion: 1 as const, updatedAt: new Date().toISOString() }),
       step: "reconnect",
+      ...(state && state.step !== "reconnect" ? { resumeStep: state.step } : {}),
     } as never).catch(() => undefined);
     return { step: "identity", note: OWNER_ACCESS_REVOKED, ask: RECONNECT_ASK };
   }
@@ -1564,8 +1677,22 @@ async function registerGitKey(root: string): Promise<{ identityFile?: string; us
   };
 }
 
-function hostLabel(): string {
-  return `${homedir().split("/").pop() ?? "user"}@${nativePlatform().os}`;
+/**
+ * The computer's name as its person knows it, for "connected from …" on the
+ * site: macOS's Computer Name ("Sam's MacBook Air"), else the host name
+ * without ".local". The home folder and OS ("home@macos") meant nothing there.
+ */
+export function hostLabel(deps: { os?: string; computerName?: () => string; hostname?: () => string } = {}): string {
+  const os = deps.os ?? nativePlatform().os;
+  if (os === "macos") {
+    try {
+      const read = deps.computerName ?? (() => execFileSync("/usr/sbin/scutil", ["--get", "ComputerName"], { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] }));
+      const named = read().trim();
+      if (named) return named.slice(0, 128);
+    } catch { /* the host name below */ }
+  }
+  const host = (deps.hostname ?? hostname)().trim().replace(/\.local$/i, "");
+  return (host || `${homedir().split("/").pop() ?? "user"}'s computer`).slice(0, 128);
 }
 
 /** The identity on disk when its key is gone; null for a machine that can still prove itself. */
@@ -1592,6 +1719,23 @@ async function setAsideLostIdentity(root: string, instanceId: string): Promise<v
   await mkdir(join(root, "supervisor"), { mode: 0o700 });
 }
 
+/**
+ * A computer its owner connected from the site holds no token of theirs yet;
+ * Konteks gives it, once, for the machine's own key (W1-M4). Offering a System
+ * and then saying the machine "holds no Konteks access for you" is gone.
+ */
+async function claimSiteAccess(
+  supervisorData: string,
+  enrollment: NonNullable<OnboardContext["deps"]>["enrollment"] & object,
+): Promise<Awaited<ReturnType<typeof readOwnerToken>>> {
+  const identity = await new SupervisorStore(supervisorData).identity().catch(() => null);
+  if (!identity?.instanceId || identity.instanceId === "pending") return null;
+  const granted = await enrollment.refreshOwnerToken(identity.instanceId).catch(() => null);
+  if (!granted) return null;
+  await writeOwnerToken(supervisorData, { ...granted, instanceId: identity.instanceId });
+  return readOwnerToken(supervisorData);
+}
+
 /** The person's token, refreshed rather than kept long (OS15). */
 async function ownerApi(
   supervisorData: string,
@@ -1599,7 +1743,7 @@ async function ownerApi(
   enrollment: NonNullable<OnboardContext["deps"]>["enrollment"] & object,
   context: OnboardContext,
 ): Promise<OwnerApiClient> {
-  const stored = await readOwnerToken(supervisorData);
+  const stored = (await readOwnerToken(supervisorData)) ?? (await claimSiteAccess(supervisorData, enrollment));
   if (!stored) {
     throw new RemoteInstanceError("permission_denied", "This machine holds no Konteks access for you; run onboard from the start.");
   }
@@ -1635,4 +1779,14 @@ export async function onboardCoreUrl(root: string): Promise<string | undefined> 
   if (prepared && typeof prepared.coreUrl === "string") return prepared.coreUrl;
   const record = await readNativeRecord(root).catch(() => null);
   return record?.coreUrl;
+}
+
+/**
+ * One line per slow step, in the connector's own log folder: a join sat 98 s
+ * after "This machine will join …" with nothing to say where (W1-E1).
+ */
+async function logStepTiming(root: string, step: string, phases: Record<string, number>): Promise<void> {
+  const line = JSON.stringify({ at: new Date().toISOString(), step, ms: phases }) + "\n";
+  await mkdir(join(root, "logs"), { recursive: true, mode: 0o700 }).catch(() => undefined);
+  await appendFile(join(root, "logs", "onboard-timing.log"), line, { mode: 0o600 }).catch(() => undefined);
 }

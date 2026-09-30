@@ -100,10 +100,14 @@ export function nativeServiceDefinition(input: {
     // launchd keeps nothing a service prints: without a file the connector's
     // log, which doctor points to, did not exist (WS1-163). The connector
     // keeps the file small itself (connector-log.ts).
+    // The home it was started from, as the service's own: launchd otherwise
+    // hands a service the login's home, so a connector installed for another
+    // home (a second person on this Mac, a stand-in laptop) read the wrong
+    // agents' sign-ins and installs (09-30).
     const logFile = path.join(normalizedRoot, "logs", CONNECTOR_LOG_FILE);
     return {
       label, path: file, requiresLinger: false,
-      contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>${xml(logFile)}</string>\n<key>StandardErrorPath</key><string>${xml(logFile)}</string>\n</dict></plist>\n`,
+      contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>${xml(logFile)}</string>\n<key>StandardErrorPath</key><string>${xml(logFile)}</string>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>${xml(input.home)}</string></dict>\n</dict></plist>\n`,
       install: [],
       start: { command: "launchctl", args: ["bootstrap", domain, file] },
       stop: { command: "launchctl", args: ["bootout", `${domain}/${label}`] },
@@ -116,7 +120,7 @@ export function nativeServiceDefinition(input: {
     const unit = `${label}.service`;
     return {
       label, path: path.join(input.home, ".config", "systemd", "user", unit), requiresLinger: true,
-      contents: `[Unit]\nDescription=Konteks native agent connector\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=${[input.executable, ...args].map(systemdArg).join(" ")}\nRestart=always\nRestartSec=5\nTimeoutStopSec=45\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`,
+      contents: `[Unit]\nDescription=Konteks native agent connector\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=${[input.executable, ...args].map(systemdArg).join(" ")}\nEnvironment=${systemdArg(`HOME=${input.home}`)}\nRestart=always\nRestartSec=5\nTimeoutStopSec=45\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`,
       install: [{ command: "systemctl", args: ["--user", "daemon-reload"] }],
       start: { command: "systemctl", args: ["--user", "enable", "--now", unit] },
       stop: { command: "systemctl", args: ["--user", "stop", unit] },

@@ -6,7 +6,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createLogger, readDarwinProcessIdentity, stopProcessGroupLeaderFirst, supportsProcessGroups, type Logger } from "@konteks/remote-common";
 import { blockedCommandPattern, DEFAULT_BASH_BLOCKLIST } from "../session/workspace-tool-policy.js";
-import { resolvePreviewPlan, substitutePreviewVariables, type PreviewPlan, type PreviewPlanResult } from "./config.js";
+import { CONVERSATION_HAS_NO_APP, resolvePreviewPlan, substitutePreviewVariables, type PreviewPlan, type PreviewPlanResult } from "./config.js";
 import { resolvePreviewPath } from "./user-path.js";
 
 /**
@@ -434,8 +434,12 @@ export class PreviewProcessManager {
     entry.state = "failed";
     entry.phase = null;
     entry.message = message;
-    this.lastFailure = { at: this.now(), message: message.slice(0, 200) };
-    this.logger.warn({ event: "preview.failed", source: entry.plan?.source ?? null }, "preview did not start");
+    // A conversation with no app of its own is an answer, not a broken preview:
+    // doctor would otherwise warn about it (09-30).
+    const expected = message === CONVERSATION_HAS_NO_APP;
+    if (!expected) this.lastFailure = { at: this.now(), message: message.slice(0, 200) };
+    if (expected) this.logger.info({ event: "preview.no_app_in_conversation" }, "a conversation has no app of its own to preview");
+    else this.logger.warn({ event: "preview.failed", source: entry.plan?.source ?? null }, "preview did not start");
     // Whatever is left of the process tree goes with the failure.
     if (entry.child) void this.kill(entry);
     this.options.onStopped?.(entry.sessionId);

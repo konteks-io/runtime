@@ -64,6 +64,47 @@ describe("native agent-add ownership lifecycle", () => {
     expect(f.restore).not.toHaveBeenCalled();
   });
 
+  it("stops a connector running in a terminal, not as the service, adds the agent and says how to start it again (W1-D3)", async () => {
+    const f = await fixture();
+    const lines: string[] = [];
+    // The service manager reports it stopped, yet the connector answers.
+    f.deps.execute = async (command: { command: string }) => { f.calls.push(command.command); return 113; };
+    const control = f.deps.control();
+    f.deps.control = () => ({ call: async (request: { op: string }) => {
+      if (request.op === "shutdown") f.owner.release();
+      return control.call(request);
+    } });
+    await runNativeAgentAdd({ root: f.root, agent: "dsh", output: createOutput({ json: false, stdout: { write: (text: string) => { lines.push(text); return true; } } as never }) }, f.deps as never);
+    expect(f.calls.indexOf("drain")).toBeLessThan(f.calls.indexOf("shutdown"));
+    expect(f.calls.indexOf("shutdown")).toBeLessThan(f.calls.indexOf("add"));
+    expect(f.calls).not.toContain("stop");
+    expect(f.start).not.toHaveBeenCalled();
+    expect(lines.join("")).toContain("is added. Konteks stopped to add it; konteks-remote start starts it again, in the background.");
+  });
+
+  it("refuses an install it cannot run before stopping anything (W1-D3)", async () => {
+    const f = await fixture();
+    const { RemoteInstanceError } = await import("@konteks/remote-common");
+    (f.deps as Record<string, unknown>).locate = async () => { throw new RemoteInstanceError("prerequisite_missing" as never, "DeepSeek Harness 0.2.0-rc.2 is not a version Konteks supports."); };
+    try {
+      await expect(runNativeAgentAdd({ root: f.root, agent: "dsh", output: createOutput({ json: false, stdout: { write: () => true } as never }) }, f.deps as never))
+        .rejects.toThrow("0.2.0-rc.2 is not a version Konteks supports");
+      expect(f.calls).not.toContain("drain");
+      expect(f.calls).not.toContain("stop");
+      expect(f.add).not.toHaveBeenCalled();
+    } finally { f.owner.release(); }
+  });
+
+  it("adds straight away when nothing runs at all", async () => {
+    const f = await fixture();
+    f.owner.release();
+    f.deps.execute = async (command: { command: string }) => { f.calls.push(command.command); return 113; };
+    f.deps.control = () => ({ call: async () => { throw new Error("connect ECONNREFUSED"); } });
+    await runNativeAgentAdd({ root: f.root, agent: "dsh", output: createOutput({ json: false, stdout: { write: () => true } as never }) }, f.deps as never);
+    expect(f.calls).toEqual(["status", "add"]);
+    expect(f.start).not.toHaveBeenCalled();
+  });
+
   it("leaves the service stopped and the original record intact if ownership never releases", async () => {
     const f = await fixture();
     try {
