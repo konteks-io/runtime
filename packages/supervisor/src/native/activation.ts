@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import { isFsErrorWithCode, jcsDigest, RemoteInstanceError, RemotePlatformSchema, type Clock, type FetchFn } from "@konteks/remote-common";
+import { createLogger, isFsErrorWithCode, jcsDigest, RemoteInstanceError, RemotePlatformSchema, type Clock, type FetchFn } from "@konteks/remote-common";
 import { selectNativeArtifacts, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { CoreClient } from "../core/client.js";
 import { runActivationExchange, type ActivationExchangeOutcome } from "../provisioning/activation.js";
@@ -50,7 +50,11 @@ export async function runNativeActivationExchange(args: {
     const enrollment = journal.execution.enrollment();
     if (enrollment && (enrollment.activationId !== args.activationId || enrollment.keyDigest !== keyDigest)) throw new RemoteInstanceError("registration_mismatch", "Native enrollment retry changed its original lineage.");
     const core = new CoreClient({ baseUrl: args.coreUrl, clock: args.clock, key: () => key, credential: () => null, ...(args.fetchFn ? { fetchFn: args.fetchFn } : {}) });
-    const outcome = await runActivationExchange({ store, core, key, clock: args.clock, activationId: args.activationId, platform: { ...platform, containerBackend: "none", deploymentKind: "native_connector" }, deploymentKind: "native_connector", release, roots: args.roots, readActivationCode: async () => {
+    const outcome = await runActivationExchange({ store, core, key, clock: args.clock, activationId: args.activationId, platform: { ...platform, containerBackend: "none", deploymentKind: "native_connector" }, deploymentKind: "native_connector", release, roots: args.roots,
+      // The person reads this terminal: its progress lines say what happens,
+      // and a JSON log line in between read as noise (W1-M2). Warnings stay.
+      logger: createLogger({ name: "provisioning", level: "warn" }),
+      readActivationCode: async () => {
       const code = await args.readActivationCode();
       owner.assertOwned();
       return code;

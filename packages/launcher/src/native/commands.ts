@@ -179,7 +179,7 @@ export async function startNativeConnector(
   });
   if (moved)
     input.output.line(
-      `Control port ${moved.previousPort} is occupied by another local process; this stopped connector now uses port ${moved.controlPort}. Its identity and local work are unchanged.`,
+      `Another program uses port ${moved.previousPort}, so Konteks uses port ${moved.controlPort} on this computer instead.`,
     );
   const started = await startNativeServiceDefinition(definition, {
     execute: command => command === definition.status ? serviceState().then(state => state === "running" ? 0 : stoppedCodes[0]!) : executeService(command),
