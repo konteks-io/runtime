@@ -1367,15 +1367,22 @@ describe("relayed session (D98/D113/D114)", () => {
       const list = () => post({ jsonrpc: "2.0", id: 1, method: "tools/list" });
       const stream = await fetch(tool.url, { headers: { authorization: tool.headers[0]!.value, accept: "text/event-stream" } });
       const reader = stream.body!.getReader();
+      // Re-reads the agent starts on its own; `stop` waits for them, so none is
+      // still in flight (and rejects unhandled) when the session closes its server.
+      const relisted: Array<Promise<unknown>> = [];
       void (async () => {
         for (;;) {
           const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true }));
           if (done) return;
-          if (relists && new TextDecoder().decode(value).includes("list_changed")) void list();
+          if (relists && new TextDecoder().decode(value).includes("list_changed")) relisted.push(list().catch(() => undefined));
         }
       })();
       const submit = (args: unknown) => post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "submit_result", arguments: args } });
-      return { list, submit, stop: () => reader.cancel().catch(() => undefined) };
+      const stop = async () => {
+        await reader.cancel().catch(() => undefined);
+        await Promise.all(relisted);
+      };
+      return { list, submit, stop };
     }
 
     it("lifts the contract into the tool, prompts with one line, and returns the tool's value with the completion", async () => {
