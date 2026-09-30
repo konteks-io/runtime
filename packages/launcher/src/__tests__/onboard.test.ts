@@ -360,7 +360,7 @@ describe("onboard", () => {
     expect((error as Error).message).toBe(OWNER_ACCESS_REVOKED);
     const stopped = await onboardFailureStep({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" }, error);
     expect(stopped.note).toBe("This machine's Konteks access was revoked in Customize → Runtimes.");
-    expect(stopped.ask).toMatchObject({ question: "Connect this machine again? It starts over with your email and a new code.", kind: "confirm" });
+    expect(stopped.ask).toMatchObject({ question: "Give this machine your access again? Konteks sends a code to your email to check it is you.", kind: "confirm" });
     expect(await readOnboardState(root)).toMatchObject({ step: "reconnect" });
     await writeOnboardState(root, { ...(await readOnboardState(root)), step: "system" } as never);
 
@@ -905,17 +905,71 @@ describe("onboard", () => {
     expect(refused.done?.links.site).toBe("https://app.test");
   });
 
-  it("connects a revoked machine again as a new runtime, with a new code to the same address, when the person says yes (W1-Z4)", async () => {
-    const { SupervisorStore } = await import("@konteks/remote-supervisor");
-    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
-    await writeOnboardState(root, { step: "reconnect", tenantId: "acme", ownerEmail: "ada@acme.test" } as never);
-    const again = await step({}, "yes");
-    // The code step says where the code went, masked; this note must not unmask it.
-    expect(again.note).toBe("Starting over as a new runtime.");
-    expect(again.run).toBeDefined();
-    expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
-    const { readdir } = await import("node:fs/promises");
-    expect((await readdir(join(root, "retired"))).some(entry => entry.startsWith("instance-1-"))).toBe(true);
+  describe("a machine whose access was revoked, when the person says yes (W1-Z4)", () => {
+    const enrolled = async () => {
+      const { writeSecretFile } = await import("@konteks/remote-common");
+      await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+        schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: [], bundleVersion: "0.7.6", manifestDigest: "digest-1", controlPort: 41800,
+      }));
+      const { SupervisorStore } = await import("@konteks/remote-supervisor");
+      vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
+    };
+    const retired = async () => {
+      const { readdir } = await import("node:fs/promises");
+      return readdir(join(root, "retired")).catch(() => [] as string[]);
+    };
+
+    it("stays the same runtime and sends a code to the same address", async () => {
+      await enrolled();
+      await writeOnboardState(root, { step: "reconnect", tenantId: "acme", ownerEmail: "ada@acme.test" } as never);
+      const again = await step({}, "yes");
+      expect(again.note).toBeUndefined();
+      expect(again.run).toBeDefined();
+      expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test", restores: "instance-1" });
+      expect(await retired()).toEqual([]);
+
+      const openIntent = vi.fn(async () => ({ intentRef: "intent-1", restoresInstanceId: "instance-1" }));
+      const sendChallenge = vi.fn(async () => ({ sentToMasked: "a••@acme.test", attemptsRemaining: 5 }));
+      const sent = await step({ enrollment: { openIntent, sendChallenge } as never });
+      expect(sendChallenge).toHaveBeenCalledWith("intent-1", "ada@acme.test");
+      expect(sent.note).toContain("A six-digit code is on its way.");
+      expect(await readOnboardState(root)).toMatchObject({ step: "code", restores: "instance-1" });
+
+      // No workspace question: the runtime already has its workspace.
+      const verifyCode = vi.fn(async () => ({ decision: "choose", workspaces: [{ tenantId: "acme", displayName: "Acme" }, { tenantId: "b", displayName: "B" }] }));
+      const restoreAccess = vi.fn(async () => ({
+        identity: { instanceId: "instance-1", workspaceId: "acme" },
+        ownerToken: { token: "new-token", expiresAt: new Date(Date.now() + 3600_000).toISOString(), userRef: "user:default/ada", tenantId: "acme" },
+        accessRestored: true,
+      }));
+      const bind = vi.fn();
+      const confirmed = await step({ enrollment: { verifyCode, restoreAccess, bind } as never }, "123456");
+      expect(confirmed.ask).toBeUndefined();
+      expect(await readOnboardState(root)).toMatchObject({ step: "start", restores: "instance-1" });
+      const back = await step({ enrollment: { verifyCode, restoreAccess, bind } as never });
+      expect(bind).not.toHaveBeenCalled();
+      expect(restoreAccess).toHaveBeenCalledWith("intent-1", { email: "ada@acme.test" });
+      expect(back.note).toContain("Your access is back: this machine works for you in");
+      const { readOwnerToken } = await import("../native/owner-api.js");
+      expect((await readOwnerToken(join(root, "supervisor")))?.token).toBe("new-token");
+      expect(await readOnboardState(root)).toMatchObject({ step: "inspect", instanceId: "instance-1", tenantId: "acme", ownerEmail: "ada@acme.test" });
+      expect((await readOnboardState(root))?.restores).toBeUndefined();
+      expect(await retired()).toEqual([]);
+    });
+
+    it("connects as a new runtime when Konteks says the runtime itself is gone too", async () => {
+      await enrolled();
+      await writeOnboardState(root, { step: "email", resendTo: "ada@acme.test", restores: "instance-1" } as never);
+      const openIntent = vi.fn()
+        .mockResolvedValueOnce({ intentRef: "intent-1" })
+        .mockResolvedValueOnce({ intentRef: "intent-2" });
+      const sendChallenge = vi.fn(async () => ({ sentToMasked: "a••@acme.test", attemptsRemaining: 5 }));
+      await step({ enrollment: { openIntent, sendChallenge } as never });
+      expect(openIntent).toHaveBeenCalledTimes(2);
+      expect(sendChallenge).toHaveBeenCalledWith("intent-2", "ada@acme.test");
+      expect((await retired()).some(entry => entry.startsWith("instance-1-"))).toBe(true);
+      expect((await readOnboardState(root))?.restores).toBeUndefined();
+    });
   });
 
   it("does not tell a revoked machine that nothing needs setting up, even mid-revisit (W1-Z4)", async () => {

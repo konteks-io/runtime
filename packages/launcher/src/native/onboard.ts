@@ -64,7 +64,7 @@ export interface OnboardContext {
     agentsWaitMs?: number;
     /** Register this runtime's managed-git key through the local service; answers where the key lives. */
     registerGitKey?: (root: string) => Promise<{ identityFile?: string; user?: string }>;
-    enrollment?: Pick<NativeEnrollment, "openIntent" | "sendChallenge" | "verifyCode" | "bind" | "refreshOwnerToken">;
+    enrollment?: Pick<NativeEnrollment, "openIntent" | "sendChallenge" | "verifyCode" | "bind" | "refreshOwnerToken" | "restoreAccess">;
     complete?: typeof completeNativeEnrollment;
     /** How long the System step waits for managed git still being set up, and how often it asks (WS1-048). */
     managedGitWaitMs?: number;
@@ -107,7 +107,7 @@ const NEGATION = /\b(no|not|don'?t|do not|never|cancel|stop|wait)\b/;
 const ASKS_OTHER_EMAIL = /\b(different|another|other|wrong|change( the)?) (e-?mail|address)\b/i;
 const ASKS_NEW_CODE = /\b(new code|another code|resend|send (it |a code )?again|didn'?t (get|receive|arrive)|did not (get|receive|arrive)|no (code|email) (came|arrived))\b/i;
 const AGAIN = { argv: ["konteks-remote", "onboard", "--json"] };
-const RECONNECT_ASK = { question: "Connect this machine again? It starts over with your email and a new code.", kind: "confirm" } as const;
+const RECONNECT_ASK = { question: "Give this machine your access again? Konteks sends a code to your email to check it is you.", kind: "confirm" } as const;
 /** How long, and how often, the agents step waits for the machine to advertise what it can run. */
 const AGENTS_WAIT_MS = 10_000;
 const AGENTS_WAIT_ATTEMPTS = 9;
@@ -383,20 +383,23 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         await save({ step: "done", closing: true });
         return { step: "identity", done: { summary: "This machine stays disconnected from Konteks.", links: { site: siteUrl } } };
       }
-      // The revoked runtime can never act again; keep its record beside the
-      // install and enroll this machine afresh, as a new runtime.
-      const revoked = await new SupervisorStore(supervisorData).identity().catch(() => null);
-      if (revoked?.instanceId && revoked.instanceId !== "pending") await setAsideLostIdentity(context.root, revoked.instanceId);
+      // Revoking the access leaves the runtime connected and holding the
+      // plan's runtime: proving the address again gives this same runtime the
+      // access back (W1-Z4). Enrolling a second one was refused by the plan in
+      // the name of this very machine. Only when Konteks says the runtime is
+      // gone too does the email step connect it as a new one.
+      const current = await new SupervisorStore(supervisorData).identity().catch(() => null);
       const address = state.ownerEmail ?? state.email;
       await writeOnboardState(context.root, {
         schemaVersion: 1,
         step: "email",
         updatedAt: new Date().toISOString(),
         ...(address ? { resendTo: address } : {}),
+        ...(current?.instanceId && current.instanceId !== "pending" ? { restores: current.instanceId } : {}),
         ...keptAnswers(state),
       } as never);
       return address
-        ? { step: "identity", note: "Starting over as a new runtime.", run: AGAIN }
+        ? { step: "identity", run: AGAIN }
         : { step: "identity", ask: { question: "What email address should this machine belong to?", kind: "email" } };
     }
     case "identity": {
@@ -453,15 +456,26 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
               EMBEDDED_RELEASE_ROOTS,
               clock.now(),
             );
-        const opened = await enrollment.openIntent({
-          platform,
-          // `assistant` is what a project-management turn places as, and
-          // `onboard` is what the catalog work needs (OS14). Which agent
-          // families exist here is recorded locally, not requested as a role.
-          requestedRoles: ["assistant", "onboard", "planner", "generator", "qa"],
-          bundleVersion: release.manifest.bundleVersion,
-          manifestDigest: release.manifest.digest,
-        });
+        const open = () =>
+          enrollment.openIntent({
+            platform,
+            // `assistant` is what a project-management turn places as, and
+            // `onboard` is what the catalog work needs (OS14). Which agent
+            // families exist here is recorded locally, not requested as a role.
+            requestedRoles: ["assistant", "onboard", "planner", "generator", "qa"],
+            bundleVersion: release.manifest.bundleVersion,
+            manifestDigest: release.manifest.digest,
+          });
+        let opened = await open();
+        if (state.restores && opened.restoresInstanceId !== state.restores) {
+          // The runtime itself was revoked or removed as well: it can never
+          // act again. Keep its record beside the install and connect this
+          // machine as a new runtime, with a new key.
+          await setAsideLostIdentity(context.root, state.restores);
+          await save({ restores: undefined } as never);
+          state.restores = undefined;
+          opened = await open();
+        }
         intentRef = opened.intentRef;
       }
       const sent = await enrollment.sendChallenge(intentRef, email);
@@ -531,6 +545,11 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
         }
         throw error;
       }
+      if (state.restores) {
+        // The runtime already belongs to its workspace; there is nothing to choose.
+        await save({ step: "start", decision: verified.decision });
+        return { step: "code", note: "Your address is confirmed; giving this machine your access back.", run: AGAIN };
+      }
       if (verified.decision === "choose") {
         await save({ step: "workspace", decision: verified.decision, ...(verified.workspaces ? { workspaces: verified.workspaces } : {}) });
         return { step: "code", note: "That address belongs to more than one workspace.", run: AGAIN };
@@ -583,6 +602,37 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       // from the identity on disk rather than asked of Core again.
       const store = new SupervisorStore(supervisorData);
       const existing = await store.identity().catch(() => null);
+      if (state.restores && existing?.instanceId === state.restores && existing.workspaceId) {
+        let restored;
+        try {
+          restored = await enrollment.restoreAccess(state.intentRef!, { email: state.email! });
+        } catch (error) {
+          if (wireCode(error) !== "enrollment_invalid") throw error;
+          // The runtime was revoked while the code was on its way: connect
+          // this machine as a new one, which costs one more code.
+          await setAsideLostIdentity(context.root, state.restores);
+          await save({ step: "email", restores: undefined, intentRef: undefined, emailMasked: undefined, decision: undefined, attemptsRemaining: undefined, resendTo: state.email } as never);
+          return {
+            step: "start",
+            note: "This machine's runtime was revoked in Customize → Runtimes too, so it connects again as a new runtime. Konteks will send a new code.",
+            run: AGAIN,
+          };
+        }
+        await writeOwnerToken(supervisorData, { ...restored.ownerToken, instanceId: restored.identity.instanceId });
+        await save({
+          step: "inspect",
+          instanceId: restored.identity.instanceId,
+          tenantId: restored.identity.workspaceId,
+          restores: undefined,
+          email: undefined,
+          ...(state.email ? { ownerEmail: state.email } : {}),
+        } as never);
+        return {
+          step: "start",
+          note: `Your access is back: this machine works for you in ${workspaceName(state, restored.identity.workspaceId)} again, as the same runtime.`,
+          run: AGAIN,
+        };
+      }
       let identity = existing && existing.instanceId !== "pending" && existing.workspaceId ? { instanceId: existing.instanceId, workspaceId: existing.workspaceId } : null;
       if (!identity) {
         const prepared = await readNativeEnrollment(context.root);

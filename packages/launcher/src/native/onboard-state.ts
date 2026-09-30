@@ -90,6 +90,8 @@ export const OnboardStateSchema = z
     closing: z.boolean().optional(),
     /** The runtime this machine was before it lost its key; the next bind replaces it (W1-L1). */
     replaces: z.string().min(1).optional(),
+    /** The runtime whose revoked access proving the address gives back; the machine stays that runtime (W1-Z4). */
+    restores: z.string().min(1).optional(),
     /** What happened to Graft, and for which repository; it is never offered twice (W1-G2). */
     graftDecision: z.enum(["accepted", "declined", "unavailable", "failed"]).optional(),
     graftRepository: z.string().optional(),

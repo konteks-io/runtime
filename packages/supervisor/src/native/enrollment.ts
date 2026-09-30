@@ -45,7 +45,13 @@ export const ENROLLMENT_PATHS = Object.freeze({
 });
 
 const IntentOpenedSchema = z
-  .object({ intentRef: z.string().min(1), status: z.string().min(1), expiresAt: z.string().min(1) })
+  .object({
+    intentRef: z.string().min(1),
+    status: z.string().min(1),
+    expiresAt: z.string().min(1),
+    /** Set when this key's runtime lost only the person's access: proving the address gives it back (W1-Z4). */
+    restoresInstanceId: z.string().min(1).optional(),
+  })
   .strict();
 
 const ChallengeSentSchema = z
@@ -91,7 +97,16 @@ const BoundSchema = z
   })
   .strict();
 
+const AccessRestoredSchema = z
+  .object({
+    identity: z.object({ instanceId: z.string().min(1), workspaceId: z.string().min(1) }).strict(),
+    ownerToken: OwnerTokenSchema,
+    accessRestored: z.literal(true),
+  })
+  .strict();
+
 export type EnrollmentIntentOpened = z.infer<typeof IntentOpenedSchema>;
+export type EnrollmentAccessRestored = z.infer<typeof AccessRestoredSchema>;
 export type EnrollmentChallengeSent = z.infer<typeof ChallengeSentSchema>;
 export type EnrollmentVerified = z.infer<typeof VerifiedSchema>;
 export type EnrollmentBound = z.infer<typeof BoundSchema>;
@@ -129,7 +144,7 @@ export class NativeEnrollment {
     bundleVersion: string;
     manifestDigest: string;
   }): Promise<EnrollmentIntentOpened> {
-    return this.withKey(async key => {
+    return this.signed(async key => {
       const body = {
         publicKeyJwk: key.publicKeyJwk as unknown as JsonValue,
         platform: input.platform as unknown as JsonValue,
@@ -142,13 +157,13 @@ export class NativeEnrollment {
   }
 
   async sendChallenge(intentRef: string, email: string): Promise<EnrollmentChallengeSent> {
-    return this.withKey(key =>
+    return this.signed(key =>
       this.post(ENROLLMENT_PATHS.challenge(intentRef), { email }, key, "enrollment_challenge", intentRef, ChallengeSentSchema),
     );
   }
 
   async verifyCode(intentRef: string, code: string): Promise<EnrollmentVerified> {
-    return this.withKey(key =>
+    return this.signed(key =>
       this.post(ENROLLMENT_PATHS.verify(intentRef), { code }, key, "enrollment_verify", intentRef, VerifiedSchema),
     );
   }
@@ -224,22 +239,38 @@ export class NativeEnrollment {
     });
   }
 
+  /**
+   * Bind a reopened intent back to the runtime it names: the person proved
+   * their address again after revoking only this machine's access (W1-Z4).
+   * Nothing on disk changes but the token the caller keeps, so this works
+   * while the connector runs.
+   */
+  async restoreAccess(intentRef: string, input: { email: string }): Promise<EnrollmentAccessRestored> {
+    return this.signed(key =>
+      this.post(ENROLLMENT_PATHS.bind(intentRef), { email: input.email }, key, "enrollment_bind", intentRef, AccessRestoredSchema),
+    );
+  }
+
   async refreshOwnerToken(instanceId: string): Promise<OwnerTokenGrant> {
-    const refresh = (key: { privateKey: unknown; publicKeyJwk: unknown }) =>
-      this.post(ENROLLMENT_PATHS.token, { instanceId }, key, "enrollment_token", instanceId, OwnerTokenSchema);
+    return this.signed(key => this.post(ENROLLMENT_PATHS.token, { instanceId }, key, "enrollment_token", instanceId, OwnerTokenSchema));
+  }
+
+  /**
+   * Run a call that only signs with this machine's key and writes nothing
+   * here. A running connector owns the data directory, so when it does, the
+   * key that already exists is read without the lock (09-30: every onboarding
+   * step after the token's first few minutes failed with "Another connector
+   * owns this native data directory" while the connector ran, looping on the
+   * System question; a revoked access could not be given back at all).
+   */
+  private async signed<T>(run: (key: { privateKey: unknown; publicKeyJwk: unknown }) => Promise<T>): Promise<T> {
     try {
-      return await this.withKey(refresh);
+      return await this.withKey(run);
     } catch (error) {
-      // A running connector owns the data directory. Refreshing the person's
-      // token changes nothing there; it only signs with the machine key that
-      // already exists, so read that key without the lock (09-30: every
-      // onboarding step after the token's first few minutes failed with
-      // "Another connector owns this native data directory" while the
-      // connector ran, looping on the System question).
       if (!(error instanceof RemoteInstanceError) || !/owns this native data directory/.test(error.message)) throw error;
       const key = await new SupervisorStore(this.options.dataDir).loadInstanceKey();
       if (!key) throw error;
-      return refresh(key as never);
+      return run(key as never);
     }
   }
 
