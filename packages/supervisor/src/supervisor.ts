@@ -147,6 +147,8 @@ const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
  * lease in a running process (RCA 2026-09-30: offline 13 h, then 6 h).
  */
 const LEASE_LAPSE_RESTART_MS = 2 * 60_000;
+/** How often a runtime Core refuses as too old re-reads the release channel. */
+const REFUSED_BUNDLE_UPDATE_INTERVAL_MS = 10 * 60_000;
 
 export interface SupervisorOptions {
   /** Native only: called once when no heartbeat has been attempted for longer
@@ -295,6 +297,7 @@ export class Supervisor {
   private livenessQuietWarned = false;
   /** Since when Core has refused this runtime's credential (401/403) without a success in between. */
   private leaseRefusedSince: number | null = null;
+  private refusedBundleUpdateAt: number | null = null;
   private pendingHeartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeLogins = new Map<string, { agentId: string; emit: (event: ControlLoginEvent) => void }>();
   /** Site-started steps waiting on the person at a window on this computer, by login id. */
@@ -770,7 +773,8 @@ export class Supervisor {
       eraseAssignments: (ids) => this.eraseAssignments(ids),
       eraseAll: () => this.eraseAll(),
       onUpdateRequired: (policy) => {
-        if (this.updates) this.updates.onUpdateRequired(policy);
+        const updates = this.ensureUpdates();
+        if (updates) updates.onUpdateRequired(policy);
         else this.logger.warn({ minimumSupportedBundle: policy.minimumSupportedBundle }, "update_required: bundle below Core's minimum");
       },
       sendAck: (ack) => this.sendControlAck(ack),
@@ -1280,6 +1284,8 @@ export class Supervisor {
       const record = this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation);
       const terminal = record && record.state !== "pending" && record.state !== "applied";
       const denied = this.administrativeStatus === "revoked" || (error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch", "reconciliation_replay", "resume_deadline_expired"].includes(error.code));
+      // Below Core's minimum no start can succeed: only an update gets back in.
+      if (error instanceof RemoteInstanceError && error.code === "update_required") this.requestUpdateForRefusedBundle();
       if (!this.stopping && !this.activeLoopStarted && !terminal && !denied && !this.recoveryRetryTimer) {
         this.recoveryRetryTimer = setTimeout(() => { this.recoveryRetryTimer = null; void this.startActiveLoop(); }, 15_000);
         this.recoveryRetryTimer.unref();
@@ -1287,6 +1293,16 @@ export class Supervisor {
     }).finally(() => { this.activeLoopStarting = null; });
     this.activeLoopStarting = operation;
     return operation;
+  }
+
+  /** At most one channel read per interval while startup keeps being refused as too old (it retries every 15 s). */
+  private requestUpdateForRefusedBundle(): void {
+    const now = Date.now();
+    if (this.refusedBundleUpdateAt !== null && now - this.refusedBundleUpdateAt < REFUSED_BUNDLE_UPDATE_INTERVAL_MS) return;
+    this.refusedBundleUpdateAt = now;
+    const updates = this.ensureUpdates();
+    if (!updates) { this.logger.warn("Core refuses this release as too old and automatic updates are off; update with `konteks-remote update`"); return; }
+    updates.onUpdateRequired({ minimumSupportedBundle: null });
   }
 
   private leaseLapseNeedsRestart(): boolean {
@@ -1383,6 +1399,16 @@ export class Supervisor {
     this.reaperTimer = setInterval(() => void this.work.reapIdleCompletedSessions(IDLE_SESSION_RELEASE_MS).catch(() => undefined), IDLE_SESSION_SWEEP_MS);
     this.reaperTimer.unref();
     this.previews.startIdleSweep();
+    this.ensureUpdates()?.start();
+    await this.work.reports.flushAll();
+  }
+
+  /**
+   * The unattended update, built on first need: after a successful start, or
+   * when Core refuses the startup reconnect because this bundle is below its
+   * minimum (then no start ever succeeds, and only an update gets back in).
+   */
+  private ensureUpdates(): NativeUpdateCoordinator | null {
     const update = this.options.native?.update;
     if (update && !this.updates) {
       this.updates = new NativeUpdateCoordinator({
@@ -1397,9 +1423,8 @@ export class Supervisor {
           return this.core.acceptedRelease(this.instanceId);
         },
       });
-      this.updates.start();
     }
-    await this.work.reports.flushAll();
+    return this.updates ?? null;
   }
 
   private async onRelayConnected(result: RelayRuntimeHandshakeResult): Promise<void> {

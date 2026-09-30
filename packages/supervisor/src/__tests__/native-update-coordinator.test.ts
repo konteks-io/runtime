@@ -59,6 +59,31 @@ describe("native update coordinator", () => {
   });
 
 
+  it("lets a runtime Core refused as too old install a newer signed release without asking (RCA 2026-09-30)", async () => {
+    const noLease = async () => { throw new Error("HTTP 403 update_required"); };
+    const refused = coordinator({ acceptedRelease: noLease });
+    refused.c.onUpdateRequired({ minimumSupportedBundle: null });
+    await vi.waitFor(() => expect(refused.launch).toHaveBeenCalledTimes(1));
+    expect(refused.launch).toHaveBeenCalledWith(expect.objectContaining({ bundleVersion: "1.1.0", reason: "core_minimum" }));
+
+    // Core named a minimum the channel's release does not reach: stay put.
+    const short = coordinator({ acceptedRelease: noLease });
+    short.c.onUpdateRequired({ minimumSupportedBundle: "1.2.0" });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(short.launch).not.toHaveBeenCalled();
+
+    // Without Core's refusal, an unreachable Core still means staying on this release.
+    const periodic = coordinator({ acceptedRelease: noLease });
+    expect((await periodic.c.apply("core_minimum")).reason).toMatch(/could not be asked/);
+    expect(periodic.launch).not.toHaveBeenCalled();
+
+    // When Core can be asked, its answer still decides.
+    const answered = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.0.0" }) });
+    answered.c.onUpdateRequired({ minimumSupportedBundle: null });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(answered.launch).not.toHaveBeenCalled();
+  });
+
   it("reports a newer verified release and launches exactly one transaction for it", async () => {
     const { c, launch, m } = coordinator({});
     expect(await c.check()).toMatchObject({ current: { bundleVersion: "1.0.0" }, available: { bundleVersion: "1.1.0", manifestDigest: m.newer.digest }, lastError: null, inFlight: null });
