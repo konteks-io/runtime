@@ -45,6 +45,10 @@ export interface NativeCodexAppServerOwnerOptions {
   /** Stop a stale server's process group; tests replace the signals. */
   stopHolder?: (pid: number) => Promise<void>;
   onStaleReplaced?: (event: { pid: number; staleRelease: string; currentRelease: string }) => void;
+  /** Every running process as `pid command`; tests replace the `ps` listing. */
+  listProcesses?: () => Promise<Array<{ pid: number; command: string }>>;
+  /** Whether a stray's socket still answers; tests replace the connect probe. */
+  strayReachable?: (socketPath: string) => Promise<boolean>;
 }
 
 export interface CodexSocketHolder { pid: number; command: string }
@@ -215,6 +219,7 @@ export class NativeCodexAppServerOwner {
     if (this.stopping || generation !== this.generation) throw unavailable("The shared Codex owner stopped during startup.");
     if (socketMode === "adopt") {
       this.watchAdoptedSocket(socketPath, generation);
+      void this.reapStrayServers(command.command, socketPath).catch(() => undefined);
       return;
     }
 
@@ -242,6 +247,7 @@ export class NativeCodexAppServerOwner {
       child.removeListener("error", exitedDuringStartup);
       this.stableTimer = setTimeout(() => { this.restartAttempt = 0; this.stableTimer = null; }, 60_000);
       this.stableTimer.unref();
+      void this.reapStrayServers(command.command, socketPath).catch(() => undefined);
     } catch (error) {
       if (this.child === child) this.child = null;
       child.removeListener("exit", exitedDuringStartup);
@@ -278,6 +284,36 @@ export class NativeCodexAppServerOwner {
     await (this.options.cleanupSocket ?? cleanupCodexSocket)(socketPath);
     this.options.onStaleReplaced?.({ pid: holder.pid, staleRelease: stale.release, currentRelease: current.release });
     return "spawn";
+  }
+
+  /**
+   * Codex app-servers an older release of THIS installation left behind on
+   * another socket (RCA 2026-09-30: a release folder deleted days earlier still
+   * had its server running, and an update's stop left the previous release's
+   * one orphaned). Only processes whose executable is inside this
+   * installation's releases folder, never the current release, never the
+   * current socket (adoption and stale replacement own that one), and only
+   * while their threads are idle when their socket still answers.
+   */
+  async reapStrayServers(currentCommand: string, currentSocket: string): Promise<number> {
+    const current = executableRelease(currentCommand);
+    if (!current) return 0;
+    const processes = await (this.options.listProcesses ?? listProcesses)().catch(() => []);
+    let reaped = 0;
+    for (const entry of processes) {
+      if (entry.pid === process.pid || this.child?.pid === entry.pid || this.adoptedHolder?.pid === entry.pid) continue;
+      const release = executableRelease(entry.command);
+      if (!release || release.releasesDir !== current.releasesDir || release.release === current.release) continue;
+      const socket = /\bcodex\b.*\bapp-server\b.*--listen unix:\/\/(\S+)/.exec(entry.command)?.[1];
+      if (!socket || socket === currentSocket) continue;
+      try {
+        if (await (this.options.strayReachable ?? canConnect)(socket)) await (this.options.assertIdleThreads ?? assertCodexThreadsIdle)(socket);
+        await (this.options.stopHolder ?? stopProcessGroup)(entry.pid);
+        reaped += 1;
+        this.options.onStaleReplaced?.({ pid: entry.pid, staleRelease: release.release, currentRelease: current.release });
+      } catch { /* busy or already gone: the next start looks again */ }
+    }
+    return reaped;
   }
 
   /** A healthy same-user socket is local-user authority and can survive a
@@ -415,6 +451,24 @@ export function releaseOf(command: string): { releasesDir: string; release: stri
 }
 
 const run = promisify(execFile);
+
+/**
+ * The release folder of a command's executable: the FIRST `…/releases/<release>/`
+ * (a Node-wrapped server names its release twice, and install roots contain spaces).
+ */
+function executableRelease(command: string): { releasesDir: string; release: string } | null {
+  const match = /^(.*?\/releases\/)([^/]+)\//.exec(command);
+  return match ? { releasesDir: match[1]!, release: match[2]! } : null;
+}
+
+/** Every running process of this user with its full command line. */
+async function listProcesses(): Promise<Array<{ pid: number; command: string }>> {
+  const { stdout } = await run("ps", ["-axo", "pid=,command="], { timeout: 5_000, maxBuffer: 8 * 1024 * 1024 });
+  return stdout.split("\n").flatMap(line => {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    return match ? [{ pid: Number(match[1]), command: match[2]!.trim() }] : [];
+  });
+}
 
 /** The Codex app-server process listening on the shared socket, if it can be told. */
 export async function findCodexSocketHolder(socketPath: string): Promise<CodexSocketHolder | null> {
