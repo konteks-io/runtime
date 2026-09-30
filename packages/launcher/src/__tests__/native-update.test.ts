@@ -455,6 +455,18 @@ describe("native update transaction", () => {
     expect(h.calls).not.toContain("commit");
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
   });
+  it("starts the unchanged release again when the service stopped but its exit was never confirmed (RCA 2026-09-30)", async () => {
+    const h = harness({ previous });
+    // The OS reports the service stopped, but the old connector never writes its stop receipt.
+    h.deps.readStopReceipt = async () => "prior-stop";
+    h.deps.stopDeadlineMs = 3_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.calls).not.toContain("commit");
+    expect(h.calls.lastIndexOf("start")).toBeGreaterThan(h.calls.indexOf("stop"));
+    expect(h.currentRecord().releaseId).toBe(previous.releaseId);
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
+  });
+
   it("does not drain or restart when the service is not running", async () => {
     const h = harness({ previous, running: false });
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: false });
