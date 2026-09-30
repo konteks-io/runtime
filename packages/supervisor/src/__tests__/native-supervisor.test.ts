@@ -204,6 +204,21 @@ describe("native Supervisor composition", () => {
       vi.useRealTimers();
     }
   });
+  it("stops on a local shutdown request after answering it, whatever runs it (W1-D3)", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const f = await fixture();
+      const onShutdownRequested = vi.fn();
+      const supervisor = new Supervisor(f.config, { ...f.options, onShutdownRequested }); supervisors.push(supervisor);
+      await supervisor.start();
+      expect(await supervisor.controlHandler()({ op: "shutdown" }, { event: () => undefined } as never)).toEqual({ stopping: true });
+      expect(onShutdownRequested).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(onShutdownRequested).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it("keeps bounded suspended heartbeats and restores only the new Core lease", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
     const heartbeat = vi.spyOn(supervisor.core, "heartbeat").mockRejectedValueOnce(new RemoteInstanceError("instance_suspended", "suspended")).mockResolvedValue(heartbeatLease());

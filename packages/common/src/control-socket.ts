@@ -79,6 +79,8 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("revoke.pending") }).strict(),
   /** Uninstall: ask Core to drain, revoke and tombstone this runtime (W1-L2). */
   z.object({ op: z.literal("instance.retire") }).strict(),
+  /** Stop this connector however it runs: a foreground `serve` has no service to stop it (W1-D3). */
+  z.object({ op: z.literal("shutdown") }).strict(),
 ]);
 export type ControlRequest = z.infer<typeof ControlRequestSchema>;
 

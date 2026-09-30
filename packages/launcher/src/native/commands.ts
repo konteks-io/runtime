@@ -286,6 +286,14 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
   const initialStatus = await deps.execute(definition.status);
   if (initialStatus !== 0 && (initialStatus === null || !stoppedCodes.includes(initialStatus))) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation's service state. Inspect only this installation's service before adding an agent; identity and local work are unchanged.");
   const wasRunning = initialStatus === 0;
+  const drain = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
+  // A connector the service manager does not run (`konteks-remote serve` in a
+  // terminal) still owns this folder. Waiting for it to let go only timed out
+  // after 90 s with "Another connector owns this native data directory"
+  // (W1-D3): ask it to stop, the way a signal would, once its work is done.
+  const foreground = !wasRunning
+    ? await deps.control(input.root, previous).call({ op: "drain.status" }, drain, { timeoutMs: 2_000 }).then(() => true, () => false)
+    : false;
   let stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
   const wait = async () => deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
   const stopped = async () => {
@@ -294,9 +302,8 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
     if (code !== null && stoppedCodes.includes(code)) return true;
     throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation stopped; its identity and local work are unchanged.");
   };
-  if (wasRunning) {
+  if (wasRunning || foreground) {
     const control = deps.control(input.root, previous);
-    const drain = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
     await control.call({ op: "drain", reason: "update" }, z.unknown());
     const drainDeadline = deps.now() + 15 * 60_000;
     for (;;) {
@@ -306,11 +313,17 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       input.output.line(`waiting for ${state.activeAssignments} active assignment(s) before installing ${input.agent}…`);
       await deps.sleep(deps.pollMs ?? 5_000);
     }
-    if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
-    stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
-    while (!await stopped()) {
-      if (deps.now() >= stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping; its installed agents were not changed.");
-      await wait();
+    if (foreground) {
+      await control.call({ op: "shutdown" }, z.unknown());
+      input.output.line("Konteks is running in a terminal here, not as its background service; stopping it there to add the agent…");
+      stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+    } else {
+      if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
+      stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+      while (!await stopped()) {
+        if (deps.now() >= stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping; its installed agents were not changed.");
+        await wait();
+      }
     }
   }
   let successor: NativeRuntimeRecord | undefined;
@@ -333,6 +346,8 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       }
     }
     if (wasRunning) await deps.start(input);
+    // Its terminal is not this one, so it is not started again here.
+    if (foreground) input.output.line(`${findAgentBridge(input.agent)?.displayName ?? input.agent} is added. Konteks stopped to add it; konteks-remote start starts it again, in the background.`);
     input.output.result({ instanceId: successor.instanceId, agents: successor.agents, state: "installed" });
   } catch (error) {
     if (successor) {

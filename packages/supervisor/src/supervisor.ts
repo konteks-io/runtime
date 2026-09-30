@@ -148,6 +148,8 @@ export interface SupervisorOptions {
   onLivenessLost?: (detail: Record<string, unknown>) => void;
   /** This runtime was removed from its workspace (uninstall): end the whole process, not only the supervisor. */
   onRetired?: () => void;
+  /** A local `shutdown` request: end the process the way a signal would. */
+  onShutdownRequested?: () => void;
   native?: {
     /** Public trust provided by the verified native executable, never by writable install metadata. */
     trustedRoots: readonly EmbeddedReleaseRoot[];
@@ -2016,6 +2018,14 @@ export class Supervisor {
         case "revoke.pending":
           this.pendingRevocation = true;
           return { pendingRevocation: true };
+        case "shutdown": {
+          // Answered first, then stopped, so the caller hears it was accepted.
+          setTimeout(() => {
+            if (this.options.onShutdownRequested) this.options.onShutdownRequested();
+            else void this.stop().catch(() => undefined);
+          }, 200).unref?.();
+          return { stopping: true };
+        }
         case "instance.retire": {
           if (!this.instanceId) throw new RemoteInstanceError("temporarily_unavailable", "This runtime is not activated, so there is nothing to remove from Konteks.");
           const result = await this.core.retire(this.instanceId);
