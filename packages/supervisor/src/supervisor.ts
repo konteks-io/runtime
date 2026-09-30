@@ -2448,8 +2448,16 @@ export class Supervisor {
       });
     };
     await note("supervisor_prelude", "entered");
-    await this.startPromise?.catch(() => undefined);
-    await this.activeLoopStarting;
+    // A stop that hung here (09-30 15:23) left no clue which wait held it:
+    // every wait that takes longer than a few seconds is named in the log.
+    const waitFor = async (step: string, pending: Promise<unknown> | null | undefined): Promise<void> => {
+      if (!pending) return;
+      const slow = setTimeout(() => this.logger.warn({ event: "shutdown.waiting", step }, "shutdown is still waiting"), 5_000);
+      slow.unref?.();
+      try { await pending; } finally { clearTimeout(slow); }
+    };
+    await waitFor("start", this.startPromise?.catch(() => undefined));
+    await waitFor("active_loop_start", this.activeLoopStarting);
     if (this.pullTimer) clearInterval(this.pullTimer);
     for (const watch of this.onComputerWatches.values()) clearInterval(watch);
     this.onComputerWatches.clear();
@@ -2461,18 +2469,18 @@ export class Supervisor {
     this.updates?.stop();
     if (this.muxTimer) clearInterval(this.muxTimer);
     if (this.cancellationTimer) clearInterval(this.cancellationTimer);
-    await this.cancellationReplay?.stop();
+    await waitFor("cancellation_replay", this.cancellationReplay?.stop());
     if (this.configurationTimer) clearInterval(this.configurationTimer);
-    await this.configurationRefresh;
-    await this.observationDelivery?.stop();
-    await this.configurationAcks?.settle();
-    await this.executionRevisionFenceReceipts?.settle();
-    await this.planningDirectivePoller?.stop();
+    await waitFor("configuration_refresh", this.configurationRefresh);
+    await waitFor("observation_delivery", this.observationDelivery?.stop());
+    await waitFor("configuration_acks", this.configurationAcks?.settle());
+    await waitFor("fence_receipts", this.executionRevisionFenceReceipts?.settle());
+    await waitFor("planning_directives", this.planningDirectivePoller?.stop());
     this.heartbeat?.stop();
-    await this.heartbeat?.settle();
-    await this.leaseAcquisition;
-    await this.leaseMutation;
-    await this.leaseLossCleanup;
+    await waitFor("heartbeat", this.heartbeat?.settle());
+    await waitFor("lease_acquisition", this.leaseAcquisition);
+    await waitFor("lease_mutation", this.leaseMutation);
+    await waitFor("lease_loss_cleanup", this.leaseLossCleanup);
     await note("supervisor_prelude", "completed");
     await note("work_drain", "entered");
     await this.work?.drainSessions("drain");

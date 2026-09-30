@@ -35,6 +35,8 @@ describe("native background service definitions", () => {
     // launchd keeps nothing the connector prints unless the plist names a file (WS1-163).
     expect(service.contents).toContain(`<key>StandardOutPath</key><string>${root}/logs/connector.log</string>`);
     expect(service.contents).toContain(`<key>StandardErrorPath</key><string>${root}/logs/connector.log</string>`);
+    // The home it was started from, not the login's (09-30).
+    expect(service.contents).toContain('<key>EnvironmentVariables</key><dict><key>HOME</key><string>/Users/Test User</string></dict>');
     expect(service.contents).not.toMatch(/Docker|docker|postgres|harness|validation-runtime|activationCode|TOKEN|PRIVATE KEY/);
   });
 
@@ -47,6 +49,7 @@ describe("native background service definitions", () => {
   it("uses systemd user services and literal path arguments, not a shell", () => {
     const service = nativeServiceDefinition({ os: 'debian', home: '/home/a', root: '/home/a/space $HOME %n', executable: '/home/a/space $HOME %n/bin/remote' });
     expect(service.contents).toContain('ExecStart="/home/a/space $$HOME %%n/bin/remote" "serve" "--root" "/home/a/space $$HOME %%n"');
+    expect(service.contents).toContain('Environment="HOME=/home/a"');
     expect(service.start).toEqual({ command: 'systemctl', args: ['--user', 'enable', '--now', `${service.label}.service`] });
     expect(service.contents).not.toMatch(/sudo|bash|docker|User=root/);
   });
