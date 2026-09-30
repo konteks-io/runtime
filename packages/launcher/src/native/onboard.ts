@@ -410,15 +410,18 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       // being asked what it is (OS9).
       const identity = await new SupervisorStore(supervisorData).identity().catch(() => null);
       if (identity?.instanceId && identity.instanceId !== "pending") {
-        const stored = await readOwnerToken(supervisorData);
+        const stored = (await readOwnerToken(supervisorData)) ?? (await claimSiteAccess(supervisorData, enrollment));
         if (!stored) {
-          // Activated through the operator door: connected, but this machine
-          // holds no person's access to register a System with. The site does.
-          await save({ step: "done", instanceId: identity.instanceId, ...(identity.workspaceId ? { tenantId: identity.workspaceId } : {}) });
+          // Connected from the site by someone else, or for the whole
+          // organization: this machine acts for no one person here, so it
+          // offers nothing it could not do. The site is where Systems go.
+          await save({ step: "done", closing: true, instanceId: identity.instanceId, ...(identity.workspaceId ? { tenantId: identity.workspaceId } : {}) });
           return {
             step: "identity",
-            note: `This machine is already connected to ${identity.workspaceId ?? "a workspace"} through an activation; register Systems from the site.`,
-            run: AGAIN,
+            done: {
+              summary: `This computer is connected to ${identity.workspaceId ?? "a workspace"} from the site, not for one person, so it cannot add this folder itself. Add Systems on the site.`,
+              links: { site: siteUrl },
+            },
           };
         }
         await save({
@@ -1681,6 +1684,23 @@ async function setAsideLostIdentity(root: string, instanceId: string): Promise<v
   await mkdir(join(root, "supervisor"), { mode: 0o700 });
 }
 
+/**
+ * A computer its owner connected from the site holds no token of theirs yet;
+ * Konteks gives it, once, for the machine's own key (W1-M4). Offering a System
+ * and then saying the machine "holds no Konteks access for you" is gone.
+ */
+async function claimSiteAccess(
+  supervisorData: string,
+  enrollment: NonNullable<OnboardContext["deps"]>["enrollment"] & object,
+): Promise<Awaited<ReturnType<typeof readOwnerToken>>> {
+  const identity = await new SupervisorStore(supervisorData).identity().catch(() => null);
+  if (!identity?.instanceId || identity.instanceId === "pending") return null;
+  const granted = await enrollment.refreshOwnerToken(identity.instanceId).catch(() => null);
+  if (!granted) return null;
+  await writeOwnerToken(supervisorData, { ...granted, instanceId: identity.instanceId });
+  return readOwnerToken(supervisorData);
+}
+
 /** The person's token, refreshed rather than kept long (OS15). */
 async function ownerApi(
   supervisorData: string,
@@ -1688,7 +1708,7 @@ async function ownerApi(
   enrollment: NonNullable<OnboardContext["deps"]>["enrollment"] & object,
   context: OnboardContext,
 ): Promise<OwnerApiClient> {
-  const stored = await readOwnerToken(supervisorData);
+  const stored = (await readOwnerToken(supervisorData)) ?? (await claimSiteAccess(supervisorData, enrollment));
   if (!stored) {
     throw new RemoteInstanceError("permission_denied", "This machine holds no Konteks access for you; run onboard from the start.");
   }

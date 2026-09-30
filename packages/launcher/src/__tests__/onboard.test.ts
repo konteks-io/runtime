@@ -905,6 +905,36 @@ describe("onboard", () => {
     expect(refused.done?.links.site).toBe("https://app.test");
   });
 
+  describe("a computer its owner connected from the site (W1-M4)", () => {
+    const connected = async () => {
+      const { SupervisorStore } = await import("@konteks/remote-supervisor");
+      vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
+      const { deleteOwnerToken } = await import("../native/owner-api.js");
+      await deleteOwnerToken(join(root, "supervisor"));
+    };
+
+    it("gets its owner's access with its own key and goes on to the folder, asking no email or code", async () => {
+      await connected();
+      const refreshOwnerToken = vi.fn(async () => ({ token: "site-token", expiresAt: new Date(Date.now() + 3600_000).toISOString(), userRef: "user:default/ada", tenantId: "acme" }));
+      const first = await step({ enrollment: { refreshOwnerToken } as never });
+      expect(refreshOwnerToken).toHaveBeenCalledWith("instance-1");
+      expect(first.ask).toBeUndefined();
+      expect(first.done).toBeUndefined();
+      expect(await readOnboardState(root)).toMatchObject({ step: "inspect", instanceId: "instance-1" });
+      const { readOwnerToken } = await import("../native/owner-api.js");
+      expect((await readOwnerToken(join(root, "supervisor")))?.token).toBe("site-token");
+    });
+
+    it("ends plainly when Konteks gives no one's access, instead of offering a System it cannot make", async () => {
+      await connected();
+      const { RemoteInstanceError: Refusal } = await import("@konteks/remote-common");
+      const refreshOwnerToken = vi.fn(async () => { throw new Refusal("enrollment_invalid" as never, "This enrollment was not accepted"); });
+      const first = await step({ enrollment: { refreshOwnerToken } as never });
+      expect(first.done?.summary).toContain("from the site, not for one person");
+      expect(first.run).toBeUndefined();
+    });
+  });
+
   describe("a machine whose access was revoked, when the person says yes (W1-Z4)", () => {
     const enrolled = async () => {
       const { writeSecretFile } = await import("@konteks/remote-common");
