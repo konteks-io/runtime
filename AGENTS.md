@@ -547,6 +547,35 @@ latest). It is also written with the release version as `commands.json` by
 `verify`. There is no
 `preview enable/disable` command: that switch is Core's.
 
+Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
+- A lapsed lease is never renewed in a running process (heartbeats and the
+  relay both need a live one; only the startup reconnect, proved with the
+  machine key, mints a new one). The liveness watchdog therefore asks the
+  service manager to restart once the lease is gone and Core, reachable, has
+  answered the 30 s configuration poll with 401/403 for two minutes
+  (`leaseLapseNeedsRestart` in `heartbeat/liveness.ts`); only after a
+  successful start, never for a revoked or suspended runtime.
+- The unattended update installs only the release Core accepts, which needs a
+  lease, except for a runtime Core refused as below its minimum (a
+  `version_policy` or a refused startup reconnect, `update_required`): it
+  installs the strictly newer signed release from the channel, at or above the
+  minimum Core named (`mayUpdateWithoutAcceptedRelease`). The coordinator is
+  built on demand (`ensureUpdates`), not only after a successful start.
+- An update whose stop is not confirmed in time starts the unchanged release
+  again once the OS no longer runs it.
+- `serve` rewrites an existing service definition that differs from what the
+  serving release renders (`refreshOwnServiceDefinition`): the install
+  launcher is never replaced and an updater is the previous release, so
+  service-level changes (the log file) otherwise arrive late or never. The OS
+  reads it from the next start.
+- After the shared Codex owner starts, app-servers that older releases of this
+  installation left on other sockets are ended once idle (or unreachable)
+  (`reapStrayServers`); nothing outside `<root>/releases/` is touched.
+- `doctor` has a `update-channel` line (unreadable channel fails, a
+  `KONTEKS_RELEASE_MANIFEST_URL` override warns, no lease warns that updates
+  wait), and `status` shows it through the separate `update.channel` op (never
+  a new status field: older launchers parse `status` strictly).
+
 Before production changes, add or update a focused characterization test and
 observe its failure or baseline. Run focused tests serially; do not start
 multiple Vitest processes or a whole suite during local proof work unless the
