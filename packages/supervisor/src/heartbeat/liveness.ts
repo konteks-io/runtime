@@ -20,3 +20,33 @@ export function evaluateHeartbeatLiveness(input: { now: number; watchingSince: n
   if (quietMs >= input.budgetMs / 2) return { state: "quiet", quietMs };
   return { state: "live", quietMs };
 }
+
+/** A 401/403 from Core: it answered and refused this runtime's credential. An unreachable Core is not a refusal. */
+export function isCredentialRefusal(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status;
+  return status === 401 || status === 403;
+}
+
+/**
+ * A running process whose lease lapsed never renews it: heartbeats and the
+ * relay both need a live lease, and only the startup reconnect (proved with the
+ * machine key) mints a new one (RCA 2026-09-30: offline 13 h, then 6 h, each
+ * time fixed by a restart). Restart into it once the lease is gone and Core,
+ * reachable, has refused it for `thresholdMs`. Only after a successful start (a
+ * refused startup reconnect never loops) and never for a runtime Core said is
+ * revoked or suspended.
+ */
+export function leaseLapseNeedsRestart(input: {
+  now: number;
+  stopping: boolean;
+  activeLoopStarted: boolean;
+  refusedSince: number | null;
+  leaseMode: "active" | "drain_only" | "none";
+  administrativeStatus: string;
+  thresholdMs: number;
+}): boolean {
+  if (input.stopping || !input.activeLoopStarted || input.refusedSince === null) return false;
+  if (input.administrativeStatus === "revoked" || input.administrativeStatus === "suspended") return false;
+  if (input.leaseMode !== "none") return false;
+  return input.now - input.refusedSince >= input.thresholdMs;
+}

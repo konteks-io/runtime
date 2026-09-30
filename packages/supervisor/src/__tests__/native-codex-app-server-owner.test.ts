@@ -280,3 +280,46 @@ describe("native shared Codex app-server owner", () => {
     expect(f.cleanupSocket).toHaveBeenCalledOnce();
   });
 });
+
+describe("stray app-servers of this installation (RCA 2026-09-30)", () => {
+  const current = "/root/releases/rel-new/agents/codex/bin/codex app-server --listen unix:///root/run/codex.sock";
+  const strays = [
+    { pid: 4630, command: "/root/releases/rel-deleted/agents/codex/bin/node /root/releases/rel-deleted/agents/codex/bin/codex app-server --listen unix:///home/.codex/app-server-control/app-server-control.sock" },
+    { pid: 2619, command: "/root/releases/rel-old/agents/codex/bin/codex app-server --listen unix:///root/run/old.sock" },
+  ];
+  const others = [
+    { pid: 900, command: "/root/releases/rel-new/agents/codex/bin/codex app-server --listen unix:///root/run/codex.sock" }, // the current release
+    { pid: 901, command: "/root/releases/rel-old/agents/codex/bin/codex app-server --listen unix:///root/run/codex.sock" }, // the current socket: stale replacement owns it
+    { pid: 902, command: "/Applications/Codex.app/Contents/Resources/codex app-server --listen unix:///home/.codex/app-server-control/app-server-control.sock" }, // the person's own Codex
+    { pid: 903, command: "/other/releases/rel-old/agents/codex/bin/codex app-server --listen unix:///x.sock" }, // another installation
+    { pid: 904, command: "/root/releases/rel-old/konteks-connector serve --root /root" }, // not an app-server
+  ];
+
+  function owner(input: { busy?: string[]; reachable?: boolean } = {}) {
+    const stopHolder = vi.fn(async () => undefined);
+    const replaced: number[] = [];
+    const o = new NativeCodexAppServerOwner({
+      config, listProcesses: async () => [...strays, ...others], stopHolder,
+      strayReachable: async () => input.reachable ?? true,
+      assertIdleThreads: async socket => { if (input.busy?.includes(socket)) throw new Error("thread active"); },
+      onStaleReplaced: event => { replaced.push(event.pid); },
+    });
+    return { o, stopHolder, replaced };
+  }
+
+  it("ends servers older releases of this installation left on other sockets, and nothing else", async () => {
+    const f = owner();
+    expect(await f.o.reapStrayServers(current, "/root/run/codex.sock")).toBe(2);
+    expect(f.stopHolder.mock.calls.map(([pid]) => pid).sort()).toEqual([2619, 4630]);
+    expect(f.replaced.sort()).toEqual([2619, 4630]);
+  });
+
+  it("leaves a stray whose threads are still busy for the next start, and stops an unreachable one", async () => {
+    const busy = owner({ busy: ["/root/run/old.sock"] });
+    expect(await busy.o.reapStrayServers(current, "/root/run/codex.sock")).toBe(1);
+    expect(busy.stopHolder).toHaveBeenCalledWith(4630);
+    expect(busy.stopHolder).not.toHaveBeenCalledWith(2619);
+    const deaf = owner({ reachable: false, busy: ["/root/run/old.sock"] });
+    expect(await deaf.o.reapStrayServers(current, "/root/run/codex.sock")).toBe(2);
+  });
+});

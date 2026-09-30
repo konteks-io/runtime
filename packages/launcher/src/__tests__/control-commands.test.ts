@@ -164,6 +164,25 @@ describe("native control commands", () => {
     expect(f.text()).toContain("running on 127.0.0.1:43100");
   });
 
+  it("says in status when updates cannot arrive, and leaves the line out for a connector without update.channel (RCA 2026-09-30)", async () => {
+    const withChannel = (report: unknown) => {
+      const f = fake();
+      const call = f.context.control.call;
+      f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) =>
+        request.op === "update.channel" ? schema.parse(report) : call(request, schema as never, options)) as typeof f.context.control.call;
+      return f;
+    };
+    const dead = withChannel({ host: "127.0.0.1:7444", override: true, lastCheckedAt: "2026-09-30T00:00:00Z", error: "The native release channel could not be read" });
+    await status(dead.context);
+    expect(dead.text()).toContain("127.0.0.1:7444 (override: KONTEKS_RELEASE_MANIFEST_URL) — cannot be read, no update can arrive");
+    const healthy = withChannel({ host: "github.com", override: false, lastCheckedAt: "2026-09-30T00:00:00Z", error: null });
+    await status(healthy.context);
+    expect(healthy.text()).toContain("github.com, checked 2026-09-30T00:00:00Z");
+    const older = fake();
+    await status(older.context);
+    expect(older.text()).not.toContain("updates");
+  });
+
   it("exposes only the public lease summary in machine-readable status", async () => {
     const f = fake({ json: true });
     await status(f.context);

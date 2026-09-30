@@ -180,6 +180,14 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       }
     } else {
       if (stopped && stopConfirmed && wasRunning) await deps.start(input).catch(() => undefined);
+      // The stop was sent but not confirmed in time (RCA 2026-09-30: an orphaned
+      // Codex app-server held it up): the installation is unchanged, so bring
+      // the same release back once the OS no longer runs the service, rather
+      // than leaving this computer disconnected until someone starts it.
+      else if (stopped && wasRunning && await deps.execute(definition.status).catch(() => 0) !== 0) {
+        input.output.line("The update did not go ahead; starting this computer's connector again on the release it had.");
+        await deps.start(input).catch(() => undefined);
+      }
       await finish("failed", detail);
     }
     throw error;

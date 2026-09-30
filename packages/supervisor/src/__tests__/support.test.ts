@@ -54,6 +54,25 @@ describe("doctor and support bundle", () => {
     expect(offline.checks.find(check => check.id === "preview")?.status).toBe("warn");
   });
 
+  it("reports the release channel: an unreadable channel fails, an override warns, only the host is shown (RCA 2026-09-30)", async () => {
+    const base = {
+      now: () => "2026-09-06T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
+      relay: { state: "connected", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: true, components: [], agents: [],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true,
+    };
+    const channel = (report: Awaited<ReturnType<typeof runDoctor>>) => report.checks.find(check => check.id === "update-channel");
+    const dead = await runDoctor({ ...base, updateChannel: { host: "127.0.0.1:7444", override: true, lastCheckedAt: "2026-09-30T00:00:00Z", lastError: "The native release channel could not be read", available: null } });
+    expect(channel(dead)).toMatchObject({ status: "fail", detail: expect.stringContaining("override 127.0.0.1:7444 (KONTEKS_RELEASE_MANIFEST_URL) could not be read") });
+    expect(channel(dead)?.detail).toContain("Remove the override");
+    const override = await runDoctor({ ...base, updateChannel: { host: "127.0.0.1:7444", override: true, lastCheckedAt: "2026-09-30T00:00:00Z", lastError: null, available: null } });
+    expect(channel(override)?.status).toBe("warn");
+    const publicChannel = await runDoctor({ ...base, updateChannel: { host: "github.com", override: false, lastCheckedAt: "2026-09-30T00:00:00Z", lastError: null, available: "0.10.0" } });
+    expect(channel(publicChannel)).toMatchObject({ status: "pass", detail: "github.com, checked 2026-09-30T00:00:00Z; 0.10.0 available" });
+    const leaseless = await runDoctor({ ...base, lease: { mode: "none" as const, expiresAt: null }, updateChannel: { host: "github.com", override: false, lastCheckedAt: "2026-09-30T00:00:00Z", lastError: null, available: "0.10.0" } });
+    expect(channel(leaseless)).toMatchObject({ status: "warn", detail: expect.stringContaining("automatic updates wait until this computer holds a lease again") });
+    expect(channel(await runDoctor(base))).toBeUndefined();
+  });
+
   it("reports the QA browser's version, the agents that carry it, and Chrome or Playwright's Chromium", async () => {
     const base = {
       now: () => "2026-09-06T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
