@@ -59,13 +59,15 @@ export interface DoctorInputs {
   updateChannel?: { host: string; override: boolean; lastCheckedAt: string | null; lastError: string | null; available: string | null };
 }
 
-function updateChannelCheck(channel: NonNullable<DoctorInputs["updateChannel"]>): Omit<DoctorCheck, "recoveryActions"> & { recoveryActions?: DoctorCheck["recoveryActions"] } {
+function updateChannelCheck(channel: NonNullable<DoctorInputs["updateChannel"]>, leaseMode: DoctorInputs["lease"]["mode"]): Omit<DoctorCheck, "recoveryActions"> & { recoveryActions?: DoctorCheck["recoveryActions"] } {
   const base = { id: "update-channel", title: "Release channel" };
   const where = channel.override ? `override ${channel.host} (KONTEKS_RELEASE_MANIFEST_URL)` : channel.host;
   if (channel.lastError) return { ...base, status: "fail", detail: `${where} could not be read: ${channel.lastError}; updates cannot arrive${channel.override ? ". Remove the override from this computer's service environment" : ""}`.slice(0, 1_024), recoveryActions: [{ kind: "run_doctor" }] };
   if (channel.override) return { ...base, status: "warn", detail: `${where} replaces the public channel; updates come only from there` };
-  if (!channel.lastCheckedAt) return { ...base, status: "pass", detail: `${where}; not checked yet` };
-  return { ...base, status: "pass", detail: `${where}, checked ${channel.lastCheckedAt}${channel.available ? `; ${channel.available} available` : "; nothing newer"}` };
+  // An unattended update installs only the release Konteks accepts, and asking needs a lease.
+  const waiting = leaseMode === "none" ? "; automatic updates wait until this computer holds a lease again (`konteks-remote update` works now)" : "";
+  if (!channel.lastCheckedAt) return { ...base, status: waiting ? "warn" : "pass", detail: `${where}; not checked yet${waiting}` };
+  return { ...base, status: waiting ? "warn" : "pass", detail: `${where}, checked ${channel.lastCheckedAt}${channel.available ? `; ${channel.available} available` : "; nothing newer"}${waiting}` };
 }
 
 export interface AntigravityDoctorInputs {
@@ -254,7 +256,7 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   }
   if (inputs.openCode) push(openCodeCheck(inputs.openCode));
   if (inputs.antigravity) push(antigravityCheck(inputs.antigravity));
-  if (inputs.updateChannel) push(updateChannelCheck(inputs.updateChannel));
+  if (inputs.updateChannel) push(updateChannelCheck(inputs.updateChannel, inputs.lease.mode));
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };
 }

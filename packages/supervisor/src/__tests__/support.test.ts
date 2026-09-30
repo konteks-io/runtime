@@ -68,6 +68,8 @@ describe("doctor and support bundle", () => {
     expect(channel(override)?.status).toBe("warn");
     const publicChannel = await runDoctor({ ...base, updateChannel: { host: "github.com", override: false, lastCheckedAt: "2026-09-30T00:00:00Z", lastError: null, available: "0.10.0" } });
     expect(channel(publicChannel)).toMatchObject({ status: "pass", detail: "github.com, checked 2026-09-30T00:00:00Z; 0.10.0 available" });
+    const leaseless = await runDoctor({ ...base, lease: { mode: "none" as const, expiresAt: null }, updateChannel: { host: "github.com", override: false, lastCheckedAt: "2026-09-30T00:00:00Z", lastError: null, available: "0.10.0" } });
+    expect(channel(leaseless)).toMatchObject({ status: "warn", detail: expect.stringContaining("automatic updates wait until this computer holds a lease again") });
     expect(channel(await runDoctor(base))).toBeUndefined();
   });
 
