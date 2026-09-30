@@ -18,11 +18,7 @@ import { isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
  * the owner token lives in its own secret file.
  */
 
-export const OnboardStateSchema = z
-  .object({
-    schemaVersion: z.literal(1),
-    /** The step that will run next. */
-    step: z.enum([
+const ONBOARD_STEPS = [
       "identity",
       "email",
       "code",
@@ -45,7 +41,15 @@ export const OnboardStateSchema = z
       "done",
       /** This machine's access was revoked; the person is asked whether to connect it again (W1-Z4). */
       "reconnect",
-    ]),
+] as const;
+
+export const OnboardStateSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    /** The step that will run next. */
+    step: z.enum(ONBOARD_STEPS),
+    /** The step a revoked access interrupted; the same runtime carries on there once the access is back (W1-Z4). */
+    resumeStep: z.enum(ONBOARD_STEPS).optional(),
     intentRef: z.string().min(1).optional(),
     /** Masked, for re-asking without holding the address. */
     emailMasked: z.string().min(1).optional(),

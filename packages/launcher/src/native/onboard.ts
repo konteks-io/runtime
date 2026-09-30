@@ -390,13 +390,16 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       // gone too does the email step connect it as a new one.
       const current = await new SupervisorStore(supervisorData).identity().catch(() => null);
       const address = state.ownerEmail ?? state.email;
+      const same = current?.instanceId && current.instanceId !== "pending" ? current.instanceId : undefined;
+      // The same runtime keeps what it knew (its System, initiative, answers)
+      // and carries on where the revoke stopped it; only the code is new.
+      const { intentRef: _intent, emailMasked: _masked, attemptsRemaining: _attempts, decision: _decision, email: _email, retryAsked: _retry, closing: _closing, ...known } = state;
       await writeOnboardState(context.root, {
-        schemaVersion: 1,
+        ...(same ? known : { schemaVersion: 1, ...keptAnswers(state) }),
         step: "email",
         updatedAt: new Date().toISOString(),
         ...(address ? { resendTo: address } : {}),
-        ...(current?.instanceId && current.instanceId !== "pending" ? { restores: current.instanceId } : {}),
-        ...keptAnswers(state),
+        ...(same ? { restores: same } : {}),
       } as never);
       return address
         ? { step: "identity", run: AGAIN }
@@ -472,8 +475,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           // act again. Keep its record beside the install and connect this
           // machine as a new runtime, with a new key.
           await setAsideLostIdentity(context.root, state.restores);
-          await save({ restores: undefined } as never);
-          state.restores = undefined;
+          forgetRuntime(state);
+          await save({});
           opened = await open();
         }
         intentRef = opened.intentRef;
@@ -611,7 +614,9 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           // The runtime was revoked while the code was on its way: connect
           // this machine as a new one, which costs one more code.
           await setAsideLostIdentity(context.root, state.restores);
-          await save({ step: "email", restores: undefined, intentRef: undefined, emailMasked: undefined, decision: undefined, attemptsRemaining: undefined, resendTo: state.email } as never);
+          const address = state.email;
+          forgetRuntime(state);
+          await save({ step: "email", ...(address ? { resendTo: address } : {}) } as never);
           return {
             step: "start",
             note: "This machine's runtime was revoked in Customize → Runtimes too, so it connects again as a new runtime. Konteks will send a new code.",
@@ -619,11 +624,16 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
           };
         }
         await writeOwnerToken(supervisorData, { ...restored.ownerToken, instanceId: restored.identity.instanceId });
+        // Back to the step the revoke interrupted; a finished machine looks at
+        // this folder again, as a new conversation there would.
+        const resume = !state.resumeStep || state.resumeStep === "done" || state.resumeStep === "reconnect" ? "inspect" : state.resumeStep;
         await save({
-          step: "inspect",
+          step: resume,
+          ...(resume === "inspect" && state.systemEntityRef ? { revisit: true } : {}),
           instanceId: restored.identity.instanceId,
           tenantId: restored.identity.workspaceId,
           restores: undefined,
+          resumeStep: undefined,
           email: undefined,
           ...(state.email ? { ownerEmail: state.email } : {}),
         } as never);
@@ -1511,6 +1521,16 @@ function joinedWorkspace(state: { decision?: string | undefined }): boolean {
  * What the person already answered about this machine and folder, kept when the
  * machine connects again as a new runtime: they are not asked twice (W1-G2).
  */
+/**
+ * A machine that becomes a new runtime keeps only the person's answers, as a
+ * machine that lost its key does; what the old runtime knew is not its own.
+ * The state is cleared in place, because every later save spreads it.
+ */
+function forgetRuntime(state: OnboardState): void {
+  const kept = new Set(["schemaVersion", "step", "updatedAt", "resendTo", "resendReason", ...Object.keys(keptAnswers(state))]);
+  for (const key of Object.keys(state)) if (!kept.has(key)) delete (state as Record<string, unknown>)[key];
+}
+
 function keptAnswers(state: { ownerEmail?: string | undefined; graftDecision?: string | undefined; graftRepository?: string | undefined }): Record<string, string> {
   return {
     ...(state.ownerEmail ? { ownerEmail: state.ownerEmail } : {}),
@@ -1567,6 +1587,7 @@ export async function onboardFailureStep(context: OnboardContext, error: unknown
     await writeOnboardState(context.root, {
       ...(state ?? { schemaVersion: 1 as const, updatedAt: new Date().toISOString() }),
       step: "reconnect",
+      ...(state && state.step !== "reconnect" ? { resumeStep: state.step } : {}),
     } as never).catch(() => undefined);
     return { step: "identity", note: OWNER_ACCESS_REVOKED, ask: RECONNECT_ASK };
   }

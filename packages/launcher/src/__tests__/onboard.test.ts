@@ -361,7 +361,7 @@ describe("onboard", () => {
     const stopped = await onboardFailureStep({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" }, error);
     expect(stopped.note).toBe("This machine's Konteks access was revoked in Customize → Runtimes.");
     expect(stopped.ask).toMatchObject({ question: "Give this machine your access again? Konteks sends a code to your email to check it is you.", kind: "confirm" });
-    expect(await readOnboardState(root)).toMatchObject({ step: "reconnect" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "reconnect", resumeStep: "system" });
     await writeOnboardState(root, { ...(await readOnboardState(root)), step: "system" } as never);
 
     const other = await step({ fetchFn: refusal({ error: { name: "AuthenticationError" } }) as never }, "yes").catch((e: unknown) => e);
@@ -921,11 +921,15 @@ describe("onboard", () => {
 
     it("stays the same runtime and sends a code to the same address", async () => {
       await enrolled();
-      await writeOnboardState(root, { step: "reconnect", tenantId: "acme", ownerEmail: "ada@acme.test" } as never);
+      await writeOnboardState(root, {
+        step: "reconnect", resumeStep: "done", tenantId: "acme", ownerEmail: "ada@acme.test",
+        systemId: "sys-1", systemEntityRef: "system:default/acme-solo", repositoryPath: "/tmp/solo",
+      } as never);
       const again = await step({}, "yes");
       expect(again.note).toBeUndefined();
       expect(again.run).toBeDefined();
-      expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test", restores: "instance-1" });
+      // The same runtime keeps what it knew.
+      expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test", restores: "instance-1", systemEntityRef: "system:default/acme-solo" });
       expect(await retired()).toEqual([]);
 
       const openIntent = vi.fn(async () => ({ intentRef: "intent-1", restoresInstanceId: "instance-1" }));
@@ -952,14 +956,16 @@ describe("onboard", () => {
       expect(back.note).toContain("Your access is back: this machine works for you in");
       const { readOwnerToken } = await import("../native/owner-api.js");
       expect((await readOwnerToken(join(root, "supervisor")))?.token).toBe("new-token");
-      expect(await readOnboardState(root)).toMatchObject({ step: "inspect", instanceId: "instance-1", tenantId: "acme", ownerEmail: "ada@acme.test" });
+      // A finished machine looks at its folder again, as a revisit: no second System question.
+      expect(await readOnboardState(root)).toMatchObject({ step: "inspect", revisit: true, instanceId: "instance-1", tenantId: "acme", ownerEmail: "ada@acme.test", systemId: "sys-1" });
       expect((await readOnboardState(root))?.restores).toBeUndefined();
+      expect((await readOnboardState(root))?.resumeStep).toBeUndefined();
       expect(await retired()).toEqual([]);
     });
 
     it("connects as a new runtime when Konteks says the runtime itself is gone too", async () => {
       await enrolled();
-      await writeOnboardState(root, { step: "email", resendTo: "ada@acme.test", restores: "instance-1" } as never);
+      await writeOnboardState(root, { step: "email", resendTo: "ada@acme.test", restores: "instance-1", ownerEmail: "ada@acme.test", systemId: "sys-1", revisit: true } as never);
       const openIntent = vi.fn()
         .mockResolvedValueOnce({ intentRef: "intent-1" })
         .mockResolvedValueOnce({ intentRef: "intent-2" });
@@ -968,7 +974,11 @@ describe("onboard", () => {
       expect(openIntent).toHaveBeenCalledTimes(2);
       expect(sendChallenge).toHaveBeenCalledWith("intent-2", "ada@acme.test");
       expect((await retired()).some(entry => entry.startsWith("instance-1-"))).toBe(true);
+      // A new runtime keeps only the person's answers.
+      expect(await readOnboardState(root)).toMatchObject({ step: "code", ownerEmail: "ada@acme.test" });
       expect((await readOnboardState(root))?.restores).toBeUndefined();
+      expect((await readOnboardState(root))?.systemId).toBeUndefined();
+      expect((await readOnboardState(root))?.revisit).toBeUndefined();
     });
   });
 
