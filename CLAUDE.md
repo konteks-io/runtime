@@ -11,7 +11,7 @@ Claude Code, Codex, DeepSeek Harness, OpenCode 2 and Google Antigravity; Pi is r
 stored values stay readable). On the development branch the
 workspaces link the sibling `../packages` sources (`file:../packages/...`,
 restored after every merge from `main`, as in Core and the App); `main` and
-public exports use the 7.1.0 tarballs in `vendor/` (`export-public.mjs` reads
+public exports use the 7.2.0 tarballs in `vendor/` (`export-public.mjs` reads
 `konteksContracts`). To refresh `vendor/`, `npm pack` from packages and keep
 `konteksContracts` at that version; never regenerate the whole lockfile. CI
 (`ci.yaml`, `release.yaml`, `agent-os-proof.yaml`) runs
@@ -94,3 +94,9 @@ no preamble, no Konteks MCP servers, policy root = the session folder); the
 connector reports its own commands (`packages/release/src/connector-commands.json`)
 as the heartbeat's `connectorCommands` (7.1 Core only, first heartbeat of each
 incarnation and on change) and the release ships them as `commands.json`.
+Test overrides of the release channel (`KONTEKS_RELEASE_MANIFEST_URL`,
+`NODE_EXTRA_CA_CERTS`) go on ONE process (the e2e controller sets them per
+run); never `launchctl setenv` or a shell profile: a session-wide override
+outlives the proof and silently points the owner's real connector at a dead
+local channel (RCA 2026-09-30, `~/Projects/refactory/rca/`). `status` and
+`doctor` report an active channel override.
