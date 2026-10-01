@@ -9,6 +9,7 @@ import { buildReleaseFixture, fetchedAgentPlatformPin, installOfflineAgentPackag
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { RunnerConfigSchema, type BridgeProcess } from "@konteks/remote-agent-runner";
 import { Supervisor } from "../supervisor.js";
+import { NativeRunner } from "../native/runner.js";
 import { NativeInputClient } from "../native/input-client.js";
 import { SupervisorConfigSchema } from "../config.js";
 import { SupervisorStore } from "../state/store.js";
@@ -469,6 +470,37 @@ describe("native Supervisor composition", () => {
     expect(doctor.checks.some(check => check.id === "gateway" || check.id === "component-harness")).toBe(false);
     await supervisor.stop();
     expect(f.stop).toHaveBeenCalledOnce();
+  });
+
+  it("lists a bundled agent that could not start as unavailable, with why, in agents and doctor (RCA 2026-10-01)", async () => {
+    const f = await fixture();
+    vi.spyOn(NativeRunner.prototype, "start").mockRejectedValue(new RemoteInstanceError("agent_unavailable", "The signed Codex app-server did not become ready in time."));
+    const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);
+    await supervisor.start();
+    const handle = supervisor.controlHandler();
+    const listed = await handle({ op: "agents" }, { event: () => undefined } as never) as { agents: Array<Record<string, unknown>> };
+    expect(listed.agents).toEqual([{ agentId: "codex", readiness: "unavailable", connectionState: "unavailable", startFailure: "The signed Codex app-server did not become ready in time" }]);
+    const doctor = await handle({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
+    expect(doctor.checks.find(check => check.id === "agent-codex")).toMatchObject({ status: "fail", detail: "could not start (The signed Codex app-server did not become ready in time); trying again in the background" });
+    // Never advertised to Core: the inventory still leaves it out.
+    expect((await supervisor.inventory.collect()).agents).toEqual([]);
+  });
+
+  it("restarts to reconnect as a new process when Core retired this one, and says so in doctor (RCA 2026-10-01)", async () => {
+    const f = await fixture();
+    const onLivenessLost = vi.fn();
+    const supervisor = new Supervisor(f.config, { ...f.options, onLivenessLost }); supervisors.push(supervisor);
+    await supervisor.start();
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    vi.spyOn(supervisor.reconciliation, "run").mockRejectedValue(new RemoteInstanceError("reconciliation_replay", "Runtime process has been retired"));
+    const internals = supervisor as unknown as { startActiveLoop(): Promise<void>; activeLoopStarting: Promise<void> | null };
+    await internals.activeLoopStarting?.catch(() => undefined);
+    await internals.startActiveLoop();
+    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; detail: string }> };
+    expect(doctor.checks.find(check => check.id === "reconciliation")?.detail).toBe("Konteks no longer accepts this connector process; it restarts to reconnect as a new one");
+    expect(onLivenessLost).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(onLivenessLost).toHaveBeenCalledWith({ reason: "recovery_refused", code: "reconciliation_replay" });
   });
 
   it("reports previews in status (old launchers too), preview.status and the doctor, and advertises no preview without a relay", async () => {

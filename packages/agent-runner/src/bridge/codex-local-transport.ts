@@ -4,6 +4,7 @@ import { createConnection } from "node:net";
 import { Duplex } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import WebSocket from "ws";
+import { resolveCodexSocket } from "./codex-socket.js";
 
 const MAX_MESSAGE = 8 * 1024 * 1024;
 
@@ -19,10 +20,15 @@ export async function connectCodexLocalTransport(socketPath: string, interceptio
   const invalid = () => new Error("The supervisor-owned shared Codex service is unavailable on its private same-user Unix socket.");
   if (process.platform === "win32" || !isAbsolute(socketPath) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(socketPath)) throw invalid();
   const parent = await lstat(dirname(socketPath)).catch(() => { throw invalid(); });
-  const before = await lstat(socketPath).catch(() => { throw invalid(); });
+  // Codex 0.159+ leaves a link at the path to the socket it bound in its own private directory.
+  const resolved = await resolveCodexSocket(socketPath).catch(() => { throw invalid(); });
+  if (resolved.kind !== "socket") throw invalid();
+  const target = resolved.target;
+  const before = await lstat(target).catch(() => { throw invalid(); });
   if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o077) !== 0 || !before.isSocket() || before.uid !== process.getuid?.() || (before.mode & 0o077) !== 0) throw invalid();
   // Codex's control socket rejects extension negotiation, including deflate.
-  const socket = new WebSocket("ws://localhost/", { createConnection: () => createConnection(socketPath), perMessageDeflate: false, maxPayload: MAX_MESSAGE, handshakeTimeout: 10_000 });
+  // Connect to the verified socket itself, so a link swapped meanwhile is not followed.
+  const socket = new WebSocket("ws://localhost/", { createConnection: () => createConnection(target), perMessageDeflate: false, maxPayload: MAX_MESSAGE, handshakeTimeout: 10_000 });
   const decoder = new StringDecoder("utf8");
   let pending = "";
   const stream = new Duplex({
@@ -49,7 +55,7 @@ export async function connectCodexLocalTransport(socketPath: string, interceptio
   const onError = () => stream.destroy(new Error("Codex local transport disconnected"));
   try {
     await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
-    const after = await lstat(socketPath);
+    const after = await lstat(target);
     if (after.dev !== before.dev || after.ino !== before.ino || after.uid !== before.uid || after.mode !== before.mode || !after.isSocket()) throw invalid();
     socket.on("error", onError);
     socket.on("message", (data, binary) => {
