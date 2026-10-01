@@ -1,9 +1,13 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PipedChildProcess } from "@konteks/remote-common";
 import type { RunnerConfig } from "@konteks/remote-agent-runner";
-import { NativeCodexAppServerOwner } from "../native/codex-app-server-owner.js";
+import { NativeCodexAppServerOwner, cleanupCodexSocket, prepareCodexSocket, waitForCodexSocket } from "../native/codex-app-server-owner.js";
 
 vi.mock("@konteks/remote-common", async importOriginal => ({
   ...await importOriginal<object>(), isProcessGroupAlive: vi.fn(() => false),
@@ -321,5 +325,75 @@ describe("stray app-servers of this installation (RCA 2026-09-30)", () => {
     expect(busy.stopHolder).not.toHaveBeenCalledWith(2619);
     const deaf = owner({ reachable: false, busy: ["/root/run/old.sock"] });
     expect(await deaf.o.reapStrayServers(current, "/root/run/codex.sock")).toBe(2);
+  });
+});
+
+/**
+ * Codex 0.159+ binds its socket in a private directory of its own and leaves a
+ * link at the `--listen unix://PATH` it was given (RCA 2026-10-01: 0.10.3's
+ * Codex never counted as started, so its update rolled back every time).
+ */
+describe.skipIf(process.platform === "win32")("a Codex socket reached through a link", () => {
+  const cleanup: Array<() => Promise<void>> = [];
+  afterEach(async () => { for (const clean of cleanup.splice(0).reverse()) await clean(); });
+  async function linked() {
+    const base = await realpath(await mkdtemp(join(tmpdir(), "cx-")));
+    cleanup.push(() => rm(base, { recursive: true, force: true }));
+    const daemon = join(base, "d"), owner = join(base, "o");
+    await mkdir(daemon, { mode: 0o700 }); await mkdir(owner, { mode: 0o700 });
+    return { base, daemon, path: join(owner, "s"), target: join(daemon, "t") };
+  }
+  async function listen(path: string): Promise<Server> {
+    const server = createServer(socket => socket.end());
+    server.listen(path); await once(server, "listening");
+    cleanup.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    return server;
+  }
+  const running = { exitCode: null, signalCode: null } as PipedChildProcess;
+
+  it("still takes a plain socket at the path, as Codex 0.153 binds it", async () => {
+    const f = await linked();
+    const ready = waitForCodexSocket(f.path, running, 5_000);
+    const server = await listen(f.path); await chmod(f.path, 0o666);
+    await expect(ready).resolves.toBeUndefined();
+    expect((await lstat(f.path)).mode & 0o777).toBe(0o600);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("adopt");
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await cleanupCodexSocket(f.path);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("spawn");
+  });
+
+  it("counts the linked socket as ready and makes the socket itself private", async () => {
+    const f = await linked();
+    const ready = waitForCodexSocket(f.path, running, 5_000);
+    await listen(f.target); await chmod(f.target, 0o666);
+    await symlink(f.target, f.path);
+    await expect(ready).resolves.toBeUndefined();
+    expect((await stat(f.target)).mode & 0o777).toBe(0o600);
+  });
+
+  it("adopts a live linked server, and removes only the link once that server is gone", async () => {
+    const f = await linked();
+    const server = await listen(f.target); await chmod(f.target, 0o600);
+    await symlink(f.target, f.path);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("adopt");
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await expect(prepareCodexSocket(f.path)).rejects.toThrow(/stale/);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("spawn");
+    await expect(lstat(f.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("cleans up a link left dangling, and never one that leads where another user can reach", async () => {
+    const f = await linked();
+    await symlink(join(f.daemon, "gone"), f.path);
+    await cleanupCodexSocket(f.path);
+    await expect(lstat(f.path)).rejects.toMatchObject({ code: "ENOENT" });
+    await listen(f.target); await chmod(f.target, 0o600);
+    await symlink(f.target, f.path);
+    await chmod(f.daemon, 0o755);
+    await expect(prepareCodexSocket(f.path, true)).rejects.toThrow(/not a private local-user socket/);
+    await cleanupCodexSocket(f.path);
+    expect((await lstat(f.path)).isSymbolicLink()).toBe(true);
+    await expect(waitForCodexSocket(f.path, running, 300)).rejects.toThrow(/did not become ready in time/);
   });
 });

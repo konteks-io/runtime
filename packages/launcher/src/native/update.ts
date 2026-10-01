@@ -35,6 +35,21 @@ export type NativeUpdateStage =
   | { status: "staged"; current: NativeRuntimeRecord; release: VerifiedNativeRelease; releaseId: string; directory: string };
 
 /**
+ * The installer folder is held by whatever is changing this installation: most
+ * often the connector's own update, still downloading. Say that, rather than
+ * the bare ownership refusal a second `update` used to answer (RCA 2026-10-01).
+ */
+function installerLockForUpdate(root: string): ReturnType<typeof acquireNativeRootLock> {
+  try { return acquireNativeRootLock(join(root, "installer")); }
+  catch (error) {
+    if (error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message)) {
+      throw new RemoteInstanceError("temporarily_unavailable", "Another update or install of this connector is still running (it may be downloading a release). Wait for it to finish, then run `konteks-remote status`.", { cause: error });
+    }
+    throw error;
+  }
+}
+
+/**
  * Stage a strictly newer signed release next to the running one. Every byte is
  * pinned by the manifest, the candidate is verified as an installable connector
  * before it gets a release id, and nothing running is touched: the runtime
@@ -43,7 +58,7 @@ export type NativeUpdateStage =
 export async function stageNativeUpdate(options: { root: string; output: Output; deps?: NativeUpdateDeps }): Promise<NativeUpdateStage> {
   const platform = options.deps?.platform ?? nativePlatform();
   const root = validRoot(options.root);
-  const lock = acquireNativeRootLock(join(root, "installer"));
+  const lock = installerLockForUpdate(root);
   try {
     const check = await checkNativeUpdate({ root, ...(options.deps ? { deps: options.deps } : {}) });
     if (check.status === "current") return check;

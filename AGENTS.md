@@ -564,10 +564,22 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
 - An update whose stop is not confirmed in time starts the unchanged release
   again once the OS no longer runs it.
 - `serve` rewrites an existing service definition that differs from what the
-  serving release renders (`refreshOwnServiceDefinition`): the install
+  serving release renders (`keepServiceOnOwnDefinition`): the install
   launcher is never replaced and an updater is the previous release, so
-  service-level changes (the log file) otherwise arrive late or never. The OS
-  reads it from the next start.
+  service-level changes (the log file) otherwise arrive late or never.
+  Rewriting the file is not enough (RCA 2026-10-01: after an operator
+  `konteks-remote update`, launchd ran the new release from the install
+  launcher's plist, stdout and stderr on /dev/null, and KeepAlive respawns and
+  `kickstart -k` reuse that loaded copy). When the service manager runs this
+  very process and its loaded definition is not this one (just rewritten, a
+  launch agent with no `stdout path` or another `program`, or systemd's
+  `NeedDaemonReload=yes`), `serve` has it reload before starting anything:
+  launchd by `bootout` + `bootstrap` from a detached `/bin/sh` whose output is
+  appended to `logs/connector.log`, systemd by `daemon-reload` + `--no-block
+  restart`. The service manager keeps owning the one supervisor; a foreground
+  `serve` is never restarted; one reload per definition per 10 minutes
+  (`supervisor/service-reload.json`), and a `serve` not stopped within 60 s
+  starts anyway. Windows only rewrites the task file: `start` re-registers it.
 - After the shared Codex owner starts, app-servers that older releases of this
   installation left on other sockets are ended once idle (or unreachable)
   (`reapStrayServers`); nothing outside `<root>/releases/` is touched.
