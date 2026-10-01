@@ -436,8 +436,17 @@ transactionally: the new release is staged beside the running one, work is
 drained, the service is swapped and health-gated, and the previous release is
 restored if the gate fails. A new release whose service exits as it starts is
 rolled back after three failed starts, within seconds, rather than at the
-gate's three-minute deadline. `update` and `update --check` say when the
-connector updated itself, and when a release already failed here.
+gate's three-minute deadline. A bundled agent the new release cannot start
+is listed as unavailable with the reason, so the gate decides at once and,
+when that agent worked before, rolls back naming it. `update` and
+`update --check` say when the connector updated itself, and when a release
+already failed here; a second `update` while one is still downloading says so.
+
+On macOS the connector logs to `logs/connector.log` in its folder; on Linux,
+to the user journal. A release that finds its service still loaded with an
+older definition (for example one that sent its output nowhere) has the
+service manager reload it and restart once, so an updated connector keeps
+logging where it did.
 
 In Activity Monitor, `ps` or Task Manager the service shows as
 `konteks-connector` (Linux cuts process names to 15 characters:

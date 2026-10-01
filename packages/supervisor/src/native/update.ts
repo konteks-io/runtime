@@ -88,7 +88,7 @@ export class NativeUpdateCoordinator {
 
   /** Core's `version_policy` says this bundle is below the minimum: act now rather than at the next tick. */
   onUpdateRequired(policy: { minimumSupportedBundle: string | null; targetBundle?: string }): void {
-    this.options.logger.warn({ minimumSupportedBundle: policy.minimumSupportedBundle, targetBundle: policy.targetBundle ?? null }, "update_required: bundle below Core's minimum; requesting update");
+    this.options.logger.warn({ minimumSupportedBundle: policy.minimumSupportedBundle, targetBundle: policy.targetBundle ?? null }, "update_required: Konteks refuses this release; requesting an update");
     this.refusedAsTooOld = { minimumSupportedBundle: policy.minimumSupportedBundle };
     void this.apply("core_minimum").catch(() => undefined);
   }

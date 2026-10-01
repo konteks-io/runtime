@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, realpath, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, realpath, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { promisify } from "node:util";
 import { dirname, isAbsolute, join } from "node:path";
@@ -17,6 +17,7 @@ import {
   verifyNativeRunnerPackage,
   assertCodexThreadsIdle,
   codexLoadedThreadStatuses,
+  resolveCodexSocket,
   type RunnerConfig,
 } from "@konteks/remote-agent-runner";
 import { resolveNativeCodexSocket } from "./installation.js";
@@ -133,11 +134,12 @@ export class NativeCodexAppServerOwner {
     await this.startPromise;
     if (this.stopping || (!this.child && !this.adoptedHolder)) throw unavailable("The shared Codex owner is unavailable.");
     const socket = this.options.config.RUNNER_NATIVE_CODEX_SOCKET!;
-    const before = await lstat(socket);
+    // The bound socket itself, also when Codex 0.159+ reached it through a link.
+    const before = await stat(socket);
     const pid = this.child?.pid ?? this.adoptedHolder?.pid;
     if (!before.isSocket() || !pid) throw unavailable("The shared Codex owner identity is unavailable.");
     const unloaded = !(await codexLoadedThreadStatuses(socket)).has(reference);
-    const after = await lstat(socket);
+    const after = await stat(socket);
     if (before.dev !== after.dev || before.ino !== after.ino || before.birthtimeMs !== after.birthtimeMs ||
         pid !== (this.child?.pid ?? this.adoptedHolder?.pid)) throw unavailable("The shared Codex owner changed during legacy admission.");
     return { unloaded, ownerGeneration: `${pid}:${before.dev}:${before.ino}:${before.birthtimeMs}` };
@@ -393,22 +395,33 @@ export async function prepareCodexSocket(socketPath: string, allowStaleCleanup =
     throw error;
   });
   if (!existing) return "spawn";
-  if (!existing.isSocket() || !privateOwner(existing)) throw unavailable("The shared Codex socket path is not a private local-user socket.");
-  if (await canConnect(socketPath)) return "adopt";
+  const socket = await resolveCodexSocket(socketPath, existing);
+  if (socket.kind === "foreign" || (socket.kind === "socket" && !privateOwner(socket.info))) throw unavailable("The shared Codex socket path is not a private local-user socket.");
+  if (socket.kind === "socket" && await canConnect(socketPath)) return "adopt";
   if (!allowStaleCleanup) throw unavailable("An explicit Codex socket is stale; refusing to remove an unproven holder's socket.");
+  // A stale socket, or the link a stopped Codex left to its own: only the
+  // entry at our path is removed, never what a link points to.
   await unlink(socketPath);
   return "spawn";
 }
 
-export async function waitForCodexSocket(socketPath: string, child: PipedChildProcess): Promise<void> {
-  const deadline = Date.now() + 15_000;
+/**
+ * How long a starting Codex app-server may take to listen. A first start of a
+ * newer Codex can migrate the state in its home before it binds, so this is
+ * generous; a server that exits fails at once, and other agents start
+ * meanwhile (start-native-agents), so the wait only costs Codex itself.
+ */
+export const CODEX_SOCKET_READY_TIMEOUT_MS = 60_000;
+
+export async function waitForCodexSocket(socketPath: string, child: PipedChildProcess, timeoutMs = CODEX_SOCKET_READY_TIMEOUT_MS): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null) throw unavailable("The signed Codex app-server exited before its socket became ready.");
-    const info = await lstat(socketPath).catch(() => null);
-    if (info?.isSocket() && info.uid === process.getuid?.() && await canConnect(socketPath)) {
-      await chmod(socketPath, 0o600);
-      const secured = await lstat(socketPath);
-      if (secured.isSocket() && privateOwner(secured)) return;
+    const socket = await resolveCodexSocket(socketPath);
+    if (socket.kind === "socket" && socket.info.uid === process.getuid?.() && await canConnect(socketPath)) {
+      await chmod(socket.target, 0o600);
+      const secured = await resolveCodexSocket(socketPath);
+      if (secured.kind === "socket" && secured.target === socket.target && privateOwner(secured.info)) return;
       throw unavailable("The shared Codex socket could not be secured.");
     }
     await pause(100);
@@ -417,11 +430,12 @@ export async function waitForCodexSocket(socketPath: string, child: PipedChildPr
 }
 
 export async function cleanupCodexSocket(socketPath: string): Promise<void> {
-  const info = await lstat(socketPath).catch(() => null);
-  if (!info?.isSocket() || !privateOwner(info)) return;
+  const socket = await resolveCodexSocket(socketPath);
+  if (socket.kind === "none" || socket.kind === "foreign" || (socket.kind === "socket" && !privateOwner(socket.info))) return;
   // Never unlink a same-user server that won a race after our process stopped.
-  if (!await canConnect(socketPath)) await unlink(socketPath).catch(() => undefined);
+  if (socket.kind === "dangling" || !await canConnect(socketPath)) await unlink(socketPath).catch(() => undefined);
 }
+
 
 function validatePath(path: string): void {
   if (process.platform === "win32" || !isAbsolute(path) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(path)) throw unavailable("The shared Codex socket path is invalid.");
@@ -472,7 +486,9 @@ async function listProcesses(): Promise<Array<{ pid: number; command: string }>>
 
 /** The Codex app-server process listening on the shared socket, if it can be told. */
 export async function findCodexSocketHolder(socketPath: string): Promise<CodexSocketHolder | null> {
-  const { stdout } = await run("lsof", ["-t", socketPath], { timeout: 5_000 });
+  // lsof names a socket by where it was bound, not by a link to it (Codex 0.159+).
+  const socket = await resolveCodexSocket(socketPath).catch(() => null);
+  const { stdout } = await run("lsof", ["-t", socket?.kind === "socket" ? socket.target : socketPath], { timeout: 5_000 });
   for (const pid of stdout.split(/\s+/).map(Number).filter(value => Number.isSafeInteger(value) && value > 0)) {
     const { stdout: command } = await run("ps", ["-o", "command=", "-p", String(pid)], { timeout: 5_000 });
     if (/\bcodex\b.*\bapp-server\b/.test(command)) return { pid, command: command.trim() };

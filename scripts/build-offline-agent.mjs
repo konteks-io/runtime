@@ -13,7 +13,8 @@ import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, sep } from "node:path";
 import { createGzip } from "node:zlib";
-import { inventoryOfflineFiles } from "./offline-agent-files.mjs";
+import { fileURLToPath } from "node:url";
+import { codexLocalProxyFiles, inventoryOfflineFiles } from "./offline-agent-files.mjs";
 import { patchCodexAcpLiveUsers } from "./codex-acp-live-user-patch.mjs";
 import { patchClaudeSettings } from "./claude-acp-settings-patch.mjs";
 
@@ -68,8 +69,9 @@ try {
     const patched = patchCodexAcpLiveUsers(readFileSync(bridgePath, "utf8"), selected.bridge.version);
     writeFileSync(bridgePath, patched.source);
     writeFileSync(join(root, "konteks", "codex-acp-provenance.json"), JSON.stringify(patched.provenance));
-    for (const file of ["codex-local-proxy.js", "codex-local-transport.js", "codex-input-correlation.js"]) {
-      cpSync(new URL(`../packages/agent-runner/dist/bridge/${file}`, import.meta.url), join(root, "konteks", file));
+    const proxyDirectory = fileURLToPath(new URL("../packages/agent-runner/dist/bridge/", import.meta.url));
+    for (const file of codexLocalProxyFiles(proxyDirectory)) {
+      cpSync(join(proxyDirectory, file), join(root, "konteks", file));
     }
     writeFileSync(join(root, "konteks", "package.json"), '{"type":"module"}\n');
     chmodSync(join(root, "konteks", "codex-local-proxy.js"), 0o755);

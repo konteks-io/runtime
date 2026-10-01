@@ -73,6 +73,7 @@ export async function agents(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "agents" }, AgentsSchema);
   context.output.result(value);
   for (const agent of value.agents as Array<Record<string, string>>) {
+    if (agent.startFailure) { context.output.line(`${agent.agentId}: could not start (${agent.startFailure}); trying again in the background`); continue; }
     context.output.line(`${agent.agentId}: ${agent.readiness} (${agent.authMode}, scope ${agent.accountScope})${agent.recoveryAction ? ` — ${agent.recoveryAction}` : ""}${downloadNote(agent)}`);
   }
   context.output.line(`advertised roles: ${value.roles.join(", ") || "(none)"}`);
