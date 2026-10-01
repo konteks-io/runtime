@@ -24,3 +24,4 @@ export * from "./auth/host-cache-import.js";
 export * from "./sessions/usage-label.js";
 export * from "./auth/opencode-auth.js";
 export * from "./auth/antigravity-auth.js";
+export * from "./bridge/integration-mcp-status.js";
