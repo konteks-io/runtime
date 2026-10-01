@@ -1,11 +1,13 @@
 import {
   INTEGRATION_TASK_LIMITS,
+  IntegrationFixtureServerSchema,
   IntegrationInventoryEntrySchema,
   type IntegrationInventoryEntry,
   type IntegrationProvider,
 } from "@konteks/backstage-plugin-common";
 import type { ClaudeMcpStatusEntry } from "@konteks/remote-agent-runner";
 import { claudeMcpServerSegment } from "../session/permission-tool-identity.js";
+import { integrationFixturesEnabled } from "./carrier.js";
 import { IntegrationTaskError } from "./errors.js";
 
 /**
@@ -114,6 +116,77 @@ export function sanitizeClaudeMcpStatus(raw: readonly ClaudeMcpStatusEntry[]): I
   }));
 }
 
+/** The variable the E2E controller sets on its connector process: `{serverName: loopback url}`. */
+export const E2E_FIXTURE_SERVERS_VARIABLE = "KONTEKS_E2E_FIXTURE_MCP_SERVERS";
+
+export interface E2EFixtureServer {
+  serverName: string;
+  url: string;
+}
+
+/**
+ * E2E only (`KONTEKS_E2E_NATIVE_CONNECTOR=1`): the synthetic provider servers
+ * the controller runs. Claude has no personal MCP source a fixture could live
+ * in (its source is the account's connectors), so its discovery offers these
+ * as `fixture_mcp` sources; Core serves the URL back on the task spec. Outside
+ * E2E mode, or for anything that is not a bounded name and a loopback HTTP
+ * URL, nothing is offered.
+ */
+export function e2eFixtureServers(env: NodeJS.ProcessEnv = process.env): E2EFixtureServer[] {
+  if (!integrationFixturesEnabled(env)) return [];
+  const raw = env[E2E_FIXTURE_SERVERS_VARIABLE];
+  if (raw === undefined || raw.length === 0 || raw.length > 16 * 1024) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  return Object.entries(parsed as Record<string, unknown>)
+    .filter((item): item is [string, string] => typeof item[1] === "string" && item[0].length <= 128 && SERVER_TOKEN.test(item[0]))
+    .filter(([, url]) => IntegrationFixtureServerSchema.safeParse({ type: "http", url }).success)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .slice(0, INTEGRATION_TASK_LIMITS.maxInventoryServers)
+    .map(([serverName, url]) => ({ serverName, url }));
+}
+
+/**
+ * Model-free listing of one fixture server: MCP `initialize` then
+ * `tools/list` over loopback streamable HTTP. Only tool names come back.
+ */
+export async function listFixtureTools(server: E2EFixtureServer, fetchImpl: typeof fetch = fetch, timeoutMs = 3_000): Promise<unknown[]> {
+  const post = async (body: unknown, session?: string) => {
+    const response = await fetchImpl(server.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", ...(session ? { "mcp-session-id": session } : {}) },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "error",
+    });
+    if (response.status !== 200 || !(response.headers.get("content-type") ?? "").includes("application/json")) throw new Error(`fixture answered ${response.status}`);
+    return { session: response.headers.get("mcp-session-id") ?? undefined, body: await response.json() as { result?: { tools?: Array<{ name?: unknown }> } } };
+  };
+  const initialized = await post({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "konteks-integration-discovery", version: "1" } } });
+  const listed = await post({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, initialized.session);
+  return (listed.body.result?.tools ?? []).map(tool => tool.name);
+}
+
+/** The `fixture_mcp` inventory entries for the E2E fixture servers; an unreachable one is `failed`. */
+export async function readFixtureInventory(servers: readonly E2EFixtureServer[], list: (server: E2EFixtureServer) => Promise<unknown[]> = listFixtureTools): Promise<IntegrationInventoryEntry[]> {
+  const entries = await Promise.all(servers.map(async server => {
+    let tools: unknown[] = [];
+    let status: IntegrationInventoryEntry["status"] = "connected";
+    try {
+      tools = await list(server);
+    } catch {
+      status = "failed";
+    }
+    return entry({ serverName: server.serverName, sourceKind: "fixture_mcp", status, providerCategory: providerCategoryOf(server.serverName), toolNames: toolNames(tools) });
+  }));
+  return bounded(entries);
+}
+
 export interface IntegrationDiscovery {
   discover(agentId: string): Promise<IntegrationInventoryEntry[]>;
 }
@@ -122,13 +195,20 @@ export interface IntegrationDiscovery {
 export interface NativeIntegrationDiscoveryReaders {
   claude?: () => Promise<ClaudeMcpStatusEntry[]>;
   codex?: () => Promise<unknown[]>;
+  /** E2E only: the `fixture_mcp` sources offered beside Claude's account connectors. */
+  fixtures?: () => Promise<IntegrationInventoryEntry[]>;
 }
 
 export class NativeIntegrationDiscovery implements IntegrationDiscovery {
   constructor(private readonly readers: NativeIntegrationDiscoveryReaders) {}
 
   async discover(agentId: string): Promise<IntegrationInventoryEntry[]> {
-    if (agentId === "claude-code" && this.readers.claude) return sanitizeClaudeMcpStatus(await this.readers.claude());
+    if (agentId === "claude-code" && this.readers.claude) {
+      const connectors = sanitizeClaudeMcpStatus(await this.readers.claude());
+      const fixtures = this.readers.fixtures ? await this.readers.fixtures() : [];
+      const names = new Set(connectors.map(item => item.serverName));
+      return bounded([...connectors, ...fixtures.filter(item => !names.has(item.serverName))]);
+    }
     if (agentId === "codex" && this.readers.codex) return sanitizeCodexMcpStatus(await this.readers.codex());
     throw new IntegrationTaskError("operation_unsupported");
   }

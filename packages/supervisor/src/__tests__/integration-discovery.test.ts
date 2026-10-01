@@ -1,6 +1,8 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
 import { IntegrationInventoryEntrySchema } from "@konteks/backstage-plugin-common";
-import { NativeIntegrationDiscovery, providerCategoryOf, sanitizeClaudeMcpStatus, sanitizeCodexMcpStatus } from "../integration/discovery.js";
+import { E2E_FIXTURE_SERVERS_VARIABLE, NativeIntegrationDiscovery, e2eFixtureServers, listFixtureTools, providerCategoryOf, readFixtureInventory, sanitizeClaudeMcpStatus, sanitizeCodexMcpStatus } from "../integration/discovery.js";
 
 const CANARY = "ghp_canary_4d1c2b";
 
@@ -70,5 +72,58 @@ describe("integration discovery allowlist (D26, secret canaries)", () => {
     expect((await discovery.discover("codex")).map(entry => entry.serverName)).toContain("atlassian");
     expect(await discovery.discover("claude-code")).toEqual([{ serverName: "claude_ai_Slack", sourceKind: "account_connector", status: "connected", providerCategory: "slack", toolNames: ["slack_read_thread"] }]);
     await expect(discovery.discover("opencode")).rejects.toMatchObject({ code: "operation_unsupported" });
+  });
+});
+
+describe("E2E fixture sources (KONTEKS_E2E_NATIVE_CONNECTOR=1 only)", () => {
+  const servers = JSON.stringify({ atlassian: "http://127.0.0.1:7801/mcp", slack: "http://localhost:7802/mcp", remote: "https://example.com/mcp", "bad name": "http://127.0.0.1:1/mcp", creds: "http://u:p@127.0.0.1:2/mcp" });
+
+  it("reads the controller's servers only in E2E mode and only as loopback HTTP", () => {
+    expect(e2eFixtureServers({ [E2E_FIXTURE_SERVERS_VARIABLE]: servers })).toEqual([]);
+    expect(e2eFixtureServers({ KONTEKS_E2E_NATIVE_CONNECTOR: "0", [E2E_FIXTURE_SERVERS_VARIABLE]: servers })).toEqual([]);
+    expect(e2eFixtureServers({ KONTEKS_E2E_NATIVE_CONNECTOR: "1", [E2E_FIXTURE_SERVERS_VARIABLE]: servers })).toEqual([
+      { serverName: "atlassian", url: "http://127.0.0.1:7801/mcp" },
+      { serverName: "slack", url: "http://localhost:7802/mcp" },
+    ]);
+    for (const value of ["", "not json", "[1]", "null"]) {
+      expect(e2eFixtureServers({ KONTEKS_E2E_NATIVE_CONNECTOR: "1", [E2E_FIXTURE_SERVERS_VARIABLE]: value })).toEqual([]);
+    }
+  });
+
+  it("lists a fixture's tool names over MCP and marks an unreachable one failed", async () => {
+    const server = createServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const message = JSON.parse(body) as { id: number; method: string };
+      const result = message.method === "initialize"
+        ? { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "atlassian", version: "1" } }
+        : { tools: [{ name: "getJiraIssue", description: "secret-canary" }, { name: "addOrEditJiraIssueComment" }, { name: "bad tool!" }] };
+      res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s1" }).end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/mcp`;
+      expect(await listFixtureTools({ serverName: "atlassian", url })).toEqual(["getJiraIssue", "addOrEditJiraIssueComment", "bad tool!"]);
+      const inventory = await readFixtureInventory([{ serverName: "atlassian", url }, { serverName: "slack", url: "http://127.0.0.1:1/mcp" }]);
+      expect(inventory).toEqual([
+        { serverName: "atlassian", sourceKind: "fixture_mcp", status: "connected", providerCategory: "jira", toolNames: ["addOrEditJiraIssueComment", "getJiraIssue"] },
+        { serverName: "slack", sourceKind: "fixture_mcp", status: "failed", providerCategory: "slack", toolNames: [] },
+      ]);
+      expect(JSON.stringify(inventory)).not.toContain("secret-canary");
+      for (const entry of inventory) IntegrationInventoryEntrySchema.parse(entry);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+
+  it("offers fixtures beside Claude's account connectors, never to Codex, and never shadowing a connector", async () => {
+    const fixture = { serverName: "atlassian", sourceKind: "fixture_mcp" as const, status: "connected" as const, providerCategory: "jira" as const, toolNames: ["getJiraIssue"] };
+    const discovery = new NativeIntegrationDiscovery({
+      codex: async () => [],
+      claude: async () => [{ name: "claude.ai Slack", status: "connected", scope: "claudeai", tools: ["slack_read_thread"] }],
+      fixtures: async () => [fixture, { ...fixture, serverName: "claude_ai_Slack" }],
+    });
+    expect((await discovery.discover("claude-code")).map(entry => `${entry.sourceKind}:${entry.serverName}`)).toEqual(["account_connector:claude_ai_Slack", "fixture_mcp:atlassian"]);
+    expect(await discovery.discover("codex")).toEqual([]);
   });
 });

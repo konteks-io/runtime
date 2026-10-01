@@ -17,7 +17,7 @@ import type { RunnerPort } from "../runner-port.js";
 import type { SupervisorJournal } from "../state/journal.js";
 import type { WorkloadDefinition } from "../work/workload.js";
 import { IntegrationTaskCarrier, integrationFixturesEnabled, type IntegrationWorkAssignment } from "./carrier.js";
-import { NativeIntegrationDiscovery } from "./discovery.js";
+import { NativeIntegrationDiscovery, e2eFixtureServers, readFixtureInventory } from "./discovery.js";
 import { OfficialSetupRunner, type SetupCommandLaunch } from "./setup.js";
 import { journalWriteLedger } from "./tool-gate.js";
 
@@ -50,6 +50,7 @@ export function composeIntegrationCarrier(inputs: IntegrationCompositionInputs):
   const claude = inputs.configs.find(config => config.RUNNER_AGENT_ID === "claude-code" && config.RUNNER_NATIVE_CLAUDE_EXECUTABLE !== undefined);
   const codex = inputs.configs.find(config => config.RUNNER_AGENT_ID === "codex");
   const codexSocket = codex?.RUNNER_NATIVE_CODEX_SOCKET;
+  const fixtureServers = integrationFixturesEnabled(inputs.env) ? e2eFixtureServers(inputs.env) : [];
   return new IntegrationTaskCarrier({
     fetchWorkload: inputs.fetchWorkload,
     discovery: new NativeIntegrationDiscovery({
@@ -63,6 +64,8 @@ export function composeIntegrationCarrier(inputs: IntegrationCompositionInputs):
         },
       } : {}),
       ...(codexSocket ? { codex: () => readCodexMcpServerStatus(codexDiscoveryConnection(codexSocket)) } : {}),
+      // E2E only: the controller's synthetic providers as Claude `fixture_mcp` sources.
+      ...(fixtureServers.length > 0 ? { fixtures: () => readFixtureInventory(fixtureServers) } : {}),
     }),
     setup: new OfficialSetupRunner({
       codex: () => {

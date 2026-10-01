@@ -211,7 +211,14 @@ that never settles is `outcome_unknown`. A source the agent cannot hold
 (Claude: account connectors only; Codex: personal servers only) is a typed
 `operation_unsupported` result with no session. `fixture_mcp` (a loopback
 HTTP server named in the spec, never a command) is served only when the
-connector process runs with `KONTEKS_E2E_NATIVE_CONNECTOR=1`. A setup task
+connector process runs with `KONTEKS_E2E_NATIVE_CONNECTOR=1`. In that mode
+Claude's discovery also offers, beside the account connectors, the
+controller's synthetic provider servers named by
+`KONTEKS_E2E_FIXTURE_MCP_SERVERS` (`{serverName: loopback url}`, set only on
+the codex-e2e connector process; `e2eFixtureServers` / `readFixtureInventory`
+in `discovery.ts`, MCP `initialize` + `tools/list`, names only) as
+`fixture_mcp` sources; Codex sees its fixtures as personal servers in the
+e2e-owned `CODEX_HOME` instead. A setup task
 (`setup.ts`, P08/D29) runs only the reviewed catalogue entry it names
 (`officialConnectionSetup`; endpoint, server name and the change's command
 digest must match; the argv is the catalogue's `setupArgv(entry, change)`):
