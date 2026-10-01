@@ -34,3 +34,11 @@ export async function isolateClaudeInstructions(settings, cwd, userConfigDir) {
   }
   return { ...base, claudeMdExcludes: [...excluded], autoMemoryEnabled: false };
 }
+
+// Stage 0 (S0-1): the repository a Konteks session works in chose its hooks,
+// not the person who started the session. As flag settings these outrank the
+// project's own, and they switch off only settings hooks: the SDK's callback
+// hooks (the bridge's PostToolUse, Stop, Task and model-switch hooks) still run.
+export function hardenClaudeSession(settings) {
+  return { ...(settings ?? {}), disableAllHooks: true };
+}

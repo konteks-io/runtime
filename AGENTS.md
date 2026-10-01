@@ -115,6 +115,19 @@ the schema into a `session/prompt` request field: the native operation permit
 signs the parsed request's digest and an older connector strips unknown
 fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
 
+**Session hardening (external-integration Stage 0, invariant N10).** A
+Konteks Claude Code session runs none of the working repository's hooks and
+starts none of its `.mcp.json` servers (S0-1): the patched claude-agent-acp
+(`scripts/claude-acp-settings-patch.mjs`, `konteks-claude-project-settings-v3`)
+forces `strictMcpConfig: true` beside `settingSources: ["project"]` (only the
+ACP request's servers load, which also leaves the account's claude.ai
+connectors out) and `hardenClaudeSession` flag settings (`disableAllHooks`;
+flag settings outrank the project's, and the SDK callback hooks the bridge
+registers keep running) on new, loaded and resumed sessions. The project's
+CLAUDE.md is still read (`claude-instruction-scope.integration.test.mjs`,
+hardened case). The bridge's marker is `instruction_scope version=3 …
+hooks=disabled repository_mcp=excluded account_connectors=excluded`.
+
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered
 since opencode-runtime-support CP6), and Google Antigravity (`antigravity`,

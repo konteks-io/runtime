@@ -117,6 +117,16 @@ safety rules stay: blocked commands (`git push`, `sudo`, …) are refused,
 file changes outside the session's folder are refused, sign-in requests are
 declined, and whatever the policy leaves to you is asked in the chat.
 
+### What a Konteks session leaves out
+
+A Konteks session works in your repository, but it does not run what the
+repository chose to run. With Claude Code, the repository's own hooks
+(`.claude/settings.json` SessionStart, PreToolUse and the rest) do not run and
+the servers in its `.mcp.json` are not started; its `CLAUDE.md` is still read.
+A repository that relied on its own hooks or `.mcp.json` tools inside Konteks
+sessions loses them until Konteks can admit them explicitly. Your own Claude
+Code sessions outside Konteks are unchanged.
+
 ### Live previews
 
 A session's agent can run a live preview of its work: a dev server started

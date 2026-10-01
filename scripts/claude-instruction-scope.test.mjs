@@ -25,3 +25,15 @@ test('excludes ancestor and personal memory while retaining project instructions
     assert.ok(resumed.claudeMdExcludes.includes(join(realpathSync(root), 'home', 'parent', 'CLAUDE.md')));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('a Konteks session runs no repository hooks, whatever the settings it was given ask for', async () => {
+  const { hardenClaudeSession } = await import('./claude-instruction-scope.mjs');
+  // Flag settings outrank project settings, so the repository cannot turn its
+  // own hooks back on; the SDK's callback hooks (the bridge's) are not settings
+  // hooks and keep running (proof/cp2-runtime/stage-0).
+  const hardened = hardenClaudeSession({ disableAllHooks: false, claudeMdExcludes: ['a'], env: { KEEP: '1' } });
+  assert.equal(hardened.disableAllHooks, true);
+  assert.deepEqual(hardened.claudeMdExcludes, ['a']);
+  assert.deepEqual(hardened.env, { KEEP: '1' });
+  assert.equal(hardenClaudeSession(undefined).disableAllHooks, true);
+});

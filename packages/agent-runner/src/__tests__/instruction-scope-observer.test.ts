@@ -17,4 +17,13 @@ describe("bridge instruction scope diagnostics", () => {
     expect(emit).not.toHaveBeenCalled();
     observe(`${marker}\n`); expect(emit).toHaveBeenCalledTimes(1);
   });
+  it("reports the Stage 0 session scope: no repository hooks, no repository MCP servers, no account connectors", () => {
+    const emit = vi.fn(); const observe = instructionScopeObserver(emit);
+    const v3 = "[konteks] instruction_scope version=3 settings=project ancestors=excluded user=excluded local=excluded auto_memory=excluded auth=official_profile exclusions=24 hooks=disabled repository_mcp=excluded account_connectors=excluded";
+    observe(`${v3}\n`);
+    expect(emit).toHaveBeenCalledExactlyOnceWith({ version: 3, settings: "project", ancestors: "excluded", user: "excluded", local: "excluded", autoMemory: "excluded", auth: "official_profile", exclusionCount: 24,
+      hooks: "disabled", repositoryMcp: "excluded", accountConnectors: "excluded" });
+    observe(`${v3.replace("hooks=disabled", "hooks=enabled")}\n`);
+    expect(emit).toHaveBeenCalledTimes(1);
+  });
 });

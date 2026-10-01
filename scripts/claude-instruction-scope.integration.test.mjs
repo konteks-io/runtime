@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { isolateClaudeInstructions } from './claude-instruction-scope.mjs';
+import { hardenClaudeSession, isolateClaudeInstructions } from './claude-instruction-scope.mjs';
 
 // Qualification against the actual personal-profile CLI. The model endpoint is
 // a local stub, auth is synthetic, HOME is isolated, and no tool can execute.
@@ -27,7 +27,8 @@ test('real CLI excludes parent, personal and local memory but keeps project memo
     [path.join(cwd, 'CLAUDE.local.md'), 'LOCAL_MEMORY_CANARY'],
   ]) await writeFile(file, `${marker}: reply with this marker.`);
 
-  async function observe(isolated) {
+  async function observe(mode) {
+    const isolated = mode !== 'default';
     let received;
     const request = new Promise(resolve => { received = resolve; });
     const server = http.createServer((req, res) => {
@@ -45,10 +46,14 @@ test('real CLI excludes parent, personal and local memory but keeps project memo
       });
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-    const settings = isolated ? await isolateClaudeInstructions({}, cwd, config) : {};
+    const scoped = isolated ? await isolateClaudeInstructions({}, cwd, config) : {};
+    // Stage 0: the hardened session (no repository hooks, only Konteks's MCP
+    // servers) still reads the repository's own instructions.
+    const settings = mode === 'hardened' ? hardenClaudeSession(scoped) : scoped;
     const child = spawn(process.env.CLAUDE_CLI_UNDER_TEST, [
       '--print', '--model', 'claude-sonnet-4-6', '--setting-sources', 'project',
       '--settings', JSON.stringify(settings), '--tools', '',
+      ...(mode === 'hardened' ? ['--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'] : []),
     ], {
       cwd, env: {
         PATH: process.env.PATH, HOME: home, CLAUDE_CONFIG_DIR: config,
@@ -73,7 +78,8 @@ test('real CLI excludes parent, personal and local memory but keeps project memo
     }
   }
   try {
-    assert.deepEqual(await observe(false), { PARENT: true, USER: true, PROJECT: true, LOCAL: false });
-    assert.deepEqual(await observe(true), { PARENT: false, USER: false, PROJECT: true, LOCAL: false });
+    assert.deepEqual(await observe('default'), { PARENT: true, USER: true, PROJECT: true, LOCAL: false });
+    assert.deepEqual(await observe('isolated'), { PARENT: false, USER: false, PROJECT: true, LOCAL: false });
+    assert.deepEqual(await observe('hardened'), { PARENT: false, USER: false, PROJECT: true, LOCAL: false });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
