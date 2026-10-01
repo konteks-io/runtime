@@ -132,7 +132,7 @@ disk. Keep tests/builds serial; dependencies alone are not behavior evidence.
 
 ### Phase 4: Publish reviewed checkpoint
 
-Status: in_progress
+Status: completed
 Repository: runtime-github-ops, GitHub konteks-io/runtime.
 Confirmed scope: non-default branch push and PR to main.
 Confirmation source: user explicitly authorized push and PR, GitHub-only.
@@ -148,11 +148,13 @@ Source evidence:
 Implementation items:
 
 - [x] Review exact diff, focused test results and Graft freshness.
-- [ ] Commit task-owned source/test/plan files only.
-- [ ] Push an explicit non-default GitHub ref and create the PR.
-- [ ] Verify and attach the PR URL; do not merge/release/deploy.
+- [x] Commit task-owned source/test/plan files only.
+- [x] Push an explicit non-default GitHub ref and create the PR.
+- [x] Verify and attach the PR URL; do not merge/release/deploy.
 
-Evidence: pending.
+Evidence: 8de75177e69ca249378ff961fd8d10b42d848b6d pushed explicitly to
+GitHub feat/ops; PR #24 verified OPEN, draft, base main and exact head.
+GitHub CI run 36890971311 is pending, not a claimed pass.
 
 Build-unblock scope confirmed 2026-10-01: native/activation.ts and its focused
 native-activation.test.ts only. Shared RemotePlatformSchema accepts generic
@@ -170,7 +172,7 @@ Characterize the rejection first; no casts or broad platform migration.
 - [x] Complete characterized scoped MCP port.
 - [x] Complete characterized Ops carrier compatibility.
 - [x] Complete characterized controller-owned E2E signed update compatibility.
-- [ ] Publish verified GitHub PR.
+- [x] Publish verified GitHub PR.
 
 ## Decisions
 
@@ -225,7 +227,8 @@ Characterize the rejection first; no casts or broad platform migration.
 
 ## Closeout
 
-Open. Draft PR #24 carries the MCP and Codex version checkpoints. Operations
-carrier and signed local update source checks now pass and await publication.
+Source migration checkpoint published through draft PR #24 at 8de7517.
 The installed connector is not updated; costed proposal and the complete
-Ops-to-Engineering-to-PR journey remain unproved.
+Ops-to-Engineering-to-PR journey remain unproved and remain the active parent
+E2E goal. A local offline Codex 0.159.0 artifact is being built from this
+checkpoint under ignored E2E private state; no public release is authorized.
