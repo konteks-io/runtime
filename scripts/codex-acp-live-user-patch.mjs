@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 // Build-time compatibility change only. Never mutate an installed signed artifact.
 // Reuse upstream's history conversion; do not reconstruct or read local files.
 export const codexAcpLiveUserPatch = {
-  id: "konteks-codex-acp-live-user-v6",
+  id: "konteks-codex-acp-live-user-v7",
   package: "@agentclientprotocol/codex-acp",
   version: "1.10.0",
   upstreamSha256: "4602784c5896fbf05a7d89b09655bacc768d0bf281e0d03a10333ff81da45268",
@@ -40,6 +40,23 @@ export async function reconcileCodexToolTerminals(turn, openByTurn, emit) {
   }
 }
 
+// Stage 0 (S0-2): a Konteks thread runs only the MCP servers Konteks gave it.
+// codex-acp keeps the person's configured servers (user and trusted project
+// layers) and adds the ACP ones; this turns each configured server off for
+// the thread (`mcp_servers.<name>.enabled = false`, deep-merged per thread;
+// measured against the pinned Codex 0.153.4: the server is never started).
+// `admittedNames` is the integration seam (CP2); nothing admits one yet.
+export function konteksCodexMcpServers(existingNames, requestedNames, admittedNames) {
+  const conflict = requestedNames.find((name) => existingNames.has(name));
+  if (conflict !== undefined) {
+    throw new Error("A personal Codex MCP server uses a name this Konteks session needs for its own; rename it in your Codex config.");
+  }
+  const keep = new Set([...requestedNames, ...admittedNames]);
+  return Object.fromEntries(
+    [...existingNames].filter((name) => !keep.has(name)).sort().map((name) => [name, { enabled: false }]),
+  );
+}
+
 export function patchCodexAcpLiveUsers(source, version) {
   if (
     version !== codexAcpLiveUserPatch.version ||
@@ -56,7 +73,48 @@ export function patchCodexAcpLiveUsers(source, version) {
   };
   replaceOnce(
     "var CodexEventHandler = class _CodexEventHandler {",
-    `${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
+    `${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
+  );
+  replaceOnce(
+    `  async createSessionConfig(projectPath, additionalDirectories, mcpServers) {`,
+    `  async createSessionConfig(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = []) {`,
+  );
+  replaceOnce(
+    `    if (mcpServers.length === 0) {
+      return configWithWorkspaceRoots;
+    }
+    const requestedServers = mcpServers.map((mcp) => ({
+      name: sanitizeMcpServerName(mcp.name),
+      server: mcp
+    }));
+    let serversToConfigure = requestedServers;
+    if (shouldDeduplicateMcpConflicts()) {
+      const existingNames = await this.getConfigMcpServerNames(projectPath);
+      serversToConfigure = requestedServers.filter((mcp) => !existingNames.has(mcp.name));
+    }
+    if (serversToConfigure.length === 0) {
+      return configWithWorkspaceRoots;
+    }
+    return {
+      ...configWithWorkspaceRoots,
+      "mcp_servers": Object.fromEntries(serversToConfigure.map((mcp) => [mcp.name, this.createMcpSeverConfig(mcp.server)]))
+    };`,
+    `    const requestedServers = mcpServers.map((mcp) => ({
+      name: sanitizeMcpServerName(mcp.name),
+      server: mcp
+    }));
+    const existingMcpServerNames = await this.getConfigMcpServerNames(projectPath);
+    const disabledMcpServers = konteksCodexMcpServers(existingMcpServerNames, requestedServers.map((mcp) => mcp.name), admittedMcpServerNames.map(sanitizeMcpServerName));
+    if (requestedServers.length === 0 && Object.keys(disabledMcpServers).length === 0) {
+      return configWithWorkspaceRoots;
+    }
+    return {
+      ...configWithWorkspaceRoots,
+      "mcp_servers": {
+        ...disabledMcpServers,
+        ...Object.fromEntries(requestedServers.map((mcp) => [mcp.name, this.createMcpSeverConfig(mcp.server)]))
+      }
+    };`,
   );
   replaceOnce(
     "  terminalCommandOutputIds = /* @__PURE__ */ new Set();\n  agentMessagePhases = /* @__PURE__ */ new Map();",

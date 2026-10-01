@@ -11,13 +11,22 @@ import { permissionToolIdentity, type McpToolCallLedger, type PermissionToolIden
  * Sign-in elicitations are never remotely answerable (D102) and always fail
  * closed in headless execution.
  */
-export type PolicyDecision = { kind: "allow"; optionId: string } | { kind: "deny"; optionId: string | null } | { kind: "defer" };
+/** `allowOnceOnly`: whoever answers a deferred request may allow it once, never always (an integration gate's call). */
+export type PolicyDecision = { kind: "allow"; optionId: string } | { kind: "deny"; optionId: string | null } | { kind: "defer"; allowOnceOnly?: true };
+
+/**
+ * An MCP server and tools an integration binding admitted into this session
+ * (external-integration CP2 seam; Stage 0 admits none). Server names are as
+ * the agent reports them (`permission-tool-identity.ts`).
+ */
+export interface AdmittedMcpTool { server: string; tools: readonly string[] }
 
 /**
  * `browserTools`: this session was given the QA browser (its gateway admits only the session's preview).
  * `sessionServers`: the MCP servers this session gave its agent, by ACP name.
  * `ledger`: the MCP calls Codex announced, which its approvals name only by id.
  * `toolIdentity`: the request's structured tool identity when the caller already read it.
+ * `admittedMcpTools`: tools of other servers an integration binding admitted (none in Stage 0).
  */
 export interface PermissionContext {
   assignmentId: string;
@@ -27,6 +36,7 @@ export interface PermissionContext {
   sessionServers?: ReadonlySet<string>;
   ledger?: McpToolCallLedger;
   toolIdentity?: PermissionToolIdentity;
+  admittedMcpTools?: readonly AdmittedMcpTool[];
 }
 
 export interface PolicyResponder {
@@ -80,6 +90,15 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
     if (browserToolFromTitle((request.toolCall as { title?: string | null }).title) !== null) return { kind: "deny", optionId: deny };
     // An MCP call whose server and tool cannot be read is never guessed.
     if (identity.kind === "unidentified" && identity.mcp) return { kind: "deny", optionId: deny };
+    // Only the MCP servers this session gave its agent are callable (S0-2):
+    // the person's claude.ai connectors and own Codex servers, a repository's
+    // servers, anything else is refused, and never put to a person. A tool an
+    // integration binding admitted goes to that binding's gate: asked, once.
+    if (identity.kind === "mcp" && context.sessionServers !== undefined && !context.sessionServers.has(identity.server)) {
+      const admitted = context.admittedMcpTools?.some(entry => entry.server === identity.server && entry.tools.includes(identity.tool)) ?? false;
+      if (admitted && this.humanDeferralAllowed()) return { kind: "defer", allowOnceOnly: true };
+      return { kind: "deny", optionId: deny };
+    }
     if (this.evaluator === null) return this.humanDeferralAllowed() ? { kind: "defer" } : { kind: "deny", optionId: deny };
     const toolCall = request.toolCall as { rawInput?: unknown; kind?: string | null; title?: string | null; locations?: unknown };
     const raw = toolCall.rawInput && typeof toolCall.rawInput === "object" && !Array.isArray(toolCall.rawInput) ? (toolCall.rawInput as Record<string, unknown>) : {};

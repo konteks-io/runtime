@@ -30,7 +30,7 @@ import type { SupervisorJournal } from "../state/journal.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest, type PendingHumanRequest, type SanitizedElicitation, type SanitizedPermission } from "./permissions.js";
 import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
-import type { PolicyResponder } from "./policy-responder.js";
+import type { AdmittedMcpTool, PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
 import { BROWSER_WORK_KINDS, PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
@@ -80,6 +80,12 @@ export interface RelayedSessionDeps {
   transport: TransportManager;
   runner: RunnerPort;
   policy: PolicyResponder;
+  /**
+   * MCP tools of servers other than the session's own that an integration
+   * binding admitted into this assignment (external-integration CP2 seam).
+   * Absent or empty, as in Stage 0: every other server's tool is refused.
+   */
+  admittedMcpTools?: (assignment: RemoteWorkAssignment) => readonly AdmittedMcpTool[];
   broker: PermissionBroker;
   /**
    * Register a policy deferral with Core (`permissions/deferred`) before the
@@ -1195,7 +1201,8 @@ export class RelayedSession {
       params = verdict.request;
     }
     const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
-      browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}) });
+      browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
+      admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
     if (decision.kind === "allow") return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
@@ -1209,6 +1216,8 @@ export class RelayedSession {
       return void (await this.answerPermission(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
     }
     if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
+    // An integration gate's question is answered once, never "always".
+    if (decision.allowOnceOnly) params = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
     const sanitized = sanitizePermissionRequest(params);
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));

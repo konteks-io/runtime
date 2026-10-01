@@ -37,3 +37,8 @@ test('a Konteks session runs no repository hooks, whatever the settings it was g
   assert.deepEqual(hardened.env, { KEEP: '1' });
   assert.equal(hardenClaudeSession(undefined).disableAllHooks, true);
 });
+
+test('a Konteks session leaves the account\'s claude.ai connectors out (S0-2)', async () => {
+  const { hardenClaudeSession } = await import('./claude-instruction-scope.mjs');
+  assert.equal(hardenClaudeSession({ disableClaudeAiConnectors: false }).disableClaudeAiConnectors, true);
+});

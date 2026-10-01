@@ -122,3 +122,31 @@ test("a failed reconciliation write remains an error with the tool still open", 
   );
   assert.deepEqual([...openByTurn.get("turn")], ["read"]);
 });
+
+test("a Konteks thread turns the person's own configured MCP servers off and keeps its own (S0-2)", async () => {
+  const { konteksCodexMcpServers } = await import("./codex-acp-live-user-patch.mjs");
+  const existing = new Set(["atlassian", "personal_notes"]);
+  assert.deepEqual(konteksCodexMcpServers(existing, ["konteks-1-a", "konteks-result"], []), {
+    atlassian: { enabled: false },
+    personal_notes: { enabled: false },
+  });
+  // The CP2 seam: a server an integration binding admitted stays on.
+  assert.deepEqual(konteksCodexMcpServers(existing, ["konteks-result"], ["atlassian"]), {
+    personal_notes: { enabled: false },
+  });
+  assert.deepEqual(konteksCodexMcpServers(new Set(), [], []), {});
+  // A personal server under a name this session gives its own server would
+  // run in its place and be judged as Konteks's: refused, never merged.
+  assert.throws(() => konteksCodexMcpServers(new Set(["konteks-result"]), ["konteks-result"], []), /uses a name/);
+});
+
+// Build qualification supplies the pristine upstream dist directory.
+test("the reviewed bridge disables configured MCP servers on every thread start, resume and fork", { skip: !process.env.CODEX_ACP_FIXTURE_DIR }, async () => {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { source } = patchCodexAcpLiveUsers(readFileSync(join(process.env.CODEX_ACP_FIXTURE_DIR, "index.js"), "utf8"), codexAcpLiveUserPatch.version);
+  assert.match(source, /async createSessionConfig\(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = \[\]\) \{/);
+  assert.match(source, /const disabledMcpServers = konteksCodexMcpServers\(existingMcpServerNames, requestedServers\.map\(\(mcp\) => mcp\.name\), admittedMcpServerNames\.map\(sanitizeMcpServerName\)\);/);
+  assert.doesNotMatch(source, /shouldDeduplicateMcpConflicts\(\)\) \{\n      const existingNames/);
+  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v7");
+});

@@ -127,6 +127,12 @@ A repository that relied on its own hooks or `.mcp.json` tools inside Konteks
 sessions loses them until Konteks can admit them explicitly. Your own Claude
 Code sessions outside Konteks are unchanged.
 
+Your personal connections stay out of Konteks sessions too: your Claude
+account's claude.ai connectors are not loaded, and the MCP servers in your
+Codex configuration are switched off for each Konteks thread. A Konteks
+session can call only the tools Konteks gave it; a call to any other MCP
+server is refused.
+
 ### Live previews
 
 A session's agent can run a live preview of its work: a dev server started

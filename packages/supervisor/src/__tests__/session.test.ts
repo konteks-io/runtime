@@ -407,6 +407,23 @@ describe("relayed session (D98/D113/D114)", () => {
       upstream.close();
     });
 
+    it("refuses every MCP server's tool but the session's own: account connectors, a repository's, the person's (S0-2)", async () => {
+      const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+      const f = await build({ policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) },
+        { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } } as RemoteWorkAssignment);
+      await f.session.bootstrap();
+      const names = (f.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string }> }).mcpServers.map(server => server.name);
+      const ask = (requestId: string, toolName: string) => f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId,
+        params: { sessionId: "acp-1", options, toolCall: { toolCallId: requestId, kind: "other", title: toolName, _meta: { claudeCode: { toolName } } } } } as never);
+      await ask("own", `mcp__${names[0]}__platform__builtin__list_sessions`);
+      await ask("connector", "mcp__claude_ai_Atlassian__getJiraIssue");
+      await ask("repository", "mcp__project_fixture__echo_allowed");
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId ?? "none";
+      expect({ own: answer("own"), connector: answer("connector"), repository: answer("repository") }).toEqual({ own: "once", connector: "reject", repository: "reject" });
+      expect(f.sent.some(message => (message.body as { method?: string }).method === "session/request_permission")).toBe(false);
+      await f.session.close("cancelled");
+    });
+
     it("decides Claude Code's and Codex's browser calls by the tool's structured identity, never by a title (S0-4)", async () => {
       const options = [{ optionId: "always", name: "Always", kind: "allow_always" }, { optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
       for (const agentId of ["claude-code", "codex"] as const) {

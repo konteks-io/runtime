@@ -39,6 +39,8 @@ export async function isolateClaudeInstructions(settings, cwd, userConfigDir) {
 // not the person who started the session. As flag settings these outrank the
 // project's own, and they switch off only settings hooks: the SDK's callback
 // hooks (the bridge's PostToolUse, Stop, Task and model-switch hooks) still run.
+// S0-2: the account's claude.ai connectors are not fetched or connected (the
+// bridge's strictMcpConfig already leaves them out; this holds on its own).
 export function hardenClaudeSession(settings) {
-  return { ...(settings ?? {}), disableAllHooks: true };
+  return { ...(settings ?? {}), disableAllHooks: true, disableClaudeAiConnectors: true };
 }

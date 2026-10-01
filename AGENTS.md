@@ -138,6 +138,18 @@ in the relayed session). The browser allow keys on server
 browser tool can only refuse (Claude's Bash title is the model-written
 description), an MCP call with no readable server/tool is refused, and every
 policy allow is `allow_once` (no fallback to `allow_always`).
+Only the session's own MCP servers are callable (S0-2): `hardenClaudeSession`
+also sets `disableClaudeAiConnectors` (claude.ai connectors stay out even
+without strict MCP); the Codex bridge patch (`konteks-codex-acp-live-user-v7`,
+`konteks/codex-acp-provenance.json`) turns every MCP server the person's or a
+trusted project's Codex config names off for the thread
+(`mcp_servers.<name>.enabled = false`, read through `config/read`; a
+personal server under a name the session needs refuses the session); and the
+policy refuses, without asking anyone, an MCP tool whose server is not in the
+session's `sessionServers`. The CP2 seam is `RelayedSessionDeps.admittedMcpTools`
+(policy: such a tool is deferred with `allowOnceOnly`, never allowed by the
+general policy) and `createSessionConfig`'s `admittedMcpServerNames` in the
+Codex patch; both are empty in Stage 0. Direct sessions get the same.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered
