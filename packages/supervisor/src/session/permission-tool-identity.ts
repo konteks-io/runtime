@@ -43,7 +43,7 @@ export function codexMcpServerName(name: string): string {
  * for names only that tool call id. Bounded; a terminal update forgets it.
  */
 export class McpToolCallLedger {
-  private readonly calls = new Map<string, { server: string; tool: string }>();
+  private readonly calls = new Map<string, { server: string; tool: string; arguments?: unknown }>();
 
   constructor(private readonly limit = 512) {}
 
@@ -58,12 +58,20 @@ export class McpToolCallLedger {
     const raw = record(value.rawInput);
     if (!raw || !nonEmpty(raw.server) || !nonEmpty(raw.tool)) return;
     this.calls.delete(value.toolCallId);
-    this.calls.set(value.toolCallId, { server: raw.server, tool: raw.tool });
+    // The call's own arguments, kept for an integration gate that must judge
+    // the exact arguments of a Codex approval (which names only the id).
+    this.calls.set(value.toolCallId, { server: raw.server, tool: raw.tool, ...("arguments" in raw ? { arguments: raw.arguments } : {}) });
     while (this.calls.size > this.limit) this.calls.delete(this.calls.keys().next().value!);
   }
 
   get(toolCallId: string): { server: string; tool: string } | undefined {
-    return this.calls.get(toolCallId);
+    const call = this.calls.get(toolCallId);
+    return call ? { server: call.server, tool: call.tool } : undefined;
+  }
+
+  /** The announced call's arguments; `undefined` when Codex announced none. */
+  arguments(toolCallId: string): unknown {
+    return this.calls.get(toolCallId)?.arguments;
   }
 }
 
