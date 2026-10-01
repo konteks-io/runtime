@@ -150,6 +150,12 @@ session's `sessionServers`. The CP2 seam is `RelayedSessionDeps.admittedMcpTools
 (policy: such a tool is deferred with `allowOnceOnly`, never allowed by the
 general policy) and `createSessionConfig`'s `admittedMcpServerNames` in the
 Codex patch; both are empty in Stage 0. Direct sessions get the same.
+Every Codex session runs in codex-acp's "Ask for approval" mode (S0-3,
+`CODEX_SESSION_GOVERNANCE` in `agent-runner/src/runtime.ts`: `read-only` =
+approvalPolicy on-request + approvalsReviewer user), applied and echoed
+before ready on new, restored and live-continued sessions; `allowedModeIds`
+refuses every other mode on `set_mode`, `set_config_option` and an admitted
+configuration, including one a later codex-acp adds.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered

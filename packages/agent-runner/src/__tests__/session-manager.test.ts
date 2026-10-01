@@ -4,6 +4,7 @@ import { RequestError, type ClientSideConnection, type InitializeResponse } from
 import type { BridgeProcess } from "../bridge/process.js";
 import { RunnerEventBus, type RunnerEvent } from "../events.js";
 import { InMemorySessionRefStore, SessionManager } from "../sessions/manager.js";
+import { CODEX_SESSION_GOVERNANCE } from "../runtime.js";
 
 function fakeBridge(overrides: Partial<Record<keyof ClientSideConnection, unknown>> = {}, initialize: Partial<InitializeResponse> = {}): { bridge: BridgeProcess; calls: Record<string, unknown[]> } {
   const calls: Record<string, unknown[]> = {};
@@ -69,6 +70,32 @@ describe("session manager (D98 bootstrap)", () => {
     ]));
     await expect(manager.restore({ context, cwd: "/w", mcpServers: [], sessionConfig: { mode: "agent" } }, "prior"))
       .rejects.toThrow("governed mode required");
+  });
+
+  it("pins Codex to Ask for approval: every other mode, named today or added later, is refused (S0-3)", async () => {
+    // codex-acp 1.10.0 "read-only" = "Ask for approval": approvalPolicy
+    // on-request, approvalsReviewer user, so Konteks's callback decides.
+    expect(CODEX_SESSION_GOVERNANCE.defaultSessionConfig).toEqual({ mode: "read-only" });
+    const { bridge, calls } = fakeBridge();
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), ...CODEX_SESSION_GOVERNANCE });
+    const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    expect(calls.setSessionConfigOption).toEqual([{ sessionId: "bridge-s1", configId: "mode", value: "read-only" }]);
+    for (const modeId of ["agent", "agent-full-access", "auto-review-next"]) {
+      const refused = nextEvent(events, "request_error");
+      manager.setMode(acpSessionRef, `mode-${modeId}`, { modeId });
+      expect(await refused).toMatchObject({ requestId: `mode-${modeId}`, class: "invalid_params", message: CODEX_SESSION_GOVERNANCE.refusedModes.message });
+    }
+    const refused = nextEvent(events, "request_error");
+    manager.setConfigOption(acpSessionRef, "config-mode", { configId: "mode", value: "auto-review-next" });
+    expect(await refused).toMatchObject({ requestId: "config-mode", class: "invalid_params" });
+    expect(calls.setSessionMode).toBeUndefined();
+    expect(calls.setSessionConfigOption).toHaveLength(1);
+    await expect(manager.restore({ context, cwd: "/w", mcpServers: [], sessionConfig: { mode: "auto-review-next" } }, "prior")).rejects.toThrow(CODEX_SESSION_GOVERNANCE.refusedModes.message);
+    // Selecting the pinned mode again is allowed.
+    const same = nextEvent(events, "set_mode_result");
+    manager.setMode(acpSessionRef, "mode-pinned", { modeId: "read-only" });
+    await same;
   });
 
   it("hands a settled live ACP session to the next turn with fresh MCP authority", async () => {

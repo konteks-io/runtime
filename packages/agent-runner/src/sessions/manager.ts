@@ -142,7 +142,12 @@ export interface SessionManagerOptions {
    * `set_mode`, on `set_config_option` for `mode` and in an admitted session
    * configuration, and dropped from the configuration the agent reports.
    */
-  refusedModes?: { readonly modeIds: readonly string[]; readonly message: string };
+  refusedModes?: {
+    readonly modeIds: readonly string[];
+    /** When set, every mode outside it is refused too (Codex: only "Ask for approval", S0-3). */
+    readonly allowedModeIds?: readonly string[];
+    readonly message: string;
+  };
   /** Slash commands this agent is never sent (Antigravity's `/plan`, `/logout`): such a prompt is refused before it reaches the agent. */
   refusedPromptCommands?: { readonly commands: readonly string[]; readonly message: string };
   /**
@@ -967,7 +972,9 @@ export class SessionManager {
   }
 
   private refusesMode(modeId: unknown): boolean {
-    return typeof modeId === "string" && (this.options.refusedModes?.modeIds.includes(modeId) ?? false);
+    const refused = this.options.refusedModes;
+    if (typeof modeId !== "string" || !refused) return false;
+    return refused.modeIds.includes(modeId) || (refused.allowedModeIds !== undefined && !refused.allowedModeIds.includes(modeId));
   }
 
   /** One immutable policy baseline for every provider-session entry path. */
@@ -1001,12 +1008,11 @@ export class SessionManager {
 
   /** The agent's configuration as Konteks reports it: a refused mode is never offered. */
   private withoutRefusedModes<T>(configOptions: T): T {
-    const refused = this.options.refusedModes?.modeIds;
-    if (!refused || !Array.isArray(configOptions)) return configOptions;
+    if (!this.options.refusedModes || !Array.isArray(configOptions)) return configOptions;
     return configOptions.map((option: unknown) => {
       const value = option as { id?: unknown; type?: unknown; options?: unknown };
       if (value?.id !== "mode" || value.type !== "select" || !Array.isArray(value.options)) return option;
-      const keep = (entry: unknown) => !refused.includes((entry as { value?: unknown })?.value as string);
+      const keep = (entry: unknown) => !this.refusesMode((entry as { value?: unknown })?.value);
       const options = (value.options as unknown[]).flatMap((entry) => {
         const group = entry as { options?: unknown };
         if (Array.isArray(group?.options)) return [{ ...group, options: group.options.filter(keep) }];

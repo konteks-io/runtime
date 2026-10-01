@@ -124,6 +124,24 @@ class FileSessionRefStore implements SessionRefStore {
   }
 }
 
+
+/**
+ * Every Codex session on Konteks runs in codex-acp's "Ask for approval" mode
+ * (`read-only`: approvalPolicy on-request, approvalsReviewer user), so each
+ * escalation reaches Konteks's permission callback rather than Codex's own
+ * auto-reviewer ("Approve for me", `agent`). It is applied before ready on
+ * new, restored and live-continued sessions, and every other mode is refused,
+ * including one a later codex-acp adds (external-integration Stage 0, S0-3).
+ */
+export const CODEX_SESSION_GOVERNANCE = {
+  defaultSessionConfig: { mode: "read-only" },
+  refusedModes: {
+    modeIds: ["agent", "agent-full-access"],
+    allowedModeIds: ["read-only"],
+    message: "Codex runs in Ask for approval mode on Konteks so workspace policy decides every sensitive action.",
+  },
+} as const;
+
 export class AgentRuntime {
   readonly events: RunnerEventBus;
   readonly sessions: SessionManager;
@@ -192,13 +210,7 @@ export class AgentRuntime {
     this.scopeStore = new AgentScopeStore(options.config.RUNNER_CREDENTIAL_DIR);
     this.availableCommands = new AvailableCommandsStore(join(options.config.RUNNER_CREDENTIAL_DIR, AVAILABLE_COMMANDS_FILE),
       this.host?.refusedPromptCommands?.commands ?? [], this.logger);
-    const codexGovernance = this.family.agentId === "codex" ? {
-      defaultSessionConfig: { mode: "read-only" } as const,
-      refusedModes: {
-        modeIds: ["agent", "agent-full-access"] as const,
-        message: "Codex runs in Ask for approval mode on Konteks so workspace policy decides every sensitive action.",
-      },
-    } : null;
+    const codexGovernance = this.family.agentId === "codex" ? CODEX_SESSION_GOVERNANCE : null;
     this.sessions = new SessionManager({
       bridge: () => this.bridge,
       ...(options.executionBridgeLimit ? { createBridge: (ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle, cwd) } : {}),

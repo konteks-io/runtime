@@ -22,7 +22,11 @@ every agent on every OS through the connector's own code
 `scripts/agent-os-proof/`); results per OS and agent are in
 opencode-runtime-support `proof/os-matrix.md` (at CP0-X: sessions are
 refused on Linux and Windows, no durable execution-process owner there; Codex
-escalations go to Codex's own auto-reviewer, not the policy). Host-installed
+escalations then went to Codex's own auto-reviewer; every Codex session is now
+pinned to Ask for approval, so they reach the policy: `CODEX_SESSION_GOVERNANCE`).
+Session hardening (external-integration Stage 0: no repository hooks or
+`.mcp.json` servers, no account connectors or personal MCP servers, structured
+tool identity, the Claude executable's identity) is described in AGENTS.md. Host-installed
 agents go through per-agent host adapters (Google Antigravity is the first
 FETCHED one: the connector downloads Google's zip pinned in
 `release/src/fetched-agents.json` on the person's yes and re-verifies it
