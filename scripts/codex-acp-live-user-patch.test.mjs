@@ -1,15 +1,49 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { runInNewContext } from "node:vm";
 import {
   codexAcpLiveUserPatch,
   konteksTitlePrefixCheck,
   missingCodexToolTerminals,
   reconcileCodexToolTerminals,
+  patchCodexAcpMcpServerResumeFilter,
   patchCodexAcpLiveUsers,
 } from "./codex-acp-live-user-patch.mjs";
 
 test("live-user compatibility change rejects an unreviewed upstream version", () => {
+  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v7");
   assert.throws(() => patchCodexAcpLiveUsers("untrusted", "1.10.1"), /requires review/);
+});
+
+test("resume refreshes only existing generated Konteks MCP names and keeps unrelated names deduplicated", () => {
+  const upstream = "let serversToConfigure = requestedServers;\nserversToConfigure = requestedServers.filter((mcp) => !existingNames.has(mcp.name));";
+  const patched = patchCodexAcpMcpServerResumeFilter(upstream);
+  const selected = runInNewContext(`${patched}\nserversToConfigure`, {
+    requestedServers: [
+      { name: "konteks-0123456789abcdef" },
+      { name: "konteks-0123456789abcde" },
+      { name: "konteks-0123456789abcdef0" },
+      { name: "konteks-0123456789abcdeF" },
+      { name: "other-0123456789abcdef" },
+      { name: "user-server" },
+      { name: "new-user-server" },
+    ],
+    existingNames: new Set([
+      "konteks-0123456789abcdef",
+      "konteks-0123456789abcde",
+      "konteks-0123456789abcdef0",
+      "konteks-0123456789abcdeF",
+      "other-0123456789abcdef",
+      "user-server",
+    ]),
+  });
+  assert.deepEqual(selected.map(({ name }) => name), ["konteks-0123456789abcdef", "new-user-server"]);
+});
+
+test("MCP resume filter transformer fails closed when its anchor is absent or ambiguous", () => {
+  const anchor = "serversToConfigure = requestedServers.filter((mcp) => !existingNames.has(mcp.name));";
+  assert.throws(() => patchCodexAcpMcpServerResumeFilter("serversToConfigure = requestedServers;"), /anchor is not unique/);
+  assert.throws(() => patchCodexAcpMcpServerResumeFilter(`${anchor}\n${anchor}`), /anchor is not unique/);
 });
 
 test("version equality does not allow modified or incomplete upstream bytes", () => {
