@@ -1,6 +1,6 @@
 import { HeartbeatMessageSchema, REMOTE_INSTANCE_PROOF_AUDIENCE, RemoteInstanceError, signInstanceProof, type AgentModelOfferedValuesSnapshot, type Clock, type HeartbeatMessage, type SupportedAgentEntry, type ConnectorCommandsManifest, type HeartbeatResult, type InstanceKeyPair, type JsonValue, type Logger, createLogger } from "@konteks/remote-common";
 import type { InventorySource } from "../inventory/snapshot.js";
-import { computeUtilization, deriveAdvertisedRoles, type RoleBinding } from "../inventory/roles.js";
+import { computeUtilization, deriveAdvertisedRoles, type RoleBinding, type RoleCapabilityInputs } from "../inventory/roles.js";
 import type { SupervisorStore } from "../state/store.js";
 import type { CoreClient } from "../core/client.js";
 import type { LeaseAcquisition } from "../lease/lease.js";
@@ -26,6 +26,8 @@ export interface HeartbeatOptions {
   inventory: InventorySource;
   onInventory?: (agents: HeartbeatMessage["agents"]) => void;
   roleBindings: () => RoleBinding[];
+  /** Derive roles from the exact inventory snapshot included in this heartbeat. */
+  roleCapabilityInputs?: (snapshot: Awaited<ReturnType<InventorySource["collect"]>>) => RoleCapabilityInputs;
   activeAssignmentIds: () => string[];
   modelCapabilitySnapshots?: () => readonly AgentModelOfferedValuesSnapshot[];
   /**
@@ -223,7 +225,8 @@ export class HeartbeatPublisher {
     const snapshot = await this.options.inventory.collect();
     assertCurrent();
     this.options.onInventory?.(snapshot.agents);
-    const roles = deriveAdvertisedRoles(this.options.roleBindings(), snapshot.agents, { gitVersion: snapshot.gitVersion });
+    const roles = deriveAdvertisedRoles(this.options.roleBindings(), snapshot.agents,
+      this.options.roleCapabilityInputs?.(snapshot) ?? { gitVersion: snapshot.gitVersion });
     this.lastRoles = roles;
     const requiredHealthy = snapshot.components.every((component) => component.healthStatus === "healthy" || component.healthStatus === "degraded");
     const utilization = computeUtilization({

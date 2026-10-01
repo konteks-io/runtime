@@ -23,9 +23,14 @@ export async function runNativeActivationExchange(args: {
   fetchFn?: FetchFn;
 }): Promise<ActivationExchangeOutcome> {
   const platform = RemotePlatformSchema.parse(args.platform);
+  if (platform.os !== "macos" && platform.os !== "windows" && platform.os !== "debian") {
+    throw new RemoteInstanceError("registration_mismatch", "This native build requires a macOS, Windows or Debian release target.");
+  }
+  const os = platform.os;
+  const nativePlatform = { ...platform, os };
   if (platform.deploymentKind !== "native_connector" || platform.containerBackend !== "none") throw new RemoteInstanceError("registration_mismatch", "Native activation cannot use an appliance platform.");
   const release = verifyNativeRelease(args.release.manifest, args.roots, args.clock.now());
-  selectNativeArtifacts(release, { ...platform, agentIds: [] });
+  selectNativeArtifacts(release, { ...nativePlatform, agentIds: [] });
   if (!isAbsolute(args.dataDir)) throw new RemoteInstanceError("install_state_corrupt", "Native enrollment requires an absolute private root.");
   let fresh = false;
   try { await mkdir(args.dataDir, { mode: 0o700 }); fresh = true; }
@@ -50,7 +55,7 @@ export async function runNativeActivationExchange(args: {
     const enrollment = journal.execution.enrollment();
     if (enrollment && (enrollment.activationId !== args.activationId || enrollment.keyDigest !== keyDigest)) throw new RemoteInstanceError("registration_mismatch", "Native enrollment retry changed its original lineage.");
     const core = new CoreClient({ baseUrl: args.coreUrl, clock: args.clock, key: () => key, credential: () => null, ...(args.fetchFn ? { fetchFn: args.fetchFn } : {}) });
-    const outcome = await exchangeOrForget(() => runActivationExchange({ store, core, key, clock: args.clock, activationId: args.activationId, platform: { ...platform, containerBackend: "none", deploymentKind: "native_connector" }, deploymentKind: "native_connector", release, roots: args.roots,
+    const outcome = await exchangeOrForget(() => runActivationExchange({ store, core, key, clock: args.clock, activationId: args.activationId, platform: { ...nativePlatform, containerBackend: "none", deploymentKind: "native_connector" }, deploymentKind: "native_connector", release, roots: args.roots,
       // The person reads this terminal: its progress lines say what happens,
       // and a JSON log line in between read as noise (W1-M2). Warnings stay.
       logger: createLogger({ name: "provisioning", level: "warn" }),

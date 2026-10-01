@@ -51,7 +51,7 @@ import { ControlHandlers, compareSemver } from "./control/handlers.js";
 import { ConfigurationAckDelivery } from "./control/configuration-ack-delivery.js";
 import { HeartbeatPublisher } from "./heartbeat/heartbeat.js";
 import type { InventorySnapshot } from "./inventory/snapshot.js";
-import { deriveAdvertisedRoles, type RoleBinding, type RoleCapabilityInputs } from "./inventory/roles.js";
+import { deriveAdvertisedRoles, operationsCarrierReady, type RoleBinding, type RoleCapabilityInputs } from "./inventory/roles.js";
 import { LocalGit, OnboardScratch } from "./onboard/git.js";
 import { GitKeyStore, sshConfigPath } from "./onboard/git-keys.js";
 import { RawFileApi } from "./onboard/raw-file-api.js";
@@ -122,7 +122,14 @@ import { evaluateHeartbeatLiveness, isCredentialRefusal, leaseLapseNeedsRestart 
 // `direct` (runtime-view R11): a person's own chat on this computer. Only a
 // Core that knows it places it; a Core built before it refuses a pull naming
 // it, so it is asked for only once Core signs 7.1 (see acceptedKinds below).
-const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation", "direct"];
+const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation", "direct", "operations"];
+
+/** Work kinds this runtime can request from the signed Core contract. */
+export function supportedWorkKindsForCore(coreContractVersion: string | null | undefined): RemoteWorkKind[] {
+  return ALL_KINDS.filter(kind =>
+    (kind !== "direct" || coreContractAtLeast(coreContractVersion ?? undefined, "7.1"))
+    && (kind !== "operations" || coreContractAtLeast(coreContractVersion ?? undefined, "7.2")));
+}
 
 /** How long preview_start waits for the dev server before answering "still starting". */
 const PREVIEW_START_WAIT_MS = 45_000;
@@ -807,7 +814,7 @@ export class Supervisor {
       roleBindings: () => this.roleBindings,
       advertisedRoles: () => deriveAdvertisedRoles(this.roleBindings, this.lastSnapshot?.agents ?? [], this.roleCapabilityInputs()),
       roleCapabilityInputs: () => this.roleCapabilityInputs(),
-      acceptedKinds: () => this.hostSettings.coreAcceptsRouteBilling ? ALL_KINDS : ALL_KINDS.filter(kind => kind !== "direct"),
+      acceptedKinds: () => supportedWorkKindsForCore(this.configuration.coreContractVersion),
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
       draining: () => this.draining,
       reconciliationComplete: () => this.reconciliation.isComplete,
@@ -1005,6 +1012,7 @@ export class Supervisor {
         void this.modelCapabilities?.refresh(agents).catch(error => this.logger.warn({ err: error }, "native model capability refresh failed"));
       },
       roleBindings: () => this.roleBindings,
+      roleCapabilityInputs: snapshot => this.roleCapabilityInputs(snapshot),
       activeAssignmentIds: () => this.work.activeAssignmentIds(),
       modelCapabilitySnapshots: () => this.modelCapabilities?.snapshots() ?? [],
       supportedAgents: agents => this.supportedAgents(agents),
@@ -1912,8 +1920,12 @@ export class Supervisor {
   }
 
   /** The non-agent facts a role may depend on; one source for every reader. */
-  private roleCapabilityInputs(): RoleCapabilityInputs {
-    return { gitVersion: this.lastSnapshot?.gitVersion ?? null };
+  private roleCapabilityInputs(snapshot = this.lastSnapshot): RoleCapabilityInputs {
+    return {
+      gitVersion: snapshot?.gitVersion ?? null,
+      operationsCarrierReady: snapshot !== null && snapshot !== undefined
+        && operationsCarrierReady(snapshot, this.configuration.coreContractVersion),
+    };
   }
 
   // ── Status and control socket ─────────────────────────────────────────────

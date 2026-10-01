@@ -54,6 +54,27 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     await publisher.start(); const message = await publisher.publish();
     expect(message.modelCapabilitySnapshots).toEqual([snapshot]);
   });
+  it("derives advertised Ops roles from the fresh signed-carrier capability inputs", async () => {
+    const f = await fixture();
+    const agent = { agentId: "codex", displayName: "Codex", connectionState: "ready" as const,
+      authMode: "agent_local_subscription" as const, accountScope: "personal" as const, readiness: "ready" as const,
+      tokenUsageObservable: true, acpCapabilities: { sessionResume: false, forkSession: false, structuredOutputShim: true, toolControl: "approve" as const } };
+    const snapshot = { components: [{ kind: "agent_runner", version: "0.1.0", healthStatus: "healthy",
+      capabilities: ["agent:codex", "execution-permits-v1"], lastProbeAt: "2026-09-06T00:00:00Z" }],
+      agents: [agent], hostPressure: 0, activeSessions: 0, activeTurns: 0, gitVersion: null, diskFreeBytes: 100 };
+    const inventory = { collect: vi.fn(async () => snapshot) };
+    const roleCapabilityInputs = vi.fn((fresh: typeof snapshot) => ({ gitVersion: fresh.gitVersion, operationsCarrierReady: true }));
+    const publisher = new HeartbeatPublisher({ ...f.options, inventory,
+      roleBindings: () => [{ role: "ops", agentPreference: ["codex"] }], roleCapabilityInputs,
+      runnerIncarnation: () => "process" } as never);
+    publishers.push(publisher);
+
+    await publisher.start();
+    const message = await publisher.publish();
+
+    expect(roleCapabilityInputs).toHaveBeenCalledWith(snapshot);
+    expect(message.roles).toContain("ops");
+  });
   it("carries every supported agent's state inside the signed body, and a failing projection never costs the heartbeat (runtime-view R21)", async () => {
     const f = await fixture();
     const supported = [{ agentId: "claude-code", state: "ready" as const }, { agentId: "antigravity", state: "not_added" as const, installCommand: "konteks-remote agent add antigravity" }];

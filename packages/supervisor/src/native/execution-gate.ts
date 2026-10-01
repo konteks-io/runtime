@@ -251,8 +251,9 @@ export class NativeExecutionGate {
         claims.deliveryIdentity.modelBinding.selectedValue === claims.modelSelection.selectedValue &&
         claims.deliveryIdentity.modelBinding.canonicalProviderId === claims.modelSelection.canonicalIdentity.canonicalProviderId &&
         claims.deliveryIdentity.modelBinding.canonicalModelId === claims.modelSelection.canonicalIdentity.canonicalModelId
-      // An Assistant turn, or a person's direct session prompt (runtime-view R16).
-      : ((assignment.kind === "assistant_execution" && assignment.source.kind === "conversation") ||
+      // An Assistant or Operations conversation turn, or a person's direct
+      // session prompt (runtime-view R16). All still bind to the signed turn.
+      : (((assignment.kind === "assistant_execution" || assignment.kind === "operations") && assignment.source.kind === "conversation") ||
           (assignment.kind === "direct" && assignment.source.kind === "direct_session")) &&
         assignment.source.sessionId === claims.sessionId && assignment.source.turnRef === claims.turnRef;
     if (!entry || !ready || !sourceMatches || entry.kind !== assignment.kind ||

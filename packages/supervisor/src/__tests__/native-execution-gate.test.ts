@@ -381,6 +381,39 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "completed" });
   });
 
+  it("requires a signed permit for an Operations conversation and closes it after the admitted end_turn", async () => {
+    const operations: RemoteWorkAssignment = { ...assignment, kind: "operations",
+      agentRoute: { agentId: "codex", requiredRole: "ops" },
+      source: { kind: "conversation", portability: "portable_before_claim", sessionId: "session", turnRef: "turn" } };
+    const f = await sessionFixture(operations);
+
+    await expect(f.session.onToRuntime(message)).rejects.toMatchObject({ code: "operation_permit_required" });
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+    await f.session.onToRuntime(f.envelope);
+    expect(f.client.consumeExecution).toHaveBeenCalledOnce();
+    expect(f.runner.prompt).toHaveBeenCalledOnce();
+
+    await f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp", requestId: "request",
+      result: { stopReason: "end_turn" } } as never);
+
+    expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("completed");
+    expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({
+      kind: "session_closed", assignmentId: "assignment", reason: "completed",
+    });
+    expect(f.session.isClosed).toBe(true);
+  });
+
+  it("fences an Operations permit for a different conversation turn", async () => {
+    const operations: RemoteWorkAssignment = { ...assignment, kind: "operations",
+      agentRoute: { agentId: "codex", requiredRole: "ops" },
+      source: { kind: "conversation", portability: "portable_before_claim", sessionId: "session", turnRef: "different-turn" } };
+    const f = await sessionFixture(operations);
+
+    await expect(f.session.onToRuntime(f.envelope)).rejects.toMatchObject({ code: "execution_fenced" });
+    expect(f.client.consumeExecution).not.toHaveBeenCalled();
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+  });
+
   it("admits a direct session prompt only with Core's permit, with nothing put in front of the person's text, and ends the assignment at end_turn (runtime-view R11, R16)", async () => {
     const direct: RemoteWorkAssignment = { ...assignment, kind: "direct", agentRoute: { agentId: "codex", requiredRole: "assistant" },
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
