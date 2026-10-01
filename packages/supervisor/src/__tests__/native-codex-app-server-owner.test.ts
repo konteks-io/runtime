@@ -351,6 +351,18 @@ describe.skipIf(process.platform === "win32")("a Codex socket reached through a 
   }
   const running = { exitCode: null, signalCode: null } as PipedChildProcess;
 
+  it("still takes a plain socket at the path, as Codex 0.153 binds it", async () => {
+    const f = await linked();
+    const ready = waitForCodexSocket(f.path, running, 5_000);
+    const server = await listen(f.path); await chmod(f.path, 0o666);
+    await expect(ready).resolves.toBeUndefined();
+    expect((await lstat(f.path)).mode & 0o777).toBe(0o600);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("adopt");
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await cleanupCodexSocket(f.path);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("spawn");
+  });
+
   it("counts the linked socket as ready and makes the socket itself private", async () => {
     const f = await linked();
     const ready = waitForCodexSocket(f.path, running, 5_000);
