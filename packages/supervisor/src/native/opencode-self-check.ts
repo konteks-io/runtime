@@ -141,9 +141,7 @@ export function openCodeAgentsDrift(agents: unknown): string[] {
     if (OPENCODE_DISABLED_AGENTS.includes(id)) { drift.push(`agent ${id} is not switched off`); continue; }
     const rules = readRules(agent.permissions);
     if (rules === null) { drift.push(`agent ${id}: permissions are not in the expected form`); continue; }
-    const tail = rules.slice(-OPENCODE_KONTEKS_PERMISSIONS.length);
-    const oursLast = tail.length === OPENCODE_KONTEKS_PERMISSIONS.length && tail.every((rule, index) => sameRule(rule, OPENCODE_KONTEKS_PERMISSIONS[index]!));
-    if (!oursLast) drift.push(`agent ${id}: the Konteks rules are not last`);
+    if (!konteksRulesLast(rules)) drift.push(`agent ${id}: the Konteks rules are not last`);
     for (const [action, resource, expected, what] of PROBES) {
       const decision = openCodePermissionDecision(rules, action, resource);
       if (decision !== expected) drift.push(`agent ${id}: ${what} is ${decision ?? "unset"}, expected ${expected}`);
@@ -167,6 +165,24 @@ const PROBES: ReadonlyArray<readonly [string, string, OpenCodePermissionRule["ef
   ["browser", "*", "deny", "the built-in browser"],
   ["opencode_session_move", "*", "deny", "OpenCode's own Code Mode tools"],
 ];
+
+/**
+ * Whether the Konteks rules decide last: they are one unbroken block, and
+ * nothing but `deny` rules follows it. OpenCode appends some rules of its own
+ * after the configuration: since 2.0.21 (anomalyco/opencode#52309, "hide
+ * browser tools unless a desktop is attached") every agent ends with
+ * `browser * deny`. A deny after ours can only take something away, never
+ * allow or ask what ours decide, so the guarantee holds; any `allow` or `ask`
+ * after ours is drift, and the probes still pin every decision that matters.
+ */
+function konteksRulesLast(rules: readonly OpenCodePermissionRule[]): boolean {
+  const size = OPENCODE_KONTEKS_PERMISSIONS.length;
+  for (let end = rules.length; end >= size; end -= 1) {
+    if (rules.slice(end - size, end).every((rule, index) => sameRule(rule, OPENCODE_KONTEKS_PERMISSIONS[index]!))) return true;
+    if (rules[end - 1]!.effect !== "deny") return false;
+  }
+  return false;
+}
 
 function readRules(value: unknown): OpenCodePermissionRule[] | null {
   if (!Array.isArray(value)) return null;
