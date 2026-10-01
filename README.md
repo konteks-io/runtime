@@ -439,6 +439,12 @@ rolled back after three failed starts, within seconds, rather than at the
 gate's three-minute deadline. `update` and `update --check` say when the
 connector updated itself, and when a release already failed here.
 
+On macOS the connector logs to `logs/connector.log` in its folder; on Linux,
+to the user journal. A release that finds its service still loaded with an
+older definition (for example one that sent its output nowhere) has the
+service manager reload it and restart once, so an updated connector keeps
+logging where it did.
+
 In Activity Monitor, `ps` or Task Manager the service shows as
 `konteks-connector` (Linux cuts process names to 15 characters:
 `konteks-connect`), and a command you run as `konteks-remote`. Both are the
