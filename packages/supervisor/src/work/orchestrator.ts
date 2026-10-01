@@ -1902,13 +1902,33 @@ export class WorkOrchestrator {
 }
 
 /** An unexpected dispatch error's class and system-style code; never its message. */
-export function dispatchErrorIdentity(error: unknown): { errorName?: string; errorCode?: string } {
-  const identity: { errorName?: string; errorCode?: string } = {};
+export function dispatchErrorIdentity(error: unknown): { errorName?: string; errorCode?: string; schemaIssue?: string } {
+  const identity: { errorName?: string; errorCode?: string; schemaIssue?: string } = {};
   const name = error instanceof Error ? error.name : undefined;
   if (name && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name)) identity.errorName = name;
   const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
   if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(code)) identity.errorCode = code;
+  const schemaIssue = schemaIssueIdentity(error);
+  if (schemaIssue) identity.schemaIssue = schemaIssue;
   return identity;
+}
+
+/** A bare `ZodError` hid which local record was refused (production
+ * 2026-10-01). Name the first issue by its code, its field path (identifier
+ * segments only) and, for this connector's own refinements, their fixed
+ * message. Never a received value or a provider message. */
+function schemaIssueIdentity(error: unknown): string | undefined {
+  if (!(error instanceof Error) || error.name !== "ZodError") return undefined;
+  const issue = (error as { issues?: unknown }).issues;
+  const first = Array.isArray(issue) ? issue[0] as { code?: unknown; path?: unknown; message?: unknown } | undefined : undefined;
+  if (!first || typeof first.code !== "string" || !/^[a-z_]{1,32}$/.test(first.code)) return undefined;
+  const path = Array.isArray(first.path)
+    ? first.path.map(segment => typeof segment === "number" ? String(segment)
+      : typeof segment === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(segment) ? segment : "?").join(".")
+    : "";
+  const message = first.code === "custom" && typeof first.message === "string" && /^[A-Za-z][A-Za-z ,;'-]{0,119}$/.test(first.message)
+    ? `: ${first.message}` : "";
+  return `${first.code}${path ? ` at ${path}` : ""}${message}`;
 }
 
 /** Execution phases of a turn that ended without completing and was not yet proven stopped. */

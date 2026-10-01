@@ -442,3 +442,70 @@ it("explains an unqualified stopped predecessor and preserves its fence", async 
   expect(f.journal.execution.execution(next)).toBeUndefined();
   expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
 });
+
+// Production 2026-10-01 (TKT-1): after a connector update the QA session was
+// restored for one re-check, which completed. The next re-check of the same
+// kept changes failed at activation with a ZodError on every try, the idle
+// reaper could not release the session either, and the review never started.
+async function restoredRoleSession() {
+  const journal = new SupervisorJournal(dir); await journal.load();
+  const outbox = new DurableOutbox(dir); await outbox.load();
+  const restored = { ...next, runnerIncarnation: "restarted-process" };
+  const recheck = { ...restored, assignmentId: "recheck", claimId: "recheck-claim", executionGeneration: "recheck-generation",
+    openedAt: "2026-09-06T00:00:04.000Z" };
+  const second = delivery(restored, "generate-2");
+  const third: RemoteWorkAssignment = { ...delivery(recheck, "generate-3", false),
+    source: { ...(delivery(recheck, "generate-3", false).source as Extract<RemoteWorkAssignment["source"], { kind: "harness_delivery" }>),
+      turn: { invocationId: "generate-3", dispatchGeneration: 0, predecessor: { invocationId: "generate-2", dispatchGeneration: 0 } } } };
+  for (const [identity, assignment] of [[prior, delivery(prior, "generate-1")], [restored, second], [recheck, third]] as const) {
+    await journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1, admission: identity, assignment,
+      evidenceUpload: "structured_only", projectionCreatedAt: identity.openedAt, claimCreatedAt: identity.openedAt }, current);
+    await journal.execution.reserveAllocation(identity, current);
+  }
+  await journal.execution.open(prior, current, prior.openedAt);
+  await journal.execution.bindReference(prior, "generator-ref", current);
+  await journal.execution.bindProcessOwner(prior, processOwner, current);
+  await journal.execution.markCompletedTurnSettled(prior, "generator-ref", "2026-09-06T00:00:01.000Z", current);
+  await journal.execution.transferRestoredContinuation({ predecessor: prior, successor: restored, sessionId: "repository-generator-session",
+    acpSessionRef: "generator-ref", processOwner, continuedAt: "2026-09-06T00:00:02.000Z" }, current);
+  const restoredOwner = { ...processOwner, pid: 77, processGroupId: 77, startToken: "restored-start" };
+  await journal.execution.bindReference(restored, "restored-ref", current);
+  await journal.execution.bindProcessOwner(restored, restoredOwner, current);
+  await journal.execution.markCompletedTurnSettled(restored, "restored-ref", "2026-09-06T00:00:03.000Z", current);
+  await journal.assignments.put({ assignmentId: restored.assignmentId, attempt: 1, claimId: restored.claimId, kind: "delivery",
+    placementId: second.placementId, workspaceId: "workspace", agentId: "claude-code", state: "running", recoveryEpoch: 0,
+    reports: { nextSequence: 2, durableWatermark: 0, terminalSequence: 1 }, evidenceUpload: "structured_only",
+    expiresAt: "2026-09-06T01:00:00.000Z", latestResumeAt: "2026-09-06T01:00:00.000Z", updatedAt: clock.nowIso() });
+  const runner = { stopForRecovery: vi.fn(async () => undefined), releaseSealedSession: vi.fn(async () => undefined), stopRetainedExecution: vi.fn(async () => undefined) };
+  const orchestrator = new WorkOrchestrator({ journal, outbox, transport: {}, clock, runners: new Map([["claude-code", runner]]),
+    sessionDeps: () => ({}), onUsage: async () => undefined, instanceId: () => "instance", workspaceId: () => "workspace",
+    runnerIncarnation: () => "restarted-process", assertOwned: () => undefined, recoveryAuthority: () => "accepted", reportDeliveryAllowed: () => false } as never);
+  const internal = orchestrator as unknown as { channelOwners: Map<string, unknown>; sessions: Map<string, unknown>;
+    reapIdleCompletedSessions(idleMs: number): Promise<number>;
+    takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined> };
+  const channel = "session:repository-generator-session";
+  const owner = { assignment: second, acpSessionRef: "restored-ref", isClosed: true,
+    releaseCompletedChannel: vi.fn(() => { internal.channelOwners.delete(channel); }) };
+  internal.channelOwners.set(channel, owner);
+  internal.sessions.set(`${restored.assignmentId}:1`, owner);
+  return { journal, runner, internal, owner, channel, restored, recheck, third, restoredOwner };
+}
+
+it("continues a restored role session for the next re-check of the same kept changes", async () => {
+  const f = await restoredRoleSession();
+  await expect(f.internal.takeOverCompletedChannel(f.third, f.recheck, current)).resolves.toEqual({ reference: "restored-ref", mode: "live" });
+  expect(f.journal.execution.execution(f.restored)).toMatchObject({ phase: "continued", continuedToGeneration: "recheck-generation" });
+  expect(f.journal.execution.execution(f.recheck)).toMatchObject({ phase: "opened", acpSessionRef: "restored-ref",
+    continuedFromGeneration: "next-generation", processOwner: f.restoredOwner });
+  expect(() => f.journal.execution.assertExecutable(f.recheck, "restored-ref")).not.toThrow();
+  expect(f.owner.releaseCompletedChannel).toHaveBeenCalledOnce();
+  expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
+});
+
+it("lets the idle reaper release a restored role session once its turn completed", async () => {
+  const f = await restoredRoleSession();
+  await expect(f.internal.reapIdleCompletedSessions(1_000)).resolves.toBe(1);
+  expect(f.runner.releaseSealedSession).toHaveBeenCalledWith("restored-ref");
+  expect(f.journal.execution.execution(f.restored)).toMatchObject({ phase: "acp_settled", restoredFromGeneration: "prior-generation" });
+  expect(f.internal.channelOwners.has(f.channel)).toBe(false);
+});

@@ -83,7 +83,12 @@ const ExecutionSchema = z.object({ schemaVersion: z.literal(1), admission: Admis
       (value.phase !== "continued" && (value.continuedToGeneration !== undefined || value.continuedAt !== undefined)) ||
       (value.continuedFromGeneration !== undefined && (!value.processOwner || value.acpSessionRef === null || value.restoredFromGeneration !== undefined)) ||
       ((value.restoredFromGeneration === undefined) !== (value.restoreAcpSessionRef === undefined)) ||
-      (value.restoredFromGeneration !== undefined && (value.phase !== "opened" || value.continuedFromGeneration !== undefined || value.restoreAcpSessionRef === value.acpSessionRef))) context.addIssue({ code: "custom", message: "Inconsistent local execution phase" });
+      // Restore provenance is permanent, like `continuedFromGeneration`: a
+      // restored turn completes, is continued, stopped or settled like any
+      // other. Limiting it to `opened` made every later transition of a
+      // restored role session throw, so its next review never started and
+      // the idle reaper could never release it (production 2026-10-01).
+      (value.restoredFromGeneration !== undefined && (value.continuedFromGeneration !== undefined || value.restoreAcpSessionRef === value.acpSessionRef))) context.addIssue({ code: "custom", message: "Inconsistent local execution phase" });
 });
 const HarnessSessionHeadSchema = z.object({
   executionSessionId: id, instanceId: id, workspaceId: id, taskId: id,
