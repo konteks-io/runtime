@@ -49,15 +49,16 @@ program.command("prepare-real")
   .requiredOption("--directory <path>", "controller-owned .runtime/native-cloud directory")
   .requiredOption("--package <paths...>", "absolute paths to complete offline Claude Code/Codex packages")
   .requiredOption("--profile <paths...>", "matching absolute paths to their konteks-agent.json profiles")
-  .option("--bundle-version <version>", "monotonically newer native release version", "0.1.0-e2e")
+  .option("--bundle-version <version>", "native release version (required with --upgrade)")
+  .option("--upgrade", "require an existing trusted release and a strictly newer bundle version")
   .option("--origin <url>", "fixed local TLS edge", "https://127.0.0.1:7443")
-  .action(async (options: { directory: string; package: string[]; profile: string[]; origin: string; bundleVersion: string }) => {
+  .action(async (options: { directory: string; package: string[]; profile: string[]; origin: string; bundleVersion?: string; upgrade?: boolean }) => {
     realGated();
     if (options.package.some(path => !isAbsolute(path)) || options.profile.some(path => !isAbsolute(path))) throw new InvalidArgumentError("real agent package and profile paths must be absolute");
     const platform = nativePlatform();
     if (platform.os === "windows") throw new InvalidArgumentError("the real Codex E2E fixture currently runs on macOS or Debian");
     const directory = resolve(options.directory);
-    const prepared = await prepareE2ERealRelease({ realAgentGate: process.env.KONTEKS_E2E_NATIVE_REAL_AGENT, directory, origin: options.origin, bundleVersion: options.bundleVersion, packagePath: options.package, profilePath: options.profile, platform: { os: platform.os, architecture: platform.architecture } });
+    const prepared = await prepareE2ERealRelease({ realAgentGate: process.env.KONTEKS_E2E_NATIVE_REAL_AGENT, directory, origin: options.origin, ...(options.bundleVersion === undefined ? {} : { bundleVersion: options.bundleVersion }), upgrade: options.upgrade === true, packagePath: options.package, profilePath: options.profile, platform: { os: platform.os, architecture: platform.architecture } });
     createOutput({ json: true }).result({ manifestDigest: prepared.manifest.digest, signer: prepared.root.keyId, directory });
   });
 program.command("install")

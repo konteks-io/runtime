@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
-import { installOfflineAgentPackage, NativeAgentPackageProfileSchema, verifyNativeRelease } from "@konteks/remote-release";
+import { installOfflineAgentPackage, NativeAgentPackageProfileSchema, signNativeReleaseManifest, verifyNativeRelease } from "@konteks/remote-release";
 import { RunnerConfigSchema, resolveBridgeSpawnSpec, spawnBridge } from "@konteks/remote-agent-runner";
 import { prepareE2ERealRelease, prepareE2ESmokeRelease } from "../e2e/smoke-release.js";
 
@@ -138,6 +138,7 @@ describe("signed E2E ACP releases", () => {
         realAgentGate: "1",
         directory,
         origin: "https://localhost:7443",
+        upgrade: true,
         bundleVersion: "0.2.0-e2e",
         platform,
         packagePath: [claude.archive, codex.archive],
@@ -160,6 +161,90 @@ describe("signed E2E ACP releases", () => {
       });
       await expect(readFile(prepared.artifactFiles.agents["claude-code"]!)).resolves.toEqual(await readFile(claude.archive));
       await expect(readFile(prepared.artifactFiles.agents.codex!)).resolves.toEqual(await readFile(codex.archive));
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("upgrades only from trusted roots and preserves the old release authority", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-real-release-upgrade-"));
+    try {
+      const platform = { os: "macos" as const, architecture: "arm64" as const };
+      const external = await writeExternalAgentPackage(root, platform, "claude-code");
+      const directory = join(root, ".runtime", "native-cloud");
+      const old = await prepareE2ERealRelease({ realAgentGate: "1", directory, origin: "https://localhost:7443", platform, packagePath: external.archive, profilePath: external.profile });
+      const rootsPath = join(directory, "release-roots.json");
+      const rootsFile = JSON.parse(await readFile(rootsPath, "utf8")) as { roots: Array<Record<string, unknown>> };
+      const priorDescriptor = { ...rootsFile.roots[0]!, coreControlKeys: [{ keyId: "local-control", publicKeyJwk: old.root.publicKeyJwk }] };
+      rootsFile.roots[0] = priorDescriptor;
+      await writeFile(rootsPath, JSON.stringify(rootsFile), { mode: 0o600 });
+
+      const prepared = await prepareE2ERealRelease({ realAgentGate: "1", directory, origin: "https://localhost:7443", platform, packagePath: external.archive, profilePath: external.profile, upgrade: true, bundleVersion: "0.2.0-e2e" });
+      const nextRoots = JSON.parse(await readFile(rootsPath, "utf8")) as { roots: Array<Record<string, unknown>> };
+      expect(nextRoots.roots[0]).toEqual(priorDescriptor);
+      expect(verifyNativeRelease(old.manifest, nextRoots.roots as never).manifest.digest).toBe(old.manifest.digest);
+      expect(verifyNativeRelease(prepared.manifest, nextRoots.roots as never).manifest.bundleVersion).toBe("0.2.0-e2e");
+      expect(prepared.root.publicKeyJwk.x).toBe(old.root.publicKeyJwk.x);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("rejects invalid upgrade requests before changing channel files and keeps fresh defaults", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-real-release-guards-"));
+    try {
+      const platform = { os: "macos" as const, architecture: "arm64" as const };
+      const external = await writeExternalAgentPackage(root, platform, "claude-code");
+      const directory = join(root, ".runtime", "native-cloud");
+      const old = await prepareE2ERealRelease({ realAgentGate: "1", directory, origin: "https://localhost:7443", platform, packagePath: external.archive, profilePath: external.profile });
+      expect(old.manifest.bundleVersion).toBe("0.1.0-e2e");
+      const destinations = ["connector", "claude-code.tgz", "release-roots.json", "native-manifest.json"];
+      const snapshot = async () => Promise.all(destinations.map(name => readFile(join(directory, name))));
+      const unchanged = async (before: Buffer[]) => expect(await snapshot()).toEqual(before);
+      const before = await snapshot();
+      for (const bundleVersion of [undefined, "0.1.0-e2e", "0.0.9-e2e", "0.2.0", "0.2.0-e2e-extra"]) {
+        await expect(prepareE2ERealRelease({ realAgentGate: "1", directory, origin: "https://localhost:7443", platform, packagePath: external.archive, profilePath: external.profile, upgrade: true, ...(bundleVersion === undefined ? {} : { bundleVersion }) })).rejects.toThrow();
+        await unchanged(before);
+      }
+      const invalidManifest = JSON.parse((await readFile(join(directory, "native-manifest.json"))).toString("utf8")) as Record<string, unknown>;
+      invalidManifest.digest = "sha256:" + "0".repeat(64);
+      await writeFile(join(directory, "native-manifest.json"), JSON.stringify(invalidManifest), { mode: 0o600 });
+      const invalidBefore = await snapshot();
+      await expect(prepareE2ERealRelease({ realAgentGate: "1", directory, origin: "https://localhost:7443", platform, packagePath: external.archive, profilePath: external.profile, upgrade: true, bundleVersion: "0.2.0-e2e" })).rejects.toThrow();
+      await unchanged(invalidBefore);
+      await writeFile(join(directory, "native-manifest.json"), JSON.stringify(old.manifest), { mode: 0o600 });
+      await rm(join(directory, "native-manifest.json"));
+      const missingManifestBefore = await Promise.all(["connector", "claude-code.tgz", "release-roots.json"].map(name => readFile(join(directory, name))));
+      await expect(prepareE2ERealRelease({ realAgentGate: "1", directory, origin: "https://localhost:7443", platform, packagePath: external.archive, profilePath: external.profile, upgrade: true, bundleVersion: "0.2.0-e2e" })).rejects.toThrow();
+      await expect(Promise.all(["connector", "claude-code.tgz", "release-roots.json"].map(name => readFile(join(directory, name))))).resolves.toEqual(missingManifestBefore);
+      await expect(readFile(join(directory, "native-manifest.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      await writeFile(join(directory, "native-manifest.json"), JSON.stringify(old.manifest), { mode: 0o600 });
+      await rm(join(directory, "release-roots.json"));
+      const partialBefore = await Promise.all(["connector", "claude-code.tgz", "native-manifest.json"].map(name => readFile(join(directory, name))));
+      await expect(prepareE2ERealRelease({ realAgentGate: "1", directory, origin: "https://localhost:7443", platform, packagePath: external.archive, profilePath: external.profile, upgrade: true, bundleVersion: "0.2.0-e2e" })).rejects.toThrow();
+      await expect(Promise.all(["connector", "claude-code.tgz", "native-manifest.json"].map(name => readFile(join(directory, name))))).resolves.toEqual(partialBefore);
+      await expect(readFile(join(directory, "release-roots.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("refuses a persistent signer key id collision without changing channel files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-real-release-signer-conflict-"));
+    try {
+      const platform = { os: "macos" as const, architecture: "arm64" as const };
+      const external = await writeExternalAgentPackage(root, platform, "claude-code");
+      const directory = join(root, ".runtime", "native-cloud");
+      const old = await prepareE2ERealRelease({ realAgentGate: "1", directory, origin: "https://localhost:7443", platform, packagePath: external.archive, profilePath: external.profile });
+      const conflictingSigner = generateKeyPairSync("ed25519");
+      const unrelatedSigner = generateKeyPairSync("ed25519");
+      const roots = [
+        { keyId: "e2e-local-native-release-1", publicKeyJwk: createPublicKey(conflictingSigner.privateKey).export({ format: "jwk" }) },
+        { keyId: "e2e-local-other", publicKeyJwk: createPublicKey(unrelatedSigner.privateKey).export({ format: "jwk" }) },
+      ];
+      const { digest: _digest, signature: _signature, ...unsigned } = old.manifest;
+      const alternate = signNativeReleaseManifest({ ...unsigned, modelCapabilityMappings: [] }, { keyId: "e2e-local-other", privateKey: unrelatedSigner.privateKey });
+      await writeFile(join(directory, "release-roots.json"), JSON.stringify({ roots }), { mode: 0o600 });
+      await writeFile(join(directory, "native-manifest.json"), JSON.stringify(alternate), { mode: 0o600 });
+      expect(verifyNativeRelease(alternate, roots as never).manifest.digest).toBe(alternate.digest);
+      const destinations = ["connector", "claude-code.tgz", "release-roots.json", "native-manifest.json"];
+      const before = await Promise.all(destinations.map(name => readFile(join(directory, name))));
+      await expect(prepareE2ERealRelease({ realAgentGate: "1", directory, origin: "https://localhost:7443", platform, packagePath: external.archive, profilePath: external.profile, upgrade: true, bundleVersion: "0.2.0-e2e" })).rejects.toThrow(/signer conflicts/i);
+      await expect(Promise.all(destinations.map(name => readFile(join(directory, name))))).resolves.toEqual(before);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

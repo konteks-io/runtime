@@ -2,7 +2,7 @@ import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sig
 import { createReadStream } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, sep } from "node:path";
 import {
   RemoteInstanceError,
   agentModelCapabilityMappingSigningBytes,
@@ -10,8 +10,9 @@ import {
   type AgentModelCapabilityMapping,
   type RemoteNativeArtifact,
 } from "@konteks/remote-common";
-import { HOST_AGENT_BRIDGES, installOfflineAgentPackage, reviewedNativeModelIdentities, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
+import { HOST_AGENT_BRIDGES, installOfflineAgentPackage, reviewedNativeModelIdentities, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, parseEmbeddedRoots, signNativeReleaseManifest, verifyNativeRelease, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RemoteSignedBundleManifest } from "@konteks/remote-common";
+import { compareSemver } from "@konteks/remote-supervisor";
 
 export interface E2ESmokeReleaseOptions {
   gate: string | undefined;
@@ -22,6 +23,7 @@ export interface E2ESmokeReleaseOptions {
 
 export interface E2ERealReleaseOptions extends Omit<E2ESmokeReleaseOptions, "gate"> {
   realAgentGate: string | undefined;
+  upgrade?: boolean;
   bundleVersion?: string;
   packagePath: string | readonly string[];
   profilePath: string | readonly string[];
@@ -61,12 +63,32 @@ export async function prepareE2ERealRelease(options: E2ERealReleaseOptions) {
     || packagePaths.some(path => !isAbsolute(path)) || profilePaths.some(path => !isAbsolute(path))) fail();
   releaseBoundary({ gate: options.realAgentGate, directory: options.directory });
   const origin = localOrigin(options.origin);
+  const existing = await readExistingReleaseState(options.directory);
+  const bundleVersion = options.bundleVersion ?? "0.1.0-e2e";
+  if (options.upgrade) {
+    if (typeof options.bundleVersion !== "string" || !/^0\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-e2e$/.test(options.bundleVersion)
+      || !existing.manifest || !existing.roots.length
+      || compareSemver(options.bundleVersion, existing.manifest.bundleVersion) <= 0) {
+      throw new RemoteInstanceError("bundle_untrusted", "A real E2E upgrade requires a valid existing signed release and a strictly newer explicit 0.x.y-e2e bundle version.");
+    }
+  }
+  const privateKey = await e2eSigningKey(options.directory);
+  const root = releaseRootFor(privateKey);
+  const trustedSigner = existing.roots.find(candidate => candidate.keyId === root.keyId);
+  if (trustedSigner && !samePublicJwk(trustedSigner.publicKeyJwk, root.publicKeyJwk)) {
+    throw new RemoteInstanceError("bundle_untrusted", "The persistent E2E release signer conflicts with the existing trusted root.");
+  }
+  if (options.upgrade && !trustedSigner) {
+    throw new RemoteInstanceError("bundle_untrusted", "A real E2E upgrade requires its persistent signer to already be trusted.");
+  }
+  const roots = trustedSigner ? existing.roots : [...existing.roots, root];
   await mkdir(options.directory, { recursive: true, mode: 0o700 });
   const connector = Buffer.from("KONTEKS_E2E_SOURCE_CONNECTOR_ONLY\n");
   const connectorPath = join(options.directory, "connector");
   const validationRoot = await mkdtemp(join(options.directory, ".real-package-validation-"));
   const artifacts: RemoteNativeArtifact[] = [];
   const artifactFiles: Record<string, string> = {};
+  const stagedArchives: Array<{ stagedPath: string; destination: string }> = [];
   try {
     for (const [index, packagePath] of packagePaths.entries()) {
       const profilePath = profilePaths[index]!;
@@ -88,20 +110,32 @@ export async function prepareE2ERealRelease(options: E2ERealReleaseOptions) {
       };
       await installOfflineAgentPackage(stagedArchive, join(validationRoot, `agent-${profile.agentId}`), artifact);
       const destination = join(options.directory, agentFile);
-      await rename(stagedArchive, destination);
+      stagedArchives.push({ stagedPath: stagedArchive, destination });
       artifacts.push(artifact);
       artifactFiles[profile.agentId] = destination;
     }
   }
-  catch { return fail(); }
-  finally { await rm(validationRoot, { recursive: true, force: true }); }
-  await writeFile(connectorPath, connector, { mode: 0o700 });
-  return writeSignedRelease(options, origin, connector, artifacts, connectorPath, artifactFiles, options.bundleVersion);
+  catch { await rm(validationRoot, { recursive: true, force: true }); return fail(); }
+  try {
+    const signed = createSignedRelease(options, origin, connector, artifacts, bundleVersion, privateKey);
+    for (const staged of stagedArchives) await rename(staged.stagedPath, staged.destination);
+    await atomicChannelWrite(connectorPath, connector, 0o700, validationRoot);
+    await atomicChannelWrite(join(options.directory, "release-roots.json"), Buffer.from(JSON.stringify({ roots })), 0o600, validationRoot);
+    await atomicChannelWrite(join(options.directory, "native-manifest.json"), Buffer.from(JSON.stringify(signed.manifest)), 0o600, validationRoot);
+    return { ...signed, artifactFiles: { connector: connectorPath, agent: artifactFiles[artifacts[0]!.agentId!]!, agents: artifactFiles } };
+  } finally { await rm(validationRoot, { recursive: true, force: true }); }
 }
 
 async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directory" | "platform">, origin: string, connector: Buffer, agentArtifacts: RemoteNativeArtifact[], connectorPath: string, agentFiles: Record<string, string>, bundleVersion = "0.1.0-e2e") {
-  const connectorArtifact: RemoteNativeArtifact = { id: "e2e-source-connector", kind: "connector", format: "executable", ...options.platform, url: `${origin}/__e2e/native/connector`, digest: sha(connector), sizeBytes: connector.length };
   const privateKey = await e2eSigningKey(options.directory);
+  const signed = createSignedRelease(options, origin, connector, agentArtifacts, bundleVersion, privateKey);
+  await writeFile(join(options.directory, "release-roots.json"), JSON.stringify({ roots: [signed.root] }), { mode: 0o600 });
+  await writeFile(join(options.directory, "native-manifest.json"), JSON.stringify(signed.manifest), { mode: 0o600 });
+  return { ...signed, artifactFiles: { connector: connectorPath, agent: agentFiles[agentArtifacts[0]!.agentId!]!, agents: agentFiles } };
+}
+
+function createSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directory" | "platform">, origin: string, connector: Buffer, agentArtifacts: RemoteNativeArtifact[], bundleVersion: string, privateKey: KeyObject) {
+  const connectorArtifact: RemoteNativeArtifact = { id: "e2e-source-connector", kind: "connector", format: "executable", ...options.platform, url: `${origin}/__e2e/native/connector`, digest: sha(connector), sizeBytes: connector.length };
   const keyId = "e2e-local-native-release-1";
   // The local stack may deliberately lengthen Core's seven-day default while
   // exercising interrupted provisioning. Its checked-in development manifest
@@ -163,10 +197,7 @@ async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directo
   const manifest = signNativeReleaseManifest({
     bundleVersion, protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [connectorArtifact, ...agentArtifacts], modelCapabilityMappings: mappings, expiresAt: expiresAt.toISOString(),
   }, { keyId, privateKey });
-  const root: EmbeddedReleaseRoot = { keyId, publicKeyJwk: createPublicKey(privateKey).export({ format: "jwk" }) } as EmbeddedReleaseRoot;
-  await writeFile(join(options.directory, "release-roots.json"), JSON.stringify({ roots: [root] }), { mode: 0o600 });
-  await writeFile(join(options.directory, "native-manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
-  return { root, manifest, artifactFiles: { connector: connectorPath, agent: agentFiles[agentArtifacts[0]!.agentId!]!, agents: agentFiles } };
+  return { root: releaseRootFor(privateKey), manifest };
 }
 
 /**
@@ -217,6 +248,44 @@ async function e2eSigningKey(publicDirectory: string): Promise<KeyObject> {
     if (!info.isFile() || info.nlink !== 1 || info.size > 4096 || process.platform !== "win32" && (info.mode & 0o077) !== 0) fail();
     return createPrivateKey({ key: await readFile(path), format: "der", type: "pkcs8" });
   }
+}
+
+function releaseRootFor(privateKey: KeyObject): EmbeddedReleaseRoot {
+  return { keyId: "e2e-local-native-release-1", publicKeyJwk: createPublicKey(privateKey).export({ format: "jwk" }) } as EmbeddedReleaseRoot;
+}
+
+function samePublicJwk(left: EmbeddedReleaseRoot["publicKeyJwk"], right: EmbeddedReleaseRoot["publicKeyJwk"]): boolean {
+  return left.kty === right.kty && left.crv === right.crv && left.x === right.x;
+}
+
+async function readExistingReleaseState(directory: string): Promise<{ roots: EmbeddedReleaseRoot[]; manifest: RemoteSignedBundleManifest | null }> {
+  const rootsPath = join(directory, "release-roots.json"), manifestPath = join(directory, "native-manifest.json");
+  const readPrivate = async (path: string, maxBytes: number): Promise<string | null> => {
+    let info;
+    try { info = await lstat(path); }
+    catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return null;
+      return fail();
+    }
+    if (!info.isFile() || info.nlink !== 1 || info.size < 1 || info.size > maxBytes || process.platform !== "win32" && (info.mode & 0o077) !== 0) return fail();
+    return readFile(path, "utf8").catch(fail);
+  };
+  const [rootsJson, manifestJson] = await Promise.all([readPrivate(rootsPath, 128 * 1024), readPrivate(manifestPath, 1024 * 1024)]);
+  if (rootsJson === null && manifestJson === null) return { roots: [], manifest: null };
+  if (rootsJson === null || manifestJson === null) return fail();
+  let roots: EmbeddedReleaseRoot[], payload: unknown;
+  try { roots = parseEmbeddedRoots(rootsJson); payload = JSON.parse(manifestJson); }
+  catch { return fail(); }
+  if (roots.length === 0 || new Set(roots.map(root => root.keyId)).size !== roots.length) return fail();
+  try { return { roots, manifest: verifyNativeRelease(payload, roots).manifest }; }
+  catch { return fail(); }
+}
+
+async function atomicChannelWrite(destination: string, bytes: Buffer, mode: number, stagingDirectory: string): Promise<void> {
+  const temporary = join(stagingDirectory, `.channel-${basename(destination)}-${process.pid}-${Math.random().toString(36).slice(2)}.tmp`);
+  await writeFile(temporary, bytes, { mode, flag: "wx" });
+  try { await rename(temporary, destination); }
+  catch (error) { await rm(temporary, { force: true }); throw error; }
 }
 
 function releaseBoundary(options: Pick<E2ESmokeReleaseOptions, "gate" | "directory">): void {
