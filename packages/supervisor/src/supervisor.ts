@@ -26,7 +26,6 @@ import {
   type JsonValue,
   type Logger,
   type RemoteWorkAssignment,
-  type RemoteWorkKind,
   type RelayRuntimeHandshakeResult,
   type SupervisorStatus,
   type PreviewStatusReport,
@@ -58,6 +57,8 @@ import { RawFileApi } from "./onboard/raw-file-api.js";
 import { createRemoteResolver, type ManagedGitBinding } from "./onboard/remotes.js";
 import { OnboardWorkCarrier, type OnboardWorkAssignment } from "./onboard/carrier.js";
 import type { PlatformMcpEntry } from "./work/workload.js";
+import { acceptedWorkKinds } from "./work/accepted-kinds.js";
+import type { IntegrationWorkCarrier } from "./integration/carrier.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
 import { PreviewWorktreePermits } from "./preview/worktree-permits.js";
@@ -116,14 +117,6 @@ import { evaluateHeartbeatLiveness, isCredentialRefusal, leaseLapseNeedsRestart 
  * The composition root: wires state, transport, heartbeat, control, work,
  * sessions, and the loopback control socket into one supervisor.
  */
-// The onboard lane (evidence collector and relocation worker) is always
-// composed below, so its two kinds are accepted too. Leaving them out meant
-// Core never offered a discovery run's evidence work, and grouping evidence
-// was never read.
-// `direct` (runtime-view R11): a person's own chat on this computer. Only a
-// Core that knows it places it; a Core built before it refuses a pull naming
-// it, so it is asked for only once Core signs 7.1 (see acceptedKinds below).
-const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation", "direct"];
 
 /** How long preview_start waits for the dev server before answering "still starting". */
 const PREVIEW_START_WAIT_MS = 45_000;
@@ -204,6 +197,10 @@ export class Supervisor {
   /** Core's desired configuration; native, with no roles, until Core sends one. */
   private configuration: ConfigRecord["configuration"] = DEFAULT_CONFIG;
   private hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: false };
+  /** The Core wire-contract version from the applied desired configuration (absent before one is applied). */
+  private coreContractVersion: string | undefined;
+  /** Runs `integration` work (external-integration CP2); composed with the native runners. */
+  private integrationCarrier: IntegrationWorkCarrier | undefined;
   private roleBindings: RoleBinding[] = [];
   private draining = false;
   private drainReason: string | null = null;
@@ -813,7 +810,9 @@ export class Supervisor {
       roleBindings: () => this.roleBindings,
       advertisedRoles: () => deriveAdvertisedRoles(this.roleBindings, this.lastSnapshot?.agents ?? [], this.roleCapabilityInputs()),
       roleCapabilityInputs: () => this.roleCapabilityInputs(),
-      acceptedKinds: () => this.hostSettings.coreAcceptsRouteBilling ? ALL_KINDS : ALL_KINDS.filter(kind => kind !== "direct"),
+      // `direct` from a 7.1 Core, `integration` from a 7.3 Core and only while
+      // the integration carrier is composed (work/accepted-kinds.ts).
+      acceptedKinds: () => acceptedWorkKinds(this.coreContractVersion).filter(kind => kind !== "integration" || this.integrationCarrier !== undefined),
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
       draining: () => this.draining,
       reconciliationComplete: () => this.reconciliation.isComplete,
@@ -2318,6 +2317,7 @@ export class Supervisor {
    * snapshots.
    */
   private applyHostSettings(configuration: ConfigRecord["configuration"]): void {
+    this.coreContractVersion = configuration.coreContractVersion;
     const settings = { openCodeFreeModels: configuration.openCodeFreeModelsEnabled === true, coreAcceptsRouteBilling: coreContractAtLeast(configuration.coreContractVersion, "7.1") };
     const changed = this.hostSettings.openCodeFreeModels !== settings.openCodeFreeModels || this.hostSettings.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling;
     this.hostSettings = settings;

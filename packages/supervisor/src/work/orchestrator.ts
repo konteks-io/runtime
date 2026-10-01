@@ -50,6 +50,7 @@ import { coreChannelId } from "../relay/channel-ids.js";
 import { isSearchAssignment, type SearchControllerBoundary } from "./search-assignment-carrier.js";
 import { isOnboardWorkAssignment, onboardTerminalResult, type OnboardWorkAssignment, type OnboardWorkCarrier } from "../onboard/carrier.js";
 import { continuedSession } from "./continued-session.js";
+import { integrationTerminalResult, isIntegrationWorkAssignment, type IntegrationWorkAssignment, type IntegrationWorkCarrier } from "../integration/carrier.js";
 
 /**
  * Pull → claim → dispatch → report. Core owns admission and placement; the
@@ -127,6 +128,8 @@ export interface OrchestratorDeps {
   searchController?: SearchControllerBoundary;
   /** Present on a runtime tagged `onboard`; absent, both kinds are refused. */
   onboardCarrier?: Pick<OnboardWorkCarrier, "execute">;
+  /** Present when this connector runs integration tasks; absent, `integration` work is refused. */
+  integrationCarrier?: IntegrationWorkCarrier;
   /** An idle completed session was released and no other session holds its channel (its preview may go). */
   onSessionReleased?: (sessionId: string) => void;
   logger?: Logger;
@@ -262,6 +265,7 @@ export class WorkOrchestrator {
     // work kind, whatever Core placed. Refusing here is the same answer as
     // never having advertised the role.
     if (isOnboardWorkAssignment(assignment) && !this.deps.onboardCarrier) return "unknown_kind";
+    if (assignment.kind === "integration" && (!this.deps.integrationCarrier || !isIntegrationWorkAssignment(assignment))) return "unknown_kind";
     if (this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) return "stale_attempt";
     if (this.deps.journal.execution.isCancelled(assignment.id, assignment.attempt)) return "stale_attempt";
     if (!this.deps.acceptedKinds().includes(assignment.kind)) return "unknown_kind";
@@ -596,6 +600,13 @@ export class WorkOrchestrator {
         await this.runOnboardWork(assignment, entry, assertAuthority);
         return;
       }
+      if (this.deps.integrationCarrier && isIntegrationWorkAssignment(assignment)) {
+        // An integration task runs on its own carrier: discovery and setup
+        // are model-free, and a phase task opens its own gated ACP session
+        // with a locally built prompt. Nothing is relayed (external-integration CP2).
+        await this.runIntegrationWork(assignment, entry, assertAuthority);
+        return;
+      }
       await this.startRelayedSession(assignment, entry, assertAuthority);
     } catch (error) {
       await this.handleDispatchFailure(assignment, entry, assertAuthority, error);
@@ -654,6 +665,20 @@ export class WorkOrchestrator {
       attempt: assignment.attempt,
       claimId: entry.claimId,
       draft: { terminal: true, result: onboardTerminalResult(outcome) },
+    });
+  }
+
+  /** Run an integration task to its terminal report; its structured result is the whole outcome. */
+  private async runIntegrationWork(assignment: IntegrationWorkAssignment, entry: JournalEntry, assertAuthority: () => void): Promise<void> {
+    await this.deps.journal.assignments.put({ ...entry, state: "running", updatedAt: this.deps.clock.nowIso() });
+    assertAuthority();
+    const outcome = await this.deps.integrationCarrier!.execute(assignment, assertAuthority);
+    assertAuthority();
+    await this.reports.submit({
+      assignmentId: assignment.id,
+      attempt: assignment.attempt,
+      claimId: entry.claimId,
+      draft: { terminal: true, result: integrationTerminalResult(outcome) },
     });
   }
 
@@ -1297,6 +1322,7 @@ export class WorkOrchestrator {
 
   async onRunnerEvent(event: RunnerEvent): Promise<void> {
     for (const session of this.sessions.values()) await session.onRunnerEvent(event);
+    await this.deps.integrationCarrier?.onRunnerEvent(event);
   }
 
   /** A policy-deferred request reached its deadline unanswered: fail it closed (D87). */
