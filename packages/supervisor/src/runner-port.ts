@@ -37,6 +37,13 @@ export interface RunnerSessionInput {
    * session's gateway. Ignored by a runner whose agent carries no browser.
    */
   browser?: { proxyUrl: string; outputDir: string; browsersPath: string };
+  /**
+   * An integration task's own NEW session (external-integration CP2): the one
+   * personal MCP server the Codex bridge leaves on for this thread, or whether
+   * Claude may load the account's connectors. Every call still meets the
+   * integration gate; this only decides what the agent can see.
+   */
+  integration?: { admittedMcpServerNames: string[]; accountConnectors: boolean };
 }
 
 export interface RunnerSessionCreated {

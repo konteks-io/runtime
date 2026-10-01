@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 // Build-time compatibility change only. Never mutate an installed signed artifact.
 // Reuse upstream's history conversion; do not reconstruct or read local files.
 export const codexAcpLiveUserPatch = {
-  id: "konteks-codex-acp-live-user-v7",
+  id: "konteks-codex-acp-live-user-v8",
   package: "@agentclientprotocol/codex-acp",
   version: "1.10.0",
   upstreamSha256: "4602784c5896fbf05a7d89b09655bacc768d0bf281e0d03a10333ff81da45268",
@@ -57,6 +57,19 @@ export function konteksCodexMcpServers(existingNames, requestedNames, admittedNa
   );
 }
 
+// CP2 (external-integration): the one personal server an integration task's
+// binding admits, read ONLY from that task's own session/new
+// (`_meta.konteksIntegration`, version 1, at most 8 bounded names). Any other
+// shape admits nothing; resume, load and fork never carry an admission.
+export function konteksAdmittedMcpServerNames(meta) {
+  const integration = meta && typeof meta === "object" ? meta.konteksIntegration : undefined;
+  if (!integration || typeof integration !== "object" || integration.version !== 1) return [];
+  const names = integration.admittedMcpServerNames;
+  if (!Array.isArray(names) || names.length > 8) return [];
+  if (!names.every((name) => typeof name === "string" && name.length <= 128 && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))) return [];
+  return [...names];
+}
+
 export function patchCodexAcpLiveUsers(source, version) {
   if (
     version !== codexAcpLiveUserPatch.version ||
@@ -73,7 +86,11 @@ export function patchCodexAcpLiveUsers(source, version) {
   };
   replaceOnce(
     "var CodexEventHandler = class _CodexEventHandler {",
-    `${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
+    `${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
+  );
+  replaceOnce(
+    "      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers),\n      modelProvider: this.getModelProvider(),",
+    "      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers, konteksAdmittedMcpServerNames(request._meta)),\n      modelProvider: this.getModelProvider(),",
   );
   replaceOnce(
     `  async createSessionConfig(projectPath, additionalDirectories, mcpServers) {`,

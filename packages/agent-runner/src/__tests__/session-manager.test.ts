@@ -729,3 +729,24 @@ describe("session manager (D98 bootstrap)", () => {
     expect(manager.activeSessions).toBe(0);
   });
 });
+
+describe("integration sessions (external-integration CP2)", () => {
+  it("tells the bridge which personal server or account connectors this one session admits", async () => {
+    const { bridge, calls } = fakeBridge();
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });
+    await manager.create({ context, cwd: "/w", mcpServers: [], integration: { admittedMcpServerNames: ["atlassian"], accountConnectors: false } });
+    expect(calls.newSession?.[0]).toMatchObject({ _meta: { konteksIntegration: { version: 1, admittedMcpServerNames: ["atlassian"], accountConnectors: false } } });
+    const plain = fakeBridge();
+    await new SessionManager({ bridge: () => plain.bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() }).create({ context, cwd: "/w", mcpServers: [] });
+    expect(plain.calls.newSession?.[0]).not.toHaveProperty("_meta.konteksIntegration");
+  });
+
+  it("never carries an admission into a continued or restored session", async () => {
+    const { bridge } = fakeBridge();
+    const store = new InMemorySessionRefStore();
+    await store.put("acp-prior", "bridge-old");
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: store });
+    await expect(manager.create({ context, cwd: "/w", mcpServers: [], acpSessionRef: "acp-prior", integration: { admittedMcpServerNames: [], accountConnectors: true } }))
+      .rejects.toMatchObject({ code: "schema_invalid" });
+  });
+});

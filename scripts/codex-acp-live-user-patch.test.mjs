@@ -148,5 +148,25 @@ test("the reviewed bridge disables configured MCP servers on every thread start,
   assert.match(source, /async createSessionConfig\(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = \[\]\) \{/);
   assert.match(source, /const disabledMcpServers = konteksCodexMcpServers\(existingMcpServerNames, requestedServers\.map\(\(mcp\) => mcp\.name\), admittedMcpServerNames\.map\(sanitizeMcpServerName\)\);/);
   assert.doesNotMatch(source, /shouldDeduplicateMcpConflicts\(\)\) \{\n      const existingNames/);
-  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v7");
+  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v8");
+});
+
+test("an integration session admits only the bound personal server, read from its own session/new (CP2)", async () => {
+  const { konteksAdmittedMcpServerNames } = await import("./codex-acp-live-user-patch.mjs");
+  assert.deepEqual(konteksAdmittedMcpServerNames({ konteksIntegration: { version: 1, admittedMcpServerNames: ["atlassian"], accountConnectors: false } }), ["atlassian"]);
+  // Nothing else admits anything: no meta, another version, a bad name, too many.
+  assert.deepEqual(konteksAdmittedMcpServerNames(undefined), []);
+  assert.deepEqual(konteksAdmittedMcpServerNames({ konteksIntegration: { version: 2, admittedMcpServerNames: ["atlassian"] } }), []);
+  assert.deepEqual(konteksAdmittedMcpServerNames({ konteksIntegration: { version: 1, admittedMcpServerNames: ["ok", "bad name"] } }), []);
+  assert.deepEqual(konteksAdmittedMcpServerNames({ konteksIntegration: { version: 1, admittedMcpServerNames: Array.from({ length: 9 }, (_, i) => `s${i}`) } }), []);
+  assert.deepEqual(konteksAdmittedMcpServerNames({ konteksIntegration: { version: 1, admittedMcpServerNames: "atlassian" } }), []);
+});
+
+test("the reviewed bridge passes the admission on thread start only, never on resume, load or fork", { skip: !process.env.CODEX_ACP_FIXTURE_DIR }, async () => {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { source } = patchCodexAcpLiveUsers(readFileSync(join(process.env.CODEX_ACP_FIXTURE_DIR, "index.js"), "utf8"), codexAcpLiveUserPatch.version);
+  assert.match(source, /config: await this\.createSessionConfig\(request\.cwd, additionalDirectories, request\.mcpServers, konteksAdmittedMcpServerNames\(request\._meta\)\),/);
+  assert.equal(source.split("konteksAdmittedMcpServerNames(request._meta)").length, 2);
+  assert.match(source, /function konteksAdmittedMcpServerNames\(meta\)/);
 });

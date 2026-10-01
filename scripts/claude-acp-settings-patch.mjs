@@ -9,8 +9,14 @@ import { createHash } from "node:crypto";
 // on new, loaded and resumed sessions alike; and every permission request
 // names its tool in `_meta.claudeCode.toolName` (S0-4). Measured against the operator's
 // Claude CLI: external-integration-via-agent proof/cp2-runtime/stage-0.
+// v4 (CP2): an integration task's own session (`_meta.konteksIntegration`,
+// sent only by the connector's integration carrier) loads the account's
+// claude.ai connectors so the bound one can be called, with NO setting
+// sources so no repository `.mcp.json` server starts (measured: proof
+// cp2-runtime/claude-project-mcp-probe.json); hooks stay off and every call
+// still meets the connector's integration gate.
 export const claudeAcpSettingsPatch = {
-  id: "konteks-claude-project-settings-v3",
+  id: "konteks-claude-project-settings-v4",
   version: "0.75.1",
   hashes: {
     "acp-agent.js": "c22424c297429378166524b59ee6bed239c999a420ad0dd06571b768efa7525b",
@@ -28,8 +34,8 @@ export function patchClaudeSettings(source, file, version) {
     source = source.replace(before, after);
   };
   if (file === "acp-agent.js") {
-    source = 'import { hardenClaudeSession, isolateClaudeInstructions } from "./konteks-instruction-scope.mjs";\n' + source;
-    replace('        const env = {\n            ...process.env,', '        settings = hardenClaudeSession(await isolateClaudeInstructions(settings, params.cwd, CLAUDE_CONFIG_DIR));\n        this.logger.log(`[konteks] instruction_scope version=3 settings=project ancestors=excluded user=excluded local=excluded auto_memory=excluded auth=official_profile exclusions=${settings.claudeMdExcludes.length} hooks=disabled repository_mcp=excluded account_connectors=excluded`);\n        const env = {\n            ...process.env,');
+    source = 'import { hardenClaudeSession, isolateClaudeInstructions, konteksAccountConnectors } from "./konteks-instruction-scope.mjs";\n' + source;
+    replace('        const env = {\n            ...process.env,', '        settings = hardenClaudeSession(await isolateClaudeInstructions(settings, params.cwd, CLAUDE_CONFIG_DIR), konteksAccountConnectors(params._meta));\n        this.logger.log(`[konteks] instruction_scope version=4 settings=${konteksAccountConnectors(params._meta) ? "none" : "project"} ancestors=excluded user=excluded local=excluded auto_memory=excluded auth=official_profile exclusions=${settings.claudeMdExcludes.length} hooks=disabled repository_mcp=excluded account_connectors=${konteksAccountConnectors(params._meta) ? "integration" : "excluded"}`);\n        const env = {\n            ...process.env,');
     replace('settingSources: ["user", "project", "local"],', 'settingSources: ["project"],');
     // Apply after the optional client options too, including session/load and
     // resume. SettingsManager and query must see the same effective scope.
@@ -37,7 +43,7 @@ export function patchClaudeSettings(source, file, version) {
     // (the request carried it only in its display title). The connector's
     // policy reads `_meta.claudeCode.toolName`, never the title.
     replace('    async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {\n', '    async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {\n        params = { ...params, toolCall: { ...params.toolCall, _meta: { ...params.toolCall._meta, claudeCode: { ...params.toolCall._meta?.claudeCode, toolName } } } };\n');
-    replace('            ...userProvidedOptions,\n', '            ...userProvidedOptions,\n            settingSources: ["project"],\n            strictMcpConfig: true,\n');
+    replace('            ...userProvidedOptions,\n', '            ...userProvidedOptions,\n            settingSources: konteksAccountConnectors(params._meta) ? [] : ["project"],\n            strictMcpConfig: !konteksAccountConnectors(params._meta),\n');
 
   } else {
     replace('resolveSettings({ cwd: this.cwd })', 'resolveSettings({ cwd: this.cwd, settingSources: ["project"] })');

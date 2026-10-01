@@ -51,6 +51,13 @@ export interface CreateSessionArgs {
   freshProviderSessionOnRestore?: boolean;
   /** Display-only naming for the provider session list; never authority. */
   sessionLabel?: KonteksSessionLabel;
+  /**
+   * An integration task's own session (external-integration CP2): the one
+   * personal MCP server (Codex) or the account connectors (Claude) this NEW
+   * session admits, sent as `_meta.konteksIntegration` for the bridge patches.
+   * Never carried into a continued or restored session.
+   */
+  integration?: IntegrationSessionAdmission;
   /** Native in-process owner; opaque connector ref, never the bridge session ID. */
   lifecycle?: {
     beforeCreate(opaqueRef: string): Promise<void>;
@@ -58,6 +65,18 @@ export interface CreateSessionArgs {
     replaceProcessOwner?(previous: RetainedProcessOwner, replacement: RetainedProcessOwner): Promise<void>;
     assertCurrent(): void;
   };
+}
+
+export interface IntegrationSessionAdmission {
+  /** Personal (or E2E) MCP servers the Codex bridge leaves enabled for this thread; none otherwise. */
+  admittedMcpServerNames: string[];
+  /** Claude only: this session may load the account's claude.ai connectors (every call still meets the gate). */
+  accountConnectors: boolean;
+}
+
+/** The `_meta` an integration session's `session/new` carries, versioned for the bridge patches. */
+export function konteksIntegrationMeta(admission: IntegrationSessionAdmission) {
+  return { konteksIntegration: { version: 1 as const, admittedMcpServerNames: [...admission.admittedMcpServerNames], accountConnectors: admission.accountConnectors } };
 }
 
 export interface CreatedSession {
@@ -360,6 +379,7 @@ export class SessionManager {
   }
 
   async create(args: CreateSessionArgs): Promise<CreatedSession> {
+    this.assertFreshIntegration(args);
     args = this.withDefaultSessionConfig(args);
     const ref = args.acpSessionRef ?? `acp-${randomUUID()}`;
     return this.createOwned(args, ref, args.acpSessionRef);
@@ -369,6 +389,7 @@ export class SessionManager {
    * execution reference. The source ref remains fenced to its old generation;
    * only its private provider-session mapping is read. */
   async restore(args: CreateSessionArgs, sourceRef: string): Promise<CreatedSession> {
+    this.assertFreshIntegration({ ...args, restoreReference: sourceRef });
     args = this.withDefaultSessionConfig(args);
     return this.createOwned(args, `acp-${randomUUID()}`, sourceRef);
   }
@@ -510,7 +531,8 @@ export class SessionManager {
       let created: { sessionId: string; configOptions?: unknown; modes?: unknown };
       try {
         created = await this.boundedBootstrap("session_new", args, bridge,
-          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: { ...konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId), ...this.options.sessionMeta } }), bootstrapAttempt);
+          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: { ...konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId), ...this.options.sessionMeta,
+            ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) } }), bootstrapAttempt);
       } catch (error) {
         if (error instanceof RemoteInstanceError && error.retryable) throw error;
         const classified = classifyBridgeError(error);
@@ -650,6 +672,7 @@ export class SessionManager {
    * its generation fence, then refresh ACP MCP/config authority before ready.
    */
   async continueLive(args: CreateSessionArgs): Promise<CreatedSession> {
+    this.assertFreshIntegration(args);
     args = this.withDefaultSessionConfig(args);
     const ref = args.acpSessionRef;
     if (!ref) throw new RemoteInstanceError("recovery_required", "Live continuation requires its predecessor session reference.", { diagnostic: "continuation_reference_missing" });
@@ -984,6 +1007,13 @@ export class SessionManager {
   }
 
   /** A mode this agent must never enter was named in an admitted session configuration. */
+  /** An integration admission belongs to exactly one new session. */
+  private assertFreshIntegration(args: CreateSessionArgs & { restoreReference?: string }): void {
+    if (args.integration && (args.acpSessionRef !== undefined || args.restoreReference !== undefined)) {
+      throw new RemoteInstanceError("schema_invalid", "An integration session is always new.");
+    }
+  }
+
   private assertAdmittedModes(sessionConfig: Record<string, string> | undefined): void {
     if (sessionConfig && this.refusesMode(sessionConfig.mode)) {
       throw new RemoteInstanceError("permission_denied", this.options.refusedModes!.message);

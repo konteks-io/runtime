@@ -42,3 +42,16 @@ test('a Konteks session leaves the account\'s claude.ai connectors out (S0-2)', 
   const { hardenClaudeSession } = await import('./claude-instruction-scope.mjs');
   assert.equal(hardenClaudeSession({ disableClaudeAiConnectors: false }).disableClaudeAiConnectors, true);
 });
+
+test('only an integration session admits the account connectors, and still runs no hooks (CP2)', async () => {
+  const { hardenClaudeSession, konteksAccountConnectors } = await import('./claude-instruction-scope.mjs');
+  const admitted = hardenClaudeSession({ disableClaudeAiConnectors: true }, true);
+  assert.equal(admitted.disableClaudeAiConnectors, undefined);
+  assert.equal(admitted.disableAllHooks, true);
+  assert.equal(hardenClaudeSession({}, false).disableClaudeAiConnectors, true);
+  assert.equal(konteksAccountConnectors({ konteksIntegration: { version: 1, admittedMcpServerNames: [], accountConnectors: true } }), true);
+  for (const meta of [undefined, null, {}, { konteksIntegration: { version: 2, accountConnectors: true } }, { konteksIntegration: { version: 1, accountConnectors: 'yes' } },
+    { konteksIntegration: { version: 1, accountConnectors: false } }, { claudeCode: { options: { strictMcpConfig: false } } }]) {
+    assert.equal(konteksAccountConnectors(meta), false);
+  }
+});
