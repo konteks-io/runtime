@@ -93,6 +93,7 @@ import type { RelayedSessionDeps } from "./session/relayed-session.js";
 import { PermissionBroker } from "./session/permissions.js";
 import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "./session/workspace-tool-policy.js";
+import { ClaudeExecutableIdentity } from "./native/claude-executable-identity.js";
 import { SupervisorJournal } from "./state/journal.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
@@ -434,8 +435,13 @@ export class Supervisor {
     const recorded = this.recordedAgentIds();
     this.notAddedAgents = new NotAddedAgentsDetector({ agentIds: SUPPORTED_AGENT_IDS.filter(agentId => !recorded.has(agentId)) });
     void this.notAddedAgents.refreshIfDue().catch(() => undefined);
+    // The personal Claude Code executable a claude-code runner runs: its
+    // version and digest ride the capabilities (S0-5).
+    const claudeExecutable = this.options.native!.runners.find(runner => runner.RUNNER_AGENT_ID === "claude-code")?.RUNNER_NATIVE_CLAUDE_EXECUTABLE;
+    const claudeIdentity = claudeExecutable ? new ClaudeExecutableIdentity(claudeExecutable, { logger: this.logger }) : null;
     this.inventory = new NativeInventoryCollector({ runners: this.runners, sampler: new SignalSampler(this.config.SUPERVISOR_DATA_DIR), bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       gitVersion: () => this.git.version(),
+      ...(claudeIdentity ? { claudeExecutable: () => claudeIdentity.capability() } : {}),
       executionPermitsReady: () => {
         // Native sessionDeps below always composes NativeExecutionGate.
         // Advertise only once that work owner exists and is still owned.

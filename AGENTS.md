@@ -156,6 +156,14 @@ approvalPolicy on-request + approvalsReviewer user), applied and echoed
 before ready on new, restored and live-continued sessions; `allowedModeIds`
 refuses every other mode on `set_mode`, `set_config_option` and an admitted
 configuration, including one a later codex-acp adds.
+A personal Claude profile runs the operator's own `claude` (the release's
+pinned package is a non-runnable stub), so the `agent_runner` component
+advertises `claude-code-executable:<version>:sha256:<hex>` for the runner's
+`RUNNER_NATIVE_CLAUDE_EXECUTABLE` (S0-5, `native/claude-executable-identity.ts`):
+`<exe> --version` and a sha256 of the file, recomputed only when its stat
+fingerprint changes (a heartbeat costs one `stat`), logged as
+`agent.claude_executable_changed`; nothing is advertised when it cannot be
+read. Anything certified against one executable is bound to that string.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered
