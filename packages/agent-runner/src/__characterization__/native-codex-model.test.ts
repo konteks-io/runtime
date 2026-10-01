@@ -6,9 +6,9 @@ import { expect, it } from "vitest";
  * native connector. No cloud assignment, tools, or workspace files are used. */
 const binary = process.env.NATIVE_CODEX_MODEL_PROBE_BINARY;
 
-it.skipIf(!binary)(
-  "completes a ChatGPT-account turn with the connector Codex model",
-  () => {
+it.skipIf(!binary).each(["gpt-6-sol", "gpt-6.1-sol"])(
+  "completes a ChatGPT-account turn with %s",
+  (model) => {
     const result = spawnSync(
       binary!,
       [
@@ -20,7 +20,7 @@ it.skipIf(!binary)(
         "-C",
         tmpdir(),
         "-m",
-        "gpt-6-sol",
+        model,
         "Reply exactly OK. Do not use tools.",
       ],
       {
