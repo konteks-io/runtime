@@ -571,6 +571,27 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
 - After the shared Codex owner starts, app-servers that older releases of this
   installation left on other sockets are ended once idle (or unreachable)
   (`reapStrayServers`); nothing outside `<root>/releases/` is touched.
+- A repository role session (every review turn of a task reuses one QA
+  delivery session, continuing the last completed turn's live ACP session)
+  survives a turn that ends unfinished (production 2026-10-01: a cancelled
+  review continuation blocked every later review with `recovery_required`
+  / `local_execution_unprovable`, restart or not). When a `harness_delivery`
+  session closes for any reason but `completed`, the orchestrator waits for
+  the session's own close, proves the exact process gone with
+  `stopRetainedExecution` and marks the execution `stopping` →
+  `process_stopped` → `interrupted_unqualified` (`retireAfterClose`, the
+  retained recovery stop's sequence). The next turn naming the completed turn
+  then starts a fresh ACP session through
+  `canStartFreshAfterRecoveredHarnessContinuation` once Core acknowledged the
+  terminal report. Journals left behind by older releases (the continuation
+  still `opened`) heal at the next turn's handoff
+  (`retireUnfinishedHarnessContinuation`): only with a terminal, acknowledged
+  claim, no local owner (session, bootstrap, dispatch, channel, recovery
+  stop) and a proven process stop; otherwise the refusal stands. Generated
+  changes in the working copy are kept; only the agent's in-session history
+  is lost. Predecessor turns are matched by `invocationId` and
+  `dispatchGeneration` only (`turnIdentity`), never their own nested
+  predecessor.
 - `doctor` has a `update-channel` line (unreadable channel fails, a
   `KONTEKS_RELEASE_MANIFEST_URL` override warns, no lease warns that updates
   wait), and `status` shows it through the separate `update.channel` op (never
