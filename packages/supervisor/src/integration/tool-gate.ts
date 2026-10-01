@@ -102,6 +102,8 @@ function safeDigest(args: unknown): string {
 export class IntegrationToolGate {
   private readonly allowed = new Map<string, AllowedIntegrationCall>();
   private readonly calls = new Map<string, IntegrationToolCallRecord>();
+  /** Every tool call id the agent asked about, whatever the answer. */
+  private readonly judged = new Set<string>();
   private allowedCount = 0;
 
   constructor(private readonly spec: IntegrationTaskSpec, private readonly deps: IntegrationToolGateDeps) {
@@ -112,6 +114,7 @@ export class IntegrationToolGate {
     const allowOnce = request.options.find(option => option.kind === "allow_once")?.optionId ?? null;
     const reject = request.options.find(option => option.kind === "reject_once")?.optionId ?? null;
     const toolCallId = request.toolCall.toolCallId;
+    this.judged.add(toolCallId);
     const identity = permissionToolIdentity(request, this.deps.agentId, { sessionServers: this.deps.sessionServers, ledger: this.deps.ledger });
     const deny = (reason: IntegrationDenyReason, call?: { server: string; tool: string; args: unknown }): IntegrationGateDecision => {
       this.note(toolCallId, identity, call, "denied");
@@ -157,6 +160,11 @@ export class IntegrationToolGate {
   /** The provider call the gate allowed under this ACP tool call id, if any. */
   allowedCall(toolCallId: string): AllowedIntegrationCall | undefined {
     return this.allowed.get(toolCallId);
+  }
+
+  /** Whether the agent asked the gate about this call at all (a call that ran without asking bypassed it). */
+  wasJudged(toolCallId: string): boolean {
+    return this.judged.has(toolCallId);
   }
 
   /** An allowed call reached its end: record what the connector observed. */
