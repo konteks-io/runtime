@@ -118,15 +118,16 @@ fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
 **Session hardening (external-integration Stage 0, invariant N10).** A
 Konteks Claude Code session runs none of the working repository's hooks and
 starts none of its `.mcp.json` servers (S0-1): the patched claude-agent-acp
-(`scripts/claude-acp-settings-patch.mjs`, `konteks-claude-project-settings-v3`)
+(`scripts/claude-acp-settings-patch.mjs`, `konteks-claude-project-settings-v4`)
 forces `strictMcpConfig: true` beside `settingSources: ["project"]` (only the
 ACP request's servers load, which also leaves the account's claude.ai
 connectors out) and `hardenClaudeSession` flag settings (`disableAllHooks`;
 flag settings outrank the project's, and the SDK callback hooks the bridge
 registers keep running) on new, loaded and resumed sessions. The project's
 CLAUDE.md is still read (`claude-instruction-scope.integration.test.mjs`,
-hardened case). The bridge's marker is `instruction_scope version=3 …
-hooks=disabled repository_mcp=excluded account_connectors=excluded`.
+hardened case). The bridge's marker is `instruction_scope version=4 …
+hooks=disabled repository_mcp=excluded account_connectors=excluded` (an
+integration session's: `settings=none … account_connectors=integration`).
 Permission decisions read the tool from structured fields only (S0-4,
 `session/permission-tool-identity.ts`): Claude's bridge now sets
 `toolCall._meta.claudeCode.toolName` on every request (same patch), and a
@@ -140,7 +141,7 @@ description), an MCP call with no readable server/tool is refused, and every
 policy allow is `allow_once` (no fallback to `allow_always`).
 Only the session's own MCP servers are callable (S0-2): `hardenClaudeSession`
 also sets `disableClaudeAiConnectors` (claude.ai connectors stay out even
-without strict MCP); the Codex bridge patch (`konteks-codex-acp-live-user-v7`,
+without strict MCP); the Codex bridge patch (`konteks-codex-acp-live-user-v8`,
 `konteks/codex-acp-provenance.json`) turns every MCP server the person's or a
 trusted project's Codex config names off for the thread
 (`mcp_servers.<name>.enabled = false`, read through `config/read`; a
@@ -149,7 +150,8 @@ policy refuses, without asking anyone, an MCP tool whose server is not in the
 session's `sessionServers`. The CP2 seam is `RelayedSessionDeps.admittedMcpTools`
 (policy: such a tool is deferred with `allowOnceOnly`, never allowed by the
 general policy) and `createSessionConfig`'s `admittedMcpServerNames` in the
-Codex patch; both are empty in Stage 0. Direct sessions get the same.
+Codex patch; an ordinary or direct session admits nothing (an integration
+task's session uses the CP2 admission below instead of these seams).
 Every Codex session runs in codex-acp's "Ask for approval" mode (S0-3,
 `CODEX_SESSION_GOVERNANCE` in `agent-runner/src/runtime.ts`: `read-only` =
 approvalPolicy on-request + approvalsReviewer user), applied and echoed
@@ -164,6 +166,58 @@ advertises `claude-code-executable:<version>:sha256:<hex>` for the runner's
 fingerprint changes (a heartbeat costs one `stat`), logged as
 `agent.claude_executable_changed`; nothing is advertised when it cannot be
 read. Anything certified against one executable is bound to that string.
+
+**Integration tasks (external-integration CP2, `packages/supervisor/src/integration/`).**
+`integration` work (packages 7.3) is asked for only from a Core that signs
+`coreContractVersion` 7.3 (`work/accepted-kinds.ts`, beside `direct` at 7.1)
+and only while the carrier is composed; the `agent_runner` advertises
+`integration-task-v1` when a Claude Code or Codex runner is installed. It
+never takes the relayed path: the orchestrator runs it on
+`IntegrationTaskCarrier` (like the onboard carrier) and reports its
+structured result as the terminal report. The carrier reads the frozen task
+from the workload route (`fetchWorkload`, assignment authority), parses it
+with the shared `IntegrationWorkloadSchema` and refuses it (failed
+assignment, `schema_invalid` + diagnostic) unless its digest equals the
+source's `specDigest` and it names the assignment's task and agent. Then:
+`discover` is model-free (`discovery.ts`: Codex `mcpServerStatus/list` with
+tools and auth only on the shared app-server; Claude the release's bundled
+Agent SDK `mcpServerStatus()` in a CHILD process, empty private folder, no
+setting sources beyond project, hooks off, connectors on, every tool refused,
+the child writing only names, status, scope and tool names) and passes an
+allowlist that keeps only server name, source kind, status, provider
+category and tool names (secret-canary tests; Claude account connectors are
+named as their tools are, `claude.ai Atlassian` -> `claude_ai_Atlassian`).
+`probe | read | verify | write` run in ONE new session (`session.ts`) on the
+bound agent in an empty private folder under the runner's workspace, with
+only `konteks-result` (and, E2E only, the fixture server), the bound source
+admitted for that session only (`RunnerSessionInput.integration` ->
+`_meta.konteksIntegration` v1 on `session/new`, never on resume/load/fork:
+Codex bridge v8 leaves exactly that personal server enabled; Claude bridge
+v4 loads the account connectors with NO setting sources, so no repository
+`.mcp.json` server starts, hooks off), one prompt built locally from the
+spec (`prompt.ts`), and `IntegrationToolGate` (`tool-gate.ts`) as the whole
+permission policy: structured identity only, only `admittedTools` up to
+`limits.maxToolCalls`, a write only with the approved canonical arguments
+and once per nonce (recorded in the journal's `integration-writes` table
+BEFORE the `allow_once`; a repeated callback for the same call is the same
+grant), every other tool denied without deferral, `allow_once` only, the
+result tool the one platform channel. The connector's own result of each
+allowed call (ACP `tool_call`/`tool_call_update`, `rawOutput` else text
+content) is an observation (`connector_observed`, bounded by `maxBytes`,
+sha256); `submit_result` is only `agentReport`. An MCP call that completes
+without reaching the gate cancels the turn (`operation_unsupported`,
+`ungated_call`); the deadline cancels it (`capacity_wait`); an allowed write
+that never settles is `outcome_unknown`. A source the agent cannot hold
+(Claude: account connectors only; Codex: personal servers only) is a typed
+`operation_unsupported` result with no session. `fixture_mcp` (a loopback
+HTTP server named in the spec, never a command) is served only when the
+connector process runs with `KONTEKS_E2E_NATIVE_CONNECTOR=1`. A setup task
+(`setup.ts`, P08/D29) runs only the reviewed catalogue entry it names
+(`officialConnectionSetup`; endpoint, server name and command digest must
+match; the argv is the catalogue's): Codex `mcp get` (an existing entry is
+never overwritten), the pinned `codex mcp add`, `mcp get` again, with the
+release's own CLI on the person's Codex profile, input closed and output
+never read; Claude returns a `handoff` to the official connectors page.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered
