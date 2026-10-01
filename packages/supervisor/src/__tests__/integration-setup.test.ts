@@ -60,6 +60,33 @@ describe("confirmed official setup (P08, D29)", () => {
     expect(calls).toEqual([]);
   });
 
+  it("signs in with the reviewed login only when the connection exists", async () => {
+    const signIn = spec({ change: "sign_in", commandDigest: setupCommandDigest(codexJira, "sign_in") });
+    let { calls, setup } = runner([0, 0]);
+    expect(await setup.run(signIn, () => undefined)).toMatchObject({ outcome: "signed_in" });
+    expect(calls).toEqual([["mcp", "get", "atlassian"], ["mcp", "login", "atlassian"]]);
+    ({ calls, setup } = runner([1]));
+    expect(await setup.run(signIn, () => undefined)).toMatchObject({ outcome: "absent" });
+    expect(calls).toEqual([["mcp", "get", "atlassian"]]);
+    ({ calls, setup } = runner([0, 1]));
+    expect(await setup.run(signIn, () => undefined)).toMatchObject({ outcome: "failed", error: { code: "needs_auth" } });
+    // The add digest is not a sign-in digest.
+    ({ calls, setup } = runner([0, 0]));
+    expect(await setup.run({ ...signIn, commandDigest: setupCommandDigest(codexJira) }, () => undefined)).toMatchObject({ outcome: "failed", error: { code: "operation_unsupported" } });
+    expect(calls).toEqual([]);
+  });
+
+  it("removes with the reviewed command and checks it is gone; nothing there is absent", async () => {
+    const remove = spec({ change: "remove", commandDigest: setupCommandDigest(codexJira, "remove"), addedByKonteks: true });
+    let { calls, setup } = runner([0, 0, 1]);
+    expect(await setup.run(remove, () => undefined)).toMatchObject({ outcome: "removed" });
+    expect(calls).toEqual([["mcp", "get", "atlassian"], ["mcp", "remove", "atlassian"], ["mcp", "get", "atlassian"]]);
+    ({ calls, setup } = runner([1]));
+    expect(await setup.run(remove, () => undefined)).toMatchObject({ outcome: "absent" });
+    ({ calls, setup } = runner([0, 1, 0]));
+    expect(await setup.run(remove, () => undefined)).toMatchObject({ outcome: "failed", error: { code: "capability_unknown", params: { reason: "remove_failed" } } });
+  });
+
   it("answers runtime_offline when this computer has no Codex to run it with", async () => {
     const setup = new OfficialSetupRunner({ codex: () => null, run: vi.fn(), timeoutMs: 1_000 });
     expect(await setup.run(spec(), () => undefined)).toMatchObject({ outcome: "failed", error: { code: "runtime_offline" } });

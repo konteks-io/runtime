@@ -213,11 +213,17 @@ that never settles is `outcome_unknown`. A source the agent cannot hold
 HTTP server named in the spec, never a command) is served only when the
 connector process runs with `KONTEKS_E2E_NATIVE_CONNECTOR=1`. A setup task
 (`setup.ts`, P08/D29) runs only the reviewed catalogue entry it names
-(`officialConnectionSetup`; endpoint, server name and command digest must
-match; the argv is the catalogue's): Codex `mcp get` (an existing entry is
-never overwritten), the pinned `codex mcp add`, `mcp get` again, with the
-release's own CLI on the person's Codex profile, input closed and output
-never read; Claude returns a `handoff` to the official connectors page.
+(`officialConnectionSetup`; endpoint, server name and the change's command
+digest must match; the argv is the catalogue's `setupArgv(entry, change)`):
+Codex `mcp get` first, then for `add` the pinned `codex mcp add` (an
+existing entry is never overwritten: `already_present`) and `mcp get`
+again; for `sign_in` `codex mcp login <name>` (only when the entry exists,
+else `absent`); for `remove` `codex mcp remove <name>` and `mcp get` to see
+it gone (Core sends `addedByKonteks`; it refuses a remove of an entry
+Konteks did not add unless the person confirmed it). All with the release's
+own CLI on the person's Codex profile, input closed and output never read.
+A handoff entry (every Claude provider, Codex Slack/Asana/GitHub) runs
+nothing and returns its official page.
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered

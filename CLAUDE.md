@@ -29,8 +29,8 @@ Session hardening (external-integration Stage 0: no repository hooks or
 tool identity, the Claude executable's identity) is described in AGENTS.md.
 Integration tasks (external-integration CP2, `packages/supervisor/src/integration/`):
 `integration` work from a 7.3 Core runs on its own carrier, never relayed:
-model-free discovery behind an allowlist, a confirmed official setup from
-the reviewed catalogue only, and one gated ACP session per probe/read/
+model-free discovery behind an allowlist, a confirmed official setup (add, sign-in or
+remove) from the reviewed catalogue only, and one gated ACP session per probe/read/
 verify/write task whose `IntegrationToolGate` admits only the spec's tools
 (a write only with its approved arguments, once per nonce, journaled before
 the answer); the bound source is admitted for that session only through
