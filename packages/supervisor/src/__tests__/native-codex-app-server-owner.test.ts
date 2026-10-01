@@ -1,9 +1,13 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
+import { createHash } from "node:crypto";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { createServer } from "node:net";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import type { PipedChildProcess } from "@konteks/remote-common";
 import type { RunnerConfig } from "@konteks/remote-agent-runner";
-import { NativeCodexAppServerOwner } from "../native/codex-app-server-owner.js";
+import { NativeCodexAppServerOwner, cleanupCodexSocket, prepareCodexSocket, waitForCodexSocket } from "../native/codex-app-server-owner.js";
 
 vi.mock("@konteks/remote-common", async importOriginal => ({
   ...await importOriginal<object>(), isProcessGroupAlive: vi.fn(() => false),
@@ -34,6 +38,29 @@ const config = {
     codexLocalProxy: { version: 1, entrypoint: "konteks/codex-local-proxy.js" },
   },
 } as RunnerConfig;
+
+it.skipIf(process.platform === "win32")("keeps a live deterministic Codex alias and removes only its stale alias after stop", async () => {
+  const root = await mkdtemp("/tmp/konteks-owner-alias-");
+  const socket = join(root, "s");
+  const directory = join(await realpath("/tmp"), `codex-daemon-${process.getuid?.()}`);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const physical = join(directory, createHash("sha256").update(join(await realpath(root), "s")).digest("hex"));
+  const server = createServer(connection => connection.destroy());
+  try {
+    server.listen(physical); await once(server, "listening"); await chmod(physical, 0o600);
+    await symlink(physical, socket);
+    await waitForCodexSocket(socket, child());
+    expect(await prepareCodexSocket(socket)).toBe("adopt");
+    await cleanupCodexSocket(socket);
+    expect((await lstat(socket)).isSymbolicLink()).toBe(true);
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    expect(await prepareCodexSocket(socket, true)).toBe("spawn");
+    await expect(lstat(socket)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function fixture() {
   const children: PipedChildProcess[] = [];

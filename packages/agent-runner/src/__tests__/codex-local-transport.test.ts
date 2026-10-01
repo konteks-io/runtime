@@ -1,4 +1,5 @@
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,16 +14,40 @@ import { findAgentBridge } from "@konteks/remote-release";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const clean of cleanup.splice(0).reverse()) await clean(); });
-async function fixture() {
+async function fixture(alias = false) {
   const root = await mkdtemp(join(tmpdir(), "codex-transport-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
   const socket = join(root, "control:literal.sock");
+  const directory = join(await realpath("/tmp"), `codex-daemon-${process.getuid?.()}`);
+  const physical = alias ? join(directory, createHash("sha256").update(join(await realpath(root), "control:literal.sock")).digest("hex")) : socket;
+  if (alias) await mkdir(directory, { mode: 0o700, recursive: true });
   const server = createServer();
   const ws = new WebSocketServer({ server, perMessageDeflate: false });
-  server.listen(socket); await once(server, "listening"); await chmod(socket, 0o600);
+  server.listen(physical); await once(server, "listening"); await chmod(physical, 0o600);
+  if (alias) await symlink(physical, socket);
   cleanup.push(async () => { for (const client of ws.clients) client.terminate(); ws.close(); await new Promise<void>(resolve => server.close(() => resolve())); });
-  return { root, socket, server, ws };
+  return { root, socket, physical, server, ws };
 }
+it.skipIf(process.platform !== "linux")("connects through Codex 0.159's deterministic private socket alias", async () => {
+  const f = await fixture(true);
+  f.ws.on("connection", socket => socket.on("message", data => socket.send(data.toString())));
+  const stream = await connectCodexLocalTransport(f.socket);
+  stream.on("error", () => undefined);
+  const response = once(stream, "data");
+  stream.write('{"id":1,"method":"initialize"}\n');
+  expect((await response)[0].toString()).toBe('{"id":1,"method":"initialize"}\n');
+  stream.destroy();
+  expect(f.server.listening).toBe(true);
+});
+it.skipIf(process.platform !== "linux")("refuses a Codex alias whose physical socket is accessible to another user", async () => {
+  const f = await fixture(true); await chmod(f.physical, 0o666);
+  await expect(connectCodexLocalTransport(f.socket)).rejects.toThrow(/private same-user/);
+});
+it.skipIf(process.platform === "win32")("refuses an arbitrary symlink even when its destination is a private socket", async () => {
+  const f = await fixture(); const alias = join(f.root, "unexpected.sock");
+  await symlink(f.socket, alias);
+  await expect(connectCodexLocalTransport(alias)).rejects.toThrow(/private same-user/);
+});
 it.skipIf(process.platform === "win32")("frames JSONL over a private Unix socket and leaves the shared server alive", async () => {
   const f = await fixture();
   let extensions: string | undefined;

@@ -3,12 +3,12 @@
 // Codex profile or starts model execution.
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { chmod, lstat, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
-import { connectCodexLocalTransport } from "../packages/agent-runner/dist/bridge/codex-local-transport.js";
+import { connectCodexLocalTransport, inspectCodexLocalSocket } from "../packages/agent-runner/dist/bridge/codex-local-transport.js";
 import { codexLoadedThreadStatuses } from "../packages/agent-runner/src/bridge/codex-thread-inventory.ts";
 
 if (process.argv[2] !== "--isolated-no-turn" || !isAbsolute(process.argv[3] ?? ""))
@@ -85,9 +85,9 @@ try {
   for (let i = 0; i < 100; i++) {
     if (child.exitCode !== null) throw new Error("Isolated app-server exited during startup");
     try {
-      const info = await lstat(socket);
-      if (!info.isSocket() || info.uid !== process.getuid?.()) throw new Error("Unexpected socket owner");
-      await chmod(socket, 0o600);
+      const info = await inspectCodexLocalSocket(socket, { allowSocketPermissions: true });
+      if (!info.socket) throw new Error("Unexpected socket owner");
+      await chmod(info.path, 0o600);
       connection = await connectCodexLocalTransport(socket);
       break;
     } catch { connection?.destroy(); connection = undefined; await delay(100); }

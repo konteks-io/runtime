@@ -17,6 +17,8 @@ import {
   verifyNativeRunnerPackage,
   assertCodexThreadsIdle,
   codexLoadedThreadStatuses,
+  inspectCodexLocalSocket,
+  sameCodexSocket,
   type RunnerConfig,
 } from "@konteks/remote-agent-runner";
 import { resolveNativeCodexSocket } from "./installation.js";
@@ -133,14 +135,14 @@ export class NativeCodexAppServerOwner {
     await this.startPromise;
     if (this.stopping || (!this.child && !this.adoptedHolder)) throw unavailable("The shared Codex owner is unavailable.");
     const socket = this.options.config.RUNNER_NATIVE_CODEX_SOCKET!;
-    const before = await lstat(socket);
+    const before = await inspectCodexLocalSocket(socket);
     const pid = this.child?.pid ?? this.adoptedHolder?.pid;
-    if (!before.isSocket() || !pid) throw unavailable("The shared Codex owner identity is unavailable.");
+    if (!before.socket || !pid) throw unavailable("The shared Codex owner identity is unavailable.");
     const unloaded = !(await codexLoadedThreadStatuses(socket)).has(reference);
-    const after = await lstat(socket);
-    if (before.dev !== after.dev || before.ino !== after.ino || before.birthtimeMs !== after.birthtimeMs ||
+    const after = await inspectCodexLocalSocket(socket);
+    if (!sameCodexSocket(before, after) ||
         pid !== (this.child?.pid ?? this.adoptedHolder?.pid)) throw unavailable("The shared Codex owner changed during legacy admission.");
-    return { unloaded, ownerGeneration: `${pid}:${before.dev}:${before.ino}:${before.birthtimeMs}` };
+    return { unloaded, ownerGeneration: `${pid}:${before.socket.dev}:${before.socket.ino}:${before.socket.birthtimeMs}` };
   }
 
   async stop(): Promise<void> {
@@ -393,9 +395,10 @@ export async function prepareCodexSocket(socketPath: string, allowStaleCleanup =
     throw error;
   });
   if (!existing) return "spawn";
-  if (!existing.isSocket() || !privateOwner(existing)) throw unavailable("The shared Codex socket path is not a private local-user socket.");
+  const identity = await inspectCodexLocalSocket(socketPath, { allowMissingTarget: true }).catch(() => { throw unavailable("The shared Codex socket path is not a private local-user socket."); });
   if (await canConnect(socketPath)) return "adopt";
   if (!allowStaleCleanup) throw unavailable("An explicit Codex socket is stale; refusing to remove an unproven holder's socket.");
+  if (!sameCodexSocket(identity, await inspectCodexLocalSocket(socketPath, { allowMissingTarget: true }))) throw unavailable("The shared Codex socket changed during cleanup.");
   await unlink(socketPath);
   return "spawn";
 }
@@ -404,11 +407,12 @@ export async function waitForCodexSocket(socketPath: string, child: PipedChildPr
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null) throw unavailable("The signed Codex app-server exited before its socket became ready.");
-    const info = await lstat(socketPath).catch(() => null);
-    if (info?.isSocket() && info.uid === process.getuid?.() && await canConnect(socketPath)) {
-      await chmod(socketPath, 0o600);
-      const secured = await lstat(socketPath);
-      if (secured.isSocket() && privateOwner(secured)) return;
+    const info = await inspectCodexLocalSocket(socketPath, { allowSocketPermissions: true }).catch(() => null);
+    if (info?.socket && await canConnect(info.path)) {
+      await chmod(info.path, 0o600);
+      const secured = await inspectCodexLocalSocket(socketPath);
+      if (secured.socket && secured.socket.dev === info.socket.dev && secured.socket.ino === info.socket.ino &&
+          secured.entry.dev === info.entry.dev && secured.entry.ino === info.entry.ino) return;
       throw unavailable("The shared Codex socket could not be secured.");
     }
     await pause(100);
@@ -417,18 +421,17 @@ export async function waitForCodexSocket(socketPath: string, child: PipedChildPr
 }
 
 export async function cleanupCodexSocket(socketPath: string): Promise<void> {
-  const info = await lstat(socketPath).catch(() => null);
-  if (!info?.isSocket() || !privateOwner(info)) return;
+  const info = await inspectCodexLocalSocket(socketPath, { allowMissingTarget: true }).catch(() => null);
+  if (!info) return;
   // Never unlink a same-user server that won a race after our process stopped.
-  if (!await canConnect(socketPath)) await unlink(socketPath).catch(() => undefined);
+  if (!await canConnect(socketPath)) {
+    const after = await inspectCodexLocalSocket(socketPath, { allowMissingTarget: true }).catch(() => null);
+    if (after && sameCodexSocket(info, after)) await unlink(socketPath).catch(() => undefined);
+  }
 }
 
 function validatePath(path: string): void {
   if (process.platform === "win32" || !isAbsolute(path) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(path)) throw unavailable("The shared Codex socket path is invalid.");
-}
-
-function privateOwner(info: { mode: number; uid: number }): boolean {
-  return info.uid === process.getuid?.() && (info.mode & 0o077) === 0;
 }
 
 function canConnect(path: string): Promise<boolean> {

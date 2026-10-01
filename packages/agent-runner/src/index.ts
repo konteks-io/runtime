@@ -15,6 +15,7 @@ export * from "./host/antigravity.js";
 export * from "./host/antigravity-relay.js";
 export * from "./bridge/browser.js";
 export * from "./bridge/codex-thread-inventory.js";
+export { inspectCodexLocalSocket, sameCodexSocket } from "./bridge/codex-local-transport.js";
 export * from "./sessions/manager.js";
 export * from "./auth/scope-store.js";
 export * from "./auth/identity.js";

@@ -6,7 +6,7 @@ import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { connectCodexLocalTransport } from '../packages/agent-runner/dist/bridge/codex-local-transport.js';
+import { connectCodexLocalTransport, inspectCodexLocalSocket } from '../packages/agent-runner/dist/bridge/codex-local-transport.js';
 import { spawnBridge } from '../packages/agent-runner/dist/bridge/process.js';
 import { resolveBridgeSpawnSpec, resolveToolingCommand, resolveBridgeFamily } from '../packages/agent-runner/dist/bridge/spec.js';
 import { RunnerConfigSchema } from '../packages/agent-runner/dist/config.js';
@@ -97,7 +97,7 @@ try {
   server.stdout.resume();
   for (let i = 0; i < 100; i++) {
     if (server.exitCode !== null) throw new Error('Diagnostic app-server exited');
-    if (await lstat(socket).then(s => s.isSocket()).catch(() => false)) break;
+    if (await inspectCodexLocalSocket(socket).then(s => Boolean(s.socket)).catch(() => false)) break;
     await delay(100);
   }
   const a = runner ? null : await client('konteks_shared_owner_probe');
