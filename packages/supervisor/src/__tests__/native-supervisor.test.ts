@@ -488,6 +488,18 @@ describe("native Supervisor composition", () => {
     expect(doctor.checks.find(check => check.id === "preview")).toMatchObject({ status: "warn" });
   });
 
+  it("composes the integration carrier: advertises integration-task-v1 and asks for integration work only from a 7.3 Core (CP2)", async () => {
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    expect((await supervisor.inventory.collect()).components[0]?.capabilities).toContain("integration-task-v1");
+    const internal = supervisor as unknown as { coreContractVersion: string | undefined; work: { deps: { acceptedKinds: () => string[] } } };
+    expect(internal.work.deps.acceptedKinds()).not.toContain("integration");
+    internal.coreContractVersion = "7.3";
+    expect(internal.work.deps.acceptedKinds()).toEqual(expect.arrayContaining(["direct", "integration"]));
+  });
+
   it("offers the connector's QA browser to its agents and advertises browser_tool while previews can run (O8)", async () => {
     const f = await fixture();
     const browser = { version: "0.0.82", packageAgent: "claude-code" as const, nodeSource: "person" as const, node: "/usr/local/bin/node", launcher: "/pkg/konteks/browser-mcp.js", entrypoint: "/pkg/node_modules/@playwright/mcp/cli.js" };

@@ -58,7 +58,8 @@ import { createRemoteResolver, type ManagedGitBinding } from "./onboard/remotes.
 import { OnboardWorkCarrier, type OnboardWorkAssignment } from "./onboard/carrier.js";
 import type { PlatformMcpEntry } from "./work/workload.js";
 import { acceptedWorkKinds } from "./work/accepted-kinds.js";
-import type { IntegrationWorkCarrier } from "./integration/carrier.js";
+import { integrationTaskCapabilities, type IntegrationWorkCarrier } from "./integration/carrier.js";
+import { composeIntegrationCarrier } from "./integration/compose.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
 import { PreviewWorktreePermits } from "./preview/worktree-permits.js";
@@ -427,6 +428,17 @@ export class Supervisor {
       this.nativeRunners.push(runner);
       this.runners.set(runner.agentId, runner);
     }
+    // external-integration CP2: integration tasks (discovery, setup, gated
+    // read/write/verify sessions) on this computer's Claude Code and Codex.
+    this.integrationCarrier = composeIntegrationCarrier({
+      configs: this.options.native!.runners,
+      runners: () => this.runners,
+      fetchWorkload: assignment => this.core.fetchWorkload(this.instanceId ?? "", assignment.id),
+      instanceId: () => this.instanceId ?? "",
+      journal: this.journal,
+      onUsage: observation => this.sendUsageObservation(observation),
+      logger: this.logger,
+    });
     // Supported agents the installation does not list: detected now, in the
     // background, so the first heartbeat can already say where they stand.
     const recorded = this.recordedAgentIds();
@@ -448,7 +460,8 @@ export class Supervisor {
       // A site-started login needs a native install with a Codex runner (WS1-115).
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
-      additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : [])],
+      additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : []),
+        ...(this.integrationCarrier ? integrationTaskCapabilities(this.runners.keys()) : [])],
       decorateAgents: agents => this.withAntigravityDownload(agents),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
@@ -839,6 +852,7 @@ export class Supervisor {
       maxPullItems: this.config.SUPERVISOR_PULL_MAX_ITEMS,
       searchController: new DurableSearchAssignmentCarrier(this.journal, this.clock),
       onboardCarrier: this.onboardCarrier(),
+      ...(this.integrationCarrier ? { integrationCarrier: this.integrationCarrier } : {}),
       runners: this.runners,
       inspectLegacyCodexThread: reference => this.nativeCodexOwner?.inspectLegacyThread(reference) ?? Promise.reject(new RemoteInstanceError("agent_unavailable", "The shared Codex owner is unavailable.")),
       sessionDeps: (assignment, runner) => ({
