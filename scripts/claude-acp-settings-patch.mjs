@@ -6,7 +6,8 @@ import { createHash } from "node:crypto";
 // `strictMcpConfig` (only the servers in the ACP request load, which also
 // leaves the account's claude.ai connectors out) and hardened flag settings
 // (`disableAllHooks`; the SDK's callback hooks, the bridge's own, still run)
-// on new, loaded and resumed sessions alike. Measured against the operator's
+// on new, loaded and resumed sessions alike; and every permission request
+// names its tool in `_meta.claudeCode.toolName` (S0-4). Measured against the operator's
 // Claude CLI: external-integration-via-agent proof/cp2-runtime/stage-0.
 export const claudeAcpSettingsPatch = {
   id: "konteks-claude-project-settings-v3",
@@ -32,6 +33,10 @@ export function patchClaudeSettings(source, file, version) {
     replace('settingSources: ["user", "project", "local"],', 'settingSources: ["project"],');
     // Apply after the optional client options too, including session/load and
     // resume. SettingsManager and query must see the same effective scope.
+    // S0-4: name the tool in a structured field on every permission request
+    // (the request carried it only in its display title). The connector's
+    // policy reads `_meta.claudeCode.toolName`, never the title.
+    replace('    async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {\n', '    async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {\n        params = { ...params, toolCall: { ...params.toolCall, _meta: { ...params.toolCall._meta, claudeCode: { ...params.toolCall._meta?.claudeCode, toolName } } } };\n');
     replace('            ...userProvidedOptions,\n', '            ...userProvidedOptions,\n            settingSources: ["project"],\n            strictMcpConfig: true,\n');
 
   } else {

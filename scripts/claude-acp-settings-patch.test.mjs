@@ -27,5 +27,8 @@ test("reviewed bridge uses project settings in both SDK resolution and query", {
   // load; the repository's .mcp.json is ignored. Flag settings switch the
   // repository's hooks off on new, loaded and resumed sessions alike.
   assert.match(agent, /settings = hardenClaudeSession\(await isolateClaudeInstructions\(settings, params.cwd, CLAUDE_CONFIG_DIR\)\)/);
+  // S0-4: every permission request names its tool in a structured field the
+  // connector reads (never the display title), set where the bridge asks.
+  assert.match(agent, /async requestPermissionFromClient\(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId\) \{\n        params = \{ \.\.\.params, toolCall: \{ \.\.\.params\.toolCall, _meta: \{ \.\.\.params\.toolCall\._meta, claudeCode: \{ \.\.\.params\.toolCall\._meta\?\.claudeCode, toolName \} \} \} \};/);
   assert.match(agent, /\[konteks\] instruction_scope version=3 .* hooks=disabled repository_mcp=excluded account_connectors=excluded/);
 });

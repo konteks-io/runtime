@@ -127,6 +127,17 @@ registers keep running) on new, loaded and resumed sessions. The project's
 CLAUDE.md is still read (`claude-instruction-scope.integration.test.mjs`,
 hardened case). The bridge's marker is `instruction_scope version=3 …
 hooks=disabled repository_mcp=excluded account_connectors=excluded`.
+Permission decisions read the tool from structured fields only (S0-4,
+`session/permission-tool-identity.ts`): Claude's bridge now sets
+`toolCall._meta.claudeCode.toolName` on every request (same patch), and a
+Codex MCP approval (`_meta.is_mcp_tool_approval`, no tool in the request) is
+matched by tool call id to the `tool_call` codex-acp announced for the item
+(`_meta.is_mcp_tool_call`, `rawInput: { server, tool }`; `McpToolCallLedger`
+in the relayed session). The browser allow keys on server
+`konteks-browser` plus the session's browser; a title that looks like a
+browser tool can only refuse (Claude's Bash title is the model-written
+description), an MCP call with no readable server/tool is refused, and every
+policy allow is `allow_once` (no fallback to `allow_always`).
 
 Supported agents are Claude Code (`claude-code`), Codex (`codex`) and the
 person's own DeepSeek Harness (`dsh`) and OpenCode 2 (`opencode`, offered

@@ -46,6 +46,7 @@ import {
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
 import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
+import { McpToolCallLedger } from "./permission-tool-identity.js";
 import { antigravityKonteksToolsLine, antigravityResultToolReference } from "./antigravity-prompt.js";
 import { openCodeKonteksToolsLine, openCodeResultToolReference } from "./opencode-prompt.js";
 import { compileResultSchema as compileTurnValidator, StructuredResultToolServer, toolInputSchema } from "../structured-result/result-tool-server.js";
@@ -198,6 +199,8 @@ export class RelayedSession {
   private readonly toolGovernance: HostToolGovernance | null;
   /** The MCP servers this session gave its agent (the only Code Mode namespaces an OpenCode block may call, the only servers Antigravity may reach). */
   private sessionServers: ReadonlySet<string> = new Set();
+  /** Codex's announced MCP calls: its approvals name only the tool call id (S0-4). */
+  private readonly mcpCalls: McpToolCallLedger | null;
   /** A governed permission request's tool call and options, until Konteks answers it. */
   private readonly governedPermissions = new Map<string, { toolCallId: string; options: RequestPermissionRequest["options"] }>();
   /** An OpenCode or Antigravity session is told once how Konteks runs its tools (in its first prompt). */
@@ -224,6 +227,7 @@ export class RelayedSession {
 
   constructor(readonly assignment: RemoteWorkAssignment, private readonly deps: RelayedSessionDeps) {
     this.toolGovernance = hostToolGovernance(assignment.agentRoute.agentId);
+    this.mcpCalls = assignment.agentRoute.agentId === "codex" ? new McpToolCallLedger() : null;
     // Bound only after input preparation proves Core's claim-bound session.
     this.boundChannelId = null;
     this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
@@ -950,6 +954,7 @@ export class RelayedSession {
         // A working agent keeps its preview from stopping as idle.
         if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
         this.observeStructuredText((event.params as { update?: unknown } | null)?.update);
+        this.mcpCalls?.observe((event.params as { update?: unknown } | null)?.update);
         const bypass = this.toolGovernance?.observe((event.params as { update?: unknown } | null)?.update, this.sessionCwd()) ?? null;
         await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
         if (bypass) await this.onToolGovernanceBypass(bypass);
@@ -1190,7 +1195,7 @@ export class RelayedSession {
       params = verdict.request;
     }
     const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
-      browserTools: this.browserGateway !== null });
+      browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}) });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
     if (decision.kind === "allow") return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
