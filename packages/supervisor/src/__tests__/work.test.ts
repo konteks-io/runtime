@@ -925,13 +925,14 @@ describe("work orchestrator claim validation", () => {
     expect(journal.assignments.get("asg-1:1")?.state).toBe("claimed");
   });
 
-  async function nativeSessions(register: (target: RemoteWorkAssignment) => Promise<void>, recoveryAuthority = () => "accepted-A", inspectLegacyCodexThread?: (reference: string) => Promise<{ unloaded: boolean; ownerGeneration: string }>) {
+  async function nativeSessions(register: (target: RemoteWorkAssignment) => Promise<void>, recoveryAuthority = () => "accepted-A", inspectLegacyCodexThread?: (reference: string) => Promise<{ unloaded: boolean; ownerGeneration: string }>, logger?: Logger) {
     const runner = {
       createSession: vi.fn(async (input: { context: { assignmentId: string }; acpSessionRef?: string; restoreAcpSessionRef?: string }, lifecycle?: RunnerSessionLifecycle) => { const ref = input.acpSessionRef ?? `acp:${input.context.assignmentId}`; await lifecycle?.beforeCreate(ref); lifecycle?.assertCurrent(); return { acpSessionRef: ref, resumed: input.acpSessionRef !== undefined || input.restoreAcpSessionRef !== undefined, capabilities: { forkSession: false, sessionResume: true } }; }),
       prompt: vi.fn(async () => undefined), cancel: vi.fn(async () => undefined), closeSession: vi.fn(async () => undefined),
     } as unknown as RunnerPort;
     const f = await orchestrator({ recoveryAuthority, components: {}, runners: new Map([["codex", runner]]),
       ...(inspectLegacyCodexThread ? { inspectLegacyCodexThread } : {}),
+      ...(logger ? { logger } : {}),
       advertisedRoles: () => ["generator", "assistant"],
       roleBindings: () => [{ role: "generator", agentPreference: ["codex"] }, { role: "assistant", agentPreference: ["codex"] }],
       sessionDeps: (target, selected) => ({ clock, journal: f.journal, transport: f.transport, runner: selected, policy: new EvaluatorPolicyResponder(null, () => true), broker: new PermissionBroker({ clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }), instanceId: "inst-1", redeemCapabilityToken: async () => ({ mcpServer: { name: "konteks", url: "https://mcp.example", headers: [{ name: "authorization", value: "Bearer fixture" }] }, expiresAt: "2026-09-07T00:00:00Z" }), workspaceRoot: "/native",         prepareInputs: async () => ({ binding: { workspaceId: target.workspaceId, assignmentId: target.id, attempt: target.attempt, instanceId: target.instanceId, sessionId: "cloud-session" }, cwd: "/native/checkout", skillInstructions: "", beforePrompt: async () => undefined }),
@@ -1065,6 +1066,86 @@ describe("work orchestrator claim validation", () => {
     await (await f.claim("legacy-cold", { kind: "assistant_execution", source: { ...source, turnRef: "cold-retry" }, agentRoute }))();
     expect(inspect).toHaveBeenCalledTimes(2);
     expect(f.runner.createSession).toHaveBeenCalledWith(expect.objectContaining({ restoreAcpSessionRef: "legacy-ref" }), expect.anything());
+  });
+
+  it("logs a static refusal reason when a legacy Codex thread is still loaded", async () => {
+    const info = vi.fn();
+    const warn = vi.fn();
+    const logger = { info, warn, error: vi.fn(), debug: vi.fn() } as unknown as Logger;
+    const inspect = vi.fn(async () => ({ unloaded: false, ownerGeneration: "owner-A" }));
+    const f = await nativeSessions(async () => undefined, () => "accepted-A", inspect, logger);
+    const source = { kind: "conversation", portability: "portable_before_claim", sessionId: "cloud-session", turnRef: "legacy-turn", acpSessionRef: "legacy-ref" } as const;
+    const agentRoute = { requiredRole: "assistant", agentId: "codex", mcpCapabilityTokenRef: "legacy-capability" } as const;
+
+    await (await f.claim("legacy-loaded", { kind: "assistant_execution", source, agentRoute }))();
+
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: "native.legacy_mcp_resume.inspected",
+      assignmentId: "legacy-loaded",
+      attempt: 1,
+      sessionId: "cloud-session",
+      stage: "legacy_mcp_resume",
+      outcome: "refused",
+      reason: "thread_loaded",
+    }), expect.any(String));
+    expect(info).not.toHaveBeenCalledWith(expect.objectContaining({ event: "native.legacy_mcp_resume.inspected" }), expect.anything());
+    expect(f.runner.createSession).not.toHaveBeenCalled();
+    expect(f.sent).not.toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "session_ready" }) }));
+    await f.prompt("legacy-loaded");
+    expect(f.runner.prompt).not.toHaveBeenCalled();
+  });
+
+  it("logs only static reasons for legacy Codex resume inspection and admission outcomes", async () => {
+    const canary = "legacy-inspection-secret-canary";
+    const scenarios: Array<{
+      reason: string;
+      outcome: "refused" | "admitted";
+      inspect?: (reference: string) => Promise<{ unloaded: boolean; ownerGeneration: string }>;
+      beforeClaim?: (f: Awaited<ReturnType<typeof nativeSessions>>) => Promise<void> | void;
+    }> = [
+      { reason: "inspection_unavailable", outcome: "refused" },
+      { reason: "inspection_failed", outcome: "refused", inspect: async () => { throw new Error(canary); } },
+      { reason: "owner_generation_unverified", outcome: "refused", inspect: async () => ({ unloaded: true, ownerGeneration: "" }) },
+      { reason: "generation_consumed", outcome: "refused", inspect: async () => ({ unloaded: true, ownerGeneration: "owner-A" }),
+        beforeClaim: f => { (f.work as unknown as { legacyCodexConsumed: Set<string> }).legacyCodexConsumed.add("owner-A:legacy-ref"); } },
+      { reason: "claim_conflict", outcome: "refused", inspect: vi.fn(async () => ({ unloaded: true, ownerGeneration: "owner-A" })),
+        beforeClaim: f => { (f.work as unknown as { legacyCodexClaims: Map<string, string> }).legacyCodexClaims.set("legacy-ref", "other:1"); } },
+      { reason: "admission_failed", outcome: "refused", inspect: async () => ({ unloaded: true, ownerGeneration: "owner-A" }),
+        beforeClaim: f => { vi.spyOn(f.journal.execution, "bindLegacyCodexAdmission").mockRejectedValue(new Error("binding failed")); } },
+      { reason: "unloaded_verified", outcome: "admitted", inspect: async () => ({ unloaded: true, ownerGeneration: "owner-A" }) },
+    ];
+    const source = { kind: "conversation", portability: "portable_before_claim", sessionId: "cloud-session", turnRef: "legacy-turn", acpSessionRef: "legacy-ref" } as const;
+    const agentRoute = { requiredRole: "assistant", agentId: "codex", mcpCapabilityTokenRef: "legacy-capability" } as const;
+
+    for (const scenario of scenarios) {
+      const info = vi.fn();
+      const warn = vi.fn();
+      const logger = { info, warn, error: vi.fn(), debug: vi.fn() } as unknown as Logger;
+      const f = await nativeSessions(async () => undefined, () => "accepted-A", scenario.inspect, logger);
+      await scenario.beforeClaim?.(f);
+      await (await f.claim(`legacy-${scenario.reason}`, { kind: "assistant_execution", source, agentRoute }))();
+
+      const log = scenario.outcome === "admitted" ? info : warn;
+      expect(log).toHaveBeenCalledWith(expect.objectContaining({
+        event: "native.legacy_mcp_resume.inspected",
+        assignmentId: `legacy-${scenario.reason}`,
+        attempt: 1,
+        sessionId: "cloud-session",
+        stage: "legacy_mcp_resume",
+        outcome: scenario.outcome,
+        reason: scenario.reason,
+      }), expect.any(String));
+      expect(JSON.stringify({ info: info.mock.calls, warn: warn.mock.calls })).not.toContain(canary);
+      if (scenario.outcome === "refused") {
+        expect(f.runner.createSession).not.toHaveBeenCalled();
+        expect(f.sent).not.toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "session_ready" }) }));
+        await f.prompt(`legacy-${scenario.reason}`);
+        expect(f.runner.prompt).not.toHaveBeenCalled();
+      } else {
+        expect(f.runner.createSession).toHaveBeenCalledOnce();
+        expect(f.sent).toContainEqual(expect.objectContaining({ body: expect.objectContaining({ kind: "session_ready" }) }));
+      }
+    }
   });
 
   it.each(["readiness_cancel", "readiness_close", "disposal_cancel", "disposal_close"])("authority movement during %s cleanup retains final ownership", async phase => {

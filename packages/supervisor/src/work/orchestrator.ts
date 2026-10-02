@@ -720,19 +720,58 @@ export class WorkOrchestrator {
       ...(mcpLocalTransport ? { mcpLocalTransport } : {}),
       ...(mcpLocalTransport && retainedReference ? { mcpLocalTransportReference: retainedReference } : {}),
       assertLegacyCodexThreadUnloaded: async legacyReference => {
+        const logResume = (outcome: "admitted" | "refused", reason: "claim_conflict" | "inspection_unavailable" | "thread_loaded" | "owner_generation_unverified" | "generation_consumed" | "inspection_failed" | "admission_failed" | "unloaded_verified") => {
+          const details = {
+            event: "native.legacy_mcp_resume.inspected",
+            assignmentId: assignment.id,
+            attempt: assignment.attempt,
+            ...(logicalSessionId ? { sessionId: logicalSessionId } : {}),
+            stage: "legacy_mcp_resume",
+            outcome,
+            reason,
+          };
+          try {
+            if (outcome === "admitted") this.logger.info(details, "native legacy Codex MCP resume inspected");
+            else this.logger.warn(details, "native legacy Codex MCP resume inspected");
+          }
+          catch { /* Diagnostics never change admission. */ }
+        };
         const claimant = this.legacyCodexClaims.get(legacyReference);
-        if (claimant && claimant !== key) return false;
+        if (claimant && claimant !== key) {
+          logResume("refused", "claim_conflict");
+          return false;
+        }
         this.legacyCodexClaims.set(legacyReference, key);
+        let stage: "inspection" | "admission" = "inspection";
         try {
           const inspection = await this.deps.inspectLegacyCodexThread?.(legacyReference);
-          if (!inspection?.unloaded || !inspection.ownerGeneration) return false;
+          if (!inspection) {
+            logResume("refused", "inspection_unavailable");
+            return false;
+          }
+          if (!inspection.unloaded) {
+            logResume("refused", "thread_loaded");
+            return false;
+          }
+          if (!inspection.ownerGeneration) {
+            logResume("refused", "owner_generation_unverified");
+            return false;
+          }
+          stage = "admission";
           const scopedReference = `${inspection.ownerGeneration}:${legacyReference}`;
-          if (this.legacyCodexConsumed.has(scopedReference) || this.deps.journal.execution.legacyCodexLoadPreviouslyAdmitted(legacyReference, inspection.ownerGeneration, admission!.executionGeneration)) return false;
+          if (this.legacyCodexConsumed.has(scopedReference) || this.deps.journal.execution.legacyCodexLoadPreviouslyAdmitted(legacyReference, inspection.ownerGeneration, admission!.executionGeneration)) {
+            logResume("refused", "generation_consumed");
+            return false;
+          }
           await this.deps.journal.execution.bindLegacyCodexAdmission(admission!, legacyReference, inspection.ownerGeneration, assertExecutionOwned);
           this.legacyCodexConsumed.add(scopedReference);
+          logResume("admitted", "unloaded_verified");
           return true;
         }
-        catch { return false; }
+        catch {
+          logResume("refused", stage === "inspection" ? "inspection_failed" : "admission_failed");
+          return false;
+        }
       },
       assertExecutionOwned,
       assertRecoveryOwned,
