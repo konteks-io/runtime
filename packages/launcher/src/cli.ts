@@ -15,6 +15,22 @@ process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
 export const LAUNCHER_VERSION = process.env.KONTEKS_LAUNCHER_VERSION ?? "0.1.0";
 
 async function main(): Promise<void> {
+  // The Windows command the MSI installed runs the installed release's own
+  // code (D131): Program Files cannot be refreshed by the connector, so its
+  // copy would otherwise run the first MSI's code forever.
+  if (process.platform === "win32") {
+    const [{ delegateToInstalledRelease }, { nativePaths }] = await Promise.all([import("./native/launcher-delegate.js"), import("./native/service.js")]);
+    const code = await delegateToInstalledRelease({
+      platform: process.platform, execPath: process.execPath, args: process.argv.slice(2), env: process.env, launcherVersion: LAUNCHER_VERSION,
+      defaultRoot: () => nativePaths({ os: "windows" }).root,
+      // The values build-launcher.mjs's entry filled in rather than found set.
+      baked: (globalThis as { __konteksLauncherBakedEnv?: string[] }).__konteksLauncherBakedEnv ?? [],
+    }).catch(() => null);
+    if (code !== null) {
+      process.exitCode = code;
+      return;
+    }
+  }
   // Keep these imports after the warning filter above without introducing
   // top-level await. The release launcher is bundled as CommonJS because
   // Node's single-executable application entry point is a CommonJS script.

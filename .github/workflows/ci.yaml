@@ -69,7 +69,7 @@ jobs:
       - name: Build workspace packages
         run: npm run build
       - name: Verify Windows service and process ownership
-        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-update.test.ts
+        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts
       - name: Verify signed Windows local release
         run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/e2e-smoke-release.test.ts -t "adds a real Windows connector and Codex package to the signed local release"
       - name: Verify organization Skill staging on Windows
