@@ -1200,17 +1200,26 @@ export class RelayedSession {
       params = verdict.request;
     }
     const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
-      browserTools: this.browserGateway !== null });
+      cwd: this.sessionCwd(), browserTools: this.browserGateway !== null });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
     if (decision.kind === "allow") return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
-    // A refused tool ends the agent's turn on Claude Code; the log named
-    // nothing about it, so a turn that stopped at a build command read as a
-    // hung agent. Bounded, sanitized title only.
+    // A refused tool ends the agent's turn on Claude Code and Codex; the log
+    // named nothing about it, so a turn that stopped at a build command read
+    // as a hung agent, and a refused "Edit files" call (T1, 2026-10-02) never
+    // said which path was wrong. Bounded, sanitized title, and the refusal's
+    // reason with each refused path workspace-relative (never a host path).
     this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId,
       title: sanitizePermissionRequest(params).params.title, decision: decision.kind,
+      ...(decision.kind === "deny" && decision.refusal ? { refusal: decision.refusal } : {}),
       humanDeferralAllowed: this.assignment.policy.humanDeferralAllowed }, "tool permission not allowed by policy");
     if (decision.kind === "deny") {
+      // The refused call carries the note before it is answered, so it reaches
+      // Konteks inside this turn: the person sees why, and Harness repeats it to
+      // the agent when it continues the stopped turn (D114).
+      if (decision.message && decision.refusal?.reason === "outside_workspace") {
+        await this.noteRefusedToolCall(ref, params.toolCall.toolCallId, decision.message);
+      }
       return void (await this.answerPermission(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
     }
     if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
@@ -1218,6 +1227,15 @@ export class RelayedSession {
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: params.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
+  }
+
+  /** Put the policy's note on a refused tool call (an ACP `tool_call_update` carrying only content). */
+  private async noteRefusedToolCall(ref: string, toolCallId: string, message: string): Promise<void> {
+    // Like every update, it is redacted on the way out: the working copy's
+    // path reads `[workspace]`.
+    await this.sendToCore({ kind: "acp", method: "session/update", params: { sessionId: ref, update: {
+      sessionUpdate: "tool_call_update", toolCallId, content: [{ type: "content", content: { type: "text", text: message } }],
+    } } as never });
   }
 
   /** Answer a permission request, telling a host agent's governance what was decided (Antigravity pairs its own reports with it). */
