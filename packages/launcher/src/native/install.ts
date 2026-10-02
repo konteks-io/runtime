@@ -3,7 +3,7 @@ import { createServer } from "node:net";
 import { chmod, lstat, mkdir, readFile, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
-import { CONTROL_SOCKET_DEFAULT_PORT, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
+import { CONTROL_SOCKET_DEFAULT_PORT, findGitForWindows, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, deleteNativeAntigravity, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, signOutNativeAntigravity, type HostAgentInstallAdapter, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
@@ -723,10 +723,14 @@ async function fetchNativeManifest(fetchFn: typeof fetch): Promise<unknown> {
   try { return await fetchNativeReleaseManifest(fetchFn); } catch { throw invalid(); }
 }
 async function discoverGit(): Promise<NativeRuntimeRecord["git"] | null> {
-  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
-    if (!directory || !parse(directory).root) continue;
+  const candidates = (process.env.PATH ?? "").split(delimiter).filter(directory => directory && parse(directory).root)
+    .map(directory => join(directory, process.platform === "win32" ? "git.exe" : "git"));
+  // Git for Windows installed during this install (winget, D116) is not on this process's PATH yet.
+  const windowsGit = process.platform === "win32" ? findGitForWindows(process.env)?.git : undefined;
+  if (windowsGit) candidates.push(windowsGit);
+  for (const candidate of candidates) {
     try {
-      const executable = await realpath(join(directory, process.platform === "win32" ? "git.exe" : "git"));
+      const executable = await realpath(candidate);
       const info = await lstat(executable);
       if (!info.isFile() || info.size > 64 * 1024 * 1024) continue;
       return await verifyNativeGitTool({ executable, digest: `sha256:${createHash("sha256").update(await readFile(executable)).digest("hex")}` });

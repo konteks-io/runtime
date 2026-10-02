@@ -72,7 +72,9 @@ agents it finds on the computer and connects even with none. Before asking
 for the code it offers, once each and only in a terminal: Claude Code through
 Anthropic's official installer (`https://claude.ai/install.ps1` on Windows,
 `https://claude.ai/install.sh` elsewhere), and Codex, which ships with the
-connector (nothing is downloaded). It then starts each one's own sign-in and
+connector (nothing is downloaded). On Windows, Claude Code needs Git for
+Windows; when it is missing it asks once to install it with winget
+(`Git.Git`), or names https://git-scm.com/download/win. It then starts each one's own sign-in and
 ends by saying which agents are ready, with the one command for the rest
 (`konteks-remote agent add claude-code|codex` offers the same later). Without a
 terminal nothing is downloaded. `--agents` names exactly the agents to use,
