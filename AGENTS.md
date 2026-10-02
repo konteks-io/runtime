@@ -280,6 +280,21 @@ disk, no pin for this computer). The relay honours `HTTPS_PROXY`/`ALL_PROXY`
 and `NO_PROXY` for Google (`openHttpsProxyTunnel`, remote-common
 `https-proxy.ts`, shared with the download).
 
+Activation install without `--agents` (D116, `native/install.ts`
+`findOrOfferAgents`, launcher `native/agent-setup.ts`): agents are detected
+like enrollment (`detectNativeAgents`) and none is required; a missing Claude
+Code or Codex is offered before the code prompt (`setupAgent`), Claude Code
+only through `claudeCodeInstaller` (Anthropic's `install.ps1`/`install.sh`,
+run in the person's terminal), Codex by creating its profile folder for the
+shipped CLI; no TTY or `--json` never asks or downloads. After `start`,
+`closeAgentSetup` runs `auth login` for what was set up, offers it once for a
+found agent without a sign-in, and prints which agents are ready and one
+command for each other. `agent add claude-code|codex` does the same through
+`ensurePersonalAgent` before stopping anything, and adds from the installed
+release itself when it is the same digest (no newer release needed). An
+explicit `--agents` list stays strict. A record with no agents loads and
+starts (`verifyInstalledNativeBridges` accepts an empty runner list).
+
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never
 get a branch of their own in generic code. Each has a runner-side
