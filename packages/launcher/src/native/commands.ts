@@ -18,7 +18,7 @@ import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from
 import { nativePlatform, nativeServiceDefinition, parseLoadedService, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { checkNativeUpdate } from "./update.js";
 import { prepareDeliveryGraft } from "./graft.js";
-import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
+import { earlierFailure, earlierFailureNote, keepLauncherCurrent, productionUpdateDeps, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 
@@ -144,14 +144,20 @@ export async function keepServiceOnOwnDefinition(root: string, deps: OwnServiceD
  * the one the service manager runs; nothing where it names none.
  */
 async function forceStopService(definition: NativeServiceDefinition): Promise<void> {
-  if (!definition.inspect || !definition.expected) return;
+  const pid = await servicePid(definition);
+  if (!pid) return;
+  try { process.kill(-pid, "SIGKILL"); }
+  catch {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+}
+
+/** The pid the service manager runs for this service; null where it names none. */
+async function servicePid(definition: NativeServiceDefinition): Promise<number | null> {
+  if (!definition.inspect || !definition.expected) return null;
   const result = await runCommand({ ...definition.inspect, env: environment(), timeoutMs: 10_000 }).catch(() => null);
   const loaded = result?.code === 0 ? parseLoadedService(nativePlatform().os, result.stdout, definition.expected) : null;
-  if (!loaded?.pid) return;
-  try { process.kill(-loaded.pid, "SIGKILL"); }
-  catch {
-    try { process.kill(loaded.pid, "SIGKILL"); } catch { /* already gone */ }
-  }
+  return loaded?.pid ?? null;
 }
 
 async function detachServiceCommand(command: NativeServiceCommand, logFile: string): Promise<void> {
@@ -726,6 +732,11 @@ export const nativeCliActions: NativeCliActions = {
       prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(input.root, cwd, agentId),
       exitProcess: code => process.exit(code) });
     await service.start();
+    // Whichever launcher drove the update, the person's konteks-remote runs this release's code from now on (D113b).
+    void keepLauncherCurrent(input.root, { execPath: process.execPath, readRecord: readNativeRecord, readLedger: readNativeUpdateLedger,
+      refresh: refreshInstalledLauncher, sleep: ms => new Promise(resolve => setTimeout(resolve, ms).unref()), now: Date.now })
+      .then(result => { if (result === "refreshed") process.stderr.write("konteks-remote now runs this release\n"); })
+      .catch(error => process.stderr.write(`konteks-remote could not be refreshed to this release: ${error instanceof Error ? error.message : String(error)}\n`));
     await service.waitUntilStopped();
   },
   start: startNativeConnector,
@@ -774,7 +785,7 @@ export const nativeCliActions: NativeCliActions = {
       const selfUpdated = check?.status === "current" ? selfUpdateNote(attempts, check.bundleVersion) : null;
       if (selfUpdated) input.output.line(selfUpdated);
     }
-    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits, forceStop: forceStopService }));
+    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits, forceStop: forceStopService, servicePid }));
   },
   uninstall: async input => {
     const result = await uninstallNative(input, productionUninstallDeps({ root: input.root, serviceDefinition, execute }));

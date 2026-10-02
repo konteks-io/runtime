@@ -105,6 +105,9 @@ const LAUNCHD_RELOAD_SCRIPT = [
   "say 30 \"launch agent reloaded\"",
 ].join("\n");
 
+/** Seconds launchd waits after SIGTERM before SIGKILL; above the connector's 15 s shutdown watchdog. */
+export const LAUNCHD_EXIT_TIMEOUT_SECONDS = 30;
+
 /**
  * Register and start the service from its definition unless it is already
  * running. The definition is rewritten and re-registered every time (the
@@ -147,9 +150,13 @@ export function nativeServiceDefinition(input: {
     // home (a second person on this Mac, a stand-in laptop) read the wrong
     // agents' sign-ins and installs (09-30).
     const logFile = path.join(normalizedRoot, "logs", CONNECTOR_LOG_FILE);
+    // launchd SIGKILLs a booted-out job 5 s after SIGTERM by default (measured
+    // 2026-10-02, D113b): an idle connector was still stopping its agents, so
+    // it never wrote its shutdown receipt and its Codex app-server was left
+    // behind. 30 s covers the connector's own 15 s shutdown watchdog.
     return {
       label, path: file, requiresLinger: false,
-      contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>${xml(logFile)}</string>\n<key>StandardErrorPath</key><string>${xml(logFile)}</string>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>${xml(input.home)}</string></dict>\n</dict></plist>\n`,
+      contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>ExitTimeOut</key><integer>${LAUNCHD_EXIT_TIMEOUT_SECONDS}</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>${xml(logFile)}</string>\n<key>StandardErrorPath</key><string>${xml(logFile)}</string>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>${xml(input.home)}</string></dict>\n</dict></plist>\n`,
       install: [],
       start: { command: "launchctl", args: ["bootstrap", domain, file] },
       stop: { command: "launchctl", args: ["bootout", `${domain}/${label}`] },

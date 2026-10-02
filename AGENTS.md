@@ -587,6 +587,28 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
   built on demand (`ensureUpdates`), not only after a successful start.
 - An update whose stop is not confirmed in time starts the unchanged release
   again once the OS no longer runs it.
+- D113b (2026-10-02): launchd SIGKILLs a booted-out job 5 s after SIGTERM
+  unless its plist sets `ExitTimeOut` (measured on macOS; the plist now sets
+  `LAUNCHD_EXIT_TIMEOUT_SECONDS` = 30, above the daemon's 15 s watchdog). An
+  idle connector still stopping its agents one after another was killed
+  before it wrote its shutdown receipt, and the update waited 90 s for a
+  receipt that never came. Now: native runners stop side by side
+  (`Promise.allSettled`; a runner that cannot stop does not keep the others,
+  the Codex owner or the state from stopping, and its error is thrown at the
+  end); the transaction reads the service pid before the stop and accepts
+  that process being gone as the stop's proof, ends its process group after
+  `stopGraceMs` (30 s; only while `ps` still shows this root's `serve`); and
+  any abort after the stop and before the swap starts the same release and
+  waits for it to answer (`restartUnchanged`).
+- `serve` keeps `<root>/bin/konteks-remote` on the running release
+  (`keepLauncherCurrent`): once no update attempt for this release is
+  `in_progress` (45 min stale bound) and the record names this process's
+  release, it replaces the launcher when its bytes differ. A launcher without
+  the transaction's own refresh (0.8.0's, D113b) otherwise drives every update.
+- A release an update just started is on probation while the ledger's attempt
+  for its release is `in_progress` (`updateProbation`, polled every 2 s, same
+  45 min bound): it takes no new work (pull gate, heartbeat
+  `acceptingWork`), so a rollback never stops it under a claim (D113).
 - `serve` rewrites an existing service definition that differs from what the
   serving release renders (`keepServiceOnOwnDefinition`): the install
   launcher is never replaced and an updater is the previous release, so

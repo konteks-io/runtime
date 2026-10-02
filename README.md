@@ -465,6 +465,10 @@ is listed as unavailable with the reason, so the gate decides at once and,
 when that agent worked before, rolls back naming it. `update` and
 `update --check` say when the connector updated itself, and when a release
 already failed here; a second `update` while one is still downloading says so.
+An update that stops the connector but cannot go ahead starts the same
+release again and says once it answers. While the new release is being
+checked it takes no new work. The running release keeps `konteks-remote`
+itself on its own version, whichever `konteks-remote` ran the update.
 
 On macOS the connector logs to `logs/connector.log` in its folder; on Linux,
 to the user journal. A release that finds its service still loaded with an
