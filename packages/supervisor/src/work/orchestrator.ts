@@ -1981,8 +1981,14 @@ export class WorkOrchestrator {
     this.deps.assertOwned();
   }
 
+  /** Every session is asked to close, even after one refuses; the first refusal is then rethrown. */
   async drainSessions(reason: "drain" | "lease_lost"): Promise<void> {
-    for (const session of [...this.sessions.values()]) await session.close(reason);
+    let refusal: { error: unknown } | null = null;
+    for (const session of [...this.sessions.values()]) {
+      try { await session.close(reason); }
+      catch (error) { refusal ??= { error }; }
+    }
+    if (refusal) throw refusal.error;
   }
 
   private async abandon(assignmentId: string, attempt: number, reason: "assignment_conflict"): Promise<void> {

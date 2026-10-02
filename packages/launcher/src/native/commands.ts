@@ -117,6 +117,22 @@ export async function keepServiceOnOwnDefinition(root: string, deps: OwnServiceD
   return "restarting";
 }
 
+/**
+ * End the service's own process group when its graceful stop did not finish
+ * (a rollback must still restore and start the previous release). The pid is
+ * the one the service manager runs; nothing where it names none.
+ */
+async function forceStopService(definition: NativeServiceDefinition): Promise<void> {
+  if (!definition.inspect || !definition.expected) return;
+  const result = await runCommand({ ...definition.inspect, env: environment(), timeoutMs: 10_000 }).catch(() => null);
+  const loaded = result?.code === 0 ? parseLoadedService(nativePlatform().os, result.stdout, definition.expected) : null;
+  if (!loaded?.pid) return;
+  try { process.kill(-loaded.pid, "SIGKILL"); }
+  catch {
+    try { process.kill(loaded.pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+}
+
 async function detachServiceCommand(command: NativeServiceCommand, logFile: string): Promise<void> {
   await mkdir(dirname(logFile), { recursive: true, mode: 0o700 });
   const log = await open(logFile, "a", 0o600);
@@ -713,7 +729,7 @@ export const nativeCliActions: NativeCliActions = {
       const selfUpdated = check?.status === "current" ? selfUpdateNote(attempts, check.bundleVersion) : null;
       if (selfUpdated) input.output.line(selfUpdated);
     }
-    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits }));
+    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits, forceStop: forceStopService }));
   },
   uninstall: async input => {
     const result = await uninstallNative(input, productionUninstallDeps({ root: input.root, serviceDefinition, execute }));

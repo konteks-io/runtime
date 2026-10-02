@@ -472,6 +472,19 @@ describe("native Supervisor composition", () => {
     expect(f.stop).toHaveBeenCalledOnce();
   });
 
+  it("still stops its runners when an open session cannot close under the authority the stop itself withdrew (D113)", async () => {
+    // 2026-10-02 09:27: a claim admitted seconds before SIGTERM; stop() makes the
+    // recovery authority null, the session's drain close then asserted it and the
+    // whole shutdown aborted before the runners and Codex owner were stopped.
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    vi.spyOn(supervisor.work, "drainSessions").mockRejectedValueOnce(new RemoteInstanceError("recovery_required", "Transport recovery generation is not currently accepted."));
+    await expect(supervisor.stop()).resolves.toBeUndefined();
+    expect(f.stop).toHaveBeenCalledOnce();
+  });
+
   it("lists a bundled agent that could not start as unavailable, with why, in agents and doctor (RCA 2026-10-01)", async () => {
     const f = await fixture();
     vi.spyOn(NativeRunner.prototype, "start").mockRejectedValue(new RemoteInstanceError("agent_unavailable", "The signed Codex app-server did not become ready in time."));

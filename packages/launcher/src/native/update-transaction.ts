@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { chmod, copyFile, readFile, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
-import { isHostAgentId } from "@konteks/remote-release";
+import { isHostAgentId, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
@@ -34,6 +34,10 @@ export interface NativeUpdateTransactionDeps {
   legacyCodexPreflight?: (root: string, previous: NativeRuntimeRecord) => Promise<void>;
   /** How often the OS has started the service and its last exit code; null where it cannot say. */
   serviceExits?: (definition: NativeServiceDefinition) => Promise<{ runs: number; lastExitCode: number | null } | null>;
+  /** Ends the service's own process group when a rollback's graceful stop does not finish; absent where the OS stop already kills it. */
+  forceStop?: (definition: NativeServiceDefinition) => Promise<void>;
+  /** Replaces the person's `konteks-remote` with the kept release's executable, so their next command runs the code they updated to. */
+  refreshLauncher?: (root: string, record: NativeRuntimeRecord) => Promise<void>;
   drainDeadlineMs?: number;
   healthDeadlineMs?: number;
   /** How long the old service may take to exit and release the runtime directory after its stop command returned. */
@@ -55,9 +59,12 @@ const DrainStatusSchema = z.object({ draining: z.boolean(), reason: z.string().n
 const AgentsSchema = z.object({ agents: z.array(z.object({ agentId: z.string(), readiness: z.string() }).passthrough()) }).passthrough();
 const CodexMaintenanceSchema = z.object({ idle: z.literal(true) }).strict();
 
-export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTransactionDeps["serviceDefinition"]; execute: NativeUpdateTransactionDeps["execute"]; start: NativeUpdateTransactionDeps["start"]; serviceExits: NonNullable<NativeUpdateTransactionDeps["serviceExits"]> }): NativeUpdateTransactionDeps {
+export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTransactionDeps["serviceDefinition"]; execute: NativeUpdateTransactionDeps["execute"]; start: NativeUpdateTransactionDeps["start"]; serviceExits: NonNullable<NativeUpdateTransactionDeps["serviceExits"]>; forceStop?: NativeUpdateTransactionDeps["forceStop"] | undefined }): NativeUpdateTransactionDeps {
+  const { forceStop, ...rest } = input;
   return {
-    ...input,
+    ...rest,
+    ...(forceStop ? { forceStop } : {}),
+    refreshLauncher: refreshInstalledLauncher,
     readRecord: readNativeRecord,
     control: (root, record) => new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort),
     stage: stageNativeUpdate,
@@ -117,7 +124,9 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
   let stopConfirmed = false;
   let successor: NativeRuntimeRecord | undefined;
   try {
-    const failingBefore = wasRunning ? await failingDoctorChecks(control).catch(() => new Set<string>()) : new Set<string>();
+    // The previous release's own doctor result is the baseline; null when it
+    // could not be read, and then only the successor's own agents can count.
+    const baseline = wasRunning ? await doctorStatuses(control).catch(() => null) : null;
     if (wasRunning) {
       await drain(input, control, deps);
       if (previous.agents.includes("codex")) {
@@ -150,9 +159,15 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     if (wasRunning) {
       input.output.line(`Starting ${successor.bundleVersion} and checking it is healthy before keeping it (up to ${spoken(deps.healthDeadlineMs ?? 180_000)})…`);
       await deps.start(input);
-      await healthGate(input, deps.control(input.root, successor), successor, failingBefore, deps, definition);
+      await healthGate(input, deps.control(input.root, successor), previous, successor, baseline, deps, definition);
     }
     await finish("applied", null);
+    // The installed `konteks-remote` is the executable the person first
+    // installed and nothing replaced it, so an operator's next update ran
+    // weeks-old transaction code (D113: the 09-28 launcher drove 0.10.8's).
+    if (deps.refreshLauncher) await deps.refreshLauncher(input.root, successor).catch(error => {
+      input.output.line(`konteks-remote itself could not be refreshed to ${successor!.bundleVersion} (${error instanceof Error ? error.message : String(error)}); the connector is updated.`);
+    });
     const outcome: NativeUpdateOutcome = { state: "updated", from: previous.bundleVersion, to: successor.bundleVersion, releaseId: successor.releaseId, previousReleaseId: previous.releaseId, restarted: wasRunning };
     input.output.line(`Native connector updated ${outcome.from} → ${outcome.to}; ${previous.releaseId} is kept for rollback.`);
     input.output.result(outcome);
@@ -161,10 +176,11 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     const detail = error instanceof Error ? error.message : String(error);
     if (successor) {
       input.output.line(`Update to ${successor.bundleVersion} failed its health gate; rolling back to ${previous.releaseId}.`);
+      let restored = false;
       try {
-        const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
-        if (await deps.execute(definition.stop).catch(() => null) === 0) await waitForServiceExit(input, definition, deps, previousReceipt);
+        await stopForRollback(input, definition, deps);
         await restoreOnceReleased(input, successor.releaseId, previous, deps);
+        restored = true;
         if (wasRunning) {
           await deps.start(input);
           // The person checks right after; say only once the old release answers again.
@@ -176,6 +192,9 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
         await finish("rolled_back", detail);
       } catch (rollbackError) {
         await finish("failed", `rollback failed after: ${detail}`);
+        // Never leave this computer without its connector (D113: the rollback
+        // gave up while launchd had already unloaded the service).
+        if (wasRunning) await keepServiceRunning(input, definition, deps, restored ? previous : successor);
         throw new RemoteInstanceError("temporarily_unavailable", "The updated connector did not pass its health gate and automatic rollback failed; identity, credentials and workspaces remain preserved.", { cause: rollbackError });
       }
     } else {
@@ -201,6 +220,44 @@ async function waitForServiceExit(input: NativeUpdateInput, definition: NativeSe
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
     progress();
     await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
+  }
+}
+
+/**
+ * Stop a successor that failed its gate. Its shutdown receipt is not waited
+ * for: once the OS no longer runs it, restoring the previous release is what
+ * keeps this computer connected (D113: its shutdown failed, no receipt was
+ * written and the rollback waited out the deadline, then gave up). A stop
+ * that does not finish ends the service's process group.
+ */
+async function stopForRollback(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
+  await deps.execute(definition.stop).catch(() => null);
+  const running = async () => await deps.execute(definition.status).catch(() => 0) === 0;
+  const stopMs = deps.stopDeadlineMs ?? 90_000;
+  const deadline = deps.now() + stopMs;
+  const progress = progressLines(input, deps, "Stopping the updated connector before restoring the previous release…", "still stopping the updated connector");
+  let forced = false;
+  while (await running()) {
+    if (deps.now() >= deadline) {
+      if (forced || !deps.forceStop) throw new RemoteInstanceError("temporarily_unavailable", "The updated connector did not stop, so the previous release could not be restored.");
+      input.output.line(`The updated connector did not stop within ${spoken(stopMs)}; ending its processes.`);
+      await deps.forceStop(definition).catch(() => undefined);
+      forced = true;
+      continue;
+    }
+    progress();
+    await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
+  }
+}
+
+/** Last resort after a failed rollback: whatever release the record names runs, rather than none. */
+async function keepServiceRunning(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, record: NativeRuntimeRecord): Promise<void> {
+  if (await deps.execute(definition.status).catch(() => null) === 0) return;
+  try {
+    await deps.start(input);
+    input.output.line(`Started ${record.bundleVersion} again so this computer stays connected; run \`konteks-remote status\` to check it.`);
+  } catch {
+    input.output.line("The connector could not be started again; run `konteks-remote start`.");
   }
 }
 
@@ -276,8 +333,10 @@ async function drain(input: NativeUpdateInput, control: UpdateControlClient, dep
   }
 }
 
-async function failingDoctorChecks(control: UpdateControlClient): Promise<Set<string>> {
-  return new Set((await failingDoctorDetails(control)).keys());
+/** Every check's status, as the previous release reports it. */
+async function doctorStatuses(control: UpdateControlClient): Promise<Map<string, string>> {
+  const report = await control.call({ op: "doctor" }, DoctorReportSchema);
+  return new Map(report.checks.map(check => [check.id, check.status]));
 }
 
 /** Each failing check's id and what it says, so a rollback can name why. */
@@ -287,11 +346,43 @@ async function failingDoctorDetails(control: UpdateControlClient): Promise<Map<s
 }
 
 /**
+ * Whether a check failing on the successor is the update's doing: the
+ * previous release reported the same check and it did not fail there. A
+ * check the previous release never reported is new in this release and only
+ * informational (D113: 0.10.8 listed Google Antigravity, which this computer
+ * never added, and the gate rolled back for it), except the check of an
+ * agent the successor itself must run.
+ */
+function introducedByUpdate(id: string, baseline: ReadonlyMap<string, string> | null, successor: NativeRuntimeRecord): boolean {
+  const before = baseline?.get(id);
+  if (before !== undefined) return before !== "fail";
+  const agentId = id.startsWith("agent-") ? id.slice("agent-".length) : null;
+  return agentId !== null && (successor.agents as readonly string[]).includes(agentId) && !isHostAgentId(agentId);
+}
+
+/** Replace `<root>/bin/konteks-remote` with the kept release's executable; a no-op where none was installed there, and on Windows, where a running executable cannot be replaced. */
+export async function refreshInstalledLauncher(root: string, record: NativeRuntimeRecord): Promise<void> {
+  if (process.platform === "win32") return;
+  const target = join(root, "bin", "konteks-remote");
+  if (!await stat(target).then(info => info.isFile(), () => false)) return;
+  const source = await resolveNativeConnectorExecutable(join(root, "releases", record.releaseId), process.platform === "darwin" ? "macos" : "debian");
+  const staged = `${target}.update-${process.pid}`;
+  try {
+    await copyFile(source, staged);
+    await chmod(staged, 0o755);
+    // A rename replaces the file a running command was started from without touching that process.
+    await rename(staged, target);
+  } finally {
+    await rm(staged, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
  * The successor must answer on the control socket with its own version, probe
  * every installed agent, and introduce no doctor failure that was not already
  * present; a pre-existing failure (an agent awaiting login) is not the update's.
  */
-async function healthGate(input: NativeUpdateInput, control: UpdateControlClient, successor: NativeRuntimeRecord, failingBefore: Set<string>, deps: NativeUpdateTransactionDeps, definition: NativeServiceDefinition): Promise<void> {
+async function healthGate(input: NativeUpdateInput, control: UpdateControlClient, previous: NativeRuntimeRecord, successor: NativeRuntimeRecord, baseline: ReadonlyMap<string, string> | null, deps: NativeUpdateTransactionDeps, definition: NativeServiceDefinition): Promise<void> {
   const deadline = deps.now() + (deps.healthDeadlineMs ?? 180_000);
   const poll = deps.pollMs ?? 3_000;
   let answered = false;
@@ -327,8 +418,12 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
   // counts against the update only if it is still there when the deadline passes.
   for (;;) {
     const failing = await failingDoctorDetails(control);
-    const introduced = [...failing.keys()].filter(id => !failingBefore.has(id));
-    if (introduced.length === 0) break;
+    const introduced = [...failing.keys()].filter(id => introducedByUpdate(id, baseline, successor));
+    if (introduced.length === 0) {
+      const added = [...failing.keys()].filter(id => baseline !== null && !baseline.has(id));
+      if (added.length > 0) input.output.line(`${successor.bundleVersion} reports a check ${previous.bundleVersion} did not have: ${added.map(id => `${id} (${failing.get(id)})`).join(", ")}. It is not held against the update.`);
+      break;
+    }
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector introduced doctor failure(s): ${introduced.map(id => `${id} (${failing.get(id)})`).join(", ")}.`);
     input.output.line(`waiting for the updated connector to clear doctor failure(s): ${introduced.join(", ")}…`);
     await deps.sleep(poll);
