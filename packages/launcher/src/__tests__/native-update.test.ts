@@ -338,7 +338,7 @@ describe("native update transaction", () => {
             const helper = written.get(`${root}\\service.js`)!;
             const encoded = /-EncodedCommand ([A-Za-z0-9+/=]+)/.exec(helper)![1]!;
             const script = Buffer.from(encoded, "base64").toString("utf16le");
-            task.target = /try \{ & '([^']+)'/.exec(script)![1]!;
+            task.target = /\$env:KONTEKS_SERVICE_PROGRAM = '([^']+)'/.exec(script)![1]!;
             task.running = true;
             return 0;
           }

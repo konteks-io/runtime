@@ -4,6 +4,7 @@ import { Command, InvalidArgumentError } from "commander";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { nativePaths, nativePlatform } from "./service.js";
 import { createOutput, type Output } from "../output.js";
+import { setVerbose } from "../verbose.js";
 
 /**
  * The agents a native runtime runs: Claude Code and Codex from signed
@@ -34,7 +35,10 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   const program = new Command("konteks-remote").description("Konteks on this computer: connect it, run its agents, keep it updated")
     .option("--root <path>", "private user-scoped installation root")
     .option("--json", "machine-readable output", false)
+    .option("--verbose", "also print each service command it runs, its exit code and output, on stderr (or set KONTEKS_REMOTE_VERBOSE=1)", false)
     .option("-V, --version", "print the release installed on this machine");
+  // Before any action runs, so the first command it starts is printed too.
+  program.hook("preAction", () => { setVerbose(program.opts<{ verbose: boolean }>().verbose); });
   // The release this machine runs, not the launcher package: after an update
   // the person checks this number, and it must match `status` and the site.
   program.on("option:version", () => {
