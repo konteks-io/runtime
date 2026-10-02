@@ -3,7 +3,7 @@ import { createServer } from "node:net";
 import { chmod, lstat, mkdir, readFile, realpath, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
-import { CONTROL_SOCKET_DEFAULT_PORT, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
+import { CONTROL_SOCKET_DEFAULT_PORT, findGitForWindows, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, deleteNativeAntigravity, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, signOutNativeAntigravity, type HostAgentInstallAdapter, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
@@ -25,6 +25,12 @@ export interface NativeInstallOptions {
     git?: NativeRuntimeRecord["git"] | null;
     /** A fetched agent's consent line answered (Google Antigravity, A20); without it nothing is downloaded. */
     consent?: FetchConsent;
+    /**
+     * Without an explicit agent list: Claude Code or Codex, when not found
+     * here, offered to the person before the code is asked (D116); true once
+     * it is here. Without it the install connects with what it found.
+     */
+    setupAgent?: (agentId: "claude-code" | "codex") => Promise<boolean>;
   };
 }
 export interface NativeAgentAddOptions {
@@ -46,7 +52,11 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
   const root = resolve(options.root);
   if (root === parse(root).root || root === resolve(homedir())) throw invalid();
   // Validate endpoints/agent selection before any activation or executable download.
-  const agents = options.agents ?? ["claude-code", "codex"];
+  // An operator's explicit list is held to (every agent must be here); without
+  // one, the agents are found the way onboarding finds them and none is
+  // required (D116, OS14): a computer with nothing installed still connects.
+  const explicit = options.agents !== undefined;
+  let agents = options.agents ?? [];
   refuseRetiredAgents(agents);
   const draft = NativeRuntimeRecordSchema.parse({ schemaVersion: 1, deploymentKind: "native_connector", instanceId: "pending", workspaceId: "pending", releaseId: "pending", manifestDigest: "pending", bundleVersion: "pending", coreUrl: options.coreUrl, relayUrl: options.relayUrl, agents, controlPort: options.controlPort ?? CONTROL_SOCKET_DEFAULT_PORT });
   await privateDirectory(root);
@@ -58,8 +68,8 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     if (existing) {
       const installation = await loadNativeInstallation(root, { roots, platform });
       const identity = await new SupervisorStore(join(root, "supervisor")).identity();
-      if (identity?.activationId !== options.activationId || installation.record.coreUrl !== draft.coreUrl || installation.record.relayUrl !== draft.relayUrl || JSON.stringify(installation.record.agents) !== JSON.stringify(agents)) throw invalid();
-      if (agents.includes("codex") && installation.record.codexHome === undefined) {
+      if (identity?.activationId !== options.activationId || installation.record.coreUrl !== draft.coreUrl || installation.record.relayUrl !== draft.relayUrl || (explicit && JSON.stringify(installation.record.agents) !== JSON.stringify(agents))) throw invalid();
+      if (installation.record.agents.includes("codex") && installation.record.codexHome === undefined) {
         const codexHome = installation.runners.find(runner => runner.RUNNER_AGENT_ID === "codex")?.RUNNER_NATIVE_CODEX_HOME;
         if (!codexHome) throw invalid();
         const bound = NativeRuntimeRecordSchema.parse({ ...installation.record, codexHome });
@@ -69,6 +79,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
       }
       return installation.record;
     }
+    if (!explicit) agents = await findOrOfferAgents(root, options.deps?.setupAgent);
     // Resolve before activation: a missing local profile must not consume an
     // activation and leave a partly installed, unstartable connector.
     const codexHome = agents.includes("codex") ? await resolveNativeCodexHome() : undefined;
@@ -97,7 +108,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     if (!identity || identity.instanceId !== activated.instanceId || activated.manifestDigest !== release.manifest.digest) throw invalid();
     // Unpacking takes about a minute; the person hears each step instead of
     // a silent terminal after the code (W1-M2: 51 s with nothing said).
-    options.output.line(`Code accepted. Unpacking the agents on this computer; this takes about a minute.`);
+    options.output.line(bundled.length > 0 ? "Code accepted. Unpacking the agents on this computer; this takes about a minute." : "Code accepted. Setting up Konteks on this computer…");
     const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: bundled }, releasesDir: join(root, "releases"), fetchFn });
     await privateDirectory(join(staged.directory, "agents"));
     let unpacked = 0;
@@ -116,7 +127,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     const releaseDirectory = join(root, "releases", releaseId);
     await rename(staged.directory, releaseDirectory);
     const git = options.deps?.git === undefined ? await discoverGit() : options.deps.git;
-    const record = NativeRuntimeRecordSchema.parse({ ...draft, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...hosted, ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
+    const record = NativeRuntimeRecordSchema.parse({ ...draft, agents, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...(codexHome ? { codexHome } : {}), ...(claudeExecutable ? { claudeExecutable } : {}), ...hosted, ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
     lock.assertOwned();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
     await loadNativeInstallation(root, { roots, platform });
@@ -153,6 +164,37 @@ export async function prepareNativeEnrollment(options: {
 }
 
 const ENROLLMENT_MANIFEST = "enrollment-manifest.json";
+
+/** The order agents are listed in (the site's order). */
+const AGENT_ORDER = ["claude-code", "codex", "dsh", "opencode", "antigravity"];
+
+/**
+ * Every agent family this machine actually has (OS14): Claude Code's
+ * executable and Codex's profile by file checks, and the agents the person
+ * installed themselves (DeepSeek Harness, OpenCode 2) when offered. A fetched
+ * one (Google Antigravity) is never detected: the connector downloads it, it
+ * is not found. Nothing is downloaded or run.
+ */
+async function detectNativeAgents(root: string): Promise<string[]> {
+  const detected: string[] = [];
+  if (await resolveNativeClaudeExecutable().then(() => true).catch(() => false)) detected.push("claude-code");
+  if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
+  for (const host of HOST_AGENT_INSTALL_ADAPTERS) {
+    if (host.fetch !== undefined) continue;
+    if (host.offered && await host.locate(undefined, { root }).then(() => true).catch(() => false)) detected.push(host.agentId);
+  }
+  return detected;
+}
+
+/** The agents found here, plus Claude Code or Codex when the person set one up on being asked (D116). */
+async function findOrOfferAgents(root: string, setupAgent?: (agentId: "claude-code" | "codex") => Promise<boolean>): Promise<string[]> {
+  const agents = await detectNativeAgents(root);
+  for (const agent of ["claude-code", "codex"] as const) {
+    if (agents.includes(agent) || !setupAgent) continue;
+    if (await setupAgent(agent).catch(() => false)) agents.push(agent);
+  }
+  return agents.sort((a, b) => AGENT_ORDER.indexOf(a) - AGENT_ORDER.indexOf(b));
+}
 
 /**
  * The control port a new enrollment records (WS1-020): the default when it is
@@ -270,17 +312,7 @@ export async function recordNativeEnrollment(options: {
     const fetched = options.agents?.find(agent => hostAgentInstallAdapter(agent)?.fetch !== undefined);
     if (fetched !== undefined) throw new RemoteInstanceError("agent_unavailable", `${findAgentBridge(fetched)?.displayName ?? fetched} is added after onboarding, once you agree to its download: konteks-remote agent add ${fetched}`);
     if (options.agents && options.agents.length > 0) detected.push(...options.agents);
-    else {
-      if (await resolveNativeClaudeExecutable().then(() => true).catch(() => false)) detected.push("claude-code");
-      if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
-      // Agents the person installed themselves (DeepSeek Harness, OpenCode 2),
-      // when offered. A fetched one (Google Antigravity) is never detected:
-      // the connector downloads it, it is not found.
-      for (const host of HOST_AGENT_INSTALL_ADAPTERS) {
-        if (host.fetch !== undefined) continue;
-        if (host.offered && await host.locate(undefined, { root }).then(() => true).catch(() => false)) detected.push(host.agentId);
-      }
-    }
+    else detected.push(...await detectNativeAgents(root));
     // None is required (OS14): a machine with no detectable family still
     // enrolls, and the closing summary says how to add one.
     const fetchFn = options.deps?.fetchFn ?? fetch;
@@ -484,7 +516,11 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
     const fetchFn = options.deps?.fetchFn ?? fetch;
     const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchFn);
     const release = verifyNativeRelease(payload, roots);
-    if (compareSemver(release.manifest.bundleVersion, current.record.bundleVersion) <= 0) {
+    // The installed release itself adds its own package for the agent (a
+    // computer connected before Claude Code or Codex was here, D116); any
+    // other release must be newer. Stale or same-version substitutes are refused.
+    const sameRelease = release.manifest.digest === current.record.manifestDigest;
+    if (!sameRelease && compareSemver(release.manifest.bundleVersion, current.record.bundleVersion) <= 0) {
       throw new RemoteInstanceError("update_required", "Adding an agent requires a newer signed native release; stale or same-version manifests are refused.");
     }
     const agents = [...current.record.agents, options.agentId];
@@ -532,7 +568,7 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
         await loadNativeInstallation(root, { roots, platform });
         throw error;
       }
-      options.output.line(`${options.agentId} installed without reactivation; existing credentials and workspaces were preserved.`);
+      options.output.line(`${findAgentBridge(options.agentId)?.displayName ?? options.agentId} added; your other agents, sign-ins and work are unchanged.`);
       return successor;
     } catch (error) {
       if (successorDirectory === null) await rm(staged.directory, { recursive: true, force: true });
@@ -687,10 +723,14 @@ async function fetchNativeManifest(fetchFn: typeof fetch): Promise<unknown> {
   try { return await fetchNativeReleaseManifest(fetchFn); } catch { throw invalid(); }
 }
 async function discoverGit(): Promise<NativeRuntimeRecord["git"] | null> {
-  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
-    if (!directory || !parse(directory).root) continue;
+  const candidates = (process.env.PATH ?? "").split(delimiter).filter(directory => directory && parse(directory).root)
+    .map(directory => join(directory, process.platform === "win32" ? "git.exe" : "git"));
+  // Git for Windows installed during this install (winget, D116) is not on this process's PATH yet.
+  const windowsGit = process.platform === "win32" ? findGitForWindows(process.env)?.git : undefined;
+  if (windowsGit) candidates.push(windowsGit);
+  for (const candidate of candidates) {
     try {
-      const executable = await realpath(join(directory, process.platform === "win32" ? "git.exe" : "git"));
+      const executable = await realpath(candidate);
       const info = await lstat(executable);
       if (!info.isFile() || info.size > 64 * 1024 * 1024) continue;
       return await verifyNativeGitTool({ executable, digest: `sha256:${createHash("sha256").update(await readFile(executable)).digest("hex")}` });

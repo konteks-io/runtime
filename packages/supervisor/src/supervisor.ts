@@ -2491,6 +2491,10 @@ export class Supervisor {
       ...(this.reconnectRefusal ? { reconciliationRefusal: this.reconnectRefusal } : {}),
       components: snapshot.components,
       agents: [...snapshot.agents, ...this.leftOutAgents(snapshot.agents)],
+      // The snapshot may carry the site's "Not added" Google Antigravity view
+      // (only after a fresh collect, so a long-running release did not show
+      // it and a just-started one did): an update gate read it as a failure.
+      ...(this.options.native ? { listedAgents: [...this.recordedAgentIds()] } : {}),
       configRevision: this.control.configRevision,
       diskFreeBytes: snapshot.diskFreeBytes,
       // Native releases name no disk minimum; the check reports free space only.
@@ -2633,8 +2637,18 @@ export class Supervisor {
     await waitFor("lease_loss_cleanup", this.leaseLossCleanup);
     await note("supervisor_prelude", "completed");
     await note("work_drain", "entered");
-    await this.work?.drainSessions("drain");
-    await note("work_drain", "completed");
+    // stop() withdrew this process's recovery authority first, so a session
+    // whose close asserts it is refused ("Transport recovery generation is not
+    // currently accepted"). That must not abort the stop before the runners
+    // and the Codex owner below are stopped (D113: it orphaned Codex and no
+    // receipt was written); the session stays journaled for recovery.
+    try {
+      await this.work?.drainSessions("drain");
+      await note("work_drain", "completed");
+    } catch (error) {
+      this.logger.warn({ event: "shutdown.session_close_unconfirmed", code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" },
+        "an open session could not close during shutdown; stopping its agent anyway, the next start recovers it");
+    }
     await note("preview_close", "entered");
     await this.previews.close();
     await note("preview_close", "completed");

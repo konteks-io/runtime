@@ -17,3 +17,4 @@ export * from "./http-client.js";
 export * from "./control-socket.js";
 export * from "./observability.js";
 export * from "./https-proxy.js";
+export * from "./git-for-windows.js";

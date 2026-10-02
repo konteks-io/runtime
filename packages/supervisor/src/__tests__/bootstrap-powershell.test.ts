@@ -76,4 +76,17 @@ describe("bootstrap/install.ps1", () => {
       expect(script.indexOf(action), action).toBeGreaterThan(stop);
     }
   });
+
+  // The MSI adds konteks-remote to the machine PATH, which this window does
+  // not see: the closing summary's commands ("konteks-remote agent add …")
+  // would fail here (D116). Said once, after the launcher, keeping its exit code.
+  it("says to open a new window when this one cannot run konteks-remote yet, and keeps the launcher's exit code", () => {
+    const launched = script.indexOf("& $launcher install --activation-id $ActivationId");
+    expect(launched).toBeGreaterThan(-1);
+    const tail = script.slice(launched);
+    expect(tail).toMatch(/\$code = \$LASTEXITCODE/);
+    expect(tail).toMatch(/Get-Command konteks-remote -ErrorAction SilentlyContinue/);
+    expect(tail).toContain("open a new PowerShell window");
+    expect(tail.trimEnd().endsWith("exit $code")).toBe(true);
+  });
 });

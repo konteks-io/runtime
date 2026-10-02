@@ -186,7 +186,7 @@ describe("native update transaction", () => {
           case "agents": return { agents: serving.agents.map(agentId => ({ agentId, readiness: "ready" })) };
           case "doctor": return { generatedAt: "2026-09-15T00:00:00Z", checks: [
             { id: "agent_login", title: "login", status: "fail", detail: "pre-existing", recoveryActions: [] },
-            ...(input.gate === "new_failure" && serving.releaseId === "release-next" ? [{ id: "runner_spawn", title: "spawn", status: "fail", detail: "new", recoveryActions: [] }] : []),
+            input.gate === "new_failure" && serving.releaseId === "release-next" ? { id: "runner_spawn", title: "spawn", status: "fail", detail: "new", recoveryActions: [] } : { id: "runner_spawn", title: "spawn", status: "pass", detail: "ok", recoveryActions: [] },
           ] };
           default: return {};
         }
@@ -524,6 +524,87 @@ describe("native update transaction", () => {
     expect(h.currentRecord().releaseId).toBe("release-prev");
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back", manifestDigest: "sha256:next", releaseId: "release-next" });
     expect((h.ledger.at(-1) as { detail: string }).detail).toMatch(/control socket|reports 1.0.0|doctor failure\(s\): runner_spawn/);
+  });
+  it("keeps the update when the successor fails a check the previous release never reported, such as an agent not added here (D113)", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "codex", "dsh"] } });
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        const value = await (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+        if (request.op === "doctor" && record.releaseId === "release-next") (value as { checks: unknown[] }).checks.push({ id: "agent-antigravity", title: "Agent antigravity", status: "fail", detail: "readiness unavailable", recoveryActions: [] });
+        return value;
+      } } as never;
+    };
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).resolves.toMatchObject({ state: "updated", to: "1.1.0" });
+    expect(h.calls).not.toContain("restore:release-next");
+    expect(lines).toContain("1.1.0 reports a check 1.0.0 did not have: agent-antigravity (readiness unavailable). It is not held against the update.");
+  });
+  it("still counts a failing check for an agent the successor runs, even when the previous release never reported it (D113)", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "codex"] } });
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        const value = await (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+        if (request.op === "doctor" && record.releaseId === "release-next") (value as { checks: unknown[] }).checks.push({ id: "agent-codex", title: "Agent codex", status: "fail", detail: "readiness unavailable", recoveryActions: [] });
+        return value;
+      } } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow(/introduced doctor failure\(s\): agent-codex/);
+    expect(h.calls).toContain("restore:release-next");
+  });
+  it("rolls back and starts the previous release when the failed successor exits without its shutdown receipt (D113)", async () => {
+    const h = harness({ previous, gate: "new_failure" });
+    // The previous release stops cleanly and writes a fresh receipt; the
+    // successor's shutdown step fails, so after the commit none is written.
+    h.deps.stopDeadlineMs = 3_000;
+    let committed = false, receipts = 0;
+    const commit = h.deps.commit;
+    h.deps.commit = async options => { committed = true; return commit(options); };
+    h.deps.readStopReceipt = async () => committed ? "stale" : `fresh-${receipts++}`;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow(/doctor failure\(s\): runner_spawn/);
+    expect(h.calls.slice(-3)).toEqual(["restore:release-next", "start", "control:status@release-prev"]);
+    expect(h.currentRecord().releaseId).toBe("release-prev");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back" });
+  });
+  it("force-stops a failed successor that never exits, then starts the previous release (D113)", async () => {
+    const h = harness({ previous, gate: "new_failure" });
+    h.deps.stopDeadlineMs = 3_000;
+    let stuck = false;
+    const execute = h.deps.execute;
+    h.deps.execute = async command => {
+      if (command.command === "stop" && h.currentRecord().releaseId === "release-next") { h.calls.push("stop"); stuck = true; return 0; }
+      if (command.command === "status" && stuck) { h.calls.push("status"); return 0; }
+      return execute(command);
+    };
+    h.deps.forceStop = async () => { h.calls.push("force-stop"); stuck = false; await execute({ command: "stop", args: [] }); };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow(/doctor failure\(s\): runner_spawn/);
+    expect(h.calls).toContain("force-stop");
+    expect(h.calls.slice(-3)).toEqual(["restore:release-next", "start", "control:status@release-prev"]);
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back" });
+  });
+  it("never leaves the service unloaded: when the rollback cannot restore the record it still starts a release (D113)", async () => {
+    const h = harness({ previous, gate: "new_failure", restoreFails: true });
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.calls.lastIndexOf("start")).toBeGreaterThan(h.calls.lastIndexOf("restore:release-next"));
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
+    expect(lines.some(line => /^Started 1\.1\.0 again so this computer stays connected/.test(line))).toBe(true);
+  });
+  it("refreshes the person's konteks-remote launcher to the release it kept, and only then (D113)", async () => {
+    const refreshed: string[] = [];
+    const applied = harness({ previous });
+    applied.deps.refreshLauncher = async (_root, record) => { refreshed.push(record.releaseId); };
+    await runNativeUpdate({ root: "/root", output: applied.output }, applied.deps);
+    expect(refreshed).toEqual(["release-next"]);
+    const rolledBack = harness({ previous, gate: "new_failure" });
+    rolledBack.deps.refreshLauncher = async (_root, record) => { refreshed.push(record.releaseId); };
+    await runNativeUpdate({ root: "/root", output: rolledBack.output }, rolledBack.deps).catch(() => undefined);
+    expect(refreshed).toEqual(["release-next"]);
   });
   it("reports a failed attempt when rollback itself refuses, preserving the previous record for the operator", async () => {
     const h = harness({ previous, gate: "new_failure", restoreFails: true });

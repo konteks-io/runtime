@@ -55,7 +55,7 @@ describe("policy responder (D87 step 1)", () => {
     const allow = new EvaluatorPolicyResponder({ evaluateToolUse: async () => ({ allowed: true }) }, () => true);
     expect(await allow.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "allow", optionId: "allow" });
     const deny = new EvaluatorPolicyResponder({ evaluateToolUse: async () => ({ allowed: false, denyMessage: "no" }) }, () => true);
-    expect(await deny.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "deny", optionId: "reject" });
+    expect(await deny.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "deny", optionId: "reject", message: "no" });
     const none = new EvaluatorPolicyResponder(null, () => true);
     expect(await none.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "defer" });
     const headless = new EvaluatorPolicyResponder(null, () => false);
@@ -466,6 +466,47 @@ describe("relayed session (D98/D113/D114)", () => {
       expect(await decide(directWork)).toEqual({ inside: "allow", relative: "allow", other: "reject", push: "reject" });
       // Konteks's own conversations keep the workspace root (unchanged here).
       expect((await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).other).toBe("allow");
+    });
+
+    // T1 (2026-10-02): a Codex "Edit files" call named four paths, one written
+    // from the filesystem root; the connector refused the whole call and said
+    // nothing about which path or why (D114).
+    it("refuses a multi-path edit naming the outside path, notes why on the call, and logs it without host paths", async () => {
+      const own = join(dir, "own"), page = "/storefront/app/checkout/confirmation/[orderId]/page.tsx";
+      await mkdir(join(own, "storefront", "lib"), { recursive: true });
+      const warn = vi.fn();
+      const f = await build({
+        workspaceRoot: dir,
+        prepareInputs: async (target: RemoteWorkAssignment) => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+          cwd: own, skillInstructions: "", beforePrompt: async () => undefined }),
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false),
+        logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
+      });
+      try {
+        await f.session.bootstrap();
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "edit-1", params: { sessionId: "acp-1",
+          toolCall: { toolCallId: "exec-1", kind: "edit", title: "Edit files", locations: [
+            { path: join(own, "storefront", "lib", "orders.ts") }, { path: join(own, "storefront", "lib", "order-store.ts") },
+            { path: page }, { path: join(own, "storefront", "lib", "cart-snapshot.ts") },
+          ] }, options } } as never);
+        const answered = vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === "edit-1")?.[2] as { outcome: { optionId?: string } };
+        expect(answered.outcome.optionId).toBe("reject");
+        const note = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } })
+          .filter(body => body.method === "session/update").map(body => body.params!.update!)
+          .find(update => update.toolCallId === "exec-1");
+        expect(note).toMatchObject({ sessionUpdate: "tool_call_update" });
+        expect(note).not.toHaveProperty("status");
+        const text = (note!.content as Array<{ content: { text: string } }>)[0]!.content.text;
+        expect(text).toBe("Konteks refused this file change: 1 of 4 paths is outside the workspace `[workspace]/`. " +
+          "`" + page + "` starts at the filesystem root; inside the workspace it is `storefront/app/checkout/confirmation/[orderId]/page.tsx`. " +
+          "Nothing in it was applied. Use paths inside the workspace, relative to it, and try again.");
+        expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+          toolCallId: "exec-1", decision: "deny",
+          refusal: { reason: "outside_workspace", pathCount: 4, outside: [{ path: page, rootAnchored: true, suggestion: "storefront/app/checkout/confirmation/[orderId]/page.tsx" }] },
+        }), "tool permission not allowed by policy");
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(dir);
+        expect(JSON.stringify(f.sent)).not.toContain(dir);
+      } finally { await f.session.close("cancelled"); }
     });
 
     it("threads a question it defers to a person onto the direct session", async () => {

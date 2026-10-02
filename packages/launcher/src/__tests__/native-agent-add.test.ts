@@ -95,6 +95,31 @@ describe("native agent-add ownership lifecycle", () => {
     } finally { f.owner.release(); }
   });
 
+  it("offers Claude Code's official installer before stopping anything, and changes nothing on a no (D116)", async () => {
+    const f = await fixture();
+    const { RemoteInstanceError } = await import("@konteks/remote-common");
+    const ensurePersonal = vi.fn(async () => { throw new RemoteInstanceError("agent_unavailable", "Nothing was installed: Claude Code was not added."); });
+    try {
+      await expect(runNativeAgentAdd({ root: f.root, agent: "claude-code", output: createOutput({ json: false, stdout: { write: () => true } as never }) }, { ...f.deps, ensurePersonal } as never))
+        .rejects.toThrow("Nothing was installed: Claude Code was not added.");
+      expect(ensurePersonal).toHaveBeenCalledWith("claude-code", expect.anything());
+      expect(f.calls).toEqual([]);
+      expect(f.add).not.toHaveBeenCalled();
+    } finally { f.owner.release(); }
+  });
+
+  it("signs a just-installed Claude Code in once the connector is back (D116)", async () => {
+    const f = await fixture();
+    const sleep = f.deps.sleep;
+    f.deps.sleep = async () => { await sleep(); f.owner.release(); };
+    const ensurePersonal = vi.fn(async () => "set_up" as const);
+    const closeAgents = vi.fn(async () => undefined);
+    await runNativeAgentAdd({ root: f.root, agent: "claude-code", output: createOutput({ json: false, stdout: { write: () => true } as never }) }, { ...f.deps, ensurePersonal, closeAgents } as never);
+    expect(f.start).toHaveBeenCalledOnce();
+    expect(closeAgents).toHaveBeenCalledWith(expect.objectContaining({ agents: ["claude-code"], signInNow: ["claude-code"], missing: [] }));
+    expect(f.start.mock.invocationCallOrder[0]!).toBeLessThan(closeAgents.mock.invocationCallOrder[0]!);
+  });
+
   it("adds straight away when nothing runs at all", async () => {
     const f = await fixture();
     f.owner.release();

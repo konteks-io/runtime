@@ -1,6 +1,6 @@
 import { userInfo } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
-import { RemoteInstanceError, sanitizeInheritedChildProcessEnv, type Logger } from "@konteks/remote-common";
+import { findGitForWindows, RemoteInstanceError, sanitizeInheritedChildProcessEnv, type Logger } from "@konteks/remote-common";
 import { findAgentBridge, verifyOfflineAgentPackageOnce, type AgentBridgeFamily, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import { hostAdapterForRunner } from "../host/registry.js";
@@ -79,6 +79,14 @@ export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamil
     // left a planning turn with none of Konteks's tools (WS1-152). A slow list
     // should delay the tools, never take them away.
     env.MCP_TIMEOUT = CLAUDE_MCP_STARTUP_TIMEOUT_MS;
+    // Claude Code on Windows runs its commands in Git Bash. The connector's
+    // PATH may predate a Git for Windows installed with it (D116), so it is
+    // named with Anthropic's documented setting, found from the connector's
+    // own environment; none found leaves Claude Code to say what it needs.
+    if (profile.os === "windows") {
+      const bash = findGitForWindows(process.env)?.bash;
+      if (bash) env.CLAUDE_CODE_GIT_BASH_PATH = bash;
+    }
   }
   if (config.RUNNER_NATIVE_CODEX_SOCKET !== undefined) {
     if (!config.RUNNER_NATIVE_CODEX_HOME || !profile?.codexLocalProxy || profile.os === "windows" ||
