@@ -1,4 +1,4 @@
-import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, createLogger, type Logger } from "@konteks/remote-common";
 
 import { z } from "zod";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
@@ -267,7 +267,19 @@ export interface CoreClientOptions {
   fetchFn?: FetchFn;
   /** The platform MCP endpoint agents reach through `mcpServers`; defaults to Core's root MCP surface. */
   platformMcpUrl?: string;
+  logger?: Logger;
 }
+
+/**
+ * How long a key set Core confirmed stays usable while Core's key endpoint
+ * cannot be reached (D110: the endpoint timed out for minutes and every prompt
+ * was refused). Every use of these keys is paired with a direct Core call over
+ * TLS (consumption, check), so a stale set never admits work Core refuses; a
+ * set missing the requested key id is never served stale.
+ */
+export const SIGNING_KEY_STALE_MAX_MS = 24 * 60 * 60_000;
+const SIGNING_KEY_RETRY_BASE_MS = 1_000;
+const SIGNING_KEY_RETRY_MAX_MS = 60_000;
 
 const RecoveryEvidenceIngressResultSchema = z.object({
   instanceId: z.string().min(1),
@@ -289,11 +301,17 @@ export class CoreClient {
   private signingKeyCache: {
     keys: ReadonlyMap<string, KeyObject>;
     expiresAtMs: number;
+    confirmedAtMs: number;
     unknownKidRefreshUsed: boolean;
   } | null = null;
   private signingKeyRefresh: Promise<ReadonlyMap<string, KeyObject>> | null = null;
+  /** Consecutive failed key refreshes and when the next may start (backoff). */
+  private signingKeyFailures = 0;
+  private signingKeyRetryAtMs = 0;
+  private readonly logger: Logger;
 
   constructor(private readonly options: CoreClientOptions) {
+    this.logger = options.logger ?? createLogger({ name: "core-client" });
     const transport = {
       baseUrl: options.baseUrl,
       ...(options.fetchFn ? { fetchFn: options.fetchFn } : {}),
@@ -392,22 +410,59 @@ export class CoreClient {
       refreshUnknownKid = Boolean(expectedKid && !cached.keys.has(expectedKid) && !cached.unknownKidRefreshUsed);
       if (!refreshUnknownKid) return cached.keys;
     }
+    // Stale-while-revalidate during an outage: inside the backoff window after
+    // a failed refresh, answer with the last confirmed keys at once instead of
+    // making every admission and renewal wait out another timeout.
+    const confirmed = this.confirmedSigningKeys(expectedKid);
+    if (confirmed && Date.now() < this.signingKeyRetryAtMs) return confirmed;
     if (!this.signingKeyRefresh) {
       this.signingKeyRefresh = this.fetchExecutionSigningKeys().then(keys => {
         // Core currently does not publish a shorter keyset max-age. Keep the
         // configured-origin cache below the C05 60-second upper bound.
+        const now = Date.now();
         this.signingKeyCache = {
           keys,
-          expiresAtMs: Date.now() + 60_000,
+          expiresAtMs: now + 60_000,
+          confirmedAtMs: now,
           // A signed-operation header can request one refresh of a still-valid
           // configured-origin epoch. Further unknown identifiers fail closed
           // until normal expiry, preventing attacker-controlled fetch loops.
           unknownKidRefreshUsed: refreshUnknownKid,
         };
+        if (this.signingKeyFailures > 0) {
+          this.logger.info({ event: "execution.signing_keys_recovered", failures: this.signingKeyFailures }, "Core signing keys readable again");
+        }
+        this.signingKeyFailures = 0;
+        this.signingKeyRetryAtMs = 0;
         return keys;
+      }, (error: unknown) => {
+        this.signingKeyFailures += 1;
+        const retryInMs = Math.min(SIGNING_KEY_RETRY_MAX_MS, SIGNING_KEY_RETRY_BASE_MS * 2 ** (this.signingKeyFailures - 1));
+        this.signingKeyRetryAtMs = Date.now() + retryInMs;
+        const stale = this.signingKeyCache;
+        this.logger.warn({ event: "execution.signing_keys_refresh_failed", failures: this.signingKeyFailures, retryInMs,
+          code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
+          ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+          servingConfirmedKeys: this.confirmedSigningKeys() !== null,
+          ...(stale ? { confirmedAgeMs: Date.now() - stale.confirmedAtMs } : {}) }, "Core signing keys could not be refreshed");
+        throw error;
       }).finally(() => { this.signingKeyRefresh = null; });
     }
-    return this.waitForSigningKeys(this.signingKeyRefresh, deadlineAtMs);
+    try {
+      return await this.waitForSigningKeys(this.signingKeyRefresh, deadlineAtMs);
+    } catch (error) {
+      const fallback = this.confirmedSigningKeys(expectedKid);
+      if (fallback && error instanceof RemoteInstanceError && error.code === "execution_authority_unavailable") return fallback;
+      throw error;
+    }
+  }
+
+  /** The last key set Core confirmed, if still within the stale bound and holding the requested key. */
+  private confirmedSigningKeys(expectedKid?: string): ReadonlyMap<string, KeyObject> | null {
+    const cached = this.signingKeyCache;
+    if (!cached || Date.now() - cached.confirmedAtMs > SIGNING_KEY_STALE_MAX_MS) return null;
+    if (expectedKid && !cached.keys.has(expectedKid)) return null;
+    return cached.keys;
   }
 
   private async fetchExecutionSigningKeys(): Promise<ReadonlyMap<string, KeyObject>> {
@@ -426,8 +481,10 @@ export class CoreClient {
         keys.set(jwk.kid, key);
       }
       return keys;
-    } catch {
-      throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.");
+    } catch (error) {
+      // The cause stays a bounded code for the log; message text never leaves.
+      throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.",
+        { diagnostic: error instanceof RemoteInstanceError ? error.code : error instanceof z.ZodError ? "schema_invalid" : "invalid_key_set" });
     }
   }
 
