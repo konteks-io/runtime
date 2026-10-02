@@ -1,5 +1,5 @@
 import { EventEmitter, once } from "node:events";
-import { chmod, lstat, mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,9 +12,16 @@ import { NativeCodexAppServerOwner, cleanupCodexSocket, prepareCodexSocket, wait
 vi.mock("@konteks/remote-common", async importOriginal => ({
   ...await importOriginal<object>(), isProcessGroupAlive: vi.fn(() => false),
 }));
-vi.mock("@konteks/remote-agent-runner", async importOriginal => ({
-  ...await importOriginal<object>(), assertCodexThreadsIdle: vi.fn(async () => undefined),
-}));
+const loadedStatuses = vi.hoisted(() => vi.fn(async (_socket: string) => new Map<string, string>()));
+vi.mock("@konteks/remote-agent-runner", async importOriginal => {
+  const actual = await importOriginal<object>();
+  const runtime = await import("../../../agent-runner/src/runtime.js");
+  return {
+    ...actual, assertCodexThreadsIdle: vi.fn(async () => undefined),
+    codexLoadedThreadStatuses: loadedStatuses,
+    FileSessionRefStore: runtime.FileSessionRefStore,
+  };
+});
 
 function child(): PipedChildProcess {
   const process = new EventEmitter() as PipedChildProcess;
@@ -55,6 +62,37 @@ function fixture() {
 }
 
 describe("native shared Codex app-server owner", () => {
+  async function legacyThreadFixture(sessionRefs: Record<string, unknown>, statuses: Map<string, string>) {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "codex-legacy-thread-")));
+    const credentialDir = join(root, "credentials");
+    const socketPath = join(root, "app-server.sock");
+    await mkdir(credentialDir, { mode: 0o700 });
+    await writeFile(join(credentialDir, "session-refs.json"), JSON.stringify(sessionRefs), { mode: 0o600 });
+    const localConfig = { ...config, RUNNER_CREDENTIAL_DIR: credentialDir, RUNNER_NATIVE_CODEX_SOCKET: socketPath } as RunnerConfig;
+    const f = fixture();
+    const server = createServer(socket => socket.end());
+    server.listen(socketPath);
+    await once(server, "listening");
+    const owner = new NativeCodexAppServerOwner({
+      config: localConfig, spawn: f.spawn, stop: f.stop,
+      prepareSocket: vi.fn(async () => "spawn" as const), waitUntilReady: f.waitUntilReady,
+      cleanupSocket: f.cleanupSocket, verifyPackage: f.verifyPackage,
+    });
+    await owner.start();
+    loadedStatuses.mockReset();
+    loadedStatuses.mockResolvedValue(statuses);
+    const socketIdentity = await stat(socketPath);
+    return {
+      owner,
+      ownerGeneration: `42:${socketIdentity.dev}:${socketIdentity.ino}:${socketIdentity.birthtimeMs}`,
+      close: async () => {
+        await owner.stop();
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        await rm(root, { recursive: true, force: true });
+      },
+    };
+  }
+
   it.each(["active", "unknown"])("keeps the exact owner alive when loaded-thread inventory is %s", async state => {
     const f = fixture();
     const assertIdleThreads = vi.fn(async (): Promise<void> => { throw new Error(`thread inventory ${state}`); });
@@ -283,6 +321,46 @@ describe("native shared Codex app-server owner", () => {
     expect(f.stop).toHaveBeenCalledOnce();
     expect(f.cleanupSocket).toHaveBeenCalledOnce();
   });
+
+  it.each(["idle", "active"])("recognizes a loaded provider thread for an ACP reference (%s)", async status => {
+    const providerThreadId = "8eac57df-c963-4f26-b417-2edbeeeae7e1";
+    const f = await legacyThreadFixture({ "acp-fixture": providerThreadId }, new Map([[providerThreadId, status]]));
+    try {
+      await expect(f.owner.inspectLegacyThread("acp-fixture")).resolves.toMatchObject({ unloaded: false });
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("reports unloaded when the mapped provider UUID is absent from the inventory", async () => {
+    const providerThreadId = "8eac57df-c963-4f26-b417-2edbeeeae7e1";
+    const f = await legacyThreadFixture({ "acp-fixture": providerThreadId }, new Map());
+    try {
+      await expect(f.owner.inspectLegacyThread("acp-fixture")).resolves.toMatchObject({
+        unloaded: true, ownerGeneration: f.ownerGeneration,
+      });
+    } finally {
+      await f.close();
+    }
+  });
+
+  it.each([
+    ["missing", {}],
+    ["malformed string", { "acp-fixture": "not-a-provider-uuid" }],
+    ["malformed null", { "acp-fixture": null }],
+    ["malformed object", { "acp-fixture": { id: "8eac57df-c963-4f26-b417-2edbeeeae7e1" } }],
+  ])(
+    "refuses legacy inspection when the ACP mapping is %s",
+    async (_label, sessionRefs) => {
+      const f = await legacyThreadFixture(sessionRefs, new Map());
+      try {
+        await expect(f.owner.inspectLegacyThread("acp-fixture")).rejects.toMatchObject({ code: "agent_unavailable" });
+        expect(loadedStatuses).not.toHaveBeenCalled();
+      } finally {
+        await f.close();
+      }
+    },
+  );
 });
 
 describe("stray app-servers of this installation (RCA 2026-09-30)", () => {
