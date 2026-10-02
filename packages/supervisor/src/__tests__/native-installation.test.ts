@@ -69,6 +69,14 @@ describe("closed native runtime installation", () => {
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, git: { ...git, digest: "sha256:" + "f".repeat(64) } }));
     await expect(loadNativeInstallation(root, f.options)).rejects.toThrow();
   });
+  it("loads and starts an installation with no agent yet (OS14, D116)", async () => {
+    const f = await fixture();
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: [] }));
+    const loaded = await loadNativeInstallation(root, f.options);
+    expect(loaded.runners).toEqual([]);
+    // Startup rechecks the (empty) runner list the same way.
+    await expect(verifyInstalledNativeBridges(loaded.release, loaded.runners, f.options.platform)).resolves.toBeUndefined();
+  });
   it("uses the production input preparer without an embedding adapter", async () => {
     const f = await fixture();
     expect(() => createNativeService({ root, ...f.options })).not.toThrow();
