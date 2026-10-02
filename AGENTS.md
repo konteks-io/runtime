@@ -581,7 +581,10 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
   restart`. The service manager keeps owning the one supervisor; a foreground
   `serve` is never restarted; one reload per definition per 10 minutes
   (`supervisor/service-reload.json`), and a `serve` not stopped within 60 s
-  starts anyway. Windows only rewrites the task file: `start` re-registers it.
+  starts anyway. Windows repairs its private windowless launch helper and
+  re-registers a changed task without starting another connector. Task XML
+  remains UTF-16LE with a BOM; failed registration restores the prior file
+  so the next startup retries.
 - After the shared Codex owner starts, app-servers that older releases of this
   installation left on other sockets are ended once idle (or unreachable)
   (`reapStrayServers`); nothing outside `<root>/releases/` is touched.

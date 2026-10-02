@@ -94,8 +94,28 @@ export async function keepServiceOnOwnDefinition(root: string, deps: OwnServiceD
   const onDisk = await deps.read(definition.path).catch(() => null);
   if (onDisk === null) return "not_installed";
   const rewritten = onDisk !== definition.contents;
-  if (rewritten) await deps.write(definition.path, definition.contents);
-  const unchanged = rewritten ? "next_start" : "current";
+  let helperChanged = false;
+  for (const file of definition.supportFiles ?? []) {
+    if (await deps.read(file.path).catch(() => null) === file.contents) continue;
+    await deps.write(file.path, file.contents);
+    helperChanged = true;
+  }
+  if (rewritten) {
+    await deps.write(definition.path, definition.contents);
+    if (deps.os === "windows") {
+      try {
+        // Task Scheduler stores its own XML copy. Replace it without starting
+        // another connector; its next start will use this release's helper.
+        for (const command of definition.install) {
+          if (await deps.execute(command) !== 0) throw new Error(`${command.command} exited unsuccessfully`);
+        }
+      } catch (error) {
+        await deps.write(definition.path, onDisk);
+        throw error;
+      }
+    }
+  }
+  const unchanged = rewritten || helperChanged ? "next_start" : "current";
   const reload = definition.reload;
   if (!reload || !definition.inspect || !definition.expected) return unchanged;
   const output = await deps.inspect(definition.inspect);
@@ -133,8 +153,14 @@ function productionOwnServiceDefinitionDeps(root: string): OwnServiceDefinitionD
   const reloadFile = join(root, "supervisor", SERVICE_RELOAD_FILE);
   return {
     definition: serviceDefinition,
-    read: path => readFile(path, "utf8"),
-    write: writeSecretFile,
+    read: async path => {
+      const bytes = await readFile(path);
+      return bytes[0] === 0xff && bytes[1] === 0xfe
+        ? bytes.subarray(2).toString("utf16le") : bytes.toString("utf8");
+    },
+    write: (path, contents) => writeSecretFile(path,
+      nativePlatform().os === "windows" && path === join(root, "service.xml")
+        ? Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(contents, "utf16le")]) : contents),
     os: nativePlatform().os,
     pid: process.pid,
     inspect: async command => {
