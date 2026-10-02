@@ -610,6 +610,19 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
   `KONTEKS_RELEASE_MANIFEST_URL` override warns, no lease warns that updates
   wait), and `status` shows it through the separate `update.channel` op (never
   a new status field: older launchers parse `status` strictly).
+- A native turn survives Core being slow or unreachable (D110,
+  `native/execution-gate.ts`). An unanswered execution-lease renewal retries
+  with backoff (1 s doubling to 30 s, no attempt cap) and the running agent
+  keeps going; once the lease has lapsed only new dispatch waits for Core's
+  next fresh check. The agent stops only when Core answers (`execution_fenced`,
+  a denial, a durable revision fence), never on a timeout; a check lease that
+  expired in transit is asked for again. `CoreClient.executionSigningKeys`
+  serves the last key set Core confirmed (up to `SIGNING_KEY_STALE_MAX_MS`,
+  never for an unknown key id) while its key endpoint fails, backing off
+  between refreshes, and admission retries its keys while the permit is
+  valid instead of dropping the relay socket. Each decision logs one line
+  (`execution.renewal_retry_scheduled`, `execution.signing_keys_refresh_failed`,
+  `execution.admission_keys_unavailable`).
 
 Before production changes, add or update a focused characterization test and
 observe its failure or baseline. Run focused tests serially; do not start

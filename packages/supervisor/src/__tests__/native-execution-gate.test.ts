@@ -7,7 +7,7 @@ import { FixedClock, RemoteInstanceError, generateEd25519, ed25519Sign, remoteCo
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { PermissionAnswerReceiver } from "../control/permission-answer-receiver.js";
 import { SupervisorJournal } from "../state/journal.js";
-import { NativeExecutionGate } from "../native/execution-gate.js";
+import { NativeExecutionGate, NATIVE_EXECUTION_RENEWAL_BUDGET_MS } from "../native/execution-gate.js";
 import { terminalOperationDispositions } from "../state/operation-dispositions.js";
 import { RelayedSession } from "../session/relayed-session.js";
 import { PermissionBroker } from "../session/permissions.js";
@@ -116,6 +116,29 @@ it("passes an operation key identifier to the configured-origin trust cache", as
   expect(f.client.executionSigningKeys).toHaveBeenCalledWith(undefined, "rotated");
 });
 
+it("waits out Core's slow key endpoint during admission instead of refusing the prompt (D110)", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const unavailable = new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.", { diagnostic: "temporarily_unavailable" });
+  f.client.executionSigningKeys.mockRejectedValueOnce(unavailable).mockRejectedValueOnce(unavailable);
+  const admitted = f.gate.admit(f.envelope);
+  await vi.advanceTimersByTimeAsync(2_000);
+  await expect(admitted).resolves.toMatchObject({ replay: false });
+  expect(f.client.executionSigningKeys).toHaveBeenCalledTimes(3);
+});
+
+it("refuses admission once waiting for keys would outlive the permit", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  f.client.executionSigningKeys.mockRejectedValue(new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable."));
+  const admitted = f.gate.admit(f.envelope);
+  const settled = expect(admitted).rejects.toMatchObject({ code: "execution_authority_unavailable" });
+  // The fixture's clock is fixed, so the permit never runs out: advance it.
+  for (let step = 0; step < 40; step += 1) { f.advance(1_000); await vi.advanceTimersByTimeAsync(1_000); }
+  await settled;
+  expect(f.client.consumeExecution).not.toHaveBeenCalled();
+});
+
 it("dispatches delivery exactly once through dedicated consumption and check routes", async () => {
   const f = await deliveryFixture(); const operation = await f.gate.admit(f.envelope);
   expect(await f.gate.begin(operation)).toBe(true);
@@ -127,7 +150,7 @@ it("dispatches delivery exactly once through dedicated consumption and check rou
   expect(f.journal.pendingRequests.get(operation.key)?.authorization?.claims).toMatchObject({ workloadKind: "harness_delivery" });
 });
 
-it("does not give renewal I/O more time than the verified monotonic lease has left", async () => {
+it("gives a renewal near or past the verified lease its whole I/O budget (D110)", async () => {
   vi.useFakeTimers();
   const f = await fixture();
   const operation = await f.gate.admit(f.envelope);
@@ -136,8 +159,10 @@ it("does not give renewal I/O more time than the verified monotonic lease has le
   f.advance(29_999);
   await vi.advanceTimersByTimeAsync(1_000);
 
+  // A budget clipped to the last millisecond of the lease could only fail
+  // and waste the attempt; Core's fresh check decides, not the old lease.
   const renewalDeadline = f.client.executionSigningKeys.mock.calls.at(-1)?.[0] as number;
-  expect(renewalDeadline).toBeLessThanOrEqual(Date.now() + 1);
+  expect(renewalDeadline).toBeGreaterThanOrEqual(Date.now() + NATIVE_EXECUTION_RENEWAL_BUDGET_MS - 1_000);
 });
 
 it("renews early enough to recover from a 19 second busy-host pause without extending the old lease", async () => {
@@ -161,7 +186,7 @@ it("renews early enough to recover from a 19 second busy-host pause without exte
   expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
 });
 
-it("refuses a successful renewal response received after the old monotonic lease expired", async () => {
+it("adopts Core's fresh check that arrives after the old lease ran out, and keeps the agent running (D110)", async () => {
   vi.useFakeTimers();
   const f = await fixture();
   const operation = await f.gate.admit(f.envelope);
@@ -173,8 +198,66 @@ it("refuses a successful renewal response received after the old monotonic lease
   });
   f.advance(5_000);
   await vi.advanceTimersByTimeAsync(1_000);
-  expect(f.onAuthorityLost).toHaveBeenCalledOnce();
-  expect(() => f.gate.assertDispatchCurrent(operation.authority)).toThrow();
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
+});
+
+it("keeps the agent running while renewals go unanswered past the lease, backing off, and stops it only when Core answers the execution is gone (D110)", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: vi.fn() };
+  const gate = f.makeGate({ logger });
+  const operation = await gate.admit(f.envelope);
+  await gate.begin(operation);
+  f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "Core request deadline expired", { retryable: true }));
+  for (let second = 0; second < 180; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  // Backoff, not a one-second hammer: three minutes cost far fewer checks.
+  expect(f.client.checkExecution.mock.calls.length).toBeLessThan(20);
+  expect(f.client.checkExecution.mock.calls.length).toBeGreaterThan(4);
+  // New work still waits for a fresh check; only the running prompt carries on.
+  expect(() => gate.assertDispatchCurrent(operation.authority)).toThrow();
+  const retries = logger.warn.mock.calls.map(call => call[0]).filter(entry => entry.event === "execution.renewal_retry_scheduled");
+  expect(retries.at(-1)).toMatchObject({ retry: retries.length, code: "temporarily_unavailable", leaseExpired: true, retryInMs: expect.any(Number) });
+  expect(retries.at(-1).retryInMs).toBeGreaterThan(retries[0].retryInMs);
+
+  f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("execution_fenced", "Execution is not current for this caller"));
+  for (let second = 0; second < 60; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
+  expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
+});
+
+it("retries a genuine check lease that expired on its way from a slow Core instead of stopping the agent (D110)", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+  const normalCheck = f.client.checkExecution.getMockImplementation()!;
+  f.client.checkExecution.mockImplementationOnce(async () => {
+    const result = await normalCheck();
+    f.advance(31_000);
+    return result;
+  });
+  f.advance(5_000);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  for (let second = 0; second < 5; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
+});
+
+it("still stops at once on Core's durable revision fence while renewals are failing (D110)", async () => {
+  vi.useFakeTimers();
+  const f = await fixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+  f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "Core request deadline expired", { retryable: true }));
+  for (let second = 0; second < 40; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  const journal = f.journal.executionRevisionFences as unknown as { pending: () => unknown[] };
+  vi.spyOn(journal, "pending").mockReturnValue([{ runnerIncarnation: "runner", connectionRef: "connection", connectionEpoch: 2,
+    intent: { instanceId: "instance", executionId: "execution", executionRevision: 1, checkId: "check", connectionRef: "connection", connectionEpoch: 2 } }]);
+  f.advance(1000); await vi.advanceTimersByTimeAsync(1000);
+  expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
 });
 
 it("records renewal stage and remaining authority without logging signed material", async () => {
@@ -701,12 +784,14 @@ describe("independent native live execution gate", () => {
     f.client.checkExecution.mockRejectedValueOnce(new RemoteInstanceError("execution_fenced", "moved"));
     f.advance(31_000); f.clock.advance(-40_000); await vi.advanceTimersByTimeAsync(1000);
     // A backward wall-clock jump cannot manufacture time before the local
-    // monotonic expiry; the old check is never retried or extended.
-    expect(f.client.checkExecution).toHaveBeenCalledOnce();
+    // monotonic expiry; the old check is never extended. Only Core's fresh
+    // answer decides (D110), and here it says the execution is gone.
+    expect(f.client.checkExecution).toHaveBeenCalledTimes(2);
+    expect(() => f.gate.assertDispatchCurrent(operation.authority)).toThrow();
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
   });
 
-  it("fences at the monotonic projection of the last verified expiry when a renewal is unavailable", async () => {
+  it("refuses new dispatch, but does not stop the running agent, at the monotonic projection of the last verified expiry", async () => {
     const f = await fixture(); vi.useFakeTimers();
     const operation = await f.gate.admit(f.envelope); await f.gate.begin(operation);
     f.client.checkExecution.mockRejectedValue(new RemoteInstanceError("temporarily_unavailable", "Core request failed", { retryable: true }));
@@ -714,9 +799,10 @@ describe("independent native live execution gate", () => {
       for (let second = 0; second < seconds; second += 1) { f.advance(1000); await vi.advanceTimersByTimeAsync(1000); }
     };
     await step(29);
-    expect(f.onAuthorityLost).not.toHaveBeenCalled();
+    expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
     await step(1);
-    expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
+    expect(() => f.gate.assertDispatchCurrent(operation.authority)).toThrow();
+    expect(f.onAuthorityLost).not.toHaveBeenCalled();
   });
 });
 
