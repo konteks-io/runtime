@@ -67,6 +67,17 @@ curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/instal
 powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://github.com/konteks-io/runtime/releases/latest/download/install.ps1))) -ActivationId <id>"
 ```
 
+Nothing needs to be installed first. Without `--agents`, `install` uses the
+agents it finds on the computer and connects even with none. Before asking
+for the code it offers, once each and only in a terminal: Claude Code through
+Anthropic's official installer (`https://claude.ai/install.ps1` on Windows,
+`https://claude.ai/install.sh` elsewhere), and Codex, which ships with the
+connector (nothing is downloaded). It then starts each one's own sign-in and
+ends by saying which agents are ready, with the one command for the rest
+(`konteks-remote agent add claude-code|codex` offers the same later). Without a
+terminal nothing is downloaded. `--agents` names exactly the agents to use,
+each required.
+
 The bootstrap verifies the signed checksum manifest and the publisher
 signature of the installer package before running anything. Signed packages
 are also published as plain release assets for offline or audited installs.

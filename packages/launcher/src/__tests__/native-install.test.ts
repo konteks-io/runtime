@@ -32,6 +32,7 @@ async function fixture() {
   const base = { protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], expiresAt: "2027-01-01T00:00:00Z" };
   const oldManifest = signed({ ...base, bundleVersion: "1.0.0", nativeArtifacts: [artifact, claude.artifact] });
   const manifest = signed({ ...base, bundleVersion: "1.1.0", nativeArtifacts: [artifact, claude.artifact, agent.artifact] });
+  const olderManifest = signed({ ...base, bundleVersion: "0.9.0", nativeArtifacts: [artifact, claude.artifact, agent.artifact] });
   const trust = [{ ...keys.root, coreControlKeys: [{ keyId: keys.keyId, publicKeyJwk: keys.root.publicKeyJwk }] }];
   const platform = { os: "macos", architecture: "arm64", deploymentKind: "native_connector", containerBackend: "none" } as const;
   const activate = vi.fn(async ({ release }: { release: { manifest: typeof manifest } }) => {
@@ -42,7 +43,7 @@ async function fixture() {
   });
   const fetchFn = vi.fn(async (url: string) => new Response(url === agent.artifact.url ? agent.archive : url === claude.artifact.url ? claude.archive : bytes));
   const options = { root, activationId: "activation-123", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", agents: ["codex"], output: createOutput({ json: true }), deps: { roots: trust, platform, manifest, activate, fetchFn, git: null } };
-  return { root, options, activate, trust, platform, manifest, oldManifest, fetchFn };
+  return { root, options, activate, trust, platform, manifest, oldManifest, olderManifest, fetchFn };
 }
 
 /** The person's own DeepSeek Harness and Node, as npm installs them (the Node only answers --version). */
@@ -382,10 +383,64 @@ describe("native install composition", () => {
     f.options.agents = ["claude-code"];
     f.options.deps.manifest = f.oldManifest;
     const before = await installNative(f.options as never);
-    await expect(addNativeAgent({ root: f.root, agentId: "codex", output: f.options.output, deps: { roots: f.trust, platform: f.platform, manifest: f.oldManifest, fetchFn: f.fetchFn } })).rejects.toMatchObject({ code: "update_required" });
+    await expect(addNativeAgent({ root: f.root, agentId: "codex", output: f.options.output, deps: { roots: f.trust, platform: f.platform, manifest: f.olderManifest, fetchFn: f.fetchFn } })).rejects.toMatchObject({ code: "update_required" });
+    // The installed release itself, which has no Codex package for this computer, adds nothing either.
+    await expect(addNativeAgent({ root: f.root, agentId: "codex", output: f.options.output, deps: { roots: f.trust, platform: f.platform, manifest: f.oldManifest, fetchFn: f.fetchFn } })).rejects.toThrow();
     await expect(addNativeAgent({ root: f.root, agentId: "codex", output: f.options.output, deps: { roots: [], platform: f.platform, manifest: f.manifest, fetchFn: f.fetchFn } })).rejects.toMatchObject({ code: "bundle_untrusted" });
     expect(await readNativeRecord(f.root)).toEqual(before);
     expect(f.activate).toHaveBeenCalledTimes(1);
+  });
+  it("connects a computer with no agent at all, offering Claude Code and Codex instead of refusing (D116)", async () => {
+    const f = await fixture();
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", join(f.root, "no-claude", "claude"));
+    vi.stubEnv("CODEX_HOME", join(f.root, "no-codex"));
+    vi.stubEnv("DSH_EXECUTABLE", "/no-dsh");
+    vi.stubEnv("OPENCODE_EXECUTABLE", "/no-opencode");
+    const { agents: _agents, ...options } = f.options;
+    const offered: string[] = [];
+    const record = await installNative({ ...options, deps: { ...options.deps, setupAgent: async (agent: string) => { offered.push(agent); return false; } } } as never);
+    expect(offered).toEqual(["claude-code", "codex"]);
+    expect(record.agents).toEqual([]);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+    // It starts like any other connector: nothing to verify, nothing refused.
+    await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).resolves.toMatchObject({ record: { agents: [] }, runners: [] });
+    // Run again (the site's command pasted twice), it keeps the connected record.
+    await expect(installNative({ ...options, deps: { ...options.deps, setupAgent: async () => false } } as never)).resolves.toEqual(record);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+
+    // Later, `agent add codex` adds it from the same release: no newer release is needed.
+    await mkdir(join(f.root, "no-codex"), { mode: 0o700 });
+    const added = await addNativeAgent({ root: f.root, agentId: "codex", output: f.options.output, deps: { roots: f.trust, platform: f.platform, manifest: f.manifest, fetchFn: f.fetchFn } });
+    expect(added).toMatchObject({ agents: ["codex"], instanceId: record.instanceId, manifestDigest: record.manifestDigest, codexHome: await realpath(join(f.root, "no-codex")) });
+    expect(added.releaseId).not.toBe(record.releaseId);
+    await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).resolves.toMatchObject({ record: { agents: ["codex"] }, runners: [{ RUNNER_AGENT_ID: "codex" }] });
+    expect(f.activate).toHaveBeenCalledTimes(1);
+  });
+  it("connects with the agents found here plus the ones the person set up when asked (D116)", async () => {
+    const f = await fixture();
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", join(f.root, "no-claude", "claude"));
+    vi.stubEnv("CODEX_HOME", join(f.root, "new-codex"));
+    vi.stubEnv("DSH_EXECUTABLE", "/no-dsh");
+    vi.stubEnv("OPENCODE_EXECUTABLE", "/no-opencode");
+    const { agents: _agents, ...options } = f.options;
+    const setupAgent = vi.fn(async (agent: string) => {
+      if (agent !== "codex") return false;
+      await mkdir(join(f.root, "new-codex"), { mode: 0o700 });
+      return true;
+    });
+    const record = await installNative({ ...options, deps: { ...options.deps, setupAgent } } as never);
+    expect(record.agents).toEqual(["codex"]);
+    expect(record.codexHome).toBe(await realpath(join(f.root, "new-codex")));
+    expect(setupAgent.mock.invocationCallOrder[1]!).toBeLessThan(f.activate.mock.invocationCallOrder[0]!);
+  });
+  it("still refuses a missing agent the operator named in --agents (D116)", async () => {
+    const f = await fixture();
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", join(f.root, "no-claude", "claude"));
+    f.options.agents = ["claude-code"];
+    const setupAgent = vi.fn(async () => true);
+    await expect(installNative({ ...f.options, deps: { ...f.options.deps, setupAgent } } as never)).rejects.toMatchObject({ code: "prerequisite_missing" });
+    expect(setupAgent).not.toHaveBeenCalled();
+    expect(f.activate).not.toHaveBeenCalled();
   });
   it("refuses a missing local Codex profile before activation", async () => {
     const f = await fixture();
