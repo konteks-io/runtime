@@ -1,10 +1,10 @@
 import { mkdtempSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
-import { DEFAULT_BASH_BLOCKLIST, blockedCommandPattern, createWorkspaceToolPolicy, isWithinWorkspace } from "../session/workspace-tool-policy.js";
+import { DEFAULT_BASH_BLOCKLIST, POLICY_REFUSAL_PREFIX, blockedCommandPattern, createWorkspaceToolPolicy, describeRefusedPath, isWithinWorkspace, type WorkspaceToolPolicyEvaluation } from "../session/workspace-tool-policy.js";
 
 const options = [
   { optionId: "allow", name: "Allow", kind: "allow_once" },
@@ -50,20 +50,65 @@ describe("native workspace tool policy", () => {
 
   it("denies blocklisted commands, including a shell call judged by its title", async () => {
     await expect(responder.evaluatePermission(request({ kind: "execute", rawInput: { command: "git push origin main" } }), context))
-      .resolves.toEqual({ kind: "deny", optionId: "reject" });
+      .resolves.toMatchObject({ kind: "deny", optionId: "reject", refusal: { reason: "bash_blocklist", pattern: "git push" } });
     await expect(responder.evaluatePermission(request({ kind: "execute", title: "sudo rm -rf x" }), context))
-      .resolves.toEqual({ kind: "deny", optionId: "reject" });
+      .resolves.toMatchObject({ kind: "deny", optionId: "reject" });
     expect(blockedCommandPattern("git branch --show-current", ["nc "])).toBeNull();
   });
 
   it("denies file changes outside the workspace, through locations or a symlink", async () => {
     await expect(responder.evaluatePermission(request({ kind: "edit", rawInput: { file_path: "/etc/hosts" } }), context))
-      .resolves.toEqual({ kind: "deny", optionId: "reject" });
+      .resolves.toMatchObject({ kind: "deny", optionId: "reject" });
     await expect(responder.evaluatePermission(request({ kind: "delete", locations: [{ path: join(root, "..", "x") }] }), context))
-      .resolves.toEqual({ kind: "deny", optionId: "reject" });
+      .resolves.toMatchObject({ kind: "deny", optionId: "reject" });
     symlinkSync(tmpdir(), join(root, "escape"));
     expect(isWithinWorkspace(join(root, "escape", "file.txt"), root)).toBe(false);
     expect(isWithinWorkspace("src/new-file.ts", root)).toBe(true);
+  });
+});
+
+// T1 (2026-10-02): one of four paths in a Codex "Edit files" call was written
+// from the filesystem root, the whole call was refused, and neither the log nor
+// the agent learned which path or why (D114).
+describe("a refused file change names what is outside and how to fix it", () => {
+  const root = mkdtempSync(join(tmpdir(), "ws-refusal-"));
+  const cwd = join(root, "session-1");
+  mkdirSync(join(cwd, "storefront", "lib"), { recursive: true });
+  const policy = createWorkspaceToolPolicy();
+  const judge = (locations: string[]) => policy.evaluateToolUse({
+    toolName: "edit", input: { locations: locations.map(path => ({ path })) }, repoPath: cwd, workspaceRoot: root, agentId: "codex", toolUseId: "t",
+  }) as WorkspaceToolPolicyEvaluation;
+
+  it("refuses the whole call, names every outside path and the working copy, and suggests the working-copy path", () => {
+    const page = "/storefront/app/checkout/confirmation/[orderId]/page.tsx";
+    const evaluation = judge([join(cwd, "storefront", "lib", "orders.ts"), page, join(cwd, "storefront", "lib", "cart.ts"), "../../outside.txt"]);
+    expect(evaluation.allowed).toBe(false);
+    expect(evaluation.refusal).toEqual({ reason: "outside_workspace", pathCount: 4, outside: [
+      { path: page, rootAnchored: true, suggestion: "storefront/app/checkout/confirmation/[orderId]/page.tsx" },
+      { path: "../../outside.txt", rootAnchored: false },
+    ] });
+    expect(evaluation.denyMessage).toBe(`Konteks refused this file change: 2 of 4 paths are outside the workspace \`${cwd}/\`. ` +
+      `\`${page}\` starts at the filesystem root; inside the workspace it is \`storefront/app/checkout/confirmation/[orderId]/page.tsx\`; ` +
+      "`../../outside.txt` is outside it. Nothing in it was applied. Use paths inside the workspace, relative to it, and try again.");
+    expect(evaluation.denyMessage!.startsWith(POLICY_REFUSAL_PREFIX)).toBe(true);
+  });
+
+  it("never allows a root-anchored path: an ACP answer cannot rewrite where the agent writes", () => {
+    expect(judge(["/storefront/lib/orders.ts"]).allowed).toBe(false);
+  });
+
+  it("reads a path as root-anchored only when that is unambiguous and stays inside", () => {
+    // A real folder at the filesystem root is the agent's real target.
+    expect(describeRefusedPath("/etc/hosts", root, cwd)).toEqual({ path: relative(cwd, "/etc/hosts"), rootAnchored: false });
+    // A traversal is never reinterpreted.
+    expect(describeRefusedPath("/storefront/../../x", root, cwd).rootAnchored).toBe(false);
+    // A folder the working copy does not have is not a working-copy path.
+    expect(describeRefusedPath("/nowhere-in-copy/x.ts", root, cwd).rootAnchored).toBe(false);
+    // A symlink inside the working copy that leaves the boundary stays outside.
+    symlinkSync(tmpdir(), join(cwd, "linked"));
+    expect(describeRefusedPath("/linked/x.ts", root, cwd).rootAnchored).toBe(false);
+    // An absolute path elsewhere is shown relative to the working copy, never as this computer's path.
+    expect(describeRefusedPath(join(root, "..", "other", "x.ts"), root, cwd)).toEqual({ path: "../../other/x.ts", rootAnchored: false });
   });
 });
 
