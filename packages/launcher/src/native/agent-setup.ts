@@ -3,7 +3,7 @@ import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { z } from "zod";
-import { RemoteInstanceError, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
+import { findGitForWindows, GIT_FOR_WINDOWS_DOWNLOAD, GIT_FOR_WINDOWS_WINGET, RemoteInstanceError, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
 import { claudeCodeInstaller, resolveNativeClaudeExecutable, resolveNativeCodexHome } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { confirm } from "../prompt.js";
@@ -40,7 +40,12 @@ export interface AgentSetupDeps {
   found: (agentId: PersonalAgentId) => Promise<boolean>;
   /** Codex's profile folder to create (CODEX_HOME, else ~/.codex); undefined when it cannot be one. */
   codexHome: () => string | undefined;
+  /** Windows: Git for Windows and its Git Bash, which Claude Code needs, are here. */
+  gitForWindows: () => boolean;
 }
+
+/** The one line for a person who needs Git for Windows and is not getting it from winget. */
+const GIT_HINT = `Claude Code needs Git for Windows: ${GIT_FOR_WINDOWS_DOWNLOAD}`;
 
 export function productionAgentSetupDeps(output: Pick<Output, "json">): AgentSetupDeps {
   return {
@@ -57,7 +62,25 @@ export function productionAgentSetupDeps(output: Pick<Output, "json">): AgentSet
       const path = process.env.CODEX_HOME ?? join(homedir(), ".codex");
       return isAbsolute(path) ? path : undefined;
     },
+    gitForWindows: () => findGitForWindows(process.env) !== null,
   };
+}
+
+/**
+ * Claude Code on Windows needs Git for Windows (D116): asked once, installed
+ * with winget's Git.Git in the person's terminal on a yes. A no, no winget, or
+ * a failed install is one line with the download page; Claude Code is still
+ * installed, and the install carries on.
+ */
+async function offerGitForWindows(output: Output, deps: AgentSetupDeps): Promise<void> {
+  if (!await deps.ask("Claude Code needs Git for Windows. Install it with winget (Git.Git) first?")) {
+    output.line(GIT_HINT);
+    return;
+  }
+  output.line("Installing Git for Windows with winget…");
+  const code = await deps.run("winget", GIT_FOR_WINDOWS_WINGET).catch(() => null);
+  if (code === null) output.line(`winget is not available here. ${GIT_HINT}`);
+  else if (code !== 0 || !deps.gitForWindows()) output.line(`Git for Windows did not install. ${GIT_HINT}`);
 }
 
 /** The official installer as a command line: Windows PowerShell on Windows, bash elsewhere. */
@@ -87,6 +110,7 @@ export async function setUpPersonalAgent(agentId: PersonalAgentId, output: Outpu
   }
   const installer = claudeCodeInstaller(deps.platform);
   if (!await deps.ask(`Claude Code is not installed. Install it with Anthropic's official installer (${installer.url}) and sign in?`)) return false;
+  if (deps.platform === "win32" && !deps.gitForWindows()) await offerGitForWindows(output, deps);
   output.line("Installing Claude Code with Anthropic's installer…");
   const [command, args] = installerCommand(deps.platform);
   const code = await deps.run(command, args).catch(() => null);
@@ -109,7 +133,7 @@ export async function ensurePersonalAgent(agentId: PersonalAgentId, output: Outp
   const name = agentName(agentId);
   if (!deps.interactive()) {
     throw new RemoteInstanceError("prerequisite_missing", agentId === "claude-code"
-      ? `Claude Code is not installed for this user. Install it with Anthropic's installer (${claudeCodeInstaller(deps.platform).command}), then: konteks-remote agent add claude-code`
+      ? `Claude Code is not installed for this user. Install it with Anthropic's installer (${claudeCodeInstaller(deps.platform).command}), then: konteks-remote agent add claude-code${deps.platform === "win32" && !deps.gitForWindows() ? `. ${GIT_HINT}` : ""}`
       : "Codex is not set up for this user. Run this in a terminal to set it up and sign in: konteks-remote agent add codex");
   }
   let yes = false;
@@ -131,6 +155,8 @@ export interface AgentClosingDeps {
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   waitMs?: number;
+  /** Windows without Git for Windows, which Claude Code needs. */
+  gitForWindowsMissing?: () => boolean;
 }
 
 const AgentsReportSchema = z.object({
@@ -160,6 +186,7 @@ export function productionAgentClosingDeps(root: string, output: Pick<Output, "j
     },
     sleep: ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms)),
     now: Date.now,
+    gitForWindowsMissing: () => process.platform === "win32" && findGitForWindows(process.env) === null,
   };
 }
 
@@ -219,5 +246,6 @@ export async function closeAgentSetup(
       default: input.output.line(`${name} is still starting; konteks-remote agents shows when it is ready.`);
     }
   }
+  if (input.agents.includes("claude-code") && deps.gitForWindowsMissing?.()) input.output.line(GIT_HINT);
   for (const agent of input.missing) input.output.line(`To add ${agentName(agent)}: konteks-remote agent add ${agent}`);
 }

@@ -26,6 +26,7 @@ function setupDeps(overrides: Partial<AgentSetupDeps> = {}): AgentSetupDeps & { 
     platform: "win32",
     found: async () => installed,
     codexHome: () => undefined,
+    gitForWindows: () => true,
     ...overrides,
   };
 }
@@ -42,6 +43,49 @@ describe("setting up a missing Claude Code or Codex (D116)", () => {
     const [command, args] = deps.runs[0]!;
     expect(command).toMatch(/powershell\.exe$/i);
     expect(args.at(-1)).toBe("irm https://claude.ai/install.ps1 | iex");
+  });
+
+  it("on Windows without Git for Windows, asks once and installs it with winget before Claude Code (D116)", async () => {
+    const { output } = captured();
+    let git = false;
+    const deps = setupDeps({ gitForWindows: () => git });
+    const run = deps.run;
+    deps.run = async (command, args) => { if (command === "winget") git = true; return run(command, args); };
+    await expect(setUpPersonalAgent("claude-code", output, deps)).resolves.toBe(true);
+    expect(deps.questions).toEqual([
+      "Claude Code is not installed. Install it with Anthropic's official installer (https://claude.ai/install.ps1) and sign in?",
+      "Claude Code needs Git for Windows. Install it with winget (Git.Git) first?",
+    ]);
+    expect(deps.runs[0]).toEqual(["winget", ["install", "--id", "Git.Git", "-e", "--source", "winget"]]);
+    expect(deps.runs[1]![0]).toMatch(/powershell\.exe$/i);
+  });
+
+  it("without winget, or on a no, gives the one download line and still installs Claude Code (D116)", async () => {
+    const noWinget = captured();
+    const deps = setupDeps({ gitForWindows: () => false });
+    const run = deps.run;
+    deps.run = async (command, args) => (command === "winget" ? null : run(command, args));
+    await expect(setUpPersonalAgent("claude-code", noWinget.output, deps)).resolves.toBe(true);
+    expect(noWinget.lines.filter(line => line.includes("https://git-scm.com/download/win"))).toHaveLength(1);
+    expect(deps.runs.map(([command]) => command).at(-1)).toMatch(/powershell\.exe$/i);
+
+    const declined = captured();
+    const answers = [true, false];
+    const no = setupDeps({ gitForWindows: () => false, ask: async question => { no.questions.push(question); return answers.shift()!; } });
+    await expect(setUpPersonalAgent("claude-code", declined.output, no)).resolves.toBe(true);
+    expect(no.runs.map(([command]) => command)).not.toContain("winget");
+    expect(declined.lines.filter(line => line.includes("https://git-scm.com/download/win"))).toHaveLength(1);
+  });
+
+  it("asks about Git only on Windows, and only when it is missing (D116)", async () => {
+    const { output } = captured();
+    const present = setupDeps();
+    await setUpPersonalAgent("claude-code", output, present);
+    expect(present.questions).toHaveLength(1);
+    const mac = setupDeps({ platform: "darwin", gitForWindows: () => false });
+    await setUpPersonalAgent("claude-code", output, mac);
+    expect(mac.questions).toHaveLength(1);
+    expect(mac.runs.map(([command]) => command)).not.toContain("winget");
   });
 
   it("runs the official shell installer on macOS and Linux", async () => {
@@ -89,6 +133,8 @@ describe("setting up a missing Claude Code or Codex (D116)", () => {
     await expect(refused).rejects.toMatchObject({ message: expect.stringContaining("irm https://claude.ai/install.ps1 | iex") });
     await expect(ensurePersonalAgent("claude-code", output, deps)).rejects.toMatchObject({ message: expect.stringContaining("konteks-remote agent add claude-code") });
     await expect(ensurePersonalAgent("claude-code", output, deps)).rejects.not.toMatchObject({ message: expect.stringContaining("install.sh") });
+    // Without a terminal and without Git for Windows: no download, the hint only.
+    await expect(ensurePersonalAgent("claude-code", output, setupDeps({ interactive: () => false, gitForWindows: () => false }))).rejects.toMatchObject({ message: expect.stringContaining("https://git-scm.com/download/win") });
     await expect(ensurePersonalAgent("claude-code", output, setupDeps({ ask: async () => false }))).rejects.toMatchObject({ message: "Nothing was installed: Claude Code was not added." });
     await expect(ensurePersonalAgent("claude-code", output, setupDeps({ found: async () => true }))).resolves.toBe("found");
     await expect(ensurePersonalAgent("claude-code", output, setupDeps())).resolves.toBe("set_up");
@@ -159,6 +205,13 @@ describe("the install's closing summary (D116)", () => {
     const c = closingDeps([null, { codex: "starting" }, { codex: "ready" }]);
     await closeAgentSetup({ agents: ["codex"], signInNow: [], missing: [], output }, c.deps);
     expect(lines).toEqual(["Checking which agents are ready…", "Ready to work here: Codex."]);
+  });
+
+  it("names Git for Windows when Claude Code is here without it (D116)", async () => {
+    const { lines, output } = captured();
+    const c = closingDeps([{ "claude-code": "failed" }], { gitForWindowsMissing: () => true });
+    await closeAgentSetup({ agents: ["claude-code"], signInNow: [], missing: [], output }, c.deps);
+    expect(lines).toContain("Claude Code needs Git for Windows: https://git-scm.com/download/win");
   });
 
   it("a sign-in that is skipped or fails leaves the command to run later", async () => {

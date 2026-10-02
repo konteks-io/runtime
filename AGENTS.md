@@ -293,7 +293,14 @@ command for each other. `agent add claude-code|codex` does the same through
 `ensurePersonalAgent` before stopping anything, and adds from the installed
 release itself when it is the same digest (no newer release needed). An
 explicit `--agents` list stays strict. A record with no agents loads and
-starts (`verifyInstalledNativeBridges` accepts an empty runner list).
+starts (`verifyInstalledNativeBridges` accepts an empty runner list). On
+Windows, a yes to Claude Code without Git for Windows (remote-common
+`findGitForWindows`: `CLAUDE_CODE_GIT_BASH_PATH`, git.exe on PATH,
+`%ProgramFiles%\Git`, `%LOCALAPPDATA%\Programs\Git`) asks once to run
+`winget install --id Git.Git -e --source winget`; a no, no winget or a failure
+is one line with git-scm.com's download page. The Claude bridge gets
+`CLAUDE_CODE_GIT_BASH_PATH` from the same lookup at every spawn, and the
+install records that git.exe when PATH does not have it yet.
 
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never
