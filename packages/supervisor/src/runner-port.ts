@@ -31,6 +31,8 @@ export interface RunnerSessionInput {
   freshProviderSessionOnRestore?: boolean;
   /** Display-only naming for the provider session list; never authority. */
   sessionLabel?: RemoteSessionLabel;
+  /** A person's direct session: the agent titles it; Konteks adds only `[konteks] ` (D130). */
+  agentTitled?: true;
   /**
    * Give the agent the session's browser (QA and validator sessions): the
    * runner adds its bundled browser MCP server, launched through this

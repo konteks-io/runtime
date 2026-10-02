@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { codexLocalProxyFiles, inventoryOfflineFiles } from "./offline-agent-files.mjs";
+import { codexLocalProxyFiles, inventoryOfflineFiles, offlineAgentPatches } from "./offline-agent-files.mjs";
 
 test("offline inventory preserves native dependency execution without making data executable", async () => {
   const root = mkdtempSync(join(tmpdir(), "offline-inventory-"));
@@ -53,4 +53,13 @@ test("a Codex proxy import that is missing fails the package build instead of th
     writeFileSync(join(root, "b.js"), "export const b = 1;\n");
     assert.deepEqual(codexLocalProxyFiles(root), ["codex-local-proxy.js", "a.js", "b.js"]);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("every platform's Codex bridge carries Konteks's session naming; only the shared proxy is Unix-only", () => {
+  // D130: the Windows package shipped the bridge unpatched, so Codex named
+  // every thread from its own title model and no session read "[konteks]".
+  for (const os of ["macos", "linux", "windows"]) {
+    assert.deepEqual(offlineAgentPatches("codex", os), { codexBridge: true, codexLocalProxy: os !== "windows", claudeFiles: [] });
+  }
+  assert.deepEqual(offlineAgentPatches("claude-code", "windows"), { codexBridge: false, codexLocalProxy: false, claudeFiles: ["acp-agent.js", "settings.js", "session-titles.js"] });
 });
