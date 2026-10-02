@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,9 +7,140 @@ import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { installOfflineAgentPackage, NativeAgentPackageProfileSchema, verifyNativeRelease } from "@konteks/remote-release";
 import { RunnerConfigSchema, resolveBridgeSpawnSpec, spawnBridge } from "@konteks/remote-agent-runner";
-import { prepareE2ERealRelease, prepareE2ESmokeRelease } from "../e2e/smoke-release.js";
+import { extendE2ERealRelease, extendE2ESmokeRelease, prepareE2ERealRelease, prepareE2ESmokeRelease, reissueE2ERelease } from "../e2e/smoke-release.js";
 
 describe("signed E2E ACP releases", () => {
+  it("adds a second machine platform without losing the original signed artifacts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-two-platforms-"));
+    try {
+      const directory = join(root, ".runtime", "native-cloud");
+      const mac = await prepareE2ESmokeRelease({
+        gate: "1", directory, origin: "https://127.0.0.1:7443",
+        platform: { os: "macos", architecture: "arm64" },
+      });
+      const linux = await extendE2ESmokeRelease({
+        gate: "1", directory, origin: "https://127.0.0.1:7443",
+        platform: { os: "debian", architecture: "arm64" },
+        bundleVersion: "0.1.1-e2e",
+      });
+      const release = verifyNativeRelease(linux.manifest, [mac.root]);
+      expect(release.manifest.nativeArtifacts).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "connector", os: "macos", architecture: "arm64" }),
+        expect.objectContaining({ kind: "agent_bridge", agentId: "codex", os: "macos", architecture: "arm64" }),
+        expect.objectContaining({ kind: "connector", os: "debian", architecture: "arm64" }),
+        expect.objectContaining({ kind: "agent_bridge", agentId: "codex", os: "debian", architecture: "arm64" }),
+      ]));
+      expect(linux.manifest.modelCapabilityMappings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ bridgeProfileRef: "e2e-fake-codex-acp-debian-arm64" }),
+      ]));
+      const linuxArtifact = release.manifest.nativeArtifacts?.find(item => item.agentId === "codex" && item.os === "debian");
+      const profile = await installOfflineAgentPackage(join(directory, "codex-debian-arm64.tgz"), join(root, "linux-agent"), linuxArtifact!);
+      expect(profile.os).toBe("debian");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("adds a real Windows connector and Codex package to the signed local release", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-windows-release-"));
+    try {
+      const directory = join(root, ".runtime", "native-cloud");
+      const mac = await prepareE2ESmokeRelease({ gate: "1", directory, origin: "https://127.0.0.1:7443", platform: { os: "macos", architecture: "arm64" } });
+      const windows = { os: "windows" as const, architecture: "amd64" as const };
+      const external = await writeExternalCodexPackage(root, windows);
+      const connectorPath = join(root, "external-connector.exe");
+      await writeFile(connectorPath, Buffer.from("MZ-local-test-connector"));
+      const prepared = await extendE2ERealRelease({
+        gate: "1", realAgentGate: "1", directory, origin: "https://127.0.0.1:7443",
+        bundleVersion: "0.1.1-e2e", platform: windows, connectorPath,
+        packagePath: external.archive, profilePath: external.profile,
+      });
+      const release = verifyNativeRelease(prepared.manifest, [mac.root]).manifest;
+      expect(release.nativeArtifacts).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "connector", os: "macos" }),
+        expect.objectContaining({ kind: "connector", os: "windows", architecture: "amd64", url: "https://127.0.0.1:7443/__e2e/native/connector-windows-amd64.exe", digest: hash(await readFile(connectorPath)) }),
+        expect.objectContaining({ kind: "agent_bridge", agentId: "codex", os: "windows", architecture: "amd64", url: "https://127.0.0.1:7443/__e2e/native/codex-windows-amd64.tgz" }),
+      ]));
+      expect(release.modelCapabilityMappings).toEqual(expect.arrayContaining([
+        expect.objectContaining({ bridgeProfileRef: "e2e-real-codex-acp-windows-amd64", modelIdentities: [{ value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" }] }),
+      ]));
+      const agent = release.nativeArtifacts?.find(item => item.agentId === "codex" && item.os === "windows");
+      expect((await installOfflineAgentPackage(join(directory, "codex-windows-amd64.tgz"), join(root, "windows-agent"), agent!)).os).toBe("windows");
+      await expect(extendE2ERealRelease({ gate: "1", realAgentGate: "0", directory, origin: "https://127.0.0.1:7443", bundleVersion: "0.1.2-e2e", platform: windows, connectorPath, packagePath: external.archive, profilePath: external.profile })).rejects.toThrow(/E2E smoke release/i);
+      const replacement = join(root, "replacement.exe");
+      await writeFile(replacement, Buffer.from("MZ-updated-test-connector"));
+      const reissued = await reissueE2ERelease({ directory, bundleVersion: "0.1.2-e2e", connectorPath: replacement, platform: windows });
+      const checked = verifyNativeRelease(reissued, [mac.root]).manifest.nativeArtifacts!;
+      expect(checked.find(item => item.kind === "connector" && item.os === "macos")?.digest).toBe(mac.manifest.nativeArtifacts?.find(item => item.kind === "connector")?.digest);
+      expect(checked.find(item => item.kind === "connector" && item.os === "windows")?.digest).toBe(hash(await readFile(replacement)));
+      expect(await readFile(join(directory, "connector-windows-amd64.exe"))).toEqual(await readFile(replacement));
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("keeps the private E2E Core control authority in a freshly prepared release root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-control-root-"));
+    try {
+      const directory = join(root, ".runtime", "native-cloud");
+      const privateDir = join(root, ".runtime", "private");
+      await mkdir(privateDir, { recursive: true, mode: 0o700 });
+      const control = {
+        keyId: "e2e-local-native-control-1",
+        publicKeyJwk: generateKeyPairSync("ed25519").publicKey.export({ format: "jwk" }),
+      };
+      await writeFile(join(privateDir, "native-control-public.json"), JSON.stringify(control), {
+        mode: 0o600,
+      });
+      const prepared = await prepareE2ESmokeRelease({
+        gate: "1",
+        directory,
+        origin: "https://127.0.0.1:7443",
+        platform: { os: "macos", architecture: "arm64" },
+      });
+      expect(prepared.root.coreControlKeys).toEqual([control]);
+      const saved = JSON.parse(await readFile(join(directory, "release-roots.json"), "utf8"));
+      expect(saved.roots[0].coreControlKeys).toEqual([control]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("answers the Codex account probe with a deterministic E2E identity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-codex-account-"));
+    try {
+      const prepared = await prepareE2ESmokeRelease({
+        gate: "1",
+        directory: join(root, ".runtime", "native-cloud"),
+        origin: "https://127.0.0.1:7443",
+        platform: { os: "macos", architecture: "arm64" },
+      });
+      const artifact = prepared.manifest.nativeArtifacts?.find((item) => item.agentId === "codex");
+      const prefix = join(root, "installed-agent");
+      await installOfflineAgentPackage(prepared.artifactFiles.agent, prefix, artifact!);
+      const replies = execFileSync(join(prefix, "bin", "codex"), ["app-server"], {
+        encoding: "utf8",
+        input: [
+          JSON.stringify({
+            method: "initialize",
+            id: 1,
+            params: { clientInfo: { name: "konteks_identity_probe", version: "0.1.0" } },
+          }),
+          JSON.stringify({ method: "initialized", params: {} }),
+          JSON.stringify({ method: "account/read", id: 2, params: { refreshToken: false } }),
+          "",
+        ].join("\n"),
+      })
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(replies).toEqual([
+        { id: 1, result: expect.any(Object) },
+        { id: 2, result: { account: { type: "chatgpt", email: "codex@e2e.konteks.test" } } },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("installs and executes one Codex-shaped ACP bridge through the normal verified package boundary", async () => {
     const root = await mkdtemp(join(tmpdir(), "konteks-e2e-smoke-release-"));
     try {
@@ -83,6 +215,35 @@ describe("signed E2E ACP releases", () => {
           }],
         });
       } finally { await bridge.stop(); }
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("uses a staged organization SKILL.md in the deterministic planning probe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "konteks-e2e-skill-probe-"));
+    try {
+      const prepared = await prepareE2ESmokeRelease({ gate: "1", directory: join(root, ".runtime", "native-cloud"), origin: "https://127.0.0.1:7443", platform: { os: "macos", architecture: "arm64" } });
+      const artifact = prepared.manifest.nativeArtifacts?.find(item => item.agentId === "codex");
+      const prefix = join(root, "installed-agent");
+      await installOfflineAgentPackage(prepared.artifactFiles.agent, prefix, artifact!);
+      const skillFile = join(root, "workspaces", "codex", "skills", `skills-${"a".repeat(64)}`, "org-55a94c78-20be-4869-958e-34ecdc8f2674", "SKILL.md");
+      await mkdir(join(skillFile, ".."), { recursive: true });
+      await writeFile(skillFile, "---\nname: native-runtime-skill-probe-20260928\n---\nNATIVE_SKILL_RUNTIME_20260928_OK\n");
+      const input = [
+        JSON.stringify({ method: "initialize", id: 1, params: {} }),
+        JSON.stringify({ method: "session/new", id: 2, params: { cwd: root, mcpServers: [] } }),
+        JSON.stringify({ method: "session/prompt", id: 3, params: { sessionId: "e2e-session-1", prompt: [
+          { type: "text", text: `Required organization skills\n${JSON.stringify({ name: "org-55a94c78-20be-4869-958e-34ecdc8f2674", skillFile })}` },
+          { type: "text", text: "Planning input:\n{}\n\nFrozen assignment inputs:\n{}" },
+        ] } }),
+        "",
+      ].join("\n");
+      const replies = execFileSync(join(prefix, "bridge", "fake-codex-acp"), [], { encoding: "utf8", input }).trim().split("\n").map(line => JSON.parse(line));
+      const chunk = replies.find(reply => reply.method === "session/update");
+      expect(JSON.parse(chunk.params.update.content.text).tasks[0].validation).toContain("NATIVE_SKILL_RUNTIME_20260928_OK");
+      await writeFile(skillFile, "---\nname: native-runtime-skill-probe-20260928\n---\nmarker removed\n");
+      const withoutMarker = execFileSync(join(prefix, "bridge", "fake-codex-acp"), [], { encoding: "utf8", input }).trim().split("\n").map(line => JSON.parse(line));
+      const secondChunk = withoutMarker.find(reply => reply.method === "session/update");
+      expect(JSON.parse(secondChunk.params.update.content.text).tasks[0].validation).not.toContain("NATIVE_SKILL_RUNTIME_20260928_OK");
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
@@ -164,17 +325,17 @@ describe("signed E2E ACP releases", () => {
   });
 });
 
-async function writeExternalCodexPackage(root: string, platform: { os: "macos"; architecture: "arm64" }) {
+async function writeExternalCodexPackage(root: string, platform: { os: "macos" | "windows"; architecture: "arm64" | "amd64" }) {
   return writeExternalAgentPackage(root, platform, "codex");
 }
 
-async function writeExternalAgentPackage(root: string, platform: { os: "macos"; architecture: "arm64" }, agentId: "codex" | "claude-code") {
+async function writeExternalAgentPackage(root: string, platform: { os: "macos" | "windows"; architecture: "arm64" | "amd64" }, agentId: "codex" | "claude-code") {
   const family = agentId === "claude-code" ? {
     bridgePackage: "@agentclientprotocol/claude-agent-acp", bridgeVersion: "0.75.1",
     bridgeEntrypoint: "bridge/claude-agent-acp", toolingPackage: "@anthropic-ai/claude-code", toolingEntrypoint: "bin/claude",
   } : {
     bridgePackage: "@agentclientprotocol/codex-acp", bridgeVersion: "1.10.0",
-    bridgeEntrypoint: "bridge/codex-acp", toolingPackage: "@openai/codex", toolingEntrypoint: "bin/codex",
+    bridgeEntrypoint: platform.os === "windows" ? "bridge/codex-acp.exe" : "bridge/codex-acp", toolingPackage: "@openai/codex", toolingEntrypoint: platform.os === "windows" ? "bin/codex.exe" : "bin/codex",
   };
   const files = [
     { path: family.toolingEntrypoint, bytes: Buffer.from("#!/bin/sh\nexit 0\n"), executable: true },

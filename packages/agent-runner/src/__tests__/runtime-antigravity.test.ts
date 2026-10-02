@@ -47,7 +47,7 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   for (const runtime of runtimes.splice(0)) await runtime.stop().catch(() => undefined);
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 async function fixture(options: { newSession?: (fake: Fake) => Promise<unknown>; prompt?: (fake: Fake, params: { sessionId: string }) => Promise<unknown>; limit?: number; bootstrapMs?: number; realIdentity?: boolean; key?: string; authenticate?: (fake: Fake, params: { methodId: string }) => Promise<unknown> } = {}) {

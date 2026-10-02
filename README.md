@@ -96,7 +96,7 @@ that does carry an Authenticode signature must also be valid and from the
 expected publisher.
 
 Supported platforms: macOS 13+ (Apple silicon and Intel), Windows 10/11
-(x64), Debian 12/13 (amd64, arm64).
+(x64), Debian 12/13 and Ubuntu 22.04/24.04 (amd64, arm64).
 
 ## Day-to-day
 

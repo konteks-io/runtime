@@ -326,7 +326,7 @@ describe("native update transaction", () => {
     const definitionFor = (record: NativeRuntimeRecord) => nativeServiceDefinition({ os: "windows", home: "C:\\Users\\a", root, executable: connector(record.releaseId), userId: "S-1-5-21-1-2-3-1001" });
     /** Task Scheduler as far as the connector sees it: the task exists throughout, running or not, and runs the <Command> it was last registered with. */
     function windows(h: ReturnType<typeof harness>) {
-      const task = { running: true, command: connector(previous.releaseId) };
+      const task = { running: true, command: connector(previous.releaseId), target: connector(previous.releaseId) };
       const written = new Map<string, string>();
       const scheduler = async (command: NativeServiceCommand): Promise<number> => {
         if (command.command === "powershell.exe") return task.running ? 0 : 1;
@@ -334,7 +334,14 @@ describe("native update transaction", () => {
         switch (command.args[0]) {
           case "/Query": return 0; // exists, whether or not it runs
           case "/Create": task.command = /<Command>(.*?)<\/Command>/.exec(written.get(command.args[4]!)!)![1]!; return 0;
-          case "/Run": task.running = true; return 0;
+          case "/Run": {
+            const helper = written.get(`${root}\\service.js`)!;
+            const encoded = /-EncodedCommand ([A-Za-z0-9+/=]+)/.exec(helper)![1]!;
+            const script = Buffer.from(encoded, "base64").toString("utf16le");
+            task.target = /try \{ & '([^']+)'/.exec(script)![1]!;
+            task.running = true;
+            return 0;
+          }
           case "/End": task.running = false; return 0;
           default: return 1;
         }
@@ -343,7 +350,7 @@ describe("native update transaction", () => {
       h.deps.serviceDefinition = async () => definitionFor(h.currentRecord());
       // The harness's control socket follows the task: /End stops what serves, a start serves the record.
       h.deps.execute = async command => { const code = await scheduler(command); if (command.args[0] === "/End") await harnessExecute({ command: "stop", args: [] }); return code; };
-      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, contents); } }); await harnessStart(input); };
+      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, typeof contents === "string" ? contents : Buffer.from(contents).subarray(2).toString("utf16le")); } }); await harnessStart(input); };
       return task;
     }
 
@@ -351,7 +358,7 @@ describe("native update transaction", () => {
       const h = harness({ previous });
       const task = windows(h);
       await expect(runNativeUpdate({ root, output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
-      expect(task).toEqual({ running: true, command: connector("release-next") });
+      expect(task).toEqual({ running: true, command: "%SystemRoot%\\System32\\wscript.exe", target: connector("release-next") });
     });
 
     it("rolls back to a task that runs the previous release again", async () => {
@@ -359,7 +366,7 @@ describe("native update transaction", () => {
       const task = windows(h);
       await expect(runNativeUpdate({ root, output: h.output }, h.deps)).rejects.toThrow();
       expect(h.currentRecord().releaseId).toBe("release-prev");
-      expect(task).toEqual({ running: true, command: connector("release-prev") });
+      expect(task).toEqual({ running: true, command: "%SystemRoot%\\System32\\wscript.exe", target: connector("release-prev") });
     });
   });
   it("waits for a slow-stopping service to exit and release the runtime directory before committing", async () => {

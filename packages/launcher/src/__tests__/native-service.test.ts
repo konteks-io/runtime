@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { runInNewContext } from "node:vm";
 import { nativePlatform, nativePaths, nativeServiceDefinition, parseLoadedService, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 
 describe("native install layout", () => {
@@ -25,6 +26,37 @@ describe("native install layout", () => {
 
 describe("native background service definitions", () => {
   const root = '/Users/Test User/Library/Application Support/konteks-remote';
+  it("keeps the Windows scheduled action windowless and waits for the connector's exit", async () => {
+    const root = "C:\\Users\\Test User\\literal %PATH% & O'Brien\\remote";
+    const executable = `${root}\\releases\\next\\konteks-connector.exe`;
+    const service = nativeServiceDefinition({ os: 'windows', home: 'C:\\Users\\Test User', root, executable, userId: 'S-1-5-21-123-456-789-1001' });
+    expect(service.contents).toContain('<Command>%SystemRoot%\\System32\\wscript.exe</Command>');
+    expect(service.contents).not.toContain(`<Command>${executable}</Command>`);
+    expect(service.contents).toContain('//B //NoLogo');
+    const helper = service.supportFiles?.[0];
+    expect(helper?.path).toBe(`${root}\\service.js`);
+    expect(helper?.contents).toContain('WScript.Quit(shell.Run(');
+    expect(helper?.contents).toContain(', 0, true)');
+    const encoded = helper!.contents.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)![1]!;
+    const script = Buffer.from(encoded, 'base64').toString('utf16le');
+    // Single-quoted PowerShell literals keep percent variables, metacharacters
+    // and apostrophes in the installation paths literal, not executable input.
+    expect(script).toContain(`& '${executable.replace(/'/g, "''")}' 'serve' '--root' '${root.replace(/'/g, "''")}'`);
+    expect(script).toContain('exit $LASTEXITCODE');
+    const run = vi.fn(() => 17), quit = vi.fn();
+    runInNewContext(helper!.contents, { WScript: { CreateObject: () => ({ Run: run }), Quit: quit } });
+    expect(run).toHaveBeenCalledWith(expect.stringContaining('-EncodedCommand'), 0, true);
+    expect(quit).toHaveBeenCalledWith(17);
+    const writes: string[] = [];
+    await startNativeServiceDefinition(service, {
+      execute: async command => command === service.status ? 1 : 0,
+      write: async path => { writes.push(path); },
+    });
+    expect(writes).toEqual([helper!.path, service.path]);
+    const execute = vi.fn(async () => 1);
+    await expect(startNativeServiceDefinition(service, { execute, write: async () => { throw new Error('helper cannot be written'); } })).rejects.toThrow('helper cannot be written');
+    expect(execute).toHaveBeenCalledTimes(1); // No registration or start beside a missing helper.
+  });
   it("uses launchd argument arrays and keeps credentials out of the service definition", () => {
     const service = nativeServiceDefinition({ os: 'macos', home: '/Users/Test User', root, executable: `${root}/bin/konteks-remote`, uid: 501 });
     expect(service.contents).toContain(`<string>${root}/bin/konteks-remote</string>`);
@@ -58,9 +90,10 @@ describe("native background service definitions", () => {
     const root = 'C:\\Users\\Test User\\AppData\\Local\\konteks-remote';
     const service = nativeServiceDefinition({ os: 'windows', home: 'C:\\Users\\Test User', root, executable: `${root}\\bin\\konteks-remote.exe`, userId: 'S-1-5-21-123-456-789-1001' });
     expect(service.contents).toContain('<LogonType>InteractiveToken</LogonType>');
+    expect(service.contents).toContain('encoding="UTF-16"');
     expect(service.contents).toContain('<RunLevel>LeastPrivilege</RunLevel>');
     expect(service.contents).toContain('<UserId>S-1-5-21-123-456-789-1001</UserId>');
-    expect(service.contents).toContain('<Arguments>serve --root &quot;C:\\Users\\Test User\\AppData\\Local\\konteks-remote&quot;</Arguments>');
+    expect(service.contents).toContain('<Arguments>//B //NoLogo //E:JScript &quot;C:\\Users\\Test User\\AppData\\Local\\konteks-remote\\service.js&quot;</Arguments>');
     expect(service.install).toEqual([{ command: 'schtasks.exe', args: ['/Create', '/TN', service.label, '/XML', service.path, '/F'] }]);
     // Status means running, not registered: `schtasks /Query` succeeds for a stopped task too.
     expect(service.status.command).toBe('powershell.exe');
@@ -76,7 +109,11 @@ describe("native background service definitions", () => {
     const execute = vi.fn(async (command: NativeServiceCommand) => { calls.push(command); return command === next.status ? 1 : 0; });
     const write = vi.fn(async () => undefined);
     await expect(startNativeServiceDefinition(next, { execute, write })).resolves.toBe('started');
-    expect(write).toHaveBeenCalledWith(next.path, expect.stringContaining(`<Command>${root}\\releases\\release-next\\konteks-connector.exe</Command>`));
+    expect(write).toHaveBeenCalledWith(next.supportFiles![0]!.path, next.supportFiles![0]!.contents);
+    const bytes = write.mock.calls[1]?.[1];
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(Buffer.from(bytes!).subarray(0, 2)).toEqual(Buffer.from([0xff, 0xfe]));
+    expect(Buffer.from(bytes!).subarray(2).toString('utf16le')).toContain("<Command>%SystemRoot%\\System32\\wscript.exe</Command>");
     expect(calls).toEqual([next.status, ...next.install, next.start]);
     // Only a running service is left alone.
     const running = vi.fn(async () => 0), untouched = vi.fn(async () => undefined);

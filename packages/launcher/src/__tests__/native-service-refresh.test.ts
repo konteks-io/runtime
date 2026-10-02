@@ -164,3 +164,45 @@ describe("the serving release keeps its service on its own definition", () => {
     expect(calls.detach).not.toHaveBeenCalled();
   });
 });
+
+
+describe("Windows task refresh", () => {
+  function setup() {
+    const definition = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\ada", root: "C:\\Users\\ada\\remote", executable: "C:\\Users\\ada\\remote\\releases\\new\\konteks-connector.exe", userId: "S-1-5-21-1-2-3-1001" });
+    const base = deps(definition).value;
+    const files = new Map([[definition.path, "older task"]]);
+    const execute = vi.fn(async () => 0);
+    const value: OwnServiceDefinitionDeps = {
+      ...base, os: "windows", execute,
+      read: async path => { const value = files.get(path); if (value === undefined) throw new Error("missing"); return value; },
+      write: async (path, contents) => { files.set(path, contents); },
+    };
+    return { definition, files, value, execute };
+  }
+  it("writes the helper and replaces the task without starting another connector, then is idempotent", async () => {
+    const { definition, files, value, execute } = setup();
+    expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
+    expect(files.get(definition.supportFiles![0]!.path)).toBe(definition.supportFiles![0]!.contents);
+    expect(execute.mock.calls).toEqual(definition.install.map(command => [command]));
+    expect(execute).not.toHaveBeenCalledWith(definition.start);
+    expect(await keepServiceOnOwnDefinition("root", value)).toBe("current");
+    expect(execute).toHaveBeenCalledTimes(definition.install.length);
+  });
+  it("restores failed registration so the next start retries it", async () => {
+    const { definition, files, value, execute } = setup();
+    execute.mockResolvedValueOnce(1);
+    await expect(keepServiceOnOwnDefinition("root", value)).rejects.toThrow("schtasks.exe exited unsuccessfully");
+    expect(files.get(definition.path)).toBe("older task");
+    expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
+    expect(await keepServiceOnOwnDefinition("root", value)).toBe("current");
+  });
+  it("repairs a missing helper but leaves an uninstalled foreground connector untouched", async () => {
+    const { definition, files, value, execute } = setup();
+    files.set(definition.path, definition.contents);
+    expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
+    expect(execute).not.toHaveBeenCalled();
+    files.clear();
+    expect(await keepServiceOnOwnDefinition("root", value)).toBe("not_installed");
+    expect(files.size).toBe(0);
+  });
+});

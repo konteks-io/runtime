@@ -105,6 +105,19 @@ describe("retained Windows process owner", () => {
     })).rejects.toThrow("process tree survives");
     expect(terminateTree).not.toHaveBeenCalled();
   });
+
+  it.skipIf(process.platform !== "win32")("captures and stops a real detached Windows bridge after a cold PowerShell start", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    try {
+      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+      const owner = captureRetainedProcessOwner(child.pid!);
+      expect(owner).toMatchObject({ platform: "win32", pid: child.pid, processGroupId: child.pid });
+      await stopRetainedProcessOwner(owner);
+      expect(readWindowsProcessIdentity(child.pid!)).toBeNull();
+    } finally {
+      if (child.pid) { try { process.kill(child.pid, "SIGKILL"); } catch { /* already gone */ } }
+    }
+  }, 45_000);
 });
 
 describe("retained Linux process owner", () => {
