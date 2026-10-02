@@ -38,9 +38,10 @@ import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
   canonicalizeAcpToolActivity,
   continuesAtBoundary,
+  contractIssue,
   endsInsidePath,
   omitPrivateAcpToolPayload,
-  redactActivity,
+  redactSessionMessage,
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
@@ -658,6 +659,8 @@ export class RelayedSession {
         acpSessionRef: this.acpSessionRef,
         toolCallId: canonicalIdentity?.toolCallId,
         stage: "wire_schema",
+        ...sessionUpdateKind(canonicalMessage),
+        ...contractIssue(parsed.error.issues),
       }, "Native session update did not match the relay contract");
       if ("id" in message && typeof message.id === "string" && "method" in message && message.kind !== "acp") {
         await this.sendToCore({ kind: "acp_error", id: message.id, method: message.method as "session/prompt", error: malformed() });
@@ -687,7 +690,7 @@ export class RelayedSession {
       const continuesPath = previous?.inPath ?? false;
       if (chunkText === undefined) this.lastChunkText.clear();
       else this.lastChunkText.set(update.sessionUpdate, { text: chunkText, inPath: endsInsidePath(chunkText, continuesPath, startsAtBoundary) });
-      const safe = SessionToCoreMessageSchema.safeParse(redactActivity(body, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
+      const safe = SessionToCoreMessageSchema.safeParse(redactSessionMessage(body, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
         { startsAtBoundary, continuesPath }));
       if (!safe.success) {
         this.counters.malformedResponses += 1;
@@ -697,6 +700,8 @@ export class RelayedSession {
           acpSessionRef: this.acpSessionRef,
           toolCallId: canonicalIdentity?.toolCallId,
           stage: "redacted_schema",
+          sessionUpdate: update.sessionUpdate,
+          ...contractIssue(safe.error.issues),
         }, "Redacted native session update did not match the relay contract");
         return;
       }
@@ -1589,6 +1594,12 @@ export class RelayedSession {
   }
 
   waitForAuthorityStop(): Promise<void> { return this.executionGate?.waitForAuthorityStop() ?? Promise.resolve(); }
+}
+
+/** A refused session update's kind for the log, only when it reads as an ACP update name. */
+function sessionUpdateKind(message: unknown): { sessionUpdate?: string } {
+  const kind = (message as { params?: { update?: { sessionUpdate?: unknown } } } | null)?.params?.update?.sessionUpdate;
+  return typeof kind === "string" && /^[a-z_]{1,64}$/.test(kind) ? { sessionUpdate: kind } : {};
 }
 
 function malformed(): AcpJsonRpcError {
