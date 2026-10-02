@@ -51,6 +51,22 @@ export function konteksCodingSessionTitle(label: KonteksSessionLabel | undefined
   return [prefix, body, ref].filter(Boolean).join(" ");
 }
 
+/**
+ * A person's direct session (D130): the agent titles it itself and Konteks
+ * asks only for `[konteks] ` ahead of that title. The pinned Codex and Claude
+ * Code bridges apply it; DeepSeek Harness, OpenCode and Antigravity have no
+ * naming API over ACP and keep their own title.
+ */
+export const KONTEKS_DIRECT_PREFIX = "[konteks]";
+
+export function konteksAgentTitledMetadata(agentId?: string) {
+  return {
+    konteksSession: { version: 1, prefix: KONTEKS_DIRECT_PREFIX },
+    // No fixed title: Claude Code would keep it and never title the session itself.
+    ...(agentId === "claude-code" ? { claudeCode: { options: { settingSources: ["project"] } } } : {}),
+  };
+}
+
 /** Provider adapters must persist this title through their native naming API. */
 export function konteksSessionMetadata(title: string, agentId?: string) {
   const nativeTitle = konteksSessionTitle(title);

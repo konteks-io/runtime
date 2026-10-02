@@ -1,9 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { chmod, copyFile, readFile, rename, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
-import { isHostAgentId, resolveNativeConnectorExecutable } from "@konteks/remote-release";
+import { isHostAgentId, nativeConnectorFileNames, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
@@ -37,11 +39,23 @@ export interface NativeUpdateTransactionDeps {
   /** Ends the service's own process group when a rollback's graceful stop does not finish; absent where the OS stop already kills it. */
   forceStop?: (definition: NativeServiceDefinition) => Promise<void>;
   /** Replaces the person's `konteks-remote` with the kept release's executable, so their next command runs the code they updated to. */
-  refreshLauncher?: (root: string, record: NativeRuntimeRecord) => Promise<void>;
+  refreshLauncher?: (root: string, record: NativeRuntimeRecord) => Promise<unknown>;
+  /**
+   * The pid the service manager runs for the service, read before the stop so
+   * its exit can be watched; null where it names none. launchd ends a
+   * booted-out job 5 s after SIGTERM, before a busy connector writes its
+   * shutdown receipt (D113b): its process being gone is then the proof.
+   */
+  servicePid?: (definition: NativeServiceDefinition) => Promise<number | null>;
+  processAlive?: (pid: number) => boolean;
+  /** Ends a process and its own process group, only while it is still this root's connector. */
+  killProcessGroup?: (pid: number, root: string) => Promise<void>;
   drainDeadlineMs?: number;
   healthDeadlineMs?: number;
   /** How long the old service may take to exit and release the runtime directory after its stop command returned. */
   stopDeadlineMs?: number;
+  /** How long a stopped connector may take to exit before its processes are ended. */
+  stopGraceMs?: number;
   pollMs?: number;
 }
 
@@ -59,11 +73,12 @@ const DrainStatusSchema = z.object({ draining: z.boolean(), reason: z.string().n
 const AgentsSchema = z.object({ agents: z.array(z.object({ agentId: z.string(), readiness: z.string() }).passthrough()) }).passthrough();
 const CodexMaintenanceSchema = z.object({ idle: z.literal(true) }).strict();
 
-export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTransactionDeps["serviceDefinition"]; execute: NativeUpdateTransactionDeps["execute"]; start: NativeUpdateTransactionDeps["start"]; serviceExits: NonNullable<NativeUpdateTransactionDeps["serviceExits"]>; forceStop?: NativeUpdateTransactionDeps["forceStop"] | undefined }): NativeUpdateTransactionDeps {
-  const { forceStop, ...rest } = input;
+export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTransactionDeps["serviceDefinition"]; execute: NativeUpdateTransactionDeps["execute"]; start: NativeUpdateTransactionDeps["start"]; serviceExits: NonNullable<NativeUpdateTransactionDeps["serviceExits"]>; forceStop?: NativeUpdateTransactionDeps["forceStop"] | undefined; servicePid?: NativeUpdateTransactionDeps["servicePid"] | undefined }): NativeUpdateTransactionDeps {
+  const { forceStop, servicePid, ...rest } = input;
   return {
     ...rest,
     ...(forceStop ? { forceStop } : {}),
+    ...(servicePid ? { servicePid, processAlive, killProcessGroup: endProcessGroup } : {}),
     refreshLauncher: refreshInstalledLauncher,
     readRecord: readNativeRecord,
     control: (root, record) => new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort),
@@ -121,7 +136,7 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
   const wasRunning = await deps.execute(definition.status) === 0;
   const control = deps.control(input.root, previous);
   let stopped = false;
-  let stopConfirmed = false;
+  let oldPid: number | null = null;
   let successor: NativeRuntimeRecord | undefined;
   try {
     // The previous release's own doctor result is the baseline; null when it
@@ -144,6 +159,7 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
         }
       }
       const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
+      oldPid = await deps.servicePid?.(definition).catch(() => null) ?? null;
       if (await deps.execute(definition.stop) !== 0) {
         await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
         throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
@@ -152,8 +168,7 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       // launchd and Task Scheduler acknowledge a stop before the process has
       // finished its graceful shutdown; the record may only move once the old
       // service is gone and has released the runtime directory.
-      await waitForServiceExit(input, definition, deps, previousReceipt);
-      stopConfirmed = true;
+      await waitForServiceExit(input, definition, deps, previousReceipt, oldPid);
     }
     successor = await commitOnceReleased(input, staged.releaseId, deps);
     if (wasRunning) {
@@ -198,29 +213,89 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
         throw new RemoteInstanceError("temporarily_unavailable", "The updated connector did not pass its health gate and automatic rollback failed; identity, credentials and workspaces remain preserved.", { cause: rollbackError });
       }
     } else {
-      if (stopped && stopConfirmed && wasRunning) await deps.start(input).catch(() => undefined);
-      // The stop was sent but not confirmed in time (RCA 2026-09-30: an orphaned
-      // Codex app-server held it up): the installation is unchanged, so bring
-      // the same release back once the OS no longer runs the service, rather
-      // than leaving this computer disconnected until someone starts it.
-      else if (stopped && wasRunning && await deps.execute(definition.status).catch(() => 0) !== 0) {
-        input.output.line("The update did not go ahead; starting this computer's connector again on the release it had.");
-        await deps.start(input).catch(() => undefined);
-      }
+      // Stopped but not swapped: the installation is unchanged, so the same
+      // release comes back, confirmed or not (RCA 2026-09-30, D113b: 0.8.0's
+      // launcher left an unconfirmed stop unloaded and the computer offline).
+      if (stopped && wasRunning) await restartUnchanged(input, definition, deps, previous, oldPid);
       await finish("failed", detail);
     }
     throw error;
   }
 }
 
-async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null): Promise<void> {
-  const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+/**
+ * The old connector is stopped once the OS no longer runs it and either it
+ * wrote a fresh shutdown receipt or its process is gone. launchd SIGKILLs a
+ * booted-out job 5 s after SIGTERM (measured 2026-10-02, D113b), so a
+ * connector still closing its agents writes no receipt; a dead process holds
+ * no lock, and the next start recovers what it journaled. One that outlives
+ * the grace has its processes ended.
+ */
+async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null, pid: number | null): Promise<void> {
+  const stopMs = deps.stopDeadlineMs ?? 90_000;
+  const started = deps.now();
+  const deadline = started + stopMs;
+  const graceMs = Math.min(deps.stopGraceMs ?? 30_000, stopMs);
+  const watched = pid !== null && deps.processAlive ? { pid, alive: deps.processAlive } : null;
   const progress = progressLines(input, deps, "Stopping the connector: it closes its agent sessions and relay first, which usually takes under a minute…", "still stopping the connector");
-  while (await deps.execute(definition.status) === 0 || (deps.readStopReceipt && await deps.readStopReceipt(input.root).then(receipt => receipt === null || receipt === previousReceipt))) {
+  let forced = false;
+  for (;;) {
+    const running = await deps.execute(definition.status) === 0;
+    const gone = watched !== null && !watched.alive(watched.pid);
+    if (!running && (gone || !deps.readStopReceipt || await deps.readStopReceipt(input.root).then(receipt => receipt !== null && receipt !== previousReceipt))) return;
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
+    if (watched && !gone && !forced && deps.killProcessGroup && deps.now() - started >= graceMs) {
+      input.output.line(`The connector did not stop within ${spoken(graceMs)}; ending its processes.`);
+      await deps.killProcessGroup(watched.pid, input.root).catch(() => undefined);
+      forced = true;
+      continue;
+    }
     progress();
     await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
   }
+}
+
+/**
+ * An update that stopped the connector but did not swap it: start the same
+ * release and return only once it answers, or say plainly that it has not.
+ * A process still running after the whole stop deadline is ended first, so
+ * the start is not mistaken for "already running".
+ */
+async function restartUnchanged(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previous: NativeRuntimeRecord, pid: number | null): Promise<void> {
+  const running = async () => await deps.execute(definition.status).catch(() => 0) === 0;
+  if (await running()) {
+    if (pid !== null && deps.killProcessGroup) await deps.killProcessGroup(pid, input.root).catch(() => undefined);
+    else await deps.forceStop?.(definition).catch(() => undefined);
+    for (let poll = 0; poll < 10 && await running(); poll += 1) await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
+  }
+  input.output.line("The update did not go ahead; starting this computer's connector again on the release it had.");
+  try {
+    await deps.start(input);
+  } catch {
+    input.output.line("The connector could not be started again; run `konteks-remote start`.");
+    return;
+  }
+  const back = await answersAgain(input, deps.control(input.root, previous), previous, deps);
+  input.output.line(back
+    ? `${previous.bundleVersion} is running and answering again; nothing was changed.`
+    : `${previous.bundleVersion} was started again but has not answered yet; run \`konteks-remote status\` in a minute.`);
+}
+
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/** A pid the OS may since have given to another program is checked first: only this root's `serve` is ended. */
+async function endProcessGroup(pid: number, root: string): Promise<void> {
+  const command = await new Promise<string | null>(done => {
+    execFile("ps", ["-o", "command=", "-p", String(pid)], { timeout: 5_000 }, (error, stdout) => done(error ? null : stdout.trim()));
+  });
+  if (!command || !command.includes(" serve ") || !command.includes(resolve(root))) return;
+  if (process.platform !== "win32") {
+    try { process.kill(-pid, "SIGKILL"); return; } catch { /* not a group leader: the process alone */ }
+  }
+  try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
 }
 
 /**
@@ -360,12 +435,19 @@ function introducedByUpdate(id: string, baseline: ReadonlyMap<string, string> | 
   return agentId !== null && (successor.agents as readonly string[]).includes(agentId) && !isHostAgentId(agentId);
 }
 
-/** Replace `<root>/bin/konteks-remote` with the kept release's executable; a no-op where none was installed there, and on Windows, where a running executable cannot be replaced. */
-export async function refreshInstalledLauncher(root: string, record: NativeRuntimeRecord): Promise<void> {
-  if (process.platform === "win32") return;
+/**
+ * Replace `<root>/bin/konteks-remote` with the kept release's executable when
+ * it differs; true when it was replaced. A no-op where none was installed
+ * there, and on Windows: the MSI's command under Program Files cannot be
+ * replaced without elevation, and from 0.10.11 it runs the installed
+ * release's own executable instead (`launcher-delegate.ts`, D131).
+ */
+export async function refreshInstalledLauncher(root: string, record: NativeRuntimeRecord): Promise<boolean> {
+  if (process.platform === "win32") return false;
   const target = join(root, "bin", "konteks-remote");
-  if (!await stat(target).then(info => info.isFile(), () => false)) return;
+  if (!await stat(target).then(info => info.isFile(), () => false)) return false;
   const source = await resolveNativeConnectorExecutable(join(root, "releases", record.releaseId), process.platform === "darwin" ? "macos" : "debian");
+  if (await sameContents(source, target)) return false;
   const staged = `${target}.update-${process.pid}`;
   try {
     await copyFile(source, staged);
@@ -374,6 +456,53 @@ export async function refreshInstalledLauncher(root: string, record: NativeRunti
     await rename(staged, target);
   } finally {
     await rm(staged, { force: true }).catch(() => undefined);
+  }
+  return true;
+}
+
+async function sameContents(a: string, b: string): Promise<boolean> {
+  const [left, right] = await Promise.all([stat(a), stat(b)]);
+  if (left.size !== right.size) return false;
+  const digest = (path: string) => new Promise<string>((done, fail) => {
+    const hash = createHash("sha256");
+    createReadStream(path).on("data", chunk => hash.update(chunk)).once("error", fail).once("end", () => done(hash.digest("hex")));
+  });
+  const [x, y] = await Promise.all([digest(a), digest(b)]);
+  return x === y;
+}
+
+export interface KeepLauncherCurrentDeps {
+  /** This process: a release's `konteks-connector` (or `connector`), or node in development. */
+  execPath: string;
+  readRecord: (root: string) => Promise<NativeRuntimeRecord>;
+  readLedger: (root: string) => Promise<{ attempts: readonly NativeUpdateAttempt[] }>;
+  refresh: (root: string, record: NativeRuntimeRecord) => Promise<boolean>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  pollMs?: number;
+  /** An `in_progress` attempt older than this is abandoned (as the supervisor's update coordinator treats it). */
+  staleAttemptMs?: number;
+}
+
+/**
+ * The running release keeps `<root>/bin/konteks-remote` on its own code. The
+ * transaction refreshes it too, but only a launcher that has that code does:
+ * the owner's was 0.8.0's, so every update it drove (0.10.9, 0.10.10) ran
+ * 0.8.0's transaction and nothing ever replaced it (D113b). Waits while an
+ * update is still checking this release, and leaves it alone unless this
+ * process is the release the record names.
+ */
+export async function keepLauncherCurrent(root: string, deps: KeepLauncherCurrentDeps): Promise<"refreshed" | "current" | "skipped"> {
+  const os = process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "debian";
+  if (!(nativeConnectorFileNames(os) as string[]).includes(basename(deps.execPath))) return "skipped";
+  for (;;) {
+    const record = await deps.readRecord(root);
+    if (resolve(dirname(deps.execPath)) !== resolve(root, "releases", record.releaseId)) return "skipped";
+    const ledger = await deps.readLedger(root).catch(() => ({ attempts: [] }));
+    const checking = ledger.attempts.some(attempt => attempt.outcome === "in_progress" && attempt.releaseId === record.releaseId &&
+      deps.now() - Date.parse(attempt.startedAt) < (deps.staleAttemptMs ?? 45 * 60_000));
+    if (!checking) return await deps.refresh(root, record) ? "refreshed" : "current";
+    await deps.sleep(deps.pollMs ?? 5_000);
   }
 }
 

@@ -3,6 +3,8 @@ konteks-remote bootstrap (Windows 10/11 x64, PowerShell) - version 1.
 
 Usage (copied verbatim from the Konteks App or MCP activation response):
   powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://github.com/konteks-io/runtime/releases/latest/download/install.ps1))) -ActivationId <id>"
+An already-connected computer, to bring its launcher up to date:
+  powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://github.com/konteks-io/runtime/releases/latest/download/install.ps1))) -Update"
 
 Trust model. Konteks has no Windows code-signing certificate yet, so the MSI
 is not Authenticode-signed and Windows shows "Unknown publisher" at the
@@ -20,6 +22,13 @@ It then invokes `konteks-remote install` with the NON-SECRET activation id.
 The activation code is prompted by the launcher without echo and never
 appears here. No general command passthrough exists.
 
+`-Update` (instead of -ActivationId) on a computer that is already connected
+replaces the launcher with this release's, then runs `konteks-remote update`
+and `konteks-remote start`. An MSI from before 0.10.11 runs its own old code
+for every command, which no connector update replaces (D131); the launcher
+from 0.10.11 on runs the installed release's code, or its own when that is
+newer, so this is needed once.
+
 `-VerifyOnly` defines the signature verifier and returns without installing
 anything; CI dot-sources the script that way to test it.
 #>
@@ -30,6 +39,7 @@ param(
   # instead of failing on a missing activation id.
   [switch]$User,
   [switch]$Enroll,
+  [switch]$Update,
   [switch]$VerifyOnly,
   [Parameter(Mandatory = $false)]
   [ValidatePattern('^[A-Za-z0-9._-]{8,128}$')]
@@ -171,7 +181,15 @@ if ($User -or $Enroll) {
   Write-Host "For now, create an activation in Konteks (Customize -> Runtimes) and run this script with -ActivationId <id>."
   exit 3
 }
-if (-not $ActivationId) {
+if ($Update -and $ActivationId) {
+  Write-Error '-Update and -ActivationId are different doors; choose one'
+  exit 2
+}
+if ($Update -and -not (Test-Path (Join-Path ${env:USERPROFILE} 'AppData\Local\konteks-remote\native-runtime.json'))) {
+  Write-Host 'Konteks is not installed on this computer yet. Create an activation in Konteks (Customize -> Runtimes) and run this script with -ActivationId <id>.'
+  exit 2
+}
+if (-not $Update -and -not $ActivationId) {
   Write-Error "-ActivationId <id> is required (copy the command from the Konteks App or MCP)"
   exit 2
 }
@@ -246,9 +264,19 @@ finally {
 
 $launcher = Join-Path ${env:ProgramFiles} 'konteks-remote\konteks-remote.exe'
 if (-not (Test-Path $launcher)) { $launcher = 'konteks-remote' }
-# The activation code is prompted by the launcher without echo; it is never an argument.
-& $launcher install --activation-id $ActivationId
-$code = $LASTEXITCODE
+if ($Update) {
+  # This launcher runs the newer of its own code and the installed release's
+  # (D131). A connector that could not start stays stopped through an update,
+  # so start it after; start leaves a running one alone.
+  & $launcher update
+  $code = $LASTEXITCODE
+  & $launcher start
+  if ($code -eq 0) { $code = $LASTEXITCODE }
+} else {
+  # The activation code is prompted by the launcher without echo; it is never an argument.
+  & $launcher install --activation-id $ActivationId
+  $code = $LASTEXITCODE
+}
 # The MSI put konteks-remote on the machine PATH, which this window cannot see
 # yet; the commands the launcher just named work in a new one.
 if (-not (Get-Command konteks-remote -ErrorAction SilentlyContinue)) {

@@ -320,6 +320,18 @@ describe("session manager (D98 bootstrap)", () => {
     const title = `[konteks/Todo List/initiative] [v3] Stand up the todo list API ${created.acpSessionRef.slice(-8)}`;
     expect(calls.newSession?.[0]).toMatchObject({ _meta: { konteksSession: { version: 1, title }, claudeCode: { options: { title } } } });
   });
+  it.each(["codex", "claude-code"])("lets %s title a direct session itself, asking only for the [konteks] prefix, also when it is reopened", async agentId => {
+    const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true } });
+    const store = new InMemorySessionRefStore();
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: store });
+    await manager.create({ context: { ...context, agentId }, cwd: "/w", mcpServers: [], agentTitled: true });
+    const meta = (calls.newSession?.[0] as { _meta: Record<string, { title?: unknown; options?: { title?: unknown } }> })._meta;
+    expect(meta.konteksSession).toEqual({ version: 1, prefix: "[konteks]" });
+    expect(meta.claudeCode?.options?.title).toBeUndefined();
+    await store.put("acp-prior", "bridge-old");
+    await manager.create({ context: { ...context, agentId }, cwd: "/w", mcpServers: [], acpSessionRef: "acp-prior", agentTitled: true });
+    expect(calls.loadSession?.[0]).toMatchObject({ _meta: { konteksSession: { version: 1, prefix: "[konteks]" } } });
+  });
   it("refuses a later setting that resets an already confirmed model", async () => {
     const option = (id: string, currentValue: string) => ({ id, type: "select", name: id, currentValue, options: [{ value: currentValue, name: currentValue }] });
     const setSessionConfigOption = vi.fn(async ({ configId }: { configId: string }) => ({ configOptions:

@@ -494,7 +494,10 @@ export class RelayedSession {
       // A conversation's context is Konteks's to restage; a direct session's is
       // only the agent's own transcript, so that one is loaded.
       ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
-      ...(this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
+      // A person's direct session keeps the agent's own title behind "[konteks] ";
+      // engineering work is named from Core's label (D130).
+      ...(isDirectAssignment(this.assignment) ? { agentTitled: true as const }
+        : this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
       ...(browser ? { browser } : {}),
     }, lifecycle));
     this.creationReturned = true;

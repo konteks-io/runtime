@@ -73,6 +73,7 @@ import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
+import { windowsInstalledLauncher } from "./native/windows-launcher.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
 import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerWatch } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
@@ -110,6 +111,7 @@ import { PlanningTerminalDirectiveProcessor } from "./work/planning-terminal-dir
 import { ControllerDirectivePoller } from "./work/controller-directive-poller.js";
 import { DurableSearchAssignmentCarrier } from "./work/search-assignment-carrier.js";
 import { NativeUpdateCoordinator, type NativeUpdateCoordinatorOptions } from "./native/update.js";
+import type { NativeUpdateLedger } from "./native/update-ledger.js";
 import { evaluateHeartbeatLiveness, isCredentialRefusal, leaseLapseNeedsRestart } from "./heartbeat/liveness.js";
 
 /**
@@ -179,6 +181,12 @@ export interface SupervisorOptions {
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;
     /** Self-update policy; absent means the connector only reports `update_required`. */
     update?: Pick<NativeUpdateCoordinatorOptions, "fetchManifest" | "launch" | "readLedger" | "checkIntervalMs" | "initialDelayMs" | "maxAttemptsPerRelease" | "attemptWindowMs" | "staleAttemptMs">;
+    /**
+     * This release and the update ledger: while an update is still checking
+     * this release (its health gate), it takes no new work, so a rollback
+     * never stops it under a claim (D113b).
+     */
+    updateProbation?: { releaseId: string; readLedger: () => Promise<NativeUpdateLedger>; pollMs?: number; staleAttemptMs?: number };
   };
 }
 
@@ -206,6 +214,9 @@ export class Supervisor {
   private hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: false };
   private roleBindings: RoleBinding[] = [];
   private draining = false;
+  /** An update is still checking this release; no new work until it keeps it (D113b). */
+  private onUpdateProbation = false;
+  private probationTimer: NodeJS.Timeout | null = null;
   private drainReason: string | null = null;
   /** Non-null only for a Core directive; the local operator cannot lift that one. */
   private drainDeadline: string | null = null;
@@ -351,6 +362,7 @@ export class Supervisor {
     await this.previewRegistry.sweep().catch(error => this.logger.warn({ err: error }, "leftover preview processes could not be checked"));
     await this.journal.load();
     await this.outbox.load();
+    await this.beginUpdateProbation();
     // A native machine that has an identity but no key has lost the only
     // proof of who it is. A fresh key would be refused by Core on every call
     // while the process looked alive (W1-L1), so it stops and says so;
@@ -813,7 +825,7 @@ export class Supervisor {
       roleCapabilityInputs: () => this.roleCapabilityInputs(),
       acceptedKinds: () => this.hostSettings.coreAcceptsRouteBilling ? ALL_KINDS : ALL_KINDS.filter(kind => kind !== "direct"),
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
-      draining: () => this.draining,
+      draining: () => this.draining || this.onUpdateProbation,
       reconciliationComplete: () => this.reconciliation.isComplete,
       recoveryAuthority: () => this.recoveryAuthority(),
       reportDeliveryAllowed: () => this.recoveryAuthority() !== null,
@@ -1017,7 +1029,7 @@ export class Supervisor {
       configRevision: () => this.control.configRevision,
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       softMaxConcurrent: () => this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT,
-      acceptingWork: () => !this.draining && this.lease.canPullNewWork() && this.reconciliation.isComplete,
+      acceptingWork: () => !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork() && this.reconciliation.isComplete,
       intervalSeconds: () => this.heartbeatIntervalSeconds ?? this.configuration.heartbeatIntervalSeconds,
       renewalDelayMs: () => this.lease.current() ? this.lease.nextRenewalDelayMs() : 5000,
     });
@@ -1973,7 +1985,7 @@ export class Supervisor {
       components: (this.lastSnapshot?.components ?? []).map((component) => ({ kind: component.kind, version: component.version, healthStatus: component.healthStatus, capabilities: component.capabilities, lastProbeAt: component.lastProbeAt })),
       roles: (this.heartbeat?.roles() ?? []) as SupervisorStatus["roles"],
       roleBindings: this.roleBindings,
-      utilization: { acceptingWork: !this.draining && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
+      utilization: { acceptingWork: !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
       pendingErase: this.journal.erase.all().filter((record) => !record.receiptSent).length,
       pendingRevocation: this.pendingRevocation,
       // Also read by launchers installed before 7.0.0, which require both fields.
@@ -2507,6 +2519,7 @@ export class Supervisor {
       ...(openCode ? { openCode } : {}),
       ...(antigravity ? { antigravity } : {}),
       ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
+      ...(this.options.native && process.platform === "win32" ? { launcher: await windowsInstalledLauncher().catch(() => null) } : {}),
     });
   }
 
@@ -2588,6 +2601,8 @@ export class Supervisor {
     this.recoveryRetryTimer = null;
     if (this.refusedRestartTimer) clearTimeout(this.refusedRestartTimer);
     this.refusedRestartTimer = null;
+    if (this.probationTimer) clearInterval(this.probationTimer);
+    this.probationTimer = null;
     this.cancelDrainTimer();
     this.stopPromise ??= this.stopImpl();
     return this.stopPromise;
@@ -2654,11 +2669,20 @@ export class Supervisor {
     await note("preview_close", "completed");
     this.previewChannel?.dispose();
     await note("runner_stop", "entered");
-    for (const runner of this.nativeRunners) await runner.stop();
-    await note("runner_stop", "completed");
+    // Side by side: one after another, an idle connector's bridges took 5 s,
+    // and launchd's SIGKILL came before the Codex owner was reached (D113b).
+    // A runner that cannot stop does not keep the others, the Codex owner or
+    // the state from stopping; its failure is reported once all are done.
+    const runnerStops = await Promise.allSettled(this.nativeRunners.map(runner => runner.stop()));
+    const runnerFailure = runnerStops.find((stop): stop is PromiseRejectedResult => stop.status === "rejected");
+    const codexUnstopped = runnerStops.some((stop, index) => stop.status === "rejected" && this.nativeRunners[index]?.agentId === "codex");
+    if (!runnerFailure) await note("runner_stop", "completed");
     await note("codex_owner_stop", "entered");
-    await this.nativeCodexOwner?.stop();
-    await note("codex_owner_stop", "completed");
+    // The shared Codex app-server is stopped here only once every Codex runner
+    // stopped; otherwise the exit reaper armed by stop() ends it with the process.
+    let codexFailure: { reason: unknown } | null = null;
+    if (!codexUnstopped) await this.nativeCodexOwner?.stop().catch((reason: unknown) => { codexFailure = { reason }; });
+    if (!codexFailure && !codexUnstopped) await note("codex_owner_stop", "completed");
     if (this.codexRetryTimer) clearTimeout(this.codexRetryTimer);
     this.codexRetryTimer = null;
     this.parkedCodex = null;
@@ -2670,6 +2694,41 @@ export class Supervisor {
     await note("state_close", "entered");
     await this.stateMutations.close();
     this.nativeOwnership?.release();
+    if (runnerFailure) throw runnerFailure.reason;
+    if (codexFailure) throw (codexFailure as { reason: unknown }).reason;
+  }
+
+  /**
+   * A release an update just started is on probation until the update keeps
+   * it: the ledger's attempt for this release is no longer in progress. An
+   * attempt older than the update coordinator's stale bound is abandoned (its
+   * updater died) and ends the probation too.
+   */
+  private async beginUpdateProbation(): Promise<void> {
+    const probation = this.options.native?.updateProbation;
+    if (!probation) return;
+    const staleMs = probation.staleAttemptMs ?? 45 * 60_000;
+    const checking = async (): Promise<boolean> => {
+      const ledger = await probation.readLedger().catch(() => null);
+      return ledger?.attempts.some(attempt => attempt.outcome === "in_progress" && attempt.releaseId === probation.releaseId &&
+        Date.now() - Date.parse(attempt.startedAt) < staleMs) ?? false;
+    };
+    if (!await checking()) return;
+    this.onUpdateProbation = true;
+    this.logger.info({ event: "update.probation_started", releaseId: probation.releaseId }, "an update is checking this release; it takes no new work until the update keeps it");
+    let reading = false;
+    this.probationTimer = setInterval(() => {
+      if (reading) return;
+      reading = true;
+      void checking().then(still => {
+        if (still || !this.onUpdateProbation) return;
+        this.onUpdateProbation = false;
+        if (this.probationTimer) clearInterval(this.probationTimer);
+        this.probationTimer = null;
+        this.logger.info({ event: "update.probation_ended", releaseId: probation.releaseId }, "the update is done with this release; taking work");
+      }).finally(() => { reading = false; });
+    }, probation.pollMs ?? 2_000);
+    this.probationTimer.unref();
   }
 }
 

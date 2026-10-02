@@ -17,7 +17,7 @@ import type { BridgeProcess } from "../bridge/process.js";
 import { classifyBridgeError } from "../bridge/process.js";
 import type { RunnerEventBus } from "../events.js";
 import type { HostPromptPrelude, HostPromptSession, HostTurnError } from "../host/host-agent.js";
-import { konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
+import { konteksAgentTitledMetadata, konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
 import type { MeasuredTurn } from "./usage-label.js";
 
 /**
@@ -51,6 +51,8 @@ export interface CreateSessionArgs {
   freshProviderSessionOnRestore?: boolean;
   /** Display-only naming for the provider session list; never authority. */
   sessionLabel?: KonteksSessionLabel;
+  /** A person's direct session: the agent titles it; Konteks asks only for the `[konteks]` prefix. */
+  agentTitled?: boolean;
   /** Native in-process owner; opaque connector ref, never the bridge session ID. */
   lifecycle?: {
     beforeCreate(opaqueRef: string): Promise<void>;
@@ -367,8 +369,17 @@ export class SessionManager {
   }
 
   /** `_meta` for `session/load` and `session/resume`: the agent's own (a persisted tool filter is overridden there). */
-  private reopenMeta(): { _meta?: Record<string, unknown> } {
-    return this.options.sessionMeta ? { _meta: { ...this.options.sessionMeta } } : {};
+  private reopenMeta(args?: Pick<CreateSessionArgs, "agentTitled">): { _meta?: Record<string, unknown> } {
+    // A reopened direct session the agent has not titled yet still gets the prefix when it does.
+    const naming = args?.agentTitled ? { konteksSession: konteksAgentTitledMetadata().konteksSession } : {};
+    const meta = { ...naming, ...this.options.sessionMeta };
+    return Object.keys(meta).length ? { _meta: meta } : {};
+  }
+
+  private newSessionMeta(args: CreateSessionArgs, acpSessionRef: string): Record<string, unknown> {
+    const naming = args.agentTitled ? konteksAgentTitledMetadata(args.context.agentId)
+      : konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId);
+    return { ...naming, ...this.options.sessionMeta };
   }
 
   async create(args: CreateSessionArgs): Promise<CreatedSession> {
@@ -502,10 +513,10 @@ export class SessionManager {
           // Session identity is retained, assignment tool authority is not.
           // Send even an empty list rather than retaining prior MCP bindings.
           bootstrapConfig = (await this.boundedBootstrap("session_resume", args, bridge,
-            bridge.connection.resumeSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
+            bridge.connection.resumeSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
         } else {
           bootstrapConfig = (await this.boundedBootstrap("session_load", args, bridge,
-            bridge.connection.loadSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
+            bridge.connection.loadSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
         }
         bridgeSessionId = prior;
         resumed = true;
@@ -522,7 +533,7 @@ export class SessionManager {
       let created: { sessionId: string; configOptions?: unknown; modes?: unknown };
       try {
         created = await this.boundedBootstrap("session_new", args, bridge,
-          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: { ...konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId), ...this.options.sessionMeta } }), bootstrapAttempt);
+          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: this.newSessionMeta(args, acpSessionRef) }), bootstrapAttempt);
       } catch (error) {
         if (error instanceof RemoteInstanceError && error.retryable) throw error;
         const classified = classifyBridgeError(error);
@@ -734,7 +745,7 @@ export class SessionManager {
       const caps = bridge.initializeResult.agentCapabilities;
       let refreshed: { configOptions?: unknown; modes?: unknown } | null | undefined;
       if (caps?.sessionCapabilities?.resume != null) {
-        const resume = () => bridge.connection.resumeSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() });
+        const resume = () => bridge.connection.resumeSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) });
         try {
           refreshed = await resume();
         } catch (error) {
@@ -750,7 +761,7 @@ export class SessionManager {
           refreshed = await resume();
         }
       } else if (caps?.loadSession === true) {
-        refreshed = await bridge.connection.loadSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() });
+        refreshed = await bridge.connection.loadSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) });
       } else {
         throw new RemoteInstanceError("recovery_required", "Agent cannot refresh a live session's authority.", { diagnostic: "agent_cannot_refresh_authority" });
       }

@@ -48,3 +48,17 @@ export function codexLocalProxyFiles(directory, { entry = "codex-local-proxy.js"
   }
   return found;
 }
+
+/**
+ * What the build changes in an agent's package for one platform. The Codex
+ * bridge patch carries Konteks's session naming, so every platform gets it
+ * (D130: Windows shipped it unpatched and no thread read "[konteks]"); only
+ * the shared app-server proxy is Unix-only.
+ */
+export function offlineAgentPatches(agent, os) {
+  return {
+    codexBridge: agent === "codex",
+    codexLocalProxy: agent === "codex" && os !== "windows",
+    claudeFiles: agent === "claude-code" ? ["acp-agent.js", "settings.js", "session-titles.js"] : [],
+  };
+}
