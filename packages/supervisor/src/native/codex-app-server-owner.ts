@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, realpath, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, realpath, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { promisify } from "node:util";
 import { dirname, isAbsolute, join } from "node:path";
@@ -17,6 +17,7 @@ import {
   verifyNativeRunnerPackage,
   assertCodexThreadsIdle,
   codexLoadedThreadStatuses,
+  resolveCodexSocket,
   type RunnerConfig,
 } from "@konteks/remote-agent-runner";
 import { resolveNativeCodexSocket } from "./installation.js";
@@ -45,6 +46,10 @@ export interface NativeCodexAppServerOwnerOptions {
   /** Stop a stale server's process group; tests replace the signals. */
   stopHolder?: (pid: number) => Promise<void>;
   onStaleReplaced?: (event: { pid: number; staleRelease: string; currentRelease: string }) => void;
+  /** Every running process as `pid command`; tests replace the `ps` listing. */
+  listProcesses?: () => Promise<Array<{ pid: number; command: string }>>;
+  /** Whether a stray's socket still answers; tests replace the connect probe. */
+  strayReachable?: (socketPath: string) => Promise<boolean>;
 }
 
 export interface CodexSocketHolder { pid: number; command: string }
@@ -129,11 +134,12 @@ export class NativeCodexAppServerOwner {
     await this.startPromise;
     if (this.stopping || (!this.child && !this.adoptedHolder)) throw unavailable("The shared Codex owner is unavailable.");
     const socket = this.options.config.RUNNER_NATIVE_CODEX_SOCKET!;
-    const before = await lstat(socket);
+    // The bound socket itself, also when Codex 0.159+ reached it through a link.
+    const before = await stat(socket);
     const pid = this.child?.pid ?? this.adoptedHolder?.pid;
     if (!before.isSocket() || !pid) throw unavailable("The shared Codex owner identity is unavailable.");
     const unloaded = !(await codexLoadedThreadStatuses(socket)).has(reference);
-    const after = await lstat(socket);
+    const after = await stat(socket);
     if (before.dev !== after.dev || before.ino !== after.ino || before.birthtimeMs !== after.birthtimeMs ||
         pid !== (this.child?.pid ?? this.adoptedHolder?.pid)) throw unavailable("The shared Codex owner changed during legacy admission.");
     return { unloaded, ownerGeneration: `${pid}:${before.dev}:${before.ino}:${before.birthtimeMs}` };
@@ -215,6 +221,7 @@ export class NativeCodexAppServerOwner {
     if (this.stopping || generation !== this.generation) throw unavailable("The shared Codex owner stopped during startup.");
     if (socketMode === "adopt") {
       this.watchAdoptedSocket(socketPath, generation);
+      void this.reapStrayServers(command.command, socketPath).catch(() => undefined);
       return;
     }
 
@@ -242,6 +249,7 @@ export class NativeCodexAppServerOwner {
       child.removeListener("error", exitedDuringStartup);
       this.stableTimer = setTimeout(() => { this.restartAttempt = 0; this.stableTimer = null; }, 60_000);
       this.stableTimer.unref();
+      void this.reapStrayServers(command.command, socketPath).catch(() => undefined);
     } catch (error) {
       if (this.child === child) this.child = null;
       child.removeListener("exit", exitedDuringStartup);
@@ -278,6 +286,36 @@ export class NativeCodexAppServerOwner {
     await (this.options.cleanupSocket ?? cleanupCodexSocket)(socketPath);
     this.options.onStaleReplaced?.({ pid: holder.pid, staleRelease: stale.release, currentRelease: current.release });
     return "spawn";
+  }
+
+  /**
+   * Codex app-servers an older release of THIS installation left behind on
+   * another socket (RCA 2026-09-30: a release folder deleted days earlier still
+   * had its server running, and an update's stop left the previous release's
+   * one orphaned). Only processes whose executable is inside this
+   * installation's releases folder, never the current release, never the
+   * current socket (adoption and stale replacement own that one), and only
+   * while their threads are idle when their socket still answers.
+   */
+  async reapStrayServers(currentCommand: string, currentSocket: string): Promise<number> {
+    const current = executableRelease(currentCommand);
+    if (!current) return 0;
+    const processes = await (this.options.listProcesses ?? listProcesses)().catch(() => []);
+    let reaped = 0;
+    for (const entry of processes) {
+      if (entry.pid === process.pid || this.child?.pid === entry.pid || this.adoptedHolder?.pid === entry.pid) continue;
+      const release = executableRelease(entry.command);
+      if (!release || release.releasesDir !== current.releasesDir || release.release === current.release) continue;
+      const socket = /\bcodex\b.*\bapp-server\b.*--listen unix:\/\/(\S+)/.exec(entry.command)?.[1];
+      if (!socket || socket === currentSocket) continue;
+      try {
+        if (await (this.options.strayReachable ?? canConnect)(socket)) await (this.options.assertIdleThreads ?? assertCodexThreadsIdle)(socket);
+        await (this.options.stopHolder ?? stopProcessGroup)(entry.pid);
+        reaped += 1;
+        this.options.onStaleReplaced?.({ pid: entry.pid, staleRelease: release.release, currentRelease: current.release });
+      } catch { /* busy or already gone: the next start looks again */ }
+    }
+    return reaped;
   }
 
   /** A healthy same-user socket is local-user authority and can survive a
@@ -357,22 +395,33 @@ export async function prepareCodexSocket(socketPath: string, allowStaleCleanup =
     throw error;
   });
   if (!existing) return "spawn";
-  if (!existing.isSocket() || !privateOwner(existing)) throw unavailable("The shared Codex socket path is not a private local-user socket.");
-  if (await canConnect(socketPath)) return "adopt";
+  const socket = await resolveCodexSocket(socketPath, existing);
+  if (socket.kind === "foreign" || (socket.kind === "socket" && !privateOwner(socket.info))) throw unavailable("The shared Codex socket path is not a private local-user socket.");
+  if (socket.kind === "socket" && await canConnect(socketPath)) return "adopt";
   if (!allowStaleCleanup) throw unavailable("An explicit Codex socket is stale; refusing to remove an unproven holder's socket.");
+  // A stale socket, or the link a stopped Codex left to its own: only the
+  // entry at our path is removed, never what a link points to.
   await unlink(socketPath);
   return "spawn";
 }
 
-export async function waitForCodexSocket(socketPath: string, child: PipedChildProcess): Promise<void> {
-  const deadline = Date.now() + 15_000;
+/**
+ * How long a starting Codex app-server may take to listen. A first start of a
+ * newer Codex can migrate the state in its home before it binds, so this is
+ * generous; a server that exits fails at once, and other agents start
+ * meanwhile (start-native-agents), so the wait only costs Codex itself.
+ */
+export const CODEX_SOCKET_READY_TIMEOUT_MS = 60_000;
+
+export async function waitForCodexSocket(socketPath: string, child: PipedChildProcess, timeoutMs = CODEX_SOCKET_READY_TIMEOUT_MS): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null) throw unavailable("The signed Codex app-server exited before its socket became ready.");
-    const info = await lstat(socketPath).catch(() => null);
-    if (info?.isSocket() && info.uid === process.getuid?.() && await canConnect(socketPath)) {
-      await chmod(socketPath, 0o600);
-      const secured = await lstat(socketPath);
-      if (secured.isSocket() && privateOwner(secured)) return;
+    const socket = await resolveCodexSocket(socketPath);
+    if (socket.kind === "socket" && socket.info.uid === process.getuid?.() && await canConnect(socketPath)) {
+      await chmod(socket.target, 0o600);
+      const secured = await resolveCodexSocket(socketPath);
+      if (secured.kind === "socket" && secured.target === socket.target && privateOwner(secured.info)) return;
       throw unavailable("The shared Codex socket could not be secured.");
     }
     await pause(100);
@@ -381,11 +430,12 @@ export async function waitForCodexSocket(socketPath: string, child: PipedChildPr
 }
 
 export async function cleanupCodexSocket(socketPath: string): Promise<void> {
-  const info = await lstat(socketPath).catch(() => null);
-  if (!info?.isSocket() || !privateOwner(info)) return;
+  const socket = await resolveCodexSocket(socketPath);
+  if (socket.kind === "none" || socket.kind === "foreign" || (socket.kind === "socket" && !privateOwner(socket.info))) return;
   // Never unlink a same-user server that won a race after our process stopped.
-  if (!await canConnect(socketPath)) await unlink(socketPath).catch(() => undefined);
+  if (socket.kind === "dangling" || !await canConnect(socketPath)) await unlink(socketPath).catch(() => undefined);
 }
+
 
 function validatePath(path: string): void {
   if (process.platform === "win32" || !isAbsolute(path) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(path)) throw unavailable("The shared Codex socket path is invalid.");
@@ -416,9 +466,29 @@ export function releaseOf(command: string): { releasesDir: string; release: stri
 
 const run = promisify(execFile);
 
+/**
+ * The release folder of a command's executable: the FIRST `…/releases/<release>/`
+ * (a Node-wrapped server names its release twice, and install roots contain spaces).
+ */
+function executableRelease(command: string): { releasesDir: string; release: string } | null {
+  const match = /^(.*?\/releases\/)([^/]+)\//.exec(command);
+  return match ? { releasesDir: match[1]!, release: match[2]! } : null;
+}
+
+/** Every running process of this user with its full command line. */
+async function listProcesses(): Promise<Array<{ pid: number; command: string }>> {
+  const { stdout } = await run("ps", ["-axo", "pid=,command="], { timeout: 5_000, maxBuffer: 8 * 1024 * 1024 });
+  return stdout.split("\n").flatMap(line => {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    return match ? [{ pid: Number(match[1]), command: match[2]!.trim() }] : [];
+  });
+}
+
 /** The Codex app-server process listening on the shared socket, if it can be told. */
 export async function findCodexSocketHolder(socketPath: string): Promise<CodexSocketHolder | null> {
-  const { stdout } = await run("lsof", ["-t", socketPath], { timeout: 5_000 });
+  // lsof names a socket by where it was bound, not by a link to it (Codex 0.159+).
+  const socket = await resolveCodexSocket(socketPath).catch(() => null);
+  const { stdout } = await run("lsof", ["-t", socket?.kind === "socket" ? socket.target : socketPath], { timeout: 5_000 });
   for (const pid of stdout.split(/\s+/).map(Number).filter(value => Number.isSafeInteger(value) && value > 0)) {
     const { stdout: command } = await run("ps", ["-o", "command=", "-p", String(pid)], { timeout: 5_000 });
     if (/\bcodex\b.*\bapp-server\b/.test(command)) return { pid, command: command.trim() };

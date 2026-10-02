@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME } from "@konteks/remote-agent-runner";
 import type { PreviewStatus } from "./process-manager.js";
+import { CONVERSATION_HAS_NO_APP, CONVERSATION_HAS_NO_APP_AGENT_NOTE } from "./config.js";
 
 /**
  * The session's preview tools, as a connector-local loopback MCP server
@@ -226,6 +227,7 @@ export class PreviewMcpServer {
 /** The plain-text answer an agent reads; the same facts are in structuredContent. */
 export function describeStatus(status: PreviewStatus, options: { browser?: boolean } = {}): string {
   const lines = [`Preview: ${status.state}${status.phase && status.state === "starting" ? ` (${status.phase})` : ""}`, status.message];
+  if (status.message === CONVERSATION_HAS_NO_APP) lines.push(CONVERSATION_HAS_NO_APP_AGENT_NOTE);
   if (status.startedBy === "viewer") lines.push("Started by a viewer who opened the preview in Konteks.");
   else if (status.startedBy === "agent") lines.push("Started by the agent (preview_start).");
   if (status.url) lines.push(`Loopback URL (a browser on this computer): ${status.url}`);

@@ -66,7 +66,42 @@ export interface NativeServiceDefinition {
   exits?: NativeServiceCommand;
   /** User services on Linux need linger to survive logout/reboot without a login. */
   requiresLinger: boolean;
+  /** Reads the definition the service manager has loaded and the pid it runs (`parseLoadedService`); absent where the OS does not say. */
+  inspect?: NativeServiceCommand;
+  /** What the loaded definition must name to be this one. */
+  expected?: { program: string; logFile: string | null };
+  /** Makes the service manager load this definition and restart the service onto it; absent where it applies only from the next start. */
+  reload?: NativeServiceReload;
 }
+
+/**
+ * A service manager reads a definition only when it loads it: launchd at
+ * `bootstrap` (a KeepAlive respawn and `kickstart -k` reuse the loaded copy),
+ * systemd at `daemon-reload`. Rewriting the file while the service runs
+ * changes nothing until it is loaded again (RCA 2026-10-01: an updated
+ * connector ran with stdout on /dev/null after the update, because the
+ * install launcher had loaded a plist without the log file).
+ */
+export type NativeServiceReload =
+  /** Run here in order; the service manager then restarts the service, this process included. */
+  | { kind: "inline"; commands: NativeServiceCommand[] }
+  /** Stops this very process with the service, so it runs in a session of its own with its output appended to `logFile`. */
+  | { kind: "detached"; command: NativeServiceCommand; logFile: string };
+
+/**
+ * Bootout, wait until launchd has let go of the job, bootstrap again. `$1` is
+ * the job, `$2` its domain, `$3` the plist: paths are arguments, never part of
+ * the script. Lines are pino-shaped so the connector log stays one format.
+ */
+const LAUNCHD_RELOAD_SCRIPT = [
+  "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+  "say() { printf '{\"level\":%s,\"time\":%s000,\"msg\":\"%s\"}\\n' \"$1\" \"$(date +%s)\" \"$2\"; }",
+  "say 30 \"reloading the launch agent so launchd runs this release's definition\"",
+  "launchctl bootout \"$1\"",
+  "n=0; while launchctl print \"$1\" >/dev/null 2>&1; do n=$((n+1)); [ \"$n\" -ge 120 ] && break; sleep 1; done",
+  "n=0; until launchctl bootstrap \"$2\" \"$3\"; do n=$((n+1)); if [ \"$n\" -ge 60 ]; then say 50 \"launchd did not load the launch agent again; konteks-remote start starts it\"; exit 1; fi; sleep 2; done",
+  "say 30 \"launch agent reloaded\"",
+].join("\n");
 
 /**
  * Register and start the service from its definition unless it is already
@@ -104,33 +139,47 @@ export function nativeServiceDefinition(input: {
     // launchd keeps nothing a service prints: without a file the connector's
     // log, which doctor points to, did not exist (WS1-163). The connector
     // keeps the file small itself (connector-log.ts).
+    // The home it was started from, as the service's own: launchd otherwise
+    // hands a service the login's home, so a connector installed for another
+    // home (a second person on this Mac, a stand-in laptop) read the wrong
+    // agents' sign-ins and installs (09-30).
     const logFile = path.join(normalizedRoot, "logs", CONNECTOR_LOG_FILE);
     return {
       label, path: file, requiresLinger: false,
-      contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>${xml(logFile)}</string>\n<key>StandardErrorPath</key><string>${xml(logFile)}</string>\n</dict></plist>\n`,
+      contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>${xml(logFile)}</string>\n<key>StandardErrorPath</key><string>${xml(logFile)}</string>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>${xml(input.home)}</string></dict>\n</dict></plist>\n`,
       install: [],
       start: { command: "launchctl", args: ["bootstrap", domain, file] },
       stop: { command: "launchctl", args: ["bootout", `${domain}/${label}`] },
       remove: [],
       status: { command: "launchctl", args: ["print", `${domain}/${label}`] },
       exits: { command: "launchctl", args: ["print", `${domain}/${label}`] },
+      inspect: { command: "launchctl", args: ["print", `${domain}/${label}`] },
+      expected: { program: input.executable, logFile },
+      reload: { kind: "detached", logFile, command: { command: "/bin/sh", args: ["-c", LAUNCHD_RELOAD_SCRIPT, "konteks-reload", `${domain}/${label}`, domain, file] } },
     };
   }
   if (input.os === "debian") {
     const unit = `${label}.service`;
     return {
       label, path: path.join(input.home, ".config", "systemd", "user", unit), requiresLinger: true,
-      contents: `[Unit]\nDescription=Konteks native agent connector\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=${[input.executable, ...args].map(systemdArg).join(" ")}\nRestart=always\nRestartSec=5\nTimeoutStopSec=45\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`,
+      contents: `[Unit]\nDescription=Konteks native agent connector\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=${[input.executable, ...args].map(systemdArg).join(" ")}\nEnvironment=${systemdArg(`HOME=${input.home}`)}\nRestart=always\nRestartSec=5\nTimeoutStopSec=45\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`,
       install: [{ command: "systemctl", args: ["--user", "daemon-reload"] }],
       start: { command: "systemctl", args: ["--user", "enable", "--now", unit] },
       stop: { command: "systemctl", args: ["--user", "stop", unit] },
       remove: [{ command: "systemctl", args: ["--user", "disable", "--now", unit] }],
       status: { command: "systemctl", args: ["--user", "is-active", unit] },
       exits: { command: "systemctl", args: ["--user", "show", unit, "-p", "NRestarts", "-p", "ExecMainStatus"] },
+      inspect: { command: "systemctl", args: ["--user", "show", unit, "-p", "MainPID", "-p", "NeedDaemonReload"] },
+      expected: { program: input.executable, logFile: null },
+      // `--no-block` only queues the restart, so this process can ask for its own.
+      reload: { kind: "inline", commands: [{ command: "systemctl", args: ["--user", "daemon-reload"] }, { command: "systemctl", args: ["--user", "--no-block", "restart", unit] }] },
     };
   }
   if (!input.userId || !/^S-1-\d+(?:-\d+)+$/.test(input.userId)) throw new Error("the current Windows user SID is required");
   const file = path.join(normalizedRoot, "service.xml");
+  // No `reload`: Task Scheduler keeps its own copy of the task, which `start`
+  // (every update and rollback) replaces with `/Create /F`, and the task names
+  // no output file, so a running connector loses nothing by keeping it.
   return {
     label, path: file, requiresLinger: false, fileEncoding: "utf16le",
     contents: `<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${input.userId}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id="Owner"><UserId>${input.userId}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings>\n<Actions Context="Owner"><Exec><Command>${xml(input.executable)}</Command><Arguments>${xml(args.map(windowsArg).join(" "))}</Arguments></Exec></Actions>\n</Task>\n`,
@@ -184,6 +233,31 @@ export function parseServiceExits(os: HostOs, stdout: string): { runs: number; l
     const status = stdout.match(/^ExecMainStatus=(\d+)$/m);
     if (!restarts) return null;
     return { runs: Number(restarts[1]) + 1, lastExitCode: status && Number(status[1]) !== 0 ? Number(status[1]) : null };
+  }
+  return null;
+}
+
+/**
+ * The pid the service manager runs for this service (null when it runs none)
+ * and whether the definition it has loaded is this one, from `inspect`'s
+ * output: launchd's `pid`, `program` and `stdout path` (a plist loaded without
+ * the log file has no `stdout path`, so its output goes to /dev/null), systemd's
+ * `MainPID` and `NeedDaemonReload`. Null where the output says neither.
+ */
+export function parseLoadedService(os: HostOs, stdout: string, expected: { program: string; logFile: string | null }): { pid: number | null; current: boolean } | null {
+  if (os === "macos") {
+    if (!/^\S+ = \{$/m.test(stdout)) return null;
+    const pid = stdout.match(/^\s*pid = (\d+)$/m);
+    const program = stdout.match(/^\s*program = (.+)$/m)?.[1];
+    const out = stdout.match(/^\s*stdout path = (.+)$/m)?.[1];
+    const err = stdout.match(/^\s*stderr path = (.+)$/m)?.[1];
+    const logged = expected.logFile === null || (out === expected.logFile && err === expected.logFile);
+    return { pid: pid ? Number(pid[1]) : null, current: program === expected.program && logged };
+  }
+  if (os === "debian") {
+    const pid = stdout.match(/^MainPID=(\d+)$/m);
+    if (!pid) return null;
+    return { pid: Number(pid[1]) > 0 ? Number(pid[1]) : null, current: !/^NeedDaemonReload=yes$/m.test(stdout) };
   }
   return null;
 }

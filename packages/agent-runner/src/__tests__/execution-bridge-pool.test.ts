@@ -5,7 +5,9 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { RetainedProcessOwner } from "@konteks/remote-common";
 import { AgentRuntime } from "../runtime.js";
 import { RunnerConfigSchema } from "../config.js";
+import type { IdentityProbe } from "../auth/identity.js";
 import type { BridgeProcess, SpawnBridgeOptions } from "../bridge/process.js";
+import { RequestError } from "@agentclientprotocol/sdk";
 
 vi.mock("../auth/login-flow.js", () => ({ runLogout: vi.fn(async () => ({ code: 0 })), startLoginFlow: vi.fn() }));
 
@@ -28,7 +30,8 @@ const retainedOwner = (pid: number): RetainedProcessOwner =>
   ({ version: 1, platform: "darwin", pid, processGroupId: pid, startToken: `start-${pid}`, commandDigest: "A".repeat(43) });
 const modelOptions = [{ id: "model", name: "Model", category: "model", type: "select", currentValue: "sonnet", options: [{ value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }] }];
 
-async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number } = {}) {
+async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number; probe?: () => Promise<IdentityProbe>;
+  newSessionFails?: () => boolean | Error; closeSession?: () => Promise<object> } = {}) {
   const root = await mkdtemp(join(tmpdir(), "execution-pool-")); roots.push(root);
   const owners: Owner[] = [];
   let sessions = 0;
@@ -42,10 +45,14 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
       retainedProcessOwner: retainedOwner(pid),
       connection: {
         // A reused process hands out a fresh private id per `session/new`.
-        newSession: vi.fn(async () => { sessions += 1; return { sessionId: `private-${pid}-${sessions}`, configOptions: modelOptions }; }),
+        newSession: vi.fn(async () => {
+          const failure = options.newSessionFails?.();
+          if (failure instanceof Error) throw failure;
+          if (failure) throw new Error("session/new refused");
+          sessions += 1; return { sessionId: `private-${pid}-${sessions}`, configOptions: modelOptions }; }),
         prompt: vi.fn(async () => ({ stopReason: "end_turn" })),
         cancel: vi.fn(async () => undefined),
-        closeSession: vi.fn(async () => ({})),
+        closeSession: vi.fn(options.closeSession ?? (async () => ({}))),
         setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => {
           selectedConfig.set(configId, value);
           return { configOptions: [...selectedConfig].map(([id, currentValue]) => ({
@@ -65,7 +72,7 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
   const runtime = new AgentRuntime({
     config: RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex", RUNNER_CREDENTIAL_DIR: root, RUNNER_WORKSPACE_DIR: root }),
     spawn, executionBridgeLimit: () => options.limit ?? 1,
-    probe: async () => ({ kind: "signal" as const, fingerprint: "opaque-identity-fingerprint" }),
+    probe: options.probe ?? (async () => ({ kind: "signal" as const, fingerprint: "opaque-identity-fingerprint" })),
     ...(options.ttlMs === undefined ? {} : { idleExecutionBridgeTtlMs: options.ttlMs }),
     ...(options.now ? { now: options.now } : {}),
     ...(options.modelCapabilityTtlMs === undefined ? {} : { modelCapabilityTtlMs: options.modelCapabilityTtlMs }),
@@ -83,7 +90,7 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
 async function completeAndRelease(f: Awaited<ReturnType<typeof fixture>>, ref: string) {
   f.runtime.sessions.prompt(ref, `turn-${ref}`, { prompt: [] });
   await f.runtime.sessions.sealCompletedTurn(ref);
-  f.runtime.sessions.releaseSealed(ref);
+  await f.runtime.sessions.releaseSealed(ref);
   return f.runtime.releaseExecutionBridge(ref);
 }
 
@@ -231,7 +238,9 @@ it("answers the model capability probe from the resident process and keeps it re
   expect(f.spawn).toHaveBeenCalledTimes(2);
   const process = f.execution().bridge;
   expect(process.connection.newSession).toHaveBeenCalledTimes(2);
-  expect(process.connection.closeSession).toHaveBeenCalledOnce();
+  // The released session, then the probe's own session: neither stays open on the resident process.
+  expect(process.connection.closeSession).toHaveBeenCalledTimes(2);
+  expect(process.connection.closeSession).toHaveBeenLastCalledWith({ sessionId: "private-1001-2" });
   expect(process.stop).not.toHaveBeenCalled();
   await f.runtime.sessions.create(f.input);
   expect(f.spawn).toHaveBeenCalledTimes(2);
@@ -245,6 +254,23 @@ it("spawns a throwaway probe process only when nothing is resident", async () =>
   expect(f.owners[1]!.bridge.stop).toHaveBeenCalledOnce();
 });
 
+it("reads the identity again when a discovery fails for good, so readiness stops saying ready (WS1-216)", async () => {
+  let signedIn = true;
+  let refuse = false;
+  const f = await fixture({
+    probe: async () => signedIn ? { kind: "signal", fingerprint: "opaque-identity-fingerprint" } : { kind: "logged_out" },
+    newSessionFails: () => refuse,
+  });
+  await f.runtime.probe(false);
+  expect(f.runtime.readiness().readiness).toBe("ready");
+  // Its sign-in went away outside Konteks (its home cleared): every session is refused.
+  signedIn = false;
+  refuse = true;
+  await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
+  await vi.waitFor(() => expect(f.runtime.readiness()).toMatchObject({ readiness: "not_configured", recoveryAction: "login_locally" }));
+
+});
+
 it("re-reads the offered models once the discovery TTL has passed (System One §6a, KM6)", async () => {
   let now = Date.parse("2026-09-27T00:00:00Z");
   const f = await fixture({ now: () => new Date(now), modelCapabilityTtlMs: 60_000 });
@@ -253,8 +279,99 @@ it("re-reads the offered models once the discovery TTL has passed (System One §
   await f.runtime.discoverModelCapability("model");
   expect(f.spawn).toHaveBeenCalledTimes(2);
   now += 60_000;
-  await f.runtime.discoverModelCapability("model");
+  // Past the TTL the last answer is served at once, with its true age, while it is read again.
+  await expect(f.runtime.discoverModelCapability("model")).resolves.toMatchObject({ currentValue: "sonnet", observedAgoMs: 60_000 });
+  await vi.waitFor(() => expect(f.spawn).toHaveBeenCalledTimes(3));
+  await vi.waitFor(async () => expect((await f.runtime.discoverModelCapability("model")).observedAgoMs).toBeUndefined());
   expect(f.spawn).toHaveBeenCalledTimes(3);
+});
+
+it("closes each released session on the reused process, so it never accumulates agent sessions (2026-10-02 leak)", async () => {
+  const f = await fixture();
+  const first = await f.runtime.sessions.create(f.input);
+  const process = f.execution().bridge;
+  await expect(completeAndRelease(f, first.acpSessionRef)).resolves.toEqual({ retained: true });
+  expect(process.connection.closeSession).toHaveBeenLastCalledWith({ sessionId: "private-1001-1" });
+  const second = await f.runtime.sessions.create(f.input);
+  await expect(completeAndRelease(f, second.acpSessionRef)).resolves.toEqual({ retained: true });
+  expect(process.connection.closeSession).toHaveBeenLastCalledWith({ sessionId: "private-1001-2" });
+  expect(process.connection.closeSession).toHaveBeenCalledTimes(2);
+  expect(f.runtime.sessions.sessionsBoundTo(process)).toBe(0);
+  expect(process.stop).not.toHaveBeenCalled();
+});
+
+it("stops and finalizes the process instead of keeping it when the agent does not confirm the close", async () => {
+  const f = await fixture({ closeSession: async () => { throw new Error("close refused"); } });
+  const first = await f.runtime.sessions.create(f.input);
+  const process = f.execution().bridge;
+  await expect(completeAndRelease(f, first.acpSessionRef)).resolves.toEqual({ retained: false });
+  expect(process.stop).toHaveBeenCalledOnce();
+  // Finalized: the slot is free and the next session starts a fresh process.
+  await f.runtime.sessions.create(f.input);
+  expect(f.spawn).toHaveBeenCalledTimes(3);
+  expect(process.connection.newSession).toHaveBeenCalledOnce();
+});
+
+it("keeps serving the last offered models after a refresh fails for a transient reason", async () => {
+  let now = Date.parse("2026-10-02T00:00:00Z");
+  let fail: Error | false = false;
+  const f = await fixture({ now: () => new Date(now), modelCapabilityTtlMs: 60_000, newSessionFails: () => fail });
+  await f.runtime.probe(false);
+  await f.runtime.discoverModelCapability("model");
+  now += 90_000;
+  fail = new Error("loaded computer");
+  const kept = await f.runtime.discoverModelCapability("model");
+  expect(kept).toMatchObject({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"], observedAgoMs: 90_000 });
+  await vi.waitFor(() => expect(f.spawn).toHaveBeenCalledTimes(3));
+  await vi.waitFor(() => expect(f.owners[2]!.bridge.stop).toHaveBeenCalled());
+  // The failed refresh dropped nothing: the same answer, older, starting one new refresh at a time.
+  now += 10_000;
+  await expect(f.runtime.discoverModelCapability("model")).resolves.toMatchObject({ currentValue: "sonnet", observedAgoMs: 100_000 });
+  await expect(f.runtime.discoverModelCapability("model")).resolves.toMatchObject({ currentValue: "sonnet" });
+  await vi.waitFor(() => expect(f.spawn).toHaveBeenCalledTimes(4));
+  expect(f.runtime.readiness().readiness).toBe("ready");
+  fail = false;
+  await vi.waitFor(async () => {
+    await f.runtime.discoverModelCapability("model");
+    expect((await f.runtime.discoverModelCapability("model")).observedAgoMs).toBeUndefined();
+  });
+});
+
+it("drops the last offered models when a refresh is definitely refused", async () => {
+  let now = Date.parse("2026-10-02T00:00:00Z");
+  let fail: Error | false = false;
+  const f = await fixture({ now: () => new Date(now), modelCapabilityTtlMs: 60_000, newSessionFails: () => fail });
+  await f.runtime.probe(false);
+  await f.runtime.discoverModelCapability("model");
+  now += 90_000;
+  fail = new RequestError(-32602, "Invalid params");
+  await f.runtime.discoverModelCapability("model");
+  await vi.waitFor(() => expect(f.owners[2]?.bridge.stop).toHaveBeenCalled());
+  // Still signed in, but nothing is kept: the next read is a discovery of its own, and it fails.
+  await vi.waitFor(async () => {
+    const spawned = f.spawn.mock.calls.length;
+    await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
+    expect(f.spawn.mock.calls.length).toBe(spawned + 1);
+  });
+  expect(f.runtime.readiness().readiness).toBe("ready");
+});
+
+it("drops the last offered models when a refresh says the agent needs signing in", async () => {
+  let now = Date.parse("2026-10-02T00:00:00Z");
+  let fail: Error | false = false;
+  const f = await fixture({ now: () => new Date(now), modelCapabilityTtlMs: 60_000, newSessionFails: () => fail });
+  await f.runtime.probe(false);
+  await f.runtime.discoverModelCapability("model");
+  now += 90_000;
+  fail = new RequestError(-32000, "Authentication required");
+  await f.runtime.discoverModelCapability("model");
+  await vi.waitFor(() => expect(f.owners[2]?.bridge.stop).toHaveBeenCalled());
+  // Nothing is kept now: the next read is a discovery of its own, and it fails.
+  await vi.waitFor(async () => {
+    const spawned = f.spawn.mock.calls.length;
+    await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
+    expect(f.spawn.mock.calls.length).toBe(spawned + 1);
+  });
 });
 
 it("refuses a restart-only retained stop for an identity live under a current owner and yields an idle one", async () => {
@@ -273,4 +390,25 @@ it("refuses a restart-only retained stop for an identity live under a current ow
   await f.runtime.yieldRetainedProcess(retainedOwner(7));
   await f.runtime.sessions.create(f.input);
   expect(f.spawn).toHaveBeenCalledTimes(3);
+});
+
+it("retries the unfinished stop of a fenced execution's process instead of refusing its retained stop for good", async () => {
+  // The fenced owner keeps its capacity slot (no qualified finalization), so the live one needs a second.
+  const f = await fixture({ limit: 2 });
+  const first = await f.runtime.sessions.create(f.input);
+  const process = f.execution().bridge;
+  const stop = process.stop as ReturnType<typeof vi.fn>;
+  const exit = stop.getMockImplementation()!;
+  // A loaded computer: the recovery stop's process stop does not finish in time.
+  stop.mockImplementationOnce(async () => { throw new Error("Bridge process exit remains unconfirmed."); });
+  await f.runtime.sessions.stopForRecovery(first.acpSessionRef).catch(() => undefined);
+  await expect(f.runtime.stopExecutionBridge(first.acpSessionRef)).rejects.toThrow("exit remains unconfirmed");
+  stop.mockImplementation(exit);
+  await expect(f.runtime.yieldRetainedProcess(process.retainedProcessOwner)).resolves.toBeUndefined();
+  expect(stop).toHaveBeenCalledTimes(2);
+  expect(process.exited).toBe(true);
+  // A live owner is still never signalled.
+  const second = await f.runtime.sessions.create(f.input);
+  expect(second.acpSessionRef).toBeTruthy();
+  await expect(f.runtime.yieldRetainedProcess(f.owners.at(-1)!.bridge.retainedProcessOwner)).rejects.toThrow(/live under a current local owner/);
 });

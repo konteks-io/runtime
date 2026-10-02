@@ -48,6 +48,15 @@ export class NativeUpdateCoordinator {
   private available: { bundleVersion: string; manifestDigest: string } | null = null;
   private lastCheckedAt: string | null = null;
   private lastError: string | null = null;
+  /**
+   * Core refused this bundle as below its minimum (a `version_policy` or a
+   * refused reconnect). Such a runtime has no lease, so Core cannot be asked
+   * which release it accepts; a strictly newer signed release is then the way
+   * back in (RCA 2026-09-30: 14 runtimes below a raised minimum never updated).
+   */
+  private refusedAsTooOld: { minimumSupportedBundle: string | null } | null = null;
+  /** The last channel read's failure only (never a launch failure), for `doctor`. */
+  private channelError: string | null = null;
   private inFlight: NonNullable<NativeUpdateStatus["inFlight"]> | null = null;
   private lastAttempt: NativeUpdateStatus["lastAttempt"] = null;
   private timer: NodeJS.Timeout | null = null;
@@ -78,8 +87,9 @@ export class NativeUpdateCoordinator {
   }
 
   /** Core's `version_policy` says this bundle is below the minimum: act now rather than at the next tick. */
-  onUpdateRequired(policy: { minimumSupportedBundle: string; targetBundle?: string }): void {
-    this.options.logger.warn({ minimumSupportedBundle: policy.minimumSupportedBundle, targetBundle: policy.targetBundle ?? null }, "update_required: bundle below Core's minimum; requesting update");
+  onUpdateRequired(policy: { minimumSupportedBundle: string | null; targetBundle?: string }): void {
+    this.options.logger.warn({ minimumSupportedBundle: policy.minimumSupportedBundle, targetBundle: policy.targetBundle ?? null }, "update_required: Konteks refuses this release; requesting an update");
+    this.refusedAsTooOld = { minimumSupportedBundle: policy.minimumSupportedBundle };
     void this.apply("core_minimum").catch(() => undefined);
   }
 
@@ -90,14 +100,32 @@ export class NativeUpdateCoordinator {
       const newer = compareSemver(release.manifest.bundleVersion, this.options.currentBundleVersion) > 0;
       this.available = newer ? { bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest } : null;
       this.lastError = null;
+      this.channelError = null;
     } catch (error) {
       this.available = null;
       this.lastError = error instanceof Error ? error.message.slice(0, 1_024) : "manifest check failed";
+      this.channelError = this.lastError;
       this.options.logger.warn({ err: error }, "native update check failed");
     }
     this.lastCheckedAt = new Date(this.now()).toISOString();
     await this.refreshLedgerView();
     return this.status();
+  }
+
+  /**
+   * Without Core's accepted release, only a runtime Core refused as too old
+   * updates unattended, and only to a strictly newer signed release (verified
+   * by `check`) at or above the minimum Core named, when it named one.
+   */
+  private mayUpdateWithoutAcceptedRelease(reason: NativeUpdateReason, bundleVersion: string): boolean {
+    if (reason !== "core_minimum" || !this.refusedAsTooOld) return false;
+    const minimum = this.refusedAsTooOld.minimumSupportedBundle;
+    return minimum === null || compareSemver(bundleVersion, minimum) >= 0;
+  }
+
+  /** The release channel's last read, for `doctor`: when, and why it failed (null when it was read). */
+  channel(): { lastCheckedAt: string | null; error: string | null; available: string | null } {
+    return { lastCheckedAt: this.lastCheckedAt, error: this.channelError, available: this.available?.bundleVersion ?? null };
   }
 
   status(): NativeUpdateStatus {
@@ -135,9 +163,10 @@ export class NativeUpdateCoordinator {
         this.options.logger.warn({ err: error }, "could not ask Konteks which release it accepts");
         return undefined;
       });
-      if (accepted === undefined) return refuse("Konteks could not be asked which release it accepts; staying on this one");
+      if (accepted === undefined && !this.mayUpdateWithoutAcceptedRelease(reason, available.bundleVersion)) return refuse("Konteks could not be asked which release it accepts; staying on this one");
+      if (accepted === undefined) this.options.logger.warn({ bundleVersion: available.bundleVersion, minimumSupportedBundle: this.refusedAsTooOld?.minimumSupportedBundle ?? null }, "Konteks refuses this release and cannot be asked which one it accepts; installing the newer signed release");
       if (accepted === null) return refuse("this Konteks does not say which release it accepts; update by hand with `konteks-remote update`");
-      if (accepted.bundleVersion !== available.bundleVersion) {
+      if (accepted !== undefined && accepted.bundleVersion !== available.bundleVersion) {
         return refuse(`Konteks accepts ${accepted.bundleVersion}, not ${available.bundleVersion} yet; staying on this one until it does`);
       }
     }

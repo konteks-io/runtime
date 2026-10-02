@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { agentName, detectAgentFamilies, detectOpenCodeProblem, initiativeTitle, isNo, isYes, onboardFailureStep, runOnboard, runOnboardStep } from "../native/onboard.js";
+import { agentName, detectAgentFamilies, detectOpenCodeProblem, hostLabel, initiativeTitle, isNo, isYes, onboardFailureStep, runOnboard, runOnboardStep } from "../native/onboard.js";
 import { OPENCODE_MIN_BINARY_BYTES } from "@konteks/remote-supervisor";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { readOnboardState, writeOnboardState } from "../native/onboard-state.js";
@@ -54,7 +54,7 @@ describe("onboard", () => {
       ...(answer !== undefined ? { answer } : {}),
       // No test reaches a real Core: a lookup nobody stubbed fails fast.
       // Nor the person's own OpenCode on this machine.
-      deps: { waitForReady: readyService, fetchFn: offline as never, openCodeProblem: async () => null, personalOpenCode: async () => false, ...extra },
+      deps: { waitForReady: readyService, fetchFn: offline as never, openCodeProblem: async () => null, dshProblem: async () => null, personalOpenCode: async () => false, ...extra },
     });
 
   it("asks for the email in its very first response on a machine that is not connected", async () => {
@@ -226,6 +226,11 @@ describe("onboard", () => {
     for (const said of ["yes, but not now", "please don't", "maybe", "acme-shop"]) {
       expect(isYes(said), said).toBe(false);
     }
+    // An answer given last, after a thought, still counts (09-30).
+    expect(isYes("It already is my System, I think. Yes.")).toBe(true);
+    expect(isNo("I thought about it. No.")).toBe(true);
+    expect(isYes("I thought about it. No.")).toBe(false);
+    expect(isYes("No. Well, maybe later. Yes.")).toBe(false);
   });
 
   it("asks a yes/no about the first System and accepts no without registering", async () => {
@@ -355,8 +360,8 @@ describe("onboard", () => {
     expect((error as Error).message).toBe(OWNER_ACCESS_REVOKED);
     const stopped = await onboardFailureStep({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" }, error);
     expect(stopped.note).toBe("This machine's Konteks access was revoked in Customize → Runtimes.");
-    expect(stopped.ask).toMatchObject({ question: "Connect this machine again? It starts over with your email and a new code.", kind: "confirm" });
-    expect(await readOnboardState(root)).toMatchObject({ step: "reconnect" });
+    expect(stopped.ask).toMatchObject({ question: "Give this machine your access again? Konteks sends a code to your email to check it is you.", kind: "confirm" });
+    expect(await readOnboardState(root)).toMatchObject({ step: "reconnect", resumeStep: "system" });
     await writeOnboardState(root, { ...(await readOnboardState(root)), step: "system" } as never);
 
     const other = await step({ fetchFn: refusal({ error: { name: "AuthenticationError" } }) as never }, "yes").catch((e: unknown) => e);
@@ -900,17 +905,111 @@ describe("onboard", () => {
     expect(refused.done?.links.site).toBe("https://app.test");
   });
 
-  it("connects a revoked machine again as a new runtime, with a new code to the same address, when the person says yes (W1-Z4)", async () => {
-    const { SupervisorStore } = await import("@konteks/remote-supervisor");
-    vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
-    await writeOnboardState(root, { step: "reconnect", tenantId: "acme", ownerEmail: "ada@acme.test" } as never);
-    const again = await step({}, "yes");
-    // The code step says where the code went, masked; this note must not unmask it.
-    expect(again.note).toBe("Starting over as a new runtime.");
-    expect(again.run).toBeDefined();
-    expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
-    const { readdir } = await import("node:fs/promises");
-    expect((await readdir(join(root, "retired"))).some(entry => entry.startsWith("instance-1-"))).toBe(true);
+  describe("a computer its owner connected from the site (W1-M4)", () => {
+    const connected = async () => {
+      const { SupervisorStore } = await import("@konteks/remote-supervisor");
+      vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
+      const { deleteOwnerToken } = await import("../native/owner-api.js");
+      await deleteOwnerToken(join(root, "supervisor"));
+    };
+
+    it("gets its owner's access with its own key and goes on to the folder, asking no email or code", async () => {
+      await connected();
+      const refreshOwnerToken = vi.fn(async () => ({ token: "site-token", expiresAt: new Date(Date.now() + 3600_000).toISOString(), userRef: "user:default/ada", tenantId: "acme" }));
+      const first = await step({ enrollment: { refreshOwnerToken } as never });
+      expect(refreshOwnerToken).toHaveBeenCalledWith("instance-1");
+      expect(first.ask).toBeUndefined();
+      expect(first.done).toBeUndefined();
+      expect(await readOnboardState(root)).toMatchObject({ step: "inspect", instanceId: "instance-1" });
+      const { readOwnerToken } = await import("../native/owner-api.js");
+      expect((await readOwnerToken(join(root, "supervisor")))?.token).toBe("site-token");
+    });
+
+    it("ends plainly when Konteks gives no one's access, instead of offering a System it cannot make", async () => {
+      await connected();
+      const { RemoteInstanceError: Refusal } = await import("@konteks/remote-common");
+      const refreshOwnerToken = vi.fn(async () => { throw new Refusal("enrollment_invalid" as never, "This enrollment was not accepted"); });
+      const first = await step({ enrollment: { refreshOwnerToken } as never });
+      expect(first.done?.summary).toContain("from the site, not for one person");
+      expect(first.run).toBeUndefined();
+    });
+  });
+
+  describe("a machine whose access was revoked, when the person says yes (W1-Z4)", () => {
+    const enrolled = async () => {
+      const { writeSecretFile } = await import("@konteks/remote-common");
+      await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
+        schemaVersion: 1, coreUrl: "https://core.test", relayUrl: "wss://relay.test", agents: [], bundleVersion: "0.7.6", manifestDigest: "digest-1", controlPort: 41800,
+      }));
+      const { SupervisorStore } = await import("@konteks/remote-supervisor");
+      vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
+    };
+    const retired = async () => {
+      const { readdir } = await import("node:fs/promises");
+      return readdir(join(root, "retired")).catch(() => [] as string[]);
+    };
+
+    it("stays the same runtime and sends a code to the same address", async () => {
+      await enrolled();
+      await writeOnboardState(root, {
+        step: "reconnect", resumeStep: "done", tenantId: "acme", ownerEmail: "ada@acme.test",
+        systemId: "sys-1", systemEntityRef: "system:default/acme-solo", repositoryPath: "/tmp/solo",
+      } as never);
+      const again = await step({}, "yes");
+      expect(again.note).toBeUndefined();
+      expect(again.run).toBeDefined();
+      // The same runtime keeps what it knew.
+      expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test", restores: "instance-1", systemEntityRef: "system:default/acme-solo" });
+      expect(await retired()).toEqual([]);
+
+      const openIntent = vi.fn(async () => ({ intentRef: "intent-1", restoresInstanceId: "instance-1" }));
+      const sendChallenge = vi.fn(async () => ({ sentToMasked: "a••@acme.test", attemptsRemaining: 5 }));
+      const sent = await step({ enrollment: { openIntent, sendChallenge } as never });
+      expect(sendChallenge).toHaveBeenCalledWith("intent-1", "ada@acme.test");
+      expect(sent.note).toContain("A six-digit code is on its way.");
+      expect(await readOnboardState(root)).toMatchObject({ step: "code", restores: "instance-1" });
+
+      // No workspace question: the runtime already has its workspace.
+      const verifyCode = vi.fn(async () => ({ decision: "choose", workspaces: [{ tenantId: "acme", displayName: "Acme" }, { tenantId: "b", displayName: "B" }] }));
+      const restoreAccess = vi.fn(async () => ({
+        identity: { instanceId: "instance-1", workspaceId: "acme" },
+        ownerToken: { token: "new-token", expiresAt: new Date(Date.now() + 3600_000).toISOString(), userRef: "user:default/ada", tenantId: "acme" },
+        accessRestored: true,
+      }));
+      const bind = vi.fn();
+      const confirmed = await step({ enrollment: { verifyCode, restoreAccess, bind } as never }, "123456");
+      expect(confirmed.ask).toBeUndefined();
+      expect(await readOnboardState(root)).toMatchObject({ step: "start", restores: "instance-1" });
+      const back = await step({ enrollment: { verifyCode, restoreAccess, bind } as never });
+      expect(bind).not.toHaveBeenCalled();
+      expect(restoreAccess).toHaveBeenCalledWith("intent-1", { email: "ada@acme.test" });
+      expect(back.note).toContain("Your access is back: this machine works for you in");
+      const { readOwnerToken } = await import("../native/owner-api.js");
+      expect((await readOwnerToken(join(root, "supervisor")))?.token).toBe("new-token");
+      // A finished machine looks at its folder again, as a revisit: no second System question.
+      expect(await readOnboardState(root)).toMatchObject({ step: "inspect", revisit: true, instanceId: "instance-1", tenantId: "acme", ownerEmail: "ada@acme.test", systemId: "sys-1" });
+      expect((await readOnboardState(root))?.restores).toBeUndefined();
+      expect((await readOnboardState(root))?.resumeStep).toBeUndefined();
+      expect(await retired()).toEqual([]);
+    });
+
+    it("connects as a new runtime when Konteks says the runtime itself is gone too", async () => {
+      await enrolled();
+      await writeOnboardState(root, { step: "email", resendTo: "ada@acme.test", restores: "instance-1", ownerEmail: "ada@acme.test", systemId: "sys-1", revisit: true } as never);
+      const openIntent = vi.fn()
+        .mockResolvedValueOnce({ intentRef: "intent-1" })
+        .mockResolvedValueOnce({ intentRef: "intent-2" });
+      const sendChallenge = vi.fn(async () => ({ sentToMasked: "a••@acme.test", attemptsRemaining: 5 }));
+      await step({ enrollment: { openIntent, sendChallenge } as never });
+      expect(openIntent).toHaveBeenCalledTimes(2);
+      expect(sendChallenge).toHaveBeenCalledWith("intent-2", "ada@acme.test");
+      expect((await retired()).some(entry => entry.startsWith("instance-1-"))).toBe(true);
+      // A new runtime keeps only the person's answers.
+      expect(await readOnboardState(root)).toMatchObject({ step: "code", ownerEmail: "ada@acme.test" });
+      expect((await readOnboardState(root))?.restores).toBeUndefined();
+      expect((await readOnboardState(root))?.systemId).toBeUndefined();
+      expect((await readOnboardState(root))?.revisit).toBeUndefined();
+    });
   });
 
   it("does not tell a revoked machine that nothing needs setting up, even mid-revisit (W1-Z4)", async () => {
@@ -1148,6 +1247,10 @@ describe("onboard", () => {
     const v1 = "OpenCode 1 is not supported (found 1.18.33): install OpenCode 2 with `curl -fsSL https://opencode.ai/v2/install | bash`, then add it here: konteks-remote agent add opencode";
     const old = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }), openCodeProblem: async () => v1 });
     expect(old.done?.remedies).toContain(v1);
+    // An unsupported DeepSeek Harness here: named too, with a supported one's install command (W1-D4).
+    const dshOld = "DeepSeek Harness 0.1.3-alpha.2 is not a version Konteks supports (0.1.5-rc.3 up to, but not including, 0.1.8). Install it with `npm install -g @deepseek-ai/dsh@0.1.7-rc.2`, then add it here: konteks-remote agent add dsh";
+    const oldDsh = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }), dshProblem: async () => dshOld });
+    expect(oldDsh.done?.remedies).toContain(dshOld);
     // Nobody with another agent and no OpenCode is told to install it.
     const without = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }) });
     expect(JSON.stringify(without.done)).not.toContain("OpenCode");
@@ -1718,5 +1821,14 @@ describe("onboard", () => {
     const result = await step({}, "");
     expect(result.note).toBe("Ending here.");
     expect(await readOnboardState(root)).toMatchObject({ step: "done" });
+  });
+});
+
+describe("the computer's name the site says a System was connected from", () => {
+  it("is macOS's Computer Name, else the host name without .local, never the home folder and OS", () => {
+    expect(hostLabel({ os: "macos", computerName: () => "Sam's MacBook Air\n" })).toBe("Sam's MacBook Air");
+    expect(hostLabel({ os: "macos", computerName: () => { throw new Error("no scutil"); }, hostname: () => "sams-air.local" })).toBe("sams-air");
+    expect(hostLabel({ os: "debian", hostname: () => "build-box" })).toBe("build-box");
+    expect(hostLabel({ os: "debian", hostname: () => "build-box" })).not.toMatch(/@/);
   });
 });

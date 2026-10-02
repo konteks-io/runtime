@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlLoginEvent } from "@konteks/remote-common";
+import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
 import type { Output } from "../output.js";
 import { confirm, promptLine, promptSecret } from "../prompt.js";
@@ -24,8 +24,17 @@ export interface ControlContext {
 
 const AgentsSchema = z.object({ agents: z.array(z.record(z.string(), z.unknown())), roles: z.array(z.string()), roleBindings: z.array(z.record(z.string(), z.unknown())) }).strict();
 
+/** Where updates come from, and whether they can: an unreadable or overridden channel is said plainly. */
+function releaseChannelLine(channel: NonNullable<UpdateChannelReport>): string {
+  const where = channel.override ? `${channel.host} (override: KONTEKS_RELEASE_MANIFEST_URL)` : channel.host;
+  if (channel.error) return `${where} — cannot be read, no update can arrive: ${channel.error}`;
+  return `${where}${channel.lastCheckedAt ? `, checked ${channel.lastCheckedAt}` : ", not checked yet"}`;
+}
+
 export async function status(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "status" }, SupervisorStatusSchema);
+  // A connector from before `update.channel` refuses the op: the line is simply left out.
+  const channel = await context.control.call({ op: "update.channel" }, UpdateChannelReportSchema).catch(() => null);
   // `lease` is intentionally bearer-redacted by generic output. Publish a
   // separate, explicit public summary; never exempt bearer fields from redaction.
   context.output.result({ ...value, leaseStatus: { mode: value.lease.mode, expiresAt: value.lease.expiresAt, drainDeadline: value.lease.drainDeadline } });
@@ -35,6 +44,7 @@ export async function status(context: ControlContext): Promise<void> {
     ["connectivity", `${value.connectivity.transport}${value.connectivity.relayConnected ? " (relay connected)" : ""}${value.connectivity.reconciliationComplete ? "" : " — reconciling"}`],
     ["lease", `${value.lease.mode}${value.lease.expiresAt ? `, expires ${value.lease.expiresAt}` : ""}`],
     ["bundle", `${value.version.bundle} (protocol ${value.version.protocol})${value.version.updateAvailable ? ` — update available: ${value.version.targetBundle}` : ""}`],
+    ...(channel ? [["updates", releaseChannelLine(channel)] as [string, string]] : []),
     ["roles", value.roles.join(", ") || "(none advertised — log in an agent and tag roles in App/MCP)"],
     ["utilization", `${value.utilization.activeSessions} sessions, ${value.utilization.activeTurns} turns, ratio ${value.utilization.utilizationRatio}${value.utilization.acceptingWork ? "" : " — not accepting work"}`],
     ["components", value.components.map((component) => `${component.kind}=${component.healthStatus}`).join(" ")],
@@ -50,7 +60,7 @@ export async function previewStatus(context: ControlContext): Promise<void> {
   context.output.line(value.capabilityAdvertised
     ? `Previews: served from this computer (at most ${value.maxRunning} at once, each stops after ${value.idleStopMinutes} idle minutes). Switch them off for this computer in Konteks: Customize → Runtimes.`
     : "Previews: not offered (this connector has no relay connection configured).");
-  if (value.previews.length === 0) context.output.line("No session preview has run since the connector started.");
+  if (value.previews.length === 0) context.output.line("No session preview is running now.");
   for (const preview of value.previews) {
     context.output.line(`${preview.sessionId}: ${preview.state}${preview.url ? ` at ${preview.url}` : ""}${preview.startedBy === "viewer" ? " (started by a viewer)" : ""}${preview.viewerConnected ? " (a viewer is connected)" : ""}`);
     if (preview.command) context.output.line(`  command: ${preview.command}${preview.explanation ? ` — ${preview.explanation}` : ""}`);
@@ -63,6 +73,7 @@ export async function agents(context: ControlContext): Promise<void> {
   const value = await context.control.call({ op: "agents" }, AgentsSchema);
   context.output.result(value);
   for (const agent of value.agents as Array<Record<string, string>>) {
+    if (agent.startFailure) { context.output.line(`${agent.agentId}: could not start (${agent.startFailure}); trying again in the background`); continue; }
     context.output.line(`${agent.agentId}: ${agent.readiness} (${agent.authMode}, scope ${agent.accountScope})${agent.recoveryAction ? ` — ${agent.recoveryAction}` : ""}${downloadNote(agent)}`);
   }
   context.output.line(`advertised roles: ${value.roles.join(", ") || "(none)"}`);

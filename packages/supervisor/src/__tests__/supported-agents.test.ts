@@ -73,7 +73,7 @@ describe("supported agents on this computer (runtime-view R21)", () => {
     expect(await detectNotAddedAgent("antigravity", { antigravityPinned: () => false })).toEqual({ state: "not_supported_on_this_os" });
   });
 
-  it("re-detects in the background on the agent retry cadence, never on every heartbeat", async () => {
+  it("re-detects in the background every minute, never on every heartbeat (W1-D4)", async () => {
     let now = 1_000_000;
     const claude = vi.fn(async () => "/usr/local/bin/claude");
     const detector = new NotAddedAgentsDetector({ agentIds: ["claude-code"], now: () => now, deps: { claude } });
@@ -86,16 +86,12 @@ describe("supported agents on this computer (runtime-view R21)", () => {
     expect(claude).toHaveBeenCalledTimes(1);
     now += 30_000; await detector.refreshIfDue();
     expect(claude).toHaveBeenCalledTimes(2);
-    // Unchanged: the next one waits twice as long (two minutes), capped at fifteen.
-    now += 60_000; await detector.refreshIfDue();
-    expect(claude).toHaveBeenCalledTimes(2);
-    now += 60_000; await detector.refreshIfDue();
-    expect(claude).toHaveBeenCalledTimes(3);
-    // A change brings the cadence back to a minute.
+    // Unchanged for a long while, it still looks every minute.
+    for (let minute = 0; minute < 10; minute += 1) { now += 60_000; await detector.refreshIfDue(); }
+    expect(claude).toHaveBeenCalledTimes(12);
+    // A change shows at the next minute.
     claude.mockRejectedValue(new RemoteInstanceError("prerequisite_missing", "Install Claude Code"));
-    now += 4 * 60_000; await detector.refreshIfDue();
-    expect(detector.current().get("claude-code")).toEqual({ state: "not_installed" });
     now += 60_000; await detector.refreshIfDue();
-    expect(claude).toHaveBeenCalledTimes(5);
+    expect(detector.current().get("claude-code")).toEqual({ state: "not_installed" });
   });
 });

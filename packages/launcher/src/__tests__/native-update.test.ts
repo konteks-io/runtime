@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture, resolveNativeConnectorExecutable } from "@konteks/remote-release";
-import { loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
 import { earlierFailure, earlierFailureNote, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
@@ -113,6 +113,14 @@ describe("native update staging and commit", () => {
 
     await restoreNativeRecord(f.root, successor.releaseId, f.installed, { roots: f.trust, platform: f.platform });
     await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).resolves.toMatchObject({ record: { releaseId: f.installed.releaseId, bundleVersion: "1.0.0" } });
+  });
+  it("says another update is still running when one holds the installation, instead of a bare ownership refusal (RCA 2026-10-01)", async () => {
+    const f = await fixture();
+    const held = acquireNativeRootLock(join(f.root, "installer"));
+    try {
+      await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } })).rejects.toThrow("Another update or install of this connector is still running (it may be downloading a release). Wait for it to finish, then run `konteks-remote status`.");
+    } finally { held.release(); }
+    await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } })).resolves.toMatchObject({ status: "staged" });
   });
   it("updates from a release staged before the rename, and rolls back to it", async () => {
     const f = await fixture();
@@ -383,6 +391,36 @@ describe("native update transaction", () => {
     expect(stopping.slice(1).every(line => /still stopping the connector \(\d+ s so far\)/.test(line))).toBe(true);
     expect(lines).toContain("Starting 1.1.0 and checking it is healthy before keeping it (up to 3 min)…");
   });
+  it("settles at once on a bundled agent the new release could not start, and names it when rolling back (RCA 2026-10-01)", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "codex"] } });
+    const control = h.deps.control;
+    // The successor lists Codex as left out instead of leaving it missing, and doctor says why.
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        const value = await (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+        if (record.releaseId !== "release-next") return value;
+        if (request.op === "agents") return { agents: [{ agentId: "claude-code", readiness: "ready" }, { agentId: "codex", readiness: "unavailable", startFailure: "The signed Codex app-server did not become ready in time" }] };
+        if (request.op === "doctor") (value as { checks: unknown[] }).checks.push({ id: "agent-codex", title: "Agent codex", status: "fail", detail: "could not start (The signed Codex app-server did not become ready in time); trying again in the background", recoveryActions: [] });
+        return value;
+      } } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow(/agent-codex \(could not start \(The signed Codex app-server did not become ready in time\)/);
+    expect(h.calls.filter(call => call === "control:agents@release-next")).toHaveLength(1);
+    expect(h.calls).toContain("restore:release-next");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back", detail: expect.stringContaining("agent-codex (could not start") });
+  });
+  it("names the agents that never settled when the probe deadline passes", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "codex"] } });
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => request.op === "agents" && record.releaseId === "release-next"
+        ? { agents: [{ agentId: "claude-code", readiness: "ready" }] }
+        : (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest) } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow("The updated connector did not finish probing its agents in time (codex).");
+  });
   it("lets a connectivity doctor failure settle within the deadline instead of rolling back", async () => {
     const h = harness({ previous, gate: "new_failure" });
     // The successor's relay check fails on the first two doctor reads, then passes.
@@ -455,6 +493,18 @@ describe("native update transaction", () => {
     expect(h.calls).not.toContain("commit");
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
   });
+  it("starts the unchanged release again when the service stopped but its exit was never confirmed (RCA 2026-09-30)", async () => {
+    const h = harness({ previous });
+    // The OS reports the service stopped, but the old connector never writes its stop receipt.
+    h.deps.readStopReceipt = async () => "prior-stop";
+    h.deps.stopDeadlineMs = 3_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.calls).not.toContain("commit");
+    expect(h.calls.lastIndexOf("start")).toBeGreaterThan(h.calls.indexOf("stop"));
+    expect(h.currentRecord().releaseId).toBe(previous.releaseId);
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
+  });
+
   it("does not drain or restart when the service is not running", async () => {
     const h = harness({ previous, running: false });
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: false });

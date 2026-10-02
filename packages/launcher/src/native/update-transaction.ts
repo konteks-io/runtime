@@ -180,6 +180,14 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       }
     } else {
       if (stopped && stopConfirmed && wasRunning) await deps.start(input).catch(() => undefined);
+      // The stop was sent but not confirmed in time (RCA 2026-09-30: an orphaned
+      // Codex app-server held it up): the installation is unchanged, so bring
+      // the same release back once the OS no longer runs the service, rather
+      // than leaving this computer disconnected until someone starts it.
+      else if (stopped && wasRunning && await deps.execute(definition.status).catch(() => 0) !== 0) {
+        input.output.line("The update did not go ahead; starting this computer's connector again on the release it had.");
+        await deps.start(input).catch(() => undefined);
+      }
       await finish("failed", detail);
     }
     throw error;
@@ -269,8 +277,13 @@ async function drain(input: NativeUpdateInput, control: UpdateControlClient, dep
 }
 
 async function failingDoctorChecks(control: UpdateControlClient): Promise<Set<string>> {
+  return new Set((await failingDoctorDetails(control)).keys());
+}
+
+/** Each failing check's id and what it says, so a rollback can name why. */
+async function failingDoctorDetails(control: UpdateControlClient): Promise<Map<string, string>> {
   const report = await control.call({ op: "doctor" }, DoctorReportSchema);
-  return new Set(report.checks.filter(check => check.status === "fail").map(check => check.id));
+  return new Map(report.checks.filter(check => check.status === "fail").map(check => [check.id, check.detail]));
 }
 
 /**
@@ -282,6 +295,8 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
   const deadline = deps.now() + (deps.healthDeadlineMs ?? 180_000);
   const poll = deps.pollMs ?? 3_000;
   let answered = false;
+  /** The agents the successor has not settled yet, named when the deadline passes. */
+  let unsettled: string[] = [];
   const progress = progressLines(input, deps, `Waiting for ${successor.bundleVersion} to answer…`, `still waiting for ${successor.bundleVersion} to answer`);
   for (;;) {
     progress();
@@ -294,8 +309,10 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
       const probed = await control.call({ op: "agents" }, AgentsSchema, { timeoutMs: 5_000 });
       // A host-installed agent (the person's own DeepSeek Harness or OpenCode) depends on
       // their install, not on this release: it never holds an update back.
-      const settled = successor.agents.filter(agentId => !isHostAgentId(agentId)).every(agentId => probed.agents.some(agent => agent.agentId === agentId && agent.readiness !== "unknown" && agent.readiness !== "probing"));
-      if (settled) break;
+      // An agent that could not start is settled too: it is listed as
+      // unavailable, and whether that is new is the doctor check's call below.
+      unsettled = successor.agents.filter(agentId => !isHostAgentId(agentId)).filter(agentId => !probed.agents.some(agent => agent.agentId === agentId && agent.readiness !== "unknown" && agent.readiness !== "probing"));
+      if (unsettled.length === 0) break;
     } catch (error) {
       if (answered && error instanceof RemoteInstanceError && error.code === "update_required") throw error;
     }
@@ -303,16 +320,16 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
     // seconds and will never answer: say so now rather than at the deadline.
     const exits = answered ? null : await deps.serviceExits?.(definition).catch(() => null);
     if (exits && exits.runs >= 3 && exits.lastExitCode) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector stopped as soon as it started, ${exits.runs} times (exit code ${exits.lastExitCode}).`);
-    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", answered ? "The updated connector did not finish probing its agents in time." : "The updated connector did not answer on its control socket in time.");
+    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", answered ? `The updated connector did not finish probing its agents in time (${unsettled.join(", ") || "unknown"}).` : "The updated connector did not answer on its control socket in time.");
     await deps.sleep(poll);
   }
   // Connectivity checks (relay, lease) settle seconds after start; a failure
   // counts against the update only if it is still there when the deadline passes.
   for (;;) {
-    const failingAfter = await failingDoctorChecks(control);
-    const introduced = [...failingAfter].filter(id => !failingBefore.has(id));
+    const failing = await failingDoctorDetails(control);
+    const introduced = [...failing.keys()].filter(id => !failingBefore.has(id));
     if (introduced.length === 0) break;
-    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector introduced doctor failure(s): ${introduced.join(", ")}.`);
+    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector introduced doctor failure(s): ${introduced.map(id => `${id} (${failing.get(id)})`).join(", ")}.`);
     input.output.line(`waiting for the updated connector to clear doctor failure(s): ${introduced.join(", ")}…`);
     await deps.sleep(poll);
   }

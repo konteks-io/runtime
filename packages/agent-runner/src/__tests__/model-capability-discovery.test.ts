@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BridgeProcess, SpawnBridgeOptions } from "../bridge/process.js";
-import { MAX_OFFERED_MODEL_VALUES, discoverBridgeModelCapability, exactSelect } from "../bridge/model-capability.js";
+import { RequestError } from "@agentclientprotocol/sdk";
+import { RemoteInstanceError } from "@konteks/remote-common";
+import { MAX_OFFERED_MODEL_VALUES, definiteModelDiscoveryFailure, discoverBridgeModelCapability, discoverySessionTimeoutMs, exactSelect } from "../bridge/model-capability.js";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -51,14 +53,47 @@ describe("supervisor-only ACP model capability discovery", () => {
     await expect(access(f.newSession.mock.calls[0]![0].cwd)).rejects.toThrow();
   });
 
-  it("leaves a lent bridge alone when the agent cannot close sessions", async () => {
+  it("stops a lent bridge that cannot close or does not confirm closing its discovery session, so it is never parked holding it", async () => {
     const root = await mkdtemp(join(tmpdir(), "model-discovery-test-")); roots.push(root);
     const f = fixture(exactModel);
-    const lent = { connection: { newSession: f.newSession, prompt: f.prompt, closeSession: f.closeSession } as never,
+    const unsupported = { connection: { newSession: f.newSession, prompt: f.prompt, closeSession: f.closeSession } as never,
       initializeResult: { protocolVersion: 1, agentCapabilities: {} }, exited: false, stderrTail: () => [], stop: f.stop } satisfies BridgeProcess;
-    await discoverBridgeModelCapability({ configId: "exact-model-id", workspaceRoot: root, spec, bridge: lent, initializeTimeoutMs: 1_000, clientVersion: "1.0.0" });
+    await expect(discoverBridgeModelCapability({ configId: "exact-model-id", workspaceRoot: root, spec, bridge: unsupported, initializeTimeoutMs: 1_000, clientVersion: "1.0.0" }))
+      .resolves.toMatchObject({ currentValue: "sonnet" });
     expect(f.closeSession).not.toHaveBeenCalled();
-    expect(f.stop).not.toHaveBeenCalled();
+    expect(f.stop).toHaveBeenCalledOnce();
+
+    const refusingStop = vi.fn(async () => undefined);
+    const refusing = { connection: { newSession: f.newSession, prompt: f.prompt, closeSession: vi.fn(async () => { throw new Error("close failed"); }) } as never,
+      initializeResult: { protocolVersion: 1, agentCapabilities: { sessionCapabilities: { close: {} } } }, exited: false, stderrTail: () => [], stop: refusingStop } satisfies BridgeProcess;
+    await expect(discoverBridgeModelCapability({ configId: "exact-model-id", workspaceRoot: root, spec, bridge: refusing, initializeTimeoutMs: 1_000, clientVersion: "1.0.0" }))
+      .resolves.toMatchObject({ currentValue: "sonnet" });
+    expect(refusingStop).toHaveBeenCalledOnce();
+    expect(f.spawn).not.toHaveBeenCalled();
+  });
+
+  it("waits longer on each attempt, within a bound, instead of a fixed session bootstrap deadline", () => {
+    expect([1, 2, 3, 4].map(attempt => discoverySessionTimeoutMs(30_000, attempt))).toEqual([30_000, 60_000, 120_000, 120_000]);
+    expect([1, 2, 3, 4].map(attempt => discoverySessionTimeoutMs(2, attempt))).toEqual([2, 4, 8, 16]);
+    // A longer agent deadline (Antigravity) is never shortened.
+    expect(discoverySessionTimeoutMs(150_000, 3)).toBe(150_000);
+  });
+
+  it("calls only a sign-in failure, a refusal or a malformed answer definite; deadlines and internal errors are transient", () => {
+    expect(definiteModelDiscoveryFailure(new RemoteInstanceError("agent_auth_required", "sign in"))).toBe(true);
+    expect(definiteModelDiscoveryFailure(new RemoteInstanceError("agent_unavailable", "failed", { cause: new RequestError(-32000, "Authentication required") }))).toBe(true);
+    expect(definiteModelDiscoveryFailure(new RemoteInstanceError("agent_unavailable", "failed", { cause: new RequestError(-32602, "Invalid params") }))).toBe(true);
+    expect(definiteModelDiscoveryFailure(new RemoteInstanceError("agent_unavailable", "x", { diagnostic: "model_discovery_refused" }))).toBe(true);
+    expect(definiteModelDiscoveryFailure(new RemoteInstanceError("agent_unavailable", "ACP model discovery session deadline elapsed.", { retryable: true, diagnostic: "model_discovery_session_new_deadline" }))).toBe(false);
+    expect(definiteModelDiscoveryFailure(new RemoteInstanceError("agent_unavailable", "failed", { cause: new RequestError(-32603, "Internal error") }))).toBe(false);
+    expect(definiteModelDiscoveryFailure(new Error("spawn failed"))).toBe(false);
+  });
+
+  it("names a malformed answer as a definite refusal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "model-discovery-test-")); roots.push(root);
+    const f = fixture([]);
+    const error = await discoverBridgeModelCapability({ configId: "exact-model-id", workspaceRoot: root, spec, spawn: f.spawn, initializeTimeoutMs: 1_000, clientVersion: "1.0.0" }).catch(caught => caught);
+    expect(definiteModelDiscoveryFailure(error)).toBe(true);
   });
 
   it("stops a timed-out lent bridge and retries discovery on a fresh process with exponential backoff", async () => {

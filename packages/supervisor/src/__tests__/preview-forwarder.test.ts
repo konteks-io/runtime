@@ -231,6 +231,9 @@ describe("preview channel on the supervisor", () => {
     f.instance.closeChannel("preview:sess-2");
     expect(f.closed).toEqual(["preview:sess-2"]);
     expect(f.instance.hasViewer("sess-2")).toBe(false);
+    // A channel no viewer reached in this process still drops its counts (W1-Z7).
+    f.instance.closeChannel("preview:sess-9");
+    expect(f.closed).toEqual(["preview:sess-2", "preview:sess-9"]);
   });
 
   it("refuses new preview traffic while the lease is draining and answers a malformed chunk on its stream", () => {

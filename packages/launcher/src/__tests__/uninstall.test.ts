@@ -73,6 +73,29 @@ describe("uninstall", () => {
     expect(lines.join("")).toContain("One piece of work is still running on this machine");
   });
 
+  it("waits for the connector to finish shutting down before deleting its folder, and removes a late write (W1-Z6)", async () => {
+    const d = deps([], {
+      "drain.status": [{ draining: true, reason: "remove", activeAssignments: 0, openSessions: 0 }],
+      "instance.retire": [{ outcome: "removed", activeAssignments: 0 }],
+    });
+    await mkdir(join(root, "bin"), { recursive: true });
+    await writeFile(join(root, "bin", "konteks-remote"), "#!/bin/sh");
+    let checks = 0;
+    const seen: boolean[] = [];
+    d.receipt = async () => "receipt-1";
+    d.shutDown = async before => {
+      expect(before).toBe("receipt-1");
+      checks += 1;
+      seen.push(await stat(root).then(() => true, () => false));
+      // The connector writes its receipt as its last act.
+      if (checks === 2) await writeFile(join(root, "supervisor", "shutdown-complete"), "receipt-2");
+      return checks >= 3;
+    };
+    await uninstallNative({ root, output: output() }, d);
+    expect(seen).toEqual([true, true, true]);
+    await expect(stat(root)).rejects.toThrow();
+  });
+
   it("says what the wait is for once, then only a line a minute", async () => {
     let now = 0;
     const running = { draining: true, reason: "remove", activeAssignments: 1, openSessions: 0 };

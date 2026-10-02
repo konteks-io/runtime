@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, symlink } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -101,4 +101,30 @@ it.skipIf(process.platform === "win32")("rejects a disconnect between loaded-lis
     }
   }));
   await expect(codexLoadedThreadStatuses(f.socket)).rejects.toThrow(/inventory unavailable/);
+});
+
+/** Codex 0.159+ binds in its own private directory and links the path it was given (RCA 2026-10-01). */
+async function linked(daemonMode = 0o700) {
+  const f = await fixture();
+  const home = await mkdtemp(join(tmpdir(), "codex-link-"));
+  cleanup.push(() => rm(home, { recursive: true, force: true }));
+  await chmod(home, daemonMode);
+  const link = join(home, "s");
+  await symlink(f.socket, link);
+  return { ...f, link };
+}
+it.skipIf(process.platform === "win32")("connects through the link a newer Codex leaves at its socket path", async () => {
+  const f = await linked();
+  f.ws.on("connection", socket => socket.on("message", data => socket.send(data.toString())));
+  const stream = await connectCodexLocalTransport(f.link);
+  stream.on("error", () => undefined);
+  const response = once(stream, "data");
+  stream.write('{"id":1,"method":"thread/read","params":{"threadId":"test"}}\n');
+  expect((await response)[0].toString()).toBe('{"id":1,"method":"thread/read","params":{"threadId":"test"}}\n');
+  stream.destroy();
+});
+it.skipIf(process.platform === "win32")("refuses a link whose socket lives where another user can reach it", async () => {
+  const f = await linked();
+  await chmod(f.root, 0o755);
+  await expect(connectCodexLocalTransport(f.link)).rejects.toThrow(/private same-user/);
 });

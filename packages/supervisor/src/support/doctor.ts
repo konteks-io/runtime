@@ -14,8 +14,11 @@ export interface DoctorInputs {
   relay: { state: string; lastError: string | null; consecutiveFailures: number };
   transport: "relay" | "https";
   reconciliationComplete: boolean;
+  /** Why Core refused the last reconnect, in plain words; absent while nothing was refused. */
+  reconciliationRefusal?: string;
   components: Array<{ kind: string; healthStatus: string; version: string }>;
-  agents: Array<{ agentId: string; readiness: string; recoveryAction?: string | undefined }>;
+  /** `startFailure`: the agent could not start and is tried again in the background. */
+  agents: Array<{ agentId: string; readiness: string; recoveryAction?: string | undefined; startFailure?: string }>;
   configRevision: number;
   diskFreeBytes: number;
   minimumDiskBytes: number;
@@ -49,6 +52,25 @@ export interface DoctorInputs {
    * its sessions get the QA browser. Never a path, the project or a secret.
    */
   antigravity?: AntigravityDoctorInputs;
+  /**
+   * The release channel the unattended update reads: its host, whether a
+   * `KONTEKS_RELEASE_MANIFEST_URL` override replaces the public channel, and the
+   * last check's time, error and newer release (RCA 2026-09-30: a leftover
+   * override pointed a real connector at a dead local channel and only
+   * `update --check` said so).
+   */
+  updateChannel?: { host: string; override: boolean; lastCheckedAt: string | null; lastError: string | null; available: string | null };
+}
+
+function updateChannelCheck(channel: NonNullable<DoctorInputs["updateChannel"]>, leaseMode: DoctorInputs["lease"]["mode"]): Omit<DoctorCheck, "recoveryActions"> & { recoveryActions?: DoctorCheck["recoveryActions"] } {
+  const base = { id: "update-channel", title: "Release channel" };
+  const where = channel.override ? `override ${channel.host} (KONTEKS_RELEASE_MANIFEST_URL)` : channel.host;
+  if (channel.lastError) return { ...base, status: "fail", detail: `${where} could not be read: ${channel.lastError}; updates cannot arrive${channel.override ? ". Remove the override from this computer's service environment" : ""}`.slice(0, 1_024), recoveryActions: [{ kind: "run_doctor" }] };
+  if (channel.override) return { ...base, status: "warn", detail: `${where} replaces the public channel; updates come only from there` };
+  // An unattended update installs only the release Konteks accepts, and asking needs a lease.
+  const waiting = leaseMode === "none" ? "; automatic updates wait until this computer holds a lease again (`konteks-remote update` works now)" : "";
+  if (!channel.lastCheckedAt) return { ...base, status: waiting ? "warn" : "pass", detail: `${where}; not checked yet${waiting}` };
+  return { ...base, status: waiting ? "warn" : "pass", detail: `${where}, checked ${channel.lastCheckedAt}${channel.available ? `; ${channel.available} available` : "; nothing newer"}${waiting}` };
 }
 
 export interface AntigravityDoctorInputs {
@@ -206,13 +228,13 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   push({ id: "identity", title: "Instance identity", status: inputs.identity.instanceId ? "pass" : "fail", detail: inputs.identity.instanceId ? `instance registered (${inputs.identity.administrativeStatus})` : "no instance identity; run install", ...(inputs.identity.instanceId ? {} : { recoveryActions: [{ kind: "new_activation" }] }) });
   push({ id: "lease", title: "Work lease", status: inputs.lease.mode === "active" ? "pass" : inputs.lease.mode === "drain_only" ? "warn" : "fail", detail: inputs.lease.mode === "none" ? "no valid lease" : `lease mode ${inputs.lease.mode}${inputs.lease.expiresAt ? `, expires ${inputs.lease.expiresAt}` : ""}` });
   push({ id: "relay", title: "Relay connection", status: inputs.relay.state === "connected" ? "pass" : inputs.transport === "https" ? "warn" : "fail", detail: inputs.relay.state === "connected" ? "one outbound WSS connected" : `relay ${inputs.relay.state}${inputs.relay.lastError ? ` (${inputs.relay.lastError})` : ""}; transport ${inputs.transport}` });
-  push({ id: "reconciliation", title: "Reconciliation", status: inputs.reconciliationComplete ? "pass" : "warn", detail: inputs.reconciliationComplete ? "reconciled with Core" : "waiting for Core reconciliation; no new work until it completes" });
+  push({ id: "reconciliation", title: "Reconciliation", status: inputs.reconciliationComplete ? "pass" : "warn", detail: inputs.reconciliationComplete ? "reconciled with Core" : inputs.reconciliationRefusal ?? "waiting for Core reconciliation; no new work until it completes" });
   for (const component of inputs.components) {
     push({ id: `component-${component.kind}`, title: `Component ${component.kind}`, status: component.healthStatus === "healthy" ? "pass" : component.healthStatus === "degraded" ? "warn" : "fail", detail: `${component.healthStatus} (version ${component.version})` });
   }
   push({ id: "core-control-key", title: "Core control signing key", status: inputs.coreSignatureConfigured ? "pass" : "fail", detail: inputs.coreSignatureConfigured ? "release root certifies a Core control key" : "no Core control key in the embedded release roots; directives will be rejected", ...(inputs.coreSignatureConfigured ? {} : { recoveryActions: [{ kind: "update" }] }) });
   for (const agent of inputs.agents) {
-    push({ id: `agent-${agent.agentId}`, title: `Agent ${agent.agentId}`, status: agent.readiness === "ready" ? "pass" : agent.readiness === "not_configured" ? "warn" : "fail", detail: `readiness ${agent.readiness}`, ...(agent.readiness === "not_configured" || agent.readiness === "reconnect_required" ? { recoveryActions: [{ kind: "login_agent", agentId: agent.agentId }] } : {}) });
+    push({ id: `agent-${agent.agentId}`, title: `Agent ${agent.agentId}`, status: agent.readiness === "ready" ? "pass" : agent.readiness === "not_configured" ? "warn" : "fail", detail: agent.startFailure ? `could not start (${agent.startFailure}); trying again in the background` : `readiness ${agent.readiness}`, ...(agent.readiness === "not_configured" || agent.readiness === "reconnect_required" ? { recoveryActions: [{ kind: "login_agent", agentId: agent.agentId }] } : {}) });
   }
   push({ id: "disk", title: "Free disk", status: inputs.diskFreeBytes >= inputs.minimumDiskBytes ? "pass" : "fail", detail: `${Math.round(inputs.diskFreeBytes / 1024 ** 3)} GiB free`, ...(inputs.diskFreeBytes >= inputs.minimumDiskBytes ? {} : { recoveryActions: [{ kind: "free_disk" }] }) });
   push({ id: "outbox", title: "Durable outbox", status: inputs.outboxDepth === 0 ? "pass" : "warn", detail: `${inputs.outboxDepth} item(s) awaiting Core acknowledgement` });
@@ -237,6 +259,7 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   }
   if (inputs.openCode) push(openCodeCheck(inputs.openCode));
   if (inputs.antigravity) push(antigravityCheck(inputs.antigravity));
+  if (inputs.updateChannel) push(updateChannelCheck(inputs.updateChannel, inputs.lease.mode));
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };
 }

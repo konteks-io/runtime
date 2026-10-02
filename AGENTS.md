@@ -324,8 +324,10 @@ copy), and the runtime never parks such a process for another session (MCP
 servers are process-wide in OpenCode). The control process (discovery,
 sign-in) uses `config/control`, which carries no instructions. Runner start
 runs `opencode-self-check.ts`: `opencode debug agents` in the private home on
-a private service port, asserting every agent ends with the Konteks rules and
-that `plan`/`title` are off (a fresh service first lists OpenCode's default
+a private service port, asserting every agent ends with the Konteks rules
+(followed by nothing but `deny` rules: since 2.0.21 OpenCode appends its own
+`browser * deny` after the configuration; any later `allow` or `ask` is drift)
+and that `plan`/`title` are off (a fresh service first lists OpenCode's default
 agents for about a second, so the listing is read until it is in force or has
 stayed unchanged for 5 s), and stopping any background service of the
 private home before and after (only processes whose environment names it;
@@ -546,6 +548,68 @@ latest). It is also written with the release version as `commands.json` by
 `release-assets.mjs commands`, shipped by the release job and required by
 `verify`. There is no
 `preview enable/disable` command: that switch is Core's.
+
+Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
+- A lapsed lease is never renewed in a running process (heartbeats and the
+  relay both need a live one; only the startup reconnect, proved with the
+  machine key, mints a new one). The liveness watchdog therefore asks the
+  service manager to restart once the lease is gone and Core, reachable, has
+  answered the 30 s configuration poll with 401/403 for two minutes
+  (`leaseLapseNeedsRestart` in `heartbeat/liveness.ts`); only after a
+  successful start, never for a revoked or suspended runtime.
+- The unattended update installs only the release Core accepts, which needs a
+  lease, except for a runtime Core refused as below its minimum (a
+  `version_policy` or a refused startup reconnect, `update_required`): it
+  installs the strictly newer signed release from the channel, at or above the
+  minimum Core named (`mayUpdateWithoutAcceptedRelease`). The coordinator is
+  built on demand (`ensureUpdates`), not only after a successful start.
+- An update whose stop is not confirmed in time starts the unchanged release
+  again once the OS no longer runs it.
+- `serve` rewrites an existing service definition that differs from what the
+  serving release renders (`keepServiceOnOwnDefinition`): the install
+  launcher is never replaced and an updater is the previous release, so
+  service-level changes (the log file) otherwise arrive late or never.
+  Rewriting the file is not enough (RCA 2026-10-01: after an operator
+  `konteks-remote update`, launchd ran the new release from the install
+  launcher's plist, stdout and stderr on /dev/null, and KeepAlive respawns and
+  `kickstart -k` reuse that loaded copy). When the service manager runs this
+  very process and its loaded definition is not this one (just rewritten, a
+  launch agent with no `stdout path` or another `program`, or systemd's
+  `NeedDaemonReload=yes`), `serve` has it reload before starting anything:
+  launchd by `bootout` + `bootstrap` from a detached `/bin/sh` whose output is
+  appended to `logs/connector.log`, systemd by `daemon-reload` + `--no-block
+  restart`. The service manager keeps owning the one supervisor; a foreground
+  `serve` is never restarted; one reload per definition per 10 minutes
+  (`supervisor/service-reload.json`), and a `serve` not stopped within 60 s
+  starts anyway. Windows only rewrites the task file: `start` re-registers it.
+- After the shared Codex owner starts, app-servers that older releases of this
+  installation left on other sockets are ended once idle (or unreachable)
+  (`reapStrayServers`); nothing outside `<root>/releases/` is touched.
+- A repository role session (every review turn of a task reuses one QA
+  delivery session, continuing the last completed turn's live ACP session)
+  survives a turn that ends unfinished (production 2026-10-01: a cancelled
+  review continuation blocked every later review with `recovery_required`
+  / `local_execution_unprovable`, restart or not). When a `harness_delivery`
+  session closes for any reason but `completed`, the orchestrator waits for
+  the session's own close, proves the exact process gone with
+  `stopRetainedExecution` and marks the execution `stopping` →
+  `process_stopped` → `interrupted_unqualified` (`retireAfterClose`, the
+  retained recovery stop's sequence). The next turn naming the completed turn
+  then starts a fresh ACP session through
+  `canStartFreshAfterRecoveredHarnessContinuation` once Core acknowledged the
+  terminal report. Journals left behind by older releases (the continuation
+  still `opened`) heal at the next turn's handoff
+  (`retireUnfinishedHarnessContinuation`): only with a terminal, acknowledged
+  claim, no local owner (session, bootstrap, dispatch, channel, recovery
+  stop) and a proven process stop; otherwise the refusal stands. Generated
+  changes in the working copy are kept; only the agent's in-session history
+  is lost. Predecessor turns are matched by `invocationId` and
+  `dispatchGeneration` only (`turnIdentity`), never their own nested
+  predecessor.
+- `doctor` has a `update-channel` line (unreadable channel fails, a
+  `KONTEKS_RELEASE_MANIFEST_URL` override warns, no lease warns that updates
+  wait), and `status` shows it through the separate `update.channel` op (never
+  a new status field: older launchers parse `status` strictly).
 
 Before production changes, add or update a focused characterization test and
 observe its failure or baseline. Run focused tests serially; do not start

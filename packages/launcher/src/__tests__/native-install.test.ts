@@ -218,7 +218,7 @@ describe("native install composition", () => {
         },
       );
       expect(lines.join("\n")).toMatch(
-        new RegExp(`Control port ${taken} is occupied by another local process`),
+        new RegExp(`Another program uses port ${taken}, so Konteks uses port`),
       );
       expect(lines.join("\n")).toContain("Konteks is starting on this computer");
       expect((await readNativeRecord(f.root)).controlPort).not.toBe(taken);

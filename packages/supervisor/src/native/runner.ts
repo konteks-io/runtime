@@ -284,9 +284,11 @@ export class NativeRunner implements RunnerPort {
     this.requireStarted();
     // `releaseSealed` refuses anything that is not an idle sealed owner, so
     // reaching the release proves this is the qualified finalization the
-    // bounded execution allocation waits for. That same idleness proof is
-    // what lets the runtime keep the process resident for the next session.
-    this.runtime.sessions.releaseSealed(ref);
+    // bounded execution allocation waits for. That same idleness proof, plus
+    // the agent's confirmed close of the released session, is what lets the
+    // runtime keep the process resident for the next session; without the
+    // close the process is stopped and finalized as before.
+    await this.runtime.sessions.releaseSealed(ref);
     const { retained } = await this.runtime.releaseExecutionBridge(ref);
     return { processRetained: retained };
   }

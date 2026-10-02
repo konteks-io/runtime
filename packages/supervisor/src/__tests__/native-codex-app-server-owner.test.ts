@@ -1,9 +1,13 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, stat, symlink } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PipedChildProcess } from "@konteks/remote-common";
 import type { RunnerConfig } from "@konteks/remote-agent-runner";
-import { NativeCodexAppServerOwner } from "../native/codex-app-server-owner.js";
+import { NativeCodexAppServerOwner, cleanupCodexSocket, prepareCodexSocket, waitForCodexSocket } from "../native/codex-app-server-owner.js";
 
 vi.mock("@konteks/remote-common", async importOriginal => ({
   ...await importOriginal<object>(), isProcessGroupAlive: vi.fn(() => false),
@@ -278,5 +282,118 @@ describe("native shared Codex app-server owner", () => {
     await expect(f.owner.start()).rejects.toThrow("not ready");
     expect(f.stop).toHaveBeenCalledOnce();
     expect(f.cleanupSocket).toHaveBeenCalledOnce();
+  });
+});
+
+describe("stray app-servers of this installation (RCA 2026-09-30)", () => {
+  const current = "/root/releases/rel-new/agents/codex/bin/codex app-server --listen unix:///root/run/codex.sock";
+  const strays = [
+    { pid: 4630, command: "/root/releases/rel-deleted/agents/codex/bin/node /root/releases/rel-deleted/agents/codex/bin/codex app-server --listen unix:///home/.codex/app-server-control/app-server-control.sock" },
+    { pid: 2619, command: "/root/releases/rel-old/agents/codex/bin/codex app-server --listen unix:///root/run/old.sock" },
+  ];
+  const others = [
+    { pid: 900, command: "/root/releases/rel-new/agents/codex/bin/codex app-server --listen unix:///root/run/codex.sock" }, // the current release
+    { pid: 901, command: "/root/releases/rel-old/agents/codex/bin/codex app-server --listen unix:///root/run/codex.sock" }, // the current socket: stale replacement owns it
+    { pid: 902, command: "/Applications/Codex.app/Contents/Resources/codex app-server --listen unix:///home/.codex/app-server-control/app-server-control.sock" }, // the person's own Codex
+    { pid: 903, command: "/other/releases/rel-old/agents/codex/bin/codex app-server --listen unix:///x.sock" }, // another installation
+    { pid: 904, command: "/root/releases/rel-old/konteks-connector serve --root /root" }, // not an app-server
+  ];
+
+  function owner(input: { busy?: string[]; reachable?: boolean } = {}) {
+    const stopHolder = vi.fn(async () => undefined);
+    const replaced: number[] = [];
+    const o = new NativeCodexAppServerOwner({
+      config, listProcesses: async () => [...strays, ...others], stopHolder,
+      strayReachable: async () => input.reachable ?? true,
+      assertIdleThreads: async socket => { if (input.busy?.includes(socket)) throw new Error("thread active"); },
+      onStaleReplaced: event => { replaced.push(event.pid); },
+    });
+    return { o, stopHolder, replaced };
+  }
+
+  it("ends servers older releases of this installation left on other sockets, and nothing else", async () => {
+    const f = owner();
+    expect(await f.o.reapStrayServers(current, "/root/run/codex.sock")).toBe(2);
+    expect(f.stopHolder.mock.calls.map(([pid]) => pid).sort()).toEqual([2619, 4630]);
+    expect(f.replaced.sort()).toEqual([2619, 4630]);
+  });
+
+  it("leaves a stray whose threads are still busy for the next start, and stops an unreachable one", async () => {
+    const busy = owner({ busy: ["/root/run/old.sock"] });
+    expect(await busy.o.reapStrayServers(current, "/root/run/codex.sock")).toBe(1);
+    expect(busy.stopHolder).toHaveBeenCalledWith(4630);
+    expect(busy.stopHolder).not.toHaveBeenCalledWith(2619);
+    const deaf = owner({ reachable: false, busy: ["/root/run/old.sock"] });
+    expect(await deaf.o.reapStrayServers(current, "/root/run/codex.sock")).toBe(2);
+  });
+});
+
+/**
+ * Codex 0.159+ binds its socket in a private directory of its own and leaves a
+ * link at the `--listen unix://PATH` it was given (RCA 2026-10-01: 0.10.3's
+ * Codex never counted as started, so its update rolled back every time).
+ */
+describe.skipIf(process.platform === "win32")("a Codex socket reached through a link", () => {
+  const cleanup: Array<() => Promise<void>> = [];
+  afterEach(async () => { for (const clean of cleanup.splice(0).reverse()) await clean(); });
+  async function linked() {
+    const base = await realpath(await mkdtemp(join(tmpdir(), "cx-")));
+    cleanup.push(() => rm(base, { recursive: true, force: true }));
+    const daemon = join(base, "d"), owner = join(base, "o");
+    await mkdir(daemon, { mode: 0o700 }); await mkdir(owner, { mode: 0o700 });
+    return { base, daemon, path: join(owner, "s"), target: join(daemon, "t") };
+  }
+  async function listen(path: string): Promise<Server> {
+    const server = createServer(socket => socket.end());
+    server.listen(path); await once(server, "listening");
+    cleanup.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    return server;
+  }
+  const running = { exitCode: null, signalCode: null } as PipedChildProcess;
+
+  it("still takes a plain socket at the path, as Codex 0.153 binds it", async () => {
+    const f = await linked();
+    const ready = waitForCodexSocket(f.path, running, 5_000);
+    const server = await listen(f.path); await chmod(f.path, 0o666);
+    await expect(ready).resolves.toBeUndefined();
+    expect((await lstat(f.path)).mode & 0o777).toBe(0o600);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("adopt");
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await cleanupCodexSocket(f.path);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("spawn");
+  });
+
+  it("counts the linked socket as ready and makes the socket itself private", async () => {
+    const f = await linked();
+    const ready = waitForCodexSocket(f.path, running, 5_000);
+    await listen(f.target); await chmod(f.target, 0o666);
+    await symlink(f.target, f.path);
+    await expect(ready).resolves.toBeUndefined();
+    expect((await stat(f.target)).mode & 0o777).toBe(0o600);
+  });
+
+  it("adopts a live linked server, and removes only the link once that server is gone", async () => {
+    const f = await linked();
+    const server = await listen(f.target); await chmod(f.target, 0o600);
+    await symlink(f.target, f.path);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("adopt");
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await expect(prepareCodexSocket(f.path)).rejects.toThrow(/stale/);
+    await expect(prepareCodexSocket(f.path, true)).resolves.toBe("spawn");
+    await expect(lstat(f.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("cleans up a link left dangling, and never one that leads where another user can reach", async () => {
+    const f = await linked();
+    await symlink(join(f.daemon, "gone"), f.path);
+    await cleanupCodexSocket(f.path);
+    await expect(lstat(f.path)).rejects.toMatchObject({ code: "ENOENT" });
+    await listen(f.target); await chmod(f.target, 0o600);
+    await symlink(f.target, f.path);
+    await chmod(f.daemon, 0o755);
+    await expect(prepareCodexSocket(f.path, true)).rejects.toThrow(/not a private local-user socket/);
+    await cleanupCodexSocket(f.path);
+    expect((await lstat(f.path)).isSymbolicLink()).toBe(true);
+    await expect(waitForCodexSocket(f.path, running, 300)).rejects.toThrow(/did not become ready in time/);
   });
 });

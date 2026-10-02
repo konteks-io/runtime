@@ -1,14 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir } from "node:fs/promises";
-import { isAbsolute } from "node:path";
-import { isFsErrorWithCode, jcsDigest, RemoteInstanceError, RemotePlatformSchema, type Clock, type FetchFn } from "@konteks/remote-common";
+import { lstat, mkdir, readdir, rm } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import { createLogger, isFsErrorWithCode, jcsDigest, RemoteInstanceError, RemotePlatformSchema, type Clock, type FetchFn } from "@konteks/remote-common";
 import { selectNativeArtifacts, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { CoreClient } from "../core/client.js";
 import { runActivationExchange, type ActivationExchangeOutcome } from "../provisioning/activation.js";
 import { SupervisorStore } from "../state/store.js";
 import { SupervisorJournal } from "../state/journal.js";
 import { StateMutationGate } from "../state/mutation-gate.js";
-import { acquireNativeRootLock } from "./root-lock.js";
+import { acquireNativeRootLock, NATIVE_ROOT_LOCK_FILE } from "./root-lock.js";
 
 /** Install's native exchange phase: owns state before creating a key or nonce. */
 export async function runNativeActivationExchange(args: {
@@ -50,11 +50,26 @@ export async function runNativeActivationExchange(args: {
     const enrollment = journal.execution.enrollment();
     if (enrollment && (enrollment.activationId !== args.activationId || enrollment.keyDigest !== keyDigest)) throw new RemoteInstanceError("registration_mismatch", "Native enrollment retry changed its original lineage.");
     const core = new CoreClient({ baseUrl: args.coreUrl, clock: args.clock, key: () => key, credential: () => null, ...(args.fetchFn ? { fetchFn: args.fetchFn } : {}) });
-    const outcome = await runActivationExchange({ store, core, key, clock: args.clock, activationId: args.activationId, platform: { ...platform, containerBackend: "none", deploymentKind: "native_connector" }, deploymentKind: "native_connector", release, roots: args.roots, readActivationCode: async () => {
+    const outcome = await exchangeOrForget(() => runActivationExchange({ store, core, key, clock: args.clock, activationId: args.activationId, platform: { ...platform, containerBackend: "none", deploymentKind: "native_connector" }, deploymentKind: "native_connector", release, roots: args.roots,
+      // The person reads this terminal: its progress lines say what happens,
+      // and a JSON log line in between read as noise (W1-M2). Warnings stay.
+      logger: createLogger({ name: "provisioning", level: "warn" }),
+      readActivationCode: async () => {
       const code = await args.readActivationCode();
       owner.assertOwned();
       return code;
-    } });
+    } }), async () => {
+      // Konteks answered: this code will never connect here (used, expired,
+      // wrong, or no room), and nothing was made. The next command, with a
+      // new code from the site as the message says, met "Native enrollment
+      // retry changed its original lineage" (W1-M3): forget this attempt.
+      // An uncertain exchange (no answer) is kept, as before.
+      if (identityBeforeExchange) return;
+      owner.assertOwned();
+      for (const entry of await readdir(args.dataDir)) {
+        if (!entry.startsWith(NATIVE_ROOT_LOCK_FILE)) await rm(join(args.dataDir, entry), { recursive: true, force: true });
+      }
+    });
     owner.assertOwned();
     if (enrollment) {
       const identity = await store.identity();
@@ -66,5 +81,17 @@ export async function runNativeActivationExchange(args: {
   } finally {
     await mutations.close();
     owner.release();
+  }
+}
+
+/** Codes by which Konteks says an activation will never exchange on this machine. */
+const REFUSED = new Set(["activation_expired", "activation_consumed", "activation_invalid", "limit_exceeded"]);
+
+async function exchangeOrForget<T>(exchange: () => Promise<T>, forget: () => Promise<void>): Promise<T> {
+  try {
+    return await exchange();
+  } catch (error) {
+    if (error instanceof RemoteInstanceError && REFUSED.has(error.code)) await forget().catch(() => undefined);
+    throw error;
   }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { nativePlatform, nativePaths, nativeServiceDefinition, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
+import { nativePlatform, nativePaths, nativeServiceDefinition, parseLoadedService, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 
 describe("native install layout", () => {
   it.each([['darwin', 'macos'], ['win32', 'windows'], ['linux', 'debian']] as const)("supports %s x64 and arm64 without a container backend", (os, expected) => {
@@ -35,6 +35,8 @@ describe("native background service definitions", () => {
     // launchd keeps nothing the connector prints unless the plist names a file (WS1-163).
     expect(service.contents).toContain(`<key>StandardOutPath</key><string>${root}/logs/connector.log</string>`);
     expect(service.contents).toContain(`<key>StandardErrorPath</key><string>${root}/logs/connector.log</string>`);
+    // The home it was started from, not the login's (09-30).
+    expect(service.contents).toContain('<key>EnvironmentVariables</key><dict><key>HOME</key><string>/Users/Test User</string></dict>');
     expect(service.contents).not.toMatch(/Docker|docker|postgres|harness|validation-runtime|activationCode|TOKEN|PRIVATE KEY/);
   });
 
@@ -47,6 +49,7 @@ describe("native background service definitions", () => {
   it("uses systemd user services and literal path arguments, not a shell", () => {
     const service = nativeServiceDefinition({ os: 'debian', home: '/home/a', root: '/home/a/space $HOME %n', executable: '/home/a/space $HOME %n/bin/remote' });
     expect(service.contents).toContain('ExecStart="/home/a/space $$HOME %%n/bin/remote" "serve" "--root" "/home/a/space $$HOME %%n"');
+    expect(service.contents).toContain('Environment="HOME=/home/a"');
     expect(service.start).toEqual({ command: 'systemctl', args: ['--user', 'enable', '--now', `${service.label}.service`] });
     expect(service.contents).not.toMatch(/sudo|bash|docker|User=root/);
   });
@@ -112,5 +115,57 @@ describe("service exits (W1-Z7)", () => {
     expect(parseServiceExits("debian", "NRestarts=2\nExecMainStatus=1\n")).toEqual({ runs: 3, lastExitCode: 1 });
     expect(parseServiceExits("debian", "NRestarts=0\nExecMainStatus=0\n")).toEqual({ runs: 1, lastExitCode: null });
     expect(parseServiceExits("windows", "anything")).toBeNull();
+  });
+});
+
+/** RCA 2026-10-01: launchd reads a plist only at bootstrap, so a rewritten one needs a reload, not `kickstart -k`. */
+describe("reloading a service onto a rewritten definition", () => {
+  const root = '/Users/Test User/Library/Application Support/konteks-remote';
+  const executable = `${root}/releases/release-new/konteks-connector`;
+  const logFile = `${root}/logs/connector.log`;
+
+  it("reloads a launch agent with bootout and bootstrap from its own session, paths as arguments", () => {
+    const service = nativeServiceDefinition({ os: 'macos', home: '/Users/Test User', root, executable, uid: 501 });
+    expect(service.inspect).toEqual({ command: 'launchctl', args: ['print', `gui/501/${service.label}`] });
+    expect(service.expected).toEqual({ program: executable, logFile });
+    expect(service.reload?.kind).toBe('detached');
+    if (service.reload?.kind !== 'detached') return;
+    expect(service.reload.logFile).toBe(logFile);
+    const [flag, script, name, ...args] = service.reload.command.args;
+    expect(service.reload.command.command).toBe('/bin/sh');
+    expect([flag, name]).toEqual(['-c', 'konteks-reload']);
+    expect(args).toEqual([`gui/501/${service.label}`, 'gui/501', service.path]);
+    expect(script).toContain('launchctl bootout "$1"');
+    expect(script).toContain('launchctl bootstrap "$2" "$3"');
+    expect(script).not.toContain('kickstart');
+    expect(script).not.toContain(root);
+  });
+
+  it("reloads a systemd unit and queues its restart; a Windows task has no reload", () => {
+    const linux = nativeServiceDefinition({ os: 'debian', home: '/home/a', root: '/home/a/remote', executable: '/home/a/remote/releases/r/konteks-connector' });
+    expect(linux.inspect).toEqual({ command: 'systemctl', args: ['--user', 'show', `${linux.label}.service`, '-p', 'MainPID', '-p', 'NeedDaemonReload'] });
+    expect(linux.reload).toEqual({ kind: 'inline', commands: [
+      { command: 'systemctl', args: ['--user', 'daemon-reload'] },
+      { command: 'systemctl', args: ['--user', '--no-block', 'restart', `${linux.label}.service`] },
+    ] });
+    const windows = nativeServiceDefinition({ os: 'windows', home: 'C:\\Users\\a', root: 'C:\\Users\\a\\remote', executable: 'C:\\Users\\a\\remote\\konteks-connector.exe', userId: 'S-1-5-21-1-2-3-1001' });
+    expect(windows.reload).toBeUndefined();
+  });
+
+  it("tells a launch agent loaded without the log file from one that logs", () => {
+    const print = (lines: string[]) => [`gui/501/dev.konteks.remote.e2e6327af4de = {`, '\tstate = running', `\tprogram = ${executable}`, '\targuments = {', `\t\t${executable}`, '\t}', ...lines, '\truns = 1', '\tpid = 34625', '}'].join('\n');
+    const expected = { program: executable, logFile };
+    // The person's connector after the 0.10.2 update: stdout and stderr on /dev/null.
+    expect(parseLoadedService('macos', print([]), expected)).toEqual({ pid: 34625, current: false });
+    expect(parseLoadedService('macos', print([`\tstdout path = ${logFile}`, `\tstderr path = ${logFile}`]), expected)).toEqual({ pid: 34625, current: true });
+    expect(parseLoadedService('macos', print([`\tstdout path = ${logFile}`, `\tstderr path = ${logFile}`]), { ...expected, program: `${root}/releases/release-old/konteks-connector` })).toEqual({ pid: 34625, current: false });
+    expect(parseLoadedService('macos', 'Bad request.\nCould not find service "x" in domain for user gui: 501', expected)).toBeNull();
+  });
+
+  it("reads systemd's main pid and whether the unit file changed since it was loaded", () => {
+    const expected = { program: '/x', logFile: null };
+    expect(parseLoadedService('debian', 'MainPID=812\nNeedDaemonReload=no\n', expected)).toEqual({ pid: 812, current: true });
+    expect(parseLoadedService('debian', 'MainPID=0\nNeedDaemonReload=yes\n', expected)).toEqual({ pid: null, current: false });
+    expect(parseLoadedService('windows', 'anything', expected)).toBeNull();
   });
 });

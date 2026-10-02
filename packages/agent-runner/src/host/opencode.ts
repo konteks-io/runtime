@@ -110,7 +110,8 @@ export interface OpenCodePermissionRule {
  * re-open them. `external_directory`, Code Mode's built-in browser and
  * OpenCode's own Code Mode tools are denied outright (no request reaches
  * Konteks). The start self-check asserts these rows end every agent's
- * resolved list.
+ * resolved list, followed by nothing but OpenCode's own denies (2.0.21
+ * appends `browser * deny` after the configuration).
  */
 export const OPENCODE_KONTEKS_PERMISSIONS: readonly OpenCodePermissionRule[] = Object.freeze([
   { action: "*", resource: "*", effect: "ask" },

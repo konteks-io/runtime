@@ -20,7 +20,8 @@ export const FINGERPRINT_KEY_FILE = "fingerprint.key";
 export type IdentityProbe =
   // `credentials`: what an agent with several sign-ins reported (OpenCode's `auth list`), no secret.
   // `tokenUsageObservable`: whether turns under this identity report billing usage (Antigravity: only through its key relay).
-  | { kind: "signal"; fingerprint: string; credentials?: ConnectedAgentCredential[]; tokenUsageObservable?: boolean }
+  // `providerAdminBlocked`: signed in, but a setting only the provider's admin can change keeps Konteks tools out (Antigravity: MCP Servers off).
+  | { kind: "signal"; fingerprint: string; credentials?: ConnectedAgentCredential[]; tokenUsageObservable?: boolean; providerAdminBlocked?: boolean }
   | { kind: "logged_out"; credentials?: ConnectedAgentCredential[] }
   | { kind: "no_official_signal" };
 

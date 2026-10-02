@@ -90,16 +90,22 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     // The native enrollment owner exclusively creates supervisor; precreating
     // it would erase the distinction between new enrollment and legacy history.
     for (const dir of ["releases", "credentials", "workspaces", "logs"]) await privateDirectory(join(root, dir));
-    options.output.line("Activating this native agent connector; no local domain services are installed.");
-    const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir: join(root, "supervisor"), coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode: options.deps?.readActivationCode ?? (() => promptSecret({ label: "Activation code", minLength: 8 })), fetchFn });
+    options.output.line("Connecting this computer to Konteks. Type the one-time code from the site.");
+    const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir: join(root, "supervisor"), coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode: options.deps?.readActivationCode ?? (() => promptSecret({ label: "One-time code", minLength: 8 })), fetchFn });
     lock.assertOwned();
     const identity = await new SupervisorStore(join(root, "supervisor")).identity();
     if (!identity || identity.instanceId !== activated.instanceId || activated.manifestDigest !== release.manifest.digest) throw invalid();
+    // Unpacking takes about a minute; the person hears each step instead of
+    // a silent terminal after the code (W1-M2: 51 s with nothing said).
+    options.output.line(`Code accepted. Unpacking the agents on this computer; this takes about a minute.`);
     const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: bundled }, releasesDir: join(root, "releases"), fetchFn });
     await privateDirectory(join(staged.directory, "agents"));
+    let unpacked = 0;
     for (const agent of agents) {
       if (bundled.includes(agent)) {
         const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
+        unpacked += 1;
+        options.output.line(`Unpacking ${findAgentBridge(agent)?.displayName ?? agent} (${unpacked} of ${bundled.filter(id => agents.includes(id)).length})…`);
         await installOfflineAgentPackage(staged.bridges[agent]!, join(staged.directory, "agents", agent), artifact);
       }
       await privateDirectory(join(root, "credentials", agent));
@@ -114,7 +120,7 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     lock.assertOwned();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
     await loadNativeInstallation(root, { roots, platform });
-    options.output.line(`Native files installed for ${record.instanceId}; activation, agent login and cloud readiness are separate states.`);
+    options.output.line("Installed. Starting Konteks on this computer next.");
     return record;
   } finally { lock.release(); }
 }

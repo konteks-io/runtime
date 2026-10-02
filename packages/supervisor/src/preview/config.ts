@@ -133,8 +133,22 @@ export async function inferPreviewPlan(cwd: string, deps: Required<PlanReadDeps>
     const rails = deps.platform === "win32" ? "ruby bin/rails" : "bin/rails";
     return { ok: true, plan: { command: `${rails} server -b $HOST -p $PORT`, healthPath: "/", env: {}, source: "inferred", explanation: "Inferred a Rails project from bin/rails.", notes: [] } };
   }
+  // A conversation's working folder carries the session's own files, never a
+  // checkout of the project: there is nothing to run here, and a delivery's
+  // app is what the person's Open preview shows (09-29: asked to see the
+  // booking page, the ticket's agent answered it could not).
+  if (await deps.exists(join(cwd, ".assistant"))) {
+    return { ok: false, message: CONVERSATION_HAS_NO_APP, notes: [] };
+  }
   return { ok: false, message: "Could not tell how to serve this working copy (no package.json, manage.py or bin/rails). Add .konteks/preview.yaml with a serve.command that listens on $HOST:$PORT.", notes: [] };
 }
+
+/** What a conversation's agent is told when asked for a preview it cannot run itself. */
+export const CONVERSATION_HAS_NO_APP = "This conversation has no copy of the project's code, so nothing runs here. "
+  + "When a delivery on this ticket built the app, Open preview at the top of the session shows it and starts it on this computer by itself.";
+
+/** Added only to the agent's tool answer: what to tell the person. */
+export const CONVERSATION_HAS_NO_APP_AGENT_NOTE = "Tell the person that, in one sentence, instead of saying you cannot.";
 
 async function detectPackageManager(cwd: string, pkg: PackageJson, deps: Required<PlanReadDeps>): Promise<{ manager: PackageManager; evidence: string }> {
   if (typeof pkg.packageManager === "string") {

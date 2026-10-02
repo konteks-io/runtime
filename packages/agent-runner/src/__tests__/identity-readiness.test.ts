@@ -114,6 +114,13 @@ describe("ConnectedAgentView projection", () => {
     expect("moneyObservable" in projectReadiness({ ...base, identity: "signal" })).toBe(false);
   });
 
+  it("a signed-in agent the provider's admin keeps Konteks tools out of is unavailable, contact the admin (WS1-196)", () => {
+    const view = projectReadiness({ ...base, family: findAgentBridge("antigravity")!, providerAdminBlocked: true });
+    expect(view.readiness).toBe("unavailable");
+    expect(view.recoveryAction).toBe("contact_provider_admin");
+    expect(projectReadiness({ ...base, providerAdminBlocked: false })).not.toHaveProperty("recoveryAction");
+  });
+
   it("a logged-out subscription agent is not_configured with login_locally", () => {
     const view = projectReadiness({ ...base, identity: "logged_out", scope: INITIAL_SCOPE_STATE });
     expect(view.readiness).toBe("not_configured");

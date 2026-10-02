@@ -7,6 +7,7 @@ import {
   REMOTE_INSTANCE_PROTOCOL_VERSION,
   PlanningControllerTerminalDirectiveSchema,
   RemoteInstanceError,
+  CoreResponseError,
   AgentLoginGcpSchema,
   AgentLoginOptionIdSchema,
   ON_COMPUTER_LOGIN_OPTION,
@@ -33,7 +34,7 @@ import {
   type RuntimeAgentLoginDeliveryRequest,
   coreContractAtLeast,
 } from "@konteks/remote-common";
-import { EmbeddedReleaseRootSchema, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EmbeddedReleaseRootSchema, NATIVE_MANIFEST_URL, isHostAgentId, nativeManifestUrl, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { chromeInstalled, readAntigravityAdminObservation, type RunnerConfig } from "@konteks/remote-agent-runner";
 import type { NativeRuntimeRecord, NativeUnavailableAgent } from "./native/installation.js";
 import { SignalSampler } from "@konteks/remote-sysmon";
@@ -60,6 +61,7 @@ import { OnboardWorkCarrier, type OnboardWorkAssignment } from "./onboard/carrie
 import type { PlatformMcpEntry } from "./work/workload.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
+import { PreviewWorktreePermits } from "./preview/worktree-permits.js";
 import { PreviewChannel } from "./preview/preview-channel.js";
 import { PreviewProcessManager, PreviewProcessRegistry } from "./preview/process-manager.js";
 import type { SessionPreviewAccess } from "./preview/mcp-server.js";
@@ -108,7 +110,7 @@ import { PlanningTerminalDirectiveProcessor } from "./work/planning-terminal-dir
 import { ControllerDirectivePoller } from "./work/controller-directive-poller.js";
 import { DurableSearchAssignmentCarrier } from "./work/search-assignment-carrier.js";
 import { NativeUpdateCoordinator, type NativeUpdateCoordinatorOptions } from "./native/update.js";
-import { evaluateHeartbeatLiveness } from "./heartbeat/liveness.js";
+import { evaluateHeartbeatLiveness, isCredentialRefusal, leaseLapseNeedsRestart } from "./heartbeat/liveness.js";
 
 /**
  * The composition root: wires state, transport, heartbeat, control, work,
@@ -139,6 +141,15 @@ const ON_COMPUTER_POLL_MS = 5_000;
 /** A turn's start or end is told to Core this soon, not at the next 30 s heartbeat (WS1-179). */
 const TURN_ACTIVITY_HEARTBEAT_MS = 500;
 const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
+/**
+ * How long Core may keep refusing this runtime's lapsed lease (Core answers,
+ * the lease is gone) before the service restarts into its startup reconnect,
+ * which proves the machine key and gets a fresh lease. Nothing renewed a lapsed
+ * lease in a running process (RCA 2026-09-30: offline 13 h, then 6 h).
+ */
+const LEASE_LAPSE_RESTART_MS = 2 * 60_000;
+/** How often a runtime Core refuses as too old re-reads the release channel. */
+const REFUSED_BUNDLE_UPDATE_INTERVAL_MS = 10 * 60_000;
 
 export interface SupervisorOptions {
   /** Native only: called once when no heartbeat has been attempted for longer
@@ -147,6 +158,8 @@ export interface SupervisorOptions {
   onLivenessLost?: (detail: Record<string, unknown>) => void;
   /** This runtime was removed from its workspace (uninstall): end the whole process, not only the supervisor. */
   onRetired?: () => void;
+  /** A local `shutdown` request: end the process the way a signal would. */
+  onShutdownRequested?: () => void;
   native?: {
     /** Public trust provided by the verified native executable, never by writable install metadata. */
     trustedRoots: readonly EmbeddedReleaseRoot[];
@@ -236,8 +249,8 @@ export class Supervisor {
   /** Each session's supervised preview dev server (at most one per session). */
   readonly previews: PreviewProcessManager;
   private readonly previewRegistry: PreviewProcessRegistry;
-  /** Worktrees a viewer may start a preview in, by session (while the session lasts). */
-  private readonly previewWorktrees = new Map<string, string>();
+  /** Worktrees a viewer may start a preview in, by session; kept across releases and restarts while the worktree exists. */
+  private readonly previewWorktrees: PreviewWorktreePermits;
   /** When a viewer last started each session's preview (to pace retries after a failure). */
   private readonly previewViewerStarts = new Map<string, number>();
   broker!: PermissionBroker;
@@ -283,6 +296,12 @@ export class Supervisor {
   private livenessTimer: NodeJS.Timeout | null = null;
   private livenessWatchingSince: number | null = null;
   private livenessQuietWarned = false;
+  /** Since when Core has refused this runtime's credential (401/403) without a success in between. */
+  private leaseRefusedSince: number | null = null;
+  private refusedBundleUpdateAt: number | null = null;
+  /** Why Core refused the last startup reconnect, in plain words for `doctor`; null once it is accepted. */
+  private reconnectRefusal: string | null = null;
+  private refusedRestartTimer: NodeJS.Timeout | null = null;
   private pendingHeartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeLogins = new Map<string, { agentId: string; emit: (event: ControlLoginEvent) => void }>();
   /** Site-started steps waiting on the person at a window on this computer, by login id. */
@@ -303,6 +322,7 @@ export class Supervisor {
     this.outbox = new DurableOutbox(this.store.path("outbox"), this.stateMutations.run);
     this.lease = new LeaseState(this.clock);
     this.previewRegistry = new PreviewProcessRegistry(join(config.SUPERVISOR_DATA_DIR, "preview-processes.json"));
+    this.previewWorktrees = new PreviewWorktreePermits(join(config.SUPERVISOR_DATA_DIR, "preview-worktrees.json"));
     this.previews = new PreviewProcessManager({
       idleMs: config.SUPERVISOR_PREVIEW_IDLE_MINUTES * 60_000,
       maxRunning: config.SUPERVISOR_PREVIEW_MAX_RUNNING,
@@ -503,8 +523,16 @@ export class Supervisor {
       persistRelayState: (state) => this.store.saveRelayState(state),
     });
     const relayState = await this.store.relayState();
-    if (relayState) this.mux.restoreDurableState(relayState, (channelId) => channelOf(channelId));
-    else this.mux.restoreCursors(await this.store.cursors(), (channelId) => channelOf(channelId));
+    // A preview stream never outlives the process that served it, and Core
+    // opens every preview grant counting from zero: counts kept from the last
+    // process made the new one drop Core's first requests as duplicates and
+    // answer out of sequence after an update (W1-Z7). They start fresh.
+    const durableChannelOf = (channelId: string) => {
+      const channel = channelOf(channelId);
+      return channel === "preview" ? null : channel;
+    };
+    if (relayState) this.mux.restoreDurableState(relayState, durableChannelOf);
+    else this.mux.restoreCursors(await this.store.cursors(), durableChannelOf);
     if (this.instanceId) this.openCoreChannels(this.instanceId);
 
     const verifier = new CoreSignatureVerifier(this.roots);
@@ -749,7 +777,8 @@ export class Supervisor {
       eraseAssignments: (ids) => this.eraseAssignments(ids),
       eraseAll: () => this.eraseAll(),
       onUpdateRequired: (policy) => {
-        if (this.updates) this.updates.onUpdateRequired(policy);
+        const updates = this.ensureUpdates();
+        if (updates) updates.onUpdateRequired(policy);
         else this.logger.warn({ minimumSupportedBundle: policy.minimumSupportedBundle }, "update_required: bundle below Core's minimum");
       },
       sendAck: (ack) => this.sendControlAck(ack),
@@ -760,7 +789,9 @@ export class Supervisor {
     this.work = new WorkOrchestrator({
       verifyCancellation: directive => verifier.verify(directive, directive.signature),
       onSessionReleased: sessionId => {
-        this.forgetPreviewWorktree(sessionId);
+        // The dev server stops with the session; its worktree stays openable
+        // by a viewer while it exists (a delivery's preview after the delivery).
+        this.previewViewerStarts.delete(sessionId);
         void this.previews.stop(sessionId, "session_released");
       },
       ...(this.assignmentSender ? { assignmentSender: this.assignmentSender } : {}),
@@ -1132,12 +1163,14 @@ export class Supervisor {
       for (const runner of parked.runners) await runner.start();
     } catch (error) {
       this.codexRetryAttempt += 1;
+      this.agentStartFailures.set("codex", error);
       this.logger.warn({ err: error, attempt: this.codexRetryAttempt }, "codex still could not start; trying again later");
       this.scheduleCodexRetry();
       return;
     }
     if (this.stopping) return;
     this.parkedCodex = null;
+    this.agentStartFailures.delete("codex");
     this.nativeCodexOwner = parked.owner;
     for (const runner of parked.runners) {
       this.nativeRunners.push(runner);
@@ -1160,8 +1193,12 @@ export class Supervisor {
         await this.executionRevisionFenceReceipts.flush();
         if (this.stopping) return;
         const desired = await this.core.fetchDesiredConfiguration(this.instanceId!);
+        this.leaseRefusedSince = null;
         if (!this.stopping) await this.control.handle(desired);
       } catch (error) {
+        // Core answered and refused the credential: the lapsed-lease signal the
+        // liveness watchdog acts on. An unreachable Core is not a refusal.
+        if (isCredentialRefusal(error)) this.leaseRefusedSince ??= Date.now();
         this.logger.warn({ err: error }, "configuration refresh failed; retaining last applied policy");
       }
     })().finally(() => { this.configurationRefresh = null; });
@@ -1253,6 +1290,16 @@ export class Supervisor {
       const record = this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation);
       const terminal = record && record.state !== "pending" && record.state !== "applied";
       const denied = this.administrativeStatus === "revoked" || (error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch", "reconciliation_replay", "resume_deadline_expired"].includes(error.code));
+      // Core retired this process's recovery generation (or it expired, or
+      // another establishment won): this incarnation can never be accepted
+      // again, and retrying it is refused forever. A new process is a new
+      // incarnation that establishes through the ordinary path, so restart.
+      const retired = this.administrativeStatus !== "revoked" && !(error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch"].includes(error.code)) &&
+        (terminal || (error instanceof RemoteInstanceError && ["reconciliation_replay", "resume_deadline_expired"].includes(error.code)));
+      this.reconnectRefusal = this.describeReconnectRefusal(error, retired);
+      // Below Core's minimum no start can succeed: only an update gets back in.
+      if (error instanceof RemoteInstanceError && error.code === "update_required") this.requestUpdateForRefusedBundle();
+      if (retired && !this.stopping && !this.activeLoopStarted) this.restartForRetiredProcess(error);
       if (!this.stopping && !this.activeLoopStarted && !terminal && !denied && !this.recoveryRetryTimer) {
         this.recoveryRetryTimer = setTimeout(() => { this.recoveryRetryTimer = null; void this.startActiveLoop(); }, 15_000);
         this.recoveryRetryTimer.unref();
@@ -1260,6 +1307,47 @@ export class Supervisor {
     }).finally(() => { this.activeLoopStarting = null; });
     this.activeLoopStarting = operation;
     return operation;
+  }
+
+  /** Plain words for `doctor` when Core refused the startup reconnect; null for a passing failure. */
+  private describeReconnectRefusal(error: unknown, retired: boolean): string | null {
+    if (retired) return "Konteks no longer accepts this connector process; it restarts to reconnect as a new one";
+    if (!(error instanceof RemoteInstanceError)) return null;
+    if (error.code === "update_required") return `Konteks refuses release ${this.config.SUPERVISOR_BUNDLE_VERSION} for this computer (${error.message}); it needs an update to the release Konteks accepts`;
+    if (error instanceof CoreResponseError && error.status >= 400 && error.status < 500) return `Konteks refused the reconnect: ${error.message}`;
+    return null;
+  }
+
+  /**
+   * Restart once, shortly, after Core refused this incarnation for good. The
+   * service manager starts a new process, which establishes a fresh
+   * incarnation; the delay keeps two processes that keep replacing each
+   * other from spinning.
+   */
+  private restartForRetiredProcess(error: unknown): void {
+    if (this.refusedRestartTimer) return;
+    this.refusedRestartTimer = setTimeout(() => {
+      if (this.stopping || this.activeLoopStarted) return;
+      const detail = { reason: "recovery_refused", code: error instanceof RemoteInstanceError ? error.code : "unknown" };
+      this.logger.error(detail, "Konteks no longer accepts this connector process; restarting to reconnect as a new one");
+      this.options.onLivenessLost?.(detail);
+    }, 15_000);
+    this.refusedRestartTimer.unref();
+  }
+
+  /** At most one channel read per interval while startup keeps being refused as too old (it retries every 15 s). */
+  private requestUpdateForRefusedBundle(): void {
+    const now = Date.now();
+    if (this.refusedBundleUpdateAt !== null && now - this.refusedBundleUpdateAt < REFUSED_BUNDLE_UPDATE_INTERVAL_MS) return;
+    this.refusedBundleUpdateAt = now;
+    const updates = this.ensureUpdates();
+    if (!updates) { this.logger.warn("Core refuses this release as too old and automatic updates are off; update with `konteks-remote update`"); return; }
+    updates.onUpdateRequired({ minimumSupportedBundle: null });
+  }
+
+  private leaseLapseNeedsRestart(): boolean {
+    return leaseLapseNeedsRestart({ now: Date.now(), stopping: this.stopping, activeLoopStarted: this.activeLoopStarted, refusedSince: this.leaseRefusedSince,
+      leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus, thresholdMs: LEASE_LAPSE_RESTART_MS });
   }
 
   /** From the first recovery cycle on, some heartbeat (pending or ordinary) is
@@ -1271,6 +1359,15 @@ export class Supervisor {
     this.livenessWatchingSince = Date.now();
     this.livenessTimer = setInterval(() => {
       if (this.stopping || !this.livenessTimer) return;
+      if (this.leaseLapseNeedsRestart()) {
+        clearInterval(this.livenessTimer);
+        this.livenessTimer = null;
+        const detail = { reason: "lease_lapsed", leaseMode: this.lease.mode(), leaseExpiresAt: this.lease.current()?.expiresAt ?? null,
+          refusedForMs: Date.now() - (this.leaseRefusedSince ?? Date.now()), administrativeStatus: this.administrativeStatus };
+        this.logger.error(detail, "the lease lapsed and Core refuses it; restarting to reconnect with this machine's key");
+        this.options.onLivenessLost?.(detail);
+        return;
+      }
       const budgetMs = Math.max(LIVENESS_MIN_BUDGET_MS, this.heartbeat.livenessBudgetMs());
       const liveness = this.heartbeat.liveness();
       const verdict = evaluateHeartbeatLiveness({ now: Date.now(), watchingSince: this.livenessWatchingSince ?? Date.now(), liveness, budgetMs });
@@ -1332,6 +1429,7 @@ export class Supervisor {
     if (this.stopping) return;
     this.requireRecoveryAuthority();
     this.activeLoopStarted = true;
+    this.reconnectRefusal = null;
     void this.resumeOnComputerWatches().catch(error => this.logger.warn({ err: error }, "on-computer steps not resumed"));
     this.transport.start();
     this.planningDirectivePoller?.start();
@@ -1342,6 +1440,16 @@ export class Supervisor {
     this.reaperTimer = setInterval(() => void this.work.reapIdleCompletedSessions(IDLE_SESSION_RELEASE_MS).catch(() => undefined), IDLE_SESSION_SWEEP_MS);
     this.reaperTimer.unref();
     this.previews.startIdleSweep();
+    this.ensureUpdates()?.start();
+    await this.work.reports.flushAll();
+  }
+
+  /**
+   * The unattended update, built on first need: after a successful start, or
+   * when Core refuses the startup reconnect because this bundle is below its
+   * minimum (then no start ever succeeds, and only an update gets back in).
+   */
+  private ensureUpdates(): NativeUpdateCoordinator | null {
     const update = this.options.native?.update;
     if (update && !this.updates) {
       this.updates = new NativeUpdateCoordinator({
@@ -1356,9 +1464,8 @@ export class Supervisor {
           return this.core.acceptedRelease(this.instanceId);
         },
       });
-      this.updates.start();
     }
-    await this.work.reports.flushAll();
+    return this.updates ?? null;
   }
 
   private async onRelayConnected(result: RelayRuntimeHandshakeResult): Promise<void> {
@@ -1880,8 +1987,10 @@ export class Supervisor {
       switch (request.op) {
         case "status":
           return this.status();
-        case "agents":
-          return { agents: this.lastSnapshot?.agents ?? this.inventory.agents(), roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
+        case "agents": {
+          const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
+          return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
+        }
         case "auth.status":
           return { agents: (this.lastSnapshot?.agents ?? this.inventory.agents()).filter((agent) => request.agentId === undefined || agent.agentId === request.agentId) };
         case "auth.login": {
@@ -1981,6 +2090,12 @@ export class Supervisor {
           return this.requireUpdates().apply("operator");
         case "update.status":
           return this.requireUpdates().status();
+        case "update.channel": {
+          // Its own op, not a status field: launchers from older releases read
+          // `status` strictly and a user install never replaces its launcher.
+          const channel = this.updates ? this.updateChannelReport() : null;
+          return channel ? { host: channel.host, override: channel.override, lastCheckedAt: channel.lastCheckedAt, error: channel.lastError } : null;
+        }
         case "release.accepted": {
           if (!this.instanceId) return { bundleVersion: null };
           const accepted = await this.core.acceptedRelease(this.instanceId);
@@ -2012,6 +2127,14 @@ export class Supervisor {
         case "revoke.pending":
           this.pendingRevocation = true;
           return { pendingRevocation: true };
+        case "shutdown": {
+          // Answered first, then stopped, so the caller hears it was accepted.
+          setTimeout(() => {
+            if (this.options.onShutdownRequested) this.options.onShutdownRequested();
+            else void this.stop().catch(() => undefined);
+          }, 200).unref?.();
+          return { stopping: true };
+        }
         case "instance.retire": {
           if (!this.instanceId) throw new RemoteInstanceError("temporarily_unavailable", "This runtime is not activated, so there is nothing to remove from Konteks.");
           const result = await this.core.retire(this.instanceId);
@@ -2242,6 +2365,26 @@ export class Supervisor {
     }
   }
 
+  /**
+   * The agents this installation lists that could not start, as unavailable,
+   * for `agents` and `doctor` (RCA 2026-10-01: a Codex left out at start was
+   * simply missing there, so the update health gate kept waiting for its
+   * probe until its deadline and blamed the probe). Only agents this release
+   * bundles: the person's own host agents have their own doctor checks and
+   * never hold an update back. Not in the heartbeat: Core hears of them
+   * through `supportedAgents`.
+   */
+  private leftOutAgents(listed: readonly { agentId: string }[]): Array<{ agentId: string; readiness: "unavailable"; connectionState: "unavailable"; startFailure: string }> {
+    const present = new Set(listed.map(agent => agent.agentId));
+    return [...this.recordedAgentIds()]
+      .filter(agentId => !isHostAgentId(agentId) && !present.has(agentId) && !this.runners.has(agentId) && this.agentStartFailures.has(agentId))
+      .map(agentId => {
+        const failure = this.agentStartFailures.get(agentId);
+        const reason = (failure instanceof Error ? failure.message : `${agentId} could not start`).replace(/\.$/, "").slice(0, 300);
+        return { agentId, readiness: "unavailable" as const, connectionState: "unavailable" as const, startFailure: reason };
+      });
+  }
+
   /** The agents this installation lists: its runners and the host agents left out at load. */
   private recordedAgentIds(): Set<string> {
     const native = this.options.native;
@@ -2343,8 +2486,9 @@ export class Supervisor {
       relay: this.relay?.status() ?? { state: "offline", lastError: "relay not configured", consecutiveFailures: 0 },
       transport: this.transport.kind,
       reconciliationComplete: this.reconciliation.isComplete,
+      ...(this.reconnectRefusal ? { reconciliationRefusal: this.reconnectRefusal } : {}),
       components: snapshot.components,
-      agents: snapshot.agents,
+      agents: [...snapshot.agents, ...this.leftOutAgents(snapshot.agents)],
       configRevision: this.control.configRevision,
       diskFreeBytes: snapshot.diskFreeBytes,
       // Native releases name no disk minimum; the check reports free space only.
@@ -2356,7 +2500,23 @@ export class Supervisor {
       browser: this.browserReport(),
       ...(openCode ? { openCode } : {}),
       ...(antigravity ? { antigravity } : {}),
+      ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
     });
+  }
+
+  /** The unattended update's channel for `doctor`: host only, never the full URL. */
+  private updateChannelReport(): NonNullable<Parameters<typeof runDoctor>[0]["updateChannel"]> {
+    const update = this.updates!.channel();
+    let host: string;
+    let override = false;
+    try {
+      const url = new URL(nativeManifestUrl(process.env));
+      host = url.host;
+      override = url.toString() !== NATIVE_MANIFEST_URL;
+    } catch (error) {
+      return { host: "(invalid override)", override: true, lastCheckedAt: update.lastCheckedAt, lastError: error instanceof Error ? error.message : String(error), available: null };
+    }
+    return { host, override, lastCheckedAt: update.lastCheckedAt, lastError: update.error, available: update.available };
   }
 
   /** The Google Antigravity doctor line's facts, when this installation lists it (running, updating, retried or given up). */
@@ -2420,6 +2580,8 @@ export class Supervisor {
     this.stopPendingHeartbeat();
     if (this.recoveryRetryTimer) clearTimeout(this.recoveryRetryTimer);
     this.recoveryRetryTimer = null;
+    if (this.refusedRestartTimer) clearTimeout(this.refusedRestartTimer);
+    this.refusedRestartTimer = null;
     this.cancelDrainTimer();
     this.stopPromise ??= this.stopImpl();
     return this.stopPromise;
@@ -2434,8 +2596,16 @@ export class Supervisor {
       });
     };
     await note("supervisor_prelude", "entered");
-    await this.startPromise?.catch(() => undefined);
-    await this.activeLoopStarting;
+    // A stop that hung here (09-30 15:23) left no clue which wait held it:
+    // every wait that takes longer than a few seconds is named in the log.
+    const waitFor = async (step: string, pending: Promise<unknown> | null | undefined): Promise<void> => {
+      if (!pending) return;
+      const slow = setTimeout(() => this.logger.warn({ event: "shutdown.waiting", step }, "shutdown is still waiting"), 5_000);
+      slow.unref?.();
+      try { await pending; } finally { clearTimeout(slow); }
+    };
+    await waitFor("start", this.startPromise?.catch(() => undefined));
+    await waitFor("active_loop_start", this.activeLoopStarting);
     if (this.pullTimer) clearInterval(this.pullTimer);
     for (const watch of this.onComputerWatches.values()) clearInterval(watch);
     this.onComputerWatches.clear();
@@ -2447,18 +2617,18 @@ export class Supervisor {
     this.updates?.stop();
     if (this.muxTimer) clearInterval(this.muxTimer);
     if (this.cancellationTimer) clearInterval(this.cancellationTimer);
-    await this.cancellationReplay?.stop();
+    await waitFor("cancellation_replay", this.cancellationReplay?.stop());
     if (this.configurationTimer) clearInterval(this.configurationTimer);
-    await this.configurationRefresh;
-    await this.observationDelivery?.stop();
-    await this.configurationAcks?.settle();
-    await this.executionRevisionFenceReceipts?.settle();
-    await this.planningDirectivePoller?.stop();
+    await waitFor("configuration_refresh", this.configurationRefresh);
+    await waitFor("observation_delivery", this.observationDelivery?.stop());
+    await waitFor("configuration_acks", this.configurationAcks?.settle());
+    await waitFor("fence_receipts", this.executionRevisionFenceReceipts?.settle());
+    await waitFor("planning_directives", this.planningDirectivePoller?.stop());
     this.heartbeat?.stop();
-    await this.heartbeat?.settle();
-    await this.leaseAcquisition;
-    await this.leaseMutation;
-    await this.leaseLossCleanup;
+    await waitFor("heartbeat", this.heartbeat?.settle());
+    await waitFor("lease_acquisition", this.leaseAcquisition);
+    await waitFor("lease_mutation", this.leaseMutation);
+    await waitFor("lease_loss_cleanup", this.leaseLossCleanup);
     await note("supervisor_prelude", "completed");
     await note("work_drain", "entered");
     await this.work?.drainSessions("drain");

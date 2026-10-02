@@ -9,6 +9,8 @@ import { openCodeInstallAdapter } from "../native/host-agents.js";
 
 /** `opencode debug agents` from OpenCode 2.0.18 with the Konteks configuration (live, 2026-09-28; home paths shortened). */
 const CAPTURED = readFileSync(new URL("./fixtures/opencode-2.0.18-debug-agents.json", import.meta.url), "utf8");
+/** The same from OpenCode 2.0.21 (live, 2026-10-02; extra fields and system prompts dropped): every agent now ends with OpenCode's own `browser * deny`. */
+const CAPTURED_2_0_21 = readFileSync(new URL("./fixtures/opencode-2.0.21-debug-agents.json", import.meta.url), "utf8");
 type Agent = { id: string; permissions: Array<{ action: string; resource: string; effect: string }> };
 const agents = (): Agent[] => JSON.parse(CAPTURED) as Agent[];
 
@@ -112,6 +114,34 @@ describe("the OpenCode start self-check", () => {
 
   it("names every drift on the captured listing as none", () => {
     expect(openCodeAgentsDrift(agents())).toEqual([]);
+  });
+
+  it("passes on OpenCode 2.0.21, which appends its own `browser * deny` after the Konteks rules", async () => {
+    const list = JSON.parse(CAPTURED_2_0_21) as Agent[];
+    for (const agent of list) expect(agent.permissions.at(-1)).toEqual({ action: "browser", resource: "*", effect: "deny" });
+    expect(openCodeAgentsDrift(list)).toEqual([]);
+    const f = await fixture([CAPTURED_2_0_21]);
+    await expect(f.check()).resolves.toBeUndefined();
+  });
+
+  const after21 = (rules: Agent["permissions"]) => { const list = JSON.parse(CAPTURED_2_0_21) as Agent[]; for (const agent of list) agent.permissions.push(...rules); return list; };
+  it("accepts any further deny after the Konteks rules, but the probes still pin every decision", () => {
+    expect(openCodeAgentsDrift(after21([{ action: "websearch", resource: "*", effect: "deny" }]))).toEqual([]);
+    expect(openCodeAgentsDrift(after21([{ action: "*", resource: "*", effect: "deny" }]))).toContain("agent build: reading a file is deny, expected allow");
+  });
+
+  it.each([
+    ["an ask after OpenCode's deny", [{ action: "external_directory", resource: "*", effect: "ask" }], /build: the Konteks rules are not last.*folder outside the working copy is ask/],
+    ["an allow after OpenCode's deny", [{ action: "browser", resource: "*", effect: "allow" }], /build: the Konteks rules are not last.*built-in browser is allow/],
+    ["an allow between denies", [{ action: "edit", resource: "*", effect: "allow" }, { action: "browser", resource: "*", effect: "deny" }], /build: the Konteks rules are not last.*an edit is allow/],
+  ])("reads %s on 2.0.21 as drift", (_name, rules, reason) => {
+    expect(openCodeAgentsDrift(after21(rules as Agent["permissions"])).join("; ")).toMatch(reason);
+  });
+
+  it("reads the Konteks rules split by OpenCode's deny as drift", () => {
+    const list = agents();
+    for (const agent of list) agent.permissions.splice(agent.permissions.length - 3, 0, { action: "browser", resource: "*", effect: "deny" });
+    expect(openCodeAgentsDrift(list)).toContain("agent build: the Konteks rules are not last");
   });
 });
 

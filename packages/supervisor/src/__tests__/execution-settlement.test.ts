@@ -1,9 +1,10 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RemoteWorkAssignment } from "@konteks/remote-common";
 import { SupervisorJournal } from "../state/journal.js";
+import { LocalExecutionRecordSchema } from "../state/local-execution.js";
 
 let dir: string;
 const admission = { instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "process", assignmentId: "assignment", attempt: 1, claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: "2026-09-06T00:00:00.000Z" };
@@ -224,6 +225,88 @@ it("makes cross-incarnation restore succession durable and exactly retryable bef
   expect(journal.execution.pendingRestore(successor, correction)).toBe("generator-ref");
   await journal.execution.bindReference(successor, "restored-ref", current);
   expect(journal.execution.pendingRestore(successor, correction)).toBeUndefined();
+});
+
+// Production 2026-10-01: a connector restart restored the QA role session
+// for one re-check, which completed. The next re-check of the same kept
+// changes then failed at activation with a ZodError on every try, and the
+// idle reaper could never release the session, because the journal refused
+// any phase but `opened` for a restored generation.
+describe("a restored role session after its turn completes", () => {
+  const restoredOwner = { ...processOwner, pid: 77, processGroupId: 77, startToken: "restored-start" };
+  const review = (identity: typeof admission, invocationId: string, predecessor?: string) =>
+    delivery(identity, { invocationId, dispatchGeneration: 0, ...(predecessor ? { predecessor: { invocationId: predecessor, dispatchGeneration: 0 } } : {}) },
+      { role: "qa", executionSessionId: "repository-qa-session" });
+  const restored = { ...admission, runnerIncarnation: "restarted-process", assignmentId: "recheck-1",
+    claimId: "recheck-1-claim", executionGeneration: "recheck-1-generation", openedAt: now };
+  const third = { ...restored, assignmentId: "recheck-2", claimId: "recheck-2-claim",
+    executionGeneration: "recheck-2-generation", openedAt: "2026-09-06T00:00:05.000Z" };
+  const completedRestore = async (journal: SupervisorJournal) => {
+    await begin(journal, admission, review(admission, "review-1"));
+    await begin(journal, restored, review(restored, "review-2", "review-1"));
+    await journal.execution.open(admission, current, admission.openedAt);
+    await journal.execution.bindReference(admission, "qa-ref", current);
+    await journal.execution.bindProcessOwner(admission, processOwner, current);
+    await journal.execution.markCompletedTurnSettled(admission, "qa-ref", now, current);
+    await journal.execution.transferRestoredContinuation({ predecessor: admission, successor: restored,
+      sessionId: "repository-qa-session", acpSessionRef: "qa-ref", processOwner, continuedAt: "2026-09-06T00:00:02.000Z" }, current);
+    await journal.execution.bindReference(restored, "restored-ref", current);
+    await journal.execution.bindProcessOwner(restored, restoredOwner, current);
+    await journal.execution.markCompletedTurnSettled(restored, "restored-ref", "2026-09-06T00:00:04.000Z", current);
+  };
+
+  it("hands its live ACP session to the next re-check, durably across a reload", async () => {
+    const journal = new SupervisorJournal(dir); await journal.load();
+    await completedRestore(journal);
+    const next = review(third, "review-3", "review-2");
+    await begin(journal, third, next);
+    expect(journal.execution.liveContinuation(next)).toEqual({ admission: restored, acpSessionRef: "restored-ref", processOwner: restoredOwner });
+    await journal.execution.transferLiveContinuation({ predecessor: restored, successor: third, sessionId: "repository-qa-session",
+      acpSessionRef: "restored-ref", processOwner: restoredOwner, continuedAt: "2026-09-06T00:00:06.000Z" }, current);
+    expect(journal.execution.execution(restored)).toMatchObject({ phase: "continued", continuedToGeneration: third.executionGeneration,
+      restoredFromGeneration: admission.executionGeneration, restoreAcpSessionRef: "qa-ref" });
+    expect(() => journal.execution.assertExecutable(third, "restored-ref")).not.toThrow();
+    expect(() => journal.execution.assertExecutable(restored, "restored-ref")).toThrow();
+
+    const reopened = new SupervisorJournal(dir); await reopened.load();
+    expect(() => reopened.execution.assertExecutable(third, "restored-ref")).not.toThrow();
+    expect(reopened.execution.headContinuationTip(next)).toEqual(third);
+  });
+
+  it("can be stopped and settled by the idle reaper", async () => {
+    const journal = new SupervisorJournal(dir); await journal.load();
+    await completedRestore(journal);
+    await journal.execution.markStopping(restored, "2026-09-06T00:00:07.000Z", current);
+    await journal.execution.markAcpSettled(restored, "restored-ref", "2026-09-06T00:00:08.000Z", current);
+    expect(journal.execution.execution(restored)).toMatchObject({ phase: "acp_settled", restoredFromGeneration: admission.executionGeneration });
+    const reopened = new SupervisorJournal(dir); await reopened.load();
+    expect(reopened.execution.execution(restored)?.phase).toBe("acp_settled");
+  });
+
+  it("is restored again after another connector restart", async () => {
+    const journal = new SupervisorJournal(dir); await journal.load();
+    await completedRestore(journal);
+    const again = { ...third, runnerIncarnation: "restarted-again" };
+    const next = review(again, "review-3", "review-2");
+    await begin(journal, again, next);
+    const proof = { predecessor: restored, successor: again, sessionId: "repository-qa-session",
+      acpSessionRef: "restored-ref", processOwner: restoredOwner, continuedAt: "2026-09-06T00:00:06.000Z" };
+    await journal.execution.transferRestoredContinuation(proof, current);
+    await expect(journal.execution.transferRestoredContinuation(proof, current)).resolves.toBeUndefined();
+    expect(journal.execution.pendingRestore(again, next)).toBe("restored-ref");
+  });
+
+  it("still refuses a restore that reuses the restored reference or claims two origins", async () => {
+    const journal = new SupervisorJournal(dir); await journal.load();
+    await completedRestore(journal);
+    const state = journal.execution.execution(restored)!;
+    const accepts = (value: object) => LocalExecutionRecordSchema.safeParse({ kind: "execution", value }).success;
+    expect(accepts({ ...state, phase: "stopping", stoppingAt: now })).toBe(true);
+    expect(accepts({ ...state, restoreAcpSessionRef: "restored-ref" })).toBe(false);
+    expect(accepts({ ...state, continuedFromGeneration: "generation" })).toBe(false);
+    const { restoreAcpSessionRef: _dropped, ...withoutRestoreRef } = state;
+    expect(accepts(withoutRestoreRef)).toBe(false);
+  });
 });
 
 it("never substitutes a persistent delivery session across role, agent, model, or stable session identity", async () => {
