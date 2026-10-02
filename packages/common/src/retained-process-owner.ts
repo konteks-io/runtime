@@ -146,8 +146,11 @@ function queryWindowsProcessPair(pid: number): [WindowsProcessRecord | null, Win
   // creation time directly; Get-CimInstance has a multi-second cold start and
   // made the first bridge race its owner-capture timeout on healthy machines.
   const script = `$items=@(); for($i=0;$i -lt 2;$i++){ $p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if($null -ne $p){ $items += [pscustomobject]@{ProcessId=[int]$p.Id;ParentProcessId=0;CreationDate=[string]$p.StartTime.ToUniversalTime().Ticks;CommandLine='';ExecutablePath=[string]$p.Path} } }; ConvertTo-Json -InputObject @($items) -Compress`;
+  // On Windows ARM running an x64 Node bridge, the native PowerShell host can
+  // take over ten seconds to initialize even while the bridge stays healthy.
+  // Timeout must cover that cold start; a miss cannot be treated as ownership.
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
-    { encoding: "utf8", windowsHide: true, timeout: 5_000, maxBuffer: 64 * 1024 });
+    { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 });
   if (result.status !== 0 || !result.stdout.trim()) return [null, null];
   try {
     const values = JSON.parse(result.stdout) as Array<Partial<WindowsProcessRecord>>;

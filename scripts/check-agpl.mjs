@@ -10,7 +10,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
 const root = process.cwd();
-const SKIP_DIRS = new Set(["node_modules", "dist", ".git", "coverage", "tmp", ".runtime", ".konteks-remote"]);
+const SKIP_DIRS = new Set(["node_modules", "dist", ".git", "coverage", "tmp", ".runtime", ".konteks-remote", "graft"]);
 const SCAN_EXTENSIONS = new Set([".ts", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json", ".yaml", ".yml", ".sh", ".ps1", ""]);
 const PATTERNS = [
   { name: "AGPL licence text", regex: /GNU AFFERO GENERAL PUBLIC LICENSE|AGPL-3\.0|agpl-3\.0|AGPLv3/i },

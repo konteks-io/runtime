@@ -50,6 +50,10 @@ export interface NativeServiceDefinition {
   label: string;
   path: string;
   contents: string;
+  /** Windows Task Scheduler imports UTF-16LE XML; other managers use UTF-8. */
+  fileEncoding?: "utf16le";
+  /** Private launch helpers, written before the service is registered. */
+  supportFiles?: readonly { path: string; contents: string }[];
   install: NativeServiceCommand[];
   start: NativeServiceCommand;
   stop: NativeServiceCommand;
@@ -109,10 +113,13 @@ const LAUNCHD_RELOAD_SCRIPT = [
  */
 export async function startNativeServiceDefinition(
   definition: NativeServiceDefinition,
-  deps: { execute: (command: NativeServiceCommand) => Promise<number | null>; write: (path: string, contents: string) => Promise<void> },
+  deps: { execute: (command: NativeServiceCommand) => Promise<number | null>; write: (path: string, contents: string | Uint8Array) => Promise<void> },
 ): Promise<"already_running" | "started"> {
   if (await deps.execute(definition.status) === 0) return "already_running";
-  await deps.write(definition.path, definition.contents);
+  for (const file of definition.supportFiles ?? []) await deps.write(file.path, file.contents);
+  await deps.write(definition.path, definition.fileEncoding === "utf16le"
+    ? Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(definition.contents, "utf16le")])
+    : definition.contents);
   for (const command of [...definition.install, definition.start]) {
     if (await deps.execute(command) !== 0) throw new Error(`${command.command} exited unsuccessfully`);
   }
@@ -173,12 +180,20 @@ export function nativeServiceDefinition(input: {
   }
   if (!input.userId || !/^S-1-\d+(?:-\d+)+$/.test(input.userId)) throw new Error("the current Windows user SID is required");
   const file = path.join(normalizedRoot, "service.xml");
-  // No `reload`: Task Scheduler keeps its own copy of the task, which `start`
-  // (every update and rollback) replaces with `/Create /F`, and the task names
-  // no output file, so a running connector loses nothing by keeping it.
+  // Task Scheduler creates a visible console for a console executable even
+  // when the task is marked Hidden. wscript is a GUI host: it starts one
+  // hidden PowerShell host, waits for the connector and forwards its exit
+  // status so the scheduler still tracks the running task and owns restarts.
+  // Encode the literal command: WScript.Shell.Run expands %variables%, which
+  // must never reinterpret an installation path containing percent signs.
+  const helper = path.join(normalizedRoot, "service.js");
+  const literal = (value: string) => `'${value.replace(/'/g, "''")}'`;
+  const script = `$ErrorActionPreference = 'Stop'; try { & ${[input.executable, ...args].map(literal).join(" ")}; exit $LASTEXITCODE } catch { exit 1 }`;
+  const host = `"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
   return {
-    label, path: file, requiresLinger: false,
-    contents: `<?xml version="1.0" encoding="UTF-8"?>\n<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${input.userId}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id="Owner"><UserId>${input.userId}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings>\n<Actions Context="Owner"><Exec><Command>${xml(input.executable)}</Command><Arguments>${xml(args.map(windowsArg).join(" "))}</Arguments></Exec></Actions>\n</Task>\n`,
+    label, path: file, requiresLinger: false, fileEncoding: "utf16le",
+    supportFiles: [{ path: helper, contents: `var shell = WScript.CreateObject("WScript.Shell");\nWScript.Quit(shell.Run(${JSON.stringify(host)}, 0, true));\n` }],
+    contents: `<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${input.userId}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id="Owner"><UserId>${input.userId}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings>\n<Actions Context="Owner"><Exec><Command>%SystemRoot%\\System32\\wscript.exe</Command><Arguments>${xml(["//B", "//NoLogo", "//E:JScript", helper].map(windowsArg).join(" "))}</Arguments></Exec></Actions>\n</Task>\n`,
     install: [{ command: "schtasks.exe", args: ["/Create", "/TN", label, "/XML", file, "/F"] }],
     start: { command: "schtasks.exe", args: ["/Run", "/TN", label] },
     stop: { command: "schtasks.exe", args: ["/End", "/TN", label] },

@@ -61,6 +61,7 @@ async function fixture() {
   const makeGate = (overrides: Record<string, unknown> = {}) => { const gate = new NativeExecutionGate({ assignment, journal, clock, runnerIncarnation: "runner", client,
     assertOwned, onAuthorityLost, currentRevisionFenceConnection: () => ({ connectionRef: "connection", connectionEpoch: 2 }), monotonicNow: () => monotonic, ...overrides } as never); gates.push(gate); return gate; };
   return { journal, clock, ready, claims, client, envelope, gate: makeGate(), makeGate, onAuthorityLost, assertOwned,
+    monotonicNow: () => monotonic,
     advance: (milliseconds: number) => { monotonic += milliseconds; clock.advance(milliseconds); } };
 }
 
@@ -96,7 +97,7 @@ async function deliveryFixture() {
         checkId: "check", iss: "konteks:control-plane", aud: "konteks:delivery-execution-lease",
         iat: f.clock.coreNow() / 1000, exp: f.clock.coreNow() / 1000 + 30 }) })) };
   const makeGate = (journal = f.journal) => { const gate = new NativeExecutionGate({ assignment: assigned, journal,
-    clock: f.clock, runnerIncarnation: "runner", client, assertOwned: f.assertOwned, onAuthorityLost: f.onAuthorityLost });
+    clock: f.clock, runnerIncarnation: "runner", client, assertOwned: f.assertOwned, onAuthorityLost: f.onAuthorityLost, monotonicNow: f.monotonicNow });
     gates.push(gate); return gate; };
   return { ...f, gate: makeGate(), makeGate, client, claims, assigned,
     envelope: { ...f.envelope, permit: signed(claims) } };
@@ -229,6 +230,13 @@ it("keeps the agent running while renewals go unanswered past the lease, backing
 it("keeps a delivery turn Core renewed running past its assignment's issued hour, adopting only the later lifetime (D115)", async () => {
   vi.useFakeTimers();
   const f = await deliveryFixture();
+  const persistUpdate = f.journal.assignments.update.bind(f.journal.assignments);
+  let persistence: Promise<unknown> = Promise.resolve();
+  vi.spyOn(f.journal.assignments, "update").mockImplementation((...args) => {
+    const pending = persistUpdate(...args);
+    persistence = pending;
+    return pending;
+  });
   const operation = await f.gate.admit(f.envelope);
   await f.gate.begin(operation);
   // The owning Harness renews the turn: Core's signed checks carry the same
@@ -241,7 +249,10 @@ it("keeps a delivery turn Core renewed running past its assignment's issued hour
       lease: signed({ ...held, expiresAt: renewedUntil, checkId: "check", iss: "konteks:control-plane", aud: "konteks:delivery-execution-lease",
         iat: f.clock.coreNow() / 1000, exp: f.clock.coreNow() / 1000 + 30 }) };
   });
-  for (let second = 0; second < 65 * 60; second += 5) { f.advance(5_000); await vi.advanceTimersByTimeAsync(5_000); }
+  // Each step stays inside the 30-second check lease and awaits real persistence.
+  for (let second = 0; second < 65 * 60; second += 25) {
+    f.advance(25_000); await vi.advanceTimersByTimeAsync(25_000); await persistence;
+  }
   expect(f.clock.coreNow()).toBeGreaterThan(Date.parse(f.assigned.expiresAt));
   expect(f.onAuthorityLost).not.toHaveBeenCalled();
   // The local record follows Core's verified lifetime (forward only), so a reconnect re-ready finds the turn live.
@@ -253,8 +264,9 @@ it("keeps a delivery turn Core renewed running past its assignment's issued hour
     expiresAt: new Date(f.clock.coreNow() + 30_000).toISOString(),
     lease: signed({ ...held, leaseSetId: "other", expiresAt: new Date(f.clock.coreNow() + 3_600_000).toISOString(), checkId: "check",
       iss: "konteks:control-plane", aud: "konteks:delivery-execution-lease", iat: f.clock.coreNow() / 1000, exp: f.clock.coreNow() / 1000 + 30 }) }));
-  for (let second = 0; second < 60; second += 5) { f.advance(5_000); await vi.advanceTimersByTimeAsync(5_000); }
-  expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
+  for (let second = 0; second < 60; second += 5) { f.advance(5_000); await vi.advanceTimersByTimeAsync(5_000); await persistence; }
+  // Advancing virtual time does not await the journal write in an in-flight renewal.
+  await vi.waitFor(() => expect(f.onAuthorityLost).toHaveBeenCalledTimes(1));
 });
 
 it("still stops a renewed delivery turn when Core answers that it is gone (D115)", async () => {

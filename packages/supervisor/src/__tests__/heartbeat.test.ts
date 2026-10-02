@@ -137,11 +137,17 @@ describe("signed HTTPS heartbeat lifecycle", () => {
   });
   it("abandons a flight that never settles so shutdown and recovery are not held hostage", async () => {
     const f = await fixture();
+    const requestStarted = Promise.withResolvers<void>();
+    vi.useFakeTimers();
     const publisher = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process", settleDeadlineMs: 40,
-      core: { heartbeat: () => new Promise<never>(() => undefined) } } as HeartbeatOptions);
+      core: { heartbeat: () => { requestStarted.resolve(); return new Promise<never>(() => undefined); } } } as HeartbeatOptions);
     publishers.push(publisher);
     await publisher.start();
-    const failure = await publisher.publish().catch((error: unknown) => error);
+    const flight = publisher.publish().catch((error: unknown) => error);
+    // Reach HTTPS after real sequence persistence before advancing its deadline.
+    await requestStarted.promise;
+    await vi.advanceTimersByTimeAsync(40);
+    const failure = await flight;
     expect(failure).toMatchObject({ code: "temporarily_unavailable", retryable: true });
     expect(String((failure as Error).message)).toMatch(/did not settle .*stage request/u);
     const liveness = publisher.liveness();

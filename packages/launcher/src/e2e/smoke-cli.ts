@@ -8,7 +8,7 @@ import { addNativeAgent, installNative, readNativeRecord } from "../native/insta
 import { nativePlatform } from "../native/service.js";
 import { prepareDeliveryGraft } from "../native/graft.js";
 import { loadE2EInstallAuthority } from "./authority.js";
-import { prepareE2ERealRelease, prepareE2ESmokeRelease, reissueE2ERelease } from "./smoke-release.js";
+import { extendE2ERealRelease, extendE2ESmokeRelease, prepareE2ERealRelease, prepareE2ESmokeRelease, reissueE2ERelease } from "./smoke-release.js";
 
 const program = new Command("konteks-remote-e2e-smoke").description("E2E-only signed native connector smoke preparation");
 const gated = () => {
@@ -27,14 +27,50 @@ program.command("prepare")
     const prepared = await prepareE2ESmokeRelease({ gate: process.env.KONTEKS_E2E_NATIVE_CONNECTOR, directory: resolve(directory), origin, platform: { os: platform.os, architecture: platform.architecture } });
     createOutput({ json: true }).result({ manifestDigest: prepared.manifest.digest, signer: prepared.root.keyId, directory: resolve(directory) });
   });
+program.command("extend")
+  .description("add this machine's platform to an existing private E2E release")
+  .requiredOption("--directory <path>", "controller-owned .runtime/native-cloud directory")
+  .requiredOption("--bundle-version <version>", "new local release version")
+  .requiredOption("--target <os/architecture>", "additional E2E target, for example debian/arm64")
+  .option("--origin <url>", "fixed local TLS edge", "https://127.0.0.1:7443")
+  .action(async ({ directory, bundleVersion, target, origin }: { directory: string; bundleVersion: string; target: string; origin: string }) => {
+    gated();
+    if (target !== "debian/amd64" && target !== "debian/arm64") throw new InvalidArgumentError("additional E2E target must be debian/amd64 or debian/arm64");
+    const architecture = target.endsWith("/arm64") ? "arm64" : "amd64";
+    const prepared = await extendE2ESmokeRelease({ gate: process.env.KONTEKS_E2E_NATIVE_CONNECTOR, directory: resolve(directory), origin, bundleVersion, platform: { os: "debian", architecture } });
+    createOutput({ json: true }).result({ manifestDigest: prepared.manifest.digest, signer: prepared.root.keyId, directory: resolve(directory) });
+  });
+program.command("extend-real-windows")
+  .description("add verified external Windows connector and Codex package to a private signed E2E release")
+  .requiredOption("--directory <path>", "controller-owned .runtime/native-cloud directory")
+  .requiredOption("--bundle-version <version>", "new local release version")
+  .requiredOption("--connector <path>", "absolute path to the Windows connector executable")
+  .requiredOption("--package <path>", "absolute path to the complete Windows Codex package")
+  .requiredOption("--profile <path>", "absolute path to the matching konteks-agent.json")
+  .option("--origin <url>", "fixed local TLS edge", "https://127.0.0.1:7443")
+  .action(async (options: { directory: string; bundleVersion: string; connector: string; package: string; profile: string; origin: string }) => {
+    gated(); realGated();
+    if (![options.connector, options.package, options.profile].every(isAbsolute)) throw new InvalidArgumentError("Windows release inputs must use absolute paths");
+    const directory = resolve(options.directory);
+    const prepared = await extendE2ERealRelease({
+      gate: process.env.KONTEKS_E2E_NATIVE_CONNECTOR, realAgentGate: process.env.KONTEKS_E2E_NATIVE_REAL_AGENT,
+      directory, bundleVersion: options.bundleVersion, origin: options.origin,
+      platform: { os: "windows", architecture: "amd64" },
+      connectorPath: options.connector, packagePath: options.package, profilePath: options.profile,
+    });
+    createOutput({ json: true }).result({ manifestDigest: prepared.manifest.digest, signer: prepared.root.keyId, directory });
+  });
 program.command("reissue")
   .description("re-sign the local release at another version, optionally with a runnable connector (W1-L4)")
   .requiredOption("--directory <path>", "controller-owned .runtime/native-cloud directory")
   .requiredOption("--bundle-version <version>", "the version to publish")
   .option("--connector <path>", "a runnable connector to publish in place of the placeholder")
-  .action(async (options: { directory: string; bundleVersion: string; connector?: string }) => {
+  .option("--target <os/architecture>", "connector target; currently windows/amd64")
+  .action(async (options: { directory: string; bundleVersion: string; connector?: string; target?: string }) => {
     gated();
-    const manifest = await reissueE2ERelease({ directory: resolve(options.directory), bundleVersion: options.bundleVersion, ...(options.connector ? { connectorPath: resolve(options.connector) } : {}) });
+    if (options.target && options.target !== "windows/amd64") throw new InvalidArgumentError("reissue target must be windows/amd64");
+    if (options.target) realGated();
+    const manifest = await reissueE2ERelease({ directory: resolve(options.directory), bundleVersion: options.bundleVersion, ...(options.connector ? { connectorPath: resolve(options.connector) } : {}), ...(options.target ? { platform: { os: "windows", architecture: "amd64" } as const } : {}) });
     createOutput({ json: true }).result({ bundleVersion: manifest.bundleVersion, manifestDigest: manifest.digest });
   });
 program.command("prepare-real")
