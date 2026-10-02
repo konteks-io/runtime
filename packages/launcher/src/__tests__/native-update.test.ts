@@ -8,7 +8,7 @@ import { buildReleaseFixture, resolveNativeConnectorExecutable } from "@konteks/
 import { acquireNativeRootLock, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
-import { earlierFailure, earlierFailureNote, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
+import { earlierFailure, earlierFailureNote, keepLauncherCurrent, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { createOutput } from "../output.js";
 import { nativeServiceDefinition, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
@@ -511,6 +511,57 @@ describe("native update transaction", () => {
     expect(h.currentRecord().releaseId).toBe(previous.releaseId);
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
   });
+  it("goes on once the old connector's process is gone, even when launchd ended it before it wrote its receipt (D113b)", async () => {
+    // 2026-10-02 15:43Z: launchd SIGKILLs a booted-out job 5 s after SIGTERM;
+    // the idle connector was still stopping its bridges, so no receipt came
+    // and the update waited out 90 s for one, then gave up.
+    const h = harness({ previous });
+    h.deps.readStopReceipt = async () => "prior-stop";
+    let pidAsked = 0;
+    h.deps.servicePid = async () => { pidAsked += 1; return 4242; };
+    h.deps.processAlive = pid => { expect(pid).toBe(4242); return false; };
+    h.deps.stopDeadlineMs = 90_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", to: "1.1.0" });
+    expect(pidAsked).toBe(1);
+    expect(h.calls.indexOf("commit")).toBeGreaterThan(h.calls.indexOf("stop"));
+  });
+  it("ends the old connector's processes when it outlives the stop grace, then goes on (D113b)", async () => {
+    const h = harness({ previous });
+    h.deps.readStopReceipt = async () => "prior-stop";
+    let alive = true;
+    const killed: number[] = [];
+    h.deps.servicePid = async () => 4242;
+    h.deps.processAlive = () => alive;
+    h.deps.killProcessGroup = async pid => { killed.push(pid); alive = false; };
+    h.deps.stopGraceMs = 5_000;
+    h.deps.stopDeadlineMs = 90_000;
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).resolves.toMatchObject({ state: "updated" });
+    expect(killed).toEqual([4242]);
+    expect(lines).toContain("The connector did not stop within 5 s; ending its processes.");
+  });
+  it("starts the unchanged release again and waits until it answers before returning, when the stop is never confirmed (D113b)", async () => {
+    const h = harness({ previous });
+    h.deps.readStopReceipt = async () => "prior-stop";
+    h.deps.stopDeadlineMs = 3_000;
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.calls.slice(-2)).toEqual(["start", "control:status@release-prev"]);
+    expect(lines).toContain("1.0.0 is running and answering again; nothing was changed.");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
+  });
+  it("starts the unchanged release again when the record cannot move after a confirmed stop, and says once it answers (D113b)", async () => {
+    const h = harness({ previous });
+    h.deps.commit = async () => { h.calls.push("commit"); throw new Error("disk full"); };
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).rejects.toThrow("disk full");
+    expect(h.calls.slice(-2)).toEqual(["start", "control:status@release-prev"]);
+    expect(h.calls.lastIndexOf("commit")).toBeLessThan(h.calls.lastIndexOf("start"));
+    expect(lines).toContain("1.0.0 is running and answering again; nothing was changed.");
+  });
 
   it("does not drain or restart when the service is not running", async () => {
     const h = harness({ previous, running: false });
@@ -605,6 +656,41 @@ describe("native update transaction", () => {
     rolledBack.deps.refreshLauncher = async (_root, record) => { refreshed.push(record.releaseId); };
     await runNativeUpdate({ root: "/root", output: rolledBack.output }, rolledBack.deps).catch(() => undefined);
     expect(refreshed).toEqual(["release-next"]);
+  });
+  it("keeps the person's konteks-remote on the running release once its update kept it, whichever launcher drove the update (D113b)", async () => {
+    // The owner's launcher was 0.8.0's: it has no refresh, so every update it
+    // drove (0.10.9, 0.10.10) ran 0.8.0's transaction. The release itself refreshes it.
+    const attempt = (outcome: string, startedAt = new Date(500_000).toISOString()) => ({ schemaVersion: 1 as const, attempts: [{ id: "u1", bundleVersion: "1.1.0", manifestDigest: "d", releaseId: "release-next", reason: "operator", startedAt, finishedAt: null, outcome: outcome as "in_progress", detail: null }] });
+    const refreshed: string[] = [];
+    let outcome = "in_progress", waits = 0;
+    const deps = {
+      execPath: "/root/releases/release-next/konteks-connector",
+      readRecord: async () => ({ ...previous, releaseId: "release-next" }),
+      readLedger: async () => attempt(outcome),
+      refresh: async (_root: string, record: NativeRuntimeRecord) => { refreshed.push(record.releaseId); return true; },
+      sleep: async () => { waits += 1; if (waits === 2) outcome = "applied"; },
+      now: () => 600_000,
+    };
+    await expect(keepLauncherCurrent("/root", deps)).resolves.toBe("refreshed");
+    expect(waits).toBe(2);
+    expect(refreshed).toEqual(["release-next"]);
+    // Rolled back (the record names another release), or a development serve: never replaced.
+    await expect(keepLauncherCurrent("/root", { ...deps, readLedger: async () => attempt("rolled_back"), readRecord: async () => previous })).resolves.toBe("skipped");
+    await expect(keepLauncherCurrent("/root", { ...deps, execPath: "/usr/local/bin/node" })).resolves.toBe("skipped");
+    // An attempt whose updater died is not waited for forever.
+    await expect(keepLauncherCurrent("/root", { ...deps, readLedger: async () => attempt("in_progress", new Date(0).toISOString()), now: () => 60 * 60_000 })).resolves.toBe("refreshed");
+    expect(refreshed).toHaveLength(2);
+  });
+  it("replaces konteks-remote only when it differs from the release's executable (D113b)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-launcher-refresh-")); roots.push(root);
+    await mkdir(join(root, "bin"), { recursive: true });
+    await mkdir(join(root, "releases", "release-next"), { recursive: true });
+    await writeFile(join(root, "bin", "konteks-remote"), "old launcher", { mode: 0o755 });
+    await writeFile(join(root, "releases", "release-next", "konteks-connector"), "new release", { mode: 0o755 });
+    const record = { ...previous, releaseId: "release-next" };
+    await expect(refreshInstalledLauncher(root, record)).resolves.toBe(true);
+    expect(await readFile(join(root, "bin", "konteks-remote"), "utf8")).toBe("new release");
+    await expect(refreshInstalledLauncher(root, record)).resolves.toBe(false);
   });
   it("reports a failed attempt when rollback itself refuses, preserving the previous record for the operator", async () => {
     const h = harness({ previous, gate: "new_failure", restoreFails: true });

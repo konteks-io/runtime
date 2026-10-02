@@ -70,6 +70,9 @@ describe("native background service definitions", () => {
     // The home it was started from, not the login's (09-30).
     expect(service.contents).toContain('<key>EnvironmentVariables</key><dict><key>HOME</key><string>/Users/Test User</string></dict>');
     expect(service.contents).not.toMatch(/Docker|docker|postgres|harness|validation-runtime|activationCode|TOKEN|PRIVATE KEY/);
+    // launchd SIGKILLs a booted-out job 5 s after SIGTERM unless told otherwise
+    // (D113b): the connector's own 15 s shutdown and exit watchdog need the room.
+    expect(service.contents).toContain('<key>ExitTimeOut</key><integer>30</integer>');
   });
 
   it("escapes XML paths rather than interpolating them as markup", () => {
