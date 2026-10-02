@@ -89,10 +89,10 @@ export function startDshKeyLogin(options: DshKeyLoginOptions): LoginFlow {
     clearTimeout(timer);
     resolveDone({ code });
   };
-  const timer = setTimeout(() => { display("The login timed out. Run it again when you have the key."); finish(1); }, options.timeoutMs ?? 15 * 60_000);
+  const timer = setTimeout(() => { display("The sign-in timed out. Try again when you have the key."); finish(1); }, options.timeoutMs ?? 15 * 60_000);
   timer.unref();
 
-  display("Paste your DeepSeek API key. Konteks checks it with DeepSeek and keeps it only on this machine.");
+  display("Paste your DeepSeek API key. Konteks checks it with DeepSeek and keeps it only on this computer.");
   ask();
   return {
     loginId,
@@ -103,25 +103,27 @@ export function startDshKeyLogin(options: DshKeyLoginOptions): LoginFlow {
       if (!KEY_SHAPE.test(key)) { display("That does not look like an API key. Paste the key from platform.deepseek.com, or press Ctrl+C to stop."); ask(); return; }
       busy = true;
       attempts += 1;
+      // The check takes a moment: say so, so the window is never silent.
+      // Success itself is said once, by the CLI ("DeepSeek Harness is ready.").
+      display("Checking the key with DeepSeek…");
       void verify(key).then(async verdict => {
         if (finished) return;
         if (verdict === "valid") {
           await writeDshApiKey(options.credentialsFile, key);
           options.logger?.info({ event: "dsh.key.saved" }, "DeepSeek API key saved");
-          display("Key saved.");
           finish(0);
         } else if (verdict === "unreachable") {
-          display("Konteks could not reach DeepSeek to check the key. Check the connection, then run the login again.");
+          display("Konteks could not reach DeepSeek. Check your connection and try again.");
           finish(1);
         } else if (attempts >= maxAttempts) {
-          display("DeepSeek did not accept the key. Run the login again with a key from platform.deepseek.com.");
+          display("DeepSeek did not accept the key. Try again with a key from platform.deepseek.com.");
           finish(1);
         } else {
           display("DeepSeek did not accept that key. Paste it again, or press Ctrl+C to stop.");
           ask();
         }
       }).catch(() => {
-        display("The key could not be saved on this machine. Run the login again.");
+        display("The key could not be saved on this computer. Try again.");
         finish(1);
       }).finally(() => { busy = false; });
     },
