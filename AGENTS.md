@@ -197,7 +197,10 @@ v4 loads the account connectors with NO setting sources, so no repository
 `.mcp.json` server starts, hooks off), one prompt built locally from the
 spec (`prompt.ts`), and `IntegrationToolGate` (`tool-gate.ts`) as the whole
 permission policy: structured identity only, only `admittedTools` up to
-`limits.maxToolCalls`, a write only with the approved canonical arguments
+`limits.maxToolCalls`, a read's fixed `requiredArgs` present and equal
+(`required_args_mismatch`; the prompt names them), the generic `executeRead`
+only with its operation pinned and `executeWrite`/`executeDestructive` never,
+a write only with the approved canonical arguments
 and once per nonce (recorded in the journal's `integration-writes` table
 BEFORE the `allow_once`; a repeated callback for the same call is the same
 grant), every other tool denied without deferral, `allow_once` only, the

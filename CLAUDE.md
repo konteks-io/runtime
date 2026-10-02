@@ -32,8 +32,10 @@ Integration tasks (external-integration CP2, `packages/supervisor/src/integratio
 model-free discovery behind an allowlist, a confirmed official setup (add, sign-in or
 remove) from the reviewed catalogue only, and one gated ACP session per probe/read/
 verify/write task whose `IntegrationToolGate` admits only the spec's tools
-(a write only with its approved arguments, once per nonce, journaled before
-the answer); the bound source is admitted for that session only through
+(a read with `requiredArgs` only with each fixed argument present and equal,
+the generic `executeRead` only with its operation pinned and
+`executeWrite`/`executeDestructive` never; a write only with its approved
+arguments, once per nonce, journaled before the answer); the bound source is admitted for that session only through
 `_meta.konteksIntegration` (Codex bridge v8, Claude bridge v4 with no setting
 sources); `fixture_mcp` only under `KONTEKS_E2E_NATIVE_CONNECTOR=1` (see AGENTS.md). Host-installed
 agents go through per-agent host adapters (Google Antigravity is the first
