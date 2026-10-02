@@ -71,6 +71,17 @@ The bootstrap verifies the signed checksum manifest and the publisher
 signature of the installer package before running anything. Signed packages
 are also published as plain release assets for offline or audited installs.
 
+Both bootstraps pin the Konteks release key (Ed25519) in the script itself;
+it is never taken from the download location, and the release job refuses to
+publish a release signed by any other key. On Windows the MSI is not yet
+Authenticode-signed (Konteks has no Windows code-signing certificate), so
+`install.ps1` trusts it through the signed checksums alone: it verifies the
+Ed25519 signature on `SHA256SUMS` itself, in plain Windows PowerShell 5.1,
+checks the MSI's SHA-256 against it, and installs nothing if either fails.
+Windows then shows "Unknown publisher" at the elevation prompt. A release
+that does carry an Authenticode signature must also be valid and from the
+expected publisher.
+
 Supported platforms: macOS 13+ (Apple silicon and Intel), Windows 10/11
 (x64), Debian 12/13 (amd64, arm64).
 
