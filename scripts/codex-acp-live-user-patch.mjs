@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 // Build-time compatibility change only. Never mutate an installed signed artifact.
 // Reuse upstream's history conversion; do not reconstruct or read local files.
 export const codexAcpLiveUserPatch = {
-  id: "konteks-codex-acp-live-user-v6",
+  id: "konteks-codex-acp-live-user-v7",
   package: "@agentclientprotocol/codex-acp",
   version: "1.10.0",
   upstreamSha256: "4602784c5896fbf05a7d89b09655bacc768d0bf281e0d03a10333ff81da45268",
@@ -40,6 +40,12 @@ export async function reconcileCodexToolTerminals(turn, openByTurn, emit) {
   }
 }
 
+export function patchCodexAcpMcpServerResumeFilter(source) {
+  const before = "serversToConfigure = requestedServers.filter((mcp) => !existingNames.has(mcp.name));";
+  if (source.split(before).length !== 2) throw new Error("Codex ACP compatibility anchor is not unique");
+  return source.replace(before, "serversToConfigure = requestedServers.filter((mcp) => !existingNames.has(mcp.name) || /^konteks-[0-9a-f]{16}$/.test(mcp.name));");
+}
+
 export function patchCodexAcpLiveUsers(source, version) {
   if (
     version !== codexAcpLiveUserPatch.version ||
@@ -54,6 +60,9 @@ export function patchCodexAcpLiveUsers(source, version) {
       throw new Error("Codex ACP compatibility anchor is not unique");
     source = source.replace(before, after);
   };
+  const mcpResumeFilter =
+    "serversToConfigure = requestedServers.filter((mcp) => !existingNames.has(mcp.name));";
+  replaceOnce(mcpResumeFilter, patchCodexAcpMcpServerResumeFilter(mcpResumeFilter));
   replaceOnce(
     "var CodexEventHandler = class _CodexEventHandler {",
     `${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,

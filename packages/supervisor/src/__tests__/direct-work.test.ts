@@ -14,6 +14,8 @@ const direct = RemoteWorkAssignmentSchema.parse({ ...base, kind: "direct",
   source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "inst", sessionId: "direct-1", turnRef: "t2", acpSessionRef: "acp-1" } });
 const conversation = RemoteWorkAssignmentSchema.parse({ ...base, kind: "assistant_execution",
   source: { kind: "conversation", portability: "portable_before_claim", sessionId: "conv-1", turnRef: "t1" } });
+const operations = RemoteWorkAssignmentSchema.parse({ ...base, kind: "operations", agentRoute: { requiredRole: "ops", agentId: "codex" },
+  source: { kind: "conversation", portability: "portable_before_claim", sessionId: "ops-1", turnRef: "ops-turn" } });
 
 describe("direct work on the connector (runtime-view R11)", () => {
   it("continues its session like a conversation, but is told apart from one", () => {
@@ -24,6 +26,8 @@ describe("direct work on the connector (runtime-view R11)", () => {
     // One prompt per assignment, admitted by Core's permits, closed at its turn's end.
     expect(isNativeTurn(direct)).toBe(true);
     expect(isNativeTurn(conversation)).toBe(true);
+    expect(continuedSession(operations.source)).toMatchObject({ sessionId: "ops-1", turnRef: "ops-turn" });
+    expect(isNativeTurn(operations)).toBe(true);
     expect(isNativeTurn({ kind: "planning", source: { kind: "planning_intake" } } as unknown as RemoteWorkAssignment)).toBe(false);
   });
 

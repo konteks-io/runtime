@@ -26,5 +26,5 @@ export function isDirectAssignment(assignment: Pick<RemoteWorkAssignment, "kind"
  * direct session prompt, or a native delivery turn.
  */
 export function isNativeTurn(assignment: Pick<RemoteWorkAssignment, "kind" | "source">): boolean {
-  return assignment.kind === "assistant_execution" || isDirectWorkKind(assignment.kind) || assignment.source.kind === "harness_delivery";
+  return assignment.kind === "assistant_execution" || assignment.kind === "operations" || isDirectWorkKind(assignment.kind) || assignment.source.kind === "harness_delivery";
 }

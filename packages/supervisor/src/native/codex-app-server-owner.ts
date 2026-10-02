@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, realpath, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { promisify } from "node:util";
 import { dirname, isAbsolute, join } from "node:path";
+import { z } from "zod";
 import {
   RemoteInstanceError,
   isProcessGroupAlive,
@@ -17,6 +18,7 @@ import {
   verifyNativeRunnerPackage,
   assertCodexThreadsIdle,
   codexLoadedThreadStatuses,
+  FileSessionRefStore,
   resolveCodexSocket,
   type RunnerConfig,
 } from "@konteks/remote-agent-runner";
@@ -138,7 +140,11 @@ export class NativeCodexAppServerOwner {
     const before = await stat(socket);
     const pid = this.child?.pid ?? this.adoptedHolder?.pid;
     if (!before.isSocket() || !pid) throw unavailable("The shared Codex owner identity is unavailable.");
-    const unloaded = !(await codexLoadedThreadStatuses(socket)).has(reference);
+    const providerThreadId = z.string().uuid().safeParse(
+      await new FileSessionRefStore(join(this.options.config.RUNNER_CREDENTIAL_DIR, "session-refs.json")).get(reference),
+    );
+    if (!providerThreadId.success) throw unavailable("The legacy Codex session reference could not be verified.");
+    const unloaded = !(await codexLoadedThreadStatuses(socket)).has(providerThreadId.data);
     const after = await stat(socket);
     if (before.dev !== after.dev || before.ino !== after.ino || before.birthtimeMs !== after.birthtimeMs ||
         pid !== (this.child?.pid ?? this.adoptedHolder?.pid)) throw unavailable("The shared Codex owner changed during legacy admission.");

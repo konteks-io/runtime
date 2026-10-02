@@ -154,6 +154,16 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.readActivationCode).not.toHaveBeenCalled();
   });
 
+  it("rejects a wire-level generic Linux target outside this build release matrix", async () => {
+    const f = fixture();
+    const dataDir = join(dir, "linux-host");
+    await expect(runNativeActivationExchange({ ...f.args, dataDir, platform: { ...platform, os: "linux" } as never }))
+      .rejects.toMatchObject({ code: "registration_mismatch" });
+    expect(await readdir(dir)).toEqual([]);
+    expect(f.args.readActivationCode).not.toHaveBeenCalled();
+    expect(f.args.fetchFn).not.toHaveBeenCalled();
+  });
+
   it("does not extend an expired provisioning window on install resume", async () => {
     const f = fixture();
     await runNativeActivationExchange(f.args);

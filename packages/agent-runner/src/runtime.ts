@@ -103,7 +103,7 @@ function sameRetainedOwner(a: RetainedProcessOwner, b: RetainedProcessOwner): bo
     a.startToken === b.startToken && a.commandDigest === b.commandDigest;
 }
 
-class FileSessionRefStore implements SessionRefStore {
+export class FileSessionRefStore implements SessionRefStore {
   private writes: Promise<void> = Promise.resolve();
   constructor(private readonly path: string) {}
 

@@ -1,4 +1,5 @@
-import type { ConnectedAgentView, RuntimeRole, RuntimeUtilization } from "@konteks/remote-common";
+import { coreContractAtLeast, REMOTE_EXECUTION_PERMITS_CAPABILITY, type ConnectedAgentView, type RuntimeRole, type RuntimeUtilization } from "@konteks/remote-common";
+import type { InventorySnapshot } from "./snapshot.js";
 
 /**
  * Role advertisement is computed from `roleBindings` and READY agents' ACP
@@ -26,6 +27,17 @@ export interface RoleCapabilityInputs {
    * neither onboard capability and Core reports it ineligible for both kinds.
    */
   gitVersion?: string | null;
+  /** Core's signed configuration and this inventory's execution carrier proof. */
+  operationsCarrierReady?: boolean;
+}
+
+/** Operations work is native execution, so a role name or agent binding alone
+ * is not enough: Core must contract for it and inventory must prove the
+ * healthy, permit-capable agent_runner that carries signed native permits. */
+export function operationsCarrierReady(snapshot: Pick<InventorySnapshot, "components">, coreContractVersion: string | null | undefined): boolean {
+  return coreContractAtLeast(coreContractVersion ?? undefined, "7.2") && snapshot.components.some(component =>
+    component.kind === "agent_runner" && component.healthStatus === "healthy"
+      && component.capabilities.includes(REMOTE_EXECUTION_PERMITS_CAPABILITY));
 }
 
 export function agentSatisfiesRole(agent: ConnectedAgentView, role: RuntimeRole, inputs: RoleCapabilityInputs): boolean {
@@ -41,8 +53,7 @@ export function agentSatisfiesRole(agent: ConnectedAgentView, role: RuntimeRole,
       // Code validation and adversarial review require only the ready ACP agent.
       return true;
     case "ops":
-      // The shared vocabulary is not proof of an installed operations carrier.
-      return false;
+      return inputs.operationsCarrierReady === true;
     case "onboard":
       // Evidence collection and relocation are git work. A ready agent alone
       // is not enough, and an absent probe is not a licence to claim it.
