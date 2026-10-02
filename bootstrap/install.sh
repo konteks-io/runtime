@@ -14,9 +14,9 @@
 # release's connector executables (and of the release signing key file) into
 # the copy of install.sh it publishes with the same immutable release, so a
 # script fetched from a tag installs only that tag's bytes. The Ed25519
-# signature over SHA256SUMS is verified as well wherever `openssl` can speak
-# Ed25519; macOS ships LibreSSL, which cannot, and a check that cannot run is
-# reported rather than faked. Once installed, the connector verifies the
+# signature over SHA256SUMS is verified as well, with the release key pinned
+# in this script, wherever `openssl` can speak Ed25519; macOS ships LibreSSL,
+# which cannot, and a check that cannot run is reported rather than faked. Once installed, the connector verifies the
 # Ed25519-signed native manifest with its own embedded roots before it stages
 # anything — that, not the bootstrap, is the trust root for everything after.
 # When publisher packaging signatures exist, the package path keeps demanding
@@ -40,6 +40,9 @@ EXPECTED_DEB_FINGERPRINT="${KONTEKS_DEB_KEY_FINGERPRINT:-00000000000000000000000
 # repository copy, which then falls back to the fetched SHA256SUMS.
 BAKED_EXECUTABLE_SUMS=""
 BAKED_RELEASE_PUBKEY_SHA256=""
+# The Konteks release key (Ed25519, SubjectPublicKeyInfo, base64), the same key
+# install.ps1 pins. Rotating it is a change to both scripts.
+PINNED_RELEASE_PUBKEY="MCowBQYDK2VwAyEA2gqrOjaUrsIxyVlXNJHhTFjQUqy4o1SsqhrovPecU64="
 
 activation_id=""
 user_install=0
@@ -92,18 +95,22 @@ fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1"; }
 echo "konteks-remote bootstrap v${BOOTSTRAP_VERSION}: fetching the signed checksum manifest"
 fetch "${RELEASE_BASE}/SHA256SUMS" "$workdir/SHA256SUMS"
 fetch "${RELEASE_BASE}/SHA256SUMS.sig" "$workdir/SHA256SUMS.sig"
-fetch "${RELEASE_BASE}/release-signing.pub" "$workdir/release-signing.pub"
 
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
 
-# The release signing key file is pinned by its digest: baked into this script
-# by the release job, or given explicitly. A swapped key fails before anything
-# it signed is believed.
+# The release signing key is pinned in this script, never taken from where the
+# manifest comes from. Only a channel signed by its own key (the local release
+# channel) names another, by the digest of its key file, baked into its copy of
+# this script or given explicitly; that key is fetched and must match.
+printf '%s\n%s\n%s\n' '-----BEGIN PUBLIC KEY-----' "$PINNED_RELEASE_PUBKEY" '-----END PUBLIC KEY-----' > "$workdir/release-signing.pub"
 expected_pub="${KONTEKS_RELEASE_PUBKEY_SHA256:-$BAKED_RELEASE_PUBKEY_SHA256}"
 if [ -n "$expected_pub" ] && [ "$(sha256_of "$workdir/release-signing.pub")" != "$expected_pub" ]; then
-  echo "error: release signing key digest mismatch; refusing to install" >&2; exit 4
+  fetch "${RELEASE_BASE}/release-signing.pub" "$workdir/release-signing.pub"
+  if [ "$(sha256_of "$workdir/release-signing.pub")" != "$expected_pub" ]; then
+    echo "error: release signing key digest mismatch; refusing to install" >&2; exit 4
+  fi
 fi
 # The checksum manifest is Ed25519-signed by that key. Verify it wherever the
 # local openssl can; LibreSSL (macOS) cannot load an Ed25519 key at all, and
