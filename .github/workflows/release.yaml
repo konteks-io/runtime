@@ -46,6 +46,7 @@ jobs:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
           MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
           WINDOWS_AUTHENTICODE_PFX: ${{ secrets.WINDOWS_AUTHENTICODE_PFX }}
+          WINDOWS_AUTHENTICODE_PASSWORD: ${{ secrets.WINDOWS_AUTHENTICODE_PASSWORD }}
           DEB_SIGNING_KEY: ${{ secrets.DEB_SIGNING_KEY }}
         run: |
           test -n "$KONTEKS_RELEASE_ROOTS_JSON" || { echo "KONTEKS_RELEASE_ROOTS_JSON variable is required: a connector without embedded roots verifies nothing"; exit 1; }

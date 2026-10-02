@@ -11,7 +11,8 @@
  * bootstrap verification (bootstrap/install.sh, install.ps1) stays in sync.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) => (value.startsWith("--") ? [value.slice(2), all[index + 1]] : [])).filter((pair) => pair.length === 2));
@@ -45,8 +46,17 @@ switch (args.os ?? layout.os) {
     break;
   }
   case "windows": {
-    const pfx = process.env.WINDOWS_AUTHENTICODE_PFX;
-    const signtool = (file) => run("signtool", ["sign", "/fd", "SHA256", "/tr", "http://timestamp.digicert.com", "/td", "SHA256", "/f", pfx, file]);
+    // A GitHub secret is the certificate's content, not a path on the runner:
+    // accept a path or base64 PFX bytes, and its password when it has one.
+    const pfxSecret = process.env.WINDOWS_AUTHENTICODE_PFX;
+    let pfx = pfxSecret;
+    if (pfxSecret && !existsSync(pfxSecret)) {
+      pfx = join(tmpdir(), `konteks-authenticode-${process.pid}.pfx`);
+      writeFileSync(pfx, Buffer.from(pfxSecret.replace(/\s+/g, ""), "base64"), { mode: 0o600 });
+      process.on("exit", () => rmSync(pfx, { force: true }));
+    }
+    const password = process.env.WINDOWS_AUTHENTICODE_PASSWORD;
+    const signtool = (file) => run("signtool", ["sign", "/fd", "SHA256", "/tr", "http://timestamp.digicert.com", "/td", "SHA256", "/f", pfx, ...(password ? ["/p", password] : []), file]);
     if (pfx) signtool(layout.executable);
     const wix = process.env.WIX ? join(process.env.WIX, "bin") : null;
     const tool = (name) => (wix ? join(wix, `${name}.exe`) : name);
