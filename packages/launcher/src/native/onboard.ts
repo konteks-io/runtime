@@ -1443,6 +1443,8 @@ export async function runOnboardStep(context: OnboardContext): Promise<OnboardSt
       const remedies: string[] = [];
       for (const family of ["claude-code", "codex"]) {
         if (notLoggedIn.includes(family)) remedies.push(`${agentName(family)} needs you to sign in here: konteks-remote auth login ${family}`);
+        // Not here at all: `agent add` installs or sets it up and signs it in (D116); there is nothing yet for `auth login` to sign in.
+        else if (!installed.includes(family)) remedies.push(`To also run ${agentName(family)} work here: konteks-remote agent add ${family}`);
         else if (!present.includes(family)) remedies.push(`To also run ${agentName(family)} work here: konteks-remote auth login ${family}`);
       }
       // DeepSeek Harness and OpenCode are named only when they are here: nobody is told to install them.

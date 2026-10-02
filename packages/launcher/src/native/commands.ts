@@ -11,6 +11,7 @@ import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyLis
 import { SupervisorControl } from "../control.js";
 import { addNativeAgent, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { terminalFetchConsent, type FetchConsent } from "./consent.js";
+import { closeAgentSetup, ensurePersonalAgent, isPersonalAgent, PERSONAL_AGENTS, productionAgentClosingDeps, setUpPersonalAgent } from "./agent-setup.js";
 import { confirm } from "../prompt.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
@@ -115,6 +116,22 @@ export async function keepServiceOnOwnDefinition(root: string, deps: OwnServiceD
     if (await deps.execute(command) !== 0) throw new Error(`${command.command} ${command.args.join(" ")} exited unsuccessfully`);
   }
   return "restarting";
+}
+
+/**
+ * End the service's own process group when its graceful stop did not finish
+ * (a rollback must still restore and start the previous release). The pid is
+ * the one the service manager runs; nothing where it names none.
+ */
+async function forceStopService(definition: NativeServiceDefinition): Promise<void> {
+  if (!definition.inspect || !definition.expected) return;
+  const result = await runCommand({ ...definition.inspect, env: environment(), timeoutMs: 10_000 }).catch(() => null);
+  const loaded = result?.code === 0 ? parseLoadedService(nativePlatform().os, result.stdout, definition.expected) : null;
+  if (!loaded?.pid) return;
+  try { process.kill(-loaded.pid, "SIGKILL"); }
+  catch {
+    try { process.kill(loaded.pid, "SIGKILL"); } catch { /* already gone */ }
+  }
 }
 
 async function detachServiceCommand(command: NativeServiceCommand, logFile: string): Promise<void> {
@@ -358,6 +375,10 @@ interface NativeAgentAddDeps {
   platform: ReturnType<typeof nativePlatform>;
   stopDeadlineMs?: number;
   pollMs?: number;
+  /** Claude Code or Codex found here, or set up now on the person's yes (D116), before anything is stopped. */
+  ensurePersonal?: typeof ensurePersonalAgent;
+  /** After the restart: sign the agent in and say whether it is ready (D116). */
+  closeAgents?: (input: Parameters<typeof closeAgentSetup>[0]) => Promise<void>;
 }
 
 const productionAgentAddDeps: NativeAgentAddDeps = {
@@ -399,6 +420,8 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
   // before anything stops: the retry stopped the connector, then refused the
   // version and left it stopped (W1-D3).
   else if (host && deps.locate) await deps.locate(host, input.root);
+  // Claude Code or Codex not here yet: offered and set up first (D116); a no stops nothing.
+  const setUp = !listed && isPersonalAgent(input.agent) && await (deps.ensurePersonal ?? ensurePersonalAgent)(input.agent, input.output) === "set_up";
   const definition = await deps.serviceDefinition(input.root);
   const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
   const initialStatus = await deps.execute(definition.status);
@@ -464,6 +487,10 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       }
     }
     if (wasRunning) await deps.start(input);
+    if (wasRunning && isPersonalAgent(input.agent)) {
+      const close = deps.closeAgents ?? (closing => closeAgentSetup(closing, productionAgentClosingDeps(input.root, input.output, agent => nativeCliActions.control({ ...input, operation: "auth.login", agent }))));
+      await close({ agents: [input.agent], signInNow: setUp ? [input.agent] : [], missing: [], output: input.output });
+    }
     // Its terminal is not this one, so it is not started again here.
     if (foreground) input.output.line(`${findAgentBridge(input.agent)?.displayName ?? input.agent} is added. Konteks stopped to add it; konteks-remote start starts it again, in the background.`);
     input.output.result({ instanceId: successor.instanceId, agents: successor.agents, state: "installed" });
@@ -624,8 +651,16 @@ export const nativeCliActions: NativeCliActions = {
     }
     // A fetched agent in --agents (Google Antigravity) asks its consent line in this terminal before anything is activated.
     const consent = terminalFetchConsent({ line: text => input.output.line(text) });
-    const record = await installNative({ ...input, activationId: input.activationId!, deps: { consent } });
+    // Without --agents, a missing Claude Code or Codex is offered before the code is asked (D116).
+    const setUp: string[] = [];
+    const setupAgent = async (agent: "claude-code" | "codex") => { const done = await setUpPersonalAgent(agent, input.output); if (done) setUp.push(agent); return done; };
+    const record = await installNative({ ...input, activationId: input.activationId!, deps: { consent, ...(input.agents === undefined ? { setupAgent } : {}) } });
     await startNativeConnector(input);
+    // Sign in what was just set up, then say plainly what is ready and the one command for the rest.
+    await closeAgentSetup(
+      { agents: record.agents, signInNow: setUp, missing: input.agents === undefined ? PERSONAL_AGENTS.filter(agent => !record.agents.includes(agent)) : [], output: input.output },
+      productionAgentClosingDeps(input.root, input.output, agent => nativeCliActions.control({ ...input, operation: "auth.login", agent })),
+    );
     input.output.result({ instanceId: record.instanceId, deploymentKind: record.deploymentKind, state: "installed" });
   },
   stageEnrollment: async input => {
@@ -713,7 +748,7 @@ export const nativeCliActions: NativeCliActions = {
       const selfUpdated = check?.status === "current" ? selfUpdateNote(attempts, check.bundleVersion) : null;
       if (selfUpdated) input.output.line(selfUpdated);
     }
-    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits }));
+    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits, forceStop: forceStopService }));
   },
   uninstall: async input => {
     const result = await uninstallNative(input, productionUninstallDeps({ root: input.root, serviceDefinition, execute }));

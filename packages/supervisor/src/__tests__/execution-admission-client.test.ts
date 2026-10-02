@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { FixedClock, jcsDigest, generateInstanceKey, verifyInstanceProof, remoteExecutionInstanceProofSubject } from "@konteks/remote-common";
-import { CoreClient, CORE_AUDIENCE } from "../core/client.js";
+import { CoreClient, CORE_AUDIENCE, SIGNING_KEY_STALE_MAX_MS } from "../core/client.js";
 
 function fixture(response: object) {
   const key = generateInstanceKey();
@@ -140,6 +140,55 @@ describe("native execution admission HTTPS proofs", () => {
     expect(results.every(keys => keys.has("rotated"))).toBe(true);
     await client.executionSigningKeys(undefined, "another-unknown-kid");
     expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("serves the last confirmed keys while Core's key endpoint times out, backing off between refreshes (D110)", async () => {
+    const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const key = { ...pair.publicKey.export({ format: "jwk" }), kid: "core", alg: "RS256", use: "sig" };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: vi.fn() };
+      const ok = () => new Response(JSON.stringify({ keys: [key] }), { status: 200 });
+      const fetchFn = vi.fn(async (_input: string | URL, _init?: RequestInit) => ok());
+      const client = new CoreClient({ baseUrl: "https://core.example", clock: new FixedClock(Date.parse("2026-09-10T00:00:00Z")),
+        key: () => generateInstanceKey(), credential: () => "test-native-lease", fetchFn, logger } as never);
+      await client.executionSigningKeys();
+      fetchFn.mockImplementation(async () => { throw Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" }); });
+
+      now.mockReturnValue(61_000);
+      expect((await client.executionSigningKeys()).get("core")?.type).toBe("public");
+      const failedFetches = fetchFn.mock.calls.length;
+      // Inside the backoff window the stale keys answer at once, without a wait on Core.
+      now.mockReturnValue(61_500);
+      expect((await client.executionSigningKeys()).get("core")?.type).toBe("public");
+      expect(fetchFn.mock.calls.length).toBe(failedFetches);
+      const refreshFailures = logger.warn.mock.calls.map(call => call[0]).filter(entry => entry.event === "execution.signing_keys_refresh_failed");
+      expect(refreshFailures[0]).toMatchObject({ failures: 1, retryInMs: expect.any(Number), servingConfirmedKeys: true });
+      // An unknown key never comes from the stale set.
+      await expect(client.executionSigningKeys(undefined, "rotated")).rejects.toMatchObject({ code: "execution_authority_unavailable" });
+
+      fetchFn.mockImplementation(async () => ok());
+      now.mockReturnValue(200_000);
+      await client.executionSigningKeys();
+      expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: "execution.signing_keys_recovered" }), expect.any(String));
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("does not trust a key set older than the stale bound when Core cannot be reached", async () => {
+    const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const key = { ...pair.publicKey.export({ format: "jwk" }), kid: "core", alg: "RS256", use: "sig" };
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      const f = fixture({ keys: [key] });
+      await f.client.executionSigningKeys();
+      f.fetchFn.mockImplementation(async () => { throw new TypeError("fetch failed"); });
+      now.mockReturnValue(1_000 + SIGNING_KEY_STALE_MAX_MS + 1);
+      await expect(f.client.executionSigningKeys()).rejects.toMatchObject({ code: "execution_authority_unavailable" });
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("refreshes configured-origin signing keys after the 60-second cache bound", async () => {

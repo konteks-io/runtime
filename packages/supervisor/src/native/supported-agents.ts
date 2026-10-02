@@ -1,7 +1,7 @@
 import { RemoteInstanceError, SupportedAgentEntrySchema, SupportedAgentListSchema, type ConnectedAgentView, type SupportedAgentEntry, type SupportedAgentState } from "@konteks/remote-common";
 import { hostAgentFamily, type HostAgentFamily } from "@konteks/remote-release";
 import { antigravityPin } from "./antigravity-installation.js";
-import { resolveNativeClaudeExecutable } from "./claude-executable.js";
+import { claudeCodeInstaller, resolveNativeClaudeExecutable } from "./claude-executable.js";
 import { resolveNativeCodexHome } from "./codex-home.js";
 import { resolveNativeDshInstallation } from "./dsh-installation.js";
 import { resolveNativeOpenCodeInstallation } from "./opencode-installation.js";
@@ -21,7 +21,7 @@ export type SupportedAgentId = (typeof SUPPORTED_AGENT_IDS)[number];
  * person's own). The official installers, one line each.
  */
 const BUNDLED_AGENT_INSTALL: Record<"claude-code" | "codex", { installCommand: string; windowsInstallCommand?: string }> = {
-  "claude-code": { installCommand: "curl -fsSL https://claude.ai/install.sh | bash", windowsInstallCommand: "irm https://claude.ai/install.ps1 | iex" },
+  "claude-code": { installCommand: claudeCodeInstaller("linux").command, windowsInstallCommand: claudeCodeInstaller("win32").command },
   codex: { installCommand: "npm install -g @openai/codex" },
 };
 

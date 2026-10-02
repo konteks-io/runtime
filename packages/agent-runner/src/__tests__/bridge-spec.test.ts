@@ -45,6 +45,27 @@ describe("bridge spawn spec", () => {
     expect(() => bridgeEnvironment(native, findAgentBridge("codex")!)).toThrow(/native personal Claude/);
     expect(() => bridgeEnvironment({ ...native, RUNNER_NATIVE_CLAUDE_EXECUTABLE: "claude" }, family)).toThrow(/native personal Claude/);
   });
+  it("points Claude Code on Windows at Git Bash with CLAUDE_CODE_GIT_BASH_PATH, from the connector's own environment (D116)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "git-bash-"));
+    try {
+      const bash = join(dir, "bash.exe");
+      await writeFile(bash, "");
+      vi.stubEnv("CLAUDE_CODE_GIT_BASH_PATH", bash);
+      const family = findAgentBridge("claude-code")!;
+      const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "claude-code" });
+      const windows = { ...config, RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture("windows", "amd64", "claude-code").profile, RUNNER_NATIVE_CLAUDE_EXECUTABLE: "/operator/.local/bin/claude.exe" };
+      expect(bridgeEnvironment(windows, family).CLAUDE_CODE_GIT_BASH_PATH).toBe(bash);
+      // Not on macOS or Linux, which have their own shell.
+      const mac = { ...windows, RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture("macos", "arm64", "claude-code").profile };
+      expect(bridgeEnvironment(mac, family).CLAUDE_CODE_GIT_BASH_PATH).toBeUndefined();
+      // No Git Bash found: nothing is set, and Claude Code says what it needs itself.
+      vi.stubEnv("CLAUDE_CODE_GIT_BASH_PATH", join(dir, "missing.exe"));
+      vi.stubEnv("PATH", "");
+      vi.stubEnv("ProgramFiles", join(dir, "none"));
+      vi.stubEnv("LOCALAPPDATA", join(dir, "none"));
+      expect(bridgeEnvironment(windows, family).CLAUDE_CODE_GIT_BASH_PATH).toBeUndefined();
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   it("selects only a signed native Codex proxy for a locally bound socket", () => {
     const profile = offlineFixture().profile;
     const config = { ...RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "codex" }), RUNNER_NATIVE_PACKAGE_PROFILE: { ...profile, codexLocalProxy: { version: 1 as const, entrypoint: "konteks/proxy.js" } }, RUNNER_NATIVE_CODEX_HOME: "/operator/.codex", RUNNER_NATIVE_CODEX_SOCKET: "/operator/.codex/private/control.sock" };

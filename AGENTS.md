@@ -280,6 +280,28 @@ disk, no pin for this computer). The relay honours `HTTPS_PROXY`/`ALL_PROXY`
 and `NO_PROXY` for Google (`openHttpsProxyTunnel`, remote-common
 `https-proxy.ts`, shared with the download).
 
+Activation install without `--agents` (D116, `native/install.ts`
+`findOrOfferAgents`, launcher `native/agent-setup.ts`): agents are detected
+like enrollment (`detectNativeAgents`) and none is required; a missing Claude
+Code or Codex is offered before the code prompt (`setupAgent`), Claude Code
+only through `claudeCodeInstaller` (Anthropic's `install.ps1`/`install.sh`,
+run in the person's terminal), Codex by creating its profile folder for the
+shipped CLI; no TTY or `--json` never asks or downloads. After `start`,
+`closeAgentSetup` runs `auth login` for what was set up, offers it once for a
+found agent without a sign-in, and prints which agents are ready and one
+command for each other. `agent add claude-code|codex` does the same through
+`ensurePersonalAgent` before stopping anything, and adds from the installed
+release itself when it is the same digest (no newer release needed). An
+explicit `--agents` list stays strict. A record with no agents loads and
+starts (`verifyInstalledNativeBridges` accepts an empty runner list). On
+Windows, a yes to Claude Code without Git for Windows (remote-common
+`findGitForWindows`: `CLAUDE_CODE_GIT_BASH_PATH`, git.exe on PATH,
+`%ProgramFiles%\Git`, `%LOCALAPPDATA%\Programs\Git`) asks once to run
+`winget install --id Git.Git -e --source winget`; a no, no winget or a failure
+is one line with git-scm.com's download page. The Claude bridge gets
+`CLAUDE_CODE_GIT_BASH_PATH` from the same lookup at every spawn, and the
+install records that git.exe when PATH does not have it yet.
+
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never
 get a branch of their own in generic code. Each has a runner-side
@@ -610,6 +632,19 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
   `KONTEKS_RELEASE_MANIFEST_URL` override warns, no lease warns that updates
   wait), and `status` shows it through the separate `update.channel` op (never
   a new status field: older launchers parse `status` strictly).
+- A native turn survives Core being slow or unreachable (D110,
+  `native/execution-gate.ts`). An unanswered execution-lease renewal retries
+  with backoff (1 s doubling to 30 s, no attempt cap) and the running agent
+  keeps going; once the lease has lapsed only new dispatch waits for Core's
+  next fresh check. The agent stops only when Core answers (`execution_fenced`,
+  a denial, a durable revision fence), never on a timeout; a check lease that
+  expired in transit is asked for again. `CoreClient.executionSigningKeys`
+  serves the last key set Core confirmed (up to `SIGNING_KEY_STALE_MAX_MS`,
+  never for an unknown key id) while its key endpoint fails, backing off
+  between refreshes, and admission retries its keys while the permit is
+  valid instead of dropping the relay socket. Each decision logs one line
+  (`execution.renewal_retry_scheduled`, `execution.signing_keys_refresh_failed`,
+  `execution.admission_keys_unavailable`).
 
 Before production changes, add or update a focused characterization test and
 observe its failure or baseline. Run focused tests serially; do not start

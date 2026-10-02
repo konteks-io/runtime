@@ -1,6 +1,7 @@
 import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import type { PolicyEvaluator } from "@konteks/agent-core";
 import { browserToolFromTitle, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
+import type { PolicyRefusal, WorkspaceToolPolicyEvaluation } from "./workspace-tool-policy.js";
 
 /**
  * The ACP policy responder (D87 step 1): a permission request or elicitation
@@ -10,10 +11,21 @@ import { browserToolFromTitle, isDeniedBrowserTool } from "@konteks/remote-agent
  * Sign-in elicitations are never remotely answerable (D102) and always fail
  * closed in headless execution.
  */
-export type PolicyDecision = { kind: "allow"; optionId: string } | { kind: "deny"; optionId: string | null } | { kind: "defer" };
+/**
+ * A deny carries why (T1, 2026-10-02: two "Edit files" refusals ended a repair
+ * turn and nothing said which path was wrong): `message` is the note for the
+ * agent and Konteks, `refusal` the detail the connector logs.
+ */
+export type PolicyDecision =
+  | { kind: "allow"; optionId: string }
+  | { kind: "deny"; optionId: string | null; message?: string; refusal?: PolicyRefusal }
+  | { kind: "defer" };
 
-/** `browserTools`: this session was given the QA browser (its gateway admits only the session's preview). */
-export interface PermissionContext { assignmentId: string; agentId: string; workspaceRoot: string; browserTools?: boolean }
+/**
+ * `browserTools`: this session was given the QA browser (its gateway admits only the session's preview).
+ * `cwd`: the session's working copy, which a refusal names; `workspaceRoot` stays the boundary.
+ */
+export interface PermissionContext { assignmentId: string; agentId: string; workspaceRoot: string; cwd?: string; browserTools?: boolean }
 
 export interface PolicyResponder {
   evaluatePermission(request: RequestPermissionRequest, context: PermissionContext): Promise<PolicyDecision>;
@@ -61,16 +73,25 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
     // title; a shell call without structured input is judged by its title.
     const input: Record<string, unknown> = { ...raw, ...(Array.isArray(toolCall.locations) ? { locations: toolCall.locations } : {}) };
     if (toolCall.kind === "execute" && typeof input.command !== "string" && toolCall.title) input.command = toolCall.title;
-    const evaluation = await this.evaluator.evaluateToolUse({
+    const evaluation: WorkspaceToolPolicyEvaluation = await this.evaluator.evaluateToolUse({
       toolName: toolCall.kind ?? toolCall.title ?? request.toolCall.toolCallId,
       input,
-      repoPath: context.workspaceRoot,
+      repoPath: context.cwd ?? context.workspaceRoot,
       workspaceRoot: context.workspaceRoot,
       agentId: context.agentId,
       toolUseId: request.toolCall.toolCallId,
     });
+    // `updatedInput` is never applied: an ACP answer can only allow or refuse
+    // the call the agent named, never rewrite it.
     if (evaluation.allowed && allow !== null) return { kind: "allow", optionId: allow };
-    if (!evaluation.allowed) return { kind: "deny", optionId: deny };
+    if (!evaluation.allowed) {
+      return {
+        kind: "deny",
+        optionId: deny,
+        ...(evaluation.denyMessage ? { message: evaluation.denyMessage } : {}),
+        ...(evaluation.refusal ? { refusal: evaluation.refusal } : {}),
+      };
+    }
     return this.humanDeferralAllowed() ? { kind: "defer" } : { kind: "deny", optionId: deny };
   }
 

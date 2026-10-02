@@ -7,7 +7,8 @@ import type { RunnerConfig } from "@konteks/remote-agent-runner";
 
 /** Verify the complete installed package before any native bridge is spawned. */
 export async function verifyInstalledNativeBridges(release: VerifiedNativeRelease, runners: readonly RunnerConfig[], platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" }): Promise<void> {
-  if (runners.length === 0) throw untrusted();
+  // No agent yet is a machine connected before any was set up (OS14, D116): nothing to verify.
+  if (runners.length === 0) return;
   // Host-installed agents are verified against their local package at load,
   // and intentionally have no signed offline bridge artifact in the release.
   const bundled = runners.filter(runner => !isHostAgentId(runner.RUNNER_AGENT_ID));

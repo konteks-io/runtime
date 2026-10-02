@@ -248,4 +248,10 @@ $launcher = Join-Path ${env:ProgramFiles} 'konteks-remote\konteks-remote.exe'
 if (-not (Test-Path $launcher)) { $launcher = 'konteks-remote' }
 # The activation code is prompted by the launcher without echo; it is never an argument.
 & $launcher install --activation-id $ActivationId
-exit $LASTEXITCODE
+$code = $LASTEXITCODE
+# The MSI put konteks-remote on the machine PATH, which this window cannot see
+# yet; the commands the launcher just named work in a new one.
+if (-not (Get-Command konteks-remote -ErrorAction SilentlyContinue)) {
+  Write-Host 'To run konteks-remote commands, open a new PowerShell window.'
+}
+exit $code

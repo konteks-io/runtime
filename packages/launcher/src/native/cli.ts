@@ -76,7 +76,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
     .option("--relay-url <url>", "relay WSS endpoint", process.env.KONTEKS_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")
-    .option("--agents <ids>", "agent families: claude-code, codex, dsh, opencode, antigravity (default: claude-code,codex; antigravity asks before downloading Google Antigravity from Google)", value => value.split(",").map(part => agent(part.trim())))
+    .option("--agents <ids>", "only these agents, each required: claude-code, codex, dsh, opencode, antigravity (default: the ones found here, offering Claude Code and Codex when missing; antigravity asks before downloading Google Antigravity from Google)", value => value.split(",").map(part => agent(part.trim())))
     .action(async (options: { activationId?: string; enroll: boolean; coreUrl: string; relayUrl: string; agents?: string[] }) => {
       if (!options.activationId && !options.enroll) throw new InvalidArgumentError("install needs either --activation-id or --enroll");
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
@@ -95,11 +95,11 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   program.command("start").description("start the connector's background service").action(async () => actions.start(context()));
   program.command("stop").description("stop the connector's background service; this computer and its work are kept").action(async () => actions.stop(context()));
   const agentLifecycle = program.command("agent").description("add or remove agents on this computer");
-  agentLifecycle.command("add").description("add one agent without reactivation: a signed package for Claude Code or Codex, your own DeepSeek Harness or OpenCode 2 install (nothing downloaded), or Google Antigravity, downloaded from Google (dl.google.com, about 110 MB) after you say yes")
+  agentLifecycle.command("add").description("add one agent without reactivation: Claude Code (Anthropic's installer is offered when it is missing) or Codex (ships with Konteks), then their sign-in, your own DeepSeek Harness or OpenCode 2 install (nothing downloaded), or Google Antigravity, downloaded from Google (dl.google.com, about 110 MB) after you say yes")
     .argument("<agent>", "agent family: claude-code, codex, dsh, opencode or antigravity", agent)
     .option("--yes", "Google Antigravity: you read the download question and agree (it is asked otherwise)", false)
     .action(async (value: NativeAgentId, options: { yes: boolean }) => {
-      if (options.yes && value !== "antigravity") throw new InvalidArgumentError("--yes answers Google Antigravity's download question; other agents ask none");
+      if (options.yes && value !== "antigravity") throw new InvalidArgumentError("--yes answers only Google Antigravity's download question; run this in a terminal to answer the others");
       await actions.addAgent({ ...context(), agent: value, ...(options.yes ? { yes: true } : {}) });
     });
   agentLifecycle.command("remove").description("remove Google Antigravity from this computer: sign it out, delete its download and its sign-ins here; other agents are untouched")
