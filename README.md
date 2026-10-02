@@ -470,6 +470,13 @@ An update that stops the connector but cannot go ahead starts the same
 release again and says once it answers. While the new release is being
 checked it takes no new work. The running release keeps `konteks-remote`
 itself on its own version, whichever `konteks-remote` ran the update.
+On Windows the `konteks-remote` the MSI installed (under Program Files) runs
+the installed release's own copy for every command except `install` and
+`uninstall`, or its own code when it is newer than the installed release, so
+it never needs replacing for an update. An MSI from before 0.10.11 runs its
+own old code; `doctor` says so, and running the Windows install line once with
+`-Update` in place of `-ActivationId` replaces it, updates and starts the
+connector.
 
 On macOS and Windows the connector logs to `logs/connector.log` in its
 folder, from its first line (on Windows the file is kept under 20 MB at each

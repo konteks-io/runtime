@@ -605,6 +605,27 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
   `in_progress` (45 min stale bound) and the record names this process's
   release, it replaces the launcher when its bytes differ. A launcher without
   the transaction's own refresh (0.8.0's, D113b) otherwise drives every update.
+- D131: Windows has no `<root>\bin` launcher; the MSI's `konteks-remote.exe`
+  (Program Files, not writable without elevation) is the person's command. At
+  start it runs `<root>\releases\<releaseId>\konteks-connector.exe` (or the
+  pre-rename `connector.exe`) from `native-runtime.json` with the same argv,
+  console stdio and exit code (`launcher-delegate.ts`, `KONTEKS_REMOTE_VIA_LAUNCHER=1`
+  on the child so it never hands on again). It runs its own code for
+  `install`, `uninstall` and `stage-enrollment` (Windows cannot delete the
+  running exe), with nothing installed or a `pending` record, when its own
+  version is newer than the record's (a newer MSI repairs an older release),
+  when the release cannot be started (said on stderr), and for any path that
+  is not a regular file at exactly `releases\<id>\<name>` under the root's
+  real path (no link, junction or dot-dot). The child gets the person's
+  environment without the values this copy's entry baked
+  (`globalThis.__konteksLauncherBakedEnv`, `build-launcher.mjs`). The MSI also
+  installs `launcher.json`; the supervisor's doctor warns (`launcher`) when the
+  MSI command lacks it: an older MSI runs its own code forever. `install.ps1
+  -Update` installs the latest MSI on a connected computer (same-version
+  upgrades allowed) and runs `update`, then `start`. An update is driven by the
+  newest code present (the running release's, or a newer MSI's); the staged
+  successor is unproven until its gate, so it takes over at its own `serve`
+  (`keepServiceOnOwnDefinition`), not mid-transaction.
 - A release an update just started is on probation while the ledger's attempt
   for its release is `in_progress` (`updateProbation`, polled every 2 s, same
   45 min bound): it takes no new work (pull gate, heartbeat

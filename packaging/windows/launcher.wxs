@@ -3,11 +3,17 @@
      under Program Files, adds it to the machine PATH, and records the
      publisher. Uninstall of the MSI never touches the restricted install root
      (%ProgramData%\konteks-remote): `konteks-remote uninstall` (with purge) owns
-     that lifecycle. -->
+     that lifecycle.
+     From 0.10.11 the launcher runs the installed release's own executable
+     (%LOCALAPPDATA%\konteks-remote\releases\<id>), or its own code when that is
+     newer, so this copy never needs replacing for an update (D131).
+     launcher.json beside it tells the connector's doctor this is such a
+     launcher; an older MSI's has none. A same-version MSI replaces the
+     installed one, so the bootstrap's -Update can always be run again. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Product Id="*" Name="Konteks Remote Instance launcher" Language="1033" Version="$(var.ProductVersion)" Manufacturer="Konteks" UpgradeCode="7d3b7f2e-6f0d-4d5b-9b52-0f3f9b1c2a01">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" Description="konteks-remote launcher" />
-    <MajorUpgrade DowngradeErrorMessage="A newer konteks-remote is already installed." />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer konteks-remote is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="ProgramFiles64Folder">
@@ -16,11 +22,15 @@
             <File Id="LauncherExe" Source="dist\launcher-build\konteks-remote.exe" KeyPath="yes" />
             <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
           </Component>
+          <Component Id="LauncherMarker" Guid="a9158923-b739-41a6-a8af-c452ec388297" Win64="yes">
+            <File Id="LauncherMarker" Source="dist\launcher-build\launcher.json" KeyPath="yes" />
+          </Component>
         </Directory>
       </Directory>
     </Directory>
     <Feature Id="Main" Level="1">
       <ComponentRef Id="Launcher" />
+      <ComponentRef Id="LauncherMarker" />
     </Feature>
   </Product>
 </Wix>

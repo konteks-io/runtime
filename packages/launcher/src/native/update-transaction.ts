@@ -438,7 +438,9 @@ function introducedByUpdate(id: string, baseline: ReadonlyMap<string, string> | 
 /**
  * Replace `<root>/bin/konteks-remote` with the kept release's executable when
  * it differs; true when it was replaced. A no-op where none was installed
- * there, and on Windows, where a running executable cannot be replaced.
+ * there, and on Windows: the MSI's command under Program Files cannot be
+ * replaced without elevation, and from 0.10.11 it runs the installed
+ * release's own executable instead (`launcher-delegate.ts`, D131).
  */
 export async function refreshInstalledLauncher(root: string, record: NativeRuntimeRecord): Promise<boolean> {
   if (process.platform === "win32") return false;
