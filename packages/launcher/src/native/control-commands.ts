@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
-import type { Output } from "../output.js";
+import { isHostAgentId } from "@konteks/remote-release";
+import { AlreadyToldError, type Output } from "../output.js";
 import { confirm, promptLine, promptSecret } from "../prompt.js";
 import { agentName } from "./agent-name.js";
 
@@ -20,6 +21,8 @@ export interface ControlContext {
   promptSecret?: (label: string) => Promise<string>;
   /** Test hook: a choice typed in the open. */
   promptLine?: (label: string) => Promise<string>;
+  /** Run in the window the site opened (KONTEKS_ON_COMPUTER=1): the last line also says the window can close. */
+  onComputer?: boolean;
 }
 
 const AgentsSchema = z.object({ agents: z.array(z.record(z.string(), z.unknown())), roles: z.array(z.string()), roleBindings: z.array(z.record(z.string(), z.unknown())) }).strict();
@@ -113,16 +116,25 @@ export async function authLogin(context: ControlContext, agentId: string, organi
     if (!ok) throw new RemoteInstanceError("ownership_promotion_denied", "organization attestation declined; log in without --organization for a personal account");
   }
   const interrupted = new AbortController();
+  const name = agentName(agentId);
+  const inWindow = context.onComputer ?? process.env.KONTEKS_ON_COMPUTER === "1";
+  let promptsOpen = 0;
+  // The flow's own last line since the last prompt.
+  let lastLine: string | null = null;
   let promptError: unknown = null;
   let loginFailure: Extract<ControlLoginEvent, { kind: "failed" }> | null = null;
   const onEvent = (event: ControlLoginEvent): void => {
     switch (event.kind) {
       case "started":
-        // The flow's own lines say what to do next; a "login started" line
-        // landed on the key prompt and named tooling DeepSeek Harness has not (WS1-153).
+        // An agent the connector asks for itself (a key, a provider) says
+        // what to do in its own lines; a start line there landed on the
+        // hidden key prompt (WS1-153). Only an agent whose own sign-in takes
+        // over gets one, and never over an open prompt.
+        if (!isHostAgentId(event.agentId) && promptsOpen === 0) context.output.line(`Starting ${agentName(event.agentId)}'s own sign-in. Follow its steps below.`);
         return;
       case "display":
         context.output.line(event.text);
+        lastLine = event.text;
         return;
       case "open_url":
         context.output.line(`open this URL to sign in: ${event.url}${event.userCode ? `\nenter code: ${event.userCode}` : ""}`);
@@ -130,14 +142,17 @@ export async function authLogin(context: ControlContext, agentId: string, organi
       case "prompt":
         // A choice (OpenCode's provider) is typed in the open; anything else,
         // an API key included, with the hidden prompt, never echoed.
+        promptsOpen += 1;
+        lastLine = null;
         void (event.visible === true && !event.secret ? line(event.label) : secret(event.label))
+          .finally(() => { promptsOpen -= 1; })
           .then((text) => context.control.call({ op: "auth.input", loginId: event.loginId, text }, z.unknown()))
           .catch((error: unknown) => { promptError = error; interrupted.abort(); });
         return;
       case "completed":
-        context.output.line(event.readiness === "ready"
-          ? `${agentName(agentId)} is ready${organization ? " for your organization" : ""}.`
-          : `${agentName(agentId)} is signed in but not ready yet; konteks-remote doctor says why.`);
+        context.output.line((event.readiness === "ready"
+          ? `${name} is ready${organization ? " for your organization" : ""}.`
+          : `${name} is signed in but not ready yet; konteks-remote doctor says why.`) + (inWindow ? " You can close this window." : ""));
         return;
       case "failed":
         loginFailure = event;
@@ -152,7 +167,12 @@ export async function authLogin(context: ControlContext, agentId: string, organi
   }
   if (loginFailure !== null) {
     const failure: Extract<ControlLoginEvent, { kind: "failed" }> = loginFailure;
-    throw new RemoteInstanceError("agent_auth_required", failure.message);
+    // A connector-asked sign-in ends a failure with one plain line (what is
+    // wrong, what to do); a coded second line would only repeat it. A
+    // progress line ("Checking the key…") explains nothing, so the error shows.
+    const last = lastLine as string | null;
+    const told = isHostAgentId(agentId) && last !== null && !last.endsWith("…");
+    throw told ? new AlreadyToldError("agent_auth_required", failure.message) : new RemoteInstanceError("agent_auth_required", failure.message);
   }
 }
 

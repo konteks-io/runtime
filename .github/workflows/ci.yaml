@@ -31,6 +31,26 @@ jobs:
         run: |
           sh -n bootstrap/install.sh
           bootstrap/install.sh --version
+      - name: The Windows bootstrap parses (it failed to load on every Windows computer until 0.10.8)
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/bootstrap/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_.ToString() }; exit 1 }
+
+  windows-bootstrap:
+    # install.ps1 trusts the MSI through its own Ed25519 check of the signed
+    # SHA256SUMS (there is no Windows code-signing certificate yet), so that
+    # check runs where people run it: Windows PowerShell 5.1, and pwsh too.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ed25519 verifier in Windows PowerShell 5.1 (RFC 8032 vectors, a real release manifest)
+        shell: powershell
+        run: .\scripts\test-bootstrap-verifier.ps1
+      - name: The same in PowerShell 7
+        shell: pwsh
+        run: .\scripts\test-bootstrap-verifier.ps1
 
   windows-native:
     runs-on: windows-2022
