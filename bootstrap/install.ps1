@@ -44,8 +44,14 @@ if ([Environment]::Is64BitOperatingSystem -eq $false -or $env:PROCESSOR_ARCHITEC
 $work = Join-Path ([IO.Path]::GetTempPath()) ("konteks-remote-" + [Guid]::NewGuid().ToString('n'))
 New-Item -ItemType Directory -Path $work | Out-Null
 try {
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-  Write-Host "konteks-remote bootstrap v$BootstrapVersion: fetching the signed checksum manifest"
+  # TLS 1.2 always; TLS 1.3 only where this .NET knows it (older Windows 10
+  # builds do not, and naming it there threw before anything ran).
+  $protocols = [Net.SecurityProtocolType]::Tls12
+  if ([Enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') { $protocols = $protocols -bor [Net.SecurityProtocolType]'Tls13' }
+  [Net.ServicePointManager]::SecurityProtocol = $protocols
+  # Braces: a variable followed by a colon inside double quotes parses as a
+  # drive-qualified name, and the whole script failed to load on Windows.
+  Write-Host "konteks-remote bootstrap v${BootstrapVersion}: fetching the signed checksum manifest"
   Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/SHA256SUMS" -OutFile (Join-Path $work 'SHA256SUMS')
   Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/SHA256SUMS.sig" -OutFile (Join-Path $work 'SHA256SUMS.sig')
   Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/release-signing.pub" -OutFile (Join-Path $work 'release-signing.pub')
@@ -62,6 +68,7 @@ try {
   if (-not $expected -or $expected.ToLowerInvariant() -ne $actual) { throw 'package checksum mismatch; refusing to install' }
 
   $sig = Get-AuthenticodeSignature -FilePath $msiPath
+  if ($sig.Status -eq 'NotSigned') { throw 'This Konteks release is not signed for Windows yet, so it was not installed. Use a Mac or Linux computer for now.' }
   if ($sig.Status -ne 'Valid') { throw "package Authenticode signature is $($sig.Status); refusing to install" }
   if ($sig.SignerCertificate.Subject -notlike "*$ExpectedPublisher*") { throw 'package signer is not the expected publisher; refusing to install' }
   if ($ExpectedThumbprint -and $sig.SignerCertificate.Thumbprint -ne $ExpectedThumbprint) { throw 'package signer thumbprint mismatch; refusing to install' }
