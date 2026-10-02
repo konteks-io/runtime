@@ -657,7 +657,9 @@ describe("native update transaction", () => {
     await runNativeUpdate({ root: "/root", output: rolledBack.output }, rolledBack.deps).catch(() => undefined);
     expect(refreshed).toEqual(["release-next"]);
   });
-  it("keeps the person's konteks-remote on the running release once its update kept it, whichever launcher drove the update (D113b)", async () => {
+  // Windows never copies a launcher: the MSI's command hands every call to the
+  // installed release instead (D131), so refreshInstalledLauncher skips there.
+  it.skipIf(process.platform === "win32")("keeps the person's konteks-remote on the running release once its update kept it, whichever launcher drove the update (D113b)", async () => {
     // The owner's launcher was 0.8.0's: it has no refresh, so every update it
     // drove (0.10.9, 0.10.10) ran 0.8.0's transaction. The release itself refreshes it.
     const attempt = (outcome: string, startedAt = new Date(500_000).toISOString()) => ({ schemaVersion: 1 as const, attempts: [{ id: "u1", bundleVersion: "1.1.0", manifestDigest: "d", releaseId: "release-next", reason: "operator", startedAt, finishedAt: null, outcome: outcome as "in_progress", detail: null }] });
@@ -681,7 +683,9 @@ describe("native update transaction", () => {
     await expect(keepLauncherCurrent("/root", { ...deps, readLedger: async () => attempt("in_progress", new Date(0).toISOString()), now: () => 60 * 60_000 })).resolves.toBe("refreshed");
     expect(refreshed).toHaveLength(2);
   });
-  it("replaces konteks-remote only when it differs from the release's executable (D113b)", async () => {
+  // Windows never copies a launcher: the MSI's command hands every call to the
+  // installed release instead (D131), so refreshInstalledLauncher skips there.
+  it.skipIf(process.platform === "win32")("replaces konteks-remote only when it differs from the release's executable (D113b)", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-launcher-refresh-")); roots.push(root);
     await mkdir(join(root, "bin"), { recursive: true });
     await mkdir(join(root, "releases", "release-next"), { recursive: true });
