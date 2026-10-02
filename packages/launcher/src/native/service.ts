@@ -64,6 +64,8 @@ export interface NativeServiceDefinition {
    * stopped service to exit.
    */
   status: NativeServiceCommand;
+  /** Exits 0 while the service is registered, running or not; only where `status` cannot say it (Windows), so `serve` can register a missing task. */
+  registered?: NativeServiceCommand;
   /** Reads how often the OS has started the service and how it last exited (`parseServiceExits`); absent where the OS does not say. */
   exits?: NativeServiceCommand;
   /** User services on Linux need linger to survive logout/reboot without a login. */
@@ -109,6 +111,101 @@ const LAUNCHD_RELOAD_SCRIPT = [
 export const LAUNCHD_EXIT_TIMEOUT_SECONDS = 30;
 
 /**
+ * The bytes of a definition file, the one encoding every writer uses: Task
+ * Scheduler reads UTF-16LE with a byte-order mark, the others UTF-8. A task
+ * file in any other encoding is refused by `schtasks /Create` with "unable to
+ * switch the encoding" (D129: 0.10.9 and older wrote UTF-8, and a failed
+ * refresh put a decoded copy back re-encoded under its old declaration).
+ */
+export function encodeServiceDefinition(definition: Pick<NativeServiceDefinition, "contents" | "fileEncoding">): Buffer {
+  return definition.fileEncoding === "utf16le"
+    ? Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(definition.contents, "utf16le")])
+    : Buffer.from(definition.contents, "utf8");
+}
+
+/** A definition file's text: UTF-16LE after its byte-order mark, UTF-8 otherwise. */
+export function decodeServiceDefinition(bytes: Uint8Array): string {
+  const buffer = Buffer.from(bytes);
+  return buffer[0] === 0xff && buffer[1] === 0xfe ? buffer.subarray(2).toString("utf16le") : buffer.toString("utf8");
+}
+
+/** How a service command ended, with what it printed, so a failure can say why. */
+export interface NativeServiceRun { code: number | null; stdout?: string; stderr?: string; error?: string; timedOut?: boolean }
+/** A service command runner: a bare exit code, or the whole outcome. */
+export type NativeServiceExecute = (command: NativeServiceCommand) => Promise<number | null | NativeServiceRun>;
+export type NativeServiceStep = "status" | "write" | "register" | "start" | "stop";
+
+export function serviceRun(value: number | null | NativeServiceRun): NativeServiceRun {
+  return value !== null && typeof value === "object" ? value : { code: value };
+}
+
+const EXCERPT_LIMIT = 300;
+
+/** The service manager's own words, bounded: stderr first, stdout when stderr is empty. */
+export function serviceOutputExcerpt(run: NativeServiceRun): string {
+  const text = (run.stderr?.trim() || run.stdout?.trim() || "").replace(/\s+/g, " ");
+  return text.length > EXCERPT_LIMIT ? `${text.slice(0, EXCERPT_LIMIT - 1)}…` : text;
+}
+
+/** `schtasks.exe /Create`, `launchctl bootstrap`, `systemctl enable`: the command and its verb, never its paths. */
+export function serviceCommandName(command: NativeServiceCommand): string {
+  const verb = command.args.find(arg => /^\/?[A-Za-z][A-Za-z-]*$/.test(arg) && !arg.startsWith("-"));
+  return verb ? `${command.command} ${verb}` : command.command;
+}
+
+/**
+ * A service command that failed, or a definition file that could not be
+ * written: which one, how it ended and what it printed (D129). The message
+ * never carries a secret: the commands are fixed and take only paths and the
+ * task label.
+ */
+export class NativeServiceCommandError extends Error {
+  readonly excerpt: string;
+  constructor(
+    readonly step: NativeServiceStep,
+    readonly command: NativeServiceCommand | null,
+    readonly run: NativeServiceRun,
+    readonly path?: string,
+  ) {
+    const excerpt = serviceOutputExcerpt(run);
+    const name = command ? serviceCommandName(command) : `writing ${path ?? "the service definition"}`;
+    const ended = run.error ? `${command ? "could not be run" : "failed"}: ${run.error}`
+      : run.timedOut ? "did not finish in time"
+        : run.code === null ? "ended without an exit code" : `exited ${run.code}`;
+    super(`${name} ${ended}${excerpt && !run.error ? `: ${excerpt}` : ""}`);
+    this.name = "NativeServiceCommandError";
+    this.excerpt = excerpt;
+  }
+}
+
+/** A failed service step in plain words, with the one next step where it can be known. */
+export function describeServiceFailure(os: HostOs, error: NativeServiceCommandError): string {
+  const output = `${error.run.stderr ?? ""}\n${error.run.stdout ?? ""}`;
+  const what = error.step === "write"
+    ? `The service definition could not be written to ${error.path ?? "its folder"} (${error.run.error ?? "unknown error"}).`
+    : `${serviceStepWords(os, error.step)} (${error.message}).`;
+  return `${what} ${serviceNextStep(os, error, output)}`;
+}
+
+function serviceStepWords(os: HostOs, step: NativeServiceStep): string {
+  if (os === "windows") return step === "register" ? "Windows refused to create the Konteks task" : step === "start" ? "Windows did not run the Konteks task" : step === "stop" ? "Windows did not end the Konteks task" : "Windows could not say whether the Konteks task is running";
+  if (os === "macos") return step === "start" || step === "register" ? "macOS did not load the Konteks launch agent" : step === "stop" ? "macOS did not unload the Konteks launch agent" : "macOS could not say whether the Konteks launch agent is running";
+  return step === "register" ? "systemd did not reload its user services" : step === "start" ? "systemd did not start the Konteks user service" : step === "stop" ? "systemd did not stop the Konteks user service" : "systemd could not say whether the Konteks user service is running";
+}
+
+function serviceNextStep(os: HostOs, error: NativeServiceCommandError, output: string): string {
+  if (error.run.timedOut) return "Run konteks-remote start again; if it keeps timing out, restart the computer.";
+  if (os === "windows") {
+    if (/access is denied/i.test(output)) return "Run konteks-remote start once from an administrator PowerShell (right-click PowerShell, Run as administrator); Konteks still runs as you.";
+    if (/malformed|incorrectly formatted|out of range|switch the encoding/i.test(output)) return "This copy of konteks-remote wrote a task Windows does not accept; run konteks-remote update, then konteks-remote start. If it stays, send konteks-remote support to Konteks support.";
+    if (/service is not available|not running|0x80041315/i.test(output)) return "Start the Task Scheduler service (services.msc), then run konteks-remote start again.";
+  }
+  if (os === "macos" && /Input\/output error|already loaded|service already/i.test(output)) return "Run konteks-remote stop, then konteks-remote start.";
+  if (error.step === "write") return "Check that this folder is yours and the disk has space, then run konteks-remote start again.";
+  return "To see every step, run konteks-remote --verbose start.";
+}
+
+/**
  * Register and start the service from its definition unless it is already
  * running. The definition is rewritten and re-registered every time (the
  * install commands replace an existing registration), so a start after an
@@ -116,15 +213,18 @@ export const LAUNCHD_EXIT_TIMEOUT_SECONDS = 30;
  */
 export async function startNativeServiceDefinition(
   definition: NativeServiceDefinition,
-  deps: { execute: (command: NativeServiceCommand) => Promise<number | null>; write: (path: string, contents: string | Uint8Array) => Promise<void> },
+  deps: { execute: NativeServiceExecute; write: (path: string, contents: string | Uint8Array) => Promise<void> },
 ): Promise<"already_running" | "started"> {
-  if (await deps.execute(definition.status) === 0) return "already_running";
-  for (const file of definition.supportFiles ?? []) await deps.write(file.path, file.contents);
-  await deps.write(definition.path, definition.fileEncoding === "utf16le"
-    ? Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(definition.contents, "utf16le")])
-    : definition.contents);
-  for (const command of [...definition.install, definition.start]) {
-    if (await deps.execute(command) !== 0) throw new Error(`${command.command} exited unsuccessfully`);
+  if (serviceRun(await deps.execute(definition.status)).code === 0) return "already_running";
+  const write = async (path: string, contents: string | Uint8Array) => {
+    try { await deps.write(path, contents); }
+    catch (error) { throw new NativeServiceCommandError("write", null, { code: null, error: error instanceof Error ? error.message : String(error) }, path); }
+  };
+  for (const file of definition.supportFiles ?? []) await write(file.path, file.contents);
+  await write(definition.path, encodeServiceDefinition(definition));
+  for (const [step, command] of [...definition.install.map(command => ["register", command] as const), ["start", definition.start] as const]) {
+    const run = serviceRun(await deps.execute(command));
+    if (run.code !== 0) throw new NativeServiceCommandError(step, command, run);
   }
   return "started";
 }
@@ -194,13 +294,12 @@ export function nativeServiceDefinition(input: {
   // Encode the literal command: WScript.Shell.Run expands %variables%, which
   // must never reinterpret an installation path containing percent signs.
   const helper = path.join(normalizedRoot, "service.js");
-  const literal = (value: string) => `'${value.replace(/'/g, "''")}'`;
-  const script = `$ErrorActionPreference = 'Stop'; try { & ${[input.executable, ...args].map(literal).join(" ")}; exit $LASTEXITCODE } catch { exit 1 }`;
+  const script = windowsServiceHost({ executable: input.executable, root: normalizedRoot, logFile: path.join(normalizedRoot, "logs", CONNECTOR_LOG_FILE) });
   const host = `"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
   return {
     label, path: file, requiresLinger: false, fileEncoding: "utf16le",
     supportFiles: [{ path: helper, contents: `var shell = WScript.CreateObject("WScript.Shell");\nWScript.Quit(shell.Run(${JSON.stringify(host)}, 0, true));\n` }],
-    contents: `<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${input.userId}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id="Owner"><UserId>${input.userId}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure></Settings>\n<Actions Context="Owner"><Exec><Command>%SystemRoot%\\System32\\wscript.exe</Command><Arguments>${xml(["//B", "//NoLogo", "//E:JScript", helper].map(windowsArg).join(" "))}</Arguments></Exec></Actions>\n</Task>\n`,
+    contents: `<?xml version="1.0" encoding="UTF-16"?>\n<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${input.userId}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id="Owner"><UserId>${input.userId}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>${WINDOWS_TASK_RESTART_COUNT}</Count></RestartOnFailure></Settings>\n<Actions Context="Owner"><Exec><Command>%SystemRoot%\\System32\\wscript.exe</Command><Arguments>${xml(["//B", "//NoLogo", "//E:JScript", helper].map(windowsArg).join(" "))}</Arguments></Exec></Actions>\n</Task>\n`,
     install: [{ command: "schtasks.exe", args: ["/Create", "/TN", label, "/XML", file, "/F"] }],
     start: { command: "schtasks.exe", args: ["/Run", "/TN", label] },
     stop: { command: "schtasks.exe", args: ["/End", "/TN", label] },
@@ -210,7 +309,67 @@ export function nativeServiceDefinition(input: {
     // task for the new release. The task's state enum reads the same in every
     // Windows language, unlike schtasks' text; the label is hex, so it quotes safely.
     status: { command: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-Command", `$task = Get-ScheduledTask -TaskPath '\\' -TaskName '${label}' -ErrorAction SilentlyContinue; if ($task -and $task.State -eq 'Running') { exit 0 }; exit 1`] },
+    registered: { command: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-Command", `if (Get-ScheduledTask -TaskPath '\\' -TaskName '${label}' -ErrorAction SilentlyContinue) { exit 0 }; exit 1`] },
   };
+}
+
+/**
+ * Task Scheduler's published schema types `RestartOnFailure/Count` as an
+ * unsignedByte; 999, which its own dialog offers, is out of that range.
+ */
+export const WINDOWS_TASK_RESTART_COUNT = 255;
+/** The connector log's limit, as the supervisor keeps it on macOS and Linux (connector-log.ts). */
+const WINDOWS_LOG_MAX_BYTES = 20 * 1024 * 1024;
+
+/**
+ * The hidden PowerShell host the Windows task runs. Task Scheduler keeps
+ * nothing a task prints, so a connector that stopped as it started left no
+ * trace (D129); like launchd's StandardOutPath, the connector's stdout and
+ * stderr are appended to `<root>\logs\connector.log` from its very first
+ * byte. Windows PowerShell's own redirection turns a native program's stderr
+ * into error records (and, under `Stop`, ends the pipeline at the first
+ * line), so cmd redirects instead. cmd reads the paths from the environment:
+ * it expands each `%NAME%` once and never re-reads a value, so a path's own
+ * `%`, `&` and `'` stay literal. The log is kept small here, before the
+ * connector holds it: cmd's handle does not append, so it cannot be emptied
+ * in place while the connector runs. A start that fails before the connector
+ * runs writes one line to the same log.
+ */
+function windowsServiceHost(input: { executable: string; root: string; logFile: string }): string {
+  const literal = (value: string) => `'${value.replace(/'/g, "''")}'`;
+  // The connector parses its command line by the C runtime's rules, where
+  // backslashes before a closing quote escape it; doubled, they stay a path.
+  const rootArgument = input.root.replace(/(\\+)$/, "$1$1");
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    `$log = ${literal(input.logFile)}`,
+    "try {",
+    "  [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($log))",
+    "  try {",
+    "    $previous = New-Object System.IO.FileInfo -ArgumentList $log",
+    `    if ($previous.Exists -and $previous.Length -gt ${WINDOWS_LOG_MAX_BYTES}) {`,
+    "      $rotated = $log + '.1'",
+    "      [System.IO.File]::Delete($rotated)",
+    "      [System.IO.File]::Move($log, $rotated)",
+    "    }",
+    "  } catch { }",
+    `  $env:KONTEKS_SERVICE_PROGRAM = ${literal(input.executable)}`,
+    `  $env:KONTEKS_SERVICE_ROOT = ${literal(rootArgument)}`,
+    "  $env:KONTEKS_SERVICE_LOG = $log",
+    "  $start = New-Object System.Diagnostics.ProcessStartInfo",
+    "  $start.FileName = [System.IO.Path]::Combine($env:SystemRoot, 'System32\\cmd.exe')",
+    `  $start.Arguments = '/d /v:off /s /c ""%KONTEKS_SERVICE_PROGRAM%" serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1"'`,
+    "  $start.UseShellExecute = $false",
+    "  $connector = [System.Diagnostics.Process]::Start($start)",
+    "  $connector.WaitForExit()",
+    "  exit $connector.ExitCode",
+    "} catch {",
+    "  $message = 'the Konteks task could not start the connector: ' + $_.Exception.Message",
+    "  $line = '{\"level\":50,\"time\":' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + ',\"msg\":' + (ConvertTo-Json -InputObject $message -Compress) + '}'",
+    "  try { [System.IO.File]::AppendAllText($log, $line + [Environment]::NewLine) } catch { }",
+    "  exit 1",
+    "}",
+  ].join("\n");
 }
 
 function assertPath(value: string, os: HostOs): void {

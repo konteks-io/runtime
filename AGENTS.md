@@ -627,8 +627,28 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
   (`supervisor/service-reload.json`), and a `serve` not stopped within 60 s
   starts anyway. Windows repairs its private windowless launch helper and
   re-registers a changed task without starting another connector. Task XML
-  remains UTF-16LE with a BOM; failed registration restores the prior file
-  so the next startup retries.
+  remains UTF-16LE with a BOM, written and compared as bytes through
+  `encodeServiceDefinition` by `start` and `serve` alike (D129: 0.10.9 wrote
+  UTF-8 and `schtasks /Create` refused it, "unable to switch the encoding");
+  a file in any other encoding is rewritten, a failed registration restores
+  the exact bytes it found so the next startup retries, and a task missing
+  although its file is current is registered again. The task's hidden
+  PowerShell host runs the connector through `cmd /d /v:off /s /c`, paths
+  passed only as `KONTEKS_SERVICE_*` environment variables, with stdout and
+  stderr appended to `logs/connector.log` (rotated past 20 MB at start; the
+  supervisor's in-place truncation is off on Windows, where cmd's handle does
+  not append). `RestartOnFailure/Count` is 255, the schema's unsignedByte.
+- A failed service step (D129) is a `NativeServiceCommandError`: the step,
+  the command and verb, its exit code and a 300-character excerpt of its
+  output, said by `describeServiceFailure` with one next step. `start` keeps
+  it in `supervisor/service-start-failure.json` (cleared by a start that
+  works, also written by a refused `serve` re-registration) and, where the
+  status means running (Windows, systemd), checks 3 s after starting that the
+  service still runs, quoting the log's last lines if not. `doctor` and
+  `support` fall back to that record and the log tail when the control socket
+  is unavailable. `--verbose` / `KONTEKS_REMOTE_VERBOSE=1` prints every
+  service command, its exit code and output, and the start's decisions, on
+  stderr (`verbose.ts`).
 - After the shared Codex owner starts, app-servers that older releases of this
   installation left on other sockets are ended once idle (or unreachable)
   (`reapStrayServers`); nothing outside `<root>/releases/` is touched.

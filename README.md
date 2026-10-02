@@ -111,6 +111,7 @@ konteks-remote preview status  # this computer's live session previews (read-onl
 konteks-remote update --check  # what the stable channel offers
 konteks-remote update          # stage, drain, swap, verify; rolls back on failure
 konteks-remote stop | start
+konteks-remote --verbose start # also print each service command, its exit code and output (or KONTEKS_REMOTE_VERBOSE=1)
 konteks-remote uninstall       # finish running work, remove this runtime from its workspace, delete the connector
 ```
 
@@ -470,8 +471,10 @@ release again and says once it answers. While the new release is being
 checked it takes no new work. The running release keeps `konteks-remote`
 itself on its own version, whichever `konteks-remote` ran the update.
 
-On macOS the connector logs to `logs/connector.log` in its folder; on Linux,
-to the user journal. A release that finds its service still loaded with an
+On macOS and Windows the connector logs to `logs/connector.log` in its
+folder, from its first line (on Windows the file is kept under 20 MB at each
+start); on Linux, to the user journal. When the connector is not running,
+`doctor` and `support` show the last failed start and the log's last lines. A release that finds its service still loaded with an
 older definition (for example one that sent its output nowhere) has the
 service manager reload it and restart once, so an updated connector keeps
 logging where it did.
