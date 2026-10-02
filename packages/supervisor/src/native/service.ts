@@ -93,6 +93,8 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
           ...(installation.unavailableAgents.length > 0 ? { unavailableAgents: installation.unavailableAgents } : {}),
           repositoryCacheRoot: join(options.root, "repositories"),
           ...(update ? { update } : {}),
+          // An update still checking this release keeps it from taking work (D113b).
+          updateProbation: { releaseId: installation.record.releaseId, readLedger: () => readNativeUpdateLedger(options.root) },
           ...(installation.record.git ? { git: installation.record.git } : {}),
           ...(options.prepareInputs ? { prepareInputs: options.prepareInputs } : {}),
           ...(options.prepareRepositoryWorktree ? { prepareRepositoryWorktree: options.prepareRepositoryWorktree } : {}),
