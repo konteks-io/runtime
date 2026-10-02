@@ -339,7 +339,8 @@ it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer",
   } else { await expect(receiver.receive(body)).rejects.toThrow(); expect(dispatched).not.toHaveBeenCalled(); }
 });
 
-async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>) {
+async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>,
+  logger?: { warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void }) {
   const f = work.source.kind === "harness_delivery" ? await deliveryFixture() : await fixture();
   const entry = f.journal.assignments.get(`${work.id}:${work.attempt}`)!;
   await f.journal.assignments.put({ ...entry, kind: work.kind });
@@ -360,7 +361,7 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
       ...(acceptDeliveryOutput ? { acceptDeliveryOutput } : {}) }),
     registerReady: async () => f.ready, redeemCapabilityToken: async () => { throw new Error("unexpected capability redemption"); },
     policy: new EvaluatorPolicyResponder(null, () => false), broker: new PermissionBroker({ clock: f.clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }),
-    onUsage: async () => undefined, onClosed: async () => undefined });
+    onUsage: async () => undefined, onClosed: async () => undefined, ...(logger ? { logger: logger as never } : {}) });
   sessions.push(session); await session.bootstrap(); send.mockClear();
   return { ...f, session, runner, send, beforePrompt };
 }
@@ -413,6 +414,30 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.send.mock.calls.at(-1)?.[0].body).toMatchObject({ kind: "session_closed", reason: "completed" });
     expect(f.session.deliveryAcceptanceReceipt()).toEqual(receipt);
     expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("completed");
+  });
+
+  // D112: the retry line carried no cause, so a Core refusal repeated 120+
+  // times looked like a transport stall from the connector log.
+  it("names the refusal code when a durable delivery output hand-back is retried", async () => {
+    const receipt = { version: 1 as const, acceptanceId: "acceptance", invocationRef: "invocation",
+      binding: { workspaceId: "tenant", instanceId: "instance", sessionId: "session", assignmentId: "assignment", attempt: 1 },
+      claimId: "claim", resultId: "result", resultDigest: `sha256:${"a".repeat(64)}`, inputSelectionDigest: `sha256:${"b".repeat(64)}`,
+      baseRevision: "base", acceptedAt: new Date().toISOString() };
+    const acceptDeliveryOutput = vi.fn<(authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>>()
+      .mockRejectedValueOnce(new RemoteInstanceError("capability_unavailable", "refused", { diagnostic: "response_status_invalid" }))
+      .mockResolvedValueOnce(receipt);
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const work = { ...assignment, kind: "delivery" as const, taskId: "task", correlationId: "invocation",
+      agentRoute: { agentId: "codex", requiredRole: "generator" as const, sessionConfig: { model: "model-a" } },
+      source: { kind: "harness_delivery" as const, portability: "instance_bound" as const, ownerInstanceId: "instance", executionSessionId: "session",
+        repositoryId: "https://git.example.com/acme/store", modelBinding: { canonicalProviderId: "openai", canonicalModelId: "model-a" },
+        turn: { invocationId: "invocation", dispatchGeneration: 0 } } };
+    const f = await sessionFixture(work, acceptDeliveryOutput, logger);
+    await f.session.onToRuntime(f.envelope);
+    await f.session.onRunnerEvent({ kind: "prompt_result", acpSessionRef: "acp", requestId: "request", result: { stopReason: "end_turn" } } as never);
+    expect(acceptDeliveryOutput).toHaveBeenCalledTimes(2);
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ transferAttempt: 1, code: "capability_unavailable",
+      diagnostic: "response_status_invalid" }), "durable delivery output retained for retry");
   });
 
   it("never falls back to bare ACP or borrowed Assistant permits for prepared delivery", async () => {

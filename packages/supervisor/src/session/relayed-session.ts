@@ -590,8 +590,15 @@ export class RelayedSession {
         this.deps.assertExecutionOwned?.();
         if (this.deps.clock.coreNow() >= Date.parse(this.assignment.expiresAt)) throw error;
         attempt += 1;
-        if (attempt === 1 || attempt % 12 === 0) this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt,
-          transferAttempt: attempt }, "durable delivery output retained for retry");
+        // Name the refusal (D112): without it a Core 422 repeated 120+ times
+        // read as a transport stall. Codes and statuses only, never messages.
+        if (attempt === 1 || attempt % 12 === 0) {
+          const status = error && typeof error === "object" && "status" in error && typeof error.status === "number" ? error.status : undefined;
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, transferAttempt: attempt,
+            code: error instanceof RemoteInstanceError ? error.code : "delivery_output_transfer_failed",
+            ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+            ...(status === undefined ? {} : { status }) }, "durable delivery output retained for retry");
+        }
         await new Promise<void>(resolve => setTimeout(resolve, Math.min(5_000, 250 * 2 ** Math.min(attempt, 5))));
       }
     }
