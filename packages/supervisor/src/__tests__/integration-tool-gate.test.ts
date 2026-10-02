@@ -106,6 +106,57 @@ describe("IntegrationToolGate: reads", () => {
   });
 });
 
+describe("IntegrationToolGate: the generic Atlassian read dispatcher", () => {
+  const listComments = IntegrationTaskSpecSchema.parse({ ...base, phase: "verify",
+    admittedTools: [{ server: "claude_ai_Atlassian", tool: "executeRead", mode: "read", requiredArgs: { name: "listJiraIssueComments" } }],
+    limits: { maxToolCalls: 4, maxBytes: 65536, deadlineMs: 60000 } });
+  const inputs = { issueIdOrKey: "SCRUM-1", orderBy: "-created", maxResults: 20 };
+
+  it("allows executeRead only with the pinned operation name", async () => {
+    const g = gate(listComments);
+    expect(await g.evaluate(claude("mcp__claude_ai_Atlassian__executeRead", { cloudId: "c1", name: "listJiraIssueComments", inputs }, "e1"))).toMatchObject({ kind: "allow", optionId: "once" });
+    expect(await g.evaluate(claude("mcp__claude_ai_Atlassian__executeRead", { cloudId: "c1", name: "searchJiraIssuesUsingJql", inputs: { jql: "project = SCRUM" } }, "e2")))
+      .toMatchObject({ kind: "deny", optionId: "reject", reason: "required_args_mismatch" });
+    expect(await g.evaluate(claude("mcp__claude_ai_Atlassian__executeRead", { cloudId: "c1", inputs }, "e3"))).toMatchObject({ kind: "deny", reason: "required_args_mismatch" });
+    expect(await g.evaluate(claude("mcp__claude_ai_Atlassian__executeWrite", { cloudId: "c1", name: "listJiraIssueComments", inputs }, "e4"))).toMatchObject({ kind: "deny", reason: "not_admitted" });
+    expect(await g.evaluate(claude("mcp__claude_ai_Atlassian__executeDestructive", { cloudId: "c1", name: "deleteJiraIssue", inputs: {} }, "e5"))).toMatchObject({ kind: "deny", reason: "not_admitted" });
+    expect(g.records().map(record => `${record.tool}:${record.status}`)).toEqual(["executeRead:allowed", "executeRead:denied", "executeRead:denied", "executeWrite:denied", "executeDestructive:denied"]);
+  });
+
+  it("reads a Codex executeRead's operation name from the call Codex announced", async () => {
+    const spec = IntegrationTaskSpecSchema.parse({ ...listComments, agentId: "codex", binding: { ...base.binding, source: { kind: "agent_mcp", serverName: "atlassian" } },
+      admittedTools: [{ server: "atlassian", tool: "executeRead", mode: "read", requiredArgs: { name: "listJiraIssueComments" } }] });
+    const ledger = new McpToolCallLedger();
+    const g = gate(spec, "codex", ledger);
+    const approval = (id: string) => ({ sessionId: "acp-1", toolCall: { toolCallId: id, kind: "execute", status: "pending" }, _meta: { is_mcp_tool_approval: true }, options }) as unknown as RequestPermissionRequest;
+    ledger.observe({ sessionUpdate: "tool_call", toolCallId: "i1", status: "pending", _meta: { is_mcp_tool_call: true }, rawInput: { server: "atlassian", tool: "executeRead", arguments: { cloudId: "c1", name: "listJiraIssueComments", inputs } } });
+    ledger.observe({ sessionUpdate: "tool_call", toolCallId: "i2", status: "pending", _meta: { is_mcp_tool_call: true }, rawInput: { server: "atlassian", tool: "executeRead", arguments: { cloudId: "c1", name: "getJiraIssueTransitions", inputs } } });
+    expect(await g.evaluate(approval("i1"))).toMatchObject({ kind: "allow" });
+    expect(await g.evaluate(approval("i2"))).toMatchObject({ kind: "deny", reason: "required_args_mismatch" });
+  });
+});
+
+describe("IntegrationToolGate: a Slack thread reply", () => {
+  const reply = { channel_id: "C0E2E0001", thread_ts: "1790977247.273309", message: "Konteks integration test, please ignore" };
+  const slackWrite = IntegrationTaskSpecSchema.parse({ ...base, phase: "write", binding: { ...base.binding, source: { kind: "account_connector", serverName: "claude_ai_Slack" } },
+    admittedTools: [{ server: "claude_ai_Slack", tool: "slack_send_message", mode: "write" }],
+    write: { tool: { server: "claude_ai_Slack", tool: "slack_send_message" }, canonicalArgs: canonicalArgs(reply), argsDigest: argsDigest(reply), actionId: "act-s", attemptId: "att-s", nonce: "nonce-s" },
+    limits: { maxToolCalls: 1, maxBytes: 65536, deadlineMs: 60000 } });
+
+  it("never sends reply_broadcast, never drops thread_ts: only the exact approved arguments pass", async () => {
+    const g = gate(slackWrite);
+    for (const [id, args] of [
+      ["b1", { ...reply, reply_broadcast: true }],
+      ["b2", { ...reply, reply_broadcast: false }],
+      ["b3", { channel_id: reply.channel_id, message: reply.message }],
+    ] as const) {
+      expect(await g.evaluate(claude("mcp__claude_ai_Slack__slack_send_message", args, id))).toMatchObject({ kind: "deny", reason: "args_mismatch" });
+    }
+    expect(journal.integrationWrites.get("nonce-s")).toBeUndefined();
+    expect(await g.evaluate(claude("mcp__claude_ai_Slack__slack_send_message", reply, "ok"))).toMatchObject({ kind: "allow" });
+  });
+});
+
 describe("IntegrationToolGate: the one approved write", () => {
   it("allows exactly the approved arguments, once per nonce, durably", async () => {
     const g = gate(writeSpec);

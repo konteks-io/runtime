@@ -1,4 +1,4 @@
-import type { IntegrationTaskSpec } from "@konteks/backstage-plugin-common";
+import { canonicalArgs, type IntegrationTaskSpec } from "@konteks/backstage-plugin-common";
 import { resultToolLine, resultToolLineWithSchema } from "../structured-result/structured-turn.js";
 import { toolInputSchema, type ResultToolDefinition } from "../structured-result/result-tool-server.js";
 
@@ -25,7 +25,11 @@ export function buildIntegrationPrompt(spec: IntegrationTaskSpec, resultTool: Re
     PHASE_LINES[spec.phase],
     "",
     `Use only these tools of the "${server}" connection:`,
-    ...spec.admittedTools.map(tool => `- ${tool.tool} (${tool.mode === "write" ? "the approved change" : "read"})`),
+    ...spec.admittedTools.map(tool => {
+      const line = `- ${tool.tool} (${tool.mode === "write" ? "the approved change" : "read"})`;
+      // Fixed arguments: a call without them, or with other values, is refused.
+      return tool.requiredArgs ? `${line}, always with these arguments set exactly: ${canonicalArgs(tool.requiredArgs)}` : line;
+    }),
     "Every other tool is refused: shell, files, web, browser and every other connection. Do not try them.",
   ];
   if (spec.resources && spec.resources.length > 0) {

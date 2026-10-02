@@ -39,6 +39,7 @@ export function journalWriteLedger(journal: SupervisorJournal): IntegrationWrite
 export type IntegrationDenyReason =
   | "not_admitted"
   | "args_mismatch"
+  | "required_args_mismatch"
   | "non_canonical_args"
   | "missing_args"
   | "limit"
@@ -90,7 +91,10 @@ function safeDigest(args: unknown): string {
  * - the tool is read only from structured fields (Stage 0 S0-4); a title can
  *   never grant;
  * - only the spec's admitted tools pass, by server and tool identity
- *   (`checkIntegrationToolCall`), and only up to `limits.maxToolCalls`;
+ *   (`checkIntegrationToolCall`), and only up to `limits.maxToolCalls`; a
+ *   read with fixed arguments (`requiredArgs`, e.g. the generic
+ *   `executeRead` with its operation `name` pinned) passes only when each one
+ *   is present and equal, and `executeWrite`/`executeDestructive` never pass;
  * - a write passes only with arguments whose canonical digest equals the
  *   approved one, once per nonce, recorded durably BEFORE the answer;
  * - shell, edit, browser, every other server and every other tool are denied
