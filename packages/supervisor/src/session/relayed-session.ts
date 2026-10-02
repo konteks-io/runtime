@@ -572,7 +572,7 @@ export class RelayedSession {
     let attempt = 0;
     while (!this.closed) {
       this.deps.assertExecutionOwned?.();
-      if (this.deps.clock.coreNow() >= Date.parse(this.assignment.expiresAt)) throw new RemoteInstanceError("execution_fenced", "Delivery output authority expired before acceptance.");
+      if (this.deps.clock.coreNow() >= this.liveUntil()) throw new RemoteInstanceError("execution_fenced", "Delivery output authority expired before acceptance.");
       const authority = this.deliveryAuthority(requestId);
       try {
         const result = resumeOnly
@@ -588,7 +588,7 @@ export class RelayedSession {
         return;
       } catch (error) {
         this.deps.assertExecutionOwned?.();
-        if (this.deps.clock.coreNow() >= Date.parse(this.assignment.expiresAt)) throw error;
+        if (this.deps.clock.coreNow() >= this.liveUntil()) throw error;
         attempt += 1;
         // Name the refusal (D112): without it a Core 422 repeated 120+ times
         // read as a transport stall. Codes and statuses only, never messages.
@@ -602,6 +602,11 @@ export class RelayedSession {
         await new Promise<void>(resolve => setTimeout(resolve, Math.min(5_000, 250 * 2 ** Math.min(attempt, 5))));
       }
     }
+  }
+
+  /** The assignment's lifetime, or the later one Core renewed a delivery turn to (D115). */
+  private liveUntil(): number {
+    return this.executionGate?.liveUntil() ?? Date.parse(this.assignment.expiresAt);
   }
 
   private async sendToCore(message: SessionToCoreMessage): Promise<void> {
