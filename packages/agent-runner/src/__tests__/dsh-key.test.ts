@@ -77,6 +77,33 @@ describe("DeepSeek API key for DeepSeek Harness", () => {
     expect(JSON.stringify(seen)).not.toContain("sk-wrong");
   });
 
+  it("speaks plainly: one line per step, the agent's name never its id, and one plain line when it fails", async () => {
+    const lines = (seen: RunnerEvent[]) => seen.flatMap(event => event.kind === "login_event" && event.event.type === "display" ? [event.event.text] : []);
+    const run = async (verdicts: Array<"valid" | "rejected" | "unreachable">, maxAttempts = 3) => {
+      const events = new RunnerEventBus();
+      const seen: RunnerEvent[] = [];
+      events.subscribe(event => seen.push(event));
+      const flow = startDshKeyLogin({ credentialsFile: await file(), events, verify: async () => verdicts.shift()!, maxAttempts });
+      while (verdicts.length > 0) { flow.input(KEY); await new Promise(resolve => setTimeout(resolve, 5)); }
+      await flow.done;
+      return lines(seen);
+    };
+    // Success is said once, by the CLI that reads the completed sign-in.
+    expect(await run(["valid"])).toEqual([
+      "Paste your DeepSeek API key. Konteks checks it with DeepSeek and keeps it only on this computer.",
+      "Checking the key with DeepSeek…",
+    ]);
+    const offline = await run(["unreachable"]);
+    expect(offline.at(-1)).toBe("Konteks could not reach DeepSeek. Check your connection and try again.");
+    const wrong = await run(["rejected", "rejected"], 2);
+    expect(wrong).toContain("DeepSeek did not accept that key. Paste it again, or press Ctrl+C to stop.");
+    expect(wrong.at(-1)).toBe("DeepSeek did not accept the key. Try again with a key from platform.deepseek.com.");
+    for (const text of [...offline, ...wrong]) {
+      expect(text).not.toMatch(/\bdsh\b|machine|login/i);
+      expect(text).not.toContain(KEY);
+    }
+  });
+
   it("stops after repeated rejection, on an unreachable DeepSeek, and on cancel, storing nothing", async () => {
     const rejected = startDshKeyLogin({ credentialsFile: await file(), events: new RunnerEventBus(), verify: async () => "rejected", maxAttempts: 2 });
     rejected.input(KEY); await new Promise(resolve => setTimeout(resolve, 5)); rejected.input(KEY);

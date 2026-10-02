@@ -67,13 +67,53 @@ describe("native control commands", () => {
     const f = fake();
     f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
       if (request.op !== "auth.login") return schema.parse({});
+      options?.onEvent?.({ kind: "display", loginId: "l1", text: "Paste your DeepSeek API key." });
+      options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "DeepSeek API key", secret: true });
       options?.onEvent?.({ kind: "started", loginId: "l1", agentId: "dsh" });
-      options?.onEvent?.({ kind: "display", loginId: "l1", text: "Key saved." });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      options?.onEvent?.({ kind: "display", loginId: "l1", text: "Checking the key with DeepSeek…" });
       options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
       return schema.parse({ loginId: "l1" });
     }) as typeof f.context.control.call;
     await authLogin(f.context, "dsh", false);
-    expect(f.text()).toBe("Key saved.\nDeepSeek Harness is ready.\n");
+    expect(f.text()).toBe("Paste your DeepSeek API key.\nChecking the key with DeepSeek…\nDeepSeek Harness is ready.\n");
+    expect(f.text()).not.toMatch(/\bdsh\b|official tooling|login (started|complete)/i);
+  });
+  it("in the window the site opened, ends with one line that says the window can close", async () => {
+    const f = fake();
+    f.context.onComputer = true;
+    await authLogin(f.context, "dsh", false);
+    expect(f.text().trim().split("\n").at(-1)).toBe("DeepSeek Harness is ready. You can close this window.");
+    expect(f.text()).not.toMatch(/\bdsh\b/);
+  });
+  it("leaves a failure at the flow's own plain line, and shows the error only when nothing said why", async () => {
+    const run = async (lines: string[]) => {
+      let text = "";
+      const sink = new Writable({ write(chunk, _encoding, done) { text += chunk.toString(); done(); } });
+      const f = fake();
+      const output = createOutput({ json: false, stdout: sink, stderr: sink });
+      f.context.output = output;
+      f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
+        if (request.op !== "auth.login") return schema.parse({});
+        options?.onEvent?.({ kind: "started", loginId: "l1", agentId: "dsh" });
+        for (const line of lines) options?.onEvent?.({ kind: "display", loginId: "l1", text: line });
+        options?.onEvent?.({ kind: "failed", loginId: "l1", code: "agent_auth_required", message: "the DeepSeek API key was not saved" });
+        return schema.parse({ loginId: "l1" });
+      }) as typeof f.context.control.call;
+      const error = await authLogin(f.context, "dsh", false).then(() => null, (failure: unknown) => failure);
+      expect(error).toMatchObject({ code: "agent_auth_required" });
+      output.error(error);
+      return text;
+    };
+    expect(await run(["Checking the key with DeepSeek…", "Konteks could not reach DeepSeek. Check your connection and try again."]))
+      .toBe("Checking the key with DeepSeek…\nKonteks could not reach DeepSeek. Check your connection and try again.\n");
+    // A progress line explains nothing: the error still shows.
+    expect(await run(["Checking the key with DeepSeek…"])).toContain("the DeepSeek API key was not saved");
+  });
+  it("starts an agent's own sign-in with its name, in plain words", async () => {
+    const f = fake();
+    await authLogin(f.context, "codex", false);
+    expect(f.text().split("\n")[0]).toBe("Starting Codex's own sign-in. Follow its steps below.");
   });
   it("asks OpenCode's provider choice in the open and its key hidden, and passes the chosen sign-in on (CP3)", async () => {
     const f = fake();
