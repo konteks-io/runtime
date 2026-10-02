@@ -173,11 +173,69 @@ describe("session manager (D98 bootstrap)", () => {
     await completed;
     await manager.sealCompletedTurn(first.acpSessionRef);
     const exited = nextEvent(events, "session_exited");
-    manager.releaseSealed(first.acpSessionRef);
+    await manager.releaseSealed(first.acpSessionRef);
     await exited;
     expect(manager.activeSessions).toBe(0);
     expect(calls.cancel ?? []).toEqual([]);
     await expect(manager.continueLive({ context, cwd: "/w", mcpServers: [], acpSessionRef: first.acpSessionRef })).rejects.toThrow();
+  });
+
+  it("closes a released session on the agent and counts it on its process until the close is confirmed (2026-10-02 leak)", async () => {
+    let confirm!: () => void;
+    const closeSession = vi.fn(() => new Promise<object>(resolve => { confirm = () => resolve({}); }));
+    const { bridge, calls } = fakeBridge({ closeSession }, { agentCapabilities: { sessionCapabilities: { close: {} } } });
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+    const first = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    const released = manager.releaseSealed(first.acpSessionRef);
+    // The record is gone at once, but the agent still holds the session.
+    expect(manager.activeSessions).toBe(0);
+    expect(manager.sessionsBoundTo(bridge)).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith({ sessionId: "bridge-s1" });
+    confirm();
+    await released;
+    expect(manager.sessionsBoundTo(bridge)).toBe(0);
+    expect(calls.cancel ?? []).toEqual([]);
+  });
+
+  it("keeps counting a released session the agent cannot close, refuses to close or never answers", async () => {
+    const sealed = async (bridge: BridgeProcess) => {
+      const events = new RunnerEventBus();
+      const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
+      const first = await manager.create({ context, cwd: "/w", mcpServers: [] });
+      const completed = nextEvent(events, "prompt_result");
+      manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+      await completed;
+      await manager.sealCompletedTurn(first.acpSessionRef);
+      return { manager, ref: first.acpSessionRef };
+    };
+    const unsupported = fakeBridge({ closeSession: vi.fn(async () => ({})) });
+    const a = await sealed(unsupported.bridge);
+    await expect(a.manager.releaseSealed(a.ref)).resolves.toBeUndefined();
+    expect(unsupported.bridge.connection.closeSession).not.toHaveBeenCalled();
+    expect(a.manager.sessionsBoundTo(unsupported.bridge)).toBe(1);
+
+    const refused = fakeBridge({ closeSession: vi.fn(async () => { throw new Error("close failed"); }) }, { agentCapabilities: { sessionCapabilities: { close: {} } } });
+    const b = await sealed(refused.bridge);
+    await expect(b.manager.releaseSealed(b.ref)).resolves.toBeUndefined();
+    expect(b.manager.sessionsBoundTo(refused.bridge)).toBe(1);
+
+    const silent = fakeBridge({ closeSession: vi.fn(() => new Promise<never>(() => undefined)) }, { agentCapabilities: { sessionCapabilities: { close: {} } } });
+    const c = await sealed(silent.bridge);
+    vi.useFakeTimers();
+    try {
+      let settled = false;
+      void c.manager.releaseSealed(c.ref).then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+    } finally { vi.useRealTimers(); }
+    expect(c.manager.sessionsBoundTo(silent.bridge)).toBe(1);
   });
 
   it("settles completed ACP operations before close without cancelling the local user's thread", async () => {

@@ -45,6 +45,26 @@ describe("authenticated model offered-values snapshot producer", () => {
     expect(producer.snapshots()).toEqual([expect.objectContaining({ snapshotId: "snapshot-2", snapshotRevision: 2, currentValue: "opus" })]);
   });
 
+  it("re-advertises a kept answer with the time it was observed and a fresh window Core accepts", async () => {
+    const own = new FixedClock(Date.parse("2026-10-02T00:00:00Z"));
+    const discover = vi.fn()
+      .mockResolvedValueOnce({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"] })
+      // The runner kept its last good answer while reading the agent again.
+      .mockResolvedValueOnce({ currentValue: "sonnet", offeredValues: ["sonnet", "opus"], observedAgoMs: 4 * 60_000 });
+    let nextId = 0;
+    const producer = new ModelCapabilitySnapshotProducer({ clock: own, instanceId: () => "instance", runnerIncarnation: () => "process", manifestId: () => "manifest",
+      mappings: () => [{ agentId: "claude-code", mapping: { ...mapping, expiresAt: "2026-10-09T00:00:00Z" } }], discover, newId: () => `snapshot-${++nextId}`, ttlMs: 5 * 60_000, refreshAheadMs: 2 * 60_000 });
+    await producer.refresh([ready]);
+    own.advance(4 * 60_000);
+    await producer.refresh([ready]);
+    const [kept] = producer.snapshots();
+    expect(kept).toMatchObject({ snapshotId: "snapshot-2", snapshotRevision: 2 });
+    // Not claimed as observed later than it was; valid for a full window from now.
+    expect(Date.parse(kept!.observedAt)).toBe(Date.parse("2026-10-02T00:00:00Z"));
+    expect(Date.parse(kept!.expiresAt)).toBe(own.now() + 5 * 60_000);
+    expect(kept).not.toHaveProperty("observedAgoMs");
+  });
+
   it("reports an agent the release signed nothing for under its catalogue authority, with names (System One §6a, KM6)", async () => {
     const codex = { ...ready, agentId: "codex", displayName: "Codex", authIdentityFingerprint: "identity-codex" };
     const discover = vi.fn(async (agentId: string, configId: string) => ({

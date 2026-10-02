@@ -250,8 +250,11 @@ export class RelayedSession {
     }
     try { await (this.deps.onExecutionAuthorityLost?.() ?? this.stopForRecovery()); }
     catch (error) {
+      // A non-Konteks error was logged as `recovery_required`, which hid
+      // where the stop failed (2026-10-02). The orchestrator retries it.
       this.logger.warn({ event: "execution.recovery_stop_unconfirmed", assignmentId: this.assignment.id,
-        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "recovery_required", err: error },
+        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
+        ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}), err: error },
       "Execution remains fenced; recovery settlement is unconfirmed");
       throw error;
     }

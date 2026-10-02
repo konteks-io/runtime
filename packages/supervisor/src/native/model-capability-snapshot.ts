@@ -33,6 +33,8 @@ interface DiscoveredOffer {
   currentValue: string;
   offeredValues: string[];
   offeredOptions?: Array<{ value: string; name?: string; group?: string; groupName?: string; billing?: "subscription" | "pay_per_use" }>;
+  /** How long ago the agent gave this answer, when the runner served an earlier one (cached, or kept while it is read again). */
+  observedAgoMs?: number;
 }
 
 export interface ModelCapabilitySnapshotProducerOptions {
@@ -141,6 +143,13 @@ export class ModelCapabilitySnapshotProducer {
       const currentAgent = this.agents.find(candidate => candidate.agentId === resolved.agentId);
       if (!eligible(currentAgent) || key !== this.authorityKey(resolved, currentAgent, this.options.manifestId() ?? "")) return;
       const now = this.options.clock.now();
+      // A kept answer is advertised with the time the agent actually gave it
+      // and a fresh validity window from now: Core takes any observedAt not
+      // after its own time with expiresAt still ahead, so the offer stays
+      // placeable while the agent is read again, and nothing claims it was
+      // observed later than it was.
+      const ageMs = typeof observed.observedAgoMs === "number" && Number.isFinite(observed.observedAgoMs) && observed.observedAgoMs > 0 ? observed.observedAgoMs : 0;
+      const observedAt = now - ageMs;
       const ttlEnd = now + (this.options.ttlMs ?? 5 * 60_000);
       const expires = resolved.expiresAt ? Math.min(parseRfc3339(resolved.expiresAt), ttlEnd) : ttlEnd;
       if (expires <= now) return;
@@ -161,7 +170,7 @@ export class ModelCapabilitySnapshotProducer {
         mappingDigest: resolved.mappingDigest, configId: resolved.configId,
         currentValue: observed.currentValue, offeredValues: observed.offeredValues,
         ...(labelled?.length ? { offeredOptions: labelled } : {}),
-        observedAt: new Date(now).toISOString(), expiresAt: new Date(expires).toISOString(),
+        observedAt: new Date(observedAt).toISOString(), expiresAt: new Date(expires).toISOString(),
       };
       const snapshot = AgentModelOfferedValuesSnapshotSchema.parse({ ...body, snapshotDigest: computeAgentModelOfferedValuesSnapshotDigest(body) });
       this.revisions.set(id, snapshotRevision); this.cache.set(id, { authorityKey: key, snapshot }); this.retry.delete(key);

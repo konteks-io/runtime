@@ -15,8 +15,10 @@ export interface DiscoverBridgeModelCapabilityOptions {
   clientVersion: string;
   spawn?: typeof spawnBridge;
   /** An idle resident bridge lent by the runtime: used for the one discovery
-   * `session/new`, never stopped here, its session closed when the agent can. */
+   * `session/new` and its `session/close`. It is stopped here only when that
+   * close is not confirmed, because the agent then still holds the session. */
   bridge?: BridgeProcess;
+  /** The first attempt's `session/new` deadline; each later attempt waits longer (`discoverySessionTimeoutMs`). */
   sessionTimeoutMs?: number;
   logger?: Logger;
   retrySleep?: (delayMs: number) => Promise<void>;
@@ -40,6 +42,47 @@ export interface DiscoveredBridgeModelCapability {
   offeredValues: string[];
   /** Parallel to `offeredValues`: same values, same order. */
   offeredOptions: DiscoveredModelOption[];
+  /**
+   * How long ago the agent gave this answer, when it was given earlier
+   * (`AgentRuntime.discoverModelCapability` caches it, and serves the last
+   * good one while a refresh runs or after one failed for a transient
+   * reason). Absent: just observed.
+   */
+  observedAgoMs?: number;
+}
+
+export const MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS = 30_000;
+const MAX_DISCOVERY_SESSION_TIMEOUT_MS = 120_000;
+
+/**
+ * Model discovery is a background check, not a turn: a loaded computer can
+ * take well over the session bootstrap deadline to answer `session/new`
+ * (2026-10-02: Claude Code and Codex both timed out four times at 10 s while
+ * signed in and fine). The runtime starts from at least
+ * `MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS`; each attempt waits twice as long
+ * as the one before, up to 2 min, and every attempt stops its own process
+ * before the next starts, so the total stays bounded (four attempts, at most
+ * one process at a time).
+ */
+export function discoverySessionTimeoutMs(baseMs: number, attempt: number): number {
+  const base = Number.isFinite(baseMs) && baseMs > 0 ? baseMs : MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS;
+  return Math.min(Math.max(base, MAX_DISCOVERY_SESSION_TIMEOUT_MS), base * 2 ** (attempt - 1));
+}
+/** How long a lent resident bridge may take to close the discovery session before it is stopped instead. */
+const LENT_CLOSE_DEADLINE_MS = 15_000;
+
+/**
+ * A discovery failure that says something definite about the agent's offer:
+ * it needs signing in, or it refused or malformed the answer. Anything else
+ * (a deadline, an internal or provider error, a process that could not
+ * start) is transient: the agent may still offer exactly what it last did.
+ */
+export function definiteModelDiscoveryFailure(error: unknown): boolean {
+  if (error instanceof RemoteInstanceError && (error.code === "agent_auth_required" || error.diagnostic === MODEL_DISCOVERY_REFUSED)) return true;
+  const cause = error instanceof RemoteInstanceError && error.cause !== undefined ? error.cause : error;
+  if (cause !== error && cause instanceof RemoteInstanceError && (cause.code === "agent_auth_required" || cause.diagnostic === MODEL_DISCOVERY_REFUSED)) return true;
+  const kind = classifyBridgeError(cause).class;
+  return kind === "agent_auth_required" || kind === "invalid_params" || kind === "unknown_request" || kind === "malformed_response";
 }
 
 /**
@@ -63,7 +106,8 @@ export function offerableModelCapability(capability: DiscoveredBridgeModelCapabi
 /** The most values one snapshot may carry (the Core wire bound). */
 export const MAX_OFFERED_MODEL_VALUES = 128;
 
-const unavailable = () => new RemoteInstanceError("agent_unavailable", "ACP model capability discovery was refused or malformed");
+const MODEL_DISCOVERY_REFUSED = "model_discovery_refused";
+const unavailable = () => new RemoteInstanceError("agent_unavailable", "ACP model capability discovery was refused or malformed", { diagnostic: MODEL_DISCOVERY_REFUSED });
 
 /**
  * One non-executing ACP discovery `session/new` in an empty private cwd with
@@ -78,12 +122,13 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
   const cwd = await mkdtemp(join(options.workspaceRoot, ".model-discovery-"));
   await chmod(cwd, 0o700);
   const logger = options.logger ?? createLogger({ name: "runner-model-discovery" });
-  const timeoutMs = options.sessionTimeoutMs ?? 10_000;
+  const baseTimeoutMs = options.sessionTimeoutMs ?? 10_000;
   const sleep = options.retrySleep ?? (delayMs => new Promise(resolve => setTimeout(resolve, delayMs)));
   const random = options.retryRandom ?? Math.random;
   const rejectDiscoveryRequest = async (): Promise<never> => { throw unavailable(); };
   try {
     for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const timeoutMs = discoverySessionTimeoutMs(baseTimeoutMs, attempt);
       let bridge = attempt === 1 ? options.bridge ?? null : null;
       let bridgeAcquired = bridge !== null;
       let spawned: BridgeProcess | null = null;
@@ -124,9 +169,7 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
         const selected = matches[0];
         if (matches.length !== 1 || selected === undefined || selected.type !== "select") throw unavailable();
         const capability = exactSelect(selected, options.spec.family.agentId);
-        if (attempt === 1 && options.bridge && options.bridge.initializeResult.agentCapabilities?.sessionCapabilities?.close != null) {
-          await options.bridge.connection.closeSession({ sessionId: created.sessionId }).catch(() => undefined);
-        }
+        if (attempt === 1 && options.bridge) await closeLentSession(options.bridge, created.sessionId, logger, options.spec.family.agentId);
         return capability;
       } catch (error) {
         const classified = classifyBridgeError(error);
@@ -171,6 +214,29 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
     throw unavailable();
   } finally {
     await rm(cwd, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Close the discovery session on a lent resident bridge. The agent keeps a
+ * session it was never told to close (Claude Code: a `claude` child), and the
+ * runtime parks the bridge again for the next turn, so a close that is not
+ * confirmed stops the bridge: the runtime then never parks it.
+ */
+async function closeLentSession(bridge: BridgeProcess, sessionId: string, logger: Logger, agentId: string): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    if (bridge.initializeResult.agentCapabilities?.sessionCapabilities?.close == null) throw new Error("the agent cannot close sessions");
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("discovery session close deadline elapsed")), LENT_CLOSE_DEADLINE_MS);
+      timer.unref();
+    });
+    await Promise.race([bridge.connection.closeSession({ sessionId }), deadline]);
+  } catch (error) {
+    logger.warn({ agentId, errorClass: classifyBridgeError(error).class }, "the resident process did not confirm closing the model discovery session; stopping it");
+    await bridge.stop().catch(() => undefined);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
