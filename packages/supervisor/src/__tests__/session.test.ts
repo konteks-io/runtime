@@ -55,7 +55,7 @@ describe("policy responder (D87 step 1)", () => {
     const allow = new EvaluatorPolicyResponder({ evaluateToolUse: async () => ({ allowed: true }) }, () => true);
     expect(await allow.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "allow", optionId: "allow" });
     const deny = new EvaluatorPolicyResponder({ evaluateToolUse: async () => ({ allowed: false, denyMessage: "no" }) }, () => true);
-    expect(await deny.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "deny", optionId: "reject" });
+    expect(await deny.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "deny", optionId: "reject", message: "no" });
     const none = new EvaluatorPolicyResponder(null, () => true);
     expect(await none.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "defer" });
     const headless = new EvaluatorPolicyResponder(null, () => false);
@@ -490,6 +490,21 @@ describe("relayed session (D98/D113/D114)", () => {
       } finally { await f.session.close("cancelled"); }
     });
 
+    it("lets the agent title the session itself and asks only for the [konteks] prefix (D130)", async () => {
+      const f = await build({ activateExecution: async () => ({ restoreReference: "acp-0" }) }, directWork);
+      try {
+        await f.session.bootstrap();
+        const created = f.runnerCalls[0]?.[1][0] as { agentTitled?: boolean; sessionLabel?: unknown };
+        expect(created.agentTitled).toBe(true);
+        expect(created.sessionLabel).toBeUndefined();
+      } finally { await f.session.close("cancelled"); }
+      const engineering = await build();
+      try {
+        await engineering.session.bootstrap();
+        expect(engineering.runnerCalls[0]?.[1][0]).not.toHaveProperty("agentTitled");
+      } finally { await engineering.session.close("cancelled"); }
+    });
+
     it("judges file changes against its own session folder, never another session's; blocked commands stay blocked", async () => {
       const own = join(dir, "session-own", "source"), other = join(dir, "session-other", "source");
       await mkdir(own, { recursive: true }); await mkdir(other, { recursive: true });
@@ -511,6 +526,47 @@ describe("relayed session (D98/D113/D114)", () => {
       expect(await decide(directWork)).toEqual({ inside: "allow", relative: "allow", other: "reject", push: "reject" });
       // Konteks's own conversations keep the workspace root (unchanged here).
       expect((await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).other).toBe("allow");
+    });
+
+    // T1 (2026-10-02): a Codex "Edit files" call named four paths, one written
+    // from the filesystem root; the connector refused the whole call and said
+    // nothing about which path or why (D114).
+    it("refuses a multi-path edit naming the outside path, notes why on the call, and logs it without host paths", async () => {
+      const own = join(dir, "own"), page = "/storefront/app/checkout/confirmation/[orderId]/page.tsx";
+      await mkdir(join(own, "storefront", "lib"), { recursive: true });
+      const warn = vi.fn();
+      const f = await build({
+        workspaceRoot: dir,
+        prepareInputs: async (target: RemoteWorkAssignment) => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
+          cwd: own, skillInstructions: "", beforePrompt: async () => undefined }),
+        policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false),
+        logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
+      });
+      try {
+        await f.session.bootstrap();
+        await f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId: "edit-1", params: { sessionId: "acp-1",
+          toolCall: { toolCallId: "exec-1", kind: "edit", title: "Edit files", locations: [
+            { path: join(own, "storefront", "lib", "orders.ts") }, { path: join(own, "storefront", "lib", "order-store.ts") },
+            { path: page }, { path: join(own, "storefront", "lib", "cart-snapshot.ts") },
+          ] }, options } } as never);
+        const answered = vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === "edit-1")?.[2] as { outcome: { optionId?: string } };
+        expect(answered.outcome.optionId).toBe("reject");
+        const note = f.sent.map(message => message.body as { method?: string; params?: { update?: Record<string, unknown> } })
+          .filter(body => body.method === "session/update").map(body => body.params!.update!)
+          .find(update => update.toolCallId === "exec-1");
+        expect(note).toMatchObject({ sessionUpdate: "tool_call_update" });
+        expect(note).not.toHaveProperty("status");
+        const text = (note!.content as Array<{ content: { text: string } }>)[0]!.content.text;
+        expect(text).toBe("Konteks refused this file change: 1 of 4 paths is outside the workspace `[workspace]/`. " +
+          "`" + page + "` starts at the filesystem root; inside the workspace it is `storefront/app/checkout/confirmation/[orderId]/page.tsx`. " +
+          "Nothing in it was applied. Use paths inside the workspace, relative to it, and try again.");
+        expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+          toolCallId: "exec-1", decision: "deny",
+          refusal: { reason: "outside_workspace", pathCount: 4, outside: [{ path: page, rootAnchored: true, suggestion: "storefront/app/checkout/confirmation/[orderId]/page.tsx" }] },
+        }), "tool permission not allowed by policy");
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(dir);
+        expect(JSON.stringify(f.sent)).not.toContain(dir);
+      } finally { await f.session.close("cancelled"); }
     });
 
     it("threads a question it defers to a person onto the direct session", async () => {
@@ -1194,6 +1250,52 @@ describe("relayed session (D98/D113/D114)", () => {
     }
     expect(sent).toHaveLength(before);
     expect(session.counters.malformedResponses).toBe(2);
+  });
+
+  it("relays every streamed chunk after one that ends inside a local path (D121)", async () => {
+    const warn = vi.fn();
+    const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never });
+    await session.bootstrap();
+    const before = sent.length;
+    const chunk = (text: string) => session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", messageId: "msg-1", content: { type: "text", text } },
+    } });
+    // Codex streams a generator's reply a few tokens at a time; a path is split.
+    await chunk("Editing /Users/private-person/rep");
+    await chunk("o/src/index.ts now");
+    await chunk(" and running the tests.");
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: { sessionUpdate: "plan", entries: [{ content: "Run the tests", priority: "medium", status: "in_progress" }] },
+    } });
+    expect(session.counters.malformedResponses).toBe(0);
+    expect(warn).not.toHaveBeenCalledWith(expect.objectContaining({ event: "session.acp_message_rejected" }), expect.anything());
+    const bodies = sent.slice(before).map(message => message.body as { kind: string; method: string; params: { update: { sessionUpdate: string; content?: { text: string } } } });
+    expect(bodies.map(body => [body.kind, body.method, body.params.update.sessionUpdate])).toEqual([
+      ["acp", "session/update", "agent_message_chunk"],
+      ["acp", "session/update", "agent_message_chunk"],
+      ["acp", "session/update", "agent_message_chunk"],
+      ["acp", "session/update", "plan"],
+    ]);
+    const text = bodies.slice(0, 3).map(body => body.params.update.content?.text).join("");
+    expect(text).toBe("Editing [local-path][local-path] now and running the tests.");
+    expect(JSON.stringify(bodies)).not.toContain("private-person");
+  });
+
+  it("names the refused field when a redacted update still fails the relay contract (D121)", async () => {
+    const warn = vi.fn();
+    const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never });
+    await session.bootstrap();
+    const before = sent.length;
+    // Within the 2048-character title bound before redaction, past it after.
+    const title = "/a ".repeat(680);
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: { sessionUpdate: "tool_call", toolCallId: "long-title", title, status: "pending" },
+    } });
+    expect(sent).toHaveLength(before);
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: "session.acp_message_rejected", stage: "redacted_schema", sessionUpdate: "tool_call", issuePath: "params.update.title", issueCode: "too_big",
+    }), expect.any(String));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("/a /a");
   });
 
   it.each([

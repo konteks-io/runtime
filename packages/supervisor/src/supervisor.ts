@@ -7,6 +7,7 @@ import {
   REMOTE_INSTANCE_PROTOCOL_VERSION,
   PlanningControllerTerminalDirectiveSchema,
   RemoteInstanceError,
+  CoreResponseError,
   AgentLoginGcpSchema,
   AgentLoginOptionIdSchema,
   ON_COMPUTER_LOGIN_OPTION,
@@ -32,7 +33,7 @@ import {
   type RuntimeAgentLoginDeliveryRequest,
   coreContractAtLeast,
 } from "@konteks/remote-common";
-import { EmbeddedReleaseRootSchema, NATIVE_MANIFEST_URL, nativeManifestUrl, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EmbeddedReleaseRootSchema, NATIVE_MANIFEST_URL, isHostAgentId, nativeManifestUrl, connectorCommandsManifest, selectNativeModelCapabilityMappings, verifyNativeRelease, type VerifiedNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { chromeInstalled, readAntigravityAdminObservation, type RunnerConfig } from "@konteks/remote-agent-runner";
 import type { NativeRuntimeRecord, NativeUnavailableAgent } from "./native/installation.js";
 import { SignalSampler } from "@konteks/remote-sysmon";
@@ -74,8 +75,9 @@ import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
+import { windowsInstalledLauncher } from "./native/windows-launcher.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
-import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerWatch } from "./native/on-computer.js";
+import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerWatch } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
@@ -112,6 +114,7 @@ import { PlanningTerminalDirectiveProcessor } from "./work/planning-terminal-dir
 import { ControllerDirectivePoller } from "./work/controller-directive-poller.js";
 import { DurableSearchAssignmentCarrier } from "./work/search-assignment-carrier.js";
 import { NativeUpdateCoordinator, type NativeUpdateCoordinatorOptions } from "./native/update.js";
+import type { NativeUpdateLedger } from "./native/update-ledger.js";
 import { evaluateHeartbeatLiveness, isCredentialRefusal, leaseLapseNeedsRestart } from "./heartbeat/liveness.js";
 
 /**
@@ -173,6 +176,12 @@ export interface SupervisorOptions {
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;
     /** Self-update policy; absent means the connector only reports `update_required`. */
     update?: Pick<NativeUpdateCoordinatorOptions, "fetchManifest" | "launch" | "readLedger" | "checkIntervalMs" | "initialDelayMs" | "maxAttemptsPerRelease" | "attemptWindowMs" | "staleAttemptMs">;
+    /**
+     * This release and the update ledger: while an update is still checking
+     * this release (its health gate), it takes no new work, so a rollback
+     * never stops it under a claim (D113b).
+     */
+    updateProbation?: { releaseId: string; readLedger: () => Promise<NativeUpdateLedger>; pollMs?: number; staleAttemptMs?: number };
   };
 }
 
@@ -204,6 +213,9 @@ export class Supervisor {
   private integrationCarrier: IntegrationWorkCarrier | undefined;
   private roleBindings: RoleBinding[] = [];
   private draining = false;
+  /** An update is still checking this release; no new work until it keeps it (D113b). */
+  private onUpdateProbation = false;
+  private probationTimer: NodeJS.Timeout | null = null;
   private drainReason: string | null = null;
   /** Non-null only for a Core directive; the local operator cannot lift that one. */
   private drainDeadline: string | null = null;
@@ -297,6 +309,9 @@ export class Supervisor {
   /** Since when Core has refused this runtime's credential (401/403) without a success in between. */
   private leaseRefusedSince: number | null = null;
   private refusedBundleUpdateAt: number | null = null;
+  /** Why Core refused the last startup reconnect, in plain words for `doctor`; null once it is accepted. */
+  private reconnectRefusal: string | null = null;
+  private refusedRestartTimer: NodeJS.Timeout | null = null;
   private pendingHeartbeatTimer: NodeJS.Timeout | null = null;
   private readonly activeLogins = new Map<string, { agentId: string; emit: (event: ControlLoginEvent) => void }>();
   /** Site-started steps waiting on the person at a window on this computer, by login id. */
@@ -346,6 +361,7 @@ export class Supervisor {
     await this.previewRegistry.sweep().catch(error => this.logger.warn({ err: error }, "leftover preview processes could not be checked"));
     await this.journal.load();
     await this.outbox.load();
+    await this.beginUpdateProbation();
     // A native machine that has an identity but no key has lost the only
     // proof of who it is. A fresh key would be refused by Core on every call
     // while the process looked alive (W1-L1), so it stops and says so;
@@ -827,7 +843,7 @@ export class Supervisor {
       // the integration carrier is composed (work/accepted-kinds.ts).
       acceptedKinds: () => acceptedWorkKinds(this.coreContractVersion).filter(kind => kind !== "integration" || this.integrationCarrier !== undefined),
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
-      draining: () => this.draining,
+      draining: () => this.draining || this.onUpdateProbation,
       reconciliationComplete: () => this.reconciliation.isComplete,
       recoveryAuthority: () => this.recoveryAuthority(),
       reportDeliveryAllowed: () => this.recoveryAuthority() !== null,
@@ -1032,7 +1048,7 @@ export class Supervisor {
       configRevision: () => this.control.configRevision,
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       softMaxConcurrent: () => this.configuration.softMaxConcurrent ?? this.config.SUPERVISOR_SOFT_MAX_CONCURRENT,
-      acceptingWork: () => !this.draining && this.lease.canPullNewWork() && this.reconciliation.isComplete,
+      acceptingWork: () => !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork() && this.reconciliation.isComplete,
       intervalSeconds: () => this.heartbeatIntervalSeconds ?? this.configuration.heartbeatIntervalSeconds,
       renewalDelayMs: () => this.lease.current() ? this.lease.nextRenewalDelayMs() : 5000,
     });
@@ -1178,12 +1194,14 @@ export class Supervisor {
       for (const runner of parked.runners) await runner.start();
     } catch (error) {
       this.codexRetryAttempt += 1;
+      this.agentStartFailures.set("codex", error);
       this.logger.warn({ err: error, attempt: this.codexRetryAttempt }, "codex still could not start; trying again later");
       this.scheduleCodexRetry();
       return;
     }
     if (this.stopping) return;
     this.parkedCodex = null;
+    this.agentStartFailures.delete("codex");
     this.nativeCodexOwner = parked.owner;
     for (const runner of parked.runners) {
       this.nativeRunners.push(runner);
@@ -1303,8 +1321,16 @@ export class Supervisor {
       const record = this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation);
       const terminal = record && record.state !== "pending" && record.state !== "applied";
       const denied = this.administrativeStatus === "revoked" || (error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch", "reconciliation_replay", "resume_deadline_expired"].includes(error.code));
+      // Core retired this process's recovery generation (or it expired, or
+      // another establishment won): this incarnation can never be accepted
+      // again, and retrying it is refused forever. A new process is a new
+      // incarnation that establishes through the ordinary path, so restart.
+      const retired = this.administrativeStatus !== "revoked" && !(error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch"].includes(error.code)) &&
+        (terminal || (error instanceof RemoteInstanceError && ["reconciliation_replay", "resume_deadline_expired"].includes(error.code)));
+      this.reconnectRefusal = this.describeReconnectRefusal(error, retired);
       // Below Core's minimum no start can succeed: only an update gets back in.
       if (error instanceof RemoteInstanceError && error.code === "update_required") this.requestUpdateForRefusedBundle();
+      if (retired && !this.stopping && !this.activeLoopStarted) this.restartForRetiredProcess(error);
       if (!this.stopping && !this.activeLoopStarted && !terminal && !denied && !this.recoveryRetryTimer) {
         this.recoveryRetryTimer = setTimeout(() => { this.recoveryRetryTimer = null; void this.startActiveLoop(); }, 15_000);
         this.recoveryRetryTimer.unref();
@@ -1312,6 +1338,32 @@ export class Supervisor {
     }).finally(() => { this.activeLoopStarting = null; });
     this.activeLoopStarting = operation;
     return operation;
+  }
+
+  /** Plain words for `doctor` when Core refused the startup reconnect; null for a passing failure. */
+  private describeReconnectRefusal(error: unknown, retired: boolean): string | null {
+    if (retired) return "Konteks no longer accepts this connector process; it restarts to reconnect as a new one";
+    if (!(error instanceof RemoteInstanceError)) return null;
+    if (error.code === "update_required") return `Konteks refuses release ${this.config.SUPERVISOR_BUNDLE_VERSION} for this computer (${error.message}); it needs an update to the release Konteks accepts`;
+    if (error instanceof CoreResponseError && error.status >= 400 && error.status < 500) return `Konteks refused the reconnect: ${error.message}`;
+    return null;
+  }
+
+  /**
+   * Restart once, shortly, after Core refused this incarnation for good. The
+   * service manager starts a new process, which establishes a fresh
+   * incarnation; the delay keeps two processes that keep replacing each
+   * other from spinning.
+   */
+  private restartForRetiredProcess(error: unknown): void {
+    if (this.refusedRestartTimer) return;
+    this.refusedRestartTimer = setTimeout(() => {
+      if (this.stopping || this.activeLoopStarted) return;
+      const detail = { reason: "recovery_refused", code: error instanceof RemoteInstanceError ? error.code : "unknown" };
+      this.logger.error(detail, "Konteks no longer accepts this connector process; restarting to reconnect as a new one");
+      this.options.onLivenessLost?.(detail);
+    }, 15_000);
+    this.refusedRestartTimer.unref();
   }
 
   /** At most one channel read per interval while startup keeps being refused as too old (it retries every 15 s). */
@@ -1408,6 +1460,7 @@ export class Supervisor {
     if (this.stopping) return;
     this.requireRecoveryAuthority();
     this.activeLoopStarted = true;
+    this.reconnectRefusal = null;
     void this.resumeOnComputerWatches().catch(error => this.logger.warn({ err: error }, "on-computer steps not resumed"));
     this.transport.start();
     this.planningDirectivePoller?.start();
@@ -1951,7 +2004,7 @@ export class Supervisor {
       components: (this.lastSnapshot?.components ?? []).map((component) => ({ kind: component.kind, version: component.version, healthStatus: component.healthStatus, capabilities: component.capabilities, lastProbeAt: component.lastProbeAt })),
       roles: (this.heartbeat?.roles() ?? []) as SupervisorStatus["roles"],
       roleBindings: this.roleBindings,
-      utilization: { acceptingWork: !this.draining && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
+      utilization: { acceptingWork: !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
       pendingErase: this.journal.erase.all().filter((record) => !record.receiptSent).length,
       pendingRevocation: this.pendingRevocation,
       // Also read by launchers installed before 7.0.0, which require both fields.
@@ -1965,8 +2018,10 @@ export class Supervisor {
       switch (request.op) {
         case "status":
           return this.status();
-        case "agents":
-          return { agents: this.lastSnapshot?.agents ?? this.inventory.agents(), roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
+        case "agents": {
+          const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
+          return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
+        }
         case "auth.status":
           return { agents: (this.lastSnapshot?.agents ?? this.inventory.agents()).filter((agent) => request.agentId === undefined || agent.agentId === request.agentId) };
         case "auth.login": {
@@ -2233,8 +2288,10 @@ export class Supervisor {
     const root = dirname(this.config.SUPERVISOR_DATA_DIR);
     // A stand-in laptop's window loads the stand-in's own terminal settings.
     const prelude = process.env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" ? standInTerminalEnv(root) : undefined;
+    // This release's own launcher, never the install-day one in bin (it is not updated).
+    const launcher = releaseLauncher();
     try {
-      const { file, opened } = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform, ...(prelude ? { prelude } : {}) }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform, confined: prelude !== undefined });
+      const { file, opened } = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform, ...(prelude ? { prelude } : {}), ...(launcher ? { launcher } : {}) }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform, confined: prelude !== undefined });
       this.logger.info({ event: opened ? "on_computer.opened" : "on_computer.left_for_tester", loginId, agentId, step: plan.step, file },
         opened ? "site-started step brought to the front on this computer" : "site-started step left in the stand-in's folder; no window opened");
     } catch (error) {
@@ -2342,6 +2399,26 @@ export class Supervisor {
     }
   }
 
+  /**
+   * The agents this installation lists that could not start, as unavailable,
+   * for `agents` and `doctor` (RCA 2026-10-01: a Codex left out at start was
+   * simply missing there, so the update health gate kept waiting for its
+   * probe until its deadline and blamed the probe). Only agents this release
+   * bundles: the person's own host agents have their own doctor checks and
+   * never hold an update back. Not in the heartbeat: Core hears of them
+   * through `supportedAgents`.
+   */
+  private leftOutAgents(listed: readonly { agentId: string }[]): Array<{ agentId: string; readiness: "unavailable"; connectionState: "unavailable"; startFailure: string }> {
+    const present = new Set(listed.map(agent => agent.agentId));
+    return [...this.recordedAgentIds()]
+      .filter(agentId => !isHostAgentId(agentId) && !present.has(agentId) && !this.runners.has(agentId) && this.agentStartFailures.has(agentId))
+      .map(agentId => {
+        const failure = this.agentStartFailures.get(agentId);
+        const reason = (failure instanceof Error ? failure.message : `${agentId} could not start`).replace(/\.$/, "").slice(0, 300);
+        return { agentId, readiness: "unavailable" as const, connectionState: "unavailable" as const, startFailure: reason };
+      });
+  }
+
   /** The agents this installation lists: its runners and the host agents left out at load. */
   private recordedAgentIds(): Set<string> {
     const native = this.options.native;
@@ -2443,8 +2520,13 @@ export class Supervisor {
       relay: this.relay?.status() ?? { state: "offline", lastError: "relay not configured", consecutiveFailures: 0 },
       transport: this.transport.kind,
       reconciliationComplete: this.reconciliation.isComplete,
+      ...(this.reconnectRefusal ? { reconciliationRefusal: this.reconnectRefusal } : {}),
       components: snapshot.components,
-      agents: snapshot.agents,
+      agents: [...snapshot.agents, ...this.leftOutAgents(snapshot.agents)],
+      // The snapshot may carry the site's "Not added" Google Antigravity view
+      // (only after a fresh collect, so a long-running release did not show
+      // it and a just-started one did): an update gate read it as a failure.
+      ...(this.options.native ? { listedAgents: [...this.recordedAgentIds()] } : {}),
       configRevision: this.control.configRevision,
       diskFreeBytes: snapshot.diskFreeBytes,
       // Native releases name no disk minimum; the check reports free space only.
@@ -2457,6 +2539,7 @@ export class Supervisor {
       ...(openCode ? { openCode } : {}),
       ...(antigravity ? { antigravity } : {}),
       ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
+      ...(this.options.native && process.platform === "win32" ? { launcher: await windowsInstalledLauncher().catch(() => null) } : {}),
     });
   }
 
@@ -2536,6 +2619,10 @@ export class Supervisor {
     this.stopPendingHeartbeat();
     if (this.recoveryRetryTimer) clearTimeout(this.recoveryRetryTimer);
     this.recoveryRetryTimer = null;
+    if (this.refusedRestartTimer) clearTimeout(this.refusedRestartTimer);
+    this.refusedRestartTimer = null;
+    if (this.probationTimer) clearInterval(this.probationTimer);
+    this.probationTimer = null;
     this.cancelDrainTimer();
     this.stopPromise ??= this.stopImpl();
     return this.stopPromise;
@@ -2585,18 +2672,37 @@ export class Supervisor {
     await waitFor("lease_loss_cleanup", this.leaseLossCleanup);
     await note("supervisor_prelude", "completed");
     await note("work_drain", "entered");
-    await this.work?.drainSessions("drain");
-    await note("work_drain", "completed");
+    // stop() withdrew this process's recovery authority first, so a session
+    // whose close asserts it is refused ("Transport recovery generation is not
+    // currently accepted"). That must not abort the stop before the runners
+    // and the Codex owner below are stopped (D113: it orphaned Codex and no
+    // receipt was written); the session stays journaled for recovery.
+    try {
+      await this.work?.drainSessions("drain");
+      await note("work_drain", "completed");
+    } catch (error) {
+      this.logger.warn({ event: "shutdown.session_close_unconfirmed", code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" },
+        "an open session could not close during shutdown; stopping its agent anyway, the next start recovers it");
+    }
     await note("preview_close", "entered");
     await this.previews.close();
     await note("preview_close", "completed");
     this.previewChannel?.dispose();
     await note("runner_stop", "entered");
-    for (const runner of this.nativeRunners) await runner.stop();
-    await note("runner_stop", "completed");
+    // Side by side: one after another, an idle connector's bridges took 5 s,
+    // and launchd's SIGKILL came before the Codex owner was reached (D113b).
+    // A runner that cannot stop does not keep the others, the Codex owner or
+    // the state from stopping; its failure is reported once all are done.
+    const runnerStops = await Promise.allSettled(this.nativeRunners.map(runner => runner.stop()));
+    const runnerFailure = runnerStops.find((stop): stop is PromiseRejectedResult => stop.status === "rejected");
+    const codexUnstopped = runnerStops.some((stop, index) => stop.status === "rejected" && this.nativeRunners[index]?.agentId === "codex");
+    if (!runnerFailure) await note("runner_stop", "completed");
     await note("codex_owner_stop", "entered");
-    await this.nativeCodexOwner?.stop();
-    await note("codex_owner_stop", "completed");
+    // The shared Codex app-server is stopped here only once every Codex runner
+    // stopped; otherwise the exit reaper armed by stop() ends it with the process.
+    let codexFailure: { reason: unknown } | null = null;
+    if (!codexUnstopped) await this.nativeCodexOwner?.stop().catch((reason: unknown) => { codexFailure = { reason }; });
+    if (!codexFailure && !codexUnstopped) await note("codex_owner_stop", "completed");
     if (this.codexRetryTimer) clearTimeout(this.codexRetryTimer);
     this.codexRetryTimer = null;
     this.parkedCodex = null;
@@ -2608,6 +2714,41 @@ export class Supervisor {
     await note("state_close", "entered");
     await this.stateMutations.close();
     this.nativeOwnership?.release();
+    if (runnerFailure) throw runnerFailure.reason;
+    if (codexFailure) throw (codexFailure as { reason: unknown }).reason;
+  }
+
+  /**
+   * A release an update just started is on probation until the update keeps
+   * it: the ledger's attempt for this release is no longer in progress. An
+   * attempt older than the update coordinator's stale bound is abandoned (its
+   * updater died) and ends the probation too.
+   */
+  private async beginUpdateProbation(): Promise<void> {
+    const probation = this.options.native?.updateProbation;
+    if (!probation) return;
+    const staleMs = probation.staleAttemptMs ?? 45 * 60_000;
+    const checking = async (): Promise<boolean> => {
+      const ledger = await probation.readLedger().catch(() => null);
+      return ledger?.attempts.some(attempt => attempt.outcome === "in_progress" && attempt.releaseId === probation.releaseId &&
+        Date.now() - Date.parse(attempt.startedAt) < staleMs) ?? false;
+    };
+    if (!await checking()) return;
+    this.onUpdateProbation = true;
+    this.logger.info({ event: "update.probation_started", releaseId: probation.releaseId }, "an update is checking this release; it takes no new work until the update keeps it");
+    let reading = false;
+    this.probationTimer = setInterval(() => {
+      if (reading) return;
+      reading = true;
+      void checking().then(still => {
+        if (still || !this.onUpdateProbation) return;
+        this.onUpdateProbation = false;
+        if (this.probationTimer) clearInterval(this.probationTimer);
+        this.probationTimer = null;
+        this.logger.info({ event: "update.probation_ended", releaseId: probation.releaseId }, "the update is done with this release; taking work");
+      }).finally(() => { reading = false; });
+    }, probation.pollMs ?? 2_000);
+    this.probationTimer.unref();
   }
 }
 

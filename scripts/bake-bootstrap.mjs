@@ -9,9 +9,12 @@
  * executables' digests — and the digest of the release signing key file —
  * into the copy of install.sh that is published with the same immutable
  * release. A script fetched from a tag only ever installs that tag's bytes.
+ * It also refuses a release whose signing key is not the one install.sh and
+ * install.ps1 pin.
  */
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) => (value.startsWith("--") ? [value.slice(2), all[index + 1]] : [])).filter(pair => pair.length === 2));
 for (const key of ["sums", "pub", "in", "out"]) if (!args[key]) throw new Error("usage: bake-bootstrap.mjs --sums SHA256SUMS --pub release-signing.pub --in bootstrap/install.sh --out dist/release/install.sh");
@@ -26,6 +29,15 @@ if (executables.length !== 5) throw new Error(`expected five connector executabl
 const lines = [...executables, ...all.filter(([, name]) => GRAFT.test(name ?? ""))];
 for (const [digest] of lines) if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("malformed digest in SHA256SUMS");
 const pubDigest = createHash("sha256").update(readFileSync(args.pub)).digest("hex");
+
+// Both bootstraps pin the release key; a release signed by any other key would
+// be refused by every installer, so it fails here instead.
+const releaseKey = createPublicKey(readFileSync(args.pub)).export({ type: "spki", format: "der" }).toString("base64");
+const pinned = {
+  "install.sh": readFileSync(args.in, "utf8").match(/^PINNED_RELEASE_PUBKEY="([^"]+)"$/m)?.[1],
+  "install.ps1": readFileSync(join(dirname(args.in), "install.ps1"), "utf8").match(/^\$PinnedReleaseKey = '([^']+)'$/m)?.[1],
+};
+for (const [name, key] of Object.entries(pinned)) if (key !== releaseKey) throw new Error(`${name} pins ${key ?? "no release key"}, but this release is signed by ${releaseKey}; update the pinned key in both bootstraps`);
 
 let script = readFileSync(args.in, "utf8");
 const marker = { sums: 'BAKED_EXECUTABLE_SUMS=""', pub: 'BAKED_RELEASE_PUBKEY_SHA256=""' };

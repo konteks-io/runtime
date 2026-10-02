@@ -22,6 +22,7 @@ function fixture(options: { loggedOut?: boolean; startGate?: Promise<void> } = {
     loadSession: vi.fn(async () => ({})),
     prompt: vi.fn(async () => ({ stopReason: "end_turn" })),
     cancel: vi.fn(async () => undefined),
+    closeSession: vi.fn(async () => ({})),
     setSessionMode: vi.fn(async () => ({})),
     setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => {
       selectedConfig.set(configId, value);
@@ -55,6 +56,12 @@ describe("native in-process runner (A4)", () => {
       konteksIntegration: { version: 1, admittedMcpServerNames: ["atlassian"], accountConnectors: false } }) }));
     await expect(f.runner.createSession({ ...f.input, integration: { admittedMcpServerNames: ["a b; rm"], accountConnectors: false } })).rejects.toThrow();
     await expect(f.runner.createSession({ ...f.input, integration: { admittedMcpServerNames: Array.from({ length: 9 }, (_, i) => `s${i}`), accountConnectors: false } })).rejects.toThrow();
+  });
+
+  it("asks a direct session's agent only for the [konteks] prefix ahead of its own title", async () => {
+    const f = fixture(); await f.runner.start();
+    await f.runner.createSession({ ...f.input, agentTitled: true });
+    expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: { konteksSession: { version: 1, prefix: "[konteks]" } } }));
   });
   it("adds no browser for an agent package that carries none, and refuses a browser request that is not a loopback gateway", async () => {
     const f = fixture(); await f.runner.start();
@@ -114,7 +121,8 @@ describe("native in-process runner (A4)", () => {
     const retainedProcessOwner = { version: 1 as const, platform: "darwin" as const, pid: 4242, processGroupId: 4242, startToken: "start", commandDigest: "A".repeat(43) };
     // Execution spawns hand the exact stop handle (with its durable identity) over before initialize, as the real spawn does.
     f.spawn.mockImplementation(async (args: SpawnBridgeOptions) => {
-      const candidate = { ...f.bridge, retainedProcessOwner, stop: vi.fn(async () => undefined) };
+      const candidate = { ...f.bridge, initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { close: {} } } },
+        retainedProcessOwner, stop: vi.fn(async () => undefined) };
       await args.onProcessOwner?.(candidate);
       return candidate;
     });
@@ -126,6 +134,8 @@ describe("native in-process runner (A4)", () => {
     await f.runner.prompt(first.acpSessionRef, "p", { sessionId: first.acpSessionRef, prompt: [{ type: "text", text: "Complete this turn." }] });
     await f.runner.closeSession(first.acpSessionRef, { completed: true });
     await expect(f.runner.releaseSealedSession(first.acpSessionRef)).resolves.toEqual({ processRetained: true });
+    // The resident process does not keep the released session open (2026-10-02 leak).
+    expect(f.connection.closeSession).toHaveBeenCalledWith({ sessionId: "first-private" });
     expect(execution.stop).not.toHaveBeenCalled();
     const second = await f.runner.createSession(f.input, lifecycle);
     expect(f.spawn).toHaveBeenCalledTimes(2);
@@ -137,6 +147,27 @@ describe("native in-process runner (A4)", () => {
     expect(execution.stop).not.toHaveBeenCalled();
     await f.runner.prompt(second.acpSessionRef, "q", { sessionId: second.acpSessionRef, prompt: [{ type: "text", text: "continue" }] });
     expect(f.connection.prompt).toHaveBeenLastCalledWith({ sessionId: "second-private", prompt: [{ type: "text", text: "continue" }] });
+  });
+
+  it("stops and finalizes a released process whose agent cannot close the session, instead of keeping it resident", async () => {
+    const f = fixture(); await f.runner.start();
+    const retainedProcessOwner = { version: 1 as const, platform: "darwin" as const, pid: 4243, processGroupId: 4243, startToken: "start", commandDigest: "A".repeat(43) };
+    f.spawn.mockImplementation(async (args: SpawnBridgeOptions) => {
+      const candidate = { ...f.bridge, retainedProcessOwner, stop: vi.fn(async () => undefined) };
+      await args.onProcessOwner?.(candidate);
+      return candidate;
+    });
+    const lifecycle = { beforeCreate: async () => undefined, recordProcessOwner: vi.fn(async () => undefined), assertCurrent: () => undefined };
+    const first = await f.runner.createSession(f.input, lifecycle);
+    const execution = await f.spawn.mock.results[1]!.value;
+    await f.runner.prompt(first.acpSessionRef, "p", { sessionId: first.acpSessionRef, prompt: [{ type: "text", text: "Complete this turn." }] });
+    await f.runner.closeSession(first.acpSessionRef, { completed: true });
+    await expect(f.runner.releaseSealedSession(first.acpSessionRef)).resolves.toEqual({ processRetained: false });
+    expect(f.connection.closeSession).not.toHaveBeenCalled();
+    expect(execution.stop).toHaveBeenCalledOnce();
+    // The next session gets a process of its own.
+    await f.runner.createSession(f.input, lifecycle);
+    expect(f.spawn).toHaveBeenCalledTimes(3);
   });
 
   it("refuses prior-reference adoption without qualified predecessor ownership", async () => {

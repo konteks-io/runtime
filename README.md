@@ -67,12 +67,36 @@ curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/instal
 powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://github.com/konteks-io/runtime/releases/latest/download/install.ps1))) -ActivationId <id>"
 ```
 
+Nothing needs to be installed first. Without `--agents`, `install` uses the
+agents it finds on the computer and connects even with none. Before asking
+for the code it offers, once each and only in a terminal: Claude Code through
+Anthropic's official installer (`https://claude.ai/install.ps1` on Windows,
+`https://claude.ai/install.sh` elsewhere), and Codex, which ships with the
+connector (nothing is downloaded). On Windows, Claude Code needs Git for
+Windows; when it is missing it asks once to install it with winget
+(`Git.Git`), or names https://git-scm.com/download/win. It then starts each one's own sign-in and
+ends by saying which agents are ready, with the one command for the rest
+(`konteks-remote agent add claude-code|codex` offers the same later). Without a
+terminal nothing is downloaded. `--agents` names exactly the agents to use,
+each required.
+
 The bootstrap verifies the signed checksum manifest and the publisher
 signature of the installer package before running anything. Signed packages
 are also published as plain release assets for offline or audited installs.
 
+Both bootstraps pin the Konteks release key (Ed25519) in the script itself;
+it is never taken from the download location, and the release job refuses to
+publish a release signed by any other key. On Windows the MSI is not yet
+Authenticode-signed (Konteks has no Windows code-signing certificate), so
+`install.ps1` trusts it through the signed checksums alone: it verifies the
+Ed25519 signature on `SHA256SUMS` itself, in plain Windows PowerShell 5.1,
+checks the MSI's SHA-256 against it, and installs nothing if either fails.
+Windows then shows "Unknown publisher" at the elevation prompt. A release
+that does carry an Authenticode signature must also be valid and from the
+expected publisher.
+
 Supported platforms: macOS 13+ (Apple silicon and Intel), Windows 10/11
-(x64), Debian 12/13 (amd64, arm64).
+(x64), Debian 12/13 and Ubuntu 22.04/24.04 (amd64, arm64).
 
 ## Day-to-day
 
@@ -87,6 +111,7 @@ konteks-remote preview status  # this computer's live session previews (read-onl
 konteks-remote update --check  # what the stable channel offers
 konteks-remote update          # stage, drain, swap, verify; rolls back on failure
 konteks-remote stop | start
+konteks-remote --verbose start # also print each service command, its exit code and output (or KONTEKS_REMOTE_VERBOSE=1)
 konteks-remote uninstall       # finish running work, remove this runtime from its workspace, delete the connector
 ```
 
@@ -452,8 +477,30 @@ transactionally: the new release is staged beside the running one, work is
 drained, the service is swapped and health-gated, and the previous release is
 restored if the gate fails. A new release whose service exits as it starts is
 rolled back after three failed starts, within seconds, rather than at the
-gate's three-minute deadline. `update` and `update --check` say when the
-connector updated itself, and when a release already failed here.
+gate's three-minute deadline. A bundled agent the new release cannot start
+is listed as unavailable with the reason, so the gate decides at once and,
+when that agent worked before, rolls back naming it. `update` and
+`update --check` say when the connector updated itself, and when a release
+already failed here; a second `update` while one is still downloading says so.
+An update that stops the connector but cannot go ahead starts the same
+release again and says once it answers. While the new release is being
+checked it takes no new work. The running release keeps `konteks-remote`
+itself on its own version, whichever `konteks-remote` ran the update.
+On Windows the `konteks-remote` the MSI installed (under Program Files) runs
+the installed release's own copy for every command except `install` and
+`uninstall`, or its own code when it is newer than the installed release, so
+it never needs replacing for an update. An MSI from before 0.10.11 runs its
+own old code; `doctor` says so, and running the Windows install line once with
+`-Update` in place of `-ActivationId` replaces it, updates and starts the
+connector.
+
+On macOS and Windows the connector logs to `logs/connector.log` in its
+folder, from its first line (on Windows the file is kept under 20 MB at each
+start); on Linux, to the user journal. When the connector is not running,
+`doctor` and `support` show the last failed start and the log's last lines. A release that finds its service still loaded with an
+older definition (for example one that sent its output nowhere) has the
+service manager reload it and restart once, so an updated connector keeps
+logging where it did.
 
 In Activity Monitor, `ps` or Task Manager the service shows as
 `konteks-connector` (Linux cuts process names to 15 characters:

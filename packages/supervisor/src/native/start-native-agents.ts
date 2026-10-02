@@ -35,20 +35,14 @@ export async function startNativeAgents<R extends StartableRunner>(input: {
   onUnavailable?: (agentId: string, error: unknown) => void;
 }): Promise<NativeAgentsStartResult<R>> {
   const unavailable: Array<{ agentId: string; reason: string }> = [];
-  let codexOwnerStarted = false;
-  if (input.codexOwner) {
-    try {
-      await input.codexOwner.start();
-      codexOwnerStarted = true;
-    } catch (error) {
-      input.onUnavailable?.("codex", error);
-      unavailable.push({ agentId: "codex", reason: error instanceof Error ? error.message : "Codex could not start." });
-    }
-  }
+  // Codex's shared server may take a while on a first start (a newer Codex
+  // migrating its home); the other agents start meanwhile instead of waiting.
+  const owner = input.codexOwner
+    ? input.codexOwner.start().then(() => ({ started: true as const }), (error: unknown) => ({ started: false as const, error }))
+    : Promise.resolve(null);
   const started: R[] = [];
   const failed: R[] = [];
-  for (const runner of input.runners) {
-    if (runner.agentId === "codex" && input.codexOwner && !codexOwnerStarted) continue;
+  const start = async (runner: R) => {
     try {
       await runner.start();
       started.push(runner);
@@ -57,7 +51,16 @@ export async function startNativeAgents<R extends StartableRunner>(input: {
       unavailable.push({ agentId: runner.agentId, reason: error instanceof Error ? error.message : `${runner.agentId} could not start.` });
       failed.push(runner);
     }
+  };
+  const behindOwner = (runner: R) => runner.agentId === "codex" && input.codexOwner !== null;
+  for (const runner of input.runners) if (!behindOwner(runner)) await start(runner);
+  const ownerResult = await owner;
+  const codexOwnerStarted = ownerResult?.started === true;
+  if (ownerResult && !ownerResult.started) {
+    input.onUnavailable?.("codex", ownerResult.error);
+    unavailable.unshift({ agentId: "codex", reason: ownerResult.error instanceof Error ? ownerResult.error.message : "Codex could not start." });
   }
+  if (codexOwnerStarted) for (const runner of input.runners) if (behindOwner(runner)) await start(runner);
   return { started, failed, unavailable, codexOwnerStarted };
 }
 

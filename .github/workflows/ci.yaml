@@ -31,3 +31,46 @@ jobs:
         run: |
           sh -n bootstrap/install.sh
           bootstrap/install.sh --version
+      - name: The Windows bootstrap parses (it failed to load on every Windows computer until 0.10.8)
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/bootstrap/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_.ToString() }; exit 1 }
+
+  windows-bootstrap:
+    # install.ps1 trusts the MSI through its own Ed25519 check of the signed
+    # SHA256SUMS (there is no Windows code-signing certificate yet), so that
+    # check runs where people run it: Windows PowerShell 5.1, and pwsh too.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ed25519 verifier in Windows PowerShell 5.1 (RFC 8032 vectors, a real release manifest)
+        shell: powershell
+        run: .\scripts\test-bootstrap-verifier.ps1
+      - name: The same in PowerShell 7
+        shell: pwsh
+        run: .\scripts\test-bootstrap-verifier.ps1
+
+  windows-native:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - name: Point the contract links at vendor/
+        shell: bash
+        run: |
+          node scripts/ci-vendored-contracts.mjs
+          npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
+      - name: Install (shared contracts are vendored under vendor/)
+        run: npm ci --ignore-scripts --legacy-peer-deps
+      - name: Build workspace packages
+        run: npm run build
+      - name: Verify Windows service and process ownership
+        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts
+      - name: Verify signed Windows local release
+        run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/e2e-smoke-release.test.ts -t "adds a real Windows connector and Codex package to the signed local release"
+      - name: Verify organization Skill staging on Windows
+        run: npx vitest run --maxWorkers=1 packages/supervisor/src/__tests__/skill-staging.test.ts -t "retains digest-bound executable metadata on Windows instead of guessing it from stat"

@@ -1,6 +1,8 @@
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, open, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
@@ -9,62 +11,232 @@ import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyLis
 import { SupervisorControl } from "../control.js";
 import { addNativeAgent, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { terminalFetchConsent, type FetchConsent } from "./consent.js";
+import { closeAgentSetup, ensurePersonalAgent, isPersonalAgent, PERSONAL_AGENTS, productionAgentClosingDeps, setUpPersonalAgent } from "./agent-setup.js";
 import { confirm } from "../prompt.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
-import { nativePlatform, nativeServiceDefinition, parseServiceExits, startNativeServiceDefinition, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
+import { describeServiceFailure, encodeServiceDefinition, nativePlatform, nativeServiceDefinition, NativeServiceCommandError, parseLoadedService, parseServiceExits, serviceRun, startNativeServiceDefinition, type NativeServiceCommand, type NativeServiceDefinition, type NativeServiceExecute, type NativeServiceRun } from "./service.js";
+import { clearServiceStartFailure, connectorLogFile, connectorLogTail, localServiceReport, readServiceStartFailure, recordServiceStartFailure } from "./service-report.js";
+import { verbose, verboseCommand } from "../verbose.js";
 import { checkNativeUpdate } from "./update.js";
 import { prepareDeliveryGraft } from "./graft.js";
-import { earlierFailure, earlierFailureNote, productionUpdateDeps, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
+import { earlierFailure, earlierFailureNote, keepLauncherCurrent, productionUpdateDeps, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 
 const environment = () => sanitizeInheritedChildProcessEnv({ env: process.env });
+/** Runs one service or OS command and keeps how it ended; `--verbose` prints it (D129). */
+async function runServiceCommand(command: NativeServiceCommand, timeoutMs = 30_000): Promise<NativeServiceRun> {
+  const started = Date.now();
+  try {
+    const result = await runCommand({ ...command, env: environment(), timeoutMs });
+    const run: NativeServiceRun = { code: result.code, stdout: result.stdout, stderr: result.stderr, ...(result.code === null && Date.now() - started >= timeoutMs ? { timedOut: true } : {}) };
+    verboseCommand(command, run, Date.now() - started);
+    return run;
+  } catch (error) {
+    verboseCommand(command, { code: null, error: error instanceof Error ? error.message : String(error) }, Date.now() - started);
+    throw error;
+  }
+}
+/** As `runServiceCommand`, with a command that cannot be run kept as its outcome instead of thrown. */
+const executeDetailed: NativeServiceExecute = command => runServiceCommand(command)
+  .catch((error: unknown): NativeServiceRun => ({ code: null, error: error instanceof Error ? error.message : String(error) }));
 async function execute(command: NativeServiceCommand): Promise<number | null> {
-  const result = await runCommand({ ...command, env: environment(), timeoutMs: 30_000 });
-  return result.code;
+  return (await runServiceCommand(command)).code;
 }
 async function serviceExits(definition: NativeServiceDefinition) {
   if (!definition.exits) return null;
-  const result = await runCommand({ ...definition.exits, env: environment(), timeoutMs: 10_000 });
-  return result.code === 0 ? parseServiceExits(nativePlatform().os, result.stdout) : null;
+  const result = await runServiceCommand(definition.exits, 10_000);
+  return result.code === 0 ? parseServiceExits(nativePlatform().os, result.stdout ?? "") : null;
 }
 async function serviceDefinition(root: string) {
   const platform = nativePlatform();
   const record = await readNativeRecord(root);
   let userId: string | undefined;
   if (platform.os === "windows") {
-    const result = await runCommand({ command: "whoami.exe", args: ["/user", "/fo", "csv", "/nh"], env: environment(), timeoutMs: 10_000 });
-    userId = result.code === 0 ? result.stdout.match(/S-1-\d+(?:-\d+)+/)?.[0] : undefined;
+    const result = await runServiceCommand({ command: "whoami.exe", args: ["/user", "/fo", "csv", "/nh"] }, 10_000);
+    userId = result.code === 0 ? result.stdout?.match(/S-1-\d+(?:-\d+)+/)?.[0] : undefined;
   }
   // `konteks-connector`, or `connector` in a release from before the rename (a rollback may return to one).
   const executable = await resolveNativeConnectorExecutable(join(root, "releases", record.releaseId), platform.os);
   return nativeServiceDefinition({ os: platform.os, home: homedir(), root, executable, uid: process.getuid?.(), ...(userId ? { userId } : {}) });
 }
 
+/** A reload for the same definition within this window means it did not take; say so instead of restarting again. */
+export const SERVICE_RELOAD_WINDOW_MS = 10 * 60_000;
+/** How long a `serve` whose service is being reloaded waits to be stopped before it starts anyway. */
+export const SERVICE_RELOAD_GRACE_MS = 60_000;
+export const SERVICE_RELOAD_FILE = "service-reload.json";
+
+export type OwnServiceDefinitionOutcome = "not_installed" | "current" | "next_start" | "restarting";
+
+export interface OwnServiceDefinitionDeps {
+  definition: (root: string) => Promise<NativeServiceDefinition>;
+  /** A file's bytes; text is read as UTF-8. */
+  read: (path: string) => Promise<Uint8Array | string>;
+  write: (path: string, contents: string | Uint8Array) => Promise<void>;
+  os: ReturnType<typeof nativePlatform>["os"];
+  /** This process. */
+  pid: number;
+  /** A service command's stdout, or null when it failed. */
+  inspect: (command: NativeServiceCommand) => Promise<string | null>;
+  execute: NativeServiceExecute;
+  /** Starts the command in a session of its own, its output appended to the log file; resolves once it runs. */
+  detach: (command: NativeServiceCommand, logFile: string) => Promise<void>;
+  lastReload: () => Promise<{ digest: string; at: number } | null>;
+  recordReload: (reload: { digest: string; at: number }) => Promise<void>;
+  now: () => number;
+  log: (line: string) => void;
+}
+
 /**
- * The release now serving rewrites its own service definition when the file on
- * disk differs from what it renders. Whoever registered the service (an install
- * launcher that is never replaced, or the previous release's updater) wrote it
- * with its own renderer, so service-level changes such as the log file arrived
- * one release late or never (RCA 2026-09-30). The OS reads the file at the next
- * load, so the change applies from the next start. A definition that is absent
- * (a foreground `serve`) is left alone.
+ * Keeps the running service on the definition this release renders, through
+ * the service manager. Whoever registered the service (the install launcher,
+ * which an update never replaces, or the previous release's updater) wrote
+ * the definition with its own renderer, so service-level changes such as the
+ * log file arrived one release late or never (RCA 2026-09-30). Rewriting the
+ * file alone left it for "the next start", which never came: launchd's
+ * KeepAlive respawns reuse the plist it loaded, so a connector updated by the
+ * install launcher (which loads a plist without the log file) ran with its
+ * output on /dev/null until someone stopped and started it (RCA 2026-10-01).
+ * When this process is the
+ * one the service manager runs and the loaded definition is not this one (it
+ * was just rewritten, or launchd shows no log file), the service manager
+ * reloads it and restarts the service onto it, so it keeps owning the single
+ * supervisor. A foreground `serve`, or one the service manager does not name,
+ * is never restarted. A second reload for the same definition within
+ * `SERVICE_RELOAD_WINDOW_MS` is refused, so a reload that does not take can
+ * never become a restart loop.
+ *
+ * Files are compared as bytes in the encoding the service manager reads
+ * (`encodeServiceDefinition`), so a Windows task file in any other encoding is
+ * rewritten too, and a refused registration puts back exactly the bytes it
+ * found (D129). A Windows task that is missing although its file is current
+ * (a start whose registration failed) is registered again.
  */
-export async function refreshOwnServiceDefinition(
-  root: string,
-  deps: { definition: (root: string) => Promise<NativeServiceDefinition>; read: (path: string) => Promise<string>; write: (path: string, contents: string) => Promise<void> },
-): Promise<boolean> {
+export async function keepServiceOnOwnDefinition(root: string, deps: OwnServiceDefinitionDeps): Promise<OwnServiceDefinitionOutcome> {
   const definition = await deps.definition(root);
-  const current = await deps.read(definition.path).catch(() => null);
-  if (current === null || current === definition.contents) return false;
-  await deps.write(definition.path, definition.contents);
-  return true;
+  const asBytes = (value: Uint8Array | string) => typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
+  const onDisk = await deps.read(definition.path).then(asBytes, () => null);
+  if (onDisk === null) return "not_installed";
+  const expected = encodeServiceDefinition(definition);
+  const rewritten = !onDisk.equals(expected);
+  let helperChanged = false;
+  for (const file of definition.supportFiles ?? []) {
+    const current = await deps.read(file.path).then(asBytes, () => null);
+    if (current?.equals(Buffer.from(file.contents, "utf8"))) continue;
+    await deps.write(file.path, file.contents);
+    helperChanged = true;
+  }
+  const register = async () => {
+    // Task Scheduler stores its own XML copy. Replace it without starting
+    // another connector; its next start will use this release's helper.
+    for (const command of definition.install) {
+      const run = serviceRun(await deps.execute(command));
+      if (run.code !== 0) throw new NativeServiceCommandError("register", command, run);
+    }
+  };
+  let reregistered = false;
+  if (rewritten) {
+    await deps.write(definition.path, definition.fileEncoding ? expected : definition.contents);
+    if (deps.os === "windows") {
+      try { await register(); }
+      catch (error) {
+        await deps.write(definition.path, onDisk);
+        throw error;
+      }
+    }
+  } else if (deps.os === "windows" && definition.registered && serviceRun(await deps.execute(definition.registered)).code === 1) {
+    deps.log("the Konteks task is not registered with Windows; registering it so it starts at the next sign-in");
+    await register();
+    reregistered = true;
+  }
+  const unchanged = rewritten || helperChanged || reregistered ? "next_start" : "current";
+  const reload = definition.reload;
+  if (!reload || !definition.inspect || !definition.expected) return unchanged;
+  const output = await deps.inspect(definition.inspect);
+  const loaded = output === null ? null : parseLoadedService(deps.os, output, definition.expected);
+  if (!loaded || loaded.pid !== deps.pid) return unchanged;
+  if (!rewritten && loaded.current) return "current";
+  const digest = createHash("sha256").update(definition.contents).digest("hex");
+  const last = await deps.lastReload().catch(() => null);
+  if (last && last.digest === digest && deps.now() - last.at < SERVICE_RELOAD_WINDOW_MS) {
+    deps.log(`the service manager was already asked to load this release's definition at ${new Date(last.at).toISOString()} and still runs another; it applies from the next start`);
+    return "next_start";
+  }
+  await deps.recordReload({ digest, at: deps.now() });
+  deps.log("the service manager runs an older definition of this connector; reloading it and restarting onto this release's");
+  if (reload.kind === "detached") await deps.detach(reload.command, reload.logFile);
+  else for (const command of reload.commands) {
+    if (serviceRun(await deps.execute(command)).code !== 0) throw new Error(`${command.command} ${command.args.join(" ")} exited unsuccessfully`);
+  }
+  return "restarting";
+}
+
+/**
+ * End the service's own process group when its graceful stop did not finish
+ * (a rollback must still restore and start the previous release). The pid is
+ * the one the service manager runs; nothing where it names none.
+ */
+async function forceStopService(definition: NativeServiceDefinition): Promise<void> {
+  const pid = await servicePid(definition);
+  if (!pid) return;
+  try { process.kill(-pid, "SIGKILL"); }
+  catch {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+}
+
+/** The pid the service manager runs for this service; null where it names none. */
+async function servicePid(definition: NativeServiceDefinition): Promise<number | null> {
+  if (!definition.inspect || !definition.expected) return null;
+  const result = await runCommand({ ...definition.inspect, env: environment(), timeoutMs: 10_000 }).catch(() => null);
+  const loaded = result?.code === 0 ? parseLoadedService(nativePlatform().os, result.stdout, definition.expected) : null;
+  return loaded?.pid ?? null;
+}
+
+async function detachServiceCommand(command: NativeServiceCommand, logFile: string): Promise<void> {
+  await mkdir(dirname(logFile), { recursive: true, mode: 0o700 });
+  const log = await open(logFile, "a", 0o600);
+  try {
+    const child = spawn(command.command, command.args, { env: environment(), stdio: ["ignore", log.fd, log.fd], detached: true });
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    child.unref();
+  } finally {
+    await log.close();
+  }
+}
+
+function productionOwnServiceDefinitionDeps(root: string): OwnServiceDefinitionDeps {
+  const reloadFile = join(root, "supervisor", SERVICE_RELOAD_FILE);
+  return {
+    definition: serviceDefinition,
+    // Bytes in, bytes out: the definition's own encoding is applied by keepServiceOnOwnDefinition.
+    read: path => readFile(path),
+    write: writeSecretFile,
+    os: nativePlatform().os,
+    pid: process.pid,
+    inspect: async command => {
+      const result = await runServiceCommand(command, 10_000).catch(() => null);
+      return result?.code === 0 ? result.stdout ?? "" : null;
+    },
+    execute: executeDetailed,
+    detach: detachServiceCommand,
+    lastReload: async () => {
+      const value = JSON.parse(await readFile(reloadFile, "utf8")) as { digest?: unknown; at?: unknown };
+      return typeof value.digest === "string" && typeof value.at === "number" ? { digest: value.digest, at: value.at } : null;
+    },
+    recordReload: reload => writeSecretFile(reloadFile, `${JSON.stringify(reload)}\n`),
+    now: Date.now,
+    log: line => process.stderr.write(`${line}\n`),
+  };
 }
 
 interface NativeStopDeps {
   definition: (root: string) => Promise<NativeServiceDefinition>;
   execute: typeof execute;
+  /** Runs the stop command keeping what it printed, so a refusal says why. */
+  run?: NativeServiceExecute;
   readReceipt: (root: string) => Promise<string | null>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
@@ -109,6 +281,7 @@ const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["status", "preview.sta
 const productionNativeStopDeps: NativeStopDeps = {
   definition: serviceDefinition,
   execute,
+  run: executeDetailed,
   readReceipt: async root => readFile(join(root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), "utf8").catch(error => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
@@ -130,7 +303,8 @@ export async function stopNativeConnector(input: NativeCommandContext, deps: Nat
     throw new RemoteInstanceError("temporarily_unavailable", "Konteks could not tell whether it is running on this computer, so nothing was stopped; konteks-remote doctor says why.");
   }
   const previousReceipt = await deps.readReceipt(input.root);
-  if (await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "Konteks could not be stopped on this computer; konteks-remote doctor says why.");
+  const stopRun = serviceRun(await (deps.run ?? deps.execute)(definition.stop));
+  if (stopRun.code !== 0) throw new RemoteInstanceError("temporarily_unavailable", `Konteks could not be stopped on this computer (${new NativeServiceCommandError("stop", definition.stop, stopRun).message}); konteks-remote --verbose stop shows every step.`);
   input.output.line("Stopping Konteks on this computer…");
   const deadline = deps.now() + (deps.deadlineMs ?? 30_000);
   for (;;) {
@@ -149,12 +323,15 @@ export async function startNativeConnector(
     roots?: readonly EmbeddedReleaseRoot[];
     platform?: ReturnType<typeof nativePlatform>;
     definition?: (root: string) => Promise<NativeServiceDefinition>;
-    execute?: typeof execute;
+    execute?: NativeServiceExecute;
+    /** How long the service is watched after it starts (default 3 s where its status says it runs: Windows, systemd; none on macOS). */
+    settleMs?: number;
+    sleep?: (ms: number) => Promise<void>;
   } = {},
 ): Promise<void> {
   const platform = deps.platform ?? nativePlatform();
   const roots = deps.roots ?? EMBEDDED_RELEASE_ROOTS;
-  const executeService = deps.execute ?? execute;
+  const executeService = deps.execute ?? executeDetailed;
   const installation = await loadNativeInstallation(input.root, { roots, platform });
   await verifyInstalledNativeConnector(
     installation.release,
@@ -168,8 +345,9 @@ export async function startNativeConnector(
   const stoppedCodes = platform.os === "macos" ? [113] : platform.os === "debian" ? [3, 4] : [1];
   const serviceState = async (): Promise<"running" | "stopped"> => {
     let code: number | null;
-    try { code = await executeService(definition.status); }
+    try { code = serviceRun(await executeService(definition.status)).code; }
     catch { code = null; }
+    verbose(`service state: ${code === 0 ? "running" : code !== null && stoppedCodes.includes(code) ? "stopped" : `unknown (status exited ${code ?? "without a code"})`}`);
     if (code === 0) return "running";
     if (code !== null && stoppedCodes.includes(code)) return "stopped";
     throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation is stopped. Inspect and stop only this installation's service before retrying start; identity and local work are unchanged.");
@@ -201,15 +379,22 @@ export async function startNativeConnector(
     input.output.line(
       `Another program uses port ${moved.previousPort}, so Konteks uses port ${moved.controlPort} on this computer instead.`,
     );
+  verbose(`registering and starting ${definition.label} from ${definition.path}`);
+  // A failure says which step, the service manager's own words and the one
+  // next step, and is kept for doctor and support (D129: "could not start"
+  // and nothing else, on a Windows PC where the task XML was refused).
+  const failed = async (detail: string, cause: unknown): Promise<never> => {
+    const message = `The native user service could not start: ${detail} Installed identity and credentials were preserved.`;
+    await recordServiceStartFailure(input.root, { at: new Date().toISOString(), message }).catch(() => undefined);
+    throw new RemoteInstanceError("temporarily_unavailable", message, { cause });
+  };
   const started = await startNativeServiceDefinition(definition, {
     execute: command => command === definition.status ? serviceState().then(state => state === "running" ? 0 : stoppedCodes[0]!) : executeService(command),
     write: writeSecretFile,
-  }).catch((error) => {
-    throw new RemoteInstanceError(
-      "temporarily_unavailable",
-      "The native user service could not start; installed identity and credentials were preserved.",
-      { cause: error },
-    );
+  }).catch(async (error: unknown) => {
+    if (error instanceof RemoteInstanceError) return failed(`${error.message}`, error);
+    if (error instanceof NativeServiceCommandError) return failed(describeServiceFailure(platform.os, error), error);
+    return failed(`${error instanceof Error ? error.message : String(error)}. To see every step, run konteks-remote --verbose start.`, error);
   });
   if (started === "already_running") {
     input.output.line(
@@ -217,6 +402,20 @@ export async function startNativeConnector(
     );
     return;
   }
+  // Where the service manager can say whether the service still runs, a
+  // connector that stopped as it started is said now, with its log, not left
+  // for the person to find with `status` (D129). launchd's `print` says only
+  // that a job is loaded, and KeepAlive restarts it anyway.
+  const settleMs = deps.settleMs ?? (platform.os === "macos" ? null : 3_000);
+  if (settleMs !== null) {
+    await (deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))))(settleMs);
+    const state = await serviceState().catch(() => "running" as const);
+    if (state === "stopped") {
+      const tail = await connectorLogTail(input.root, 3).catch(() => null);
+      await failed(`it started and stopped again at once.${tail?.length ? ` The connector log ends: ${tail.join(" | ")}` : ""} The whole log: ${connectorLogFile(input.root)}.`, null);
+    }
+  }
+  await clearServiceStartFailure(input.root).catch(() => undefined);
   if (definition.requiresLinger)
     input.output.line(
       "This Linux user service needs user lingering to remain available after logout. Configure it explicitly if required.",
@@ -267,6 +466,10 @@ interface NativeAgentAddDeps {
   platform: ReturnType<typeof nativePlatform>;
   stopDeadlineMs?: number;
   pollMs?: number;
+  /** Claude Code or Codex found here, or set up now on the person's yes (D116), before anything is stopped. */
+  ensurePersonal?: typeof ensurePersonalAgent;
+  /** After the restart: sign the agent in and say whether it is ready (D116). */
+  closeAgents?: (input: Parameters<typeof closeAgentSetup>[0]) => Promise<void>;
 }
 
 const productionAgentAddDeps: NativeAgentAddDeps = {
@@ -308,6 +511,8 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
   // before anything stops: the retry stopped the connector, then refused the
   // version and left it stopped (W1-D3).
   else if (host && deps.locate) await deps.locate(host, input.root);
+  // Claude Code or Codex not here yet: offered and set up first (D116); a no stops nothing.
+  const setUp = !listed && isPersonalAgent(input.agent) && await (deps.ensurePersonal ?? ensurePersonalAgent)(input.agent, input.output) === "set_up";
   const definition = await deps.serviceDefinition(input.root);
   const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
   const initialStatus = await deps.execute(definition.status);
@@ -373,6 +578,10 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       }
     }
     if (wasRunning) await deps.start(input);
+    if (wasRunning && isPersonalAgent(input.agent)) {
+      const close = deps.closeAgents ?? (closing => closeAgentSetup(closing, productionAgentClosingDeps(input.root, input.output, agent => nativeCliActions.control({ ...input, operation: "auth.login", agent }))));
+      await close({ agents: [input.agent], signInNow: setUp ? [input.agent] : [], missing: [], output: input.output });
+    }
     // Its terminal is not this one, so it is not started again here.
     if (foreground) input.output.line(`${findAgentBridge(input.agent)?.displayName ?? input.agent} is added. Konteks stopped to add it; konteks-remote start starts it again, in the background.`);
     input.output.result({ instanceId: successor.instanceId, agents: successor.agents, state: "installed" });
@@ -533,8 +742,16 @@ export const nativeCliActions: NativeCliActions = {
     }
     // A fetched agent in --agents (Google Antigravity) asks its consent line in this terminal before anything is activated.
     const consent = terminalFetchConsent({ line: text => input.output.line(text) });
-    const record = await installNative({ ...input, activationId: input.activationId!, deps: { consent } });
+    // Without --agents, a missing Claude Code or Codex is offered before the code is asked (D116).
+    const setUp: string[] = [];
+    const setupAgent = async (agent: "claude-code" | "codex") => { const done = await setUpPersonalAgent(agent, input.output); if (done) setUp.push(agent); return done; };
+    const record = await installNative({ ...input, activationId: input.activationId!, deps: { consent, ...(input.agents === undefined ? { setupAgent } : {}) } });
     await startNativeConnector(input);
+    // Sign in what was just set up, then say plainly what is ready and the one command for the rest.
+    await closeAgentSetup(
+      { agents: record.agents, signInNow: setUp, missing: input.agents === undefined ? PERSONAL_AGENTS.filter(agent => !record.agents.includes(agent)) : [], output: input.output },
+      productionAgentClosingDeps(input.root, input.output, agent => nativeCliActions.control({ ...input, operation: "auth.login", agent })),
+    );
     input.output.result({ instanceId: record.instanceId, deploymentKind: record.deploymentKind, state: "installed" });
   },
   stageEnrollment: async input => {
@@ -560,13 +777,30 @@ export const nativeCliActions: NativeCliActions = {
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now, platform: nativePlatform(),
   }),
   serve: async input => {
-    await refreshOwnServiceDefinition(input.root, { definition: serviceDefinition, read: path => readFile(path, "utf8"), write: writeSecretFile })
-      .then(rewritten => { if (rewritten) process.stderr.write("service definition rewritten by this release; it applies from the next start\n"); })
-      .catch(error => process.stderr.write(`service definition not refreshed: ${error instanceof Error ? error.message : String(error)}\n`));
+    const own = await keepServiceOnOwnDefinition(input.root, productionOwnServiceDefinitionDeps(input.root))
+      .catch(async error => {
+        const detail = error instanceof NativeServiceCommandError ? describeServiceFailure(nativePlatform().os, error) : error instanceof Error ? error.message : String(error);
+        process.stderr.write(`service definition not refreshed: ${detail}\n`);
+        await recordServiceStartFailure(input.root, { at: new Date().toISOString(), message: `The background service could not be registered again: ${detail}` }).catch(() => undefined);
+        return "current" as const;
+      });
+    if (own === "next_start") process.stderr.write("service definition rewritten by this release; it applies from the next start\n");
+    if (own === "restarting") {
+      // Nothing is claimed yet: the service manager stops this process within
+      // seconds and starts the release on its own definition. Should it not,
+      // the connector starts here anyway rather than stay disconnected.
+      await new Promise(resolve => setTimeout(resolve, SERVICE_RELOAD_GRACE_MS));
+      process.stderr.write("the service manager did not restart this connector onto its definition; starting on the one it has\n");
+    }
     const service = createNativeService({ root: input.root, roots: EMBEDDED_RELEASE_ROOTS, platform: nativePlatform(),
       prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(input.root, cwd, agentId),
       exitProcess: code => process.exit(code) });
     await service.start();
+    // Whichever launcher drove the update, the person's konteks-remote runs this release's code from now on (D113b).
+    void keepLauncherCurrent(input.root, { execPath: process.execPath, readRecord: readNativeRecord, readLedger: readNativeUpdateLedger,
+      refresh: refreshInstalledLauncher, sleep: ms => new Promise(resolve => setTimeout(resolve, ms).unref()), now: Date.now })
+      .then(result => { if (result === "refreshed") process.stderr.write("konteks-remote now runs this release\n"); })
+      .catch(error => process.stderr.write(`konteks-remote could not be refreshed to this release: ${error instanceof Error ? error.message : String(error)}\n`));
     await service.waitUntilStopped();
   },
   start: startNativeConnector,
@@ -615,7 +849,7 @@ export const nativeCliActions: NativeCliActions = {
       const selfUpdated = check?.status === "current" ? selfUpdateNote(attempts, check.bundleVersion) : null;
       if (selfUpdated) input.output.line(selfUpdated);
     }
-    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits }));
+    await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits, forceStop: forceStopService, servicePid }));
   },
   uninstall: async input => {
     const result = await uninstallNative(input, productionUninstallDeps({ root: input.root, serviceDefinition, execute }));
@@ -645,8 +879,29 @@ export const nativeCliActions: NativeCliActions = {
         }
       }
       case "agents": return agents(context);
-      case "doctor": if (!await doctor(context)) process.exitCode = 2; return;
-      case "support": return supportBundle(context);
+      case "doctor":
+      case "support": {
+        // Doctor and support ask the running connector; a connector that is
+        // not running still gets the last failed start and its log (D129).
+        let healthy: boolean;
+        try { healthy = input.operation === "doctor" ? await doctor(context) : (await supportBundle(context), true); }
+        catch (error) {
+          if (!(error instanceof RemoteInstanceError) || error.code !== "control_socket_unavailable") throw error;
+          const report = await localServiceReport(input.root, { tailLines: input.operation === "doctor" ? 10 : 200 });
+          input.output.result(report.value);
+          for (const line of report.lines) input.output.line(line);
+          if (input.operation === "doctor") process.exitCode = 2;
+          return;
+        }
+        if (input.operation === "doctor") {
+          input.output.line(`Connector log: ${connectorLogFile(input.root)}`);
+          if (!healthy) process.exitCode = 2;
+        } else {
+          const failure = await readServiceStartFailure(input.root);
+          if (failure) input.output.line(`Last failed start (${failure.at}): ${failure.message}`);
+        }
+        return;
+      }
       case "preview.status": return previewStatus(context);
       case "auth.status": return authStatus(context, input.agent);
       case "auth.login": return authLogin(context, input.agent!, input.organization ?? false, {

@@ -45,12 +45,12 @@ export async function readOrCreateSecretFile(args: ReadOrCreateSecretFileArgs): 
   return raced;
 }
 
-export async function writeSecretFile(path: string, value: string): Promise<void> {
+export async function writeSecretFile(path: string, value: string | Uint8Array): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const tempPath = `${path}.${randomBytes(6).toString("hex")}.tmp`;
   try {
     const file = await open(tempPath, "wx", 0o600);
-    try { await file.writeFile(value, "utf8"); await file.sync(); }
+    try { await file.writeFile(value); await file.sync(); }
     finally { await file.close(); }
     await rename(tempPath, path);
     if (process.platform !== "win32") {

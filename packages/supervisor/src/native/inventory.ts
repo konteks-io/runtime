@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DELIVERY_TURN_RENEWAL_CAPABILITY } from "./delivery-turn-renewal.js";
 import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY, REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
 import type { InventorySnapshot } from "../inventory/snapshot.js";
@@ -108,7 +109,7 @@ export class NativeInventoryCollector {
     const capabilities = agents.filter(agent => agent.readiness === "ready" && agent.connectionState === "ready").map(agent => `agent:${agent.agentId}`);
     if (capabilities.length > 0 && this.options.executionPermitsReady?.()) capabilities.push(REMOTE_EXECUTION_PERMITS_CAPABILITY);
     if (agents.some(agent => agent.readiness === 'ready' && agent.connectionState === 'ready') &&
-      this.options.deliveryExecutionPermitsReady?.()) capabilities.push(REMOTE_DELIVERY_PERMITS_CAPABILITY);
+      this.options.deliveryExecutionPermitsReady?.()) capabilities.push(REMOTE_DELIVERY_PERMITS_CAPABILITY, DELIVERY_TURN_RENEWAL_CAPABILITY);
     if (this.options.cancellationDeliveryReady?.()) capabilities.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
     if (this.options.agentLoginReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_CAPABILITY);
     if (this.options.agentLoginBrowserReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);

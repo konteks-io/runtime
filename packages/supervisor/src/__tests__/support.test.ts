@@ -39,6 +39,37 @@ describe("doctor and support bundle", () => {
     expect(JSON.stringify(report)).not.toContain(dir);
   });
 
+  it("treats an agent this computer has not added as informational, never a failure (D113)", async () => {
+    // 0.10.8 on a Mac with claude-code, codex and dsh: the inventory carries a
+    // synthetic "Not added" Google Antigravity view for the site's add card;
+    // the update health gate read its `unavailable` readiness as a failure.
+    const report = await runDoctor({
+      now: () => "2026-10-02T09:27:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active", expiresAt: null },
+      relay: { state: "connected", lastError: null, consecutiveFailures: 0 }, transport: "relay", reconciliationComplete: true, components: [],
+      agents: [{ agentId: "claude-code", readiness: "ready" }, { agentId: "codex", readiness: "unavailable", startFailure: "Codex did not start" }, { agentId: "antigravity", readiness: "unavailable" }],
+      listedAgents: ["claude-code", "codex", "dsh"],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true,
+    });
+    expect(report.checks.find(check => check.id === "agent-antigravity")).toMatchObject({ status: "skip", detail: "not added on this computer", recoveryActions: [] });
+    // An agent this computer lists still fails when it cannot start.
+    expect(report.checks.find(check => check.id === "agent-codex")).toMatchObject({ status: "fail" });
+    expect(report.checks.find(check => check.id === "agent-claude-code")).toMatchObject({ status: "pass" });
+  });
+
+  it("says why an agent is left out and why Core refused the reconnect, in plain words (RCA 2026-10-01)", async () => {
+    const base = {
+      now: () => "2026-10-01T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
+      relay: { state: "offline", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: false, components: [],
+      configRevision: 1, diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true,
+    };
+    const report = await runDoctor({ ...base, reconciliationRefusal: "Konteks no longer accepts this connector process; it restarts to reconnect as a new one",
+      agents: [{ agentId: "claude-code", readiness: "ready" }, { agentId: "codex", readiness: "unavailable", startFailure: "The signed Codex app-server did not become ready in time" }] });
+    expect(report.checks.find(check => check.id === "agent-codex")).toMatchObject({ status: "fail", detail: "could not start (The signed Codex app-server did not become ready in time); trying again in the background" });
+    expect(report.checks.find(check => check.id === "reconciliation")).toMatchObject({ status: "warn", detail: "Konteks no longer accepts this connector process; it restarts to reconnect as a new one" });
+    const waiting = await runDoctor({ ...base, agents: [] });
+    expect(waiting.checks.find(check => check.id === "reconciliation")?.detail).toBe("waiting for Core reconciliation; no new work until it completes");
+  });
+
   it("reports whether previews are offered and when the last one failed, without paths or commands", async () => {
     const base = {
       now: () => "2026-09-06T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },

@@ -33,6 +33,7 @@ const inputSchema = z.object({
   restoreAcpSessionRef: z.string().min(1).max(256).optional(),
   freshProviderSessionOnRestore: z.boolean().optional(),
   sessionLabel: RemoteSessionLabelSchema.optional(),
+  agentTitled: z.literal(true).optional(),
   browser: z.object({
     proxyUrl: z.string().regex(/^http:\/\/127\.0\.0\.1:\d{1,5}$/),
     outputDir: z.string().min(1).refine(isAbsolute),
@@ -216,7 +217,7 @@ export class NativeRunner implements RunnerPort {
     const parsed = inputSchema.safeParse(input);
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
-    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, browser, integration } = parsed.data;
+    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser, integration } = parsed.data;
     // The session's browser is a stdio MCP server the agent launches (its own
     // package's, or the connector's for an agent without one); composed here,
     // where the paths are known.
@@ -224,7 +225,7 @@ export class NativeRunner implements RunnerPort {
     const mcpServers = browserServer === null ? parsed.data.mcpServers : [...parsed.data.mcpServers, browserServer];
     const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
       ...(freshProviderSessionOnRestore === undefined ? {} : { freshProviderSessionOnRestore }),
-      ...(sessionLabel === undefined ? {} : { sessionLabel }), ...(integration === undefined ? {} : { integration }), lifecycle: {
+      ...(sessionLabel === undefined ? {} : { sessionLabel }), ...(agentTitled ? { agentTitled } : {}), ...(integration === undefined ? {} : { integration }), lifecycle: {
       beforeCreate: async (ref: string) => { await lifecycle?.beforeCreate(ref); },
       recordProcessOwner: async (owner: RetainedProcessOwner) => { await lifecycle?.recordProcessOwner(owner); },
       replaceProcessOwner: async (previous: RetainedProcessOwner, replacement: RetainedProcessOwner) => {
@@ -290,9 +291,11 @@ export class NativeRunner implements RunnerPort {
     this.requireStarted();
     // `releaseSealed` refuses anything that is not an idle sealed owner, so
     // reaching the release proves this is the qualified finalization the
-    // bounded execution allocation waits for. That same idleness proof is
-    // what lets the runtime keep the process resident for the next session.
-    this.runtime.sessions.releaseSealed(ref);
+    // bounded execution allocation waits for. That same idleness proof, plus
+    // the agent's confirmed close of the released session, is what lets the
+    // runtime keep the process resident for the next session; without the
+    // close the process is stopped and finalized as before.
+    await this.runtime.sessions.releaseSealed(ref);
     const { retained } = await this.runtime.releaseExecutionBridge(ref);
     return { processRetained: retained };
   }

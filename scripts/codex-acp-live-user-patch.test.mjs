@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 import {
   codexAcpLiveUserPatch,
   konteksTitlePrefixCheck,
@@ -148,7 +151,7 @@ test("the reviewed bridge disables configured MCP servers on every thread start,
   assert.match(source, /async createSessionConfig\(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = \[\]\) \{/);
   assert.match(source, /const disabledMcpServers = konteksCodexMcpServers\(existingMcpServerNames, requestedServers\.map\(\(mcp\) => mcp\.name\), admittedMcpServerNames\.map\(sanitizeMcpServerName\)\);/);
   assert.doesNotMatch(source, /shouldDeduplicateMcpConflicts\(\)\) \{\n      const existingNames/);
-  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v8");
+  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v9");
 });
 
 test("an integration session admits only the bound personal server, read from its own session/new (CP2)", async () => {
@@ -169,4 +172,81 @@ test("the reviewed bridge passes the admission on thread start only, never on re
   assert.match(source, /config: await this\.createSessionConfig\(request\.cwd, additionalDirectories, request\.mcpServers, konteksAdmittedMcpServerNames\(request\._meta\)\),/);
   assert.equal(source.split("konteksAdmittedMcpServerNames(request._meta)").length, 2);
   assert.match(source, /function konteksAdmittedMcpServerNames\(meta\)/);
+});
+
+test("a direct session keeps the agent's own title behind one [konteks] prefix", () => {
+  assert.equal(konteksPrefixedName("[konteks]", "Fix login redirect loop"), "[konteks] Fix login redirect loop");
+  assert.equal(konteksPrefixedName("[konteks]", "[konteks] Fix login"), "[konteks] Fix login");
+  const labelled = "[konteks/Todo List/initiative] Stand up the API 3fa9c1d2";
+  assert.equal(konteksPrefixedName("[konteks]", labelled), labelled);
+  assert.equal(konteksPrefixedName("[konteks]", " Fix\n\tlogin\u202e "), "[konteks] Fix login");
+  assert.equal(konteksPrefixedName("[konteks]", ""), "[konteks]");
+  assert.equal(konteksPrefixedName("[konteks]", null), "[konteks]");
+  assert.equal(konteksPrefixedName("[other]", "Fix login"), null);
+  assert.equal(konteksPrefixedName(undefined, "Fix login"), null);
+  const cut = konteksPrefixedName("[konteks]", "word ".repeat(40), 80);
+  assert.ok(cut.length <= 80);
+  assert.match(cut, /^\[konteks\] (word )+word…$/);
+});
+
+// Build qualification supplies the pristine upstream dist directory.
+const fixture = process.env.CODEX_ACP_FIXTURE_DIR;
+function titleGenerator() {
+  const patched = patchCodexAcpLiveUsers(readFileSync(join(fixture, "index.js"), "utf8"), codexAcpLiveUserPatch.version).source;
+  const start = patched.indexOf("// src/TitleGenerator.ts");
+  const end = patched.indexOf("\n// src/CodexAcpServer.ts\nimport { once }");
+  assert.ok(start > 0 && end > start, "the TitleGenerator section moved");
+  return { patched, TitleGenerator: new Function(`${konteksPrefixedName.toString()}\n${patched.slice(start, end)}\nreturn TitleGenerator;`)() };
+}
+function codexClient(answer) {
+  const named = [];
+  let settle;
+  const done = new Promise(resolve => { settle = resolve; });
+  return { named, done, client: {
+    threadStart: async () => ({ thread: { id: "ephemeral" } }),
+    runTurn: async () => answer(),
+    threadSetName: async params => { named.push(params); settle(); },
+  } };
+}
+const titled = title => ({ turn: { items: [{ type: "agentMessage", text: JSON.stringify({ title }) }] } });
+
+test("Codex's own title for a direct session gains the prefix once; the name is never Konteks-built", { skip: !fixture }, async () => {
+  const { TitleGenerator, patched } = titleGenerator();
+  assert.match(patched, /titleGen\.konteksPrefix = konteksSession\.prefix/);
+  const direct = codexClient(() => titled("Fix login redirect loop"));
+  const generator = new TitleGenerator(direct.client, "thread-1", "/w", () => "unset");
+  generator.konteksPrefix = "[konteks]";
+  generator.onTurnCompleted("the login page keeps redirecting to itself after sign-in");
+  await direct.done;
+  assert.deepEqual(direct.named, [{ threadId: "thread-1", name: "[konteks] Fix login redirect loop" }]);
+  generator.onTurnCompleted("a second turn never renames");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(direct.named.length, 1);
+});
+
+test("a failed title model still names a direct thread, from the first message", { skip: !fixture }, async () => {
+  const { TitleGenerator } = titleGenerator();
+  const failing = codexClient(() => { throw new Error("title model unavailable"); });
+  const generator = new TitleGenerator(failing.client, "thread-2", "/w", () => "unset");
+  generator.konteksPrefix = "[konteks]";
+  generator.onTurnCompleted("Please add a dark mode toggle to the settings page of the dashboard app we built last week");
+  await failing.done;
+  assert.equal(failing.named[0].threadId, "thread-2");
+  assert.match(failing.named[0].name, /^\[konteks\] Please add a dark mode toggle .*…$/);
+  assert.ok(failing.named[0].name.length <= 80);
+});
+
+test("an engineering or unprefixed thread keeps upstream naming, and a name set meanwhile is kept", { skip: !fixture }, async () => {
+  const { TitleGenerator } = titleGenerator();
+  const upstream = codexClient(() => titled("Fix login redirect loop"));
+  new TitleGenerator(upstream.client, "thread-3", "/w", () => "unset").onTurnCompleted("the login page loops");
+  await upstream.done;
+  assert.deepEqual(upstream.named, [{ threadId: "thread-3", name: "Fix login redirect loop" }]);
+  let source = "unset";
+  const renamed = codexClient(() => { source = "explicit"; return titled("Something else"); });
+  const generator = new TitleGenerator(renamed.client, "thread-4", "/w", () => source);
+  generator.konteksPrefix = "[konteks]";
+  generator.onTurnCompleted("the person renames it while the title is generated");
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(renamed.named, []);
 });

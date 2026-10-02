@@ -38,9 +38,10 @@ import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
   canonicalizeAcpToolActivity,
   continuesAtBoundary,
+  contractIssue,
   endsInsidePath,
   omitPrivateAcpToolPayload,
-  redactActivity,
+  redactSessionMessage,
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
@@ -260,8 +261,11 @@ export class RelayedSession {
     }
     try { await (this.deps.onExecutionAuthorityLost?.() ?? this.stopForRecovery()); }
     catch (error) {
+      // A non-Konteks error was logged as `recovery_required`, which hid
+      // where the stop failed (2026-10-02). The orchestrator retries it.
       this.logger.warn({ event: "execution.recovery_stop_unconfirmed", assignmentId: this.assignment.id,
-        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "recovery_required", err: error },
+        attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
+        ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}), err: error },
       "Execution remains fenced; recovery settlement is unconfirmed");
       throw error;
     }
@@ -500,7 +504,10 @@ export class RelayedSession {
       // A conversation's context is Konteks's to restage; a direct session's is
       // only the agent's own transcript, so that one is loaded.
       ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
-      ...(this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
+      // A person's direct session keeps the agent's own title behind "[konteks] ";
+      // engineering work is named from Core's label (D130).
+      ...(isDirectAssignment(this.assignment) ? { agentTitled: true as const }
+        : this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
       ...(browser ? { browser } : {}),
     }, lifecycle));
     this.creationReturned = true;
@@ -579,7 +586,7 @@ export class RelayedSession {
     let attempt = 0;
     while (!this.closed) {
       this.deps.assertExecutionOwned?.();
-      if (this.deps.clock.coreNow() >= Date.parse(this.assignment.expiresAt)) throw new RemoteInstanceError("execution_fenced", "Delivery output authority expired before acceptance.");
+      if (this.deps.clock.coreNow() >= this.liveUntil()) throw new RemoteInstanceError("execution_fenced", "Delivery output authority expired before acceptance.");
       const authority = this.deliveryAuthority(requestId);
       try {
         const result = resumeOnly
@@ -595,13 +602,25 @@ export class RelayedSession {
         return;
       } catch (error) {
         this.deps.assertExecutionOwned?.();
-        if (this.deps.clock.coreNow() >= Date.parse(this.assignment.expiresAt)) throw error;
+        if (this.deps.clock.coreNow() >= this.liveUntil()) throw error;
         attempt += 1;
-        if (attempt === 1 || attempt % 12 === 0) this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt,
-          transferAttempt: attempt }, "durable delivery output retained for retry");
+        // Name the refusal (D112): without it a Core 422 repeated 120+ times
+        // read as a transport stall. Codes and statuses only, never messages.
+        if (attempt === 1 || attempt % 12 === 0) {
+          const status = error && typeof error === "object" && "status" in error && typeof error.status === "number" ? error.status : undefined;
+          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, transferAttempt: attempt,
+            code: error instanceof RemoteInstanceError ? error.code : "delivery_output_transfer_failed",
+            ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+            ...(status === undefined ? {} : { status }) }, "durable delivery output retained for retry");
+        }
         await new Promise<void>(resolve => setTimeout(resolve, Math.min(5_000, 250 * 2 ** Math.min(attempt, 5))));
       }
     }
+  }
+
+  /** The assignment's lifetime, or the later one Core renewed a delivery turn to (D115). */
+  private liveUntil(): number {
+    return this.executionGate?.liveUntil() ?? Date.parse(this.assignment.expiresAt);
   }
 
   private async sendToCore(message: SessionToCoreMessage): Promise<void> {
@@ -653,6 +672,8 @@ export class RelayedSession {
         acpSessionRef: this.acpSessionRef,
         toolCallId: canonicalIdentity?.toolCallId,
         stage: "wire_schema",
+        ...sessionUpdateKind(canonicalMessage),
+        ...contractIssue(parsed.error.issues),
       }, "Native session update did not match the relay contract");
       if ("id" in message && typeof message.id === "string" && "method" in message && message.kind !== "acp") {
         await this.sendToCore({ kind: "acp_error", id: message.id, method: message.method as "session/prompt", error: malformed() });
@@ -682,7 +703,7 @@ export class RelayedSession {
       const continuesPath = previous?.inPath ?? false;
       if (chunkText === undefined) this.lastChunkText.clear();
       else this.lastChunkText.set(update.sessionUpdate, { text: chunkText, inPath: endsInsidePath(chunkText, continuesPath, startsAtBoundary) });
-      const safe = SessionToCoreMessageSchema.safeParse(redactActivity(body, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
+      const safe = SessionToCoreMessageSchema.safeParse(redactSessionMessage(body, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
         { startsAtBoundary, continuesPath }));
       if (!safe.success) {
         this.counters.malformedResponses += 1;
@@ -692,6 +713,8 @@ export class RelayedSession {
           acpSessionRef: this.acpSessionRef,
           toolCallId: canonicalIdentity?.toolCallId,
           stage: "redacted_schema",
+          sessionUpdate: update.sessionUpdate,
+          ...contractIssue(safe.error.issues),
         }, "Redacted native session update did not match the relay contract");
         return;
       }
@@ -1201,18 +1224,27 @@ export class RelayedSession {
       params = verdict.request;
     }
     const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
-      browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
+      cwd: this.sessionCwd(), browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
       admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
     if (decision.kind === "allow") return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
-    // A refused tool ends the agent's turn on Claude Code; the log named
-    // nothing about it, so a turn that stopped at a build command read as a
-    // hung agent. Bounded, sanitized title only.
+    // A refused tool ends the agent's turn on Claude Code and Codex; the log
+    // named nothing about it, so a turn that stopped at a build command read
+    // as a hung agent, and a refused "Edit files" call (T1, 2026-10-02) never
+    // said which path was wrong. Bounded, sanitized title, and the refusal's
+    // reason with each refused path workspace-relative (never a host path).
     this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId,
       title: sanitizePermissionRequest(params).params.title, decision: decision.kind,
+      ...(decision.kind === "deny" && decision.refusal ? { refusal: decision.refusal } : {}),
       humanDeferralAllowed: this.assignment.policy.humanDeferralAllowed }, "tool permission not allowed by policy");
     if (decision.kind === "deny") {
+      // The refused call carries the note before it is answered, so it reaches
+      // Konteks inside this turn: the person sees why, and Harness repeats it to
+      // the agent when it continues the stopped turn (D114).
+      if (decision.message && decision.refusal?.reason === "outside_workspace") {
+        await this.noteRefusedToolCall(ref, params.toolCall.toolCallId, decision.message);
+      }
       return void (await this.answerPermission(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
     }
     if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
@@ -1222,6 +1254,15 @@ export class RelayedSession {
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: params.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
+  }
+
+  /** Put the policy's note on a refused tool call (an ACP `tool_call_update` carrying only content). */
+  private async noteRefusedToolCall(ref: string, toolCallId: string, message: string): Promise<void> {
+    // Like every update, it is redacted on the way out: the working copy's
+    // path reads `[workspace]`.
+    await this.sendToCore({ kind: "acp", method: "session/update", params: { sessionId: ref, update: {
+      sessionUpdate: "tool_call_update", toolCallId, content: [{ type: "content", content: { type: "text", text: message } }],
+    } } as never });
   }
 
   /** Answer a permission request, telling a host agent's governance what was decided (Antigravity pairs its own reports with it). */
@@ -1570,6 +1611,12 @@ export class RelayedSession {
   }
 
   waitForAuthorityStop(): Promise<void> { return this.executionGate?.waitForAuthorityStop() ?? Promise.resolve(); }
+}
+
+/** A refused session update's kind for the log, only when it reads as an ACP update name. */
+function sessionUpdateKind(message: unknown): { sessionUpdate?: string } {
+  const kind = (message as { params?: { update?: { sessionUpdate?: unknown } } } | null)?.params?.update?.sessionUpdate;
+  return typeof kind === "string" && /^[a-z_]{1,64}$/.test(kind) ? { sessionUpdate: kind } : {};
 }
 
 function malformed(): AcpJsonRpcError {

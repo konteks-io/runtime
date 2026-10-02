@@ -9,7 +9,7 @@ import { hostAgentRunnerAdapter } from "./host/registry.js";
 import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentRunnerAdapter, type HostAgentSettings, type HostLoginRequest, type HostSpawn, type HostWorkingCopyBinding } from "./host/host-agent.js";
 import { AgentScopeStore, applyIdentityObservation, type AgentScopeState } from "./auth/scope-store.js";
 import { classifyBridgeError, spawnBridge, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
-import { discoverBridgeModelCapability, offerableModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
+import { MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS, definiteModelDiscoveryFailure, discoverBridgeModelCapability, offerableModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
 import { resolveBridgeSpawnSpec, verifyNativeRunnerPackage, type BridgeSpawnSpec } from "./bridge/spec.js";
 import type { RunnerConfig } from "./config.js";
 import { RunnerEventBus } from "./events.js";
@@ -90,6 +90,14 @@ interface IdleExecutionBridge {
   expiry: NodeJS.Timeout;
 }
 
+/** One authenticated identity, bridge version and config id's offered models. */
+interface ModelCapabilityEntry {
+  /** The last answer the agent actually gave under this key, and when (runtime clock). */
+  good: { capability: DiscoveredBridgeModelCapability; at: number } | null;
+  /** The discovery running now, shared by every caller. */
+  refresh: Promise<DiscoveredBridgeModelCapability> | null;
+}
+
 function sameRetainedOwner(a: RetainedProcessOwner, b: RetainedProcessOwner): boolean {
   return a.version === b.version && a.platform === b.platform && a.pid === b.pid && a.processGroupId === b.processGroupId &&
     a.startToken === b.startToken && a.commandDigest === b.commandDigest;
@@ -163,10 +171,11 @@ export class AgentRuntime {
   private authRequired = false;
   /** The provider's admin keeps Konteks tools out (the last identity probe said so). */
   private providerAdminBlocked = false;
-  /** ACP exposes model choices only through session/new. Cache the immutable
-   * capability by authenticated identity for this runtime lifetime so status
-   * polling cannot create a visible Codex thread on every refresh. */
-  private readonly modelCapabilities = new Map<string, { at: number; pending: Promise<DiscoveredBridgeModelCapability> }>();
+  /** ACP exposes model choices only through session/new. Cache the
+   * capability by authenticated identity and bridge version so status
+   * polling cannot create a visible Codex thread on every refresh, and keep
+   * the last good answer while it is read again (`discoverModelCapability`). */
+  private readonly modelCapabilities = new Map<string, ModelCapabilityEntry>();
   private stopping = false;
   /** Set when the agent broke a governance guarantee; no bridge starts again in this process. */
   private quarantined: string | null = null;
@@ -626,8 +635,10 @@ export class AgentRuntime {
   /**
    * Qualified finalization of an idle sealed release. The caller has proven
    * (`SessionManager.releaseSealed`) that the session was an idle, settled
-   * completion with no turn, operation or pending request, so its healthy
-   * process may stay resident for the next reference instead of exiting.
+   * completion with no turn, operation or pending request, and awaited the
+   * agent's close of it, so its healthy process may stay resident for the
+   * next reference instead of exiting. A process still holding any session
+   * the agent did not confirm closed (`sessionsBoundTo`) is stopped instead.
    * `retained` tells the caller whether it did; a stop proven earlier for the
    * same reference, a stopping runtime or an occupied idle slot all yield
    * `false` with the process stopped as before.
@@ -759,9 +770,17 @@ export class AgentRuntime {
    * signal then proves it gone); a match under a live owner is refused.
    */
   async yieldRetainedProcess(owner: RetainedProcessOwner): Promise<void> {
-    for (const record of this.executionBridges.values()) {
+    for (const [ref, record] of this.executionBridges) {
       const identity = record.durable?.retainedProcessOwner;
       if (!identity || record.finalized || record.durable!.exited || !sameRetainedOwner(identity, owner)) continue;
+      // Its own reference was already being stopped (a recovery stop whose
+      // process stop did not finish on a loaded computer): nothing else owns
+      // this process, so retry that exact stop rather than refuse for good.
+      if (record.stopping && !record.retained) {
+        this.logger.warn({ agentId: this.family.agentId, acpSessionRef: ref }, "retrying the unfinished stop of a fenced execution process");
+        await this.stopExecutionBridge(ref);
+        continue;
+      }
       throw new RemoteInstanceError("recovery_required", "The retained execution process is live under a current local owner; a restart-only stop cannot signal it.");
     }
     const idle = this.idleExecutionBridge;
@@ -825,6 +844,17 @@ export class AgentRuntime {
     void this.probe(false, false, { fresh: true }).catch(() => undefined);
   }
 
+  /**
+   * The agent's offered models, read with one non-executing `session/new` at
+   * most every TTL. Stale-while-revalidate: past the TTL the last good answer
+   * for the same sign-in and bridge version is served at once (with how old
+   * it is, `observedAgoMs`) while one shared refresh runs, and it is kept
+   * when that refresh fails for a transient reason (a deadline on a loaded
+   * computer, an internal error). A sign-in failure, a definite refusal or a
+   * malformed answer drops it; a sign-in or version change is a new key.
+   * Without that, one slow refresh left Core no offered models and every
+   * delivery placement failed (2026-10-02).
+   */
   async discoverModelCapability(configId: string): Promise<DiscoveredBridgeModelCapability> {
     const view = this.readiness();
     if (view.readiness !== "ready" || view.connectionState !== "ready" || view.authIdentityFingerprint === undefined) {
@@ -833,39 +863,69 @@ export class AgentRuntime {
     const cacheKey = `${view.authIdentityFingerprint}\u0000${this.options.config.RUNNER_BRIDGE_VERSION}\u0000${configId}`;
     const nowMs = this.now().getTime();
     const ttlMs = this.options.modelCapabilityTtlMs ?? DEFAULT_MODEL_CAPABILITY_TTL_MS;
-    let cached = this.modelCapabilities.get(cacheKey)?.pending;
-    if (cached && nowMs - this.modelCapabilities.get(cacheKey)!.at >= ttlMs) {
-      this.modelCapabilities.delete(cacheKey);
-      cached = undefined;
+    let entry = this.modelCapabilities.get(cacheKey);
+    if (!entry) {
+      // The control plane supplies a reviewed config id, but keep the cache
+      // bounded if that contract regresses. Oldest insertion is safe to evict.
+      if (this.modelCapabilities.size >= 16) {
+        const oldest = this.modelCapabilities.keys().next().value as string | undefined;
+        if (oldest) this.modelCapabilities.delete(oldest);
+      }
+      entry = { good: null, refresh: null };
+      this.modelCapabilities.set(cacheKey, entry);
     }
-    if (cached) {
+    let answer: { capability: DiscoveredBridgeModelCapability; at: number };
+    if (entry.good && nowMs - entry.good.at < ttlMs) {
       this.logger.debug({ event: "model_capability.cache_hit", agentId: this.family.agentId, configId },
         "reusing authenticated ACP model capability");
-      return structuredClone(await cached);
+      answer = entry.good;
+    } else if (entry.good) {
+      answer = entry.good;
+      if (!entry.refresh) {
+        this.logger.info({ event: "model_capability.revalidate", agentId: this.family.agentId, configId, ageMs: nowMs - answer.at },
+          "serving the last offered models while they are read again");
+        void this.refreshModelCapability(cacheKey, entry, configId).catch(() => undefined);
+      }
+    } else {
+      const capability = await (entry.refresh ?? this.refreshModelCapability(cacheKey, entry, configId));
+      answer = { capability, at: this.now().getTime() };
     }
-    await this.prepareToSpawn();
-    const discovery = {
-      configId,
-      workspaceRoot: this.options.config.RUNNER_WORKSPACE_DIR,
-      spec: this.spec,
-      initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
-      sessionTimeoutMs: this.sessionBootstrapTimeoutMs(),
-      clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
-      logger: this.logger,
-      ...(this.options.retrySleep ? { retrySleep: this.options.retrySleep } : {}),
-      ...(this.options.retryRandom ? { retryRandom: this.options.retryRandom } : {}),
-      spawn: this.spawnProcess,
-      ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
-      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.readStderrFailure(line) } : {}),
-    };
+    const offers = this.host?.offersModel;
+    const capability = structuredClone(answer.capability);
+    const offered = offers ? offerableModelCapability(capability, value => offers(value, this.hostSettings), this.family) : capability;
+    const ageMs = Math.max(0, this.now().getTime() - answer.at);
+    return ageMs > 0 ? { ...offered, observedAgoMs: ageMs } : offered;
+  }
+
+  /** One shared discovery for `entry`; settles the entry itself (see `discoverModelCapability`). */
+  private refreshModelCapability(cacheKey: string, entry: ModelCapabilityEntry, configId: string): Promise<DiscoveredBridgeModelCapability> {
     // The periodic probe used to spawn and initialize its own throwaway
     // process. An idle resident bridge answers the same `session/new` without
     // that cost; it is checked out for the probe so no session can adopt it
-    // meanwhile, and returned only when the probe succeeded on it.
-    const pending = (async () => {
+    // meanwhile, and returned only when the probe succeeded on it. Only a
+    // bridge that can close the probe's session is lent: one that cannot
+    // would keep it open for good.
+    const task = (async () => {
+      await this.prepareToSpawn();
+      const discovery = {
+        configId,
+        workspaceRoot: this.options.config.RUNNER_WORKSPACE_DIR,
+        spec: this.spec,
+        initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
+        // A background check, not a turn: never the 10 s session bootstrap deadline.
+        sessionTimeoutMs: Math.max(this.sessionBootstrapTimeoutMs(), MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS),
+        clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
+        logger: this.logger,
+        ...(this.options.retrySleep ? { retrySleep: this.options.retrySleep } : {}),
+        ...(this.options.retryRandom ? { retryRandom: this.options.retryRandom } : {}),
+        spawn: this.spawnProcess,
+        ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
+        ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.readStderrFailure(line) } : {}),
+      };
       this.logger.info({ event: "model_capability.cache_miss", agentId: this.family.agentId, configId },
         "discovering authenticated ACP model capability once");
-      const idle = this.takeIdleExecutionBridge();
+      const closes = this.idleExecutionBridge?.bridge.initializeResult.agentCapabilities?.sessionCapabilities?.close != null;
+      const idle = closes ? this.takeIdleExecutionBridge() : null;
       if (!idle) return discoverBridgeModelCapability(discovery);
       let succeeded = false;
       try {
@@ -881,25 +941,26 @@ export class AgentRuntime {
         }
       }
     })();
-    // The control plane supplies a reviewed config id, but keep the cache
-    // bounded if that contract regresses. Oldest insertion is safe to evict.
-    if (this.modelCapabilities.size >= 16) {
-      const oldest = this.modelCapabilities.keys().next().value as string | undefined;
-      if (oldest) this.modelCapabilities.delete(oldest);
-    }
-    this.modelCapabilities.set(cacheKey, { at: nowMs, pending });
-    try {
-      const offers = this.host?.offersModel;
-      const capability = structuredClone(await pending);
-      return offers ? offerableModelCapability(capability, value => offers(value, this.hostSettings), this.family) : capability;
-    }
-    catch (error) {
-      if (this.modelCapabilities.get(cacheKey)?.pending === pending) {
+    entry.refresh = task;
+    // Registered before any caller awaits `task`, so the entry is settled
+    // (its answer kept, the refresh slot free) before any caller resumes.
+    void task.then(capability => {
+      if (entry.refresh === task) entry.refresh = null;
+      if (this.modelCapabilities.get(cacheKey) === entry) entry.good = { capability, at: this.now().getTime() };
+    }, (error: unknown) => {
+      if (entry.refresh === task) entry.refresh = null;
+      if (this.modelCapabilities.get(cacheKey) !== entry) return;
+      if (entry.good && !definiteModelDiscoveryFailure(error)) {
+        this.logger.warn({ event: "model_capability.kept", agentId: this.family.agentId, configId,
+          ageMs: this.now().getTime() - entry.good.at, errorClass: classifyBridgeError(error).class,
+          errorCode: error instanceof RemoteInstanceError ? error.code : "model_discovery_failed" },
+        "reading the offered models again failed for a transient reason; keeping the last ones");
+      } else {
         this.modelCapabilities.delete(cacheKey);
-        this.afterDiscoveryFailure(error);
       }
-      throw error;
-    }
+      this.afterDiscoveryFailure(error);
+    }).catch(() => undefined);
+    return task;
   }
 
   /** (Re)spawns the bridge and performs the runner-local `initialize`. */
@@ -1169,7 +1230,11 @@ export class AgentRuntime {
       await this.options.afterSuccessfulLogin?.();
       await this.ensureBridge();
       const view = await this.probe(true, args.organization);
-      this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "completed", readiness: view.readiness } });
+      if (view.readiness === "ready") {
+        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "completed", readiness: view.readiness } });
+      } else {
+        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: "official login returned without an authenticated local account; retry sign-in on this machine" } });
+      }
       this.activeLogin = null;
     }).catch(error => {
       this.activeLogin = null;

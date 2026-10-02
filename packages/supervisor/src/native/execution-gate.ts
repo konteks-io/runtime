@@ -44,6 +44,15 @@ export interface AuthorizedNativeOperation {
 }
 const fenced = () => new RemoteInstanceError("execution_fenced", "Native execution authority is no longer current.");
 const unavailable = () => new RemoteInstanceError("execution_authority_unavailable", "Fresh execution authority is unavailable.");
+/** The permit's own expiry, read without trust: it only bounds how long admission waits for keys. */
+const signedOperationExpiryMs = (permit: string): number | undefined => {
+  try {
+    const claims = JSON.parse(Buffer.from(permit.split(".")[1] ?? "", "base64url").toString("utf8"));
+    return typeof claims.exp === "number" && Number.isFinite(claims.exp) ? claims.exp * 1000 : undefined;
+  } catch {
+    return undefined;
+  }
+};
 const signedOperationKeyId = (permit: string): string | undefined => {
   try {
     const header = JSON.parse(Buffer.from(permit.split(".", 1)[0] ?? "", "base64url").toString("utf8"));
@@ -56,7 +65,17 @@ const signedOperationKeyId = (permit: string): string | undefined => {
 };
 /** The whole trust fetch and signed check exchange share this one budget. */
 export const NATIVE_EXECUTION_RENEWAL_BUDGET_MS = 12_000;
-const RENEWAL_RETRY_DELAY_MS = 1_000;
+
+/**
+ * An unanswered renewal is retried with exponential backoff (1 s, 2 s, 4 s …
+ * 30 s) and no attempt cap (D110, owner 09-24). Only Core's own answer that
+ * the execution is gone stops the agent; a timeout never does.
+ */
+const RENEWAL_RETRY_BASE_MS = 1_000;
+const RENEWAL_RETRY_MAX_MS = 30_000;
+/** Waiting for trust keys during admission never outlives the permit itself. */
+const ADMISSION_KEYS_RETRY_BASE_MS = 500;
+const ADMISSION_KEYS_RETRY_MAX_MS = 8_000;
 // Begin while a full busy-host event-loop pause can still elapse before the
 // verified lease expires. A collaboration/Core restart has produced a 19 s
 // pause in practice; a 25 s renewal lead avoids lengthening the
@@ -77,6 +96,8 @@ export class NativeExecutionGate {
   private checkId: string | null = null;
   private monotonicDeadline = 0;
   private refreshAfter = 0;
+  /** Consecutive unanswered renewals; reset by Core's next fresh check. */
+  private renewalFailures = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   private refreshing: Promise<void> | null = null;
   private stopped = false;
@@ -106,7 +127,7 @@ export class NativeExecutionGate {
     this.options.assertOwned();
     if (this.stopped) throw fenced();
     // Fetch only the configured Core trust. No token header may select a URL.
-    const keys = await this.options.client.executionSigningKeys(undefined, signedOperationKeyId(envelope.permit));
+    const keys = await this.signingKeysForAdmission(envelope.permit);
     this.options.assertOwned();
     const ref = this.options.journal.assignments.get(`${this.options.assignment.id}:${this.options.assignment.attempt}`)?.executionReady?.acpSessionRef;
     const message = envelope.message;
@@ -126,6 +147,8 @@ export class NativeExecutionGate {
       prior.claims.executionRevision !== claims.executionRevision)) {
       throw new RemoteInstanceError("operation_conflict", "The ACP request already has a different durable admission.");
     }
+    // A fresh Core-signed delivery permit may carry the turn's renewed lifetime (D115).
+    if (!replay && delivery(claims)) await this.followCoreHorizon(Date.parse(claims.expiresAt));
     const authority = this.localAuthority(claims, replay);
     if (replay) {
       if (prior.claims.permitId !== claims.permitId || prior.claims.operationId !== claims.operationId ||
@@ -171,6 +194,37 @@ export class NativeExecutionGate {
     this.keys = keys;
     this.authority = authority;
     return { key: admittedOperationKey(receipt), envelope, authority, replay: false, ...(admissionFailure ? { admissionFailure } : {}) };
+  }
+
+  /**
+   * Core's key endpoint answering slowly must not refuse a prompt and drop the
+   * relay socket (D110: three refusals cost four minutes). Retry with backoff
+   * while the permit is still valid; the client also serves its last confirmed
+   * keys during an outage, so this matters only before any key was ever read.
+   */
+  private async signingKeysForAdmission(permit: string): Promise<ReadonlyMap<string, KeyObject>> {
+    const kid = signedOperationKeyId(permit);
+    const permitExpiresAtMs = signedOperationExpiryMs(permit);
+    for (let retry = 1; ; retry += 1) {
+      try {
+        return await this.options.client.executionSigningKeys(undefined, kid);
+      } catch (error) {
+        const delayMs = Math.min(ADMISSION_KEYS_RETRY_MAX_MS, ADMISSION_KEYS_RETRY_BASE_MS * 2 ** (retry - 1));
+        const code = error instanceof RemoteInstanceError ? error.code : "unexpected_error";
+        const willRetry = transientLoss(error) && !this.stopped && permitExpiresAtMs !== undefined &&
+          this.options.clock.coreNow() + delayMs < permitExpiresAtMs;
+        this.logger.warn({ event: "execution.admission_keys_unavailable", assignmentId: this.options.assignment.id,
+          attempt: this.options.assignment.attempt, retry, code,
+          ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+          willRetry, ...(willRetry ? { retryInMs: delayMs } : {}),
+          permitRemainingMs: permitExpiresAtMs === undefined ? null : Math.max(0, permitExpiresAtMs - this.options.clock.coreNow()) },
+        willRetry ? "Core signing keys unavailable; retrying admission" : "Core signing keys unavailable; admission refused");
+        if (!willRetry) throw error;
+        await new Promise<void>(resolve => { const timer = setTimeout(resolve, delayMs); timer.unref?.(); });
+        this.options.assertOwned();
+        if (this.stopped) throw fenced();
+      }
+    }
   }
 
   /** Called immediately before the bridge call, after any local preparation IO. */
@@ -229,7 +283,12 @@ export class NativeExecutionGate {
    * evidence that the bridge stopped or that cancellation succeeded. */
   waitForAuthorityStop(): Promise<void> { return this.authorityStop ?? Promise.resolve(); }
 
-  private localAuthority(claims: RemoteExecutionOperationPermitClaims | RemoteDeliveryOperationPermitClaims | Authority, replay = false): Authority {
+  /**
+   * `deadline: false` for the renewal path and the running prompt's tick: the
+   * local record of the assignment's lifetime never stops an agent that is
+   * already running; Core's answer to the next check does (D110, D115).
+   */
+  private localAuthority(claims: RemoteExecutionOperationPermitClaims | RemoteDeliveryOperationPermitClaims | Authority, replay = false, deadline = true): Authority {
     this.options.assertOwned();
     if (this.stopped) throw fenced();
     const assignment = this.options.assignment;
@@ -261,9 +320,9 @@ export class NativeExecutionGate {
       entry.workspaceId !== claims.workspaceId || assignment.agentRoute.agentId !== claims.agentId ||
       entry.claimId !== claims.claimId || entry.recoveryEpoch !== claims.recoveryEpoch || entry.agentId !== claims.agentId ||
       claims.runnerIncarnation !== this.options.runnerIncarnation ||
-      (!replay && (!["claimed", "running", "checkpointed"].includes(entry.state) || Date.parse(entry.expiresAt) <= this.options.clock.coreNow())) ||
+      (!replay && (!["claimed", "running", "checkpointed"].includes(entry.state) || (deadline && Date.parse(entry.expiresAt) <= this.options.clock.coreNow()))) ||
       !Number.isFinite(Date.parse(entry.expiresAt)) || !Number.isFinite(Date.parse(assignment.expiresAt)) ||
-      Date.parse(claims.expiresAt) > Date.parse(assignment.expiresAt)) throw fenced();
+      Date.parse(claims.expiresAt) > this.liveUntil()) throw fenced();
     for (const field of ["workspaceId", "instanceId", "sessionId", "channelId", "assignmentId", "attempt", "claimId",
       "recoveryEpoch", "runnerIncarnation", "agentId", "acpSessionRef", "readyRevision"] as const) {
       if (ready[field] !== claims[field]) throw fenced();
@@ -333,14 +392,12 @@ export class NativeExecutionGate {
   private async refreshImpl(): Promise<void> {
     const authority = this.authority;
     if (!authority || !this.keys) throw unavailable();
-    this.localAuthority(authority);
-    // The first check establishes a lease. Every later renewal is bounded by
-    // both its bounded I/O policy and the last verified monotonic lease;
-    // a slow renewal must not obtain authority after that lease expires.
-    const remainingLeaseMs = this.monotonicDeadline > 0
-      ? Math.max(0, this.monotonicDeadline - this.monotonic())
-      : NATIVE_EXECUTION_RENEWAL_BUDGET_MS;
-    const deadlineAtMs = Date.now() + Math.min(NATIVE_EXECUTION_RENEWAL_BUDGET_MS, remainingLeaseMs);
+    this.localAuthority(authority, false, false);
+    // Every renewal gets its whole bounded I/O budget, even near or past the
+    // last verified lease: Core's fresh signed check is what grants authority
+    // (it answers execution_fenced once the execution is gone), and a budget
+    // clipped to the lease's last milliseconds could only fail (D110).
+    const deadlineAtMs = Date.now() + NATIVE_EXECUTION_RENEWAL_BUDGET_MS;
     const startedAt = this.monotonic();
     let stage = "signing_keys";
     let keysElapsedMs = 0;
@@ -350,40 +407,54 @@ export class NativeExecutionGate {
       const keys = await this.options.client.executionSigningKeys(deadlineAtMs);
       keysElapsedMs = this.monotonic() - startedAt;
       stage = "check";
-      this.localAuthority(authority);
+      this.localAuthority(authority, false, false);
       const check = delivery(authority) ? this.options.client.checkDeliveryExecution : this.options.client.checkExecution;
       if (!check) throw unavailable();
       const result = await check.call(this.options.client, authority.instanceId, authority.executionId, {
         executionRevision: authority.executionRevision, readyRevision: authority.readyRevision, runnerIncarnation: authority.runnerIncarnation,
       }, deadlineAtMs);
-      this.localAuthority(authority);
+      this.localAuthority(authority, false, false);
       stage = "verification";
-      if (this.monotonicDeadline > 0 && this.monotonic() >= this.monotonicDeadline) throw fenced();
+      const lapsedMs = this.monotonicDeadline > 0 ? Math.max(0, this.monotonic() - this.monotonicDeadline) : 0;
       const checkInput = { lease: result.lease, trustedKeys: keys, nowSeconds: Math.floor(this.options.clock.coreNow() / 1000), issuedAtToleranceSeconds: 1 };
       let claims;
       try {
-        claims = delivery(authority) ? verifyRemoteDeliveryCheckLease({ ...checkInput, currentAuthority: authority })
+        claims = delivery(authority) ? verifyRemoteDeliveryCheckLease({ ...checkInput, currentAuthority: renewedView(authority, result.lease) })
           : verifyRemoteExecutionCheckLease({ ...checkInput, currentAuthority: authority });
       } catch (error) {
+        const reason = verificationReason(error);
         this.logger.warn({ event: "execution.check_refused", assignmentId: authority.assignmentId, attempt: authority.attempt,
           claimId: authority.claimId, executionId: authority.executionId, executionRevision: authority.executionRevision,
-          diagnostic: verificationReason(error), skewMs: this.options.clock.skewMs(), issuedAtToleranceSeconds: 1 }, "Native execution check refused");
-        throw new RemoteInstanceError("execution_fenced", "Invalid execution check lease", { diagnostic: verificationReason(error) });
+          diagnostic: reason, skewMs: this.options.clock.skewMs(), issuedAtToleranceSeconds: 1 }, "Native execution check refused");
+        // A genuine check that a slow Core answered after its own expiry says
+        // nothing about the execution; ask again rather than stop the agent.
+        if (reason === "expired") throw new RemoteInstanceError("execution_authority_unavailable", "Execution check lease expired in transit", { diagnostic: reason, retryable: true });
+        throw new RemoteInstanceError("execution_fenced", "Invalid execution check lease", { diagnostic: reason });
       }
       if (result.executionId !== authority.executionId || result.executionRevision !== authority.executionRevision || Date.parse(result.expiresAt) !== claims.exp * 1000) throw fenced();
       this.keys = keys;
       this.checkId = claims.checkId;
+      if (delivery(authority) && Date.parse(claims.expiresAt) > Date.parse(authority.expiresAt)) {
+        // Core renewed this turn (D115): the verified answer is the same
+        // authority with a later lifetime; hold that from now on.
+        await this.followCoreHorizon(Date.parse(claims.expiresAt));
+        if (this.authority === authority) this.authority = { ...authority, expiresAt: claims.expiresAt };
+      }
       const remainingMs = Math.max(0, claims.exp * 1000 - this.options.clock.coreNow());
       this.monotonicDeadline = this.monotonic() + remainingMs;
       this.refreshAfter = Math.max(this.monotonic(), this.monotonicDeadline - Math.min(RENEWAL_LEAD_MS, remainingMs));
+      const recoveredAfter = this.renewalFailures;
+      this.renewalFailures = 0;
       this.logger.info({ event: "execution.renewal_completed", ...context,
         elapsedMs: this.monotonic() - startedAt, keysElapsedMs,
         remainingLeaseMs: remainingMs, nextRenewalInMs: Math.max(0, this.refreshAfter - this.monotonic()),
+        ...(recoveredAfter > 0 ? { recoveredAfterFailures: recoveredAfter } : {}),
+        ...(lapsedMs > 0 ? { leaseLapsedMs: Math.round(lapsedMs) } : {}),
         skewMs: this.options.clock.skewMs() }, "Native execution lease verified");
     } catch (error) {
       this.logger.warn({ event: "execution.renewal_failed", ...context, stage,
         elapsedMs: this.monotonic() - startedAt, keysElapsedMs,
-        budgetMs: Math.min(NATIVE_EXECUTION_RENEWAL_BUDGET_MS, remainingLeaseMs),
+        budgetMs: NATIVE_EXECUTION_RENEWAL_BUDGET_MS,
         remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
         code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
         retryable: transientLoss(error), skewMs: this.options.clock.skewMs() }, "Native execution renewal failed");
@@ -394,30 +465,67 @@ export class NativeExecutionGate {
   private async tick(): Promise<void> {
     if (this.stopped || !this.authority) return;
     try {
-      this.assertDispatchCurrent(this.authority);
+      // The running prompt stays bound to its own local admission and to
+      // Core's durable revision fence; an expired lease only holds back new
+      // dispatch (assertDispatchCurrent) until Core answers again.
+      this.localAuthority(this.authority, false, false);
+      if (this.hasDurableRevisionFence(this.authority)) throw fenced();
       if (!this.refreshing && this.monotonic() >= this.refreshAfter) await this.refresh();
     } catch (error) {
       if (this.stopped) return;
-      if (this.canRetryRenewal(error)) {
-        this.refreshAfter = Math.min(this.monotonicDeadline, this.monotonic() + RENEWAL_RETRY_DELAY_MS);
-        this.logger.warn({ event: "execution.renewal_retry_scheduled", executionId: this.authority?.executionId,
-          remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
-          retryInMs: Math.max(0, this.refreshAfter - this.monotonic()) }, "Retrying within the verified execution lease");
+      if (transientLoss(error)) {
+        // D110: one unanswered renewal (Core slow, a heartbeat took 87 s)
+        // killed the agent. The owner's rule: no deadline on the person's own
+        // agent; a transient loss retries with backoff, without an attempt cap.
+        this.renewalFailures += 1;
+        const now = this.monotonic();
+        const delayMs = Math.min(RENEWAL_RETRY_MAX_MS, RENEWAL_RETRY_BASE_MS * 2 ** (this.renewalFailures - 1));
+        const leaseExpired = now >= this.monotonicDeadline;
+        // While the verified lease still runs, retry before it ends.
+        this.refreshAfter = leaseExpired ? now + delayMs : Math.min(this.monotonicDeadline, now + delayMs);
+        this.logger.warn({ event: "execution.renewal_retry_scheduled", assignmentId: this.authority?.assignmentId,
+          attempt: this.authority?.attempt, executionId: this.authority?.executionId,
+          retry: this.renewalFailures, retryInMs: Math.max(0, Math.round(this.refreshAfter - now)), leaseExpired,
+          remainingLeaseMs: Math.max(0, Math.round(this.monotonicDeadline - now)),
+          code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
+          ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}) },
+        leaseExpired ? "Execution lease lapsed while Core is unreachable; the agent keeps running and renewal retries" : "Retrying within the verified execution lease");
         return;
       }
-      this.logger.warn({ event: "execution.renewal_fenced", executionId: this.authority?.executionId,
+      this.logger.warn({ event: "execution.renewal_fenced", assignmentId: this.authority?.assignmentId,
+        attempt: this.authority?.attempt, executionId: this.authority?.executionId,
         remainingLeaseMs: Math.max(0, this.monotonicDeadline - this.monotonic()),
-        renewalInFlight: this.refreshing !== null,
-        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" }, "Execution authority can no longer renew safely");
+        renewalInFlight: this.refreshing !== null, failuresBefore: this.renewalFailures,
+        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
+        ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}) },
+      "Core answered that this execution is no longer current; stopping it");
       await this.fenceAuthority();
     }
   }
 
-  private canRetryRenewal(error: unknown): boolean {
-    // Optional continuationPolicy claims are intentionally not a local grant
-    // yet: runtime has not qualified the exact operation/provider-side-effect
-    // fence. A transient failure may retry only within the verified lease.
-    return transientLoss(error) && this.monotonic() < this.monotonicDeadline;
+  /**
+   * The latest instant this assignment is known to be live: its own expiry,
+   * or later where Core's verified checks have carried the local record
+   * (D115: Core renews a live delivery turn past its issued hour).
+   */
+  liveUntil(): number {
+    const assignment = this.options.assignment;
+    const entry = this.options.journal.assignments.get(`${assignment.id}:${assignment.attempt}`);
+    const recorded = entry ? Date.parse(entry.expiresAt) : Number.NaN;
+    const issued = Date.parse(assignment.expiresAt);
+    return Number.isFinite(recorded) && recorded > issued ? recorded : issued;
+  }
+
+  /** A verified check lease reaching past the local record of the assignment's lifetime moves it there, forward only. */
+  private async followCoreHorizon(untilMs: number): Promise<void> {
+    const assignment = this.options.assignment;
+    const key = `${assignment.id}:${assignment.attempt}`;
+    const entry = this.options.journal.assignments.get(key);
+    if (!entry || !(untilMs > Date.parse(entry.expiresAt))) return;
+    await this.options.journal.assignments.update(key, current => {
+      if (!current) throw fenced();
+      return untilMs > Date.parse(current.expiresAt) ? { ...current, expiresAt: new Date(untilMs).toISOString() } : current;
+    });
   }
 
   private async fenceAuthority(): Promise<void> {
@@ -431,4 +539,21 @@ function verificationReason(error: unknown): string {
   const reason = error && typeof error === "object" && "verificationReason" in error ? error.verificationReason : undefined;
   return typeof reason === "string" && ["signature_or_encoding", "schema", "not_yet_valid", "expired", "authority_mismatch", "operation_mismatch", "invalid_clock"].includes(reason)
     ? reason : "execution_verification_failed";
+}
+
+/**
+ * The authority a delivery check lease is verified against: the one held,
+ * or, when Core's lease names a later `expiresAt`, the same authority with
+ * that lifetime (D115: Core renews a live turn). The lease is still verified
+ * in full against it, signature and every other field, so nothing but the
+ * lifetime can move this way, and only forward.
+ */
+function renewedView<T extends { expiresAt: string }>(held: T, lease: string): T {
+  try {
+    const body = JSON.parse(Buffer.from(lease.split(".")[1] ?? "", "base64url").toString("utf8")) as { expiresAt?: unknown };
+    return typeof body.expiresAt === "string" && Date.parse(body.expiresAt) > Date.parse(held.expiresAt)
+      ? { ...held, expiresAt: body.expiresAt } : held;
+  } catch {
+    return held;
+  }
 }

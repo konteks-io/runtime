@@ -1258,6 +1258,10 @@ describe("onboard", () => {
     const none = await step({ families: async () => [], agentReadiness: async () => ({}) });
     expect(none.done?.summary).toContain("No coding agent was found on this machine; install Claude Code, Codex, DeepSeek Harness or OpenCode, or add Google Antigravity, and run konteks-remote auth login.");
     expect(none.done?.remedies).toContain("To run OpenCode work here: install it with `curl -fsSL https://opencode.ai/v2/install | bash`, then: konteks-remote agent add opencode");
+    // Claude Code or Codex not here: `agent add` installs or sets it up and signs it in; `auth login` has nothing to sign in (D116).
+    expect(none.done?.remedies).toContain("To also run Claude Code work here: konteks-remote agent add claude-code");
+    expect(none.done?.remedies).toContain("To also run Codex work here: konteks-remote agent add codex");
+    expect(JSON.stringify(none.done)).not.toContain("konteks-remote auth login claude-code");
   });
   it("offers Google Antigravity in one line only to a person with no agent, and names it once added: sign-in, or doctor (antigravity CP6)", async () => {
     await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);

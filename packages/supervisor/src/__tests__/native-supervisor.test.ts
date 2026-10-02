@@ -9,6 +9,7 @@ import { buildReleaseFixture, fetchedAgentPlatformPin, installOfflineAgentPackag
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { RunnerConfigSchema, type BridgeProcess } from "@konteks/remote-agent-runner";
 import { Supervisor } from "../supervisor.js";
+import { NativeRunner } from "../native/runner.js";
 import { NativeInputClient } from "../native/input-client.js";
 import { SupervisorConfigSchema } from "../config.js";
 import { SupervisorStore } from "../state/store.js";
@@ -469,6 +470,95 @@ describe("native Supervisor composition", () => {
     expect(doctor.checks.some(check => check.id === "gateway" || check.id === "component-harness")).toBe(false);
     await supervisor.stop();
     expect(f.stop).toHaveBeenCalledOnce();
+  });
+
+  it("still stops its runners when an open session cannot close under the authority the stop itself withdrew (D113)", async () => {
+    // 2026-10-02 09:27: a claim admitted seconds before SIGTERM; stop() makes the
+    // recovery authority null, the session's drain close then asserted it and the
+    // whole shutdown aborted before the runners and Codex owner were stopped.
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options);
+    supervisors.push(supervisor);
+    await supervisor.start();
+    vi.spyOn(supervisor.work, "drainSessions").mockRejectedValueOnce(new RemoteInstanceError("recovery_required", "Transport recovery generation is not currently accepted."));
+    await expect(supervisor.stop()).resolves.toBeUndefined();
+    expect(f.stop).toHaveBeenCalledOnce();
+  });
+
+  it("stops its agents side by side, and still stops the Codex owner and its state when one agent cannot stop (D113b)", async () => {
+    // 2026-10-02 15:43Z: an idle connector stopped its agents' bridges one after
+    // another for 5 s and launchd killed it before the Codex owner was reached.
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options);
+    await supervisor.start();
+    const internals = supervisor as unknown as { nativeRunners: Array<{ agentId: string; stop(): Promise<void> }>; nativeCodexOwner: { shutdownRequested(): void; stop(): Promise<void> } | null };
+    let otherStarted!: () => void;
+    const otherStarting = new Promise<void>(resolve => { otherStarted = resolve; });
+    let overlapped = false;
+    vi.spyOn(NativeRunner.prototype, "stop").mockImplementation(async () => {
+      overlapped = await Promise.race([otherStarting.then(() => true), new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1_000))]);
+    });
+    internals.nativeRunners.push({ agentId: "claude-code", stop: async () => { otherStarted(); throw new RemoteInstanceError("recovery_required", "Bridge process exit remains unconfirmed."); } });
+    const codexOwner = { shutdownRequested: vi.fn(), stop: vi.fn(async () => undefined) };
+    internals.nativeCodexOwner = codexOwner;
+    await expect(supervisor.stop()).rejects.toThrow("Bridge process exit remains unconfirmed.");
+    expect(overlapped).toBe(true);
+    expect(codexOwner.stop).toHaveBeenCalledOnce();
+  });
+
+  it("takes no new work while an update is still checking this release, and takes it once the update kept it (D113b)", async () => {
+    // D113: during the 0.10.8 health gate the successor claimed work; the
+    // rollback then stopped it under that claim.
+    const f = await fixture();
+    let outcome: "in_progress" | "applied" = "in_progress";
+    const ledger = () => ({ schemaVersion: 1 as const, attempts: [{ id: "update-1", bundleVersion: "1.0.0", manifestDigest: "digest", releaseId: "release-next", reason: "operator", startedAt: new Date().toISOString(), finishedAt: null, outcome, detail: null }] });
+    const supervisor = new Supervisor(f.config, { native: { ...f.options.native, updateProbation: { releaseId: "release-next", readLedger: async () => ledger(), pollMs: 10 } } });
+    supervisors.push(supervisor);
+    await supervisor.start();
+    const deps = (supervisor.work as unknown as { deps: { draining(): boolean } }).deps;
+    expect(deps.draining()).toBe(true);
+    outcome = "applied";
+    await vi.waitFor(() => expect(deps.draining()).toBe(false));
+  });
+
+  it("is on no probation when the update in progress is another release's (D113b)", async () => {
+    const f = await fixture();
+    const ledger = { schemaVersion: 1 as const, attempts: [{ id: "update-1", bundleVersion: "1.1.0", manifestDigest: "digest", releaseId: "release-next", reason: "operator", startedAt: new Date().toISOString(), finishedAt: null, outcome: "in_progress" as const, detail: null }] };
+    const supervisor = new Supervisor(f.config, { native: { ...f.options.native, updateProbation: { releaseId: "release-prev", readLedger: async () => ledger, pollMs: 10 } } });
+    supervisors.push(supervisor);
+    await supervisor.start();
+    expect((supervisor.work as unknown as { deps: { draining(): boolean } }).deps.draining()).toBe(false);
+  });
+
+  it("lists a bundled agent that could not start as unavailable, with why, in agents and doctor (RCA 2026-10-01)", async () => {
+    const f = await fixture();
+    vi.spyOn(NativeRunner.prototype, "start").mockRejectedValue(new RemoteInstanceError("agent_unavailable", "The signed Codex app-server did not become ready in time."));
+    const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor);
+    await supervisor.start();
+    const handle = supervisor.controlHandler();
+    const listed = await handle({ op: "agents" }, { event: () => undefined } as never) as { agents: Array<Record<string, unknown>> };
+    expect(listed.agents).toEqual([{ agentId: "codex", readiness: "unavailable", connectionState: "unavailable", startFailure: "The signed Codex app-server did not become ready in time" }]);
+    const doctor = await handle({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string }> };
+    expect(doctor.checks.find(check => check.id === "agent-codex")).toMatchObject({ status: "fail", detail: "could not start (The signed Codex app-server did not become ready in time); trying again in the background" });
+    // Never advertised to Core: the inventory still leaves it out.
+    expect((await supervisor.inventory.collect()).agents).toEqual([]);
+  });
+
+  it("restarts to reconnect as a new process when Core retired this one, and says so in doctor (RCA 2026-10-01)", async () => {
+    const f = await fixture();
+    const onLivenessLost = vi.fn();
+    const supervisor = new Supervisor(f.config, { ...f.options, onLivenessLost }); supervisors.push(supervisor);
+    await supervisor.start();
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    vi.spyOn(supervisor.reconciliation, "run").mockRejectedValue(new RemoteInstanceError("reconciliation_replay", "Runtime process has been retired"));
+    const internals = supervisor as unknown as { startActiveLoop(): Promise<void>; activeLoopStarting: Promise<void> | null };
+    await internals.activeLoopStarting?.catch(() => undefined);
+    await internals.startActiveLoop();
+    const doctor = await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; detail: string }> };
+    expect(doctor.checks.find(check => check.id === "reconciliation")?.detail).toBe("Konteks no longer accepts this connector process; it restarts to reconnect as a new one");
+    expect(onLivenessLost).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(onLivenessLost).toHaveBeenCalledWith({ reason: "recovery_refused", code: "reconciliation_replay" });
   });
 
   it("reports previews in status (old launchers too), preview.status and the doctor, and advertises no preview without a relay", async () => {

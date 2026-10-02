@@ -27,6 +27,8 @@ export function spawnPiped(request: SpawnRequest): PipedChildProcess {
     cwd: request.cwd,
     env: request.env,
     detached: request.detached ?? supportsProcessGroups(),
+    // Background probes and ACP bridges must not open a Windows console.
+    windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
   });
   if (!child.stdin || !child.stdout || !child.stderr) {

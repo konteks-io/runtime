@@ -17,7 +17,7 @@ import type { BridgeProcess } from "../bridge/process.js";
 import { classifyBridgeError } from "../bridge/process.js";
 import type { RunnerEventBus } from "../events.js";
 import type { HostPromptPrelude, HostPromptSession, HostTurnError } from "../host/host-agent.js";
-import { konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
+import { konteksAgentTitledMetadata, konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
 import type { MeasuredTurn } from "./usage-label.js";
 
 /**
@@ -58,6 +58,8 @@ export interface CreateSessionArgs {
    * Never carried into a continued or restored session.
    */
   integration?: IntegrationSessionAdmission;
+  /** A person's direct session: the agent titles it; Konteks asks only for the `[konteks]` prefix. */
+  agentTitled?: boolean;
   /** Native in-process owner; opaque connector ref, never the bridge session ID. */
   lifecycle?: {
     beforeCreate(opaqueRef: string): Promise<void>;
@@ -125,6 +127,8 @@ export type TurnUsageLabel =
   | { moneyBasis: "pay_per_use"; provider: string; model?: string };
 
 const MAX_CONNECTOR_TURNS = 256;
+/** How long a released session's ACP `session/close` may take before its process is stopped instead of kept. */
+const RELEASE_CLOSE_DEADLINE_MS = 15_000;
 const REFUSED_MODEL_MESSAGE = "That model is not available to this agent here. OpenCode Zen's free models are switched off for this computer.";
 type AcpNativeObservation = z.infer<typeof AcpNativeObservationSchema>;
 
@@ -245,6 +249,14 @@ export class SessionManager {
   /** Known private bridge IDs with in-flight/uncertain load outcomes. Not an
    * OS stop proof; uncertainty is never cleared just because load rejected. */
   private readonly creatingBridgeIds = new Set<string>();
+  /**
+   * ACP sessions whose record was dropped while their process lived on and
+   * that the agent was never confirmed to close (a pending, failed or
+   * unsupported `session/close`). The agent still holds each one (Claude
+   * Code keeps a `claude` child per session), so such a process must never
+   * be kept resident for another session.
+   */
+  private readonly unclosedSessions = new WeakMap<BridgeProcess, number>();
   private readonly logger: Logger;
   private readonly now: () => Date;
   private readonly bootstrapTimeoutMs: number;
@@ -269,12 +281,19 @@ export class SessionManager {
     return turns;
   }
 
-  /** Sessions still bound to exactly this process, fenced ones included. A
+  /** Sessions still bound to exactly this process, fenced ones included,
+   * plus every dropped session the agent was not confirmed to close. A
    * resident process is kept only when this reads zero. */
   sessionsBoundTo(bridge: BridgeProcess): number {
-    let bound = 0;
+    let bound = this.unclosedSessions.get(bridge) ?? 0;
     for (const record of this.sessions.values()) if (record.bridge === bridge) bound += 1;
     return bound;
+  }
+
+  /** A dropped record's ACP session is still open on its live process. */
+  private markUnclosed(bridge: BridgeProcess, delta: 1 | -1): void {
+    if (bridge.exited && delta > 0) return;
+    this.unclosedSessions.set(bridge, Math.max(0, (this.unclosedSessions.get(bridge) ?? 0) + delta));
   }
 
   private requireBridge(record?: SessionRecord): BridgeProcess {
@@ -374,8 +393,17 @@ export class SessionManager {
   }
 
   /** `_meta` for `session/load` and `session/resume`: the agent's own (a persisted tool filter is overridden there). */
-  private reopenMeta(): { _meta?: Record<string, unknown> } {
-    return this.options.sessionMeta ? { _meta: { ...this.options.sessionMeta } } : {};
+  private reopenMeta(args?: Pick<CreateSessionArgs, "agentTitled">): { _meta?: Record<string, unknown> } {
+    // A reopened direct session the agent has not titled yet still gets the prefix when it does.
+    const naming = args?.agentTitled ? { konteksSession: konteksAgentTitledMetadata().konteksSession } : {};
+    const meta = { ...naming, ...this.options.sessionMeta };
+    return Object.keys(meta).length ? { _meta: meta } : {};
+  }
+
+  private newSessionMeta(args: CreateSessionArgs, acpSessionRef: string): Record<string, unknown> {
+    const naming = args.agentTitled ? konteksAgentTitledMetadata(args.context.agentId)
+      : konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId);
+    return { ...naming, ...this.options.sessionMeta, ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) };
   }
 
   async create(args: CreateSessionArgs): Promise<CreatedSession> {
@@ -511,10 +539,10 @@ export class SessionManager {
           // Session identity is retained, assignment tool authority is not.
           // Send even an empty list rather than retaining prior MCP bindings.
           bootstrapConfig = (await this.boundedBootstrap("session_resume", args, bridge,
-            bridge.connection.resumeSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
+            bridge.connection.resumeSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
         } else {
           bootstrapConfig = (await this.boundedBootstrap("session_load", args, bridge,
-            bridge.connection.loadSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
+            bridge.connection.loadSession({ sessionId: prior, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) }), bootstrapAttempt) as { configOptions?: unknown; modes?: unknown } | null);
         }
         bridgeSessionId = prior;
         resumed = true;
@@ -531,8 +559,7 @@ export class SessionManager {
       let created: { sessionId: string; configOptions?: unknown; modes?: unknown };
       try {
         created = await this.boundedBootstrap("session_new", args, bridge,
-          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: { ...konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId), ...this.options.sessionMeta,
-            ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) } }), bootstrapAttempt);
+          bridge.connection.newSession({ cwd: args.cwd, mcpServers: args.mcpServers, _meta: this.newSessionMeta(args, acpSessionRef) }), bootstrapAttempt);
       } catch (error) {
         if (error instanceof RemoteInstanceError && error.retryable) throw error;
         const classified = classifyBridgeError(error);
@@ -631,15 +658,28 @@ export class SessionManager {
     for (const pending of record.pendingClientRequests.values()) pending.reject(new Error("session closed"));
     this.sessions.delete(acpSessionRef);
     this.byBridgeId.delete(record.bridgeSessionId);
+    // No ACP close is sent here (the caller stops the process next), so the
+    // agent still holds the session: its process must not be kept resident.
+    this.markUnclosed(record.bridge, 1);
     this.options.events.publish({ kind: "session_exited", acpSessionRef, reason: "closed" });
   }
 
   /**
    * Release an idle sealed completion that no successor will continue, like
    * bb's releaseSession: no cancellation and no faked interruption of the
-   * settled turn. Anything that is not an idle sealed owner is refused.
+   * settled turn. Anything that is not an idle sealed owner is refused, and
+   * refused synchronously, before anything changes.
+   *
+   * The released session is then closed on the agent (`session/close`): the
+   * process may stay resident for the next session, and an ACP adapter keeps
+   * every session it was never told to close alive (Claude Code: one
+   * `claude` child each, which piled up on a reused process, 2026-10-02).
+   * The returned promise settles once that close is confirmed, failed or past
+   * its deadline; anything but a confirmed close leaves the session counted
+   * by `sessionsBoundTo`, so the runtime stops the process instead of
+   * keeping it. It never rejects.
    */
-  releaseSealed(acpSessionRef: string): void {
+  releaseSealed(acpSessionRef: string): Promise<void> {
     const record = this.sessions.get(acpSessionRef);
     if (!record || !record.continuationSealed || record.recoveryStopping || record.operationFailed || record.activeTurns !== 0 ||
         record.operations.size !== 0 || record.pendingClientRequests.size !== 0) {
@@ -648,7 +688,36 @@ export class SessionManager {
     record.continuationSealed = false;
     this.sessions.delete(acpSessionRef);
     this.byBridgeId.delete(record.bridgeSessionId);
+    // Counted before any await: until the agent confirms the close, nothing
+    // may park this process (its own session is still open there).
+    this.markUnclosed(record.bridge, 1);
     this.options.events.publish({ kind: "session_exited", acpSessionRef, reason: "closed" });
+    return this.closeReleased(record);
+  }
+
+  private async closeReleased(record: SessionRecord): Promise<void> {
+    const bridge = record.bridge;
+    if (bridge.exited) return;
+    const log = { agentId: record.context.agentId, assignmentId: record.context.assignmentId, attempt: record.context.attempt };
+    if (bridge.initializeResult.agentCapabilities?.sessionCapabilities?.close == null) {
+      this.logger.info({ ...log, outcome: "close_unsupported" }, "the agent cannot close a released session; its process will be stopped");
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const deadline = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new RemoteInstanceError("agent_unavailable", "Released session close deadline elapsed.")), RELEASE_CLOSE_DEADLINE_MS);
+        timer.unref();
+      });
+      await Promise.race([bridge.connection.closeSession({ sessionId: record.bridgeSessionId }), deadline]);
+      if (bridge.exited) return;
+      this.markUnclosed(bridge, -1);
+    } catch (error) {
+      this.logger.warn({ ...log, outcome: "close_unconfirmed", err: classifyBridgeError(error).class },
+        "the agent did not confirm closing a released session; its process will be stopped");
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
@@ -703,7 +772,7 @@ export class SessionManager {
       const caps = bridge.initializeResult.agentCapabilities;
       let refreshed: { configOptions?: unknown; modes?: unknown } | null | undefined;
       if (caps?.sessionCapabilities?.resume != null) {
-        const resume = () => bridge.connection.resumeSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() });
+        const resume = () => bridge.connection.resumeSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) });
         try {
           refreshed = await resume();
         } catch (error) {
@@ -719,7 +788,7 @@ export class SessionManager {
           refreshed = await resume();
         }
       } else if (caps?.loadSession === true) {
-        refreshed = await bridge.connection.loadSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta() });
+        refreshed = await bridge.connection.loadSession({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) });
       } else {
         throw new RemoteInstanceError("recovery_required", "Agent cannot refresh a live session's authority.", { diagnostic: "agent_cannot_refresh_authority" });
       }
@@ -788,6 +857,7 @@ export class SessionManager {
       if (record.recoveryStopping || this.creatingRefs.has(ref)) { record.operationFailed = true; continue; }
       this.sessions.delete(ref);
       this.byBridgeId.delete(record.bridgeSessionId);
+      this.markUnclosed(record.bridge, 1);
       this.options.events.publish({ kind: "session_exited", acpSessionRef: ref, reason });
     }
   }

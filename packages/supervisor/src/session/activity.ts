@@ -244,6 +244,51 @@ export function redactActivity(value: unknown, workspaceRoot: string, options: A
   return result;
 }
 
+/**
+ * Redact a relayed session message. A streamed chunk's continuation options
+ * describe that chunk's text alone: applied to every string they turned the
+ * message's own `kind`, `method` and `sessionUpdate` into `[local-path]`
+ * whenever the previous chunk ended inside a path, so the relay contract
+ * refused the chunk and every update after it in that word (D121).
+ */
+export function redactSessionMessage(message: unknown, workspaceRoot: string, chunk: ActivityTextOptions = {}): unknown {
+  const redacted = redactActivity(message, workspaceRoot);
+  const text = (message as { params?: { update?: { content?: { type?: unknown; text?: unknown } } } } | null)?.params?.update?.content;
+  if (text?.type !== "text" || typeof text.text !== "string") return redacted;
+  const content = (redacted as { params: { update: { content: Record<string, unknown> } } }).params.update.content;
+  content.text = redactActivity(text.text, workspaceRoot, chunk);
+  return redacted;
+}
+
+interface ContractIssue {
+  code: string;
+  path: ReadonlyArray<PropertyKey>;
+  errors?: ReadonlyArray<ReadonlyArray<ContractIssue>>;
+}
+
+/**
+ * The deepest field a contract parse refused, as a dotted path and the zod
+ * issue code, never the value. A union reports each branch; the branch that
+ * got furthest is the one the message meant.
+ */
+export function contractIssue(issues: ReadonlyArray<ContractIssue>): { issuePath: string; issueCode: string } | undefined {
+  let best: { path: PropertyKey[]; code: string } | undefined;
+  const visit = (list: ReadonlyArray<ContractIssue>, prefix: PropertyKey[]) => {
+    for (const issue of list) {
+      const path = [...prefix, ...issue.path];
+      if (issue.code === "invalid_union" && issue.errors && issue.errors.length > 0) {
+        for (const branch of issue.errors) visit(branch, path);
+        continue;
+      }
+      if (best === undefined || path.length > best.path.length) best = { path, code: issue.code };
+    }
+  };
+  visit(issues, []);
+  // A key inside an open JSON payload is the agent's text: name only safe segments.
+  const segment = (key: PropertyKey) => typeof key === "number" || /^[A-Za-z0-9_]{1,64}$/.test(String(key)) ? String(key) : "*";
+  return best === undefined ? undefined : { issuePath: best.path.map(segment).join("."), issueCode: best.code };
+}
+
 export interface ActivityTextOptions {
   /**
    * False for a streamed chunk that continues a word: its first character is

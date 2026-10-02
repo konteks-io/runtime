@@ -48,6 +48,7 @@ describe("learnt slash commands (runtime-view R19)", () => {
     // Something that is not a command list changes nothing.
     store.learn({ sessionUpdate: "available_commands_update" }, new Date("2026-09-29T10:06:00.000Z"));
     expect(store.current()?.learntAt).toBe("2026-09-29T10:05:00.000Z");
+    await store.settled();
   });
 
   it("survives a connector restart in the agent's own folder (0600), and a refused command never comes back from disk", async () => {

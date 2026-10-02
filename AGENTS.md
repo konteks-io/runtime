@@ -118,7 +118,7 @@ fields. dsh governance admits `mcp__konteks-result__*` like the preview tools.
 **Session hardening (external-integration Stage 0, invariant N10).** A
 Konteks Claude Code session runs none of the working repository's hooks and
 starts none of its `.mcp.json` servers (S0-1): the patched claude-agent-acp
-(`scripts/claude-acp-settings-patch.mjs`, `konteks-claude-project-settings-v4`)
+(`scripts/claude-acp-settings-patch.mjs`, `konteks-claude-project-settings-v5`)
 forces `strictMcpConfig: true` beside `settingSources: ["project"]` (only the
 ACP request's servers load, which also leaves the account's claude.ai
 connectors out) and `hardenClaudeSession` flag settings (`disableAllHooks`;
@@ -141,7 +141,7 @@ description), an MCP call with no readable server/tool is refused, and every
 policy allow is `allow_once` (no fallback to `allow_always`).
 Only the session's own MCP servers are callable (S0-2): `hardenClaudeSession`
 also sets `disableClaudeAiConnectors` (claude.ai connectors stay out even
-without strict MCP); the Codex bridge patch (`konteks-codex-acp-live-user-v8`,
+without strict MCP); the Codex bridge patch (`konteks-codex-acp-live-user-v9`,
 `konteks/codex-acp-provenance.json`) turns every MCP server the person's or a
 trusted project's Codex config names off for the thread
 (`mcp_servers.<name>.enabled = false`, read through `config/read`; a
@@ -400,6 +400,28 @@ disk, no pin for this computer). The relay honours `HTTPS_PROXY`/`ALL_PROXY`
 and `NO_PROXY` for Google (`openHttpsProxyTunnel`, remote-common
 `https-proxy.ts`, shared with the download).
 
+Activation install without `--agents` (D116, `native/install.ts`
+`findOrOfferAgents`, launcher `native/agent-setup.ts`): agents are detected
+like enrollment (`detectNativeAgents`) and none is required; a missing Claude
+Code or Codex is offered before the code prompt (`setupAgent`), Claude Code
+only through `claudeCodeInstaller` (Anthropic's `install.ps1`/`install.sh`,
+run in the person's terminal), Codex by creating its profile folder for the
+shipped CLI; no TTY or `--json` never asks or downloads. After `start`,
+`closeAgentSetup` runs `auth login` for what was set up, offers it once for a
+found agent without a sign-in, and prints which agents are ready and one
+command for each other. `agent add claude-code|codex` does the same through
+`ensurePersonalAgent` before stopping anything, and adds from the installed
+release itself when it is the same digest (no newer release needed). An
+explicit `--agents` list stays strict. A record with no agents loads and
+starts (`verifyInstalledNativeBridges` accepts an empty runner list). On
+Windows, a yes to Claude Code without Git for Windows (remote-common
+`findGitForWindows`: `CLAUDE_CODE_GIT_BASH_PATH`, git.exe on PATH,
+`%ProgramFiles%\Git`, `%LOCALAPPDATA%\Programs\Git`) asks once to run
+`winget install --id Git.Git -e --source winget`; a no, no winget or a failure
+is one line with git-scm.com's download page. The Claude bridge gets
+`CLAUDE_CODE_GIT_BASH_PATH` from the same lookup at every spawn, and the
+install records that git.exe when PATH does not have it yet.
+
 Agents used from the person's own installation (`HOST_AGENT_BRIDGES` in
 `packages/release/src/bridges.ts`: dsh, and OpenCode 2 as `opencode`) never
 get a branch of their own in generic code. Each has a runner-side
@@ -444,8 +466,10 @@ copy), and the runtime never parks such a process for another session (MCP
 servers are process-wide in OpenCode). The control process (discovery,
 sign-in) uses `config/control`, which carries no instructions. Runner start
 runs `opencode-self-check.ts`: `opencode debug agents` in the private home on
-a private service port, asserting every agent ends with the Konteks rules and
-that `plan`/`title` are off (a fresh service first lists OpenCode's default
+a private service port, asserting every agent ends with the Konteks rules
+(followed by nothing but `deny` rules: since 2.0.21 OpenCode appends its own
+`browser * deny` after the configuration; any later `allow` or `ask` is drift)
+and that `plan`/`title` are off (a fresh service first lists OpenCode's default
 agents for about a second, so the listing is read until it is in force or has
 stayed unchanged for 5 s), and stopping any background service of the
 private home before and after (only processes whose environment names it;
@@ -683,18 +707,130 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
   built on demand (`ensureUpdates`), not only after a successful start.
 - An update whose stop is not confirmed in time starts the unchanged release
   again once the OS no longer runs it.
+- D113b (2026-10-02): launchd SIGKILLs a booted-out job 5 s after SIGTERM
+  unless its plist sets `ExitTimeOut` (measured on macOS; the plist now sets
+  `LAUNCHD_EXIT_TIMEOUT_SECONDS` = 30, above the daemon's 15 s watchdog). An
+  idle connector still stopping its agents one after another was killed
+  before it wrote its shutdown receipt, and the update waited 90 s for a
+  receipt that never came. Now: native runners stop side by side
+  (`Promise.allSettled`; a runner that cannot stop does not keep the others,
+  the Codex owner or the state from stopping, and its error is thrown at the
+  end); the transaction reads the service pid before the stop and accepts
+  that process being gone as the stop's proof, ends its process group after
+  `stopGraceMs` (30 s; only while `ps` still shows this root's `serve`); and
+  any abort after the stop and before the swap starts the same release and
+  waits for it to answer (`restartUnchanged`).
+- `serve` keeps `<root>/bin/konteks-remote` on the running release
+  (`keepLauncherCurrent`): once no update attempt for this release is
+  `in_progress` (45 min stale bound) and the record names this process's
+  release, it replaces the launcher when its bytes differ. A launcher without
+  the transaction's own refresh (0.8.0's, D113b) otherwise drives every update.
+- D131: Windows has no `<root>\bin` launcher; the MSI's `konteks-remote.exe`
+  (Program Files, not writable without elevation) is the person's command. At
+  start it runs `<root>\releases\<releaseId>\konteks-connector.exe` (or the
+  pre-rename `connector.exe`) from `native-runtime.json` with the same argv,
+  console stdio and exit code (`launcher-delegate.ts`, `KONTEKS_REMOTE_VIA_LAUNCHER=1`
+  on the child so it never hands on again). It runs its own code for
+  `install`, `uninstall` and `stage-enrollment` (Windows cannot delete the
+  running exe), with nothing installed or a `pending` record, when its own
+  version is newer than the record's (a newer MSI repairs an older release),
+  when the release cannot be started (said on stderr), and for any path that
+  is not a regular file at exactly `releases\<id>\<name>` under the root's
+  real path (no link, junction or dot-dot). The child gets the person's
+  environment without the values this copy's entry baked
+  (`globalThis.__konteksLauncherBakedEnv`, `build-launcher.mjs`). The MSI also
+  installs `launcher.json`; the supervisor's doctor warns (`launcher`) when the
+  MSI command lacks it: an older MSI runs its own code forever. `install.ps1
+  -Update` installs the latest MSI on a connected computer (same-version
+  upgrades allowed) and runs `update`, then `start`. An update is driven by the
+  newest code present (the running release's, or a newer MSI's); the staged
+  successor is unproven until its gate, so it takes over at its own `serve`
+  (`keepServiceOnOwnDefinition`), not mid-transaction.
+- A release an update just started is on probation while the ledger's attempt
+  for its release is `in_progress` (`updateProbation`, polled every 2 s, same
+  45 min bound): it takes no new work (pull gate, heartbeat
+  `acceptingWork`), so a rollback never stops it under a claim (D113).
 - `serve` rewrites an existing service definition that differs from what the
-  serving release renders (`refreshOwnServiceDefinition`): the install
+  serving release renders (`keepServiceOnOwnDefinition`): the install
   launcher is never replaced and an updater is the previous release, so
-  service-level changes (the log file) otherwise arrive late or never. The OS
-  reads it from the next start.
+  service-level changes (the log file) otherwise arrive late or never.
+  Rewriting the file is not enough (RCA 2026-10-01: after an operator
+  `konteks-remote update`, launchd ran the new release from the install
+  launcher's plist, stdout and stderr on /dev/null, and KeepAlive respawns and
+  `kickstart -k` reuse that loaded copy). When the service manager runs this
+  very process and its loaded definition is not this one (just rewritten, a
+  launch agent with no `stdout path` or another `program`, or systemd's
+  `NeedDaemonReload=yes`), `serve` has it reload before starting anything:
+  launchd by `bootout` + `bootstrap` from a detached `/bin/sh` whose output is
+  appended to `logs/connector.log`, systemd by `daemon-reload` + `--no-block
+  restart`. The service manager keeps owning the one supervisor; a foreground
+  `serve` is never restarted; one reload per definition per 10 minutes
+  (`supervisor/service-reload.json`), and a `serve` not stopped within 60 s
+  starts anyway. Windows repairs its private windowless launch helper and
+  re-registers a changed task without starting another connector. Task XML
+  remains UTF-16LE with a BOM, written and compared as bytes through
+  `encodeServiceDefinition` by `start` and `serve` alike (D129: 0.10.9 wrote
+  UTF-8 and `schtasks /Create` refused it, "unable to switch the encoding");
+  a file in any other encoding is rewritten, a failed registration restores
+  the exact bytes it found so the next startup retries, and a task missing
+  although its file is current is registered again. The task's hidden
+  PowerShell host runs the connector through `cmd /d /v:off /s /c`, paths
+  passed only as `KONTEKS_SERVICE_*` environment variables, with stdout and
+  stderr appended to `logs/connector.log` (rotated past 20 MB at start; the
+  supervisor's in-place truncation is off on Windows, where cmd's handle does
+  not append). `RestartOnFailure/Count` is 255, the schema's unsignedByte.
+- A failed service step (D129) is a `NativeServiceCommandError`: the step,
+  the command and verb, its exit code and a 300-character excerpt of its
+  output, said by `describeServiceFailure` with one next step. `start` keeps
+  it in `supervisor/service-start-failure.json` (cleared by a start that
+  works, also written by a refused `serve` re-registration) and, where the
+  status means running (Windows, systemd), checks 3 s after starting that the
+  service still runs, quoting the log's last lines if not. `doctor` and
+  `support` fall back to that record and the log tail when the control socket
+  is unavailable. `--verbose` / `KONTEKS_REMOTE_VERBOSE=1` prints every
+  service command, its exit code and output, and the start's decisions, on
+  stderr (`verbose.ts`).
 - After the shared Codex owner starts, app-servers that older releases of this
   installation left on other sockets are ended once idle (or unreachable)
   (`reapStrayServers`); nothing outside `<root>/releases/` is touched.
+- A repository role session (every review turn of a task reuses one QA
+  delivery session, continuing the last completed turn's live ACP session)
+  survives a turn that ends unfinished (production 2026-10-01: a cancelled
+  review continuation blocked every later review with `recovery_required`
+  / `local_execution_unprovable`, restart or not). When a `harness_delivery`
+  session closes for any reason but `completed`, the orchestrator waits for
+  the session's own close, proves the exact process gone with
+  `stopRetainedExecution` and marks the execution `stopping` →
+  `process_stopped` → `interrupted_unqualified` (`retireAfterClose`, the
+  retained recovery stop's sequence). The next turn naming the completed turn
+  then starts a fresh ACP session through
+  `canStartFreshAfterRecoveredHarnessContinuation` once Core acknowledged the
+  terminal report. Journals left behind by older releases (the continuation
+  still `opened`) heal at the next turn's handoff
+  (`retireUnfinishedHarnessContinuation`): only with a terminal, acknowledged
+  claim, no local owner (session, bootstrap, dispatch, channel, recovery
+  stop) and a proven process stop; otherwise the refusal stands. Generated
+  changes in the working copy are kept; only the agent's in-session history
+  is lost. Predecessor turns are matched by `invocationId` and
+  `dispatchGeneration` only (`turnIdentity`), never their own nested
+  predecessor.
 - `doctor` has a `update-channel` line (unreadable channel fails, a
   `KONTEKS_RELEASE_MANIFEST_URL` override warns, no lease warns that updates
   wait), and `status` shows it through the separate `update.channel` op (never
   a new status field: older launchers parse `status` strictly).
+- A native turn survives Core being slow or unreachable (D110,
+  `native/execution-gate.ts`). An unanswered execution-lease renewal retries
+  with backoff (1 s doubling to 30 s, no attempt cap) and the running agent
+  keeps going; once the lease has lapsed only new dispatch waits for Core's
+  next fresh check. The agent stops only when Core answers (`execution_fenced`,
+  a denial, a durable revision fence), never on a timeout; a check lease that
+  expired in transit is asked for again. `CoreClient.executionSigningKeys`
+  serves the last key set Core confirmed (up to `SIGNING_KEY_STALE_MAX_MS`,
+  never for an unknown key id) while its key endpoint fails, backing off
+  between refreshes, and admission retries its keys while the permit is
+  valid instead of dropping the relay socket. Each decision logs one line
+  (`execution.renewal_retry_scheduled`, `execution.signing_keys_refresh_failed`,
+  `execution.admission_keys_unavailable`).
 
 Before production changes, add or update a focused characterization test and
 observe its failure or baseline. Run focused tests serially; do not start

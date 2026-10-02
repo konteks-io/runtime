@@ -1,7 +1,7 @@
 import { copyFile, stat, truncate } from "node:fs/promises";
 import { join } from "node:path";
 
-/** The connector's own log in `<root>/logs`, where the OS keeps none (macOS launchd). */
+/** The connector's own log in `<root>/logs`, where the OS keeps none (macOS launchd, the Windows task). */
 export const CONNECTOR_LOG_FILE = "connector.log";
 export const CONNECTOR_LOG_MAX_BYTES = 20 * 1024 * 1024;
 const CHECK_EVERY_MS = 60 * 60_000;
@@ -20,8 +20,15 @@ export async function keepConnectorLogSmall(file: string, maxBytes = CONNECTOR_L
   return true;
 }
 
-/** Checks the log now and every hour while the connector runs; returns a stop. */
-export function startConnectorLogKeeper(root: string, onError: (error: unknown) => void = () => undefined): () => void {
+/**
+ * Checks the log now and every hour while the connector runs; returns a stop.
+ * Not on Windows: there cmd holds the log with a handle that writes at its own
+ * offset rather than appending, so emptying it in place would leave a gap of
+ * zeros as long as the old log; the task's host keeps it small before each
+ * start instead (launcher service.ts, D129).
+ */
+export function startConnectorLogKeeper(root: string, onError: (error: unknown) => void = () => undefined, platform: NodeJS.Platform = process.platform): () => void {
+  if (platform === "win32") return () => undefined;
   const file = join(root, "logs", CONNECTOR_LOG_FILE);
   const check = () => { void keepConnectorLogSmall(file).catch(onError); };
   check();

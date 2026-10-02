@@ -27,6 +27,19 @@ describe("startNativeAgents", () => {
     expect(result.codexOwnerStarted).toBe(false);
   });
 
+  it("starts the other agents while Codex's shared server is still starting, and Codex's runner only after it", async () => {
+    let finishOwner!: () => void;
+    const codexOwner = { start: vi.fn(() => new Promise<void>(resolve => { finishOwner = resolve; })), stop: vi.fn(async () => {}) };
+    const codex = runner("codex"), claude = runner("claude-code");
+    const pending = startNativeAgents({ codexOwner, runners: [codex, claude] });
+    await vi.waitFor(() => expect(claude.start).toHaveBeenCalled());
+    expect(codex.start).not.toHaveBeenCalled();
+    finishOwner();
+    const result = await pending;
+    expect(result.started).toEqual([claude, codex]);
+    expect(result.codexOwnerStarted).toBe(true);
+  });
+
   it("leaves out any agent whose runner cannot start and starts the rest, keeping Codex's server up", async () => {
     const codexOwner = { start: vi.fn(async () => {}), stop: vi.fn(async () => {}) };
     const codex = runner("codex"), claude = runner("claude-code", true), dsh = runner("dsh", true);

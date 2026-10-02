@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
+import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 
 // Build-time compatibility change only. Never mutate an installed signed artifact.
 // Reuse upstream's history conversion; do not reconstruct or read local files.
+// v9: v8 (integration admission, S0-2 server switch-off) combined with
+// main's v7 (a direct session's own title behind the [konteks] prefix).
 export const codexAcpLiveUserPatch = {
-  id: "konteks-codex-acp-live-user-v8",
+  id: "konteks-codex-acp-live-user-v9",
   package: "@agentclientprotocol/codex-acp",
   version: "1.10.0",
   upstreamSha256: "4602784c5896fbf05a7d89b09655bacc768d0bf281e0d03a10333ff81da45268",
@@ -86,7 +89,7 @@ export function patchCodexAcpLiveUsers(source, version) {
   };
   replaceOnce(
     "var CodexEventHandler = class _CodexEventHandler {",
-    `${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
+    `${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\n${konteksPrefixedName.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,
   );
   replaceOnce(
     "      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers),\n      modelProvider: this.getModelProvider(),",
@@ -157,6 +160,10 @@ export function patchCodexAcpLiveUsers(source, version) {
       state.sessionTitle = konteksSession.title;
       state.sessionTitleSource = "explicit";
       state.titleGen?.markExistingTitle();
+    } else if (konteksSession?.version === 1 && konteksSession.prefix === "[konteks]") {
+      // A direct session: Codex titles it itself; the name gets only the prefix.
+      const titleGen = this.getSessionState(sessionId).titleGen;
+      if (titleGen) titleGen.konteksPrefix = konteksSession.prefix;
     }
     logger.log("New session created", {`,
   );
@@ -254,6 +261,35 @@ export function patchCodexAcpLiveUsers(source, version) {
           return null;
         }
         return await this.completeItemEvent(notification.params);`,
+  );
+  // Codex's own title for a direct session, behind "[konteks] ". The title
+  // model's failure falls back to the first message, so the thread is still
+  // recognisable; a name someone set meanwhile is never replaced.
+  replaceOnce(
+    "    this.generated = true;\n    this.generateAndPersist(userPromptText).catch(() => {\n    });",
+    "    this.generated = true;\n    (this.konteksPrefix ? this.konteksNameThread(userPromptText) : this.generateAndPersist(userPromptText)).catch(() => {\n    });",
+  );
+  replaceOnce(
+    "  async generateAndPersist(userPromptText) {\n",
+    `  async konteksNameThread(userPromptText) {
+    let title = null;
+    try {
+      title = await this.generateAndPersist(userPromptText);
+    } catch {
+    }
+    const name = title ? konteksPrefixedName(this.konteksPrefix, title) : konteksPrefixedName(this.konteksPrefix, userPromptText, 80);
+    if (!name || this.getSessionTitleSource() === "explicit") return;
+    await this.client.threadSetName({
+      threadId: this.mainThreadId,
+      name
+    });
+  }
+  async generateAndPersist(userPromptText) {
+`,
+  );
+  replaceOnce(
+    "    const title = extractTitle(turnResult.turn);\n    if (!title) return;",
+    "    const title = extractTitle(turnResult.turn);\n    if (this.konteksPrefix) return title;\n    if (!title) return;",
   );
   return {
     source,

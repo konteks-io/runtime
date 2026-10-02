@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FixedClock, RemoteInstanceError, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { FixedClock, RemoteInstanceError, ed25519Sign, generateEd25519, remoteControlSigningBytes, type CancelDirective, type RemoteWorkAssignment } from "@konteks/remote-common";
 import { SessionManager, InMemorySessionRefStore } from "../../../agent-runner/src/sessions/manager.js";
 import { RunnerEventBus } from "../../../agent-runner/src/events.js";
 import { RelayedSession, type RelayedSessionDeps } from "../session/relayed-session.js";
@@ -636,4 +636,119 @@ it("still attempts cancellation when persisting the uncertainty observation fail
   expect(f.connection.cancel).toHaveBeenCalled();
   expect(f.outbox.depth).toBe(0);
   expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
+});
+
+describe("settling an execution whose authority was lost (production 2026-10-02)", () => {
+  type Settling = {
+    recoverLostExecutionAuthority(id: string, attempt: number): Promise<void>;
+    retryLostAuthoritySettlements(): void;
+    lostAuthority: Map<string, { failures: number; nextAt: number; running: Promise<void> | null }>;
+    deps: { verifyCancellation?: (directive: CancelDirective) => boolean };
+  };
+  const processOwner = { version: 1 as const, platform: "darwin" as const, pid: 321, processGroupId: 321, startToken: "start", commandDigest: "A".repeat(43) };
+
+  /** A running turn whose agent will not settle its cancelled prompt, as on the loaded Mac. */
+  async function fencedRun(stopRetainedExecution: ReturnType<typeof vi.fn>) {
+    const f = await realOwnedWork(); await f.dispatch();
+    await vi.waitFor(() => expect(f.journal.assignments.get("assignment:1")?.state).toBe("running"));
+    await f.journal.execution.bindProcessOwner(f.admission, processOwner, () => undefined);
+    Object.assign(f.runner, { stopRetainedExecution });
+    f.connection.cancel.mockRejectedValue(new RemoteInstanceError("recovery_required", "agent recovery stop deadline elapsed"));
+    const internal = f.work as unknown as Settling;
+    const tick = async () => {
+      internal.retryLostAuthoritySettlements();
+      await internal.lostAuthority.get("assignment:1")?.running?.catch(() => undefined);
+    };
+    return { ...f, internal, tick };
+  }
+  const terminal = (f: Awaited<ReturnType<typeof fencedRun>>) => {
+    const entry = f.journal.assignments.get("assignment:1")!;
+    return entry.reports.terminalSequence === undefined ? undefined : f.work.reports.queuedTerminalReport("assignment", 1, entry.claimId)?.result;
+  };
+
+  it("reports the claim interrupted once the exact process is proven gone, though the agent never settled its turn", async () => {
+    const stop = vi.fn(async () => undefined);
+    const f = await fencedRun(stop);
+    await f.internal.recoverLostExecutionAuthority("assignment", 1);
+    expect(stop).toHaveBeenCalledWith(processOwner);
+    // Interrupted without settlement or quiescence: the reference stays fenced.
+    expect(f.journal.execution.execution(f.admission)).toMatchObject({ phase: "interrupted_unqualified", acpSettledAt: null });
+    expect(() => f.journal.execution.assertQuiescent(f.admission)).toThrow();
+    expect(terminal(f)).toMatchObject({ class: "interrupted", reason: "agent_session_lost" });
+    expect(f.outbox.depth).toBe(1);
+    expect(f.internal.lostAuthority.size).toBe(0);
+    expect(() => f.manager.prompt("acp", "late", { prompt: [] })).toThrow();
+  });
+
+  it("retries a failed settlement on the maintenance tick with exponential backoff until it is reported", async () => {
+    let failures = 2;
+    const stop = vi.fn(async () => { if (failures-- > 0) throw new RemoteInstanceError("recovery_required", "Retained bridge process-group exit remains unconfirmed."); });
+    const f = await fencedRun(stop);
+    await expect(f.internal.recoverLostExecutionAuthority("assignment", 1)).rejects.toMatchObject({ code: "recovery_required" });
+    expect(terminal(f)).toBeUndefined();
+    expect(f.journal.execution.execution(f.admission)?.phase).toBe("stopping");
+    // Not due yet: nothing hammers a loaded computer.
+    await f.tick();
+    expect(stop).toHaveBeenCalledTimes(1);
+    clock.advance(5_000);
+    await f.tick();
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(f.internal.lostAuthority.get("assignment:1")).toMatchObject({ failures: 2, nextAt: clock.now() + 10_000 });
+    clock.advance(9_999);
+    await f.tick();
+    expect(stop).toHaveBeenCalledTimes(2);
+    clock.advance(1);
+    await f.tick();
+    expect(stop).toHaveBeenCalledTimes(3);
+    expect(terminal(f)).toMatchObject({ class: "interrupted", reason: "agent_session_lost" });
+    expect(f.internal.lostAuthority.size).toBe(0);
+    // Settled: later ticks do nothing more.
+    clock.advance(60_000);
+    await f.tick();
+    expect(stop).toHaveBeenCalledTimes(3);
+    expect(f.outbox.depth).toBe(1);
+  });
+
+  it("ends a fenced, unsettled execution cancelled when Core's stop directive arrives, without waiting for the backoff", async () => {
+    let fail = true;
+    const stop = vi.fn(async () => { if (fail) throw new RemoteInstanceError("recovery_required", "process stop unconfirmed"); });
+    const f = await fencedRun(stop);
+    await expect(f.internal.recoverLostExecutionAuthority("assignment", 1)).rejects.toThrow();
+    f.internal.deps.verifyCancellation = () => true;
+    const core = generateEd25519();
+    const unsigned = { assignmentId: "assignment", attempt: 1, reason: "user_cancelled" as const, issuedAt: clock.nowIso() };
+    const directive: CancelDirective = { ...unsigned, signature: ed25519Sign(core.privateKey, remoteControlSigningBytes(unsigned)) };
+    fail = false;
+    await f.work.onCancel(directive);
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(terminal(f)).toMatchObject({ class: "cancelled", reason: "user_cancelled" });
+    expect(f.journal.execution.execution(f.admission)?.phase).toBe("interrupted_unqualified");
+    // A repeated directive finds the claim settled and does nothing.
+    await f.work.onCancel(directive);
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(f.outbox.depth).toBe(1);
+  });
+
+  it("after a restart, settles the execution a failed live stop left `stopping`", async () => {
+    const f = await sessionFixture();
+    const retainedStop = vi.fn(async () => undefined);
+    const admission = { instanceId: "instance", workspaceId: "workspace", runnerIncarnation: "predecessor", assignmentId: "assignment", attempt: 1, claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: clock.nowIso() };
+    await f.journal.assignments.put({ assignmentId: "assignment", attempt: 1, claimId: "claim", kind: "validation", placementId: "placement", workspaceId: "workspace", agentId: "codex", state: "running", acpSessionRef: "fenced-ref", recoveryEpoch: 0, reports: { nextSequence: 1, durableWatermark: 0 }, evidenceUpload: "structured_only", expiresAt: assignment.expiresAt, latestResumeAt: assignment.policy.latestResumeAt, updatedAt: clock.nowIso() });
+    await f.journal.execution.admit(admission, () => undefined);
+    await f.journal.execution.open(admission, () => undefined, clock.nowIso());
+    await f.journal.execution.bindReference(admission, "fenced-ref", () => undefined);
+    await f.journal.execution.bindProcessOwner(admission, processOwner, () => undefined);
+    // The live recovery got this far: stopping, ACP never settled, no report.
+    await f.journal.execution.markStopping(admission, clock.nowIso(), () => undefined);
+    const restarted = new SupervisorJournal(dir); await restarted.load();
+    const work = new WorkOrchestrator({ journal: restarted, outbox: f.outbox, transport: f.transport, clock,
+      runners: new Map([["codex", { ...f.runner, stopRetainedExecution: retainedStop }]]), sessionDeps: () => f.deps, onUsage: async () => undefined,
+      instanceId: () => "instance", workspaceId: () => "workspace", runnerIncarnation: () => "successor", assertOwned: () => undefined,
+      recoveryAuthority: () => "accepted-successor", reportDeliveryAllowed: () => false } as never);
+    // Reconciliation's stop: proven gone, interrupted; its decision then reports the claim.
+    await expect(work.stopForRecovery("assignment", 1, () => undefined)).resolves.toBeUndefined();
+    expect(retainedStop).toHaveBeenCalledWith(processOwner);
+    expect(restarted.execution.execution(admission)).toMatchObject({ phase: "interrupted_unqualified", acpSettledAt: null });
+    expect(() => restarted.execution.assertQuiescent(admission)).toThrow("not qualified execution quiescence");
+  });
 });

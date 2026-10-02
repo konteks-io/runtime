@@ -14,8 +14,17 @@ export interface DoctorInputs {
   relay: { state: string; lastError: string | null; consecutiveFailures: number };
   transport: "relay" | "https";
   reconciliationComplete: boolean;
+  /** Why Core refused the last reconnect, in plain words; absent while nothing was refused. */
+  reconciliationRefusal?: string;
   components: Array<{ kind: string; healthStatus: string; version: string }>;
-  agents: Array<{ agentId: string; readiness: string; recoveryAction?: string | undefined }>;
+  /** `startFailure`: the agent could not start and is tried again in the background. */
+  agents: Array<{ agentId: string; readiness: string; recoveryAction?: string | undefined; startFailure?: string }>;
+  /**
+   * The agents this installation lists. Another agent reported here (the
+   * site's "Not added" Google Antigravity card) is informational: `skip`,
+   * never a failure (D113). Absent: every reported agent is checked.
+   */
+  listedAgents?: readonly string[];
   configRevision: number;
   diskFreeBytes: number;
   minimumDiskBytes: number;
@@ -57,6 +66,11 @@ export interface DoctorInputs {
    * `update --check` said so).
    */
   updateChannel?: { host: string; override: boolean; lastCheckedAt: string | null; lastError: string | null; available: string | null };
+  /**
+   * Windows: whether the `konteks-remote` command the MSI installed runs this
+   * release's code (`windowsInstalledLauncher`, D131); null without one.
+   */
+  launcher?: "current" | "older" | null;
 }
 
 function updateChannelCheck(channel: NonNullable<DoctorInputs["updateChannel"]>, leaseMode: DoctorInputs["lease"]["mode"]): Omit<DoctorCheck, "recoveryActions"> & { recoveryActions?: DoctorCheck["recoveryActions"] } {
@@ -225,13 +239,17 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   push({ id: "identity", title: "Instance identity", status: inputs.identity.instanceId ? "pass" : "fail", detail: inputs.identity.instanceId ? `instance registered (${inputs.identity.administrativeStatus})` : "no instance identity; run install", ...(inputs.identity.instanceId ? {} : { recoveryActions: [{ kind: "new_activation" }] }) });
   push({ id: "lease", title: "Work lease", status: inputs.lease.mode === "active" ? "pass" : inputs.lease.mode === "drain_only" ? "warn" : "fail", detail: inputs.lease.mode === "none" ? "no valid lease" : `lease mode ${inputs.lease.mode}${inputs.lease.expiresAt ? `, expires ${inputs.lease.expiresAt}` : ""}` });
   push({ id: "relay", title: "Relay connection", status: inputs.relay.state === "connected" ? "pass" : inputs.transport === "https" ? "warn" : "fail", detail: inputs.relay.state === "connected" ? "one outbound WSS connected" : `relay ${inputs.relay.state}${inputs.relay.lastError ? ` (${inputs.relay.lastError})` : ""}; transport ${inputs.transport}` });
-  push({ id: "reconciliation", title: "Reconciliation", status: inputs.reconciliationComplete ? "pass" : "warn", detail: inputs.reconciliationComplete ? "reconciled with Core" : "waiting for Core reconciliation; no new work until it completes" });
+  push({ id: "reconciliation", title: "Reconciliation", status: inputs.reconciliationComplete ? "pass" : "warn", detail: inputs.reconciliationComplete ? "reconciled with Core" : inputs.reconciliationRefusal ?? "waiting for Core reconciliation; no new work until it completes" });
   for (const component of inputs.components) {
     push({ id: `component-${component.kind}`, title: `Component ${component.kind}`, status: component.healthStatus === "healthy" ? "pass" : component.healthStatus === "degraded" ? "warn" : "fail", detail: `${component.healthStatus} (version ${component.version})` });
   }
   push({ id: "core-control-key", title: "Core control signing key", status: inputs.coreSignatureConfigured ? "pass" : "fail", detail: inputs.coreSignatureConfigured ? "release root certifies a Core control key" : "no Core control key in the embedded release roots; directives will be rejected", ...(inputs.coreSignatureConfigured ? {} : { recoveryActions: [{ kind: "update" }] }) });
   for (const agent of inputs.agents) {
-    push({ id: `agent-${agent.agentId}`, title: `Agent ${agent.agentId}`, status: agent.readiness === "ready" ? "pass" : agent.readiness === "not_configured" ? "warn" : "fail", detail: `readiness ${agent.readiness}`, ...(agent.readiness === "not_configured" || agent.readiness === "reconnect_required" ? { recoveryActions: [{ kind: "login_agent", agentId: agent.agentId }] } : {}) });
+    if (inputs.listedAgents && !inputs.listedAgents.includes(agent.agentId)) {
+      push({ id: `agent-${agent.agentId}`, title: `Agent ${agent.agentId}`, status: "skip", detail: "not added on this computer" });
+      continue;
+    }
+    push({ id: `agent-${agent.agentId}`, title: `Agent ${agent.agentId}`, status: agent.readiness === "ready" ? "pass" : agent.readiness === "not_configured" ? "warn" : "fail", detail: agent.startFailure ? `could not start (${agent.startFailure}); trying again in the background` : `readiness ${agent.readiness}`, ...(agent.readiness === "not_configured" || agent.readiness === "reconnect_required" ? { recoveryActions: [{ kind: "login_agent", agentId: agent.agentId }] } : {}) });
   }
   push({ id: "disk", title: "Free disk", status: inputs.diskFreeBytes >= inputs.minimumDiskBytes ? "pass" : "fail", detail: `${Math.round(inputs.diskFreeBytes / 1024 ** 3)} GiB free`, ...(inputs.diskFreeBytes >= inputs.minimumDiskBytes ? {} : { recoveryActions: [{ kind: "free_disk" }] }) });
   push({ id: "outbox", title: "Durable outbox", status: inputs.outboxDepth === 0 ? "pass" : "warn", detail: `${inputs.outboxDepth} item(s) awaiting Core acknowledgement` });
@@ -257,6 +275,7 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   if (inputs.openCode) push(openCodeCheck(inputs.openCode));
   if (inputs.antigravity) push(antigravityCheck(inputs.antigravity));
   if (inputs.updateChannel) push(updateChannelCheck(inputs.updateChannel, inputs.lease.mode));
+  if (inputs.launcher === "older") push({ id: "launcher", title: "konteks-remote command", status: "warn", detail: "konteks-remote is from an older installer and runs its old code, not this release's. Update it once: run the Windows install line with -Update in place of -ActivationId." });
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };
 }

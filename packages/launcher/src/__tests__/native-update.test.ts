@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture, resolveNativeConnectorExecutable } from "@konteks/remote-release";
-import { loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
 import { checkNativeUpdate, commitNativeUpdate, stageNativeUpdate } from "../native/update.js";
-import { earlierFailure, earlierFailureNote, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
+import { earlierFailure, earlierFailureNote, keepLauncherCurrent, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote, type NativeUpdateTransactionDeps } from "../native/update-transaction.js";
 import { createOutput } from "../output.js";
 import { nativeServiceDefinition, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
@@ -114,6 +114,14 @@ describe("native update staging and commit", () => {
     await restoreNativeRecord(f.root, successor.releaseId, f.installed, { roots: f.trust, platform: f.platform });
     await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).resolves.toMatchObject({ record: { releaseId: f.installed.releaseId, bundleVersion: "1.0.0" } });
   });
+  it("says another update is still running when one holds the installation, instead of a bare ownership refusal (RCA 2026-10-01)", async () => {
+    const f = await fixture();
+    const held = acquireNativeRootLock(join(f.root, "installer"));
+    try {
+      await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } })).rejects.toThrow("Another update or install of this connector is still running (it may be downloading a release). Wait for it to finish, then run `konteks-remote status`.");
+    } finally { held.release(); }
+    await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } })).resolves.toMatchObject({ status: "staged" });
+  });
   it("updates from a release staged before the rename, and rolls back to it", async () => {
     const f = await fixture();
     // The installed release as an older connector staged it: `connector` only.
@@ -178,7 +186,7 @@ describe("native update transaction", () => {
           case "agents": return { agents: serving.agents.map(agentId => ({ agentId, readiness: "ready" })) };
           case "doctor": return { generatedAt: "2026-09-15T00:00:00Z", checks: [
             { id: "agent_login", title: "login", status: "fail", detail: "pre-existing", recoveryActions: [] },
-            ...(input.gate === "new_failure" && serving.releaseId === "release-next" ? [{ id: "runner_spawn", title: "spawn", status: "fail", detail: "new", recoveryActions: [] }] : []),
+            input.gate === "new_failure" && serving.releaseId === "release-next" ? { id: "runner_spawn", title: "spawn", status: "fail", detail: "new", recoveryActions: [] } : { id: "runner_spawn", title: "spawn", status: "pass", detail: "ok", recoveryActions: [] },
           ] };
           default: return {};
         }
@@ -318,7 +326,7 @@ describe("native update transaction", () => {
     const definitionFor = (record: NativeRuntimeRecord) => nativeServiceDefinition({ os: "windows", home: "C:\\Users\\a", root, executable: connector(record.releaseId), userId: "S-1-5-21-1-2-3-1001" });
     /** Task Scheduler as far as the connector sees it: the task exists throughout, running or not, and runs the <Command> it was last registered with. */
     function windows(h: ReturnType<typeof harness>) {
-      const task = { running: true, command: connector(previous.releaseId) };
+      const task = { running: true, command: connector(previous.releaseId), target: connector(previous.releaseId) };
       const written = new Map<string, string>();
       const scheduler = async (command: NativeServiceCommand): Promise<number> => {
         if (command.command === "powershell.exe") return task.running ? 0 : 1;
@@ -326,7 +334,14 @@ describe("native update transaction", () => {
         switch (command.args[0]) {
           case "/Query": return 0; // exists, whether or not it runs
           case "/Create": task.command = /<Command>(.*?)<\/Command>/.exec(written.get(command.args[4]!)!)![1]!; return 0;
-          case "/Run": task.running = true; return 0;
+          case "/Run": {
+            const helper = written.get(`${root}\\service.js`)!;
+            const encoded = /-EncodedCommand ([A-Za-z0-9+/=]+)/.exec(helper)![1]!;
+            const script = Buffer.from(encoded, "base64").toString("utf16le");
+            task.target = /\$env:KONTEKS_SERVICE_PROGRAM = '([^']+)'/.exec(script)![1]!;
+            task.running = true;
+            return 0;
+          }
           case "/End": task.running = false; return 0;
           default: return 1;
         }
@@ -335,7 +350,7 @@ describe("native update transaction", () => {
       h.deps.serviceDefinition = async () => definitionFor(h.currentRecord());
       // The harness's control socket follows the task: /End stops what serves, a start serves the record.
       h.deps.execute = async command => { const code = await scheduler(command); if (command.args[0] === "/End") await harnessExecute({ command: "stop", args: [] }); return code; };
-      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, contents); } }); await harnessStart(input); };
+      h.deps.start = async input => { await startNativeServiceDefinition(definitionFor(h.currentRecord()), { execute: scheduler, write: async (path, contents) => { written.set(path, typeof contents === "string" ? contents : Buffer.from(contents).subarray(2).toString("utf16le")); } }); await harnessStart(input); };
       return task;
     }
 
@@ -343,7 +358,7 @@ describe("native update transaction", () => {
       const h = harness({ previous });
       const task = windows(h);
       await expect(runNativeUpdate({ root, output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
-      expect(task).toEqual({ running: true, command: connector("release-next") });
+      expect(task).toEqual({ running: true, command: "%SystemRoot%\\System32\\wscript.exe", target: connector("release-next") });
     });
 
     it("rolls back to a task that runs the previous release again", async () => {
@@ -351,7 +366,7 @@ describe("native update transaction", () => {
       const task = windows(h);
       await expect(runNativeUpdate({ root, output: h.output }, h.deps)).rejects.toThrow();
       expect(h.currentRecord().releaseId).toBe("release-prev");
-      expect(task).toEqual({ running: true, command: connector("release-prev") });
+      expect(task).toEqual({ running: true, command: "%SystemRoot%\\System32\\wscript.exe", target: connector("release-prev") });
     });
   });
   it("waits for a slow-stopping service to exit and release the runtime directory before committing", async () => {
@@ -382,6 +397,36 @@ describe("native update transaction", () => {
     expect(stopping.length).toBeLessThanOrEqual(6);
     expect(stopping.slice(1).every(line => /still stopping the connector \(\d+ s so far\)/.test(line))).toBe(true);
     expect(lines).toContain("Starting 1.1.0 and checking it is healthy before keeping it (up to 3 min)…");
+  });
+  it("settles at once on a bundled agent the new release could not start, and names it when rolling back (RCA 2026-10-01)", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "codex"] } });
+    const control = h.deps.control;
+    // The successor lists Codex as left out instead of leaving it missing, and doctor says why.
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        const value = await (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+        if (record.releaseId !== "release-next") return value;
+        if (request.op === "agents") return { agents: [{ agentId: "claude-code", readiness: "ready" }, { agentId: "codex", readiness: "unavailable", startFailure: "The signed Codex app-server did not become ready in time" }] };
+        if (request.op === "doctor") (value as { checks: unknown[] }).checks.push({ id: "agent-codex", title: "Agent codex", status: "fail", detail: "could not start (The signed Codex app-server did not become ready in time); trying again in the background", recoveryActions: [] });
+        return value;
+      } } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow(/agent-codex \(could not start \(The signed Codex app-server did not become ready in time\)/);
+    expect(h.calls.filter(call => call === "control:agents@release-next")).toHaveLength(1);
+    expect(h.calls).toContain("restore:release-next");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back", detail: expect.stringContaining("agent-codex (could not start") });
+  });
+  it("names the agents that never settled when the probe deadline passes", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "codex"] } });
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => request.op === "agents" && record.releaseId === "release-next"
+        ? { agents: [{ agentId: "claude-code", readiness: "ready" }] }
+        : (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest) } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow("The updated connector did not finish probing its agents in time (codex).");
   });
   it("lets a connectivity doctor failure settle within the deadline instead of rolling back", async () => {
     const h = harness({ previous, gate: "new_failure" });
@@ -466,6 +511,57 @@ describe("native update transaction", () => {
     expect(h.currentRecord().releaseId).toBe(previous.releaseId);
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
   });
+  it("goes on once the old connector's process is gone, even when launchd ended it before it wrote its receipt (D113b)", async () => {
+    // 2026-10-02 15:43Z: launchd SIGKILLs a booted-out job 5 s after SIGTERM;
+    // the idle connector was still stopping its bridges, so no receipt came
+    // and the update waited out 90 s for one, then gave up.
+    const h = harness({ previous });
+    h.deps.readStopReceipt = async () => "prior-stop";
+    let pidAsked = 0;
+    h.deps.servicePid = async () => { pidAsked += 1; return 4242; };
+    h.deps.processAlive = pid => { expect(pid).toBe(4242); return false; };
+    h.deps.stopDeadlineMs = 90_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", to: "1.1.0" });
+    expect(pidAsked).toBe(1);
+    expect(h.calls.indexOf("commit")).toBeGreaterThan(h.calls.indexOf("stop"));
+  });
+  it("ends the old connector's processes when it outlives the stop grace, then goes on (D113b)", async () => {
+    const h = harness({ previous });
+    h.deps.readStopReceipt = async () => "prior-stop";
+    let alive = true;
+    const killed: number[] = [];
+    h.deps.servicePid = async () => 4242;
+    h.deps.processAlive = () => alive;
+    h.deps.killProcessGroup = async pid => { killed.push(pid); alive = false; };
+    h.deps.stopGraceMs = 5_000;
+    h.deps.stopDeadlineMs = 90_000;
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).resolves.toMatchObject({ state: "updated" });
+    expect(killed).toEqual([4242]);
+    expect(lines).toContain("The connector did not stop within 5 s; ending its processes.");
+  });
+  it("starts the unchanged release again and waits until it answers before returning, when the stop is never confirmed (D113b)", async () => {
+    const h = harness({ previous });
+    h.deps.readStopReceipt = async () => "prior-stop";
+    h.deps.stopDeadlineMs = 3_000;
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.calls.slice(-2)).toEqual(["start", "control:status@release-prev"]);
+    expect(lines).toContain("1.0.0 is running and answering again; nothing was changed.");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
+  });
+  it("starts the unchanged release again when the record cannot move after a confirmed stop, and says once it answers (D113b)", async () => {
+    const h = harness({ previous });
+    h.deps.commit = async () => { h.calls.push("commit"); throw new Error("disk full"); };
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).rejects.toThrow("disk full");
+    expect(h.calls.slice(-2)).toEqual(["start", "control:status@release-prev"]);
+    expect(h.calls.lastIndexOf("commit")).toBeLessThan(h.calls.lastIndexOf("start"));
+    expect(lines).toContain("1.0.0 is running and answering again; nothing was changed.");
+  });
 
   it("does not drain or restart when the service is not running", async () => {
     const h = harness({ previous, running: false });
@@ -479,6 +575,126 @@ describe("native update transaction", () => {
     expect(h.currentRecord().releaseId).toBe("release-prev");
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back", manifestDigest: "sha256:next", releaseId: "release-next" });
     expect((h.ledger.at(-1) as { detail: string }).detail).toMatch(/control socket|reports 1.0.0|doctor failure\(s\): runner_spawn/);
+  });
+  it("keeps the update when the successor fails a check the previous release never reported, such as an agent not added here (D113)", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "codex", "dsh"] } });
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        const value = await (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+        if (request.op === "doctor" && record.releaseId === "release-next") (value as { checks: unknown[] }).checks.push({ id: "agent-antigravity", title: "Agent antigravity", status: "fail", detail: "readiness unavailable", recoveryActions: [] });
+        return value;
+      } } as never;
+    };
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).resolves.toMatchObject({ state: "updated", to: "1.1.0" });
+    expect(h.calls).not.toContain("restore:release-next");
+    expect(lines).toContain("1.1.0 reports a check 1.0.0 did not have: agent-antigravity (readiness unavailable). It is not held against the update.");
+  });
+  it("still counts a failing check for an agent the successor runs, even when the previous release never reported it (D113)", async () => {
+    const h = harness({ previous: { ...previous, agents: ["claude-code", "codex"] } });
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        const value = await (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+        if (request.op === "doctor" && record.releaseId === "release-next") (value as { checks: unknown[] }).checks.push({ id: "agent-codex", title: "Agent codex", status: "fail", detail: "readiness unavailable", recoveryActions: [] });
+        return value;
+      } } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow(/introduced doctor failure\(s\): agent-codex/);
+    expect(h.calls).toContain("restore:release-next");
+  });
+  it("rolls back and starts the previous release when the failed successor exits without its shutdown receipt (D113)", async () => {
+    const h = harness({ previous, gate: "new_failure" });
+    // The previous release stops cleanly and writes a fresh receipt; the
+    // successor's shutdown step fails, so after the commit none is written.
+    h.deps.stopDeadlineMs = 3_000;
+    let committed = false, receipts = 0;
+    const commit = h.deps.commit;
+    h.deps.commit = async options => { committed = true; return commit(options); };
+    h.deps.readStopReceipt = async () => committed ? "stale" : `fresh-${receipts++}`;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow(/doctor failure\(s\): runner_spawn/);
+    expect(h.calls.slice(-3)).toEqual(["restore:release-next", "start", "control:status@release-prev"]);
+    expect(h.currentRecord().releaseId).toBe("release-prev");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back" });
+  });
+  it("force-stops a failed successor that never exits, then starts the previous release (D113)", async () => {
+    const h = harness({ previous, gate: "new_failure" });
+    h.deps.stopDeadlineMs = 3_000;
+    let stuck = false;
+    const execute = h.deps.execute;
+    h.deps.execute = async command => {
+      if (command.command === "stop" && h.currentRecord().releaseId === "release-next") { h.calls.push("stop"); stuck = true; return 0; }
+      if (command.command === "status" && stuck) { h.calls.push("status"); return 0; }
+      return execute(command);
+    };
+    h.deps.forceStop = async () => { h.calls.push("force-stop"); stuck = false; await execute({ command: "stop", args: [] }); };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow(/doctor failure\(s\): runner_spawn/);
+    expect(h.calls).toContain("force-stop");
+    expect(h.calls.slice(-3)).toEqual(["restore:release-next", "start", "control:status@release-prev"]);
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back" });
+  });
+  it("never leaves the service unloaded: when the rollback cannot restore the record it still starts a release (D113)", async () => {
+    const h = harness({ previous, gate: "new_failure", restoreFails: true });
+    const lines: string[] = [];
+    const output = { ...h.output, line: (text: string) => { lines.push(text); } };
+    await expect(runNativeUpdate({ root: "/root", output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.calls.lastIndexOf("start")).toBeGreaterThan(h.calls.lastIndexOf("restore:release-next"));
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
+    expect(lines.some(line => /^Started 1\.1\.0 again so this computer stays connected/.test(line))).toBe(true);
+  });
+  it("refreshes the person's konteks-remote launcher to the release it kept, and only then (D113)", async () => {
+    const refreshed: string[] = [];
+    const applied = harness({ previous });
+    applied.deps.refreshLauncher = async (_root, record) => { refreshed.push(record.releaseId); };
+    await runNativeUpdate({ root: "/root", output: applied.output }, applied.deps);
+    expect(refreshed).toEqual(["release-next"]);
+    const rolledBack = harness({ previous, gate: "new_failure" });
+    rolledBack.deps.refreshLauncher = async (_root, record) => { refreshed.push(record.releaseId); };
+    await runNativeUpdate({ root: "/root", output: rolledBack.output }, rolledBack.deps).catch(() => undefined);
+    expect(refreshed).toEqual(["release-next"]);
+  });
+  // Windows never copies a launcher: the MSI's command hands every call to the
+  // installed release instead (D131), so refreshInstalledLauncher skips there.
+  it.skipIf(process.platform === "win32")("keeps the person's konteks-remote on the running release once its update kept it, whichever launcher drove the update (D113b)", async () => {
+    // The owner's launcher was 0.8.0's: it has no refresh, so every update it
+    // drove (0.10.9, 0.10.10) ran 0.8.0's transaction. The release itself refreshes it.
+    const attempt = (outcome: string, startedAt = new Date(500_000).toISOString()) => ({ schemaVersion: 1 as const, attempts: [{ id: "u1", bundleVersion: "1.1.0", manifestDigest: "d", releaseId: "release-next", reason: "operator", startedAt, finishedAt: null, outcome: outcome as "in_progress", detail: null }] });
+    const refreshed: string[] = [];
+    let outcome = "in_progress", waits = 0;
+    const deps = {
+      execPath: "/root/releases/release-next/konteks-connector",
+      readRecord: async () => ({ ...previous, releaseId: "release-next" }),
+      readLedger: async () => attempt(outcome),
+      refresh: async (_root: string, record: NativeRuntimeRecord) => { refreshed.push(record.releaseId); return true; },
+      sleep: async () => { waits += 1; if (waits === 2) outcome = "applied"; },
+      now: () => 600_000,
+    };
+    await expect(keepLauncherCurrent("/root", deps)).resolves.toBe("refreshed");
+    expect(waits).toBe(2);
+    expect(refreshed).toEqual(["release-next"]);
+    // Rolled back (the record names another release), or a development serve: never replaced.
+    await expect(keepLauncherCurrent("/root", { ...deps, readLedger: async () => attempt("rolled_back"), readRecord: async () => previous })).resolves.toBe("skipped");
+    await expect(keepLauncherCurrent("/root", { ...deps, execPath: "/usr/local/bin/node" })).resolves.toBe("skipped");
+    // An attempt whose updater died is not waited for forever.
+    await expect(keepLauncherCurrent("/root", { ...deps, readLedger: async () => attempt("in_progress", new Date(0).toISOString()), now: () => 60 * 60_000 })).resolves.toBe("refreshed");
+    expect(refreshed).toHaveLength(2);
+  });
+  // Windows never copies a launcher: the MSI's command hands every call to the
+  // installed release instead (D131), so refreshInstalledLauncher skips there.
+  it.skipIf(process.platform === "win32")("replaces konteks-remote only when it differs from the release's executable (D113b)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-launcher-refresh-")); roots.push(root);
+    await mkdir(join(root, "bin"), { recursive: true });
+    await mkdir(join(root, "releases", "release-next"), { recursive: true });
+    await writeFile(join(root, "bin", "konteks-remote"), "old launcher", { mode: 0o755 });
+    await writeFile(join(root, "releases", "release-next", "konteks-connector"), "new release", { mode: 0o755 });
+    const record = { ...previous, releaseId: "release-next" };
+    await expect(refreshInstalledLauncher(root, record)).resolves.toBe(true);
+    expect(await readFile(join(root, "bin", "konteks-remote"), "utf8")).toBe("new release");
+    await expect(refreshInstalledLauncher(root, record)).resolves.toBe(false);
   });
   it("reports a failed attempt when rollback itself refuses, preserving the previous record for the operator", async () => {
     const h = harness({ previous, gate: "new_failure", restoreFails: true });

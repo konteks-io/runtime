@@ -61,7 +61,7 @@ afterEach(async () => {
   for (const runtime of runtimes.splice(0)) await runtime.stop();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
-async function fixture(limit = 2, executionSpawnProcess?: SpawnBridgeOptions["spawnProcess"], bootstrapTimeoutMs?: number, afterSuccessfulLogin?: () => Promise<void>, probe?: () => Promise<{ kind: "signal"; fingerprint: string } | { kind: "no_official_signal" }>) {
+async function fixture(limit = 2, executionSpawnProcess?: SpawnBridgeOptions["spawnProcess"], bootstrapTimeoutMs?: number, afterSuccessfulLogin?: () => Promise<void>, probe?: () => Promise<{ kind: "signal"; fingerprint: string } | { kind: "no_official_signal" } | { kind: "logged_out" }>) {
   const root = await mkdtemp(join(tmpdir(), "execution-owner-")); roots.push(root);
   const owners: Array<{ bridge: BridgeProcess; handlers: SpawnBridgeOptions["handlers"] }> = [];
   const spawn = vi.fn(async (input: SpawnBridgeOptions) => {
@@ -271,7 +271,7 @@ it("does not begin a native login while a Codex session is still owned", async (
 
 it("refreshes the supervisor-owned Codex service before completing native login", async () => {
   const refresh = vi.fn(async () => undefined);
-  const f = await fixture(2, undefined, undefined, refresh);
+  const f = await fixture(2, undefined, undefined, refresh, async () => ({ kind: "signal", fingerprint: "authenticated-codex" }));
   let finishLogin!: (value: { code: number }) => void;
   const done = new Promise<{ code: number }>(resolve => { finishLogin = resolve; });
   vi.mocked(startLoginFlow).mockReturnValueOnce({ loginId: "native-login", done, input: vi.fn(), cancel: vi.fn(async () => undefined) });
@@ -282,6 +282,22 @@ it("refreshes the supervisor-owned Codex service before completing native login"
   await vi.waitFor(() => expect(completed).toHaveBeenCalledOnce());
   expect(refresh).toHaveBeenCalledOnce();
   expect(refresh.mock.invocationCallOrder[0]).toBeLessThan(completed.mock.invocationCallOrder[0]!);
+});
+
+it("reports a failed login when official tooling exits zero but Codex is still signed out", async () => {
+  const f = await fixture(2, undefined, undefined, vi.fn(async () => undefined), async () => ({ kind: "logged_out" }));
+  let finishLogin!: (value: { code: number }) => void;
+  const done = new Promise<{ code: number }>(resolve => { finishLogin = resolve; });
+  vi.mocked(startLoginFlow).mockReturnValueOnce({ loginId: "signed-out-login", done, input: vi.fn(), cancel: vi.fn(async () => undefined) });
+  const terminal = vi.fn();
+  f.runtime.events.subscribe(event => {
+    if (event.kind === "login_event" && (event.event.type === "completed" || event.event.type === "failed")) terminal(event.event);
+  });
+  f.runtime.startLogin({ organization: false, personal: true });
+  finishLogin({ code: 0 });
+  await vi.waitFor(() => expect(terminal).toHaveBeenCalledOnce());
+  expect(terminal).toHaveBeenCalledWith(expect.objectContaining({ type: "failed", code: "agent_auth_required" }));
+  expect(f.runtime.readiness().readiness).toBe("not_configured");
 });
 
 it("reports a terminal login failure if the shared Codex owner cannot refresh", async () => {
