@@ -19,6 +19,12 @@ export interface DoctorInputs {
   components: Array<{ kind: string; healthStatus: string; version: string }>;
   /** `startFailure`: the agent could not start and is tried again in the background. */
   agents: Array<{ agentId: string; readiness: string; recoveryAction?: string | undefined; startFailure?: string }>;
+  /**
+   * The agents this installation lists. Another agent reported here (the
+   * site's "Not added" Google Antigravity card) is informational: `skip`,
+   * never a failure (D113). Absent: every reported agent is checked.
+   */
+  listedAgents?: readonly string[];
   configRevision: number;
   diskFreeBytes: number;
   minimumDiskBytes: number;
@@ -234,6 +240,10 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   }
   push({ id: "core-control-key", title: "Core control signing key", status: inputs.coreSignatureConfigured ? "pass" : "fail", detail: inputs.coreSignatureConfigured ? "release root certifies a Core control key" : "no Core control key in the embedded release roots; directives will be rejected", ...(inputs.coreSignatureConfigured ? {} : { recoveryActions: [{ kind: "update" }] }) });
   for (const agent of inputs.agents) {
+    if (inputs.listedAgents && !inputs.listedAgents.includes(agent.agentId)) {
+      push({ id: `agent-${agent.agentId}`, title: `Agent ${agent.agentId}`, status: "skip", detail: "not added on this computer" });
+      continue;
+    }
     push({ id: `agent-${agent.agentId}`, title: `Agent ${agent.agentId}`, status: agent.readiness === "ready" ? "pass" : agent.readiness === "not_configured" ? "warn" : "fail", detail: agent.startFailure ? `could not start (${agent.startFailure}); trying again in the background` : `readiness ${agent.readiness}`, ...(agent.readiness === "not_configured" || agent.readiness === "reconnect_required" ? { recoveryActions: [{ kind: "login_agent", agentId: agent.agentId }] } : {}) });
   }
   push({ id: "disk", title: "Free disk", status: inputs.diskFreeBytes >= inputs.minimumDiskBytes ? "pass" : "fail", detail: `${Math.round(inputs.diskFreeBytes / 1024 ** 3)} GiB free`, ...(inputs.diskFreeBytes >= inputs.minimumDiskBytes ? {} : { recoveryActions: [{ kind: "free_disk" }] }) });
