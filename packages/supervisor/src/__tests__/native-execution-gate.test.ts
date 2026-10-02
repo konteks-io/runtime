@@ -226,6 +226,47 @@ it("keeps the agent running while renewals go unanswered past the lease, backing
   expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
 });
 
+it("keeps a delivery turn Core renewed running past its assignment's issued hour, adopting only the later lifetime (D115)", async () => {
+  vi.useFakeTimers();
+  const f = await deliveryFixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+  // The owning Harness renews the turn: Core's signed checks carry the same
+  // authority with a later expiresAt (an hour ahead, sliding), never anything else.
+  const { iss: _iss, aud: _aud, iat: _iat, exp: _exp, operationId: _op, permitId: _permit, kind: _kind, method: _method,
+    requestId: _request, payloadDigest: _digest, sender: _sender, ...held } = f.claims;
+  f.client.checkDeliveryExecution.mockImplementation(async () => {
+    const renewedUntil = new Date(f.clock.coreNow() + 3_600_000).toISOString();
+    return { executionId: "execution", executionRevision: 1, expiresAt: new Date(f.clock.coreNow() + 30_000).toISOString(),
+      lease: signed({ ...held, expiresAt: renewedUntil, checkId: "check", iss: "konteks:control-plane", aud: "konteks:delivery-execution-lease",
+        iat: f.clock.coreNow() / 1000, exp: f.clock.coreNow() / 1000 + 30 }) };
+  });
+  for (let second = 0; second < 65 * 60; second += 5) { f.advance(5_000); await vi.advanceTimersByTimeAsync(5_000); }
+  expect(f.clock.coreNow()).toBeGreaterThan(Date.parse(f.assigned.expiresAt));
+  expect(f.onAuthorityLost).not.toHaveBeenCalled();
+  // The local record follows Core's verified lifetime (forward only), so a reconnect re-ready finds the turn live.
+  expect(Date.parse(f.journal.assignments.get("assignment:1")!.expiresAt)).toBeGreaterThan(f.clock.coreNow() + 3_000_000);
+  expect(f.gate.liveUntil()).toBeGreaterThan(f.clock.coreNow() + 3_000_000);
+  // Anything but a later lifetime is still another authority: Core changing the lease set fences at once.
+
+  f.client.checkDeliveryExecution.mockImplementation(async () => ({ executionId: "execution", executionRevision: 1,
+    expiresAt: new Date(f.clock.coreNow() + 30_000).toISOString(),
+    lease: signed({ ...held, leaseSetId: "other", expiresAt: new Date(f.clock.coreNow() + 3_600_000).toISOString(), checkId: "check",
+      iss: "konteks:control-plane", aud: "konteks:delivery-execution-lease", iat: f.clock.coreNow() / 1000, exp: f.clock.coreNow() / 1000 + 30 }) }));
+  for (let second = 0; second < 60; second += 5) { f.advance(5_000); await vi.advanceTimersByTimeAsync(5_000); }
+  expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
+});
+
+it("still stops a renewed delivery turn when Core answers that it is gone (D115)", async () => {
+  vi.useFakeTimers();
+  const f = await deliveryFixture();
+  const operation = await f.gate.admit(f.envelope);
+  await f.gate.begin(operation);
+  f.client.checkDeliveryExecution.mockRejectedValue(new RemoteInstanceError("execution_fenced", "Execution is not current for this caller"));
+  for (let second = 0; second < 60; second += 5) { f.advance(5_000); await vi.advanceTimersByTimeAsync(5_000); }
+  expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
+});
+
 it("retries a genuine check lease that expired on its way from a slow Core instead of stopping the agent (D110)", async () => {
   vi.useFakeTimers();
   const f = await fixture();

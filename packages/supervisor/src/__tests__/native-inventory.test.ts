@@ -31,7 +31,7 @@ describe("native host inventory (A4 D133)", () => {
   it('advertises delivery separately and removes it when ownership or local-agent readiness is lost', async () => {
     let owned = true;
     const f = fixture(() => true, undefined, () => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(['agent:codex', 'execution-permits-v1', 'delivery-execution-permits-v1', 'session-label-v1', 'core-contract-version-v1']);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(['agent:codex', 'execution-permits-v1', 'delivery-execution-permits-v1', 'delivery-turn-renewal-v1', 'session-label-v1', 'core-contract-version-v1']);
     owned = false;
     expect((await f.inventory.collect()).components[0]?.capabilities).not.toContain('delivery-execution-permits-v1');
     owned = true;
