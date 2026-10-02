@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, sep } from "node:path";
 import { createGzip } from "node:zlib";
 import { fileURLToPath } from "node:url";
-import { codexLocalProxyFiles, inventoryOfflineFiles } from "./offline-agent-files.mjs";
+import { codexLocalProxyFiles, inventoryOfflineFiles, offlineAgentPatches } from "./offline-agent-files.mjs";
 import { patchCodexAcpLiveUsers } from "./codex-acp-live-user-patch.mjs";
 import { patchClaudeSettings } from "./claude-acp-settings-patch.mjs";
 
@@ -28,7 +28,8 @@ const work = mkdtempSync(join(tmpdir(), "konteks-agent-build-")), root = join(wo
 try {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const packages = [...new Set([`${selected.bridge.package}@${selected.bridge.version}`, `${selected.tooling.package}@${selected.tooling.version}`])];
-  const sharedCodex = args.agent === "codex" && args.os !== "windows";
+  const patches = offlineAgentPatches(args.agent, args.os);
+  const sharedCodex = patches.codexLocalProxy;
   if (sharedCodex) packages.push("ws@8.21.3");
   // The QA/validator browser (Playwright MCP) rides in the agents that can use it.
   const browser = config.browser?.agents?.includes(args.agent) ? config.browser : null;
@@ -55,7 +56,7 @@ try {
     mkdirSync(join(root, "konteks"), { recursive: true, mode: 0o700 });
     cpSync(new URL("./claude-instruction-scope.mjs", import.meta.url), join(root, "node_modules", "@agentclientprotocol", "claude-agent-acp", "dist", "konteks-instruction-scope.mjs"));
     const provenance = [];
-    for (const file of ["acp-agent.js", "settings.js"]) {
+    for (const file of patches.claudeFiles) {
       const path = join(root, "node_modules", "@agentclientprotocol", "claude-agent-acp", "dist", file);
       const patched = patchClaudeSettings(readFileSync(path, "utf8"), file, selected.bridge.version);
       writeFileSync(path, patched.source);
@@ -63,12 +64,14 @@ try {
     }
     writeFileSync(join(root, "konteks", "claude-acp-provenance.json"), JSON.stringify(provenance));
   }
-  if (sharedCodex) {
+  if (patches.codexBridge) {
     mkdirSync(join(root, "konteks"), { recursive: true, mode: 0o700 });
     const bridgePath = join(root, bridgeEntry);
     const patched = patchCodexAcpLiveUsers(readFileSync(bridgePath, "utf8"), selected.bridge.version);
     writeFileSync(bridgePath, patched.source);
     writeFileSync(join(root, "konteks", "codex-acp-provenance.json"), JSON.stringify(patched.provenance));
+  }
+  if (sharedCodex) {
     const proxyDirectory = fileURLToPath(new URL("../packages/agent-runner/dist/bridge/", import.meta.url));
     for (const file of codexLocalProxyFiles(proxyDirectory)) {
       cpSync(join(proxyDirectory, file), join(root, "konteks", file));

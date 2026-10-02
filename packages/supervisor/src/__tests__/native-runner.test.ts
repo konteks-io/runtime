@@ -49,6 +49,11 @@ describe("native in-process runner (A4)", () => {
     expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: { konteksSession: { version: 1,
       title: `[konteks/Todo List/initiative] [v3] Stand up the todo list API ${acpSessionRef.slice(-8)}` } } }));
   });
+  it("asks a direct session's agent only for the [konteks] prefix ahead of its own title", async () => {
+    const f = fixture(); await f.runner.start();
+    await f.runner.createSession({ ...f.input, agentTitled: true });
+    expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: { konteksSession: { version: 1, prefix: "[konteks]" } } }));
+  });
   it("adds no browser for an agent package that carries none, and refuses a browser request that is not a loopback gateway", async () => {
     const f = fixture(); await f.runner.start();
     expect(f.runner.browserVersion()).toBeNull();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { konteksCodingSessionTitle, konteksSessionMetadata, konteksSessionTitle } from "../sessions/title.js";
+import { konteksAgentTitledMetadata, konteksCodingSessionTitle, konteksSessionMetadata, konteksSessionTitle } from "../sessions/title.js";
 
 describe("native session provenance title", () => {
   it("uses the exact prefix once and normalizes control characters", () => {
@@ -51,6 +51,17 @@ describe("coding session title from Core's display label", () => {
     expect(konteksSessionMetadata(title, "claude-code")).toEqual({
       konteksSession: { version: 1, title },
       claudeCode: { options: { title, settingSources: ["project"] } },
+    });
+  });
+});
+
+describe("a person's direct session: the agent's own title behind [konteks]", () => {
+  it("asks only for the prefix and never imposes a title", () => {
+    expect(konteksAgentTitledMetadata("codex")).toEqual({ konteksSession: { version: 1, prefix: "[konteks]" } });
+    // Claude Code keeps its repository-only settings, and no fixed title that would stop its own.
+    expect(konteksAgentTitledMetadata("claude-code")).toEqual({
+      konteksSession: { version: 1, prefix: "[konteks]" },
+      claudeCode: { options: { settingSources: ["project"] } },
     });
   });
 });

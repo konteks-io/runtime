@@ -445,6 +445,21 @@ describe("relayed session (D98/D113/D114)", () => {
       } finally { await f.session.close("cancelled"); }
     });
 
+    it("lets the agent title the session itself and asks only for the [konteks] prefix (D130)", async () => {
+      const f = await build({ activateExecution: async () => ({ restoreReference: "acp-0" }) }, directWork);
+      try {
+        await f.session.bootstrap();
+        const created = f.runnerCalls[0]?.[1][0] as { agentTitled?: boolean; sessionLabel?: unknown };
+        expect(created.agentTitled).toBe(true);
+        expect(created.sessionLabel).toBeUndefined();
+      } finally { await f.session.close("cancelled"); }
+      const engineering = await build();
+      try {
+        await engineering.session.bootstrap();
+        expect(engineering.runnerCalls[0]?.[1][0]).not.toHaveProperty("agentTitled");
+      } finally { await engineering.session.close("cancelled"); }
+    });
+
     it("judges file changes against its own session folder, never another session's; blocked commands stay blocked", async () => {
       const own = join(dir, "session-own", "source"), other = join(dir, "session-other", "source");
       await mkdir(own, { recursive: true }); await mkdir(other, { recursive: true });
