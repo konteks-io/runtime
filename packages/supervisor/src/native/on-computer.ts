@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, posix, win32 } from "node:path";
 import type { OnComputerStep } from "@konteks/remote-common";
+import { nativeConnectorFileNames } from "@konteks/remote-release";
 
 /** The agents a person can set up on this computer from the site (`on-computer`). */
 export const ON_COMPUTER_AGENTS = ["dsh", "opencode", "antigravity"] as const;
@@ -63,37 +64,68 @@ export function planOnComputer(agent: OnComputerAgentFacts, platform: NodeJS.Pla
 }
 
 /**
- * The script the window runs: it names this installation (so the commands act
- * on this connector, never another on the same computer), says in one line
- * what it is doing, runs the steps, and ends with what to do next.
+ * The running release's own `konteks-remote`, when this connector runs as one
+ * (a release folder's `konteks-connector`, or `connector` before the rename).
+ * The window runs its commands with it: `<root>/bin/konteks-remote` is the
+ * launcher from the day Konteks was installed and is never replaced by an
+ * update, so it would print an old release's words (and speak an old
+ * protocol) to the person. Undefined in development, where this is node.
  */
-export function onComputerScript(plan: OnComputerPlan, context: { agentId: OnComputerAgent; root: string; platform: NodeJS.Platform; prelude?: string }): string {
+export function releaseLauncher(execPath: string = process.execPath, platform: NodeJS.Platform = process.platform): string | undefined {
+  const names = nativeConnectorFileNames(platform === "win32" ? "windows" : platform === "darwin" ? "macos" : "debian");
+  return names.includes((platform === "win32" ? win32 : posix).basename(execPath)) ? execPath : undefined;
+}
+
+/**
+ * The script the window runs: its commands act on this connector only (its
+ * root, run by this release's own launcher when there is one), it says in one
+ * line what it is doing, and runs the steps, each only after the one before
+ * worked. The sign-in at the end speaks for itself: it says the agent is
+ * ready and the window can close (`KONTEKS_ON_COMPUTER`), or in one line what
+ * went wrong and what to do; only an install or add that failed gets the
+ * generic line. The window stays open either way.
+ */
+export function onComputerScript(plan: OnComputerPlan, context: { agentId: OnComputerAgent; root: string; platform: NodeJS.Platform; prelude?: string; launcher?: string }): string {
   const name = NAMES[context.agentId];
-  const intro = `Konteks is setting up ${name} on this computer. Answer below; your answers stay on this computer.`;
-  const done = plan.until === "added"
-    ? `${name} is added. You can close this window and sign it in on the Konteks site.`
-    : `${name} is set up. You can close this window; Konteks shows it on the site.`;
+  const intro = `Konteks is setting up ${name} on this computer.`;
+  const done = `${name} is added. You can close this window and sign it in on the Konteks site.`;
   const failed = "That did not finish. You can close this window and try again from Konteks.";
+  const signsIn = plan.until === "ready";
   if (context.platform === "win32") {
     const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
+    const own = (command: string) => command.startsWith("konteks-remote ")
+      ? `& ${context.launcher ? quote(context.launcher) : "konteks-remote"} --root ${quote(context.root)} ${command.slice("konteks-remote ".length)}`
+      : command;
+    const commands = plan.commands.map(own);
+    const before = signsIn ? commands.slice(0, -1) : commands;
     return [
       `$env:KONTEKS_ROOT = ${quote(context.root)}`,
+      "$env:KONTEKS_ON_COMPUTER = '1'",
       `$env:PATH = ${quote(join(context.root, "bin"))} + ';' + $env:PATH`,
       `Write-Host ${quote(intro)}`,
       "$ok = $true",
-      ...plan.commands.map(command => `if ($ok) { ${command}; $ok = $? }`),
-      `if ($ok) { Write-Host ${quote(done)} } else { Write-Host ${quote(failed)} }`,
+      ...before.map(command => `if ($ok) { ${command}; $ok = $? }`),
+      signsIn ? `if ($ok) { ${commands.at(-1)} } else { Write-Host ${quote(failed)} }` : `if ($ok) { Write-Host ${quote(done)} } else { Write-Host ${quote(failed)} }`,
       "",
     ].join("\r\n");
   }
   const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  const own = (command: string) => command.startsWith("konteks-remote ")
+    ? `${context.launcher ? quote(context.launcher) : "konteks-remote"} --root ${quote(context.root)} ${command.slice("konteks-remote ".length)}`
+    : command;
+  const commands = plan.commands.map(own);
+  const before = signsIn ? commands.slice(0, -1) : commands;
+  const run = !signsIn ? `if ${before.join(" && ")}; then echo ${quote(done)}; else echo ${quote(failed)}; fi`
+    : before.length === 0 ? commands.at(-1)!
+      : `if ${before.join(" && ")}; then ${commands.at(-1)}; else echo ${quote(failed)}; fi`;
   return [
     "#!/bin/sh",
     ...(context.prelude ? [`. ${quote(context.prelude)}`] : []),
     `export KONTEKS_ROOT=${quote(context.root)}`,
+    "export KONTEKS_ON_COMPUTER=1",
     `PATH=${quote(join(context.root, "bin"))}:"$PATH"; export PATH`,
     `echo ${quote(intro)}`,
-    `if ${plan.commands.join(" && ")}; then echo; echo ${quote(done)}; else echo; echo ${quote(failed)}; fi`,
+    run,
     "",
   ].join("\n");
 }

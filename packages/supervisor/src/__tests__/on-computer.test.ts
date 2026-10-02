@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch } from "../native/on-computer.js";
+import { canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch } from "../native/on-computer.js";
 
 describe("a step the site brings to the front on this computer (on-computer)", () => {
   const dirs: string[] = [];
@@ -24,16 +24,36 @@ describe("a step the site brings to the front on this computer (on-computer)", (
     expect(planOnComputer({ agentId: "dsh", state: "ready" }, "darwin")).toBeNull();
   });
 
-  it("acts on this connector only, says in one line what it does, and ends with what to do next", () => {
-    const script = onComputerScript({ step: "sign_in", commands: ["konteks-remote auth login dsh"], until: "ready" }, { agentId: "dsh", root: "/Users/p/Library/Application Support/konteks-remote", platform: "darwin" });
-    expect(script).toContain("export KONTEKS_ROOT='/Users/p/Library/Application Support/konteks-remote'");
-    expect(script).toContain("Konteks is setting up DeepSeek Harness on this computer.");
-    expect(script).toContain("if konteks-remote auth login dsh; then");
-    expect(script).toContain("DeepSeek Harness is set up. You can close this window");
-    const windows = onComputerScript({ step: "add", commands: ["konteks-remote agent add antigravity"], until: "added" }, { agentId: "antigravity", root: "C:\\Users\\p\\konteks", platform: "win32" });
+  it("acts on this connector only, says in one line what it does, and lets the sign-in say how it ended", () => {
+    const root = "/Users/p/Library/Application Support/konteks-remote";
+    const launcher = `${root}/releases/r1/konteks-connector`;
+    const script = onComputerScript({ step: "sign_in", commands: ["konteks-remote auth login dsh"], until: "ready" }, { agentId: "dsh", root, platform: "darwin", launcher });
+    expect(script).toContain(`export KONTEKS_ROOT='${root}'`);
+    expect(script).toContain("export KONTEKS_ON_COMPUTER=1");
+    // This release's launcher, on this connector's root: never the install-day one in bin, nor another connector.
+    expect(script).toContain(`\n'${launcher}' --root '${root}' auth login dsh\n`);
+    // The person reads one intro line; the sign-in itself says it is ready and the window can close.
+    const echoed = script.split("\n").filter(line => line.includes("echo "));
+    expect(echoed).toEqual(["echo 'Konteks is setting up DeepSeek Harness on this computer.'"]);
+    // An install or add that fails gets the generic line; the sign-in after it speaks for itself.
+    const install = onComputerScript({ step: "add", commands: ["konteks-remote agent add dsh", "konteks-remote auth login dsh"], until: "ready" }, { agentId: "dsh", root, platform: "darwin" });
+    expect(install).toContain(`if konteks-remote --root '${root}' agent add dsh; then konteks-remote --root '${root}' auth login dsh; else echo 'That did not finish. You can close this window and try again from Konteks.'; fi`);
+    for (const text of [script, install]) {
+      const said = [...text.matchAll(/echo '([^']*)'/g)].map(match => match[1]).join("\n");
+      expect(said).not.toMatch(/\bdsh\b|machine/);
+    }
+    const windows = onComputerScript({ step: "add", commands: ["konteks-remote agent add antigravity"], until: "added" }, { agentId: "antigravity", root: "C:\\Users\\p\\konteks", platform: "win32", launcher: "C:\\Users\\p\\konteks\\releases\\r1\\konteks-connector.exe" });
     expect(windows).toContain("$env:KONTEKS_ROOT = 'C:\\Users\\p\\konteks'");
-    expect(windows).toContain("if ($ok) { konteks-remote agent add antigravity; $ok = $? }");
-    expect(windows).toContain("sign it in on the Konteks site");
+    expect(windows).toContain("$env:KONTEKS_ON_COMPUTER = '1'");
+    expect(windows).toContain("if ($ok) { & 'C:\\Users\\p\\konteks\\releases\\r1\\konteks-connector.exe' --root 'C:\\Users\\p\\konteks' agent add antigravity; $ok = $? }");
+    expect(windows).toContain("Google Antigravity is added. You can close this window and sign it in on the Konteks site.");
+  });
+
+  it("runs the window's commands with this release's launcher only when this is one", () => {
+    expect(releaseLauncher("/r/releases/1/konteks-connector", "darwin")).toBe("/r/releases/1/konteks-connector");
+    expect(releaseLauncher("/r/releases/0/connector", "linux")).toBe("/r/releases/0/connector");
+    expect(releaseLauncher("C:\\r\\releases\\1\\konteks-connector.exe", "win32")).toBe("C:\\r\\releases\\1\\konteks-connector.exe");
+    expect(releaseLauncher("/usr/local/bin/node", "darwin")).toBeUndefined();
   });
 
   it("opens it in Terminal on a Mac, and only leaves it in a stand-in laptop's spool", async () => {

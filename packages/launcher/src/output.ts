@@ -12,6 +12,13 @@ export interface Output {
   error(error: unknown): void;
 }
 
+/**
+ * A failure whose reason the person has already read (a sign-in flow's own
+ * last line): the command still fails, and `--json` still reports it, but a
+ * terminal shows no second, coded line after the plain one.
+ */
+export class AlreadyToldError extends RemoteInstanceError {}
+
 export function createOutput(options: { json: boolean; stdout?: NodeJS.WritableStream; stderr?: NodeJS.WritableStream }): Output {
   const stdout = options.stdout ?? process.stdout;
   const stderr = options.stderr ?? process.stderr;
@@ -32,6 +39,7 @@ export function createOutput(options: { json: boolean; stdout?: NodeJS.WritableS
       if (error instanceof RemoteInstanceError) {
         const actions = error.recoveryActions.map((action) => describeAction(action)).filter((text) => text.length > 0);
         if (options.json) stderr.write(`${JSON.stringify(redactValue({ error: error.toJSON() }))}\n`);
+        else if (error instanceof AlreadyToldError) return;
         else stderr.write(`${redactText(`error (${error.code}): ${error.message}`)}\n${actions.map((action) => `  → ${action}`).join("\n")}${actions.length > 0 ? "\n" : ""}`);
         return;
       }
