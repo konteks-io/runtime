@@ -18,7 +18,9 @@ import {
   signBody,
   type AgentTurnUsageObservation,
   type ControlAck,
+  type ControlEmitter,
   type ControlHandler,
+  type ControlRequest,
   type ControlLoginEvent,
   type ConnectedAgentView,
   type ConnectorCommandsManifest,
@@ -77,7 +79,7 @@ import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOpti
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { windowsInstalledLauncher } from "./native/windows-launcher.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
-import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerWatch } from "./native/on-computer.js";
+import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerPlan, type OnComputerWatch } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
@@ -2060,11 +2062,8 @@ export class Supervisor {
   private async startPreviewForViewer(sessionId: string): Promise<boolean> {
     const current = this.previews.status(sessionId);
     if (current.state === "starting") return true;
-    if (this.stopping || this.draining || this.lease.mode() !== "active") return false;
-    const cwd = this.previewWorktrees.get(sessionId);
-    if (cwd === undefined || !existsSync(cwd)) return false;
-    const last = this.previewViewerStarts.get(sessionId);
-    if (current.state === "failed" && last !== undefined && Date.now() - last < PREVIEW_VIEWER_RETRY_MS) return false;
+    const cwd = this.viewerPreviewWorktree(sessionId, current.state);
+    if (cwd === null) return false;
     this.previewViewerStarts.set(sessionId, Date.now());
     const started = await this.previews.start(sessionId, cwd, "viewer");
     if (started.state !== "starting" && started.state !== "running") {
@@ -2073,6 +2072,19 @@ export class Supervisor {
     }
     this.logger.info({ event: "preview.viewer_started" }, "a viewer started this session's preview");
     return true;
+  }
+
+  /** The session's worktree when a viewer may start its preview now; null while stopping, draining, without an active lease or a worktree, or soon after a viewer start failed. */
+  private viewerPreviewWorktree(sessionId: string, state: string): string | null {
+    if (this.stopping || this.draining || this.lease.mode() !== "active") return null;
+    const cwd = this.previewWorktrees.get(sessionId);
+    if (cwd === undefined || !existsSync(cwd)) return null;
+    return this.viewerRetryPending(sessionId, state) ? null : cwd;
+  }
+
+  private viewerRetryPending(sessionId: string, state: string): boolean {
+    const last = this.previewViewerStarts.get(sessionId);
+    return state === "failed" && last !== undefined && Date.now() - last < PREVIEW_VIEWER_RETRY_MS;
   }
 
   private forgetPreviewWorktree(sessionId: string): void {
@@ -2099,9 +2111,7 @@ export class Supervisor {
       agents.push(agentId);
       version ??= offered;
     }
-    const browser = this.connectorBrowser;
-    return { version, agents: agents.sort(), chrome: chromeInstalled(),
-      ...(browser.available ? { packageAgent: browser.browser.packageAgent, nodeSource: browser.browser.nodeSource } : version === null && browser.message ? { unavailable: browser.message } : {}) };
+    return { version, agents: agents.sort(), chrome: chromeInstalled(), ...connectorBrowserFields(this.connectorBrowser, version) };
   }
 
   private previewCapable(): boolean {
@@ -2140,20 +2150,18 @@ export class Supervisor {
   // ── Status and control socket ─────────────────────────────────────────────
 
   status(): SupervisorStatus {
-    const relay = this.relay?.status();
-    const lease = this.lease.current();
     return {
       instanceId: this.instanceId,
       workspaceId: this.workspaceId,
       administrativeStatus: this.administrativeStatus,
-      connectivity: { transport: relay?.state === "connected" ? "relay" : this.transport?.available ? "https_fallback" : "offline", relayConnected: relay?.state === "connected", lastConnectedAt: relay?.lastConnectedAt ?? null, reconciliationComplete: this.reconciliation?.isComplete ?? false },
-      lease: { mode: this.lease.mode(), expiresAt: lease?.expiresAt ?? null, drainDeadline: lease?.drainDeadline ?? null },
-      version: { bundle: this.config.SUPERVISOR_BUNDLE_VERSION, protocol: String(REMOTE_INSTANCE_PROTOCOL_VERSION), manifestDigest: this.manifestDigest || null, updateAvailable: this.control?.versionPolicy?.updateAvailable ?? false, targetBundle: this.control?.versionPolicy?.targetBundle ?? null },
+      connectivity: this.connectivityStatus(),
+      lease: this.leaseStatus(),
+      version: this.versionStatus(),
       configRevision: this.control?.configRevision ?? 0,
       components: (this.lastSnapshot?.components ?? []).map((component) => ({ kind: component.kind, version: component.version, healthStatus: component.healthStatus, capabilities: component.capabilities, lastProbeAt: component.lastProbeAt })),
       roles: (this.heartbeat?.roles() ?? []) as SupervisorStatus["roles"],
       roleBindings: this.roleBindings,
-      utilization: { acceptingWork: !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
+      utilization: this.utilizationStatus(),
       pendingErase: this.journal.erase.all().filter((record) => !record.receiptSent).length,
       pendingRevocation: this.pendingRevocation,
       // Also read by launchers installed before 7.0.0, which require both fields.
@@ -2162,176 +2170,213 @@ export class Supervisor {
     };
   }
 
+  private connectivityStatus(): SupervisorStatus["connectivity"] {
+    const relay = this.relay?.status();
+    const relayConnected = relay?.state === "connected";
+    return { transport: this.transportState(relayConnected), relayConnected, lastConnectedAt: relay?.lastConnectedAt ?? null, reconciliationComplete: this.reconciliation?.isComplete ?? false };
+  }
+
+  private transportState(relayConnected: boolean): SupervisorStatus["connectivity"]["transport"] {
+    if (relayConnected) return "relay";
+    return this.transport?.available ? "https_fallback" : "offline";
+  }
+
+  private leaseStatus(): SupervisorStatus["lease"] {
+    const lease = this.lease.current();
+    return { mode: this.lease.mode(), expiresAt: lease?.expiresAt ?? null, drainDeadline: lease?.drainDeadline ?? null };
+  }
+
+  private versionStatus(): SupervisorStatus["version"] {
+    const policy = this.control?.versionPolicy;
+    return { bundle: this.config.SUPERVISOR_BUNDLE_VERSION, protocol: String(REMOTE_INSTANCE_PROTOCOL_VERSION), manifestDigest: this.manifestDigest || null,
+      updateAvailable: policy?.updateAvailable ?? false, targetBundle: policy?.targetBundle ?? null };
+  }
+
+  private utilizationStatus(): SupervisorStatus["utilization"] {
+    return { acceptingWork: !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork(), ...snapshotLoad(this.lastSnapshot),
+      ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) };
+  }
+
   controlHandler(): ControlHandler {
-    return async (request, emit) => {
-      switch (request.op) {
-        case "status":
-          return this.status();
-        case "agents": {
-          const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
-          return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
+    const ops = this.controlOps();
+    return async (request, emit) => (ops[request.op] as (request: ControlRequest, emit: ControlEmitter) => unknown)(request, emit);
+  }
+
+  /** One handler per control-socket op. */
+  private controlOps(): ControlOps {
+    return {
+      status: () => this.status(),
+      agents: () => {
+        const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
+        return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
+      },
+      "auth.status": request => ({ agents: (this.lastSnapshot?.agents ?? this.inventory.agents()).filter((agent) => request.agentId === undefined || agent.agentId === request.agentId) }),
+      "auth.login": (request, emit) => this.localLogin(request, emit),
+      "auth.input": async request => {
+        const login = this.activeLogins.get(request.loginId);
+        if (!login) throw new RemoteInstanceError("temporarily_unavailable", "no login in progress with that id");
+        await this.requireRunner(login.agentId).loginInput(request.loginId, request.text);
+        return {};
+      },
+      "auth.cancel": request => this.cancelLocalLogin(request.loginId),
+      "auth.logout": request => {
+        const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }) };
+        return Object.keys(which).length === 0 ? this.requireRunner(request.agentId).logout() : this.requireRunner(request.agentId).logout(which);
+      },
+      "git.key.add": request => this.addGitKey(request.title),
+      "git.key.list": async () => ({ keys: await this.gitKeys().list() }),
+      "git.key.remove": async request => {
+        const store = this.gitKeys();
+        await store.remove(request.keyRef);
+        this.managedGitBinding = await store.binding();
+        return { keyRef: request.keyRef, revoked: true };
+      },
+      drain: async request => ({ activeAssignments: await this.beginDrain(request.reason, null) }),
+      "drain.status": () => this.drainStatus(),
+      "codex.maintenance.preflight": async () => {
+        if (!this.draining || this.drainReason !== "update" || this.work.activeCount() !== 0 || this.stopping) {
+          throw new RemoteInstanceError("active_work", "The update drain has not settled for Codex maintenance.");
         }
-        case "auth.status":
-          return { agents: (this.lastSnapshot?.agents ?? this.inventory.agents()).filter((agent) => request.agentId === undefined || agent.agentId === request.agentId) };
-        case "auth.login": {
-          const runner = this.requireRunner(request.agentId);
-          const loginId = `login-${randomUUID()}`;
-          this.activeLogins.set(loginId, { agentId: request.agentId, emit: (event) => emit.event(event) });
-          emit.signal.addEventListener("abort", () => {
-            if (!this.activeLogins.delete(loginId)) return;
-            void runner.loginCancel(loginId).catch(error => this.logger.warn({ err: error }, "orphaned local login cancellation failed"));
-          }, { once: true });
-          // The person ran this on their own machine: their own login.
-          const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }),
-            ...(request.reuse === undefined ? {} : { reuse: request.reuse }),
-            // Gemini Enterprise's project and location, both or neither (the runner checks them again).
-            ...(request.project !== undefined && request.location !== undefined ? { gcp: AgentLoginGcpSchema.parse({ project: request.project, location: request.location }) } : {}) };
-          try {
-            if (Object.keys(which).length > 0) await runner.login(request.organization, loginId, true, which);
-            else await runner.login(request.organization, loginId, true);
-            if (emit.signal.aborted) {
-              await runner.loginCancel(loginId);
-              throw new RemoteInstanceError("temporarily_unavailable", "login caller disconnected");
-            }
-          } catch (error) {
-            this.activeLogins.delete(loginId);
-            throw error;
-          }
-          emit.event({ kind: "started", loginId, agentId: request.agentId });
-          return { loginId };
-        }
-        case "auth.input": {
-          const login = this.activeLogins.get(request.loginId);
-          if (!login) throw new RemoteInstanceError("temporarily_unavailable", "no login in progress with that id");
-          await this.requireRunner(login.agentId).loginInput(request.loginId, request.text);
-          return {};
-        }
-        case "auth.cancel": {
-          const login = this.activeLogins.get(request.loginId);
-          if (!login) return {};
-          this.activeLogins.delete(request.loginId);
-          await this.requireRunner(login.agentId).loginCancel(request.loginId);
-          login.emit({ kind: "failed", loginId: request.loginId, code: "login_cancelled", message: "login cancelled" });
-          return {};
-        }
-        case "auth.logout": {
-          const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }) };
-          return Object.keys(which).length === 0 ? this.requireRunner(request.agentId).logout() : this.requireRunner(request.agentId).logout(which);
-        }
-        case "git.key.add": {
-          const store = this.gitKeys();
-          const key = await store.add(request.title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);
-          this.managedGitBinding = await store.binding();
-          // The reference, the fingerprint and the host; never the key.
-          // The key file's PATH lets the person's own git use the key for the
-          // repository onboarding pushes; the key itself never leaves.
-          return {
-            keyRef: key.keyRef, title: key.title, fingerprint: key.fingerprint, host: key.host,
-            sshConfig: sshConfigPath(this.config.SUPERVISOR_ONBOARD_GIT_KEY_DIR),
-            // The key file, wherever the person's push needs it: the binding
-            // exists only when the registration named a host.
-            identityFile: store.privateKeyPath,
-            user: this.managedGitBinding?.user ?? "git",
-          };
-        }
-        case "git.key.list":
-          return { keys: await this.gitKeys().list() };
-        case "git.key.remove": {
-          const store = this.gitKeys();
-          await store.remove(request.keyRef);
-          this.managedGitBinding = await store.binding();
-          return { keyRef: request.keyRef, revoked: true };
-        }
-        case "drain":
-          return { activeAssignments: await this.beginDrain(request.reason, null) };
-        case "drain.status":
-          return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
-        case "codex.maintenance.preflight": {
-          if (!this.draining || this.drainReason !== "update" || this.work.activeCount() !== 0 || this.stopping) {
-            throw new RemoteInstanceError("active_work", "The update drain has not settled for Codex maintenance.");
-          }
-          await this.nativeCodexOwner?.preflightMaintenance();
-          return { idle: true };
-        }
-        case "drain.cancel": {
-          // Only a locally requested drain is reversible; a Core directive with a
-          // deadline stays in force until Core lifts it.
-          if (this.draining && this.drainDeadline === null) {
-            this.draining = false;
-            this.drainReason = null;
-            if (this.administrativeStatus === "draining") this.administrativeStatus = "active";
-            this.logger.info("drain cancelled by the local operator");
-          }
-          return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
-        }
-        case "update.check":
-          return this.requireUpdates().check();
-        case "update.apply":
-          return this.requireUpdates().apply("operator");
-        case "update.status":
-          return this.requireUpdates().status();
-        case "update.channel": {
-          // Its own op, not a status field: launchers from older releases read
-          // `status` strictly and a user install never replaces its launcher.
-          const channel = this.updates ? this.updateChannelReport() : null;
-          return channel ? { host: channel.host, override: channel.override, lastCheckedAt: channel.lastCheckedAt, error: channel.lastError } : null;
-        }
-        case "release.accepted": {
-          if (!this.instanceId) return { bundleVersion: null };
-          const accepted = await this.core.acceptedRelease(this.instanceId);
-          return { bundleVersion: accepted?.bundleVersion ?? null };
-        }
-        case "preview.status":
-          return this.previewReport();
-        case "doctor":
-          return this.doctor();
-        case "logs":
-          return { lines: this.logLines.slice(-2_000) };
-        case "support.bundle": {
-          const doctor = await this.doctor();
-          return buildSupportBundle({
-            bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
-            protocolVersion: String(REMOTE_INSTANCE_PROTOCOL_VERSION),
-            instanceId: this.instanceId,
-            administrativeStatus: this.administrativeStatus,
-            doctor,
-            configurationKeys: flattenKeys(this.configuration),
-            counters: { relay: { ...this.mux.counters }, control: { ...this.control.counters }, work: { ...this.work.counters } },
-            recentLogLines: this.logLines,
-            generatedAt: this.clock.nowIso(),
-          }).document;
-        }
-        case "readiness.submit":
-          await this.continueProvisioning();
-          return this.status();
-        case "revoke.pending":
-          this.pendingRevocation = true;
-          return { pendingRevocation: true };
-        case "shutdown": {
-          // Answered first, then stopped, so the caller hears it was accepted.
-          setTimeout(() => {
-            if (this.options.onShutdownRequested) this.options.onShutdownRequested();
-            else void this.stop().catch(() => undefined);
-          }, 200).unref?.();
-          return { stopping: true };
-        }
-        case "instance.retire": {
-          if (!this.instanceId) throw new RemoteInstanceError("temporarily_unavailable", "This runtime is not activated, so there is nothing to remove from Konteks.");
-          const result = await this.core.retire(this.instanceId);
-          if (result.outcome !== "draining") {
-            // Removed from its workspace, a runtime has nothing left to do:
-            // it stops once this answer is sent, so uninstall never deletes a
-            // folder out from under a process still running in it.
-            this.administrativeStatus = "removed";
-            setTimeout(() => {
-              if (this.options.onRetired) this.options.onRetired();
-              else void this.stop().catch(() => undefined);
-            }, 500).unref?.();
-          }
-          return result;
-        }
-      }
+        await this.nativeCodexOwner?.preflightMaintenance();
+        return { idle: true };
+      },
+      "drain.cancel": () => this.cancelLocalDrain(),
+      "update.check": () => this.requireUpdates().check(),
+      "update.apply": () => this.requireUpdates().apply("operator"),
+      "update.status": () => this.requireUpdates().status(),
+      // Its own op, not a status field: launchers from older releases read
+      // `status` strictly and a user install never replaces its launcher.
+      "update.channel": () => {
+        const channel = this.updates ? this.updateChannelReport() : null;
+        return channel ? { host: channel.host, override: channel.override, lastCheckedAt: channel.lastCheckedAt, error: channel.lastError } : null;
+      },
+      "release.accepted": async () => {
+        if (!this.instanceId) return { bundleVersion: null };
+        const accepted = await this.core.acceptedRelease(this.instanceId);
+        return { bundleVersion: accepted?.bundleVersion ?? null };
+      },
+      "preview.status": () => this.previewReport(),
+      doctor: () => this.doctor(),
+      logs: () => ({ lines: this.logLines.slice(-2_000) }),
+      "support.bundle": () => this.supportBundle(),
+      "readiness.submit": async () => {
+        await this.continueProvisioning();
+        return this.status();
+      },
+      "revoke.pending": () => {
+        this.pendingRevocation = true;
+        return { pendingRevocation: true };
+      },
+      // Answered first, then stopped, so the caller hears it was accepted.
+      shutdown: () => {
+        setTimeout(() => {
+          if (this.options.onShutdownRequested) this.options.onShutdownRequested();
+          else void this.stop().catch(() => undefined);
+        }, 200).unref?.();
+        return { stopping: true };
+      },
+      "instance.retire": () => this.retireInstance(),
     };
+  }
+
+  /** The person ran this on their own machine: their own login. */
+  private async localLogin(request: ControlRequestOf<"auth.login">, emit: ControlEmitter): Promise<{ loginId: string }> {
+    const runner = this.requireRunner(request.agentId);
+    const loginId = `login-${randomUUID()}`;
+    this.activeLogins.set(loginId, { agentId: request.agentId, emit: (event) => emit.event(event) });
+    emit.signal.addEventListener("abort", () => {
+      if (!this.activeLogins.delete(loginId)) return;
+      void runner.loginCancel(loginId).catch(error => this.logger.warn({ err: error }, "orphaned local login cancellation failed"));
+    }, { once: true });
+    const which = localLoginSelection(request);
+    try {
+      if (Object.keys(which).length > 0) await runner.login(request.organization, loginId, true, which);
+      else await runner.login(request.organization, loginId, true);
+      if (emit.signal.aborted) {
+        await runner.loginCancel(loginId);
+        throw new RemoteInstanceError("temporarily_unavailable", "login caller disconnected");
+      }
+    } catch (error) {
+      this.activeLogins.delete(loginId);
+      throw error;
+    }
+    emit.event({ kind: "started", loginId, agentId: request.agentId });
+    return { loginId };
+  }
+
+  private async cancelLocalLogin(loginId: string): Promise<Record<string, never>> {
+    const login = this.activeLogins.get(loginId);
+    if (!login) return {};
+    this.activeLogins.delete(loginId);
+    await this.requireRunner(login.agentId).loginCancel(loginId);
+    login.emit({ kind: "failed", loginId, code: "login_cancelled", message: "login cancelled" });
+    return {};
+  }
+
+  /**
+   * The reference, the fingerprint and the host; never the key. The key
+   * file's path lets the person's own git use the key for the repository
+   * onboarding pushes; the key itself never leaves. The binding exists only
+   * when the registration named a host.
+   */
+  private async addGitKey(title: string | undefined) {
+    const store = this.gitKeys();
+    const key = await store.add(title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);
+    this.managedGitBinding = await store.binding();
+    return {
+      keyRef: key.keyRef, title: key.title, fingerprint: key.fingerprint, host: key.host,
+      sshConfig: sshConfigPath(this.config.SUPERVISOR_ONBOARD_GIT_KEY_DIR),
+      identityFile: store.privateKeyPath,
+      user: this.managedGitBinding?.user ?? "git",
+    };
+  }
+
+  private drainStatus() {
+    return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
+  }
+
+  /** Only a locally requested drain is reversible; a Core directive with a deadline stays in force until Core lifts it. */
+  private cancelLocalDrain() {
+    if (this.draining && this.drainDeadline === null) {
+      this.draining = false;
+      this.drainReason = null;
+      if (this.administrativeStatus === "draining") this.administrativeStatus = "active";
+      this.logger.info("drain cancelled by the local operator");
+    }
+    return this.drainStatus();
+  }
+
+  private async supportBundle() {
+    const doctor = await this.doctor();
+    return buildSupportBundle({
+      bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
+      protocolVersion: String(REMOTE_INSTANCE_PROTOCOL_VERSION),
+      instanceId: this.instanceId,
+      administrativeStatus: this.administrativeStatus,
+      doctor,
+      configurationKeys: flattenKeys(this.configuration),
+      counters: { relay: { ...this.mux.counters }, control: { ...this.control.counters }, work: { ...this.work.counters } },
+      recentLogLines: this.logLines,
+      generatedAt: this.clock.nowIso(),
+    }).document;
+  }
+
+  /**
+   * Removed from its workspace, a runtime has nothing left to do: it stops
+   * once this answer is sent, so uninstall never deletes a folder out from
+   * under a process still running in it.
+   */
+  private async retireInstance() {
+    if (!this.instanceId) throw new RemoteInstanceError("temporarily_unavailable", "This runtime is not activated, so there is nothing to remove from Konteks.");
+    const result = await this.core.retire(this.instanceId);
+    if (result.outcome !== "draining") {
+      this.administrativeStatus = "removed";
+      setTimeout(() => {
+        if (this.options.onRetired) this.options.onRetired();
+        else void this.stop().catch(() => undefined);
+      }, 500).unref?.();
+    }
+    return result;
   }
 
   private requireUpdates(): NativeUpdateCoordinator {
@@ -2351,65 +2396,68 @@ export class Supervisor {
       throw new RemoteInstanceError("permission_denied", "Core agent login signatures are required");
     }
     const { intent } = request;
+    const instanceId = this.loginRuntime(intent);
+    if (isOnComputerLogin(intent)) return this.startOnComputer(instanceId, intent.loginId, intent.agentId as OnComputerAgent, intent.action);
+    const agentId = intent.agentId;
+    if (!isSiteLoginAgent(agentId)) return this.refuseLoginAgent(instanceId, intent);
+    const site = siteLoginSelection(intent);
+    const report = this.siteLoginReporter(instanceId, intent.loginId, site.loginOption);
+    if (intent.action === "cancel") return this.cancelSiteLogin(intent.loginId);
+    // A repeated delivery of a login already under way changes nothing.
+    if (this.activeLogins.has(intent.loginId)) return;
+    const runner = this.runners.get(agentId);
+    if (!runner || siteLoginRefused(agentId, site, runner)) {
+      await report({ loginId: intent.loginId, agentId, state: "failed", failure: "unavailable" });
+      return;
+    }
+    await this.startSiteLogin(intent.loginId, agentId, runner, site, report);
+  }
+
+  /** The runtime a signed login names: this one, or the login is refused. */
+  private loginRuntime(intent: AgentLoginIntent): string {
     const instanceId = this.instanceId;
     if (!instanceId || intent.instanceId !== instanceId || intent.tenantId !== this.workspaceId) {
       throw new RemoteInstanceError("recovery_required", "This agent login is for another runtime");
     }
-    if (intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId)) {
-      await this.startOnComputer(instanceId, intent.loginId, intent.agentId as OnComputerAgent, intent.action);
-      return;
-    }
-    if (intent.agentId !== "codex" && intent.agentId !== "claude-code" && intent.agentId !== "opencode" && intent.agentId !== "antigravity") {
-      if (intent.action !== "cancel") {
-        await this.core.reportAgentLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as Parameters<CoreClient["reportAgentLogin"]>[1])
-          .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
-      }
-      return;
-    }
-    // An OpenCode or Antigravity login names its sign-in option; every report
-    // echoes it. Another agent's option is never started (the runner offers
-    // only its own). Gemini Enterprise carries its Google Cloud project.
-    const optionAgent = intent.agentId === "opencode" || intent.agentId === "antigravity";
-    const requestedOption = optionAgent && intent.loginOption !== undefined ? AgentLoginOptionIdSchema.safeParse(intent.loginOption) : undefined;
-    const loginOption = requestedOption?.success ? requestedOption.data : undefined;
-    const gcp = intent.agentId === "antigravity" && loginOption === "gemini-enterprise" && intent.gcp !== undefined ? intent.gcp : undefined;
-    const report = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) =>
-      this.core.reportAgentLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as Parameters<CoreClient["reportAgentLogin"]>[1])
-        .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
-    if (intent.action === "cancel") {
-      const login = this.activeLogins.get(intent.loginId);
-      if (login) {
-        this.activeLogins.delete(intent.loginId);
-        await this.requireRunner(login.agentId).loginCancel(intent.loginId).catch(() => undefined);
-      }
-      return;
-    }
-    // A repeated delivery of a login already under way changes nothing.
-    if (this.activeLogins.has(intent.loginId)) return;
-    const runner = this.runners.get(intent.agentId);
-    if (!runner) {
-      await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
-      return;
-    }
-    // A sign-in this machine does not offer (any more) is not started; nor a
-    // Gemini Enterprise sign-in without its project.
-    if ((requestedOption !== undefined && !requestedOption.success) || (loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(loginOption))
-        || (intent.agentId === "antigravity" && (loginOption === undefined || (loginOption === "gemini-enterprise" && gcp === undefined)))) {
-      await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
-      return;
-    }
-    const relay = siteLoginRelay({ loginId: intent.loginId, agentId: intent.agentId, ...(loginOption === undefined ? {} : { loginOption }),
+    return instanceId;
+  }
+
+  /** An agent this connector cannot sign in from the site: its start is reported unavailable. */
+  private async refuseLoginAgent(instanceId: string, intent: AgentLoginIntent): Promise<void> {
+    if (intent.action === "cancel") return;
+    await this.core.reportAgentLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as AgentLoginReport)
+      .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
+  }
+
+  /** Every report of a site sign-in echoes the sign-in option it named. */
+  private siteLoginReporter(instanceId: string, loginId: string, loginOption: SiteLoginSelection["loginOption"]) {
+    return (value: AgentLoginReport) =>
+      this.core.reportAgentLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as AgentLoginReport)
+        .catch(error => this.logger.warn({ err: error, loginId }, "agent login report not delivered"));
+  }
+
+  private async cancelSiteLogin(loginId: string): Promise<void> {
+    const login = this.activeLogins.get(loginId);
+    if (!login) return;
+    this.activeLogins.delete(loginId);
+    await this.requireRunner(login.agentId).loginCancel(loginId).catch(() => undefined);
+  }
+
+  private async startSiteLogin(loginId: string, agentId: SiteLoginAgent, runner: RunnerPort, site: SiteLoginSelection,
+    report: (value: AgentLoginReport) => Promise<unknown>): Promise<void> {
+    const { loginOption, gcp } = site;
+    const relay = siteLoginRelay({ loginId, agentId, ...(loginOption === undefined ? {} : { loginOption }),
       coreAcceptsNoLicense: this.hostSettings.coreAcceptsRouteBilling,
       report: value => { void report(value); },
-      cancel: () => { void runner.loginCancel(intent.loginId).catch(() => undefined); },
-      onFinished: () => { this.activeLogins.delete(intent.loginId); },
+      cancel: () => { void runner.loginCancel(loginId).catch(() => undefined); },
+      onFinished: () => { this.activeLogins.delete(loginId); },
       // Ready shows on the site now, not at the next heartbeat.
       onSucceeded: () => { if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed")); },
     });
-    this.activeLogins.set(intent.loginId, { agentId: intent.agentId, emit: event => relay.emit(event) });
+    this.activeLogins.set(loginId, { agentId, emit: event => relay.emit(event) });
     try {
-      if (loginOption === undefined) await runner.login(false, intent.loginId, true);
-      else await runner.login(false, intent.loginId, true, { loginOption, ...(gcp ? { gcp } : {}) });
+      if (loginOption === undefined) await runner.login(false, loginId, true);
+      else await runner.login(false, loginId, true, { loginOption, ...(gcp ? { gcp } : {}) });
       relay.started();
     } catch (error) {
       const busy = error instanceof RemoteInstanceError && /already in progress/i.test(error.message);
@@ -2432,19 +2480,9 @@ export class Supervisor {
     const facts = this.onComputerFacts(agentId);
     if (!facts) { await report({ state: "failed", failure: "unavailable" }); return; }
     if (onComputerDone(facts.state)) { await report({ state: "succeeded" }); return; }
-    const plan = planOnComputer({ agentId, state: facts.state, ...(facts.installCommand ? { installCommand: facts.installCommand } : {}), ...(facts.windowsInstallCommand ? { windowsInstallCommand: facts.windowsInstallCommand } : {}) }, process.platform);
+    const plan = onComputerPlan(agentId, facts);
     if (!plan) { await report({ state: "failed", failure: "unavailable" }); return; }
-    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
-    // A stand-in laptop's window loads the stand-in's own terminal settings.
-    const prelude = process.env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" ? standInTerminalEnv(root) : undefined;
-    // This release's own launcher, never the install-day one in bin (it is not updated).
-    const launcher = releaseLauncher();
-    try {
-      const { file, opened } = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform, ...(prelude ? { prelude } : {}), ...(launcher ? { launcher } : {}) }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform, confined: prelude !== undefined });
-      this.logger.info({ event: opened ? "on_computer.opened" : "on_computer.left_for_tester", loginId, agentId, step: plan.step, file },
-        opened ? "site-started step brought to the front on this computer" : "site-started step left in the stand-in's folder; no window opened");
-    } catch (error) {
-      this.logger.warn({ err: error, loginId, agentId }, "site-started step could not be opened on this computer");
+    if (!await this.openOnComputerStep(loginId, agentId, plan)) {
       await report({ state: "failed", failure: "unavailable" });
       return;
     }
@@ -2454,6 +2492,24 @@ export class Supervisor {
     // still end (and say so on the site) in the connector that comes back.
     await writeOnComputerWatch(this.config.SUPERVISOR_DATA_DIR, watch).catch(error => this.logger.warn({ err: error, loginId }, "on-computer step not kept across a restart"));
     this.watchOnComputer(watch);
+  }
+
+  /** Bring the step's window to the front; false when it could not be opened. */
+  private async openOnComputerStep(loginId: string, agentId: OnComputerAgent, plan: OnComputerPlan): Promise<boolean> {
+    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
+    // A stand-in laptop's window loads the stand-in's own terminal settings.
+    const prelude = process.env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" ? standInTerminalEnv(root) : undefined;
+    // This release's own launcher, never the install-day one in bin (it is not updated).
+    const launcher = releaseLauncher();
+    try {
+      const { file, opened } = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform, ...(prelude ? { prelude } : {}), ...(launcher ? { launcher } : {}) }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform, confined: prelude !== undefined });
+      this.logger.info({ event: opened ? "on_computer.opened" : "on_computer.left_for_tester", loginId, agentId, step: plan.step, file },
+        opened ? "site-started step brought to the front on this computer" : "site-started step left in the stand-in's folder; no window opened");
+      return true;
+    } catch (error) {
+      this.logger.warn({ err: error, loginId, agentId }, "site-started step could not be opened on this computer");
+      return false;
+    }
   }
 
   private onComputerReporter(instanceId: string, loginId: string, agentId: OnComputerAgent) {
@@ -2974,6 +3030,76 @@ export class Supervisor {
 }
 
 const channelOf = channelOfId;
+
+type ControlRequestOf<Op extends ControlRequest["op"]> = Extract<ControlRequest, { op: Op }>;
+type ControlOps = { [Op in ControlRequest["op"]]: (request: ControlRequestOf<Op>, emit: ControlEmitter) => unknown };
+
+/** The provider, method, reuse and Gemini Enterprise project and location a local sign-in names; the runner checks them again. */
+function localLoginSelection(request: ControlRequestOf<"auth.login">) {
+  return { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }),
+    ...(request.reuse === undefined ? {} : { reuse: request.reuse }),
+    ...(request.project !== undefined && request.location !== undefined ? { gcp: AgentLoginGcpSchema.parse({ project: request.project, location: request.location }) } : {}) };
+}
+
+/** Sessions, turns and host pressure from the last inventory snapshot; zero before the first. */
+function snapshotLoad(snapshot: InventorySnapshot | null) {
+  return { activeSessions: snapshot?.activeSessions ?? 0, activeTurns: snapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, snapshot?.hostPressure ?? 0) };
+}
+
+/** The connector's QA browser package and Node, or why there is none when no agent offers one. */
+function connectorBrowserFields(browser: ConnectorBrowserStatus, version: string | null) {
+  if (browser.available) return { packageAgent: browser.browser.packageAgent, nodeSource: browser.browser.nodeSource };
+  return version === null && browser.message ? { unavailable: browser.message } : {};
+}
+
+type AgentLoginIntent = RuntimeAgentLoginDeliveryRequest["intent"];
+type AgentLoginReport = Parameters<CoreClient["reportAgentLogin"]>[1];
+type SiteLoginAgent = "codex" | "claude-code" | "opencode" | "antigravity";
+
+function isSiteLoginAgent(agentId: string): agentId is SiteLoginAgent {
+  return agentId === "codex" || agentId === "claude-code" || agentId === "opencode" || agentId === "antigravity";
+}
+
+function isOnComputerLogin(intent: AgentLoginIntent): boolean {
+  return intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId);
+}
+
+type SiteLoginSelection = ReturnType<typeof siteLoginSelection>;
+
+/**
+ * An OpenCode or Antigravity login names its sign-in option; every report
+ * echoes it. Another agent's option is never started (the runner offers
+ * only its own). Gemini Enterprise carries its Google Cloud project.
+ */
+function siteLoginSelection(intent: AgentLoginIntent) {
+  const optionAgent = intent.agentId === "opencode" || intent.agentId === "antigravity";
+  const requestedOption = optionAgent && intent.loginOption !== undefined ? AgentLoginOptionIdSchema.safeParse(intent.loginOption) : undefined;
+  const loginOption = requestedOption?.success ? requestedOption.data : undefined;
+  return { requestedOption, loginOption, gcp: geminiEnterpriseProject(intent, loginOption) };
+}
+
+function geminiEnterpriseProject(intent: AgentLoginIntent, loginOption: string | undefined) {
+  return intent.agentId === "antigravity" && loginOption === "gemini-enterprise" && intent.gcp !== undefined ? intent.gcp : undefined;
+}
+
+/** A sign-in this machine does not offer (any more) is not started; nor a Gemini Enterprise sign-in without its project. */
+function siteLoginRefused(agentId: SiteLoginAgent, site: SiteLoginSelection, runner: RunnerPort): boolean {
+  return siteLoginOptionRefused(site, runner) || antigravityLoginIncomplete(agentId, site);
+}
+
+function siteLoginOptionRefused(site: SiteLoginSelection, runner: RunnerPort): boolean {
+  if (site.requestedOption !== undefined && !site.requestedOption.success) return true;
+  return site.loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(site.loginOption);
+}
+
+function antigravityLoginIncomplete(agentId: SiteLoginAgent, site: SiteLoginSelection): boolean {
+  return agentId === "antigravity" && (site.loginOption === undefined || (site.loginOption === "gemini-enterprise" && site.gcp === undefined));
+}
+
+function onComputerPlan(agentId: OnComputerAgent, facts: { state: Parameters<typeof planOnComputer>[0]["state"]; installCommand?: string | undefined; windowsInstallCommand?: string | undefined }): OnComputerPlan | null {
+  return planOnComputer({ agentId, state: facts.state, ...(facts.installCommand ? { installCommand: facts.installCommand } : {}),
+    ...(facts.windowsInstallCommand ? { windowsInstallCommand: facts.windowsInstallCommand } : {}) }, process.platform);
+}
 
 type SupervisorRunnerEvent = Parameters<WorkOrchestrator["onRunnerEvent"]>[0];
 
