@@ -25,3 +25,33 @@ test('excludes ancestor and personal memory while retaining project instructions
     assert.ok(resumed.claudeMdExcludes.includes(join(realpathSync(root), 'home', 'parent', 'CLAUDE.md')));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('a Konteks session runs no repository hooks, whatever the settings it was given ask for', async () => {
+  const { hardenClaudeSession } = await import('./claude-instruction-scope.mjs');
+  // Flag settings outrank project settings, so the repository cannot turn its
+  // own hooks back on; the SDK's callback hooks (the bridge's) are not settings
+  // hooks and keep running (proof/cp2-runtime/stage-0).
+  const hardened = hardenClaudeSession({ disableAllHooks: false, claudeMdExcludes: ['a'], env: { KEEP: '1' } });
+  assert.equal(hardened.disableAllHooks, true);
+  assert.deepEqual(hardened.claudeMdExcludes, ['a']);
+  assert.deepEqual(hardened.env, { KEEP: '1' });
+  assert.equal(hardenClaudeSession(undefined).disableAllHooks, true);
+});
+
+test('a Konteks session leaves the account\'s claude.ai connectors out (S0-2)', async () => {
+  const { hardenClaudeSession } = await import('./claude-instruction-scope.mjs');
+  assert.equal(hardenClaudeSession({ disableClaudeAiConnectors: false }).disableClaudeAiConnectors, true);
+});
+
+test('only an integration session admits the account connectors, and still runs no hooks (CP2)', async () => {
+  const { hardenClaudeSession, konteksAccountConnectors } = await import('./claude-instruction-scope.mjs');
+  const admitted = hardenClaudeSession({ disableClaudeAiConnectors: true }, true);
+  assert.equal(admitted.disableClaudeAiConnectors, undefined);
+  assert.equal(admitted.disableAllHooks, true);
+  assert.equal(hardenClaudeSession({}, false).disableClaudeAiConnectors, true);
+  assert.equal(konteksAccountConnectors({ konteksIntegration: { version: 1, admittedMcpServerNames: [], accountConnectors: true } }), true);
+  for (const meta of [undefined, null, {}, { konteksIntegration: { version: 2, accountConnectors: true } }, { konteksIntegration: { version: 1, accountConnectors: 'yes' } },
+    { konteksIntegration: { version: 1, accountConnectors: false } }, { claudeCode: { options: { strictMcpConfig: false } } }]) {
+    assert.equal(konteksAccountConnectors(meta), false);
+  }
+});

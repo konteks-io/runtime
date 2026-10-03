@@ -39,6 +39,12 @@ const inputSchema = z.object({
     outputDir: z.string().min(1).refine(isAbsolute),
     browsersPath: z.string().min(1).refine(isAbsolute),
   }).strict().optional(),
+  // An integration task's own session: server names are bounded tokens (the
+  // bridge patches re-check them), at most a handful per session.
+  integration: z.object({
+    admittedMcpServerNames: z.array(z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/)).max(8),
+    accountConnectors: z.boolean(),
+  }).strict().optional(),
 }).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined);
 
 export interface NativeRunnerOptions {
@@ -211,7 +217,7 @@ export class NativeRunner implements RunnerPort {
     const parsed = inputSchema.safeParse(input);
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
-    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser } = parsed.data;
+    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser, integration } = parsed.data;
     // The session's browser is a stdio MCP server the agent launches (its own
     // package's, or the connector's for an agent without one); composed here,
     // where the paths are known.
@@ -219,7 +225,7 @@ export class NativeRunner implements RunnerPort {
     const mcpServers = browserServer === null ? parsed.data.mcpServers : [...parsed.data.mcpServers, browserServer];
     const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
       ...(freshProviderSessionOnRestore === undefined ? {} : { freshProviderSessionOnRestore }),
-      ...(sessionLabel === undefined ? {} : { sessionLabel }), ...(agentTitled ? { agentTitled } : {}), lifecycle: {
+      ...(sessionLabel === undefined ? {} : { sessionLabel }), ...(agentTitled ? { agentTitled } : {}), ...(integration === undefined ? {} : { integration }), lifecycle: {
       beforeCreate: async (ref: string) => { await lifecycle?.beforeCreate(ref); },
       recordProcessOwner: async (owner: RetainedProcessOwner) => { await lifecycle?.recordProcessOwner(owner); },
       replaceProcessOwner: async (previous: RetainedProcessOwner, replacement: RetainedProcessOwner) => {

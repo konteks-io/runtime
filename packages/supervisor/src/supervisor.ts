@@ -27,7 +27,6 @@ import {
   type JsonValue,
   type Logger,
   type RemoteWorkAssignment,
-  type RemoteWorkKind,
   type RelayRuntimeHandshakeResult,
   type SupervisorStatus,
   type PreviewStatusReport,
@@ -59,6 +58,9 @@ import { RawFileApi } from "./onboard/raw-file-api.js";
 import { createRemoteResolver, type ManagedGitBinding } from "./onboard/remotes.js";
 import { OnboardWorkCarrier, type OnboardWorkAssignment } from "./onboard/carrier.js";
 import type { PlatformMcpEntry } from "./work/workload.js";
+import { acceptedWorkKinds } from "./work/accepted-kinds.js";
+import { integrationTaskCapabilities, type IntegrationWorkCarrier } from "./integration/carrier.js";
+import { composeIntegrationCarrier } from "./integration/compose.js";
 import { LeaseState, decodeLeaseClaims, decodeStoredLeaseClaims, leaseRecordFromClaims } from "./lease/lease.js";
 import { channelOfId, coreChannelId, CORE_BOUND_CHANNELS } from "./relay/channel-ids.js";
 import { PreviewWorktreePermits } from "./preview/worktree-permits.js";
@@ -95,6 +97,7 @@ import type { RelayedSessionDeps } from "./session/relayed-session.js";
 import { PermissionBroker } from "./session/permissions.js";
 import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "./session/workspace-tool-policy.js";
+import { ClaudeExecutableIdentity } from "./native/claude-executable-identity.js";
 import { SupervisorJournal } from "./state/journal.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
@@ -118,14 +121,6 @@ import { evaluateHeartbeatLiveness, isCredentialRefusal, leaseLapseNeedsRestart 
  * The composition root: wires state, transport, heartbeat, control, work,
  * sessions, and the loopback control socket into one supervisor.
  */
-// The onboard lane (evidence collector and relocation worker) is always
-// composed below, so its two kinds are accepted too. Leaving them out meant
-// Core never offered a discovery run's evidence work, and grouping evidence
-// was never read.
-// `direct` (runtime-view R11): a person's own chat on this computer. Only a
-// Core that knows it places it; a Core built before it refuses a pull naming
-// it, so it is asked for only once Core signs 7.1 (see acceptedKinds below).
-const ALL_KINDS: RemoteWorkKind[] = ["planning", "delivery", "validation", "qa", "assistant_execution", "search_generation", "onboarding", "repository_relocation", "direct"];
 
 /** How long preview_start waits for the dev server before answering "still starting". */
 const PREVIEW_START_WAIT_MS = 45_000;
@@ -212,6 +207,10 @@ export class Supervisor {
   /** Core's desired configuration; native, with no roles, until Core sends one. */
   private configuration: ConfigRecord["configuration"] = DEFAULT_CONFIG;
   private hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: false };
+  /** The Core wire-contract version from the applied desired configuration (absent before one is applied). */
+  private coreContractVersion: string | undefined;
+  /** Runs `integration` work (external-integration CP2); composed with the native runners. */
+  private integrationCarrier: IntegrationWorkCarrier | undefined;
   private roleBindings: RoleBinding[] = [];
   private draining = false;
   /** An update is still checking this release; no new work until it keeps it (D113b). */
@@ -445,13 +444,29 @@ export class Supervisor {
       this.nativeRunners.push(runner);
       this.runners.set(runner.agentId, runner);
     }
+    // external-integration CP2: integration tasks (discovery, setup, gated
+    // read/write/verify sessions) on this computer's Claude Code and Codex.
+    this.integrationCarrier = composeIntegrationCarrier({
+      configs: this.options.native!.runners,
+      runners: () => this.runners,
+      fetchWorkload: assignment => this.core.fetchWorkload(this.instanceId ?? "", assignment.id),
+      instanceId: () => this.instanceId ?? "",
+      journal: this.journal,
+      onUsage: observation => this.sendUsageObservation(observation),
+      logger: this.logger,
+    });
     // Supported agents the installation does not list: detected now, in the
     // background, so the first heartbeat can already say where they stand.
     const recorded = this.recordedAgentIds();
     this.notAddedAgents = new NotAddedAgentsDetector({ agentIds: SUPPORTED_AGENT_IDS.filter(agentId => !recorded.has(agentId)) });
     void this.notAddedAgents.refreshIfDue().catch(() => undefined);
+    // The personal Claude Code executable a claude-code runner runs: its
+    // version and digest ride the capabilities (S0-5).
+    const claudeExecutable = this.options.native!.runners.find(runner => runner.RUNNER_AGENT_ID === "claude-code")?.RUNNER_NATIVE_CLAUDE_EXECUTABLE;
+    const claudeIdentity = claudeExecutable ? new ClaudeExecutableIdentity(claudeExecutable, { logger: this.logger }) : null;
     this.inventory = new NativeInventoryCollector({ runners: this.runners, sampler: new SignalSampler(this.config.SUPERVISOR_DATA_DIR), bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       gitVersion: () => this.git.version(),
+      ...(claudeIdentity ? { claudeExecutable: () => claudeIdentity.capability() } : {}),
       executionPermitsReady: () => {
         // Native sessionDeps below always composes NativeExecutionGate.
         // Advertise only once that work owner exists and is still owned.
@@ -461,7 +476,8 @@ export class Supervisor {
       // A site-started login needs a native install with a Codex runner (WS1-115).
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
-      additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : [])],
+      additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : []),
+        ...(this.integrationCarrier ? integrationTaskCapabilities(this.runners.keys()) : [])],
       decorateAgents: agents => this.withAntigravityDownload(agents),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
@@ -823,7 +839,9 @@ export class Supervisor {
       roleBindings: () => this.roleBindings,
       advertisedRoles: () => deriveAdvertisedRoles(this.roleBindings, this.lastSnapshot?.agents ?? [], this.roleCapabilityInputs()),
       roleCapabilityInputs: () => this.roleCapabilityInputs(),
-      acceptedKinds: () => this.hostSettings.coreAcceptsRouteBilling ? ALL_KINDS : ALL_KINDS.filter(kind => kind !== "direct"),
+      // `direct` from a 7.1 Core, `integration` from a 7.3 Core and only while
+      // the integration carrier is composed (work/accepted-kinds.ts).
+      acceptedKinds: () => acceptedWorkKinds(this.coreContractVersion).filter(kind => kind !== "integration" || this.integrationCarrier !== undefined),
       instanceEvidencePolicy: () => this.configuration.evidenceUpload,
       draining: () => this.draining || this.onUpdateProbation,
       reconciliationComplete: () => this.reconciliation.isComplete,
@@ -850,6 +868,7 @@ export class Supervisor {
       maxPullItems: this.config.SUPERVISOR_PULL_MAX_ITEMS,
       searchController: new DurableSearchAssignmentCarrier(this.journal, this.clock),
       onboardCarrier: this.onboardCarrier(),
+      ...(this.integrationCarrier ? { integrationCarrier: this.integrationCarrier } : {}),
       runners: this.runners,
       inspectLegacyCodexThread: reference => this.nativeCodexOwner?.inspectLegacyThread(reference) ?? Promise.reject(new RemoteInstanceError("agent_unavailable", "The shared Codex owner is unavailable.")),
       sessionDeps: (assignment, runner) => ({
@@ -2369,6 +2388,7 @@ export class Supervisor {
    * snapshots.
    */
   private applyHostSettings(configuration: ConfigRecord["configuration"]): void {
+    this.coreContractVersion = configuration.coreContractVersion;
     const settings = { openCodeFreeModels: configuration.openCodeFreeModelsEnabled === true, coreAcceptsRouteBilling: coreContractAtLeast(configuration.coreContractVersion, "7.1") };
     const changed = this.hostSettings.openCodeFreeModels !== settings.openCodeFreeModels || this.hostSettings.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling;
     this.hostSettings = settings;

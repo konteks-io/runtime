@@ -51,6 +51,13 @@ export interface CreateSessionArgs {
   freshProviderSessionOnRestore?: boolean;
   /** Display-only naming for the provider session list; never authority. */
   sessionLabel?: KonteksSessionLabel;
+  /**
+   * An integration task's own session (external-integration CP2): the one
+   * personal MCP server (Codex) or the account connectors (Claude) this NEW
+   * session admits, sent as `_meta.konteksIntegration` for the bridge patches.
+   * Never carried into a continued or restored session.
+   */
+  integration?: IntegrationSessionAdmission;
   /** A person's direct session: the agent titles it; Konteks asks only for the `[konteks]` prefix. */
   agentTitled?: boolean;
   /** Native in-process owner; opaque connector ref, never the bridge session ID. */
@@ -60,6 +67,18 @@ export interface CreateSessionArgs {
     replaceProcessOwner?(previous: RetainedProcessOwner, replacement: RetainedProcessOwner): Promise<void>;
     assertCurrent(): void;
   };
+}
+
+export interface IntegrationSessionAdmission {
+  /** Personal (or E2E) MCP servers the Codex bridge leaves enabled for this thread; none otherwise. */
+  admittedMcpServerNames: string[];
+  /** Claude only: this session may load the account's claude.ai connectors (every call still meets the gate). */
+  accountConnectors: boolean;
+}
+
+/** The `_meta` an integration session's `session/new` carries, versioned for the bridge patches. */
+export function konteksIntegrationMeta(admission: IntegrationSessionAdmission) {
+  return { konteksIntegration: { version: 1 as const, admittedMcpServerNames: [...admission.admittedMcpServerNames], accountConnectors: admission.accountConnectors } };
 }
 
 export interface CreatedSession {
@@ -146,7 +165,12 @@ export interface SessionManagerOptions {
    * `set_mode`, on `set_config_option` for `mode` and in an admitted session
    * configuration, and dropped from the configuration the agent reports.
    */
-  refusedModes?: { readonly modeIds: readonly string[]; readonly message: string };
+  refusedModes?: {
+    readonly modeIds: readonly string[];
+    /** When set, every mode outside it is refused too (Codex: only "Ask for approval", S0-3). */
+    readonly allowedModeIds?: readonly string[];
+    readonly message: string;
+  };
   /** Slash commands this agent is never sent (Antigravity's `/plan`, `/logout`): such a prompt is refused before it reaches the agent. */
   refusedPromptCommands?: { readonly commands: readonly string[]; readonly message: string };
   /**
@@ -379,10 +403,11 @@ export class SessionManager {
   private newSessionMeta(args: CreateSessionArgs, acpSessionRef: string): Record<string, unknown> {
     const naming = args.agentTitled ? konteksAgentTitledMetadata(args.context.agentId)
       : konteksSessionMetadata(konteksCodingSessionTitle(args.sessionLabel, acpSessionRef.slice(-8)), args.context.agentId);
-    return { ...naming, ...this.options.sessionMeta };
+    return { ...naming, ...this.options.sessionMeta, ...(args.integration ? konteksIntegrationMeta(args.integration) : {}) };
   }
 
   async create(args: CreateSessionArgs): Promise<CreatedSession> {
+    this.assertFreshIntegration(args);
     args = this.withDefaultSessionConfig(args);
     const ref = args.acpSessionRef ?? `acp-${randomUUID()}`;
     return this.createOwned(args, ref, args.acpSessionRef);
@@ -392,6 +417,7 @@ export class SessionManager {
    * execution reference. The source ref remains fenced to its old generation;
    * only its private provider-session mapping is read. */
   async restore(args: CreateSessionArgs, sourceRef: string): Promise<CreatedSession> {
+    this.assertFreshIntegration({ ...args, restoreReference: sourceRef });
     args = this.withDefaultSessionConfig(args);
     return this.createOwned(args, `acp-${randomUUID()}`, sourceRef);
   }
@@ -715,6 +741,7 @@ export class SessionManager {
    * its generation fence, then refresh ACP MCP/config authority before ready.
    */
   async continueLive(args: CreateSessionArgs): Promise<CreatedSession> {
+    this.assertFreshIntegration(args);
     args = this.withDefaultSessionConfig(args);
     const ref = args.acpSessionRef;
     if (!ref) throw new RemoteInstanceError("recovery_required", "Live continuation requires its predecessor session reference.", { diagnostic: "continuation_reference_missing" });
@@ -1038,7 +1065,9 @@ export class SessionManager {
   }
 
   private refusesMode(modeId: unknown): boolean {
-    return typeof modeId === "string" && (this.options.refusedModes?.modeIds.includes(modeId) ?? false);
+    const refused = this.options.refusedModes;
+    if (typeof modeId !== "string" || !refused) return false;
+    return refused.modeIds.includes(modeId) || (refused.allowedModeIds !== undefined && !refused.allowedModeIds.includes(modeId));
   }
 
   /** One immutable policy baseline for every provider-session entry path. */
@@ -1048,6 +1077,13 @@ export class SessionManager {
   }
 
   /** A mode this agent must never enter was named in an admitted session configuration. */
+  /** An integration admission belongs to exactly one new session. */
+  private assertFreshIntegration(args: CreateSessionArgs & { restoreReference?: string }): void {
+    if (args.integration && (args.acpSessionRef !== undefined || args.restoreReference !== undefined)) {
+      throw new RemoteInstanceError("schema_invalid", "An integration session is always new.");
+    }
+  }
+
   private assertAdmittedModes(sessionConfig: Record<string, string> | undefined): void {
     if (sessionConfig && this.refusesMode(sessionConfig.mode)) {
       throw new RemoteInstanceError("permission_denied", this.options.refusedModes!.message);
@@ -1072,12 +1108,11 @@ export class SessionManager {
 
   /** The agent's configuration as Konteks reports it: a refused mode is never offered. */
   private withoutRefusedModes<T>(configOptions: T): T {
-    const refused = this.options.refusedModes?.modeIds;
-    if (!refused || !Array.isArray(configOptions)) return configOptions;
+    if (!this.options.refusedModes || !Array.isArray(configOptions)) return configOptions;
     return configOptions.map((option: unknown) => {
       const value = option as { id?: unknown; type?: unknown; options?: unknown };
       if (value?.id !== "mode" || value.type !== "select" || !Array.isArray(value.options)) return option;
-      const keep = (entry: unknown) => !refused.includes((entry as { value?: unknown })?.value as string);
+      const keep = (entry: unknown) => !this.refusesMode((entry as { value?: unknown })?.value);
       const options = (value.options as unknown[]).flatMap((entry) => {
         const group = entry as { options?: unknown };
         if (Array.isArray(group?.options)) return [{ ...group, options: group.options.filter(keep) }];

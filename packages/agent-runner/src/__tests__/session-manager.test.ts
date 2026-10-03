@@ -4,6 +4,7 @@ import { RequestError, type ClientSideConnection, type InitializeResponse } from
 import type { BridgeProcess } from "../bridge/process.js";
 import { RunnerEventBus, type RunnerEvent } from "../events.js";
 import { InMemorySessionRefStore, SessionManager } from "../sessions/manager.js";
+import { CODEX_SESSION_GOVERNANCE } from "../runtime.js";
 
 function fakeBridge(overrides: Partial<Record<keyof ClientSideConnection, unknown>> = {}, initialize: Partial<InitializeResponse> = {}): { bridge: BridgeProcess; calls: Record<string, unknown[]> } {
   const calls: Record<string, unknown[]> = {};
@@ -69,6 +70,32 @@ describe("session manager (D98 bootstrap)", () => {
     ]));
     await expect(manager.restore({ context, cwd: "/w", mcpServers: [], sessionConfig: { mode: "agent" } }, "prior"))
       .rejects.toThrow("governed mode required");
+  });
+
+  it("pins Codex to Ask for approval: every other mode, named today or added later, is refused (S0-3)", async () => {
+    // codex-acp 1.10.0 "read-only" = "Ask for approval": approvalPolicy
+    // on-request, approvalsReviewer user, so Konteks's callback decides.
+    expect(CODEX_SESSION_GOVERNANCE.defaultSessionConfig).toEqual({ mode: "read-only" });
+    const { bridge, calls } = fakeBridge();
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), ...CODEX_SESSION_GOVERNANCE });
+    const { acpSessionRef } = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    expect(calls.setSessionConfigOption).toEqual([{ sessionId: "bridge-s1", configId: "mode", value: "read-only" }]);
+    for (const modeId of ["agent", "agent-full-access", "auto-review-next"]) {
+      const refused = nextEvent(events, "request_error");
+      manager.setMode(acpSessionRef, `mode-${modeId}`, { modeId });
+      expect(await refused).toMatchObject({ requestId: `mode-${modeId}`, class: "invalid_params", message: CODEX_SESSION_GOVERNANCE.refusedModes.message });
+    }
+    const refused = nextEvent(events, "request_error");
+    manager.setConfigOption(acpSessionRef, "config-mode", { configId: "mode", value: "auto-review-next" });
+    expect(await refused).toMatchObject({ requestId: "config-mode", class: "invalid_params" });
+    expect(calls.setSessionMode).toBeUndefined();
+    expect(calls.setSessionConfigOption).toHaveLength(1);
+    await expect(manager.restore({ context, cwd: "/w", mcpServers: [], sessionConfig: { mode: "auto-review-next" } }, "prior")).rejects.toThrow(CODEX_SESSION_GOVERNANCE.refusedModes.message);
+    // Selecting the pinned mode again is allowed.
+    const same = nextEvent(events, "set_mode_result");
+    manager.setMode(acpSessionRef, "mode-pinned", { modeId: "read-only" });
+    await same;
   });
 
   it("hands a settled live ACP session to the next turn with fresh MCP authority", async () => {
@@ -770,5 +797,26 @@ describe("session manager (D98 bootstrap)", () => {
     await expect(pending).rejects.toThrow("agent_exited");
     expect(await exited).toMatchObject({ kind: "session_exited", reason: "agent_exited" });
     expect(manager.activeSessions).toBe(0);
+  });
+});
+
+describe("integration sessions (external-integration CP2)", () => {
+  it("tells the bridge which personal server or account connectors this one session admits", async () => {
+    const { bridge, calls } = fakeBridge();
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });
+    await manager.create({ context, cwd: "/w", mcpServers: [], integration: { admittedMcpServerNames: ["atlassian"], accountConnectors: false } });
+    expect(calls.newSession?.[0]).toMatchObject({ _meta: { konteksIntegration: { version: 1, admittedMcpServerNames: ["atlassian"], accountConnectors: false } } });
+    const plain = fakeBridge();
+    await new SessionManager({ bridge: () => plain.bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() }).create({ context, cwd: "/w", mcpServers: [] });
+    expect(plain.calls.newSession?.[0]).not.toHaveProperty("_meta.konteksIntegration");
+  });
+
+  it("never carries an admission into a continued or restored session", async () => {
+    const { bridge } = fakeBridge();
+    const store = new InMemorySessionRefStore();
+    await store.put("acp-prior", "bridge-old");
+    const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: store });
+    await expect(manager.create({ context, cwd: "/w", mcpServers: [], acpSessionRef: "acp-prior", integration: { admittedMcpServerNames: [], accountConnectors: true } }))
+      .rejects.toMatchObject({ code: "schema_invalid" });
   });
 });

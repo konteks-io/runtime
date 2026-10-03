@@ -22,7 +22,22 @@ every agent on every OS through the connector's own code
 `scripts/agent-os-proof/`); results per OS and agent are in
 opencode-runtime-support `proof/os-matrix.md` (at CP0-X: sessions are
 refused on Linux and Windows, no durable execution-process owner there; Codex
-escalations go to Codex's own auto-reviewer, not the policy). Host-installed
+escalations then went to Codex's own auto-reviewer; every Codex session is now
+pinned to Ask for approval, so they reach the policy: `CODEX_SESSION_GOVERNANCE`).
+Session hardening (external-integration Stage 0: no repository hooks or
+`.mcp.json` servers, no account connectors or personal MCP servers, structured
+tool identity, the Claude executable's identity) is described in AGENTS.md.
+Integration tasks (external-integration CP2, `packages/supervisor/src/integration/`):
+`integration` work from a 7.3 Core runs on its own carrier, never relayed:
+model-free discovery behind an allowlist, a confirmed official setup (add, sign-in or
+remove) from the reviewed catalogue only, and one gated ACP session per probe/read/
+verify/write task whose `IntegrationToolGate` admits only the spec's tools
+(a read with `requiredArgs` only with each fixed argument present and equal,
+the generic `executeRead` only with its operation pinned and
+`executeWrite`/`executeDestructive` never; a write only with its approved
+arguments, once per nonce, journaled before the answer); the bound source is admitted for that session only through
+`_meta.konteksIntegration` (Codex bridge v8, Claude bridge v4 with no setting
+sources); `fixture_mcp` only under `KONTEKS_E2E_NATIVE_CONNECTOR=1` (see AGENTS.md). Host-installed
 agents go through per-agent host adapters (Google Antigravity is the first
 FETCHED one: the connector downloads Google's zip pinned in
 `release/src/fetched-agents.json` on the person's yes and re-verifies it
