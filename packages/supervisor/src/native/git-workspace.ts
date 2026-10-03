@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { constants, type Stats } from "node:fs";
-import { chmod, lstat, mkdir, open, readdir, type FileHandle } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { RemoteFileTreeSchema, RemoteInstanceError, sha256Hex } from "@konteks/remote-common";
+import { readFully } from "./read-fully.js";
 
 /** Installer-selected local tool, never a field in a cloud assignment. */
 export const NativeGitToolSchema = z
@@ -55,7 +56,7 @@ async function boundedFile(path: string, limit: number, tool = false): Promise<B
     if (stat.ino !== before.ino || stat.dev !== before.dev || stat.size !== before.size)
       throw unavailable();
     const buffer = Buffer.alloc(stat.size + 1);
-    const count = await readInto(handle, buffer);
+    const count = await readFully(handle, buffer);
     if (!unchangedWhileRead(count, before, await handle.stat())) throw unavailable();
     return buffer.subarray(0, count);
   } finally {
@@ -78,15 +79,7 @@ function unchangedWhileRead(count: number, before: Stats, after: Stats): boolean
   return count === before.size && after.mtimeMs === before.mtimeMs && after.ctimeMs === before.ctimeMs;
 }
 
-async function readInto(handle: FileHandle, buffer: Buffer): Promise<number> {
-  let count = 0;
-  while (count < buffer.length) {
-    const { bytesRead } = await handle.read(buffer, count, buffer.length - count, count);
-    if (!bytesRead) break;
-    count += bytesRead;
-  }
-  return count;
-}export async function verifyNativeGitTool(value: unknown): Promise<NativeGitTool> {
+export async function verifyNativeGitTool(value: unknown): Promise<NativeGitTool> {
   try {
     const tool = NativeGitToolSchema.parse(value);
     const bytes = await boundedFile(tool.executable, 64 * 1024 * 1024, true);

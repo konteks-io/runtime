@@ -16,6 +16,7 @@ import {
   type RemoteDeliveryResultCandidate,
   type SessionToCoreMessage,
 } from "@konteks/remote-common";
+import { readFully } from "./read-fully.js";
 
 const MAX_RECORD_BYTES = 16 * 1024 * 1024;
 const RecordSchema = z.discriminatedUnion("state", [
@@ -273,16 +274,6 @@ async function readUnchanged(handle: FileHandle, before: Stats): Promise<Buffer>
   const after = await handle.stat();
   if (offset !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) throw unavailable();
   return bytes.subarray(0, offset);
-}
-
-async function readFully(handle: FileHandle, bytes: Buffer): Promise<number> {
-  let offset = 0;
-  while (offset < bytes.length) {
-    const next = await handle.read(bytes, offset, bytes.length - offset, offset);
-    if (!next.bytesRead) break;
-    offset += next.bytesRead;
-  }
-  return offset;
 }
 
 function candidateOfTurn(candidate: RemoteDeliveryResultCandidate, turn: TurnIdentity): boolean {
