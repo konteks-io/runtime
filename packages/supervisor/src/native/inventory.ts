@@ -21,7 +21,7 @@ interface NativeInventoryOptions {
   deliveryExecutionPermitsReady?: () => boolean;
   /** Cancellation remains available independently of agent sign-in/readiness. */
   cancellationDeliveryReady?: () => boolean;
-  /** A person may start this machine's Codex login from the site (WS1-115). */
+  /** A person may start this machine's Codex login from the site. */
   agentLoginReady?: () => boolean;
   /** ...and Claude Code's, which needs a browser this machine can open. */
   agentLoginBrowserReady?: () => boolean;
@@ -39,12 +39,12 @@ interface NativeInventoryOptions {
    * of it can start). Never changes readiness or capabilities.
    */
   decorateAgents?: (agents: ConnectedAgentView[]) => Promise<ConnectedAgentView[]>;
-  /** The machine's git probe (OB6 §1); omitted, the runtime is not `onboard`. */
+  /** The machine's git probe; omitted, the runtime is not `onboard`. */
   gitVersion?: () => Promise<string | null>;
   /**
    * The personal Claude Code executable's identity
    * (`claude-code-executable:<version>:sha256:<hex>`, `claude-executable-identity.ts`):
-   * a change invalidates anything certified against the previous one (S0-5).
+   * a change invalidates anything certified against the previous one.
    */
   claudeExecutable?: () => Promise<string | null>;
   now?: () => Date;
@@ -55,6 +55,29 @@ interface NativeInventoryOptions {
 export function machineHasDesktop(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): boolean {
   if (platform === "darwin" || platform === "win32") return env.SSH_CONNECTION === undefined;
   return Boolean(env.DISPLAY || env.WAYLAND_DISPLAY);
+}
+
+/** A probe's answer, or null when there is no probe or it failed. */
+function settledProbe(pending: Promise<string | null> | undefined): Promise<string | null> {
+  return pending?.catch(() => null) ?? Promise.resolve(null);
+}
+
+/** A runner's readiness when it parses and names its own agent; null otherwise (probe errors are never published). */
+async function runnerReadiness(agentId: string, runner: Pick<RunnerPort, "readiness">): Promise<{ agentId: string; readiness: z.infer<typeof readinessSchema> | null }> {
+  try {
+    const parsed = readinessSchema.safeParse(await runner.readiness());
+    if (parsed.success && parsed.data.agent.agentId === agentId && parsed.data.agent.authMode === "agent_local_subscription") return { agentId, readiness: parsed.data };
+  } catch { /* Closed unavailable projection below; never publish probe errors. */ }
+  return { agentId, readiness: null };
+}
+
+function parsedSignals<T>(signals: { success: true; data: T } | { success: false } | null): T | null {
+  return signals?.success ? signals.data : null;
+}
+
+function runnerHealth(healthy: number, total: number): "unhealthy" | "healthy" | "degraded" {
+  if (healthy === 0) return "unhealthy";
+  return healthy === total ? "healthy" : "degraded";
 }
 
 export class NativeInventoryCollector {
@@ -76,70 +99,90 @@ export class NativeInventoryCollector {
 
   async collect(): Promise<InventorySnapshot> {
     const at = this.now().toISOString();
-    const gitVersion = await (this.options.gitVersion?.().catch(() => null) ?? Promise.resolve(null));
-    const claudeExecutable = await (this.options.claudeExecutable?.().catch(() => null) ?? Promise.resolve(null));
+    const gitVersion = await settledProbe(this.options.gitVersion?.());
+    const claudeExecutable = await settledProbe(this.options.claudeExecutable?.());
     const [signals, results] = await Promise.all([
       this.options.sampler.sample(this.now).then(value => UtilizationSignalsSchema.safeParse(value)).catch(() => null),
-      Promise.all([...this.options.runners].map(async ([agentId, runner]) => {
-        try {
-          const parsed = readinessSchema.safeParse(await runner.readiness());
-          if (parsed.success && parsed.data.agent.agentId === agentId && parsed.data.agent.authMode === "agent_local_subscription") return { agentId, readiness: parsed.data };
-        } catch { /* Closed unavailable projection below; never publish probe errors. */ }
-        return { agentId, readiness: null };
-      })),
+      Promise.all([...this.options.runners].map(([agentId, runner]) => runnerReadiness(agentId, runner))),
     ]);
-    let healthyRunners = 0;
-    let activeSessions = 0;
-    let activeTurns = 0;
-    const agents: ConnectedAgentView[] = [];
-    for (const { agentId, readiness } of results) {
-      if (readiness) {
-        healthyRunners += 1;
-        activeSessions += readiness.utilization.activeSessions;
-        activeTurns += readiness.utilization.activeTurns;
-        agents.push(readiness.agent);
-      } else {
-        const cached = this.cached.get(agentId);
-        if (cached) agents.push({ ...cached, readiness: "unavailable", connectionState: "unavailable" });
-      }
-    }
+    const tally = this.tally(results);
     this.cached.clear();
-    for (const agent of agents) this.cached.set(agent.agentId, structuredClone(agent));
-    const metrics = signals?.success ? signals.data : null;
-    const capabilities = agents.filter(agent => agent.readiness === "ready" && agent.connectionState === "ready").map(agent => `agent:${agent.agentId}`);
-    if (capabilities.length > 0 && this.options.executionPermitsReady?.()) capabilities.push(REMOTE_EXECUTION_PERMITS_CAPABILITY);
-    if (agents.some(agent => agent.readiness === 'ready' && agent.connectionState === 'ready') &&
-      this.options.deliveryExecutionPermitsReady?.()) capabilities.push(REMOTE_DELIVERY_PERMITS_CAPABILITY, DELIVERY_TURN_RENEWAL_CAPABILITY);
-    if (this.options.cancellationDeliveryReady?.()) capabilities.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
-    if (this.options.agentLoginReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_CAPABILITY);
-    if (this.options.agentLoginBrowserReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);
-    for (const capability of this.options.additionalCapabilities?.() ?? []) if (!capabilities.includes(capability)) capabilities.push(capability);
-    // The onboard role is git on THIS machine, not a signed-in agent: the
-    // capabilities are advertised whenever git answers, and withheld the moment
-    // it does not (OB6 §1).
-    capabilities.push(...onboardCapabilities(gitVersion));
-    if (claudeExecutable !== null) capabilities.push(claudeExecutable);
-    // This build names the person's coding sessions from Core's display label;
-    // an older one rejects the field, so Core sends it only on this signal.
-    if (agents.some(agent => agent.readiness === "ready" && agent.connectionState === "ready")) capabilities.push(REMOTE_SESSION_LABEL_CAPABILITY);
-    // Always, whatever agents are installed: this build reads the Core
-    // wire-contract version (`coreContractVersion`) Core signs into the desired
-    // configuration of a connector that asks for it, and takes Core's 7.1
-    // fields (pay-per-use turns, the download state, a credential's reason)
-    // from it (antigravity CP6).
-    capabilities.push(REMOTE_CORE_CONTRACT_CAPABILITY);
-    if (this.options.previewReady?.()) capabilities.push(REMOTE_PREVIEW_CAPABILITY);
-    const reported = this.options.decorateAgents ? await this.options.decorateAgents(structuredClone(agents)).catch(() => agents) : agents;
+    for (const agent of tally.agents) this.cached.set(agent.agentId, structuredClone(agent));
+    const metrics = parsedSignals(signals);
+    const capabilities = this.capabilities(tally.agents, gitVersion, claudeExecutable);
+    const reported = await this.decorated(tally.agents);
     return {
-      components: [{ kind: "agent_runner", version: this.options.bundleVersion,
-        healthStatus: healthyRunners === 0 ? "unhealthy" : healthyRunners === results.length ? "healthy" : "degraded",
-        capabilities, lastProbeAt: at }],
+      components: [{ kind: "agent_runner", version: this.options.bundleVersion, healthStatus: runnerHealth(tally.healthyRunners, results.length), capabilities, lastProbeAt: at }],
       agents: reported,
       hostPressure: metrics ? hostPressureRatio(metrics) : 1,
-      activeSessions,
-      activeTurns,
+      activeSessions: tally.activeSessions,
+      activeTurns: tally.activeTurns,
       gitVersion,
       diskFreeBytes: metrics?.diskFreeBytes ?? 0,
     };
   }
-}
+
+  /** Runner totals and the agents to report: each ready runner's view, else its last view marked unavailable. */
+  private tally(results: ReadonlyArray<{ agentId: string; readiness: z.infer<typeof readinessSchema> | null }>) {
+    const tally = { healthyRunners: 0, activeSessions: 0, activeTurns: 0, agents: [] as ConnectedAgentView[] };
+    for (const { agentId, readiness } of results) {
+      if (readiness) {
+        tally.healthyRunners += 1;
+        tally.activeSessions += readiness.utilization.activeSessions;
+        tally.activeTurns += readiness.utilization.activeTurns;
+        tally.agents.push(readiness.agent);
+        continue;
+      }
+      const cached = this.cached.get(agentId);
+      if (cached) tally.agents.push({ ...cached, readiness: "unavailable", connectionState: "unavailable" });
+    }
+    return tally;
+  }
+
+  private decorated(agents: ConnectedAgentView[]): Promise<ConnectedAgentView[]> {
+    if (!this.options.decorateAgents) return Promise.resolve(agents);
+    return this.options.decorateAgents(structuredClone(agents)).catch(() => agents);
+  }
+
+  private capabilities(agents: readonly ConnectedAgentView[], gitVersion: string | null, claudeExecutable: string | null): string[] {
+    const ready = agents.filter(agent => agent.readiness === "ready" && agent.connectionState === "ready");
+    const capabilities = this.withAdditional([...ready.map(agent => `agent:${agent.agentId}`), ...this.permitCapabilities(ready.length > 0), ...this.deliveryChannelCapabilities()]);
+    // The onboard role is git on THIS machine, not a signed-in agent: the
+    // capabilities are advertised whenever git answers, and withheld the moment
+    // it does not.
+    capabilities.push(...onboardCapabilities(gitVersion));
+    if (claudeExecutable !== null) capabilities.push(claudeExecutable);
+    // This build names the person's coding sessions from Core's display label;
+    // an older one rejects the field, so Core sends it only on this signal.
+    if (ready.length > 0) capabilities.push(REMOTE_SESSION_LABEL_CAPABILITY);
+    // Always, whatever agents are installed: this build reads the Core
+    // wire-contract version (`coreContractVersion`) Core signs into the desired
+    // configuration of a connector that asks for it, and takes Core's 7.1
+    // fields (pay-per-use turns, the download state, a credential's reason)
+    // from it.
+    capabilities.push(REMOTE_CORE_CONTRACT_CAPABILITY);
+    if (this.options.previewReady?.()) capabilities.push(REMOTE_PREVIEW_CAPABILITY);
+    return capabilities;
+  }
+
+  /** Signed execution and delivery permits, only while some agent is ready to use them. */
+  private permitCapabilities(anyReady: boolean): string[] {
+    const permits: string[] = [];
+    if (anyReady && this.options.executionPermitsReady?.()) permits.push(REMOTE_EXECUTION_PERMITS_CAPABILITY);
+    if (anyReady && this.options.deliveryExecutionPermitsReady?.()) permits.push(REMOTE_DELIVERY_PERMITS_CAPABILITY, DELIVERY_TURN_RENEWAL_CAPABILITY);
+    return permits;
+  }
+
+  /** Cancellation delivery and site-started logins, whatever the agents' readiness. */
+  private deliveryChannelCapabilities(): string[] {
+    const channels: string[] = [];
+    if (this.options.cancellationDeliveryReady?.()) channels.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
+    if (this.options.agentLoginReady?.()) channels.push(REMOTE_AGENT_LOGIN_CAPABILITY);
+    if (this.options.agentLoginBrowserReady?.()) channels.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);
+    return channels;
+  }
+
+  private withAdditional(capabilities: string[]): string[] {
+    for (const capability of this.options.additionalCapabilities?.() ?? []) if (!capabilities.includes(capability)) capabilities.push(capability);
+    return capabilities;
+  }}
