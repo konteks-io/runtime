@@ -9,6 +9,7 @@ import {
   RemoteTransferBindingSchema,
   RemoteExecutionReadyResultSchema,
   RemoteInstanceError,
+  allEqual,
   createLogger,
   type AcpJsonRpcError,
   type AgentTurnUsageObservation,
@@ -24,7 +25,7 @@ import {
   type SessionToRuntimeMessage,
 } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME, type RunnerEvent } from "@konteks/remote-agent-runner";
-import type { RunnerPort } from "../runner-port.js";
+import type { RunnerPort, RunnerSessionCreated, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 import type { SupervisorJournal } from "../state/journal.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest, type PendingHumanRequest, type SanitizedElicitation, type SanitizedPermission } from "./permissions.js";
@@ -298,174 +299,245 @@ export class RelayedSession {
     const startedAt = Date.now();
     try {
       const result = await operation();
-      // One line per finished stage, so a slow bootstrap says where (WS2-156).
+      // One line per finished stage, so a slow bootstrap says where.
       this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
         stage, durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
       return result;
     } catch (error) {
-      const known = error instanceof RemoteInstanceError;
-      this.logger.warn({
-        assignmentId: this.assignment.id,
-        attempt: this.assignment.attempt,
-        stage,
-        code: known ? error.code : "unexpected_error",
-        retryable: known ? error.retryable : false,
-        ...(known && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
-        // An unknown error still names its class and, for an agent's JSON-RPC
-        // refusal, its numeric code: no message text, but enough to tell
-        // "method not found" from "invalid params" (WS1-168).
-        ...(!known && error instanceof Error ? { errorName: error.name } : {}),
-        ...(!known && typeof (error as { code?: unknown } | null)?.code === "number" ? { rpcCode: (error as { code: number }).code } : {}),
-      }, "native session bootstrap stage failed");
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage, ...stageFailure(error) },
+        "native session bootstrap stage failed");
       throw error;
     }
   }
 
   private async bootstrapImpl(): Promise<{ acpSessionRef: string; resumed: boolean }> {
+    const { prepared, binding } = await this.prepareSessionInputs();
+    const mcpServers: SessionMcpServer[] = [];
+    // A direct session is the person's own agent with nothing of Konteks in
+    // it: no platform tools even when a capability is named, no preview or
+    // browser (not a preview kind), no result tool.
+    const direct = isDirectAssignment(this.assignment);
+    await this.startCapabilityFacade(binding.sessionId, direct, mcpServers);
+    const browser = await this.startPreviewTools(binding.sessionId, prepared.cwd, mcpServers);
+    // The turn result tool: every Konteks session gets it, so a turn that asks
+    // for a structured result can be answered through a validated tool call.
+    // A direct turn asks for none: it ends on the agent's own end_turn.
+    if (!direct) await this.startResultTool(mcpServers);
+    await this.awaitToolWiring();
+    const activation = await this.activate();
+    const references = await this.chosenReferences(activation);
+    const reserved: { ref?: string } = {};
+    const lifecycle = this.sessionLifecycle(reserved);
+    // The browser is a stdio server the runner adds; OpenCode's Code Mode
+    // gate and its tools line need its name too.
+    this.sessionServers = new Set([...mcpServers.map(server => server.name), ...(browser ? [BROWSER_MCP_SERVER_NAME] : [])]);
+    const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession(
+      this.sessionRequest(prepared.cwd, mcpServers, references, browser), lifecycle));
+    await this.adoptCreated(created, lifecycle !== undefined, reserved);
+    const readyProjection = await this.registerReadiness(created);
+    await this.announceReady(created, readyProjection);
+    return { acpSessionRef: created.acpSessionRef, resumed: created.resumed };
+  }
+
+  /** Core's claim-bound local inputs, verified against this assignment; binds the session channel. */
+  private async prepareSessionInputs(): Promise<{ prepared: PreparedSessionInputs; binding: RemoteTransferBinding }> {
     this.deps.assertExecutionOwned?.();
-    if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+    if (this.closed) throw sessionClosed();
     let prepared: PreparedSessionInputs;
     try { prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs(this.assignment)); }
     catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
     this.deps.assertExecutionOwned?.();
-    const parsedBinding = RemoteTransferBindingSchema.safeParse(prepared.binding);
-    if (!parsedBinding.success) throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
-    const binding = parsedBinding.data;
-    if (binding.workspaceId !== this.assignment.workspaceId || binding.assignmentId !== this.assignment.id || binding.attempt !== this.assignment.attempt || binding.instanceId !== this.assignment.instanceId || binding.instanceId !== this.deps.instanceId ||
-        (continuedSession(this.assignment.source) !== null && binding.sessionId !== continuedSession(this.assignment.source)!.sessionId) || !isAbsolute(prepared.cwd) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(prepared.cwd)) {
-      throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
-    }
+    const binding = this.verifiedBinding(prepared);
     this.preparedInputs = prepared;
     // Input preparation verifies Core's claim-bound selection. Use its logical
     // session identity, never a bridge ref or an assignment-local random ID.
     this.boundChannelId = `session:${binding.sessionId}`;
-    if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-    const mcpServers: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }> = [];
-    // A direct session is the person's own agent with nothing of Konteks in
-    // it (runtime-view R11, R14): no platform tools even when a capability
-    // is named, no preview or browser (not a preview kind), no result tool.
-    const direct = isDirectAssignment(this.assignment);
-    if (this.assignment.agentRoute.mcpCapabilityTokenRef && !direct) {
-      const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
-      this.deps.assertExecutionOwned?.();
-      const facade = new McpCapabilityFacade({
-        initial: issue,
-        ...(this.deps.mcpLocalTransport ? { localTransport: this.deps.mcpLocalTransport } : {}),
-        initiallyInactive: true,
-        renew: () => {
-          this.deps.assertExecutionOwned?.();
-          if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
-          return this.deps.redeemCapabilityToken(this.assignment);
-        },
-        onUnavailable: () => this.close("agent_exited"),
-        // Core's answer to environment_open is the only thing that widens
-        // this session's browser, and only to what Core named.
-        onBrowserAccess: grant => { this.browserGateway?.grant(grant.origins, grant.kind); },
-        context: {
-          assignmentId: this.assignment.id,
-          attempt: this.assignment.attempt,
-          sessionId: binding.sessionId,
-        },
-        logger: this.logger,
-        now: () => this.deps.clock.coreNow(),
-      });
-      this.mcpFacade = facade;
-      mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
+    if (this.closed) throw sessionClosed();
+    return { prepared, binding };
+  }
+
+  private verifiedBinding(prepared: PreparedSessionInputs): RemoteTransferBinding {
+    const parsed = RemoteTransferBindingSchema.safeParse(prepared.binding);
+    if (!parsed.success || !this.bindingMatches(parsed.data, prepared.cwd)) {
+      throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
     }
+    return parsed.data;
+  }
+
+  /** The binding is this assignment's (and this computer's), in its continued session, with a plain absolute working copy. */
+  private bindingMatches(binding: RemoteTransferBinding, cwd: string): boolean {
+    const continued = continuedSession(this.assignment.source);
+    return allEqual([
+      [binding.workspaceId, this.assignment.workspaceId], [binding.assignmentId, this.assignment.id], [binding.attempt, this.assignment.attempt],
+      [binding.instanceId, this.assignment.instanceId], [binding.instanceId, this.deps.instanceId],
+    ]) && (continued === null || binding.sessionId === continued.sessionId) && isAbsolute(cwd) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(cwd);
+  }
+
+  /** The platform tools, through a session-scoped loopback facade that holds Core's bearer. */
+  private async startCapabilityFacade(sessionId: string, direct: boolean, mcpServers: SessionMcpServer[]): Promise<void> {
+    if (!this.assignment.agentRoute.mcpCapabilityTokenRef || direct) return;
+    const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
+    this.deps.assertExecutionOwned?.();
+    const facade = new McpCapabilityFacade({
+      initial: issue,
+      ...(this.deps.mcpLocalTransport ? { localTransport: this.deps.mcpLocalTransport } : {}),
+      initiallyInactive: true,
+      renew: () => {
+        this.deps.assertExecutionOwned?.();
+        if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
+        return this.deps.redeemCapabilityToken(this.assignment);
+      },
+      onUnavailable: () => this.close("agent_exited"),
+      // Core's answer to environment_open is the only thing that widens
+      // this session's browser, and only to what Core named.
+      onBrowserAccess: grant => { this.browserGateway?.grant(grant.origins, grant.kind); },
+      context: {
+        assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt,
+        sessionId,
+      },
+      logger: this.logger,
+      now: () => this.deps.clock.coreNow(),
+    });
+    this.mcpFacade = facade;
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
+  }
+
+  /** The preview tools (and the browser, when this computer has one) for a kind of work that runs a preview. */
+  private async startPreviewTools(sessionId: string, cwd: string, mcpServers: SessionMcpServer[]): Promise<SessionBrowser | undefined> {
     const preview = this.deps.preview;
-    let browser: { proxyUrl: string; outputDir: string; browsersPath: string } | undefined;
-    if (preview && PREVIEW_WORK_KINDS.has(this.assignment.kind)) {
-      const sessionId = binding.sessionId;
-      const cwd = prepared.cwd;
-      // The session's browser: the connector's, for every agent when the
-      // connector has one (Claude Code and Codex run their own package's,
-      // DeepSeek Harness and OpenCode the connector's), reaching only this
-      // session's running preview through its own gateway.
-      const browserVersion = this.deps.runner.browserVersion?.() ?? null;
-      if (browserVersion !== null && preview.origin && preview.browsersPath) {
-        const origin = preview.origin.bind(preview);
-        const gateway = new PreviewBrowserGateway({
-          target: () => origin(sessionId),
-          onActivity: () => preview.touch(sessionId),
-          logger: this.logger,
-          context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
-        });
-        this.browserGateway = gateway;
-        const proxyUrl = await this.bootstrapStage("browser_gateway", () => gateway.start());
-        this.browserOutputDir = await mkdtemp(join(tmpdir(), "konteks-browser-"));
-        browser = { proxyUrl, outputDir: this.browserOutputDir, browsersPath: preview.browsersPath };
-      }
-      const tools = new PreviewMcpServer({
-        start: () => preview.start(sessionId, cwd),
-        stop: () => preview.stop(sessionId, "agent"),
-        status: () => preview.status(sessionId),
-      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, browser: browser !== undefined });
-      this.previewTools = tools;
-      this.previewSessionId = sessionId;
-      // A viewer may start this worktree's preview too (the same process
-      // manager and inference as preview_start).
-      preview.permit?.(sessionId, cwd);
-      mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
-    }
-    // The turn result tool: every Konteks session gets it, so a turn that asks
-    // for a structured result can be answered through a validated tool call.
-    // A direct turn asks for none: it ends on the agent's own end_turn.
-    if (!direct) {
-      const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
-      this.resultTools = resultTools;
-      mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
-    }
-    // Optional tool wiring (Graft) ran alongside redemption and the facade.
-    // The agent must find it in place, and the ownership commit below must
-    // stay a short step from runner adoption, so settle it here. It never
-    // rejects: a failed wiring is logged and the delivery continues.
-    if (this.preparedInputs?.toolWiring) {
-      await this.bootstrapStage("tool_wiring_wait", () => this.preparedInputs!.toolWiring!);
-      this.deps.assertExecutionOwned?.();
-      if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-    }
-    // Keep every fallible cloud/file input ahead of the local ownership
-    // commit. Once activation succeeds, only local channel reservation and
-    // runner adoption stand between the old and new ACP generations.
+    if (!preview || !PREVIEW_WORK_KINDS.has(this.assignment.kind)) return undefined;
+    const browser = await this.startBrowserGateway(preview, sessionId);
+    const tools = new PreviewMcpServer({
+      start: () => preview.start(sessionId, cwd),
+      stop: () => preview.stop(sessionId, "agent"),
+      status: () => preview.status(sessionId),
+    }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, browser: browser !== undefined });
+    this.previewTools = tools;
+    this.previewSessionId = sessionId;
+    // A viewer may start this worktree's preview too (the same process
+    // manager and inference as preview_start).
+    preview.permit?.(sessionId, cwd);
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
+    return browser;
+  }
+
+  /**
+   * The session's browser: the connector's, for every agent when the
+   * connector has one (Claude Code and Codex run their own package's,
+   * DeepSeek Harness and OpenCode the connector's), reaching only this
+   * session's running preview through its own gateway.
+   */
+  private async startBrowserGateway(preview: SessionPreviewAccess, sessionId: string): Promise<SessionBrowser | undefined> {
+    const browserVersion = this.deps.runner.browserVersion?.() ?? null;
+    if (browserVersion === null || !preview.origin || !preview.browsersPath) return undefined;
+    const origin = preview.origin.bind(preview);
+    const gateway = new PreviewBrowserGateway({
+      target: () => origin(sessionId),
+      onActivity: () => preview.touch(sessionId),
+      logger: this.logger,
+      context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+    });
+    this.browserGateway = gateway;
+    const proxyUrl = await this.bootstrapStage("browser_gateway", () => gateway.start());
+    this.browserOutputDir = await mkdtemp(join(tmpdir(), "konteks-browser-"));
+    return { proxyUrl, outputDir: this.browserOutputDir, browsersPath: preview.browsersPath };
+  }
+
+  private async startResultTool(mcpServers: SessionMcpServer[]): Promise<void> {
+    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+    this.resultTools = resultTools;
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
+  }
+
+  /**
+   * Optional tool wiring (Graft) ran alongside redemption and the facade.
+   * The agent must find it in place, and the ownership commit below must
+   * stay a short step from runner adoption, so settle it here. It never
+   * rejects: a failed wiring is logged and the delivery continues.
+   */
+  private async awaitToolWiring(): Promise<void> {
+    if (!this.preparedInputs?.toolWiring) return;
+    await this.bootstrapStage("tool_wiring_wait", () => this.preparedInputs!.toolWiring!);
+    this.deps.assertExecutionOwned?.();
+    if (this.closed) throw sessionClosed();
+  }
+
+  /**
+   * Keep every fallible cloud/file input ahead of the local ownership
+   * commit. Once activation succeeds, only local channel reservation and
+   * runner adoption stand between the old and new ACP generations.
+   */
+  private async activate(): Promise<ExecutionActivation | undefined> {
     const activation = this.deps.activateExecution
       ? await this.bootstrapStage("activation", () => this.deps.activateExecution!())
       : undefined;
     this.deps.assertExecutionOwned?.();
-    if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-    if (this.mcpFacade && this.deps.recordMcpLocalTransport) {
-      await this.bootstrapStage("mcp_transport_identity", () => this.deps.recordMcpLocalTransport!(this.mcpFacade!.localTransportIdentity()));
-      this.deps.assertExecutionOwned?.();
-    }
+    if (this.closed) throw sessionClosed();
+    await this.recordTransportIdentity();
     if (this.boundChannelId !== null && this.deps.reserveChannel) {
       this.releaseChannel = this.deps.reserveChannel(this.boundChannelId, this);
     }
-    const source = this.assignment.source;
+    return activation;
+  }
+
+  private async recordTransportIdentity(): Promise<void> {
+    if (!this.mcpFacade || !this.deps.recordMcpLocalTransport) return;
+    await this.bootstrapStage("mcp_transport_identity", () => this.deps.recordMcpLocalTransport!(this.mcpFacade!.localTransportIdentity()));
+    this.deps.assertExecutionOwned?.();
+  }
+
+  /** The provider session to continue or restore, checked against the retained transport; then the facade opens. */
+  private async chosenReferences(activation: ExecutionActivation | undefined): Promise<SessionReferences> {
+    const references = this.referencesFor(activation);
+    this.assertTransportReference(references);
+    await this.assertLegacyCodexThread(references);
+    this.mcpFacade?.enable();
+    if (this.closed) throw sessionClosed();
+    this.deps.assertExecutionOwned?.();
+    return references;
+  }
+
+  /**
+   * A live in-process owner is strictly stronger than Core's restart-only
+   * restore fallback. Passing both references is ambiguous and rejected by
+   * the native runner; once live continuation wins, suppress the fallback.
+   */
+  private referencesFor(activation: ExecutionActivation | undefined): SessionReferences {
     const priorRef = activation?.continueReference ?? this.deps.continueReference;
-    // A live in-process owner is strictly stronger than Core's restart-only
-    // restore fallback. Passing both references is ambiguous and rejected by
-    // the native runner; once live continuation wins, suppress the fallback.
-    const restoreRef = priorRef === undefined
-      ? activation?.restoreReference ?? this.deps.restoreReference
-      : undefined;
-    if (this.deps.mcpLocalTransportReference && priorRef !== this.deps.mcpLocalTransportReference && restoreRef !== this.deps.mcpLocalTransportReference) {
+    const restoreRef = priorRef === undefined ? activation?.restoreReference ?? this.deps.restoreReference : undefined;
+    return { priorRef, restoreRef };
+  }
+
+  private assertTransportReference({ priorRef, restoreRef }: SessionReferences): void {
+    const retained = this.deps.mcpLocalTransportReference;
+    if (retained && priorRef !== retained && restoreRef !== retained) {
       throw new RemoteInstanceError("recovery_required", "The retained MCP transport does not belong to the chosen provider session.",
         { diagnostic: "mcp_transport_reference_mismatch" });
     }
-    if (this.assignment.agentRoute.agentId === "codex" && this.assignment.agentRoute.mcpCapabilityTokenRef &&
-        (priorRef || restoreRef) && !this.deps.mcpLocalTransport) {
-      const legacyReference = priorRef ?? restoreRef!;
-      const unloaded = await this.deps.assertLegacyCodexThreadUnloaded?.(legacyReference).catch(() => false);
-      if (!unloaded) throw new RemoteInstanceError("recovery_required", "The retained Codex thread cannot safely refresh its local MCP transport.",
-        { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
-    }
-    this.mcpFacade?.enable();
-    if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-    this.deps.assertExecutionOwned?.();
-    let reservedRef: string | undefined;
-    const lifecycle = this.deps.reserveExecutionReference ? {
+  }
+
+  /** A Codex thread from before the retained local transport must not be loaded while its MCP transport is refreshed. */
+  private async assertLegacyCodexThread({ priorRef, restoreRef }: SessionReferences): Promise<void> {
+    if (!this.legacyCodexTransport(priorRef || restoreRef)) return;
+    const legacyReference = priorRef ?? restoreRef!;
+    const unloaded = await this.deps.assertLegacyCodexThreadUnloaded?.(legacyReference).catch(() => false);
+    if (!unloaded) throw new RemoteInstanceError("recovery_required", "The retained Codex thread cannot safely refresh its local MCP transport.",
+      { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
+  }
+
+  private legacyCodexTransport(reference: string | undefined): boolean {
+    return this.assignment.agentRoute.agentId === "codex" && Boolean(this.assignment.agentRoute.mcpCapabilityTokenRef) &&
+      Boolean(reference) && !this.deps.mcpLocalTransport;
+  }
+
+  /** Durable reference and process ownership around the runner's session creation. */
+  private sessionLifecycle(reserved: { ref?: string }): RunnerSessionLifecycle | undefined {
+    if (!this.deps.reserveExecutionReference) return undefined;
+    return {
       beforeCreate: async (ref: string) => {
         await this.deps.reserveExecutionReference!(ref);
-        reservedRef = ref;
+        reserved.ref = ref;
         // This is an opaque ownership reservation, NOT a confirmed bridge
         // creation. Unknown creation still fails the runner settlement lookup.
         this.acpSessionRef = ref;
@@ -478,72 +550,103 @@ export class RelayedSession {
         if (!this.deps.replaceExecutionProcessOwner) throw new RemoteInstanceError("recovery_required", "Durable bootstrap process-owner replacement is unavailable.");
         await this.deps.replaceExecutionProcessOwner(previous, replacement);
       },
-      assertCurrent: () => {
-        // The runner's recovery stop asserts this fence first. The fence is
-        // this session's own recovery mark, not a stale owner, so answer with
-        // admission ownership for that one settlement operation only.
-        if (this.recoverySettlementInProgress) return void this.assertRecoveryOwned();
-        if (this.closed && !this.completedSettlementInProgress) {
-          throw new RemoteInstanceError("recovery_required", "Session generation is fenced.", { diagnostic: "session_generation_fenced" });
-        }
-        this.deps.assertExecutionOwned?.();
-      },
-    } : undefined;
-    // The browser is a stdio server the runner adds; OpenCode's Code Mode
-    // gate and its tools line need its name too.
-    this.sessionServers = new Set([...mcpServers.map(server => server.name), ...(browser ? [BROWSER_MCP_SERVER_NAME] : [])]);
-    const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession({
+      assertCurrent: () => this.assertLifecycleCurrent(),
+    };
+  }
+
+  /**
+   * The runner's recovery stop asserts this fence first. The fence is this
+   * session's own recovery mark, not a stale owner, so answer with admission
+   * ownership for that one settlement operation only.
+   */
+  private assertLifecycleCurrent(): void {
+    if (this.recoverySettlementInProgress) return void this.assertRecoveryOwned();
+    if (this.closed && !this.completedSettlementInProgress) {
+      throw new RemoteInstanceError("recovery_required", "Session generation is fenced.", { diagnostic: "session_generation_fenced" });
+    }
+    this.deps.assertExecutionOwned?.();
+  }
+
+  private sessionRequest(cwd: string, mcpServers: SessionMcpServer[], { priorRef, restoreRef }: SessionReferences, browser: SessionBrowser | undefined): RunnerSessionInput {
+    return {
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
-      cwd: prepared.cwd,
+      cwd,
       mcpServers,
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
-      ...(restoreRef ? { restoreAcpSessionRef: restoreRef } : {}),
-      // A conversation's context is Konteks's to restage; a direct session's is
-      // only the agent's own transcript, so that one is loaded.
-      ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
-      // A person's direct session keeps the agent's own title behind "[konteks] ";
-      // engineering work is named from Core's label (D130).
-      ...(isDirectAssignment(this.assignment) ? { agentTitled: true as const }
-        : this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
+      ...this.restoreOptions(restoreRef),
+      ...this.titleOptions(),
       ...(browser ? { browser } : {}),
-    }, lifecycle));
+    };
+  }
+
+  /**
+   * A conversation's context is Konteks's to restage; a direct session's is
+   * only the agent's own transcript, so that one is loaded.
+   */
+  private restoreOptions(restoreRef: string | undefined): Partial<RunnerSessionInput> {
+    if (!restoreRef) return {};
+    const fresh = this.assignment.source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code";
+    return { restoreAcpSessionRef: restoreRef, ...(fresh ? { freshProviderSessionOnRestore: true } : {}) };
+  }
+
+  /** A person's direct session keeps the agent's own title behind "[konteks] "; engineering work is named from Core's label. */
+  private titleOptions(): Partial<RunnerSessionInput> {
+    if (isDirectAssignment(this.assignment)) return { agentTitled: true as const };
+    return this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {};
+  }
+
+  /** The runner created the session: it must keep the reserved reference, and a session closed meanwhile is closed again. */
+  private async adoptCreated(created: RunnerSessionCreated, reserving: boolean, reserved: { ref?: string }): Promise<void> {
     this.creationReturned = true;
-    if (lifecycle && reservedRef !== created.acpSessionRef) throw new RemoteInstanceError("recovery_required", "Runner did not preserve durable reference ownership.");
+    if (reserving && reserved.ref !== created.acpSessionRef) throw new RemoteInstanceError("recovery_required", "Runner did not preserve durable reference ownership.");
     this.acpSessionRef = created.acpSessionRef;
     this.deps.assertExecutionOwned?.();
     if (this.closed) {
-      if (!this.recoveryStopping) {
-        await this.deps.runner.cancel(created.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-        await this.deps.runner.closeSession(created.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-      }
-      throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+      await this.abandonCreated(created.acpSessionRef);
+      throw sessionClosed();
     }
-    let readyProjection: Pick<RemoteExecutionReadyResult, "attempt" | "recoveryEpoch" | "readyRevision"> | undefined;
+  }
+
+  /** Cancel and close a session this bootstrap created but cannot keep (unless recovery owns stopping it). */
+  private async abandonCreated(ref: string): Promise<void> {
+    if (this.recoveryStopping) return;
+    await this.deps.runner.cancel(ref).catch(() => undefined);
+    this.deps.assertExecutionOwned?.();
+    await this.deps.runner.closeSession(ref).catch(() => undefined);
+    this.deps.assertExecutionOwned?.();
+  }
+
+  /** Core registers the created session as ready, for exactly the prepared binding and channel. */
+  private async registerReadiness(created: RunnerSessionCreated): Promise<ReadyProjection> {
     try {
       const binding = this.preparedInputs!.binding;
       const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("readiness", () =>
         this.deps.registerReady(this.assignment, binding, created.acpSessionRef)));
       this.deps.assertExecutionOwned?.();
-      if (ready.workspaceId !== binding.workspaceId || ready.instanceId !== binding.instanceId || ready.sessionId !== binding.sessionId || ready.assignmentId !== binding.assignmentId || ready.attempt !== binding.attempt ||
-          ready.agentId !== this.assignment.agentRoute.agentId || ready.acpSessionRef !== created.acpSessionRef || ready.channelId !== this.boundChannelId) {
+      if (!this.readyMatches(ready, binding, created.acpSessionRef)) {
         throw new RemoteInstanceError("workspace_binding_invalid", "Core readiness does not match the prepared local session.");
       }
-      if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-      readyProjection = { attempt: ready.attempt, recoveryEpoch: ready.recoveryEpoch, readyRevision: ready.readyRevision };
+      if (this.closed) throw sessionClosed();
+      return { attempt: ready.attempt, recoveryEpoch: ready.recoveryEpoch, readyRevision: ready.readyRevision };
     } catch (error) {
       this.deps.assertExecutionOwned?.();
-      if (!this.recoveryStopping) {
-        await this.deps.runner.cancel(created.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-        await this.deps.runner.closeSession(created.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-      }
+      await this.abandonCreated(created.acpSessionRef);
       throw error;
     }
+  }
+
+  private readyMatches(ready: RemoteExecutionReadyResult, binding: RemoteTransferBinding, acpSessionRef: string): boolean {
+    return allEqual([
+      [ready.workspaceId, binding.workspaceId], [ready.instanceId, binding.instanceId], [ready.sessionId, binding.sessionId],
+      [ready.assignmentId, binding.assignmentId], [ready.attempt, binding.attempt], [ready.agentId, this.assignment.agentRoute.agentId],
+      [ready.acpSessionRef, acpSessionRef], [ready.channelId, this.boundChannelId],
+    ]);
+  }
+
+  /** Open the session channel and announce `session_ready`; a delivery resumes any durable output it left. */
+  private async announceReady(created: RunnerSessionCreated, readyProjection: ReadyProjection): Promise<void> {
     if (this.boundChannelId === null) throw new RemoteInstanceError("workspace_binding_invalid", "The session channel has no authorized binding.");
     this.deps.assertExecutionOwned?.();
     this.deps.transport.openChannel(this.boundChannelId, "session");
@@ -555,7 +658,6 @@ export class RelayedSession {
           code: error instanceof RemoteInstanceError ? error.code : "delivery_output_recovery_failed" }, "durable delivery output recovery stopped");
       });
     }
-    return { acpSessionRef: created.acpSessionRef, resumed: created.resumed };
   }
 
   private deliveryAuthority(requestId: string) {
@@ -1610,6 +1712,27 @@ export class RelayedSession {
   }
 
   waitForAuthorityStop(): Promise<void> { return this.executionGate?.waitForAuthorityStop() ?? Promise.resolve(); }
+}
+
+type SessionMcpServer = { type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> };
+type SessionBrowser = { proxyUrl: string; outputDir: string; browsersPath: string };
+type SessionReferences = { priorRef: string | undefined; restoreRef: string | undefined };
+type ExecutionActivation = Awaited<ReturnType<NonNullable<RelayedSessionDeps["activateExecution"]>>>;
+type ReadyProjection = Pick<RemoteExecutionReadyResult, "attempt" | "recoveryEpoch" | "readyRevision">;
+
+function sessionClosed(): RemoteInstanceError {
+  return new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+}
+
+/**
+ * Why a bootstrap stage failed, without copying provider/Core error messages
+ * into logs: the stable code and retryability, and for an unknown error its
+ * class and, for an agent's JSON-RPC refusal, its numeric code.
+ */
+function stageFailure(error: unknown): Record<string, unknown> {
+  if (error instanceof RemoteInstanceError) return { code: error.code, retryable: error.retryable, ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}) };
+  const rpcCode = (error as { code?: unknown } | null)?.code;
+  return { code: "unexpected_error", retryable: false, ...(error instanceof Error ? { errorName: error.name } : {}), ...(typeof rpcCode === "number" ? { rpcCode } : {}) };
 }
 
 /** A refused session update's kind for the log, only when it reads as an ACP update name. */
