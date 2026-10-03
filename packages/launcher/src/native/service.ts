@@ -419,7 +419,6 @@ function windowsServiceHost(input: { executable: string; root: string; logFile: 
 function assertPath(value: string, os: HostOs): void {
   if (!(os === "windows" ? win32 : posix).isAbsolute(value)) throw new Error("native install paths must be absolute");
   // Reject control bytes deliberately; they can inject service-definition lines.
-  // eslint-disable-next-line no-control-regex
   if (/[\x00-\x1f\x7f]/.test(value)) throw new Error("control characters are not allowed in native install paths");
 }
 

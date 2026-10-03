@@ -44,7 +44,6 @@ export function sanitizeElicitationRequest(request: CreateElicitationRequest): S
   return { kind: "elicitation", requestDigest: jcsDigest(params as unknown as JsonValue), isSignIn: isSignInElicitation(request), params };
 }
 
-// eslint-disable-next-line no-control-regex
 const CONTROL_AND_DIRECTIONAL = /[\x00-\x1f\x7f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
 function plainText(value: string, max: number): string {

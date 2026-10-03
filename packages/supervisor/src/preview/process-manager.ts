@@ -454,7 +454,6 @@ export class PreviewProcessManager {
   }
 
   private appendLog(entry: Entry, line: string): void {
-    // eslint-disable-next-line no-control-regex
     const clean = line.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").trimEnd();
     if (clean.length === 0) return;
     entry.logs.push(clean.length > LOG_LINE_CHARS ? `${clean.slice(0, LOG_LINE_CHARS)}…` : clean);

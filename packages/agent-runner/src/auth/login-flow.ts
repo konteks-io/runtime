@@ -51,8 +51,7 @@ const USER_CODE_PATTERN = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/;
 const PROMPT_PATTERN = /(?:paste|enter|input|type)[^\n]*(?:code|token|key|url)[^\n]*[:?]\s*$/i;
 // Codex colours its device link and one-time code. Left in, the escape after
 // the link became part of the URL Konteks showed, and the one before the code
-// hid it from USER_CODE_PATTERN's word boundary (WS1-115).
-// eslint-disable-next-line no-control-regex
+// hid it from USER_CODE_PATTERN's word boundary.
 const TERMINAL_ESCAPE = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b[@-_]/g;
 
 export function withoutTerminalEscapes(line: string): string {

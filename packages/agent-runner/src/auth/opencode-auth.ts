@@ -670,7 +670,6 @@ function findIntegration(integrations: readonly OpenCodeIntegration[], value: st
  * redraw is one short line the relay can de-duplicate.
  */
 export function splitTerminalOutput(chunk: string): string[] {
-  // eslint-disable-next-line no-control-regex
   const marked = chunk.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b[@-_]/g, "\n");
   return withoutTerminalEscapes(marked).split(/\r\n|\r|\n/).map(line => line.trimEnd()).filter(line => line.length > 0);
 }
