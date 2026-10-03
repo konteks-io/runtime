@@ -11,7 +11,7 @@ import {
   type IntegrationTaskResult,
   type IntegrationTaskSpec,
 } from "@konteks/backstage-plugin-common";
-import { RemoteInstanceError, createLogger, type AgentTurnUsageObservation, type Logger, type RemoteWorkAssignment } from "@konteks/remote-common";
+import { RemoteInstanceError, createLogger, plainRecord, type AgentTurnUsageObservation, type Logger, type RemoteWorkAssignment } from "@konteks/remote-common";
 import type { RunnerEvent } from "@konteks/remote-agent-runner";
 import type { RunnerPort, RunnerSessionInput } from "../runner-port.js";
 import { McpToolCallLedger } from "../session/permission-tool-identity.js";
@@ -39,9 +39,6 @@ type TurnEnd = { kind: "result" } | { kind: "error"; class: string } | { kind: "
 
 const TERMINAL = new Set(["completed", "failed"]);
 
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
 
 /** The text of an ACP tool result: the structured `rawOutput` when the agent gives one, else its text content blocks. */
 function toolResultText(update: Record<string, unknown>): string | null {
@@ -56,7 +53,7 @@ function jsonText(value: unknown): string | null {
 }
 
 function blockText(block: unknown): string | null {
-  const inner = record(record(block)?.content);
+  const inner = plainRecord(plainRecord(block)?.content);
   return inner?.type === "text" && typeof inner.text === "string" ? inner.text : null;
 }
 
@@ -80,7 +77,7 @@ function sourceFitsAgent(agentId: string, kind: IntegrationSource["kind"]): bool
 }
 
 function compiledResultSchema(spec: IntegrationTaskSpec): Record<string, unknown> {
-  const resultSchema = record(spec.resultSchema);
+  const resultSchema = plainRecord(spec.resultSchema);
   try {
     if (!resultSchema) throw new Error("not an object");
     compileResultSchema(resultSchema);
@@ -261,7 +258,7 @@ export class IntegrationSession {
   }
 
   private async handle(event: RunnerEvent): Promise<void> {
-    if (event.kind === "session_update") return this.observe(record(record(event.params)?.update));
+    if (event.kind === "session_update") return this.observe(plainRecord(plainRecord(event.params)?.update));
     if (event.kind === "permission_request") return this.answerPermission(event.requestId, event.params as RequestPermissionRequest);
     // A provider asking for a sign-in or a form is never answered here.
     if (event.kind === "elicitation_request") return void await this.deps.runner.answer(this.acpSessionRef!, event.requestId, { action: "decline" }).catch(() => undefined);
@@ -306,9 +303,9 @@ export class IntegrationSession {
   }
 
   private trackMcpCall(update: Record<string, unknown>, id: string): void {
-    const meta = record(update._meta);
-    const claudeTool = record(meta?.claudeCode)?.toolName;
-    const codexServer = record(update.rawInput)?.server;
+    const meta = plainRecord(update._meta);
+    const claudeTool = plainRecord(meta?.claudeCode)?.toolName;
+    const codexServer = plainRecord(update.rawInput)?.server;
     if (isMcpCall(meta, claudeTool) && !isOwnResultCall(codexServer, claudeTool)) this.mcpCalls.add(id);
   }
 

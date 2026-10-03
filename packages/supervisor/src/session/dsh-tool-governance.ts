@@ -1,9 +1,9 @@
-import { isAbsolute, resolve } from "node:path";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { BROWSER_MCP_SERVER_NAME, DSH_READ_ONLY_TOOLS, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
+import { resolveIn } from "./host-decisions.js";
 
 /**
- * Permission parity for DeepSeek Harness (dsh-runtime-support CP3).
+ * Permission parity for DeepSeek Harness.
  *
  * dsh reports every tool call as ACP kind `other`, titled with its own tool
  * name, and its `session/request_permission` carries only the tool call id
@@ -86,7 +86,7 @@ function editPath(rawInput: Record<string, unknown>): string | undefined {
 
 function editDecision(request: RequestPermissionRequest, toolCallId: string, title: string, path: string | undefined, cwd: string): DshPermissionDecision {
   if (path === undefined || path.length === 0) return { kind: "deny", reason: `${title} call has no path to judge` };
-  const filePath = isAbsolute(path) ? path : resolve(cwd, path);
+  const filePath = resolveIn(cwd, path);
   return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "edit", title, rawInput: { file_path: filePath } } } };
 }
 

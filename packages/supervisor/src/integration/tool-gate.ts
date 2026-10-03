@@ -7,7 +7,7 @@ import {
   type IntegrationTaskSpec,
   type IntegrationToolCallRecord,
 } from "@konteks/backstage-plugin-common";
-import { RemoteInstanceError } from "@konteks/remote-common";
+import { RemoteInstanceError, plainRecord } from "@konteks/remote-common";
 import { STRUCTURED_RESULT_MCP_SERVER_NAME, STRUCTURED_RESULT_TOOL_NAME } from "../structured-result/result-tool-server.js";
 import { permissionToolIdentity, type McpToolCallLedger, type PermissionToolIdentity } from "../session/permission-tool-identity.js";
 import type { IntegrationWriteRecord, SupervisorJournal } from "../state/journal.js";
@@ -75,9 +75,6 @@ const token = (value: string, pattern: RegExp, fallback: string): string => {
   return pattern.test(cleaned) ? cleaned : fallback;
 };
 
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
 
 function safeDigest(args: unknown): string {
   try { return argsDigest(args); } catch { return argsDigest(null); }
@@ -175,7 +172,7 @@ export class IntegrationToolGate {
     if (identity.server === STRUCTURED_RESULT_MCP_SERVER_NAME) {
       return identity.tool !== STRUCTURED_RESULT_TOOL_NAME || allowOnce === null ? deny("not_admitted") : { kind: "allow", optionId: allowOnce };
     }
-    const args = this.deps.agentId === "codex" ? this.deps.ledger.arguments(toolCallId) : record(request.toolCall)?.rawInput;
+    const args = this.deps.agentId === "codex" ? this.deps.ledger.arguments(toolCallId) : plainRecord(request.toolCall)?.rawInput;
     const call = { server: identity.server, tool: identity.tool, args };
     const repeated = this.allowed.get(toolCallId);
     if (repeated) return repeatedGrant(repeated, call, allowOnce, deny);

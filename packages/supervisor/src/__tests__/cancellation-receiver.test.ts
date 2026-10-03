@@ -17,6 +17,15 @@ const deliveryWork = { kind: "validation" as const, agentRoute: { requiredRole: 
   source: { kind: "harness_delivery" as const, portability: "instance_bound" as const, ownerInstanceId: "instance",
     executionSessionId: "session", repositoryId: "https://git.example.com/acme/store",
     modelBinding: { canonicalProviderId: "openai", canonicalModelId: "model" }, turn: { invocationId: "qa-run", dispatchGeneration: 0 } } };
+/** The admitted assignment's kind, route and source: a conversation turn unless a delivery is given. */
+function admittedWork(work: typeof deliveryWork | undefined) {
+  if (work === undefined) {
+    return { kind: "assistant_execution", correlationId: "correlation", agentRoute: { requiredRole: "assistant", agentId: "codex" },
+      source: { kind: "conversation", portability: "portable_before_claim", sessionId: "session", turnRef: "turn" } };
+  }
+  return { kind: work.kind, correlationId: work.source.turn.invocationId, agentRoute: work.agentRoute, source: work.source };
+}
+
 async function fixture(core?: CoreClient, onPersisted?: (record: CancellationInboxRecord) => void, work?: typeof deliveryWork) {
   const journal = new SupervisorJournal(dir); await journal.load();
   const key = generateEd25519();
@@ -29,10 +38,8 @@ async function fixture(core?: CoreClient, onPersisted?: (record: CancellationInb
   await journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1,
     admission: { instanceId: "instance", workspaceId: "tenant", runnerIncarnation: "runner", assignmentId: "assignment",
       attempt: 1, claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: seed.createdAt },
-    assignment: { id: "assignment", kind: work?.kind ?? "assistant_execution", placementId: "placement", instanceId: "instance", workspaceId: "tenant",
-      taskId: "turn", correlationId: work?.source.turn.invocationId ?? "correlation", attempt: 1, expiresAt: new Date(now + 60000).toISOString(), requiredCapabilities: [],
-      agentRoute: work?.agentRoute ?? { requiredRole: "assistant", agentId: "codex" },
-      source: work?.source ?? { kind: "conversation", portability: "portable_before_claim", sessionId: "session", turnRef: "turn" },
+    assignment: { id: "assignment", placementId: "placement", instanceId: "instance", workspaceId: "tenant",
+      taskId: "turn", attempt: 1, expiresAt: new Date(now + 60000).toISOString(), requiredCapabilities: [], ...admittedWork(work),
       policy: { maxDurationSeconds: 60, maxArtifactBytes: 1, evidenceUpload: "structured_only", allowedArtifactKinds: [],
         recoveryMode: "report_interrupted", latestResumeAt: new Date(now + 60000).toISOString(), permissionResponderDeadlineSeconds: 60, humanDeferralAllowed: true } },
     evidenceUpload: "structured_only", projectionCreatedAt: seed.createdAt, claimCreatedAt: seed.createdAt }, () => {});

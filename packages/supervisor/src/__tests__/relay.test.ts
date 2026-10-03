@@ -356,17 +356,22 @@ describe("channel mux", () => {
     } finally { gate.resolve(); await Promise.all([assignment, control, ack]); }
   });
 
-  it.each(["future", "grant_on_core", "core_on_session", "supervisor_to_core"])("rejects %s acknowledgements without persisting or freeing replay", async failure => {
+  const ACK_FAILURES: Readonly<Record<string, Record<string, unknown>>> = {
+    future: { cumulativeSeq: 2, origin: "core" },
+    grant_on_core: { origin: "grant_holder", grantId: "grant" },
+    core_on_session: { origin: "core" },
+    supervisor_to_core: { origin: "supervisor", signature: "c2ln" },
+  };
+
+  it.each(Object.keys(ACK_FAILURES))("rejects %s acknowledgements without persisting or freeing replay", async failure => {
     const { mux, persisted } = buildMux();
     await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: [] });
     const channel = failure === "core_on_session" ? "session" : "heartbeat";
     mux.send(channel, channel, heartbeat as never);
     await vi.waitFor(() => expect(persisted.length).toBeGreaterThan(1));
     const before = persisted.length;
-    await mux.receive({ kind: "ack", channelId: channel, connectionEpoch: 1, cumulativeSeq: failure === "future" ? 2 : 1, issuedAt: "2026-09-06T00:00:00Z", dataDirection: "to_core",
-      origin: failure === "grant_on_core" ? "grant_holder" : failure === "supervisor_to_core" ? "supervisor" : "core",
-      ...(failure === "grant_on_core" ? { grantId: "grant" } : {}), ...(failure === "supervisor_to_core" ? { signature: "c2ln" } : {}),
-    });
+    await mux.receive({ kind: "ack", channelId: channel, connectionEpoch: 1, cumulativeSeq: 1, issuedAt: "2026-09-06T00:00:00Z", dataDirection: "to_core",
+      ...ACK_FAILURES[failure] } as never);
     expect(mux.snapshot()[0]?.unacked).toBe(1);
     expect(mux.handshakeCursors()[channel]?.to_core).toBe(0);
     expect(persisted).toHaveLength(before);

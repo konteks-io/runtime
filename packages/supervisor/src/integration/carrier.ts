@@ -48,7 +48,7 @@ export function integrationTerminalResult(outcome: IntegrationWorkOutcome): { cl
   return { class: "succeeded", structuredOutput: outcome.structuredOutput, terminalResultHash: jcsDigest(outcome.structuredOutput as JsonValue) };
 }
 
-/** The agents an integration task can run on: the two with a certified permission gate (Stage 0). */
+/** The agents an integration task can run on: the two with a certified permission gate. */
 const INTEGRATION_AGENT_IDS: ReadonlySet<string> = new Set(["claude-code", "codex"]);
 
 /** `integration-task-v1` for the `agent_runner` component when a Claude Code or Codex runner is installed. */

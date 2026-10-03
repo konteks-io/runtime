@@ -3,6 +3,7 @@ export * from "./parser.js";
 export * from "./errors.js";
 export * from "./defined.js";
 export * from "./equal.js";
+export * from "./record.js";
 export * from "./redaction.js";
 export * from "./logger.js";
 export * from "./clock.js";

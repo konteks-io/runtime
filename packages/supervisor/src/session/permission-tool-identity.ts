@@ -1,8 +1,9 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
+import { plainRecord } from "@konteks/remote-common";
 
 /**
- * Which tool a permission request asks for, read only from structured fields
- * (external-integration Stage 0, S0-4 / invariant N10). A request's `title` is
+ * Which tool a permission request asks for, read only from structured fields.
+ * A request's `title` is
  * display text: Claude Code's shell title is the model-written description,
  * and an MCP tool chooses its own display title, so a title never identifies
  * a tool and never grants anything.
@@ -19,9 +20,6 @@ export type PermissionToolIdentity =
   | { kind: "native"; tool: string }
   | { kind: "unidentified"; mcp: boolean };
 
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
 
 const MAX_NAME = 256;
 const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= MAX_NAME;
@@ -46,8 +44,8 @@ function toolCallUpdate(value: Record<string, unknown> | undefined): value is Re
  * exact arguments of a Codex approval (which names only the id).
  */
 function announcedMcpCall(value: Record<string, unknown>): { server: string; tool: string; arguments?: unknown } | null {
-  if (value.sessionUpdate !== "tool_call" || record(value._meta)?.is_mcp_tool_call !== true) return null;
-  const raw = record(value.rawInput);
+  if (value.sessionUpdate !== "tool_call" || plainRecord(value._meta)?.is_mcp_tool_call !== true) return null;
+  const raw = plainRecord(value.rawInput);
   if (!raw || !nonEmpty(raw.server) || !nonEmpty(raw.tool)) return null;
   return { server: raw.server, tool: raw.tool, ...("arguments" in raw ? { arguments: raw.arguments } : {}) };
 }
@@ -64,7 +62,7 @@ export class McpToolCallLedger {
   constructor(private readonly limit = 512) {}
 
   observe(update: unknown): void {
-    const value = record(update);
+    const value = plainRecord(update);
     if (!toolCallUpdate(value)) return;
     if (value.status === "completed" || value.status === "failed") {
       this.calls.delete(value.toolCallId);
@@ -108,7 +106,7 @@ function claudeMcpIdentity(name: string, servers: ReadonlySet<string> | undefine
 }
 
 export function permissionToolIdentity(request: RequestPermissionRequest, agentId: string, inputs: PermissionIdentityInputs = {}): PermissionToolIdentity {
-  const toolCall = record(request.toolCall) ?? {};
+  const toolCall = plainRecord(request.toolCall) ?? {};
   if (agentId === "claude-code") return claudeIdentity(toolCall, inputs);
   if (agentId === "codex") return codexIdentity(request, toolCall, inputs);
   return { kind: "unidentified", mcp: false };
@@ -116,7 +114,7 @@ export function permissionToolIdentity(request: RequestPermissionRequest, agentI
 
 /** The bridge names the tool in `_meta.claudeCode.toolName`. */
 function claudeIdentity(toolCall: Record<string, unknown>, inputs: PermissionIdentityInputs): PermissionToolIdentity {
-  const toolName = record(record(toolCall._meta)?.claudeCode)?.toolName;
+  const toolName = plainRecord(plainRecord(toolCall._meta)?.claudeCode)?.toolName;
   if (!nonEmpty(toolName)) return { kind: "unidentified", mcp: false };
   return toolName.startsWith("mcp__") ? claudeMcpIdentity(toolName, inputs.sessionServers) : { kind: "native", tool: toolName };
 }
@@ -126,7 +124,7 @@ function claudeIdentity(toolCall: Record<string, unknown>, inputs: PermissionIde
  * carries its server name in rawInput. Both are MCP, never native.
  */
 function codexIdentity(request: RequestPermissionRequest, toolCall: Record<string, unknown>, inputs: PermissionIdentityInputs): PermissionToolIdentity {
-  if (record(request._meta)?.is_mcp_tool_approval === true || typeof record(toolCall.rawInput)?.serverName === "string") return codexMcpIdentity(toolCall, inputs);
+  if (plainRecord(request._meta)?.is_mcp_tool_approval === true || typeof plainRecord(toolCall.rawInput)?.serverName === "string") return codexMcpIdentity(toolCall, inputs);
   return nonEmpty(toolCall.kind) ? { kind: "native", tool: toolCall.kind } : { kind: "unidentified", mcp: false };
 }
 

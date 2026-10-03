@@ -25,7 +25,7 @@ export type PolicyDecision =
 
 /**
  * An MCP server and tools an integration binding admitted into this session
- * (external-integration CP2 seam; Stage 0 admits none). Server names are as
+ * (a seam: no production caller admits any today). Server names are as
  * the agent reports them (`permission-tool-identity.ts`).
  */
 export interface AdmittedMcpTool { server: string; tools: readonly string[] }
@@ -36,7 +36,7 @@ export interface AdmittedMcpTool { server: string; tools: readonly string[] }
  * `sessionServers`: the MCP servers this session gave its agent, by ACP name.
  * `ledger`: the MCP calls Codex announced, which its approvals name only by id.
  * `toolIdentity`: the request's structured tool identity when the caller already read it.
- * `admittedMcpTools`: tools of other servers an integration binding admitted (none in Stage 0).
+ * `admittedMcpTools`: tools of other servers an integration binding admitted (none today).
  */
 export interface PermissionContext {
   assignmentId: string;

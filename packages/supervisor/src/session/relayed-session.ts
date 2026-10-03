@@ -82,8 +82,8 @@ export interface RelayedSessionDeps {
   policy: PolicyResponder;
   /**
    * MCP tools of servers other than the session's own that an integration
-   * binding admitted into this assignment (external-integration CP2 seam).
-   * Absent or empty, as in Stage 0: every other server's tool is refused.
+   * binding admitted into this assignment (a seam no production caller sets
+   * today). Absent or empty: every other server's tool is refused.
    */
   admittedMcpTools?: (assignment: RemoteWorkAssignment) => readonly AdmittedMcpTool[];
   broker: PermissionBroker;
@@ -205,7 +205,7 @@ export class RelayedSession {
   private readonly toolGovernance: HostToolGovernance | null;
   /** The MCP servers this session gave its agent (the only Code Mode namespaces an OpenCode block may call, the only servers Antigravity may reach). */
   private sessionServers: ReadonlySet<string> = new Set();
-  /** Codex's announced MCP calls: its approvals name only the tool call id (S0-4). */
+  /** Codex's announced MCP calls: its approvals name only the tool call id. */
   private readonly mcpCalls: McpToolCallLedger | null;
   /** A governed permission request's tool call and options, until Konteks answers it. */
   private readonly governedPermissions = new Map<string, { toolCallId: string; options: RequestPermissionRequest["options"] }>();
