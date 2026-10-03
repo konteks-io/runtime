@@ -167,11 +167,13 @@ describe("native update staging and commit", () => {
 });
 
 describe("native update transaction", () => {
-  function harness(input: { previous: NativeRuntimeRecord; running?: boolean; gate?: "pass" | "no_answer" | "wrong_version" | "new_failure"; restoreFails?: boolean }) {
+  function harness(input: { previous: NativeRuntimeRecord; running?: boolean; foreground?: boolean; gate?: "pass" | "no_answer" | "wrong_version" | "new_failure"; restoreFails?: boolean }) {
     const running = input.running ?? true;
     const successor: NativeRuntimeRecord = { ...input.previous, releaseId: "release-next", bundleVersion: "1.1.0", manifestDigest: "sha256:next" };
     const calls: string[] = [];
-    let serving: NativeRuntimeRecord | null = running ? input.previous : null;
+    let serving: NativeRuntimeRecord | null = running || input.foreground ? input.previous : null;
+    let managed = running;
+    let receipt: string | null = null;
     const ledger: unknown[] = [];
     const definition = { label: "svc", path: "/svc", contents: "", install: [], start: { command: "start", args: [] }, stop: { command: "stop", args: [] }, remove: [], status: { command: "status", args: [] }, requiresLinger: false };
     const control = (_root: string, record: NativeRuntimeRecord) => ({
@@ -179,6 +181,7 @@ describe("native update transaction", () => {
         calls.push(`control:${request.op}@${record.releaseId}`);
         if (!serving) throw new RemoteInstanceError("temporarily_unavailable", "socket closed");
         switch (request.op) {
+          case "shutdown": serving = null; receipt = "fresh-foreground-shutdown"; return {};
           case "drain": return { activeAssignments: 0 };
           case "drain.status": return { draining: true, reason: "update", activeAssignments: 0, openSessions: 0 };
           case "drain.cancel": return { draining: false, reason: null, activeAssignments: 0, openSessions: 0 };
@@ -193,10 +196,11 @@ describe("native update transaction", () => {
       },
     });
     const deps: NativeUpdateTransactionDeps = {
+      ...(input.foreground ? { readStopReceipt: async () => receipt } : {}),
       readRecord: async () => input.previous,
       serviceDefinition: async () => definition,
-      execute: async command => { calls.push(command.command); if (command.command === "status") return serving ? 0 : 1; if (command.command === "stop") { serving = null; return 0; } return 0; },
-      start: async () => { calls.push("start"); serving = current; if (input.gate === "no_answer" && current.releaseId === "release-next") serving = null; },
+      execute: async command => { calls.push(command.command); if (command.command === "status") return managed && serving ? 0 : 1; if (command.command === "stop") { serving = null; return 0; } return 0; },
+      start: async () => { calls.push("start"); managed = true; serving = current; if (input.gate === "no_answer" && current.releaseId === "release-next") serving = null; },
       control,
       stage: async () => ({ status: "staged", current: input.previous, release: { manifest: { bundleVersion: "1.1.0", digest: "sha256:next" } } as never, releaseId: "release-next", directory: "/releases/release-next" }),
       commit: async () => { calls.push("commit"); current = successor; return successor; },
@@ -213,6 +217,51 @@ describe("native update transaction", () => {
   }
   const previous: NativeRuntimeRecord = { schemaVersion: 1, deploymentKind: "native_connector", instanceId: "instance", workspaceId: "tenant", releaseId: "release-prev", manifestDigest: "sha256:prev", bundleVersion: "1.0.0", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", controlPort: 47_311, agents: ["claude-code"] };
 
+  it("updates a foreground connector through authenticated drain and shutdown before starting its user service", async () => {
+    const h = harness({ previous, running: false, foreground: true });
+    const outcome = await runNativeUpdate({ root: "/root", output: h.output }, h.deps);
+    expect(outcome).toMatchObject({ state: "updated", restarted: true });
+    expect(h.calls).toContain("control:shutdown@release-prev");
+    expect(h.calls).not.toContain("stop");
+    expect(h.calls.indexOf("control:drain.status@release-prev")).toBeLessThan(h.calls.indexOf("control:shutdown@release-prev"));
+    expect(h.calls.indexOf("control:shutdown@release-prev")).toBeLessThan(h.calls.indexOf("commit"));
+    expect(h.calls).toContain("control:doctor@release-next");
+    expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress","applied"]);
+  });
+  it("preserves a foreground connector when its authenticated shutdown is refused", async () => {
+    const h = harness({ previous, running: false, foreground: true });
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request, schema, options) => {
+        if (request.op === "shutdown") throw new RemoteInstanceError("active_work", "shutdown refused");
+        return inner.call(request, schema, options);
+      } };
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "active_work" });
+    expect(h.calls).not.toContain("commit");
+    expect(h.calls).not.toContain("start");
+    expect(h.currentRecord()).toEqual(previous);
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed", detail: "[foreground_shutdown] shutdown refused" });
+  });
+  it("does not stop a foreground connector when its user service manager is unavailable", async () => {
+    const h = harness({ previous, running: false, foreground: true });
+    h.deps.serviceStoppedCodes = [3, 4];
+    h.deps.execute = async () => null;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.calls).not.toContain("control:shutdown@release-prev");
+    expect(h.calls).not.toContain("commit");
+    expect(h.calls).not.toContain("start");
+  });
+  it("does not start a duplicate foreground connector when shutdown never produces a fresh receipt", async () => {
+    const h = harness({ previous, running: false, foreground: true });
+    h.deps.readStopReceipt = async () => "old-receipt";
+    h.deps.stopDeadlineMs = 2_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(h.calls).not.toContain("commit");
+    expect(h.calls).not.toContain("start");
+    expect(h.currentRecord()).toEqual(previous);
+  });
   it("drains, stops, commits, restarts and gates the successor, recording an applied attempt", async () => {
     const h = harness({ previous });
     const outcome = await runNativeUpdate({ root: "/root", output: h.output }, h.deps);
@@ -243,6 +292,7 @@ describe("native update transaction", () => {
     expect(h.calls).not.toContain("start");
     expect(h.currentRecord().releaseId).toBe("release-prev");
     expect(h.ledger.map(attempt => (attempt as { outcome: string }).outcome)).toEqual(["in_progress", "failed"]);
+    expect(h.ledger.at(-1)).toMatchObject({ detail: "[codex_preflight] Codex has an active or unreadable loaded thread" });
   });
   it.each([false, true])("uses a verified private-socket inventory when the previous connector lacks the new preflight op (idle=%s)", async idle => {
     const h = harness({ previous: { ...previous, agents: ["codex"] } });
@@ -566,7 +616,7 @@ describe("native update transaction", () => {
   it("does not drain or restart when the service is not running", async () => {
     const h = harness({ previous, running: false });
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: false });
-    expect(h.calls).toEqual(["status", "commit"]);
+    expect(h.calls).toEqual(["status", "control:drain.status@release-prev", "commit"]);
   });
   it.each(["no_answer", "wrong_version", "new_failure"] as const)("rolls back to the previous release and restarts it when the gate fails (%s)", async gate => {
     const h = harness({ previous, gate });
@@ -645,6 +695,22 @@ describe("native update transaction", () => {
     expect(h.calls.lastIndexOf("start")).toBeGreaterThan(h.calls.lastIndexOf("restore:release-next"));
     expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
     expect(lines.some(line => /^Started 1\.1\.0 again so this computer stays connected/.test(line))).toBe(true);
+  });
+  it("refreshes the installed manual for current and successfully applied updates, never rollback", async () => {
+    const refreshed: string[] = [];
+    const current = harness({ previous });
+    current.deps.stage = async () => ({ status: "current", current: previous, bundleVersion: previous.bundleVersion });
+    current.deps.refreshManual = async root => { refreshed.push(root); };
+    await runNativeUpdate({ root: "/current", output: current.output }, current.deps);
+    expect(refreshed).toEqual(["/current"]);
+    const applied = harness({ previous });
+    applied.deps.refreshManual = async root => { refreshed.push(root); };
+    await runNativeUpdate({ root: "/updated", output: applied.output }, applied.deps);
+    expect(refreshed).toEqual(["/current", "/updated"]);
+    const rolledBack = harness({ previous, gate: "new_failure" });
+    rolledBack.deps.refreshManual = async root => { refreshed.push(root); };
+    await runNativeUpdate({ root: "/rollback", output: rolledBack.output }, rolledBack.deps).catch(() => undefined);
+    expect(refreshed).toEqual(["/current", "/updated"]);
   });
   it("refreshes the person's konteks-remote launcher to the release it kept, and only then (D113)", async () => {
     const refreshed: string[] = [];

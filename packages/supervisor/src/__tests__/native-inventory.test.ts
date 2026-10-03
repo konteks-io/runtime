@@ -14,6 +14,14 @@ function fixture(executionPermitsReady?: () => boolean, cancellationDeliveryRead
 }
 
 describe("native host inventory (A4 D133)", () => {
+  it("advertises Skill sync independently of sign-in only while the local owner supports it", async () => {
+    let supported = true;
+    const inventory = new NativeInventoryCollector({ runners: new Map(), sampler: { sample: async () => signals }, bundleVersion: "1.0.0", skillSyncReady: () => supported });
+    expect((await inventory.collect()).components[0]?.capabilities).toContain("runtime-skill-sync-v1");
+    supported = false;
+    expect((await inventory.collect()).components[0]?.capabilities).not.toContain("runtime-skill-sync-v1");
+    expect((await fixture().inventory.collect()).components[0]?.capabilities).not.toContain("runtime-skill-sync-v1");
+  });
   it("discovers every signed installed runner without an agent-add registration step", async () => {
     const claude = { ...agent, agentId: "claude-code", displayName: "Claude Code", readiness: "not_configured" as const };
     const runners = new Map([

@@ -1,3 +1,4 @@
+import { RuntimeSkillSyncItemSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { z } from "zod";
 import { DoctorReportSchema, PreviewStatusReportSchema, RemoteInstanceError, SupervisorStatusSchema, UpdateChannelReportSchema, type ControlLoginEvent, type UpdateChannelReport } from "@konteks/remote-common";
 import type { SupervisorControl } from "../control.js";
@@ -231,4 +232,18 @@ export async function supportBundle(context: ControlContext): Promise<void> {
   const document = await context.control.call({ op: "support.bundle" }, z.record(z.string(), z.unknown()));
   context.output.line("support bundle preview (versions, status, configuration keys, doctor, counters, redacted logs):");
   context.output.line(JSON.stringify(document, null, 2));
+}
+
+/** A slow sync has its own bounded timeout, without shell or agent passthrough. */
+export async function skillsControl(context: ControlContext, operation: "skills.sync" | "skills.status"): Promise<void> {
+  const schema = z.object({ syncing: z.boolean(), lastSuccess: z.object({ syncedAt: z.iso.datetime(),
+    inventory: z.object({ skills: z.array(RuntimeSkillSyncItemSchema).max(64), profiles: z.array(z.object({ home: z.string(), paths: z.array(z.string()).max(64) }).strict()).max(16) }).strict(),
+  }).strict().optional(), lastFailure: z.object({ phase: z.enum(["configuration", "catalog", "staging", "authorization", "publication"]), at: z.iso.datetime(), httpStatus: z.number().int().min(100).max(599).optional() }).strict().optional() }).strict();
+  const result = await context.control.call({ op: operation }, schema, { timeoutMs: operation === "skills.sync" ? 120000 : 10000 });
+  context.output.line(result.lastSuccess
+    ? `Last successful Skill sync: ${result.lastSuccess.syncedAt}. ${result.lastSuccess.inventory.skills.length} organization Skills in ${result.lastSuccess.inventory.profiles.length} local profiles.${result.syncing ? " Synchronization is running." : ""}`
+    : result.syncing ? "Organization Skill synchronization is running; no successful sync recorded yet." : "No successful organization Skill sync recorded yet.");
+  for (const skill of result.lastSuccess?.inventory.skills ?? []) context.output.line(`${skill.name} ${skill.version}`);
+  if (result.lastFailure) context.output.line(`Latest Skill sync failed during ${result.lastFailure.phase} at ${result.lastFailure.at}.`);
+  context.output.result(result);
 }

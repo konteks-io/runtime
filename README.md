@@ -15,6 +15,44 @@ provider keys on the host are the ones you give DeepSeek Harness, OpenCode or
 Google Antigravity (a DeepSeek key; any provider's key OpenCode supports; a
 Gemini API key), kept in the connector's private folder.
 
+## Shared Skills in local agents
+
+New installations bind native Skill discovery to `~/.codex`, the operator's
+custom `CODEX_HOME` when present, `~/.agents` for current Codex discovery,
+and `~/.claude`. An explicit `CLAUDE_CONFIG_DIR` adds that profile too, so a
+Claude DeepSeek profile can discover the same workspace Skills. OpenCode,
+DeepSeek Harness and Antigravity discovery folders are bound too; connector-run
+OpenCode and Antigravity use their own managed Skill stores. These local
+paths are installer metadata, never paths received from the cloud.
+
+When a native session prepares its inputs, the connector stages the complete
+Core-authorized active workspace catalog and publishes `konteks-<skill-id-hash>`
+links below each profile's `skills` directory. Each profile retains its own
+verified, content-addressed copy outside the agent's discovery directory, so
+the links survive removal of the connector staging cache and old versions are
+not discovered as additional Skills. The copies include scripts, assets and
+references and preserve executable modes. Windows uses directory
+junctions. A later authorized catalog updates these links and removes managed
+links for Skills that are no longer active; personal directories remain intact.
+The connector refreshes configured profiles when it becomes ready and after
+active relay or HTTPS reconciliation.
+Run `konteks-remote skills sync` for a manual refresh and
+`konteks-remote skills status` for inventory and the last successful sync in
+this installation, including across connector restarts. Local agent sessions may need a restart to discover changes.
+
+Each profile's hidden `.konteks-skill-sync` receipt binds the managed links to one
+workspace and machine. Another binding, a personal-folder collision, a replaced
+link or a linked profile/Skills root stops publication. A write-ahead receipt
+recovers interrupted updates under a process-owned filesystem lock. Original
+Skill caches remain immutable and session prompts revalidate their authority.
+Retained trees are verified before reuse; edited trees are preserved and
+refused. Inactive links are removed; retained historical bytes are not erased.
+Older installations without `agentSkillHomes` keep their existing behavior
+until their local profile binding is explicitly configured. With the connector
+stopped through its normal lifecycle, run `konteks-remote skills configure`
+(set `CLAUDE_CONFIG_DIR` for a custom Claude profile), then start it normally.
+This command records local paths without reactivation or transferring credentials. An explicitly set `CODEX_HOME` also rebinds the stopped connector to that verified existing local profile; without it, its saved Codex profile stays selected. This can repair a deleted temporary test profile.
+
 ## Install
 
 There are two doors, and they lead to the same place.
@@ -99,6 +137,22 @@ Supported platforms: macOS 13+ (Apple silicon and Intel), Windows 10/11
 (x64), Debian 12/13 and Ubuntu 22.04/24.04 (amd64, arm64).
 
 ## Day-to-day
+
+`konteks-remote guide` is an offline user guide for setup, commands,
+background operation, troubleshooting and removal, including on Windows.
+Use `konteks-remote <command> --help` for that command's options. On Unix:
+
+```sh
+konteks-remote guide --man > konteks-remote.1
+man ./konteks-remote.1
+```
+
+Installation includes `share/man/man1/konteks-remote.1` below the runtime root.
+On macOS, `man konteks-remote` discovers it when the runtime's `bin` folder is
+on `PATH`. On Unix, use `man -M <runtime-root>/share/man konteks-remote`
+directly, or add `<runtime-root>/share/man` to `MANPATH` with a trailing colon
+to retain system manuals. No system directory or elevated permission is needed.
+Uninstall removes this manual; remove any `PATH` or `MANPATH` entry you added.
 
 ```
 konteks-remote status          # cloud readiness, lease, agents

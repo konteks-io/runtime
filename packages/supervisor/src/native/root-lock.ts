@@ -1,10 +1,11 @@
 import { closeSync, lstatSync, mkdirSync, openSync, realpathSync, type Stats } from "node:fs";
 import { createRequire } from "node:module";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { isFsErrorWithCode, RemoteInstanceError } from "@konteks/remote-common";
 
 export const NATIVE_ROOT_LOCK_FILE = "connector-owner.sqlite";
+export const NATIVE_UNINSTALL_FENCE_FILE = "native-uninstall.pending";
 export interface NativeRootLock {
   assertOwned(): void;
   release(): void;
@@ -16,8 +17,15 @@ export interface NativeRootLock {
  * This file contains no domain data, credentials or ownership TTL. Never unlink
  * it during normal release: all contenders must lock the same inode.
  */
-export function acquireNativeRootLock(dataDir: string, options: { onLost?: () => void; checkIntervalMs?: number } = {}): NativeRootLock {
+export function acquireNativeRootLock(dataDir: string, options: { onLost?: () => void; checkIntervalMs?: number; allowUninstall?: boolean } = {}): NativeRootLock {
   if (!isAbsolute(dataDir)) throw new RemoteInstanceError("install_state_corrupt", "Native state requires an absolute private directory.");
+  const checkRemoval = () => {
+    if (options.allowUninstall || !["installer", "supervisor"].includes(basename(dataDir))) return;
+    try { lstatSync(join(dirname(dataDir), NATIVE_UNINSTALL_FENCE_FILE)); }
+    catch (error) { if (isFsErrorWithCode(error, "ENOENT")) return; throw unsafe(); }
+    throw new RemoteInstanceError("temporarily_unavailable", "Native uninstall is pending. Run konteks-remote uninstall again to finish removal before starting or changing this installation.");
+  };
+  checkRemoval();
   let sqlite: typeof import("node:sqlite");
   try { sqlite = loadSqlite(); }
   catch { throw new RemoteInstanceError("prerequisite_missing", "Native ownership requires the bundled Node runtime with SQLite support."); }
@@ -59,7 +67,7 @@ export function acquireNativeRootLock(dataDir: string, options: { onLost?: () =>
       throw unsafe();
     }
   };
-  try { assertOwned(); }
+  try { checkRemoval(); assertOwned(); }
   catch (error) { db.close(); throw error; }
   timer = setInterval(() => { try { assertOwned(); } catch { /* The owner is notified once; never reacquire. */ } }, options.checkIntervalMs ?? 1_000);
   timer.unref();

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rm, stat, symlink } from "node:fs/promises";
 import { isAbsolute, posix, win32 } from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
@@ -242,17 +242,23 @@ export async function antigravityTokenPresent(file: string): Promise<boolean> {
  * the person's alone (0700), `settings.json` says exactly what the connector
  * holds, nothing is trusted (the trust file is removed, so a repository's
  * `.agents/hooks.json` never runs, A4), and the global `config/` and the
- * CLI's skills folder are empty folders the connector owns (no global hooks,
- * MCP servers or skills from anyone else). Token files are the server's; the
+ * CLI's skills folder expose only the connector-owned Skill store (no global
+ * hooks or MCP servers from anyone else). Token files are the server's; the
  * connector never reads them.
  */
+/** Stable receipt-owned Skill storage, outside the reset discovery/config folders. */
+export function antigravitySkillHome(credentialDir: string, platform: NodeJS.Platform = process.platform): string {
+  return (platform === "win32" ? win32 : posix).join(antigravityRuntimePaths(credentialDir, platform).geminiHome, "konteks-skills");
+}
 export async function prepareAntigravityHome(credentialDir: string, platform: NodeJS.Platform = process.platform): Promise<AntigravityRuntimePaths> {
   const paths = antigravityRuntimePaths(credentialDir, platform);
   const path = platform === "win32" ? win32 : posix;
   const acp = path.join(paths.geminiHome, "antigravity-acp");
   const config = path.join(paths.geminiHome, "config");
   const cliSkills = path.join(paths.geminiHome, "antigravity-cli", "skills");
-  for (const folder of [paths.root, paths.home, paths.geminiHome, acp]) {
+  const skillHome = antigravitySkillHome(credentialDir, platform);
+  const managedSkills = path.join(skillHome, "skills");
+  for (const folder of [paths.root, paths.home, paths.geminiHome, acp, skillHome, managedSkills, path.dirname(cliSkills)]) {
     await mkdir(folder, { recursive: true, mode: 0o700 });
     const found = await lstat(folder);
     if (!found.isDirectory() || found.isSymbolicLink()) throw new RemoteInstanceError("agent_unavailable", "Google Antigravity's private folder is not a folder.", { diagnostic: "antigravity_home_unsafe" });
@@ -261,11 +267,13 @@ export async function prepareAntigravityHome(credentialDir: string, platform: No
   // A sign-in under way owns settings.json until it ends (the server writes it too).
   if (!signInsUnderWay.has(paths.home)) await writeSecretFile(paths.settingsFile, renderAntigravitySettings(await readAntigravitySignIn(credentialDir, platform)));
   await rm(paths.trustFile, { force: true, recursive: true });
-  for (const owned of [config, cliSkills]) {
-    await rm(owned, { force: true, recursive: true });
-    await mkdir(owned, { recursive: true, mode: 0o700 });
+  await rm(config, { force: true, recursive: true });
+  await mkdir(config, { recursive: true, mode: 0o700 });
+  await rm(cliSkills, { force: true, recursive: true });
+  await mkdir(path.dirname(cliSkills), { recursive: true, mode: 0o700 });
+  for (const discovery of [path.join(config, "skills"), cliSkills]) {
+    await symlink(managedSkills, discovery, platform === "win32" ? "junction" : "dir");
   }
-  await mkdir(path.join(config, "skills"), { recursive: true, mode: 0o700 });
   return paths;
 }
 

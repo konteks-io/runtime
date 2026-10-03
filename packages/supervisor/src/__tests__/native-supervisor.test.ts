@@ -1,4 +1,5 @@
 import { createHash, sign } from "node:crypto";
+import { runtimeSkillSyncRequestSigningBytes, ToRuntimeRelayFrameSchema } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fix
 import { RunnerConfigSchema, type BridgeProcess } from "@konteks/remote-agent-runner";
 import { Supervisor } from "../supervisor.js";
 import { NativeRunner } from "../native/runner.js";
+import * as machineSkillRefresh from "../native/skill-refresh.js";
 import { NativeInputClient } from "../native/input-client.js";
 import { SupervisorConfigSchema } from "../config.js";
 import { SupervisorStore } from "../state/store.js";
@@ -68,6 +70,170 @@ async function fixture() {
 }
 
 describe("native Supervisor composition", () => {
+  it("keeps failed phase diagnostics local and clears them after real success", async () => {
+    const f = await fixture();
+    const refreshSkills = vi.fn<() => Promise<{ skills: []; profiles: [] }>>()
+      .mockRejectedValueOnce(new machineSkillRefresh.MachineSkillSyncFailure("catalog"))
+      .mockResolvedValue({ skills: [], profiles: [] });
+    const supervisor = new Supervisor(f.config, { ...f.options, native: { ...f.options.native, refreshSkills } });
+    supervisors.push(supervisor); await supervisor.start();
+    const internal = supervisor as unknown as { lease: { mode(): string }; reconciliation: { isComplete: boolean } };
+    vi.spyOn(internal.lease, "mode").mockReturnValue("active");
+    vi.spyOn(internal.reconciliation, "isComplete", "get").mockReturnValue(true);
+    const control = supervisor.controlHandler();
+    await expect(control({ op: "skills.sync" }, {} as never)).rejects.toThrow();
+    expect(await control({ op: "skills.status" }, {} as never)).toMatchObject({ syncing: false, lastFailure: { phase: "catalog", at: expect.any(String) } });
+    expect(supervisor.skillStatus()).not.toHaveProperty("lastFailure");
+    await control({ op: "skills.sync" }, {} as never);
+    expect(await control({ op: "skills.status" }, {} as never)).not.toHaveProperty("lastFailure");
+  });
+  it("reports manual Skill sync support only with owned configured homes and trusted Core keys", async () => {
+    const f = await fixture();
+    const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
+    const capabilities = async () => (await supervisor.inventory.collect()).components[0]?.capabilities;
+    expect(await capabilities()).not.toContain("runtime-skill-sync-v1");
+    f.options.native.runners[0]!.RUNNER_NATIVE_SKILL_HOMES = [join(root, "personal-profile")];
+    expect(await capabilities()).toContain("runtime-skill-sync-v1");
+    const internal = supervisor as unknown as { roots: typeof f.options.native.trustedRoots };
+    const roots = internal.roots;
+    internal.roots = roots.map(value => ({ ...value, coreControlKeys: [] }));
+    expect(await capabilities()).not.toContain("runtime-skill-sync-v1");
+    internal.roots = roots;
+    await supervisor.stop();
+    expect(await capabilities()).not.toContain("runtime-skill-sync-v1");
+  });
+  it("durably admits relay Skill sync without blocking other control messages", async () => {
+    const f = await fixture(); let finish!: () => void;
+    const refreshSkills = vi.fn(() => new Promise<{ skills: []; profiles: [] }>(resolve => { finish = () => resolve({ skills: [], profiles: [] }); }));
+    const supervisor = new Supervisor(f.config, { ...f.options, native: { ...f.options.native, refreshSkills } });
+    supervisors.push(supervisor); await supervisor.start();
+    const internal = supervisor as unknown as { lease: { mode(): string }; reconciliation: { isComplete: boolean }; control: { handle(body: unknown): Promise<void> }; onInbound(message: { channel: string; channelId: string; body: unknown }): Promise<void> };
+    vi.spyOn(internal.lease, "mode").mockReturnValue("active");
+    vi.spyOn(internal.reconciliation, "isComplete", "get").mockReturnValue(true);
+    const ordinary = vi.spyOn(internal.control, "handle").mockResolvedValue();
+    const body = { type: "runtime_skill_sync_request", workspaceId: "tenant", instanceId: "instance", requestId: "relay-manual", issuedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 30000).toISOString() };
+    const request = { ...body, signature: sign(null, runtimeSkillSyncRequestSigningBytes(body), f.signing.privateKey).toString("base64url") };
+    const frame = ToRuntimeRelayFrameSchema.parse({ direction: "to_runtime", channel: "control", channelId: "control", connectionEpoch: 1, seq: 1, issuedAt: body.issuedAt, body: request });
+    try {
+      await internal.onInbound(frame);
+      await vi.waitFor(() => expect(refreshSkills).toHaveBeenCalledTimes(1));
+      expect(ordinary).not.toHaveBeenCalled();
+      expect(await supervisor.controlHandler()({ op: "skills.status" }, {} as never)).toMatchObject({ syncing: true });
+      await internal.onInbound(frame);
+      expect(refreshSkills).toHaveBeenCalledTimes(1);
+      await expect(internal.onInbound({ ...frame, body: { ...request, workspaceId: "other-tenant" } })).rejects.toThrow();
+      await internal.onInbound({ ...frame, body: { type: "ordinary-control-fixture" } });
+      expect(ordinary).toHaveBeenCalledTimes(1);
+    } finally { finish?.(); }
+  });
+  it("executes a signed manual Skill request once through durable admission", async () => {
+    const f = await fixture(), refreshSkills = vi.fn(async () => ({ skills: [], profiles: [] }));
+    const supervisor = new Supervisor(f.config, { ...f.options, native: { ...f.options.native, refreshSkills } });
+    supervisors.push(supervisor); await supervisor.start();
+    const internal = supervisor as unknown as { lease: { mode(): string }; reconciliation: { isComplete: boolean } };
+    vi.spyOn(internal.lease, "mode").mockReturnValue("active");
+    vi.spyOn(internal.reconciliation, "isComplete", "get").mockReturnValue(true);
+    const body = { type: "runtime_skill_sync_request", workspaceId: "tenant", instanceId: "instance", requestId: "manual-one", issuedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 30000).toISOString() };
+    const request = { ...body, signature: sign(null, runtimeSkillSyncRequestSigningBytes(body), f.signing.privateKey).toString("base64url") };
+    expect(await supervisor.receiveSkillSyncRequest(request)).toBe("executed");
+    expect(await supervisor.receiveSkillSyncRequest(request)).toBe("duplicate");
+    expect(refreshSkills).toHaveBeenCalledTimes(1);
+  });
+  it("restores historical Skill sync status for the enrolled runtime at startup", async () => {
+    const f = await fixture();
+    const success = { syncedAt: new Date(1000).toISOString(), inventory: { skills: [], profiles: [] } };
+    await f.store.saveSkillSyncSuccess({ workspaceId: "tenant", instanceId: "instance" }, success);
+    const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
+    expect(await supervisor.controlHandler()({ op: "skills.status" }, {} as never)).toEqual({ syncing: false, lastSuccess: success });
+  });
+  it("triggers organization refresh after successful relay reconciliation without blocking work", async () => {
+    const f = await fixture(); let finish!: () => void;
+    const refreshSkills = vi.fn(() => new Promise<never>(resolve => { finish = () => resolve({ skills: [], profiles: [] } as never); }));
+    const supervisor = new Supervisor(f.config, { ...f.options, native: { ...f.options.native, refreshSkills } });
+    supervisors.push(supervisor); await supervisor.start();
+    const internal = supervisor as unknown as { validateRelayHandshake(): void; transport: { resumeAfterRecovery(): void }; work: { reports: { flushAll(): Promise<void> } }; lease: { mode(): string }; reconciliation: { isComplete: boolean }; onRelayConnected(result: never): Promise<void> };
+    vi.spyOn(internal, "validateRelayHandshake").mockImplementation(() => {});
+    vi.spyOn(internal.transport, "resumeAfterRecovery").mockImplementation(() => {});
+    vi.spyOn(internal.work.reports, "flushAll").mockResolvedValue();
+    vi.spyOn(internal.lease, "mode").mockReturnValue("active");
+    vi.spyOn(internal.reconciliation, "isComplete", "get").mockReturnValue(true);
+    await internal.onRelayConnected({} as never); await Promise.resolve();
+    expect(refreshSkills).toHaveBeenCalledTimes(1);
+    const control = supervisor.controlHandler();
+    const manual = control({ op: "skills.sync" }, {} as never);
+    finish(); await manual;
+    const status = await control({ op: "skills.status" }, {} as never) as { syncing: boolean; lastSuccess?: { syncedAt: string; inventory: unknown } };
+    expect(status.syncing).toBe(false); expect(status.lastSuccess?.syncedAt).toMatch(/T/);
+    expect(status.lastSuccess?.inventory).toEqual({ skills: [], profiles: [] });
+    expect(refreshSkills).toHaveBeenCalledTimes(1);
+    vi.mocked(internal.lease.mode).mockReturnValue("drain_only");
+    await expect(control({ op: "skills.sync" }, {} as never)).rejects.toThrow();
+  });
+
+  it("refreshes organization Skills after HTTPS reconciliation", async () => {
+    const f = await fixture();
+    const refreshSkills = vi.fn(async () => ({ skills: [], profiles: [] }));
+    const supervisor = new Supervisor(f.config, { ...f.options, native: { ...f.options.native, refreshSkills } });
+    supervisors.push(supervisor); await supervisor.start();
+    const internal = supervisor as unknown as { refreshConfiguration(): Promise<void>; reconnectOverHttps(): Promise<void>; lease: { mode(): string }; reconciliation: { run(): Promise<void>; isComplete: boolean } };
+    vi.spyOn(internal, "refreshConfiguration").mockResolvedValue();
+    vi.spyOn(internal.reconciliation, "run").mockResolvedValue();
+    vi.spyOn(internal.reconciliation, "isComplete", "get").mockReturnValue(true);
+    vi.spyOn(internal.lease, "mode").mockReturnValue("active");
+    await internal.reconnectOverHttps();
+    await vi.waitFor(() => expect(refreshSkills).toHaveBeenCalledTimes(1));
+  });
+
+  it.each(["active", "drain_only"])("initial readiness refresh honors the %s lease", async mode => {
+    const f = await fixture();
+    const refreshSkills = vi.fn(async () => ({ skills: [], profiles: [] }));
+    const supervisor = new Supervisor(f.config, { ...f.options, native: { ...f.options.native, refreshSkills } });
+    supervisors.push(supervisor); await supervisor.start();
+    const internal = supervisor as unknown as {
+      activeLoopStarting: Promise<void> | null; startActiveLoopImpl(): Promise<void>;
+      reloadManagedGitBinding(): Promise<void>; requireRecoveryAuthority(): void;
+      openCoreChannels(): void; refreshConfiguration(): Promise<void>; resumeOnComputerWatches(): Promise<void>;
+      reconciliation: { run(): Promise<void>; isComplete: boolean }; lease: { mode(): string };
+      heartbeat: { settle(): Promise<void>; start(): Promise<void> };
+      transport: { start(): void; resumeAfterRecovery(): void }; work: { reports: { flushAll(): Promise<void> } };
+    };
+    await internal.activeLoopStarting?.catch(() => undefined);
+    vi.spyOn(internal, "reloadManagedGitBinding").mockResolvedValue();
+    vi.spyOn(internal, "requireRecoveryAuthority").mockImplementation(() => {});
+    vi.spyOn(internal, "openCoreChannels").mockImplementation(() => {});
+    vi.spyOn(internal, "refreshConfiguration").mockResolvedValue();
+    vi.spyOn(internal, "resumeOnComputerWatches").mockResolvedValue();
+    vi.spyOn(internal.reconciliation, "run").mockResolvedValue();
+    vi.spyOn(internal.reconciliation, "isComplete", "get").mockReturnValue(true);
+    vi.spyOn(internal.lease, "mode").mockReturnValue(mode);
+    vi.spyOn(internal.heartbeat, "settle").mockResolvedValue();
+    vi.spyOn(internal.heartbeat, "start").mockResolvedValue();
+    vi.spyOn(internal.transport, "start").mockImplementation(() => {});
+    vi.spyOn(internal.transport, "resumeAfterRecovery").mockImplementation(() => {});
+    vi.spyOn(internal.work.reports, "flushAll").mockResolvedValue();
+    await internal.startActiveLoopImpl();
+    if (mode === "active") await vi.waitFor(() => expect(refreshSkills).toHaveBeenCalledTimes(1));
+    else expect(refreshSkills).not.toHaveBeenCalled();
+  });
+
+  it("refreshes newly configured Skill homes on the next manual sync", async () => {
+    const f = await fixture();
+    const first = join(root, "profile-one"), second = join(root, "profile-two");
+    f.options.native.runners[0]!.RUNNER_NATIVE_SKILL_HOMES = [first];
+    const refresh = vi.spyOn(machineSkillRefresh, "refreshMachineSkills").mockImplementation(async options => ({ skills: [], profiles: options.homes.map(home => ({ home, paths: [] })) }));
+    const supervisor = new Supervisor(f.config, f.options); supervisors.push(supervisor); await supervisor.start();
+    const internal = supervisor as unknown as { lease: { mode(): string }; reconciliation: { isComplete: boolean } };
+    vi.spyOn(internal.lease, "mode").mockReturnValue("active");
+    vi.spyOn(internal.reconciliation, "isComplete", "get").mockReturnValue(true);
+    const control = supervisor.controlHandler();
+    await control({ op: "skills.sync" }, {} as never);
+    f.options.native.runners[0]!.RUNNER_NATIVE_SKILL_HOMES = [first, second];
+    await control({ op: "skills.sync" }, {} as never);
+    expect(refresh.mock.calls[1]?.[0].homes).toEqual([first, second]);
+    const status = await control({ op: "skills.status" }, {} as never) as { lastSuccess: { inventory: { profiles: Array<{ home: string }> } } };
+    expect(status.lastSuccess.inventory.profiles.map(profile => profile.home)).toEqual([first, second]);
+  });
+
   it("shows a runner's changed readiness immediately in local auth status", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);

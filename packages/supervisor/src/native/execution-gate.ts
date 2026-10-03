@@ -339,6 +339,12 @@ export class NativeExecutionGate {
     if (this.hasDurableRevisionFence(authority)) throw fenced();
   }
 
+  /** Telemetry identity only: no network check or renewed dispatch permission. */
+  skillReadAuthority(): Authority | null {
+    if (!this.authority || this.hasDurableRevisionFence(this.authority)) return null;
+    return this.localAuthority(this.authority, false, false);
+  }
+
   /**
    * The receiver verified the Core signature and exact live socket before
    * persisting this record. The gate still requires the same current local

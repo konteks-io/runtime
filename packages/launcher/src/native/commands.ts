@@ -7,9 +7,9 @@ import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
-import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle } from "./control-commands.js";
+import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, skillsControl, status, supportBundle } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
-import { addNativeAgent, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
+import { addNativeAgent, configureNativeSkillHomes, fetchHostAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord, stageNativeEnrollment } from "./install.js";
 import { terminalFetchConsent, type FetchConsent } from "./consent.js";
 import { closeAgentSetup, ensurePersonalAgent, isPersonalAgent, PERSONAL_AGENTS, productionAgentClosingDeps, setUpPersonalAgent } from "./agent-setup.js";
 import { confirm } from "../prompt.js";
@@ -276,7 +276,7 @@ export async function waitWhileStarting(
 }
 
 /** Operations that act through the running connector, and so wait for one that is starting. */
-const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
+const WAITS_FOR_CONNECTOR: ReadonlySet<string> = new Set(["skills.sync", "skills.status", "status", "preview.status", "agents", "auth.status", "auth.login", "auth.logout", "git.key.add", "git.key.list", "git.key.remove"]);
 
 const productionNativeStopDeps: NativeStopDeps = {
   definition: serviceDefinition,
@@ -776,6 +776,11 @@ export const nativeCliActions: NativeCliActions = {
     confirm: question => confirmOnTerminal(question),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), now: Date.now, platform: nativePlatform(),
   }),
+  configureSkills: async input => {
+    const record = await configureNativeSkillHomes({ root: input.root });
+    input.output.line("Local Skill folders are configured. Start the connector through its normal lifecycle; the next authorized session refreshes shared Skills.");
+    input.output.result({ state: "configured", agentSkillHomes: record.agentSkillHomes });
+  },
   serve: async input => {
     const own = await keepServiceOnOwnDefinition(input.root, productionOwnServiceDefinitionDeps(input.root))
       .catch(async error => {
@@ -878,6 +883,8 @@ export const nativeCliActions: NativeCliActions = {
           return;
         }
       }
+      case "skills.sync":
+      case "skills.status": return skillsControl(context, input.operation);
       case "agents": return agents(context);
       case "doctor":
       case "support": {

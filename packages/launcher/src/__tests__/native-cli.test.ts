@@ -5,12 +5,44 @@ import { join } from "node:path";
 import { createNativeProgram, installedReleaseVersion } from "../native/cli.js";
 
 function fixture() {
-  const actions = { install: vi.fn(async () => {}), addAgent: vi.fn(async () => {}), removeAgent: vi.fn(async () => {}), serve: vi.fn(async () => {}), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), update: vi.fn(async () => {}), uninstall: vi.fn(async () => {}), control: vi.fn(async () => {}) };
+  const actions = { install: vi.fn(async () => {}), configureSkills: vi.fn(async () => {}), addAgent: vi.fn(async () => {}), removeAgent: vi.fn(async () => {}), serve: vi.fn(async () => {}), start: vi.fn(async () => {}), stop: vi.fn(async () => {}), update: vi.fn(async () => {}), uninstall: vi.fn(async () => {}), control: vi.fn(async () => {}) };
   const program = createNativeProgram(actions).exitOverride().configureOutput({ writeOut: () => {}, writeErr: () => {} });
   return { program, actions };
 }
 
 describe("native customer entry point", () => {
+  it("provides an offline guide and a Unix manual without starting the connector", async () => {
+    const { program, actions } = fixture();
+    let output = "";
+    program.configureOutput({ writeOut: text => { output += text; } });
+    await program.parseAsync(["guide"], { from: "user" });
+    expect(output).toContain("konteks-remote uninstall");
+    expect(output).toContain("konteks-remote <command> --help");
+    expect(output).toContain("Task Scheduler");
+    expect(output).toContain("session");
+    expect(actions.start).not.toHaveBeenCalled();
+    expect(actions.control).not.toHaveBeenCalled();
+    output = "";
+    await program.parseAsync(["guide", "--man"], { from: "user" });
+    expect(output).toMatch(/^\.TH KONTEKS-REMOTE 1/);
+    expect(output).toContain(".SH REMOVAL");
+    expect(output).toContain(".SH EXAMPLES");
+  });
+  it("routes manual Skill synchronization and inventory through local control", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["skills", "sync"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "skills.sync" }));
+    await program.parseAsync(["skills", "status"], { from: "user" });
+    expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "skills.status" }));
+    expect(actions.start).not.toHaveBeenCalled();
+  });
+  it("lets an existing installation explicitly bind local Skill profiles", async () => {
+    const { program, actions } = fixture();
+    await program.parseAsync(["--root", "/private/native-root", "skills", "configure"], { from: "user" });
+    expect(actions.configureSkills).toHaveBeenCalledWith(expect.objectContaining({ root: "/private/native-root" }));
+    expect(actions.install).not.toHaveBeenCalled();
+    expect(actions.start).not.toHaveBeenCalled();
+  });
   it("exposes native lifecycle without a BYOK or appliance command", () => {
     const { program } = fixture();
     expect(program.commands.map(command => command.name())).toEqual(expect.arrayContaining(["install", "serve", "start", "stop", "status", "agents", "auth"]));

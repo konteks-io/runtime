@@ -10,6 +10,11 @@ beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "observation-ack-"))
 afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 const usage = { instanceId: "i", assignmentId: "a", agentId: "claude-code", attempt: 1,
   moneyBasis: "unavailable_local_subscription" as const, observedAt: "2026-09-22T00:00:00Z", outputTokens: 3 };
+const skillRead = { kind: "skill_read_completed", eventId: "read-event", instanceId: "i", agentId: "codex",
+  executionId: "execution", sessionId: "session", assignmentId: "a", attempt: 1, claimId: "claim",
+  recoveryEpoch: 0, readyRevision: 1, runnerIncarnation: "runner", acpSessionRef: "acp",
+  executionRevision: 1, leaseSetId: "lease", turnId: "turn", toolCallId: "read",
+  capabilityId: "7db42743-32df-4990-ad5d-6f5433f872fc", version: "1.0.1", observedAt: usage.observedAt };
 async function fixture() {
   const outbox = new DurableOutbox(dir); await outbox.load();
   let enabled = true;
@@ -18,6 +23,22 @@ async function fixture() {
     clock: new FixedClock(Date.parse(usage.observedAt)), canSend: () => enabled });
   return { outbox, delivery, submitObservation, disable: () => { enabled = false; } };
 }
+it("retains an immutable completed Skill read through offline enqueue and process restart", async () => {
+  const f = await fixture(); f.disable();
+  await f.delivery.submit(skillRead);
+  expect(f.submitObservation).not.toHaveBeenCalled();
+  expect(f.outbox.depth).toBe(1);
+  const restarted = await fixture();
+  await restarted.delivery.flush();
+  expect(restarted.submitObservation).toHaveBeenCalledWith("i", skillRead);
+  expect(restarted.outbox.depth).toBe(0);
+});
+it("refuses private paths or caller tenant data before durable Skill enqueue", async () => {
+  const f = await fixture(); f.disable();
+  await expect(f.delivery.submit({ ...skillRead, path: "/private/skill" })).rejects.toThrow();
+  await expect(f.delivery.submit({ ...skillRead, tenantId: "foreign" })).rejects.toThrow();
+  expect(f.outbox.depth).toBe(0);
+});
 it("retires historical usage only after the correlated Core receipt, across restart", async () => {
   const f = await fixture();
   await f.outbox.enqueue({ id: "old", key: "usage:a:old", group: "observation", channel: "observation", order: 1, body: usage, createdAt: usage.observedAt });

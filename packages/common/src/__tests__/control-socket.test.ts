@@ -215,6 +215,10 @@ describe("loopback control socket", () => {
       expect(ControlRequestSchema.safeParse({ op }).success).toBe(true);
       expect(ControlRequestSchema.safeParse({ op, url: "https://evil.example/manifest.json" }).success).toBe(false);
     }
+    for (const op of ["skills.sync", "skills.status"]) {
+      expect(ControlRequestSchema.safeParse({ op }).success).toBe(true);
+      expect(ControlRequestSchema.safeParse({ op, workspaceId: "foreign" }).success).toBe(false);
+    }
     expect(ControlRequestSchema.safeParse({ op: "status", extra: 1 }).success).toBe(false);
     expect(ControlRequestSchema.safeParse({ op: "auth.logout", agentId: "Codex Bad" }).success).toBe(false);
     // The retired appliance's BYOK gateway operations are gone.

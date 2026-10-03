@@ -69,6 +69,12 @@ export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamil
     // (macOS keychain / ~/.claude). Konteks never copies or reads credentials.
     const operator = userInfo();
     env.CLAUDE_CODE_EXECUTABLE = config.RUNNER_NATIVE_CLAUDE_EXECUTABLE;
+    if (config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR !== undefined) {
+      if (!isAbsolute(config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR)) {
+        throw new RemoteInstanceError("agent_unavailable", "A personal Claude profile requires an absolute locally bound config directory.");
+      }
+      env.CLAUDE_CONFIG_DIR = config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR;
+    }
     env.HOME = operator.homedir;
     env.USER = operator.username;
     env.LOGNAME = operator.username;

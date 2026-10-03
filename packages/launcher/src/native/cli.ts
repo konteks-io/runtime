@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { nativePaths, nativePlatform } from "./service.js";
+import { nativeGuide } from "./guide.js";
 import { createOutput, type Output } from "../output.js";
 import { setVerbose } from "../verbose.js";
 
@@ -22,12 +23,13 @@ export interface NativeCliActions {
   stageEnrollment(input: NativeCommandContext): Promise<void>;
   addAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
   removeAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
+  configureSkills(input: NativeCommandContext): Promise<void>;
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
   update(input: NativeCommandContext & { check: boolean; unattended: boolean }): Promise<void>;
   uninstall(input: NativeCommandContext): Promise<void>;
-  control(input: NativeCommandContext & { operation: "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
+  control(input: NativeCommandContext & { operation: "skills.sync" | "skills.status" | "status" | "agents" | "doctor" | "support" | "preview.status" | "auth.status" | "auth.login" | "auth.logout" | "git.key.add" | "git.key.list" | "git.key.remove"; agent?: string; organization?: boolean; provider?: string; method?: string; reuse?: boolean; project?: string; location?: string; title?: string; keyRef?: string }): Promise<void>;
 }
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
@@ -48,6 +50,9 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     process.stdout.write(`${installedReleaseVersion(root) ?? process.env.KONTEKS_LAUNCHER_VERSION ?? "0.1.0"}\n`);
     process.exit(0);
   });
+  program.command("guide").description("read the offline user guide, including setup, background operation and removal")
+    .option("--man", "emit a Unix section 1 manual", false)
+    .action((options: { man: boolean }) => { program.configureOutput().writeOut!(nativeGuide(options.man)); });
   const context = (): NativeCommandContext => {
     const options = program.opts<{ root?: string; json: boolean }>();
     return { root: options.root ?? nativePaths({ os: nativePlatform().os }).root, output: createOutput({ json: options.json }) };
@@ -117,6 +122,13 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     support: "collect a support bundle to share with Konteks support",
   } as const;
   for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).description(CONTROL_HELP[operation]).action(async () => actions.control({ ...context(), operation }));
+  const skills = program.command("skills").description("shared Skills in your local coding agent profiles");
+  skills.command("sync").description("refresh organization Skills in the configured local agent profiles")
+    .action(async () => actions.control({ ...context(), operation: "skills.sync" }));
+  skills.command("status").description("show installed organization Skills and the last successful synchronization")
+    .action(async () => actions.control({ ...context(), operation: "skills.status" }));
+  skills.command("configure").description("bind local Codex and Claude Skill folders for this installation; requires the connector to be stopped")
+    .action(async () => actions.configureSkills(context()));
   // Read-only. Whether this computer serves previews is switched per machine
   // in Konteks (Customize → Runtimes), never here.
   const preview = program.command("preview").description("live previews of sessions' work, served from this computer");

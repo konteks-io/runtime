@@ -1,3 +1,6 @@
+import { SkillSyncReceiptSchema, type SkillSyncSuccess } from "../skills/sync-receipt.js";
+import { constants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import type { SchemaParser } from "@konteks/remote-common";
 import { join } from "node:path";
@@ -18,6 +21,11 @@ import {
   type RemoteSignedBundleManifest,
 } from "@konteks/remote-common";
 import type { RelayDurableState } from "../relay/channel-mux.js";
+
+const PendingSkillReceiptSchema = z.object({ version: z.literal(1),
+  owner: z.object({ workspaceId: z.string().min(1).max(512), instanceId: z.string().min(1).max(512) }).strict(),
+  result: z.object({ requestId: z.string().min(1).max(512), state: z.enum(["succeeded", "failed"]) }).strict().nullable(),
+}).strict();
 
 /**
  * The supervisor's restricted volume. Layout (all files 0600, directory 0700):
@@ -187,6 +195,49 @@ export class SupervisorStore {
 
   private async writeJson(name: string, value: unknown): Promise<void> {
     await this.mutate(() => writeSecretFile(this.path(name), `${JSON.stringify(value)}\n`));
+  }
+
+  async saveSkillSyncSuccess(owner: { workspaceId: string; instanceId: string }, success: SkillSyncSuccess): Promise<void> {
+    const receipt = SkillSyncReceiptSchema.parse({ version: 1, owner, success });
+    if (Buffer.byteLength(JSON.stringify(receipt)) > 2 * 1024 * 1024) throw new Error("Skill sync receipt is unavailable");
+    await this.writeJson("skill-sync-success.json", receipt);
+  }
+
+  private async readPrivateJson<T>(name: string, schema: SchemaParser<T>, maxBytes: number): Promise<T | null> {
+    try {
+      const path = this.path(name), stat = await lstat(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || (process.platform !== "win32" && (stat.mode & 0o077) !== 0) || stat.size > maxBytes) throw new Error("Skill sync receipt is unavailable");
+      await assertRestrictedMode(path);
+      const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      let receipt;
+      try {
+        const current = await handle.stat();
+        if (current.ino !== stat.ino || current.dev !== stat.dev || current.size !== stat.size || !current.isFile() || current.nlink !== 1) throw new Error("Skill sync receipt is unavailable");
+        const bytes = Buffer.alloc(stat.size + 1); let count = 0;
+        while (count < bytes.length) { const result = await handle.read(bytes, count, bytes.length - count, count); if (!result.bytesRead) break; count += result.bytesRead; }
+        if (count !== stat.size) throw new Error("Skill sync receipt is unavailable");
+        receipt = schema.parse(JSON.parse(bytes.subarray(0, count).toString("utf8")));
+      } finally { await handle.close(); }
+      return receipt;
+    } catch (error) { if (isFsErrorWithCode(error, "ENOENT")) return null; throw error; }
+  }
+
+  async skillSyncSuccess(owner: { workspaceId: string; instanceId: string }): Promise<SkillSyncSuccess | null> {
+    const receipt = await this.readPrivateJson("skill-sync-success.json", SkillSyncReceiptSchema, 2 * 1024 * 1024);
+    if (!receipt) return null;
+    if (receipt.owner.workspaceId !== owner.workspaceId || receipt.owner.instanceId !== owner.instanceId) throw new Error("Skill sync receipt owner differs from enrollment");
+    return receipt.success;
+  }
+
+  async savePendingSkillReceipt(owner: { workspaceId: string; instanceId: string }, result: { requestId: string; state: "succeeded" | "failed" } | null): Promise<void> {
+    await this.writeJson("skill-sync-pending.json", PendingSkillReceiptSchema.parse({ version: 1, owner, result }));
+  }
+
+  async pendingSkillReceipt(owner: { workspaceId: string; instanceId: string }) {
+    const receipt = await this.readPrivateJson("skill-sync-pending.json", PendingSkillReceiptSchema, 4096);
+    if (!receipt) return null;
+    if (receipt.owner.workspaceId !== owner.workspaceId || receipt.owner.instanceId !== owner.instanceId) throw new Error("Skill sync receipt owner differs from enrollment");
+    return receipt.result;
   }
 
   /** Replaces the single private record before a controlled nonzero exit. */

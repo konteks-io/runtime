@@ -159,3 +159,15 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     await expect(publisher.settle()).resolves.toBeUndefined();
   });
 });
+
+it("includes Skills status inside the instance-signed heartbeat", async () => {
+  const f = await fixture();
+  const status = { syncing: false, lastSuccess: { syncedAt: "2026-09-06T00:00:00Z", skills: [] } };
+  const publisher = new HeartbeatPublisher({ ...f.options, runnerIncarnation: () => "process", skillStatus: () => status } as HeartbeatOptions);
+  publishers.push(publisher);
+  await publisher.start(); const message = await publisher.publish();
+  expect(message.skillStatus).toEqual(status);
+  const sent = f.heartbeat.mock.calls[0]?.[0] as Record<string, unknown>;
+  const { signature, ...body } = sent;
+  expect(verifyInstanceProof(f.key.publicKey, { method: "heartbeat", audience: CORE_AUDIENCE, subject: "instance", body: body as never }, { algorithm: "ES256", nonce: `seq:${message.sequence}`, signature: signature as string })).toBe(true);
+});

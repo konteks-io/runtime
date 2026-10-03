@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { REMOTE_RUNTIME_SKILL_SYNC_CAPABILITY } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { DELIVERY_TURN_RENEWAL_CAPABILITY } from "./delivery-turn-renewal.js";
 import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY, REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
@@ -25,6 +26,8 @@ export interface NativeInventoryOptions {
   agentLoginReady?: () => boolean;
   /** ...and Claude Code's, which needs a browser this machine can open. */
   agentLoginBrowserReady?: () => boolean;
+  /** Owned native Skill homes and signature verification, independent of sign-in. */
+  skillSyncReady?: () => boolean;
   /** Further agent capabilities (OpenCode: its free-models switch and the sign-ins the site may start). */
   additionalCapabilities?: () => readonly string[];
   /**
@@ -113,6 +116,7 @@ export class NativeInventoryCollector {
     if (this.options.cancellationDeliveryReady?.()) capabilities.push(REMOTE_CANCELLATION_DELIVERY_CAPABILITY);
     if (this.options.agentLoginReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_CAPABILITY);
     if (this.options.agentLoginBrowserReady?.()) capabilities.push(REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY);
+    if (this.options.skillSyncReady?.()) capabilities.push(REMOTE_RUNTIME_SKILL_SYNC_CAPABILITY);
     for (const capability of this.options.additionalCapabilities?.() ?? []) if (!capabilities.includes(capability)) capabilities.push(capability);
     // The onboard role is git on THIS machine, not a signed-in agent: the
     // capabilities are advertised whenever git answers, and withheld the moment

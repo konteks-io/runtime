@@ -7,7 +7,7 @@ import { RunnerConfigSchema } from "../config.js";
 import { bridgeEnvironment, resolveBridgeSpawnSpec } from "../bridge/spec.js";
 import {
   OPENCODE_INHERITED_VARIABLES, OPENCODE_KONTEKS_PERMISSIONS, bindOpenCodeWorkingCopy, openCodeEnvironment, openCodeKonteksSettings, openCodePermissionDecision,
-  openCodeRunnerAdapter, openCodeRuntimePaths, openCodeWorkingCopyConfig, openCodeWorkingCopyKey, renderOpenCodeKonteksConfig, syncOpenCodeInstructions,
+  openCodeProcessEnvironment, openCodeRunnerAdapter, openCodeRuntimePaths, openCodeWorkingCopyConfig, openCodeWorkingCopyKey, renderOpenCodeKonteksConfig, syncOpenCodeInstructions,
 } from "../host/opencode.js";
 import { hostAgentRunnerAdapter } from "../host/registry.js";
 import { projectReadiness } from "../readiness.js";
@@ -54,7 +54,7 @@ describe("OpenCode's environment is an allow-list", () => {
       // The locked Konteks configuration, the repository's own config off, no file watcher.
       OPENCODE_CONFIG_PROJECT_DISABLE: "1", OPENCODE_FILEWATCHER_DISABLE: "1",
     });
-    expect(JSON.parse(spec.env.OPENCODE_CONFIG_CONTENT!)).toEqual(renderOpenCodeKonteksConfig());
+    expect(JSON.parse(spec.env.OPENCODE_CONFIG_CONTENT!)).toEqual(renderOpenCodeKonteksConfig(join(paths.root, "skills")));
     expect(paths.home).toBe(join("/rt/credentials/opencode", "opencode", "home"));
     for (const name of Object.keys(OWNER_SECRETS).filter(name => !(name in openCodeKonteksSettings()))) expect(spec.env[name], name).toBeUndefined();
     for (const value of Object.values(OWNER_SECRETS)) expect(JSON.stringify(spec.env)).not.toContain(value);
@@ -265,4 +265,16 @@ describe("one OpenCode process per working copy", () => {
     await expect(bindOpenCodeWorkingCopy("/cred", "work")).rejects.toMatchObject({ code: "agent_unavailable" });
     await expect(openCodeRunnerAdapter.bindWorkingCopy!(config(), findAgentBridge("codex")!, "/wc")).rejects.toThrow(/OpenCode/);
   });
+});
+
+it("gives every private OpenCode process the connector-owned Skill source", () => {
+  const credentialDir = join(tmpdir(), "opencode-native-skills");
+  const paths = openCodeRuntimePaths(credentialDir);
+  for (const configHome of [paths.controlConfig, openCodeWorkingCopyConfig(credentialDir, join(tmpdir(), "isolated-worktree"))]) {
+    const env = openCodeProcessEnvironment(credentialDir, configHome);
+    const config = JSON.parse(env.OPENCODE_CONFIG_CONTENT!);
+    expect(config.skills).toEqual([join(paths.root, "skills")]);
+    expect(config.plugins).toEqual([]);
+    expect(env.OPENCODE_CONFIG_PROJECT_DISABLE).toBe("1");
+  }
 });

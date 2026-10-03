@@ -24,6 +24,29 @@ function acquire(path = root, onLost = vi.fn()) {
 }
 
 describe("native data-root process ownership", () => {
+  it("blocks a separate connector process before it recreates removed state directories", async () => {
+    await writeFile(join(root, "native-uninstall.pending"), "uninstall-v1\n", { mode: 0o600 });
+    const data = join(root, "supervisor");
+    const moduleUrl = new URL("../../dist/native/root-lock.js", import.meta.url).href;
+    const code = `import { acquireNativeRootLock } from ${JSON.stringify(moduleUrl)}; acquireNativeRootLock(process.argv[1]);`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", code, data], { stdio: ["ignore", "ignore", "pipe"] });
+    children.push(child);
+    let diagnostic = "";
+    child.stderr!.on("data", chunk => { diagnostic = (diagnostic + String(chunk)).slice(0, 4096); });
+    const [exitCode] = await once(child, "exit");
+    expect(exitCode).toBe(1);
+    expect(diagnostic).toContain("Native uninstall is pending");
+    await expect(stat(data)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+  it("refuses new ownership after uninstall releases its locks, while allowing uninstall retry", async () => {
+    const data = join(root, "supervisor");
+    const owner = acquire(data);
+    await writeFile(join(root, "native-uninstall.pending"), "uninstall-v1\n", { mode: 0o600 });
+    owner.assertOwned(); owner.release();
+    expect(() => acquire(data)).toThrow(/uninstall/i);
+    const retry = acquireNativeRootLock(data, { allowUninstall: true });
+    releases.push(() => retry.release()); retry.assertOwned();
+  });
   it("excludes another owner until release without deleting or replacing the lock inode", async () => {
     const lock = acquire();
     const before = await stat(join(root, NATIVE_ROOT_LOCK_FILE));

@@ -27,6 +27,35 @@ describe("observation HTTPS receipts", () => {
   });
 });
 
+describe("completed Skill read HTTPS receipts", () => {
+  const read = { kind: "skill_read_completed", eventId: "read-event", instanceId: "instance", agentId: "codex",
+    executionId: "execution", sessionId: "session", assignmentId: "a", attempt: 1, claimId: "claim",
+    recoveryEpoch: 0, readyRevision: 1, runnerIncarnation: "runner", acpSessionRef: "acp",
+    executionRevision: 1, leaseSetId: "lease", turnId: "turn", toolCallId: "read",
+    capabilityId: "7db42743-32df-4990-ad5d-6f5433f872fc", version: "1.0.1", observedAt: "2026-09-22T00:00:00Z" };
+  const digest = jcsDigest(read);
+  const receipt = { stored: true, observationId: `ri:skill:${digest}`, observationDigest: digest };
+  it("retains immutable observation bytes while signing each retry under the lease", async () => {
+    const f = fixture(receipt);
+    await f.client.submitObservation("instance", read);
+    await f.client.submitObservation("instance", read);
+    const first = f.fetchFn.mock.calls[0]![1]!;
+    const second = f.fetchFn.mock.calls[1]![1]!;
+    expect(first.headers).toMatchObject({ authorization: "Bearer test-native-lease" });
+    const { proof, ...body } = JSON.parse(String(first.body));
+    expect(body).toEqual({ observation: read });
+    const binding = { method: "skill_usage_observation", audience: CORE_AUDIENCE, subject: "instance", body };
+    expect(verifyInstanceProof(f.key.publicKey, binding, proof)).toBe(true);
+    expect(verifyInstanceProof(f.key.publicKey, { ...binding, method: "execution_check" }, proof)).toBe(false);
+    expect(JSON.parse(String(second.body)).observation).toEqual(read);
+    expect(JSON.parse(String(second.body)).proof.nonce).not.toBe(proof.nonce);
+  });
+  it.each([{ stored: false }, { observationId: "foreign" }, { observationDigest: "x".repeat(43) }])("refuses an uncommitted or unbound receipt", async patch => {
+    const f = fixture({ ...receipt, ...patch });
+    await expect(f.client.submitObservation("instance", read)).rejects.toBeDefined();
+  });
+});
+
 describe("native execution admission HTTPS proofs", () => {
   it("binds consume proofs to both path identities and fresh retry nonces", async () => {
     const f = fixture({ outcome: "admitted", admissionId: "admission", receipt: "a.b.c" });

@@ -76,6 +76,17 @@ describe("bridge spawn spec", () => {
     expect(() => bridgeEnvironment({ ...config, RUNNER_NATIVE_CODEX_SOCKET: "ws://remote" }, findAgentBridge("codex")!)).toThrow(/absolute local socket/);
   });
 
+  it("uses only the locally bound Claude config directory, without inheriting an unvalidated profile", () => {
+    vi.stubEnv("CLAUDE_CONFIG_DIR", "/unvalidated/inherited");
+    const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "claude-code" });
+    const family = findAgentBridge("claude-code")!;
+    expect(bridgeEnvironment(config, family).CLAUDE_CONFIG_DIR).toBeUndefined();
+    const native = { ...config, RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture().profile,
+      RUNNER_NATIVE_CLAUDE_EXECUTABLE: "/operator/.local/bin/claude", RUNNER_NATIVE_CLAUDE_CONFIG_DIR: "/operator/.claude-deepseek" };
+    expect(bridgeEnvironment(native, family).CLAUDE_CONFIG_DIR).toBe("/operator/.claude-deepseek");
+    expect(() => bridgeEnvironment({ ...native, RUNNER_NATIVE_CLAUDE_CONFIG_DIR: "relative" }, family)).toThrow(/profile/);
+  });
+
   it("preserves explicit native additional CA trust without inheriting TLS bypasses or credentials", () => {
     vi.stubEnv("NODE_EXTRA_CA_CERTS", "/local/operator/ca.pem");
     vi.stubEnv("CODEX_CA_CERTIFICATE", "/local/operator/codex-ca.pem");

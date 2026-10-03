@@ -117,6 +117,18 @@ it("passes an operation key identifier to the configured-origin trust cache", as
   expect(f.client.executionSigningKeys).toHaveBeenCalledWith(undefined, "rotated");
 });
 
+it("exposes only locally owned Skill read identity without renewing dispatch", async () => {
+  const f = await fixture();
+  expect(f.gate.skillReadAuthority()).toBeNull();
+  await f.gate.admit(f.envelope);
+  const calls = f.client.checkExecution.mock.calls.length;
+  f.advance(60_000);
+  expect(f.gate.skillReadAuthority()).toMatchObject({ executionId: "execution", claimId: "claim", turnRef: "turn" });
+  expect(f.client.checkExecution).toHaveBeenCalledTimes(calls);
+  f.assertOwned.mockImplementation(() => { throw new Error("owner lost"); });
+  expect(() => f.gate.skillReadAuthority()).toThrow("owner lost");
+});
+
 it("waits out Core's slow key endpoint during admission instead of refusing the prompt (D110)", async () => {
   vi.useFakeTimers();
   const f = await fixture();
@@ -404,6 +416,7 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
     stopForRecovery: vi.fn(async () => undefined) };
   const send = vi.fn();
   const beforePrompt = vi.fn(async () => undefined);
+  const skillRead = vi.fn(async () => undefined);
   const session = new RelayedSession(work, { clock: f.clock, journal: f.journal, runner: runner as unknown as RunnerPort,
     transport: { send, openChannel: vi.fn() } as unknown as TransportManager,
     instanceId: "instance", workspaceRoot: root,
@@ -411,15 +424,29 @@ async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDel
     // The orchestrator wires settlement recording for every native session.
     recordCompletedSettlement: async () => undefined,
     prepareInputs: async () => ({ binding: { workspaceId: "tenant", instanceId: "instance", sessionId: "session", assignmentId: "assignment", attempt: 1 }, cwd: root, skillInstructions: "trusted local skill", beforePrompt,
+      managedSkillReadTargets: [{ skillId: "7db42743-32df-4990-ad5d-6f5433f872fc", version: "1.0.1", skillFile: join(root, "SKILL.md") }],
       ...(acceptDeliveryOutput ? { acceptDeliveryOutput } : {}) }),
     registerReady: async () => f.ready, redeemCapabilityToken: async () => { throw new Error("unexpected capability redemption"); },
     policy: new EvaluatorPolicyResponder(null, () => false), broker: new PermissionBroker({ clock: f.clock, deadlineSeconds: () => 60, onTimeout: async () => undefined }),
-    onUsage: async () => undefined, onClosed: async () => undefined, ...(logger ? { logger: logger as never } : {}) });
+    onSkillReadObservation: skillRead, onUsage: async () => undefined, onClosed: async () => undefined, ...(logger ? { logger: logger as never } : {}) });
   sessions.push(session); await session.bootstrap(); send.mockClear();
-  return { ...f, session, runner, send, beforePrompt };
+  return { ...f, session, runner, send, beforePrompt, skillRead };
 }
 
 describe("native session dispatch uses genuine execution admission", () => {
+  it("emits a completed staged Skill read from its admitted native session", async () => {
+    const f = await sessionFixture();
+    await f.session.onToRuntime(f.envelope);
+    const event = { kind: "session_update", acpSessionRef: "acp", params: { sessionId: "acp",
+      update: { sessionUpdate: "tool_call", toolCallId: "read", title: "Read Skill", kind: "read",
+        status: "completed", locations: [{ path: join(root, "SKILL.md") }] } } };
+    await f.session.onRunnerEvent(event as never);
+    await f.session.onRunnerEvent(event as never);
+    expect(f.skillRead).toHaveBeenCalledTimes(1);
+    expect(f.skillRead).toHaveBeenCalledWith(expect.objectContaining({ kind: "skill_read_completed",
+      executionId: "execution", claimId: "claim", turnId: "turn", version: "1.0.1" }));
+    expect(JSON.stringify(f.skillRead.mock.calls)).not.toContain(root);
+  });
   it("closes a prepared delivery assignment after its authorized pre-prompt cancellation", async () => {
     const work = { ...assignment, kind: "delivery" as const, taskId: "task", correlationId: "invocation",
       agentRoute: { agentId: "codex", requiredRole: "generator" as const, sessionConfig: { model: "model-a" } },

@@ -1,6 +1,7 @@
 {
   "$comment": "The konteks-remote commands a person runs on a connected computer, one plain line each, for the systems each applies to (runtime-view R20). The connector carries them in its executable and sends them on the heartbeat as connectorCommands with its bundle version (packages/release/src/connector-commands.ts); a release also ships them as commands.json (scripts/release-assets.mjs commands). packages/launcher/src/__tests__/connector-commands.test.ts checks every entry against the launcher's real command table, and that every command a person runs is listed.",
   "commands": [
+    { "id": "guide", "command": "konteks-remote guide", "description": "Reads the offline user guide, including setup, background operation and removal.", "os": ["macos", "windows", "debian"] },
     { "id": "status", "command": "konteks-remote status", "description": "Shows whether this computer is connected to Konteks and ready for work.", "os": ["macos", "windows", "debian"] },
     { "id": "agents", "command": "konteks-remote agents", "description": "Lists the agents on this computer and whether each one is ready.", "os": ["macos", "windows", "debian"] },
     { "id": "doctor", "command": "konteks-remote doctor", "description": "Checks the connector and every agent on this computer, and says what to fix.", "os": ["macos", "windows", "debian"] },
@@ -12,6 +13,9 @@
     { "id": "agent.add", "command": "konteks-remote agent add <agent>", "description": "Adds an agent to this computer's connector: claude-code, codex, dsh, opencode or antigravity.", "os": ["macos", "windows", "debian"] },
     { "id": "agent.remove", "command": "konteks-remote agent remove antigravity", "description": "Removes Google Antigravity from this computer, with its download and its sign-ins here.", "os": ["macos"] },
     { "id": "preview.status", "command": "konteks-remote preview status", "description": "Lists this computer's session previews and why any of them stopped. Turn previews on or off in Konteks.", "os": ["macos", "windows", "debian"] },
+    { "id": "skills.sync", "command": "konteks-remote skills sync", "description": "Refreshes organization Skills in the configured local agent profiles.", "os": ["macos", "windows", "debian"] },
+    { "id": "skills.status", "command": "konteks-remote skills status", "description": "Shows installed organization Skills and the last successful synchronization.", "os": ["macos", "windows", "debian"] },
+    { "id": "skills.configure", "command": "konteks-remote skills configure", "description": "Binds shared Skill folders in your local Codex and Claude profiles. Stop the connector first, then start it normally.", "os": ["macos", "windows", "debian"] },
     { "id": "start", "command": "konteks-remote start", "description": "Starts the connector's background service.", "os": ["macos", "windows", "debian"] },
     { "id": "stop", "command": "konteks-remote stop", "description": "Stops the connector's background service. This computer and its work are kept.", "os": ["macos", "windows", "debian"] },
     { "id": "git.key.add", "command": "konteks-remote git key add", "description": "Creates this computer's key for Konteks-managed repositories and registers it.", "os": ["macos", "windows", "debian"] },

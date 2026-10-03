@@ -40,6 +40,9 @@ import { NativeRepositoryCache } from "./repository-cache.js";
 interface NativeInputPreparerOptions {
   /** Private, runner-specific connector workspace root, never a user checkout. */
   root: string;
+  /** Operator-owned native discovery homes, resolved locally at installation. */
+  agentSkillHomes?: readonly string[];
+  directSkillReads?: (assignment: RemoteWorkAssignment) => Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead">;
   clock: Clock;
   client: () => NativeInputClient;
   /** Current locally accepted claim; returning null denies preparation/continuation. */
@@ -459,7 +462,7 @@ export function createNativeInputPreparer(
         stageStartedAt = Date.now();
         // No skills and no instructions for a direct session (R11): the
         // person's text reaches the agent as typed.
-        const prepared = direct ? await prepareDirectSessionInputs({ cwd: source.cwd, binding: selection.binding }) : await prepareOrganizationSkillSession({
+        const prepared = direct ? await prepareDirectSessionInputs({ cwd: source.cwd, binding: selection.binding, ...(options.directSkillReads ? { skillReads: options.directSkillReads(current) } : {}) }) : await prepareOrganizationSkillSession({
           cwd: source.cwd,
           scratchRoot: join(root, "skills"),
           catalog: selection.skills,
@@ -471,8 +474,10 @@ export function createNativeInputPreparer(
           // nothing that recheck does not, and cost a full authority round trip
           // (several locked reads plus owner callbacks) per stage — ten per
           // turn, ~100 s before the agent even started.
-          assertAuthorized: async () => undefined,
+          assertAuthorized: async () => { if (options.claimId(current) !== claimId) throw unavailable(); },
           fetchTree: (manifest) => client.read(current, claimId, envelope, manifest.transferId),
+          ...(options.agentSkillHomes ? { agentHomes: options.agentSkillHomes } : {}),
+          authorizeHomeSync: authorize,
         });
         logStage("skills", Date.now() - stageStartedAt);
         stage = "source_verification";

@@ -39,6 +39,8 @@ export * from "./session/permissions.js";
 export * from "./session/relayed-session.js";
 export * from "./skills/staging.js";
 export * from "./skills/session-inputs.js";
+export * from "./skills/home-sync.js";
+export * from "./native/skill-homes.js";
 export * from "./reconnect/reconciliation.js";
 export * from "./native/model-capability-snapshot.js";
 export * from "./support/doctor.js";

@@ -1,9 +1,9 @@
-import { readdir, readFile, rm, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { join, parse, resolve } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
 import { RemoteInstanceError } from "@konteks/remote-common";
-import { NATIVE_SHUTDOWN_RECEIPT_FILE } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, removeAgentHomeSkillLinks, NATIVE_SHUTDOWN_RECEIPT_FILE, NATIVE_UNINSTALL_FENCE_FILE } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { SupervisorControl } from "../control.js";
 import { readNativeRecord } from "./install.js";
@@ -14,6 +14,8 @@ const DrainStatusSchema = z.object({ draining: z.boolean(), reason: z.string().n
 const RetireSchema = z.object({ outcome: z.enum(["removed", "draining", "already_removed"]), activeAssignments: z.number().int().min(0) }).passthrough();
 
 export interface UninstallDeps {
+  /** Acquire exclusive runtime ownership and remove only its owned discovery links. */
+  cleanupSkillHomes?(): Promise<void>;
   /** The running connector's control socket; null when nothing answers. */
   control(): Promise<Pick<SupervisorControl, "call"> | null>;
   serviceDefinition(): Promise<NativeServiceDefinition | null>;
@@ -41,6 +43,7 @@ const POLL_MS = 5_000;
 /** A connector closes its agents and writes its receipt within seconds of being stopped. */
 const SHUTDOWN_WAIT_MS = 30_000;
 const REMOVE_ATTEMPTS = 5;
+const UNINSTALL_FENCE_CONTENT = "uninstall-v1\n";
 
 /**
  * Remove Konteks from this machine (W1-L2): let running work finish, have
@@ -117,8 +120,14 @@ export async function uninstallNative(input: { root: string; output: Output }, d
   // ENOTEMPTY and left a folder behind (W1-Z6). Wait until it has let go.
   if (control && deps.shutDown) {
     const until = deps.now() + SHUTDOWN_WAIT_MS;
-    while (!(await deps.shutDown(receiptBefore).catch(() => false)) && deps.now() < until) await deps.sleep(500);
+    let complete = await deps.shutDown(receiptBefore).catch(() => false);
+    while (!complete && deps.now() < until) {
+      await deps.sleep(500);
+      complete = await deps.shutDown(receiptBefore).catch(() => false);
+    }
+    if (!complete) throw new RemoteInstanceError("temporarily_unavailable", "The connector has not confirmed shutdown completion. Its installation was preserved; run konteks-remote uninstall again after it finishes stopping.");
   }
+  await deps.cleanupSkillHomes?.();
   await removeFolder(root, deps);
 
   const kept = repositoryPath ? ` Your repository at ${repositoryPath} and your coding agents' logins were not touched.` : " Your repositories and your coding agents' logins were not touched.";
@@ -141,15 +150,29 @@ async function removeFolder(root: string, deps: Pick<UninstallDeps, "sleep">): P
   for (let attempt = 1; ; attempt += 1) {
     try {
       const entries = await readdir(root).catch(() => [] as string[]);
-      for (const entry of entries.filter(name => name !== "bin")) await rm(join(root, entry), { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+      for (const entry of entries.filter(name => name !== "bin" && name !== NATIVE_UNINSTALL_FENCE_FILE)) await rm(join(root, entry), { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
       await rm(join(root, "bin"), { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
-      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
     } catch (error) {
       if (attempt >= REMOVE_ATTEMPTS) {
         throw new RemoteInstanceError("temporarily_unavailable", `Konteks is stopped on this machine, but its folder ${root} could not be deleted (${(error as Error).message}). Run konteks-remote uninstall again in a moment.`);
       }
     }
-    if (!(await stat(root).then(() => true).catch(() => false))) return;
+    const remaining = await readdir(root).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    });
+    if (remaining.every(name => name === NATIVE_UNINSTALL_FENCE_FILE)) {
+      // Once the fence is released, never recursively remove this path again:
+      // another installer may now own it. rmdir preserves any newly created files.
+      await unlink(join(root, NATIVE_UNINSTALL_FENCE_FILE)).catch(error => {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      });
+      await rmdir(root).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw new RemoteInstanceError("temporarily_unavailable", "The installation folder changed during final removal. Its remaining files were preserved; check the folder before retrying uninstall.");
+      });
+      return;
+    }
     if (attempt >= REMOVE_ATTEMPTS) {
       throw new RemoteInstanceError("temporarily_unavailable", `Konteks is stopped on this machine, but something kept writing to its folder ${root}. Run konteks-remote uninstall again in a moment.`);
     }
@@ -164,6 +187,41 @@ export function productionUninstallDeps(input: {
   execute: (command: NativeServiceCommand) => Promise<number | null>;
 }): UninstallDeps {
   return {
+    cleanupSkillHomes: async () => {
+      for (const path of [input.root, join(input.root, "installer"), join(input.root, "supervisor")]) {
+        const info = await lstat(path).catch(error => {
+          if (path !== input.root && (error as NodeJS.ErrnoException).code === "ENOENT") return null;
+          throw error;
+        });
+        if (!info) continue; // The ownership lock creates a private directory.
+        if (!info.isDirectory() || info.isSymbolicLink() || (process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o022) !== 0))) {
+          throw new RemoteInstanceError("local_io_failure", "Uninstall found an unsafe installation. Its files were preserved.");
+        }
+      }
+      const installer = acquireNativeRootLock(join(input.root, "installer"), { allowUninstall: true });
+      let runtime: ReturnType<typeof acquireNativeRootLock> | undefined;
+      try {
+        runtime = acquireNativeRootLock(join(input.root, "supervisor"), { allowUninstall: true });
+        const fence = join(input.root, NATIVE_UNINSTALL_FENCE_FILE);
+        await validateUninstallFence(fence);
+        // A missing record is not proof that a connector has released its data.
+        // Establish ownership before deciding there is no home binding to clean.
+        const exists = await lstat(join(input.root, "native-runtime.json")).then(() => true).catch(error => {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
+        });
+        const record = exists ? await readNativeRecord(input.root) : null;
+        for (const home of record?.agentSkillHomes ?? []) {
+          installer.assertOwned(); runtime.assertOwned();
+          await removeAgentHomeSkillLinks({ home, owner: { workspaceId: record!.workspaceId, instanceId: record!.instanceId } });
+        }
+        installer.assertOwned(); runtime.assertOwned();
+        await writeFile(fence, UNINSTALL_FENCE_CONTENT, { flag: "wx", mode: 0o600 }).catch(async error => {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          if (!await validateUninstallFence(fence)) throw unsafeUninstallFence();
+        });
+      } finally { runtime?.release(); installer.release(); }
+    },
     control: async () => {
       const record = await readNativeRecord(input.root).catch(() => null);
       if (!record) return null;
@@ -186,6 +244,20 @@ export function productionUninstallDeps(input: {
     sleep: ms => new Promise(done => setTimeout(done, ms)),
     now: () => Date.now(),
   };
+}
+
+async function validateUninstallFence(path: string): Promise<boolean> {
+  const info = await lstat(path).catch(error => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (!info) return false;
+  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size !== Buffer.byteLength(UNINSTALL_FENCE_CONTENT) || (process.platform !== "win32" && (info.uid !== process.getuid?.() || (info.mode & 0o077) !== 0)) || await readFile(path, "utf8") !== UNINSTALL_FENCE_CONTENT) throw unsafeUninstallFence();
+  return true;
+}
+
+function unsafeUninstallFence(): RemoteInstanceError {
+  return new RemoteInstanceError("local_io_failure", "The uninstall marker is unsafe. Removal stopped; check the installation before retrying uninstall.");
 }
 
 function readReceipt(root: string): Promise<string | null> {

@@ -143,8 +143,10 @@ export const OPENCODE_DISABLED_AGENTS: readonly string[] = Object.freeze(["title
  * OpenCode 2's own key names. It is passed as `OPENCODE_CONFIG_CONTENT` and
  * never read from the person's home or the repository.
  */
-export function renderOpenCodeKonteksConfig(): Record<string, unknown> {
+export function renderOpenCodeKonteksConfig(skillSource?: string): Record<string, unknown> {
+  if (skillSource !== undefined && (!isAbsolute(skillSource) || CONTROL.test(skillSource))) throw new RemoteInstanceError("agent_unavailable", "OpenCode Skills require an absolute locally owned folder.");
   return {
+    ...(skillSource === undefined ? {} : { skills: [skillSource] }),
     $schema: "https://opencode.ai/config.json",
     permissions: OPENCODE_KONTEKS_PERMISSIONS.map(rule => ({ ...rule })),
     share: "disabled",
@@ -163,9 +165,9 @@ export function renderOpenCodeKonteksConfig(): Record<string, unknown> {
  * `opencode.json` or `.opencode/agent` re-allowed everything in CP0), and no
  * file watcher (it otherwise watches every parent folder up to `/`).
  */
-export function openCodeKonteksSettings(): Record<string, string> {
+export function openCodeKonteksSettings(skillSource?: string): Record<string, string> {
   return {
-    OPENCODE_CONFIG_CONTENT: JSON.stringify(renderOpenCodeKonteksConfig()),
+    OPENCODE_CONFIG_CONTENT: JSON.stringify(renderOpenCodeKonteksConfig(skillSource)),
     OPENCODE_CONFIG_PROJECT_DISABLE: "1",
     OPENCODE_FILEWATCHER_DISABLE: "1",
   };
@@ -175,7 +177,7 @@ export function openCodeKonteksSettings(): Record<string, string> {
 export function openCodeProcessEnvironment(credentialDir: string, configHome: string, inherited?: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv {
   const paths = openCodeRuntimePaths(credentialDir, platform);
   return openCodeEnvironment({ home: { home: paths.home, data: paths.data, state: paths.state, cache: paths.cache, config: configHome },
-    settings: openCodeKonteksSettings(), platform, ...(inherited === undefined ? {} : { inherited }) });
+    settings: openCodeKonteksSettings((platform === "win32" ? win32 : posix).join(paths.root, "skills")), platform, ...(inherited === undefined ? {} : { inherited }) });
 }
 
 /**

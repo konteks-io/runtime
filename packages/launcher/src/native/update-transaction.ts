@@ -7,6 +7,7 @@ import { z } from "zod";
 import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
 import { isHostAgentId, nativeConnectorFileNames, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
+import { installNativeManual } from "./guide.js";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
@@ -22,6 +23,8 @@ export interface NativeUpdateTransactionDeps {
   readRecord: (root: string) => Promise<NativeRuntimeRecord>;
   serviceDefinition: (root: string) => Promise<NativeServiceDefinition>;
   execute: (command: NativeServiceCommand) => Promise<number | null>;
+  /** OS-specific codes that prove the user service is inactive or absent. */
+  serviceStoppedCodes?: readonly number[];
   start: (input: NativeCommandContext) => Promise<void>;
   control: (root: string, record: NativeRuntimeRecord) => UpdateControlClient;
   stage: (options: { root: string; output: NativeCommandContext["output"]; deps?: NativeUpdateDeps }) => Promise<NativeUpdateStage>;
@@ -40,6 +43,8 @@ export interface NativeUpdateTransactionDeps {
   forceStop?: (definition: NativeServiceDefinition) => Promise<void>;
   /** Replaces the person's `konteks-remote` with the kept release's executable, so their next command runs the code they updated to. */
   refreshLauncher?: (root: string, record: NativeRuntimeRecord) => Promise<unknown>;
+  /** Repair manuals missing from installations created before offline guides shipped. */
+  refreshManual?: (root: string) => Promise<unknown>;
   /**
    * The pid the service manager runs for the service, read before the stop so
    * its exit can be watched; null where it names none. launchd ends a
@@ -77,9 +82,11 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
   const { forceStop, servicePid, ...rest } = input;
   return {
     ...rest,
+    serviceStoppedCodes: process.platform === "darwin" ? [113] : process.platform === "win32" ? [1] : [3, 4],
     ...(forceStop ? { forceStop } : {}),
     ...(servicePid ? { servicePid, processAlive, killProcessGroup: endProcessGroup } : {}),
     refreshLauncher: refreshInstalledLauncher,
+    refreshManual: installNativeManual,
     readRecord: readNativeRecord,
     control: (root, record) => new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort),
     stage: stageNativeUpdate,
@@ -108,6 +115,11 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
  */
 export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps): Promise<NativeUpdateOutcome> {
   const previous = await deps.readRecord(input.root);
+  const refreshManual = async (): Promise<void> => {
+    if (deps.refreshManual) await deps.refreshManual(input.root).catch(() => {
+      input.output.line("The installed manual could not be refreshed. Use konteks-remote guide for offline help.");
+    });
+  };
   let staged: NativeUpdateStage;
   try {
     staged = await deps.stage({ root: input.root, output: input.output, ...(input.deps ? { deps: input.deps } : {}) });
@@ -119,7 +131,8 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     throw error;
   }
   if (staged.status === "current") {
-    input.output.line(`Installed release ${staged.bundleVersion} is current; nothing was changed.`);
+    await refreshManual();
+    input.output.line(`Installed release ${staged.bundleVersion} is current.`);
     const outcome: NativeUpdateOutcome = { state: "current", bundleVersion: staged.bundleVersion };
     input.output.result(outcome);
     return outcome;
@@ -133,18 +146,31 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     await deps.recordAttempt(input.root, { ...attempt, outcome, detail: detail?.slice(0, 1_024) ?? null, finishedAt: new Date(deps.now()).toISOString() }).catch(() => undefined);
   };
   const definition = await deps.serviceDefinition(input.root);
-  const wasRunning = await deps.execute(definition.status) === 0;
+  const serviceStatus = await deps.execute(definition.status);
+  const serviceWasRunning = serviceStatus === 0;
   const control = deps.control(input.root, previous);
+  // The private authenticated control channel also finds a foreground serve.
+  // A service-manager status alone cannot prove that this folder is unowned.
+  const foreground = !serviceWasRunning
+    && await control.call({ op: "drain.status" }, DrainStatusSchema, { timeoutMs: 2_000 }).then(() => true, () => false);
+  const wasRunning = serviceWasRunning || foreground;
   let stopped = false;
+  let foregroundStopped = false;
   let oldPid: number | null = null;
   let successor: NativeRuntimeRecord | undefined;
+  let failureStage = "service_state";
   try {
+    if (!serviceWasRunning && deps.serviceStoppedCodes && (serviceStatus === null || !deps.serviceStoppedCodes.includes(serviceStatus))) {
+      throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation's state; its running connector and installation are unchanged.");
+    }
     // The previous release's own doctor result is the baseline; null when it
     // could not be read, and then only the successor's own agents can count.
     const baseline = wasRunning ? await doctorStatuses(control).catch(() => null) : null;
     if (wasRunning) {
+      failureStage = "drain";
       await drain(input, control, deps);
       if (previous.agents.includes("codex")) {
+        failureStage = "codex_preflight";
         try { await control.call({ op: "codex.maintenance.preflight" }, CodexMaintenanceSchema); }
         catch (error) {
           const unsupported = error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" &&
@@ -158,22 +184,45 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
           }
         }
       }
+      failureStage = "stop_preparation";
       const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
       oldPid = await deps.servicePid?.(definition).catch(() => null) ?? null;
-      if (await deps.execute(definition.stop) !== 0) {
-        await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
-        throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
+      if (foreground) {
+        failureStage = "foreground_shutdown";
+        try { await control.call({ op: "shutdown" }, z.unknown()); }
+        catch (error) {
+          await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
+          throw error;
+        }
+        input.output.line("Stopping the connector running in a terminal; the updated connector will start as this user's background service.");
+      } else {
+        failureStage = "service_stop";
+        if (await deps.execute(definition.stop) !== 0) {
+          await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
+          throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
+        }
       }
       stopped = true;
       // launchd and Task Scheduler acknowledge a stop before the process has
       // finished its graceful shutdown; the record may only move once the old
       // service is gone and has released the runtime directory.
-      await waitForServiceExit(input, definition, deps, previousReceipt, oldPid);
+      if (foreground) {
+        failureStage = "foreground_exit";
+        await waitForForegroundExit(input, control, deps, previousReceipt);
+        foregroundStopped = true;
+      }
+      else {
+        failureStage = "service_exit";
+        await waitForServiceExit(input, definition, deps, previousReceipt, oldPid);
+      }
     }
+    failureStage = "commit";
     successor = await commitOnceReleased(input, staged.releaseId, deps);
     if (wasRunning) {
       input.output.line(`Starting ${successor.bundleVersion} and checking it is healthy before keeping it (up to ${spoken(deps.healthDeadlineMs ?? 180_000)})…`);
+      failureStage = "service_start";
       await deps.start(input);
+      failureStage = "health_gate";
       await healthGate(input, deps.control(input.root, successor), previous, successor, baseline, deps, definition);
     }
     await finish("applied", null);
@@ -183,12 +232,13 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     if (deps.refreshLauncher) await deps.refreshLauncher(input.root, successor).catch(error => {
       input.output.line(`konteks-remote itself could not be refreshed to ${successor!.bundleVersion} (${error instanceof Error ? error.message : String(error)}); the connector is updated.`);
     });
+    await refreshManual();
     const outcome: NativeUpdateOutcome = { state: "updated", from: previous.bundleVersion, to: successor.bundleVersion, releaseId: successor.releaseId, previousReleaseId: previous.releaseId, restarted: wasRunning };
     input.output.line(`Native connector updated ${outcome.from} → ${outcome.to}; ${previous.releaseId} is kept for rollback.`);
     input.output.result(outcome);
     return outcome;
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
+    const detail = `[${failureStage}] ${error instanceof Error ? error.message : String(error)}`;
     if (successor) {
       input.output.line(`Update to ${successor.bundleVersion} failed its health gate; rolling back to ${previous.releaseId}.`);
       let restored = false;
@@ -216,10 +266,28 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       // Stopped but not swapped: the installation is unchanged, so the same
       // release comes back, confirmed or not (RCA 2026-09-30, D113b: 0.8.0's
       // launcher left an unconfirmed stop unloaded and the computer offline).
-      if (stopped && wasRunning) await restartUnchanged(input, definition, deps, previous, oldPid);
+      if (stopped && wasRunning && (!foreground || foregroundStopped)) await restartUnchanged(input, definition, deps, previous, oldPid);
+      else if (foreground && stopped) await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
       await finish("failed", detail);
     }
     throw error;
+  }
+}
+
+async function waitForForegroundExit(input: NativeUpdateInput, control: UpdateControlClient, deps: NativeUpdateTransactionDeps, previousReceipt: string | null): Promise<void> {
+  const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+  for (;;) {
+    // A receipt follows complete daemon cleanup. commitOnceReleased then takes
+    // the same kernel ownership lock before any installation record can move.
+    if (deps.readStopReceipt) {
+      const receipt = await deps.readStopReceipt(input.root);
+      if (receipt !== null && receipt !== previousReceipt) return;
+    } else {
+      const answering = await control.call({ op: "drain.status" }, DrainStatusSchema, { timeoutMs: 2_000 }).then(() => true, () => false);
+      if (!answering) return;
+    }
+    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The foreground connector did not finish stopping; its installation was not changed.");
+    await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
   }
 }
 

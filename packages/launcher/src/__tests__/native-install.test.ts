@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { bundleManifestSigningBytes, computeBundleManifestDigest, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
 import { acquireNativeRootLock, hostAgentInstallAdapter, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, SupervisorStore, verifyInstalledNativeConnector } from "@konteks/remote-supervisor";
-import { addNativeAgent, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
+import { addNativeAgent, configureNativeSkillHomes, installNative, readNativeRecord, reassignOccupiedNativeControlPort, recordNativeEnrollment, removeNativeAgent, restoreNativeRecord } from "../native/install.js";
 import { startNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
@@ -77,6 +77,50 @@ async function personOpenCode(root: string, version = "2.0.18", name = "@opencod
 }
 
 describe("native install composition", () => {
+  it("can explicitly rebind a deleted legacy Codex profile during stopped Skill configuration", async () => {
+    const f = await fixture(); const installed = await installNative(f.options);
+    const missing = join(f.root, "removed-personal-profile");
+    const legacy = { ...installed, codexHome: missing }; delete legacy.agentSkillHomes; delete legacy.claudeConfigDir;
+    await writeSecretFile(join(f.root, "native-runtime.json"), JSON.stringify(legacy));
+    const operatorHome = join(f.root, "person"); const selected = join(operatorHome, ".codex");
+    await mkdir(selected, { recursive: true, mode: 0o700 });
+    await writeSecretFile(join(selected, "personal-marker"), "preserve");
+    await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).rejects.toMatchObject({ code: "prerequisite_missing" });
+    await expect(configureNativeSkillHomes({ root: f.root, deps: { roots: f.trust, platform: f.platform, operatorHome, env: {} } })).rejects.toMatchObject({ code: "prerequisite_missing" });
+    await expect(configureNativeSkillHomes({ root: f.root, deps: { roots: f.trust, platform: f.platform, operatorHome, env: { CODEX_HOME: missing } } })).rejects.toMatchObject({ code: "prerequisite_missing" });
+    expect(await readNativeRecord(f.root)).toEqual(legacy);
+    const configured = await configureNativeSkillHomes({ root: f.root, deps: { roots: f.trust, platform: f.platform, operatorHome, env: { CODEX_HOME: selected } } });
+    const canonical = await realpath(selected);
+    expect(configured.codexHome).toBe(canonical);
+    expect(configured.instanceId).toBe(installed.instanceId);
+    expect(await readFile(join(selected, "personal-marker"), "utf8")).toBe("preserve");
+    expect(f.activate).toHaveBeenCalledTimes(1);
+    expect((await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).runners.find(r => r.RUNNER_AGENT_ID === "codex")?.RUNNER_NATIVE_CODEX_HOME).toBe(canonical);
+  });
+  it("binds an existing stopped record to local Skill profiles without reactivation or changing identity", async () => {
+    const f = await fixture(); const installed = await installNative(f.options);
+    const legacy = { ...installed }; delete legacy.agentSkillHomes; delete legacy.claudeConfigDir;
+    await writeSecretFile(join(f.root, "native-runtime.json"), JSON.stringify(legacy));
+    const identity = await readFile(join(f.root, "supervisor", "identity.json"), "utf8");
+    const operatorHome = join(f.root, "person");
+    const configured = await configureNativeSkillHomes({ root: f.root, deps: { roots: f.trust, platform: f.platform, operatorHome, env: { CLAUDE_CONFIG_DIR: join(operatorHome, ".claude-deepseek") } } });
+    expect(configured).toEqual({ ...legacy, claudeConfigDir: join(operatorHome, ".claude-deepseek"),
+      agentSkillHomes: [join(operatorHome, ".codex"), installed.codexHome, join(operatorHome, ".agents"),
+        join(operatorHome, ".claude"), join(operatorHome, ".claude-deepseek"),
+        join(operatorHome, ".config", "opencode"), join(operatorHome, ".dsh"), join(operatorHome, ".gemini", "config")] });
+    expect(await readNativeRecord(f.root)).toEqual(configured);
+    expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(identity);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+  });
+  it("refuses Skill profile configuration while the connector owns the installation", async () => {
+    const f = await fixture(); await installNative(f.options);
+    const before = await readFile(join(f.root, "native-runtime.json"), "utf8");
+    const lock = acquireNativeRootLock(join(f.root, "supervisor"));
+    try {
+      await expect(configureNativeSkillHomes({ root: f.root, deps: { roots: f.trust, platform: f.platform, operatorHome: join(f.root, "person"), env: {} } })).rejects.toMatchObject({ code: "temporarily_unavailable" });
+      expect(await readFile(join(f.root, "native-runtime.json"), "utf8")).toBe(before);
+    } finally { lock.release(); }
+  });
   it("moves a stopped installation off a port owned by another process without changing durable identity or work", async () => {
     const f = await fixture();
     const holder = createServer();
@@ -330,6 +374,8 @@ describe("native install composition", () => {
     const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
     expect(loaded.record).toMatchObject({ agents: ["codex", "dsh"], dshRoot: dsh.pkg, dshNode: dsh.node });
     expect(loaded.runners.find(runner => runner.RUNNER_AGENT_ID === "dsh")).toMatchObject({ RUNNER_NATIVE_DSH_ROOT: dsh.pkg, RUNNER_NATIVE_DSH_NODE: dsh.node });
+    expect(loaded.record.agentSkillHomes).toBeDefined();
+    expect(loaded.runners.find(runner => runner.RUNNER_AGENT_ID === "dsh")?.RUNNER_NATIVE_SKILL_HOMES).toEqual(loaded.record.agentSkillHomes);
     const release = join(f.root, "releases", loaded.record.releaseId, "agents");
     expect(await readdir(release)).toEqual(["codex"]);
     expect(await readdir(join(f.root, "credentials"))).toEqual(expect.arrayContaining(["codex", "dsh"]));

@@ -33,6 +33,7 @@ export interface HeartbeatOptions {
    * from the agents just collected; undefined to leave the field out (an
    * older Core, or nothing detected yet). Never throws the heartbeat away.
    */
+  skillStatus?: () => HeartbeatMessage["skillStatus"];
   supportedAgents?: (agents: HeartbeatMessage["agents"]) => readonly SupportedAgentEntry[] | undefined;
   /**
    * The `konteks-remote` commands this installed release has (runtime-view
@@ -264,6 +265,7 @@ export class HeartbeatPublisher {
       bundleVersion: this.options.bundleVersion,
       ...(this.options.modelCapabilitySnapshots ? { modelCapabilitySnapshots: this.options.modelCapabilitySnapshots() } : {}),
       ...(supportedAgents ? { supportedAgents } : {}),
+      ...(this.options.skillStatus ? { skillStatus: this.options.skillStatus() } : {}),
       ...(connectorCommands ? { connectorCommands } : {}),
     });
     // The wire carries a top-level `signature` and no `proof` envelope, but the

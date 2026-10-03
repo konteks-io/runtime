@@ -50,6 +50,10 @@ export const NativeRuntimeRecordSchema = z.object({
   codexSocket: z.string().min(1).max(4096).optional(),
   /** The operator's own installed Claude Code CLI, located at install time. */
   claudeExecutable: z.string().min(1).max(4096).optional(),
+  /** Optional local CLAUDE_CONFIG_DIR, captured by the installer; contains no credential values. */
+  claudeConfigDir: z.string().min(1).max(4096).refine(value => isAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)).optional(),
+  /** Explicit installer-owned discovery targets. Old records without this field do not mutate operator homes. */
+  agentSkillHomes: z.array(z.string().min(1).max(4096).refine(value => isAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value))).max(8).optional(),
   /** The person's own installed DeepSeek Harness package root, located at install time. */
   dshRoot: z.string().min(1).max(4096).optional(),
   /** The person's Node that runs it (the connector cannot run another script). */
@@ -117,6 +121,9 @@ export function parseNativeRuntimeRecord(value: unknown): { record: NativeRuntim
 }
 
 export interface NativeInstallationOptions {
+  /** Explicit local installer profile rebinding, never a cloud or ACP path.
+   * Installation, release, identity and profile checks still run in full. */
+  localCodexHome?: string;
   /** Supplied by the verified executable, never discovered in the writable installation. */
   roots: readonly EmbeddedReleaseRoot[];
   platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" };
@@ -158,6 +165,8 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
     if (exchangeRecord.manifestDigest !== exchange.manifest.digest) throw invalid();
     if (release.manifest.bundleVersion !== record.bundleVersion) throw invalid();
     const runners = [];
+    const claudeConfigDir = record.claudeConfigDir ?? join(homedir(), ".claude");
+    const skillHomes = record.agentSkillHomes;
     const unavailableAgents: NativeUnavailableAgent[] = [];
     // A host-installed agent (the person's own DeepSeek Harness or OpenCode)
     // has no signed artifact: its adapter re-locates and re-verifies it here
@@ -193,7 +202,7 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
               entry.relocate = async () => {
                 const updated = await updateNativeAntigravity(canonicalRoot, record, { selfCheck: config => host.selfCheck(config) });
                 entry.fetched = updated.fetched;
-                return updated.config;
+                return RunnerConfigSchema.parse({ ...updated.config, ...(skillHomes ? { RUNNER_NATIVE_SKILL_HOMES: skillHomes } : {}) });
               };
             }
             unavailableAgents.push(entry);
@@ -209,13 +218,15 @@ export async function loadNativeInstallation(root: string, options: NativeInstal
       for (const path of [prefix, credentials, workspace]) await directory(path);
       const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
       const profile = await verifyOfflineAgentPackage(prefix, artifact);
-      const codexHome = agent === "codex" ? await resolveNativeCodexHome(record.codexHome === undefined ? process.env : { CODEX_HOME: record.codexHome }) : undefined;
+      const codexHome = agent === "codex" ? await resolveNativeCodexHome((options.localCodexHome ?? record.codexHome) === undefined ? process.env : { CODEX_HOME: options.localCodexHome ?? record.codexHome }) : undefined;
       const claudeExecutable = agent === "claude-code" ? await resolveNativeClaudeExecutable(record.claudeExecutable === undefined ? process.env : { CLAUDE_CODE_EXECUTABLE: record.claudeExecutable }) : undefined;
       runners.push(RunnerConfigSchema.parse({
         RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
         RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
         ...(codexHome ? { RUNNER_NATIVE_CODEX_HOME: codexHome } : {}),
         ...(claudeExecutable ? { RUNNER_NATIVE_CLAUDE_EXECUTABLE: claudeExecutable } : {}),
+        ...(claudeExecutable ? { RUNNER_NATIVE_CLAUDE_CONFIG_DIR: claudeConfigDir } : {}),
+        ...(skillHomes ? { RUNNER_NATIVE_SKILL_HOMES: skillHomes } : {}),
         // The supervisor owns this shared service lifecycle. Its default socket
         // is per connector; only the official CODEX_HOME remains shared.
         ...(codexHome && profile.codexLocalProxy ? { RUNNER_NATIVE_CODEX_SOCKET: await resolveNativeCodexSocket(root, codexHome, record.codexSocket) } : {}),
@@ -295,6 +306,7 @@ export async function nativeHostRunnerConfig(root: string, record: NativeRuntime
   return RunnerConfigSchema.parse({
     RUNNER_AGENT_ID: agent, RUNNER_AUTH_MODE: "agent_local_subscription",
     RUNNER_CREDENTIAL_DIR: credentials, RUNNER_WORKSPACE_DIR: workspace,
+    ...(record.agentSkillHomes ? { RUNNER_NATIVE_SKILL_HOMES: record.agentSkillHomes } : {}),
     ...await host.runnerSettings(record, { root }),
   });
 }

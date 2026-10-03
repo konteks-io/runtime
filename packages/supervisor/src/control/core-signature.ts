@@ -1,3 +1,4 @@
+import { RuntimeSkillSyncEnvelopeSchema, RuntimeSkillSyncRequestSchema, runtimeSkillSyncSigningBytes, runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import type { KeyObject } from "node:crypto";
 import { PlanningControllerTerminalDirectiveSchema, RemoteControlSigningKeySchema, planningControllerTerminalDirectiveSigningBytes, remoteControlSigningBytes, ed25519PublicKeyFromJwk, ed25519Verify, type JsonValue, type PlanningControllerTerminalDirective } from "@konteks/remote-common";
 import type { EmbeddedReleaseRoot } from "@konteks/remote-release";
@@ -115,6 +116,32 @@ export class CoreSignatureVerifier {
     try {
       return ed25519Verify(key, diagnosticCarrierCompanionSigningBytes(request), request.signature);
     } catch { return false; }
+  }
+
+  /** Persistent organization discovery uses an independent machine envelope domain. */
+  verifyRuntimeSkillSync(candidate: unknown): boolean {
+    const parsed = RuntimeSkillSyncEnvelopeSchema.safeParse(candidate);
+    if (!parsed.success || !this.configured) return false;
+    const { signature } = parsed.data;
+    if (!/^[A-Za-z0-9_-]{86}$/.test(signature) || Buffer.from(signature, "base64url").toString("base64url") !== signature) return false;
+    try {
+      const bytes = runtimeSkillSyncSigningBytes(parsed.data);
+      for (const key of this.keys.values()) if (ed25519Verify(key, bytes, signature)) return true;
+    } catch { return false; }
+    return false;
+  }
+
+  /** Crypto only: admission must also check local identity, time, and replay. */
+  verifyRuntimeSkillSyncRequest(candidate: unknown): boolean {
+    const parsed = RuntimeSkillSyncRequestSchema.safeParse(candidate);
+    if (!parsed.success || !this.configured) return false;
+    const { signature } = parsed.data;
+    if (!/^[A-Za-z0-9_-]{86}$/.test(signature) || Buffer.from(signature, "base64url").toString("base64url") !== signature) return false;
+    try {
+      const bytes = runtimeSkillSyncRequestSigningBytes(parsed.data);
+      for (const key of this.keys.values()) if (ed25519Verify(key, bytes, signature)) return true;
+    } catch { return false; }
+    return false;
   }
 
   verify(body: { [key: string]: JsonValue }, signature: string): boolean {

@@ -1,4 +1,5 @@
-import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, createLogger, type Logger } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, AgentSkillReadObservationSchema, RemoteSkillReadObservationReceiptSchema,
+  RemoteSkillReadObservationRequestSchema, RuntimeAgentLoginReportSchema, createLogger, type Logger } from "@konteks/remote-common";
 
 import { z } from "zod";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
@@ -711,6 +712,21 @@ export class CoreClient {
 
   /** The mounted Core route accepts one body, and replies only after commit. */
   async submitObservation(instanceId: string, body: unknown): Promise<void> {
+    const read = AgentSkillReadObservationSchema.safeParse(body);
+    if (read.success) {
+      const observation = read.data;
+      if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Observation instance mismatch");
+      const digest = jcsDigest(observation as unknown as JsonValue);
+      const expectedId = `ri:skill:${digest}`;
+      const semantic = { observation };
+      const result = await this.http.request({ method: "POST", path: CORE_PATHS.observations(instanceId),
+        bodyFactory: () => RemoteSkillReadObservationRequestSchema.parse({ ...semantic,
+          proof: this.proof("skill_usage_observation", instanceId, semantic as unknown as { [key: string]: JsonValue }) }),
+        schema: RemoteSkillReadObservationReceiptSchema, idempotencyKey: `observation:${expectedId}`, operationPolicy: "progressRead" });
+      if (result.observationId !== expectedId || result.observationDigest !== digest)
+        throw new RemoteInstanceError("registration_mismatch", "Observation receipt does not match submitted bytes");
+      return;
+    }
     const observation = AgentTurnUsageObservationSchema.parse(body);
     if (observation.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Observation instance mismatch");
     const digest = jcsDigest(observation as unknown as JsonValue);

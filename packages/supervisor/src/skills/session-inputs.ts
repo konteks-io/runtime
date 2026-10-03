@@ -1,13 +1,18 @@
 import { lstat, realpath } from "node:fs/promises";
-import { isAbsolute } from "node:path";
-import { RemoteInstanceError, RemoteSkillCatalogSchema, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
-import { stageOrganizationSkills, type StageOrganizationSkillsOptions, type StagedOrganizationSkills } from "./staging.js";
+import { isAbsolute, join } from "node:path";
+import { RemoteInstanceError, RemoteSkillCatalogSchema, sha256Hex, type RemoteDeliveryAcceptanceReceipt, type RemoteTransferBinding, type SessionToCoreMessage } from "@konteks/remote-common";
+import { stageOrganizationSkills, verifyRetainedSkillTree, type StageOrganizationSkillsOptions, type StagedOrganizationSkills } from "./staging.js";
+import type { ManagedSkillReadTarget, CompletedSkillRead } from "./read-tracker.js";
+import { syncAgentHomeSkills, verifyAgentHomeSkillRead } from "./home-sync.js";
 
 /** Local-only preparation result: paths/instructions never enter relay frames. */
 export interface PreparedSessionInputs {
   binding: RemoteTransferBinding;
   cwd: string;
   skillInstructions: string;
+  /** Verified immutable file identities; instruction injection is not usage. */
+  managedSkillReadTargets?: readonly ManagedSkillReadTarget[];
+  verifyManagedSkillRead?: (read: CompletedSkillRead) => Promise<boolean>;
   beforePrompt: () => Promise<void>;
   /** Delivery-only terminal barrier. Public ACP completion waits for its durable cloud receipt. */
   acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string; completion: SessionToCoreMessage }) => Promise<RemoteDeliveryAcceptanceReceipt>;
@@ -43,11 +48,16 @@ async function checkedDirectory(cwd: string): Promise<string> {
  * is put in front of the person's text; before each prompt the folder is
  * checked to be the same one the session started in.
  */
-export async function prepareDirectSessionInputs(options: { cwd: string; binding: RemoteTransferBinding }): Promise<PreparedSessionInputs> {
+export async function prepareDirectSessionInputs(options: { cwd: string; binding: RemoteTransferBinding;
+  /** Caller supplies a freshly verified machine inventory, never an agent path. */
+  skillReads?: Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead">;
+}): Promise<PreparedSessionInputs> {
   try {
     const cwd = await checkedDirectory(options.cwd);
     return {
       binding: { ...options.binding }, cwd, skillInstructions: "",
+      ...(options.skillReads?.managedSkillReadTargets ? { managedSkillReadTargets: options.skillReads.managedSkillReadTargets.map(target => ({ ...target })) } : {}),
+      ...(options.skillReads?.verifyManagedSkillRead ? { verifyManagedSkillRead: options.skillReads.verifyManagedSkillRead } : {}),
       beforePrompt: async () => {
         try { if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved"); }
         catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
@@ -57,7 +67,7 @@ export async function prepareDirectSessionInputs(options: { cwd: string; binding
 }
 
 /** Caller resolves the approved source checkout and authoritative skill selection. */
-export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string }): Promise<PreparedSessionInputs> {
+export async function prepareOrganizationSkillSession(options: StageOrganizationSkillsOptions & { cwd: string; agentHomes?: readonly string[]; authorizeHomeSync?: () => Promise<void> }): Promise<PreparedSessionInputs> {
   try {
     const cwd = await checkedDirectory(options.cwd);
     const snapshot = {
@@ -66,9 +76,41 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
       authority: { binding: { ...options.authority.binding }, catalogDigest: options.authority.catalogDigest },
     };
     const staged = await stageOrganizationSkills(snapshot);
+    const homes = new Set(options.agentHomes ?? []);
+    if (homes.size) await options.authorizeHomeSync?.();
+    for (const home of homes) {
+      await syncAgentHomeSkills({ home, staged,
+        owner: { workspaceId: snapshot.authority.binding.workspaceId, instanceId: snapshot.authority.binding.instanceId },
+        assertAuthorized: async () => {
+          await options.assertAuthorized();
+          // Native discovery outlives this session's prompt boundary. Recheck
+          // Core immediately before publishing there, even when local staging
+          // deliberately uses only the admitted envelope between prompts.
+          await options.authorizeHomeSync?.();
+          // Link publication must not expose a tree changed after staging.
+          await stageOrganizationSkills(snapshot);
+        },
+      });
+    }
+    if (homes.size) await options.authorizeHomeSync?.();
     return {
       binding: { ...snapshot.authority.binding }, cwd,
       skillInstructions: organizationSkillInstructions(staged),
+      managedSkillReadTargets: staged.skills.flatMap(skill => [skill.skillFile,
+        ...[...homes].map(home => join(home, "skills", `konteks-${sha256Hex(skill.skillId)}`, "SKILL.md"))]
+        .map(skillFile => ({ skillId: skill.skillId, version: skill.version, skillFile }))),
+      verifyManagedSkillRead: async read => {
+        const skill = staged.skills.find(item => item.skillId === read.capabilityId && item.version === read.version);
+        if (!skill) return false;
+        try {
+          await verifyRetainedSkillTree(skill, skill.directory);
+          for (const home of homes) {
+            if (!await verifyAgentHomeSkillRead({ home, owner: { workspaceId: snapshot.authority.binding.workspaceId,
+              instanceId: snapshot.authority.binding.instanceId }, skill })) return false;
+          }
+          return true;
+        } catch { return false; }
+      },
       beforePrompt: async () => {
         try {
           if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved");
@@ -78,4 +120,19 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
       },
     };
   } catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+}
+
+/** Machine-sync snapshot used only for read telemetry, never prompt instructions. */
+export function machineSkillReadTracking(staged: StagedOrganizationSkills, homes: readonly string[],
+  owner: { workspaceId: string; instanceId: string }): Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead"> {
+  const snapshot = structuredClone(staged), profiles = [...homes], binding = { ...owner };
+  const targets = snapshot.skills.flatMap(skill => profiles.map(home => ({ skillId: skill.skillId, version: skill.version,
+    skillFile: join(home, "skills", `konteks-${sha256Hex(skill.skillId)}`, "SKILL.md") })));
+  if (targets.length > 512) throw new RemoteInstanceError("capability_unavailable", "Skill read inventory is too large.");
+  return { managedSkillReadTargets: targets, verifyManagedSkillRead: async read => {
+    const skill = snapshot.skills.find(item => item.skillId === read.capabilityId && item.version === read.version);
+    if (!skill || profiles.length === 0) return false;
+    for (const home of profiles) if (!await verifyAgentHomeSkillRead({ home, owner: binding, skill })) return false;
+    return true;
+  } };
 }

@@ -1,3 +1,10 @@
+import { SkillRefreshScheduler } from "./skills/refresh-scheduler.js";
+import { machineSkillReadTracking, type PreparedSessionInputs } from "./skills/session-inputs.js";
+import { publicSkillStatus } from "./skills/public-status.js";
+import type { SkillSyncSuccess } from "./skills/sync-receipt.js";
+import { NativeSkillSyncClient } from "./native/skill-sync-client.js";
+import { MachineSkillSyncFailure, machineSkillHomes, refreshMachineSkills, type MachineSkillInventory, type MachineSkillSyncPhase } from "./native/skill-refresh.js";
+import { SkillSyncCoordinator } from "./skills/sync-coordinator.js";
 import { ObservationDelivery } from "./control/observation-delivery.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -85,6 +92,8 @@ import { NativeInputClient } from "./native/input-client.js";
 import { NativeOutputClient } from "./native/output-client.js";
 import { createRetainedDeliveryOutputRecovery } from "./native/output-recovery.js";
 import { createNativeInputPreparer } from "./native/input-preparer.js";
+import { admitSkillSyncRequest } from "./skills/sync-request.js";
+import { reserveSkillSyncRequest } from "./skills/sync-replay.js";
 import { createNativeReadyRegistrar } from "./native/execution-ready.js";
 import type { NativeGitTool } from "./native/git-workspace.js";
 import { verifyInstalledNativeBridges } from "./native/installed.js";
@@ -163,6 +172,8 @@ export interface SupervisorOptions {
     runners: RunnerConfig[];
     /** Tests/embedding may override; installed native service uses the production preparer. */
     prepareInputs?: NonNullable<RelayedSessionDeps["prepareInputs"]>;
+    /** Embedding/test seam; installed connectors use the machine-authorized production refresh. */
+    refreshSkills?: (signal: AbortSignal) => Promise<MachineSkillInventory>;
     git?: NativeGitTool;
     /** Shared object cache across every configured local agent. */
     repositoryCacheRoot?: string;
@@ -272,6 +283,15 @@ export class Supervisor {
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private stopping = false;
+  private machineSkillReads: { workspaceId: string; instanceId: string; inputs: Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead"> } | undefined;
+  private skillSync: SkillSyncCoordinator<MachineSkillInventory> | undefined;
+  private skillRefreshScheduler: SkillRefreshScheduler | undefined;
+  private skillSyncClient: NativeSkillSyncClient | undefined;
+  private skillPollBusy = false;
+  private readonly skillPollAbort = new AbortController();
+  private pendingSkillReceipt: { requestId: string; state: "succeeded" | "failed" } | undefined;
+  private historicalSkillSync: SkillSyncSuccess | undefined;
+  private lastSkillSyncFailure: { phase: MachineSkillSyncPhase; at: string; httpStatus?: number } | undefined;
   private nativeOwnership: NativeRootLock | null = null;
   private readonly runnerIncarnation = randomUUID();
   private readonly stateMutations: StateMutationGate;
@@ -377,6 +397,10 @@ export class Supervisor {
     const manifest = await this.store.manifest();
     this.instanceId = identity?.instanceId ?? null;
     this.workspaceId = identity?.workspaceId ?? null;
+    if (this.workspaceId && this.instanceId) {
+      try { this.historicalSkillSync = await this.store.skillSyncSuccess({ workspaceId: this.workspaceId, instanceId: this.instanceId }) ?? undefined; }
+      catch { this.logger.warn({ event: "skills.sync_receipt_unavailable" }, "Previous Skill sync status could not be verified"); }
+    }
     this.administrativeStatus = identity?.administrativeStatus ?? "unknown";
     this.manifestDigest = manifest?.manifestDigest ?? "";
     if (!identity || !manifest) throw new RemoteInstanceError("install_state_corrupt", "Native activation and release state are required before startup.");
@@ -476,6 +500,13 @@ export class Supervisor {
       // A site-started login needs a native install with a Codex runner (WS1-115).
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
+      skillSyncReady: () => {
+        if (!this.options.native || !this.nativeOwnership || this.stopping) return false;
+        try {
+          this.nativeOwnership.assertOwned();
+          return new CoreSignatureVerifier(this.roots).configured && machineSkillHomes(this.options.native.runners).length > 0;
+        } catch { return false; }
+      },
       additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : []),
         ...(this.integrationCarrier ? integrationTaskCapabilities(this.runners.keys()) : [])],
       decorateAgents: agents => this.withAntigravityDownload(agents),
@@ -881,6 +912,7 @@ export class Supervisor {
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
         broker: this.broker,
         registerDeferral: (body) => this.core.deferPermission(this.instanceId ?? "", body),
+        onSkillReadObservation: observation => this.observationDelivery.submit(observation),
         instanceId: this.instanceId ?? "",
         redeemCapabilityToken: async (target) => {
           const deadlineAtMs = Date.now() + Math.max(0, Date.parse(target.expiresAt) - this.clock.coreNow());
@@ -911,7 +943,14 @@ export class Supervisor {
         }),
         prepareInputs: this.options.native!.prepareInputs ?? createNativeInputPreparer({
           logger: this.logger,
+          directSkillReads: assignment => {
+            const snapshot = this.machineSkillReads;
+            if (this.stopping || !snapshot || assignment.workspaceId !== snapshot.workspaceId || assignment.instanceId !== snapshot.instanceId ||
+              this.workspaceId !== snapshot.workspaceId || this.instanceId !== snapshot.instanceId) return {};
+            return snapshot.inputs;
+          },
           root: this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
+          agentSkillHomes: this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_NATIVE_SKILL_HOMES ?? [],
           clock: this.clock,
           mutate: this.stateMutations.run,
           ...(this.options.native!.git ? { git: this.options.native!.git } : {}),
@@ -1043,6 +1082,7 @@ export class Supervisor {
       activeAssignmentIds: () => this.work.activeAssignmentIds(),
       modelCapabilitySnapshots: () => this.modelCapabilities?.snapshots() ?? [],
       supportedAgents: agents => this.supportedAgents(agents),
+      skillStatus: () => this.skillStatus(),
       // The commands this release carries (runtime-view R20), only to a Core that takes 7.1 fields.
       connectorCommands: () => (this.hostSettings.coreAcceptsRouteBilling ? this.connectorCommands() : undefined),
       configRevision: () => this.control.configRevision,
@@ -1450,7 +1490,7 @@ export class Supervisor {
     if (this.stopping) return;
     this.requireRecoveryAuthority();
     if (!this.configurationTimer) {
-      this.configurationTimer = setInterval(() => void this.refreshConfiguration(), 30_000);
+      this.configurationTimer = setInterval(() => { void this.refreshConfiguration(); void this.pollSkillSyncRequest(); }, 30_000);
       this.configurationTimer.unref();
     }
     if (!this.ordinaryHeartbeatStarted) {
@@ -1473,6 +1513,8 @@ export class Supervisor {
     this.previews.startIdleSweep();
     this.ensureUpdates()?.start();
     await this.work.reports.flushAll();
+    this.triggerSkillRefresh();
+    void this.pollSkillSyncRequest();
   }
 
   /**
@@ -1499,12 +1541,127 @@ export class Supervisor {
     return this.updates ?? null;
   }
 
+  private machineSkillSyncClient(): NativeSkillSyncClient {
+    if (!this.skillSyncClient) this.skillSyncClient = new NativeSkillSyncClient({ baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots,
+      now: () => this.clock.coreNow(), identity: () => ({ workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" }),
+      credential: () => !this.stopping && this.lease.mode() === "active" ? this.lease.current()?.lease ?? null : null,
+    });
+    return this.skillSyncClient;
+  }
+
+  private async pollSkillSyncRequest(): Promise<void> {
+    if (this.skillPollBusy || this.stopping || !this.options.native || !this.nativeOwnership ||
+        this.lease.mode() !== "active" || !this.reconciliation.isComplete) return;
+    this.skillPollBusy = true;
+    try {
+      const client = this.machineSkillSyncClient(), signal = this.skillPollAbort.signal;
+      const owner = { workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" };
+      this.pendingSkillReceipt = await this.store.pendingSkillReceipt(owner) ?? undefined;
+      if (this.pendingSkillReceipt) {
+        const accepted = await client.receipt(this.pendingSkillReceipt, signal);
+        if (!accepted) this.logger.warn({ event: "skills.manual_sync_result_refused" }, "Core no longer accepts this Skill sync result");
+        await this.store.savePendingSkillReceipt(owner, null); this.pendingSkillReceipt = undefined;
+        return;
+      }
+      const request = await client.pendingRequest(signal);
+      if (!request) return;
+      await this.admitManualSkillSync(request, async () => {
+        // A crash before completion retains failure, never an invented success.
+        this.pendingSkillReceipt = { requestId: request.requestId, state: "failed" };
+        await this.store.savePendingSkillReceipt(owner, this.pendingSkillReceipt);
+        if (!await client.receipt({ requestId: request.requestId, state: "accepted" }, signal)) throw new Error("Skill sync admission was refused");
+        try {
+          await this.syncOrganizationSkills();
+          this.pendingSkillReceipt = { requestId: request.requestId, state: "succeeded" };
+        } catch {
+          this.pendingSkillReceipt = { requestId: request.requestId, state: "failed" };
+        }
+        await this.store.savePendingSkillReceipt(owner, this.pendingSkillReceipt ?? null);
+      });
+      if (this.pendingSkillReceipt) {
+        const accepted = await client.receipt(this.pendingSkillReceipt, signal);
+        if (!accepted) this.logger.warn({ event: "skills.manual_sync_result_refused" }, "Core no longer accepts this Skill sync result");
+        await this.store.savePendingSkillReceipt(owner, null); this.pendingSkillReceipt = undefined;
+      }
+    } catch {
+      if (!this.stopping) this.logger.warn({ event: "skills.manual_sync_unavailable" }, "Manual Skill synchronization could not be delivered");
+    } finally { this.skillPollBusy = false; }
+  }
+
+  private async syncOrganizationSkills(): Promise<MachineSkillInventory> {
+    if (this.stopping || !this.options.native || !this.nativeOwnership || this.lease.mode() !== "active" || !this.reconciliation.isComplete) throw new RemoteInstanceError("capability_unavailable", "Organization Skill synchronization is unavailable");
+    const homes = machineSkillHomes(this.options.native.runners);
+    if (!homes.length && !this.options.native.refreshSkills) throw new RemoteInstanceError("capability_unavailable", "Local agent Skill homes are not configured");
+    if (!this.skillSync) {
+      const client = this.machineSkillSyncClient();
+      this.skillSync = new SkillSyncCoordinator(signal => this.stateMutations.run(async () => {
+        if (this.stopping) throw new Error("Skill synchronization is stopped");
+        if (this.options.native!.refreshSkills) return this.options.native!.refreshSkills(signal);
+        const currentHomes = machineSkillHomes(this.options.native!.runners);
+        return refreshMachineSkills({ client, homes: currentHomes, scratchRoot: join(this.config.SUPERVISOR_DATA_DIR, "machine-skills"),
+          owner: { workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" }, now: () => this.clock.coreNow(),
+          onVerified: (staged, profiles, owner) => {
+            this.machineSkillReads = { ...owner, inputs: machineSkillReadTracking(staged, profiles, owner) };
+          } }, signal);
+      }), () => this.clock.coreNow(), {
+        ...(this.historicalSkillSync ? { initialSuccess: this.historicalSkillSync } : {}),
+        persistSuccess: async success => {
+          if (this.stopping || !this.workspaceId || !this.instanceId) throw new Error("Skill synchronization is stopped");
+          await this.store.saveSkillSyncSuccess({ workspaceId: this.workspaceId, instanceId: this.instanceId }, success);
+          this.historicalSkillSync = structuredClone(success);
+        },
+      });
+    }
+    try {
+      const result = await this.skillSync.sync();
+      this.lastSkillSyncFailure = undefined;
+      return result;
+    } catch (error) {
+      if (error instanceof MachineSkillSyncFailure) {
+        this.lastSkillSyncFailure = { phase: error.phase, at: new Date(this.clock.coreNow()).toISOString(),
+          ...(error.httpStatus === undefined ? {} : { httpStatus: error.httpStatus }) };
+        this.logger.warn({ event: "skills.sync_failed", phase: error.phase }, "Organization Skill synchronization failed");
+      }
+      throw error;
+    }
+  }
+
+  private triggerSkillRefresh(): void {
+    this.skillRefreshScheduler ??= new SkillRefreshScheduler({
+      refresh: () => this.syncOrganizationSkills(),
+      active: () => !this.stopping && !!this.options.native && !!this.nativeOwnership &&
+        this.lease.mode() === "active" && this.reconciliation.isComplete,
+      failed: () => this.logger.warn({ event: "skills.sync_unavailable" }, "Organization Skills could not be refreshed; the previous successful inventory is retained"),
+    });
+    this.skillRefreshScheduler.request();
+  }
+
+  /** Closed machine intent only; its transport must independently authenticate Core. */
+  async receiveSkillSyncRequest(candidate: unknown): Promise<"executed" | "duplicate"> {
+    return this.admitManualSkillSync(candidate, () => this.syncOrganizationSkills());
+  }
+
+  private async admitManualSkillSync(candidate: unknown, sync: () => Promise<unknown>): Promise<"executed" | "duplicate"> {
+    const verifier = new CoreSignatureVerifier(this.roots);
+    return admitSkillSyncRequest(candidate, {
+      verify: request => verifier.verifyRuntimeSkillSyncRequest(request),
+      owner: () => ({ workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "",
+        active: !this.stopping && !!this.options.native && !!this.nativeOwnership && this.lease.mode() === "active" && this.reconciliation.isComplete }),
+      now: () => this.clock.coreNow(),
+      // The replay ledger owns its own exclusive lock. Waiting behind an entire
+      // refresh would block relay receipts, including duplicate requests.
+      reserve: (request, digest) => reserveSkillSyncRequest(this.config.SUPERVISOR_DATA_DIR, request, digest, this.clock.coreNow()),
+      sync,
+    });
+  }
+
   private async onRelayConnected(result: RelayRuntimeHandshakeResult): Promise<void> {
     // Reconnect completes before any channel other than control reopens.
     try {
       this.validateRelayHandshake(result);
       this.transport.resumeAfterRecovery();
       await this.work.reports.flushAll();
+      this.triggerSkillRefresh();
     } catch (error) {
       this.logger.warn({ err: error }, "reconciliation failed after relay connect; retrying on next handshake");
       this.relay?.rehandshake("reconciliation-failed");
@@ -1555,6 +1712,7 @@ export class Supervisor {
     try {
       await this.refreshConfiguration();
       await this.reconciliation.run();
+      this.triggerSkillRefresh();
     } catch (error) {
       this.logger.warn({ err: error }, "https reconciliation failed; will retry");
       setTimeout(() => void this.reconnectOverHttps(), 15_000).unref();
@@ -1661,6 +1819,12 @@ export class Supervisor {
     switch (message.channel) {
       case "control": {
         const body = message.body as { type?: string; manifestId?: string };
+        if (body.type === "runtime_skill_sync_request") {
+          // Receipt waits for durable admission, while catalog I/O runs through
+          // the background coordinator. A relay ack never implies sync success.
+          await this.admitManualSkillSync(message.body, async () => this.triggerSkillRefresh());
+          return;
+        }
         if (body.manifestId !== undefined) {
           await this.reconciliation.apply(message.body);
           return;
@@ -1990,6 +2154,11 @@ export class Supervisor {
 
   // ── Status and control socket ─────────────────────────────────────────────
 
+  skillStatus() {
+    return publicSkillStatus(this.skillSync?.status() ?? { syncing: false,
+      ...(this.historicalSkillSync ? { lastSuccess: this.historicalSkillSync } : {}) });
+  }
+
   status(): SupervisorStatus {
     const relay = this.relay?.status();
     const lease = this.lease.current();
@@ -2018,6 +2187,12 @@ export class Supervisor {
       switch (request.op) {
         case "status":
           return this.status();
+        case "skills.status":
+          return { ...(this.skillSync?.status() ?? { syncing: false, ...(this.historicalSkillSync ? { lastSuccess: structuredClone(this.historicalSkillSync) } : {}) }),
+            ...(this.lastSkillSyncFailure ? { lastFailure: { ...this.lastSkillSyncFailure } } : {}) };
+        case "skills.sync":
+          await this.syncOrganizationSkills();
+          return this.skillSync!.status();
         case "agents": {
           const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
           return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
@@ -2612,6 +2787,9 @@ export class Supervisor {
   stop(): Promise<void> {
     this.leaseAuthorityEpoch++;
     this.stopping = true;
+    this.skillPollAbort.abort();
+    this.skillRefreshScheduler?.stop();
+    this.skillSync?.stop();
     // Before anything that can outlast the daemon's exit watchdog (WS1-042).
     this.nativeCodexOwner?.shutdownRequested();
     this.draining = true;

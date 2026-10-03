@@ -12,6 +12,7 @@ import {
   createLogger,
   type AcpJsonRpcError,
   type AgentTurnUsageObservation,
+  type AgentSkillReadObservation,
   type Clock,
   type JsonValue,
   type Logger,
@@ -45,6 +46,7 @@ import {
   type CanonicalAcpToolIdentity,
 } from "./activity.js";
 import { NativeExecutionGate, type NativeExecutionGateOptions } from "../native/execution-gate.js";
+import { SkillReadEmitter } from "../skills/read-emitter.js";
 import { continuedSession, isDirectAssignment, isNativeTurn } from "../work/continued-session.js";
 import { hostToolGovernance, type HostToolBypass, type HostToolGovernance } from "./host-tool-governance.js";
 import { McpToolCallLedger } from "./permission-tool-identity.js";
@@ -153,6 +155,7 @@ export interface RelayedSessionDeps {
   /** Rechecked immediately before a local prompt crosses into the bridge. */
   assertPromptAllowed?: () => void;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
+  onSkillReadObservation?: (observation: AgentSkillReadObservation) => Promise<void>;
   /** A turn started or ended: the computer's busy state changed (WS1-179). */
   onTurnActivity?: () => void;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
@@ -214,6 +217,7 @@ export class RelayedSession {
   private toolFormTold = false;
   private readonly logger: Logger;
   private preparedInputs: PreparedSessionInputs | null = null;
+  private skillReads: SkillReadEmitter | null = null;
   private readonly executionGate: NativeExecutionGate | null;
   /** Durable key of the last prompt admitted on this session (see promptBusy). */
   private promptReservation: string | null = null;
@@ -337,6 +341,12 @@ export class RelayedSession {
       throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
     }
     this.preparedInputs = prepared;
+    if (this.executionGate && this.deps.onSkillReadObservation) {
+      this.skillReads = new SkillReadEmitter({ targets: prepared.managedSkillReadTargets ?? [], cwd: prepared.cwd,
+        authority: () => this.executionGate!.skillReadAuthority(), coreNow: () => this.deps.clock.coreNow(),
+        ...(prepared.verifyManagedSkillRead ? { verifyRead: prepared.verifyManagedSkillRead } : {}),
+        submit: observation => this.deps.onSkillReadObservation!(observation) });
+    }
     // Input preparation verifies Core's claim-bound selection. Use its logical
     // session identity, never a bridge ref or an assignment-local random ID.
     this.boundChannelId = `session:${binding.sessionId}`;
@@ -984,6 +994,7 @@ export class RelayedSession {
         if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
         this.observeStructuredText((event.params as { update?: unknown } | null)?.update);
         this.mcpCalls?.observe((event.params as { update?: unknown } | null)?.update);
+        await this.skillReads?.observe((event.params as { update?: unknown } | null)?.update);
         const bypass = this.toolGovernance?.observe((event.params as { update?: unknown } | null)?.update, this.sessionCwd()) ?? null;
         await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
         if (bypass) await this.onToolGovernanceBypass(bypass);
