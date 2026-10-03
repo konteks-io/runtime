@@ -53,12 +53,17 @@ function plainText(value: string, max: number): string {
 
 /** Does an answer name a listed option / validate against the schema? Defense in depth over Core's own check. */
 export function answerIsValid(pending: SanitizedPermission | SanitizedElicitation, answer: unknown): boolean {
-  if (pending.kind === "permission") {
-    const parsed = z.object({ outcome: z.union([z.object({ outcome: z.literal("cancelled") }).strict(), z.object({ outcome: z.literal("selected"), optionId: z.string() }).strict()]) }).passthrough().safeParse(answer);
-    if (!parsed.success) return false;
-    if (parsed.data.outcome.outcome === "cancelled") return true;
-    return pending.params.options.some((option) => option.optionId === (parsed.data.outcome as { optionId: string }).optionId);
-  }
+  return pending.kind === "permission" ? permissionAnswerValid(pending, answer) : elicitationAnswerValid(pending, answer);
+}
+
+function permissionAnswerValid(pending: SanitizedPermission, answer: unknown): boolean {
+  const parsed = z.object({ outcome: z.union([z.object({ outcome: z.literal("cancelled") }).strict(), z.object({ outcome: z.literal("selected"), optionId: z.string() }).strict()]) }).passthrough().safeParse(answer);
+  if (!parsed.success) return false;
+  if (parsed.data.outcome.outcome === "cancelled") return true;
+  return pending.params.options.some((option) => option.optionId === (parsed.data.outcome as { optionId: string }).optionId);
+}
+
+function elicitationAnswerValid(pending: SanitizedElicitation, answer: unknown): boolean {
   if (pending.isSignIn) return false;
   const parsed = z.object({ action: z.enum(["accept", "decline", "cancel"]) }).passthrough().safeParse(answer);
   if (!parsed.success) return false;
@@ -66,7 +71,6 @@ export function answerIsValid(pending: SanitizedPermission | SanitizedElicitatio
   const content = (answer as { content?: unknown }).content;
   return content === undefined || content === null || BoundedJsonValueSchema.safeParse(content).success;
 }
-
 export interface PendingHumanRequest {
   acpSessionRef: string;
   requestId: string;
@@ -188,20 +192,32 @@ export async function registerDeferral(
   const sleep = options.sleep ?? (ms => new Promise<void>(resolve => { setTimeout(resolve, ms).unref(); }));
   for (let attempt = 1; attempt <= REGISTRATION_ATTEMPTS; attempt += 1) {
     try {
-      const view = await register(body);
-      if (view.kind !== body.kind || view.requestId !== body.requestId || view.assignmentId !== body.assignmentId || view.agentId !== body.agentId) {
-        options.logger?.warn({ requestId: body.requestId, assignmentId: body.assignmentId, stage: "permission_deferral", outcome: "mismatched" }, "Core registered a different pending request; failing closed");
-        return null;
-      }
-      return view;
+      return registeredRequest(await register(body), body, options.logger);
     } catch (error) {
-      const retryable = error instanceof RemoteInstanceError && error.retryable;
-      options.logger?.warn({ requestId: body.requestId, assignmentId: body.assignmentId, stage: "permission_deferral", attempt, retryable,
-        ...(error instanceof RemoteInstanceError ? { code: error.code } : { errorName: error instanceof Error ? error.name : "unknown" }) },
-        retryable && attempt < REGISTRATION_ATTEMPTS ? "permission deferral registration failed; retrying" : "permission deferral registration failed; failing closed");
-      if (!retryable || attempt === REGISTRATION_ATTEMPTS) return null;
+      if (!registrationRetried(error, attempt, body, options.logger)) return null;
       await sleep(Math.min(REGISTRATION_MIN_DELAY_MS * 2 ** (attempt - 1), REGISTRATION_MAX_DELAY_MS));
     }
   }
   return null;
+}
+
+/** Core's record of the request, when it is exactly the request raised; null (failing closed) otherwise. */
+function registeredRequest(view: PendingPermissionView, body: DeferredPermissionBody, logger: Logger | undefined): PendingPermissionView | null {
+  if (view.kind === body.kind && view.requestId === body.requestId && view.assignmentId === body.assignmentId && view.agentId === body.agentId) return view;
+  logger?.warn({ requestId: body.requestId, assignmentId: body.assignmentId, stage: "permission_deferral", outcome: "mismatched" }, "Core registered a different pending request; failing closed");
+  return null;
+}
+
+/** Whether a failed registration is tried again: only a transient failure, and not after the last attempt. */
+function registrationRetried(error: unknown, attempt: number, body: DeferredPermissionBody, logger: Logger | undefined): boolean {
+  const retryable = error instanceof RemoteInstanceError && error.retryable;
+  const again = Boolean(retryable) && attempt < REGISTRATION_ATTEMPTS;
+  logger?.warn({ requestId: body.requestId, assignmentId: body.assignmentId, stage: "permission_deferral", attempt, retryable, ...registrationFailure(error) },
+    again ? "permission deferral registration failed; retrying" : "permission deferral registration failed; failing closed");
+  return again;
+}
+
+function registrationFailure(error: unknown): { code: string } | { errorName: string } {
+  if (error instanceof RemoteInstanceError) return { code: error.code };
+  return { errorName: error instanceof Error ? error.name : "unknown" };
 }
