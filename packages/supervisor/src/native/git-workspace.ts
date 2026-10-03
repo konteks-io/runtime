@@ -5,7 +5,7 @@ import { chmod, lstat, mkdir, open, readdir } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { RemoteFileTreeSchema, RemoteInstanceError, sha256Hex } from "@konteks/remote-common";
-import { readFully } from "./read-fully.js";
+import { readFully } from "../read-fully.js";
 
 /** Installer-selected local tool, never a field in a cloud assignment. */
 export const NativeGitToolSchema = z

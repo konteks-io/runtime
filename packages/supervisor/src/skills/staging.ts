@@ -11,6 +11,7 @@ import {
   type RemoteTransferBinding, type RemoteTransferManifest, type RemoteSkillCatalog,
   type RemoteFileEntry, type RemoteFileTree,
 } from "@konteks/remote-common";
+import { readFully } from "../read-fully.js";
 
 /**
  * Content-addressed private staging follows bb's injected-skills pattern:
@@ -20,9 +21,8 @@ import {
  * rarely, so a tree fetched once is reused by every later turn, and reuse
  * still revalidates the complete tree on disk against the CURRENT manifest
  * (`validateRemoteTransfer` checks tree content by digest) and the current
- * authority. Keying by assignment staged identical catalogs once per turn —
- * 38 copies of the same skills on one connector — and fetched every one.
- * See THIRD_PARTY_NOTICES.md and proof/BB-REUSE.md for attribution.
+ * authority. Keying by assignment would stage and fetch an identical catalog
+ * once per turn. See THIRD_PARTY_NOTICES.md for attribution.
  */
 export interface StageOrganizationSkillsOptions {
   scratchRoot: string;
@@ -85,47 +85,57 @@ async function readPrivate(path: string, maxBytes: number): Promise<{ bytes: Buf
   try {
     const stat = await handle.stat(); privateNode(stat, false);
     if (stat.ino !== before.ino || stat.dev !== before.dev || stat.size !== before.size) throw unavailable();
-    const buffer = Buffer.alloc(stat.size + 1); let count = 0;
-    while (count < buffer.length) {
-      const read = await handle.read(buffer, count, buffer.length - count, count);
-      if (read.bytesRead === 0) break;
-      count += read.bytesRead;
-    }
+    const buffer = Buffer.alloc(stat.size + 1);
+    const count = await readFully(handle, buffer);
     if (count !== stat.size) throw unavailable();
     return { bytes: buffer.subarray(0, count), stat };
   } finally { await handle.close(); }
 }
 
-async function readTree(root: string, modes: Record<string, 384 | 448>): Promise<RemoteFileTree> {
-  const entries: RemoteFileEntry[] = []; let total = 0;
-  async function visit(directory: string, relative: string, depth: number): Promise<void> {
+/** Reads a staged skill tree back, bounded by the file-tree limits and the receipt's modes. */
+class TreeReader {
+  readonly entries: RemoteFileEntry[] = [];
+  private total = 0;
+
+  constructor(private readonly modes: Record<string, 384 | 448>) {}
+
+  async visit(directory: string, relative: string, depth: number): Promise<void> {
+    for (const name of await this.listChildren(directory, relative, depth)) {
+      const path = join(directory, name), wirePath = relative ? `${relative}/${name}` : name;
+      const stat = await lstat(path);
+      if (stat.isDirectory() && !stat.isSymbolicLink()) await this.visit(path, wirePath, depth + 1);
+      else await this.readEntry(path, wirePath);
+    }
+  }
+
+  private async listChildren(directory: string, relative: string, depth: number): Promise<string[]> {
     if (depth > REMOTE_FILE_TREE_LIMITS.depth) throw unavailable();
     privateNode(await lstat(directory), true);
     const names = await readdir(directory);
     if ((relative && names.length === 0) || names.length > REMOTE_FILE_TREE_LIMITS.files) throw unavailable();
-    for (const name of names) {
-      const path = join(directory, name), wirePath = relative ? `${relative}/${name}` : name;
-      const stat = await lstat(path);
-      if (stat.isDirectory() && !stat.isSymbolicLink()) await visit(path, wirePath, depth + 1);
-      else {
-        if (entries.length >= REMOTE_FILE_TREE_LIMITS.files) throw unavailable();
-        const file = await readPrivate(path, REMOTE_FILE_TREE_LIMITS.bytes - total);
-        total += file.bytes.length;
-        if (!Object.hasOwn(modes, wirePath)) throw unavailable();
-        const mode = modes[wirePath]!;
-        // Mode metadata is bound by the authorized tree digest, not trusted
-        // merely because it is in the receipt. Windows ACL isolation still
-        // requires independent installer/service proof on actual Windows.
-        if (process.platform !== "win32" && (file.stat.mode & 0o7777) !== mode) throw unavailable();
-        entries.push({ path: wirePath, mode, sizeBytes: file.bytes.length, digest: `sha256:${sha256Hex(file.bytes)}`, contentBase64: file.bytes.toString("base64") });
-      }
-    }
+    return names;
   }
-  await visit(root, "", 0);
-  if (entries.length !== Object.keys(modes).length) throw unavailable();
-  return { format: "konteks-file-tree-v1", entries, treeDigest: computeRemoteFileTreeDigest(entries) };
+
+  private async readEntry(path: string, wirePath: string): Promise<void> {
+    if (this.entries.length >= REMOTE_FILE_TREE_LIMITS.files) throw unavailable();
+    const file = await readPrivate(path, REMOTE_FILE_TREE_LIMITS.bytes - this.total);
+    this.total += file.bytes.length;
+    if (!Object.hasOwn(this.modes, wirePath)) throw unavailable();
+    const mode = this.modes[wirePath]!;
+    // Mode metadata is bound by the authorized tree digest, not trusted
+    // merely because it is in the receipt. Windows ACL isolation still
+    // requires independent installer/service proof on actual Windows.
+    if (process.platform !== "win32" && (file.stat.mode & 0o7777) !== mode) throw unavailable();
+    this.entries.push({ path: wirePath, mode, sizeBytes: file.bytes.length, digest: `sha256:${sha256Hex(file.bytes)}`, contentBase64: file.bytes.toString("base64") });
+  }
 }
 
+async function readTree(root: string, modes: Record<string, 384 | 448>): Promise<RemoteFileTree> {
+  const reader = new TreeReader(modes);
+  await reader.visit(root, "", 0);
+  if (reader.entries.length !== Object.keys(modes).length) throw unavailable();
+  return { format: "konteks-file-tree-v1", entries: reader.entries, treeDigest: computeRemoteFileTreeDigest(reader.entries) };
+}
 function result(root: string, catalog: RemoteSkillCatalog): StagedOrganizationSkills {
   return {
     root, catalogDigest: catalog.catalogDigest,
@@ -161,49 +171,88 @@ async function verifyCatalog(root: string, catalog: RemoteSkillCatalog, now: num
 }
 
 export async function stageOrganizationSkills(options: StageOrganizationSkillsOptions): Promise<StagedOrganizationSkills> {
+  const { catalog, binding } = authorizedCatalog(options);
+  try { await current(options, catalog); } catch { throw unavailable(); }
+  const scratch = await privateRoot(options.scratchRoot);
+  const destination = join(scratch, `skills-${skillContentIdentity(catalog)}`);
+  if (await stagedAlready(destination)) return reuseStaged(destination, catalog, options);
+  return stageFresh(scratch, destination, { catalog, binding }, options);
+}
+
+type AuthorizedCatalog = { catalog: RemoteSkillCatalog; binding: RemoteTransferBinding };
+
+function authorizedCatalog(options: StageOrganizationSkillsOptions): AuthorizedCatalog {
   const parsed = RemoteSkillCatalogSchema.safeParse(options.catalog);
   const authority = RemoteTransferBindingSchema.safeParse(options.authority.binding);
   if (!parsed.success || !authority.success || canonicalize(parsed.data.binding) !== canonicalize(authority.data) || parsed.data.catalogDigest !== options.authority.catalogDigest) {
     throw new RemoteInstanceError("workspace_binding_invalid", "Organization skill selection does not match the authorized assignment.");
   }
-  const catalog = parsed.data;
-  try { await current(options, catalog); } catch { throw unavailable(); }
-  const scratch = await privateRoot(options.scratchRoot);
-  const name = `skills-${skillContentIdentity(catalog)}`;
-  const destination = join(scratch, name);
-  let exists = true;
-  try { await lstat(destination); } catch (error) { if (isFsErrorWithCode(error, "ENOENT")) exists = false; else throw unavailable(); }
-  if (exists) {
-    try { await verifyCatalog(destination, catalog, options.now()); await current(options, catalog); return result(destination, catalog); }
-    catch { throw unavailable(); }
+  return { catalog: parsed.data, binding: authority.data };
+}
+
+async function stagedAlready(destination: string): Promise<boolean> {
+  try {
+    await lstat(destination);
+    return true;
+  } catch (error) {
+    if (isFsErrorWithCode(error, "ENOENT")) return false;
+    throw unavailable();
   }
+}
+
+async function reuseStaged(destination: string, catalog: RemoteSkillCatalog, options: StageOrganizationSkillsOptions): Promise<StagedOrganizationSkills> {
+  try { await verifyCatalog(destination, catalog, options.now()); await current(options, catalog); return result(destination, catalog); }
+  catch { throw unavailable(); }
+}
+
+async function stageFresh(scratch: string, destination: string, authorized: AuthorizedCatalog, options: StageOrganizationSkillsOptions): Promise<StagedOrganizationSkills> {
+  const { catalog } = authorized;
   let temporary: string | undefined;
   try {
     temporary = await mkdtemp(join(scratch, ".stage-"));
     await chmod(temporary, 0o700);
-    const modes: Array<[string, Record<string, 384 | 448>]> = [];
-    for (const skill of catalog.skills) {
-      const data = await options.fetchTree(skill.transfer);
-      if (!validateRemoteTransfer(skill.transfer, data, { binding: authority.data, manifestDigest: computeRemoteTransferManifestDigest(skill.transfer), now: options.now() }).valid) throw unavailable();
-      const tree = RemoteFileTreeSchema.parse(data);
-      if (!tree.entries.some(e => e.path === "SKILL.md")) throw unavailable();
-      modes.push([skill.name, Object.fromEntries(tree.entries.map(entry => [entry.path, entry.mode]))]);
-      for (const entry of tree.entries) await writePrivate(join(temporary, skill.name, ...entry.path.split("/")), Buffer.from(entry.contentBase64, "base64"), entry.mode);
-    }
-    await writePrivate(join(temporary, ".catalog.json"), Buffer.from(JSON.stringify({ catalog, modes: Object.fromEntries(modes) })));
+    await writeSkills(temporary, authorized, options);
     await verifyCatalog(temporary, catalog, options.now());
     await current(options, catalog);
-    try { await rename(temporary, destination); temporary = undefined; }
-    catch (error) {
-      if (!isFsErrorWithCode(error, "EEXIST") && !isFsErrorWithCode(error, "ENOTEMPTY")) throw error;
-      // Another caller won the same immutable catalog. Never overwrite it.
-      await verifyCatalog(destination, catalog, options.now());
-    }
+    if (await publishStaged(temporary, destination, catalog, options)) temporary = undefined;
     await current(options, catalog);
     return result(destination, catalog);
   } catch { throw unavailable(); }
   finally {
     // Only the exact mkdtemp child created by this call is eligible for cleanup.
     if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function writeSkills(temporary: string, { catalog, binding }: AuthorizedCatalog, options: StageOrganizationSkillsOptions): Promise<void> {
+  const modes: Array<[string, Record<string, 384 | 448>]> = [];
+  for (const skill of catalog.skills) {
+    const tree = await fetchedSkillTree(skill.transfer, binding, options);
+    modes.push([skill.name, Object.fromEntries(tree.entries.map(entry => [entry.path, entry.mode]))]);
+    for (const entry of tree.entries) await writePrivate(join(temporary, skill.name, ...entry.path.split("/")), Buffer.from(entry.contentBase64, "base64"), entry.mode);
+  }
+  await writePrivate(join(temporary, ".catalog.json"), Buffer.from(JSON.stringify({ catalog, modes: Object.fromEntries(modes) })));
+}
+
+async function fetchedSkillTree(manifest: RemoteTransferManifest, binding: RemoteTransferBinding, options: StageOrganizationSkillsOptions): Promise<RemoteFileTree> {
+  const data = await options.fetchTree(manifest);
+  if (!validateRemoteTransfer(manifest, data, { binding, manifestDigest: computeRemoteTransferManifestDigest(manifest), now: options.now() }).valid) throw unavailable();
+  const tree = RemoteFileTreeSchema.parse(data);
+  if (!tree.entries.some(e => e.path === "SKILL.md")) throw unavailable();
+  return tree;
+}
+
+/**
+ * Renames the staged catalog into place: true once it moved. Another caller
+ * that won the same immutable catalog is verified, never overwritten.
+ */
+async function publishStaged(temporary: string, destination: string, catalog: RemoteSkillCatalog, options: StageOrganizationSkillsOptions): Promise<boolean> {
+  try {
+    await rename(temporary, destination);
+    return true;
+  } catch (error) {
+    if (!isFsErrorWithCode(error, "EEXIST") && !isFsErrorWithCode(error, "ENOTEMPTY")) throw error;
+    await verifyCatalog(destination, catalog, options.now());
+    return false;
   }
 }

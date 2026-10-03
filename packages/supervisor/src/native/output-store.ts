@@ -16,7 +16,7 @@ import {
   type RemoteDeliveryResultCandidate,
   type SessionToCoreMessage,
 } from "@konteks/remote-common";
-import { readFully } from "./read-fully.js";
+import { readFully } from "../read-fully.js";
 
 const MAX_RECORD_BYTES = 16 * 1024 * 1024;
 const RecordSchema = z.discriminatedUnion("state", [

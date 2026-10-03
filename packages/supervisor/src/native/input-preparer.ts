@@ -28,7 +28,7 @@ import type { NativeInputClient } from "./input-client.js";
 import type { NativeOutputClient } from "./output-client.js";
 import { captureNativeDeliveryOutput } from "./output-capture.js";
 import { NativeOutputSessionHeadStore, type NativeOutputRecord, type NativeOutputStore } from "./output-store.js";
-import { readFully } from "./read-fully.js";
+import { readFully } from "../read-fully.js";
 import { unrestrictedStateMutation, type StateMutation } from "../state/mutation-gate.js";
 import {
   initializeNativeGitWorkspace,
