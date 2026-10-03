@@ -55,23 +55,37 @@ export async function checkDshKonteksProfile(options: DshProfileCheckOptions): P
  */
 export function dshProfileDrift(dump: string, konteksDir: string, platform: NodeJS.Platform, version?: string): string[] {
   const rows = parseDshDumpConfig(dump);
-  const drift: string[] = [];
-  for (const expected of DSH_PROFILE_EXPECTATIONS(konteksDir, platform)) {
-    const row = rows.get(expected.id);
-    if (!row) {
-      if (!(expected.absentBelow !== undefined && version !== undefined && olderThan(version, expected.absentBelow))) drift.push(`${expected.id}: missing`);
-      continue;
-    }
-    if (expected.name !== undefined && row.name !== expected.name) drift.push(`${expected.id}: module is ${JSON.stringify(row.name ?? null)}, expected ${JSON.stringify(expected.name)}`);
-    if (expected.disabled === true && row.disabled !== "true") drift.push(`${expected.id}: expected disabled`);
-    if (expected.disabled === false && row.disabled === "true") drift.push(`${expected.id}: expected enabled`);
-    for (const [key, value] of Object.entries(expected.config ?? {})) {
-      if (row.config[key] !== value) drift.push(`${expected.id}: config ${key} is ${JSON.stringify(row.config[key] ?? null)}, expected ${JSON.stringify(value)}`);
-    }
-  }
-  return drift;
+  return DSH_PROFILE_EXPECTATIONS(konteksDir, platform).flatMap(expected => expectationDrift(expected, rows.get(expected.id), version));
 }
 
+type DshProfileExpectation = ReturnType<typeof DSH_PROFILE_EXPECTATIONS>[number];
+
+function expectationDrift(expected: DshProfileExpectation, row: DshDumpRow | undefined, version: string | undefined): string[] {
+  if (!row) return absentAllowed(expected, version) ? [] : [`${expected.id}: missing`];
+  return [...nameDrift(expected, row), ...disabledDrift(expected, row), ...configDrift(expected, row)];
+}
+
+/** A row newer than the installed dsh may be absent. */
+function absentAllowed(expected: DshProfileExpectation, version: string | undefined): boolean {
+  return expected.absentBelow !== undefined && version !== undefined && olderThan(version, expected.absentBelow);
+}
+
+function nameDrift(expected: DshProfileExpectation, row: DshDumpRow): string[] {
+  if (expected.name === undefined || row.name === expected.name) return [];
+  return [`${expected.id}: module is ${JSON.stringify(row.name ?? null)}, expected ${JSON.stringify(expected.name)}`];
+}
+
+function disabledDrift(expected: DshProfileExpectation, row: DshDumpRow): string[] {
+  if (expected.disabled === true && row.disabled !== "true") return [`${expected.id}: expected disabled`];
+  if (expected.disabled === false && row.disabled === "true") return [`${expected.id}: expected enabled`];
+  return [];
+}
+
+function configDrift(expected: DshProfileExpectation, row: DshDumpRow): string[] {
+  return Object.entries(expected.config ?? {})
+    .filter(([key, value]) => row.config[key] !== value)
+    .map(([key, value]) => `${expected.id}: config ${key} is ${JSON.stringify(row.config[key] ?? null)}, expected ${JSON.stringify(value)}`);
+}
 function olderThan(version: string, than: string): boolean {
   try { return compareAgentVersions(version, than) < 0; } catch { return false; }
 }
@@ -83,44 +97,65 @@ function olderThan(version: string, than: string): boolean {
  * an unexpected format fails the check instead of passing it.
  */
 export function parseDshDumpConfig(dump: string): Map<string, DshDumpRow> {
-  const rows = new Map<string, DshDumpRow>();
-  const lines = dump.split(/\r?\n/);
-  let row: DshDumpRow | null = null;
-  let inConfig = false;
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]!;
-    const top = /^- id: (.+)$/.exec(line);
-    if (top) {
-      row = { config: {} };
-      rows.set(scalar(top[1]!), row);
-      inConfig = false;
-      continue;
-    }
-    if (!row || line.startsWith("#") || line.trim() === "") continue;
-    if (!line.startsWith(" ")) { row = null; continue; }
-    const field = /^ {2}([A-Za-z][\w-]*):(?: (.*))?$/.exec(line);
-    if (field) {
-      inConfig = field[1] === "config" && field[2] === undefined;
-      if (field[1] === "name" && field[2] !== undefined) row.name = scalar(field[2]);
-      if (field[1] === "disabled" && field[2] !== undefined) row.disabled = field[2].trim();
-      continue;
-    }
-    const entry = inConfig ? /^ {4}([A-Za-z][\w-]*):(?: (.*))?$/.exec(line) : null;
-    if (entry && entry[2] !== undefined) {
-      const block = /^([>|])([-+]?)$/.exec(entry[2].trim());
-      if (block) {
-        const body: string[] = [];
-        while (index + 1 < lines.length && (lines[index + 1]!.startsWith("      ") || lines[index + 1]!.trim() === "")) body.push(lines[++index]!.slice(6));
-        while (body.length > 0 && body[body.length - 1] === "") body.pop();
-        row.config[entry[1]!] = block[1] === ">" ? body.join(" ") : body.join("\n");
-      } else {
-        row.config[entry[1]!] = scalar(entry[2]);
-      }
-    }
-  }
-  return rows;
+  return new DumpConfigReader(dump.split(/\r?\n/)).read();
 }
 
+class DumpConfigReader {
+  private readonly rows = new Map<string, DshDumpRow>();
+  private row: DshDumpRow | null = null;
+  private inConfig = false;
+  private index = 0;
+
+  constructor(private readonly lines: string[]) {}
+
+  read(): Map<string, DshDumpRow> {
+    for (this.index = 0; this.index < this.lines.length; this.index += 1) this.readLine(this.lines[this.index]!);
+    return this.rows;
+  }
+
+  private readLine(line: string): void {
+    const top = /^- id: (.+)$/.exec(line);
+    if (top) return this.startRow(scalar(top[1]!));
+    const row = this.row;
+    if (!row || line.startsWith("#") || line.trim() === "") return;
+    if (!line.startsWith(" ")) {
+      this.row = null;
+      return;
+    }
+    if (!this.readField(row, line)) this.readConfigEntry(row, line);
+  }
+
+  private startRow(id: string): void {
+    this.row = { config: {} };
+    this.rows.set(id, this.row);
+    this.inConfig = false;
+  }
+
+  /** A two-space row field; false when the line is not one. */
+  private readField(row: DshDumpRow, line: string): boolean {
+    const field = /^ {2}([A-Za-z][\w-]*):(?: (.*))?$/.exec(line);
+    if (!field) return false;
+    this.inConfig = field[1] === "config" && field[2] === undefined;
+    if (field[1] === "name" && field[2] !== undefined) row.name = scalar(field[2]);
+    if (field[1] === "disabled" && field[2] !== undefined) row.disabled = field[2].trim();
+    return true;
+  }
+
+  /** A four-space scalar `config` entry, or a block scalar whose body follows. */
+  private readConfigEntry(row: DshDumpRow, line: string): void {
+    const entry = this.inConfig ? /^ {4}([A-Za-z][\w-]*):(?: (.*))?$/.exec(line) : null;
+    if (!entry || entry[2] === undefined) return;
+    const block = /^([>|])([-+]?)$/.exec(entry[2].trim());
+    row.config[entry[1]!] = block ? this.blockBody(block[1]!) : scalar(entry[2]);
+  }
+
+  private blockBody(style: string): string {
+    const body: string[] = [];
+    while (this.index + 1 < this.lines.length && (this.lines[this.index + 1]!.startsWith("      ") || this.lines[this.index + 1]!.trim() === "")) body.push(this.lines[++this.index]!.slice(6));
+    while (body.length > 0 && body[body.length - 1] === "") body.pop();
+    return style === ">" ? body.join(" ") : body.join("\n");
+  }
+}
 function scalar(raw: string): string {
   const value = raw.trim();
   if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) return value.slice(1, -1).replace(/''/g, "'");

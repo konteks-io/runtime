@@ -4,6 +4,7 @@ import { access, lstat, readdir, readFile, realpath, stat } from "node:fs/promis
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
+import { absolutePathEntries, plainAbsolutePath, safelyOwned } from "./host-files.js";
 import { compareAgentVersions, hostAgentFamily, hostAgentVersionSupported, type HostAgentFamily } from "@konteks/remote-release";
 
 /** The person's own installed DeepSeek Harness, as the runtime will launch it. */
@@ -42,49 +43,76 @@ function notFound(): Refusal {
  * copy wins. Otherwise the first supported, safely owned package wins. Operator process configuration only; never take
  * this path from Core or ACP.
  */
-export async function resolveNativeDshInstallation(env: NodeJS.ProcessEnv = process.env, operatorHome = homedir(), platform: NodeJS.Platform = process.platform): Promise<NativeDshInstallation> {
-  const bin = family().hostInstall.bin;
-  const candidates: string[] = [];
-  const override = env.DSH_EXECUTABLE;
-  if (override !== undefined) {
-    if (!isAbsolute(override) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(override)) throw refuse({ diagnostic: "dsh_not_found", message: "DSH_EXECUTABLE must be an absolute path to the installed @deepseek-ai/dsh package or its launcher." });
-    candidates.push(override);
-  } else {
-    const names = platform === "win32"
-      ? [...(env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map(ext => `${bin}${ext.toLowerCase()}`), `${bin}.ps1`, bin]
-      : [bin];
-    for (const directory of (env.PATH ?? "").split(platform === "win32" ? ";" : ":")) {
-      if (directory && isAbsolute(directory)) for (const name of names) candidates.push(join(directory, name));
-    }
-  }
-  let best: Refusal = notFound();
-  for (const candidate of candidates) {
-    for (const packageRoot of await packageRootsFor(candidate)) {
-      const outcome = await inspect(packageRoot, platform);
-      if ("root" in outcome) return outcome;
-      if (PRIORITY[outcome.diagnostic] > PRIORITY[best.diagnostic]) best = outcome;
-    }
-  }
-  if (override === undefined) {
-    for (const packageRoot of globalPackageRoots(env, operatorHome, platform)) {
-      const outcome = await inspect(packageRoot, platform);
-      if ("root" in outcome) return outcome;
-      if (outcome.diagnostic !== "dsh_not_found" && PRIORITY[outcome.diagnostic] > PRIORITY[best.diagnostic]) best = outcome;
-    }
-    let newest: NativeDshInstallation | null = null;
-    for (const packageRoot of await npxPackageRoots(env, operatorHome, platform)) {
-      const outcome = await inspect(packageRoot, platform);
-      if ("root" in outcome) { if (!newest || compareAgentVersions(outcome.version, newest.version) > 0) newest = outcome; continue; }
-      if (outcome.diagnostic !== "dsh_not_found" && PRIORITY[outcome.diagnostic] > PRIORITY[best.diagnostic]) best = outcome;
-    }
-    if (newest) return newest;
-  }
-  throw refuse(best);
+export function resolveNativeDshInstallation(env: NodeJS.ProcessEnv = process.env, operatorHome = homedir(), platform: NodeJS.Platform = process.platform): Promise<NativeDshInstallation> {
+  return locateDsh(env, operatorHome, platform);
 }
 
+async function locateDsh(env: NodeJS.ProcessEnv, operatorHome: string, platform: NodeJS.Platform): Promise<NativeDshInstallation> {
+  const override = env.DSH_EXECUTABLE;
+  if (override !== undefined && !plainAbsolutePath(override)) throw refuse({ diagnostic: "dsh_not_found", message: "DSH_EXECUTABLE must be an absolute path to the installed @deepseek-ai/dsh package or its launcher." });
+  const search = new DshSearch(platform);
+  const found = override !== undefined ? await search.fromLaunchers([override]) : await search.anywhere(env, operatorHome);
+  if (found) return found;
+  throw refuse(search.best);
+}
+
+/** `dsh` on PATH: every PATHEXT name on Windows. */
+function pathLaunchers(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string[] {
+  const bin = family().hostInstall.bin;
+  const names = platform === "win32"
+    ? [...(env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map(ext => `${bin}${ext.toLowerCase()}`), `${bin}.ps1`, bin]
+    : [bin];
+  return absolutePathEntries(env.PATH, platform === "win32" ? ";" : ":").flatMap(directory => names.map(name => join(directory, name)));
+}
+
+/** One search for an installed DeepSeek Harness, remembering the most telling refusal along the way. */
+class DshSearch {
+  best: Refusal = notFound();
+
+  constructor(private readonly platform: NodeJS.Platform) {}
+
+  /** PATH, then the npm global package roots, then the newest supported copy in npm's npx cache. */
+  async anywhere(env: NodeJS.ProcessEnv, operatorHome: string): Promise<NativeDshInstallation | null> {
+    return (await this.fromLaunchers(pathLaunchers(env, this.platform)))
+      ?? (await this.first(globalPackageRoots(env, operatorHome, this.platform)))
+      ?? (await this.newest(await npxPackageRoots(env, operatorHome, this.platform)));
+  }
+
+  async fromLaunchers(candidates: readonly string[]): Promise<NativeDshInstallation | null> {
+    for (const candidate of candidates) {
+      const found = await this.first(await packageRootsFor(candidate));
+      if (found) return found;
+    }
+    return null;
+  }
+
+  /** The first supported, safely owned package. */
+  async first(packageRoots: readonly string[]): Promise<NativeDshInstallation | null> {
+    for (const packageRoot of packageRoots) {
+      const outcome = await inspect(packageRoot, this.platform);
+      if ("root" in outcome) return outcome;
+      this.consider(outcome);
+    }
+    return null;
+  }
+
+  async newest(packageRoots: readonly string[]): Promise<NativeDshInstallation | null> {
+    let newest: NativeDshInstallation | null = null;
+    for (const packageRoot of packageRoots) {
+      const outcome = await inspect(packageRoot, this.platform);
+      if (!("root" in outcome)) this.consider(outcome);
+      else if (!newest || compareAgentVersions(outcome.version, newest.version) > 0) newest = outcome;
+    }
+    return newest;
+  }
+
+  private consider(refusal: Refusal): void {
+    if (PRIORITY[refusal.diagnostic] > PRIORITY[this.best.diagnostic]) this.best = refusal;
+  }
+}
 /** Re-verify a recorded package root before every start. */
 export async function verifyNativeDshRoot(root: string, platform: NodeJS.Platform = process.platform): Promise<NativeDshInstallation> {
-  if (!isAbsolute(root) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(root)) throw refuse(notFound());
+  if (!plainAbsolutePath(root)) throw refuse(notFound());
   const outcome = await inspect(root, platform);
   if ("root" in outcome) return outcome;
   throw refuse(outcome);
@@ -129,59 +157,81 @@ function globalPackageRoots(env: NodeJS.ProcessEnv, operatorHome: string, platfo
 /** Copies `npx` left in npm's cache: `npm_config_cache`, else `~/.npm` (`%LOCALAPPDATA%\npm-cache` on Windows). */
 async function npxPackageRoots(env: NodeJS.ProcessEnv, operatorHome: string, platform: NodeJS.Platform): Promise<string[]> {
   if (platform !== "win32" && process.getuid?.() === 0) return []; // root must not inherit a user-writable cache
-  const cache = env.npm_config_cache && isAbsolute(env.npm_config_cache) ? env.npm_config_cache
-    : platform === "win32" ? (env.LOCALAPPDATA && isAbsolute(env.LOCALAPPDATA) ? join(env.LOCALAPPDATA, "npm-cache") : undefined)
-      : join(operatorHome, ".npm");
+  const cache = npmCacheFolder(env, operatorHome, platform);
   if (!cache) return [];
   const entries = await readdir(join(cache, "_npx"), { withFileTypes: true }).catch(() => []);
   return entries.filter(entry => entry.isDirectory()).map(entry => entry.name).sort()
     .map(name => join(cache, "_npx", name, "node_modules", "@deepseek-ai", "dsh"));
 }
 
+function npmCacheFolder(env: NodeJS.ProcessEnv, operatorHome: string, platform: NodeJS.Platform): string | undefined {
+  if (env.npm_config_cache && isAbsolute(env.npm_config_cache)) return env.npm_config_cache;
+  if (platform !== "win32") return join(operatorHome, ".npm");
+  return env.LOCALAPPDATA && isAbsolute(env.LOCALAPPDATA) ? join(env.LOCALAPPDATA, "npm-cache") : undefined;
+}
 async function inspect(candidateRoot: string, platform: NodeJS.Platform): Promise<NativeDshInstallation | Refusal> {
   const dsh = family();
-  let root: string;
-  let manifest: { name?: unknown; version?: unknown; bin?: unknown };
-  try {
-    root = await realpath(candidateRoot);
-    const file = join(root, "package.json");
-    const info = await stat(file);
-    if (!info.isFile() || info.size > 256 * 1024) return notFound();
-    manifest = JSON.parse(await readFile(file, "utf8")) as typeof manifest;
-  } catch {
-    return notFound();
-  }
-  if (manifest.name !== dsh.package || typeof manifest.version !== "string") return notFound();
-  const binPath = typeof manifest.bin === "string" ? manifest.bin
-    : manifest.bin && typeof manifest.bin === "object" ? (manifest.bin as Record<string, unknown>)[dsh.hostInstall.bin] : undefined;
-  if (typeof binPath !== "string" || binPath.length === 0 || isAbsolute(binPath)) return notFound();
-  let entry: string;
-  try {
-    entry = await realpath(resolve(root, binPath));
-    if (!(await stat(entry)).isFile()) return notFound();
-  } catch {
-    return notFound();
-  }
-  const inside = relative(root, entry);
-  if (inside.startsWith("..") || isAbsolute(inside)) return notFound();
-  if (!hostAgentVersionSupported(dsh, manifest.version)) {
+  const found = await readPackage(candidateRoot);
+  const version = found?.manifest.version;
+  if (!found || found.manifest.name !== dsh.package || typeof version !== "string") return notFound();
+  const entry = await binEntry(found.root, declaredBin(found.manifest.bin, dsh.hostInstall.bin));
+  if (!entry) return notFound();
+  if (!hostAgentVersionSupported(dsh, version)) {
     return {
       diagnostic: "dsh_unsupported_version",
-      message: `DeepSeek Harness ${manifest.version} is not a version Konteks supports (${dsh.hostInstall.versions.min} up to, but not including, ${dsh.hostInstall.versions.belowCore}). Install it with \`${dsh.hostInstall.installCommand}\`, then retry.`,
+      message: `DeepSeek Harness ${version} is not a version Konteks supports (${dsh.hostInstall.versions.min} up to, but not including, ${dsh.hostInstall.versions.belowCore}). Install it with \`${dsh.hostInstall.installCommand}\`, then retry.`,
     };
   }
-  if (platform !== "win32" && process.platform !== "win32") {
-    for (const path of [root, join(root, "package.json"), entry]) {
-      const info = await stat(path);
-      const owner = info.uid === process.getuid?.() || info.uid === 0;
-      if (!owner || (info.mode & 0o022) !== 0) {
-        return { diagnostic: "dsh_unsafe_install", message: `The DeepSeek Harness installation at ${root} can be changed by other users; reinstall it for this user only, then retry.` };
-      }
-    }
-  }
-  return { root, entry, version: manifest.version };
+  return (await unsafeInstall(found.root, entry, platform)) ?? { root: found.root, entry, version };
 }
 
+/** The package's real root and its bounded `package.json`; null when either cannot be read. */
+async function readPackage(candidateRoot: string): Promise<{ root: string; manifest: { name?: unknown; version?: unknown; bin?: unknown } } | null> {
+  try {
+    const root = await realpath(candidateRoot);
+    const file = join(root, "package.json");
+    const info = await stat(file);
+    if (!info.isFile() || info.size > 256 * 1024) return null;
+    return { root, manifest: JSON.parse(await readFile(file, "utf8")) as { name?: unknown; version?: unknown; bin?: unknown } };
+  } catch {
+    return null;
+  }
+}
+
+/** The relative path a package's `bin` declares for `name`. */
+function declaredBin(bin: unknown, name: string): unknown {
+  if (typeof bin === "string") return bin;
+  return bin && typeof bin === "object" ? (bin as Record<string, unknown>)[name] : undefined;
+}
+
+/** The real entry file a relative bin path names, only when it stays inside the package root. */
+async function binEntry(root: string, binPath: unknown): Promise<string | null> {
+  if (typeof binPath !== "string" || binPath.length === 0 || isAbsolute(binPath)) return null;
+  const entry = await realFile(resolve(root, binPath));
+  if (!entry) return null;
+  const inside = relative(root, entry);
+  return inside.startsWith("..") || isAbsolute(inside) ? null : entry;
+}
+
+async function realFile(path: string): Promise<string | null> {
+  try {
+    const real = await realpath(path);
+    return (await stat(real)).isFile() ? real : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Outside Windows, a root, manifest or entry other users can change refuses the install. */
+async function unsafeInstall(root: string, entry: string, platform: NodeJS.Platform): Promise<Refusal | null> {
+  if (platform === "win32" || process.platform === "win32") return null;
+  for (const path of [root, join(root, "package.json"), entry]) {
+    if (!safelyOwned(await stat(path))) {
+      return { diagnostic: "dsh_unsafe_install", message: `The DeepSeek Harness installation at ${root} can be changed by other users; reinstall it for this user only, then retry.` };
+    }
+  }
+  return null;
+}
 /**
  * The Node that runs the person's DeepSeek Harness. The connector is a Node
  * single-executable app and cannot run another script, so dsh runs on the
@@ -197,64 +247,61 @@ export async function resolveNativeDshNode(
   platform: NodeJS.Platform = process.platform,
   deps: { version?: (node: string) => Promise<string | null> } = {},
 ): Promise<string> {
-  const binary = platform === "win32" ? "node.exe" : "node";
-  let candidates: string[];
-  if (env.DSH_NODE !== undefined) {
-    if (!isAbsolute(env.DSH_NODE) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(env.DSH_NODE)) throw refuse(nodeUnsupported(null));
-    candidates = [env.DSH_NODE];
-  } else {
-    // <prefix>/lib/node_modules/@deepseek-ai/dsh -> <prefix>/bin/node (npm, nvm, Homebrew);
-    // <nodejs>\node_modules\@deepseek-ai\dsh -> <nodejs>\node.exe (Windows installer prefix).
-    candidates = [platform === "win32" ? resolve(installation.root, "..", "..", "..", binary) : resolve(installation.root, "..", "..", "..", "..", "bin", binary),
-      ...personNodeCandidates(env, platform)];
-  }
-  const found = await locatePersonNode(candidates, nodeSupported, platform, deps);
+  const found = await locatePersonNode(dshNodeCandidates(installation, env, platform), nodeSupported, platform, deps);
   if (found.node !== null) return found.node;
   throw refuse(nodeUnsupported(found.seen));
 }
 
+function dshNodeCandidates(installation: NativeDshInstallation, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string[] {
+  if (env.DSH_NODE !== undefined) {
+    if (!plainAbsolutePath(env.DSH_NODE)) throw refuse(nodeUnsupported(null));
+    return [env.DSH_NODE];
+  }
+  const binary = platform === "win32" ? "node.exe" : "node";
+  // <prefix>/lib/node_modules/@deepseek-ai/dsh -> <prefix>/bin/node (npm, nvm, Homebrew);
+  // <nodejs>\node_modules\@deepseek-ai\dsh -> <nodejs>\node.exe (Windows installer prefix).
+  return [platform === "win32" ? resolve(installation.root, "..", "..", "..", binary) : resolve(installation.root, "..", "..", "..", "..", "bin", binary),
+    ...personNodeCandidates(env, platform)];
+}
 /** Where a person's own Node usually is: every PATH folder, then the usual install locations. */
 export function personNodeCandidates(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string[] {
   const binary = platform === "win32" ? "node.exe" : "node";
-  const candidates: string[] = [];
-  for (const directory of (env.PATH ?? "").split(platform === "win32" ? ";" : ":")) if (directory && isAbsolute(directory)) candidates.push(join(directory, binary));
-  if (platform === "win32") {
-    for (const programs of [env.ProgramFiles, env["ProgramFiles(x86)"]]) if (programs && isAbsolute(programs)) candidates.push(join(programs, "nodejs", binary));
-  } else {
-    candidates.push("/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node");
-  }
-  return candidates;
+  const onPath = absolutePathEntries(env.PATH, platform === "win32" ? ";" : ":").map(directory => join(directory, binary));
+  return [...onPath, ...usualNodeLocations(env, platform, binary)];
 }
 
+function usualNodeLocations(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, binary: string): string[] {
+  if (platform !== "win32") return ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"];
+  return [env.ProgramFiles, env["ProgramFiles(x86)"]]
+    .filter((programs): programs is string => Boolean(programs && isAbsolute(programs)))
+    .map(programs => join(programs, "nodejs", binary));
+}
 /**
  * The first candidate that is a safely owned executable (the person's or
  * root's, not group or world writable) reporting a version `supported`
  * accepts; `seen` is the first version reported by one that did not qualify.
  * `node --version` is the only thing run. Shared by DeepSeek Harness and the
- * connector's QA browser (O8).
+ * connector's QA browser.
  */
-export async function locatePersonNode(
+export function locatePersonNode(
   candidates: readonly string[],
   supported: (reported: string) => boolean,
   platform: NodeJS.Platform = process.platform,
   deps: { version?: (node: string) => Promise<string | null> } = {},
 ): Promise<{ node: string; version: string } | { node: null; seen: string | null }> {
-  const version = deps.version ?? nodeVersion;
+  return firstSupportedNode([...new Set(candidates)], supported, platform, deps.version ?? nodeVersion);
+}
+
+async function firstSupportedNode(
+  candidates: readonly string[],
+  supported: (reported: string) => boolean,
+  platform: NodeJS.Platform,
+  version: (node: string) => Promise<string | null>,
+): Promise<{ node: string; version: string } | { node: null; seen: string | null }> {
   let seen: string | null = null;
-  for (const candidate of [...new Set(candidates)]) {
-    let node: string;
-    try {
-      node = await realpath(candidate);
-      const info = await stat(node);
-      if (!info.isFile()) continue;
-      if (platform !== "win32" && process.platform !== "win32") {
-        const owner = info.uid === process.getuid?.() || info.uid === 0;
-        if (!owner || (info.mode & 0o022) !== 0) continue;
-        await access(node, constants.X_OK);
-      }
-    } catch {
-      continue;
-    }
+  for (const candidate of candidates) {
+    const node = await runnableNode(candidate, platform);
+    if (node === null) continue;
     const reported = await version(node).catch(() => null);
     if (reported !== null && supported(reported)) return { node, version: reported.trim() };
     seen ??= reported;
@@ -262,6 +309,21 @@ export async function locatePersonNode(
   return { node: null, seen };
 }
 
+/** The candidate's real path when it is a file, and outside Windows a safely owned executable. */
+async function runnableNode(candidate: string, platform: NodeJS.Platform): Promise<string | null> {
+  try {
+    const node = await realpath(candidate);
+    const info = await stat(node);
+    if (!info.isFile()) return null;
+    if (platform !== "win32" && process.platform !== "win32") {
+      if (!safelyOwned(info)) return null;
+      await access(node, constants.X_OK);
+    }
+    return node;
+  } catch {
+    return null;
+  }
+}
 function nodeSupported(reported: string): boolean {
   const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(reported.trim());
   if (!match) return false;

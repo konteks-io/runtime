@@ -11,23 +11,23 @@ import type { NativeRuntimeRecord } from "./installation.js";
 import { downloadPinnedFile, extractZipEntry, FetchedArchiveError, freeDiskBytes, readZipEntries, verifyFetchedSignature } from "./fetched-archive.js";
 
 /**
- * Google Antigravity's ACP server, fetched by the connector
- * (antigravity-runtime-support A2, A14–A20). Nobody installs it: on the
+ * Google Antigravity's ACP server, fetched by the connector. Nobody
+ * installs it: on the
  * person's yes the connector downloads Google's zip from the URL this runtime
  * release pins (`fetched-agents.json`), checks its size and sha256, unpacks it
  * with path checks, checks every file's size and sha256 and Google's
  * signature, and moves it into `<root>/agents/antigravity/<version>-<platform>/`
  * (folders 0700, files 0755, never on PATH, never under `<root>/credentials`).
- * Before every start the same checks run again (A16), the hash cached per
+ * Before every start the same checks run again, the hash cached per
  * file identity; any mismatch means the copy is never run.
  */
 
 const ANTIGRAVITY_AGENT_ID = "antigravity";
 
-/** Asked before anything is downloaded (A20): onboarding, `agent add antigravity`, and the site's card. */
+/** Asked before anything is downloaded: onboarding, `agent add antigravity`, and the site's card. */
 export const ANTIGRAVITY_CONSENT_TEXT = "Konteks will download Google Antigravity from Google's server (dl.google.com, about 110 MB, 400 MB on disk), check Google's signature, and keep it updated with Konteks updates. Google's terms apply to its use (antigravity.google/terms). Download it now? [y/N]";
 
-/** A19: a fetch needs about 1.2 GB (zip, unpacked copy, the previous version during an update); below 1.5 GB free it is refused. */
+/** A fetch needs about 1.2 GB (zip, unpacked copy, the previous version during an update); below 1.5 GB free it is refused. */
 export const ANTIGRAVITY_MIN_FREE_BYTES = 1_500_000_000;
 
 type Diagnostic = "antigravity_not_fetched" | "antigravity_unsupported_version" | "antigravity_unsafe_install" | "antigravity_no_disk_space" | "antigravity_unsupported_platform";
@@ -71,7 +71,10 @@ export interface AntigravityInstallDeps {
 
 /** This release's pin for this computer; refused when there is none. */
 export function antigravityPin(deps: AntigravityInstallDeps = {}): AntigravityPin {
-  if (deps.pin) return deps.pin;
+  return deps.pin ?? releasePin();
+}
+
+function releasePin(): AntigravityPin {
   const pin = fetchedAgentPin(ANTIGRAVITY_AGENT_ID);
   const key = fetchedAgentPlatformKey();
   const platform = key === null ? undefined : pin?.platforms[key];
@@ -80,7 +83,6 @@ export function antigravityPin(deps: AntigravityInstallDeps = {}): AntigravityPi
   if (!hostAgentVersionSupported(hostAgentFamily(ANTIGRAVITY_AGENT_ID), pin.version)) throw refuse("antigravity_unsupported_version");
   return { version: pin.version, key, platform };
 }
-
 /** Where the connector keeps Antigravity: `<root>/agents/antigravity/` and the pinned version's folder in it. */
 export function antigravityFolders(root: string, pin: Pick<AntigravityPin, "version" | "key">): { agents: string; base: string; version: string } {
   const agents = join(root, "agents");
@@ -97,7 +99,7 @@ interface NativeAntigravityInstallation {
 }
 
 /**
- * Integrity before every start (A16): the connector's folders are private and
+ * Integrity before every start: the connector's folders are private and
  * the person's; the folder holds exactly the pinned files, each a plain file
  * with one link, owned by the person, writable only by them, of the pinned
  * size and sha256 and carrying the pinned signature. Hashes and signature
@@ -120,22 +122,29 @@ export async function verifyNativeAntigravityFolder(root: string, deps: Antigrav
 
 async function verifyFolderContents(folders: { agents: string; base: string; version: string }, pin: AntigravityPin, deps: AntigravityInstallDeps): Promise<void> {
   for (const folder of [folders.agents, folders.base, folders.version]) {
-    const info = await lstat(folder);
-    if (!info.isDirectory() || !privateFolder(info)) throw refuse("antigravity_unsafe_install");
+    if (!privateDirectoryEntry(await lstat(folder))) throw refuse("antigravity_unsafe_install");
   }
-  const expected = new Map(pin.platform.files.map(file => [file.path, file]));
+  const expected = new Set(pin.platform.files.map(file => file.path));
   const found = await listFiles(folders.version);
   if (found.length !== expected.size || found.some(path => !expected.has(path))) throw refuse("antigravity_unsafe_install");
   const verifySignature = deps.verifySignature ?? ((file: string, signer: FetchedAgentSigner) => verifyFetchedSignature(file, signer));
   for (const file of pin.platform.files) {
-    const path = join(folders.version, ...file.path.split("/"));
-    const info = await lstat(path);
-    if (!info.isFile() || info.nlink !== 1 || !personsFile(info) || info.size !== file.size) throw refuse("antigravity_unsafe_install");
-    if (await cachedSha256(path, info) !== file.sha256) throw refuse("antigravity_unsafe_install");
-    if (!await cachedSignature(path, info, pin.platform.signer, verifySignature)) throw refuse("antigravity_unsafe_install");
+    if (!await pinnedFileIntact(join(folders.version, ...file.path.split("/")), file, pin.platform.signer, verifySignature)) throw refuse("antigravity_unsafe_install");
   }
 }
 
+/** A plain, singly linked file the person owns, of the pinned size, sha256 and signature. */
+async function pinnedFileIntact(
+  path: string,
+  file: AntigravityPin["platform"]["files"][number],
+  signer: FetchedAgentSigner,
+  verifySignature: (file: string, signer: FetchedAgentSigner) => Promise<boolean>,
+): Promise<boolean> {
+  const info = await lstat(path);
+  if (!info.isFile() || info.nlink !== 1 || !personsFile(info) || info.size !== file.size) return false;
+  if (await cachedSha256(path, info) !== file.sha256) return false;
+  return cachedSignature(path, info, signer, verifySignature);
+}
 /** Every file under `folder` as a `/`-separated relative path; a link or special file refuses. */
 async function listFiles(folder: string): Promise<string[]> {
   const files: string[] = [];
@@ -155,6 +164,7 @@ async function listFiles(folder: string): Promise<string[]> {
 }
 
 const posix = process.platform !== "win32";
+function privateDirectoryEntry(info: Stats): boolean { return info.isDirectory() && privateFolder(info); }
 function privateFolder(info: Stats): boolean { return !posix || (info.uid === process.getuid?.() && (info.mode & 0o077) === 0); }
 function personsFolder(info: Stats): boolean { return !posix || (info.uid === process.getuid?.() && (info.mode & 0o022) === 0); }
 function personsFile(info: Stats): boolean { return !posix || (info.uid === process.getuid?.() && (info.mode & 0o022) === 0); }
@@ -200,7 +210,7 @@ export function clearAntigravityVerificationCache(): void {
 
 /**
  * The install-record fields for the fetched copy in `root`, verified now
- * (A16). Never downloads: an absent copy reads "not fetched".
+ * Never downloads: an absent copy reads "not fetched".
  */
 export async function locateNativeAntigravity(root: string, deps: AntigravityInstallDeps = {}): Promise<Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot">> {
   const installation = await verifyNativeAntigravityFolder(root, deps);
@@ -210,7 +220,7 @@ export async function locateNativeAntigravity(root: string, deps: AntigravityIns
 /**
  * Every load: the recorded copy must be the one this release pins, in the
  * connector's own folder, and still verify. A record naming another version
- * (a runtime update carried a new pin, A17) reads "unsupported version"
+ * (a runtime update carried a new pin) reads "unsupported version"
  * until the new copy is fetched.
  */
 export async function verifyNativeAntigravityRecord(record: Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot">, root: string, deps: AntigravityInstallDeps = {}): Promise<NativeAntigravityInstallation> {
@@ -222,9 +232,9 @@ export async function verifyNativeAntigravityRecord(record: Pick<NativeRuntimeRe
 }
 
 /**
- * Fetch the pinned copy on the person's yes (A2, A20). Nothing is downloaded
+ * Fetch the pinned copy on the person's yes. Nothing is downloaded
  * without `consent`; a copy that already verifies is kept as it is. Otherwise:
- * the disk budget (A19), then the download into a private staging folder in
+ * the disk budget, then the download into a private staging folder in
  * the connector's own folder over HTTPS from the pinned URL only, size and
  * sha256, the zip unpacked with path checks and nothing but the pinned files,
  * the zip deleted, every file verified with the signature, and the folder
@@ -246,41 +256,56 @@ export async function fetchNativeAntigravity(request: { root: string; consent: b
   const progress = { receivedBytes: 0, sizeBytes: pin.platform.archive.size };
   fetchesUnderWay.set(request.root, progress);
   try {
-    const archive = join(staging, "archive.zip");
-    const unpacked = join(staging, "unpacked");
-    await downloadPinnedFile({ url: pin.platform.url, destination: archive, expected: pin.platform.archive, ...deps.download,
-      onProgress: received => { progress.receivedBytes = received; } });
-    const entries = await readZipEntries(archive);
-    const pinned = new Map(pin.platform.files.map(file => [file.path, file]));
-    if (entries.length !== pinned.size || entries.some(entry => !pinned.has(entry.path))) throw new FetchedArchiveError("unsafe_archive", "the archive does not hold exactly the pinned files");
-    await mkdir(unpacked, { mode: 0o700 });
-    for (const entry of entries) await extractZipEntry(archive, entry, join(unpacked, ...entry.path.split("/")), pinned.get(entry.path)!);
-    await rm(archive, { force: true });
-    await chmod(unpacked, 0o700);
-    // Verify where it will run from: the same checks as every start.
-    const stale = await lstat(folders.version).then(() => true, () => false);
-    if (stale) {
-      const aside = join(staging, "stale");
-      await rename(folders.version, aside);
-    }
-    await rename(unpacked, folders.version);
-    try {
-      await verifyNativeAntigravityFolder(request.root, deps);
-    } catch (error) {
-      await rm(folders.version, { recursive: true, force: true });
-      throw error;
-    }
+    await stagePinnedCopy({ pin, folders, staging, deps, onProgress: received => { progress.receivedBytes = received; } });
+    await verifyOrRemove(request.root, folders.version, deps);
     return { antigravityVersion: pin.version, antigravityRoot: folders.version };
   } catch (error) {
-    if (error instanceof RemoteInstanceError) throw error;
-    const diagnostic: Diagnostic = error instanceof FetchedArchiveError && error.reason === "download_failed" ? "antigravity_not_fetched" : "antigravity_unsafe_install";
-    throw refuse(diagnostic, error);
+    throw fetchFailure(error);
   } finally {
     if (fetchesUnderWay.get(request.root) === progress) fetchesUnderWay.delete(request.root);
     await rm(staging, { recursive: true, force: true });
   }
 }
 
+/** Download the pinned zip into `staging`, unpack exactly the pinned files, and move them into the version folder. */
+async function stagePinnedCopy(stage: {
+  pin: AntigravityPin;
+  folders: { version: string };
+  staging: string;
+  deps: AntigravityInstallDeps;
+  onProgress: (received: number) => void;
+}): Promise<void> {
+  const { pin, folders, staging, deps } = stage;
+  const archive = join(staging, "archive.zip");
+  const unpacked = join(staging, "unpacked");
+  await downloadPinnedFile({ url: pin.platform.url, destination: archive, expected: pin.platform.archive, ...deps.download, onProgress: stage.onProgress });
+  const entries = await readZipEntries(archive);
+  const pinned = new Map(pin.platform.files.map(file => [file.path, file]));
+  if (entries.length !== pinned.size || entries.some(entry => !pinned.has(entry.path))) throw new FetchedArchiveError("unsafe_archive", "the archive does not hold exactly the pinned files");
+  await mkdir(unpacked, { mode: 0o700 });
+  for (const entry of entries) await extractZipEntry(archive, entry, join(unpacked, ...entry.path.split("/")), pinned.get(entry.path)!);
+  await rm(archive, { force: true });
+  await chmod(unpacked, 0o700);
+  // Verify where it will run from: the same checks as every start.
+  if (await lstat(folders.version).then(() => true, () => false)) await rename(folders.version, join(staging, "stale"));
+  await rename(unpacked, folders.version);
+}
+
+/** The moved copy must pass the start checks where it will run; one that does not is removed. */
+async function verifyOrRemove(root: string, version: string, deps: AntigravityInstallDeps): Promise<void> {
+  try {
+    await verifyNativeAntigravityFolder(root, deps);
+  } catch (error) {
+    await rm(version, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function fetchFailure(error: unknown): unknown {
+  if (error instanceof RemoteInstanceError) return error;
+  const diagnostic: Diagnostic = error instanceof FetchedArchiveError && error.reason === "download_failed" ? "antigravity_not_fetched" : "antigravity_unsafe_install";
+  return refuse(diagnostic, error);
+}
 /** Fetches running in this process, by connector root: what the site's "Downloading" line shows. */
 const fetchesUnderWay = new Map<string, { receivedBytes: number; sizeBytes: number }>();
 
@@ -305,24 +330,30 @@ export async function antigravityFetchUnderWay(root: string, deps: AntigravityIn
   if (running) return running;
   let pin: AntigravityPin;
   try { pin = antigravityPin(deps); } catch { return undefined; }
-  const base = antigravityFolders(root, pin).base;
-  const entries = await readdir(base).catch(() => [] as string[]);
-  let newest: Stats | undefined;
-  for (const name of entries) {
-    if (!name.startsWith(".fetch-")) continue;
-    const info = await lstat(join(base, name, "archive.zip")).catch(() => undefined);
-    if (info?.isFile() && now - info.mtimeMs <= FETCH_ACTIVE_MS && (!newest || info.mtimeMs > newest.mtimeMs)) newest = info;
-  }
+  const newest = await newestStagingDownload(antigravityFolders(root, pin).base, now);
   return newest ? { receivedBytes: Math.min(newest.size, pin.platform.archive.size), sizeBytes: pin.platform.archive.size } : undefined;
 }
 
+async function newestStagingDownload(base: string, now: number): Promise<Stats | undefined> {
+  const entries = await readdir(base).catch(() => [] as string[]);
+  let newest: Stats | undefined;
+  for (const name of entries.filter(entry => entry.startsWith(".fetch-"))) {
+    const info = await lstat(join(base, name, "archive.zip")).catch(() => undefined);
+    if (recentDownload(info, now) && (!newest || info.mtimeMs > newest.mtimeMs)) newest = info;
+  }
+  return newest;
+}
+
+function recentDownload(info: Stats | undefined, now: number): info is Stats {
+  return info?.isFile() === true && now - info.mtimeMs <= FETCH_ACTIVE_MS;
+}
 /** What the pinned copy takes on disk once unpacked (doctor's "disk used"). */
 export function antigravityDiskBytes(pin: Pick<AntigravityPin, "platform">): number {
   return pin.platform.files.reduce((total, file) => total + file.size, 0);
 }
 
 /**
- * Remove every downloaded copy (A18's file part; signing out and the private
+ * Remove every downloaded copy (the file part; signing out and the private
  * home are `agent remove antigravity`, antigravity-removal.ts). Sign-ins live
  * under `<root>/credentials`, which this never touches.
  */
@@ -331,7 +362,7 @@ export async function removeNativeAntigravity(root: string): Promise<void> {
 }
 
 /**
- * After an update switched to a new pin (A17) and the old copy's last process
+ * After an update switched to a new pin and the old copy's last process
  * exited: remove every version folder and leftover staging folder but `keep`.
  */
 export async function pruneNativeAntigravity(root: string, keep: string): Promise<void> {

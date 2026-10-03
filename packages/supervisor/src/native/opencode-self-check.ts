@@ -65,30 +65,10 @@ export async function checkOpenCodeKonteksConfig(options: OpenCodeSelfCheckOptio
   const file = await stat(options.binary);
   const key = [options.binary, options.version, file.ino, file.size, file.mtimeMs, JSON.stringify(openCodeKonteksSettings())].join("\u0000");
   if (cache.has(key)) return;
-
   const paths = openCodeRuntimePaths(options.credentialDir, platform);
   const configHome = join(paths.configs, CHECK_FOLDER);
-  for (const folder of [paths.home, paths.data, paths.state, paths.cache, join(configHome, "opencode")]) await mkdir(folder, { recursive: true, mode: 0o700 });
-  // A private port and password: never the default port the person's own service holds.
-  await writeSecretFile(join(configHome, "opencode", "service.json"),
-    `${JSON.stringify({ hostname: "127.0.0.1", port: await freeLoopbackPort(), password: randomBytes(24).toString("base64url") }, null, 2)}\n`);
-  await rm(join(configHome, "opencode", "AGENTS.md"), { force: true });
-  const env = openCodeProcessEnvironment(options.credentialDir, configHome, undefined, platform);
-  const run = options.run ?? runOpenCode;
-  const services = options.services ?? (platform === "win32" ? NO_SERVICE_SCAN : processServiceControl(platform));
-  const stopServices = async () => {
-    await run(options.binary, ["service", "stop"], { env, cwd: paths.home, timeoutMs: 15_000 }).catch(() => undefined);
-    const left = await services.list(paths);
-    if (left.length > 0) await services.stop(left);
-  };
-
-  let agents: unknown;
-  await stopServices();
-  try {
-    agents = await listAgents(run, options.binary, env, paths.home, options.deadlineMs ?? 20_000, options.settledMs ?? SETTLED_MS);
-  } finally {
-    await stopServices();
-  }
+  await prepareCheckHome(paths, configHome);
+  const agents = await listAgentsPrivately(options, platform, paths, configHome);
   const drift = openCodeAgentsDrift(agents);
   if (drift.length > 0) {
     throw new RemoteInstanceError("prerequisite_missing",
@@ -99,58 +79,104 @@ export async function checkOpenCodeKonteksConfig(options: OpenCodeSelfCheckOptio
   cache.set(key, true);
 }
 
+async function prepareCheckHome(paths: OpenCodeRuntimePaths, configHome: string): Promise<void> {
+  for (const folder of [paths.home, paths.data, paths.state, paths.cache, join(configHome, "opencode")]) await mkdir(folder, { recursive: true, mode: 0o700 });
+  // A private port and password: never the default port the person's own service holds.
+  await writeSecretFile(join(configHome, "opencode", "service.json"),
+    `${JSON.stringify({ hostname: "127.0.0.1", port: await freeLoopbackPort(), password: randomBytes(24).toString("base64url") }, null, 2)}\n`);
+  await rm(join(configHome, "opencode", "AGENTS.md"), { force: true });
+}
+
+/** The resolved agent list, read with this check's private services stopped before and after. */
+async function listAgentsPrivately(options: OpenCodeSelfCheckOptions, platform: NodeJS.Platform, paths: OpenCodeRuntimePaths, configHome: string): Promise<unknown> {
+  const env = openCodeProcessEnvironment(options.credentialDir, configHome, undefined, platform);
+  const run = options.run ?? runOpenCode;
+  const services = options.services ?? (platform === "win32" ? NO_SERVICE_SCAN : processServiceControl(platform));
+  const stopServices = async () => {
+    await run(options.binary, ["service", "stop"], { env, cwd: paths.home, timeoutMs: 15_000 }).catch(() => undefined);
+    const left = await services.list(paths);
+    if (left.length > 0) await services.stop(left);
+  };
+  await stopServices();
+  try {
+    return await listAgents(run, options.binary, env, paths.home, options.deadlineMs ?? 20_000, options.settledMs ?? SETTLED_MS);
+  } finally {
+    await stopServices();
+  }
+}
 /**
  * A freshly started service first lists no agents, then OpenCode's DEFAULT
  * agents (plan and title included, none of our rules) for about a second,
- * and only then the agents resolved with our configuration (2.0.18, live
- * 2026-09-28). So the listing is read until it is in force, or until it has
+ * and only then the agents resolved with our configuration. So the listing is read until it is in force, or until it has
  * stayed the same for `SETTLED_MS` (a real drift), or until the deadline.
  */
 const SETTLED_MS = 5_000;
 
 async function listAgents(run: OpenCodeCommandRunner, binary: string, env: NodeJS.ProcessEnv, cwd: string, deadlineMs: number, settledMs: number): Promise<unknown> {
   const until = Date.now() + deadlineMs;
-  let last: { text: string; since: number } | null = null;
+  let last: ListingSeen | null = null;
   for (;;) {
-    const result = await run(binary, ["debug", "agents"], { env, cwd, timeoutMs: Math.max(1_000, Math.min(15_000, until - Date.now())) });
-    if (result.code !== 0) {
-      throw new RemoteInstanceError("agent_unavailable", "OpenCode could not check its settings on this computer. Try again in a moment.",
-        { diagnostic: "opencode_self_check_failed", retryable: true });
-    }
-    let parsed: unknown;
-    try { parsed = JSON.parse(result.stdout); } catch { return result.stdout; }
+    const listing = await agentListing(run, binary, env, cwd, until);
+    if (!listing.ok) return listing.stdout;
     const now = Date.now();
-    const loaded = !Array.isArray(parsed) || parsed.length > 0;
-    if (loaded && openCodeAgentsDrift(parsed).length === 0) return parsed;
-    const text = JSON.stringify(parsed);
-    if (!last || last.text !== text) last = { text, since: now };
-    if (now >= until || (loaded && now - last.since >= settledMs)) return parsed;
+    const settled = listingSettled(listing.value, last, now, until, settledMs);
+    if (settled.done) return listing.value;
+    last = settled.last;
     await new Promise(resolve => setTimeout(resolve, 250));
   }
 }
 
+/** One listing's text and when it was first seen unchanged. */
+interface ListingSeen { text: string; since: number }
+
+async function agentListing(run: OpenCodeCommandRunner, binary: string, env: NodeJS.ProcessEnv, cwd: string, until: number): Promise<{ ok: true; value: unknown } | { ok: false; stdout: string }> {
+  const result = await run(binary, ["debug", "agents"], { env, cwd, timeoutMs: Math.max(1_000, Math.min(15_000, until - Date.now())) });
+  if (result.code !== 0) {
+    throw new RemoteInstanceError("agent_unavailable", "OpenCode could not check its settings on this computer. Try again in a moment.",
+      { diagnostic: "opencode_self_check_failed", retryable: true });
+  }
+  try {
+    return { ok: true, value: JSON.parse(result.stdout) as unknown };
+  } catch {
+    return { ok: false, stdout: result.stdout };
+  }
+}
+
+/** Whether to stop reading: the listing is in force, it stayed the same for `settledMs`, or the deadline passed. */
+function listingSettled(parsed: unknown, last: ListingSeen | null, now: number, until: number, settledMs: number): { done: boolean; last: ListingSeen | null } {
+  const loaded = !Array.isArray(parsed) || parsed.length > 0;
+  if (loaded && openCodeAgentsDrift(parsed).length === 0) return { done: true, last };
+  const seen = seenSince(last, JSON.stringify(parsed), now);
+  return { done: now >= until || (loaded && now - seen.since >= settledMs), last: seen };
+}
+
+function seenSince(last: ListingSeen | null, text: string, now: number): ListingSeen {
+  return last && last.text === text ? last : { text, since: now };
+}
 /** What each resolved agent must satisfy; plain lines naming what drifted, empty when in force. */
 export function openCodeAgentsDrift(agents: unknown): string[] {
   if (!Array.isArray(agents)) return ["the agent list is not in the expected form"];
-  const drift: string[] = [];
-  const ids = new Set<string>();
-  for (const agent of agents as Array<{ id?: unknown; permissions?: unknown }>) {
-    const id = typeof agent?.id === "string" ? agent.id : null;
-    if (id === null) { drift.push("an agent has no id"); continue; }
-    ids.add(id);
-    if (OPENCODE_DISABLED_AGENTS.includes(id)) { drift.push(`agent ${id} is not switched off`); continue; }
-    const rules = readRules(agent.permissions);
-    if (rules === null) { drift.push(`agent ${id}: permissions are not in the expected form`); continue; }
-    if (!konteksRulesLast(rules)) drift.push(`agent ${id}: the Konteks rules are not last`);
-    for (const [action, resource, expected, what] of PROBES) {
-      const decision = openCodePermissionDecision(rules, action, resource);
-      if (decision !== expected) drift.push(`agent ${id}: ${what} is ${decision ?? "unset"}, expected ${expected}`);
-    }
-  }
-  if (!ids.has("build")) drift.push("the build agent is missing");
+  const listed = agents as Array<{ id?: unknown; permissions?: unknown }>;
+  const drift = listed.flatMap(agentDrift);
+  if (!listed.some(agent => agent?.id === "build")) drift.push("the build agent is missing");
   return [...new Set(drift)];
 }
 
+function agentDrift(agent: { id?: unknown; permissions?: unknown }): string[] {
+  const id = typeof agent?.id === "string" ? agent.id : null;
+  if (id === null) return ["an agent has no id"];
+  if (OPENCODE_DISABLED_AGENTS.includes(id)) return [`agent ${id} is not switched off`];
+  const rules = readRules(agent.permissions);
+  if (rules === null) return [`agent ${id}: permissions are not in the expected form`];
+  return [...(konteksRulesLast(rules) ? [] : [`agent ${id}: the Konteks rules are not last`]), ...probeDrift(id, rules)];
+}
+
+function probeDrift(id: string, rules: readonly OpenCodePermissionRule[]): string[] {
+  return PROBES.flatMap(([action, resource, expected, what]) => {
+    const decision = openCodePermissionDecision(rules, action, resource);
+    return decision === expected ? [] : [`agent ${id}: ${what} is ${decision ?? "unset"}, expected ${expected}`];
+  });
+}
 /** Resolved decisions the Konteks configuration must produce for every agent. */
 const PROBES: ReadonlyArray<readonly [string, string, OpenCodePermissionRule["effect"], string]> = [
   ["bash", "git push origin main", "ask", "a shell command"],
@@ -231,10 +257,8 @@ function processServiceControl(platform: NodeJS.Platform = process.platform): Op
       const listing = await capture("ps", platform === "linux" ? ["-e", "-ww", "-o", "pid=,args="] : ["-axww", "-o", "pid=,command="]);
       const pids: number[] = [];
       for (const line of listing.split("\n")) {
-        const match = /^\s*(\d+)\s+(.*)$/.exec(line);
-        if (!match || !/\bserve --service\b/.test(match[2]!) || !/opencode/i.test(match[2]!)) continue;
-        const pid = Number(match[1]);
-        if (pid === process.pid) continue;
+        const pid = serviceProcessPid(line);
+        if (pid === null) continue;
         const env = await processEnvironment(pid, platform);
         if (env !== null && ownsPrivateHome(env, paths)) pids.push(pid);
       }
@@ -249,6 +273,14 @@ function processServiceControl(platform: NodeJS.Platform = process.platform): Op
       throw new RemoteInstanceError("agent_unavailable", "An OpenCode background service of this connector did not stop.", { diagnostic: "opencode_service_stop_failed", retryable: true });
     },
   };
+}
+
+/** The pid on a `ps` line of another process running OpenCode's `serve --service`; null for any other line. */
+function serviceProcessPid(line: string): number | null {
+  const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+  if (!match || !/\bserve --service\b/.test(match[2]!) || !/opencode/i.test(match[2]!)) return null;
+  const pid = Number(match[1]);
+  return pid === process.pid ? null : pid;
 }
 
 function alive(pid: number): boolean {

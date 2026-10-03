@@ -46,18 +46,30 @@ export async function checkAntigravityServer(options: AntigravitySelfCheckOption
     throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity has not been downloaded to this computer.", { diagnostic: "antigravity_not_fetched" });
   }
   const cache = options.cache ?? PASSED;
-  const files = await Promise.all(pin.files.map(async file => {
+  const key = await checkKey(folder, pin.files, config.RUNNER_BRIDGE_VERSION);
+  if (cache.has(key)) return;
+  const initialize = await initializeOnce(options, config);
+  const drift = antigravityInitializeDrift(initialize, config.RUNNER_BRIDGE_VERSION);
+  if (drift.length > 0) throw unsupported(config.RUNNER_BRIDGE_VERSION, drift);
+  if (cache.size >= 16) cache.delete(cache.keys().next().value as string);
+  cache.set(key, true);
+}
+
+/** The folder, the version and each pinned file's identity: a pass holds until any of them changes. */
+async function checkKey(folder: string, files: ReadonlyArray<{ path: string }>, version: string): Promise<string> {
+  const identities = await Promise.all(files.map(async file => {
     const found = await stat(join(folder, ...file.path.split("/")));
     return [file.path, found.dev, found.ino, found.size, found.mtimeMs].join(":");
   }));
-  const key = [folder, config.RUNNER_BRIDGE_VERSION, ...files].join("\u0000");
-  if (cache.has(key)) return;
+  return [folder, version, ...identities].join("\u0000");
+}
 
+/** Start the server once in the private home, take its initialize answer, and stop it; leftovers are swept before and after. */
+async function initializeOnce(options: AntigravitySelfCheckOptions, config: ReturnType<typeof RunnerConfigSchema.parse>): Promise<InitializeResponse> {
   const sweep = options.sweep ?? (credentialDir => sweepAntigravityProcesses(credentialDir));
   await sweep(config.RUNNER_CREDENTIAL_DIR);
   const paths = await prepareAntigravityHome(config.RUNNER_CREDENTIAL_DIR);
   const refuse = async () => { throw new RemoteInstanceError("agent_unavailable", "not answered during the start check"); };
-  let initialize: InitializeResponse;
   try {
     const bridge = await (options.spawn ?? spawnBridge)({
       spec: { ...resolveBridgeSpawnSpec(config), cwd: paths.home },
@@ -65,20 +77,16 @@ export async function checkAntigravityServer(options: AntigravitySelfCheckOption
       clientVersion: config.RUNNER_BRIDGE_VERSION,
       handlers: { onSessionUpdate: () => undefined, onRequestPermission: refuse, onCreateElicitation: refuse, onExit: () => undefined },
     });
-    initialize = bridge.initializeResult;
+    const initialize = bridge.initializeResult;
     await bridge.stop();
+    return initialize;
   } catch (error) {
     if (error instanceof RemoteInstanceError && error.code === "protocol_incompatible") throw unsupported(config.RUNNER_BRIDGE_VERSION, ["it speaks another ACP protocol version"]);
     throw new RemoteInstanceError("agent_unavailable", "Google Antigravity could not start on this computer. Try again in a moment.", { diagnostic: "antigravity_self_check_failed", retryable: true, cause: error });
   } finally {
     await sweep(config.RUNNER_CREDENTIAL_DIR).catch(() => 0);
   }
-  const drift = antigravityInitializeDrift(initialize, config.RUNNER_BRIDGE_VERSION);
-  if (drift.length > 0) throw unsupported(config.RUNNER_BRIDGE_VERSION, drift);
-  if (cache.size >= 16) cache.delete(cache.keys().next().value as string);
-  cache.set(key, true);
 }
-
 function unsupported(version: string, drift: readonly string[]): RemoteInstanceError {
   return new RemoteInstanceError("prerequisite_missing",
     `Unsupported Google Antigravity version: ${version} does not answer as Konteks expects (${drift.slice(0, 4).join("; ")}${drift.length > 4 ? "; …" : ""}). Update the connector.`,
@@ -87,19 +95,41 @@ function unsupported(version: string, drift: readonly string[]): RemoteInstanceE
 
 /** Plain lines naming what differs from the server Konteks governs; empty when it answers as expected. */
 export function antigravityInitializeDrift(initialize: InitializeResponse, pinnedVersion: string): string[] {
-  const drift: string[] = [];
-  const family = findAgentBridge("antigravity")!;
-  const info = initialize.agentInfo;
-  if (info?.name !== "antigravity-acp") drift.push("it is not Google's antigravity-acp server");
-  if (typeof info?.version !== "string" || info.version !== pinnedVersion) drift.push(`it reports version ${typeof info?.version === "string" ? info.version : "none"}, not the pinned ${pinnedVersion}`);
-  else if (!hostAgentVersionSupported(family, info.version)) drift.push(`version ${info.version} is outside the supported range`);
-  const methods = new Set((initialize.authMethods ?? []).map(method => method.id));
-  for (const method of ANTIGRAVITY_AUTH_METHODS) if (!methods.has(method)) drift.push(`the ${method} sign-in is missing`);
+  return [
+    ...identityDrift(initialize.agentInfo, pinnedVersion),
+    ...authDrift(initialize.authMethods),
+    ...capabilityDrift(initialize.agentCapabilities),
+  ];
+}
+
+function identityDrift(info: InitializeResponse["agentInfo"], pinnedVersion: string): string[] {
+  const name = info?.name === "antigravity-acp" ? [] : ["it is not Google's antigravity-acp server"];
+  return [...name, ...versionDrift(typeof info?.version === "string" ? info.version : null, pinnedVersion)];
+}
+
+function versionDrift(version: string | null, pinnedVersion: string): string[] {
+  if (version !== pinnedVersion) return [`it reports version ${version ?? "none"}, not the pinned ${pinnedVersion}`];
+  return hostAgentVersionSupported(findAgentBridge("antigravity")!, pinnedVersion) ? [] : [`version ${pinnedVersion} is outside the supported range`];
+}
+
+function authDrift(authMethods: InitializeResponse["authMethods"]): string[] {
+  const methods = new Set((authMethods ?? []).map(method => method.id));
+  const drift = ANTIGRAVITY_AUTH_METHODS.filter(method => !methods.has(method)).map(method => `the ${method} sign-in is missing`);
   if (methods.has("gateway")) drift.push("it offers the gateway sign-in, which Konteks never enables");
-  const caps = initialize.agentCapabilities;
-  if (caps?.mcpCapabilities?.http !== true) drift.push("it does not take MCP servers over http");
-  if (caps?.loadSession !== true) drift.push("it cannot load a session");
-  if (caps?.sessionCapabilities?.resume == null) drift.push("it cannot resume a session");
-  if (caps?.promptCapabilities?.embeddedContext !== true) drift.push("it does not take embedded context");
   return drift;
+}
+
+type AgentCapabilities = NonNullable<InitializeResponse["agentCapabilities"]>;
+
+/** What the governed server must be able to do, and the line naming it when it cannot. */
+const CAPABILITY_CHECKS: ReadonlyArray<readonly [(caps: AgentCapabilities) => boolean, string]> = [
+  [caps => caps.mcpCapabilities?.http === true, "it does not take MCP servers over http"],
+  [caps => caps.loadSession === true, "it cannot load a session"],
+  [caps => caps.sessionCapabilities?.resume != null, "it cannot resume a session"],
+  [caps => caps.promptCapabilities?.embeddedContext === true, "it does not take embedded context"],
+];
+
+function capabilityDrift(caps: InitializeResponse["agentCapabilities"]): string[] {
+  const present: AgentCapabilities = caps ?? {};
+  return CAPABILITY_CHECKS.filter(([holds]) => !holds(present)).map(([, line]) => line);
 }

@@ -77,16 +77,20 @@ export async function resolveConnectorBrowser(runners: readonly RunnerConfig[], 
   for (const candidate of packaged) {
     if (await executable(candidate.node)) return { available: true, browser: { ...source, node: candidate.node, nodeSource: "agent_package" } };
   }
+  const node = await personBrowserNode(runners, deps);
+  if (node === null) return { available: false, reason: "no_node", message: BROWSER_NO_NODE_MESSAGE };
+  return { available: true, browser: { ...source, node, nodeSource: "person" } };
+}
+
+/** The Node the person's DeepSeek Harness already runs on (Node 22.19+), then the usual places. */
+async function personBrowserNode(runners: readonly RunnerConfig[], deps: ConnectorBrowserDeps): Promise<string | null> {
   const env = deps.env ?? process.env;
   const platform = deps.platform ?? process.platform;
-  // The Node the person's DeepSeek Harness already runs on (Node 22.19+), then the usual places.
   const dshNode = runners.find(runner => runner.RUNNER_AGENT_ID === "dsh")?.RUNNER_NATIVE_DSH_NODE;
   const person = await locatePersonNode([...(dshNode ? [dshNode] : []), ...personNodeCandidates(env, platform)], browserNodeSupported, platform,
     deps.version ? { version: deps.version } : {});
-  if (person.node === null) return { available: false, reason: "no_node", message: BROWSER_NO_NODE_MESSAGE };
-  return { available: true, browser: { ...source, node: person.node, nodeSource: "person" } };
+  return person.node;
 }
-
 /**
  * Hand the connector's browser to every runner whose own package carries
  * none (DeepSeek Harness, OpenCode). Claude Code and Codex keep their own,
