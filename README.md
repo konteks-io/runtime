@@ -111,6 +111,7 @@ konteks-remote preview status  # this computer's live session previews (read-onl
 konteks-remote update --check  # what the stable channel offers
 konteks-remote update          # stage, drain, swap, verify; rolls back on failure
 konteks-remote stop | start
+konteks-remote --verbose start # also print each service command, its exit code and output (or KONTEKS_REMOTE_VERBOSE=1)
 konteks-remote uninstall       # finish running work, remove this runtime from its workspace, delete the connector
 ```
 
@@ -465,9 +466,22 @@ is listed as unavailable with the reason, so the gate decides at once and,
 when that agent worked before, rolls back naming it. `update` and
 `update --check` say when the connector updated itself, and when a release
 already failed here; a second `update` while one is still downloading says so.
+An update that stops the connector but cannot go ahead starts the same
+release again and says once it answers. While the new release is being
+checked it takes no new work. The running release keeps `konteks-remote`
+itself on its own version, whichever `konteks-remote` ran the update.
+On Windows the `konteks-remote` the MSI installed (under Program Files) runs
+the installed release's own copy for every command except `install` and
+`uninstall`, or its own code when it is newer than the installed release, so
+it never needs replacing for an update. An MSI from before 0.10.11 runs its
+own old code; `doctor` says so, and running the Windows install line once with
+`-Update` in place of `-ActivationId` replaces it, updates and starts the
+connector.
 
-On macOS the connector logs to `logs/connector.log` in its folder; on Linux,
-to the user journal. A release that finds its service still loaded with an
+On macOS and Windows the connector logs to `logs/connector.log` in its
+folder, from its first line (on Windows the file is kept under 20 MB at each
+start); on Linux, to the user journal. When the connector is not running,
+`doctor` and `support` show the last failed start and the log's last lines. A release that finds its service still loaded with an
 older definition (for example one that sent its output nowhere) has the
 service manager reload it and restart once, so an updated connector keeps
 logging where it did.

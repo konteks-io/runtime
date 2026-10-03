@@ -445,6 +445,21 @@ describe("relayed session (D98/D113/D114)", () => {
       } finally { await f.session.close("cancelled"); }
     });
 
+    it("lets the agent title the session itself and asks only for the [konteks] prefix (D130)", async () => {
+      const f = await build({ activateExecution: async () => ({ restoreReference: "acp-0" }) }, directWork);
+      try {
+        await f.session.bootstrap();
+        const created = f.runnerCalls[0]?.[1][0] as { agentTitled?: boolean; sessionLabel?: unknown };
+        expect(created.agentTitled).toBe(true);
+        expect(created.sessionLabel).toBeUndefined();
+      } finally { await f.session.close("cancelled"); }
+      const engineering = await build();
+      try {
+        await engineering.session.bootstrap();
+        expect(engineering.runnerCalls[0]?.[1][0]).not.toHaveProperty("agentTitled");
+      } finally { await engineering.session.close("cancelled"); }
+    });
+
     it("judges file changes against its own session folder, never another session's; blocked commands stay blocked", async () => {
       const own = join(dir, "session-own", "source"), other = join(dir, "session-other", "source");
       await mkdir(own, { recursive: true }); await mkdir(other, { recursive: true });
@@ -1190,6 +1205,52 @@ describe("relayed session (D98/D113/D114)", () => {
     }
     expect(sent).toHaveLength(before);
     expect(session.counters.malformedResponses).toBe(2);
+  });
+
+  it("relays every streamed chunk after one that ends inside a local path (D121)", async () => {
+    const warn = vi.fn();
+    const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never });
+    await session.bootstrap();
+    const before = sent.length;
+    const chunk = (text: string) => session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: { sessionUpdate: "agent_message_chunk", messageId: "msg-1", content: { type: "text", text } },
+    } });
+    // Codex streams a generator's reply a few tokens at a time; a path is split.
+    await chunk("Editing /Users/private-person/rep");
+    await chunk("o/src/index.ts now");
+    await chunk(" and running the tests.");
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: { sessionUpdate: "plan", entries: [{ content: "Run the tests", priority: "medium", status: "in_progress" }] },
+    } });
+    expect(session.counters.malformedResponses).toBe(0);
+    expect(warn).not.toHaveBeenCalledWith(expect.objectContaining({ event: "session.acp_message_rejected" }), expect.anything());
+    const bodies = sent.slice(before).map(message => message.body as { kind: string; method: string; params: { update: { sessionUpdate: string; content?: { text: string } } } });
+    expect(bodies.map(body => [body.kind, body.method, body.params.update.sessionUpdate])).toEqual([
+      ["acp", "session/update", "agent_message_chunk"],
+      ["acp", "session/update", "agent_message_chunk"],
+      ["acp", "session/update", "agent_message_chunk"],
+      ["acp", "session/update", "plan"],
+    ]);
+    const text = bodies.slice(0, 3).map(body => body.params.update.content?.text).join("");
+    expect(text).toBe("Editing [local-path][local-path] now and running the tests.");
+    expect(JSON.stringify(bodies)).not.toContain("private-person");
+  });
+
+  it("names the refused field when a redacted update still fails the relay contract (D121)", async () => {
+    const warn = vi.fn();
+    const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never });
+    await session.bootstrap();
+    const before = sent.length;
+    // Within the 2048-character title bound before redaction, past it after.
+    const title = "/a ".repeat(680);
+    await session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
+      sessionId: "acp-1", update: { sessionUpdate: "tool_call", toolCallId: "long-title", title, status: "pending" },
+    } });
+    expect(sent).toHaveLength(before);
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: "session.acp_message_rejected", stage: "redacted_schema", sessionUpdate: "tool_call", issuePath: "params.update.title", issueCode: "too_big",
+    }), expect.any(String));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("/a /a");
   });
 
   it.each([

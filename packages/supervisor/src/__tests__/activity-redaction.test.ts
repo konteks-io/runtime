@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { SessionToCoreMessageSchema } from "@konteks/remote-common";
 import {
   canonicalizeAcpToolActivity,
+  contractIssue,
   continuesAtBoundary,
   endsInsidePath,
   redactActivity,
+  redactSessionMessage,
 } from "../session/activity.js";
 
 /** Redact a stream chunk by chunk the way RelayedSession does. */
@@ -18,6 +21,20 @@ function redactStream(chunks: string[], root = "/Users/me/work"): string {
 }
 
 describe("streamed activity redaction", () => {
+  it("applies a chunk's continuation only to its text, never to the message's own fields (D121)", () => {
+    const message = { kind: "acp", method: "session/update", params: { sessionId: "acp-1",
+      update: { sessionUpdate: "agent_message_chunk", messageId: "msg-1", content: { type: "text", text: "o/src/index.ts now" } } } };
+    const chunk = { startsAtBoundary: false, continuesPath: true };
+    // The cause: the chunk's options reached `kind`, `method` and `sessionUpdate`.
+    const whole = SessionToCoreMessageSchema.safeParse(redactActivity(message, "/Users/me/work", chunk));
+    expect(whole.success).toBe(false);
+    expect(whole.success ? undefined : contractIssue(whole.error.issues)).toMatchObject({ issuePath: expect.stringMatching(/^(kind|method|params\.update\.sessionUpdate)$/) });
+    const scoped = SessionToCoreMessageSchema.safeParse(redactSessionMessage(message, "/Users/me/work", chunk));
+    expect(scoped.success).toBe(true);
+    expect(scoped.data).toMatchObject({ kind: "acp", method: "session/update",
+      params: { update: { sessionUpdate: "agent_message_chunk", messageId: "msg-1", content: { type: "text", text: "[local-path] now" } } } });
+  });
+
   it.each([
     ["Agent", "other"],
     ["ToolSearch", "search"],

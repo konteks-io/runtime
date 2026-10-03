@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { keepServiceOnOwnDefinition, SERVICE_RELOAD_WINDOW_MS, type OwnServiceDefinitionDeps } from "../native/commands.js";
-import { nativeServiceDefinition, type NativeServiceCommand, type NativeServiceDefinition } from "../native/service.js";
+import { encodeServiceDefinition, nativeServiceDefinition, type NativeServiceCommand, type NativeServiceDefinition } from "../native/service.js";
 
 const root = "/Users/ada/Library/Application Support/konteks-remote";
 const executable = `${root}/releases/release-new/konteks-connector`;
@@ -37,7 +37,7 @@ function launchdPrint(input: { pid?: number; program?: string; logFile?: string 
 
 function deps(definition: NativeServiceDefinition, input: { onDisk?: string | null; loaded?: string | null; last?: { digest: string; at: number } | null; os?: "macos" | "debian"; now?: number; executeCode?: number } = {}) {
   const calls = {
-    write: vi.fn(async (_path: string, _contents: string) => undefined),
+    write: vi.fn(async (_path: string, _contents: string | Uint8Array) => undefined),
     detach: vi.fn(async (_command: NativeServiceCommand, _logFile: string) => undefined),
     execute: vi.fn(async (_command: NativeServiceCommand) => input.executeCode ?? 0),
     recordReload: vi.fn(async (_reload: { digest: string; at: number }) => undefined),
@@ -159,7 +159,8 @@ describe("the serving release keeps its service on its own definition", () => {
     const windows = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Ada", root: "C:\\Users\\Ada\\AppData\\Local\\konteks-remote", executable: "C:\\Users\\Ada\\AppData\\Local\\konteks-remote\\releases\\release-new\\konteks-connector.exe", userId: "S-1-5-21-1-2-3-1001" });
     const { value, calls } = deps(windows, { onDisk: "<Task/>" });
     expect(await keepServiceOnOwnDefinition(root, value)).toBe("next_start");
-    expect(calls.write).toHaveBeenCalledWith(windows.path, windows.contents);
+    // In the encoding Task Scheduler reads (D129).
+    expect(calls.write).toHaveBeenCalledWith(windows.path, encodeServiceDefinition(windows));
     expect(calls.execute).not.toHaveBeenCalled();
     expect(calls.detach).not.toHaveBeenCalled();
   });
@@ -170,7 +171,7 @@ describe("Windows task refresh", () => {
   function setup() {
     const definition = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\ada", root: "C:\\Users\\ada\\remote", executable: "C:\\Users\\ada\\remote\\releases\\new\\konteks-connector.exe", userId: "S-1-5-21-1-2-3-1001" });
     const base = deps(definition).value;
-    const files = new Map([[definition.path, "older task"]]);
+    const files = new Map<string, string | Uint8Array>([[definition.path, "older task"]]);
     const execute = vi.fn(async () => 0);
     const value: OwnServiceDefinitionDeps = {
       ...base, os: "windows", execute,
@@ -186,21 +187,23 @@ describe("Windows task refresh", () => {
     expect(execute.mock.calls).toEqual(definition.install.map(command => [command]));
     expect(execute).not.toHaveBeenCalledWith(definition.start);
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("current");
-    expect(execute).toHaveBeenCalledTimes(definition.install.length);
+    // Only asked whether the task exists; not registered again.
+    expect(execute.mock.calls.filter(call => (call as unknown[])[0] === definition.install[0])).toHaveLength(definition.install.length);
   });
   it("restores failed registration so the next start retries it", async () => {
     const { definition, files, value, execute } = setup();
     execute.mockResolvedValueOnce(1);
-    await expect(keepServiceOnOwnDefinition("root", value)).rejects.toThrow("schtasks.exe exited unsuccessfully");
-    expect(files.get(definition.path)).toBe("older task");
+    await expect(keepServiceOnOwnDefinition("root", value)).rejects.toThrow("schtasks.exe /Create exited 1");
+    // The exact bytes it found, never a re-encoded copy (D129).
+    expect(Buffer.from(files.get(definition.path)!).toString("utf8")).toBe("older task");
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("current");
   });
   it("repairs a missing helper but leaves an uninstalled foreground connector untouched", async () => {
     const { definition, files, value, execute } = setup();
-    files.set(definition.path, definition.contents);
+    files.set(definition.path, encodeServiceDefinition(definition));
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
-    expect(execute).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalledWith(definition.install[0]);
     files.clear();
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("not_installed");
     expect(files.size).toBe(0);

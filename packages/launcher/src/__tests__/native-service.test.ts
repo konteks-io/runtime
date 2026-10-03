@@ -40,9 +40,12 @@ describe("native background service definitions", () => {
     const encoded = helper!.contents.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)![1]!;
     const script = Buffer.from(encoded, 'base64').toString('utf16le');
     // Single-quoted PowerShell literals keep percent variables, metacharacters
-    // and apostrophes in the installation paths literal, not executable input.
-    expect(script).toContain(`& '${executable.replace(/'/g, "''")}' 'serve' '--root' '${root.replace(/'/g, "''")}'`);
-    expect(script).toContain('exit $LASTEXITCODE');
+    // and apostrophes in the installation paths literal, not executable input;
+    // cmd reads them from the environment and appends the output to the log (D129).
+    expect(script).toContain(`$env:KONTEKS_SERVICE_PROGRAM = '${executable.replace(/'/g, "''")}'`);
+    expect(script).toContain(`$env:KONTEKS_SERVICE_ROOT = '${root.replace(/'/g, "''")}'`);
+    expect(script).toContain('serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1');
+    expect(script).toContain('exit $connector.ExitCode');
     const run = vi.fn(() => 17), quit = vi.fn();
     runInNewContext(helper!.contents, { WScript: { CreateObject: () => ({ Run: run }), Quit: quit } });
     expect(run).toHaveBeenCalledWith(expect.stringContaining('-EncodedCommand'), 0, true);
@@ -70,6 +73,9 @@ describe("native background service definitions", () => {
     // The home it was started from, not the login's (09-30).
     expect(service.contents).toContain('<key>EnvironmentVariables</key><dict><key>HOME</key><string>/Users/Test User</string></dict>');
     expect(service.contents).not.toMatch(/Docker|docker|postgres|harness|validation-runtime|activationCode|TOKEN|PRIVATE KEY/);
+    // launchd SIGKILLs a booted-out job 5 s after SIGTERM unless told otherwise
+    // (D113b): the connector's own 15 s shutdown and exit watchdog need the room.
+    expect(service.contents).toContain('<key>ExitTimeOut</key><integer>30</integer>');
   });
 
   it("escapes XML paths rather than interpolating them as markup", () => {

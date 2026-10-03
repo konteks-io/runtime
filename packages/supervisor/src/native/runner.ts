@@ -33,6 +33,7 @@ const inputSchema = z.object({
   restoreAcpSessionRef: z.string().min(1).max(256).optional(),
   freshProviderSessionOnRestore: z.boolean().optional(),
   sessionLabel: RemoteSessionLabelSchema.optional(),
+  agentTitled: z.literal(true).optional(),
   browser: z.object({
     proxyUrl: z.string().regex(/^http:\/\/127\.0\.0\.1:\d{1,5}$/),
     outputDir: z.string().min(1).refine(isAbsolute),
@@ -210,7 +211,7 @@ export class NativeRunner implements RunnerPort {
     const parsed = inputSchema.safeParse(input);
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
-    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, browser } = parsed.data;
+    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser } = parsed.data;
     // The session's browser is a stdio MCP server the agent launches (its own
     // package's, or the connector's for an agent without one); composed here,
     // where the paths are known.
@@ -218,7 +219,7 @@ export class NativeRunner implements RunnerPort {
     const mcpServers = browserServer === null ? parsed.data.mcpServers : [...parsed.data.mcpServers, browserServer];
     const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
       ...(freshProviderSessionOnRestore === undefined ? {} : { freshProviderSessionOnRestore }),
-      ...(sessionLabel === undefined ? {} : { sessionLabel }), lifecycle: {
+      ...(sessionLabel === undefined ? {} : { sessionLabel }), ...(agentTitled ? { agentTitled } : {}), lifecycle: {
       beforeCreate: async (ref: string) => { await lifecycle?.beforeCreate(ref); },
       recordProcessOwner: async (owner: RetainedProcessOwner) => { await lifecycle?.recordProcessOwner(owner); },
       replaceProcessOwner: async (previous: RetainedProcessOwner, replacement: RetainedProcessOwner) => {

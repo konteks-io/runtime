@@ -89,4 +89,24 @@ describe("bootstrap/install.ps1", () => {
     expect(tail).toContain("open a new PowerShell window");
     expect(tail.trimEnd().endsWith("exit $code")).toBe(true);
   });
+
+  // D131: an MSI from before 0.10.11 runs its own old code for every command
+  // and no connector update replaces it. -Update installs this release's
+  // launcher on a connected computer, then updates and starts the connector.
+  it("updates a connected computer's launcher with -Update: no activation, the MSI first, then update and start", () => {
+    expect(script).toMatch(/^\s*\[switch\]\$Update,$/m);
+    const refuseBoth = script.indexOf("if ($Update -and $ActivationId) {");
+    const notInstalled = script.indexOf("if ($Update -and -not (Test-Path (Join-Path ${env:USERPROFILE} 'AppData\\Local\\konteks-remote\\native-runtime.json'))) {");
+    const requireId = script.indexOf("if (-not $Update -and -not $ActivationId) {");
+    expect(refuseBoth).toBeGreaterThan(script.indexOf("if ($VerifyOnly) { return }"));
+    expect(notInstalled).toBeGreaterThan(refuseBoth);
+    expect(requireId).toBeGreaterThan(notInstalled);
+    const msiexec = script.indexOf("msiexec.exe");
+    const update = script.indexOf("& $launcher update");
+    const start = script.indexOf("& $launcher start");
+    expect(msiexec).toBeGreaterThan(requireId);
+    expect(update).toBeGreaterThan(msiexec);
+    expect(start).toBeGreaterThan(update);
+    expect(script.slice(update, start)).toMatch(/\$code = \$LASTEXITCODE/);
+  });
 });

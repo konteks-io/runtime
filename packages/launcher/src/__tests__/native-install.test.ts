@@ -292,6 +292,41 @@ describe("native install composition", () => {
     }
   });
 
+  it("says which service step failed, with the service manager's own words, and keeps it for doctor (D129)", async () => {
+    const f = await fixture();
+    await installNative(f.options as never);
+    const status = { command: "service-status", args: [] };
+    const register = { command: "service-register", args: ["/Create", "/TN", "label"] };
+    const definition = { label: "label", path: join(f.root, "service.plist"), contents: "service", install: [register], start: { command: "service-start", args: [] }, status, requiresLinger: false } as never;
+    const failing = startNativeConnector({ root: f.root, output: f.options.output }, {
+      roots: f.trust, platform: f.platform, definition: async () => definition,
+      execute: async command => command === status ? 113 : command === register ? { code: 1, stdout: "", stderr: "ERROR: Access is denied.\r\n" } : 0,
+    });
+    await expect(failing).rejects.toMatchObject({
+      code: "temporarily_unavailable",
+      message: "The native user service could not start: macOS did not load the Konteks launch agent (service-register /Create exited 1: ERROR: Access is denied.). To see every step, run konteks-remote --verbose start. Installed identity and credentials were preserved.",
+    });
+    const kept = JSON.parse(await readFile(join(f.root, "supervisor", "service-start-failure.json"), "utf8")) as { message: string };
+    expect(kept.message).toContain("service-register /Create exited 1: ERROR: Access is denied.");
+    // A start that works forgets it.
+    await startNativeConnector({ root: f.root, output: f.options.output }, { roots: f.trust, platform: f.platform, definition: async () => definition, execute: async command => command === status ? 113 : 0 });
+    await expect(readFile(join(f.root, "supervisor", "service-start-failure.json"), "utf8")).rejects.toThrow();
+  });
+
+  it("says a connector that stopped as soon as it started, with its log, where the service manager can tell (D129)", async () => {
+    const f = await fixture();
+    await installNative(f.options as never);
+    await mkdir(join(f.root, "logs"), { recursive: true });
+    await writeFile(join(f.root, "logs", "connector.log"), '{"level":60,"msg":"cannot read native-runtime.json"}\n');
+    const status = { command: "service-status", args: [] };
+    const definition = { label: "label", path: join(f.root, "service.unit"), contents: "service", install: [], start: { command: "service-start", args: [] }, status, requiresLinger: false } as never;
+    await expect(startNativeConnector({ root: f.root, output: f.options.output }, {
+      roots: f.trust, platform: f.platform, definition: async () => definition,
+      // Stopped before the start, and again right after it.
+      execute: async command => command === status ? 113 : 0, settleMs: 0, sleep: async () => undefined,
+    })).rejects.toMatchObject({ message: expect.stringMatching(/started and stopped again at once\. The connector log ends: .*cannot read native-runtime\.json.*The whole log: .*connector\.log/) });
+  });
+
   it("refuses port recovery when the service manager cannot determine whether this root is stopped", async () => {
     const f = await fixture();
     const holder = createServer();

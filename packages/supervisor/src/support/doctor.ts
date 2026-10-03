@@ -66,6 +66,11 @@ export interface DoctorInputs {
    * `update --check` said so).
    */
   updateChannel?: { host: string; override: boolean; lastCheckedAt: string | null; lastError: string | null; available: string | null };
+  /**
+   * Windows: whether the `konteks-remote` command the MSI installed runs this
+   * release's code (`windowsInstalledLauncher`, D131); null without one.
+   */
+  launcher?: "current" | "older" | null;
 }
 
 function updateChannelCheck(channel: NonNullable<DoctorInputs["updateChannel"]>, leaseMode: DoctorInputs["lease"]["mode"]): Omit<DoctorCheck, "recoveryActions"> & { recoveryActions?: DoctorCheck["recoveryActions"] } {
@@ -270,6 +275,7 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   if (inputs.openCode) push(openCodeCheck(inputs.openCode));
   if (inputs.antigravity) push(antigravityCheck(inputs.antigravity));
   if (inputs.updateChannel) push(updateChannelCheck(inputs.updateChannel, inputs.lease.mode));
+  if (inputs.launcher === "older") push({ id: "launcher", title: "konteks-remote command", status: "warn", detail: "konteks-remote is from an older installer and runs its old code, not this release's. Update it once: run the Windows install line with -Update in place of -ActivationId." });
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };
 }

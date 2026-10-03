@@ -587,6 +587,49 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
   built on demand (`ensureUpdates`), not only after a successful start.
 - An update whose stop is not confirmed in time starts the unchanged release
   again once the OS no longer runs it.
+- D113b (2026-10-02): launchd SIGKILLs a booted-out job 5 s after SIGTERM
+  unless its plist sets `ExitTimeOut` (measured on macOS; the plist now sets
+  `LAUNCHD_EXIT_TIMEOUT_SECONDS` = 30, above the daemon's 15 s watchdog). An
+  idle connector still stopping its agents one after another was killed
+  before it wrote its shutdown receipt, and the update waited 90 s for a
+  receipt that never came. Now: native runners stop side by side
+  (`Promise.allSettled`; a runner that cannot stop does not keep the others,
+  the Codex owner or the state from stopping, and its error is thrown at the
+  end); the transaction reads the service pid before the stop and accepts
+  that process being gone as the stop's proof, ends its process group after
+  `stopGraceMs` (30 s; only while `ps` still shows this root's `serve`); and
+  any abort after the stop and before the swap starts the same release and
+  waits for it to answer (`restartUnchanged`).
+- `serve` keeps `<root>/bin/konteks-remote` on the running release
+  (`keepLauncherCurrent`): once no update attempt for this release is
+  `in_progress` (45 min stale bound) and the record names this process's
+  release, it replaces the launcher when its bytes differ. A launcher without
+  the transaction's own refresh (0.8.0's, D113b) otherwise drives every update.
+- D131: Windows has no `<root>\bin` launcher; the MSI's `konteks-remote.exe`
+  (Program Files, not writable without elevation) is the person's command. At
+  start it runs `<root>\releases\<releaseId>\konteks-connector.exe` (or the
+  pre-rename `connector.exe`) from `native-runtime.json` with the same argv,
+  console stdio and exit code (`launcher-delegate.ts`, `KONTEKS_REMOTE_VIA_LAUNCHER=1`
+  on the child so it never hands on again). It runs its own code for
+  `install`, `uninstall` and `stage-enrollment` (Windows cannot delete the
+  running exe), with nothing installed or a `pending` record, when its own
+  version is newer than the record's (a newer MSI repairs an older release),
+  when the release cannot be started (said on stderr), and for any path that
+  is not a regular file at exactly `releases\<id>\<name>` under the root's
+  real path (no link, junction or dot-dot). The child gets the person's
+  environment without the values this copy's entry baked
+  (`globalThis.__konteksLauncherBakedEnv`, `build-launcher.mjs`). The MSI also
+  installs `launcher.json`; the supervisor's doctor warns (`launcher`) when the
+  MSI command lacks it: an older MSI runs its own code forever. `install.ps1
+  -Update` installs the latest MSI on a connected computer (same-version
+  upgrades allowed) and runs `update`, then `start`. An update is driven by the
+  newest code present (the running release's, or a newer MSI's); the staged
+  successor is unproven until its gate, so it takes over at its own `serve`
+  (`keepServiceOnOwnDefinition`), not mid-transaction.
+- A release an update just started is on probation while the ledger's attempt
+  for its release is `in_progress` (`updateProbation`, polled every 2 s, same
+  45 min bound): it takes no new work (pull gate, heartbeat
+  `acceptingWork`), so a rollback never stops it under a claim (D113).
 - `serve` rewrites an existing service definition that differs from what the
   serving release renders (`keepServiceOnOwnDefinition`): the install
   launcher is never replaced and an updater is the previous release, so
@@ -605,8 +648,28 @@ Connector self-recovery (RCA 2026-09-30, `~/Projects/refactory/rca/`):
   (`supervisor/service-reload.json`), and a `serve` not stopped within 60 s
   starts anyway. Windows repairs its private windowless launch helper and
   re-registers a changed task without starting another connector. Task XML
-  remains UTF-16LE with a BOM; failed registration restores the prior file
-  so the next startup retries.
+  remains UTF-16LE with a BOM, written and compared as bytes through
+  `encodeServiceDefinition` by `start` and `serve` alike (D129: 0.10.9 wrote
+  UTF-8 and `schtasks /Create` refused it, "unable to switch the encoding");
+  a file in any other encoding is rewritten, a failed registration restores
+  the exact bytes it found so the next startup retries, and a task missing
+  although its file is current is registered again. The task's hidden
+  PowerShell host runs the connector through `cmd /d /v:off /s /c`, paths
+  passed only as `KONTEKS_SERVICE_*` environment variables, with stdout and
+  stderr appended to `logs/connector.log` (rotated past 20 MB at start; the
+  supervisor's in-place truncation is off on Windows, where cmd's handle does
+  not append). `RestartOnFailure/Count` is 255, the schema's unsignedByte.
+- A failed service step (D129) is a `NativeServiceCommandError`: the step,
+  the command and verb, its exit code and a 300-character excerpt of its
+  output, said by `describeServiceFailure` with one next step. `start` keeps
+  it in `supervisor/service-start-failure.json` (cleared by a start that
+  works, also written by a refused `serve` re-registration) and, where the
+  status means running (Windows, systemd), checks 3 s after starting that the
+  service still runs, quoting the log's last lines if not. `doctor` and
+  `support` fall back to that record and the log tail when the control socket
+  is unavailable. `--verbose` / `KONTEKS_REMOTE_VERBOSE=1` prints every
+  service command, its exit code and output, and the start's decisions, on
+  stderr (`verbose.ts`).
 - After the shared Codex owner starts, app-servers that older releases of this
   installation left on other sockets are ended once idle (or unreachable)
   (`reapStrayServers`); nothing outside `<root>/releases/` is touched.
