@@ -198,6 +198,19 @@ export class McpOnboardFacade implements OnboardFacade {
   }
 
   private async call(tool: string, args: Record<string, unknown>): Promise<unknown> {
+    const response = await this.post(tool, args);
+    const envelope = McpResponseSchema.safeParse(await response.json());
+    if (!envelope.success) throw new RemoteInstanceError("schema_invalid", `The onboard facade answered ${tool} off contract.`, { diagnostic: "onboard_facade_envelope" });
+    if (envelope.data.error) {
+      // A tool-level refusal is Core's decision (budget exhausted, run out of
+      // scope, submission beyond the allowance). It is surfaced with its own
+      // code so the worker can tell "refused" from "unreachable".
+      throw new RemoteInstanceError("conflict", `The onboard facade refused ${tool}: ${envelope.data.error.code}.`, { diagnostic: "onboard_facade_refused" });
+    }
+    return toolContent(tool, envelope.data.result);
+  }
+
+  private async post(tool: string, args: Record<string, unknown>): Promise<Response> {
     const headers: Record<string, string> = { "content-type": "application/json", accept: "application/json" };
     for (const header of this.options.endpoint.headers) headers[header.name] = header.value;
     let response: Response;
@@ -217,27 +230,22 @@ export class McpOnboardFacade implements OnboardFacade {
     if (!response.ok) {
       throw new RemoteInstanceError("temporarily_unavailable", `The onboard facade refused ${tool}.`, { retryable: true, diagnostic: "onboard_facade_http" });
     }
-    const envelope = McpResponseSchema.safeParse(await response.json());
-    if (!envelope.success) throw new RemoteInstanceError("schema_invalid", `The onboard facade answered ${tool} off contract.`, { diagnostic: "onboard_facade_envelope" });
-    if (envelope.data.error) {
-      // A tool-level refusal is Core's decision (budget exhausted, run out of
-      // scope, submission beyond the allowance). It is surfaced with its own
-      // code so the worker can tell "refused" from "unreachable".
-      throw new RemoteInstanceError("conflict", `The onboard facade refused ${tool}: ${envelope.data.error.code}.`, { diagnostic: "onboard_facade_refused" });
-    }
-    const result = envelope.data.result;
-    if (result?.isError) throw new RemoteInstanceError("conflict", `The onboard facade refused ${tool}.`, { diagnostic: "onboard_tool_error" });
-    if (result?.structuredContent !== undefined) return result.structuredContent;
-    const text = result?.content?.find(entry => entry.type === "text")?.text;
-    if (text === undefined) return {};
-    try {
-      return JSON.parse(text) as unknown;
-    } catch {
-      throw new RemoteInstanceError("schema_invalid", `The onboard facade answered ${tool} with unparseable content.`, { diagnostic: "onboard_facade_content" });
-    }
+    return response;
+  }}
+
+/** A tool result's structured content, or its first text part parsed as JSON; `{}` when it has neither. */
+function toolContent(tool: string, result: z.infer<typeof McpResponseSchema>["result"]): unknown {
+  if (!result) return {};
+  if (result.isError) throw new RemoteInstanceError("conflict", `The onboard facade refused ${tool}.`, { diagnostic: "onboard_tool_error" });
+  if (result.structuredContent !== undefined) return result.structuredContent;
+  const text = result.content?.find(entry => entry.type === "text")?.text;
+  if (text === undefined) return {};
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new RemoteInstanceError("schema_invalid", `The onboard facade answered ${tool} with unparseable content.`, { diagnostic: "onboard_facade_content" });
   }
 }
-
 const McpResponseSchema = z
   .object({
     error: z.object({ code: z.union([z.number(), z.string()]), message: z.string().max(2_048).optional() }).passthrough().optional(),

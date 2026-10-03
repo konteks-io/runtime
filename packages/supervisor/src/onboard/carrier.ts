@@ -78,17 +78,22 @@ export class OnboardWorkCarrier {
     }
     const facade = (this.deps.createFacade ?? ((value: PlatformMcpEntry) => new McpOnboardFacade({ endpoint: value })))(entry);
     assertCurrent();
-    if (assignment.kind === "repository_relocation") {
-      const source = assignment.source;
-      if (source.kind !== "repository_relocation") {
-        throw new RemoteInstanceError("schema_invalid", "A relocation assignment carries the relocation source.", { diagnostic: "onboard_source_mismatch" });
-      }
-      const worker = new RepositoryRelocationWorker({ ...this.deps.relocation, facade });
-      const outcome = await worker.run(source.relocationRef, assertCurrent);
-      this.logger.info({ relocationRef: source.relocationRef, step: outcome.step, disposition: outcome.disposition }, "relocation step reported");
-      return { structuredOutput: { relocation: { step: outcome.step, disposition: outcome.disposition, ...(outcome.gap ? { gap: outcome.gap.code } : {}) } } };
-    }
+    if (assignment.kind === "repository_relocation") return this.relocate(assignment, facade, assertCurrent);
+    return this.collectEvidence(assignment, facade, assertCurrent);
+  }
 
+  private async relocate(assignment: OnboardWorkAssignment, facade: OnboardFacade, assertCurrent: () => void): Promise<OnboardWorkOutcome> {
+    const source = assignment.source;
+    if (source.kind !== "repository_relocation") {
+      throw new RemoteInstanceError("schema_invalid", "A relocation assignment carries the relocation source.", { diagnostic: "onboard_source_mismatch" });
+    }
+    const worker = new RepositoryRelocationWorker({ ...this.deps.relocation, facade });
+    const outcome = await worker.run(source.relocationRef, assertCurrent);
+    this.logger.info({ relocationRef: source.relocationRef, step: outcome.step, disposition: outcome.disposition }, "relocation step reported");
+    return { structuredOutput: { relocation: { step: outcome.step, disposition: outcome.disposition, ...(outcome.gap ? { gap: outcome.gap.code } : {}) } } };
+  }
+
+  private async collectEvidence(assignment: OnboardWorkAssignment, facade: OnboardFacade, assertCurrent: () => void): Promise<OnboardWorkOutcome> {
     const source = assignment.source;
     if (source.kind !== "discovery_run") {
       throw new RemoteInstanceError("schema_invalid", "An onboard evidence assignment carries the discovery-run source.", { diagnostic: "onboard_source_mismatch" });
@@ -102,7 +107,7 @@ export class OnboardWorkCarrier {
       return { structuredOutput: { enrichment: { ...outcome, systemRef: scope.systemRef } } };
     }
     if (run.depth === "inventory") {
-      // Inventory is Core's, through the connector (ON4). A runtime asked to
+      // Inventory is Core's, through the connector. A runtime asked to
       // collect at that depth has nothing to do and says so rather than
       // inventing a pass nobody authorised.
       return { structuredOutput: { grouping: { submitted: 0, unreadable: 0, skipped: "inventory_depth" } } };
@@ -110,7 +115,6 @@ export class OnboardWorkCarrier {
     const outcome = await collector.collectGrouping(run, assertCurrent);
     return { structuredOutput: { grouping: { submitted: outcome.submitted, unreadable: outcome.unreadable.length } } };
   }
-
   private async enrichmentScope(assignment: OnboardWorkAssignment): Promise<EnrichmentScope | null> {
     const workload = await this.deps.fetchWorkload(assignment);
     const parsed = OnboardWorkloadSchema.safeParse(workload.workload);

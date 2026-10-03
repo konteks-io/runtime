@@ -109,25 +109,20 @@ export function parseLsRemote(stdout: string): GitRef[] {
  */
 export function classifyGitFailure(stderr: string): GitGap {
   const text = stderr.toLowerCase();
-  if (
-    text.includes("authentication failed") ||
-    text.includes("could not read username") ||
-    text.includes("could not read password") ||
-    text.includes("permission denied") ||
-    text.includes("terminal prompts disabled") ||
-    text.includes("access denied") ||
-    text.includes("403 forbidden") ||
-    text.includes("401 unauthorized") ||
-    text.includes("invalid username or token")
-  ) {
+  if (CREDENTIAL_PHRASES.some(phrase => text.includes(phrase))) {
     return { code: "credential_unavailable", remedy: CREDENTIAL_UNAVAILABLE_REMEDY };
   }
-  if (text.includes("repository not found") || text.includes("not found") || text.includes("does not exist") || text.includes("404")) {
+  if (NOT_FOUND_PHRASES.some(phrase => text.includes(phrase))) {
     return { code: "not_found", remedy: "confirm the repository still exists and this machine may see it" };
   }
   return { code: "unavailable", remedy: "retry when this machine can reach the provider" };
 }
 
+const CREDENTIAL_PHRASES = [
+  "authentication failed", "could not read username", "could not read password", "permission denied", "terminal prompts disabled",
+  "access denied", "403 forbidden", "401 unauthorized", "invalid username or token",
+];
+const NOT_FOUND_PHRASES = ["repository not found", "not found", "does not exist", "404"];
 interface LocalGitOptions {
   /** Injected in tests; production runs the real subprocess. */
   run?: typeof runCommand;

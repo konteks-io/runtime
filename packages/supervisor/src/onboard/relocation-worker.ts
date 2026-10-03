@@ -20,6 +20,13 @@ import { cloneUrl, resolveRemote, type ManagedGitBinding, type RepositoryLocatio
 
 type RelocationStep = RelocationPlan["step"];
 
+/** The steps a worker waits for once Core has frozen the source. */
+const AFTER_FREEZE: RelocationStep[] = ["sync", "verify", "cutover", "settle"];
+
+function isOutcome(value: RelocationPlan | RelocationOutcome): value is RelocationOutcome {
+  return "disposition" in value;
+}
+
 interface RelocationOutcome {
   step: RelocationStep;
   disposition: "settled" | "refused" | "awaiting_core";
@@ -58,34 +65,45 @@ export class RepositoryRelocationWorker {
   }
 
   async run(relocationRef: string, assertCurrent: () => void = () => undefined): Promise<RelocationOutcome> {
-    // Resume from Core's recorded step, never from a step we remember: the
-    // reassigned worker and the one that died must agree, and only Core can
-    // say. A worker that died after `sync` therefore finds `sync` and re-runs
-    // it, which is safe because a mirror push is idempotent.
+    const frozen = await this.throughFreeze(relocationRef, assertCurrent);
+    if (isOutcome(frozen)) return frozen;
+    const verified = await this.throughVerify(relocationRef, frozen, assertCurrent);
+    if (isOutcome(verified)) return verified;
+    if (verified.step === "cutover") {
+      const refused = await this.cutover(verified, assertCurrent);
+      if (refused) return refused;
+    }
+    return this.settle(verified);
+  }
+
+  /**
+   * Resume from Core's recorded step, never from a step we remember: the
+   * reassigned worker and the one that died must agree, and only Core can
+   * say. A worker that died after `sync` therefore finds `sync` and re-runs
+   * it, which is safe because a mirror push is idempotent.
+   */
+  private async throughFreeze(relocationRef: string, assertCurrent: () => void): Promise<RelocationPlan | RelocationOutcome> {
     let plan = await this.deps.facade.relocationStatus(relocationRef);
     if (plan.step === "propose") {
       const refused = await this.propose(plan, assertCurrent);
       if (refused) return refused;
       // `freeze` is Core's: it makes the source read-only before any byte moves.
-      plan = await this.awaitStep(relocationRef, ["sync", "verify", "cutover", "settle"], assertCurrent);
+      plan = await this.awaitStep(relocationRef, AFTER_FREEZE, assertCurrent);
     }
-    if (plan.step === "freeze") plan = await this.awaitStep(relocationRef, ["sync", "verify", "cutover", "settle"], assertCurrent);
+    if (plan.step === "freeze") plan = await this.awaitStep(relocationRef, AFTER_FREEZE, assertCurrent);
     if (plan.step === "propose" || plan.step === "freeze") return { step: plan.step, disposition: "awaiting_core" };
-
-    if (plan.step === "sync" || plan.step === "verify") {
-      const verified = await this.syncAndVerify(plan, assertCurrent);
-      if (verified.disposition !== "settled") return verified;
-      // The cutover permit is a named human's answer, raised in the session.
-      plan = await this.awaitStep(relocationRef, ["cutover", "settle"], assertCurrent);
-      if (plan.step !== "cutover" && plan.step !== "settle") return { step: plan.step, disposition: "awaiting_core" };
-    }
-    if (plan.step === "cutover") {
-      const refused = await this.cutover(plan, assertCurrent);
-      if (refused) return refused;
-    }
-    return this.settle(plan);
+    return plan;
   }
 
+  private async throughVerify(relocationRef: string, plan: RelocationPlan, assertCurrent: () => void): Promise<RelocationPlan | RelocationOutcome> {
+    if (plan.step !== "sync" && plan.step !== "verify") return plan;
+    const verified = await this.syncAndVerify(plan, assertCurrent);
+    if (verified.disposition !== "settled") return verified;
+    // The cutover permit is a named human's answer, raised in the session.
+    const next = await this.awaitStep(relocationRef, ["cutover", "settle"], assertCurrent);
+    if (next.step !== "cutover" && next.step !== "settle") return { step: next.step, disposition: "awaiting_core" };
+    return next;
+  }
   /**
    * `propose`: count the source's refs, confirm the target is empty, and prove
    * both sides are readable from this machine. Some providers pre-create a
@@ -167,34 +185,17 @@ export class RepositoryRelocationWorker {
 
   /**
    * The permit has been answered. Both sides are re-verified against the stored
-   * digest within the answer's window (gap R7): a moved writable source is
+   * digest within the answer's window: a moved writable source is
    * synced and verified once more, and a moved TARGET is refused outright —
    * something else wrote to it and the move is no longer the one approved.
    */
   private async cutover(plan: RelocationPlan, assertCurrent: () => void): Promise<RelocationOutcome | null> {
     assertCurrent();
-    const target = await this.deps.git.lsRemote(this.remote(plan.to));
-    if (!target.ok) return this.refuse(plan, "cutover", target.gap, "relocation_target_unreadable");
-    if (plan.verification && refDigest(target.value) !== plan.verification.headShaByRef) {
-      return this.refuse(
-        plan,
-        "cutover",
-        { code: "unavailable", remedy: "the target changed after it was verified; propose the move again" },
-        "relocation_target_diverged",
-      );
-    }
+    const targetRefused = await this.targetRefusal(plan);
+    if (targetRefused) return targetRefused;
     const source = await this.deps.git.lsRemote(this.remote(plan.from));
     if (!source.ok) return this.refuse(plan, "cutover", source.gap, "relocation_source_unreadable");
-    if (plan.verification && refDigest(source.value) !== plan.verification.headShaByRef) {
-      // A source that stayed writable moved. Sync and verify once more rather
-      // than cutting over to something that is now behind.
-      const resynced = await this.sync(plan, assertCurrent);
-      if (resynced) return resynced;
-      const reverified = await this.verify(plan, assertCurrent);
-      if (reverified.disposition !== "settled") return reverified;
-      await this.report({ relocationRef: plan.relocationRef, step: "cutover", ...(reverified.verification ? { verification: reverified.verification } : {}) });
-      return null;
-    }
+    if (plan.verification && refDigest(source.value) !== plan.verification.headShaByRef) return this.resyncSource(plan, assertCurrent);
     await this.report({
       relocationRef: plan.relocationRef,
       step: "cutover",
@@ -203,6 +204,31 @@ export class RepositoryRelocationWorker {
     return null;
   }
 
+  /** A target that cannot be read, or moved after it was verified, refuses the cutover; null when it is unchanged. */
+  private async targetRefusal(plan: RelocationPlan): Promise<RelocationOutcome | null> {
+    const target = await this.deps.git.lsRemote(this.remote(plan.to));
+    if (!target.ok) return this.refuse(plan, "cutover", target.gap, "relocation_target_unreadable");
+    if (!plan.verification || refDigest(target.value) === plan.verification.headShaByRef) return null;
+    return this.refuse(
+      plan,
+      "cutover",
+      { code: "unavailable", remedy: "the target changed after it was verified; propose the move again" },
+      "relocation_target_diverged",
+    );
+  }
+
+  /**
+   * A source that stayed writable moved. Sync and verify once more rather
+   * than cutting over to something that is now behind.
+   */
+  private async resyncSource(plan: RelocationPlan, assertCurrent: () => void): Promise<RelocationOutcome | null> {
+    const resynced = await this.sync(plan, assertCurrent);
+    if (resynced) return resynced;
+    const reverified = await this.verify(plan, assertCurrent);
+    if (reverified.disposition !== "settled") return reverified;
+    await this.report({ relocationRef: plan.relocationRef, step: "cutover", ...(reverified.verification ? { verification: reverified.verification } : {}) });
+    return null;
+  }
   /** `settle` removes the scratch. The source is retained; that is Core's act. */
   private async settle(plan: RelocationPlan): Promise<RelocationOutcome> {
     await this.deps.scratch.releaseClone(scratchName(plan.relocationRef));

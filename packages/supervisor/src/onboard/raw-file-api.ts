@@ -34,6 +34,18 @@ interface RawFileApiOptions {
   timeoutMs?: number;
 }
 
+async function fileBody(response: Response): Promise<GitResult<Buffer>> {
+  if (response.status === 401 || response.status === 403) {
+    return gitGap("credential_unavailable", "sign in to this provider with git on the machine running this Konteks runtime");
+  }
+  if (response.status === 404) return gitGap("not_found", "the repository does not carry this file at its default branch");
+  if (!response.ok) return gitGap("unavailable", "retry when this machine can reach the provider");
+  const body = Buffer.from(await response.arrayBuffer());
+  // Truncating rather than refusing keeps a huge lockfile from losing a
+  // repository its whole evidence row; the facts we extract sit at the top.
+  return gitOk(body.byteLength > MAX_EVIDENCE_FILE_BYTES ? body.subarray(0, MAX_EVIDENCE_FILE_BYTES) : body);
+}
+
 export class RawFileApi {
   private readonly fetchFn: FetchFn;
   private readonly timeoutMs: number;
@@ -61,17 +73,8 @@ export class RawFileApi {
     } catch {
       return gitGap("unavailable", "retry when this machine can reach the provider");
     }
-    if (response.status === 401 || response.status === 403) {
-      return gitGap("credential_unavailable", "sign in to this provider with git on the machine running this Konteks runtime");
-    }
-    if (response.status === 404) return gitGap("not_found", "the repository does not carry this file at its default branch");
-    if (!response.ok) return gitGap("unavailable", "retry when this machine can reach the provider");
-    const body = Buffer.from(await response.arrayBuffer());
-    // Truncating rather than refusing keeps a huge lockfile from losing a
-    // repository its whole evidence row; the facts we extract sit at the top.
-    return gitOk(body.byteLength > MAX_EVIDENCE_FILE_BYTES ? body.subarray(0, MAX_EVIDENCE_FILE_BYTES) : body);
-  }
-}
+    return fileBody(response);
+  }}
 
 /**
  * Provider raw-file endpoints. Only the four providers the catalog's repository

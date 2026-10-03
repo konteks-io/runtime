@@ -66,24 +66,36 @@ const CODEX_RUNTIME_STATUS: Readonly<Record<string, IntegrationInventoryEntry["s
 
 /** Codex `mcpServerStatus/list` data (pinned 0.153.4 schema): name, authStatus, runtimeStatus, pluginId, tools keys. */
 export function sanitizeCodexMcpStatus(raw: readonly unknown[]): IntegrationInventoryEntry[] {
-  return bounded(raw.map(item => {
-    if (item === null || typeof item !== "object" || Array.isArray(item)) return null;
-    const server = item as { name?: unknown; authStatus?: unknown; runtimeStatus?: unknown; pluginId?: unknown; tools?: unknown };
-    if (typeof server.name !== "string" || server.name.length > 128 || !SERVER_TOKEN.test(server.name)) return null;
-    const runtime = typeof server.runtimeStatus === "string" ? CODEX_RUNTIME_STATUS[server.runtimeStatus] : undefined;
-    const tools = server.tools !== null && typeof server.tools === "object" && !Array.isArray(server.tools) ? Object.keys(server.tools) : [];
-    // Outside a thread Codex reports no runtime status; a server whose tools
-    // it just listed did connect for that listing (measured, pinned 0.153.4).
-    const listed = runtime === undefined && server.runtimeStatus == null && tools.length > 0 ? "connected" : undefined;
-    const status = server.authStatus === "notLoggedIn" && runtime !== "disabled" ? "needs_auth" : runtime ?? listed ?? "unknown";
-    return entry({
-      serverName: server.name,
-      sourceKind: typeof server.pluginId === "string" && server.pluginId.length > 0 ? "plugin_mcp" : "agent_mcp",
-      status,
-      providerCategory: providerCategoryOf(server.name),
-      toolNames: toolNames(tools),
-    });
-  }));
+  return bounded(raw.map(item => codexServerEntry(item)));
+}
+
+type CodexServerStatus = { name?: unknown; authStatus?: unknown; runtimeStatus?: unknown; pluginId?: unknown; tools?: unknown };
+
+function isPlainObject(value: unknown): value is object {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function codexServerEntry(item: unknown): IntegrationInventoryEntry | null {
+  if (!isPlainObject(item)) return null;
+  const server = item as CodexServerStatus;
+  if (typeof server.name !== "string" || server.name.length > 128 || !SERVER_TOKEN.test(server.name)) return null;
+  const tools = isPlainObject(server.tools) ? Object.keys(server.tools) : [];
+  return entry({
+    serverName: server.name,
+    sourceKind: typeof server.pluginId === "string" && server.pluginId.length > 0 ? "plugin_mcp" : "agent_mcp",
+    status: codexServerState(server, tools),
+    providerCategory: providerCategoryOf(server.name),
+    toolNames: toolNames(tools),
+  });
+}
+
+function codexServerState(server: CodexServerStatus, tools: readonly string[]): IntegrationInventoryEntry["status"] {
+  const runtime = typeof server.runtimeStatus === "string" ? CODEX_RUNTIME_STATUS[server.runtimeStatus] : undefined;
+  if (server.authStatus === "notLoggedIn" && runtime !== "disabled") return "needs_auth";
+  if (runtime !== undefined) return runtime;
+  // Outside a thread Codex reports no runtime status; a server whose tools
+  // it just listed did connect for that listing (measured, pinned 0.153.4).
+  return server.runtimeStatus == null && tools.length > 0 ? "connected" : "unknown";
 }
 
 const CLAUDE_STATUS: Readonly<Record<string, IntegrationInventoryEntry["status"]>> = {
@@ -133,17 +145,7 @@ interface E2EFixtureServer {
  * URL, nothing is offered.
  */
 export function e2eFixtureServers(env: NodeJS.ProcessEnv = process.env): E2EFixtureServer[] {
-  if (!integrationFixturesEnabled(env)) return [];
-  const raw = env[E2E_FIXTURE_SERVERS_VARIABLE];
-  if (raw === undefined || raw.length === 0 || raw.length > 16 * 1024) return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return [];
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return [];
-  return Object.entries(parsed as Record<string, unknown>)
+  return Object.entries(fixtureServerMap(env))
     .filter((item): item is [string, string] => typeof item[1] === "string" && item[0].length <= 128 && SERVER_TOKEN.test(item[0]))
     .filter(([, url]) => IntegrationFixtureServerSchema.safeParse({ type: "http", url }).success)
     .sort(([a], [b]) => a.localeCompare(b))
@@ -151,6 +153,19 @@ export function e2eFixtureServers(env: NodeJS.ProcessEnv = process.env): E2EFixt
     .map(([serverName, url]) => ({ serverName, url }));
 }
 
+/** The fixture servers variable as an object, or empty outside E2E mode or when it is not a bounded JSON object. */
+function fixtureServerMap(env: NodeJS.ProcessEnv): Record<string, unknown> {
+  if (!integrationFixturesEnabled(env)) return {};
+  const raw = env[E2E_FIXTURE_SERVERS_VARIABLE];
+  if (raw === undefined || raw.length === 0 || raw.length > 16 * 1024) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  return isPlainObject(parsed) ? parsed as Record<string, unknown> : {};
+}
 /**
  * Model-free listing of one fixture server: MCP `initialize` then
  * `tools/list` over loopback streamable HTTP. Only tool names come back.

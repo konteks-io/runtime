@@ -98,23 +98,7 @@ export class OnboardEvidenceCollector {
       const outstanding = page.items.filter(item => !item.collected);
       for (const batch of chunk(outstanding, this.batchSize)) {
         assertCurrent();
-        const results = await mapWithConcurrency(batch, this.concurrency, item => this.readRepository(item, run.bounds));
-        const submissions: OnboardEvidenceSubmission[] = [];
-        for (const result of results) {
-          if (result.submission.refs.length === 0 && result.gaps.length > 0) {
-            // Nothing readable: the gap IS the evidence for this repository,
-            // and it travels with it so the person sees why and what to do.
-            const gap = result.gaps[0]!;
-            outcome.unreadable.push({ canonicalKey: result.submission.canonicalKey, gap });
-            submissions.push({ ...result.submission, gap });
-            continue;
-          }
-          submissions.push(result.submission);
-        }
-        if (submissions.length > 0) {
-          await this.deps.facade.evidenceSubmit(run.runRef, submissions);
-          outcome.submitted += submissions.length;
-        }
+        await this.submitGroupingBatch(run, batch, outcome);
       }
       cursor = page.nextCursor ?? undefined;
     } while (cursor);
@@ -124,8 +108,23 @@ export class OnboardEvidenceCollector {
     return outcome;
   }
 
+  private async submitGroupingBatch(run: OnboardRunView, batch: DiscoveryInventoryItem[], outcome: GroupingOutcome): Promise<void> {
+    const results = await mapWithConcurrency(batch, this.concurrency, item => this.readRepository(item, run.bounds));
+    const submissions: OnboardEvidenceSubmission[] = results.map(result => {
+      if (result.submission.refs.length > 0 || result.gaps.length === 0) return result.submission;
+      // Nothing readable: the gap IS the evidence for this repository, and
+      // it travels with it so the person sees why and what to do.
+      const gap = result.gaps[0]!;
+      outcome.unreadable.push({ canonicalKey: result.submission.canonicalKey, gap });
+      return { ...result.submission, gap };
+    });
+    if (submissions.length > 0) {
+      await this.deps.facade.evidenceSubmit(run.runRef, submissions);
+      outcome.submitted += submissions.length;
+    }
+  }
   /**
-   * `deep` enrichment for ONE accepted System (ON5, gap 4). Every clone is
+   * `deep` enrichment for ONE accepted System. Every clone is
    * announced to Core BEFORE it starts and reported `extracted` with its
    * submission, so Core's per-repository ledger is never behind what is on disk:
    * a clone that died before extraction is retried on the SAME budget instead of
@@ -139,14 +138,7 @@ export class OnboardEvidenceCollector {
       return { cloned: 0, submitted: 0, disposition: "budget_exhausted" };
     }
     const keys = scope.canonicalKeys.slice(0, Math.min(scope.allowance, run.bounds.maxRepositoriesDeep));
-    const byKey = new Map<string, DiscoveryInventoryItem>();
-    let cursor: string | undefined;
-    do {
-      const page = await this.deps.facade.inventoryList(run.runRef, cursor);
-      for (const item of page.items) if (keys.includes(item.canonicalKey)) byKey.set(item.canonicalKey, item);
-      cursor = page.nextCursor ?? undefined;
-    } while (cursor && byKey.size < keys.length);
-
+    const byKey = await this.inventoryByKey(run, keys);
     const outcome: EnrichmentOutcome = { cloned: 0, submitted: 0, disposition: "completed" };
     for (const batch of chunk(keys, this.concurrency)) {
       assertCurrent();
@@ -155,18 +147,31 @@ export class OnboardEvidenceCollector {
         if (!item) return null;
         return this.enrichOne(run, item, outcome, assertCurrent);
       });
-      const ready = submissions.filter((entry): entry is DiscoveryEvidenceSubmission => entry !== null);
-      if (ready.length > 0) {
-        await this.deps.facade.enrichmentSubmit(run.runRef, scope.systemRef, ready);
-        outcome.submitted += ready.length;
-        for (const submission of ready) {
-          await this.deps.facade.enrichmentProgress(run.runRef, { canonicalKey: submission.canonicalKey, state: "extracted" });
-        }
-      }
+      await this.submitEnrichment(run, scope, submissions.filter((entry): entry is DiscoveryEvidenceSubmission => entry !== null), outcome);
     }
     return outcome;
   }
 
+  /** The inventory items for `keys`, paging only until all are found. */
+  private async inventoryByKey(run: OnboardRunView, keys: string[]): Promise<Map<string, DiscoveryInventoryItem>> {
+    const byKey = new Map<string, DiscoveryInventoryItem>();
+    let cursor: string | undefined;
+    do {
+      const page = await this.deps.facade.inventoryList(run.runRef, cursor);
+      for (const item of page.items) if (keys.includes(item.canonicalKey)) byKey.set(item.canonicalKey, item);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor && byKey.size < keys.length);
+    return byKey;
+  }
+
+  private async submitEnrichment(run: OnboardRunView, scope: EnrichmentScope, ready: DiscoveryEvidenceSubmission[], outcome: EnrichmentOutcome): Promise<void> {
+    if (ready.length === 0) return;
+    await this.deps.facade.enrichmentSubmit(run.runRef, scope.systemRef, ready);
+    outcome.submitted += ready.length;
+    for (const submission of ready) {
+      await this.deps.facade.enrichmentProgress(run.runRef, { canonicalKey: submission.canonicalKey, state: "extracted" });
+    }
+  }
   private async enrichOne(
     run: OnboardRunView,
     item: DiscoveryInventoryItem,
