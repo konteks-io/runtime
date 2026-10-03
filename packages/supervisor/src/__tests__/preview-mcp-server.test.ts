@@ -66,6 +66,22 @@ describe("session preview tools (loopback MCP)", () => {
     await expect(call({ jsonrpc: "2.0", id: 2, method: "ping" })).rejects.toThrow();
   });
 
+  it("logs failed starts with session and bounded diagnostics, never the preview answer", async () => {
+    const warn = vi.fn();
+    const info = vi.fn();
+    const failed: PreviewStatus = { ...running, state: "failed", url: null, message: "private-message-canary", logTail: ["private-output-canary"],
+      failure: { code: "step_failed", phase: "install", exitCode: 7, timedOut: false } };
+    server = new PreviewMcpServer({ start: async () => failed, stop: async () => failed, status: () => failed },
+      { logger: { info, warn } as never, context: { assignmentId: "assignment", attempt: 2 } });
+    const entry = await server.start();
+    const response = await fetch(entry.url, { method: "POST", headers: { authorization: entry.headers[0]!.value, "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview_start" } }) });
+    expect(await response.json()).toMatchObject({ result: { isError: true } });
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "preview.tool_called", assignmentId: "assignment", attempt: 2, sessionId: "s", state: "failed", failureCode: "step_failed", phase: "install", exitCode: 7, timedOut: false }), "preview tool called");
+    expect(info).not.toHaveBeenCalled();
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private-message-canary|private-output-canary|Bearer|pnpm run/);
+  });
+
   it("describes a starting preview with the next step", () => {
     expect(describeStatus({ ...running, state: "starting", phase: "install", url: null })).toContain("Still starting: call preview_status");
     // Only the agent is told what to say when a conversation has no app of its own (09-30).

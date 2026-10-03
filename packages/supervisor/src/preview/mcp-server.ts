@@ -202,7 +202,14 @@ export class PreviewMcpServer {
       this.logger.warn({ event: "preview.tool_failed", tool: name, ...this.options.context, code: error instanceof RemoteInstanceError ? error.code : "unexpected" }, "preview tool call failed");
       return { content: [{ type: "text", text: `The preview tool failed: ${error instanceof Error ? error.message.slice(0, 300) : "unexpected error"}.` }], isError: true };
     }
-    this.logger.info({ event: "preview.tool_called", tool: name, state: status.state, ...this.options.context }, "preview tool called");
+    const failedStart = name === "preview_start" && status.state === "failed";
+    const failure = status.failure;
+    const facts = { event: "preview.tool_called", ...this.options.context, sessionId: status.sessionId, tool: name, state: status.state,
+      ...(failure ? { failureCode: failure.code, phase: failure.phase,
+        ...(failure.exitCode !== undefined ? { exitCode: failure.exitCode } : {}),
+        ...(failure.timedOut !== undefined ? { timedOut: failure.timedOut } : {}) } : {}) };
+    if (failedStart && failure?.code !== "no_app") this.logger.warn(facts, "preview tool called");
+    else this.logger.info(facts, "preview tool called");
     return { content: [{ type: "text", text: describeStatus(status, { browser: this.options.browser === true }) }], structuredContent: status, ...(name === "preview_start" && status.state === "failed" ? { isError: true } : {}) };
   }
 

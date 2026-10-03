@@ -912,7 +912,7 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(updates).toEqual([
       { kind: "acp", method: "session/update", params: { sessionId: acpSessionRef, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Running tests" } } } },
       { kind: "acp", method: "session/update", params: { sessionId: acpSessionRef, update: { sessionUpdate: "tool_call", toolCallId: "tool-1", title: "Run tests", status: "in_progress" } } },
-      { kind: "acp", method: "session/update", params: { sessionId: acpSessionRef, update: { sessionUpdate: "tool_call_update", toolCallId: "tool-1", status: "completed" } } },
+      { kind: "acp", method: "session/update", params: { sessionId: acpSessionRef, update: { sessionUpdate: "tool_call_update", toolCallId: "tool-1", status: "completed", diagnostics: { availability: "status_only" } } } },
     ]);
     expect(base.session.counters.malformedResponses).toBe(0);
     expect(JSON.stringify(base.sent)).not.toMatch(/private-bridge-session|private-thought-canary|wrong-session-canary/);
