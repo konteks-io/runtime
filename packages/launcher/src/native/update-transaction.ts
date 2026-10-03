@@ -10,7 +10,7 @@ import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, recordNativeU
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
-import type { NativeServiceCommand, NativeServiceDefinition } from "./service.js";
+import { CONNECTOR_LOG_FILE, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps, type NativeUpdateStage } from "./update.js";
 
 export interface UpdateControlClient {
@@ -50,7 +50,14 @@ export interface NativeUpdateTransactionDeps {
   processAlive?: (pid: number) => boolean;
   /** Ends a process and its own process group, only while it is still this root's connector. */
   killProcessGroup?: (pid: number, root: string) => Promise<void>;
+  /**
+   * A mark that changes whenever the starting connector shows progress (its
+   * log grows); null where it cannot say. The health deadline counts from the
+   * last change, so a slow start on a busy computer is not rolled back.
+   */
+  startupProgress?: (root: string) => Promise<string | null>;
   drainDeadlineMs?: number;
+  /** How long the successor may show no progress before it is rolled back. */
   healthDeadlineMs?: number;
   /** How long the old service may take to exit and release the runtime directory after its stop command returned. */
   stopDeadlineMs?: number;
@@ -88,6 +95,10 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
     recordAttempt: recordNativeUpdateAttempt,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     now: Date.now,
+    startupProgress: async root => {
+      const log = await stat(join(root, "logs", CONNECTOR_LOG_FILE)).catch(() => null);
+      return log ? `${log.size}:${log.mtimeMs}` : null;
+    },
     readStopReceipt: async root => readFile(join(root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), "utf8").catch(error => {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
@@ -172,7 +183,7 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     }
     successor = await commitOnceReleased(input, staged.releaseId, deps);
     if (wasRunning) {
-      input.output.line(`Starting ${successor.bundleVersion} and checking it is healthy before keeping it (up to ${spoken(deps.healthDeadlineMs ?? 180_000)})…`);
+      input.output.line(`Starting ${successor.bundleVersion} and checking it is healthy before keeping it (rolled back if it makes no progress for ${spoken(deps.healthDeadlineMs ?? 180_000)})…`);
       await deps.start(input);
       await healthGate(input, deps.control(input.root, successor), previous, successor, baseline, deps, definition);
     }
@@ -512,9 +523,14 @@ export async function keepLauncherCurrent(root: string, deps: KeepLauncherCurren
  * present; a pre-existing failure (an agent awaiting login) is not the update's.
  */
 async function healthGate(input: NativeUpdateInput, control: UpdateControlClient, previous: NativeRuntimeRecord, successor: NativeRuntimeRecord, baseline: ReadonlyMap<string, string> | null, deps: NativeUpdateTransactionDeps, definition: NativeServiceDefinition): Promise<void> {
-  const deadline = deps.now() + (deps.healthDeadlineMs ?? 180_000);
+  const quietMs = deps.healthDeadlineMs ?? 180_000;
+  let deadline = deps.now() + quietMs;
   const poll = deps.pollMs ?? 3_000;
   let answered = false;
+  // A connector still starting (QA browser, agent packages, model discovery)
+  // keeps writing its log; on a loaded computer that alone took over three
+  // minutes (X27). Only a successor that stops making progress is rolled back.
+  let progressMark: string | null | undefined;
   /** The agents the successor has not settled yet, named when the deadline passes. */
   let unsettled: string[] = [];
   const progress = progressLines(input, deps, `Waiting for ${successor.bundleVersion} to answer…`, `still waiting for ${successor.bundleVersion} to answer`);
@@ -540,11 +556,15 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
     // seconds and will never answer: say so now rather than at the deadline.
     const exits = answered ? null : await deps.serviceExits?.(definition).catch(() => null);
     if (exits && exits.runs >= 3 && exits.lastExitCode) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector stopped as soon as it started, ${exits.runs} times (exit code ${exits.lastExitCode}).`);
-    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", answered ? `The updated connector did not finish probing its agents in time (${unsettled.join(", ") || "unknown"}).` : "The updated connector did not answer on its control socket in time.");
+    const mark = await deps.startupProgress?.(input.root).catch(() => null) ?? null;
+    if (mark !== null && progressMark !== undefined && mark !== progressMark) deadline = deps.now() + quietMs;
+    if (mark !== null) progressMark = mark;
+    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", answered ? `The updated connector stopped making progress while probing its agents (${unsettled.join(", ") || "unknown"}).` : "The updated connector stopped making progress before it answered on its control socket.");
     await deps.sleep(poll);
   }
   // Connectivity checks (relay, lease) settle seconds after start; a failure
   // counts against the update only if it is still there when the deadline passes.
+  deadline = Math.max(deadline, deps.now() + quietMs);
   for (;;) {
     const failing = await failingDoctorDetails(control);
     const introduced = [...failing.keys()].filter(id => introducedByUpdate(id, baseline, successor));

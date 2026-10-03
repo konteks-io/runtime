@@ -396,7 +396,7 @@ describe("native update transaction", () => {
     // The harness clock moves a second per reading (two per poll): about 50 s, so one line then one per ten seconds, not 25.
     expect(stopping.length).toBeLessThanOrEqual(6);
     expect(stopping.slice(1).every(line => /still stopping the connector \(\d+ s so far\)/.test(line))).toBe(true);
-    expect(lines).toContain("Starting 1.1.0 and checking it is healthy before keeping it (up to 3 min)…");
+    expect(lines).toContain("Starting 1.1.0 and checking it is healthy before keeping it (rolled back if it makes no progress for 3 min)…");
   });
   it("settles at once on a bundled agent the new release could not start, and names it when rolling back (RCA 2026-10-01)", async () => {
     const h = harness({ previous: { ...previous, agents: ["claude-code", "codex"] } });
@@ -426,7 +426,7 @@ describe("native update transaction", () => {
         ? { agents: [{ agentId: "claude-code", readiness: "ready" }] }
         : (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest) } as never;
     };
-    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow("The updated connector did not finish probing its agents in time (codex).");
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow("The updated connector stopped making progress while probing its agents (codex).");
   });
   it("lets a connectivity doctor failure settle within the deadline instead of rolling back", async () => {
     const h = harness({ previous, gate: "new_failure" });
@@ -460,10 +460,34 @@ describe("native update transaction", () => {
     expect(lines).toContain("Rolled back: 1.0.0 is running and answering again. 1.1.0 was not kept.");
     expect((h.ledger.at(-1) as { outcome: string; detail: string }).detail).toMatch(/stopped as soon as it started/);
   });
+  it("keeps waiting for a release that is slow to start but still making progress (X27)", async () => {
+    const h = harness({ previous });
+    // The successor logs for ten polls (twice the 5 s window) before it answers.
+    let polls = 0;
+    h.deps.startupProgress = async () => { polls += 1; return `log:${Math.min(polls, 10)}`; };
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request: { op: string }, ...rest: unknown[]) => {
+        if (record.releaseId === "release-next" && polls < 10) throw new RemoteInstanceError("temporarily_unavailable", "socket closed");
+        return (inner.call as (...args: unknown[]) => Promise<unknown>)(request, ...rest);
+      } } as never;
+    };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated" });
+    expect(h.calls).not.toContain("restore:release-next");
+  });
+  it("rolls back a starting release once it stops making progress (X27)", async () => {
+    const h = harness({ previous, gate: "no_answer" });
+    let polls = 0;
+    h.deps.startupProgress = async () => { polls += 1; return `log:${Math.min(polls, 4)}`; };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow("stopped making progress before it answered on its control socket");
+    expect(polls).toBeGreaterThan(4);
+    expect(h.calls).toContain("restore:release-next");
+  });
   it("does not count a service that is still starting as a crash", async () => {
     const h = harness({ previous, gate: "no_answer" });
     h.deps.serviceExits = async () => ({ runs: 1, lastExitCode: null });
-    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow("did not answer on its control socket in time");
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow("stopped making progress before it answered on its control socket");
   });
   it("says when the installed release came from Konteks updating itself (W1-Z7)", () => {
     const attempt = (reason: "unattended" | "operator", outcome: "applied" | "rolled_back", bundleVersion = "0.5.1") => ({ id: `u-${reason}-${outcome}`, bundleVersion, manifestDigest: "sha256:a", releaseId: "release-x", reason, startedAt: "2026-09-21T23:10:09.083Z", finishedAt: "2026-09-21T23:11:27.626Z", outcome, detail: null });
