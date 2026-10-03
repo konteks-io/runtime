@@ -164,21 +164,16 @@ function outsideWorkspaceMessage(outside: readonly RefusedPath[], pathCount: num
 }
 
 function changedPaths(input: Record<string, unknown>): string[] {
-  const paths: string[] = [];
-  for (const key of PATH_KEYS) {
-    const value = input[key];
-    if (typeof value === "string" && value.trim()) paths.push(value);
-  }
-  const locations = input.locations;
-  if (Array.isArray(locations)) {
-    for (const location of locations) {
-      const path = (location as { path?: unknown } | null)?.path;
-      if (typeof path === "string" && path.trim()) paths.push(path);
-    }
-  }
-  return paths;
+  const named = PATH_KEYS.map(key => input[key]).filter(nonBlankString);
+  const locations = Array.isArray(input.locations)
+    ? input.locations.map(location => (location as { path?: unknown } | null)?.path).filter(nonBlankString)
+    : [];
+  return [...named, ...locations];
 }
 
+function nonBlankString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
 export function createWorkspaceToolPolicy(options: { bashBlocklist?: readonly string[] } = {}): PolicyEvaluator {
   const blocklist = options.bashBlocklist ?? DEFAULT_BASH_BLOCKLIST;
   return {

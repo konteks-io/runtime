@@ -22,20 +22,33 @@ export class ControllerDirectivePoller {
     this.timer.unref();
   }
   private async tick(): Promise<void> {
-    if (!this.running || !this.options.canPoll()) return;
+    if (!this.polling()) return;
     const instanceId = this.options.instanceId(), runnerIncarnation = this.options.runnerIncarnation();
-    for (const retained of this.options.journal.planning.pendingDirectives(instanceId)) { if (!this.running || !this.options.canPoll()) return; await this.options.processor.accept(retained); }
+    if (!await this.acceptAll(this.options.journal.planning.pendingDirectives(instanceId))) return;
     const afterSequence = this.options.journal.planning.cursor(instanceId);
+    const page = await this.pull(instanceId, afterSequence, runnerIncarnation);
+    if (!this.polling() || instanceId !== this.options.instanceId() || runnerIncarnation !== this.options.runnerIncarnation()) return;
+    await this.options.journal.planning.storePulled(instanceId, afterSequence, page);
+    await this.acceptAll(page.directives);
+  }
+
+  private polling(): boolean { return this.running && this.options.canPoll(); }
+
+  /** Accept each directive in order while polling continues; false once it stopped. */
+  private async acceptAll(directives: readonly Parameters<PlanningTerminalDirectiveProcessor["accept"]>[0][]): Promise<boolean> {
+    for (const directive of directives) {
+      if (!this.polling()) return false;
+      await this.options.processor.accept(directive);
+    }
+    return true;
+  }
+
+  private async pull(instanceId: string, afterSequence: number, runnerIncarnation: string) {
     const controller = new AbortController();
     this.pollAbort = controller;
-    let page;
     try {
-      page = await this.options.core.pullControllerDirectives(instanceId, { version: 1, afterSequence, runnerIncarnation, maxItems: 32, waitSeconds: 20 }, controller.signal);
+      return await this.options.core.pullControllerDirectives(instanceId, { version: 1, afterSequence, runnerIncarnation, maxItems: 32, waitSeconds: 20 }, controller.signal);
     } finally {
       if (this.pollAbort === controller) this.pollAbort = null;
     }
-    if (!this.running || !this.options.canPoll() || instanceId !== this.options.instanceId() || runnerIncarnation !== this.options.runnerIncarnation()) return;
-    await this.options.journal.planning.storePulled(instanceId, afterSequence, page);
-    for (const directive of page.directives) { if (!this.running || !this.options.canPoll()) return; await this.options.processor.accept(directive); }
-  }
-}
+  }}

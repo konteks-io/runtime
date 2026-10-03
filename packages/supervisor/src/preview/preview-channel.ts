@@ -55,35 +55,37 @@ export class PreviewChannel {
   onToRuntime(channelId: string, body: unknown): void {
     const sessionId = sessionIdOf(channelId);
     const parsed = PreviewToRuntimeChunkSchema.safeParse(body);
-    const streamId = typeof (body as { streamId?: unknown } | null)?.streamId === "string" ? (body as { streamId: string }).streamId : null;
-    if (sessionId === null || !parsed.success) {
-      this.counters.malformed += 1;
-      if (sessionId !== null && streamId !== null && /^[A-Za-z0-9._:-]{1,256}$/.test(streamId)) this.reply(channelId, streamId, 400, "Malformed preview chunk.");
-      return;
-    }
+    if (sessionId === null || !parsed.success) return this.malformed(channelId, sessionId, body);
     const chunk = parsed.data;
-    if (this.disposed || !this.deps.lease.canOpenChannel("preview")) {
-      this.counters.refusedDraining += 1;
-      if (chunk.kind === "request") this.reply(channelId, chunk.streamId, 503, "This computer is not taking preview traffic right now (it is draining or disconnected).");
-      return;
-    }
-    // A viewer's first request for a session with nothing running: start it
-    // and say so, instead of "nothing is running". Only a request that is
-    // complete in one chunk (a page load, an asset, an upgrade): a multi-part
-    // body keeps going to the forwarder, which answers it plainly.
-    if (
-      chunk.kind === "request" &&
-      chunk.final &&
-      this.deps.previews.autoStart &&
-      this.deps.previews.originFor(sessionId) === null &&
-      !this.forwarders.get(channelId)?.hasStream(chunk.streamId)
-    ) {
+    if (this.disposed || !this.deps.lease.canOpenChannel("preview")) return this.refuseDraining(channelId, chunk);
+    if (this.startsSession(channelId, sessionId, chunk)) {
       void this.startForViewer(channelId, sessionId, chunk);
       return;
     }
     this.forwarderFor(channelId, sessionId).handle(chunk);
   }
 
+  private malformed(channelId: string, sessionId: string | null, body: unknown): void {
+    this.counters.malformed += 1;
+    const streamId = typeof (body as { streamId?: unknown } | null)?.streamId === "string" ? (body as { streamId: string }).streamId : null;
+    if (sessionId !== null && streamId !== null && /^[A-Za-z0-9._:-]{1,256}$/.test(streamId)) this.reply(channelId, streamId, 400, "Malformed preview chunk.");
+  }
+
+  private refuseDraining(channelId: string, chunk: PreviewToRuntimeChunk): void {
+    this.counters.refusedDraining += 1;
+    if (chunk.kind === "request") this.reply(channelId, chunk.streamId, 503, "This computer is not taking preview traffic right now (it is draining or disconnected).");
+  }
+
+  /**
+   * A viewer's first request for a session with nothing running: start it
+   * and say so, instead of "nothing is running". Only a request that is
+   * complete in one chunk (a page load, an asset, an upgrade): a multi-part
+   * body keeps going to the forwarder, which answers it plainly.
+   */
+  private startsSession(channelId: string, sessionId: string, chunk: PreviewToRuntimeChunk): chunk is Extract<PreviewToRuntimeChunk, { kind: "request" }> {
+    return chunk.kind === "request" && chunk.final === true && this.deps.previews.autoStart !== undefined &&
+      this.deps.previews.originFor(sessionId) === null && !this.forwarders.get(channelId)?.hasStream(chunk.streamId);
+  }
   private async startForViewer(channelId: string, sessionId: string, chunk: Extract<PreviewToRuntimeChunk, { kind: "request" }>): Promise<void> {
     let starting = false;
     try {

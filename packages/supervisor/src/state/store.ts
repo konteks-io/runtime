@@ -147,6 +147,10 @@ export const ShutdownProgressSchema = z.object({
 }).strict();
 export type ShutdownProgress = z.infer<typeof ShutdownProgressSchema>;
 
+function validEntryMetadata(entry: { bytes: number; enqueuedAt: number }): boolean {
+  return Number.isSafeInteger(entry.bytes) && entry.bytes >= 0 && Number.isSafeInteger(entry.enqueuedAt) && entry.enqueuedAt >= 0;
+}
+
 export class SupervisorStore {
   private heartbeatWrites: Promise<void> = Promise.resolve();
   /**
@@ -312,14 +316,7 @@ export class SupervisorStore {
   saveRelayState(value: RelayDurableState): Promise<void> {
     // Full validation of cursors, entry metadata and every frame not seen
     // before; a known frame reuses its checked JSON. Same file as before.
-    const unseen: RelayDurableState["outbound"] = {};
-    for (const [channelId, entries] of Object.entries(value.outbound)) {
-      unseen[channelId] = entries.filter(entry => !this.relayFrameJson.has(entry.frame));
-      for (const entry of entries) {
-        if (this.relayFrameJson.has(entry.frame) && !(Number.isSafeInteger(entry.bytes) && entry.bytes >= 0 &&
-            Number.isSafeInteger(entry.enqueuedAt) && entry.enqueuedAt >= 0)) throw new TypeError("relay outbound entry is invalid");
-      }
-    }
+    const unseen = this.unseenFrames(value.outbound);
     RelayDurableStateSchema.parse({ cursors: value.cursors, outbound: unseen });
     for (const entries of Object.values(unseen)) {
       for (const entry of entries) this.relayFrameJson.set(entry.frame, JSON.stringify(entry.frame));
@@ -330,6 +327,17 @@ export class SupervisorStore {
     return this.mutate(() => writeSecretFile(this.path("relay-state.json"), text));
   }
 
+  /** Each channel's frames not checked before; a known frame's entry metadata is still checked. */
+  private unseenFrames(outbound: RelayDurableState["outbound"]): RelayDurableState["outbound"] {
+    const unseen: RelayDurableState["outbound"] = {};
+    for (const [channelId, entries] of Object.entries(outbound)) {
+      unseen[channelId] = entries.filter(entry => !this.relayFrameJson.has(entry.frame));
+      for (const entry of entries) {
+        if (this.relayFrameJson.has(entry.frame) && !validEntryMetadata(entry)) throw new TypeError("relay outbound entry is invalid");
+      }
+    }
+    return unseen;
+  }
   async heartbeatSequence(): Promise<number> {
     return (await this.readJson("heartbeat.json", HeartbeatSeqSchema))?.sequence ?? 0;
   }

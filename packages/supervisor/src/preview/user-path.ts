@@ -26,9 +26,25 @@ export async function resolvePreviewPath(deps: UserPathDeps = {}): Promise<strin
   const platform = deps.platform ?? process.platform;
   const current = env.PATH ?? env.Path ?? "";
   if (platform === "win32") return current;
-  const home = deps.home ?? env.HOME ?? homedir();
-  const shell = env.SHELL && isAbsolute(env.SHELL) ? env.SHELL : platform === "darwin" ? "/bin/zsh" : "/bin/sh";
-  const fromShell = await (deps.shellPath ?? loginShellPath)(shell).catch(() => null);
+  const home = userHome(deps, env);
+  return searchPath(await shellSearchPath(deps, loginShell(env, platform)), current, home);
+}
+
+function userHome(deps: UserPathDeps, env: NodeJS.ProcessEnv): string {
+  return deps.home ?? env.HOME ?? homedir();
+}
+
+function shellSearchPath(deps: UserPathDeps, shell: string): Promise<string | null> {
+  return (deps.shellPath ?? loginShellPath)(shell).catch(() => null);
+}
+
+function loginShell(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string {
+  if (env.SHELL && isAbsolute(env.SHELL)) return env.SHELL;
+  return platform === "darwin" ? "/bin/zsh" : "/bin/sh";
+}
+
+/** The login shell's PATH, then the service's, then the usual per-user and system folders: absolute, plain, each once. */
+function searchPath(fromShell: string | null, current: string, home: string): string {
   const common = [
     join(home, ".volta", "bin"), join(home, ".bun", "bin"), join(home, ".local", "share", "pnpm"), join(home, "Library", "pnpm"),
     join(home, ".local", "bin"), join(home, ".cargo", "bin"),
@@ -38,7 +54,6 @@ export async function resolvePreviewPath(deps: UserPathDeps = {}): Promise<strin
     .filter(entry => entry.length > 0 && isAbsolute(entry) && !/[\p{Cc}]/u.test(entry));
   return [...new Set(entries)].join(":");
 }
-
 /** `$SHELL -ilc` prints PATH between markers; 5 s bound; rc-file noise is ignored. */
 function loginShellPath(shell: string): Promise<string | null> {
   return new Promise(resolve => {
