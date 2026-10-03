@@ -18,4 +18,10 @@ export default tseslint.config(
       "@typescript-eslint/no-explicit-any": "error",
     },
   },
+  {
+    // Cyclomatic complexity of 8 at most (HARDENING.md), enforced per package
+    // as each one is brought under it.
+    files: ["packages/common/src/**/*.ts", "packages/release/src/**/*.ts", "packages/sysmon/src/**/*.ts"],
+    rules: { complexity: ["error", 8] },
+  },
 );

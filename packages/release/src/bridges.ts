@@ -172,19 +172,34 @@ function parseVersion(version: string): { core: [number, number, number]; pre: s
 /** Semantic-version precedence (build metadata ignored); throws on anything else. */
 export function compareAgentVersions(left: string, right: string): number {
   const a = parseVersion(left), b = parseVersion(right);
-  for (let index = 0; index < 3; index += 1) if (a.core[index] !== b.core[index]) return a.core[index]! - b.core[index]!;
+  const core = compareCore(a.core, b.core);
+  if (core !== 0) return core;
+  // A release ranks above any of its prereleases.
   if (a.pre.length === 0 || b.pre.length === 0) return b.pre.length - a.pre.length;
-  for (let index = 0; index < Math.max(a.pre.length, b.pre.length); index += 1) {
-    const x = a.pre[index], y = b.pre[index];
+  return comparePrerelease(a.pre, b.pre);
+}
+
+function compareCore(a: readonly number[], b: readonly number[]): number {
+  for (let index = 0; index < 3; index += 1) if (a[index] !== b[index]) return a[index]! - b[index]!;
+  return 0;
+}
+
+function comparePrerelease(a: readonly string[], b: readonly string[]): number {
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const x = a[index], y = b[index];
     if (x === undefined) return -1;
     if (y === undefined) return 1;
-    if (x === y) continue;
-    const xNumeric = /^\d+$/.test(x), yNumeric = /^\d+$/.test(y);
-    if (xNumeric && yNumeric) return Number(x) - Number(y);
-    if (xNumeric !== yNumeric) return xNumeric ? -1 : 1;
-    return x < y ? -1 : 1;
+    if (x !== y) return comparePrereleaseIdentifier(x, y);
   }
   return 0;
+}
+
+/** Numeric identifiers compare as numbers and rank below alphanumeric ones, which compare as text. */
+function comparePrereleaseIdentifier(x: string, y: string): number {
+  const xNumeric = /^\d+$/.test(x), yNumeric = /^\d+$/.test(y);
+  if (xNumeric && yNumeric) return Number(x) - Number(y);
+  if (xNumeric !== yNumeric) return xNumeric ? -1 : 1;
+  return x < y ? -1 : 1;
 }
 
 /** A host-installed agent family, with its install facts guaranteed present. */

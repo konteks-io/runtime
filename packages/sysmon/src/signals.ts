@@ -6,7 +6,7 @@ import { z } from "zod";
 /**
  * Read-only host utilization signals. Sysmon never writes anything and never
  * reports a path, hostname, address, or process list — only ratios and byte
- * counts the supervisor folds into `RuntimeUtilization` for D74 ranking.
+ * counts the supervisor folds into `RuntimeUtilization` for ranking.
  */
 export const UtilizationSignalsSchema = z
   .object({
@@ -19,7 +19,7 @@ export const UtilizationSignalsSchema = z
     observedAt: z.string(),
   })
   .strict();
-export type UtilizationSignals = z.infer<typeof UtilizationSignalsSchema>;
+type UtilizationSignals = z.infer<typeof UtilizationSignalsSchema>;
 
 interface CpuSnapshot {
   idle: number;
@@ -91,19 +91,20 @@ export function parseDarwinAvailableBytes(output: string | null): number | null 
   if (!output) return null;
   const pageSize = Number(/page size of (\d+) bytes/.exec(output)?.[1]);
   if (!Number.isSafeInteger(pageSize) || pageSize <= 0) return null;
-  let pages = 0;
-  let matched = false;
-  for (const name of ["free", "inactive", "speculative", "purgeable"]) {
-    const value = new RegExp(`^Pages ${name}:\\s+(\\d+)\\.`, "m").exec(output)?.[1];
-    if (value === undefined) continue;
-    const count = Number(value);
-    if (!Number.isSafeInteger(count) || count < 0) return null;
-    pages += count;
-    matched = true;
-  }
-  if (!matched) return null;
+  const pages = reclaimablePages(output);
+  if (pages === null) return null;
   const bytes = pages * pageSize;
   return Number.isSafeInteger(bytes) ? bytes : null;
+}
+
+/** The sum of the reclaimable page counts `vm_stat` printed; null when none was printed or one is malformed. */
+function reclaimablePages(output: string): number | null {
+  const counts = ["free", "inactive", "speculative", "purgeable"]
+    .map(name => new RegExp(`^Pages ${name}:\\s+(\\d+)\\.`, "m").exec(output)?.[1])
+    .filter((value): value is string => value !== undefined)
+    .map(Number);
+  if (counts.length === 0 || counts.some(count => !Number.isSafeInteger(count) || count < 0)) return null;
+  return counts.reduce((sum, count) => sum + count, 0);
 }
 
 function darwinVmStat(): string | null {

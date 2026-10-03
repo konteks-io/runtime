@@ -146,7 +146,7 @@ const recoveryActionsSchema = z
   .array(z.object({ kind: z.string(), agentId: z.string().optional() }).strict())
   .max(8);
 
-export const ControlResponseSchema = z.discriminatedUnion("kind", [
+const ControlResponseSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("ok"), id: z.string(), result: z.unknown() }).strict(),
   z
     .object({
@@ -160,7 +160,7 @@ export const ControlResponseSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("event"), id: z.string(), event: ControlLoginEventSchema }).strict(),
   z.object({ kind: z.literal("done"), id: z.string() }).strict(),
 ]);
-export type ControlResponse = z.infer<typeof ControlResponseSchema>;
+type ControlResponse = z.infer<typeof ControlResponseSchema>;
 
 const AuthEnvelopeSchema = z.object({ auth: z.string().min(16).max(256) }).strict();
 const RequestEnvelopeSchema = z
@@ -175,7 +175,7 @@ export interface ControlEmitter {
 
 export type ControlHandler = (request: ControlRequest, emit: ControlEmitter) => Promise<unknown>;
 
-export interface ControlSocketServerOptions {
+interface ControlSocketServerOptions {
   token: string;
   port: number;
   handler: ControlHandler;
@@ -293,7 +293,7 @@ function handleConnection(socket: Socket, options: ControlSocketServerOptions): 
   socket.on("error", () => socket.destroy());
 }
 
-export interface ControlSocketClientOptions {
+interface ControlSocketClientOptions {
   token: string;
   port: number;
   timeoutMs?: number;
@@ -367,40 +367,47 @@ export function controlCall<T>(options: ControlSocketClientOptions, call: Contro
     // readline forwards input errors independently of the socket listener.
     // A stopped service must reject the call, not crash the launcher.
     lines.on("error", error => finish(() => reject(unavailable("cannot read the supervisor control socket", error))));
-    lines.on("line", (line) => {
-      const parsed = ControlResponseSchema.safeParse(safeJson(line));
-      // A request the server cannot parse is answered with id "unknown". Each
-      // call owns its connection and sends one request, so that error is ours.
-      if (!parsed.success || (parsed.data.id !== id && !(parsed.data.kind === "error" && parsed.data.id === "unknown"))) return;
-      const response = parsed.data;
-      if (response.kind === "event") {
-        call.onEvent?.(response.event);
-        if (response.event.kind === "completed" || response.event.kind === "failed") {
-          loginFinished = true;
+    const onResponse = (response: ControlResponse): void => {
+      switch (response.kind) {
+        case "event":
+          call.onEvent?.(response.event);
+          if (response.event.kind === "completed" || response.event.kind === "failed") {
+            loginFinished = true;
+            complete();
+          }
+          return;
+        case "ok":
+          result = response.result;
+          sawOk = true;
+          return;
+        case "error":
+          finish(() => reject(new RemoteInstanceError("temporarily_unavailable", `${response.code}: ${response.message}`, {
+            recoveryActions: response.recoveryActions as RecoveryAction[],
+          })));
+          return;
+        default:
+          sawDone = true;
           complete();
-        }
-        return;
       }
-      if (response.kind === "ok") {
-        result = response.result;
-        sawOk = true;
-        return;
-      }
-      if (response.kind === "error") {
-        finish(() =>
-          reject(
-            new RemoteInstanceError("temporarily_unavailable", `${response.code}: ${response.message}`, {
-              recoveryActions: response.recoveryActions as RecoveryAction[],
-            }),
-          ),
-        );
-        return;
-      }
-      sawDone = true;
-      complete();
+    };
+    lines.on("line", (line) => {
+      const response = ownResponse(line, id);
+      if (response) onResponse(response);
     });
     socket.once("close", () => finish(() => reject(unavailable("control socket closed early"))));
   });
+}
+
+/**
+ * The response on `line` when it answers this call. A request the server
+ * cannot parse is answered with id "unknown"; each call owns its connection
+ * and sends one request, so that error is ours.
+ */
+function ownResponse(line: string, id: string): ControlResponse | null {
+  const parsed = ControlResponseSchema.safeParse(safeJson(line));
+  if (!parsed.success) return null;
+  const unparsedRequest = parsed.data.kind === "error" && parsed.data.id === "unknown";
+  return parsed.data.id === id || unparsedRequest ? parsed.data : null;
 }
 
 function safeJson(line: string): unknown {
