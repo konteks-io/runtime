@@ -5,7 +5,7 @@ import { isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
 
 /**
  * What one onboarding conversation remembers between commands
- * (onboarding-simplified OS9, "Onboard state").
+ * ("Onboard state").
  *
  * Every `konteks-remote onboard` invocation is a fresh process: the person's
  * agent runs the command, relays the question, waits for a human, and runs it
@@ -29,7 +29,7 @@ const ONBOARD_STEPS = [
       "push",
       /** The person said yes to the push; the next run performs it, so the agent can say it is under way. */
       "pushing",
-      /** Graft is offered for the repository (W1-G1). */
+      /** Graft is offered for the repository. */
       "graft",
       /** The person said yes to Graft; the next run sets it up, so the agent can say it is under way. */
       "graft_setup",
@@ -39,7 +39,7 @@ const ONBOARD_STEPS = [
       /** The person answered the first task; the next run creates the initiative. */
       "initiative",
       "done",
-      /** This machine's access was revoked; the person is asked whether to connect it again (W1-Z4). */
+      /** This machine's access was revoked; the person is asked whether to connect it again. */
       "reconnect",
 ] as const;
 
@@ -48,22 +48,22 @@ export const OnboardStateSchema = z
     schemaVersion: z.literal(1),
     /** The step that will run next. */
     step: z.enum(ONBOARD_STEPS),
-    /** The step a revoked access interrupted; the same runtime carries on there once the access is back (W1-Z4). */
+    /** The step a revoked access interrupted; the same runtime carries on there once the access is back. */
     resumeStep: z.enum(ONBOARD_STEPS).optional(),
     intentRef: z.string().min(1).optional(),
     /** Masked, for re-asking without holding the address. */
     emailMasked: z.string().min(1).optional(),
     /** An address to send a fresh code to without asking again, after a lost bind. */
     resendTo: z.string().min(1).optional(),
-    /** Why a fresh code is being sent, said with it (W1-Z2). */
+    /** Why a fresh code is being sent, said with it. */
     resendReason: z.string().min(1).optional(),
-    /** The address the person gave, needed once more at bind (OS6). */
+    /** The address the person gave, needed once more at bind. */
     email: z.string().min(1).optional(),
     decision: z.enum(["join", "choose", "create"]).optional(),
     workspaces: z.array(z.object({ tenantId: z.string(), displayName: z.string() }).strict()).optional(),
     proposedTenantId: z.string().optional(),
     tenantId: z.string().optional(),
-    /** The workspace was named to the person once already (W1-A4). */
+    /** The workspace was named to the person once already. */
     workspaceAnnounced: z.boolean().optional(),
     instanceId: z.string().optional(),
     /** Code attempts left on the live challenge, for the re-ask. */
@@ -76,7 +76,7 @@ export const OnboardStateSchema = z
     remoteUrl: z.string().optional(),
     defaultBranch: z.string().optional(),
     repositoryKind: z.enum(["existing", "managed"]).optional(),
-    /** The folder is not a git repository yet; the push makes it one (W1-A5). */
+    /** The folder is not a git repository yet; the push makes it one. */
     repositoryNeedsInit: z.boolean().optional(),
     /** The folder already has Konteks managed git as its "konteks" remote. */
     repositoryOnManagedGit: z.boolean().optional(),
@@ -84,33 +84,33 @@ export const OnboardStateSchema = z
     repositoryUnpushed: z.number().int().nonnegative().optional(),
     /** Who authors the first commit of a folder the push turns into a repository. */
     ownerEmail: z.string().min(1).optional(),
-    /** A new conversation on a machine that finished onboarding (W1-A8). */
+    /** A new conversation on a machine that finished onboarding. */
     revisit: z.boolean().optional(),
-    /** How many times inspect has found the service still starting (WS1-036). */
+    /** How many times inspect has found the service still starting. */
     startWaits: z.number().int().min(0).optional(),
     /** The last reply asked "Try that step again now?": its answer is not the step's own. */
     retryAsked: z.boolean().optional(),
     /** The last step just finished: the next run closes this conversation instead of starting a revisit. */
     closing: z.boolean().optional(),
-    /** The runtime this machine was before it lost its key; the next bind replaces it (W1-L1). */
+    /** The runtime this machine was before it lost its key; the next bind replaces it. */
     replaces: z.string().min(1).optional(),
-    /** The runtime whose revoked access proving the address gives back; the machine stays that runtime (W1-Z4). */
+    /** The runtime whose revoked access proving the address gives back; the machine stays that runtime. */
     restores: z.string().min(1).optional(),
-    /** What happened to Graft, and for which repository; it is never offered twice (W1-G2). */
+    /** What happened to Graft, and for which repository; it is never offered twice. */
     graftDecision: z.enum(["accepted", "declined", "unavailable", "failed"]).optional(),
     graftRepository: z.string().optional(),
     systemId: z.string().optional(),
-    /** The System already existed in the workspace; this machine joined it (WS1-089). */
+    /** The System already existed in the workspace; this machine joined it. */
     systemExisting: z.boolean().optional(),
     systemEntityRef: z.string().optional(),
     managedRemoteUrl: z.string().optional(),
-    /** The managed repository's SSH URL, pushed to with the runtime's key (WS1-021). */
+    /** The managed repository's SSH URL, pushed to with the runtime's key. */
     managedSshUrl: z.string().optional(),
     /** Kept readable for state files written before initiatives; never offered as a link. */
     sessionUrl: z.string().optional(),
     /** How many times this run has waited for the machine's agents to be advertised. */
     agentsWaited: z.number().int().min(0).optional(),
-    /** The workspace agent setup this machine started, until it is ready (W1-A6). */
+    /** The workspace agent setup this machine started, until it is ready. */
     setupOperationId: z.string().optional(),
     /** The person's answer to "what do you want to build first?", until it is the first turn. */
     firstTask: z.string().optional(),

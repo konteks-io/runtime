@@ -17,7 +17,7 @@ import {
  * loopback port the supervisor spawned for that session's preview, and
  * returns `PreviewToCoreChunk`s (adapted from bb `tunnel-client/session.ts`
  * stream mechanics: per-stream body accumulation, chunked responses and a
- * WebSocket relay, with the D125 policy in place of an open passthrough).
+ * WebSocket relay, with the preview policy in place of an open passthrough).
  *
  * The forwarder never lets a viewer name a host: the origin comes only from
  * the process manager and must be a loopback address. It never follows a

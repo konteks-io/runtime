@@ -34,7 +34,7 @@ anything; CI dot-sources the script that way to test it.
 #>
 [CmdletBinding()]
 param(
-  # Agent-first onboarding (onboarding-simplified R17): the user-local install
+  # Agent-first onboarding: the user-local install
   # arrives for Windows in a later release. Until then these switches say so
   # instead of failing on a missing activation id.
   [switch]$User,
@@ -266,7 +266,7 @@ $launcher = Join-Path ${env:ProgramFiles} 'konteks-remote\konteks-remote.exe'
 if (-not (Test-Path $launcher)) { $launcher = 'konteks-remote' }
 if ($Update) {
   # This launcher runs the newer of its own code and the installed release's
-  # (D131). A connector that could not start stays stopped through an update,
+  # code. A connector that could not start stays stopped through an update,
   # so start it after; start leaves a running one alone.
   & $launcher update
   $code = $LASTEXITCODE

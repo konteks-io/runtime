@@ -4,7 +4,7 @@ import { z } from "zod";
 import { isFsErrorWithCode, writeSecretFile, type OwnershipScope } from "@konteks/remote-common";
 
 /**
- * Per-agent ownership scope state (D101), kept inside the private credential
+ * Per-agent ownership scope state, kept inside the private credential
  * volume next to the login it describes. Holds only the opaque keyed
  * fingerprint — never an account identifier — and the scope the operator
  * attested. Any fingerprint change resets the scope to `personal`.

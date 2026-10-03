@@ -54,7 +54,7 @@ export function packageBrowser(config: RunnerConfig): RunnerBrowser | null {
 }
 
 /**
- * The QA browser a session of this runner gets (O8: a connector capability,
+ * The QA browser a session of this runner gets (a connector capability,
  * not an agent package feature). Claude Code and Codex keep the one in their
  * own package; any other agent gets the one the supervisor resolved for the
  * connector (`RUNNER_BROWSER`); null when the connector has none.

@@ -16,7 +16,7 @@ interface LearntCommands {
 }
 
 /**
- * The slash commands one agent announced on this computer (runtime-view R19):
+ * The slash commands one agent announced on this computer:
  * the latest ACP `available_commands_update` of any of its sessions, minus the
  * commands the runtime refuses (Antigravity's `/plan`, `/logout`), normalized
  * so the heartbeat schema always takes it. Kept in a small JSON file in the

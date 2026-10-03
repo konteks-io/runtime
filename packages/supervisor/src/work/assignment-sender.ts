@@ -38,7 +38,7 @@ interface AssignmentSenderDeps {
 }
 
 /**
- * The one durable logical sender for assignment operations (D143).
+ * The one durable logical sender for assignment operations.
  *
  * Every request's frame and sequence are frozen BEFORE the first send, so an
  * uncertain outcome replays the same bytes rather than allocating a second

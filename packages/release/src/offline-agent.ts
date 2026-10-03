@@ -126,7 +126,7 @@ const verifiedPackages = new Map<string, { fingerprint: string; profile: NativeA
 
 /**
  * Full integrity check on first use, then only while the package is unchanged
- * a stat fingerprint (WS2-156): rehashing a 400 MB agent every turn cost ~12 s.
+ * a stat fingerprint: rehashing a 400 MB agent every turn cost ~12 s.
  * A changed fingerprint, another artifact (digest) or another path verifies in
  * full again; a failure is never remembered.
  */

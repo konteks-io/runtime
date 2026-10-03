@@ -103,7 +103,7 @@ it.skipIf(process.platform === "win32")("rejects a disconnect between loaded-lis
   await expect(codexLoadedThreadStatuses(f.socket)).rejects.toThrow(/inventory unavailable/);
 });
 
-/** Codex 0.159+ binds in its own private directory and links the path it was given (RCA 2026-10-01). */
+/** Codex 0.159+ binds in its own private directory and links the path it was given. */
 async function linked(daemonMode = 0o700) {
   const f = await fixture();
   const home = await mkdtemp(join(tmpdir(), "codex-link-"));

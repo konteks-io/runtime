@@ -33,7 +33,7 @@ it("missing history is legacy_unknown, including a reopened empty root", async (
   expect(reopened.execution.coverage("instance", "workspace")).toBe("legacy_unknown");
 });
 
-it("loads pre-D162 delivery claims with a non-authoritative sentinel identity so the runtime can drain them", async () => {
+it("loads older delivery claims with a non-authoritative sentinel identity so the runtime can drain them", async () => {
   const journal = await fixture();
   const legacy = {
     ...start,

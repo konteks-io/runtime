@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { RemoteInstanceError } from "@konteks/remote-common";
 
 /**
- * The person's answer to a fetched agent's consent line (antigravity A20):
+ * The person's answer to a fetched agent's consent line:
  * `konteks-remote agent add antigravity` and `install --agents …,antigravity`
  * show the line exactly as written (it ends "[y/N]") and download only on an
  * explicit yes. In a terminal the person answers it; `--yes` is that answer

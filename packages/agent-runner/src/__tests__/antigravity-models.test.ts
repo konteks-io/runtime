@@ -3,9 +3,9 @@ import { recogniseNativeModel } from "@konteks/backstage-plugin-common/known-mod
 import { MAX_OFFERED_MODEL_VALUES, exactSelect } from "../bridge/model-capability.js";
 
 /**
- * Google Antigravity's models come from its `model` select (CP0: 14 with an
- * API key; 11 under the Gemini Enterprise Plus licence, CP2 live) and are
- * recognised by packages' `recogniseNativeModel('antigravity', …)` (CP5).
+ * Google Antigravity's models come from its `model` select (14 with an
+ * API key; 11 under the Gemini Enterprise Plus licence, both seen live) and are
+ * recognised by packages' `recogniseNativeModel('antigravity', …)`.
  */
 const ENTERPRISE = ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low",
   "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.1-pro-low", "gemini-3.1-pro-high"];
@@ -20,7 +20,7 @@ describe("Google Antigravity's model select", () => {
     expect(recogniseNativeModel("antigravity", "gemini-3.8-flash-high")).toMatchObject({ effort: "high" });
   });
 
-  it("above the wire bound keeps the known Gemini models first and the current one (KM6)", () => {
+  it("above the wire bound keeps the known Gemini models first and the current one", () => {
     const unknown = Array.from({ length: 140 }, (_value, index) => ({ value: `org-model-${index}`, name: `Org model ${index}` }));
     const gemini = ENTERPRISE.map(value => ({ value, name: value }));
     const result = exactSelect({ id: "model", name: "Model", type: "select", currentValue: "org-model-139", options: [...unknown, ...gemini] } as never, "antigravity");

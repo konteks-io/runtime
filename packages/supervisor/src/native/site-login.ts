@@ -146,7 +146,7 @@ export function openCodeRunnerCapabilities(input: { installed: boolean; relayRea
  * while the relay can carry a site-started login and this
  * machine can open a browser, `agent-login-antigravity-v1` with one
  * capability per released sign-in (Gemini Enterprise; personal Google
- * sign-in is held back, A10). Nothing otherwise: whether Core takes 7.1
+ * sign-in is held back). Nothing otherwise: whether Core takes 7.1
  * fields is the generic `core-contract-version-v1` signal (inventory.ts).
  */
 export function antigravityRunnerCapabilities(input: { installed: boolean; relayReady: boolean; options: readonly AgentLoginOptionId[]; desktop: boolean }): string[] {

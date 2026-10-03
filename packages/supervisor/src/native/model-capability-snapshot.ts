@@ -17,8 +17,7 @@ interface ResolvedModelCapabilityMapping { agentId: string; mapping: AgentModelC
 /**
  * What one snapshot is bound to: a reviewed signed mapping from the release,
  * or, for an agent the release signed nothing for, the fixed catalogue
- * authority Core resolves through its own known-model catalogue (System One
- * §6a, KM5). A catalogue authority has no expiry of its own.
+ * authority Core resolves through its own known-model catalogue. A catalogue authority has no expiry of its own.
  */
 interface OfferedAuthority {
   agentId: string;
@@ -48,7 +47,7 @@ interface ModelCapabilitySnapshotProducerOptions {
   discover: (agentId: string, configId: string) => Promise<DiscoveredOffer>;
   /**
    * How one offered value is billed on this machine (OpenCode: by route
-   * provider and the credential that serves it; CP3). Undefined leaves the
+   * provider and the credential that serves it). Undefined leaves the
    * option unlabelled, which an older Core requires.
    */
   optionBilling?: (agentId: string, value: string, agent: ConnectedAgentView) => "subscription" | "pay_per_use" | undefined;
@@ -61,7 +60,7 @@ interface ModelCapabilitySnapshotProducerOptions {
 interface CacheEntry { authorityKey: string; snapshot: AgentModelOfferedValuesSnapshot }
 interface RetryEntry { failures: number; nextAt: number }
 
-/** Incremental, bounded owner for D150 snapshots; it never scans history. */
+/** Incremental, bounded owner for model capability snapshots; it never scans history. */
 export class ModelCapabilitySnapshotProducer {
   private readonly cache = new Map<string, CacheEntry>();
   private readonly inFlight = new Map<string, Promise<void>>();
@@ -232,7 +231,7 @@ export class ModelCapabilitySnapshotProducer {
 }
 
 /**
- * How one offered OpenCode value is billed on this machine (CP3, O7/O11):
+ * How one offered OpenCode value is billed on this machine:
  * its route provider (`openai` in `openai/gpt-5.5`) and the credential kind
  * the agent reports for that provider. Undefined for every other agent (Core
  * classifies those by agent) and for a value without a provider.
@@ -247,7 +246,7 @@ export function openCodeOptionBilling(agent: Pick<ConnectedAgentView, "agentId" 
 }
 
 /**
- * How Google Antigravity's offered models are billed (antigravity CP3): by how
+ * How Google Antigravity's offered models are billed: by how
  * Google is signed in, i.e. the credential in use, which the connector lists
  * first among the ready ones (Gemini Enterprise: a subscription, or
  * pay-per-use for its Pay-as-you-go edition; a Gemini API key: pay-per-use).

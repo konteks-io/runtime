@@ -116,7 +116,7 @@ export class PreviewChannel {
       forwarder.dispose();
     }
     // Its counts go even when no viewer reached this process yet: a reset
-    // that left them kept the channel out of step with Core (W1-Z7).
+    // that left them kept the channel out of step with Core.
     this.deps.transport.closeChannel(channelId);
   }
 

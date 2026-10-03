@@ -240,7 +240,7 @@ export async function authLogout(context: ControlContext, agentId: string, provi
 }
 
 /**
- * `git key add [--title]` (ON16, OB6 §4): the runtime generates (or reuses) an
+ * `git key add [--title]`: the runtime generates (or reuses) an
  * ed25519 key, registers its PUBLIC half through Core, and writes an SSH config
  * stanza for the managed host. The private half never leaves the machine, which
  * is why this is a launcher command on the trusted machine and not a field in

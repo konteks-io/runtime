@@ -79,7 +79,7 @@ export function leaseRecordFromClaims(lease: string, claims: LeaseClaims): Lease
   };
 }
 
-/** Channels a drain-only lease may still open (A2 §5). */
+/** Channels a drain-only lease may still open. */
 const DRAIN_ONLY_CHANNELS: ReadonlySet<RelayChannel> = new Set(["control", "heartbeat", "assignment", "observation", "support"]);
 
 export class LeaseState {

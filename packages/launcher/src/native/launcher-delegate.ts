@@ -40,7 +40,7 @@ interface InstalledReleaseInput {
 
 /**
  * The installed release's own `konteks-remote`, when this process is the
- * Windows command the MSI installed and should run that instead (D131). The
+ * Windows command the MSI installed and should run that instead. The
  * MSI's copy sits under Program Files, which the running connector cannot
  * replace without elevation, so every command it ran kept the code of the
  * first MSI the person installed whatever release the connector ran. Now it

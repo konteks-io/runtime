@@ -19,7 +19,7 @@ import type { IntegrationSetupRunner } from "./setup.js";
 import type { IntegrationWriteLedger } from "./tool-gate.js";
 
 /**
- * An `integration` assignment (external-integration-via-agent CP2): one
+ * An `integration` assignment: one
  * bounded integration task Core placed on the runtime that holds the
  * binding. It never takes the relayed-session path: the carrier fetches the
  * frozen task from Core's workload route and runs it here, model-free for
@@ -81,7 +81,7 @@ interface IntegrationTaskCarrierDeps {
 }
 
 /**
- * The integration lane (DESIGN §2). Fetches the frozen task through the
+ * The integration lane. Fetches the frozen task through the
  * workload route, refuses it unless it parses with the shared schema, its
  * digest equals the assignment source's `specDigest`, and it names this
  * assignment's task and agent; then runs it: discovery model-free, setup

@@ -11,7 +11,7 @@ import { classifyAgentBilling, recogniseNativeModel } from "@konteks/backstage-p
 
 const credential = (providerId: string, kind: "sign_in" | "api_key"): ConnectedAgentCredential => ({ providerId, label: `${providerId} ${kind}`, kind, state: "ready" });
 
-describe("a turn's money basis follows how its provider bills (O7)", () => {
+describe("a turn's money basis follows how its provider bills", () => {
   const accepts = { coreAcceptsRouteBilling: true };
   it("keeps Claude Code and Codex on the subscription basis", () => {
     for (const agentId of ["claude-code", "codex"]) expect(turnUsageLabel({ agentId, modelValue: "sonnet", credentials: undefined, ...accepts })).toEqual({ moneyBasis: "unavailable_local_subscription" });
@@ -89,7 +89,7 @@ async function turn(sessions: SessionManager, events: RunnerEventBus, ref: strin
   await new Promise(resolve => setTimeout(resolve, 0));
 }
 
-describe("OpenCode turns carry the provider's reported cost (O7)", () => {
+describe("OpenCode turns carry the provider's reported cost", () => {
   const label = (credentials: ConnectedAgentCredential[]) => (modelValue: string | undefined) => turnUsageLabel({ agentId: "opencode", modelValue, credentials, coreAcceptsRouteBilling: true });
 
   it("reports each turn's `usage_update.cost` delta in USD micros, with the provider and model the session runs", async () => {
@@ -146,7 +146,7 @@ describe("OpenCode turns carry the provider's reported cost (O7)", () => {
   });
 });
 
-describe("Zen's free models only with the person's say-so (O6)", () => {
+describe("Zen's free models only with the person's say-so", () => {
   const offOnly = (value: string) => !/^opencode\/[^/]+-free$/.test(value);
 
   it("moves a session that would start on a free model to the first model it may use, and refuses switching to one", async () => {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AGPL guard (CP2 item 1 / CI acceptance): no Shellular (AGPL-3.0) code may
+ * AGPL guard: no Shellular (AGPL-3.0) code may
  * enter this repository. It scans source, scripts and release metadata for
  * AGPL licence headers, Shellular identifiers, and
  * imports of Shellular packages, and fails the build on any hit. Design

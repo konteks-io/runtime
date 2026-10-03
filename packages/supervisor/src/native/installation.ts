@@ -99,10 +99,9 @@ function explicitSocket(requested: string): string {
  * Read a stored record. One written before 7.0.0 may still list Pi or the
  * old bundled OpenCode: those agents are not run, so they are dropped (and
  * reported back for a warning) instead of failing the whole installation. A
- * host agent that is not offered is dropped the same way (none today: since
- * opencode-runtime-support CP6 an old record naming `opencode` reads as the
- * person's own OpenCode 2, O13, and Google Antigravity is offered since its
- * CP6). The strict schema refuses a retired id that
+ * host agent that is not offered is dropped the same way (none today: an old
+ * record naming `opencode` reads as the person's own OpenCode 2, and Google
+ * Antigravity is offered). The strict schema refuses a retired id that
  * is not a native agent (Pi); the installer refuses the rest.
  */
 export function parseNativeRuntimeRecord(value: unknown): { record: NativeRuntimeRecord; retiredAgents: string[] } {

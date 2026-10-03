@@ -31,7 +31,7 @@ import type { SupervisorJournal } from "../state/journal.js";
 
 /**
  * The closed control protocol: desired configuration, version policy, key
- * rotation, erase, and drain. Every directive is a strict CP1 schema, must
+ * rotation, erase, and drain. Every directive is a strict shared schema, must
  * carry a verifying Core signature and a fresh (monotonic or unexpired)
  * revision/nonce, and is acknowledged with a signed body. There is no
  * arbitrary directive; anything else is dropped and counted.

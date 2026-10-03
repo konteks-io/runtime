@@ -9,7 +9,7 @@ import {
 
 const DeliveryDigestSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 
-/** A bounded, redacted join record for a separately delivered C01 companion. */
+/** A bounded, redacted join record for a separately delivered diagnostic companion. */
 const DiagnosticCompanionInboxRecordBaseSchema = z
   .object({
     version: z.literal(1),
@@ -61,7 +61,7 @@ export function diagnosticCompanionDigest(
 }
 
 /**
- * Durable C01 diagnostic intake. The record is a correlation aid only: it
+ * Durable diagnostic companion intake. The record is a correlation aid only: it
  * cannot admit, retry, acknowledge, fence, or terminate an assignment.
  */
 export class DiagnosticCompanionInbox {

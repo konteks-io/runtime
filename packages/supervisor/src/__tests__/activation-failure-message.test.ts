@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { activationFailureMessage } from "../provisioning/activation.js";
 
-describe("a code the site gave that does not connect this computer (W1-M3)", () => {
+describe("a code the site gave that does not connect this computer", () => {
   it("says what happened and where a new code comes from, in plain words", () => {
     for (const code of ["activation_expired", "activation_consumed"]) {
       const said = activationFailureMessage(code);

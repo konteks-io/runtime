@@ -31,7 +31,7 @@ export interface RunnerSessionInput {
   freshProviderSessionOnRestore?: boolean;
   /** Display-only naming for the provider session list; never authority. */
   sessionLabel?: RemoteSessionLabel;
-  /** A person's direct session: the agent titles it; Konteks adds only `[konteks] ` (D130). */
+  /** A person's direct session: the agent titles it; Konteks adds only `[konteks] `. */
   agentTitled?: true;
   /**
    * Give the agent the session's browser (QA and validator sessions): the
@@ -40,7 +40,7 @@ export interface RunnerSessionInput {
    */
   browser?: { proxyUrl: string; outputDir: string; browsersPath: string };
   /**
-   * An integration task's own NEW session (external-integration CP2): the one
+   * An integration task's own NEW session: the one
    * personal MCP server the Codex bridge leaves on for this thread, or whether
    * Claude may load the account's connectors. Every call still meets the
    * integration gate; this only decides what the agent can see.
@@ -71,7 +71,7 @@ export interface RunnerPort {
   readiness(): Promise<{ agent: ConnectedAgentView; utilization: { activeSessions: number; activeTurns: number } }>;
   createSession(input: RunnerSessionInput, lifecycle?: RunnerSessionLifecycle): Promise<RunnerSessionCreated>;
   closeSession(ref: string, options?: { completed: true }): Promise<unknown>;
-  /** Native stage one: tracked ACP settlement only, NEVER D139 quiescence.
+  /** Native stage one: tracked ACP settlement only, NEVER quiescence.
    * Retains the fenced live owner; no close-only fallback or finalization. */
   stopForRecovery?(ref: string): Promise<void>;
   /** Native: release an idle sealed completion no successor continues and
@@ -87,7 +87,7 @@ export interface RunnerPort {
   setMode(ref: string, id: string, params: unknown): Promise<unknown>;
   setConfigOption(ref: string, id: string, params: unknown): Promise<unknown>;
   answer(ref: string, id: string, response: unknown): Promise<{ delivered: boolean }>;
-  /** `personal`: the person asked for their own device login on this machine (WS1-115). */
+  /** `personal`: the person asked for their own device login on this machine. */
   login(organization: boolean, loginId: string, personal?: boolean, request?: RunnerLoginRequest): Promise<{ loginId: string }>;
   loginInput(loginId: string, text: string): Promise<unknown>;
   loginCancel(loginId: string): Promise<unknown>;

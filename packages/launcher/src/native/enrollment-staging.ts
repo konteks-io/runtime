@@ -6,7 +6,7 @@ import { isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
 import { z } from "zod";
 
 /**
- * The agent packages an enrollment install unpacks (WS1-012).
+ * The agent packages an enrollment install unpacks.
  *
  * A release carries an offline package per agent family, each with its own
  * Node and dependency tree: hundreds of megabytes and thousands of files. The

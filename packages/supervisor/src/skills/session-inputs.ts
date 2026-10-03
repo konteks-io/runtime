@@ -38,7 +38,7 @@ async function checkedDirectory(cwd: string): Promise<string> {
 }
 
 /**
- * A person's direct session (runtime-view R11, R13): its private session
+ * A person's direct session: its private session
  * folder and nothing else. No organization skill is staged and no instruction
  * is put in front of the person's text; before each prompt the folder is
  * checked to be the same one the session started in.

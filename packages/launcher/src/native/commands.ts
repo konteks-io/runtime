@@ -26,7 +26,7 @@ import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
 
 const environment = () => sanitizeInheritedChildProcessEnv({ env: process.env });
-/** Runs one service or OS command and keeps how it ended; `--verbose` prints it (D129). */
+/** Runs one service or OS command and keeps how it ended; `--verbose` prints it. */
 async function runServiceCommand(command: NativeServiceCommand, timeoutMs = 30_000): Promise<NativeServiceRun> {
   const started = Date.now();
   try {
@@ -95,11 +95,11 @@ export interface OwnServiceDefinitionDeps {
  * the service manager. Whoever registered the service (the install launcher,
  * which an update never replaces, or the previous release's updater) wrote
  * the definition with its own renderer, so service-level changes such as the
- * log file arrived one release late or never (RCA 2026-09-30). Rewriting the
+ * log file would arrive one release late or never. Rewriting the
  * file alone left it for "the next start", which never came: launchd's
  * KeepAlive respawns reuse the plist it loaded, so a connector updated by the
  * install launcher (which loads a plist without the log file) ran with its
- * output on /dev/null until someone stopped and started it (RCA 2026-10-01).
+ * output on /dev/null until someone stopped and started it.
  * When this process is the
  * one the service manager runs and the loaded definition is not this one (it
  * was just rewritten, or launchd shows no log file), the service manager
@@ -112,7 +112,7 @@ export interface OwnServiceDefinitionDeps {
  * Files are compared as bytes in the encoding the service manager reads
  * (`encodeServiceDefinition`), so a Windows task file in any other encoding is
  * rewritten too, and a refused registration puts back exactly the bytes it
- * found (D129). A Windows task that is missing although its file is current
+ * found. A Windows task that is missing although its file is current
  * (a start whose registration failed) is registered again.
  */
 export async function keepServiceOnOwnDefinition(root: string, deps: OwnServiceDefinitionDeps): Promise<OwnServiceDefinitionOutcome> {
@@ -294,8 +294,8 @@ const STARTING_WAIT_MS = 90_000;
  * A command that needs the running connector, run while it is still coming up
  * (right after `start`, or after `agent add` restarted it), waits for it and
  * says so once, instead of failing with "cannot reach the supervisor control
- * socket" (the setup window ran `auth login` straight after `agent add`,
- * WS1-167). A stopped service is not waited for: the command's own error says so.
+ * socket" (the setup window ran `auth login` straight after `agent add`).
+ * A stopped service is not waited for: the command's own error says so.
  */
 export async function waitWhileStarting(
   input: { control: Pick<SupervisorControl, "call">; output: { line(text: string): void } },
@@ -658,7 +658,7 @@ async function onboardStep(input: { root: string; output: NativeCommandContext["
 
 interface NativeAgentAddDeps {
   readRecord: (root: string) => Promise<NativeRuntimeRecord>;
-  /** A fetched agent's consent line answered (Google Antigravity, A20). */
+  /** A fetched agent's consent line answered. */
   consent?: FetchConsent;
   /** A fetched agent's download, while the service keeps running (tests replace it). */
   fetchAgent?: typeof fetchHostAgent;
@@ -675,9 +675,9 @@ interface NativeAgentAddDeps {
   platform: ReturnType<typeof nativePlatform>;
   stopDeadlineMs?: number;
   pollMs?: number;
-  /** Claude Code or Codex found here, or set up now on the person's yes (D116), before anything is stopped. */
+  /** Claude Code or Codex found here, or set up now on the person's yes, before anything is stopped. */
   ensurePersonal?: typeof ensurePersonalAgent;
-  /** After the restart: sign the agent in and say whether it is ready (D116). */
+  /** After the restart: sign the agent in and say whether it is ready. */
   closeAgents?: (input: Parameters<typeof closeAgentSetup>[0]) => Promise<void>;
 }
 
@@ -954,7 +954,7 @@ interface NativeAgentRemoveDeps {
   control: (root: string, record: NativeRuntimeRecord) => Pick<SupervisorControl, "call">;
   remove: typeof removeNativeAgent;
   start: (input: NativeCommandContext) => Promise<void>;
-  /** The one question (A18); `--yes` answers it up front. */
+  /** The one question; `--yes` answers it up front. */
   confirm: (question: string) => Promise<boolean>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
@@ -964,7 +964,7 @@ interface NativeAgentRemoveDeps {
 }
 
 /**
- * `konteks-remote agent remove antigravity` (A18): asks once, drains and
+ * `konteks-remote agent remove antigravity`: asks once, drains and
  * stops the service (its processes stop with it), signs out, drops it from
  * the record, deletes its downloads and its private home, and starts the
  * service again if it was running. Only a fetched agent is removed this way.
@@ -1028,10 +1028,10 @@ export const nativeCliActions: NativeCliActions = {
   install: async input => {
     if (input.enroll) {
       // The enrollment install stops short of an identity, because there is no
-      // Workspace to have one in yet (onboarding-simplified OS3). It verifies
+      // Workspace to have one in yet. It verifies
       // and records the release, and unpacks the agent packages in the
-      // background so the person's first question does not wait on them
-      // (WS1-012); `onboard` waits for the unpacking where it is needed.
+      // background so the person's first question does not wait on them;
+      // `onboard` waits for the unpacking where it is needed.
       const prepared = await recordNativeEnrollment(input);
       let unpacking = "done";
       if (!prepared.staged) {
@@ -1042,7 +1042,7 @@ export const nativeCliActions: NativeCliActions = {
           unpacking = "background";
         }
       }
-      // The install starts onboarding itself (W1-C2, WS1-078): the agent that
+      // The install starts onboarding itself: the agent that
       // ran the one install command reads the first question here, instead of
       // being told to run a second command to get it.
       const first = await onboardStep({ root: input.root, output: input.output });
@@ -1056,7 +1056,7 @@ export const nativeCliActions: NativeCliActions = {
     }
     // A fetched agent in --agents (Google Antigravity) asks its consent line in this terminal before anything is activated.
     const consent = terminalFetchConsent({ line: text => input.output.line(text) });
-    // Without --agents, a missing Claude Code or Codex is offered before the code is asked (D116).
+    // Without --agents, a missing Claude Code or Codex is offered before the code is asked.
     const setUp: string[] = [];
     const setupAgent = async (agent: "claude-code" | "codex") => { const done = await setUpPersonalAgent(agent, input.output); if (done) setUp.push(agent); return done; };
     const record = await installNative({ ...input, activationId: input.activationId!, deps: { consent, ...(input.agents === undefined ? { setupAgent } : {}) } });
@@ -1110,7 +1110,7 @@ export const nativeCliActions: NativeCliActions = {
       prepareRepositoryWorktree: (cwd, agentId) => prepareDeliveryGraft(input.root, cwd, agentId),
       exitProcess: code => process.exit(code) });
     await service.start();
-    // Whichever launcher drove the update, the person's konteks-remote runs this release's code from now on (D113b).
+    // Whichever launcher drove the update, the person's konteks-remote runs this release's code from now on.
     void keepLauncherCurrent(input.root, { execPath: process.execPath, readRecord: readNativeRecord, readLedger: readNativeUpdateLedger,
       refresh: refreshInstalledLauncher, sleep: ms => new Promise(resolve => setTimeout(resolve, ms).unref()), now: Date.now })
       .then(result => { if (result === "refreshed") process.stderr.write("konteks-remote now runs this release\n"); })

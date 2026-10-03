@@ -40,7 +40,7 @@ import type { RelayDurableState } from "../relay/channel-mux.js";
  * Nothing under this root is ever a checkpoint payload, agent stdio, a
  * provider key, or a capability token.
  */
-/** Said when a machine with an identity has lost its key (W1-L1). */
+/** Said when a machine with an identity has lost its key. */
 export const MACHINE_KEY_LOST =
   "This machine's Konteks key is missing, so it can no longer prove which runtime it is. Run `konteks-remote onboard` to connect it again; it will replace its old runtime.";
 
@@ -156,7 +156,7 @@ export class SupervisorStore {
   /**
    * Serialized JSON of each buffered relay frame already validated here. A
    * buffered frame is never changed after it is sent, so it is validated and
-   * serialized once instead of on every relay-state write (WS2-157).
+   * serialized once instead of on every relay-state write.
    */
   private readonly relayFrameJson = new WeakMap<object, string>();
   constructor(readonly dataDir: string, private readonly mutate: StateMutation = unrestrictedStateMutation) {}

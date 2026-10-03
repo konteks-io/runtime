@@ -5,16 +5,16 @@ import { permissionToolIdentity, type McpToolCallLedger, type PermissionToolIden
 import type { PolicyRefusal, WorkspaceToolPolicyEvaluation } from "./workspace-tool-policy.js";
 
 /**
- * The ACP policy responder (D87 step 1): a permission request or elicitation
+ * The ACP policy responder: a permission request or elicitation
  * is answered FIRST by policy. A definitive allow/deny is answered locally
  * within the responder deadline; only when policy defers (and the assignment
  * allows human deferral) is the request forwarded to a human over the relay.
- * Sign-in elicitations are never remotely answerable (D102) and always fail
+ * Sign-in elicitations are never remotely answerable and always fail
  * closed in headless execution.
  */
 /**
- * A deny carries why (T1, 2026-10-02: two "Edit files" refusals ended a repair
- * turn and nothing said which path was wrong): `message` is the note for the
+ * A deny carries why (two "Edit files" refusals once ended a repair turn
+ * and nothing said which path was wrong): `message` is the note for the
  * agent and Konteks, `refusal` the detail the connector logs.
  * `allowOnceOnly`: whoever answers a deferred request may allow it once, never always (an integration gate's call).
  */

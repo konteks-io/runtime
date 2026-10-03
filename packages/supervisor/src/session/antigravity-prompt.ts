@@ -3,7 +3,7 @@ import { STRUCTURED_RESULT_MCP_SERVER_NAME, STRUCTURED_RESULT_TOOL_NAME } from "
 /**
  * How a Google Antigravity session is told to call Konteks tools. Antigravity
  * registers no tool per MCP server: the model reaches every one through its
- * single lazy `call_mcp_tool {ServerName, ToolName, Arguments}` (CP0 B10), so
+ * single lazy `call_mcp_tool {ServerName, ToolName, Arguments}`, so
  * a `mcp__<server>__<tool>` name never exists for it. The first prompt names
  * that form with the servers this session actually has, in the same words as
  * the Assistant's hint (`NATIVE_PLATFORM_MCP_SERVER_NAME` = `konteks-platform`,

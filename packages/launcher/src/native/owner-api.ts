@@ -8,7 +8,7 @@ export const OWNER_ACCESS_REVOKED = "This machine's Konteks access was revoked i
 
 /**
  * The person's own credential, and the three calls the onboarding flow makes
- * with it (onboarding-simplified OS13, OS15, core chapter §5–§6).
+ * with it.
  *
  * It is a login for that person on this machine, so it is treated as one: a
  * secret file, never printed, never logged, refreshed rather than kept long,
@@ -62,7 +62,7 @@ export async function writeOwnerToken(
 const FirstSystemSchema = z
   .object({
     systemId: z.string().min(1),
-    /** The workspace already had this System; this machine now works on it (WS1-089). */
+    /** The workspace already had this System; this machine now works on it. */
     existing: z.boolean().optional(),
     systemEntityRef: z.string().min(1),
     componentEntityRef: z.string().min(1),
@@ -105,7 +105,7 @@ export class OwnerApiClient {
   }
 
   /**
-   * Whether this workspace can already run work (W1-A6).
+   * Whether this workspace can already run work.
    *
    * A workspace made from a coding agent has never been through the setup the
    * site offers, so its first session needs a ready default revision. A
@@ -139,7 +139,7 @@ export class OwnerApiClient {
 
   /**
    * Whether this person may start planning work here: a Member or the owner
-   * can, a Viewer cannot (WS1-131). Undefined when Konteks cannot say, so a
+   * can, a Viewer cannot. Undefined when Konteks cannot say, so a
    * check that fails never stops someone who can.
    */
   async canStartWork(): Promise<boolean | undefined> {

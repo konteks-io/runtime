@@ -3,8 +3,7 @@ import { basename, join, relative, resolve } from "node:path";
 import { runCommand, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
 
 /**
- * What the machine can see about the repository the person's agent is in
- * (onboarding-simplified OS10).
+ * What the machine can see about the repository the person's agent is in.
  *
  * Deliberately shallow. It asks git four questions and looks at nothing else:
  * no file bodies, no history, no scan of the tree. The first System is a
@@ -17,7 +16,7 @@ interface RepositoryFacts {
   path: string | null;
   name: string;
   remoteUrl: string | null;
-  /** Whether the machine's own git can actually reach that remote (OS11). */
+  /** Whether the machine's own git can actually reach that remote. */
   remoteReachable: boolean;
   /** The remote is a folder on this machine (a path or file:// URL): Konteks itself cannot reach it. */
   remoteLocal?: boolean;
@@ -240,7 +239,7 @@ async function attachManagedRemote(
   return null;
 }
 
-/** Add the managed remote and push the current branch (OS11, R15). */
+/** Add the managed remote and push the current branch. */
 export async function pushToManagedRemote(input: {
   repositoryPath: string;
   remoteUrl: string;
@@ -255,7 +254,7 @@ export async function pushToManagedRemote(input: {
     ...(input.sshCommand ? { sshCommand: input.sshCommand } : {}),
   });
   if (attached) return { pushed: false, message: attached };
-  // Only the branch the person is on (R15); the rest follow through ordinary
+  // Only the branch the person is on; the rest follow through ordinary
   // git use, and pushing a whole history of branches is not what they agreed to.
   const pushed = await git(
     input.repositoryPath,

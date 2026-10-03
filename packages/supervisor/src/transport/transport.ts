@@ -3,7 +3,7 @@ import type { AssignmentRequestReference, LogicalAssignmentRequestFrame, RelayCh
 /**
  * The supervisor's transport seam. The relay and the HTTPS fallback carry the
  * same messages with the same idempotency keys; the orchestrator above this
- * interface never knows which one is active (D84/D91).
+ * interface never knows which one is active.
  */
 import type { OutboundBody } from "../relay/channel-mux.js";
 export type { OutboundBody };

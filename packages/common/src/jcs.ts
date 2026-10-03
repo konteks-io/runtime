@@ -1,7 +1,7 @@
 /**
  * RFC 8785 JSON Canonicalization Scheme.
  *
- * Every digest and signature in the contract is computed over JCS bytes (D125),
+ * Every digest and signature in the contract is computed over JCS bytes,
  * so two implementations produce the same signature. Numbers use the ES
  * `Number::toString` serialization that `JSON.stringify` already implements;
  * object members sort by UTF-16 code units; whitespace is absent.

@@ -64,7 +64,7 @@ async function workFixture(f: Awaited<ReturnType<typeof fixture>>, draining = fa
   return { work, box, sent };
 }
 
-it("keeps strict unsolicited cancellation available when the D143 sender is installed", async () => {
+it("keeps strict unsolicited cancellation available when the assignment sender is installed", async () => {
   const f = await fixture(); const w = await workFixture(f);
   await w.work.onAssignmentMessage({ assignmentId: "assignment", attempt: 1, reason: "user_cancelled", issuedAt: at, signature: "signature" });
   expect(f.journal.assignments.get("assignment:1")?.state).toBe("terminal_pending_report");

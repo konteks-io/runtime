@@ -42,8 +42,7 @@ import type { LoginEvent, LoginFailureReason, LoginFlow } from "./login-flow.js"
 import { checkApiKey, type KeyVerdict } from "./key-check.js";
 
 /**
- * Google Antigravity's sign-ins (antigravity-runtime-support A6, A7, A10,
- * CP3), driven by the connector the way the other agents' are:
+ * Google Antigravity's sign-ins, driven by the connector the way the other agents' are:
  * - **Gemini API key** (as DeepSeek Harness's): typed into the launcher's
  *   hidden prompt, checked with Google's free model list, kept in the
  *   connector's own store outside the agent's home (`<root>/relay`), never an
@@ -59,13 +58,13 @@ import { checkApiKey, type KeyVerdict } from "./key-check.js";
  *   private home (forced file storage); the connector checks it exists and
  *   never reads it.
  * - **Personal Google sign-in** exists only behind packages'
- *   `ANTIGRAVITY_LOGIN_OPTIONS['google-account'].released`, which is off
- *   (A10): never offered, never started.
+ *   `ANTIGRAVITY_LOGIN_OPTIONS['google-account'].released`, which is off:
+ *   never offered, never started.
  */
 
 const KEY_SHAPE = /^[\x21-\x7e]{16,512}$/;
 const MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1";
-/** Google's own sign-in times out after 300 s (CP0); a little more for the licence page. */
+/** Google's own sign-in times out after 300 s; a little more for the licence page. */
 const ANTIGRAVITY_SIGN_IN_TIMEOUT_MS = 330_000;
 const REQUIRE_REVIEW_LINE = "Your Google Cloud admin must set Terminal auto-execution to Require review. Otherwise Konteks stops Google Antigravity after its first command.";
 
@@ -273,7 +272,7 @@ interface AntigravityLoginOptions {
   timeoutMs?: number;
   /** Google's own sign-in (300 s). */
   signInTimeoutMs?: number;
-  /** Test seam: packages' switch for personal Google sign-in (A10). */
+  /** Test seam: packages' switch for personal Google sign-in. */
   googleSignInReleased?: boolean;
 }
 

@@ -30,8 +30,7 @@ export function isCredentialRefusal(error: unknown): boolean {
 /**
  * A running process whose lease lapsed never renews it: heartbeats and the
  * relay both need a live lease, and only the startup reconnect (proved with the
- * machine key) mints a new one (RCA 2026-09-30: offline 13 h, then 6 h, each
- * time fixed by a restart). Restart into it once the lease is gone and Core,
+ * machine key) mints a new one. Restart into it once the lease is gone and Core,
  * reachable, has refused it for `thresholdMs`. Only after a successful start (a
  * refused startup reconnect never loops) and never for a runtime Core said is
  * revoked or suspended.

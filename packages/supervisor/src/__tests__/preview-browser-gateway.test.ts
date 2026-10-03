@@ -87,7 +87,7 @@ describe("the QA browser's gateway", () => {
     expect(g.gw.counters.tunnels).toBe(1);
   });
 
-  it("survives a browser resetting a refused CONNECT or upgrade socket (found live in O8: Chrome resets them)", async () => {
+  it("survives a browser resetting a refused CONNECT or upgrade socket (Chrome resets them)", async () => {
     const g = await gateway(() => "http://127.0.0.1:43100");
     const handlers = g.gw as unknown as { onConnect(request: unknown, socket: PassThrough, head: Buffer): void; onUpgrade(request: unknown, socket: PassThrough, head: Buffer): void };
     for (const [name, request] of [["onConnect", { url: "accounts.google.com:443" }], ["onUpgrade", { url: "http://example.com/socket", rawHeaders: [], method: "GET" }]] as const) {

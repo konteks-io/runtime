@@ -12,7 +12,7 @@ import {
 
 /**
  * Before OpenCode reads "ready", prove the locked Konteks configuration is in
- * force in the exact installation that will run (O4): `opencode debug agents`
+ * force in the exact installation that will run: `opencode debug agents`
  * in the connector's private home, with the Konteks environment, lists every
  * agent's RESOLVED permission rules. OpenCode 2 is days old and moves fast; a
  * release that renames a key, reorders its defaults after ours or brings back

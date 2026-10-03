@@ -11,8 +11,8 @@ const BASE_KINDS: readonly RemoteWorkKind[] = ["planning", "delivery", "validati
  * The work kinds this connector names in a pull. A Core built before a kind
  * refuses a pull naming it, so each later kind is asked for only once Core
  * signs the contract version that introduced it into the desired
- * configuration: `direct` (runtime-view R11, a person's own chat) from 7.1,
- * `integration` (external-integration CP2, one bounded integration task)
+ * configuration: `direct` (a person's own chat) from 7.1,
+ * `integration` (one bounded integration task)
  * from 7.3. Never inferred from an unrelated field.
  */
 export function acceptedWorkKinds(coreContractVersion: string | undefined): RemoteWorkKind[] {

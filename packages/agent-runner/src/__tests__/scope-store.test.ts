@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentScopeStore, INITIAL_SCOPE_STATE, applyIdentityObservation } from "../auth/scope-store.js";
 
-describe("per-agent ownership scope (D101)", () => {
+describe("per-agent ownership scope", () => {
   const at = "2026-09-06T00:00:00Z";
 
   it("records an organization attestation only for a login with an identity", () => {

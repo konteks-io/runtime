@@ -36,7 +36,7 @@ describe("native workspace tool policy", () => {
 
   it("allows the QA browser's tools only on a session given the browser, and never the unsafe ones", async () => {
     const browser = { ...context, browserTools: true };
-    // Identity is the bridge's structured tool name (S0-4), never the title.
+    // Identity is the bridge's structured tool name, never the title.
     const claude = (toolName: string, rest: Record<string, unknown> = {}) => request({ kind: "other", title: toolName, ...rest, _meta: { claudeCode: { toolName } } });
     await expect(responder.evaluatePermission(claude("mcp__konteks-browser__browser_navigate", { rawInput: { url: "http://127.0.0.1:43100/" } }), browser))
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
@@ -75,9 +75,9 @@ describe("native workspace tool policy", () => {
   });
 });
 
-// T1 (2026-10-02): one of four paths in a Codex "Edit files" call was written
+// One of four paths in a Codex "Edit files" call was written
 // from the filesystem root, the whole call was refused, and neither the log nor
-// the agent learned which path or why (D114).
+// the agent learned which path or why.
 describe("a refused file change names what is outside and how to fix it", () => {
   const root = mkdtempSync(join(tmpdir(), "ws-refusal-"));
   const cwd = join(root, "session-1");

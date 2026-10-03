@@ -11,7 +11,7 @@ const olderPlist = macos.contents
   .replace(/<key>StandardOutPath<\/key><string>[^<]*<\/string>\n<key>StandardErrorPath<\/key><string>[^<]*<\/string>\n/, "")
   .replace(/<key>EnvironmentVariables<\/key><dict>.*<\/dict>\n/, "");
 
-/** `launchctl print` of the job, as launchd showed the person's connector on 2026-10-01. */
+/** `launchctl print` of the job, as launchd showed the person's connector. */
 function launchdPrint(input: { pid?: number; program?: string; logFile?: string | null }): string {
   const logFile = input.logFile === undefined ? `${root}/logs/connector.log` : input.logFile;
   return [
@@ -64,7 +64,7 @@ function deps(definition: NativeServiceDefinition, input: { onDisk?: string | nu
   return { value, calls };
 }
 
-/** RCA 2026-09-30 and 2026-10-01: a launcher that is never replaced loaded the plist without the log file, and the rewritten file never applied. */
+/** A launcher that is never replaced must not leave the plist without the log file, nor a rewritten file unapplied. */
 describe("the serving release keeps its service on its own definition", () => {
   it("rewrites a definition an older launcher wrote and has launchd reload it, outside this process", async () => {
     const { value, calls } = deps(macos, { onDisk: olderPlist, loaded: launchdPrint({ pid: 34625, logFile: null }) });
@@ -159,7 +159,7 @@ describe("the serving release keeps its service on its own definition", () => {
     const windows = nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Ada", root: "C:\\Users\\Ada\\AppData\\Local\\konteks-remote", executable: "C:\\Users\\Ada\\AppData\\Local\\konteks-remote\\releases\\release-new\\konteks-connector.exe", userId: "S-1-5-21-1-2-3-1001" });
     const { value, calls } = deps(windows, { onDisk: "<Task/>" });
     expect(await keepServiceOnOwnDefinition(root, value)).toBe("next_start");
-    // In the encoding Task Scheduler reads (D129).
+    // In the encoding Task Scheduler reads.
     expect(calls.write).toHaveBeenCalledWith(windows.path, encodeServiceDefinition(windows));
     expect(calls.execute).not.toHaveBeenCalled();
     expect(calls.detach).not.toHaveBeenCalled();
@@ -194,7 +194,7 @@ describe("Windows task refresh", () => {
     const { definition, files, value, execute } = setup();
     execute.mockResolvedValueOnce(1);
     await expect(keepServiceOnOwnDefinition("root", value)).rejects.toThrow("schtasks.exe /Create exited 1");
-    // The exact bytes it found, never a re-encoded copy (D129).
+    // The exact bytes it found, never a re-encoded copy.
     expect(Buffer.from(files.get(definition.path)!).toString("utf8")).toBe("older task");
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("next_start");
     expect(await keepServiceOnOwnDefinition("root", value)).toBe("current");

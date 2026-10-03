@@ -22,8 +22,8 @@ interface CapturedExecutionRevisionControlConnection {
 }
 
 /**
- * Authenticated C02 intake. It makes a durable pre-fence record only; the
- * exact execution gate and C03 terminal convergence remain separate owners.
+ * Authenticated execution revision control intake. It makes a durable pre-fence record only; the
+ * exact execution gate and recovery-evidence terminal convergence remain separate owners.
  */
 export class ExecutionRevisionControlReceiver {
   private readonly coreToMonotonicOffset: number;

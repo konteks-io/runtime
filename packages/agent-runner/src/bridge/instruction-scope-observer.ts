@@ -9,7 +9,7 @@ interface InstructionScopeV2 {
   exclusionCount: number;
 }
 
-/** Stage 0 (S0-1): the bridge also runs no repository hooks and loads only the MCP servers Konteks gave the session. */
+/** Stage 0: the bridge also runs no repository hooks and loads only the MCP servers Konteks gave the session. */
 interface InstructionScopeV3 extends Omit<InstructionScopeV2, "version"> {
   version: 3;
   hooks: "disabled";
@@ -17,7 +17,7 @@ interface InstructionScopeV3 extends Omit<InstructionScopeV2, "version"> {
   accountConnectors: "excluded";
 }
 
-/** CP2: the same, except an integration task's own session admits the account connectors (every call still meets the gate). */
+/** The same, except an integration task's own session admits the account connectors (every call still meets the gate). */
 interface InstructionScopeV4 extends Omit<InstructionScopeV3, "version" | "accountConnectors" | "settings"> {
   version: 4;
   settings: "project" | "none";

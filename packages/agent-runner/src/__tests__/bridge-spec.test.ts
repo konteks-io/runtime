@@ -36,7 +36,7 @@ describe("bridge spawn spec", () => {
     expect(env.USER).toBe(userInfo().username);
     expect(env.XDG_CONFIG_HOME).toBeUndefined();
     expect(env.CI).toBeUndefined();
-    // A slow Konteks tool list delays the tools; Claude Code's 30 s default dropped them (WS1-152).
+    // A slow Konteks tool list delays the tools; Claude Code's 30 s default dropped them.
     expect(env.MCP_TIMEOUT).toBe("180000");
     expect(resolveToolingCommand(native, family, family.tooling.identitySignal!)).toEqual({ command: "/operator/.local/bin/claude", args: ["auth", "status", "--json"] });
     expect(() => bridgeEnvironment({ ...native, RUNNER_AUTH_MODE: "gateway_keyed" }, family)).toThrow(/native personal Claude/);
@@ -44,7 +44,7 @@ describe("bridge spawn spec", () => {
     expect(() => bridgeEnvironment(native, findAgentBridge("codex")!)).toThrow(/native personal Claude/);
     expect(() => bridgeEnvironment({ ...native, RUNNER_NATIVE_CLAUDE_EXECUTABLE: "claude" }, family)).toThrow(/native personal Claude/);
   });
-  it("points Claude Code on Windows at Git Bash with CLAUDE_CODE_GIT_BASH_PATH, from the connector's own environment (D116)", async () => {
+  it("points Claude Code on Windows at Git Bash with CLAUDE_CODE_GIT_BASH_PATH, from the connector's own environment", async () => {
     const dir = await mkdtemp(join(tmpdir(), "git-bash-"));
     try {
       const bash = join(dir, "bash.exe");
@@ -146,7 +146,7 @@ describe("bridge spawn spec", () => {
   });
 });
 
-describe("native agent package verification (WS2-156)", () => {
+describe("native agent package verification", () => {
   it("hashes the package on first use, then reuses it while unchanged, and logs which", async () => {
     const fixture = offlineFixture();
     const root = await mkdtemp(join(tmpdir(), "runner-package-"));

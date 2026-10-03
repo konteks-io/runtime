@@ -40,7 +40,7 @@ describe("doctor and support bundle", () => {
     expect(JSON.stringify(report)).not.toContain(dir);
   });
 
-  it("treats an agent this computer has not added as informational, never a failure (D113)", async () => {
+  it("treats an agent this computer has not added as informational, never a failure", async () => {
     // 0.10.8 on a Mac with claude-code, codex and dsh: the inventory carries a
     // synthetic "Not added" Google Antigravity view for the site's add card;
     // the update health gate read its `unavailable` readiness as a failure.
@@ -120,7 +120,7 @@ describe("doctor and support bundle", () => {
     expectNoPath(chrome);
   });
 
-  it("reports the person's own OpenCode: version, install, settings check, sign-ins by label, free models, browser, or why it is left out (opencode CP6)", async () => {
+  it("reports the person's own OpenCode: version, install, settings check, sign-ins by label, free models, browser, or why it is left out", async () => {
     const base = {
       now: () => "2026-09-06T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
       relay: { state: "connected", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: true, components: [], agents: [],
@@ -156,7 +156,7 @@ describe("doctor and support bundle", () => {
     expect((await runDoctor(base)).checks.find(check => check.id === "opencode")).toBeUndefined();
   });
 
-  it("reports Google Antigravity: pinned version, Google's signature, sign-ins with the no-licence remedy, MCP Servers off, Require review, disk, browser, or why it is left out (antigravity CP6)", async () => {
+  it("reports Google Antigravity: pinned version, Google's signature, sign-ins with the no-licence remedy, MCP Servers off, Require review, disk, browser, or why it is left out", async () => {
     const base = {
       now: () => "2026-09-29T00:00:00Z", dataDir: dir, identity: { instanceId: "inst", administrativeStatus: "active" }, lease: { mode: "active" as const, expiresAt: null },
       relay: { state: "connected", lastError: null, consecutiveFailures: 0 }, transport: "relay" as const, reconciliationComplete: true, components: [], agents: [],
@@ -184,7 +184,7 @@ describe("doctor and support bundle", () => {
     expect(mcpOff.status).toBe("warn");
     expect(mcpOff.detail).toContain("Konteks tools unavailable: turn on MCP Servers in Gemini Enterprise settings");
     expect((await check({ mcpServersOffAt: "2026-09-29T01:02:03.000Z", credentials: [{ ...key, state: "ready" }] })).detail).not.toContain("MCP Servers");
-    // A21: the Require review line.
+    // The Require review line.
     const a21 = await check({ quarantine: "Your organisation's Gemini Enterprise settings let Antigravity run commands without asking. Ask your Google Cloud admin to set Terminal auto-execution to Require review, then restart the connector." });
     expect(a21.status).toBe("fail");
     expect(a21.detail).toContain("Needs your organisation's Require review setting");

@@ -57,8 +57,8 @@ const MAX_DISCOVERY_SESSION_TIMEOUT_MS = 120_000;
 /**
  * Model discovery is a background check, not a turn: a loaded computer can
  * take well over the session bootstrap deadline to answer `session/new`
- * (2026-10-02: Claude Code and Codex both timed out four times at 10 s while
- * signed in and fine). The runtime starts from at least
+ * (Claude Code and Codex have timed out four times at 10 s while signed in
+ * and fine). The runtime starts from at least
  * `MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS`; each attempt waits twice as long
  * as the one before, up to 2 min, and every attempt stops its own process
  * before the next starts, so the total stays bounded (four attempts, at most

@@ -36,7 +36,7 @@ function bundled(agentId: "claude-code" | "codex", prefix: string): RunnerConfig
 const host = (agentId: "dsh" | "opencode", extra: Record<string, unknown> = {}) => RunnerConfigSchema.parse({ RUNNER_AGENT_ID: agentId, ...extra });
 const request = { proxyUrl: "http://127.0.0.1:50123", outputDir: "/tmp/konteks-browser-x", browsersPath: "/state/browsers" };
 
-describe("the QA browser as a connector capability (O8)", () => {
+describe("the QA browser as a connector capability", () => {
   it("runs from an installed Claude Code package first, on that package's own Node", async () => {
     const claude = join(root, "claude-code"), codex = join(root, "codex");
     const node = await executable(join(claude, "bin", "node"));

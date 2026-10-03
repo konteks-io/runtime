@@ -10,14 +10,14 @@ import {
 
 /**
  * Before Google Antigravity reads "ready", prove the exact server the
- * connector fetched answers as the one Konteks governs (A3): its own name and
+ * connector fetched answers as the one Konteks governs: its own name and
  * the pinned version, the four sign-in methods (and not the hidden gateway),
  * MCP over http (the Konteks servers), load and resume, and embedded context
- * (how its `AGENTS.md` arrives, A9). One `initialize` in the connector's
+ * (how its `AGENTS.md` arrives). One `initialize` in the connector's
  * private home, with the Konteks environment, then the process and anything
  * it left are stopped. A session needs a sign-in, so the rest is judged per
  * session: the `model` select and the `default` mode before a session reads
- * ready (`verifyAntigravitySession`), the tool filter by effect (CP4's
+ * ready (`verifyAntigravitySession`), the tool filter by effect (the
  * tripwire: a subagent tool never appears in a `tool_call`).
  */
 

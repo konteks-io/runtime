@@ -196,7 +196,7 @@ function nativeCommand(config: RunnerConfig, entry: NativeAgentPackageProfile["b
 /**
  * Recheck the complete closure before process restart or official
  * authentication. The first use in this process hashes every file; later
- * uses rehash only when the package's stat fingerprint moved (WS2-156).
+ * uses rehash only when the package's stat fingerprint moved.
  */
 export async function verifyNativeRunnerPackage(config: RunnerConfig, logger?: Pick<Logger, "info">): Promise<void> {
   if (!config.RUNNER_NATIVE_PACKAGE_PROFILE && !config.RUNNER_NATIVE_PACKAGE_ARTIFACT) return;

@@ -6,7 +6,7 @@ import { OnboardEvidenceCollector, type EnrichmentScope, type OnboardEvidenceCol
 import { RepositoryRelocationWorker, type RelocationWorkerDeps } from "./relocation-worker.js";
 
 /**
- * Where an onboard assignment goes (OB6 §2, §3).
+ * Where an onboard assignment goes.
  *
  * `onboarding` is the one work kind that carries two sources. A `conversation`
  * source is a session turn and takes the ordinary relayed ACP path, exactly as
@@ -26,8 +26,8 @@ export function isOnboardWorkAssignment(assignment: RemoteWorkAssignment): assig
 }
 
 /**
- * CONTRACT-GAP: OB2 §3b puts `enrichment: {systemRef, allowance}` "on the
- * assignment", but OB1's `discovery_run` source carries only `runRef` — a
+ * CONTRACT-GAP: the onboarding contract puts `enrichment: {systemRef,
+ * allowance}` "on the assignment", but the `discovery_run` source carries only `runRef` — a
  * source is the thing that survives re-placement, and an allowance is not. The
  * scope is read instead from Core's existing definition-of-claimed-work route
  * (`GET …/assignments/:id/workload`), which is where every other kind reads the

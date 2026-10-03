@@ -170,7 +170,7 @@ export function verifyBody(
 /**
  * The supervisor `RelayAck` signature covers `channelId`, `dataDirection`,
  * `cumulativeSeq`, and `issuedAt` — never the epoch, which the relay re-stamps
- * per hop (D115).
+ * per hop.
  */
 export function signRelayAck(
   key: Pick<InstanceKeyPair, "privateKey">,

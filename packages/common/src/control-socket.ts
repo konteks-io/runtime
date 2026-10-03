@@ -49,7 +49,7 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("auth.cancel"), loginId: z.string().min(1) }).strict(),
   // `method`: which of an agent's sign-ins to remove (Antigravity: its key or Gemini Enterprise).
   z.object({ op: z.literal("auth.logout"), agentId: agentIdSchema, provider: providerIdSchema.optional(), method: methodIdSchema.optional() }).strict(),
-  // Managed-git key registration (ON16). Nothing here carries key material:
+  // Managed-git key registration. Nothing here carries key material:
   // the private half is generated on the machine and never crosses this hop,
   // not even to be shown to the person who ran the command.
   z.object({ op: z.literal("git.key.add"), title: z.string().trim().min(1).max(256).optional() }).strict(),
@@ -69,9 +69,9 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   /** Ask the supervisor to launch the installer's transactional update in a separate process. */
   z.object({ op: z.literal("update.apply") }).strict(),
   z.object({ op: z.literal("update.status") }).strict(),
-  /** Where the unattended update reads releases (host only), an override, and the last read's failure (RCA 2026-09-30). */
+  /** Where the unattended update reads releases (host only), an override, and the last read's failure. */
   z.object({ op: z.literal("update.channel") }).strict(),
-  /** The release Konteks accepts for this machine, asked with this machine's lease (WS1-093). */
+  /** The release Konteks accepts for this machine, asked with this machine's lease. */
   z.object({ op: z.literal("release.accepted") }).strict(),
   z
     .object({ op: z.literal("logs"), sinceSeconds: z.number().int().min(1).max(86_400 * 7) })
@@ -79,9 +79,9 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("support.bundle") }).strict(),
   z.object({ op: z.literal("readiness.submit") }).strict(),
   z.object({ op: z.literal("revoke.pending") }).strict(),
-  /** Uninstall: ask Core to drain, revoke and tombstone this runtime (W1-L2). */
+  /** Uninstall: ask Core to drain, revoke and tombstone this runtime. */
   z.object({ op: z.literal("instance.retire") }).strict(),
-  /** Stop this connector however it runs: a foreground `serve` has no service to stop it (W1-D3). */
+  /** Stop this connector however it runs: a foreground `serve` has no service to stop it. */
   z.object({ op: z.literal("shutdown") }).strict(),
 ]);
 export type ControlRequest = z.infer<typeof ControlRequestSchema>;
@@ -222,7 +222,7 @@ function handleConnection(socket: Socket, options: ControlSocketServerOptions): 
   // A client that resets mid-read (a `status` probe exiting early) surfaces as
   // an 'error' on the socket AND, independently, on the readline interface.
   // Unhandled, either one is an uncaught exception that takes the whole
-  // supervisor down — observed live 2026-09-12 (`read ECONNRESET` emitted on
+  // supervisor down (`read ECONNRESET` emitted on
   // the Interface). A peer's failure ends that connection, nothing else.
   socket.on("error", () => socket.destroy());
   lines.on("error", () => socket.destroy());

@@ -280,7 +280,7 @@ export class WorkOrchestrator {
       .finally(() => { if (this.pullTask === task) this.pullTask = null; });
   }
 
-  /** Local validation of an assignment Core returned; the closed refusal list of cp2.md §8. */
+  /** Local validation of an assignment Core returned; the closed refusal list. */
   validate(assignment: RemoteWorkAssignment): ClaimRejection | null {
     const gate = this.canPull();
     if (gate !== null) return gate;
@@ -725,7 +725,7 @@ export class WorkOrchestrator {
         // Evidence collection and the relocation mirror are deterministic local
         // git work with no model in the loop, so they never open an ACP session
         // and never bind the gateway. An onboarding SESSION turn carries the
-        // `conversation` source and does not land here (OB6 §2, §3).
+        // `conversation` source and does not land here.
         await this.runOnboardWork(assignment, entry, assertAuthority);
         return;
       }

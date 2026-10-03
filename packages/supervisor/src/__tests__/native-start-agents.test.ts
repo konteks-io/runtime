@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeRunner } from "../native/runner.js";
 import { NativeAgentRetry, startNativeAgents } from "../native/start-native-agents.js";
 
-/** One agent that cannot start must not take the runtime down (WS1-018, dsh-runtime-support CP5). */
+/** One agent that cannot start must not take the runtime down. */
 describe("startNativeAgents", () => {
   const runner = (agentId: string, fail = false) => ({ agentId, start: vi.fn(async () => { if (fail) throw new Error(`${agentId} failed`); }) });
 
@@ -93,7 +93,7 @@ describe("NativeAgentRetry", () => {
   });
 });
 
-/** The person's own OpenCode (opencode-runtime-support CP6): parked like any agent, the others run. */
+/** The person's own OpenCode: parked like any agent, the others run. */
 describe("an OpenCode that cannot start", () => {
   afterEach(() => vi.useRealTimers());
 
@@ -137,7 +137,7 @@ describe("an OpenCode that cannot start", () => {
   });
 });
 
-/** Google Antigravity (antigravity CP6): a copy that fails its start check is parked like any agent, the others run. */
+/** Google Antigravity: a copy that fails its start check is parked like any agent, the others run. */
 describe.runIf(fetchedAgentPlatformPin("antigravity") !== undefined)("a Google Antigravity that cannot start", () => {
   afterEach(() => vi.useRealTimers());
 
@@ -184,7 +184,7 @@ describe.runIf(fetchedAgentPlatformPin("antigravity") !== undefined)("a Google A
     }
   });
 
-  it("starts an update's retry at once, not after a minute (A17)", async () => {
+  it("starts an update's retry at once, not after a minute", async () => {
     vi.useFakeTimers();
     const started = vi.fn(async () => undefined);
     const retry = new NativeAgentRetry({ onStarted: vi.fn(), onGaveUp: vi.fn(), log: () => undefined });

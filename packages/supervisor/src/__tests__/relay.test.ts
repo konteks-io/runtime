@@ -59,7 +59,7 @@ function toRuntime(channelId: string, seq: number, epoch: number, body: ToRuntim
   return { channel: "assignment", direction: "to_runtime", channelId, connectionEpoch: epoch, seq, issuedAt: "2026-09-06T00:00:00Z", body } as ToRuntimeRelayFrame;
 }
 
-describe("replay buffer (D99)", () => {
+describe("replay buffer", () => {
   it("frees frames only on cumulative ack and replays after a cursor", () => {
     const buffer = new ReplayBuffer<string>({ maxBytes: 1_000, maxAgeMs: 1_000 });
     buffer.push(1, "a", 10, 0);
@@ -147,7 +147,7 @@ describe("channel mux", () => {
     await vi.waitFor(() => expect(order).toEqual(["persist:start", "persist:done", "emit"]));
   });
 
-  it("group-commits a burst: one write covers every frame queued behind the last, none is emitted before a write holds it, and a restart replays them all (WS2-157)", async () => {
+  it("group-commits a burst: one write covers every frame queued behind the last, none is emitted before a write holds it, and a restart replays them all", async () => {
     const dir = await mkdtemp(join(tmpdir(), "kr-relay-burst-"));
     try {
       const store = new SupervisorStore(dir);
@@ -231,7 +231,7 @@ describe("channel mux", () => {
     // the holder had already received 5 durably (its ACK was in flight).
     // Restoring `nextSeq = to_core + 1` and then resetting on the relay's
     // cache miss reissued seq 5 for a fresh session_ready, which the holder
-    // dropped as an already-durable duplicate (live 2026-09-12 20:25Z).
+    // dropped as an already-durable duplicate.
     const { mux, persisted } = buildMux();
     mux.restoreCursors({ "session:s": { to_core: 4, to_runtime: 0, allocated: 5 } }, () => "session");
     await mux.applyHandshake({ connectionEpoch: 1, resume: {}, reset: ["session:s"] });

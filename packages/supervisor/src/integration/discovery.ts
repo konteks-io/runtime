@@ -11,8 +11,7 @@ import { integrationFixturesEnabled } from "./carrier.js";
 import { IntegrationTaskError } from "./errors.js";
 
 /**
- * The discovery allowlist (D26; capabilities-and-execution "Enrollment
- * algorithm" step 1). An agent's listing output may carry URLs with tokens,
+ * The discovery allowlist. An agent's listing output may carry URLs with tokens,
  * headers, commands, environment values, server descriptions and error text;
  * none of it may leave this function. What comes out is exactly the
  * `IntegrationInventoryEntry` fields: server name, source kind, status,

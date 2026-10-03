@@ -172,7 +172,7 @@ describe("native activation and resumable exchange", () => {
     expect(f.args.readActivationCode).not.toHaveBeenCalled();
   });
 
-  it("forgets a code Konteks refused, so a new code from the site connects this machine (W1-M3)", async () => {
+  it("forgets a code Konteks refused, so a new code from the site connects this machine", async () => {
     const f = fixture();
     const exchange = f.args.fetchFn.getMockImplementation()!;
     f.args.fetchFn.mockImplementationOnce(async () => new Response(JSON.stringify({ code: "activation_consumed", message: "Activation already used" }), { status: 409, headers: { "content-type": "application/json" } }));

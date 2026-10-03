@@ -1,5 +1,5 @@
 /**
- * Sender-owned bounded replay buffer for one `(channelId, direction)` (D99).
+ * Sender-owned bounded replay buffer for one `(channelId, direction)`.
  * Frames stay here until a validated, epoch-matching `RelayAck` covers them.
  * Bounds are bytes and age from Core configuration; once a frame the buffer
  * no longer holds would be needed for replay, the channel must `reset`.

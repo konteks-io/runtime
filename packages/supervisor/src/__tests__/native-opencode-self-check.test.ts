@@ -7,9 +7,9 @@ import { OPENCODE_KONTEKS_PERMISSIONS, openCodeRuntimePaths, type RunnerConfig }
 import { checkOpenCodeKonteksConfig, openCodeAgentsDrift, type OpenCodeCommandRunner, type OpenCodeServiceControl } from "../native/opencode-self-check.js";
 import { openCodeInstallAdapter } from "../native/host-agents.js";
 
-/** `opencode debug agents` from OpenCode 2.0.18 with the Konteks configuration (live, 2026-09-28; home paths shortened). */
+/** `opencode debug agents` from OpenCode 2.0.18 with the Konteks configuration (live; home paths shortened). */
 const CAPTURED = readFileSync(new URL("./fixtures/opencode-2.0.18-debug-agents.json", import.meta.url), "utf8");
-/** The same from OpenCode 2.0.21 (live, 2026-10-02; extra fields and system prompts dropped): every agent now ends with OpenCode's own `browser * deny`. */
+/** The same from OpenCode 2.0.21 (live; extra fields and system prompts dropped): every agent now ends with OpenCode's own `browser * deny`. */
 const CAPTURED_2_0_21 = readFileSync(new URL("./fixtures/opencode-2.0.21-debug-agents.json", import.meta.url), "utf8");
 type Agent = { id: string; permissions: Array<{ action: string; resource: string; effect: string }> };
 const agents = (): Agent[] => JSON.parse(CAPTURED) as Agent[];
@@ -146,7 +146,7 @@ describe("the OpenCode start self-check", () => {
 });
 
 describe("the OpenCode install adapter", () => {
-  it("runs the self-check at runner start with the runner's binary, version and private home, and is offered (CP6)", async () => {
+  it("runs the self-check at runner start with the runner's binary, version and private home, and is offered", async () => {
     const check = vi.fn(async () => undefined);
     const config = { RUNNER_NATIVE_OPENCODE_BINARY: "/opt/opencode/bin/opencode", RUNNER_BRIDGE_VERSION: "2.0.18", RUNNER_CREDENTIAL_DIR: "/cred" } as RunnerConfig;
     await openCodeInstallAdapter.selfCheck(config, { openCodeSelfCheck: check });

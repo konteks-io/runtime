@@ -16,7 +16,7 @@ async function programFiles(files: string[]) {
   return base;
 }
 
-describe("the Windows konteks-remote command the MSI installed (D131)", () => {
+describe("the Windows konteks-remote command the MSI installed", () => {
   it("is current when its installer put the marker next to it, older without, and absent when there is no MSI command", async () => {
     await expect(windowsInstalledLauncher({ ProgramFiles: await programFiles(["konteks-remote.exe", WINDOWS_LAUNCHER_MARKER]) })).resolves.toBe("current");
     await expect(windowsInstalledLauncher({ ProgramFiles: await programFiles(["konteks-remote.exe"]) })).resolves.toBe("older");

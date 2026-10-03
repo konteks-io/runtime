@@ -77,7 +77,7 @@ export interface HostAgentInstallAdapter {
   selfCheck(config: RunnerConfig, deps?: HostAgentSelfCheckDeps): Promise<void>;
 }
 
-/** The person's own DeepSeek Harness (dsh-runtime-support CP1-CP5). */
+/** The person's own DeepSeek Harness. */
 const dshInstallAdapter: HostAgentInstallAdapter = {
   agentId: "dsh",
   offered: true,
@@ -105,10 +105,10 @@ const dshInstallAdapter: HostAgentInstallAdapter = {
 };
 
 /**
- * The person's own OpenCode 2 (opencode-runtime-support CP1-CP6): found,
+ * The person's own OpenCode 2: found,
  * version checked and recorded like dsh, and proven at runner start to run
- * with the locked Konteks configuration (`opencode debug agents`). Offered
- * since CP6, once its tool governance (CP4) and sign-in (CP3) were in:
+ * with the locked Konteks configuration (`opencode debug agents`). Offered,
+ * with its tool governance and sign-in:
  * installs, enrollment detection, `agent add opencode` and stored records
  * take it like DeepSeek Harness.
  */
@@ -139,16 +139,16 @@ export const openCodeInstallAdapter: HostAgentInstallAdapter = {
 };
 
 /**
- * Google Antigravity (antigravity-runtime-support CP1-CP6): the first
+ * Google Antigravity: the first
  * FETCHED host agent. Nothing is located on the person's machine: `fetch`
  * downloads Google's pinned zip into `<root>/agents/antigravity/` on the
  * person's yes, `locate` and every load re-verify that copy against the
  * release's pin (sizes, sha256, Google's signature), and the start check
  * verifies it again, then proves its `initialize` (antigravity-self-check.ts).
- * Offered since CP6, once its governance (CP4) and sign-in (CP3) were in:
+ * Offered, with its governance and sign-in:
  * `install --agents …,antigravity` and `agent add antigravity` ask the
  * consent line and fetch, a stored record keeps it (and, after an update
- * carried a new pin, fetches that on the first yes, A17). Never detected at
+ * carried a new pin, fetches that on the first yes). Never detected at
  * enrollment: it is fetched, not found.
  */
 export const antigravityInstallAdapter: HostAgentInstallAdapter = {
@@ -166,8 +166,8 @@ export const antigravityInstallAdapter: HostAgentInstallAdapter = {
     return { RUNNER_NATIVE_ANTIGRAVITY_ROOT: installation.root, RUNNER_BRIDGE_PREFIX: installation.root, RUNNER_BRIDGE_VERSION: installation.version };
   },
   fetch: request => fetchNativeAntigravity(request),
-  // Integrity on every start (A16), then one `initialize` in the private home
-  // proves the server answers as the one Konteks governs (A3, CP2).
+  // Integrity on every start, then one `initialize` in the private home
+  // proves the server answers as the one Konteks governs.
   async selfCheck(config, deps = {}) {
     const folder = config.RUNNER_NATIVE_ANTIGRAVITY_ROOT;
     if (!folder) throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity has not been downloaded to this computer.", { diagnostic: "antigravity_not_fetched" });

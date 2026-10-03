@@ -12,7 +12,7 @@ import { readNativeRecord } from "./install.js";
 const run = promisify(execFile);
 
 /**
- * Graft, wired into the person's repository (W1-G1..G3, WS1-081).
+ * Graft, wired into the person's repository.
  *
  * Graft maps a repository into a small linked graph its coding agents read
  * before they grep. It is a Node program with native grammar builds, so a
@@ -51,7 +51,7 @@ export interface GraftTool {
 
 /** The agent families Graft knows how to wire, by Graft's own ids. */
 // Google Antigravity does not read AGENTS.md itself; the connector puts it
-// in each session's first prompt (antigravity A9), so it is wired like Codex.
+// in each session's first prompt, so it is wired like Codex.
 const GRAFT_AGENT_IDS: Record<string, string> = { "claude-code": "claude", codex: "agents", dsh: "agents", opencode: "agents", antigravity: "agents" };
 
 /** What each wired agent adds to the repository, in words for the offer. */
@@ -204,7 +204,7 @@ async function git(repo: string, args: string[]): Promise<string> {
   return (await run("git", ["-C", repo, ...args], { maxBuffer: 16 * 1024 * 1024 })).stdout;
 }
 
-/** Whether this repository already has the Graft wiring onboarding sets up (WS1-090). */
+/** Whether this repository already has the Graft wiring onboarding sets up. */
 export async function graftAlreadyWired(repo: string): Promise<boolean> {
   const file = await excludeFile(repo).catch(() => "");
   if (!file) return false;

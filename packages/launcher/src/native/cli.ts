@@ -75,7 +75,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   };
   program.command("install").description("install the connector with a one-time code from Konteks, then start it")
     .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
-    // Agent-first onboarding (onboarding-simplified OS3): no activation, no
+    // Agent-first onboarding: no activation, no
     // prompt, no TTY. The install stops short of an identity; `onboard` binds.
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
@@ -86,7 +86,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
       await actions.install({ ...context(), ...options });
     });
-  // The conversation the person's own coding agent relays (OS2, OS16). One
+  // The conversation the person's own coding agent relays. One
   // step per invocation; the agent runs what the step says and nothing else.
   program.command("onboard").description("connect this machine to Konteks, one question at a time")
     .option("--answer <text>", "the person's answer to the question the previous step asked")
@@ -149,7 +149,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--check", "report the available release without installing anything", false)
     .option("--unattended", "launched by the connector itself; recorded as such in the update ledger", false)
     .action(async (options: { check: boolean; unattended: boolean }) => actions.update({ ...context(), ...options }));
-  // ON16: managed-git key registration is a command on the trusted machine,
+  // Managed-git key registration is a command on the trusted machine,
   // because the private half must never leave it. The App shows this command.
   const git = program.command("git").description("this computer's key for Konteks-managed repositories");
   const key = git.command("key").description("the SSH key this computer uses for Konteks-managed repositories");
@@ -159,7 +159,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   key.command("list").description("list the keys registered for this computer").action(async () => actions.control({ ...context(), operation: "git.key.list" }));
   key.command("remove").description("revoke one registered key").argument("<keyRef>", "key reference from `git key list`")
     .action(async (keyRef: string) => actions.control({ ...context(), operation: "git.key.remove", keyRef }));
-  // W1-L2: a person asks their agent to remove Konteks, in plain words; the
+  // A person asks their agent to remove Konteks, in plain words; the
   // description is what the agent finds in `--help`.
   program.command("uninstall").description("remove Konteks from this computer after running work finishes; your repositories and your agents' own sign-ins stay")
     .action(async () => actions.uninstall(context()));

@@ -86,7 +86,7 @@ describe("native control commands", () => {
     await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "agent_auth_required", message: "the DeepSeek API key was not saved" });
     expect(f.text()).not.toContain("pasted-secret-value");
   });
-  it("names the agent when a sign-in finishes, with no internal start line (WS1-153)", async () => {
+  it("names the agent when a sign-in finishes, with no internal start line", async () => {
     const f = fake();
     f.context.control.call = scriptedLogin([
       { kind: "display", loginId: "l1", text: "Paste your DeepSeek API key." },
@@ -134,7 +134,7 @@ describe("native control commands", () => {
     await authLogin(f.context, "codex", false);
     expect(f.text().split("\n")[0]).toBe("Starting Codex's own sign-in. Follow its steps below.");
   });
-  it("asks OpenCode's provider choice in the open and its key hidden, and passes the chosen sign-in on (CP3)", async () => {
+  it("asks OpenCode's provider choice in the open and its key hidden, and passes the chosen sign-in on", async () => {
     const f = fake();
     const typed: string[] = [];
     const hidden: string[] = [];
@@ -153,7 +153,7 @@ describe("native control commands", () => {
     expect(f.calls.slice(1)).toEqual([{ op: "auth.input", loginId: "l1", text: "deepseek" }, { op: "auth.input", loginId: "l1", text: "sk-typed-key-never-shown" }]);
     expect(f.text()).not.toContain("sk-typed-key-never-shown");
   });
-  it("passes Google Antigravity's Gemini Enterprise project and location on, and its key only through the hidden prompt (antigravity CP3)", async () => {
+  it("passes Google Antigravity's Gemini Enterprise project and location on, and its key only through the hidden prompt", async () => {
     const f = fake();
     const hidden: string[] = [];
     f.context.promptSecret = async label => { hidden.push(label); return "AIzaSyTYPED-never-shown-000000000000"; };
@@ -194,7 +194,7 @@ describe("native control commands", () => {
     expect(f.text()).toContain("Customize → Runtimes");
   });
 
-  it("names Google Antigravity's download state in the agent list, with the command that changes it (antigravity CP6)", async () => {
+  it("names Google Antigravity's download state in the agent list, with the command that changes it", async () => {
     let text = "";
     const sink = new Writable({ write(chunk, _encoding, done) { text += chunk.toString(); done(); } });
     const view = (state: string) => ({ agentId: "antigravity", readiness: "unavailable", authMode: "agent_local_subscription", accountScope: "personal", hostAgentDownload: { state } });

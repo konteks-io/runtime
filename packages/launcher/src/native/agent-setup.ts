@@ -15,7 +15,7 @@ import { readNativeRecord } from "./install.js";
  * Claude Code and Codex run from the person's own installation and sign-in
  * (`claudeExecutable`, `codexHome`), with their ACP bridges and Codex's own
  * CLI shipped in the connector's signed packages. A computer without them is
- * still connected (D116); this offers each one, once, on the person's yes:
+ * still connected; this offers each one, once, on the person's yes:
  * Claude Code through Anthropic's official installer (nothing else is ever
  * downloaded or run for it), Codex by creating its profile folder for the
  * copy Konteks ships (nothing is downloaded). Without a terminal nothing is
@@ -67,7 +67,7 @@ function productionAgentSetupDeps(output: Pick<Output, "json">): AgentSetupDeps 
 }
 
 /**
- * Claude Code on Windows needs Git for Windows (D116): asked once, installed
+ * Claude Code on Windows needs Git for Windows: asked once, installed
  * with winget's Git.Git in the person's terminal on a yes. A no, no winget, or
  * a failed install is one line with the download page; Claude Code is still
  * installed, and the install carries on.

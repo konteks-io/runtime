@@ -69,7 +69,7 @@ describe("host-installed agent families", () => {
     for (const platform of ["darwin", "linux", "win32"] as const) expect(hostInstallCommand(fetched, platform)).toBe("konteks-remote agent add opencode");
   });
 
-  it("registers Google Antigravity as a fetched host agent, never bundled, with Google's release pinned (A1, A3, A15)", () => {
+  it("registers Google Antigravity as a fetched host agent, never bundled, with Google's release pinned", () => {
     const antigravity = hostAgentFamily("antigravity");
     expect(antigravity).toMatchObject({ displayName: "Google Antigravity", package: "antigravity-acp", version: "1.2.1", command: [] });
     expect(antigravity.hostInstall).toMatchObject({ launch: "fetched", versions: { min: "1.2.1", belowCore: "1.3.0" } });
@@ -78,7 +78,7 @@ describe("host-installed agent families", () => {
     for (const platform of ["darwin", "linux", "win32"] as const) expect(hostInstallCommand(antigravity, platform)).toBe("konteks-remote agent add antigravity");
     for (const version of ["1.2.1", "1.2.12"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(true);
     for (const version of ["1.1.1", "1.3.0", "1.3.0-rc.1", "2.0.0"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(false);
-    // The pin: only macOS arm64 is proven (A11); the connector never follows the registry itself.
+    // The pin: only macOS arm64 is proven; the connector never follows the registry itself.
     expect(FETCHED_AGENT_PINS.map(pin => pin.agentId)).toEqual(["antigravity"]);
     const pin = fetchedAgentPin("antigravity")!;
     expect(pin).toMatchObject({ registryId: "antigravity-acp", version: "1.2.1", terms: "https://antigravity.google/terms" });

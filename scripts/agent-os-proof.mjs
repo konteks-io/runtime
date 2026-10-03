@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Agent OS proof (opencode-runtime-support CP0-X): one agent, this OS, the
+ * Agent OS proof: one agent, this OS, the
  * connector's OWN code end to end, one JSON result.
  *
  *   node scripts/agent-os-proof.mjs --agent <claude-code|codex|dsh|opencode> --out result.json

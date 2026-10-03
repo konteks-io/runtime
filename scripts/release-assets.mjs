@@ -10,8 +10,8 @@
  *   collect — release job: merge every platform's staging directory.
  *   commands — release job: `commands.json`, the konteks-remote commands a
  *             person runs on a connected computer for this release
- *             (packages/release/src/connector-commands.json plus the version; runtime-view
- *             R20). The site reads it from this release's assets, so the
+ *             (packages/release/src/connector-commands.json plus the version).
+ *             The site reads it from this release's assets, so the
  *             page never lists a command the installed connector lacks.
  *   verify  — release job: every manifest artifact is present with its exact bytes.
  *   notes   — release job: human-readable release notes from the manifest.
@@ -46,7 +46,7 @@ switch (command) {
       node("scripts/build-offline-agent.mjs", ["--agent", agent, "--os", args.os, "--architecture", args.architecture, "--approval", args.approval, "--out", join(out, name), "--profile", profile]);
       node("scripts/native-artifact-index.mjs", ["--file", join(out, name), "--profile", profile, "--id", `${agent}-${args.os}-${args.architecture}`, "--kind", "agent_bridge", "--format", "offline_agent_tgz", "--agent", agent, "--os", args.os, "--architecture", args.architecture, "--url", url(name), "--out", join(out, `${agent}-${args.os}-${args.architecture}.artifact.json`)]);
     }
-    // Graft rides next to the connector, listed in SHA256SUMS (W1-G1). It is
+    // Graft rides next to the connector, listed in SHA256SUMS. It is
     // a local tool Core never hands out, so it is not a manifest artifact.
     if (args.os !== "windows") node("scripts/build-offline-tool.mjs", ["--tool", "graft", "--out", join(out, `konteks-graft-${args.os}-${args.architecture}.tgz`)]);
     copyFileSync(args.package, join(out, basename(args.package)));

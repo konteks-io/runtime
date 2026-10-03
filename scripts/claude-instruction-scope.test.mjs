@@ -38,12 +38,12 @@ test('a Konteks session runs no repository hooks, whatever the settings it was g
   assert.equal(hardenClaudeSession(undefined).disableAllHooks, true);
 });
 
-test('a Konteks session leaves the account\'s claude.ai connectors out (S0-2)', async () => {
+test('a Konteks session leaves the account\'s claude.ai connectors out', async () => {
   const { hardenClaudeSession } = await import('./claude-instruction-scope.mjs');
   assert.equal(hardenClaudeSession({ disableClaudeAiConnectors: false }).disableClaudeAiConnectors, true);
 });
 
-test('only an integration session admits the account connectors, and still runs no hooks (CP2)', async () => {
+test('only an integration session admits the account connectors, and still runs no hooks', async () => {
   const { hardenClaudeSession, konteksAccountConnectors } = await import('./claude-instruction-scope.mjs');
   const admitted = hardenClaudeSession({ disableClaudeAiConnectors: true }, true);
   assert.equal(admitted.disableClaudeAiConnectors, undefined);

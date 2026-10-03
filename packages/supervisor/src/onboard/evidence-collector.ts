@@ -6,11 +6,11 @@ import { MAX_EVIDENCE_FILE_BYTES, type EvidenceReadPath, type RawFileApi } from 
 import type { GitAccess, GitGap, GitRemote, OnboardScratch } from "./git.js";
 
 /**
- * The evidence collector (OB6 §2). It reads a bounded, named set of files per
+ * The evidence collector. It reads a bounded, named set of files per
  * repository with the machine's own git, extracts facts locally, and submits
  * `DiscoveryEvidence` — refs, hashes, facts. It never submits a body, never
  * reads a file it cannot name in `refs`, and refuses a run whose bounds are
- * absent (ON30).
+ * absent.
  *
  * Two depths land here:
  *
@@ -26,7 +26,7 @@ export interface OnboardEvidenceCollectorDeps {
   rawFiles: Pick<RawFileApi, "read">;
   scratch: OnboardScratch;
   facade: OnboardFacade;
-  /** Managed git is the one place the runtime's own key is the credential (A10). */
+  /** Managed git is the one place the runtime's own key is the credential. */
   resolveRemote: (item: DiscoveryInventoryItem) => GitRemote;
   /** Default 4 repositories in flight, so a laptop stays usable. */
   concurrency?: number;
@@ -41,7 +41,7 @@ const DEFAULT_BATCH_SIZE = 8;
 /** What one repository's read produced, including what it could not read. */
 interface RepositoryEvidence {
   submission: DiscoveryEvidenceSubmission;
-  /** Which path produced each ref (OB6 gotcha); diagnostics, never submitted. */
+  /** Which path produced each ref; diagnostics, never submitted. */
   readPaths: Record<string, EvidenceReadPath>;
   /** Ordinary evidence gaps, never exceptions: a side we could not read. */
   gaps: GitGap[];
@@ -55,7 +55,7 @@ interface GroupingOutcome {
 
 export interface EnrichmentScope {
   systemRef: string;
-  /** `min(remainingRunBudget, repositoriesOfSystem)`, computed by Core (gap R6). */
+  /** `min(remainingRunBudget, repositoriesOfSystem)`, computed by Core. */
   allowance: number;
   /** Only the accepted System's repositories, in the order Core authorised them. */
   canonicalKeys: string[];
@@ -254,7 +254,7 @@ export class OnboardEvidenceCollector {
       refs.push(ref);
       readPaths[ref.ref] = via;
     }
-    // Which path produced each ref is a fact about the run (OB6 gotcha): a
+    // Which path produced each ref is a fact about the run: a
     // portfolio read entirely through `git archive` and one that fell back for
     // half its repositories are different things to have measured.
     this.logger.debug({

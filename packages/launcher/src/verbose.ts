@@ -4,7 +4,7 @@ import { redactText } from "@konteks/remote-common";
  * `konteks-remote --verbose` (or `KONTEKS_REMOTE_VERBOSE=1`): every service
  * and OS command the launcher runs, its exit code and what it printed, and
  * the decisions it takes, on stderr so `--json` stays one document. Off by
- * default; the normal output does not change (D129: a Windows start failed
+ * default; the normal output does not change (a Windows start failed
  * with one generic line and nothing to diagnose it by).
  */
 let enabled = fromEnvironment();

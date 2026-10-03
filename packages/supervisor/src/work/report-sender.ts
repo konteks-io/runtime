@@ -333,7 +333,7 @@ export class ReportSender {
     }
   }
 
-  /** Apply a `ReportAck` verdict exactly as the D125 sender-side table prescribes. */
+  /** Apply a `ReportAck` verdict exactly as the sender-side table prescribes. */
   async onAck(candidate: ReportAck, reference?: AssignmentRequestReference): Promise<void> {
     const ack = ReportAckSchema.parse(candidate);
     const key = `${ack.assignmentId}:${ack.attempt}`;

@@ -12,7 +12,7 @@ import type { CancellationInboxRecord } from "../state/cancellation-inbox.js";
 let dir: string;
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "cancellation-receiver-")); });
 afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
-// A repository-role delivery turn claimed but never prompted (WS2-159).
+// A repository-role delivery turn claimed but never prompted.
 const deliveryWork = { kind: "validation" as const, agentRoute: { requiredRole: "qa" as const, agentId: "codex" },
   source: { kind: "harness_delivery" as const, portability: "instance_bound" as const, ownerInstanceId: "instance",
     executionSessionId: "session", repositoryId: "https://git.example.com/acme/store",
@@ -120,7 +120,7 @@ describe("native cancellation receiver admission", () => {
     expect(f.journal.cancellations.pending()).toHaveLength(1);
   });
 
-  it("admits Core's signed stop for a claimed delivery turn of the exact role session (WS2-159)", async () => {
+  it("admits Core's signed stop for a claimed delivery turn of the exact role session", async () => {
     const persisted = vi.fn();
     const f = await fixture(undefined, persisted, deliveryWork);
     const record = await f.receiver.receive(f.make());

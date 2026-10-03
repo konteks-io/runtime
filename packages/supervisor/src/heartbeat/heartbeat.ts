@@ -29,14 +29,14 @@ export interface HeartbeatOptions {
   activeAssignmentIds: () => string[];
   modelCapabilitySnapshots?: () => readonly AgentModelOfferedValuesSnapshot[];
   /**
-   * Every supported agent's real state on this computer (runtime-view R21),
+   * Every supported agent's real state on this computer,
    * from the agents just collected; undefined to leave the field out (an
    * older Core, or nothing detected yet). Never throws the heartbeat away.
    */
   supportedAgents?: (agents: HeartbeatMessage["agents"]) => readonly SupportedAgentEntry[] | undefined;
   /**
-   * The `konteks-remote` commands this installed release has (runtime-view
-   * R20); undefined to leave it out (an older Core, or no table). Sent on the
+   * The `konteks-remote` commands this installed release has;
+   * undefined to leave it out (an older Core, or no table). Sent on the
    * first heartbeat Core accepts from each runner incarnation and again only
    * when it changes: Core keeps the latest value it received.
    */

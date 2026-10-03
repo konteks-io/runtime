@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureGraft, graftAlreadyWired, planGraft, prepareDeliveryGraft, wireGraft, writeGraftRecord, type GraftTool } from "../native/graft.js";
 
 /**
- * Graft in the person's repository (W1-G1..G3, WS1-081). A stand-in Graft
+ * Graft in the person's repository. A stand-in Graft
  * program writes what the real one writes, so what is kept out of git, and
  * what the wiring points at, can be checked without the real package.
  */
@@ -72,11 +72,11 @@ describe("graft", () => {
     // Codex and DeepSeek Harness both read AGENTS.md: wired once.
     expect((await planGraft(repo, ["codex", "dsh"])).agents).toEqual(["agents"]);
     expect((await planGraft(repo, ["dsh"])).adds).toEqual(["graft/", "AGENTS.md", ".ignore"]);
-    // OpenCode reads AGENTS.md too (opencode CP6): still one Graft id with Codex and dsh.
+    // OpenCode reads AGENTS.md too: still one Graft id with Codex and dsh.
     expect((await planGraft(repo, ["codex", "dsh", "opencode"])).agents).toEqual(["agents"]);
     expect((await planGraft(repo, ["claude-code", "opencode"])).agents).toEqual(["claude", "agents"]);
     expect((await planGraft(repo, ["opencode"])).adds).toEqual(["graft/", "AGENTS.md", ".ignore"]);
-    // Google Antigravity gets AGENTS.md from the connector (A9): the same Graft id (antigravity CP6).
+    // Google Antigravity gets AGENTS.md from the connector: the same Graft id.
     expect((await planGraft(repo, ["codex", "antigravity"])).agents).toEqual(["agents"]);
     expect((await planGraft(repo, ["claude-code", "antigravity"])).agents).toEqual(["claude", "agents"]);
 
@@ -92,7 +92,7 @@ describe("graft", () => {
     expect(wired.changedTracked).toEqual([]);
     expect(wired.added).toEqual([".claude/helpers/", ".claude/settings.json", ".claude/skills/graft/", ".ignore", ".mcp.json", "AGENTS.md", "graft/"]);
 
-    // Nothing Graft wrote shows as a change the person did not ask for (W1-G3).
+    // Nothing Graft wrote shows as a change the person did not ask for.
     expect(git(repo, "status", "--porcelain", "--untracked-files=all").trim()).toBe("?? index.ts");
     const exclude = await readFile(join(repo, ".git", "info", "exclude"), "utf8");
     expect(exclude).toContain("/graft/");
@@ -164,7 +164,7 @@ describe("graft", () => {
     expect(await graftAlreadyWired(copy)).toBe(true);
   });
 
-  it("wires a delivery worktree once and leaves it as it is on later turns (WS2-156)", async () => {
+  it("wires a delivery worktree once and leaves it as it is on later turns", async () => {
     await writeFile(join(repo, "AGENTS.md"), "# rules\n");
     git(repo, "add", "AGENTS.md", "index.ts");
     git(repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base");
@@ -211,7 +211,7 @@ describe("graft", () => {
     await expect(ensureGraft(root, { fetchFn: served(Buffer.from("tampered")), node })).rejects.toThrow(/does not match this release's checksum/);
 
     const installed = await ensureGraft(root, { fetchFn: served(bytes), node });
-    // It lives in ~/.graft with its own Node, so it outlives Konteks (WS1-091).
+    // It lives in ~/.graft with its own Node, so it outlives Konteks.
     expect(installed.cli.startsWith(join(home, ".graft", "konteks"))).toBe(true);
     expect(installed.node).toBe(join(dirname(dirname(dirname(dirname(dirname(installed.cli))))), "bin", "node"));
     expect(await readFile(installed.node, "utf8")).toBe("#!/bin/sh\n");

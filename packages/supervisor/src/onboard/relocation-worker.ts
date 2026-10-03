@@ -4,7 +4,7 @@ import { refDigest, type GitAccess, type GitGap, type GitRemote, type OnboardScr
 import { cloneUrl, resolveRemote, type ManagedGitBinding, type RepositoryLocation } from "./remotes.js";
 
 /**
- * The repository relocation worker (OB6 §3, graduation G6).
+ * The repository relocation worker.
  *
  * The bytes move HERE, under a permit, as a mirror push: Core never sees the
  * code and the broker is never called. The worker's authority at each step is

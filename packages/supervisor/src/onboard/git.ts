@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { RemoteInstanceError, createLogger, runCommand, sanitizeInheritedChildProcessEnv, sha256Hex, type Logger } from "@konteks/remote-common";
 
 /**
- * The onboard role's git access (OB6 §5, invariant 3, amendments A5/A10).
+ * The onboard role's git access.
  *
  * The runtime uses **the machine's own git access** for a customer's VCS —
  * whatever `git` on this machine already authenticates with, exactly as native
@@ -35,7 +35,7 @@ const CREDENTIAL_UNAVAILABLE_REMEDY =
 
 export type GitGapCode = "credential_unavailable" | "not_found" | "unavailable";
 
-/** An evidence gap, never an exception text (OB6 §5). */
+/** An evidence gap, never an exception text. */
 export interface GitGap {
   code: GitGapCode;
   /** What a person does about it. Bounded prose; never command output. */
@@ -56,7 +56,7 @@ export interface GitRef {
 /**
  * How this machine reaches one repository. `identityFile` is present only for
  * managed git, where the runtime's own registered key IS the person's
- * credential (A10); for a customer connector it is absent and git resolves
+ * credential; for a customer connector it is absent and git resolves
  * whatever it already has.
  */
 export interface GitRemote {
@@ -83,7 +83,7 @@ export interface GitAccess {
 }
 
 /**
- * The digest both sides of a relocation are compared on (G6): sha256 over the
+ * The digest both sides of a relocation are compared on: sha256 over the
  * sorted `"<ref> <sha>"` lines. Sorting is what makes two providers that
  * enumerate refs in different orders comparable at all.
  */
@@ -235,7 +235,7 @@ export class LocalGit implements GitAccess {
   async pushMirror(directory: string, remote: GitRemote): Promise<GitResult<void>> {
     // A mirror push is idempotent: re-running it after a worker died between
     // `sync` and `verify` converges on the same refs rather than duplicating
-    // anything (G6, OB6 §3).
+    // anything.
     const result = await this.git(remote, ["push", "--mirror", "--quiet", "--", remote.url], { cwd: directory });
     return result.ok ? gitOk(undefined) : result;
   }
@@ -269,8 +269,8 @@ export class LocalGit implements GitAccess {
     const env = sanitizeInheritedChildProcessEnv({ env: process.env });
     Object.assign(env, NON_INTERACTIVE_ENV);
     if (identityFile) {
-      // Managed git is the one place the runtime's own key is the credential
-      // (A10). `IdentitiesOnly` stops ssh from offering every agent key first
+      // Managed git is the one place the runtime's own key is the credential.
+      // `IdentitiesOnly` stops ssh from offering every agent key first
       // and being refused before it reaches ours.
       env.GIT_SSH_COMMAND = `ssh -i ${identityFile} -o IdentitiesOnly=yes -o BatchMode=yes`;
     }
@@ -305,8 +305,7 @@ function safeUrl(value: string): URL | null {
 /**
  * The scratch the onboard lane owns, split in two on purpose. **Clones** live
  * under `clones/` and nowhere else, so "the clones directory stayed empty" is a
- * checkable proof that a `grouping` pass never cloned anything (OB6 acceptance
- * criteria); the short-lived tar a single-file `git archive` writes lives under
+ * checkable proof that a `grouping` pass never cloned anything; the short-lived tar a single-file `git archive` writes lives under
  * `archives/` so it cannot be mistaken for one.
  */
 export class OnboardScratch {

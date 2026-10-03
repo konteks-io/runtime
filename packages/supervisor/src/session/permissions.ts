@@ -5,7 +5,7 @@ import type { DeferredPermissionBody } from "../core/client.js";
 import { isSignInElicitation } from "./policy-responder.js";
 
 /**
- * Sanitized pending-permission facts (D87/D102). The supervisor forwards ONLY
+ * Sanitized pending-permission facts. The supervisor forwards ONLY
  * these fields for a policy-deferred request — title, tool kind, options, or
  * a bounded elicitation message + schema — plus the `requestDigest` Core and
  * the answerer must echo. Raw tool input, paths, and `_meta` never leave.

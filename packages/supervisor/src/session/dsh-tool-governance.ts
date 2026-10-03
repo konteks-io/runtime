@@ -6,11 +6,10 @@ import { resolveIn } from "./host-decisions.js";
  * Permission parity for DeepSeek Harness.
  *
  * dsh reports every tool call as ACP kind `other`, titled with its own tool
- * name, and its `session/request_permission` carries only the tool call id
- * (CP0 s4). The runtime policy judges a kind plus raw input, so on its own it
+ * name, and its `session/request_permission` carries only the tool call id. The runtime policy judges a kind plus raw input, so on its own it
  * would see nothing: a shell `git push` or a write outside the workspace
  * would pass unjudged. dsh always sends the `tool_call` update before the
- * request (CP0: 13 of 13), so this keeps each session's recent tool calls and
+ * request (13 of 13), so this keeps each session's recent tool calls and
  * rebuilds the request the policy needs. A request it cannot rebuild is
  * denied, never allowed by default.
  *
@@ -36,7 +35,7 @@ const READ_ONLY = new Set(DSH_READ_ONLY_TOOLS);
  */
 const KONTEKS_MCP = /^mcp__konteks-(platform|preview|result)__[A-Za-z0-9_-]+$/;
 /**
- * The QA browser (O8: a connector capability, so dsh gets it too), allowed
+ * The QA browser (a connector capability, so dsh gets it too), allowed
  * only on a session given it and never for a tool the launcher hides
  * (`browser_run_code_unsafe`, the route tools): its gateway confines it to
  * the session's preview and the origins Core opened.

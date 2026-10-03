@@ -4,7 +4,7 @@ import { packageBrowser, type RunnerBrowser, type RunnerConfig } from "@konteks/
 import { locatePersonNode, personNodeCandidates } from "./dsh-installation.js";
 
 /**
- * The QA browser as a connector capability (opencode-runtime-support O8).
+ * The QA browser as a connector capability.
  *
  * The browser (Playwright MCP, pinned by the release) is packaged inside the
  * Claude Code and Codex offline agent packages, with the connector's launcher.

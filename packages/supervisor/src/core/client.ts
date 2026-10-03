@@ -101,7 +101,7 @@ import { decodeLeaseClaims } from "../lease/lease.js";
 type RuntimeAgentLoginReport = ReturnType<typeof RuntimeAgentLoginReportSchema.parse>;
 
 /**
- * Core's private supervisor endpoints over TLS. CP3 mounts the
+ * Core's private supervisor endpoints over TLS. Core mounts the
  * `remote-instance-backend` plugin at `/api/remote-instances`; its
  * supervisor-private table is exactly: `jwks`, `activation-exchange`,
  * `:id/provisioning-credential`, `:id/desired-configuration[/ack]`,
@@ -128,7 +128,7 @@ const CORE_PATHS = Object.freeze({
   deliveryExecutionCheck: (instanceId: string, executionId: string) => instancePath(instanceId, `delivery-executions/${encodeURIComponent(executionId)}/check`),
   executionCheck: (instanceId: string, executionId: string) => instancePath(instanceId, `executions/${encodeURIComponent(executionId)}/check`),
   desiredConfiguration: (instanceId: string) => instancePath(instanceId, "desired-configuration"),
-  /** CP3 exposes this route for configuration acknowledgements only. */
+  /** Core exposes this route for configuration acknowledgements only. */
   controlAck: (instanceId: string) => instancePath(instanceId, "desired-configuration/ack"),
   reconnect: (instanceId: string) => instancePath(instanceId, "reconnect"),
   runtimeOwnerResolve: (instanceId: string) => instancePath(instanceId, "runtime-owner/resolve"),
@@ -146,24 +146,24 @@ const CORE_PATHS = Object.freeze({
   observations: (instanceId: string) => instancePath(instanceId, "observations"),
   permissionsDeferred: (instanceId: string) => instancePath(instanceId, "permissions/deferred"),
   capabilityTokenRedeem: (instanceId: string) => instancePath(instanceId, "capability-tokens/redeem"),
-  // CONTRACT-GAP: OB6 §4 names the App BFF route
+  // CONTRACT-GAP: the onboarding contract names the App BFF route
   // `POST /api/app/remote-instances/:id/git-keys`, but a runtime holds a lease,
   // not a person's session, and cannot authenticate against an App route. The
   // registration therefore sits on the supervisor-private table beside every
   // other route the runtime calls; Core forwards it to managed-git with the
   // instance id exactly as the contract describes.
   gitKeys: (instanceId: string) => instancePath(instanceId, "git-keys"),
-  // A coding agent login the person started from the site (WS1-115).
+  // A coding agent login the person started from the site.
   agentLoginReport: (instanceId: string) => instancePath(instanceId, "agent-logins/report"),
   acceptedRelease: (instanceId: string) => instancePath(instanceId, "accepted-release"),
-  // Uninstall: the runtime removes itself (W1-L2), lease-authenticated like the rest.
+  // Uninstall: the runtime removes itself, lease-authenticated like the rest.
   retire: (instanceId: string) => instancePath(instanceId, "retire"),
   gitKey: (instanceId: string, keyRef: string) => instancePath(instanceId, `git-keys/${encodeURIComponent(keyRef)}`),
   // CONTRACT-GAP: `RemoteWorkAssignment` carries no delivery/validation/qa
   // definition, so the supervisor reads it for a CLAIMED assignment from
   // this lease-guarded route (added to Core with this seam).
   workload: (instanceId: string, assignmentId: string) => instancePath(instanceId, `assignments/${encodeURIComponent(assignmentId)}/workload`),
-  // CONTRACT-GAP: durable task-checkout affinity (invariant 15) had no route
+  // CONTRACT-GAP: durable task-checkout affinity had no route
   // for the owner to report a materialization. Added to Core with this seam.
   // CONTRACT-GAP: control-poll and generic session-frame HTTPS routes are not
   // mounted by Core. Lease renewal uses only the signed heartbeat above.
@@ -173,7 +173,7 @@ const CORE_PATHS = Object.freeze({
 });
 
 /**
- * Audience of every instance-key proof (CP3 `instanceProof.ts`): the proof
+ * Audience of every instance-key proof (Core's `instanceProof.ts`): the proof
  * bytes are JCS of `{v:'konteks-instance-proof-v1', method, audience:
  * 'konteks:remote-instance', subject, nonce, bodyDigest}`, ES256. The lease
  * itself carries the distinct `REMOTE_INSTANCE_LEASE_AUDIENCE`.
@@ -182,7 +182,7 @@ const CORE_PATHS = Object.freeze({
 export const CORE_AUDIENCE = REMOTE_INSTANCE_PROOF_AUDIENCE;
 export const LEASE_AUDIENCE: string = REMOTE_INSTANCE_LEASE_AUDIENCE;
 
-// CONTRACT-GAP: CP1 exports the readiness request but no response schema.
+// CONTRACT-GAP: the shared contract exports the readiness request but no response schema.
 // Match ProvisioningService's initial and idempotent response, remaining strict.
 const ReadinessResultSchema = z.object({ instanceId: z.string(), administrativeStatus: z.literal("active"), lease: z.string().min(1), leaseExpiresAt: z.string(), leaseMode: RemoteLeaseModeSchema, heartbeatIntervalSeconds: z.number().int().positive() }).strict();
 const ControlPollSchema = z.object({ frames: z.array(ToRuntimeRelayFrameSchema).max(64) }).strict();
@@ -198,7 +198,7 @@ const ControllerDirectivePullInputSchema = z.object({
 type ControllerDirectivePullInput = Omit<PlanningControllerDirectivePullRequest, "proof">;
 /**
  * Core answers a redemption with the bearer token itself (`{token, expiresAt,
- * toolScopes}`, CP3 `TokenService.redeemAgentCapabilityToken`); the supervisor
+ * toolScopes}`, Core's `TokenService.redeemAgentCapabilityToken`); the supervisor
  * composes the ACP `mcpServers` entry from it and the configured platform MCP
  * URL. The response cannot substitute an MCP endpoint or headers.
  */
@@ -211,12 +211,12 @@ const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: 
 type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
 
 /**
- * Managed-git key registration (ON16). Core answers with the reference it
+ * Managed-git key registration. Core answers with the reference it
  * minted, the fingerprint managed-git stored, and the SSH host this key opens —
  * the runtime cannot know the managed host on its own, and guessing one would
  * make the machine offer its key to whatever answered.
  *
- * CONTRACT-GAP: `ManagedGitKeyRegisterRequest` (OB1 §6) also carries
+ * CONTRACT-GAP: `ManagedGitKeyRegisterRequest` also carries
  * `userEntityRef`. A runtime does not know which person it belongs to; Core
  * derives it from the instance, which is also what binds the key to this
  * runtime so removing the runtime revokes exactly this key.
@@ -225,7 +225,7 @@ type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
  * What Core answers with. Managed git registers a key for the PERSON, so its
  * record names them and the instance and carries no host; a runtime reads the
  * parts it needs and ignores the rest, rather than refusing its own
- * registration as malformed (WS1-026).
+ * registration as malformed.
  */
 const GitKeyRegisterResultSchema = z.object({
   keyRef: z.string().min(1).max(200),
@@ -250,7 +250,7 @@ const GitKeyListResultSchema = z.object({
   })).max(64),
 }).strict();
 
-/** Core's `DeferredPermission` (CP3 `PendingPermissionService`): what the supervisor posts for a component-raised deferral. */
+/** Core's `DeferredPermission` (Core's `PendingPermissionService`): what the supervisor posts for a component-raised deferral. */
 export type DeferredPermissionBody =
   | { kind: "permission"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; permission: { title: string; toolKind?: string; options: Array<{ optionId: string; name: string; kind: string }> } }
   | { kind: "elicitation"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; elicitation: { message: string; requestedSchema: BoundedJsonValue; isSignIn: boolean } };
@@ -269,7 +269,7 @@ interface CoreClientOptions {
 
 /**
  * How long a key set Core confirmed stays usable while Core's key endpoint
- * cannot be reached (D110: the endpoint timed out for minutes and every prompt
+ * cannot be reached (the endpoint timed out for minutes and every prompt
  * was refused). Every use of these keys is paired with a direct Core call over
  * TLS (consumption, check), so a stale set never admits work Core refuses; a
  * set missing the requested key id is never served stale.
@@ -606,13 +606,13 @@ export class CoreClient {
   }
 
   /**
-   * Submit an already-durable C03 stop observation. This route is a private,
+   * Submit an already-durable recovery-evidence stop observation. This route is a private,
    * machine-proof boundary; its acknowledgement records only acceptance of
    * observation bytes and never a terminal result or quiescence decision.
    */
   // The identity key joins its fields with NUL, which no HTTP header may carry:
   // sent raw, fetch refused every submission locally, so a fenced session could
-  // never be recovered over HTTPS (WS2-159). The header carries its digest.
+  // never be recovered over HTTPS. The header carries its digest.
   async submitRecoveryEvidence(input: { evidence: RemoteRecoveryEvidence; connection: RemoteReconciliationConnection }): Promise<RecoveryEvidenceIngressResult> {
     const evidence = RemoteRecoveryEvidenceSchema.parse(structuredClone(input.evidence));
     const connection = RemoteReconciliationConnectionSchema.parse(structuredClone(input.connection));
@@ -661,7 +661,7 @@ export class CoreClient {
    * `HeartbeatMessage` plus a detached instance-proof signature binding the
    * heartbeat operation, instance, audience and body digest. Core derives
    * the replay nonce as `seq:<sequence>`, so
-   * the message carries no nonce of its own (CP3 integration note).
+   * the message carries no nonce of its own.
    */
   async heartbeat(message: HeartbeatMessage & { signature: string }): Promise<HeartbeatResult> {
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.heartbeat(message.instanceId), body: message, schema: HeartbeatResultSchema, idempotencyKey: `heartbeat:${message.instanceId}:${message.sequence}` });
@@ -855,7 +855,7 @@ export class CoreClient {
   }
 
   /**
-   * The release this Core accepts right now (WS1-093). An update to anything
+   * The release this Core accepts right now. An update to anything
    * else would be refused by Core and leave the machine offline until it
    * rolls back. Null from a Core that does not say.
    */

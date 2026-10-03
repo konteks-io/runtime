@@ -23,7 +23,7 @@ import { ReplayBuffer } from "./replay-buffer.js";
 import { RecoveryAuthority } from "../transport/recovery-authority.js";
 
 /**
- * The typed channel mux (D99/D107/D114/D115/D117):
+ * The typed channel mux:
  *  - per `(channelId, to_core)` monotonic `seq` and a sender-owned replay buffer;
  *  - per `(channelId, to_runtime)` durable receive cursor with dedup;
  *  - explicit supervisor-signed `RelayAck`s at the configured cadence and
@@ -55,14 +55,14 @@ export interface MuxOptions {
   emit: (envelope: ToCoreRelayFrame | AssignmentRequestFrame | RelayAck) => boolean;
   /** Resolve only after durable acceptance, not completion of the agent turn. */
   onFrame: (frame: ToRuntimeRelayFrame) => void | Promise<void>;
-  /** D143 assignment receipts and request ACKs use the durable assignment journal. */
+  /** Assignment receipts and request ACKs use the durable assignment journal. */
   onAssignmentFrame?: (frame: AssignmentReplyFrame) => Promise<number>;
   onAssignmentRequestAck?: (ack: RelayAck) => Promise<void>;
-  /** D143 logical cursors replace generic mux counters in the relay handshake. */
+  /** Assignment logical cursors replace generic mux counters in the relay handshake. */
   assignmentCursors?: () => { channelId: string; to_core: number; to_runtime: number } | null;
   onStall: (channelId: string) => void;
   onReset: (channelId: string) => void;
-  /** Persist the durable receive cursor (the authoritative cursor for to_runtime, D107). */
+  /** Persist the durable receive cursor (the authoritative cursor for to_runtime). */
   persistCursors: (cursors: Record<string, { to_core: number; to_runtime: number; allocated?: number | undefined }>) => Promise<void>;
   /** Production durability boundary: allocation, replay bytes and cursors in one atomic write. */
   persistRelayState?: (state: RelayDurableState) => Promise<void>;
@@ -162,7 +162,7 @@ export class ChannelMux {
   private pending: Promise<void> = Promise.resolve();
   /**
    * Sent frames waiting for the durability write that has not started yet
-   * (group commit, WS2-157). Every frame queued while an earlier write runs
+   * (group commit). Every frame queued while an earlier write runs
    * joins this one batch; the batch closes when its own write starts.
    */
   private openSendBatch: PendingSend[] | null = null;
@@ -193,8 +193,7 @@ export class ChannelMux {
       // frame allocated before a restart but never acknowledged here may still
       // have reached the holder durably (its ACK was in flight); reusing that
       // sequence after the restart made the holder drop the new frame as an
-      // already-durable duplicate — a fresh session_ready vanished silently
-      // (live 2026-09-12). Sequence numbers are never handed out twice.
+      // already-durable duplicate — a fresh session_ready would vanish silently. Sequence numbers are never handed out twice.
       state.nextSeq = Math.max(state.nextSeq, cursor.to_core + 1, (cursor.allocated ?? 0) + 1);
       state.buffer.ackUpTo(cursor.to_core);
     }
@@ -268,7 +267,7 @@ export class ChannelMux {
     return out;
   }
 
-  /** Generic replay cursor persistence excludes D143's independently durable stream. */
+  /** Generic replay cursor persistence excludes the assignment's independently durable stream. */
   private genericCursors(): Record<string, { to_core: number; to_runtime: number; allocated: number }> {
     const out: Record<string, { to_core: number; to_runtime: number; allocated: number }> = {};
     for (const [channelId, state] of this.channels) {

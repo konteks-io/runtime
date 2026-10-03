@@ -15,7 +15,7 @@ const direct = RemoteWorkAssignmentSchema.parse({ ...base, kind: "direct",
 const conversation = RemoteWorkAssignmentSchema.parse({ ...base, kind: "assistant_execution",
   source: { kind: "conversation", portability: "portable_before_claim", sessionId: "conv-1", turnRef: "t1" } });
 
-describe("direct work on the connector (runtime-view R11)", () => {
+describe("direct work on the connector", () => {
   it("continues its session like a conversation, but is told apart from one", () => {
     expect(continuedSession(direct.source)).toMatchObject({ sessionId: "direct-1", turnRef: "t2", acpSessionRef: "acp-1" });
     expect(continuedSession(conversation.source)).toMatchObject({ sessionId: "conv-1" });

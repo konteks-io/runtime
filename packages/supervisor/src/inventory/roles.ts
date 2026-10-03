@@ -2,7 +2,7 @@ import type { ConnectedAgentView, RuntimeRole, RuntimeUtilization } from "@konte
 
 /**
  * Role advertisement is computed from `roleBindings` and READY agents' ACP
- * capabilities (D100/D101): a role appears only when at least one agent in
+ * capabilities: a role appears only when at least one agent in
  * its preference list is ready and capable of the work kind that role maps
  * to. Core strips anything it disagrees with; the supervisor never claims a
  * role it cannot serve.
@@ -22,7 +22,7 @@ export interface RoleCapabilityInputs {
   /**
    * The git version this machine reports, or `null` when git is not on PATH.
    * The `onboard` role reads repositories and moves bytes with the machine's
-   * own git (onboarding-mode OB6 §1), so without it the runtime advertises
+   * own git, so without it the runtime advertises
    * neither onboard capability and Core reports it ineligible for both kinds.
    */
   gitVersion?: string | null;
@@ -43,7 +43,7 @@ export function agentSatisfiesRole(agent: ConnectedAgentView, role: RuntimeRole,
  */
 const READY_AGENT_ROLES: ReadonlySet<RuntimeRole> = new Set<RuntimeRole>(["planner", "generator", "assistant", "qa"]);
 /**
- * What an `onboard` runtime advertises when git is present (OB6 §1). Both
+ * What an `onboard` runtime advertises when git is present. Both
  * capabilities go together: one machine's git either reads repositories and
  * pushes mirrors or it does neither, and Core places both work kinds on the
  * same role. The git version rides along as its own advertised string so an
@@ -71,7 +71,7 @@ export function deriveAdvertisedRoles(bindings: readonly RoleBinding[], agents: 
   return roles;
 }
 
-/** The Core-placed agent must be ready at claim; the supervisor never substitutes (D100). */
+/** The Core-placed agent must be ready at claim; the supervisor never substitutes. */
 export function placedAgentReady(agents: readonly ConnectedAgentView[], agentId: string, role: RuntimeRole, inputs: RoleCapabilityInputs): boolean {
   const agent = agents.find((candidate) => candidate.agentId === agentId);
   return agent !== undefined && agentSatisfiesRole(agent, role, inputs);
@@ -86,7 +86,7 @@ interface UtilizationInputs {
 }
 
 /**
- * Self-reported utilization for D74/D153 ranking. Active execution against the
+ * Self-reported utilization for Core's ranking. Active execution against the
  * soft ceiling dominates when a ceiling is set; idle continuation/replay
  * sessions never consume a turn slot. Host pressure remains the other signal.
  *

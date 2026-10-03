@@ -6,7 +6,7 @@ import { CONNECTOR_LOG_FILE } from "./service.js";
 /**
  * The last time the background service could not be registered or started,
  * kept beside the supervisor's state so `doctor` and `support` can say it
- * while nothing is running to ask (D129: a Windows start failed and doctor,
+ * while nothing is running to ask (a Windows start failed and doctor,
  * which asks the running connector, had nothing to show).
  */
 const SERVICE_START_FAILURE_FILE = "service-start-failure.json";

@@ -45,7 +45,7 @@ export interface AgentRuntimeOptions {
 }
 
 /**
- * The offered models are re-read at least this often (System One §6a, KM6),
+ * The offered models are re-read at least this often ,
  * so a model the agent starts offering shows up without a restart. A sign-in
  * change re-reads at once: the account fingerprint is part of the cache key.
  */
@@ -139,7 +139,7 @@ class FileSessionRefStore implements SessionRefStore {
  * escalation reaches Konteks's permission callback rather than Codex's own
  * auto-reviewer ("Approve for me", `agent`). It is applied before ready on
  * new, restored and live-continued sessions, and every other mode is refused,
- * including one a later codex-acp adds (external-integration Stage 0, S0-3).
+ * including one a later codex-acp adds (external-integration Stage 0).
  */
 export const CODEX_SESSION_GOVERNANCE = {
   defaultSessionConfig: { mode: "read-only" },
@@ -296,7 +296,7 @@ export class AgentRuntime {
   private controlIdleTimer: NodeJS.Timeout | null = null;
   /** What the control process answered before it was stopped for being idle; readiness keeps reading it. */
   private parkedInitializeResult: InitializeResponse | null = null;
-  /** The slash commands this agent announced on this computer (runtime-view R19), kept across restarts. */
+  /** The slash commands this agent announced on this computer, kept across restarts. */
   private readonly availableCommands: AvailableCommandsStore;
 
   constructor(private readonly options: AgentRuntimeOptions) {
@@ -394,7 +394,7 @@ export class AgentRuntime {
     return previous.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling && this.host?.identity !== undefined;
   }
 
-  /** How one turn's usage is labelled (O7): sessions/usage-label.ts. */
+  /** How one turn's usage is labelled: sessions/usage-label.ts. */
   private usageLabel(modelValue: string | undefined): TurnUsageLabel | null {
     return turnUsageLabel({ agentId: this.family.agentId, modelValue, credentials: this.credentials, coreAcceptsRouteBilling: this.hostSettings.coreAcceptsRouteBilling });
   }
@@ -430,7 +430,7 @@ export class AgentRuntime {
     catch (error) { this.logger.warn({ agentId: this.family.agentId, errorCode: error instanceof RemoteInstanceError ? error.code : "sweep_failed" }, "processes the agent left behind could not all be stopped"); }
   }
 
-  /** Execution processes that may live at once: the supervisor's ceiling, and the agent's own when lower (Antigravity: two, A12). */
+  /** Execution processes that may live at once: the supervisor's ceiling, and the agent's own when lower (Antigravity: two). */
   private executionLimit(): number | undefined {
     const limit = this.options.executionBridgeLimit?.();
     const own = this.host?.processLimits?.executionProcesses;
@@ -961,8 +961,8 @@ export class AgentRuntime {
 
   /**
    * Whether this agent was signed in and the sign-in no longer works: a turn
-   * failed on it, or a credential it holds needs signing in again (runtime-view
-   * R21 `sign_in_expired`, as opposed to never signed in).
+   * failed on it, or a credential it holds needs signing in again (`sign_in_expired`,
+   * as opposed to never signed in).
    */
   signInLost(): boolean {
     return this.authRequired || (this.credentials?.some(credential => credential.state === "needs_sign_in") ?? false);
@@ -986,7 +986,7 @@ export class AgentRuntime {
   /**
    * A discovery that failed for good may mean the agent's sign-in went away
    * outside Konteks (its home cleared, a token revoked): read the identity
-   * again, so readiness stops saying ready while nothing can run (WS1-216).
+   * again, so readiness stops saying ready while nothing can run.
    */
   private afterDiscoveryFailure(error: unknown): void {
     if (this.stopping) return;
@@ -1005,8 +1005,8 @@ export class AgentRuntime {
    * when that refresh fails for a transient reason (a deadline on a loaded
    * computer, an internal error). A sign-in failure, a definite refusal or a
    * malformed answer drops it; a sign-in or version change is a new key.
-   * Without that, one slow refresh left Core no offered models and every
-   * delivery placement failed (2026-10-02).
+   * Without that, one slow refresh would leave Core no offered models and every
+   * delivery placement would fail.
    */
   async discoverModelCapability(configId: string): Promise<DiscoveredBridgeModelCapability> {
     const view = this.readiness();
@@ -1166,7 +1166,7 @@ export class AgentRuntime {
    * Before any bridge process starts: re-verify a bundled package, or let a
    * host-installed agent's adapter write the Konteks overlay or config it boots
    * from. Every dsh process reads those files at boot, so a changed copy heals
-   * on the next spawn instead of leaving it unguarded (CP3 live proof, phase 2).
+   * on the next spawn instead of leaving it unguarded.
    */
   private async prepareToSpawn(logger?: Pick<Logger, "info">): Promise<void> {
     await verifyNativeRunnerPackage(this.options.config, logger);

@@ -79,7 +79,7 @@ describe("bootstrap/install.ps1", () => {
 
   // The MSI adds konteks-remote to the machine PATH, which this window does
   // not see: the closing summary's commands ("konteks-remote agent add …")
-  // would fail here (D116). Said once, after the launcher, keeping its exit code.
+  // would fail here. Said once, after the launcher, keeping its exit code.
   it("says to open a new window when this one cannot run konteks-remote yet, and keeps the launcher's exit code", () => {
     const launched = script.indexOf("& $launcher install --activation-id $ActivationId");
     expect(launched).toBeGreaterThan(-1);
@@ -90,7 +90,7 @@ describe("bootstrap/install.ps1", () => {
     expect(tail.trimEnd().endsWith("exit $code")).toBe(true);
   });
 
-  // D131: an MSI from before 0.10.11 runs its own old code for every command
+  // An MSI from before 0.10.11 runs its own old code for every command
   // and no connector update replaces it. -Update installs this release's
   // launcher on a connected computer, then updates and starts the connector.
   it("updates a connected computer's launcher with -Update: no activation, the MSI first, then update and start", () => {

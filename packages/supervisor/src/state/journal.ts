@@ -546,7 +546,7 @@ export class SupervisorJournal {
   readonly decisions: AppendLog<DecisionRecord>;
   readonly manifests: AppendLog<ReconciliationManifestRecord>;
   readonly erase: AppendLog<EraseRecord>;
-  /** C03 local durable evidence. Never use this table as a terminal owner. */
+  /** Local durable recovery evidence. Never use this table as a terminal owner. */
   readonly recoveryEvidence: AppendLog<RecoveryEvidenceRecord>;
   /** Consumed integration write nonces; never pruned with assignments. */
   readonly integrationWrites: AppendLog<IntegrationWriteRecord>;
@@ -554,10 +554,10 @@ export class SupervisorJournal {
   private readonly planningLog: AppendLog<PlanningTerminalRecord>;
   readonly cancellations: CancellationInbox;
   private readonly cancellationLog: AppendLog<CancellationInboxRecord>;
-  /** C02 pre-fence evidence; not a provider-stop or terminal result. */
+  /** Execution revision pre-fence evidence; not a provider-stop or terminal result. */
   readonly executionRevisionFences: ExecutionRevisionFenceInbox;
   private readonly executionRevisionFenceLog: AppendLog<ExecutionRevisionFenceInboxRecord>;
-  /** C01 diagnostic-only evidence; it never changes delivery or authority. */
+  /** Diagnostic-only companion evidence; it never changes delivery or authority. */
   readonly diagnosticCompanions: DiagnosticCompanionInbox;
   private readonly diagnosticCompanionLog: AppendLog<DiagnosticCompanionInboxRecord>;
 

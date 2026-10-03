@@ -41,7 +41,7 @@ export function codexSetupLaunch(config: RunnerConfig): SetupCommandLaunch {
 }
 
 /**
- * The integration lane for a native installation (external-integration CP2):
+ * The integration lane for a native installation:
  * discovery through each agent's reviewed listing interface, the reviewed
  * setup catalogue, the runners for gated sessions, and the journal's
  * one-use write grants.

@@ -78,7 +78,7 @@ export class NativeRunner implements RunnerPort {
 
   /**
    * The browser (Playwright MCP) version this agent's sessions get: its own
-   * package's, or the connector's (O8) for an agent without one; null when
+   * package's, or the connector's for an agent without one; null when
    * the connector has no browser.
    */
   browserVersion(): string | null {
@@ -171,7 +171,7 @@ export class NativeRunner implements RunnerPort {
   }
 
   /** Why this agent was taken out of service, or null (doctor). */
-  /** The agent was signed in and the sign-in no longer works (runtime-view R21). */
+  /** The agent was signed in and the sign-in no longer works. */
   signInLost(): boolean {
     return this.runtime.signInLost();
   }

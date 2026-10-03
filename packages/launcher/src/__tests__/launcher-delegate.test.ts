@@ -24,7 +24,7 @@ function input(root: string, args: string[], overrides: Partial<Parameters<typeo
   return { platform: "win32", execPath: msi, args: ["--root", root, ...args], env: {}, launcherVersion: "v0.10.11", defaultRoot: () => root, ...overrides };
 }
 
-describe("the Windows konteks-remote command runs the installed release's own code (D131)", () => {
+describe("the Windows konteks-remote command runs the installed release's own code", () => {
   it("resolves the record's release executable for an ordinary command, with --root before or after it", async () => {
     const { root, executable } = await installedRoot();
     await expect(installedReleaseLauncher(input(root, ["start"]))).resolves.toEqual({ executable, bundleVersion: "0.10.12" });

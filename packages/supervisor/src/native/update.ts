@@ -27,7 +27,7 @@ export interface NativeUpdateCoordinatorOptions {
   /** An `in_progress` attempt older than this is treated as abandoned. */
   staleAttemptMs?: number;
   /**
-   * The release Core accepts (WS1-093): installing any other one is refused
+   * The release Core accepts: installing any other one is refused
    * by Core and costs minutes offline and a rollback. Undefined when Core
    * could not be asked; null when this Core does not say.
    */
@@ -54,7 +54,7 @@ export class NativeUpdateCoordinator {
    * Core refused this bundle as below its minimum (a `version_policy` or a
    * refused reconnect). Such a runtime has no lease, so Core cannot be asked
    * which release it accepts; a strictly newer signed release is then the way
-   * back in (RCA 2026-09-30: 14 runtimes below a raised minimum never updated).
+   * back in, so a runtime below a raised minimum still updates.
    */
   private refusedAsTooOld: { minimumSupportedBundle: string | null } | null = null;
   /** The last channel read's failure only (never a launch failure), for `doctor`. */

@@ -7,7 +7,7 @@ const disk = (...files: string[]) => (path: string) => files.map(file => file.to
 const PF = "C:\\Program Files";
 const LOCAL = "C:\\Users\\person\\AppData\\Local";
 
-describe("finding Git for Windows and its Git Bash (D116)", () => {
+describe("finding Git for Windows and its Git Bash", () => {
   it("follows git.exe on PATH to the Git Bash beside it, from cmd or mingw64\\bin", () => {
     const env = { PATH: `C:\\Windows\\System32;${PF}\\Git\\cmd` };
     expect(findGitForWindows(env, disk(`${PF}\\Git\\cmd\\git.exe`, `${PF}\\Git\\bin\\bash.exe`))).toEqual({ git: `${PF}\\Git\\cmd\\git.exe`, bash: `${PF}\\Git\\bin\\bash.exe` });

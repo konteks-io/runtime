@@ -7,7 +7,7 @@ import { writeOnboardState } from "../native/onboard-state.js";
 import { createOutput } from "../output.js";
 
 /**
- * W1-L2: a person asks their agent, in plain words, to remove Konteks from
+ * A person asks their agent, in plain words, to remove Konteks from
  * this laptop. Work drains, Konteks revokes and tombstones the runtime, and
  * the connector's folder goes; the repository and agent logins stay.
  */
@@ -73,7 +73,7 @@ describe("uninstall", () => {
     expect(lines.join("")).toContain("One piece of work is still running on this machine");
   });
 
-  it("waits for the connector to finish shutting down before deleting its folder, and removes a late write (W1-Z6)", async () => {
+  it("waits for the connector to finish shutting down before deleting its folder, and removes a late write", async () => {
     const d = deps([], {
       "drain.status": [{ draining: true, reason: "remove", activeAssignments: 0, openSessions: 0 }],
       "instance.retire": [{ outcome: "removed", activeAssignments: 0 }],

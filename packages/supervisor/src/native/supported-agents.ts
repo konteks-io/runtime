@@ -8,7 +8,7 @@ import { resolveNativeOpenCodeInstallation } from "./opencode-installation.js";
 
 /**
  * Every agent Konteks supports on a connector, in the order the site lists
- * them (runtime-view R21): the connector reports all five on each heartbeat,
+ * them: the connector reports all five on each heartbeat,
  * whether or not it runs them.
  */
 export const SUPPORTED_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode", "antigravity"] as const;
@@ -197,7 +197,7 @@ function antigravityPinnedHere(deps: NotAddedDetectionDeps): boolean {
 /**
  * Every minute. It is a look at a few folders and at most a `--version`, and
  * a person who installs an agent expects to see it within about a minute; the
- * doubling to fifteen minutes it had took seven after a while (W1-D4).
+ * doubling to fifteen minutes it had took seven after a while.
  */
 const REDETECT_MS = 60_000;
 

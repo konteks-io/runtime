@@ -41,7 +41,7 @@ function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdate
 const attempt = (over: Partial<NativeUpdateAttempt>): NativeUpdateAttempt => ({ id: `a-${Math.random()}`, bundleVersion: "1.1.0", manifestDigest: "d", releaseId: "release-x", reason: "unattended", startedAt: "2026-09-15T11:00:00Z", finishedAt: "2026-09-15T11:05:00Z", outcome: "rolled_back", detail: null, ...over });
 
 describe("native update coordinator", () => {
-  it("installs unattended only the release Core accepts (WS1-093)", async () => {
+  it("installs unattended only the release Core accepts", async () => {
     const ahead = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.0.0" }) });
     expect(await ahead.c.apply("periodic")).toMatchObject({ started: false, reason: "Konteks accepts 1.0.0, not 1.1.0 yet; staying on this one until it does" });
     expect(ahead.launch).not.toHaveBeenCalled();

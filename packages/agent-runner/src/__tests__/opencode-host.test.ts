@@ -114,7 +114,7 @@ describe("the OpenCode runner adapter", () => {
     // The control process (discovery, sign-in) never carries a working copy's instructions.
     await expect(lstat(join(paths.controlConfig, "opencode", "AGENTS.md"))).rejects.toThrow();
     await expect(openCodeRunnerAdapter.prepareToSpawn(config({ RUNNER_NATIVE_OPENCODE_BINARY: undefined }))).rejects.toMatchObject({ code: "agent_unavailable" });
-    // CP3: sign-in, sign-out and identity run OpenCode's own `auth` (opencode-login.test.ts); never without the located binary.
+    // Sign-in, sign-out and identity run OpenCode's own `auth` (opencode-login.test.ts); never without the located binary.
     const unlocated = config({ RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_NATIVE_OPENCODE_BINARY: undefined });
     expect(() => openCodeRunnerAdapter.startLogin!({ config: unlocated, events: {} as never, logger: { info: () => undefined, warn: () => undefined } })).toThrow(/installed OpenCode 2/);
     await expect(openCodeRunnerAdapter.logout!(unlocated)).rejects.toMatchObject({ code: "agent_unavailable" });

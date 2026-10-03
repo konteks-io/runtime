@@ -22,7 +22,7 @@ interface CapturedDiagnosticCompanionConnection {
 }
 
 /**
- * Receives the C01 sidecar independently from assignment and control traffic.
+ * Receives the diagnostic companion independently from assignment and control traffic.
  * Failure is deliberately diagnosable but cannot alter business delivery.
  */
 export class DiagnosticCompanionReceiver {
@@ -77,7 +77,7 @@ export class DiagnosticCompanionReceiver {
     try {
       await this.deps.onAccepted?.(record);
     } catch {
-      // C01 observation failure is explicitly non-fatal to work transport.
+      // A diagnostic companion's observation failure is explicitly non-fatal to work transport.
     }
     assertCurrent();
     return record;

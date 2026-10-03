@@ -80,7 +80,7 @@ describe("supervisor store", () => {
     expect((await stat(store.path("instance-key.jwk"))).mode & 0o777).toBe(0o600);
   });
 
-  it("writes relay state exactly as before while checking each buffered frame only once (WS2-157)", async () => {
+  it("writes relay state exactly as before while checking each buffered frame only once", async () => {
     const store = new SupervisorStore(dir);
     await store.init();
     const frame = (seq: number, reason = "completed") => ({ channel: "session", direction: "to_core", channelId: "s", connectionEpoch: 1, seq,
@@ -182,7 +182,7 @@ describe("assignment recovery journal", () => {
     expect(journal.assignments.all().length).toBeLessThanOrEqual(2_000);
   });
 
-  it("tracks pending requests per acpSessionRef (D114)", async () => {
+  it("tracks pending requests per acpSessionRef", async () => {
     const journal = new SupervisorJournal(dir);
     await journal.load();
     await journal.pendingRequests.put({ acpSessionRef: "acp-1", id: "r1", method: "session/prompt", direction: "received", openedAt: "2026-09-06T00:00:00Z", closedAt: null, deadlineAt: null, requestDigest: null });

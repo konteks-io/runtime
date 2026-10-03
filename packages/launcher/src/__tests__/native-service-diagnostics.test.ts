@@ -19,7 +19,7 @@ function decodeServiceDefinition(bytes: Uint8Array): string {
 const windowsRoot = "C:\\Users\\Test User\\AppData\\Local\\konteks-remote";
 const windows = () => nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Test User", root: windowsRoot, executable: `${windowsRoot}\\releases\\r1\\konteks-connector.exe`, userId: "S-1-5-21-1-2-3-1001" });
 
-describe("a service command that fails says which, how and what it printed (D129)", () => {
+describe("a service command that fails says which, how and what it printed", () => {
   it("carries the failing command, its exit code and a bounded excerpt of its output", async () => {
     const service = windows();
     const failing = async (command: NativeServiceCommand) => command === service.status ? 1 : command === service.install[0]
@@ -71,7 +71,7 @@ describe("a service command that fails says which, how and what it printed (D129
   });
 });
 
-describe("the Windows task keeps a connector log, like launchd's (D129)", () => {
+describe("the Windows task keeps a connector log, like launchd's", () => {
   const script = (service: ReturnType<typeof windows>) => {
     const encoded = service.supportFiles![0]!.contents.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)![1]!;
     return Buffer.from(encoded, "base64").toString("utf16le");
@@ -113,7 +113,7 @@ describe("the Windows task keeps a connector log, like launchd's (D129)", () => 
   });
 });
 
-describe("--verbose and KONTEKS_REMOTE_VERBOSE=1 (D129)", () => {
+describe("--verbose and KONTEKS_REMOTE_VERBOSE=1", () => {
   afterEach(() => setVerbose(false));
 
   it("prints each service command, its exit code and output to stderr only when asked", () => {
@@ -154,7 +154,7 @@ describe("--verbose and KONTEKS_REMOTE_VERBOSE=1 (D129)", () => {
   });
 });
 
-describe("doctor and support say the last failed start when the connector is not running (D129)", () => {
+describe("doctor and support say the last failed start when the connector is not running", () => {
   const dirs: string[] = [];
   afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
 
@@ -185,7 +185,7 @@ describe("doctor and support say the last failed start when the connector is not
   });
 });
 
-describe("service.xml is UTF-16 with a BOM wherever it is written, and heals when it is not (D129)", () => {
+describe("service.xml is UTF-16 with a BOM wherever it is written, and heals when it is not", () => {
   /** What 0.10.9 and older wrote (their renderer and a plain UTF-8 write): schtasks says "unable to switch the encoding". */
   const utf8Task = (definition: ReturnType<typeof windows>) => Buffer.from(definition.contents.replace('encoding="UTF-16"', 'encoding="UTF-8"'), "utf8");
 
@@ -262,11 +262,11 @@ describe("service.xml is UTF-16 with a BOM wherever it is written, and heals whe
 });
 
 /**
- * Only a real Windows can prove these; CI's windows-native job runs them
- * (D129). The task test needs an elevated runner, which CI is, so it proves
+ * Only a real Windows can prove these; CI's windows-native job runs them.
+ * The task test needs an elevated runner, which CI is, so it proves
  * Task Scheduler accepts the XML and its encoding, not a standard user's rights.
  */
-describe.runIf(process.platform === "win32")("on a real Windows (D129)", () => {
+describe.runIf(process.platform === "win32")("on a real Windows", () => {
   const dirs: string[] = [];
   afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
   const hostScript = (service: ReturnType<typeof windows>) => Buffer.from(service.supportFiles![0]!.contents.match(/-EncodedCommand ([A-Za-z0-9+/=]+)/)![1]!, "base64").toString("utf16le");

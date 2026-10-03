@@ -229,8 +229,8 @@ it("keeps a previous turn's channel while its terminal report is still being jou
 it("supersedes a previous turn that is still live here when Core places a new turn for the conversation", async () => {
   // Core admits a new conversation turn only when the session has no queued
   // or claimed assignment, so a live local owner is a turn Core already
-  // cancelled — and the cancellation itself needs protocol 2.0. Live
-  // 2026-09-12: a hosted turn that failed before its prompt arrived left a
+  // cancelled — and the cancellation itself needs protocol 2.0. Live,
+  // a hosted turn that failed before its prompt arrived left a
   // zombie owner, and every later turn on the session was refused as
   // assignment_conflict until the connector restarted.
   const f = await fixture({ closed: false, terminal: false });
@@ -452,7 +452,7 @@ it("explains an unqualified stopped predecessor and preserves its fence", async 
   expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
 });
 
-// Production 2026-10-01 (TKT-1): after a connector update the QA session was
+// After a connector update the QA session was
 // restored for one re-check, which completed. The next re-check of the same
 // kept changes failed at activation with a ZodError on every try, the idle
 // reaper could not release the session either, and the review never started.

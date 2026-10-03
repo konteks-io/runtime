@@ -233,7 +233,7 @@ export class Supervisor {
   /** The cached detection of supported agents the installation does not list. */
   private notAddedAgents: NotAddedAgentsDetector | null = null;
   /**
-   * The machine's own git (OB6 §5). It is a field rather than a dependency
+   * The machine's own git. It is a field rather than a dependency
    * because every onboard lane — role advertisement, the evidence collector
    * and the relocation worker — must use the SAME access, or a runtime could
    * advertise a capability one path has and another does not.

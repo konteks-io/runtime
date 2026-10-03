@@ -84,7 +84,7 @@ export interface NativeServiceDefinition {
  * A service manager reads a definition only when it loads it: launchd at
  * `bootstrap` (a KeepAlive respawn and `kickstart -k` reuse the loaded copy),
  * systemd at `daemon-reload`. Rewriting the file while the service runs
- * changes nothing until it is loaded again (RCA 2026-10-01: an updated
+ * changes nothing until it is loaded again (an updated
  * connector ran with stdout on /dev/null after the update, because the
  * install launcher had loaded a plist without the log file).
  */
@@ -116,7 +116,7 @@ const LAUNCHD_EXIT_TIMEOUT_SECONDS = 30;
  * The bytes of a definition file, the one encoding every writer uses: Task
  * Scheduler reads UTF-16LE with a byte-order mark, the others UTF-8. A task
  * file in any other encoding is refused by `schtasks /Create` with "unable to
- * switch the encoding" (D129: 0.10.9 and older wrote UTF-8, and a failed
+ * switch the encoding" (0.10.9 and older wrote UTF-8, and a failed
  * refresh put a decoded copy back re-encoded under its old declaration).
  */
 export function encodeServiceDefinition(definition: Pick<NativeServiceDefinition, "contents" | "fileEncoding">): Buffer {
@@ -151,7 +151,7 @@ function serviceCommandName(command: NativeServiceCommand): string {
 
 /**
  * A service command that failed, or a definition file that could not be
- * written: which one, how it ended and what it printed (D129). The message
+ * written: which one, how it ended and what it printed. The message
  * never carries a secret: the commands are fixed and take only paths and the
  * task label.
  */
@@ -284,15 +284,15 @@ function launchAgentDefinition({ input, path, normalizedRoot, label, args }: Ser
   const file = path.join(input.home, "Library", "LaunchAgents", `${label}.plist`);
   const domain = `gui/${input.uid}`;
   // launchd keeps nothing a service prints: without a file the connector's
-  // log, which doctor points to, did not exist (WS1-163). The connector
+  // log, which doctor points to, did not exist. The connector
   // keeps the file small itself (connector-log.ts).
   // The home it was started from, as the service's own: launchd otherwise
   // hands a service the login's home, so a connector installed for another
   // home (a second person on this Mac, a stand-in laptop) read the wrong
   // agents' sign-ins and installs (09-30).
   const logFile = path.join(normalizedRoot, "logs", CONNECTOR_LOG_FILE);
-  // launchd SIGKILLs a booted-out job 5 s after SIGTERM by default (measured
-  // 2026-10-02, D113b): an idle connector was still stopping its agents, so
+  // launchd SIGKILLs a booted-out job 5 s after SIGTERM by default (measured):
+  // an idle connector was still stopping its agents, so
   // it never wrote its shutdown receipt and its Codex app-server was left
   // behind. 30 s covers the connector's own 15 s shutdown watchdog.
   return {
@@ -368,7 +368,7 @@ const WINDOWS_LOG_MAX_BYTES = 20 * 1024 * 1024;
 /**
  * The hidden PowerShell host the Windows task runs. Task Scheduler keeps
  * nothing a task prints, so a connector that stopped as it started left no
- * trace (D129); like launchd's StandardOutPath, the connector's stdout and
+ * trace; like launchd's StandardOutPath, the connector's stdout and
  * stderr are appended to `<root>\logs\connector.log` from its very first
  * byte. Windows PowerShell's own redirection turns a native program's stderr
  * into error records (and, under `Stop`, ends the pipeline at the first

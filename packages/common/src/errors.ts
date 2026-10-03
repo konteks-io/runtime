@@ -55,7 +55,7 @@ export const RemoteInstanceErrorCodeSchema = z.enum([
   "active_work",
   "ownership_promotion_denied",
   "limit_exceeded",
-  // D143 assignment transport dispositions, mirrored from the shared taxonomy.
+  // Assignment transport dispositions, mirrored from the shared taxonomy.
   "assignment_channel_invalid",
   "assignment_sequence_gap",
   "assignment_replay_conflict",

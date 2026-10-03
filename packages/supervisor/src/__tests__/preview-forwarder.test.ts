@@ -51,7 +51,7 @@ function responseOf(sent: PreviewToCoreChunk[], streamId: string) {
 
 const b64 = (text: string) => Buffer.from(text).toString("base64url");
 
-describe("preview forwarder (loopback only, D125 policy on this hop)", () => {
+describe("preview forwarder (loopback only, preview policy on this hop)", () => {
   it("forwards a GET to the session's loopback port and returns the response in bounded chunks with only allowlisted headers", async () => {
     handler = (request, response) => {
       response.setHeader("set-cookie", "leak=1");
@@ -231,7 +231,7 @@ describe("preview channel on the supervisor", () => {
     f.instance.closeChannel("preview:sess-2");
     expect(f.closed).toEqual(["preview:sess-2"]);
     expect(f.instance.hasViewer("sess-2")).toBe(false);
-    // A channel no viewer reached in this process still drops its counts (W1-Z7).
+    // A channel no viewer reached in this process still drops its counts.
     f.instance.closeChannel("preview:sess-9");
     expect(f.closed).toEqual(["preview:sess-2", "preview:sess-9"]);
   });

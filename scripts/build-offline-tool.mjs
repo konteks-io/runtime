@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Build the offline Graft package a release ships next to the connector
- * (W1-G1, WS1-081): `konteks-graft-<os>-<architecture>.tgz`, holding
+ * Build the offline Graft package a release ships next to the connector:
+ * `konteks-graft-<os>-<architecture>.tgz`, holding
  * `node_modules/@nanonets/graft` with its native grammars compiled for this
  * platform. It carries no Node: the connector runs it on the Node inside the
  * release's own agent packages, so it must be built with that same Node

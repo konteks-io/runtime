@@ -2,7 +2,7 @@ import type { FetchFn } from "@konteks/remote-common";
 import { gitGap, gitOk, type GitAccess, type GitResult } from "./git.js";
 
 /**
- * The fallback single-file read (OB6 gotcha): `git archive --remote` is disabled
+ * The fallback single-file read: `git archive --remote` is disabled
  * on GitHub and on plenty of self-hosted installs, so a ref that the archive
  * path cannot produce is read through the provider's raw-file API instead —
  * still with **the machine's own credential**, obtained through `git credential

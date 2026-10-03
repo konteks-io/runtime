@@ -23,7 +23,7 @@ import type { MeasuredTurn } from "./usage-label.js";
 
 /**
  * ACP sessions inside this runner. The supervisor creates them as a
- * consequence of claiming an assignment (D98): `session/new` or a proven
+ * consequence of claiming an assignment: `session/new` or a proven
  * `load`/`resume`, with the redeemed platform MCP capability token composed
  * into `mcpServers` in memory. The runner keeps only an opaque `acpSessionRef`
  * per session; the bridge's own session id never leaves this process.
@@ -53,7 +53,7 @@ interface CreateSessionArgs {
   /** Display-only naming for the provider session list; never authority. */
   sessionLabel?: KonteksSessionLabel;
   /**
-   * An integration task's own session (external-integration CP2): the one
+   * An integration task's own session: the one
    * personal MCP server (Codex) or the account connectors (Claude) this NEW
    * session admits, sent as `_meta.konteksIntegration` for the bridge patches.
    * Never carried into a continued or restored session.
@@ -109,7 +109,7 @@ interface SessionRecord {
   modelValue?: string;
   /** The session's cumulative cost in USD as the agent last reported it (`usage_update.cost`); unknown until reported or a new session. */
   sessionCostUsd?: number;
-  /** `sessionCostUsd` when the running turn started; its cost is the difference (O7). */
+  /** `sessionCostUsd` when the running turn started; its cost is the difference. */
   turnCostStartUsd?: number;
   /** The agent reported a cost since the last turn ended: without one, a turn's cost is unknown, never zero. */
   costReported?: boolean;
@@ -120,7 +120,7 @@ interface SessionRecord {
 }
 
 /**
- * How a turn's usage is labelled (O7): a subscription turn, or a pay-per-use
+ * How a turn's usage is labelled: a subscription turn, or a pay-per-use
  * turn naming the provider (and model) it reached. Null: not reported at all.
  */
 export type TurnUsageLabel =
@@ -168,7 +168,7 @@ export interface SessionManagerOptions {
    */
   refusedModes?: {
     readonly modeIds: readonly string[];
-    /** When set, every mode outside it is refused too (Codex: only "Ask for approval", S0-3). */
+    /** When set, every mode outside it is refused too (Codex: only "Ask for approval"). */
     readonly allowedModeIds?: readonly string[];
     readonly message: string;
   };
@@ -176,7 +176,7 @@ export interface SessionManagerOptions {
   refusedPromptCommands?: { readonly commands: readonly string[]; readonly message: string };
   /**
    * Whether a model value may be used (OpenCode: Zen's free models only when
-   * switched on, O6). A session that would start on a model it may not use is
+   * switched on). A session that would start on a model it may not use is
    * moved to the first one it may, before ready; asking for one is refused.
    */
   modelAllowed?: (value: string) => boolean;
@@ -186,7 +186,7 @@ export interface SessionManagerOptions {
   sessionMeta?: Readonly<Record<string, unknown>>;
   /** Checks what a new, loaded or resumed session reports before it reads ready; throws on drift. */
   verifySession?: (response: { configOptions?: unknown; modes?: unknown }) => void;
-  /** Content put in front of a prompt (Antigravity: the working copy's AGENTS.md, A9). */
+  /** Content put in front of a prompt (Antigravity: the working copy's AGENTS.md). */
   promptPrelude?: (session: HostPromptSession) => Promise<HostPromptPrelude | null>;
   /** A reply text that is really the agent's failure report; never forwarded, reported as the turn's error. */
   agentErrorText?: (text: string) => HostTurnError | null;
@@ -197,7 +197,7 @@ export interface SessionManagerOptions {
    */
   measureTurn?: (bridge: BridgeProcess) => (() => MeasuredTurn | null) | null;
   /**
-   * Every `available_commands_update` of a session (runtime-view R19): the
+   * Every `available_commands_update` of a session: the
    * runtime keeps the latest per agent. The update is still forwarded on the
    * session stream unchanged.
    */
@@ -678,7 +678,7 @@ export class SessionManager {
    * The released session is then closed on the agent (`session/close`): the
    * process may stay resident for the next session, and an ACP adapter keeps
    * every session it was never told to close alive (Claude Code: one
-   * `claude` child each, which piled up on a reused process, 2026-10-02).
+   * `claude` child each, which piled up on a reused process).
    * The returned promise settles once that close is confirmed, failed or past
    * its deadline; anything but a confirmed close leaves the session counted
    * by `sessionsBoundTo`, so the runtime stops the process instead of
@@ -1207,7 +1207,7 @@ export class SessionManager {
    * the connector sent it. Join here, under the session owner, so the reply to
    * a Konteks prompt is the Konteks turn's output. Before this, every Codex
    * reply to a Konteks prompt was treated as someone else's local turn and
-   * dropped, so a Codex QA could never return a verdict (WS2-158). A turn the
+   * dropped, so a Codex QA could never return a verdict. A turn the
    * connector did not open stays unclassified.
    */
   private attributeNativeTurn(record: SessionRecord, sessionUpdate: string, observation: AcpNativeObservation): AcpNativeObservation {
@@ -1227,7 +1227,7 @@ export class SessionManager {
   /**
    * Bridge → supervisor: permission and elicitation requests. The runner never
    * decides; it forwards to the supervisor (policy first, then a human via the
-   * relay, D87) and waits for exactly one answer or a deadline failure.
+   * relay) and waits for exactly one answer or a deadline failure.
    */
   onRequestPermission(params: RequestPermissionRequest, bridge = this.options.bridge()): Promise<RequestPermissionResponse> {
     const record = this.liveRecord(params.sessionId, bridge);
@@ -1254,7 +1254,7 @@ export class SessionManager {
    * until the next adopts it. Work the agent starts on its own in between (a
    * background timer from the last turn firing) has nobody to answer it. A
    * request parked here was never answered and made the next turn refuse the
-   * session as busy (WS2-130). Refuse it at once and cancel that stray turn.
+   * session as busy. Refuse it at once and cancel that stray turn.
    */
   private refuseUnownedWork<T>(record: SessionRecord, refusal: T): Promise<T> {
     const bridge = record.bridge;
@@ -1283,7 +1283,7 @@ export class SessionManager {
 
   /**
    * A turn measured outside the agent: pay-per-use on the person's own key,
-   * with the list-price estimate when every model it used has a price (A8).
+   * with the list-price estimate when every model it used has a price.
    */
   private publishMeasuredUsage(record: SessionRecord, turn: MeasuredTurn): void {
     const observation: AgentTurnUsageObservation = {

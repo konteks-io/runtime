@@ -2,8 +2,8 @@ import { z } from "zod";
 import pins from "./fetched-agents.json" with { type: "json" };
 
 /**
- * The pins of the agents the connector fetches itself (antigravity-runtime-support
- * A2, A15): per platform, the vendor's archive URL, its size and sha256, the
+ * The pins of the agents the connector fetches itself:
+ * per platform, the vendor's archive URL, its size and sha256, the
  * size and sha256 of every file it unpacks to, the command and arguments the
  * vendor's registry entry names, and the signer the OS must confirm. The file
  * is reviewed like the host model mappings and travels inside the connector

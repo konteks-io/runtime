@@ -19,7 +19,7 @@ import { StateMutationGate } from "../state/mutation-gate.js";
 import { acquireNativeRootLock } from "./root-lock.js";
 
 /**
- * The runtime's half of agent-first enrollment (onboarding-simplified OS5–OS9).
+ * The runtime's half of agent-first enrollment.
  *
  * This is the launcher's client, not the supervisor's: at enrollment time no
  * supervisor is running, there is no identity and no lease, and the process
@@ -49,7 +49,7 @@ const IntentOpenedSchema = z
     intentRef: z.string().min(1),
     status: z.string().min(1),
     expiresAt: z.string().min(1),
-    /** Set when this key's runtime lost only the person's access: proving the address gives it back (W1-Z4). */
+    /** Set when this key's runtime lost only the person's access: proving the address gives it back. */
     restoresInstanceId: z.string().min(1).optional(),
   })
   .strict();
@@ -169,8 +169,7 @@ export class NativeEnrollment {
   }
 
   /**
-   * Bind, then persist what the activation exchange would have persisted
-   * (onboarding-simplified OS3, OS9).
+   * Bind, then persist what the activation exchange would have persisted.
    *
    * Core answers with the identity, the provisioning credential and the
    * signed bundle manifest. Before any of it is believed, the manifest is
@@ -251,7 +250,7 @@ export class NativeEnrollment {
 
   /**
    * Bind a reopened intent back to the runtime it names: the person proved
-   * their address again after revoking only this machine's access (W1-Z4).
+   * their address again after revoking only this machine's access.
    * Nothing on disk changes but the token the caller keeps, so this works
    * while the connector runs.
    */

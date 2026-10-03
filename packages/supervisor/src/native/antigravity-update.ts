@@ -6,13 +6,13 @@ import { nativeHostRunnerConfig, NativeRuntimeRecordSchema, readNativeRuntimeRec
 import { acquireNativeRootLock } from "./root-lock.js";
 
 /**
- * Keeping Google Antigravity current (antigravity-runtime-support A17). The
+ * Keeping Google Antigravity current. The
  * pin travels with the runtime release, so after `konteks-remote update`
  * the new connector finds a record naming the old version (or, after a
  * rollback, a version whose folder a newer connector already pruned). The
- * person's first yes covers keeping it current (A20's consent text says so):
+ * person's first yes covers keeping it current (its consent text says so):
  * a record that lists Antigravity is that yes. So the connector fetches this
- * release's pin in the background, verifies it (A16), runs the start check
+ * release's pin in the background, verifies it, runs the start check
  * on it, and only then switches: the record names the new copy, new
  * sessions run it, and the other versions are removed. The old copy cannot
  * run under a release that no longer pins it, so no session is left on it

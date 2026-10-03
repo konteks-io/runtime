@@ -27,7 +27,7 @@ const FINGERPRINT_KEY_FILE = "fingerprint.key";
 
 /**
  * The person's own OpenCode 2 (opencode-runtime-support). OpenCode signs in
- * from its environment (CP0: `auth list` showed "GitHub Copilot ·
+ * from its environment (`auth list` showed "GitHub Copilot ·
  * GITHUB_TOKEN · environment"), so every execution of the binary by the
  * connector (sessions, `--version`, `debug`, `auth`) gets an environment built
  * from an ALLOW-LIST: nothing inherited but what is named below, never a
@@ -47,7 +47,7 @@ export interface OpenCodeRuntimePaths {
   data: string;
   state: string;
   cache: string;
-  /** Parent of the per-working-copy XDG_CONFIG_HOME folders (CP2). */
+  /** Parent of the per-working-copy XDG_CONFIG_HOME folders. */
   configs: string;
   /** XDG_CONFIG_HOME of the control process (discovery, sign-in), which has no working copy. */
   controlConfig: string;
@@ -102,7 +102,7 @@ export interface OpenCodePermissionRule {
 
 /**
  * The Konteks permission rules, in order. OpenCode applies the LAST matching
- * rule and puts its own defaults before ours (CP0-v2, verified with `opencode
+ * rule and puts its own defaults before ours (verified with `opencode
  * debug agents`), so the leading `* ask` overrides every default, and the
  * `.env` rows are restated after our `read` allow, which would otherwise
  * re-open them. `external_directory`, Code Mode's built-in browser and
@@ -127,7 +127,7 @@ export const OPENCODE_KONTEKS_PERMISSIONS: readonly OpenCodePermissionRule[] = O
   // `browser`) and OpenCode's own (`tools.opencode.session_move`, which moves
   // the session to another folder, `session_rename`, `models`, the MCP
   // resource readers; permission `opencode_<tool>`). A deny drops a tool from
-  // the catalogue (live on 2.0.18, CP4: `browser.*` and `opencode.*` do not).
+  // the catalogue (live on 2.0.18: `browser.*` and `opencode.*` do not).
   { action: "browser", resource: "*", effect: "deny" },
   { action: "opencode_*", resource: "*", effect: "deny" },
 ].map(rule => Object.freeze(rule as OpenCodePermissionRule)));
@@ -158,7 +158,7 @@ export function renderOpenCodeKonteksConfig(): Record<string, unknown> {
 /**
  * Konteks' own `OPENCODE_*` settings for every OpenCode process: the locked
  * configuration, the repository's own config switched off (a repo
- * `opencode.json` or `.opencode/agent` re-allowed everything in CP0), and no
+ * `opencode.json` or `.opencode/agent` would otherwise re-allow everything), and no
  * file watcher (it otherwise watches every parent folder up to `/`).
  */
 export function openCodeKonteksSettings(): Record<string, string> {
@@ -351,7 +351,7 @@ function openCodeLoginRequest(request: HostLoginRequest): OpenCodeLoginRequest {
  * every OpenCode process of this runner (sign-ins and sessions). The control
  * process (discovery, sign-in) uses a config folder with no instructions;
  * each execution process gets its working copy's own (`bindWorkingCopy`).
- * Offered on the install side since CP6 (`openCodeInstallAdapter.offered`).
+ * Offered on the install side (`openCodeInstallAdapter.offered`).
  */
 export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   agentId: "opencode",
@@ -373,8 +373,8 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
     binary(config, family);
     return bindOpenCodeWorkingCopy(config.RUNNER_CREDENTIAL_DIR, workingCopy);
   },
-  // O2: OpenCode's own `auth login`, driven and relayed (link and code for a
-  // subscription, OpenCode's own key prompt for an API key); O10's one-time
+  // OpenCode's own `auth login`, driven and relayed (link and code for a
+  // subscription, OpenCode's own key prompt for an API key); the one-time
   // offer to repeat the person's own OpenCode sign-ins.
   startLogin: ({ config, events, logger, loginId, request }) => {
     const context = openCodeCommandContext(config);
@@ -389,7 +389,7 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   async identity(config, settings) {
     // What OpenCode's own `auth list` reports in the private home: provider,
     // method and credential id, never a secret. With nothing signed in, Zen's
-    // free models make it ready only when the person switched them on (O6).
+    // free models make it ready only when the person switched them on.
     const stored = await listOpenCodeCredentials(await preparedOpenCodeCommandContext(config));
     const credentials = openCodeCredentialViews(stored);
     const material = openCodeIdentityMaterial(stored, settings.openCodeFreeModels);
@@ -400,9 +400,9 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   siteLoginOptions: async config => openCodeSiteLoginOptions(await listOpenCodeIntegrations(await preparedOpenCodeCommandContext(config))),
   offersModel: (value, settings) => settings.openCodeFreeModels || !isOpenCodeFreeModel(value),
   hostVersion: config => config.RUNNER_BRIDGE_VERSION !== "unknown" ? config.RUNNER_BRIDGE_VERSION : undefined,
-  // OpenCode returns usage with each prompt response (CP0-v2).
+  // OpenCode returns usage with each prompt response.
   tokenUsageObservable: true,
   // ACP still offers `plan` with the plan agent switched off, accepts it, and
-  // a prompt in that mode hangs (CP2); plan mode also runs shell unasked.
+  // a prompt in that mode hangs; plan mode also runs shell unasked.
   refusedSessionModes: { modeIds: ["plan"], message: "OpenCode's plan mode is not available on Konteks." },
 };

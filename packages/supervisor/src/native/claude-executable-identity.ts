@@ -11,7 +11,7 @@ import { createLogger, type Logger } from "@konteks/remote-common";
  * release's pinned package is not runnable. Its version and sha256 ride the
  * `agent_runner` component's capabilities as one string, so anything bound to
  * one executable (a compatibility certificate) is invalidated when the person
- * updates or replaces it (external-integration Stage 0, S0-5; finding C1).
+ * updates or replaces it.
  */
 const CLAUDE_EXECUTABLE_CAPABILITY_PREFIX = "claude-code-executable:";
 

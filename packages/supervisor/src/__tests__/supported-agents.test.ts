@@ -8,7 +8,7 @@ const view = (agentId: string, readiness: ConnectedAgentView["readiness"], conne
 });
 const refusal = (diagnostic: string | undefined, message = "refused") => new RemoteInstanceError("prerequisite_missing", message, diagnostic ? { diagnostic } : {});
 
-describe("supported agents on this computer (runtime-view R21)", () => {
+describe("supported agents on this computer", () => {
   it("reports all five, in order, with a state each, the supported range and the install commands", () => {
     const added = new Map<string, AddedAgentFacts>([
       ["claude-code", { view: view("claude-code", "ready") }],
@@ -73,7 +73,7 @@ describe("supported agents on this computer (runtime-view R21)", () => {
     expect(await detectNotAddedAgent("antigravity", { antigravityPinned: () => false })).toEqual({ state: "not_supported_on_this_os" });
   });
 
-  it("re-detects in the background every minute, never on every heartbeat (W1-D4)", async () => {
+  it("re-detects in the background every minute, never on every heartbeat", async () => {
     let now = 1_000_000;
     const claude = vi.fn(async () => "/usr/local/bin/claude");
     const detector = new NotAddedAgentsDetector({ agentIds: ["claude-code"], now: () => now, deps: { claude } });

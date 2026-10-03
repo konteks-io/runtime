@@ -22,11 +22,11 @@ interface NativeInstallOptions {
     manifest?: unknown; fetchFn?: typeof fetch; activate?: typeof runNativeActivationExchange;
     readActivationCode?: () => Promise<string>;
     git?: NativeRuntimeRecord["git"] | null;
-    /** A fetched agent's consent line answered (Google Antigravity, A20); without it nothing is downloaded. */
+    /** A fetched agent's consent line answered; without it nothing is downloaded. */
     consent?: FetchConsent;
     /**
      * Without an explicit agent list: Claude Code or Codex, when not found
-     * here, offered to the person before the code is asked (D116); true once
+     * here, offered to the person before the code is asked; true once
      * it is here. Without it the install connects with what it found.
      */
     setupAgent?: (agentId: "claude-code" | "codex") => Promise<boolean>;
@@ -185,7 +185,7 @@ const ENROLLMENT_MANIFEST = "enrollment-manifest.json";
 const AGENT_ORDER = ["claude-code", "codex", "dsh", "opencode", "antigravity"];
 
 /**
- * Every agent family this machine actually has (OS14): Claude Code's
+ * Every agent family this machine actually has: Claude Code's
  * executable and Codex's profile by file checks, and the agents the person
  * installed themselves (DeepSeek Harness, OpenCode 2) when offered. A fetched
  * one (Google Antigravity) is never detected: the connector downloads it, it
@@ -202,7 +202,7 @@ async function detectNativeAgents(root: string): Promise<string[]> {
   return detected;
 }
 
-/** The agents found here, plus Claude Code or Codex when the person set one up on being asked (D116). */
+/** The agents found here, plus Claude Code or Codex when the person set one up on being asked. */
 async function findOrOfferAgents(root: string, setupAgent?: (agentId: "claude-code" | "codex") => Promise<boolean>): Promise<string[]> {
   const agents = await detectNativeAgents(root);
   for (const agent of ["claude-code", "codex"] as const) {
@@ -213,7 +213,7 @@ async function findOrOfferAgents(root: string, setupAgent?: (agentId: "claude-co
 }
 
 /**
- * The control port a new enrollment records (WS1-020): the default when it is
+ * The control port a new enrollment records: the default when it is
  * free, otherwise one the system hands out. A machine that already runs another
  * Konteks connector would otherwise get a runtime that activates and then dies
  * on `EADDRINUSE`.
@@ -371,7 +371,7 @@ export async function moveRecordAndManifest(move: {
 }
 
 /**
- * The fast half of an enrollment install (WS1-012): detect the families,
+ * The fast half of an enrollment install: detect the families,
  * fetch and verify the signed release, and remember it. Enough for `onboard`
  * to ask the first question; nothing is unpacked. The signed payload is kept
  * so the unpacking verifies exactly what was recorded, without a second fetch.
@@ -533,7 +533,7 @@ const NativeEnrollmentRecordSchema = z.object({
   coreUrl: z.string().min(1),
   relayUrl: z.string().min(1),
   agents: z.array(z.string().min(1)),
-  /** Absent until the agent packages are unpacked (WS1-012). */
+  /** Absent until the agent packages are unpacked. */
   releaseId: z.string().min(1).optional(),
   bundleVersion: z.string().min(1),
   manifestDigest: z.string().min(1),
@@ -549,7 +549,7 @@ export async function readNativeEnrollment(root: string): Promise<NativeEnrollme
 }
 
 /**
- * Finish an enrollment install once `onboard` has bound the machine (OS3).
+ * Finish an enrollment install once `onboard` has bound the machine.
  *
  * `bind` persisted the identity, provisioning state and manifest record under
  * `supervisor/`; this writes the runtime record that `start`, `status` and
@@ -766,7 +766,7 @@ interface NativeAgentRemoveOptions {
 }
 
 /**
- * Remove a fetched agent (Google Antigravity, A18) without reactivation:
+ * Remove a fetched agent without reactivation:
  * with the service stopped (the caller's part, as for `agent add`), sign it
  * out on a process of the connector's own, drop it from the runtime record
  * (the installation must still load), then delete every downloaded version,
@@ -849,8 +849,7 @@ function invalid() { return new RemoteInstanceError("install_state_corrupt", "Na
 /**
  * Retired agents (Pi, Cline) are refused on install with the one shared
  * sentence. A host agent that is not offered is refused too, whatever the
- * shared list says (none today: OpenCode 2 is offered since
- * opencode-runtime-support CP6).
+ * shared list says (none today: OpenCode 2 is offered).
  */
 function refuseRetiredAgents(agents: readonly string[]): void {
   const retired = agents.find(agent => isRetiredAgentId(agent));
@@ -881,7 +880,7 @@ async function locateHostAgents(agents: readonly string[], root: string, consent
 }
 
 /**
- * A fetched agent's download (A20): refused first where the release pins no
+ * A fetched agent's download: refused first where the release pins no
  * copy for this computer, then the consent line, then Google's zip into the
  * connector's own folder, checked. A copy that already verifies is kept
  * without asking.

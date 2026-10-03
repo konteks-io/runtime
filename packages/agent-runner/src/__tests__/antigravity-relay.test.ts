@@ -10,7 +10,7 @@ import { GEMINI_API_ORIGIN, geminiRelayRoute, startAntigravityRelay, type Antigr
 import { geminiMeasuredTurn } from "../sessions/usage-label.js";
 
 /**
- * The Gemini API key relay (A7, CP3) against a fake Google endpoint on
+ * The Gemini API key relay against a fake Google endpoint on
  * loopback: the per-process token is required, only Gemini model paths reach
  * Google, the real key replaces the token and nothing else is sent, answers
  * stream through, and Google's usageMetadata is counted per model and turn.
@@ -77,7 +77,7 @@ function call(relay: AntigravityRelay, path: string, options: { method?: string;
   });
 }
 
-describe("the Gemini API key relay (A7)", () => {
+describe("the Gemini API key relay", () => {
   it("listens on loopback only and forwards to Google unless a test replaces the upstream", async () => {
     const relay = await startAntigravityRelay({ key: KEY });
     relays.push(relay);
@@ -173,7 +173,7 @@ describe("the Gemini API key relay (A7)", () => {
 
 const haveOpenssl = (() => { try { execFileSync("openssl", ["version"], { stdio: "ignore" }); return true; } catch { return false; } })();
 
-describe("the relay behind a proxy (antigravity CP6)", () => {
+describe("the relay behind a proxy", () => {
   it.runIf(haveOpenssl)("reaches Google through HTTPS_PROXY's CONNECT tunnel with its own TLS session, and straight when NO_PROXY covers the host", async () => {
     const certDir = await mkdtemp(join(tmpdir(), "agy-relay-cert-"));
     const sockets: Socket[] = [];
@@ -238,7 +238,7 @@ describe("the relay behind a proxy (antigravity CP6)", () => {
   });
 });
 
-describe("an API-key turn's money (A8)", () => {
+describe("an API-key turn's money", () => {
   it("is Google's usage at the catalogue's list price, named as an estimate of the model that did the work", () => {
     const turn = geminiMeasuredTurn([{ model: "gemini-3.8-flash", requests: 3, usage: { ...USAGE_1, toolUsePromptTokenCount: 0 } }]);
     expect(turn).toMatchObject({
