@@ -397,6 +397,33 @@ describe("the zip reader and the signature check", () => {
     for (const name of ["agy_acp_server.par", "bin/agy", "a.b/c-d_e"]) expect(safeArchivePath(name), name).toBe(true);
   });
 
+  it("refuses links, special files, duplicate names, a local header that disagrees, overlapping data and zip64 or spanned markers", async () => {
+    dir = await mkdtemp(join(tmpdir(), "agy-zip-"));
+    const write = async (name: string, data: Buffer) => { const path = join(dir, name); await writeFile(path, data); return path; };
+    const refused = async (name: string, data: Buffer) => expect(readZipEntries(await write(name, data))).rejects.toMatchObject({ reason: "unsafe_archive" });
+    await refused("link.zip", zip([{ name: "a", data: SERVER, mode: 0o120777 }]));
+    await refused("fifo.zip", zip([{ name: "a", data: SERVER, mode: 0o010644 }]));
+    await refused("twice.zip", zip([{ name: "a", data: SERVER }, { name: "A", data: HARNESS }]));
+    await refused("folder-with-data.zip", zip([{ name: "bin/", data: SERVER, mode: 0o040755 }]));
+    const renamed = zip([{ name: "a", data: SERVER }]);
+    renamed.write("b", 30);
+    await refused("renamed.zip", renamed);
+    const stored = zip([{ name: "a", data: SERVER }]);
+    stored.writeUInt16LE(0, stored.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02])) + 10);
+    await refused("method.zip", stored);
+    const overlapping = zip([{ name: "a", data: SERVER }, { name: "b", data: SERVER }]);
+    const second = overlapping.lastIndexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    overlapping.writeUInt32LE(0, second + 42);
+    await refused("overlap.zip", overlapping);
+    const zip64 = zip([{ name: "a", data: SERVER }]);
+    zip64.writeUInt32LE(0xffffffff, zip64.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02])) + 24);
+    await refused("zip64.zip", zip64);
+    const spanned = zip([{ name: "a", data: SERVER }]);
+    spanned.writeUInt16LE(1, spanned.length - 22 + 4);
+    await refused("spanned.zip", spanned);
+    await expect(readZipEntries(await write("good-again.zip", GOOD))).resolves.toHaveLength(2);
+  });
+
   it("never passes a signer for another operating system", async () => {
     await expect(verifyFetchedSignature("/nonexistent", { kind: "apple_team_id", teamId: "EQHXZ8M8AV" }, "linux")).resolves.toBe(false);
     await expect(verifyFetchedSignature("/nonexistent", { kind: "authenticode", subject: "CN=Google LLC" }, "darwin")).resolves.toBe(false);
