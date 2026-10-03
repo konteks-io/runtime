@@ -1143,178 +1143,243 @@ export class WorkOrchestrator {
    * thread's existing session before starting another. Returns the continued
    * reference, if any.
    */
-  private async takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<{ reference: string; mode: "live" | "restore" } | undefined> {
-    const source = assignment.source;
-    const continued = continuedSession(source);
-    if (!continued && source.kind !== "harness_delivery") return undefined;
-    const logicalSessionId = source.kind === "harness_delivery" ? source.executionSessionId : continued!.sessionId;
-    const channelId = `session:${logicalSessionId}`;
-    // The channel's owner may be a turn that just closed unfinished and is
-    // still proving its process gone: hand over only after that stop settles.
+  private async takeOverCompletedChannel(assignment: RemoteWorkAssignment, admission: LocalAdmission, assertCurrent: () => void): Promise<Takeover | undefined> {
+    const sessionId = logicalSessionId(assignment.source);
+    if (sessionId === undefined) return undefined;
+    const channelId = `session:${sessionId}`;
+    await this.awaitClosingOwner(channelId, assertCurrent);
+    this.assertNoRecoveringPredecessor(assignment);
+    const predecessor = this.channelOwners.get(channelId);
+    if (!predecessor) return this.takeOverWithoutLiveOwner(assignment, admission, sessionId, assertCurrent);
+    return this.takeOverFromOwner({ assignment, admission, sessionId, channelId, predecessor, assertCurrent });
+  }
+
+  /**
+   * The channel's owner may be a turn that just closed unfinished and is
+   * still proving its process gone: hand over only after that stop settles.
+   */
+  private async awaitClosingOwner(channelId: string, assertCurrent: () => void): Promise<void> {
     const closing = this.channelOwners.get(channelId);
     const closingAdmission = closing && this.deps.journal.execution.admission(closing.assignment.id, closing.assignment.attempt);
     const retiring = closingAdmission && this.executionRetirements.get(closingAdmission.executionGeneration);
-    if (retiring) {
-      await retiring.catch(() => undefined);
-      assertCurrent();
+    if (!retiring) return;
+    await retiring.catch(() => undefined);
+    assertCurrent();
+  }
+
+  /**
+   * A connector restart removes only the in-memory owner. Core's opaque
+   * reference and the runner's credential-volume mapping survive, so the
+   * later bootstrap must attempt ACP session/load. The runner fails closed
+   * with agent_session_lost if either the mapping or provider state is gone.
+   */
+  private async takeOverWithoutLiveOwner(assignment: RemoteWorkAssignment, admission: LocalAdmission, sessionId: string, assertCurrent: () => void): Promise<Takeover | undefined> {
+    const continued = continuedSession(assignment.source);
+    if (continued && continued.acpSessionRef !== undefined) this.logger.info({ assignmentId: assignment.id, attempt: assignment.attempt, stage: "channel_handoff", outcome: "restore_session" },
+      "the conversation's previous session is not live here; restoring it from the durable ACP reference");
+    if (!harnessDelivery(assignment)) return undefined;
+    return this.takeOverHarnessHead(assignment, admission, sessionId, assertCurrent);
+  }
+
+  /** A repository role's head: restore or continue its retained session, or start fresh when the journal proves that is safe. */
+  private async takeOverHarnessHead(assignment: HarnessAssignment, admission: LocalAdmission, sessionId: string, assertCurrent: () => void): Promise<Takeover | undefined> {
+    const pendingRestore = this.deps.journal.execution.pendingRestore(admission, assignment);
+    if (pendingRestore) return { reference: pendingRestore, mode: "restore" };
+    let retained;
+    try {
+      retained = this.deps.journal.execution.liveContinuation(assignment);
+    } catch (error) {
+      if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error;
+      return this.freshAfterUncontinuableHead(assignment, assertCurrent, error);
     }
-    this.assertNoRecoveringPredecessor(assignment);
-    const predecessor = this.channelOwners.get(channelId);
-    if (!predecessor) {
-      // A connector restart removes only the in-memory owner. Core's opaque
-      // reference and the runner's credential-volume mapping survive, so the
-      // later bootstrap must attempt ACP session/load. The runner fails closed
-      // with agent_session_lost if either the mapping or provider state is gone.
-      if (continued && continued.acpSessionRef !== undefined) this.logger.info({ assignmentId: assignment.id, attempt: assignment.attempt, stage: "channel_handoff", outcome: "restore_session" },
-        "the conversation's previous session is not live here; restoring it from the durable ACP reference");
-      if (source.kind === "harness_delivery") {
-        const pendingRestore = this.deps.journal.execution.pendingRestore(admission, assignment);
-        if (pendingRestore) return { reference: pendingRestore, mode: "restore" };
-        let retained;
-        try {
-          retained = this.deps.journal.execution.liveContinuation(assignment);
-        } catch (error) {
-          if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error;
-          // A continuation that just closed unfinished may still be proving its
-          // process gone; decide on the outcome of that stop, not a snapshot.
-          const tip = this.deps.journal.execution.headContinuationTip(assignment);
-          const retiring = tip && this.executionRetirements.get(tip.executionGeneration);
-          if (retiring) await retiring.catch(() => undefined);
-          const unresumablePredecessor = this.canStartFreshAfterUnresumableHarnessPredecessor(assignment);
-          const recoveredContinuation = this.canStartFreshAfterRecoveredHarnessContinuation(assignment);
-          const settledPredecessor = this.canStartFreshAfterSettledHarnessPredecessor(assignment);
-          const repositoryAnchor = this.canStartFreshRepositoryAnchorAfterSettledHead(assignment);
-          if (!unresumablePredecessor && !recoveredContinuation && !settledPredecessor && !repositoryAnchor) {
-            // Journals written before close-time retirement (production
-            // 2026-10-01): a continuation that was cancelled or failed stays
-            // `opened` with no live owner, its turn terminal and settled by
-            // Core. Prove its process gone now and start fresh, as the live
-            // channel path does for an unusable predecessor.
-            if (!(await this.retireUnfinishedHarnessContinuation(assignment, assertCurrent))) throw error;
-            this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt, predecessorAssignmentId: tip?.assignmentId,
-              predecessorAttempt: tip?.attempt, stage: "channel_handoff", outcome: "released_unfinished_continuation" },
-            "the role session's last continuation ended unfinished; its process is stopped and a fresh ACP session starts");
-            return undefined;
-          }
-          // A settled head is not always this turn's predecessor: a fresh
-          // repository anchor deliberately declines generated workspace state.
-          // Otherwise the exact predecessor was already fenced or reported as
-          // unresumable. In every case its old generation/reference stays
-          // fenced; opening below creates a fresh session inside the admitted
-          // repository, role, agent and model boundary.
-          this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt,
-            stage: "channel_handoff", outcome: repositoryAnchor ? "fresh_repository_anchor" : settledPredecessor ? "fresh_after_settled_predecessor" : "discarded_unresumable_predecessor" },
-          repositoryAnchor
-            ? "the new cycle is repository-anchored and the previous role session is settled; starting a fresh ACP session"
-            : settledPredecessor
-              ? "the exact predecessor session was durably settled; starting a fresh ACP session to preserve the required review"
-            : "the repository role's exact predecessor is not resumable; starting a fresh ACP session");
-          return undefined;
-        }
-        if (!retained) {
-          if (source.turn.predecessor) throw new RemoteInstanceError("assignment_conflict",
-            "The repository role's exact predecessor turn is not durably continuable yet.");
-          return undefined;
-        }
-        const priorEntry = this.deps.journal.assignments.get(`${retained.admission.assignmentId}:${retained.admission.attempt}`);
-        if (priorEntry?.reports.terminalSequence === undefined) {
-          throw new RemoteInstanceError("assignment_conflict", "The repository role's previous turn has not durably completed.");
-        }
-        const mode = retained.admission.runnerIncarnation === admission.runnerIncarnation ? "live" : "restore";
-        const transfer = { predecessor: retained.admission, successor: admission, sessionId: logicalSessionId,
-          acpSessionRef: retained.acpSessionRef, processOwner: retained.processOwner, continuedAt: this.deps.clock.nowIso() };
-        if (mode === "live") await this.deps.journal.execution.transferLiveContinuation(transfer, assertCurrent);
-        else await this.deps.journal.execution.transferRestoredContinuation(transfer, assertCurrent);
-        return { reference: retained.acpSessionRef, mode };
-      }
+    if (!retained) {
+      if (assignment.source.turn.predecessor) throw new RemoteInstanceError("assignment_conflict",
+        "The repository role's exact predecessor turn is not durably continuable yet.");
       return undefined;
     }
+    return this.transferHead(retained, admission, sessionId, assertCurrent);
+  }
+
+  /**
+   * A continuation that just closed unfinished may still be proving its
+   * process gone; decide on the outcome of that stop, not a snapshot.
+   */
+  private async freshAfterUncontinuableHead(assignment: HarnessAssignment, assertCurrent: () => void, error: RemoteInstanceError): Promise<undefined> {
+    const tip = this.deps.journal.execution.headContinuationTip(assignment);
+    const retiring = tip && this.executionRetirements.get(tip.executionGeneration);
+    if (retiring) await retiring.catch(() => undefined);
+    const fresh = this.freshStartReason(assignment);
+    if (fresh === null) return this.releaseUnfinishedContinuation(assignment, assertCurrent, tip, error);
+    // A settled head is not always this turn's predecessor: a fresh
+    // repository anchor deliberately declines generated workspace state.
+    // Otherwise the exact predecessor was already fenced or reported as
+    // unresumable. In every case its old generation/reference stays
+    // fenced; opening below creates a fresh session inside the admitted
+    // repository, role, agent and model boundary.
+    const { outcome, message } = FRESH_STARTS[fresh];
+    this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt, stage: "channel_handoff", outcome }, message);
+    return undefined;
+  }
+
+  private freshStartReason(assignment: HarnessAssignment): FreshStart | null {
+    if (this.canStartFreshRepositoryAnchorAfterSettledHead(assignment)) return "repository_anchor";
+    if (this.canStartFreshAfterSettledHarnessPredecessor(assignment)) return "settled_predecessor";
+    if (this.canStartFreshAfterUnresumableHarnessPredecessor(assignment) || this.canStartFreshAfterRecoveredHarnessContinuation(assignment)) return "unresumable";
+    return null;
+  }
+
+  /**
+   * Journals written before close-time retirement: a continuation that was
+   * cancelled or failed stays `opened` with no live owner, its turn terminal
+   * and settled by Core. Prove its process gone now and start fresh, as the
+   * live channel path does for an unusable predecessor.
+   */
+  private async releaseUnfinishedContinuation(assignment: HarnessAssignment, assertCurrent: () => void, tip: LocalAdmission | undefined, error: RemoteInstanceError): Promise<undefined> {
+    if (!(await this.retireUnfinishedHarnessContinuation(assignment, assertCurrent))) throw error;
+    this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt, predecessorAssignmentId: tip?.assignmentId,
+      predecessorAttempt: tip?.attempt, stage: "channel_handoff", outcome: "released_unfinished_continuation" },
+    "the role session's last continuation ended unfinished; its process is stopped and a fresh ACP session starts");
+    return undefined;
+  }
+
+  /** Hand the completed head to this turn: live in the same runner incarnation, else restored under a fresh reference. */
+  private async transferHead(retained: NonNullable<ReturnType<SupervisorJournal["execution"]["liveContinuation"]>>, admission: LocalAdmission, sessionId: string, assertCurrent: () => void): Promise<Takeover> {
+    const priorEntry = this.deps.journal.assignments.get(`${retained.admission.assignmentId}:${retained.admission.attempt}`);
+    if (priorEntry?.reports.terminalSequence === undefined) {
+      throw new RemoteInstanceError("assignment_conflict", "The repository role's previous turn has not durably completed.");
+    }
+    const mode = retained.admission.runnerIncarnation === admission.runnerIncarnation ? "live" : "restore";
+    const transfer = { predecessor: retained.admission, successor: admission, sessionId,
+      acpSessionRef: retained.acpSessionRef, processOwner: retained.processOwner, continuedAt: this.deps.clock.nowIso() };
+    if (mode === "live") await this.deps.journal.execution.transferLiveContinuation(transfer, assertCurrent);
+    else await this.deps.journal.execution.transferRestoredContinuation(transfer, assertCurrent);
+    return { reference: retained.acpSessionRef, mode };
+  }
+
+  private async takeOverFromOwner(handoff: ChannelHandoff): Promise<Takeover | undefined> {
+    const { predecessor } = handoff;
     const key = `${predecessor.assignment.id}:${predecessor.assignment.attempt}`;
-    const prior = this.deps.journal.execution.admission(predecessor.assignment.id, predecessor.assignment.attempt);
-    const execution = prior ? this.deps.journal.execution.execution(prior) : undefined;
-    const ref = predecessor.acpSessionRef;
-    if (!predecessor.isClosed) {
-      if (source.kind === "harness_delivery") {
-        throw new RemoteInstanceError("assignment_conflict",
-          "The repository role's previous turn still owns its persistent ACP session.");
-      }
-      // Core places a conversation turn only while the session has no queued or
-      // claimed assignment (AssistantTurnAdmissionService), so a predecessor
-      // that is still live HERE is a turn Core has already cancelled or closed
-      // — typically a hosted turn that failed before its prompt ever arrived.
-      // The cancellation that would have told us needs runtime protocol 2.0,
-      // which this connector does not speak yet, so the new turn is the
-      // cancellation: refusing it instead pinned the conversation on a zombie
-      // owner until the connector restarted (live 2026-09-12).
-      this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt, predecessorAssignmentId: predecessor.assignment.id,
-        stage: "channel_handoff", outcome: "superseded_live_predecessor" },
-        "Core placed a new turn for this conversation while the previous one is still live here; cancelling it and starting a fresh session");
-      await predecessor.close("cancelled");
-      assertCurrent();
-      if (this.channelOwners.get(channelId) === predecessor) this.channelOwners.delete(channelId);
-      if (this.sessions.get(key) === predecessor) this.sessions.delete(key);
-      return undefined;
-    }
+    if (!predecessor.isClosed) return this.supersedeLiveOwner(handoff, key);
     // Closed but its terminal report is still being journaled: a transient
     // state the next attempt clears, so this stays a refusal.
     if (this.deps.journal.assignments.get(key)?.reports.terminalSequence === undefined) {
       throw new RemoteInstanceError("assignment_conflict", "The conversation's previous turn still owns its session channel.");
     }
-    // Finished, but not continuable: the journal lost or fenced what a
-    // continuation (or a proven stop) needs. Refusing here pinned the channel
-    // until the connector restarted, because the idle reaper screens on these
-    // same facts and could never reclaim it either. Losing in-agent history is
-    // the right price; losing the turn is not — this is bb's behaviour when a
-    // thread cannot be restored. If the owner itself refuses release, it is not
-    // an idle completion after all and the original refusal stands.
-    if (!prior || !ref || this.recoveryFences.has(key) || execution?.phase !== "opened" ||
-        execution.acpSessionRef !== ref || execution.completedTurnSettledAt === undefined || !execution.processOwner) {
-      try {
-        predecessor.releaseCompletedChannel();
-      } catch {
-        throw new RemoteInstanceError("assignment_conflict", "The conversation's previous turn still owns its session channel.");
-      }
-      if (this.sessions.get(key) === predecessor) this.sessions.delete(key);
-      this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt, predecessorAssignmentId: predecessor.assignment.id,
-        stage: "channel_handoff", outcome: "released_unusable_predecessor" },
-        "the conversation's previous turn cannot be continued or proven stopped; released its channel and started a fresh session");
-      return undefined;
+    const owner = this.completedOwner(key, predecessor);
+    if (owner === null) return this.releaseUnusableOwner(handoff, key);
+    return this.continueOrStopOwner(handoff, owner);
+  }
+
+  /** The closed owner's admission, reference and retained process, when it can still be continued or proven stopped. */
+  private completedOwner(key: string, predecessor: RelayedSession): CompletedOwner | null {
+    const prior = this.deps.journal.execution.admission(predecessor.assignment.id, predecessor.assignment.attempt);
+    const ref = predecessor.acpSessionRef;
+    if (!prior || !ref) return null;
+    const processOwner = this.continuableProcess(key, prior, ref);
+    return processOwner === null ? null : { key, prior, ref, processOwner };
+  }
+
+  /**
+   * Core places a conversation turn only while the session has no queued or
+   * claimed assignment, so a predecessor that is still live HERE is a turn
+   * Core has already cancelled or closed: typically a hosted turn that failed
+   * before its prompt ever arrived. The cancellation that would have told us
+   * needs a runtime protocol this connector does not speak yet, so the new
+   * turn is the cancellation: refusing it instead pinned the conversation on
+   * a zombie owner until the connector restarted.
+   */
+  private async supersedeLiveOwner({ assignment, channelId, predecessor, assertCurrent }: ChannelHandoff, key: string): Promise<undefined> {
+    if (harnessDelivery(assignment)) {
+      throw new RemoteInstanceError("assignment_conflict",
+        "The repository role's previous turn still owns its persistent ACP session.");
     }
-    const processOwner = execution.processOwner;
+    this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt, predecessorAssignmentId: predecessor.assignment.id,
+      stage: "channel_handoff", outcome: "superseded_live_predecessor" },
+      "Core placed a new turn for this conversation while the previous one is still live here; cancelling it and starting a fresh session");
+    await predecessor.close("cancelled");
+    assertCurrent();
+    if (this.channelOwners.get(channelId) === predecessor) this.channelOwners.delete(channelId);
+    if (this.sessions.get(key) === predecessor) this.sessions.delete(key);
+    return undefined;
+  }
+
+  /** The completed owner's retained process, when its execution is still an opened, settled turn on exactly this reference. */
+  private continuableProcess(key: string, prior: LocalAdmission, ref: string): RetainedProcessOwner | null {
+    const execution = this.deps.journal.execution.execution(prior);
+    if (this.recoveryFences.has(key) || execution?.phase !== "opened" || execution.acpSessionRef !== ref || execution.completedTurnSettledAt === undefined) return null;
+    return execution.processOwner ?? null;
+  }
+
+  /**
+   * Finished, but not continuable: the journal lost or fenced what a
+   * continuation (or a proven stop) needs. Refusing here pinned the channel
+   * until the connector restarted, because the idle reaper screens on these
+   * same facts and could never reclaim it either. Losing in-agent history is
+   * the right price; losing the turn is not (bb's behaviour when a thread
+   * cannot be restored). If the owner itself refuses release, it is not an
+   * idle completion after all and the original refusal stands.
+   */
+  private releaseUnusableOwner({ assignment, predecessor }: ChannelHandoff, key: string): undefined {
+    try {
+      predecessor.releaseCompletedChannel();
+    } catch {
+      throw new RemoteInstanceError("assignment_conflict", "The conversation's previous turn still owns its session channel.");
+    }
+    if (this.sessions.get(key) === predecessor) this.sessions.delete(key);
+    this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt, predecessorAssignmentId: predecessor.assignment.id,
+      stage: "channel_handoff", outcome: "released_unusable_predecessor" },
+      "the conversation's previous turn cannot be continued or proven stopped; released its channel and started a fresh session");
+    return undefined;
+  }
+
+  /** Continue the idle completed session when this turn names it, else stop it and start fresh. */
+  private async continueOrStopOwner(handoff: ChannelHandoff, owner: CompletedOwner): Promise<Takeover | undefined> {
+    const { prior, ref, processOwner } = owner;
     const assertPredecessor = () => {
-      assertCurrent();
-      if (this.channelOwners.get(channelId) !== predecessor || prior.runnerIncarnation !== this.deps.runnerIncarnation?.()) {
+      handoff.assertCurrent();
+      if (this.channelOwners.get(handoff.channelId) !== handoff.predecessor || prior.runnerIncarnation !== this.deps.runnerIncarnation?.()) {
         throw new RemoteInstanceError("recovery_required", "The previous turn's channel owner changed during handoff.");
       }
       this.deps.journal.execution.assertAdmission(prior);
     };
     const release = () => {
-      predecessor.releaseCompletedChannel();
-      if (this.sessions.get(key) === predecessor) this.sessions.delete(key);
+      handoff.predecessor.releaseCompletedChannel();
+      if (this.sessions.get(owner.key) === handoff.predecessor) this.sessions.delete(owner.key);
     };
-    if ((source.kind === "harness_delivery" || continued?.acpSessionRef === ref) && prior.agentId === admission.agentId) {
-      try {
-        await this.deps.journal.execution.transferLiveContinuation({ predecessor: prior, successor: admission, sessionId: logicalSessionId,
-          acpSessionRef: ref, processOwner, continuedAt: this.deps.clock.nowIso() }, assertPredecessor);
-        release();
-        return { reference: ref, mode: "live" };
-      } catch (error) {
-        // The transfer is one atomic journal batch, so a refusal wrote nothing.
-        // A continuation the journal cannot prove costs in-agent history, not
-        // the turn: stop the idle completion (its process stays resident) and
-        // start fresh, exactly as an unusable predecessor is handled above.
-        if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error;
-        if (source.kind === "harness_delivery") throw error;
-        this.logger.warn({ assignmentId: assignment.id, attempt: assignment.attempt, predecessorAssignmentId: prior.assignmentId,
-          stage: "channel_handoff", outcome: "continuation_unprovable", ...(error.diagnostic !== undefined ? { detail: error.diagnostic } : {}) },
-          "the conversation's previous session could not be continued; stopping it and starting a fresh session");
-      }
-    }
+    if (this.liveContinuable(handoff, owner) && await this.tryLiveTransfer(handoff, owner, assertPredecessor, release)) return { reference: ref, mode: "live" };
     await this.stopCompletedOwner(prior, ref, processOwner, assertPredecessor);
     release();
-    this.logger.info({ assignmentId: assignment.id, attempt: assignment.attempt, predecessorAssignmentId: prior.assignmentId, stage: "channel_handoff", outcome: "predecessor_stopped" },
+    this.logger.info({ assignmentId: handoff.assignment.id, attempt: handoff.assignment.attempt, predecessorAssignmentId: prior.assignmentId, stage: "channel_handoff", outcome: "predecessor_stopped" },
       "stopped the conversation's idle completed session before a fresh turn");
     return undefined;
+  }
+
+  /** A delivery head, or the conversation turn that names this reference, on the same agent. */
+  private liveContinuable({ assignment, admission }: ChannelHandoff, { prior, ref }: CompletedOwner): boolean {
+    return (harnessDelivery(assignment) || continuedSession(assignment.source)?.acpSessionRef === ref) && prior.agentId === admission.agentId;
+  }
+
+  /**
+   * The transfer is one atomic journal batch, so a refusal wrote nothing. A
+   * continuation the journal cannot prove costs in-agent history, not the
+   * turn: stop the idle completion (its process stays resident) and start
+   * fresh, exactly as an unusable predecessor is handled. False when it could
+   * not be continued.
+   */
+  private async tryLiveTransfer(handoff: ChannelHandoff, owner: CompletedOwner, assertPredecessor: () => void, release: () => void): Promise<boolean> {
+    try {
+      await this.deps.journal.execution.transferLiveContinuation({ predecessor: owner.prior, successor: handoff.admission, sessionId: handoff.sessionId,
+        acpSessionRef: owner.ref, processOwner: owner.processOwner, continuedAt: this.deps.clock.nowIso() }, assertPredecessor);
+      release();
+      return true;
+    } catch (error) {
+      if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error;
+      if (harnessDelivery(handoff.assignment)) throw error;
+      this.logger.warn({ assignmentId: handoff.assignment.id, attempt: handoff.assignment.attempt, predecessorAssignmentId: owner.prior.assignmentId,
+        stage: "channel_handoff", outcome: "continuation_unprovable", ...(error.diagnostic !== undefined ? { detail: error.diagnostic } : {}) },
+        "the conversation's previous session could not be continued; stopping it and starting a fresh session");
+      return false;
+    }
   }
 
   /**
@@ -1346,18 +1411,17 @@ export class WorkOrchestrator {
 
   /**
    * The repository role's completed head was continued by a turn that was then
-   * fenced, stopped and settled by Core (WS2-159), or that ended unfinished
+   * fenced, stopped and settled by Core, or that ended unfinished
    * (cancelled, failed) and was retired at close. That session is spent: its
    * head cannot be transferred again and the fenced reference is never
    * resumed. The next turn of the same role session starts a fresh ACP
    * session under the same exact boundaries instead of refusing forever.
    */
   private canStartFreshAfterRecoveredHarnessContinuation(successor: RemoteWorkAssignment): boolean {
-    if (successor.source.kind !== "harness_delivery" || !successor.source.turn.predecessor) return false;
+    if (!harnessDelivery(successor) || !successor.source.turn.predecessor) return false;
     const tip = this.deps.journal.execution.headContinuationTip(successor);
     const fenced = tip && this.deps.journal.execution.start(tip.assignmentId, tip.attempt)?.assignment;
-    if (!tip || !fenced || fenced.source.kind !== "harness_delivery" || !sameHarnessRoleSession(fenced, successor) ||
-        jcsDigest((fenced.source.turn.predecessor ?? null) as JsonValue) !== jcsDigest(successor.source.turn.predecessor as JsonValue)) return false;
+    if (!tip || !fenced || !continuesSamePredecessor(fenced, successor)) return false;
     return this.recoveredExecutionSettled(tip);
   }
 
@@ -1373,33 +1437,52 @@ export class WorkOrchestrator {
    * keeps the refusal: two agents must never run on one workspace.
    */
   private async retireUnfinishedHarnessContinuation(successor: RemoteWorkAssignment, assertCurrent: () => void): Promise<boolean> {
-    if (successor.source.kind !== "harness_delivery" || !successor.source.turn.predecessor) return false;
-    const tip = this.deps.journal.execution.headContinuationTip(successor);
-    const continuation = tip && this.deps.journal.execution.start(tip.assignmentId, tip.attempt)?.assignment;
-    if (!tip || !continuation || continuation.source.kind !== "harness_delivery" || !sameHarnessRoleSession(continuation, successor) ||
-        !continuation.source.turn.predecessor ||
-        turnIdentity(continuation.source.turn.predecessor) !== turnIdentity(successor.source.turn.predecessor)) return false;
+    const tip = this.unfinishedContinuationTip(successor);
+    if (!tip) return false;
     const key = `${tip.assignmentId}:${tip.attempt}`;
-    const execution = this.deps.journal.execution.execution(tip);
-    const entry = this.deps.journal.assignments.get(key);
-    const ownedLocally = () => this.sessions.has(key) || this.bootstrapping.has(key) || this.dispatching.has(key) ||
-      this.pendingClaims.has(key) || this.recoveryStops.has(key) ||
-      [...this.channelOwners.values()].some(owner => owner.assignment.id === tip.assignmentId && owner.assignment.attempt === tip.attempt);
-    if (!execution || !UNFINISHED_PHASES.has(execution.phase) || !execution.processOwner ||
-        entry?.claimId !== tip.claimId || entry.reports.terminalSequence === undefined ||
-        this.reports.acknowledgedTerminalReport(tip.assignmentId, tip.attempt, tip.claimId) === undefined || ownedLocally()) return false;
+    const unfinished = this.unfinishedButSettled(tip, key);
+    if (!unfinished || this.ownedLocally(tip, key)) return false;
     const assertTip = () => {
       assertCurrent();
       this.requireNativeOwner();
-      if (tip.instanceId !== this.deps.instanceId() || tip.workspaceId !== this.deps.workspaceId() || ownedLocally() ||
+      if (tip.instanceId !== this.deps.instanceId() || tip.workspaceId !== this.deps.workspaceId() || this.ownedLocally(tip, key) ||
           this.deps.journal.assignments.get(key)?.claimId !== tip.claimId) {
         throw new RemoteInstanceError("recovery_required", "The unfinished continuation gained a local owner during its stop.");
       }
     };
     this.logger.warn({ event: "execution.unfinished_continuation", assignmentId: successor.id, attempt: successor.attempt,
       predecessorAssignmentId: tip.assignmentId, predecessorAttempt: tip.attempt, predecessorClaimId: tip.claimId,
-      phase: execution.phase, terminalClass: entry.reports.terminalResult?.class ?? null, stage: "channel_handoff" },
+      phase: unfinished.execution.phase, terminalClass: unfinished.entry.reports.terminalResult?.class ?? null, stage: "channel_handoff" },
     "the role session's last continuation ended unfinished and was never stopped; proving its process gone");
+    return this.retireTip(successor, tip, assertTip);
+  }
+
+  /** The head's last continuation, when it continued exactly this successor's predecessor turn. */
+  private unfinishedContinuationTip(successor: RemoteWorkAssignment): LocalAdmission | undefined {
+    if (!harnessDelivery(successor) || !successor.source.turn.predecessor) return undefined;
+    const tip = this.deps.journal.execution.headContinuationTip(successor);
+    const continuation = tip && this.deps.journal.execution.start(tip.assignmentId, tip.attempt)?.assignment;
+    if (!tip || !continuation || !continuesTurn(continuation, successor, successor.source.turn.predecessor)) return undefined;
+    return tip;
+  }
+
+  /** Still unfinished with a retained process, yet its claim is terminal and Core acknowledged that report. */
+  private unfinishedButSettled(tip: LocalAdmission, key: string): { execution: LocalExecution; entry: JournalEntry } | null {
+    const execution = this.deps.journal.execution.execution(tip);
+    const entry = this.deps.journal.assignments.get(key);
+    if (!execution || !UNFINISHED_PHASES.has(execution.phase) || !execution.processOwner || entry?.claimId !== tip.claimId ||
+        entry.reports.terminalSequence === undefined || this.reports.acknowledgedTerminalReport(tip.assignmentId, tip.attempt, tip.claimId) === undefined) return null;
+    return { execution, entry };
+  }
+
+  /** Something in this process still owns the execution (session, bootstrap, dispatch, pending claim, recovery stop or channel). */
+  private ownedLocally(tip: LocalAdmission, key: string): boolean {
+    return this.sessions.has(key) || this.bootstrapping.has(key) || this.dispatching.has(key) ||
+      this.pendingClaims.has(key) || this.recoveryStops.has(key) ||
+      [...this.channelOwners.values()].some(owner => owner.assignment.id === tip.assignmentId && owner.assignment.attempt === tip.attempt);
+  }
+
+  private async retireTip(successor: RemoteWorkAssignment, tip: LocalAdmission, assertTip: () => void): Promise<boolean> {
     let retired: boolean;
     try { retired = await this.retireUnfinishedExecution(tip, assertTip, "channel_handoff"); }
     catch (error) {
@@ -1416,7 +1499,7 @@ export class WorkOrchestrator {
   /**
    * A non-completed delivery close (cancelled, failed, lease lost, drain,
    * replay gap) ends that turn for good, but its record stayed `opened`, so
-   * the role session's next turn could never start (production 2026-10-01).
+   * the role session's next turn could never start.
    * Once the session's own close has finished (the runner was already asked
    * to close the ACP session and stop its bridge), prove the exact process
    * gone and mark the execution exactly as a retained recovery stop does.
@@ -1429,8 +1512,7 @@ export class WorkOrchestrator {
     if (!admission) return;
     const assertCurrent = () => {
       this.requireNativeOwner();
-      if (admission.instanceId !== this.deps.instanceId() || admission.workspaceId !== this.deps.workspaceId() ||
-          admission.runnerIncarnation !== this.deps.runnerIncarnation?.() || this.recoveryFences.has(key) || this.sessions.has(key) ||
+      if (!this.inOwnScope(admission) || this.recoveryFences.has(key) || this.sessions.has(key) ||
           this.deps.journal.assignments.get(key)?.claimId !== admission.claimId) {
         throw new RemoteInstanceError("recovery_required", "The closed execution changed owner before its process stop.");
       }
@@ -1462,30 +1544,39 @@ export class WorkOrchestrator {
     const generation = admission.executionGeneration;
     const existing = this.executionRetirements.get(generation);
     if (existing) return existing;
-    const task = (async () => {
-      await before?.();
-      const execution = this.deps.journal.execution.execution(admission);
-      if (execution?.phase === "interrupted_unqualified") return true;
-      if (!execution || !UNFINISHED_PHASES.has(execution.phase) || !execution.processOwner) return false;
-      const runner = this.deps.runners.get(admission.agentId);
-      if (!runner?.stopRetainedExecution) return false;
-      assertCurrent();
-      await this.deps.journal.execution.markStopping(admission, this.deps.clock.nowIso(), assertCurrent);
-      if (execution.phase !== "process_stopped") {
-        await runner.stopRetainedExecution(execution.processOwner);
-        assertCurrent();
-        await this.deps.journal.execution.markProcessStopped(admission, this.deps.clock.nowIso(), assertCurrent);
-      }
-      await this.deps.journal.execution.markInterruptedWithoutQuiescence(admission, this.deps.clock.nowIso(), assertCurrent);
-      this.logger.info({ event: "execution.unfinished_retired", assignmentId: admission.assignmentId, attempt: admission.attempt,
-        claimId: admission.claimId, stage, outcome: "interrupted_without_quiescence" },
-      "the unfinished turn's process is gone; its session's next turn starts fresh");
-      return true;
-    })();
+    const task = this.retireExecution(admission, assertCurrent, stage, before);
     this.executionRetirements.set(generation, task);
     const clear = () => { if (this.executionRetirements.get(generation) === task) this.executionRetirements.delete(generation); };
     void task.then(clear, clear);
     return task;
+  }
+
+  private async retireExecution(admission: LocalAdmission, assertCurrent: () => void, stage: "session_close" | "channel_handoff", before?: () => Promise<void>): Promise<boolean> {
+    await before?.();
+    const execution = this.deps.journal.execution.execution(admission);
+    if (execution?.phase === "interrupted_unqualified") return true;
+    const owner = this.retirementOwner(admission, execution);
+    if (!owner) return false;
+    assertCurrent();
+    await this.deps.journal.execution.markStopping(admission, this.deps.clock.nowIso(), assertCurrent);
+    if (owner.phase !== "process_stopped") {
+      await owner.stop(owner.processOwner);
+      assertCurrent();
+      await this.deps.journal.execution.markProcessStopped(admission, this.deps.clock.nowIso(), assertCurrent);
+    }
+    await this.deps.journal.execution.markInterruptedWithoutQuiescence(admission, this.deps.clock.nowIso(), assertCurrent);
+    this.logger.info({ event: "execution.unfinished_retired", assignmentId: admission.assignmentId, attempt: admission.attempt,
+      claimId: admission.claimId, stage, outcome: "interrupted_without_quiescence" },
+    "the unfinished turn's process is gone; its session's next turn starts fresh");
+    return true;
+  }
+
+  /** An unfinished execution with a retained process, and a runner that can stop it. */
+  private retirementOwner(admission: LocalAdmission, execution: LocalExecution | undefined): { phase: LocalExecution["phase"]; processOwner: RetainedProcessOwner; stop: (owner: RetainedProcessOwner) => Promise<unknown> } | null {
+    if (!execution || !UNFINISHED_PHASES.has(execution.phase) || !execution.processOwner) return null;
+    const runner = this.deps.runners.get(admission.agentId);
+    if (!runner?.stopRetainedExecution) return null;
+    return { phase: execution.phase, processOwner: execution.processOwner, stop: runner.stopRetainedExecution.bind(runner) };
   }
 
   /** The idle reaper may settle a completed role session before a later
@@ -1494,14 +1585,25 @@ export class WorkOrchestrator {
    * fresh process only for the exact acknowledged head named as predecessor;
    * repository, task, role, agent and model identity remain unchanged. */
   private canStartFreshAfterSettledHarnessPredecessor(successor: RemoteWorkAssignment): boolean {
-    if (successor.source.kind !== "harness_delivery" || !successor.source.turn.predecessor) return false;
-    const head = this.deps.journal.execution.harnessRoleHead(successor);
-    const execution = head && this.deps.journal.execution.execution(head);
-    const predecessor = head && this.deps.journal.execution.start(head.assignmentId, head.attempt)?.assignment;
-    if (!head || !execution || execution.phase !== "acp_settled" || !predecessor ||
-        predecessor.source.kind !== "harness_delivery" || !sameHarnessRoleSession(predecessor, successor) ||
-        jcsDigest({ invocationId: predecessor.source.turn.invocationId, dispatchGeneration: predecessor.source.turn.dispatchGeneration } as JsonValue) !==
+    if (!harnessDelivery(successor) || !successor.source.turn.predecessor) return false;
+    const settled = this.settledRoleHead(successor);
+    if (!settled) return false;
+    const turn = settled.predecessor.source.turn;
+    if (jcsDigest({ invocationId: turn.invocationId, dispatchGeneration: turn.dispatchGeneration } as JsonValue) !==
           jcsDigest(successor.source.turn.predecessor as JsonValue)) return false;
+    return this.acknowledgedHead(settled.head);
+  }
+
+  /** The role's head, ACP-settled, for the same repository role session as this successor. */
+  private settledRoleHead(successor: HarnessAssignment): { head: LocalAdmission; predecessor: HarnessAssignment } | null {
+    const head = this.deps.journal.execution.harnessRoleHead(successor);
+    if (!head || this.deps.journal.execution.execution(head)?.phase !== "acp_settled") return null;
+    const predecessor = this.deps.journal.execution.start(head.assignmentId, head.attempt)?.assignment;
+    if (!predecessor || !harnessDelivery(predecessor) || !sameHarnessRoleSession(predecessor, successor)) return null;
+    return { head, predecessor };
+  }
+
+  private acknowledgedHead(head: LocalAdmission): boolean {
     return this.reports.acknowledgedTerminalReport(head.assignmentId, head.attempt, head.claimId) !== undefined;
   }
 
@@ -1510,13 +1612,9 @@ export class WorkOrchestrator {
    * licence to discard preserved changes: only an ACP-settled role head whose
    * exact terminal report Core acknowledged may be left behind. */
   private canStartFreshRepositoryAnchorAfterSettledHead(successor: RemoteWorkAssignment): boolean {
-    if (successor.source.kind !== "harness_delivery" || successor.source.turn.predecessor) return false;
-    const head = this.deps.journal.execution.harnessRoleHead(successor);
-    const execution = head && this.deps.journal.execution.execution(head);
-    const predecessor = head && this.deps.journal.execution.start(head.assignmentId, head.attempt)?.assignment;
-    if (!head || !execution || execution.phase !== "acp_settled" || !predecessor ||
-        predecessor.source.kind !== "harness_delivery" || !sameHarnessRoleSession(predecessor, successor)) return false;
-    return this.reports.acknowledgedTerminalReport(head.assignmentId, head.attempt, head.claimId) !== undefined;
+    if (!harnessDelivery(successor) || successor.source.turn.predecessor) return false;
+    const settled = this.settledRoleHead(successor);
+    return settled !== null && this.acknowledgedHead(settled.head);
   }
 
   /** Release an idle sealed completion, then journal its proven stop. */
@@ -2291,6 +2389,35 @@ function dispatchFailureOutcome(error: unknown): { class: "interrupted"; reason:
 function dispatchFailureDetail(error: unknown): Record<string, unknown> {
   if (!(error instanceof RemoteInstanceError)) return dispatchErrorIdentity(error);
   return error.diagnostic !== undefined ? { detail: error.diagnostic } : {};
+}
+
+type HarnessAssignment = RemoteWorkAssignment & { source: Extract<RemoteWorkAssignment["source"], { kind: "harness_delivery" }> };
+type Takeover = { reference: string; mode: "live" | "restore" };
+type FreshStart = "repository_anchor" | "settled_predecessor" | "unresumable";
+type ChannelHandoff = { assignment: RemoteWorkAssignment; admission: LocalAdmission; sessionId: string; channelId: string; predecessor: RelayedSession; assertCurrent: () => void };
+type CompletedOwner = { key: string; prior: LocalAdmission; ref: string; processOwner: RetainedProcessOwner };
+
+function harnessDelivery(assignment: RemoteWorkAssignment): assignment is HarnessAssignment {
+  return assignment.source.kind === "harness_delivery";
+}
+
+/** Why a repository role starts a fresh ACP session, as logged. */
+const FRESH_STARTS: Readonly<Record<FreshStart, { outcome: string; message: string }>> = {
+  repository_anchor: { outcome: "fresh_repository_anchor", message: "the new cycle is repository-anchored and the previous role session is settled; starting a fresh ACP session" },
+  settled_predecessor: { outcome: "fresh_after_settled_predecessor", message: "the exact predecessor session was durably settled; starting a fresh ACP session to preserve the required review" },
+  unresumable: { outcome: "discarded_unresumable_predecessor", message: "the repository role's exact predecessor is not resumable; starting a fresh ACP session" },
+};
+
+/** The fenced continuation continued the same predecessor turn this successor names, in the same role session. */
+function continuesSamePredecessor(fenced: RemoteWorkAssignment, successor: HarnessAssignment): boolean {
+  return harnessDelivery(fenced) && sameHarnessRoleSession(fenced, successor) &&
+    jcsDigest((fenced.source.turn.predecessor ?? null) as JsonValue) === jcsDigest(successor.source.turn.predecessor as JsonValue);
+}
+
+/** A continuation of the same role session that continued exactly this predecessor turn. */
+function continuesTurn(continuation: RemoteWorkAssignment, successor: HarnessAssignment, predecessorTurn: { invocationId: string; dispatchGeneration: number }): boolean {
+  return harnessDelivery(continuation) && sameHarnessRoleSession(continuation, successor) &&
+    continuation.source.turn.predecessor !== undefined && turnIdentity(continuation.source.turn.predecessor) === turnIdentity(predecessorTurn);
 }
 
 /** What a dispatch shares with the session it starts: its admission, chosen reference and ownership checks. */
