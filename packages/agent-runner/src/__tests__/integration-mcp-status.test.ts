@@ -90,6 +90,33 @@ describe("Claude MCP status discovery (model-free, Agent SDK mcpServerStatus in 
     ]);
   });
 
+  it("keeps asking while Claude's first answers are still empty, then reports the account connectors", async () => {
+    // Claude loads claude.ai connectors asynchronously: the first status is an empty list.
+    const sdk = join(dir, "sdk.mjs");
+    await writeFile(sdk, `
+      let calls = 0;
+      export function query() {
+        return {
+          async mcpServerStatus() {
+            calls += 1;
+            if (calls < 3) return [];
+            return [{ name: "claude.ai Atlassian", status: "connected", scope: "claudeai", tools: [{ name: "getJiraIssue" }] }];
+          },
+          close() {},
+        };
+      }`);
+    const servers = await readClaudeMcpStatus({ command: process.execPath, args: ["--input-type=module", "-e", CLAUDE_MCP_STATUS_SCRIPT, sdk, "/bin/false", dir, "8000"], env: { PATH: process.env.PATH ?? "" }, timeoutMs: 12_000 });
+    expect(servers).toEqual([{ name: "claude.ai Atlassian", status: "connected", scope: "claudeai", tools: ["getJiraIssue"] }]);
+  });
+
+  it("reports an empty list once the settle window or the budget runs out", async () => {
+    const sdk = join(dir, "sdk.mjs");
+    await writeFile(sdk, `export function query() { return { async mcpServerStatus() { return []; }, close() {} }; }`);
+    const started = Date.now();
+    await expect(readClaudeMcpStatus({ command: process.execPath, args: ["--input-type=module", "-e", CLAUDE_MCP_STATUS_SCRIPT, sdk, "/bin/false", dir, "4000"], env: { PATH: process.env.PATH ?? "" }, timeoutMs: 10_000 })).resolves.toEqual([]);
+    expect(Date.now() - started).toBeLessThan(9_000);
+  });
+
   it("asks for account connectors with no hooks and no tool use, in the given empty folder", async () => {
     const sdk = join(dir, "sdk.mjs");
     await writeFile(sdk, `
