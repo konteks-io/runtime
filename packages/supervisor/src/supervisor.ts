@@ -99,6 +99,7 @@ import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "./session/workspace-tool-policy.js";
 import { ClaudeExecutableIdentity } from "./native/claude-executable-identity.js";
 import { SupervisorJournal, type JournalEntry } from "./state/journal.js";
+import type { RuntimeRecoveryRecord } from "./state/runtime-recovery.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
 import { buildSupportBundle } from "./support/bundle.js";
@@ -1341,89 +1342,110 @@ export class Supervisor {
     if (this.provisioningLoopActive) return;
     this.provisioningLoopActive = true;
     this.provisioningCredential = provisioning.provisioningCredential;
-    const tick = async (): Promise<void> => {
-      const current = await this.store.provisioning();
-      if (!current) return void (this.provisioningLoopActive = false);
-      if (parseRfc3339(current.provisioningWindowExpiresAt) <= this.clock.coreNow()) {
-        this.provisioningLoopActive = false;
-        this.logger.error("provisioning window expired; a fresh activation is required");
-        return;
-      }
-      if (provisioningCredentialIsExpired(current, this.clock)) {
-        await refreshProvisioningCredential({ store: this.store, core: this.core, clock: this.clock, logger: this.logger }).catch((error: unknown) => this.logger.warn({ err: error }, "provisioning refresh failed"));
-        this.provisioningCredential = (await this.store.provisioning())?.provisioningCredential ?? null;
-      }
-      const snapshot = await this.inventory.collect();
-      this.lastSnapshot = snapshot;
-      const unhealthy = snapshot.components.filter((component) => component.healthStatus !== "healthy");
-      if (unhealthy.length > 0) {
-        // Provisioning waits for all four components. Silence here reads as a
-        // hung install, so name what is still missing on every attempt.
-        this.logger.info({ waitingFor: unhealthy.map((component) => `${component.kind}:${component.healthStatus}`) }, "provisioning is waiting for components to become healthy");
-        setTimeout(() => void tick(), 10_000).unref();
-        return;
-      }
-      try {
-        await this.refreshConfiguration();
-        const result = await submitReadiness({
-          store: this.store,
-          core: this.core,
-          clock: this.clock,
-          protocolVersion: String(REMOTE_INSTANCE_PROTOCOL_VERSION),
-          bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
-          components: snapshot.components.map((component) => ({ kind: component.kind, version: component.version, capabilities: component.capabilities, health: "healthy" as const })) as never,
-          logger: this.logger,
-        });
-        this.provisioningCredential = null;
-        this.administrativeStatus = "active";
-        this.provisioningLoopActive = false;
-        await this.adoptLease(result.lease);
-        await this.startActiveLoop();
-      } catch (error) {
-        this.logger.warn({ err: error }, "readiness not yet accepted; retrying");
-        // Core may have committed readiness and revoked the short credential
-        // before its response reached us. Recover through the existing signed
-        // owner/establishment/receipt protocol, never by reviving that bearer.
-        // Core refuses recovery for identities still provisioning or revoked.
-        await this.startActiveLoop();
-        if (this.activeLoopStarted) return;
-        setTimeout(() => void tick(), 15_000).unref();
-      }
-    };
-    await tick();
+    await this.provisioningTick();
+  }
+
+  private async provisioningTick(): Promise<void> {
+    const current = await this.store.provisioning();
+    if (!current) return void (this.provisioningLoopActive = false);
+    if (parseRfc3339(current.provisioningWindowExpiresAt) <= this.clock.coreNow()) {
+      this.provisioningLoopActive = false;
+      this.logger.error("provisioning window expired; a fresh activation is required");
+      return;
+    }
+    if (provisioningCredentialIsExpired(current, this.clock)) await this.refreshProvisioning();
+    const snapshot = await this.inventory.collect();
+    this.lastSnapshot = snapshot;
+    const unhealthy = snapshot.components.filter((component) => component.healthStatus !== "healthy");
+    if (unhealthy.length > 0) {
+      // Provisioning waits for all four components. Silence here reads as a
+      // hung install, so name what is still missing on every attempt.
+      this.logger.info({ waitingFor: unhealthy.map((component) => `${component.kind}:${component.healthStatus}`) }, "provisioning is waiting for components to become healthy");
+      setTimeout(() => void this.provisioningTick(), 10_000).unref();
+      return;
+    }
+    await this.submitProvisioningReadiness(snapshot);
+  }
+
+  private async refreshProvisioning(): Promise<void> {
+    await refreshProvisioningCredential({ store: this.store, core: this.core, clock: this.clock, logger: this.logger }).catch((error: unknown) => this.logger.warn({ err: error }, "provisioning refresh failed"));
+    this.provisioningCredential = (await this.store.provisioning())?.provisioningCredential ?? null;
+  }
+
+  private async submitProvisioningReadiness(snapshot: InventorySnapshot): Promise<void> {
+    try {
+      await this.refreshConfiguration();
+      const result = await submitReadiness({
+        store: this.store,
+        core: this.core,
+        clock: this.clock,
+        protocolVersion: String(REMOTE_INSTANCE_PROTOCOL_VERSION),
+        bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
+        components: snapshot.components.map((component) => ({ kind: component.kind, version: component.version, capabilities: component.capabilities, health: "healthy" as const })) as never,
+        logger: this.logger,
+      });
+      this.provisioningCredential = null;
+      this.administrativeStatus = "active";
+      this.provisioningLoopActive = false;
+      await this.adoptLease(result.lease);
+      await this.startActiveLoop();
+    } catch (error) {
+      this.logger.warn({ err: error }, "readiness not yet accepted; retrying");
+      // Core may have committed readiness and revoked the short credential
+      // before its response reached us. Recover through the existing signed
+      // owner/establishment/receipt protocol, never by reviving that bearer.
+      // Core refuses recovery for identities still provisioning or revoked.
+      await this.startActiveLoop();
+      if (this.activeLoopStarted) return;
+      setTimeout(() => void this.provisioningTick(), 15_000).unref();
+    }
   }
 
   private startActiveLoop(): Promise<void> {
     if (this.stopping || this.activeLoopStarted) return Promise.resolve();
     if (this.activeLoopStarting) return this.activeLoopStarting;
     this.startLivenessWatchdog();
-    if (this.recoveryRetryTimer) clearTimeout(this.recoveryRetryTimer);
+    stopTimeout(this.recoveryRetryTimer);
     this.recoveryRetryTimer = null;
-    const operation = this.startActiveLoopImpl().catch(error => {
-      // The logger keeps no stack, and every local-history refusal says the same
-      // sentence: name where it came from, or a stuck recovery is undiagnosable.
-      const at = error instanceof Error ? error.stack?.split("\n").slice(1, 6).map(line => line.trim().replace(/^at /, "")).join(" < ") : undefined;
-      this.logger.warn({ err: error, ...(at ? { at } : {}) }, "startup recovery remains pending");
-      const record = this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation);
-      const terminal = record && record.state !== "pending" && record.state !== "applied";
-      const denied = this.administrativeStatus === "revoked" || (error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch", "reconciliation_replay", "resume_deadline_expired"].includes(error.code));
-      // Core retired this process's recovery generation (or it expired, or
-      // another establishment won): this incarnation can never be accepted
-      // again, and retrying it is refused forever. A new process is a new
-      // incarnation that establishes through the ordinary path, so restart.
-      const retired = this.administrativeStatus !== "revoked" && !(error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch"].includes(error.code)) &&
-        (terminal || (error instanceof RemoteInstanceError && ["reconciliation_replay", "resume_deadline_expired"].includes(error.code)));
-      this.reconnectRefusal = this.describeReconnectRefusal(error, retired);
-      // Below Core's minimum no start can succeed: only an update gets back in.
-      if (error instanceof RemoteInstanceError && error.code === "update_required") this.requestUpdateForRefusedBundle();
-      if (retired && !this.stopping && !this.activeLoopStarted) this.restartForRetiredProcess(error);
-      if (!this.stopping && !this.activeLoopStarted && !terminal && !denied && !this.recoveryRetryTimer) {
-        this.recoveryRetryTimer = setTimeout(() => { this.recoveryRetryTimer = null; void this.startActiveLoop(); }, 15_000);
-        this.recoveryRetryTimer.unref();
-      }
-    }).finally(() => { this.activeLoopStarting = null; });
+    const operation = this.startActiveLoopImpl().catch(error => this.onActiveLoopFailed(error))
+      .finally(() => { this.activeLoopStarting = null; });
     this.activeLoopStarting = operation;
     return operation;
+  }
+
+  private onActiveLoopFailed(error: unknown): void {
+    // The logger keeps no stack, and every local-history refusal says the same
+    // sentence: name where it came from, or a stuck recovery is undiagnosable.
+    this.logger.warn({ err: error, ...stackField(error) }, "startup recovery remains pending");
+    const terminal = recoveryEnded(this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation));
+    const retired = this.retiredByCore(error, terminal);
+    this.reconnectRefusal = this.describeReconnectRefusal(error, retired);
+    // Below Core's minimum no start can succeed: only an update gets back in.
+    if (remoteErrorCodeIn(error, ["update_required"])) this.requestUpdateForRefusedBundle();
+    if (retired && !this.stopping && !this.activeLoopStarted) this.restartForRetiredProcess(error);
+    if (!terminal && !this.refusedForGood(error)) this.armRecoveryRetry();
+  }
+
+  /**
+   * Core retired this process's recovery generation (or it expired, or
+   * another establishment won): this incarnation can never be accepted
+   * again, and retrying it is refused forever. A new process is a new
+   * incarnation that establishes through the ordinary path, so restart.
+   */
+  private retiredByCore(error: unknown, terminal: boolean): boolean {
+    return this.administrativeStatus !== "revoked" && !remoteErrorCodeIn(error, REVOKED_CODES) &&
+      (terminal || remoteErrorCodeIn(error, RETIRED_CODES));
+  }
+
+  /** A revoked or retired runtime is never retried in place. */
+  private refusedForGood(error: unknown): boolean {
+    return this.administrativeStatus === "revoked" || remoteErrorCodeIn(error, [...REVOKED_CODES, ...RETIRED_CODES]);
+  }
+
+  private armRecoveryRetry(): void {
+    if (this.stopping || this.activeLoopStarted || this.recoveryRetryTimer) return;
+    this.recoveryRetryTimer = setTimeout(() => { this.recoveryRetryTimer = null; void this.startActiveLoop(); }, 15_000);
+    this.recoveryRetryTimer.unref();
   }
 
   /** Plain words for `doctor` when Core refused the startup reconnect; null for a passing failure. */
@@ -1474,35 +1496,40 @@ export class Supervisor {
   private startLivenessWatchdog(): void {
     if (this.livenessTimer) return;
     this.livenessWatchingSince = Date.now();
-    this.livenessTimer = setInterval(() => {
-      if (this.stopping || !this.livenessTimer) return;
-      if (this.leaseLapseNeedsRestart()) {
-        clearInterval(this.livenessTimer);
-        this.livenessTimer = null;
-        const detail = { reason: "lease_lapsed", leaseMode: this.lease.mode(), leaseExpiresAt: this.lease.current()?.expiresAt ?? null,
-          refusedForMs: Date.now() - (this.leaseRefusedSince ?? Date.now()), administrativeStatus: this.administrativeStatus };
-        this.logger.error(detail, "the lease lapsed and Core refuses it; restarting to reconnect with this machine's key");
-        this.options.onLivenessLost?.(detail);
-        return;
-      }
-      const budgetMs = Math.max(LIVENESS_MIN_BUDGET_MS, this.heartbeat.livenessBudgetMs());
-      const liveness = this.heartbeat.liveness();
-      const verdict = evaluateHeartbeatLiveness({ now: Date.now(), watchingSince: this.livenessWatchingSince ?? Date.now(), liveness, budgetMs });
-      if (verdict.state === "live") { this.livenessQuietWarned = false; return; }
-      const detail = { ...verdict, budgetMs, heartbeat: liveness, activeLoopStarted: this.activeLoopStarted, activeLoopStarting: this.activeLoopStarting !== null,
-        recoveryRetryArmed: this.recoveryRetryTimer !== null, leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus,
-        activeResources: process.getActiveResourcesInfo().slice(0, 32) };
-      if (verdict.state === "quiet") {
-        if (!this.livenessQuietWarned) this.logger.warn(detail, "no heartbeat attempted for a while; the supervisor may be stuck");
-        this.livenessQuietWarned = true;
-        return;
-      }
-      clearInterval(this.livenessTimer);
-      this.livenessTimer = null;
-      this.logger.error(detail, "supervisor liveness lost: no heartbeat attempted within the budget; asking the service to restart");
-      this.options.onLivenessLost?.(detail);
-    }, LIVENESS_CHECK_MS);
+    this.livenessTimer = setInterval(() => this.checkLiveness(), LIVENESS_CHECK_MS);
     this.livenessTimer.unref();
+  }
+
+  private checkLiveness(): void {
+    if (this.stopping || !this.livenessTimer) return;
+    if (this.leaseLapseNeedsRestart()) return this.restartForLapsedLease();
+    const budgetMs = Math.max(LIVENESS_MIN_BUDGET_MS, this.heartbeat.livenessBudgetMs());
+    const liveness = this.heartbeat.liveness();
+    const verdict = evaluateHeartbeatLiveness({ now: Date.now(), watchingSince: this.livenessWatchingSince ?? Date.now(), liveness, budgetMs });
+    if (verdict.state === "live") { this.livenessQuietWarned = false; return; }
+    const detail = { ...verdict, budgetMs, heartbeat: liveness, activeLoopStarted: this.activeLoopStarted, activeLoopStarting: this.activeLoopStarting !== null,
+      recoveryRetryArmed: this.recoveryRetryTimer !== null, leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus,
+      activeResources: process.getActiveResourcesInfo().slice(0, 32) };
+    if (verdict.state === "quiet") return this.warnLivenessQuiet(detail);
+    stopInterval(this.livenessTimer);
+    this.livenessTimer = null;
+    this.logger.error(detail, "supervisor liveness lost: no heartbeat attempted within the budget; asking the service to restart");
+    this.options.onLivenessLost?.(detail);
+  }
+
+  /** Warn once per quiet stretch. */
+  private warnLivenessQuiet(detail: Record<string, unknown>): void {
+    if (!this.livenessQuietWarned) this.logger.warn(detail, "no heartbeat attempted for a while; the supervisor may be stuck");
+    this.livenessQuietWarned = true;
+  }
+
+  private restartForLapsedLease(): void {
+    stopInterval(this.livenessTimer);
+    this.livenessTimer = null;
+    const detail = { reason: "lease_lapsed", leaseMode: this.lease.mode(), leaseExpiresAt: this.lease.current()?.expiresAt ?? null,
+      refusedForMs: Date.now() - (this.leaseRefusedSince ?? Date.now()), administrativeStatus: this.administrativeStatus };
+    this.logger.error(detail, "the lease lapsed and Core refuses it; restarting to reconnect with this machine's key");
+    this.options.onLivenessLost?.(detail);
   }
 
   private async startActiveLoopImpl(): Promise<void> {
@@ -1517,24 +1544,37 @@ export class Supervisor {
       await this.heartbeat.settle();
     }
     this.requireRecoveryAuthority();
-    if (await this.store.provisioning()) {
-      this.requireRecoveryAuthority();
-      const identity = await this.store.identity();
-      this.requireRecoveryAuthority();
-      const status = this.administrativeStatus;
-      if (!identity || identity.instanceId !== this.instanceId || (status !== "active" && status !== "draining" && status !== "suspended")) {
-        throw new RemoteInstanceError("registration_mismatch", "Recovered provisioning identity is not authoritative.");
-      }
-      await this.store.saveIdentity({ ...identity, administrativeStatus: status });
-      this.requireRecoveryAuthority();
-      await this.store.clearProvisioning();
-      this.provisioningCredential = null;
-      this.provisioningLoopActive = false;
-    }
+    if (await this.store.provisioning()) await this.adoptRecoveredProvisioning();
     if (this.instanceId) this.openCoreChannels(this.instanceId);
     await this.refreshConfiguration();
     if (this.stopping) return;
     this.requireRecoveryAuthority();
+    await this.startOrdinaryLoops();
+    if (this.stopping) return;
+    this.requireRecoveryAuthority();
+    this.activeLoopStarted = true;
+    this.reconnectRefusal = null;
+    this.beginActiveWork();
+    await this.work.reports.flushAll();
+  }
+
+  /** Readiness was committed but its response lost: the recovered identity ends provisioning. */
+  private async adoptRecoveredProvisioning(): Promise<void> {
+    this.requireRecoveryAuthority();
+    const identity = await this.store.identity();
+    this.requireRecoveryAuthority();
+    const status = this.administrativeStatus;
+    if (!identity || identity.instanceId !== this.instanceId || !recoveredStatus(status)) {
+      throw new RemoteInstanceError("registration_mismatch", "Recovered provisioning identity is not authoritative.");
+    }
+    await this.store.saveIdentity({ ...identity, administrativeStatus: status });
+    this.requireRecoveryAuthority();
+    await this.store.clearProvisioning();
+    this.provisioningCredential = null;
+    this.provisioningLoopActive = false;
+  }
+
+  private async startOrdinaryLoops(): Promise<void> {
     if (!this.configurationTimer) {
       this.configurationTimer = setInterval(() => void this.refreshConfiguration(), 30_000);
       this.configurationTimer.unref();
@@ -1543,22 +1583,20 @@ export class Supervisor {
       await this.heartbeat.start();
       this.ordinaryHeartbeatStarted = true;
     }
-    if (this.stopping) return;
-    this.requireRecoveryAuthority();
-    this.activeLoopStarted = true;
-    this.reconnectRefusal = null;
+  }
+
+  private beginActiveWork(): void {
     void this.resumeOnComputerWatches().catch(error => this.logger.warn({ err: error }, "on-computer steps not resumed"));
     this.transport.start();
     this.planningDirectivePoller?.start();
     this.transport.resumeAfterRecovery();
     this.pullTimer = setInterval(() => this.work.pull(), 5_000);
     this.pullTimer.unref();
-    // bb: every 5 minutes release sessions idle for 30 minutes.
+    // Every 5 minutes, release sessions idle for 30 minutes.
     this.reaperTimer = setInterval(() => void this.work.reapIdleCompletedSessions(IDLE_SESSION_RELEASE_MS).catch(() => undefined), IDLE_SESSION_SWEEP_MS);
     this.reaperTimer.unref();
     this.previews.startIdleSweep();
     this.ensureUpdates()?.start();
-    await this.work.reports.flushAll();
   }
 
   /**
@@ -1612,11 +1650,22 @@ export class Supervisor {
 
   /** Local accepted-generation identity, not a substitute for Core authorization. */
   private recoveryAuthority(): string | null {
-    if (this.stopping || !this.nativeOwnership || !this.instanceId || !this.lease.isValid() || this.lease.mode() === "none" || !this.reconciliation?.isComplete) return null;
+    const instanceId = this.ownedRecoveryInstance();
+    if (!instanceId) return null;
+    const recovery = this.journal.recovery.current(instanceId, this.runnerIncarnation);
+    if (!appliedRecovery(recovery)) return null;
+    return JSON.stringify([instanceId, this.runnerIncarnation, this.leaseAuthorityEpoch, recovery.manifest.ownerRevision, recovery.manifest.manifestId, recovery.receipt.digest, recovery.acceptedAt]);
+  }
+
+  /** This process's instance while it owns its state under a usable lease after reconciliation; null otherwise. */
+  private ownedRecoveryInstance(): string | null {
+    if (this.stopping || !this.nativeOwnership || !this.instanceId || !this.leaseUsable() || !this.reconciliation?.isComplete) return null;
     try { this.nativeOwnership.assertOwned(); } catch { return null; }
-    const recovery = this.journal.recovery.current(this.instanceId, this.runnerIncarnation);
-    if (recovery?.state !== "applied" || !recovery.manifest || !recovery.receipt || !recovery.acceptedAt) return null;
-    return JSON.stringify([this.instanceId, this.runnerIncarnation, this.leaseAuthorityEpoch, recovery.manifest.ownerRevision, recovery.manifest.manifestId, recovery.receipt.digest, recovery.acceptedAt]);
+    return this.instanceId;
+  }
+
+  private leaseUsable(): boolean {
+    return this.lease.isValid() && this.lease.mode() !== "none";
   }
 
   private requireRecoveryAuthority(): void {
@@ -1698,8 +1747,7 @@ export class Supervisor {
   private async adoptHeartbeat(result: HeartbeatResult, assertCurrent: () => void): Promise<void> {
     if (this.stopping) return;
     const claims = decodeLeaseClaims(result.lease, { instanceId: this.instanceId ?? "", audience: LEASE_AUDIENCE });
-    if (result.instanceId !== this.instanceId || result.leaseMode !== claims.lease_mode || parseRfc3339(result.leaseExpiresAt) !== claims.exp * 1000 ||
-        (result.drainDeadline === undefined ? undefined : parseRfc3339(result.drainDeadline) / 1000) !== claims.drain_deadline) {
+    if (!heartbeatMatchesClaims(result, claims, this.instanceId)) {
       throw new RemoteInstanceError("registration_mismatch", "Heartbeat lease metadata does not match its claims.");
     }
     if (claims.exp * 1000 <= this.clock.coreNow()) throw new RemoteInstanceError("temporarily_unavailable", "Heartbeat returned an expired lease.");
@@ -1710,26 +1758,34 @@ export class Supervisor {
   private async onHeartbeatFailure(error: unknown): Promise<void> {
     if (this.stopping) return;
     const code = error instanceof RemoteInstanceError ? error.code : "temporarily_unavailable";
-    if (code === "instance_revoked" || code === "instance_suspended") {
-      this.logger.error({ code }, "heartbeat renewal denied; stopping new work");
-      this.administrativeStatus = code === "instance_revoked" ? "revoked" : "suspended";
-      this.leaseAuthorityEpoch++;
-      this.leaseRestorationAllowed = false;
-      if (code === "instance_revoked") this.heartbeat.stop();
-      this.lease.set(null);
-      if (!this.draining) { this.draining = true; this.drainReason = "lease_lost"; }
-      await this.mutateLease(() => this.store.clearLease());
-      // Cancellation is tracked, but never awaited inside lease acquisition:
-      // a stuck local tool cannot prevent suspended heartbeat retries. New
-      // work stays drained until both cleanup and fresh Core authority agree.
-      if (!this.leaseLossCleanup) {
-        this.leaseLossCleanupFailed = false;
-        void this.previews.stopAll("lease_lost");
-        this.leaseLossCleanup = Promise.resolve().then(() => this.work.drainSessions("lease_lost"))
-          .catch(() => { this.leaseLossCleanupFailed = true; this.logger.error("lease-loss session cleanup failed; work remains drained"); })
-          .finally(() => { this.leaseLossCleanup = null; this.restoreLeaseDrain(); });
-      }
-    }
+    if (code === "instance_revoked" || code === "instance_suspended") await this.loseLeaseAuthority(code);
+  }
+
+  /** Core revoked or suspended this runtime: stop new work, forget the lease and close its sessions. */
+  private async loseLeaseAuthority(code: "instance_revoked" | "instance_suspended"): Promise<void> {
+    this.logger.error({ code }, "heartbeat renewal denied; stopping new work");
+    this.administrativeStatus = code === "instance_revoked" ? "revoked" : "suspended";
+    this.leaseAuthorityEpoch++;
+    this.leaseRestorationAllowed = false;
+    if (code === "instance_revoked") this.heartbeat.stop();
+    this.lease.set(null);
+    if (!this.draining) { this.draining = true; this.drainReason = "lease_lost"; }
+    await this.mutateLease(() => this.store.clearLease());
+    this.startLeaseLossCleanup();
+  }
+
+  /**
+   * Cancellation is tracked, but never awaited inside lease acquisition:
+   * a stuck local tool cannot prevent suspended heartbeat retries. New
+   * work stays drained until both cleanup and fresh Core authority agree.
+   */
+  private startLeaseLossCleanup(): void {
+    if (this.leaseLossCleanup) return;
+    this.leaseLossCleanupFailed = false;
+    void this.previews.stopAll("lease_lost");
+    this.leaseLossCleanup = Promise.resolve().then(() => this.work.drainSessions("lease_lost"))
+      .catch(() => { this.leaseLossCleanupFailed = true; this.logger.error("lease-loss session cleanup failed; work remains drained"); })
+      .finally(() => { this.leaseLossCleanup = null; this.restoreLeaseDrain(); });
   }
 
   private restoreLeaseDrain(): void {
@@ -1745,26 +1801,10 @@ export class Supervisor {
   private async onInbound(message: InboundMessage): Promise<void> {
     if (this.stopping) throw new RemoteInstanceError("temporarily_unavailable", "supervisor is stopping before durable receipt");
     switch (message.channel) {
-      case "control": {
-        const body = message.body as { type?: string; manifestId?: string };
-        if (body.manifestId !== undefined) {
-          await this.reconciliation.apply(message.body);
-          return;
-        }
-        await this.control.handle(message.body);
-        return;
-      }
-      case "assignment": {
-        const terminal = PlanningControllerTerminalDirectiveSchema.safeParse(message.body);
-        if (terminal.success) {
-          const instanceId = this.instanceId ?? "", afterSequence = this.journal.planning.cursor(instanceId);
-          await this.journal.planning.storePulled(instanceId, afterSequence, { version: 1, directives: [terminal.data], highWater: terminal.data.directiveSequence });
-          await this.planningTerminal.accept(terminal.data);
-          return;
-        }
-        await this.work.onAssignmentMessage(message.body, message.assignmentRequest);
-        return;
-      }
+      case "control":
+        return this.onControlMessage(message.body);
+      case "assignment":
+        return this.onAssignmentChannelMessage(message);
       case "session":
         await this.work.onSessionMessage(message.channelId, message.body);
         return;
@@ -1775,6 +1815,27 @@ export class Supervisor {
     }
   }
 
+  /** A control frame naming a manifest is reconciliation; any other is a control directive. */
+  private async onControlMessage(body: unknown): Promise<void> {
+    if ((body as { manifestId?: string }).manifestId !== undefined) {
+      await this.reconciliation.apply(body);
+      return;
+    }
+    await this.control.handle(body);
+  }
+
+  /** A planning controller's terminal directive is stored and accepted; anything else is assignment work. */
+  private async onAssignmentChannelMessage(message: InboundMessage): Promise<void> {
+    const terminal = PlanningControllerTerminalDirectiveSchema.safeParse(message.body);
+    if (terminal.success) {
+      const instanceId = this.instanceId ?? "", afterSequence = this.journal.planning.cursor(instanceId);
+      await this.journal.planning.storePulled(instanceId, afterSequence, { version: 1, directives: [terminal.data], highWater: terminal.data.directiveSequence });
+      await this.planningTerminal.accept(terminal.data);
+      return;
+    }
+    await this.work.onAssignmentMessage(message.body, message.assignmentRequest);
+  }
+
   private async onChannelReset(channelId: string): Promise<void> {
     const channel = channelOf(channelId);
     if (channel === "session") await this.work.onChannelReset(channelId);
@@ -1783,27 +1844,30 @@ export class Supervisor {
   }
 
   private async onRunnerEvent(agentId: string, event: Parameters<WorkOrchestrator["onRunnerEvent"]>[0]): Promise<void> {
-    if (event.kind === "readiness_changed") {
-      this.inventory.updateAgent(event.agent);
-      if (this.lastSnapshot) this.lastSnapshot = { ...this.lastSnapshot, agents: this.inventory.agents() };
-      const agents = this.inventory.agents();
-      this.modelCapabilities?.invalidateForAgents(agents);
-      void this.modelCapabilities?.refresh(agents).catch(error => this.logger.warn({ err: error }, "native model capability discovery failed"));
-    }
-    if (event.kind === "login_event") {
-      const login = this.activeLogins.get(event.loginId);
-      if (login) {
-        const mapped = mapLoginEvent(event.loginId, event.event);
-        login.emit(mapped);
-        if (event.event.type === "completed" || event.event.type === "failed") {
-          if (event.event.type === "completed") this.modelCapabilities?.invalidateAgent(agentId);
-          this.activeLogins.delete(event.loginId);
-        }
-      }
-    }
+    if (event.kind === "readiness_changed") this.onAgentReadinessChanged(event.agent);
+    if (event.kind === "login_event") this.onLoginEvent(agentId, event);
     if (event.kind === "agent_scope_reset") { this.modelCapabilities?.invalidateAgent(agentId); this.logger.info({ agentId, previousScope: event.previousScope }, "agent_scope_reset"); }
     if (event.kind === "agent_scope_attested") this.modelCapabilities?.invalidateAgent(agentId);
     await this.work.onRunnerEvent(event);
+  }
+
+  private onAgentReadinessChanged(agent: Extract<SupervisorRunnerEvent, { kind: "readiness_changed" }>["agent"]): void {
+    this.inventory.updateAgent(agent);
+    if (this.lastSnapshot) this.lastSnapshot = { ...this.lastSnapshot, agents: this.inventory.agents() };
+    const agents = this.inventory.agents();
+    this.modelCapabilities?.invalidateForAgents(agents);
+    void this.modelCapabilities?.refresh(agents).catch(error => this.logger.warn({ err: error }, "native model capability discovery failed"));
+  }
+
+  /** Relay a runner's sign-in event to the login that asked for it; a completed or failed sign-in ends it. */
+  private onLoginEvent(agentId: string, event: Extract<SupervisorRunnerEvent, { kind: "login_event" }>): void {
+    const login = this.activeLogins.get(event.loginId);
+    if (!login) return;
+    login.emit(mapLoginEvent(event.loginId, event.event));
+    const type = event.event.type;
+    if (type !== "completed" && type !== "failed") return;
+    if (type === "completed") this.modelCapabilities?.invalidateAgent(agentId);
+    this.activeLogins.delete(event.loginId);
   }
 
   // ── Outbound facts ─────────────────────────────────────────────────────────
@@ -1813,8 +1877,7 @@ export class Supervisor {
       await this.configurationAcks.submit(ack);
       return;
     }
-    const key = `control:${"directiveId" in ack ? ack.directiveId : "rotationId" in ack ? ack.rotationId : `${ack.type}:${"revision" in ack ? ack.revision : ack.type === "version_ack" ? ack.bundleVersion : ack.acknowledgedAt}`}`;
-    await this.outbox.enqueue({ id: randomUUID(), channel: "control", key, group: "control", order: this.clock.now(), body: ack, createdAt: this.clock.nowIso() });
+    await this.outbox.enqueue({ id: randomUUID(), channel: "control", key: controlAckKey(ack), group: "control", order: this.clock.now(), body: ack, createdAt: this.clock.nowIso() });
     if (!this.stopping) {
       this.transport.send({ channel: "control", channelId: coreChannelId("control", this.instanceId ?? ""), body: ack, signature: "signature" in ack ? ack.signature : signBody(this.key, ack as unknown as { [key: string]: JsonValue }) });
     }
@@ -2911,6 +2974,60 @@ export class Supervisor {
 }
 
 const channelOf = channelOfId;
+
+type SupervisorRunnerEvent = Parameters<WorkOrchestrator["onRunnerEvent"]>[0];
+
+/** Statuses a recovered provisioning identity may hold once Core committed its readiness. */
+function recoveredStatus(status: string): status is "active" | "draining" | "suspended" {
+  return status === "active" || status === "draining" || status === "suspended";
+}
+/** Core refuses this runtime itself. */
+const REVOKED_CODES = ["instance_revoked", "registration_mismatch"] as const;
+/** Core refuses this process's recovery generation for good. */
+const RETIRED_CODES = ["reconciliation_replay", "resume_deadline_expired"] as const;
+
+function remoteErrorCodeIn(error: unknown, codes: readonly string[]): boolean {
+  return error instanceof RemoteInstanceError && codes.includes(error.code);
+}
+
+/** The first five call sites of an error's stack, innermost first, when it has one. */
+function stackField(error: unknown): { at?: string } {
+  const at = error instanceof Error ? error.stack?.split("\n").slice(1, 6).map(line => line.trim().replace(/^at /, "")).join(" < ") : undefined;
+  return at ? { at } : {};
+}
+
+/** A recovery record past pending and applied: this incarnation's recovery ended. */
+function recoveryEnded(record: RuntimeRecoveryRecord | undefined): boolean {
+  return record !== undefined && record.state !== "pending" && record.state !== "applied";
+}
+
+type AppliedRecovery = RuntimeRecoveryRecord & {
+  manifest: NonNullable<RuntimeRecoveryRecord["manifest"]>;
+  receipt: NonNullable<RuntimeRecoveryRecord["receipt"]>;
+  acceptedAt: NonNullable<RuntimeRecoveryRecord["acceptedAt"]>;
+};
+
+function appliedRecovery(recovery: RuntimeRecoveryRecord | undefined): recovery is AppliedRecovery {
+  return recovery?.state === "applied" && Boolean(recovery.manifest) && Boolean(recovery.receipt) && Boolean(recovery.acceptedAt);
+}
+
+function heartbeatDrainDeadline(result: HeartbeatResult): number | undefined {
+  return result.drainDeadline === undefined ? undefined : parseRfc3339(result.drainDeadline) / 1000;
+}
+
+/** The heartbeat's lease metadata matches the claims of the lease it carries. */
+function heartbeatMatchesClaims(result: HeartbeatResult, claims: ReturnType<typeof decodeLeaseClaims>, instanceId: string | null): boolean {
+  return result.instanceId === instanceId && result.leaseMode === claims.lease_mode &&
+    parseRfc3339(result.leaseExpiresAt) === claims.exp * 1000 && heartbeatDrainDeadline(result) === claims.drain_deadline;
+}
+
+/** One outbox key per directive, rotation or acknowledged version of a control ACK. */
+function controlAckKey(ack: ControlAck): string {
+  if ("directiveId" in ack) return `control:${ack.directiveId}`;
+  if ("rotationId" in ack) return `control:${ack.rotationId}`;
+  if ("revision" in ack) return `control:${ack.type}:${ack.revision}`;
+  return `control:${ack.type}:${ack.type === "version_ack" ? ack.bundleVersion : ack.acknowledgedAt}`;
+}
 
 type NativeOptions = NonNullable<SupervisorOptions["native"]>;
 type StoredIdentity = NonNullable<Awaited<ReturnType<SupervisorStore["identity"]>>>;
