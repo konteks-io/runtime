@@ -1,4 +1,5 @@
 import {
+  allEqual,
   RemoteExecutionRevisionControlDeliveryRequestSchema,
   RemoteInstanceError,
   type RemoteExecutionRevisionControlDeliveryRequest,
@@ -99,18 +100,17 @@ export class ExecutionRevisionControlReceiver {
     request: RemoteExecutionRevisionControlDeliveryRequest,
     scope: CapturedExecutionRevisionControlConnection,
   ): void {
-    if (
-      request.path.instanceId !== scope.instanceId ||
-      request.intent.instanceId !== scope.instanceId ||
-      request.intent.tenantId !== scope.workspaceId ||
-      request.nodeId !== scope.nodeId ||
-      request.connectionRef !== scope.connectionRef ||
-      request.connectionEpoch !== scope.connectionEpoch ||
-      request.intent.connectionRef !== scope.connectionRef ||
-      request.intent.connectionEpoch !== scope.connectionEpoch
-    ) {
-      throw this.unavailable();
-    }
+    const owned = allEqual([
+      [request.path.instanceId, scope.instanceId],
+      [request.intent.instanceId, scope.instanceId],
+      [request.intent.tenantId, scope.workspaceId],
+      [request.nodeId, scope.nodeId],
+      [request.connectionRef, scope.connectionRef],
+      [request.connectionEpoch, scope.connectionEpoch],
+      [request.intent.connectionRef, scope.connectionRef],
+      [request.intent.connectionEpoch, scope.connectionEpoch],
+    ]);
+    if (!owned) throw this.unavailable();
   }
 
   private unavailable(): RemoteInstanceError {

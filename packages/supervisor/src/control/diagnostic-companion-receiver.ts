@@ -1,4 +1,5 @@
 import {
+  allEqual,
   DiagnosticCarrierCompanionDeliveryRequestSchema,
   RemoteInstanceError,
   type DiagnosticCarrierCompanionDeliveryRequest,
@@ -89,20 +90,15 @@ export class DiagnosticCompanionReceiver {
     const now = this.deps.now();
     const issuedAt = Date.parse(request.issuedAt);
     const expiresAt = Date.parse(request.expiresAt);
-    if (
-      !Number.isFinite(now) ||
-      !Number.isFinite(issuedAt) ||
-      !Number.isFinite(expiresAt) ||
-      issuedAt > now + 300_000 ||
-      expiresAt <= now ||
-      request.path.instanceId !== scope.instanceId ||
-      request.nodeId !== scope.nodeId ||
-      request.connectionRef !== scope.connectionRef ||
-      request.connectionEpoch !== scope.connectionEpoch ||
-      request.companion.carrier.context.tenantId !== scope.workspaceId
-    ) {
-      throw this.unavailable();
-    }
+    const window = [now, issuedAt, expiresAt].every(Number.isFinite) && issuedAt <= now + 300_000 && expiresAt > now;
+    const owned = allEqual([
+      [request.path.instanceId, scope.instanceId],
+      [request.nodeId, scope.nodeId],
+      [request.connectionRef, scope.connectionRef],
+      [request.connectionEpoch, scope.connectionEpoch],
+      [request.companion.carrier.context.tenantId, scope.workspaceId],
+    ]);
+    if (!window || !owned) throw this.unavailable();
   }
 
   private unavailable(): RemoteInstanceError {

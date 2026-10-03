@@ -30,26 +30,18 @@ export interface RoleCapabilityInputs {
 
 export function agentSatisfiesRole(agent: ConnectedAgentView, role: RuntimeRole, inputs: RoleCapabilityInputs): boolean {
   if (agent.readiness !== "ready" || agent.connectionState !== "ready") return false;
-  switch (role) {
-    case "planner":
-      return true;
-    case "generator":
-      return true;
-    case "assistant":
-      return true;
-    case "qa":
-      // Code validation and adversarial review require only the ready ACP agent.
-      return true;
-    case "ops":
-      // The shared vocabulary is not proof of an installed operations carrier.
-      return false;
-    case "onboard":
-      // Evidence collection and relocation are git work. A ready agent alone
-      // is not enough, and an absent probe is not a licence to claim it.
-      return typeof inputs.gitVersion === "string" && inputs.gitVersion.length > 0;
-  }
+  // Evidence collection and relocation are git work. A ready agent alone
+  // is not enough, and an absent probe is not a licence to claim it.
+  if (role === "onboard") return typeof inputs.gitVersion === "string" && inputs.gitVersion.length > 0;
+  return READY_AGENT_ROLES.has(role);
 }
 
+/**
+ * Roles the ready ACP agent alone satisfies (code validation and adversarial
+ * review included). Not "ops": the shared vocabulary is not proof of an
+ * installed operations carrier.
+ */
+const READY_AGENT_ROLES: ReadonlySet<RuntimeRole> = new Set<RuntimeRole>(["planner", "generator", "assistant", "qa"]);
 /**
  * What an `onboard` runtime advertises when git is present (OB6 §1). Both
  * capabilities go together: one machine's git either reads repositories and

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { assertInboxCapacity, INBOX_MAX_BYTES, INBOX_MAX_ENTRIES } from "./inbox-capacity.js";
 import {
   computeExecutionRevisionControlIntentDigest,
   RemoteExecutionRevisionControlIntentSchema,
@@ -93,19 +94,10 @@ function executionRevisionFenceTuple(
 export class ExecutionRevisionFenceInbox {
   constructor(
     private readonly log: ExecutionRevisionFenceInboxLog,
-    private readonly maxEntries = 2_000,
-    private readonly maxBytes = 8 * 1024 * 1024,
+    private readonly maxEntries = INBOX_MAX_ENTRIES,
+    private readonly maxBytes = INBOX_MAX_BYTES,
   ) {
-    if (
-      !Number.isSafeInteger(maxEntries) ||
-      maxEntries < 1 ||
-      maxEntries > 2_000 ||
-      !Number.isSafeInteger(maxBytes) ||
-      maxBytes < 1 ||
-      maxBytes > 8 * 1024 * 1024
-    ) {
-      throw new Error("Revision fence inbox capacity must be bounded");
-    }
+    assertInboxCapacity(maxEntries, maxBytes, "Revision fence inbox capacity must be bounded");
   }
 
   pending(): ExecutionRevisionFenceInboxRecord[] {

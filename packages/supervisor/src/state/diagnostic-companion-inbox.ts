@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { assertInboxCapacity, INBOX_MAX_BYTES, INBOX_MAX_ENTRIES } from "./inbox-capacity.js";
 import { z } from "zod";
 import {
   DiagnosticCarrierCompanionSchema,
@@ -66,19 +67,10 @@ export function diagnosticCompanionDigest(
 export class DiagnosticCompanionInbox {
   constructor(
     private readonly log: DiagnosticCompanionInboxLog,
-    private readonly maxEntries = 2_000,
-    private readonly maxBytes = 8 * 1024 * 1024,
+    private readonly maxEntries = INBOX_MAX_ENTRIES,
+    private readonly maxBytes = INBOX_MAX_BYTES,
   ) {
-    if (
-      !Number.isSafeInteger(maxEntries) ||
-      maxEntries < 1 ||
-      maxEntries > 2_000 ||
-      !Number.isSafeInteger(maxBytes) ||
-      maxBytes < 1 ||
-      maxBytes > 8 * 1024 * 1024
-    ) {
-      throw new Error("Diagnostic companion inbox capacity must be bounded");
-    }
+    assertInboxCapacity(maxEntries, maxBytes, "Diagnostic companion inbox capacity must be bounded");
   }
 
   all(): DiagnosticCompanionInboxRecord[] {

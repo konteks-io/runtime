@@ -45,20 +45,26 @@ export class ConfigurationAckDelivery {
       for (const item of pending) {
         if (!this.options.canSend()) return;
         attempted.add(item.id);
-        const parsed = DesiredConfigurationAckSchema.safeParse(item.body);
-        if (!parsed.success || parsed.data.instanceId !== this.options.instanceId()) continue;
-        try {
-          await this.options.outbox.markAttempt(item.id, this.options.clock.nowIso());
-          if (!this.options.canSend()) return;
-          const accepted = await this.options.core.controlAck(parsed.data.instanceId, parsed.data);
-          if (accepted === true) await this.options.outbox.ack(item.id);
-          else if (accepted !== false) await this.options.outbox.supersedeConfigurationAck(item.id, accepted);
-        } catch {
-          // Core may have committed before a response was lost. Keep the exact
-          // signed record, including after a local acknowledgement-write failure.
-          this.logger.warn({ revision: parsed.data.revision }, "configuration acknowledgement retained for retry");
-        }
+        if (!await this.deliver(item)) return;
       }
     }
+  }
+
+  /** Deliver one retained acknowledgement; false once sending has stopped. */
+  private async deliver(item: ReturnType<DurableOutbox["all"]>[number]): Promise<boolean> {
+    const parsed = DesiredConfigurationAckSchema.safeParse(item.body);
+    if (!parsed.success || parsed.data.instanceId !== this.options.instanceId()) return true;
+    try {
+      await this.options.outbox.markAttempt(item.id, this.options.clock.nowIso());
+      if (!this.options.canSend()) return false;
+      const accepted = await this.options.core.controlAck(parsed.data.instanceId, parsed.data);
+      if (accepted === true) await this.options.outbox.ack(item.id);
+      else if (accepted !== false) await this.options.outbox.supersedeConfigurationAck(item.id, accepted);
+    } catch {
+      // Core may have committed before a response was lost. Keep the exact
+      // signed record, including after a local acknowledgement-write failure.
+      this.logger.warn({ revision: parsed.data.revision }, "configuration acknowledgement retained for retry");
+    }
+    return true;
   }
 }

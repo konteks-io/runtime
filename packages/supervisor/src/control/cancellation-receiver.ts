@@ -1,4 +1,5 @@
-import { RemoteInstanceError, RuntimeCancellationDeliveryRequestSchema } from "@konteks/remote-common";
+import { allEqual, RemoteInstanceError, RuntimeCancellationDeliveryRequestSchema } from "@konteks/remote-common";
+import { deliveryNotCurrent } from "./delivery-scope.js";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { CancellationInbox, CancellationInboxRecord } from "../state/cancellation-inbox.js";
 import type { LocalExecutionJournal } from "../state/local-execution.js";
@@ -7,8 +8,9 @@ import type { CoreClient } from "../core/client.js";
 type StartedAssignment = NonNullable<ReturnType<LocalExecutionJournal["start"]>>["assignment"];
 
 /** The work a Core cancellation may name: an Assistant conversation turn, a
- * person's direct session prompt (runtime-view R18), or a native delivery turn of a repository-role Session whose cleanup Core owns
- * (WS2-159). The session must be the assignment's own. */
+ * person's direct session prompt, or a native delivery turn of a
+ * repository-role Session whose cleanup Core owns. The session must be the
+ * assignment's own. */
 export function cancellationNamesAssignment(assignment: StartedAssignment, sessionId: string): boolean {
   const source = assignment.source;
   if (source.kind === "harness_delivery") return source.executionSessionId === sessionId;
@@ -19,13 +21,27 @@ export function cancellationNamesAssignment(assignment: StartedAssignment, sessi
 /**
  * A turn that stops through the ordinary signed cancel (its session closes and
  * reports a cancelled terminal, which is Core's stop proof): a
- * delivery turn (WS2-159) and a direct session's turn. A direct turn that was
+ * delivery turn and a direct session's turn. A direct turn that was
  * only stopped for recovery never reported, and Core's cancel left it
  * unsettled here, so every later prompt in that session was refused as
- * waiting on its predecessor (WS1-172).
+ * waiting on its predecessor.
  */
 export function isDeliveryCancellation(assignment: StartedAssignment): boolean {
   return assignment.source.kind === "harness_delivery" || assignment.source.kind === "direct_session";
+}
+
+/** Whether the started assignment is the one the cancellation names, claimed by this connection's runner. */
+function claimedOnConnection(
+  start: NonNullable<ReturnType<LocalExecutionJournal["start"]>>,
+  intent: { claimId: string; sessionId: string },
+  scope: CapturedCancellationConnection,
+): boolean {
+  return allEqual([
+    [start.admission.instanceId, scope.instanceId],
+    [start.admission.workspaceId, scope.workspaceId],
+    [start.admission.runnerIncarnation, scope.runnerIncarnation],
+    [start.admission.claimId, intent.claimId],
+  ]) && cancellationNamesAssignment(start.assignment, intent.sessionId);
 }
 
 export interface CapturedCancellationConnection {
@@ -65,17 +81,10 @@ export class CancellationReceiver {
     if (!scope) throw unavailable();
     const assertCurrent = () => {
       scope.assertCurrent();
-      const now = this.deps.now();
-      const leaseDeadline = Date.parse(scope.leaseExpiresAt);
-      if (!Number.isFinite(now) || !Number.isFinite(leaseDeadline) ||
-        request.intent.instanceId !== scope.instanceId || request.intent.tenantId !== scope.workspaceId ||
-        request.connectionEpoch !== scope.connectionEpoch || Date.parse(request.issuedAt) > now + 300000 ||
-        Date.parse(request.expiresAt) <= now || Date.parse(request.expiresAt) > leaseDeadline) throw unavailable();
+      if (deliveryNotCurrent(request, scope, this.deps.now(), 300_000)) throw unavailable();
       const { assignmentId, attempt } = request.intent.directive;
       const start = this.deps.claims.start(assignmentId, attempt);
-      if (!start || start.admission.instanceId !== scope.instanceId || start.admission.workspaceId !== scope.workspaceId ||
-        start.admission.runnerIncarnation !== scope.runnerIncarnation || start.admission.claimId !== request.intent.claimId ||
-        !cancellationNamesAssignment(start.assignment, request.intent.sessionId)) throw unavailable();
+      if (!start || !claimedOnConnection(start, request.intent, scope)) throw unavailable();
     };
     // The inbox repeats this guard under its write lane and after fsync. The
     // exact parsed intent cannot be changed by caller mutation during awaits.

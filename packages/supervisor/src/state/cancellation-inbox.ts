@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { assertInboxCapacity, INBOX_MAX_BYTES, INBOX_MAX_ENTRIES } from "./inbox-capacity.js";
 import { RemoteInstanceError, RuntimeCancellationIntentSchema, runtimeCancellationIntentDigest } from "@konteks/remote-common";
 
 export const CancellationInboxRecordSchema = z.object({
@@ -21,11 +22,8 @@ interface CancellationInboxLog {
  */
 export class CancellationInbox {
   constructor(private readonly log: CancellationInboxLog,
-    private readonly maxEntries = 2000, private readonly maxBytes = 8 * 1024 * 1024) {
-    if (!Number.isSafeInteger(maxEntries) || maxEntries < 1 || maxEntries > 2000 ||
-      !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 8 * 1024 * 1024) {
-      throw new Error("Cancellation inbox capacity must be bounded");
-    }
+    private readonly maxEntries = INBOX_MAX_ENTRIES, private readonly maxBytes = INBOX_MAX_BYTES) {
+    assertInboxCapacity(maxEntries, maxBytes, "Cancellation inbox capacity must be bounded");
   }
 
   pending(): CancellationInboxRecord[] {

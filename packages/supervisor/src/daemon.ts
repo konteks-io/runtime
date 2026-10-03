@@ -45,6 +45,29 @@ export interface Daemon {
 const TERMINATION_SIGNALS: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
 const PROCESS_FAILURE_EVENTS: ProcessFailureEvent[] = ["uncaughtException", "unhandledRejection"];
 const DEFAULT_SHUTDOWN_EXIT_GRACE_MS = 15_000;
+/** How a shutdown reason is recorded; any other reason is "other". */
+const EXIT_CLASSIFICATIONS = new Map<string, ControlledExitReason>([
+  ["liveness-lost", "liveness_lost"],
+  ["uncaughtException", "uncaught_exception"],
+  ["unhandledRejection", "unhandled_rejection"],
+  ["startup-failed", "startup_failed"],
+  ["shutdown-step-failed", "shutdown_step_failed"],
+]);
+
+/** Runs every step even after one fails; the first failure is returned. */
+async function runShutdownSteps(steps: DaemonStep[], logger: Logger): Promise<Error | null> {
+  let failure: Error | null = null;
+  for (const step of steps) {
+    try {
+      await step.run();
+    } catch (error) {
+      const stepError = normalizeCaughtError(error);
+      failure ??= stepError;
+      logger.error({ err: stepError, step: step.name }, "shutdown step failed");
+    }
+  }
+  return failure;
+}
 
 export function createDaemon(options: CreateDaemonOptions): Daemon {
   const logger = options.logger ?? createLogger({ name: options.name });
@@ -75,11 +98,7 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
   async function recordExit(reason: string): Promise<void> {
     if (exitRecorded || !options.recordNonzeroExit) return;
     exitRecorded = true;
-    const classification: ControlledExitReason = reason === "liveness-lost" ? "liveness_lost"
-      : reason === "uncaughtException" ? "uncaught_exception"
-      : reason === "unhandledRejection" ? "unhandled_rejection"
-      : reason === "startup-failed" ? "startup_failed"
-      : reason === "shutdown-step-failed" ? "shutdown_step_failed" : "other";
+    const classification = EXIT_CLASSIFICATIONS.get(reason) ?? "other";
     try {
       await options.recordNonzeroExit(classification);
     } catch (error) {
@@ -105,16 +124,7 @@ export function createDaemon(options: CreateDaemonOptions): Daemon {
       // Startup may still be acquiring ownership or spawning children. The
       // watchdog remains active, but cleanup cannot race those operations.
       await startupSettled;
-      let failure: Error | null = null;
-      for (const step of options.shutdownSteps()) {
-        try {
-          await step.run();
-        } catch (error) {
-          const stepError = normalizeCaughtError(error);
-          failure ??= stepError;
-          logger.error({ err: stepError, step: step.name }, "shutdown step failed");
-        }
-      }
+      const failure = await runShutdownSteps(options.shutdownSteps(), logger);
       if (failure) {
         shutdownExitCode = 1;
         await recordExit("shutdown-step-failed");
