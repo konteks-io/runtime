@@ -78,16 +78,21 @@ const LENT_CLOSE_DEADLINE_MS = 15_000;
  * start) is transient: the agent may still offer exactly what it last did.
  */
 export function definiteModelDiscoveryFailure(error: unknown): boolean {
-  if (error instanceof RemoteInstanceError && (error.code === "agent_auth_required" || error.diagnostic === MODEL_DISCOVERY_REFUSED)) return true;
+  if (refusedOrSignedOut(error)) return true;
   const cause = error instanceof RemoteInstanceError && error.cause !== undefined ? error.cause : error;
-  if (cause !== error && cause instanceof RemoteInstanceError && (cause.code === "agent_auth_required" || cause.diagnostic === MODEL_DISCOVERY_REFUSED)) return true;
-  const kind = classifyBridgeError(cause).class;
-  return kind === "agent_auth_required" || kind === "invalid_params" || kind === "unknown_request" || kind === "malformed_response";
+  if (cause !== error && refusedOrSignedOut(cause)) return true;
+  return DEFINITE_BRIDGE_ERRORS.has(classifyBridgeError(cause).class);
+}
+
+const DEFINITE_BRIDGE_ERRORS: ReadonlySet<string> = new Set(["agent_auth_required", "invalid_params", "unknown_request", "malformed_response"]);
+
+function refusedOrSignedOut(error: unknown): boolean {
+  return error instanceof RemoteInstanceError && (error.code === "agent_auth_required" || error.diagnostic === MODEL_DISCOVERY_REFUSED);
 }
 
 /**
  * What may be offered under the agent's settings (OpenCode: Zen's free models
- * only when the person switched them on, O6). A hidden current value gives way
+ * only when the person switched them on). A hidden current value gives way
  * to the first offered one; nothing left to offer reads as needing a sign-in.
  */
 export function offerableModelCapability(capability: DiscoveredBridgeModelCapability, offers: (value: string) => boolean, family: { agentId: string; displayName: string }): DiscoveredBridgeModelCapability {
@@ -121,100 +126,182 @@ export async function discoverBridgeModelCapability(options: DiscoverBridgeModel
   if (!options.configId || options.configId.length > 256) throw unavailable();
   const cwd = await mkdtemp(join(options.workspaceRoot, ".model-discovery-"));
   await chmod(cwd, 0o700);
-  const logger = options.logger ?? createLogger({ name: "runner-model-discovery" });
-  const baseTimeoutMs = options.sessionTimeoutMs ?? 10_000;
-  const sleep = options.retrySleep ?? (delayMs => new Promise(resolve => setTimeout(resolve, delayMs)));
-  const random = options.retryRandom ?? Math.random;
-  const rejectDiscoveryRequest = async (): Promise<never> => { throw unavailable(); };
+  const run = discoveryRun(options, cwd);
   try {
-    for (let attempt = 1; attempt <= 4; attempt += 1) {
-      const timeoutMs = discoverySessionTimeoutMs(baseTimeoutMs, attempt);
-      let bridge = attempt === 1 ? options.bridge ?? null : null;
-      let bridgeAcquired = bridge !== null;
-      let spawned: BridgeProcess | null = null;
-      let timer: NodeJS.Timeout | undefined;
-      let sessionCreated = false;
-      let stopped = false;
-      try {
-        if (!bridge) {
-          const spawnOptions: SpawnBridgeOptions = {
-            spec: options.spec,
-            initializeTimeoutMs: options.initializeTimeoutMs,
-            clientVersion: options.clientVersion,
-            logger,
-            handlers: {
-              onSessionUpdate: () => undefined,
-              onRequestPermission: rejectDiscoveryRequest,
-              onCreateElicitation: rejectDiscoveryRequest,
-              onExit: () => undefined,
-            },
-            ...(options.stderrFailure ? { stderrFailure: options.stderrFailure } : {}),
-          };
-          spawned = bridge = await (options.spawn ?? spawnBridge)(spawnOptions);
-          bridgeAcquired = true;
-        }
-        const deadline = new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new RemoteInstanceError("agent_unavailable", "ACP model discovery session deadline elapsed.", {
-            retryable: true, diagnostic: "model_discovery_session_new_deadline",
-          })), timeoutMs);
-          timer.unref();
-        });
-        const created = await Promise.race([
-          bridge.connection.newSession({ cwd, mcpServers: [], _meta: { ...konteksSessionMetadata("Model capability check", options.spec.family.agentId), ...options.sessionMeta } }),
-          deadline,
-          ...(bridge.failure ? [bridge.failure] : []),
-        ]);
-        sessionCreated = true;
-        const matches = (created.configOptions ?? []).filter(option => option.id === options.configId);
-        const selected = matches[0];
-        if (matches.length !== 1 || selected === undefined || selected.type !== "select") throw unavailable();
-        const capability = exactSelect(selected, options.spec.family.agentId);
-        if (attempt === 1 && options.bridge) await closeLentSession(options.bridge, created.sessionId, logger, options.spec.family.agentId);
-        return capability;
-      } catch (error) {
-        const classified = classifyBridgeError(error);
-        const retryable = !sessionCreated && (!bridgeAcquired ||
-          (error instanceof RemoteInstanceError && (error.retryable || error.code === "agent_unavailable")) || classified.retryable);
-        const mustStop = retryable || spawned !== null;
-        let stopConfirmed = !mustStop;
-        if (mustStop && bridge) {
-          try { await bridge.stop(); stopped = true; stopConfirmed = true; }
-          catch (stopError) {
-            logger.error({ agentId: options.spec.family.agentId, attempt, timeoutMs, stopConfirmed: false,
-              errorClass: classifyBridgeError(stopError).class,
-              errorCode: stopError instanceof RemoteInstanceError ? stopError.code : "bridge_stop_failed" },
-            "model discovery bridge stop is unconfirmed");
-            throw new RemoteInstanceError("recovery_required", "Model discovery bridge stop is unconfirmed.", {
-              diagnostic: "model_discovery_stop_unconfirmed", cause: stopError,
-            });
-          }
-        }
-        const exhausted = !retryable || attempt === 4;
-        logger.warn({ agentId: options.spec.family.agentId, attempt, maxAttempts: 4, timeoutMs, stopConfirmed,
-          retryable, exhausted, errorClass: classified.class,
-          errorCode: error instanceof RemoteInstanceError ? error.code : "model_discovery_failed",
-          // What the agent said, so a failure that repeats can be told apart
-          // (WS1-216: Codex failed as "internal" every five minutes, unexplained).
-          acpCode: classified.code, reason: logReason(classified.message) },
-        "ACP model capability discovery attempt failed");
-        if (exhausted) {
-          if (error instanceof RemoteInstanceError) throw error;
-          throw new RemoteInstanceError("agent_unavailable", "ACP model capability discovery failed", { cause: error });
-        }
-        const exponentialMs = 500 * (2 ** (attempt - 1));
-        const delayMs = Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + (random() * 0.5)))));
-        logger.warn({ agentId: options.spec.family.agentId, attempt, nextAttempt: attempt + 1, maxAttempts: 4, delayMs,
-          recovery: "fresh_bridge" }, "retrying model capability discovery with exponential backoff");
-        await sleep(delayMs);
-      } finally {
-        if (timer) clearTimeout(timer);
-        if (spawned && !stopped) await spawned.stop().catch(() => undefined);
-      }
+    for (let attempt = 1; attempt <= DISCOVERY_ATTEMPTS; attempt += 1) {
+      const capability = await discoveryAttempt(run, attempt);
+      if (capability) return capability;
+      await retryPause(run, attempt);
     }
     throw unavailable();
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+}
+
+const DISCOVERY_ATTEMPTS = 4;
+
+interface DiscoveryRun {
+  options: DiscoverBridgeModelCapabilityOptions;
+  cwd: string;
+  logger: Logger;
+  agentId: string;
+  baseTimeoutMs: number;
+  sleep: (delayMs: number) => Promise<void>;
+  random: () => number;
+}
+
+function discoveryRun(options: DiscoverBridgeModelCapabilityOptions, cwd: string): DiscoveryRun {
+  return {
+    options, cwd,
+    logger: options.logger ?? createLogger({ name: "runner-model-discovery" }),
+    agentId: options.spec.family.agentId,
+    baseTimeoutMs: options.sessionTimeoutMs ?? 10_000,
+    sleep: options.retrySleep ?? (delayMs => new Promise(resolve => setTimeout(resolve, delayMs))),
+    random: options.retryRandom ?? Math.random,
+  };
+}
+
+/** One attempt's bridge: the lent one on the first attempt, else a process of its own (`spawned`). */
+interface AttemptState {
+  bridge: BridgeProcess | null;
+  spawned: BridgeProcess | null;
+  bridgeAcquired: boolean;
+  sessionCreated: boolean;
+  stopped: boolean;
+}
+
+/** The capability, or null when the attempt failed in a way worth another one (it already stopped its process). */
+async function discoveryAttempt(run: DiscoveryRun, attempt: number): Promise<DiscoveredBridgeModelCapability | null> {
+  const { options } = run;
+  const timeoutMs = discoverySessionTimeoutMs(run.baseTimeoutMs, attempt);
+  // Only the first attempt uses the lent bridge; a retry always gets a fresh process.
+  const lent = attempt === 1 && options.bridge ? options.bridge : null;
+  const state: AttemptState = { bridge: lent, spawned: null, bridgeAcquired: lent !== null, sessionCreated: false, stopped: false };
+  const deadline = sessionDeadline(timeoutMs);
+  try {
+    const bridge = state.bridge ?? await spawnDiscoveryBridge(run, state);
+    const created = await Promise.race([
+      bridge.connection.newSession({ cwd: run.cwd, mcpServers: [], _meta: { ...konteksSessionMetadata("Model capability check", run.agentId), ...options.sessionMeta } }),
+      deadline.start(),
+      ...failureOf(bridge),
+    ]);
+    state.sessionCreated = true;
+    const capability = exactSelect(selectedConfigOption(created.configOptions, options.configId), run.agentId);
+    if (lent) await closeLentSession(lent, created.sessionId, run.logger, run.agentId);
+    return capability;
+  } catch (error) {
+    await failedAttempt(run, state, error, attempt, timeoutMs);
+    return null;
+  } finally {
+    deadline.clear();
+    if (state.spawned && !state.stopped) await state.spawned.stop().catch(() => undefined);
+  }
+}
+
+function failureOf(bridge: BridgeProcess): Promise<never>[] {
+  return bridge.failure ? [bridge.failure] : [];
+}
+
+/** An isolated process that refuses every bridge-to-client request. */
+async function spawnDiscoveryBridge(run: DiscoveryRun, state: AttemptState): Promise<BridgeProcess> {
+  const { options } = run;
+  const rejectDiscoveryRequest = async (): Promise<never> => { throw unavailable(); };
+  const spawnOptions: SpawnBridgeOptions = {
+    spec: options.spec,
+    initializeTimeoutMs: options.initializeTimeoutMs,
+    clientVersion: options.clientVersion,
+    logger: run.logger,
+    handlers: {
+      onSessionUpdate: () => undefined,
+      onRequestPermission: rejectDiscoveryRequest,
+      onCreateElicitation: rejectDiscoveryRequest,
+      onExit: () => undefined,
+    },
+    ...(options.stderrFailure ? { stderrFailure: options.stderrFailure } : {}),
+  };
+  const bridge = await (options.spawn ?? spawnBridge)(spawnOptions);
+  state.spawned = state.bridge = bridge;
+  state.bridgeAcquired = true;
+  return bridge;
+}
+
+/** The `session/new` deadline, started once the bridge is up. */
+function sessionDeadline(timeoutMs: number): { start(): Promise<never>; clear(): void } {
+  let timer: NodeJS.Timeout | undefined;
+  return {
+    start: () => new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new RemoteInstanceError("agent_unavailable", "ACP model discovery session deadline elapsed.", {
+        retryable: true, diagnostic: "model_discovery_session_new_deadline",
+      })), timeoutMs);
+      timer.unref();
+    }),
+    clear: () => { if (timer) clearTimeout(timer); },
+  };
+}
+
+/** Exactly one select option with the configured id. */
+function selectedConfigOption(configOptions: SessionConfigOption[] | null | undefined, configId: string): Extract<SessionConfigOption, { type: "select" }> {
+  const matches = (configOptions ?? []).filter(option => option.id === configId);
+  const selected = matches[0];
+  if (matches.length !== 1 || selected === undefined || selected.type !== "select") throw unavailable();
+  return selected;
+}
+
+/**
+ * A failed attempt stops its process when another may follow (or when the
+ * process was its own), logs what the agent said, and throws once no attempt
+ * is left or the failure is not worth retrying.
+ */
+async function failedAttempt(run: DiscoveryRun, state: AttemptState, error: unknown, attempt: number, timeoutMs: number): Promise<void> {
+  const classified = classifyBridgeError(error);
+  const retryable = attemptRetryable(state, error, classified.retryable);
+  const stopConfirmed = await stopAfterFailure(run, state, retryable, attempt, timeoutMs);
+  const exhausted = !retryable || attempt === DISCOVERY_ATTEMPTS;
+  run.logger.warn({ agentId: run.agentId, attempt, maxAttempts: DISCOVERY_ATTEMPTS, timeoutMs, stopConfirmed,
+    retryable, exhausted, errorClass: classified.class,
+    errorCode: error instanceof RemoteInstanceError ? error.code : "model_discovery_failed",
+    // What the agent said, so a failure that repeats can be told apart.
+    acpCode: classified.code, reason: logReason(classified.message) },
+  "ACP model capability discovery attempt failed");
+  if (!exhausted) return;
+  if (error instanceof RemoteInstanceError) throw error;
+  throw new RemoteInstanceError("agent_unavailable", "ACP model capability discovery failed", { cause: error });
+}
+
+/** Retried only before a session exists: a bridge that never came up, or a transient answer. */
+function attemptRetryable(state: AttemptState, error: unknown, classifiedRetryable: boolean): boolean {
+  if (state.sessionCreated) return false;
+  if (!state.bridgeAcquired || classifiedRetryable) return true;
+  return error instanceof RemoteInstanceError && (error.retryable || error.code === "agent_unavailable");
+}
+
+/** Whether the attempt's process is known to be stopped; an unconfirmed stop needs recovery. */
+async function stopAfterFailure(run: DiscoveryRun, state: AttemptState, retryable: boolean, attempt: number, timeoutMs: number): Promise<boolean> {
+  if (!retryable && state.spawned === null) return true;
+  if (!state.bridge) return false;
+  try {
+    await state.bridge.stop();
+    state.stopped = true;
+    return true;
+  } catch (stopError) {
+    run.logger.error({ agentId: run.agentId, attempt, timeoutMs, stopConfirmed: false,
+      errorClass: classifyBridgeError(stopError).class,
+      errorCode: stopError instanceof RemoteInstanceError ? stopError.code : "bridge_stop_failed" },
+    "model discovery bridge stop is unconfirmed");
+    throw new RemoteInstanceError("recovery_required", "Model discovery bridge stop is unconfirmed.", {
+      diagnostic: "model_discovery_stop_unconfirmed", cause: stopError,
+    });
+  }
+}
+
+/** Exponential backoff with jitter before a fresh bridge tries again. */
+async function retryPause(run: DiscoveryRun, attempt: number): Promise<void> {
+  const exponentialMs = 500 * (2 ** (attempt - 1));
+  const delayMs = Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + (run.random() * 0.5)))));
+  run.logger.warn({ agentId: run.agentId, attempt, nextAttempt: attempt + 1, maxAttempts: DISCOVERY_ATTEMPTS, delayMs,
+    recovery: "fresh_bridge" }, "retrying model capability discovery with exponential backoff");
+  await run.sleep(delayMs);
 }
 
 /**
@@ -263,8 +350,7 @@ function validValue(value: unknown): value is string {
 }
 
 /**
- * Every option the agent offers, with its name and group (System One §6a,
- * KM6). Malformed entries and repeats are skipped rather than failing the
+ * Every option the agent offers, with its name and group. Malformed entries and repeats are skipped rather than failing the
  * whole report. Above the wire bound the known models come first, then the
  * recognised, so a DeepSeek Harness fronting many providers still reports
  * what Konteks can price; the current value is always kept.

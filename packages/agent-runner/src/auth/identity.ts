@@ -8,7 +8,7 @@ import { hostAgentRunnerAdapter } from "../host/registry.js";
 import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentSettings } from "../host/host-agent.js";
 
 /**
- * The opaque `authIdentityFingerprint` (D111): a keyed hash of the identity
+ * The opaque `authIdentityFingerprint`: a keyed hash of the identity
  * signal the bridge's OFFICIAL tooling exposes (a status/whoami result). The
  * runner never parses a credential file. The HMAC key is generated once into
  * the credential volume so the fingerprint is stable across restarts but
@@ -43,19 +43,25 @@ export async function probeIdentity(
   if (host?.identity) return host.identity(config, settings);
   if (!family.tooling.identitySignal) return { kind: "no_official_signal" };
   const key = await readOrCreateSecretFile({ bytes: 32, dataDir: config.RUNNER_CREDENTIAL_DIR, encoding: "base64url", fileName: FINGERPRINT_KEY_FILE });
-  if (family.agentId === "codex") {
-    const account = await (deps.readAccount ?? readCodexAccount)(config, family, env);
-    return account === null ? { kind: "logged_out" } : { kind: "signal", fingerprint: keyedFingerprint(Buffer.from(key, "base64url"), `${family.agentId}\n${account}`) };
-  }
-  const { command, args } = resolveToolingCommand(config, family, family.tooling.identitySignal);
-  const run = deps.run ?? runCommand;
+  const signal = await identitySignal(config, family, family.tooling.identitySignal, env, deps);
+  return signal === null ? { kind: "logged_out" } : { kind: "signal", fingerprint: keyedFingerprint(Buffer.from(key, "base64url"), `${family.agentId}\n${signal}`) };
+}
+
+/** Codex's signed-in account email, else the official status signal. */
+function identitySignal(config: RunnerConfig, family: AgentBridgeFamily, signal: readonly string[], env: NodeJS.ProcessEnv, deps: IdentityProbeDeps): Promise<string | null> {
+  if (family.agentId === "codex") return (deps.readAccount ?? readCodexAccount)(config, family, env);
+  return officialStatusSignal(config, family, signal, env, deps.run ?? runCommand);
+}
+
+/** The stable projection of the official status command's output; null when it says nobody is signed in. */
+async function officialStatusSignal(config: RunnerConfig, family: AgentBridgeFamily, identitySignal: readonly string[], env: NodeJS.ProcessEnv, run: typeof runCommand): Promise<string | null> {
+  const { command, args } = resolveToolingCommand(config, family, identitySignal);
   const result = await run({ command, args, env, cwd: config.RUNNER_CREDENTIAL_DIR, timeoutMs: 20_000, outputCapBytes: 64 * 1024 });
-  if (result.code !== 0) return { kind: "logged_out" };
+  if (result.code !== 0) return null;
   // Claude Code's status exits 0 when signed out; only `loggedIn: true` is an identity.
-  if (family.agentId === "claude-code" && !claudeLoggedIn(result.stdout)) return { kind: "logged_out" };
+  if (family.agentId === "claude-code" && !claudeLoggedIn(result.stdout)) return null;
   const signal = normalizeSignal(result.stdout);
-  if (signal.length === 0) return { kind: "logged_out" };
-  return { kind: "signal", fingerprint: keyedFingerprint(Buffer.from(key, "base64url"), `${family.agentId}\n${signal}`) };
+  return signal.length === 0 ? null : signal;
 }
 
 /**

@@ -8,17 +8,17 @@ import { hostAgentRunnerAdapter } from "./host/registry.js";
  * The sanitized `ConnectedAgentView` this runner publishes. It is computed
  * from the ACP `initialize` result plus connection state — never from a parsed
  * credential file — and carries no account, email, path, token, or raw probe
- * output. Tool control per bridge comes from the CP0 matrix.
+ * output. Tool control per bridge is fixed per agent.
  */
 const TOOL_CONTROL: Record<AgentBridgeFamily["agentId"], ConnectedAgentView["acpCapabilities"]["toolControl"]> = {
   "claude-code": "approve",
   codex: "approve",
   // Every non-read-only dsh tool asks through the Konteks hook (dsh-profile.ts).
   dsh: "approve",
-  // Every gated OpenCode tool asks through the locked Konteks config (CP2/CP4).
+  // Every gated OpenCode tool asks through the locked Konteks config.
   opencode: "approve",
   // Every Antigravity tool that is not a read asks by default; mode stays
-  // `default` and its permission requests reach the Konteks policy (CP4).
+  // `default` and its permission requests reach the Konteks policy.
   antigravity: "approve",
 };
 
@@ -38,13 +38,12 @@ interface ReadinessInputs {
   tokenUsageObservable?: boolean;
   /** Signed in, but the provider's admin keeps Konteks tools out (Antigravity with MCP Servers off): no Konteks work can run on it. */
   providerAdminBlocked?: boolean;
-  /** The slash commands this agent announced on this computer and when (runtime-view R19). */
+  /** The slash commands this agent announced on this computer and when. */
   availableCommands?: { readonly commands: readonly AvailableCommand[]; readonly learntAt: string };
   lastProbeAt: string | null;
 }
 
 export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
-  const caps = inputs.initializeResult?.agentCapabilities;
   const readiness = deriveReadiness(inputs);
   const view: ConnectedAgentView = {
     agentId: inputs.family.agentId,
@@ -53,33 +52,50 @@ export function projectReadiness(inputs: ReadinessInputs): ConnectedAgentView {
     authMode: inputs.authMode,
     accountScope: inputs.scope.accountScope,
     readiness,
-    // A host agent may send no billing usage with a turn (DeepSeek Harness:
-    // its usage_update is context occupancy, dsh-runtime-support D4).
-    tokenUsageObservable: inputs.tokenUsageObservable ?? hostAgentRunnerAdapter(inputs.family.agentId)?.tokenUsageObservable ?? true,
-    acpCapabilities: {
-      sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
-      forkSession: caps?.sessionCapabilities?.fork != null,
-      structuredOutputShim: true,
-      toolControl: TOOL_CONTROL[inputs.family.agentId],
-    },
+    tokenUsageObservable: tokenUsageObservable(inputs),
+    acpCapabilities: acpCapabilities(inputs.initializeResult, inputs.family.agentId),
+    ...optionalViewFields(inputs),
   };
-  if (inputs.family.hostInstall !== undefined && inputs.hostAgentVersion) view.hostAgentVersion = inputs.hostAgentVersion;
-  if (inputs.credentials !== undefined) view.credentials = inputs.credentials.map(credential => ({ ...credential }));
-  if (inputs.scope.authIdentityFingerprint !== null) view.authIdentityFingerprint = inputs.scope.authIdentityFingerprint;
-  if (inputs.scope.scopeAttestedAt !== null) view.scopeAttestedAt = inputs.scope.scopeAttestedAt;
-  if (inputs.lastProbeAt !== null) view.lastProbeAt = inputs.lastProbeAt;
-  if (inputs.availableCommands !== undefined) {
-    view.availableCommands = inputs.availableCommands.commands.map(command => ({ ...command }));
-    view.availableCommandsLearntAt = inputs.availableCommands.learntAt;
-  }
   const recovery = deriveRecoveryAction(inputs, readiness);
   if (recovery) view.recoveryAction = recovery;
   return ConnectedAgentViewSchema.parse(view);
 }
 
+/**
+ * A host agent may send no billing usage with a turn (DeepSeek Harness: its
+ * usage_update is context occupancy); the sign-in in use may say otherwise.
+ */
+function tokenUsageObservable(inputs: ReadinessInputs): boolean {
+  return inputs.tokenUsageObservable ?? hostAgentRunnerAdapter(inputs.family.agentId)?.tokenUsageObservable ?? true;
+}
+
+function acpCapabilities(initializeResult: InitializeResponse | null, agentId: AgentBridgeFamily["agentId"]): ConnectedAgentView["acpCapabilities"] {
+  const caps = initializeResult?.agentCapabilities;
+  return {
+    sessionResume: caps?.loadSession === true || caps?.sessionCapabilities?.resume != null,
+    forkSession: caps?.sessionCapabilities?.fork != null,
+    structuredOutputShim: true,
+    toolControl: TOOL_CONTROL[agentId],
+  };
+}
+
+function optionalViewFields(inputs: ReadinessInputs): Partial<ConnectedAgentView> {
+  return {
+    ...(inputs.family.hostInstall !== undefined && inputs.hostAgentVersion ? { hostAgentVersion: inputs.hostAgentVersion } : {}),
+    ...(inputs.credentials !== undefined ? { credentials: inputs.credentials.map(credential => ({ ...credential })) } : {}),
+    ...(inputs.scope.authIdentityFingerprint !== null ? { authIdentityFingerprint: inputs.scope.authIdentityFingerprint } : {}),
+    ...(inputs.scope.scopeAttestedAt !== null ? { scopeAttestedAt: inputs.scope.scopeAttestedAt } : {}),
+    ...(inputs.lastProbeAt !== null ? { lastProbeAt: inputs.lastProbeAt } : {}),
+    ...(inputs.availableCommands !== undefined ? {
+      availableCommands: inputs.availableCommands.commands.map(command => ({ ...command })),
+      availableCommandsLearntAt: inputs.availableCommands.learntAt,
+    } : {}),
+  };
+}
+
 function deriveReadiness(inputs: ReadinessInputs): ConnectedAgentView["readiness"] {
   if (!inputs.bridgeVersionCompatible) return "reconnect_required";
-  if (inputs.connectionState !== "ready") return inputs.connectionState === "starting" ? "unavailable" : "unavailable";
+  if (inputs.connectionState !== "ready") return "unavailable";
   switch (inputs.identity) {
     case "signal":
       return inputs.providerAdminBlocked ? "unavailable" : "ready";

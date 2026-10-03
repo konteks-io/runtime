@@ -1,3 +1,4 @@
+import type { Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises";
 import { isAbsolute, posix, resolve, win32 } from "node:path";
@@ -212,7 +213,7 @@ interface OpenCodeInstructionsDeps {
 /**
  * OpenCode loads a repository's `AGENTS.md` only while project config is on,
  * which the lock switches off, but always loads the `AGENTS.md` in its own
- * config folder (CP0-v2 row 6). So each working copy's process gets a config
+ * config folder. So each working copy's process gets a config
  * folder whose `opencode/AGENTS.md` is a symlink to the working copy's, or a
  * copy where symlinks are not allowed (Windows without the privilege). Only a
  * regular file inside the working copy is ever linked, so a repository cannot
@@ -225,17 +226,25 @@ export async function syncOpenCodeInstructions(configHome: string, workingCopy: 
   const target = posixOrWin(configHome).join(folder, "AGENTS.md");
   const source = await instructionsInside(workingCopy);
   const current = await lstat(target).catch(() => null);
-  if (source === null) {
-    if (current) await rm(target, { recursive: true, force: true });
-    return "none";
-  }
-  if (current?.isSymbolicLink() && await readlink(target).catch(() => null) === source) return "link";
+  if (source !== null && await linksTo(target, current, source)) return "link";
   if (current) await rm(target, { recursive: true, force: true });
+  if (source === null) return "none";
+  return linkOrCopy(source, target, deps.symlink ?? symlink);
+}
+
+async function linksTo(target: string, current: Stats | null, source: string): Promise<boolean> {
+  return current !== null && current.isSymbolicLink() && await readlink(target).catch(() => null) === source;
+}
+
+/** Codes of a symlink the account may not make (Windows without the privilege): the file is copied instead. */
+const SYMLINK_REFUSED = ["EPERM", "EACCES", "ENOTSUP", "EINVAL", "UNKNOWN"];
+
+async function linkOrCopy(source: string, target: string, link: typeof symlink): Promise<OpenCodeInstructions> {
   try {
-    await (deps.symlink ?? symlink)(source, target, "file");
+    await link(source, target, "file");
     return "link";
   } catch (error) {
-    if (!["EPERM", "EACCES", "ENOTSUP", "EINVAL", "UNKNOWN"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    if (!SYMLINK_REFUSED.includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
     await copyFile(source, target);
     return "copy";
   }

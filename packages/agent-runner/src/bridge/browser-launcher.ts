@@ -59,15 +59,31 @@ export function launcherEnvironment(env: NodeJS.ProcessEnv): { env: NodeJS.Proce
 /** Only well-formed http(s) origins, sorted, so the same set is the same flag. */
 export function sanitizeOrigins(value: unknown): string[] | null {
   if (!value || typeof value !== "object" || !Array.isArray((value as { origins?: unknown }).origins)) return null;
-  const out = new Set<string>();
-  for (const entry of (value as { origins: unknown[] }).origins) {
-    if (typeof entry !== "string") continue;
-    try {
-      const url = new URL(entry);
-      if ((url.protocol === "http:" || url.protocol === "https:") && url.origin === entry) out.add(entry);
-    } catch { /* not an origin */ }
-  }
-  return [...out].sort();
+  return [...new Set((value as { origins: unknown[] }).origins.filter(isHttpOrigin))].sort();
+}
+
+function isHttpOrigin(entry: unknown): entry is string {
+  if (typeof entry !== "string") return false;
+  try {
+    const url = new URL(entry);
+    return (url.protocol === "http:" || url.protocol === "https:") && url.origin === entry;
+  } catch { return false; }
+}
+
+/** A JSON-RPC message, or null for a line that is not one (passed through untouched). */
+function parseMessage(line: string): Message | null {
+  try {
+    const message = JSON.parse(line) as unknown;
+    return message !== null && typeof message === "object" && !Array.isArray(message) ? message as Message : null;
+  } catch { return null; }
+}
+
+function hasId(message: Message): message is Message & { id: string | number } {
+  return message.id !== undefined && message.id !== null;
+}
+
+function toolError(id: string | number | null, text: string): unknown {
+  return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text }], isError: true } };
 }
 
 /** The gateway's list, asked over loopback; null when it does not answer in time. */
@@ -119,24 +135,27 @@ export function startBrowserLauncher(options: BrowserLauncherOptions): void {
   const reply = (message: unknown) => void options.stdout.write(`${JSON.stringify(message)}\n`);
   const toChild = (line: string) => void child.stdin.write(`${line}\n`);
 
-  const fromServer = (line: string): void => {
-    let message: Message;
-    try { message = JSON.parse(line) as Message; } catch { return void options.stdout.write(`${line}\n`); }
-    if (message && typeof message === "object" && message.id !== undefined && message.id !== null) {
-      if (handshake && message.id === handshake.id) {
-        handshake.resolve();
-        return;
-      }
-      // A response (not a server-to-client request) settles an agent call.
-      if (message.method === undefined && pending.delete(message.id) && pending.size === 0) drained?.();
-      if (toolListIds.has(message.id)) {
-        toolListIds.delete(message.id);
-        if (Array.isArray(message.result?.tools)) {
-          message.result.tools = message.result.tools.filter(tool => !(typeof tool.name === "string" && isDeniedBrowserTool(tool.name)));
-          return reply(message);
-        }
-      }
+  /** True when the message was answered here (a restart's handshake, or a filtered tool list). */
+  const handledResponse = (message: Message & { id: string | number }): boolean => {
+    if (handshake && message.id === handshake.id) {
+      handshake.resolve();
+      return true;
     }
+    // A response (not a server-to-client request) settles an agent call.
+    if (message.method === undefined) settle(message.id);
+    if (!toolListIds.delete(message.id) || !Array.isArray(message.result?.tools)) return false;
+    message.result.tools = message.result.tools.filter(tool => !(typeof tool.name === "string" && isDeniedBrowserTool(tool.name)));
+    reply(message);
+    return true;
+  };
+
+  const settle = (id: string | number) => {
+    if (pending.delete(id) && pending.size === 0) drained?.();
+  };
+
+  const fromServer = (line: string): void => {
+    const message = parseMessage(line);
+    if (message && hasId(message) && handledResponse(message)) return;
     options.stdout.write(`${line}\n`);
   };
 
@@ -201,25 +220,34 @@ export function startBrowserLauncher(options: BrowserLauncherOptions): void {
     options.stderr.write(`konteks browser: this session's browser may now also open ${granted.length > 0 ? granted.join(", ") : "nothing beyond its live preview"}.\n`);
   };
 
-  const fromAgent = async (line: string): Promise<void> => {
-    let message: Message;
-    try { message = JSON.parse(line) as Message; } catch { return toChild(line); }
-    if (message === null || typeof message !== "object" || Array.isArray(message)) return toChild(line);
-    if (message.method === "initialize" && initializeLine === null) initializeLine = line;
-    if (message.method === "tools/list" && message.id !== undefined && message.id !== null) toolListIds.add(message.id);
-    if (message.method === "tools/call" && message.id !== undefined) {
-      const name = typeof message.params?.name === "string" ? message.params.name : "";
-      if (isDeniedBrowserTool(name)) {
-        return reply({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: `${name} is not available in Konteks: this browser only opens, reads and operates this session's preview.` }], isError: true } });
-      }
-      const failure = await ensureChromium();
-      if (failure !== null) {
-        installed = null; // tried again on the next call
-        return reply({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: `The browser could not be installed on this computer (${failure}). Install Google Chrome, or try again.` }], isError: true } });
-      }
-      await syncAllowedOrigins();
+  /** A refusal for the agent, or null when the call goes on to Playwright MCP. */
+  const refuseToolCall = async (message: Message & { id: string | number | null }): Promise<unknown | null> => {
+    const name = typeof message.params?.name === "string" ? message.params.name : "";
+    if (isDeniedBrowserTool(name)) return toolError(message.id, `${name} is not available in Konteks: this browser only opens, reads and operates this session's preview.`);
+    const failure = await ensureChromium();
+    if (failure !== null) {
+      installed = null; // tried again on the next call
+      return toolError(message.id, `The browser could not be installed on this computer (${failure}). Install Google Chrome, or try again.`);
     }
-    if (message.method !== undefined && message.id !== undefined && message.id !== null) pending.add(message.id);
+    await syncAllowedOrigins();
+    return null;
+  };
+
+  /** The agent's `initialize` (replayed on a restart) and its tool-list requests (whose answers are filtered). */
+  const noteRequest = (message: Message, line: string) => {
+    if (message.method === "initialize" && initializeLine === null) initializeLine = line;
+    if (message.method === "tools/list" && hasId(message)) toolListIds.add(message.id);
+  };
+
+  const fromAgent = async (line: string): Promise<void> => {
+    const message = parseMessage(line);
+    if (message === null) return toChild(line);
+    noteRequest(message, line);
+    if (message.method === "tools/call" && message.id !== undefined) {
+      const refusal = await refuseToolCall(message as Message & { id: string | number | null });
+      if (refusal !== null) return reply(refusal);
+    }
+    if (message.method !== undefined && hasId(message)) pending.add(message.id);
     toChild(line);
   };
 

@@ -21,7 +21,7 @@ export default tseslint.config(
   {
     // Cyclomatic complexity of 8 at most (HARDENING.md), enforced per package
     // as each one is brought under it.
-    files: ["packages/common/src/**/*.ts", "packages/release/src/**/*.ts", "packages/sysmon/src/**/*.ts"],
+    files: ["packages/common/src/**/*.ts", "packages/release/src/**/*.ts", "packages/sysmon/src/**/*.ts", "packages/agent-runner/src/**/*.{ts,mjs}"],
     rules: { complexity: ["error", 8] },
   },
 );

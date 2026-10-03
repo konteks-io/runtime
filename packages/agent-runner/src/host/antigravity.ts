@@ -119,8 +119,13 @@ export function antigravityProcessEnvironment(credentialDir: string, options: { 
 function loopbackRelayUrl(value: string): string {
   let url: URL;
   try { url = new URL(value); } catch { throw relayRefused(); }
-  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.port === "" || url.username || url.password || url.search || url.hash || (url.pathname !== "/" && url.pathname !== "")) throw relayRefused();
+  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.port === "" || !bareOrigin(url)) throw relayRefused();
   return `http://127.0.0.1:${url.port}`;
+}
+
+/** No credentials, query, fragment or path beyond `/`. */
+function bareOrigin(url: URL): boolean {
+  return !url.username && !url.password && !url.search && !url.hash && (url.pathname === "/" || url.pathname === "");
 }
 function relayRefused() { return new RemoteInstanceError("agent_unavailable", "The Google Antigravity relay must listen on 127.0.0.1."); }
 
@@ -251,12 +256,7 @@ export async function prepareAntigravityHome(credentialDir: string, platform: No
   const acp = path.join(paths.geminiHome, "antigravity-acp");
   const config = path.join(paths.geminiHome, "config");
   const cliSkills = path.join(paths.geminiHome, "antigravity-cli", "skills");
-  for (const folder of [paths.root, paths.home, paths.geminiHome, acp]) {
-    await mkdir(folder, { recursive: true, mode: 0o700 });
-    const found = await lstat(folder);
-    if (!found.isDirectory() || found.isSymbolicLink()) throw new RemoteInstanceError("agent_unavailable", "Google Antigravity's private folder is not a folder.", { diagnostic: "antigravity_home_unsafe" });
-    if (platform !== "win32") await chmod(folder, 0o700);
-  }
+  for (const folder of [paths.root, paths.home, paths.geminiHome, acp]) await ensurePrivateFolder(folder, platform);
   // A sign-in under way owns settings.json until it ends (the server writes it too).
   if (!signInsUnderWay.has(paths.home)) await writeSecretFile(paths.settingsFile, renderAntigravitySettings(await readAntigravitySignIn(credentialDir, platform)));
   await rm(paths.trustFile, { force: true, recursive: true });
@@ -266,6 +266,13 @@ export async function prepareAntigravityHome(credentialDir: string, platform: No
   }
   await mkdir(path.join(config, "skills"), { recursive: true, mode: 0o700 });
   return paths;
+}
+
+async function ensurePrivateFolder(folder: string, platform: NodeJS.Platform): Promise<void> {
+  await mkdir(folder, { recursive: true, mode: 0o700 });
+  const found = await lstat(folder);
+  if (!found.isDirectory() || found.isSymbolicLink()) throw new RemoteInstanceError("agent_unavailable", "Google Antigravity's private folder is not a folder.", { diagnostic: "antigravity_home_unsafe" });
+  if (platform !== "win32") await chmod(folder, 0o700);
 }
 
 /** Larger than this, a working copy's `AGENTS.md` is not sent (a prompt is not the place for a book). */
@@ -336,12 +343,16 @@ export function verifyAntigravitySession(response: { configOptions?: unknown; mo
   if (!model || model.type !== "select" || typeof model.currentValue !== "string") {
     throw new RemoteInstanceError("agent_unavailable", "Unsupported Google Antigravity version: its session offers no model choice. Update the connector.", { diagnostic: "antigravity_unsupported_version" });
   }
-  const modeOption = options.find(option => option?.id === "mode");
-  const modes = response.modes as { currentModeId?: unknown } | null | undefined;
-  const current = typeof modeOption?.currentValue === "string" ? modeOption.currentValue : typeof modes?.currentModeId === "string" ? modes.currentModeId : undefined;
+  const current = sessionModeId(options.find(option => option?.id === "mode"), response.modes as { currentModeId?: unknown } | null | undefined);
   if (current !== undefined && current !== "default") {
     throw new RemoteInstanceError("agent_unavailable", "Google Antigravity started a session outside its default mode, where it would not ask before commands. Update the connector.", { diagnostic: "antigravity_session_mode" });
   }
+}
+
+/** The session's mode: its `mode` config option, else its ACP modes. */
+function sessionModeId(modeOption: { currentValue?: unknown } | undefined, modes: { currentModeId?: unknown } | null | undefined): string | undefined {
+  if (typeof modeOption?.currentValue === "string") return modeOption.currentValue;
+  return typeof modes?.currentModeId === "string" ? modes.currentModeId : undefined;
 }
 
 /**
@@ -357,13 +368,7 @@ export function antigravityStderrFailure(line: string, credentialDir?: string): 
   // Konteks tool can run in it, so it ends now as an access error instead of
   // a turn that cannot read its own discussion (WS1-196). The observation is
   // written before this returns, so the identity read that follows sees it.
-  const dropped = MCP_DROPPED.exec(line);
-  if (dropped && Number(dropped[1]) > 0) {
-    if (credentialDir !== undefined) {
-      try { recordMcpServersOff(credentialDir, new Date()); } catch { /* doctor and readiness then miss it; the session still ends */ }
-    }
-    return new RemoteInstanceError("agent_unavailable", ANTIGRAVITY_MCP_SERVERS_OFF, { diagnostic: "antigravity_mcp_servers_off" });
-  }
+  if (droppedServerCount(line) > 0) return mcpServersOff(credentialDir);
   if (credentialDir !== undefined) void observeAntigravityAdminLine(line, credentialDir).catch(() => undefined);
   const auth = (message: string, diagnostic: string) => new RemoteInstanceError("agent_auth_required", message, { diagnostic, recoveryActions: [{ kind: "login_agent", agentId: "antigravity" }] });
   if (/has no available license/i.test(line)) {
@@ -375,6 +380,18 @@ export function antigravityStderrFailure(line: string, credentialDir?: string): 
     return auth("Google Antigravity needs to sign in again. Run `konteks-remote auth login antigravity`.", "antigravity_sign_in_needed");
   }
   return null;
+}
+
+function droppedServerCount(line: string): number {
+  const dropped = MCP_DROPPED.exec(line);
+  return dropped ? Number(dropped[1]) : 0;
+}
+
+function mcpServersOff(credentialDir: string | undefined): RemoteInstanceError {
+  if (credentialDir !== undefined) {
+    try { recordMcpServersOff(credentialDir, new Date()); } catch { /* doctor and readiness then miss it; the session still ends */ }
+  }
+  return new RemoteInstanceError("agent_unavailable", ANTIGRAVITY_MCP_SERVERS_OFF, { diagnostic: "antigravity_mcp_servers_off" });
 }
 
 /**
@@ -409,14 +426,21 @@ const MCP_ALLOWLIST = /Admin MCP allowlist active: custom MCP servers (.*?) -> (
 
 /** Read one stderr line of an execution or discovery process for the admin settings it shows; writes the observation. */
 export async function observeAntigravityAdminLine(line: string, credentialDir: string, now: () => Date = () => new Date()): Promise<void> {
+  const verdict = adminLineVerdict(line);
+  if (verdict === "allowed") await clearAntigravityAdminObservation(credentialDir);
+  if (verdict !== "off") return;
+  const paths = antigravityRuntimePaths(credentialDir);
+  await mkdir(paths.root, { recursive: true, mode: 0o700 });
+  await writeSecretFile(paths.adminControls, `${JSON.stringify({ mcpServersOffAt: now().toISOString() } satisfies AntigravityAdminObservation)}\n`);
+}
+
+/** "off": servers were dropped, or an allowlist left `konteks-result` out; "allowed": an allowlist keeps it; null: neither line. */
+function adminLineVerdict(line: string): "off" | "allowed" | null {
   const dropped = MCP_DROPPED.exec(line);
-  const allowlist = dropped ? null : MCP_ALLOWLIST.exec(line);
-  if (!dropped && !allowlist) return;
-  const file = antigravityRuntimePaths(credentialDir).adminControls;
-  if (allowlist && /konteks-result/.test(allowlist[2] ?? "")) { await clearAntigravityAdminObservation(credentialDir); return; }
-  if (dropped && Number(dropped[1]) === 0) return;
-  await mkdir(antigravityRuntimePaths(credentialDir).root, { recursive: true, mode: 0o700 });
-  await writeSecretFile(file, `${JSON.stringify({ mcpServersOffAt: now().toISOString() } satisfies AntigravityAdminObservation)}\n`);
+  if (dropped) return Number(dropped[1]) === 0 ? null : "off";
+  const allowlist = MCP_ALLOWLIST.exec(line);
+  if (!allowlist) return null;
+  return /konteks-result/.test(allowlist[2] ?? "") ? "allowed" : "off";
 }
 
 /** The last observation, or null (none, or unreadable). */
@@ -545,11 +569,14 @@ function signInProcess(config: RunnerConfig, spawn: HostSpawn | undefined): Goog
   };
 }
 
+function fetchedAntigravityRunner(config: RunnerConfig, family: AgentBridgeFamily): boolean {
+  return family.agentId === "antigravity" && family.hostInstall?.launch === "fetched" && config.RUNNER_AUTH_MODE === "agent_local_subscription";
+}
+
 /** The verified fetched folder of an Antigravity runner and this platform's pin; refuses anything else. */
 function fetched(config: RunnerConfig, family: AgentBridgeFamily): { root: string; pin: FetchedAgentPlatformPin } {
   const root = config.RUNNER_NATIVE_ANTIGRAVITY_ROOT;
-  if (family.agentId !== "antigravity" || family.hostInstall?.launch !== "fetched" || config.RUNNER_AUTH_MODE !== "agent_local_subscription"
-      || root === undefined || !isAbsolute(root) || CONTROL.test(root)) {
+  if (!fetchedAntigravityRunner(config, family) || root === undefined || !isAbsolute(root) || CONTROL.test(root)) {
     throw new RemoteInstanceError("agent_unavailable", "A Google Antigravity runner requires the copy the connector fetched, at an absolute local path.");
   }
   const pin = fetchedAgentPlatformPin("antigravity");

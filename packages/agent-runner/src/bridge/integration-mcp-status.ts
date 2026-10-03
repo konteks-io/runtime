@@ -9,9 +9,8 @@ import { bridgeEnvironment, resolveBridgeFamily } from "./spec.js";
 import { connectCodexLocalTransport } from "./codex-local-transport.js";
 
 /**
- * Model-free MCP discovery for integrations (external-integration CP2,
- * capabilities-and-execution "Enrollment algorithm" step 1): the agents' own
- * reviewed listing interfaces, never a configuration file. Both readers hand
+ * Model-free MCP discovery for integrations: the agents' own reviewed listing
+ * interfaces, never a configuration file. Both readers hand
  * back RAW status objects in memory only; the supervisor's allowlist
  * (`integration/discovery.ts`) is the only thing that may look at them, and
  * nothing here logs them.
@@ -65,25 +64,34 @@ export async function readCodexMcpServerStatus(connect: () => Promise<Duplex>): 
   try {
     await request("initialize", { clientInfo: { name: "konteks_integration_discovery", version: "1" }, capabilities: { experimentalApi: true, requestAttestation: false } });
     stream.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
-    const servers: unknown[] = [];
-    const seen = new Set<string>();
-    let cursor: string | null = null;
-    for (let page = 0; ; page += 1) {
-      if (page >= CODEX_MAX_PAGES) throw new Error("Codex MCP status exceeded its page bound");
-      const result = await request("mcpServerStatus/list", { detail: "toolsAndAuthOnly", limit: 64, ...(cursor ? { cursor } : {}) }) as { data?: unknown; nextCursor?: unknown } | null;
-      if (!result || !Array.isArray(result.data)) throw new Error("Codex MCP status response was malformed");
-      servers.push(...result.data);
-      const next = typeof result.nextCursor === "string" && result.nextCursor.length > 0 ? result.nextCursor : null;
-      if (next === null) return servers;
-      if (seen.has(next)) throw new Error("Codex MCP status cursor repeated");
-      seen.add(next);
-      cursor = next;
-    }
+    return await allServerStatuses(request);
   } finally {
     clearTimeout(timer);
     lines.close();
     stream.destroy();
   }
+}
+
+/** Every page of `mcpServerStatus/list`; a repeated cursor or too many pages fails closed. */
+async function allServerStatuses(request: (method: string, params: unknown) => Promise<unknown>): Promise<unknown[]> {
+  const servers: unknown[] = [];
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  for (let page = 0; ; page += 1) {
+    if (page >= CODEX_MAX_PAGES) throw new Error("Codex MCP status exceeded its page bound");
+    const result = await request("mcpServerStatus/list", { detail: "toolsAndAuthOnly", limit: 64, ...(cursor ? { cursor } : {}) }) as { data?: unknown; nextCursor?: unknown } | null;
+    if (!result || !Array.isArray(result.data)) throw new Error("Codex MCP status response was malformed");
+    servers.push(...result.data);
+    const next = nextCursor(result.nextCursor);
+    if (next === null) return servers;
+    if (seen.has(next)) throw new Error("Codex MCP status cursor repeated");
+    seen.add(next);
+    cursor = next;
+  }
+}
+
+function nextCursor(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 /** The connector's shared Codex app-server socket as a discovery stream. */
@@ -95,8 +103,8 @@ export function codexDiscoveryConnection(socketPath: string): () => Promise<Dupl
  * The child that asks the bundled Claude Agent SDK for its MCP status. It runs
  * in its own process (the SDK and the Claude CLI never load into the
  * connector), in an empty private folder (so no repository `.mcp.json`
- * exists), with project settings only (no personal settings, C2), hooks off
- * (S0-1), account connectors ON (that is what is being listed) and every tool
+ * exists), with project settings only (no personal settings), hooks off,
+ * account connectors ON (that is what is being listed) and every tool
  * refused. It writes only name, status, scope and tool names: never config,
  * URLs, commands, env, headers, server info, descriptions or error text.
  * argv: sdkEntry, claudeExecutable, cwd, budgetMs.
@@ -176,15 +184,17 @@ export async function readClaudeMcpStatus(launch: ClaudeMcpStatusLaunch, spawn: 
   let parsed: unknown;
   try { parsed = JSON.parse(output); } catch { throw failed(); }
   if (!Array.isArray(parsed)) throw failed();
-  return parsed.map(entry => {
-    const value = entry as Partial<ClaudeMcpStatusEntry> | null;
-    return {
-      name: typeof value?.name === "string" ? value.name : "",
-      status: typeof value?.status === "string" ? value.status : "",
-      scope: typeof value?.scope === "string" ? value.scope : "",
-      tools: Array.isArray(value?.tools) ? value.tools.filter((tool): tool is string => typeof tool === "string") : [],
-    };
-  });
+  return parsed.map(entry => statusEntry(entry as Partial<ClaudeMcpStatusEntry> | null));
+}
+
+function statusEntry(value: Partial<ClaudeMcpStatusEntry> | null): ClaudeMcpStatusEntry {
+  const text = (field: unknown) => (typeof field === "string" ? field : "");
+  return {
+    name: text(value?.name),
+    status: text(value?.status),
+    scope: text(value?.scope),
+    tools: Array.isArray(value?.tools) ? value.tools.filter((tool): tool is string => typeof tool === "string") : [],
+  };
 }
 
 /**

@@ -41,25 +41,25 @@ export function applyIdentityObservation(
   state: AgentScopeState,
   observation: { fingerprint: string | null; organizationAttested: boolean; at: string; isLogin: boolean },
 ): ScopeTransition {
-  const identityChanged =
-    observation.fingerprint !== null && state.authIdentityFingerprint !== null && observation.fingerprint !== state.authIdentityFingerprint;
-  const loggedOut = observation.fingerprint === null && state.authIdentityFingerprint !== null;
   let next: AgentScopeState = {
     ...state,
     authIdentityFingerprint: observation.fingerprint,
     ...(observation.isLogin ? { lastLoginAt: observation.at } : {}),
   };
-  let reset = false;
-  if (identityChanged || loggedOut) {
-    if (state.accountScope === "organization") reset = true;
-    next = { ...next, accountScope: "personal", scopeAttestedAt: null };
-  }
+  const lost = identityLost(state.authIdentityFingerprint, observation.fingerprint);
+  const reset = lost && state.accountScope === "organization";
+  if (lost) next = { ...next, accountScope: "personal", scopeAttestedAt: null };
   if (observation.organizationAttested && observation.fingerprint !== null) {
     next = { ...next, accountScope: "organization", scopeAttestedAt: observation.at };
     return { kind: "attested", state: next };
   }
   if (reset) return { kind: "reset", state: next, previousScope: "organization" };
   return { kind: "unchanged", state: next };
+}
+
+/** A known identity was replaced by another or signed out. */
+function identityLost(previous: string | null, observed: string | null): boolean {
+  return previous !== null && observed !== previous;
 }
 
 export class AgentScopeStore {

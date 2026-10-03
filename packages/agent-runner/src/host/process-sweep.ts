@@ -22,11 +22,7 @@ export function privateHomeProcesses(platform: NodeJS.Platform = process.platfor
       if (platform === "win32") return [];
       const listing = await capture("ps", platform === "linux" ? ["-e", "-ww", "-o", "pid=,args="] : ["-axww", "-o", "pid=,command="]).catch(() => "");
       const pids: number[] = [];
-      for (const line of listing.split("\n")) {
-        const match = /^\s*(\d+)\s+(.*)$/.exec(line);
-        if (!match || !programs.some(program => match[2]!.includes(program))) continue;
-        const pid = Number(match[1]);
-        if (pid === process.pid) continue;
+      for (const pid of programPids(listing, programs)) {
         const env = await processEnvironment(pid, platform);
         if (env !== null && hasHome(env, home)) pids.push(pid);
       }
@@ -41,6 +37,16 @@ export function privateHomeProcesses(platform: NodeJS.Platform = process.platfor
       throw new RemoteInstanceError("agent_unavailable", "A process this connector started did not stop.", { diagnostic: "host_agent_leftover_stop_failed", retryable: true });
     },
   };
+}
+
+/** Other processes whose command names one of the programs. */
+function programPids(listing: string, programs: readonly string[]): number[] {
+  return listing.split("\n").flatMap(line => {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!match || !programs.some(program => match[2]!.includes(program))) return [];
+    const pid = Number(match[1]);
+    return pid === process.pid ? [] : [pid];
+  });
 }
 
 function alive(pid: number): boolean {

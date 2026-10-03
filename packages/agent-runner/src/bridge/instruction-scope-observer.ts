@@ -42,17 +42,27 @@ export function instructionScopeObserver(emit: (scope: InstructionScope) => void
         if (pending.length > 2048) { pending = ""; overflow = true; }
       }
       if (!part.endsWith("\n")) continue;
-      if (!overflow) {
-        const base = { settings: "project", ancestors: "excluded", user: "excluded", local: "excluded", autoMemory: "excluded", auth: "official_profile" } as const;
-        const v4 = V4.exec(pending);
-        const v3 = v4 ? null : V3.exec(pending);
-        const v2 = v4 || v3 ? null : V2.exec(pending);
-        // An integration session loads no setting sources at all (`settings=none`) and only it admits the account connectors.
-        if (v4 && (v4[1] === "none") === (v4[3] === "integration")) emit({ version: 4, ...base, settings: v4[1] as "project" | "none", exclusionCount: Number(v4[2]), hooks: "disabled", repositoryMcp: "excluded", accountConnectors: v4[3] as "excluded" | "integration" });
-        else if (v3) emit({ version: 3, ...base, exclusionCount: Number(v3[1]), hooks: "disabled", repositoryMcp: "excluded", accountConnectors: "excluded" });
-        else if (v2) emit({ version: 2, ...base, exclusionCount: Number(v2[1]) });
-      }
+      const scope = overflow ? null : decodeInstructionScope(pending);
+      if (scope) emit(scope);
       pending = ""; overflow = false;
     }
   };
+}
+
+const SCOPE_BASE = { settings: "project", ancestors: "excluded", user: "excluded", local: "excluded", autoMemory: "excluded", auth: "official_profile" } as const;
+
+/** One complete marker line, newest version first; null for anything else. */
+function decodeInstructionScope(line: string): InstructionScope | null {
+  const v4 = V4.exec(line);
+  if (v4) return scopeV4(v4);
+  const v3 = V3.exec(line);
+  if (v3) return { version: 3, ...SCOPE_BASE, exclusionCount: Number(v3[1]), hooks: "disabled", repositoryMcp: "excluded", accountConnectors: "excluded" };
+  const v2 = V2.exec(line);
+  return v2 ? { version: 2, ...SCOPE_BASE, exclusionCount: Number(v2[1]) } : null;
+}
+
+/** An integration session loads no setting sources at all (`settings=none`) and only it admits the account connectors. */
+function scopeV4(match: RegExpExecArray): InstructionScope | null {
+  if ((match[1] === "none") !== (match[3] === "integration")) return null;
+  return { version: 4, ...SCOPE_BASE, settings: match[1] as "project" | "none", exclusionCount: Number(match[2]), hooks: "disabled", repositoryMcp: "excluded", accountConnectors: match[3] as "excluded" | "integration" };
 }

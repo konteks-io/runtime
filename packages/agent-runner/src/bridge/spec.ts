@@ -33,7 +33,22 @@ export function resolveBridgeFamily(agentId: string): AgentBridgeFamily {
 
 export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamily): NodeJS.ProcessEnv {
   const base = sanitizeInheritedChildProcessEnv({ env: { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", TERM: "dumb" } });
-  let env: NodeJS.ProcessEnv = {
+  let env = privateHomeEnvironment(config, base);
+  const profile = config.RUNNER_NATIVE_PACKAGE_PROFILE;
+  // A host-installed agent (the person's own DeepSeek Harness or OpenCode)
+  // gets the environment and private home its adapter builds.
+  const host = hostAdapterForRunner(config, family);
+  if (host) env = host.environment(config, family, env);
+  if (config.RUNNER_NATIVE_CODEX_HOME !== undefined) useSharedCodexHome(config, family, profile, config.RUNNER_NATIVE_CODEX_HOME, env);
+  if (config.RUNNER_NATIVE_CLAUDE_EXECUTABLE !== undefined) usePersonalClaude(config, family, profile, config.RUNNER_NATIVE_CLAUDE_EXECUTABLE, env);
+  if (config.RUNNER_NATIVE_CODEX_SOCKET !== undefined) useSharedCodexSocket(config, profile, config.RUNNER_NATIVE_CODEX_SOCKET, env);
+  if (profile) useNativePackage(config, profile, base.PATH ?? "", env);
+  return env;
+}
+
+/** The sanitized inherited environment with a dedicated HOME and XDG directories inside the private credential folder. */
+function privateHomeEnvironment(config: RunnerConfig, base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
     ...base,
     // The platform's own separator: a `:` on Windows fused the prefix with the
     // first PATH entry, which a host agent's environment then inherited.
@@ -46,80 +61,99 @@ export function bridgeEnvironment(config: RunnerConfig, family: AgentBridgeFamil
     NO_COLOR: "1",
     CI: "1",
   };
-  const profile = config.RUNNER_NATIVE_PACKAGE_PROFILE;
-  // A host-installed agent (the person's own DeepSeek Harness or OpenCode)
-  // gets the environment and private home its adapter builds.
-  const host = hostAdapterForRunner(config, family);
-  if (host) env = host.environment(config, family, env);
-  if (config.RUNNER_NATIVE_CODEX_HOME !== undefined) {
-    if (!profile || family.agentId !== "codex" || config.RUNNER_AUTH_MODE !== "agent_local_subscription" ||
-        !isAbsolute(config.RUNNER_NATIVE_CODEX_HOME) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(config.RUNNER_NATIVE_CODEX_HOME)) {
-      throw new RemoteInstanceError("agent_unavailable", "A shared Codex profile requires a native personal Codex runner and an absolute local profile path.");
-    }
-    // Official Codex owns this profile and its thread store. Do not copy or
-    // synthesize rollouts; connector scope/identity metadata stays private.
-    env.CODEX_HOME = config.RUNNER_NATIVE_CODEX_HOME;
+}
+
+/** An absolute path with no control or format characters. */
+function localAbsolutePath(value: string): boolean {
+  return isAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value);
+}
+
+function personalRunner(config: RunnerConfig, family: AgentBridgeFamily, profile: NativeAgentPackageProfile | undefined, agentId: string): profile is NativeAgentPackageProfile {
+  return profile !== undefined && family.agentId === agentId && config.RUNNER_AUTH_MODE === "agent_local_subscription";
+}
+
+/**
+ * Official Codex owns this profile and its thread store. Do not copy or
+ * synthesize rollouts; connector scope/identity metadata stays private.
+ */
+function useSharedCodexHome(config: RunnerConfig, family: AgentBridgeFamily, profile: NativeAgentPackageProfile | undefined, codexHome: string, env: NodeJS.ProcessEnv): void {
+  if (!personalRunner(config, family, profile, "codex") || !localAbsolutePath(codexHome)) {
+    throw new RemoteInstanceError("agent_unavailable", "A shared Codex profile requires a native personal Codex runner and an absolute local profile path.");
   }
-  if (config.RUNNER_NATIVE_CLAUDE_EXECUTABLE !== undefined) {
-    if (!profile || family.agentId !== "claude-code" || config.RUNNER_AUTH_MODE !== "agent_local_subscription" ||
-        !isAbsolute(config.RUNNER_NATIVE_CLAUDE_EXECUTABLE) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(config.RUNNER_NATIVE_CLAUDE_EXECUTABLE)) {
-      throw new RemoteInstanceError("agent_unavailable", "A personal Claude Code profile requires a native personal Claude runner and an absolute local executable.");
-    }
-    // Like bb, reuse the operator's own installed CLI and its official login
-    // (macOS keychain / ~/.claude). Konteks never copies or reads credentials.
-    const operator = userInfo();
-    env.CLAUDE_CODE_EXECUTABLE = config.RUNNER_NATIVE_CLAUDE_EXECUTABLE;
-    env.HOME = operator.homedir;
-    env.USER = operator.username;
-    env.LOGNAME = operator.username;
-    if (process.env.SHELL && isAbsolute(process.env.SHELL)) env.SHELL = process.env.SHELL;
-    for (const name of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "CI"] as const) delete env[name];
-    // Claude Code drops an MCP server whose tool list takes longer than its
-    // 30 s default, for the whole session: one slow start on a loaded machine
-    // left a planning turn with none of Konteks's tools (WS1-152). A slow list
-    // should delay the tools, never take them away.
-    env.MCP_TIMEOUT = CLAUDE_MCP_STARTUP_TIMEOUT_MS;
-    // Claude Code on Windows runs its commands in Git Bash. The connector's
-    // PATH may predate a Git for Windows installed with it (D116), so it is
-    // named with Anthropic's documented setting, found from the connector's
-    // own environment; none found leaves Claude Code to say what it needs.
-    if (profile.os === "windows") {
-      const bash = findGitForWindows(process.env)?.bash;
-      if (bash) env.CLAUDE_CODE_GIT_BASH_PATH = bash;
-    }
+  env.CODEX_HOME = codexHome;
+}
+
+/**
+ * Like bb, reuse the operator's own installed CLI and its official login
+ * (macOS keychain / ~/.claude). Konteks never copies or reads credentials.
+ */
+function usePersonalClaude(config: RunnerConfig, family: AgentBridgeFamily, profile: NativeAgentPackageProfile | undefined, executable: string, env: NodeJS.ProcessEnv): void {
+  if (!personalRunner(config, family, profile, "claude-code") || !localAbsolutePath(executable)) {
+    throw new RemoteInstanceError("agent_unavailable", "A personal Claude Code profile requires a native personal Claude runner and an absolute local executable.");
   }
-  if (config.RUNNER_NATIVE_CODEX_SOCKET !== undefined) {
-    if (!config.RUNNER_NATIVE_CODEX_HOME || !profile?.codexLocalProxy || profile.os === "windows" ||
-        !isAbsolute(config.RUNNER_NATIVE_CODEX_SOCKET) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(config.RUNNER_NATIVE_CODEX_SOCKET)) {
-      throw new RemoteInstanceError("agent_unavailable", "Shared Codex transport requires its signed native proxy and an absolute local socket.");
-    }
-    env.CODEX_PATH = join(config.RUNNER_BRIDGE_PREFIX, profile.codexLocalProxy.entrypoint);
-    env.KONTEKS_NATIVE_CODEX_SOCKET = config.RUNNER_NATIVE_CODEX_SOCKET;
+  const operator = userInfo();
+  env.CLAUDE_CODE_EXECUTABLE = executable;
+  env.HOME = operator.homedir;
+  env.USER = operator.username;
+  env.LOGNAME = operator.username;
+  if (process.env.SHELL && isAbsolute(process.env.SHELL)) env.SHELL = process.env.SHELL;
+  for (const name of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "CI"] as const) delete env[name];
+  // Claude Code drops an MCP server whose tool list takes longer than its
+  // 30 s default, for the whole session: one slow start on a loaded machine
+  // left a planning turn with none of Konteks's tools. A slow list should
+  // delay the tools, never take them away.
+  env.MCP_TIMEOUT = CLAUDE_MCP_STARTUP_TIMEOUT_MS;
+  if (profile.os === "windows") useGitBash(env);
+}
+
+/**
+ * Claude Code on Windows runs its commands in Git Bash. The connector's PATH
+ * may predate a Git for Windows installed with it, so it is named with
+ * Anthropic's documented setting, found from the connector's own
+ * environment; none found leaves Claude Code to say what it needs.
+ */
+function useGitBash(env: NodeJS.ProcessEnv): void {
+  const bash = findGitForWindows(process.env)?.bash;
+  if (bash) env.CLAUDE_CODE_GIT_BASH_PATH = bash;
+}
+
+function useSharedCodexSocket(config: RunnerConfig, profile: NativeAgentPackageProfile | undefined, socket: string, env: NodeJS.ProcessEnv): void {
+  const proxy = profile?.os === "windows" ? undefined : profile?.codexLocalProxy;
+  if (!config.RUNNER_NATIVE_CODEX_HOME || !proxy || !localAbsolutePath(socket)) {
+    throw new RemoteInstanceError("agent_unavailable", "Shared Codex transport requires its signed native proxy and an absolute local socket.");
   }
-  if (profile) {
-    // Preserve the native machine operator's explicit additional CA trust.
-    // Do not inherit NODE_OPTIONS, bearer credentials or TLS-disable flags.
-    // Node bridges and Codex's Rust HTTP client use different CA settings.
-    // Preserve explicit operator settings; do not infer or replace trust roots.
-    for (const name of ["NODE_EXTRA_CA_CERTS", "CODEX_CA_CERTIFICATE"] as const) {
-      const extraCa = process.env[name];
-      if (!extraCa) continue;
-      if (!isAbsolute(extraCa) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(extraCa)) {
-        throw new RemoteInstanceError("agent_unavailable", "Native additional CA certificate path must be absolute.");
-      }
-      env[name] = extraCa;
-    }
-    const separator = profile.os === "windows" ? ";" : ":";
-    const prefixes = [dirname(join(config.RUNNER_BRIDGE_PREFIX, profile.tooling.entrypoint))];
-    if (profile.node) prefixes.push(dirname(join(config.RUNNER_BRIDGE_PREFIX, profile.node.entrypoint)));
-    env.PATH = [...new Set(prefixes), base.PATH ?? ""].join(separator);
-    if (profile.os === "windows") {
-      env.USERPROFILE = config.RUNNER_CREDENTIAL_DIR;
-      env.APPDATA = join(config.RUNNER_CREDENTIAL_DIR, "AppData", "Roaming");
-      env.LOCALAPPDATA = join(config.RUNNER_CREDENTIAL_DIR, "AppData", "Local");
-    }
+  env.CODEX_PATH = join(config.RUNNER_BRIDGE_PREFIX, proxy.entrypoint);
+  env.KONTEKS_NATIVE_CODEX_SOCKET = socket;
+}
+
+function useNativePackage(config: RunnerConfig, profile: NativeAgentPackageProfile, basePath: string, env: NodeJS.ProcessEnv): void {
+  keepOperatorCaTrust(env);
+  const separator = profile.os === "windows" ? ";" : ":";
+  const prefixes = [dirname(join(config.RUNNER_BRIDGE_PREFIX, profile.tooling.entrypoint))];
+  if (profile.node) prefixes.push(dirname(join(config.RUNNER_BRIDGE_PREFIX, profile.node.entrypoint)));
+  env.PATH = [...new Set(prefixes), basePath].join(separator);
+  if (profile.os === "windows") {
+    env.USERPROFILE = config.RUNNER_CREDENTIAL_DIR;
+    env.APPDATA = join(config.RUNNER_CREDENTIAL_DIR, "AppData", "Roaming");
+    env.LOCALAPPDATA = join(config.RUNNER_CREDENTIAL_DIR, "AppData", "Local");
   }
-  return env;
+}
+
+/**
+ * Preserve the native machine operator's explicit additional CA trust. Do
+ * not inherit NODE_OPTIONS, bearer credentials or TLS-disable flags. Node
+ * bridges and Codex's Rust HTTP client use different CA settings. Preserve
+ * explicit operator settings; do not infer or replace trust roots.
+ */
+function keepOperatorCaTrust(env: NodeJS.ProcessEnv): void {
+  for (const name of ["NODE_EXTRA_CA_CERTS", "CODEX_CA_CERTIFICATE"] as const) {
+    const extraCa = process.env[name];
+    if (!extraCa) continue;
+    if (!localAbsolutePath(extraCa)) {
+      throw new RemoteInstanceError("agent_unavailable", "Native additional CA certificate path must be absolute.");
+    }
+    env[name] = extraCa;
+  }
 }
 
 export function resolveBridgeSpawnSpec(config: RunnerConfig): BridgeSpawnSpec {

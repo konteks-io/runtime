@@ -23,8 +23,7 @@ import type { RunnerEventBus } from "../events.js";
 import { withoutTerminalEscapes, type LoginEvent, type LoginFlow } from "./login-flow.js";
 
 /**
- * OpenCode 2's own sign-ins, driven by the connector (opencode-runtime-support
- * O2, CP3). Everything goes through OpenCode's OWN commands in the private
+ * OpenCode 2's own sign-ins, driven by the connector. Everything goes through OpenCode's OWN commands in the private
  * home, with the allow-list environment (never a provider key, token or other
  * credential variable, never an inherited `OPENCODE_*`):
  * - what can be signed in: `opencode api --standalone integration.list`
@@ -94,29 +93,47 @@ function parseJson(stdout: string): unknown {
 
 /** Parse `opencode api integration.list` (`{data: [...]}` or a bare array). */
 export function parseOpenCodeIntegrations(stdout: string): OpenCodeIntegration[] {
-  const parsed = parseJson(stdout) as { data?: unknown } | unknown[];
-  const list = Array.isArray(parsed) ? parsed : Array.isArray((parsed as { data?: unknown }).data) ? (parsed as { data: unknown[] }).data : [];
-  const integrations: OpenCodeIntegration[] = [];
-  for (const raw of list) {
-    const entry = raw as { id?: unknown; name?: unknown; methods?: unknown };
-    const id = plain(entry.id, 64)?.toLowerCase();
-    if (!id || !PROVIDER_ID.test(id)) continue;
-    const name = plain(entry.name, 64) ?? id;
-    const methods: OpenCodeLoginMethod[] = [];
-    for (const rawMethod of Array.isArray(entry.methods) ? entry.methods : []) {
-      const method = rawMethod as { id?: unknown; type?: unknown; label?: unknown; form?: unknown };
-      const answers = formAnswers(method.form);
-      if (answers === null) continue;
-      if (method.type === "key") methods.push({ id: "key", kind: "api_key", label: plain(method.label, 80) ?? "API key", answers });
-      else if (method.type === "oauth") {
-        const methodId = plain(method.id, 64);
-        if (methodId && /^[A-Za-z0-9._-]+$/.test(methodId)) methods.push({ id: methodId, kind: "sign_in", label: plain(method.label, 80) ?? name, answers });
-      }
-    }
-    integrations.push({ id, name, methods });
-  }
-  return integrations;
+  return integrationEntries(parseJson(stdout)).flatMap(raw => {
+    const integration = parseIntegration(raw);
+    return integration ? [integration] : [];
+  });
 }
+
+function integrationEntries(parsed: unknown): unknown[] {
+  if (Array.isArray(parsed)) return parsed;
+  const data = (parsed as { data?: unknown }).data;
+  return Array.isArray(data) ? data : [];
+}
+
+/** A plain lower-case provider id, else undefined. */
+function providerId(value: unknown): string | undefined {
+  const id = plain(value, 64)?.toLowerCase();
+  return id && PROVIDER_ID.test(id) ? id : undefined;
+}
+
+function parseIntegration(raw: unknown): OpenCodeIntegration | null {
+  const entry = raw as { id?: unknown; name?: unknown; methods?: unknown };
+  const id = providerId(entry.id);
+  if (!id) return null;
+  const name = plain(entry.name, 64) ?? id;
+  const methods = (Array.isArray(entry.methods) ? entry.methods : []).flatMap(rawMethod => {
+    const method = parseLoginMethod(rawMethod, name);
+    return method ? [method] : [];
+  });
+  return { id, name, methods };
+}
+
+function parseLoginMethod(raw: unknown, integrationName: string): OpenCodeLoginMethod | null {
+  const method = raw as { id?: unknown; type?: unknown; label?: unknown; form?: unknown };
+  const answers = formAnswers(method.form);
+  if (answers === null) return null;
+  if (method.type === "key") return { id: "key", kind: "api_key", label: plain(method.label, 80) ?? "API key", answers };
+  if (method.type !== "oauth") return null;
+  const methodId = plain(method.id, 64);
+  return methodId && /^[A-Za-z0-9._-]+$/.test(methodId) ? { id: methodId, kind: "sign_in", label: plain(method.label, 80) ?? integrationName, answers } : null;
+}
+
+type FormField = { key?: unknown; required?: unknown; default?: unknown; hidden?: unknown; options?: unknown; when?: unknown };
 
 /**
  * The non-secret answers a method's form needs so it runs without a
@@ -127,41 +144,59 @@ export function parseOpenCodeIntegrations(stdout: string): OpenCodeIntegration[]
  */
 function formAnswers(form: unknown): string[] | null {
   const answers: string[] = [];
-  for (const rawField of Array.isArray(form) ? form : []) {
-    const field = rawField as { key?: unknown; required?: unknown; default?: unknown; hidden?: unknown; options?: unknown; when?: unknown };
-    const key = plain(field.key, 64);
-    if (!key || !/^[A-Za-z0-9_-]+$/.test(key)) return null;
-    if (field.when !== undefined) continue; // only asked for another choice (GitHub Enterprise)
-    if (field.hidden === true) continue; // OpenCode fills it itself
-    const fallback = typeof field.default === "string" ? field.default
-      : Array.isArray(field.options) ? plain((field.options[0] as { value?: unknown } | undefined)?.value, 256) : undefined;
-    if (fallback !== undefined) {
-      if (CONTROL.test(fallback) || fallback.length > 256) return null;
-      answers.push(`${key}=${fallback}`);
-    } else if (field.required === true) return null;
+  for (const field of Array.isArray(form) ? form : []) {
+    const answer = fieldAnswer(field as FormField);
+    if (answer === null) return null;
+    if (answer !== undefined) answers.push(answer);
   }
   return answers;
+}
+
+/** One field's `key=value` answer; undefined when it needs none, null when only a terminal could answer it. */
+function fieldAnswer(field: FormField): string | null | undefined {
+  const key = fieldKey(field.key);
+  if (!key) return null;
+  if (field.when !== undefined) return undefined; // only asked for another choice (GitHub Enterprise)
+  if (field.hidden === true) return undefined; // OpenCode fills it itself
+  const fallback = fieldDefault(field);
+  if (fallback === undefined) return field.required === true ? null : undefined;
+  return CONTROL.test(fallback) || fallback.length > 256 ? null : `${key}=${fallback}`;
+}
+
+function fieldKey(value: unknown): string | undefined {
+  const key = plain(value, 64);
+  return key && /^[A-Za-z0-9_-]+$/.test(key) ? key : undefined;
+}
+
+function fieldDefault(field: FormField): string | undefined {
+  if (typeof field.default === "string") return field.default;
+  return Array.isArray(field.options) ? plain((field.options[0] as { value?: unknown } | undefined)?.value, 256) : undefined;
 }
 
 /** Parse `opencode auth list --format json`: stored credentials only (never an environment one). */
 export function parseOpenCodeAuthList(stdout: string): OpenCodeStoredCredential[] {
   const parsed = parseJson(stdout);
   if (!Array.isArray(parsed)) throw new Error("OpenCode's credential list is not a list");
-  const out: OpenCodeStoredCredential[] = [];
-  for (const raw of parsed) {
-    const entry = raw as { id?: unknown; name?: unknown; connections?: unknown };
-    const integrationId = plain(entry.id, 64)?.toLowerCase();
-    if (!integrationId || !PROVIDER_ID.test(integrationId)) continue;
-    const integrationName = plain(entry.name, 64) ?? integrationId;
-    for (const rawConnection of Array.isArray(entry.connections) ? entry.connections : []) {
-      const connection = rawConnection as { type?: unknown; id?: unknown; method?: unknown };
-      if (connection.type !== "credential") continue;
-      const credentialId = plain(connection.id, 128);
-      if (!credentialId || !/^[A-Za-z0-9_-]+$/.test(credentialId)) continue;
-      out.push({ integrationId, integrationName, credentialId, method: plain(connection.method, 32)?.toLowerCase() ?? "unknown" });
-    }
-  }
-  return out;
+  return parsed.flatMap(storedCredentials);
+}
+
+function storedCredentials(raw: unknown): OpenCodeStoredCredential[] {
+  const entry = raw as { id?: unknown; name?: unknown; connections?: unknown };
+  const integrationId = providerId(entry.id);
+  if (!integrationId) return [];
+  const integrationName = plain(entry.name, 64) ?? integrationId;
+  return (Array.isArray(entry.connections) ? entry.connections : []).flatMap(rawConnection => {
+    const connection = storedConnection(rawConnection);
+    return connection ? [{ integrationId, integrationName, ...connection }] : [];
+  });
+}
+
+function storedConnection(raw: unknown): { credentialId: string; method: string } | null {
+  const connection = raw as { type?: unknown; id?: unknown; method?: unknown };
+  if (connection.type !== "credential") return null;
+  const credentialId = plain(connection.id, 128);
+  if (!credentialId || !/^[A-Za-z0-9_-]+$/.test(credentialId)) return null;
+  return { credentialId, method: plain(connection.method, 32)?.toLowerCase() ?? "unknown" };
 }
 
 async function runOpenCode(context: OpenCodeCommandContext, args: string[], run: OpenCodeRun = runCommand, timeoutMs = 30_000) {
@@ -188,7 +223,7 @@ function reviewedOptionFor(integrationId: string) {
 }
 
 /**
- * The credentials the connected agent reports (CP3 prep): one per stored
+ * The credentials the connected agent reports: one per stored
  * credential, a plain label ("ChatGPT Plus or Pro", "DeepSeek key"; never an
  * account), how it signed in, OpenCode's method id when known, and how the
  * provider bills it (`classifyAgentBilling`). `authRequired`: OpenCode refused
@@ -197,23 +232,30 @@ function reviewedOptionFor(integrationId: string) {
 export function openCodeCredentialViews(stored: readonly OpenCodeStoredCredential[], authRequired = false): ConnectedAgentCredential[] {
   const views: ConnectedAgentCredential[] = [];
   for (const credential of stored) {
-    const kind = credential.method === "key" || credential.method === "api" ? "api_key" as const : "sign_in" as const;
-    const option = kind === "sign_in" ? reviewedOptionFor(credential.integrationId) : undefined;
-    const label = kind === "api_key" ? `${credential.integrationName} key` : option?.label ?? `${credential.integrationName} sign-in`;
-    const method = kind === "api_key" ? "key" : option?.methodId;
-    const view = ConnectedAgentCredentialSchema.safeParse({
-      providerId: credential.integrationId, label: label.slice(0, 80), kind, ...(method ? { method } : {}),
-      billing: classifyAgentBilling({ agentId: "opencode", providerId: credential.integrationId, credential: kind }),
-      state: authRequired ? "needs_sign_in" : "ready",
-    });
+    const view = ConnectedAgentCredentialSchema.safeParse(credentialView(credential, authRequired));
     if (view.success) views.push(view.data);
     if (views.length >= MAX_CONNECTED_AGENT_CREDENTIALS) break;
   }
   return views;
 }
 
+function credentialView(credential: OpenCodeStoredCredential, authRequired: boolean): unknown {
+  const kind = credential.method === "key" || credential.method === "api" ? "api_key" as const : "sign_in" as const;
+  const { label, method } = kind === "api_key" ? { label: `${credential.integrationName} key`, method: "key" } : signInLabel(credential);
+  return {
+    providerId: credential.integrationId, label: label.slice(0, 80), kind, ...(method ? { method } : {}),
+    billing: classifyAgentBilling({ agentId: "opencode", providerId: credential.integrationId, credential: kind }),
+    state: authRequired ? "needs_sign_in" : "ready",
+  };
+}
+
+function signInLabel(credential: OpenCodeStoredCredential): { label: string; method: string | undefined } {
+  const option = reviewedOptionFor(credential.integrationId);
+  return { label: option?.label ?? `${credential.integrationName} sign-in`, method: option?.methodId };
+}
+
 /**
- * The identity signal (D111): what `auth list` reports, as (provider, method,
+ * The identity signal: what `auth list` reports, as (provider, method,
  * credential id) lines, sorted. No secret is part of it. Adding or removing a
  * credential changes it; so does switching free models on with none signed in.
  */
@@ -222,7 +264,7 @@ export function openCodeIdentityMaterial(stored: readonly OpenCodeStoredCredenti
   return ["opencode", ...stored.map(credential => `${credential.integrationId}\t${credential.method}\t${credential.credentialId}`).sort()].join("\n");
 }
 
-/** OpenCode Zen's free models (`opencode/<id>-free`): offered only with the person's say-so (O6). */
+/** OpenCode Zen's free models (`opencode/<id>-free`): offered only with the person's say-so. */
 export function isOpenCodeFreeModel(value: string): boolean {
   return /^opencode\/[^/\s]+-free$/i.test(value.trim());
 }
@@ -259,11 +301,11 @@ export interface OpenCodeLoginRequest {
   method?: string;
   /** A reviewed option the site started (device or machine-browser methods only). */
   loginOption?: OpenCodeLoginOptionId;
-  /** Offer to repeat the sign-ins of the person's own OpenCode (O10). */
+  /** Offer to repeat the sign-ins of the person's own OpenCode. */
   reuse?: boolean;
 }
 
-/** The person's own OpenCode, read only through its own `auth list`, only after their yes (O10). */
+/** The person's own OpenCode, read only through its own `auth list`, only after their yes. */
 interface OpenCodePersonalHome {
   /** Their own OpenCode data exists on this computer (nothing is read to know it). */
   exists(): boolean;
@@ -365,48 +407,46 @@ export function startOpenCodeLogin(options: OpenCodeLoginOptions): LoginFlow {
   const begin = async () => {
     await options.prepare?.();
     integrations = await listOpenCodeIntegrations(options.context, options.run);
-    if (request.loginOption !== undefined) {
-      const option = OPENCODE_LOGIN_OPTIONS[request.loginOption];
-      const integration = integrations.find(candidate => candidate.id === option.integration);
-      const method = integration?.methods.find(candidate => candidate.kind === "sign_in" && candidate.id === option.methodId);
-      if (!integration || !method) return fail(`This OpenCode does not offer ${option.label} sign-in.`);
-      return run(integration, method);
-    }
-    if (request.provider !== undefined) {
-      const integration = findIntegration(integrations, request.provider);
-      if (!integration) return fail(`OpenCode has no provider called ${request.provider}. Run \`konteks-remote auth login opencode\` to pick one.`);
-      return chooseMethod(integration);
-    }
-    const personal = options.personal;
-    const offered = existsSync(join(options.stateDir, REUSE_OFFERED_FILE));
-    if (personal?.exists() && (request.reuse === true || !offered)) {
-      await mkdir(options.stateDir, { recursive: true, mode: 0o700 });
-      await writeFile(join(options.stateDir, REUSE_OFFERED_FILE), "offered\n", { mode: 0o600 });
-      display("You already use OpenCode on this computer. Konteks keeps its own OpenCode sign-ins, separate from yours.");
-      step = { kind: "reuse" };
-      return ask("Check which providers your own OpenCode is signed in to, so you can sign in to the same ones here? Konteks reads only their names. (yes/no)", false);
-    }
+    if (request.loginOption !== undefined) return beginReviewedOption(request.loginOption);
+    if (request.provider !== undefined) return beginProvider(request.provider);
+    if (await offerReuse()) return;
     if (request.reuse === true) display("There is no OpenCode of your own on this computer to reuse sign-ins from.");
     return chooseProvider();
   };
 
+  const beginReviewedOption = (id: OpenCodeLoginOptionId) => {
+    const signIn = reviewedSignIn(integrations, id);
+    if (!signIn) return fail(`This OpenCode does not offer ${OPENCODE_LOGIN_OPTIONS[id].label} sign-in.`);
+    return run(signIn.integration, signIn.method);
+  };
+
+  const beginProvider = (provider: string) => {
+    const integration = findIntegration(integrations, provider);
+    if (!integration) return fail(`OpenCode has no provider called ${provider}. Run \`konteks-remote auth login opencode\` to pick one.`);
+    return chooseMethod(integration);
+  };
+
+  /** Offers once (or again on --reuse) to read which providers the person's own OpenCode uses. */
+  const offerReuse = async (): Promise<boolean> => {
+    const offered = existsSync(join(options.stateDir, REUSE_OFFERED_FILE));
+    if (!options.personal?.exists() || (request.reuse !== true && offered)) return false;
+    await mkdir(options.stateDir, { recursive: true, mode: 0o700 });
+    await writeFile(join(options.stateDir, REUSE_OFFERED_FILE), "offered\n", { mode: 0o600 });
+    display("You already use OpenCode on this computer. Konteks keeps its own OpenCode sign-ins, separate from yours.");
+    step = { kind: "reuse" };
+    ask("Check which providers your own OpenCode is signed in to, so you can sign in to the same ones here? Konteks reads only their names. (yes/no)", false);
+    return true;
+  };
+
   const chooseProvider = () => {
-    const signIns: Array<{ integration: OpenCodeIntegration; method: OpenCodeLoginMethod }> = [];
-    for (const id of OPENCODE_LOGIN_OPTION_IDS) {
-      const option = OPENCODE_LOGIN_OPTIONS[id];
-      const integration = integrations.find(candidate => candidate.id === option.integration);
-      const method = integration?.methods.find(candidate => candidate.kind === "sign_in" && candidate.id === option.methodId);
-      if (integration && method) signIns.push({ integration, method: { ...method, label: option.label } });
-    }
+    const signIns = OPENCODE_LOGIN_OPTION_IDS.flatMap(id => {
+      const signIn = reviewedSignIn(integrations, id);
+      return signIn ? [{ integration: signIn.integration, method: { ...signIn.method, label: OPENCODE_LOGIN_OPTIONS[id].label } }] : [];
+    });
     // The person's own sign-ins first, when they asked to repeat them.
     const theirs = new Set(reusable.map(credential => credential.integrationId));
     signIns.sort((a, b) => Number(theirs.has(b.integration.id)) - Number(theirs.has(a.integration.id)));
-    const lines = ["Sign OpenCode in on this computer. Subscriptions and accounts this OpenCode offers:",
-      ...signIns.map((choice, index) => `  ${index + 1}. ${choice.method.label}${theirs.has(choice.integration.id) ? " (your own OpenCode uses it)" : ""}`),
-      "Or add an API key for any provider OpenCode supports: type the provider's id, for example deepseek, anthropic or openrouter."];
-    const keyed = reusable.filter(credential => credential.method === "key").map(credential => credential.integrationId);
-    if (keyed.length > 0) lines.push(`Your own OpenCode has keys for: ${[...new Set(keyed)].join(", ")}.`);
-    display(lines.join("\n"));
+    display(providerMenu(signIns, theirs, reusable));
     step = { kind: "provider", choices: signIns };
     ask("Number or provider id", false);
   };
@@ -414,11 +454,7 @@ export function startOpenCodeLogin(options: OpenCodeLoginOptions): LoginFlow {
   const chooseMethod = (integration: OpenCodeIntegration) => {
     const methods = integration.methods;
     const wanted = request.method?.trim();
-    if (wanted) {
-      const method = methods.find(candidate => candidate.id === wanted);
-      if (!method) return fail(`OpenCode cannot sign ${integration.name} in with "${wanted}" from Konteks. Methods: ${methods.map(candidate => candidate.id).join(", ") || "none"}.`);
-      return run(integration, method);
-    }
+    if (wanted) return runNamedMethod(integration, wanted);
     if (methods.length === 0) return fail(`${integration.name} needs details only your own OpenCode can ask for. Konteks cannot sign it in yet.`);
     if (methods.length === 1) return run(integration, methods[0]!);
     display([`${integration.name} can sign in these ways:`, ...methods.map((method, index) => `  ${index + 1}. ${method.kind === "api_key" ? "API key" : method.label}`)].join("\n"));
@@ -426,68 +462,69 @@ export function startOpenCodeLogin(options: OpenCodeLoginOptions): LoginFlow {
     return ask("Number", false);
   };
 
+  const runNamedMethod = (integration: OpenCodeIntegration, wanted: string) => {
+    const method = integration.methods.find(candidate => candidate.id === wanted);
+    if (!method) return fail(`OpenCode cannot sign ${integration.name} in with "${wanted}" from Konteks. Methods: ${integration.methods.map(candidate => candidate.id).join(", ") || "none"}.`);
+    return run(integration, method);
+  };
+
   const run = (integration: OpenCodeIntegration, method: OpenCodeLoginMethod) => {
     const argv = [options.context.binary, "auth", "login", integration.id, "--method", method.id, ...method.answers.flatMap(answer => ["--answer", answer]), "--standalone"];
-    const spawner = options.spawn ?? spawnPiped;
-    let spec: { command: string; args: string[] } | null = { command: argv[0]!, args: argv.slice(1) };
-    if (method.kind === "api_key") {
-      spec = openCodePtyCommand(argv, options.platform ?? process.platform);
-      if (spec === null) return fail("Adding an API key from Konteks needs macOS or Linux for now. Sign in with a subscription instead.");
-    }
-    try {
-      child = spawner({ command: spec.command, args: spec.args, cwd: options.context.cwd, env: options.context.env, detached: true });
-    } catch {
-      return fail("OpenCode's sign-in could not be started. Check the installation with `konteks-remote doctor`.");
-    }
+    const spec = method.kind === "api_key" ? openCodePtyCommand(argv, options.platform ?? process.platform) : { command: argv[0]!, args: argv.slice(1) };
+    if (spec === null) return fail("Adding an API key from Konteks needs macOS or Linux for now. Sign in with a subscription instead.");
+    const started = startChild(spec);
+    if (!started) return fail("OpenCode's sign-in could not be started. Check the installation with `konteks-remote doctor`.");
+    child = started;
     options.logger?.info({ event: "opencode.login.started", provider: integration.id, method: method.id, kind: method.kind }, "OpenCode sign-in started");
-    step = method.kind === "api_key" ? { kind: "key" } : { kind: "running" };
     if (method.kind === "api_key") {
+      step = { kind: "key" };
       display(`OpenCode asks for your ${integration.name} API key. It is typed into OpenCode's own prompt on this computer and never leaves it.`);
       ask(`${integration.name} API key`, true);
     } else {
-      child.stdin.end();
+      step = { kind: "running" };
+      started.stdin.end();
     }
+    const relay = outputRelay(method);
+    started.stdout.setEncoding("utf8");
+    started.stderr.setEncoding("utf8");
+    started.stdout.on("data", relay);
+    started.stderr.on("data", relay);
+    started.once("close", exitCode => onExit(integration, method, exitCode));
+  };
+
+  const startChild = (spec: { command: string; args: string[] }): PipedChildProcess | null => {
+    try {
+      return (options.spawn ?? spawnPiped)({ command: spec.command, args: spec.args, cwd: options.context.cwd, env: options.context.env, detached: true });
+    } catch {
+      return null;
+    }
+  };
+
+  /** Relays OpenCode's output once per line, never the typed key, and its sign-in link with its code. */
+  const outputRelay = (method: OpenCodeLoginMethod) => {
     const seen = new Set<string>();
-    let url: string | undefined;
-    let code: string | undefined;
-    const relay = (chunk: string) => {
-      for (const raw of splitTerminalOutput(chunk)) {
-        if (typedKey !== null && raw.includes(typedKey)) continue;
-        const line = raw.replace(SPINNER_OR_BOX, "").trim();
-        if (line.length === 0 || MASK.test(line)) continue;
-        if (method.kind === "api_key" && !keyPromptSeen && KEY_PROMPT.test(line)) { keyPromptSeen = true; sendKey(); }
-        const text = redactText(line).slice(0, 4_096);
-        const dedupe = text.replace(/\.+$/, "");
-        if (seen.has(dedupe)) continue;
-        seen.add(dedupe);
-        display(text);
-        const foundCode = CODE_LINE.exec(text)?.[1];
-        const foundUrl = URL_PATTERN.exec(text)?.[0];
-        if (foundCode && foundCode !== code) {
-          code = foundCode;
-          if (url) publish({ type: "open_url", url, userCode: code });
-        }
-        if (foundUrl && foundUrl !== url) {
-          url = foundUrl;
-          publish({ type: "open_url", url, ...(code ? { userCode: code } : {}) });
-        }
-      }
+    const link: { url?: string; code?: string } = {};
+    const relayLine = (raw: string) => {
+      const line = visibleLine(raw, typedKey);
+      if (line === null) return;
+      if (method.kind === "api_key" && !keyPromptSeen && KEY_PROMPT.test(line)) { keyPromptSeen = true; sendKey(); }
+      const text = redactText(line).slice(0, 4_096);
+      const dedupe = text.replace(/\.+$/, "");
+      if (seen.has(dedupe)) return;
+      seen.add(dedupe);
+      display(text);
+      for (const event of signInLinkEvents(text, link)) publish(event);
     };
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", relay);
-    child.stderr.on("data", relay);
-    child.once("close", exitCode => {
-      child = null;
-      if (finished) return;
-      if (exitCode === 0) {
-        options.logger?.info({ event: "opencode.login.completed", provider: integration.id, kind: method.kind }, "OpenCode sign-in completed");
-        display(method.kind === "api_key" ? `${integration.name} key saved for Konteks' OpenCode.` : `${integration.name} signed in for Konteks' OpenCode.`);
-        finish(0);
-      } else {
-        fail(method.kind === "api_key" && typedKey === null ? "No key was entered." : `OpenCode did not finish signing ${integration.name} in.`);
-      }
-    });
+    return (chunk: string) => { for (const raw of splitTerminalOutput(chunk)) relayLine(raw); };
+  };
+
+  const onExit = (integration: OpenCodeIntegration, method: OpenCodeLoginMethod, exitCode: number | null) => {
+    child = null;
+    if (finished) return;
+    if (exitCode !== 0) return fail(method.kind === "api_key" && typedKey === null ? "No key was entered." : `OpenCode did not finish signing ${integration.name} in.`);
+    options.logger?.info({ event: "opencode.login.completed", provider: integration.id, kind: method.kind }, "OpenCode sign-in completed");
+    display(method.kind === "api_key" ? `${integration.name} key saved for Konteks' OpenCode.` : `${integration.name} signed in for Konteks' OpenCode.`);
+    finish(0);
   };
 
   const sendKey = () => {
@@ -501,49 +538,50 @@ export function startOpenCodeLogin(options: OpenCodeLoginOptions): LoginFlow {
     child.stdin.end(`${key}\r`);
   };
 
+  const onReuseAnswer = async (answer: string) => {
+    if (/^y(es)?$/i.test(answer)) {
+      try {
+        reusable = await options.personal!.list();
+        display(reusedSignInsLine(reusable));
+      } catch {
+        display("Your own OpenCode's sign-ins could not be listed. Pick a provider below.");
+      }
+    }
+    return chooseProvider();
+  };
+
+  const onProviderAnswer = (answer: string, choices: Extract<Step, { kind: "provider" }>["choices"]) => {
+    const picked = choices[menuIndex(answer)];
+    if (picked) return run(picked.integration, picked.method);
+    const integration = findIntegration(integrations, answer);
+    if (!integration) { display(`OpenCode has no provider called "${answer.slice(0, 64)}".`); return ask("Number or provider id", false); }
+    const keyMethod = integration.methods.find(method => method.kind === "api_key");
+    // A typed provider id means its key; a provider with only sign-ins asks which.
+    return keyMethod && !request.method ? run(integration, keyMethod) : chooseMethod(integration);
+  };
+
+  const onMethodAnswer = (answer: string, integration: OpenCodeIntegration) => {
+    const method = integration.methods[menuIndex(answer)];
+    if (!method) { display("Pick one of the numbers above."); return ask("Number", false); }
+    return run(integration, method);
+  };
+
+  const onKeyAnswer = (answer: string) => {
+    if (answer.length === 0) { display("No key was entered. Paste the key, or press Ctrl+C to stop."); return ask("API key", true); }
+    if (answer.length > 4_096 || CONTROL.test(answer)) { display("That does not look like an API key."); return ask("API key", true); }
+    pendingKey = answer;
+    step = { kind: "running" };
+    sendKey();
+  };
+
   const onInput = async (text: string) => {
     const answer = text.trim();
     switch (step.kind) {
-      case "reuse": {
-        if (/^y(es)?$/i.test(answer)) {
-          try {
-            reusable = await options.personal!.list();
-            const names = [...new Set(reusable.map(credential => `${credential.integrationName} (${credential.method === "key" ? "key" : "sign-in"})`))];
-            display(names.length > 0
-              ? `Your own OpenCode is signed in to: ${names.join(", ")}. OpenCode cannot copy a sign-in, so sign in to the same ones here.`
-              : "Your own OpenCode is not signed in to anything yet.");
-          } catch {
-            display("Your own OpenCode's sign-ins could not be listed. Pick a provider below.");
-          }
-        }
-        return chooseProvider();
-      }
-      case "provider": {
-        const index = /^\d+$/.test(answer) ? Number(answer) - 1 : -1;
-        const picked = index >= 0 ? step.choices[index] : undefined;
-        if (picked) return run(picked.integration, picked.method);
-        const integration = findIntegration(integrations, answer);
-        if (!integration) { display(`OpenCode has no provider called "${answer.slice(0, 64)}".`); return ask("Number or provider id", false); }
-        const keyMethod = integration.methods.find(method => method.kind === "api_key");
-        // A typed provider id means its key; a provider with only sign-ins asks which.
-        return keyMethod && !request.method ? run(integration, keyMethod) : chooseMethod(integration);
-      }
-      case "method": {
-        const index = /^\d+$/.test(answer) ? Number(answer) - 1 : -1;
-        const method = step.integration.methods[index];
-        if (!method) { display("Pick one of the numbers above."); return ask("Number", false); }
-        return run(step.integration, method);
-      }
-      case "key": {
-        if (answer.length === 0) { display("No key was entered. Paste the key, or press Ctrl+C to stop."); return ask("API key", true); }
-        if (answer.length > 4_096 || CONTROL.test(answer)) { display("That does not look like an API key."); return ask("API key", true); }
-        pendingKey = answer;
-        step = { kind: "running" };
-        sendKey();
-        return;
-      }
-      default:
-        return;
+      case "reuse": return onReuseAnswer(answer);
+      case "provider": return onProviderAnswer(answer, step.choices);
+      case "method": return onMethodAnswer(answer, step.integration);
+      case "key": return onKeyAnswer(answer);
+      default: return;
     }
   };
 
@@ -564,6 +602,62 @@ export function startOpenCodeLogin(options: OpenCodeLoginOptions): LoginFlow {
   };
 }
 
+/** A reviewed sign-in option the installed OpenCode offers, with its integration and method. */
+function reviewedSignIn(integrations: readonly OpenCodeIntegration[], id: OpenCodeLoginOptionId): { integration: OpenCodeIntegration; method: OpenCodeLoginMethod } | null {
+  const option = OPENCODE_LOGIN_OPTIONS[id];
+  const integration = integrations.find(candidate => candidate.id === option.integration);
+  const method = integration?.methods.find(candidate => candidate.kind === "sign_in" && candidate.id === option.methodId);
+  return integration && method ? { integration, method } : null;
+}
+
+function providerMenu(signIns: ReadonlyArray<{ integration: OpenCodeIntegration; method: OpenCodeLoginMethod }>, theirs: ReadonlySet<string>, reusable: readonly OpenCodeStoredCredential[]): string {
+  const lines = ["Sign OpenCode in on this computer. Subscriptions and accounts this OpenCode offers:",
+    ...signIns.map((choice, index) => `  ${index + 1}. ${choice.method.label}${theirs.has(choice.integration.id) ? " (your own OpenCode uses it)" : ""}`),
+    "Or add an API key for any provider OpenCode supports: type the provider's id, for example deepseek, anthropic or openrouter."];
+  const keyed = reusable.filter(credential => credential.method === "key").map(credential => credential.integrationId);
+  if (keyed.length > 0) lines.push(`Your own OpenCode has keys for: ${[...new Set(keyed)].join(", ")}.`);
+  return lines.join("\n");
+}
+
+function reusedSignInsLine(reusable: readonly OpenCodeStoredCredential[]): string {
+  const names = [...new Set(reusable.map(credential => `${credential.integrationName} (${credential.method === "key" ? "key" : "sign-in"})`))];
+  return names.length > 0
+    ? `Your own OpenCode is signed in to: ${names.join(", ")}. OpenCode cannot copy a sign-in, so sign in to the same ones here.`
+    : "Your own OpenCode is not signed in to anything yet.";
+}
+
+/** A 1-based menu answer as an index; -1 for anything else. */
+function menuIndex(answer: string): number {
+  return /^\d+$/.test(answer) ? Number(answer) - 1 : -1;
+}
+
+/** A terminal line worth showing: never the typed key, a spinner or box drawing, or a masked echo. */
+function visibleLine(raw: string, typedKey: string | null): string | null {
+  if (typedKey !== null && raw.includes(typedKey)) return null;
+  const line = raw.replace(SPINNER_OR_BOX, "").trim();
+  return line.length === 0 || MASK.test(line) ? null : line;
+}
+
+/**
+ * The `open_url` events a line brings: a new code is sent with the link
+ * already seen, a new link with the code already seen.
+ */
+function signInLinkEvents(text: string, link: { url?: string; code?: string }): LoginEvent[] {
+  return [...newCodeEvents(CODE_LINE.exec(text)?.[1], link), ...newLinkEvents(URL_PATTERN.exec(text)?.[0], link)];
+}
+
+function newCodeEvents(code: string | undefined, link: { url?: string; code?: string }): LoginEvent[] {
+  if (!code || code === link.code) return [];
+  link.code = code;
+  return link.url ? [{ type: "open_url", url: link.url, userCode: code }] : [];
+}
+
+function newLinkEvents(url: string | undefined, link: { url?: string; code?: string }): LoginEvent[] {
+  if (!url || url === link.url) return [];
+  link.url = url;
+  return [{ type: "open_url", url, ...(link.code ? { userCode: link.code } : {}) }];
+}
+
 function findIntegration(integrations: readonly OpenCodeIntegration[], value: string): OpenCodeIntegration | undefined {
   const wanted = value.trim().toLowerCase();
   if (wanted.length === 0) return undefined;
@@ -581,7 +675,7 @@ export function splitTerminalOutput(chunk: string): string[] {
   return withoutTerminalEscapes(marked).split(/\r\n|\r|\n/).map(line => line.trimEnd()).filter(line => line.length > 0);
 }
 
-/** The person's own OpenCode (their HOME, their XDG folders), read only through `auth list` (O10). */
+/** The person's own OpenCode (their HOME, their XDG folders), read only through `auth list`. */
 export function personalOpenCodeHome(options: { binary: string; scratchDir: string; allowList: (home: { home: string; data: string; state: string; cache: string; config: string }) => NodeJS.ProcessEnv; run?: OpenCodeRun; inherited?: NodeJS.ProcessEnv }): OpenCodePersonalHome {
   const folders = personalOpenCodeFolders(options.inherited ?? process.env);
   return {
@@ -608,7 +702,7 @@ function personalOpenCodeFolders(inherited: NodeJS.ProcessEnv): { home: string; 
 
 /**
  * Whether the person's own OpenCode keeps data (and so, likely, sign-ins) on
- * this machine: the database file's existence only, nothing read (O10). Used
+ * this machine: the database file's existence only, nothing read. Used
  * by onboarding to name `auth login opencode --reuse`.
  */
 export function personalOpenCodeDataExists(inherited: NodeJS.ProcessEnv = process.env): boolean {
