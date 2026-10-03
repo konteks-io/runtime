@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, open, rename, rm } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { lstat, open, rename, rm, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import {
@@ -55,38 +55,29 @@ export class NativeOutputStore {
   async read(): Promise<NativeOutputRecord | null> {
     try {
       const before = await lstat(this.path);
-      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > MAX_RECORD_BYTES ||
-        (process.platform !== "win32" && (before.mode & 0o7777) !== 0o600)) throw unavailable();
+      if (!privateRecordFile(before, MAX_RECORD_BYTES)) throw unavailable();
       const handle = await open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       try {
-        const stat = await handle.stat();
-        if (stat.dev !== before.dev || stat.ino !== before.ino || stat.size !== before.size) throw unavailable();
-        const bytes = Buffer.alloc(stat.size + 1); let offset = 0;
-        while (offset < bytes.length) { const next = await handle.read(bytes, offset, bytes.length - offset, offset); if (!next.bytesRead) break; offset += next.bytesRead; }
-        const after = await handle.stat();
-        if (offset !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) throw unavailable();
-        return RecordSchema.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, offset))));
+        const bytes = await readUnchanged(handle, before);
+        return RecordSchema.parse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
       } finally { await handle.close(); }
     } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+      if (missing(error)) return null;
       throw unavailable();
     }
   }
-
   async savePending(candidate: RemoteDeliveryResultCandidate, completion: SessionToCoreMessage): Promise<void> {
     const parsed = RemoteDeliveryResultCandidateSchema.parse(candidate);
     const parsedCompletion = SessionToCoreMessageSchema.parse(completion);
     if (parsedCompletion.kind !== "acp_result" || parsedCompletion.method !== "session/prompt") throw unavailable();
-    if (this.turn && (parsed.binding.sessionId !== this.turn.sessionId || parsed.invocationRef !== this.turn.invocationId ||
-        parsed.claimId !== this.turn.claimId)) throw unavailable();
+    if (this.turn && !candidateOfTurn(parsed, this.turn)) throw unavailable();
     const existing = await this.read();
     if (existing) {
-      if (canonicalize(existing.candidate as never) !== canonicalize(parsed as never) || canonicalize(existing.completion as never) !== canonicalize(parsedCompletion as never)) throw unavailable();
+      if (!sameCandidate(existing, parsed, parsedCompletion)) throw unavailable();
       return;
     }
     await this.write({ version: 1, state: "pending", candidate: parsed, completion: parsedCompletion });
   }
-
   async saveAccepted(candidate: RemoteDeliveryResultCandidate, receipt: RemoteDeliveryAcceptanceReceipt): Promise<void> {
     const existing = await this.read();
     if (!existing) throw unavailable();
@@ -158,60 +149,69 @@ export class NativeOutputSessionHeadStore {
    * an accepted record whose head promotion may merely have lost its fsync. */
   async begin(current: Omit<TurnIdentity, "sessionId">): Promise<void> {
     const identity = TurnIdentitySchema.parse({ sessionId: this.sessionId, ...current });
-    const before = await this.read();
-    if (before) await this.cleanup(before);
-    const settled = await this.read();
-    if (settled?.pending) {
-      if (sameTurn(settled.pending, identity)) return;
-      const abandoned = await this.record(settled.pending).read();
-      if (abandoned?.state === "accepted") throw unavailable();
-      if (abandoned) await rmRecord(this.record(settled.pending));
-    }
-    await this.write({ version: 1, ...(settled?.latest ? { latest: settled.latest } : {}), pending: identity });
+    const settled = await this.settled();
+    const pending = settled?.pending;
+    if (pending && sameTurn(pending, identity)) return;
+    if (pending) await this.discardAbandoned(pending);
+    await this.write({ version: 1, ...latestOf(settled), pending: identity });
   }
 
-  async verifyExpected(expected: Omit<TurnIdentity, "sessionId"> & { acceptanceId: string; resultDigest: string },
-    current: Omit<TurnIdentity, "sessionId">): Promise<void> {
-    let head = await this.read();
-    if (!head) throw unavailable();
+  /** The head after any finished cleanup it still records. */
+  private async settled(): Promise<SessionHead | null> {
+    const before = await this.read();
+    if (before) await this.cleanup(before);
+    return this.read();
+  }
+
+  /** An abandoned pending record may go; an accepted one may only have lost its head promotion, and refuses. */
+  private async discardAbandoned(pending: TurnIdentity): Promise<void> {
+    const abandoned = await this.record(pending).read();
+    if (abandoned?.state === "accepted") throw unavailable();
+    if (abandoned) await rmRecord(this.record(pending));
+  }
+  async verifyExpected(expected: ExpectedAcceptance, current: Omit<TurnIdentity, "sessionId">): Promise<void> {
+    let head = await this.required();
     await this.cleanup(head);
-    head = await this.read();
-    if (!head) throw unavailable();
-    if (head.pending?.invocationId === expected.invocationId && head.pending.claimId === expected.claimId) {
-      const accepted = await this.record({ invocationId: expected.invocationId, claimId: expected.claimId }).read();
-      if (!accepted || accepted.state !== "accepted" || accepted.receipt.acceptanceId !== expected.acceptanceId ||
-          accepted.receipt.resultDigest !== expected.resultDigest) throw unavailable();
+    head = await this.required();
+    if (turnIs(head.pending, expected)) {
+      await this.assertAccepted(expected);
       await this.promote({ invocationId: expected.invocationId, claimId: expected.claimId });
-      head = await this.read();
-      if (!head) throw unavailable();
+      head = await this.required();
     }
-    if (head.latest?.invocationId === current.invocationId && head.latest.claimId === current.claimId) {
+    if (turnIs(head.latest, current)) {
       const replay = await this.record(current).read();
       if (replay?.state === "accepted") return;
       throw unavailable();
     }
-    if (!head.latest || head.latest.invocationId !== expected.invocationId || head.latest.claimId !== expected.claimId) throw unavailable();
+    if (!turnIs(head.latest, expected)) throw unavailable();
+    await this.assertAccepted(expected);
+  }
+
+  private async required(): Promise<SessionHead> {
+    const head = await this.read();
+    if (!head) throw unavailable();
+    return head;
+  }
+
+  private async assertAccepted(expected: ExpectedAcceptance): Promise<void> {
     const record = await this.record({ invocationId: expected.invocationId, claimId: expected.claimId }).read();
     if (!record || record.state !== "accepted" || record.receipt.acceptanceId !== expected.acceptanceId ||
         record.receipt.resultDigest !== expected.resultDigest) throw unavailable();
   }
-
   async promote(current: Omit<TurnIdentity, "sessionId">): Promise<void> {
     const identity = TurnIdentitySchema.parse({ sessionId: this.sessionId, ...current });
     const before = await this.read();
-    if (before?.latest && sameTurn(before.latest, identity)) {
-      await this.cleanup(before);
+    if (isTurn(before?.latest, identity)) {
+      await this.cleanup(before!);
       return;
     }
-    if (!before?.pending || !sameTurn(before.pending, identity)) throw unavailable();
+    if (!isTurn(before?.pending, identity)) throw unavailable();
     const record = await this.record(current).read();
     if (record?.state !== "accepted") throw unavailable();
-    const next = SessionHeadSchema.parse({ version: 1, latest: identity,
-      ...(before.latest ? { cleanup: before.latest } : {}) });
+    const next = SessionHeadSchema.parse({ version: 1, latest: identity, ...(before!.latest ? { cleanup: before!.latest } : {}) });
     await this.write(next);
     await this.cleanup(next);
   }
-
   private async cleanup(head: z.infer<typeof SessionHeadSchema>): Promise<void> {
     if (!head.cleanup) return;
     const record = new NativeOutputStore(this.root, head.cleanup);
@@ -224,20 +224,18 @@ export class NativeOutputSessionHeadStore {
       ...(head.pending ? { pending: head.pending } : {}) });
   }
 
-  private async read(): Promise<z.infer<typeof SessionHeadSchema> | null> {
+  private async read(): Promise<SessionHead | null> {
     try {
       const before = await lstat(this.path);
-      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > 16 * 1024 ||
-          (process.platform !== "win32" && (before.mode & 0o7777) !== 0o600)) throw unavailable();
+      if (!privateRecordFile(before, 16 * 1024)) throw unavailable();
       const handle = await open(this.path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       try { return SessionHeadSchema.parse(JSON.parse(await handle.readFile("utf8"))); }
       finally { await handle.close(); }
     } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+      if (missing(error)) return null;
       throw unavailable();
     }
   }
-
   private async write(value: z.infer<typeof SessionHeadSchema>): Promise<void> {
     const temporary = `${this.path}.new-${randomUUID()}`;
     try {
@@ -251,6 +249,62 @@ export class NativeOutputSessionHeadStore {
       }
     } finally { await rm(temporary, { force: true }); }
   }
+}
+
+type SessionHead = z.infer<typeof SessionHeadSchema>;
+type ExpectedAcceptance = Omit<TurnIdentity, "sessionId"> & { acceptanceId: string; resultDigest: string };
+
+/** A private, singly linked regular file of at most `maxBytes`, readable and writable by its owner only. */
+function privateRecordFile(info: Stats, maxBytes: number): boolean {
+  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > maxBytes) return false;
+  return process.platform === "win32" || (info.mode & 0o7777) === 0o600;
+}
+
+function missing(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
+}
+
+/** The opened file's bytes, when it is the file inspected and did not change while it was read. */
+async function readUnchanged(handle: FileHandle, before: Stats): Promise<Buffer> {
+  const stat = await handle.stat();
+  if (stat.dev !== before.dev || stat.ino !== before.ino || stat.size !== before.size) throw unavailable();
+  const bytes = Buffer.alloc(stat.size + 1);
+  const offset = await readFully(handle, bytes);
+  const after = await handle.stat();
+  if (offset !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ctimeMs !== stat.ctimeMs) throw unavailable();
+  return bytes.subarray(0, offset);
+}
+
+async function readFully(handle: FileHandle, bytes: Buffer): Promise<number> {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const next = await handle.read(bytes, offset, bytes.length - offset, offset);
+    if (!next.bytesRead) break;
+    offset += next.bytesRead;
+  }
+  return offset;
+}
+
+function candidateOfTurn(candidate: RemoteDeliveryResultCandidate, turn: TurnIdentity): boolean {
+  return candidate.binding.sessionId === turn.sessionId && candidate.invocationRef === turn.invocationId && candidate.claimId === turn.claimId;
+}
+
+/** The record already holds exactly this candidate and completion. */
+function sameCandidate(existing: NativeOutputRecord, candidate: RemoteDeliveryResultCandidate, completion: SessionToCoreMessage): boolean {
+  return canonicalize(existing.candidate as never) === canonicalize(candidate as never) && canonicalize(existing.completion as never) === canonicalize(completion as never);
+}
+
+function latestOf(head: SessionHead | null): { latest?: TurnIdentity } {
+  return head?.latest ? { latest: head.latest } : {};
+}
+
+/** Whether a head entry names this invocation and claim. */
+function turnIs(turn: TurnIdentity | undefined, expected: Omit<TurnIdentity, "sessionId">): boolean {
+  return turn?.invocationId === expected.invocationId && turn.claimId === expected.claimId;
+}
+
+function isTurn(turn: TurnIdentity | undefined, identity: TurnIdentity): boolean {
+  return turn !== undefined && sameTurn(turn, identity);
 }
 
 function sameTurn(left: TurnIdentity, right: TurnIdentity): boolean {
