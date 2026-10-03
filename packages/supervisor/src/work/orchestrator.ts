@@ -37,6 +37,7 @@ import type { LeaseState } from "../lease/lease.js";
 import { placedAgentReady, type RoleBinding, type RoleCapabilityInputs } from "../inventory/roles.js";
 import { recoveryEvidenceRecordKey, type SupervisorJournal, type JournalEntry, type RecoveryEvidenceRecord } from "../state/journal.js";
 import type { LocalAdmission } from "../state/local-admission.js";
+import type { RuntimeRecoveryRecord } from "../state/runtime-recovery.js";
 import type { RetainedProcessOwner } from "@konteks/remote-common";
 import type { DurableOutbox } from "../state/outbox.js";
 import type { TransportManager } from "../transport/relay-transport.js";
@@ -56,7 +57,7 @@ import { integrationTerminalResult, isIntegrationWorkAssignment, type Integratio
 /**
  * Pull → claim → dispatch → report. Core owns admission and placement; the
  * supervisor validates every assignment locally, claims exactly the agent
- * Core placed (D100), intersects evidence policy most-restrictively, and
+ * Core placed, intersects evidence policy most-restrictively, and
  * refuses the closed list of unacceptable work. It never runs peer election
  * or a global balancer.
  */
@@ -104,7 +105,7 @@ interface OrchestratorDeps {
   recoveryAuthority?: () => string | null;
   /** Native delivery requires current receipt authority; omission fails closed. */
   reportDeliveryAllowed?: () => boolean;
-  /** C03 private Core boundary; submission cannot select a terminal winner. */
+  /** Private Core boundary for recovery evidence; submission cannot select a terminal winner. */
   recoveryEvidence?: {
     submit(input: { evidence: RemoteRecoveryEvidence; connection: RemoteReconciliationConnection }): Promise<{ outcome: "accepted" | "duplicate"; acceptedAt: string }>;
   };
@@ -731,7 +732,7 @@ export class WorkOrchestrator {
       if (this.deps.integrationCarrier && isIntegrationWorkAssignment(assignment)) {
         // An integration task runs on its own carrier: discovery and setup
         // are model-free, and a phase task opens its own gated ACP session
-        // with a locally built prompt. Nothing is relayed (external-integration CP2).
+        // with a locally built prompt. Nothing is relayed.
         await this.runIntegrationWork(assignment, entry, assertAuthority);
         return;
       }
@@ -1652,35 +1653,59 @@ export class WorkOrchestrator {
     let reaped = 0;
     const now = this.deps.clock.now();
     for (const [channelId, owner] of [...this.channelOwners]) {
-      const key = `${owner.assignment.id}:${owner.assignment.attempt}`;
-      const prior = this.deps.journal.execution.admission(owner.assignment.id, owner.assignment.attempt);
-      const execution = prior ? this.deps.journal.execution.execution(prior) : undefined;
-      const ref = owner.acpSessionRef;
-      if (!prior || !ref || !owner.isClosed || this.recoveryFences.has(key) || this.deps.journal.assignments.get(key)?.reports.terminalSequence === undefined ||
-          execution?.phase !== "opened" || execution.acpSessionRef !== ref || !execution.completedTurnSettledAt || !execution.processOwner ||
-          now - Date.parse(execution.completedTurnSettledAt) < idleMs) continue;
-      const assertCurrent = () => {
-        this.requireNativeOwner();
-        if (this.channelOwners.get(channelId) !== owner || prior.runnerIncarnation !== this.deps.runnerIncarnation?.()) {
-          throw new RemoteInstanceError("recovery_required", "The idle session's channel owner changed during release.");
-        }
-        this.deps.journal.execution.assertAdmission(prior);
-      };
-      try {
-        assertCurrent();
-        await this.stopCompletedOwner(prior, ref, execution.processOwner, assertCurrent);
-        owner.releaseCompletedChannel();
-        if (this.sessions.get(key) === owner) this.sessions.delete(key);
-        if (!this.channelOwners.has(channelId) && channelId.startsWith("session:")) this.deps.onSessionReleased?.(channelId.slice("session:".length));
-        reaped += 1;
-        this.logger.info({ assignmentId: owner.assignment.id, attempt: owner.assignment.attempt, stage: "idle_reaper", outcome: "released",
-          idleMs: now - Date.parse(execution.completedTurnSettledAt) }, "released an idle completed session");
-      } catch (error) {
-        this.logger.warn({ assignmentId: owner.assignment.id, attempt: owner.assignment.attempt, stage: "idle_reaper", outcome: "skipped",
-          ...dispatchErrorIdentity(error), ...(error instanceof RemoteInstanceError ? { code: error.code } : {}) }, "idle completed session could not be released");
-      }
+      const idle = this.idleCompletedSession(owner, now, idleMs);
+      if (idle && await this.releaseIdleSession(channelId, owner, idle, now)) reaped += 1;
     }
     return reaped;
+  }
+
+  /** A closed, reported completion settled at least `idleMs` ago whose execution still holds its process. */
+  private idleCompletedSession(owner: RelayedSession, now: number, idleMs: number): IdleCompletedSession | undefined {
+    const prior = this.deps.journal.execution.admission(owner.assignment.id, owner.assignment.attempt);
+    const ref = owner.acpSessionRef;
+    if (!prior || !ref || !this.closedAndReported(owner)) return undefined;
+    const settled = this.settledOpenedExecution(prior, ref);
+    if (!settled || now - settled.settledAt < idleMs) return undefined;
+    return { prior, ref, ...settled };
+  }
+
+  private closedAndReported(owner: RelayedSession): boolean {
+    const key = `${owner.assignment.id}:${owner.assignment.attempt}`;
+    return owner.isClosed && !this.recoveryFences.has(key) && this.deps.journal.assignments.get(key)?.reports.terminalSequence !== undefined;
+  }
+
+  /** The still-opened execution of `ref` whose completed turn settled and that still holds its process. */
+  private settledOpenedExecution(prior: LocalAdmission, ref: string): { processOwner: RetainedProcessOwner; settledAt: number } | undefined {
+    const execution = this.deps.journal.execution.execution(prior);
+    if (execution?.phase !== "opened" || execution.acpSessionRef !== ref) return undefined;
+    const { completedTurnSettledAt, processOwner } = execution;
+    return completedTurnSettledAt && processOwner ? { processOwner, settledAt: Date.parse(completedTurnSettledAt) } : undefined;
+  }
+
+  private async releaseIdleSession(channelId: string, owner: RelayedSession, idle: IdleCompletedSession, now: number): Promise<boolean> {
+    const { prior, ref, processOwner } = idle;
+    const key = `${owner.assignment.id}:${owner.assignment.attempt}`;
+    const assertCurrent = () => {
+      this.requireNativeOwner();
+      if (this.channelOwners.get(channelId) !== owner || prior.runnerIncarnation !== this.deps.runnerIncarnation?.()) {
+        throw new RemoteInstanceError("recovery_required", "The idle session's channel owner changed during release.");
+      }
+      this.deps.journal.execution.assertAdmission(prior);
+    };
+    const log = { assignmentId: owner.assignment.id, attempt: owner.assignment.attempt, stage: "idle_reaper" };
+    try {
+      assertCurrent();
+      await this.stopCompletedOwner(prior, ref, processOwner, assertCurrent);
+      owner.releaseCompletedChannel();
+      if (this.sessions.get(key) === owner) this.sessions.delete(key);
+      if (!this.channelOwners.has(channelId) && channelId.startsWith("session:")) this.deps.onSessionReleased?.(channelId.slice("session:".length));
+      this.logger.info({ ...log, outcome: "released", idleMs: now - idle.settledAt }, "released an idle completed session");
+      return true;
+    } catch (error) {
+      this.logger.warn({ ...log, outcome: "skipped", ...dispatchErrorIdentity(error), ...errorCodeField(error) },
+        "idle completed session could not be released");
+      return false;
+    }
   }
 
   private async bootstrapRelayedSession(session: RelayedSession, assignment: RemoteWorkAssignment, entry: JournalEntry,
@@ -1713,47 +1738,27 @@ export class WorkOrchestrator {
     assertAuthority();
     const retainCompletedOwner = reason === "completed";
     const key = `${session.assignment.id}:${session.assignment.attempt}`;
-    if (this.recoveryFences.has(key)) return;
-    if (this.sessions.get(key) !== session) return;
+    if (this.recoveryFences.has(key) || this.sessions.get(key) !== session) return;
     const entry = this.deps.journal.assignments.get(key);
     assertAuthority();
     // Registered before the report, so a next turn Core places on that report
     // waits for this stop instead of finding the record still `opened`.
-    if (entry && !retainCompletedOwner && session.assignment.source.kind === "harness_delivery") this.retireAfterClose(session, reason);
-    if (!entry || entry.reports.terminalSequence !== undefined) { if (!retainCompletedOwner) this.sessions.delete(key); return; }
-    if (entry.kind === "planning" || entry.kind === "search_generation") {
-      // The hosted controller owns the terminal decision. Session closure is
-      // transcript evidence only and cannot independently choose a report.
-      if (!retainCompletedOwner) this.sessions.delete(key);
-      return;
-    }
+    if (retiresOnClose(entry, session, reason)) this.retireAfterClose(session, reason);
+    if (!reportsOnClose(entry)) { if (!retainCompletedOwner) this.sessions.delete(key); return; }
     const usage = session.usage();
-    const draft = (() => {
-      switch (reason) {
-        case "completed":
-          { const receipt = session.deliveryAcceptanceReceipt();
-            const semantic = { class: "succeeded" as const, ...(receipt ? { structuredOutput: { nativeDeliveryAcceptance: receipt } } : {}) };
-            return { ...semantic, terminalResultHash: jcsDigest({ ...semantic, acpSessionRef: session.acpSessionRef }) }; }
-        case "cancelled":
-          return { class: "cancelled" as const, reason: "user_cancelled" as const, terminalResultHash: jcsDigest({ class: "cancelled" }) };
-        case "agent_exited":
-          return { class: "failed" as const, reason: "agent_failed" as const, terminalResultHash: jcsDigest({ class: "failed", reason: "agent_failed" }) };
-        case "lease_lost":
-          return { class: "interrupted" as const, reason: "lease_lost" as const, terminalResultHash: jcsDigest({ class: "interrupted", reason: "lease_lost" }) };
-        case "drain":
-          return { class: "interrupted" as const, reason: "drain" as const, terminalResultHash: jcsDigest({ class: "interrupted", reason: "drain" }) };
-        case "relay_replay_gap":
-          return { class: "interrupted" as const, reason: "relay_replay_gap" as const, terminalResultHash: jcsDigest({ class: "interrupted", reason: "relay_replay_gap" }) };
-      }
-    })();
     await this.reports.submit({
       assignmentId: session.assignment.id,
       attempt: session.assignment.attempt,
       claimId: entry.claimId,
-      draft: { terminal: true, result: draft, ...(usage ? { usage: [usage] } : {}), ...(session.acpSessionRef ? { acpSessionRef: session.acpSessionRef } : {}) },
+      draft: { terminal: true, result: closedSessionResult(session, reason), ...(usage ? { usage: [usage] } : {}), ...acpSessionRefField(session.acpSessionRef) },
     });
     assertAuthority();
-    if (!retainCompletedOwner && !this.recoveryFences.has(key) && this.sessions.get(key) === session) this.sessions.delete(key);
+    if (!retainCompletedOwner) this.forgetSession(key, session);
+  }
+
+  /** Drop the session unless a recovery fenced its key or another session replaced it. */
+  private forgetSession(key: string, session: RelayedSession): void {
+    if (!this.recoveryFences.has(key) && this.sessions.get(key) === session) this.sessions.delete(key);
   }
 
   /** Session-channel frames are routed by channelId to the owning session. */
@@ -1780,14 +1785,14 @@ export class WorkOrchestrator {
     await this.deps.integrationCarrier?.onRunnerEvent(event);
   }
 
-  /** A policy-deferred request reached its deadline unanswered: fail it closed (D87). */
+  /** A policy-deferred request reached its deadline unanswered: fail it closed. */
   async onPermissionTimeout(request: PendingHumanRequest): Promise<void> {
     for (const session of this.sessions.values()) {
       if (session.acpSessionRef === request.acpSessionRef) await session.onDeadline(request);
     }
   }
 
-  /** A channel reset on a session stream closes it with relay_replay_gap (D99/D107). */
+  /** A channel reset on a session stream closes it with relay_replay_gap. */
   async onChannelReset(channelId: string): Promise<void> {
     let liveOwner = false;
     for (const session of this.sessions.values()) {
@@ -1813,25 +1818,11 @@ export class WorkOrchestrator {
   }
 
   async onCancel(directive: CancelDirective): Promise<void> {
-    const parsed = CancelDirectiveSchema.safeParse(directive);
-    if (!parsed.success || this.deps.verifyCancellation?.(parsed.data) !== true) {
-      throw new RemoteInstanceError("permission_denied", "Core cancellation signature is required");
-    }
+    this.assertSignedCancellation(directive);
     const key = `${directive.assignmentId}:${directive.attempt}`;
     const entry = this.deps.journal.assignments.get(key);
     if (!entry || entry.reports.terminalSequence !== undefined) return;
-    if (this.recoveryFences.has(key)) {
-      // An execution whose authority was lost and that is not settled yet
-      // (its stop did not finish): Core's stop ends it the same way, now,
-      // with the cancellation as its result; a failure keeps retrying. Any
-      // other fence belongs to a recovery that reports the claim itself.
-      const settlement = this.lostAuthority.get(key);
-      if (settlement) {
-        settlement.nextAt = 0;
-        await this.recoverLostExecutionAuthority(directive.assignmentId, directive.attempt, directive.reason).catch(() => undefined);
-      }
-      return;
-    }
+    if (this.recoveryFences.has(key)) return this.cancelFencedExecution(key, directive);
     const session = this.sessions.get(key);
     if (session) {
       await session.close("cancelled");
@@ -1839,6 +1830,26 @@ export class WorkOrchestrator {
     }
     if (entry.kind === "planning") return; // Hosted settlement supplies the directive-bound terminal winner.
     await this.reports.submit({ assignmentId: directive.assignmentId, attempt: directive.attempt, claimId: entry.claimId, draft: { terminal: true, result: { class: "cancelled", reason: directive.reason, terminalResultHash: jcsDigest({ class: "cancelled", reason: directive.reason }) } } });
+  }
+
+  private assertSignedCancellation(directive: CancelDirective): void {
+    const parsed = CancelDirectiveSchema.safeParse(directive);
+    if (!parsed.success || this.deps.verifyCancellation?.(parsed.data) !== true) {
+      throw new RemoteInstanceError("permission_denied", "Core cancellation signature is required");
+    }
+  }
+
+  /**
+   * An execution whose authority was lost and that is not settled yet (its
+   * stop did not finish): Core's stop ends it the same way, now, with the
+   * cancellation as its result; a failure keeps retrying. Any other fence
+   * belongs to a recovery that reports the claim itself.
+   */
+  private async cancelFencedExecution(key: string, directive: CancelDirective): Promise<void> {
+    const settlement = this.lostAuthority.get(key);
+    if (!settlement) return;
+    settlement.nextAt = 0;
+    await this.recoverLostExecutionAuthority(directive.assignmentId, directive.attempt, directive.reason).catch(() => undefined);
   }
 
   /** Drain: no new pulls; open sessions close with `drain` after the caller's grace. */
@@ -1851,9 +1862,8 @@ export class WorkOrchestrator {
    * own. One attempt runs now; a failed attempt (an agent that did not settle
    * its cancelled turn in time, a slow process stop, a journal or Core hiccup)
    * is retried on the maintenance tick with exponential backoff and no cap
-   * until the claim has a durable terminal report (production 2026-10-02: a
-   * single failure left the claim open and its delivery deadlocked for good).
-   * Every attempt keeps the fences: the attempt never runs again, its
+   * until the claim has a durable terminal report, so a single failure never
+   * leaves the claim open and its delivery deadlocked. Every attempt keeps the fences: the attempt never runs again, its
    * reference is never reused, and nothing reports before the exact process
    * is proven gone.
    */
@@ -1870,42 +1880,63 @@ export class WorkOrchestrator {
 
   private runLostAuthoritySettlement(settlement: LostAuthoritySettlement): Promise<void> {
     if (settlement.running) return settlement.running;
-    const { assignmentId, attempt } = settlement;
-    const key = `${assignmentId}:${attempt}`;
     const task = (async () => {
       try {
         await this.settleLostExecutionAuthority(settlement);
       } catch (error) {
-        settlement.failures += 1;
-        const delayMs = lostAuthorityRetryDelayMs(settlement.failures);
-        settlement.nextAt = this.deps.clock.now() + delayMs;
-        const current = this.lostAuthorityStillOwned(settlement);
-        this.logger.warn({ event: current ? "execution.lost_authority_settlement_retry" : "execution.lost_authority_settlement_dropped",
-          assignmentId, attempt, failures: settlement.failures, ...(current ? { retryInMs: delayMs } : {}),
-          code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
-          ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
-          ...(error instanceof RemoteInstanceError ? { reason: error.message.slice(0, 200) } : dispatchErrorIdentity(error)) },
-        current ? "Settling the fenced execution failed; retrying with backoff" : "The fenced execution is no longer this connector's to settle; stopped retrying");
-        if (!current && this.lostAuthority.get(key) === settlement) this.lostAuthority.delete(key);
+        this.lostAuthoritySettlementFailed(settlement, error);
         throw error;
       }
-      if (this.lostAuthority.get(key) === settlement) this.lostAuthority.delete(key);
-      if (settlement.failures > 0) this.logger.info({ event: "execution.lost_authority_settled", assignmentId, attempt,
-        failures: settlement.failures }, "The fenced execution is settled after retrying");
+      this.forgetLostAuthority(settlement);
+      if (settlement.failures > 0) this.logger.info({ event: "execution.lost_authority_settled", assignmentId: settlement.assignmentId,
+        attempt: settlement.attempt, failures: settlement.failures }, "The fenced execution is settled after retrying");
     })();
     settlement.running = task;
     void task.finally(() => { if (settlement.running === task) settlement.running = null; }).catch(() => undefined);
     return task;
   }
 
+  /** Schedule the next attempt, or stop retrying a settlement that is no longer this process's. */
+  private lostAuthoritySettlementFailed(settlement: LostAuthoritySettlement, error: unknown): void {
+    const { assignmentId, attempt } = settlement;
+    settlement.failures += 1;
+    const delayMs = lostAuthorityRetryDelayMs(settlement.failures);
+    settlement.nextAt = this.deps.clock.now() + delayMs;
+    if (this.lostAuthorityStillOwned(settlement)) {
+      this.logger.warn({ event: "execution.lost_authority_settlement_retry", assignmentId, attempt, failures: settlement.failures,
+        retryInMs: delayMs, ...recoveryFailureFields(error) }, "Settling the fenced execution failed; retrying with backoff");
+      return;
+    }
+    this.logger.warn({ event: "execution.lost_authority_settlement_dropped", assignmentId, attempt, failures: settlement.failures,
+      ...recoveryFailureFields(error) }, "The fenced execution is no longer this connector's to settle; stopped retrying");
+    this.forgetLostAuthority(settlement);
+  }
+
+  private forgetLostAuthority(settlement: LostAuthoritySettlement): void {
+    const key = `${settlement.assignmentId}:${settlement.attempt}`;
+    if (this.lostAuthority.get(key) === settlement) this.lostAuthority.delete(key);
+  }
+
   /** Whether a settlement that failed is still this process's to retry. */
   private lostAuthorityStillOwned(settlement: LostAuthoritySettlement): boolean {
     const { assignmentId, attempt } = settlement;
+    const owned = this.ownedClaim(assignmentId, attempt);
+    if (!owned) return false;
+    return owned.entry.reports.terminalSequence === undefined || !this.reports.hasDurableTerminalReport(assignmentId, attempt, owned.entry.claimId);
+  }
+
+  /** The journaled claim and its admission, while this connector instance and runner incarnation own them. */
+  private ownedClaim(assignmentId: string, attempt: number): { admission: LocalAdmission; entry: JournalEntry } | undefined {
     const admission = this.deps.journal.execution.admission(assignmentId, attempt);
     const entry = this.deps.journal.assignments.get(`${assignmentId}:${attempt}`);
-    if (!admission || !entry || entry.claimId !== admission.claimId || admission.runnerIncarnation !== this.deps.runnerIncarnation?.() ||
-        admission.instanceId !== this.deps.instanceId() || admission.workspaceId !== this.deps.workspaceId()) return false;
-    return entry.reports.terminalSequence === undefined || !this.reports.hasDurableTerminalReport(assignmentId, attempt, entry.claimId);
+    if (!admission || !entry || entry.claimId !== admission.claimId) return undefined;
+    return this.admissionOwnedHere(admission) ? { admission, entry } : undefined;
+  }
+
+  /** Admitted by this instance and workspace under the current runner incarnation. */
+  private admissionOwnedHere(admission: LocalAdmission): boolean {
+    return admission.runnerIncarnation === this.deps.runnerIncarnation?.() &&
+      admission.instanceId === this.deps.instanceId() && admission.workspaceId === this.deps.workspaceId();
   }
 
   /** The maintenance tick's half of `recoverLostExecutionAuthority`: run every settlement whose backoff is over. */
@@ -1921,41 +1952,15 @@ export class WorkOrchestrator {
   private async settleLostExecutionAuthority(settlement: LostAuthoritySettlement): Promise<void> {
     const { assignmentId, attempt } = settlement;
     const observedAdmission = this.deps.journal.execution.admission(assignmentId, attempt);
-    if (observedAdmission) {
-      const assertCurrent = () => {
-        this.requireNativeOwner();
-        if (observedAdmission.runnerIncarnation !== this.deps.runnerIncarnation?.() ||
-            observedAdmission.instanceId !== this.deps.instanceId() || observedAdmission.workspaceId !== this.deps.workspaceId()) {
-          throw new RemoteInstanceError("recovery_required", "Recovery observer no longer owns this execution.");
-        }
-        this.deps.journal.execution.assertAdmission(observedAdmission);
-      };
-      assertCurrent();
-      // The negative observation must survive even when cancellation never
-      // returns. It is not terminal authority and cannot release resources.
-      try {
-        await this.recordTurnSettledRecoveryEvidence(observedAdmission, assertCurrent, "stop_unconfirmed", false);
-        void this.retryRecoveryEvidence().catch(error => {
-          this.logger.warn({ assignmentId, attempt, code: recoveryEvidenceFailureCode(error) }, "Recovery evidence delivery remains pending");
-        });
-      } catch (error) {
-        // Diagnostic durability must never suppress the independent stop path.
-        this.logger.error({ event: "execution.recovery_observation_persist_failed", assignmentId, attempt,
-          code: recoveryEvidenceFailureCode(error), stopClass: "stop_unconfirmed", capacityReleased: false, err: error },
-        "Recovery observation could not be persisted; cancellation will still be attempted");
-      }
-    }
+    if (observedAdmission) await this.recordStopUnconfirmed(observedAdmission);
     await this.stopForRecovery(assignmentId, attempt);
-    const admission = this.deps.journal.execution.admission(assignmentId, attempt);
-    const entry = this.deps.journal.assignments.get(`${assignmentId}:${attempt}`);
     this.requireNativeOwner();
-    if (!admission || !entry || entry.claimId !== admission.claimId ||
-        admission.instanceId !== this.deps.instanceId() || admission.workspaceId !== this.deps.workspaceId() ||
-        admission.runnerIncarnation !== this.deps.runnerIncarnation?.() ||
-        this.deps.journal.execution.execution(admission)?.phase !== "interrupted_unqualified") {
+    const owned = this.ownedClaim(assignmentId, attempt);
+    if (!owned || this.deps.journal.execution.execution(owned.admission)?.phase !== "interrupted_unqualified") {
       throw new RemoteInstanceError("recovery_required", "Stopped execution evidence is unavailable.");
     }
-    this.deps.journal.execution.assertAdmission(admission);
+    this.deps.journal.execution.assertAdmission(owned.admission);
+    const { entry } = owned;
     if (entry.reports.terminalSequence !== undefined) {
       if (!this.reports.hasDurableTerminalReport(assignmentId, attempt, entry.claimId)) {
         throw new RemoteInstanceError("recovery_required", "The interrupted report is not yet durable.");
@@ -1965,7 +1970,39 @@ export class WorkOrchestrator {
     // A planning claim's terminal comes only from its hosted controller's
     // directive; the proven stop is all this connector settles for it.
     if (entry.kind === "planning") return;
-    // Core asked for this claim to stop: it ends cancelled, as an unfenced one would.
+    await this.reportLostExecution(settlement, entry);
+  }
+
+  /**
+   * The negative observation must survive even when cancellation never
+   * returns. It is not terminal authority and cannot release resources.
+   */
+  private async recordStopUnconfirmed(observedAdmission: LocalAdmission): Promise<void> {
+    const { assignmentId, attempt } = observedAdmission;
+    const assertCurrent = () => {
+      this.requireNativeOwner();
+      if (!this.admissionOwnedHere(observedAdmission)) {
+        throw new RemoteInstanceError("recovery_required", "Recovery observer no longer owns this execution.");
+      }
+      this.deps.journal.execution.assertAdmission(observedAdmission);
+    };
+    assertCurrent();
+    try {
+      await this.recordTurnSettledRecoveryEvidence(observedAdmission, assertCurrent, "stop_unconfirmed", false);
+      void this.retryRecoveryEvidence().catch(error => {
+        this.logger.warn({ assignmentId, attempt, code: recoveryEvidenceFailureCode(error) }, "Recovery evidence delivery remains pending");
+      });
+    } catch (error) {
+      // Diagnostic durability must never suppress the independent stop path.
+      this.logger.error({ event: "execution.recovery_observation_persist_failed", assignmentId, attempt,
+        code: recoveryEvidenceFailureCode(error), stopClass: "stop_unconfirmed", capacityReleased: false, err: error },
+      "Recovery observation could not be persisted; cancellation will still be attempted");
+    }
+  }
+
+  /** Core asked for this claim to stop: it ends cancelled, as an unfenced one would; otherwise it ends interrupted. */
+  private async reportLostExecution(settlement: LostAuthoritySettlement, entry: JournalEntry): Promise<void> {
+    const { assignmentId, attempt } = settlement;
     const result = settlement.cancelReason !== undefined
       ? { class: "cancelled" as const, reason: settlement.cancelReason }
       : { class: "interrupted" as const, reason: "agent_session_lost" as const };
@@ -1993,140 +2030,176 @@ export class WorkOrchestrator {
     // Session fencing is synchronous; the task below is registered before any
     // dispatched claim continuation can create or report this attempt again.
     session?.fenceForRecovery();
-    const task = Promise.resolve().then(async () => {
+    const stop: RecoveryStop = { assignmentId, attempt, key, session, dispatch, assertRecoveryCurrent, retained: !session && !dispatch };
+    const task = Promise.resolve().then(() => {
       const admission = this.deps.journal.execution.admission(assignmentId, attempt);
-      const retained = !session && !dispatch;
-      const retainedExecution = retained && admission ? this.deps.journal.execution.execution(admission) : undefined;
-      const retainedRunner = retained && admission ? this.deps.runners.get(admission.agentId) : undefined;
-      if (retained && admission && !retainedExecution) {
-        const assertCurrent = () => {
-          assertRecoveryCurrent?.();
-          this.requireNativeOwner();
-          if (!assertRecoveryCurrent || admission.instanceId !== this.deps.instanceId() || admission.workspaceId !== this.deps.workspaceId() || this.deps.journal.assignments.get(key)?.claimId !== admission.claimId) throw new RemoteInstanceError("recovery_required", "No exact current admission owner can settle this claim.");
-          this.deps.journal.execution.assertAdmission(admission);
-        };
-        assertCurrent();
-        // Admission is durable before dispatch and execution is durable before
-        // any bridge process is opened. Therefore an admission with no
-        // execution record proves that no local agent process ever started.
-        // The reconciliation decision may safely publish its terminal result
-        // without inventing an impossible process owner after restart.
-        this.logger.info({ assignmentId, attempt, stage: "admission_only_recovery", outcome: "never_opened" },
-          "claimed admission never opened local execution; no process stop is required");
-        return;
-      }
-      if (retained && (!admission || !retainedExecution?.processOwner || !retainedExecution.acpSessionRef || !retainedRunner?.stopRetainedExecution)) {
-        throw new RemoteInstanceError("recovery_required", "No current local owner can prove that the prior attempt stopped.");
-      }
-      const assertCurrent = () => {
-        assertRecoveryCurrent?.();
-        this.requireNativeOwner();
-        if (!admission || admission.instanceId !== this.deps.instanceId() || admission.workspaceId !== this.deps.workspaceId() || (!retained && admission.runnerIncarnation !== this.deps.runnerIncarnation?.()) || (retained && !assertRecoveryCurrent) || this.deps.journal.assignments.get(key)?.claimId !== admission.claimId) throw new RemoteInstanceError("recovery_required", "No exact current execution owner can settle this claim.");
-        this.deps.journal.execution.assertAdmission(admission);
-      };
-      assertCurrent();
-      const recoveryEntry = this.deps.journal.assignments.get(key);
-      if (retained && recoveryEntry?.kind === "delivery" && recoveryEntry.reports.terminalSequence === undefined && this.deps.recoverPendingDeliveryOutput) {
-        const recovered = await this.deps.recoverPendingDeliveryOutput(admission!, {
-          acpSessionRef: retainedExecution!.acpSessionRef,
-          processOwner: retainedExecution!.processOwner,
-        });
-        assertCurrent();
-        if (recovered) {
-          const semantic = { class: "succeeded" as const, structuredOutput: { nativeDeliveryAcceptance: recovered.receipt } };
-          await this.reports.submit({ assignmentId, attempt, claimId: admission!.claimId, draft: { terminal: true,
-            result: { ...semantic, terminalResultHash: jcsDigest({ ...semantic, acpSessionRef: recovered.acpSessionRef }) }, acpSessionRef: recovered.acpSessionRef } });
-          assertCurrent();
-        }
-      }
-      await this.deps.journal.execution.markStopping(admission!, this.deps.clock.nowIso(), assertCurrent);
-      if (retained) {
-        if (retainedExecution!.phase !== "process_stopped") {
-          await retainedRunner!.stopRetainedExecution!(retainedExecution!.processOwner!);
-          assertCurrent();
-          await this.deps.journal.execution.markProcessStopped(admission!, this.deps.clock.nowIso(), assertCurrent);
-        }
-        // The bridge may be only a transport adapter to a user-owned Codex
-        // app-server. Process-group exit therefore cannot settle the ACP turn,
-        // tool calls, or MCP work, and this is deliberately NOT D139 quiescence:
-        // the retained reference stays excluded from reuse and no capacity is
-        // released. What it does settle is that this attempt cannot continue,
-        // so recovery states that and the claim is reported interrupted.
-        // Refusing instead left a restarted connector unable to finish startup
-        // recovery at all, so the whole runtime stayed offline permanently.
-        await this.deps.journal.execution.markInterruptedWithoutQuiescence(admission!, this.deps.clock.nowIso(), assertCurrent);
-        this.logger.warn({ assignmentId, attempt, stage: "retained_execution_recovery", outcome: "interrupted_without_quiescence" },
-          "retained execution process is gone; reporting the claim interrupted without certifying background work");
-        return;
-      }
-      const sessionStop = session?.stopForRecovery();
-      void sessionStop?.catch(() => undefined);
-      await dispatch;
-      let owner: RelayedSession | undefined;
-      let settlementError: unknown;
-      try {
-        await sessionStop;
-        const late = this.sessions.get(key);
-        if (late && late !== session) await late.stopForRecovery();
-        owner = late ?? session;
-        if (!owner?.acpSessionRef) throw new RemoteInstanceError("recovery_required", "No confirmed ACP session settlement is available.");
-      } catch (error) {
-        // The agent did not settle its cancelled turn in time (a loaded
-        // computer, 2026-10-02: the ACP stop deadline elapsed) or the stop
-        // failed. That is not terminal: the exact process proof below still
-        // shows this attempt cannot continue, exactly as restart recovery
-        // does. Without it the claim stayed open and its delivery deadlocked.
-        settlementError = error;
-        this.logger.warn({ event: "execution.acp_settlement_unconfirmed", assignmentId, attempt, claimId: admission!.claimId,
-          code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
-          ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
-          ...(error instanceof RemoteInstanceError ? { reason: error.message.slice(0, 200) } : dispatchErrorIdentity(error)) },
-        "ACP settlement of the fenced turn is unconfirmed; proving its exact process gone instead");
-      }
-      if (settlementError === undefined) {
-        await this.deps.journal.execution.markAcpSettled(admission!, owner!.acpSessionRef!, this.deps.clock.nowIso(), assertCurrent);
-        // C03 observes the already-durable `acp_settled` boundary. It is neither
-        // a terminal report nor proof that background tools have stopped.
-        await this.recordTurnSettledRecoveryEvidence(admission!, assertCurrent);
-      }
-      const stopped = this.deps.journal.execution.execution(admission!);
-      const runner = this.deps.runners.get(admission!.agentId);
-      if (stopped?.processOwner && runner?.stopRetainedExecution) {
-        // Apply the same exact-process proof as restart recovery. This only
-        // proves interruption, never background-tool quiescence or safe reuse.
-        const stopStartedAt = performance.now();
-        try { await runner.stopRetainedExecution(stopped.processOwner); }
-        catch (error) {
-          this.logger.warn({ event: "execution.process_stop_unconfirmed", assignmentId, attempt,
-            claimId: admission!.claimId, acpSessionRef: owner?.acpSessionRef ?? stopped.acpSessionRef, phase: stopped.phase,
-            elapsedMs: Math.round(performance.now() - stopStartedAt),
-            code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" },
-          "Exact process stop is unconfirmed; no interruption report or capacity release is authorized");
-          throw error;
-        }
-        assertCurrent();
-        await this.deps.journal.execution.markProcessStopped(admission!, this.deps.clock.nowIso(), assertCurrent);
-        await this.deps.journal.execution.markInterruptedWithoutQuiescence(admission!, this.deps.clock.nowIso(), assertCurrent);
-        this.logger.warn({ event: "execution.recovery_interrupted", assignmentId, attempt, claimId: admission!.claimId,
-          acpSessionRef: owner?.acpSessionRef ?? stopped.acpSessionRef, phase: "interrupted_unqualified", quiescenceQualified: false,
-          acpSettled: settlementError === undefined, capacityReleased: false }, "Exact execution process stopped; background work remains unqualified");
-        return;
-      }
-      if (settlementError !== undefined) throw settlementError;
-      // Without independent process proof, ACP settlement alone cannot even
-      // qualify the interrupted report. Keep the owner for evidence retries.
-      this.logger.warn({ event: "execution.recovery_blocked", assignmentId, attempt, claimId: admission!.claimId,
-        acpSessionRef: owner?.acpSessionRef, phase: stopped?.phase,
-        stoppingAt: stopped?.stoppingAt, acpSettledAt: stopped?.acpSettledAt,
-        lifecycleProfileDigest: stopped?.lifecycleProfileDigest ?? null,
-        executionProfileDigest: stopped?.executionProfileDigest ?? null,
-        diagnostic: "lifecycle_quiescence_unqualified", terminalReported: false, capacityReleased: false },
-      "ACP turn settled; background work remains unqualified and the execution stays fenced");
-      this.deps.journal.execution.assertQuiescent(admission!);
+      return stop.retained ? this.stopRetainedForRecovery(stop, admission) : this.stopLiveForRecovery(stop, admission);
     });
     this.recoveryStops.set(key, task);
     void task.catch(() => { if (this.recoveryStops.get(key) === task) this.recoveryStops.delete(key); });
     return task;
+  }
+
+  /**
+   * The admission checked against the current owner, and that check to repeat
+   * after every await. A retained execution is current only under a caller's
+   * recovery check; a live one only under the runner incarnation that admitted it.
+   */
+  private ownedRecoveryAdmission(stop: RecoveryStop, admission: LocalAdmission | undefined, message: string): { admission: LocalAdmission; assertCurrent: () => void } {
+    const check = (): LocalAdmission => {
+      stop.assertRecoveryCurrent?.();
+      this.requireNativeOwner();
+      if (!admission || !this.recoveryOwnerCurrent(stop, admission)) throw new RemoteInstanceError("recovery_required", message);
+      this.deps.journal.execution.assertAdmission(admission);
+      return admission;
+    };
+    return { admission: check(), assertCurrent: () => { check(); } };
+  }
+
+  private recoveryOwnerCurrent(stop: RecoveryStop, admission: LocalAdmission): boolean {
+    const ownerCurrent = stop.retained ? stop.assertRecoveryCurrent !== undefined : admission.runnerIncarnation === this.deps.runnerIncarnation?.();
+    return ownerCurrent && admission.instanceId === this.deps.instanceId() && admission.workspaceId === this.deps.workspaceId() &&
+      this.deps.journal.assignments.get(stop.key)?.claimId === admission.claimId;
+  }
+
+  /** No live session or dispatch: stop the retained process the journal names, as restart recovery does. */
+  private async stopRetainedForRecovery(stop: RecoveryStop, observed: LocalAdmission | undefined): Promise<void> {
+    const noOwner = () => new RemoteInstanceError("recovery_required", "No current local owner can prove that the prior attempt stopped.");
+    if (!observed) throw noOwner();
+    const execution = this.deps.journal.execution.execution(observed);
+    if (!execution) return this.settleAdmissionOnly(stop, observed);
+    const target = retainedStopTarget(execution, this.deps.runners.get(observed.agentId));
+    if (!target) throw noOwner();
+    const { admission, assertCurrent } = this.ownedRecoveryAdmission(stop, observed, "No exact current execution owner can settle this claim.");
+    await this.recoverRetainedDeliveryOutput(stop, admission, target, assertCurrent);
+    await this.deps.journal.execution.markStopping(admission, this.deps.clock.nowIso(), assertCurrent);
+    if (target.phase !== "process_stopped") {
+      await target.stopProcess();
+      assertCurrent();
+      await this.deps.journal.execution.markProcessStopped(admission, this.deps.clock.nowIso(), assertCurrent);
+    }
+    // The bridge may be only a transport adapter to a user-owned Codex
+    // app-server. Process-group exit therefore cannot settle the ACP turn,
+    // tool calls, or MCP work, and this is deliberately NOT quiescence:
+    // the retained reference stays excluded from reuse and no capacity is
+    // released. What it does settle is that this attempt cannot continue,
+    // so recovery states that and the claim is reported interrupted.
+    // Refusing instead would leave a restarted connector unable to finish
+    // startup recovery, and the whole runtime offline.
+    await this.deps.journal.execution.markInterruptedWithoutQuiescence(admission, this.deps.clock.nowIso(), assertCurrent);
+    this.logger.warn({ assignmentId: stop.assignmentId, attempt: stop.attempt, stage: "retained_execution_recovery", outcome: "interrupted_without_quiescence" },
+      "retained execution process is gone; reporting the claim interrupted without certifying background work");
+  }
+
+  /**
+   * Admission is durable before dispatch and execution is durable before any
+   * bridge process is opened. Therefore an admission with no execution record
+   * proves that no local agent process ever started. The reconciliation
+   * decision may safely publish its terminal result without inventing an
+   * impossible process owner after restart.
+   */
+  private settleAdmissionOnly(stop: RecoveryStop, observed: LocalAdmission): void {
+    this.ownedRecoveryAdmission(stop, observed, "No exact current admission owner can settle this claim.");
+    this.logger.info({ assignmentId: stop.assignmentId, attempt: stop.attempt, stage: "admission_only_recovery", outcome: "never_opened" },
+      "claimed admission never opened local execution; no process stop is required");
+  }
+
+  /** A retained delivery whose output is already accepted reports it succeeded before its process is stopped. */
+  private async recoverRetainedDeliveryOutput(stop: RecoveryStop, admission: LocalAdmission, target: RetainedStopTarget, assertCurrent: () => void): Promise<void> {
+    const entry = this.deps.journal.assignments.get(stop.key);
+    if (entry?.kind !== "delivery" || entry.reports.terminalSequence !== undefined || !this.deps.recoverPendingDeliveryOutput) return;
+    const recovered = await this.deps.recoverPendingDeliveryOutput(admission, { acpSessionRef: target.acpSessionRef, processOwner: target.processOwner });
+    assertCurrent();
+    if (!recovered) return;
+    const semantic = { class: "succeeded" as const, structuredOutput: { nativeDeliveryAcceptance: recovered.receipt } };
+    await this.reports.submit({ assignmentId: stop.assignmentId, attempt: stop.attempt, claimId: admission.claimId, draft: { terminal: true,
+      result: { ...semantic, terminalResultHash: jcsDigest({ ...semantic, acpSessionRef: recovered.acpSessionRef }) }, acpSessionRef: recovered.acpSessionRef } });
+    assertCurrent();
+  }
+
+  /** A live session or dispatch: stop its turn, then prove the exact process gone. */
+  private async stopLiveForRecovery(stop: RecoveryStop, observed: LocalAdmission | undefined): Promise<void> {
+    const { admission, assertCurrent } = this.ownedRecoveryAdmission(stop, observed, "No exact current execution owner can settle this claim.");
+    await this.deps.journal.execution.markStopping(admission, this.deps.clock.nowIso(), assertCurrent);
+    const settlement = await this.settleFencedTurn(stop, admission);
+    if (settlement.settled) {
+      await this.deps.journal.execution.markAcpSettled(admission, settlement.acpSessionRef, this.deps.clock.nowIso(), assertCurrent);
+      // Recovery evidence observes the already-durable `acp_settled` boundary. It is
+      // neither a terminal report nor proof that background tools have stopped.
+      await this.recordTurnSettledRecoveryEvidence(admission, assertCurrent);
+    }
+    const stopped = this.deps.journal.execution.execution(admission);
+    const runner = this.deps.runners.get(admission.agentId);
+    const target = stopped && runner ? liveStopTarget(stopped, runner) : undefined;
+    if (stopped && target) return this.proveFencedProcessStopped(stop, admission, stopped, target, settlement, assertCurrent);
+    if (!settlement.settled) throw settlement.error;
+    this.blockFencedRecovery(stop, admission, settlement.owner, stopped);
+  }
+
+  /**
+   * Stop the fenced session, and any session its dispatch created meanwhile.
+   * An agent that did not settle its cancelled turn in time (a loaded computer
+   * past the ACP stop deadline) or a failed stop is not terminal: the exact
+   * process proof still shows this attempt cannot continue, as restart
+   * recovery does, so the claim never stays open with its delivery deadlocked.
+   */
+  private async settleFencedTurn(stop: RecoveryStop, admission: LocalAdmission): Promise<FencedTurnSettlement> {
+    const sessionStop = stop.session?.stopForRecovery();
+    void sessionStop?.catch(() => undefined);
+    await stop.dispatch;
+    let owner: RelayedSession | undefined;
+    try {
+      await sessionStop;
+      owner = await this.stopLateSession(stop);
+      if (!owner?.acpSessionRef) throw new RemoteInstanceError("recovery_required", "No confirmed ACP session settlement is available.");
+      return { settled: true, owner, acpSessionRef: owner.acpSessionRef };
+    } catch (error) {
+      this.logger.warn({ event: "execution.acp_settlement_unconfirmed", assignmentId: stop.assignmentId, attempt: stop.attempt,
+        claimId: admission.claimId, ...recoveryFailureFields(error) },
+      "ACP settlement of the fenced turn is unconfirmed; proving its exact process gone instead");
+      return { settled: false, owner, error };
+    }
+  }
+
+  /** A session the dispatch opened after the fence is stopped too; the fenced turn's owner is that one, else the original. */
+  private async stopLateSession(stop: RecoveryStop): Promise<RelayedSession | undefined> {
+    const late = this.sessions.get(stop.key);
+    if (late && late !== stop.session) await late.stopForRecovery();
+    return late ?? stop.session;
+  }
+
+  /** Apply the same exact-process proof as restart recovery. This only proves interruption, never background-tool quiescence or safe reuse. */
+  private async proveFencedProcessStopped(stop: RecoveryStop, admission: LocalAdmission, stopped: ExecutionState, target: LiveStopTarget,
+    settlement: FencedTurnSettlement, assertCurrent: () => void): Promise<void> {
+    const { assignmentId, attempt } = stop;
+    const stopStartedAt = performance.now();
+    try { await target.stopProcess(); }
+    catch (error) {
+      this.logger.warn({ event: "execution.process_stop_unconfirmed", assignmentId, attempt,
+        claimId: admission.claimId, acpSessionRef: settlement.owner?.acpSessionRef ?? stopped.acpSessionRef, phase: stopped.phase,
+        elapsedMs: Math.round(performance.now() - stopStartedAt),
+        code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" },
+      "Exact process stop is unconfirmed; no interruption report or capacity release is authorized");
+      throw error;
+    }
+    assertCurrent();
+    await this.deps.journal.execution.markProcessStopped(admission, this.deps.clock.nowIso(), assertCurrent);
+    await this.deps.journal.execution.markInterruptedWithoutQuiescence(admission, this.deps.clock.nowIso(), assertCurrent);
+    this.logger.warn({ event: "execution.recovery_interrupted", assignmentId, attempt, claimId: admission.claimId,
+      acpSessionRef: settlement.owner?.acpSessionRef ?? stopped.acpSessionRef, phase: "interrupted_unqualified", quiescenceQualified: false,
+      acpSettled: settlement.settled, capacityReleased: false }, "Exact execution process stopped; background work remains unqualified");
+  }
+
+  /**
+   * Without independent process proof, ACP settlement alone cannot even
+   * qualify the interrupted report. Keep the owner for evidence retries.
+   */
+  private blockFencedRecovery(stop: RecoveryStop, admission: LocalAdmission, owner: RelayedSession, stopped: ExecutionState | undefined): void {
+    this.logger.warn({ event: "execution.recovery_blocked", assignmentId: stop.assignmentId, attempt: stop.attempt, claimId: admission.claimId,
+      acpSessionRef: owner.acpSessionRef, ...blockedExecutionFields(stopped),
+      diagnostic: "lifecycle_quiescence_unqualified", terminalReported: false, capacityReleased: false },
+    "ACP turn settled; background work remains unqualified and the execution stays fenced");
+    this.deps.journal.execution.assertQuiescent(admission);
   }
 
   /** Retry only the exact bytes that were first fsynced with the observation. */
@@ -2164,42 +2237,20 @@ export class WorkOrchestrator {
     stopClass: "turn_settled" | "stop_unconfirmed" = "turn_settled", deliver = true): Promise<void> {
     const execution = this.deps.journal.execution.execution(admission);
     const entry = this.deps.journal.assignments.get(`${admission.assignmentId}:${admission.attempt}`);
-    if (!execution || (stopClass === "turn_settled" && (execution.phase !== "acp_settled" || !execution.acpSettledAt)) || !entry || entry.claimId !== admission.claimId) {
+    const settledAt = observedSettlement(execution, stopClass);
+    if (settledAt === undefined || !entry || entry.claimId !== admission.claimId) {
       throw new RemoteInstanceError("recovery_required", "Durable ACP settlement does not match the current claim.");
     }
-    // One clock for the whole record. The schema requires ageMs to equal
-    // recordedAt minus observedAt exactly, and acpSettledAt is host time;
-    // mixing in Core's fractional skew estimate made every live stop fail
-    // to parse, so a lost lease held its claim until the next restart.
-    const recordedMs = this.deps.clock.now();
-    const settledMs = stopClass === "turn_settled" ? Date.parse(execution.acpSettledAt!) : recordedMs;
-    const observedMs = Number.isFinite(settledMs) ? Math.min(settledMs, recordedMs) : recordedMs;
-    const recordedAt = new Date(recordedMs).toISOString();
-    const observedAt = new Date(observedMs).toISOString();
-    const ageMs = recordedMs - observedMs;
-    const semantic = {
-      instanceId: admission.instanceId,
-      assignmentId: admission.assignmentId,
-      attempt: admission.attempt,
-      claimId: admission.claimId,
-      runnerIncarnation: admission.runnerIncarnation,
-      recoveryEpoch: entry.recoveryEpoch,
-      evidenceKind: "stop_observation" as const,
-      schemaVersion: "remote-recovery-evidence-v1" as const,
-      stopClass,
-      reason: "ownership_scope_lost" as const,
-      observedAt,
-      recordedAt,
-      ageMs,
-      nextRetryAt: new Date(recordedMs + 5_000).toISOString(),
-      safeAction: { kind: "retry_later" as const, instanceId: admission.instanceId, agentId: admission.agentId },
-      terminalDisposition: "not_terminal" as const,
-      quiescenceAssertion: "not_asserted_by_recovery_evidence" as const,
-    };
-    const evidence = {
-      ...semantic,
-      evidenceDigest: computeRemoteRecoveryEvidenceDigest(semantic),
-    } as RemoteRecoveryEvidence;
+    const evidence = stopObservationEvidence(admission, entry.recoveryEpoch, stopClass, settledAt, this.deps.clock.now());
+    const record = await this.persistRecoveryEvidence(evidence, assertCurrent);
+    if (record && deliver) await this.deliverRecoveryEvidence(record, assertCurrent);
+  }
+
+  /**
+   * A retry reaches the same identity after time has passed. Reuse the first
+   * fsynced bytes rather than recalculating recorded time, age or digest.
+   */
+  private async persistRecoveryEvidence(evidence: RemoteRecoveryEvidence, assertCurrent: () => void): Promise<RecoveryEvidenceRecord | undefined> {
     const key = recoveryEvidenceRecordKey(evidence);
     const existing = this.deps.journal.recoveryEvidence.get(key);
     if (!existing) {
@@ -2208,17 +2259,14 @@ export class WorkOrchestrator {
         delivery: "pending",
         attempts: 0,
         lastAttemptAt: null,
-        nextAttemptAt: recordedAt,
+        nextAttemptAt: evidence.recordedAt,
         acceptedAt: null,
         lastFailureCode: null,
-        updatedAt: recordedAt,
+        updatedAt: evidence.recordedAt,
       });
     }
     assertCurrent();
-    // A retry reaches the same identity after time has passed. Reuse the
-    // first fsynced bytes rather than recalculating recorded time/age/digest.
-    const record = existing ?? this.deps.journal.recoveryEvidence.get(key);
-    if (record && deliver) await this.deliverRecoveryEvidence(record, assertCurrent);
+    return existing ?? this.deps.journal.recoveryEvidence.get(key);
   }
 
   private async deliverRecoveryEvidence(record: RecoveryEvidenceRecord, assertCurrent?: () => void): Promise<void> {
@@ -2227,44 +2275,52 @@ export class WorkOrchestrator {
     const key = recoveryEvidenceRecordKey(record);
     const attemptedAt = this.deps.clock.nowIso();
     await this.deps.journal.recoveryEvidence.update(key, current => {
-      if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", "Recovery evidence record changed before delivery.");
-      return { ...current, attempts: current.attempts + 1, lastAttemptAt: attemptedAt, updatedAt: attemptedAt };
+      const same = sameRecoveryEvidence(current, record, "Recovery evidence record changed before delivery.");
+      return { ...same, attempts: same.attempts + 1, lastAttemptAt: attemptedAt, updatedAt: attemptedAt };
     });
     try {
-      const result = await client.submit({ evidence: structuredClone(record.evidence), connection: this.deps.recoveryEvidenceConnection?.() ?? { kind: "https" } });
+      const result = await client.submit({ evidence: structuredClone(record.evidence), connection: this.recoveryEvidenceConnection() });
       assertCurrent?.();
       const acceptedAt = result.acceptedAt;
       await this.deps.journal.recoveryEvidence.update(key, current => {
-        if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", "Recovery evidence record changed after delivery.");
-        return { ...current, delivery: result.outcome, acceptedAt, lastFailureCode: null, updatedAt: this.deps.clock.nowIso() };
+        const same = sameRecoveryEvidence(current, record, "Recovery evidence record changed after delivery.");
+        return { ...same, delivery: result.outcome, acceptedAt, lastFailureCode: null, updatedAt: this.deps.clock.nowIso() };
       });
-      this.logger.info({ assignmentId: record.evidence.assignmentId, attempt: record.evidence.attempt, evidenceDigest: record.evidence.evidenceDigest, outcome: result.outcome }, "recovery stop observation accepted by Core");
+      this.logger.info({ ...recoveryEvidenceLog(record), outcome: result.outcome }, "recovery stop observation accepted by Core");
     } catch (error) {
-      const failureCode = recoveryEvidenceFailureCode(error);
-      const supersededReason = this.recoveryEvidenceSuperseded(record, error);
-      if (supersededReason) {
-        const supersededAt = this.deps.clock.nowIso();
-        await this.deps.journal.recoveryEvidence.update(key, current => {
-          if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", "Recovery evidence record changed after delivery failure.");
-          if (current.delivery !== "pending") return current;
-          return { ...current, delivery: "superseded", supersededAt, supersededReason, lastFailureCode: failureCode, updatedAt: supersededAt };
-        });
-        this.logger.info({ assignmentId: record.evidence.assignmentId, attempt: record.evidence.attempt, evidenceDigest: record.evidence.evidenceDigest,
-          outcome: "superseded", reason: supersededReason, failureCode },
-        "recovery stop observation superseded by Core's settled state; kept for audit, no longer sent");
-        return;
-      }
-      const nextAttemptAt = new Date(this.deps.clock.coreNow() + recoveryEvidenceRetryDelayMs(record.attempts)).toISOString();
-      await this.deps.journal.recoveryEvidence.update(key, current => {
-        if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", "Recovery evidence record changed after delivery failure.");
-        return { ...current, nextAttemptAt, lastFailureCode: failureCode, updatedAt: this.deps.clock.nowIso() };
-      });
-      this.logger.warn({ assignmentId: record.evidence.assignmentId, attempt: record.evidence.attempt, evidenceDigest: record.evidence.evidenceDigest, outcome: "pending", failureCode }, "recovery stop observation remains pending Core acknowledgement");
+      await this.recoveryEvidenceDeliveryFailed(record, key, error);
     }
   }
 
+  private recoveryEvidenceConnection(): RemoteReconciliationConnection {
+    return this.deps.recoveryEvidenceConnection?.() ?? { kind: "https" };
+  }
+
+  /** Superseded evidence is kept for audit and no longer sent; anything else is retried with backoff. */
+  private async recoveryEvidenceDeliveryFailed(record: RecoveryEvidenceRecord, key: string, error: unknown): Promise<void> {
+    const failureCode = recoveryEvidenceFailureCode(error);
+    const supersededReason = this.recoveryEvidenceSuperseded(record, error);
+    if (supersededReason) {
+      const supersededAt = this.deps.clock.nowIso();
+      await this.deps.journal.recoveryEvidence.update(key, current => {
+        const same = sameRecoveryEvidence(current, record, "Recovery evidence record changed after delivery failure.");
+        if (same.delivery !== "pending") return same;
+        return { ...same, delivery: "superseded", supersededAt, supersededReason, lastFailureCode: failureCode, updatedAt: supersededAt };
+      });
+      this.logger.info({ ...recoveryEvidenceLog(record), outcome: "superseded", reason: supersededReason, failureCode },
+        "recovery stop observation superseded by Core's settled state; kept for audit, no longer sent");
+      return;
+    }
+    const nextAttemptAt = new Date(this.deps.clock.coreNow() + recoveryEvidenceRetryDelayMs(record.attempts)).toISOString();
+    await this.deps.journal.recoveryEvidence.update(key, current => {
+      const same = sameRecoveryEvidence(current, record, "Recovery evidence record changed after delivery failure.");
+      return { ...same, nextAttemptAt, lastFailureCode: failureCode, updatedAt: this.deps.clock.nowIso() };
+    });
+    this.logger.warn({ ...recoveryEvidenceLog(record), outcome: "pending", failureCode }, "recovery stop observation remains pending Core acknowledgement");
+  }
+
   /**
-   * Core refusals that no retry can change (WS2-159). `reconciliation_replay`
+   * Core refusals that no retry can change. `reconciliation_replay`
    * for bytes observed by a process that is no longer this one: Core accepts
    * evidence only from the current incarnation, so a retired one's can never
    * land. `assignment_conflict` once Core has acknowledged this exact claim's
@@ -2281,21 +2337,46 @@ export class WorkOrchestrator {
     return null;
   }
 
-  /** D141: the same retained log serializes admission and exact absence. */
+  /** The same retained log serializes admission and exact absence. */
   async cancelAbsentForRecovery(manifest: RemoteInstanceReconciliationManifest, decision: Extract<RecoveryDecision, { action: "cancel" }>, assertCurrent: () => void): Promise<void> {
     const instanceId = this.deps.instanceId(); const workspaceId = this.deps.workspaceId();
     const runnerIncarnation = this.deps.runnerIncarnation?.();
     if (!workspaceId || !runnerIncarnation) throw new RemoteInstanceError("recovery_required", "Native absence requires exact process and workspace ownership.");
+    const scope: AbsenceScope = { instanceId, workspaceId, runnerIncarnation };
     const decisionDigest = jcsDigest(decision);
     const assertAbsent = () => {
       assertCurrent(); this.requireNativeOwner();
-      const recovery = this.deps.journal.recovery.current(instanceId, runnerIncarnation);
-      if (instanceId !== this.deps.instanceId() || workspaceId !== this.deps.workspaceId() || runnerIncarnation !== this.deps.runnerIncarnation?.() || manifest.instanceId !== instanceId || manifest.runnerIncarnation !== runnerIncarnation || recovery?.state !== "pending" || recovery.manifest?.digest !== computeRemoteReconciliationManifestDigest(manifest) || !manifest.decisions.some(item => item.action === "cancel" && jcsDigest(item) === decisionDigest)) throw new RemoteInstanceError("reconciliation_replay", "Absence cancellation is not the current authorized manifest decision.");
-      if (recovery.intent.claims.some(claim => claim.assignmentId === decision.assignmentId) || this.deps.journal.latestAttempt(decision.assignmentId) || [...this.pendingClaims.values()].some(item => item.id === decision.assignmentId) || [...this.sessions.values()].some(item => item.assignment.id === decision.assignmentId) || [...this.dispatching.keys(), ...this.recoveryStops.keys()].some(key => key.startsWith(`${decision.assignmentId}:`)) || this.deps.outbox.all("assignment").some(item => typeof item.body === "object" && item.body !== null && "assignmentId" in item.body && item.body.assignmentId === decision.assignmentId)) throw new RemoteInstanceError("recovery_required", "Existing local claim, bootstrap or session is not absence.");
+      const recovery = this.currentAbsenceRecovery(scope, manifest, decisionDigest);
+      if (!recovery) throw new RemoteInstanceError("reconciliation_replay", "Absence cancellation is not the current authorized manifest decision.");
+      if (this.knownLocally(decision.assignmentId, recovery)) throw new RemoteInstanceError("recovery_required", "Existing local claim, bootstrap or session is not absence.");
     };
     assertAbsent();
     const existing = this.deps.journal.execution.tombstone({ manifestId: manifest.manifestId, assignmentId: decision.assignmentId, attempt: decision.attempt });
     await this.deps.journal.execution.cancelAbsent({ instanceId, workspaceId, runnerIncarnation, manifestId: manifest.manifestId, assignmentId: decision.assignmentId, attempt: decision.attempt, decisionDigest, cancelledAt: existing?.cancelledAt ?? this.deps.clock.nowIso() }, assertAbsent);
+  }
+
+  /** The pending recovery whose manifest carries exactly this cancel decision, while scope and manifest are still current. */
+  private currentAbsenceRecovery(scope: AbsenceScope, manifest: RemoteInstanceReconciliationManifest, decisionDigest: string): RuntimeRecoveryRecord | undefined {
+    const recovery = this.deps.journal.recovery.current(scope.instanceId, scope.runnerIncarnation);
+    if (!this.absenceScopeCurrent(scope, manifest)) return undefined;
+    if (recovery?.state !== "pending" || recovery.manifest?.digest !== computeRemoteReconciliationManifestDigest(manifest)) return undefined;
+    return manifest.decisions.some(item => item.action === "cancel" && jcsDigest(item) === decisionDigest) ? recovery : undefined;
+  }
+
+  private absenceScopeCurrent(scope: AbsenceScope, manifest: RemoteInstanceReconciliationManifest): boolean {
+    return scope.instanceId === this.deps.instanceId() && scope.workspaceId === this.deps.workspaceId() &&
+      scope.runnerIncarnation === this.deps.runnerIncarnation?.() &&
+      manifest.instanceId === scope.instanceId && manifest.runnerIncarnation === scope.runnerIncarnation;
+  }
+
+  /** Any local claim, journal entry, pending claim, session, dispatch, recovery stop or queued report for the assignment. */
+  private knownLocally(assignmentId: string, recovery: RuntimeRecoveryRecord): boolean {
+    return recovery.intent.claims.some(claim => claim.assignmentId === assignmentId) ||
+      this.deps.journal.latestAttempt(assignmentId) !== undefined ||
+      [...this.pendingClaims.values()].some(item => item.id === assignmentId) ||
+      [...this.sessions.values()].some(item => item.assignment.id === assignmentId) ||
+      [...this.dispatching.keys(), ...this.recoveryStops.keys()].some(key => key.startsWith(`${assignmentId}:`)) ||
+      this.deps.outbox.all("assignment").some(item => namesAssignment(item.body, assignmentId));
   }
 
   private requireNativeOwner(): void {
@@ -2443,31 +2524,60 @@ function takeoverReferences(takeover: NativeDispatch["takeover"]): { continueRef
 
 export function dispatchErrorIdentity(error: unknown): { errorName?: string; errorCode?: string; schemaIssue?: string } {
   const identity: { errorName?: string; errorCode?: string; schemaIssue?: string } = {};
-  const name = error instanceof Error ? error.name : undefined;
-  if (name && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name)) identity.errorName = name;
-  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
-  if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(code)) identity.errorCode = code;
+  const name = errorName(error);
+  if (name) identity.errorName = name;
+  const code = errorCode(error);
+  if (code) identity.errorCode = code;
   const schemaIssue = schemaIssueIdentity(error);
   if (schemaIssue) identity.schemaIssue = schemaIssue;
   return identity;
 }
 
-/** A bare `ZodError` hid which local record was refused (production
- * 2026-10-01). Name the first issue by its code, its field path (identifier
+const IDENTIFIER = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+function errorName(error: unknown): string | undefined {
+  const name = error instanceof Error ? error.name : undefined;
+  return name && IDENTIFIER.test(name) ? name : undefined;
+}
+
+function errorCode(error: unknown): string | undefined {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(code) ? code : undefined;
+}
+
+/** A bare `ZodError` would hide which local record was refused. Name the first issue by its code, its field path (identifier
  * segments only) and, for this connector's own refinements, their fixed
  * message. Never a received value or a provider message. */
 function schemaIssueIdentity(error: unknown): string | undefined {
+  const first = firstSchemaIssue(error);
+  if (!first) return undefined;
+  const path = schemaIssuePath(first.path);
+  return `${first.code}${path ? ` at ${path}` : ""}${schemaIssueMessage(first)}`;
+}
+
+interface SchemaIssue { code: string; path?: unknown; message?: unknown }
+
+function firstSchemaIssue(error: unknown): SchemaIssue | undefined {
   if (!(error instanceof Error) || error.name !== "ZodError") return undefined;
-  const issue = (error as { issues?: unknown }).issues;
-  const first = Array.isArray(issue) ? issue[0] as { code?: unknown; path?: unknown; message?: unknown } | undefined : undefined;
-  if (!first || typeof first.code !== "string" || !/^[a-z_]{1,32}$/.test(first.code)) return undefined;
-  const path = Array.isArray(first.path)
-    ? first.path.map(segment => typeof segment === "number" ? String(segment)
-      : typeof segment === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(segment) ? segment : "?").join(".")
-    : "";
-  const message = first.code === "custom" && typeof first.message === "string" && /^[A-Za-z][A-Za-z ,;'-]{0,119}$/.test(first.message)
-    ? `: ${first.message}` : "";
-  return `${first.code}${path ? ` at ${path}` : ""}${message}`;
+  const issues = (error as { issues?: unknown }).issues;
+  const first = Array.isArray(issues) ? issues[0] as { code?: unknown } | undefined : undefined;
+  return first && typeof first.code === "string" && /^[a-z_]{1,32}$/.test(first.code) ? first as SchemaIssue : undefined;
+}
+
+/** Identifier and index segments only; anything else shows as `?`. */
+function schemaIssuePath(path: unknown): string {
+  if (!Array.isArray(path)) return "";
+  return path.map(segment => {
+    if (typeof segment === "number") return String(segment);
+    return typeof segment === "string" && IDENTIFIER.test(segment) ? segment : "?";
+  }).join(".");
+}
+
+/** This connector's own refinements carry a fixed message; never a provider one. */
+function schemaIssueMessage(issue: SchemaIssue): string {
+  const ownMessage = issue.code === "custom" && typeof issue.message === "string" &&
+    /^[A-Za-z][A-Za-z ,;'-]{0,119}$/.test(issue.message);
+  return ownMessage ? `: ${issue.message as string}` : "";
 }
 
 /** Execution phases of a turn that ended without completing and was not yet proven stopped. */
@@ -2482,16 +2592,192 @@ function turnIdentity(turn: { invocationId: string; dispatchGeneration: number }
 function sameHarnessRoleSession(predecessor: RemoteWorkAssignment, successor: RemoteWorkAssignment): boolean {
   const before = predecessor.source, after = successor.source;
   if (before.kind !== "harness_delivery" || after.kind !== "harness_delivery") return false;
-  return predecessor.instanceId === successor.instanceId &&
-    predecessor.workspaceId === successor.workspaceId &&
-    predecessor.taskId === successor.taskId &&
-    predecessor.agentRoute.requiredRole === successor.agentRoute.requiredRole &&
-    predecessor.agentRoute.agentId === successor.agentRoute.agentId &&
-    predecessor.agentRoute.sessionConfig?.model === successor.agentRoute.sessionConfig?.model &&
+  return sameRoleRoute(predecessor, successor) &&
     before.ownerInstanceId === after.ownerInstanceId &&
     before.executionSessionId === after.executionSessionId &&
     before.repositoryId === after.repositoryId &&
     jcsDigest(before.modelBinding as JsonValue) === jcsDigest(after.modelBinding as JsonValue);
+}
+
+/** Same instance, workspace, task, role, agent and model. */
+function sameRoleRoute(predecessor: RemoteWorkAssignment, successor: RemoteWorkAssignment): boolean {
+  const before = predecessor.agentRoute, after = successor.agentRoute;
+  return predecessor.instanceId === successor.instanceId &&
+    predecessor.workspaceId === successor.workspaceId &&
+    predecessor.taskId === successor.taskId &&
+    before.requiredRole === after.requiredRole &&
+    before.agentId === after.agentId &&
+    before.sessionConfig?.model === after.sessionConfig?.model;
+}
+
+/** A harness delivery that closed without completing retires its execution. */
+function retiresOnClose(entry: JournalEntry | undefined, session: RelayedSession, reason: SessionClosedReason): boolean {
+  return entry !== undefined && reason !== "completed" && session.assignment.source.kind === "harness_delivery";
+}
+
+/**
+ * A closed session reports its claim's terminal result unless the claim is
+ * gone, already reported, or controller-owned: for planning and search the
+ * hosted controller owns the terminal decision, and closure is transcript
+ * evidence only.
+ */
+function reportsOnClose(entry: JournalEntry | undefined): entry is JournalEntry {
+  return entry !== undefined && entry.reports.terminalSequence === undefined &&
+    entry.kind !== "planning" && entry.kind !== "search_generation";
+}
+
+/** Terminal results of a session that closed without completing, with the exact fields each hash covers. */
+const UNCOMPLETED_CLOSES = {
+  cancelled: { result: { class: "cancelled", reason: "user_cancelled" }, hashed: { class: "cancelled" } },
+  agent_exited: { result: { class: "failed", reason: "agent_failed" }, hashed: { class: "failed", reason: "agent_failed" } },
+  lease_lost: { result: { class: "interrupted", reason: "lease_lost" }, hashed: { class: "interrupted", reason: "lease_lost" } },
+  drain: { result: { class: "interrupted", reason: "drain" }, hashed: { class: "interrupted", reason: "drain" } },
+  relay_replay_gap: { result: { class: "interrupted", reason: "relay_replay_gap" }, hashed: { class: "interrupted", reason: "relay_replay_gap" } },
+} as const satisfies Record<Exclude<SessionClosedReason, "completed">, { result: object; hashed: JsonValue }>;
+
+function closedSessionResult(session: RelayedSession, reason: SessionClosedReason) {
+  if (reason !== "completed") {
+    const { result, hashed } = UNCOMPLETED_CLOSES[reason];
+    return { ...result, terminalResultHash: jcsDigest(hashed) };
+  }
+  const receipt = session.deliveryAcceptanceReceipt();
+  const semantic = { class: "succeeded" as const, ...(receipt ? { structuredOutput: { nativeDeliveryAcceptance: receipt } } : {}) };
+  return { ...semantic, terminalResultHash: jcsDigest({ ...semantic, acpSessionRef: session.acpSessionRef }) };
+}
+
+function acpSessionRefField(acpSessionRef: string | null | undefined): { acpSessionRef?: string } {
+  return acpSessionRef ? { acpSessionRef } : {};
+}
+
+interface AbsenceScope {
+  readonly instanceId: string;
+  readonly workspaceId: string;
+  readonly runnerIncarnation: string;
+}
+
+function namesAssignment(body: unknown, assignmentId: string): boolean {
+  return typeof body === "object" && body !== null && "assignmentId" in body && body.assignmentId === assignmentId;
+}
+
+/**
+ * When the observed stop happened: the durable ACP settlement for a settled
+ * turn, null (the moment of recording) for an unconfirmed stop, undefined
+ * when a settled turn has no durable settlement.
+ */
+function observedSettlement(execution: ExecutionState | undefined, stopClass: "turn_settled" | "stop_unconfirmed"): string | null | undefined {
+  if (!execution) return undefined;
+  if (stopClass !== "turn_settled") return null;
+  return execution.phase === "acp_settled" && execution.acpSettledAt ? execution.acpSettledAt : undefined;
+}
+
+/**
+ * One clock for the whole record: the schema requires ageMs to equal
+ * recordedAt minus observedAt exactly, and acpSettledAt is host time, so
+ * Core's fractional skew estimate never enters it.
+ */
+function stopObservationEvidence(admission: LocalAdmission, recoveryEpoch: number, stopClass: "turn_settled" | "stop_unconfirmed",
+  settledAt: string | null, recordedMs: number): RemoteRecoveryEvidence {
+  const settledMs = settledAt === null ? recordedMs : Date.parse(settledAt);
+  const observedMs = Number.isFinite(settledMs) ? Math.min(settledMs, recordedMs) : recordedMs;
+  const semantic = {
+    instanceId: admission.instanceId,
+    assignmentId: admission.assignmentId,
+    attempt: admission.attempt,
+    claimId: admission.claimId,
+    runnerIncarnation: admission.runnerIncarnation,
+    recoveryEpoch,
+    evidenceKind: "stop_observation" as const,
+    schemaVersion: "remote-recovery-evidence-v1" as const,
+    stopClass,
+    reason: "ownership_scope_lost" as const,
+    observedAt: new Date(observedMs).toISOString(),
+    recordedAt: new Date(recordedMs).toISOString(),
+    ageMs: recordedMs - observedMs,
+    nextRetryAt: new Date(recordedMs + 5_000).toISOString(),
+    safeAction: { kind: "retry_later" as const, instanceId: admission.instanceId, agentId: admission.agentId },
+    terminalDisposition: "not_terminal" as const,
+    quiescenceAssertion: "not_asserted_by_recovery_evidence" as const,
+  };
+  return { ...semantic, evidenceDigest: computeRemoteRecoveryEvidenceDigest(semantic) } as RemoteRecoveryEvidence;
+}
+
+/** The journaled record, refused when it no longer holds the same evidence bytes. */
+function sameRecoveryEvidence(current: RecoveryEvidenceRecord | undefined, record: RecoveryEvidenceRecord, message: string): RecoveryEvidenceRecord {
+  if (!current || current.evidence.evidenceDigest !== record.evidence.evidenceDigest) throw new RemoteInstanceError("recovery_required", message);
+  return current;
+}
+
+function recoveryEvidenceLog(record: RecoveryEvidenceRecord): { assignmentId: string; attempt: number; evidenceDigest: string } {
+  const { assignmentId, attempt, evidenceDigest } = record.evidence;
+  return { assignmentId, attempt, evidenceDigest };
+}
+
+type ExecutionState = NonNullable<ReturnType<SupervisorJournal["execution"]["execution"]>>;
+
+/** One `stopForRecovery` call: the attempt, and the live session and dispatch it found when it fenced the key. */
+interface RecoveryStop {
+  readonly assignmentId: string;
+  readonly attempt: number;
+  readonly key: string;
+  readonly session: RelayedSession | undefined;
+  readonly dispatch: Promise<void> | undefined;
+  readonly assertRecoveryCurrent: (() => void) | undefined;
+  /** Neither a session nor a dispatch: only the journal's retained execution remains. */
+  readonly retained: boolean;
+}
+
+interface LiveStopTarget {
+  readonly stopProcess: () => Promise<void>;
+}
+
+interface RetainedStopTarget extends LiveStopTarget {
+  readonly phase: string;
+  readonly acpSessionRef: string;
+  readonly processOwner: RetainedProcessOwner;
+}
+
+type FencedTurnSettlement =
+  | { readonly settled: true; readonly owner: RelayedSession; readonly acpSessionRef: string }
+  | { readonly settled: false; readonly owner: RelayedSession | undefined; readonly error: unknown };
+
+/** A retained execution its runner can stop: the process owner, its ACP session and the runner's stop. */
+function retainedStopTarget(execution: ExecutionState, runner: RunnerPort | undefined): RetainedStopTarget | undefined {
+  const { processOwner, acpSessionRef } = execution;
+  const stopRetained = runner?.stopRetainedExecution;
+  if (!processOwner || !acpSessionRef || !stopRetained) return undefined;
+  return { phase: execution.phase, acpSessionRef, processOwner, stopProcess: () => stopRetained.call(runner, processOwner) };
+}
+
+function liveStopTarget(execution: ExecutionState, runner: RunnerPort): LiveStopTarget | undefined {
+  const { processOwner } = execution;
+  const stopRetained = runner.stopRetainedExecution;
+  if (!processOwner || !stopRetained) return undefined;
+  return { stopProcess: () => stopRetained.call(runner, processOwner) };
+}
+
+function blockedExecutionFields(stopped: ExecutionState | undefined) {
+  if (!stopped) return { phase: undefined, stoppingAt: undefined, acpSettledAt: undefined, lifecycleProfileDigest: null, executionProfileDigest: null };
+  return { phase: stopped.phase, stoppingAt: stopped.stoppingAt, acpSettledAt: stopped.acpSettledAt,
+    lifecycleProfileDigest: stopped.lifecycleProfileDigest ?? null, executionProfileDigest: stopped.executionProfileDigest ?? null };
+}
+
+interface IdleCompletedSession {
+  readonly prior: LocalAdmission;
+  readonly ref: string;
+  readonly processOwner: RetainedProcessOwner;
+  /** Host clock time the completed turn settled. */
+  readonly settledAt: number;
+}
+
+/** A failure's code, diagnostic and bounded reason for a log line; an unexpected error shows only its identity. */
+function recoveryFailureFields(error: unknown): Record<string, unknown> {
+  if (!(error instanceof RemoteInstanceError)) return { code: "unexpected_error", ...dispatchErrorIdentity(error) };
+  return { code: error.code, ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}), reason: error.message.slice(0, 200) };
+}
+
+/** The connector's own error code, when the error carries one. */
+function errorCodeField(error: unknown): { code?: string } {
+  return error instanceof RemoteInstanceError ? { code: error.code } : {};
 }
 
 interface LostAuthoritySettlement {
