@@ -250,11 +250,11 @@ export const recoveryEvidenceRecordKey = (record: Pick<RecoveryEvidenceRecord, "
   remoteRecoveryEvidenceIdentityKey("evidence" in record ? record.evidence : record);
 
 /**
- * One consumed integration write grant (external-integration CP2): the gate
- * records it BEFORE it answers `allow_once`, so a nonce allows at most one
- * provider call even across a crash or a repeated assignment. Identifiers and
- * digests only, never arguments or credentials (N05: the attempt journal
- * survives restart without storing credentials).
+ * One consumed integration write grant: the gate records it BEFORE it
+ * answers `allow_once`, so a nonce allows at most one provider call even
+ * across a crash or a repeated assignment. Identifiers and digests only,
+ * never arguments or credentials (the attempt journal survives restart
+ * without storing credentials).
  */
 export const IntegrationWriteRecordSchema = z.object({
   nonce: z.string().min(1).max(256),
@@ -548,7 +548,7 @@ export class SupervisorJournal {
   readonly erase: AppendLog<EraseRecord>;
   /** C03 local durable evidence. Never use this table as a terminal owner. */
   readonly recoveryEvidence: AppendLog<RecoveryEvidenceRecord>;
-  /** Consumed integration write nonces (external-integration CP2); never pruned with assignments. */
+  /** Consumed integration write nonces; never pruned with assignments. */
   readonly integrationWrites: AppendLog<IntegrationWriteRecord>;
   readonly planning: PlanningTerminalJournal;
   private readonly planningLog: AppendLog<PlanningTerminalRecord>;
