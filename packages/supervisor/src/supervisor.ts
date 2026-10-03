@@ -2438,15 +2438,19 @@ export class Supervisor {
     void detector.refreshIfDue().catch(() => undefined);
     if (!detector.detectedOnce()) return undefined;
     const added = new Map<string, AddedAgentFacts>();
-    for (const agentId of this.recordedAgentIds()) {
-      const live = this.nativeRunners.find(runner => runner.agentId === agentId && this.runners.get(agentId) === runner);
-      const view = live ? agents.find(agent => agent.agentId === agentId) : undefined;
-      const version = (live ?? this.parkedRunners.get(agentId) ?? this.gaveUpRunners.get(agentId))?.hostInstallation()?.version;
-      added.set(agentId, live && view
-        ? { view, signInLost: live.signInLost(), ...(version ? { version } : {}) }
-        : { failure: this.agentStartFailures.get(agentId), ...(version ? { version } : {}) });
-    }
+    for (const agentId of this.recordedAgentIds()) added.set(agentId, this.addedAgentFacts(agentId, agents));
     return projectSupportedAgents({ added, notAdded: detector.current() });
+  }
+
+  /** A listed agent from its live runner's view, or from why it is left out. */
+  private addedAgentFacts(agentId: string, agents: readonly ConnectedAgentView[]): AddedAgentFacts {
+    const live = this.liveNativeRunner(agentId);
+    const view = live ? agents.find(agent => agent.agentId === agentId) : undefined;
+    const version = this.runnerInstallation(agentId, live)?.version;
+    const versionField = version ? { version } : {};
+    return live && view
+      ? { view, signInLost: live.signInLost(), ...versionField }
+      : { failure: this.agentStartFailures.get(agentId), ...versionField };
   }
 
   /** What this connector advertises for OpenCode: the free-models switch, and the sign-ins the site may start here. */
@@ -2485,14 +2489,9 @@ export class Supervisor {
   private antigravityRecordFields(): Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot"> | null {
     const native = this.options.native;
     if (!native) return null;
-    const runner = this.nativeRunners.find(candidate => candidate.agentId === "antigravity") ?? this.parkedRunners.get("antigravity") ?? this.gaveUpRunners.get("antigravity");
-    const live = runner?.hostInstallation();
+    const live = this.runnerInstallation("antigravity", this.nativeRunners.find(candidate => candidate.agentId === "antigravity"));
     if (live?.fetchedRoot !== undefined) return { antigravityVersion: live.version, antigravityRoot: live.fetchedRoot };
-    const unavailable = native.unavailableAgents?.find(entry => entry.agentId === "antigravity");
-    if (unavailable) return unavailable.fetched ?? {};
-    const config = native.runners.find(candidate => candidate.RUNNER_AGENT_ID === "antigravity");
-    if (config?.RUNNER_NATIVE_ANTIGRAVITY_ROOT !== undefined) return { antigravityVersion: config.RUNNER_BRIDGE_VERSION, antigravityRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT };
-    return null;
+    return listedAntigravityFields(native);
   }
 
   /** What this connector advertises for Google Antigravity: its Gemini Enterprise sign-in from the site (CP3). */
@@ -2512,20 +2511,29 @@ export class Supervisor {
     const snapshot = this.lastSnapshot ?? (await this.inventory.collect());
     const openCode = this.openCodeDoctor(snapshot.agents);
     const antigravity = await this.antigravityDoctor(snapshot.agents).catch(() => undefined);
-    return runDoctor({
+    const inputs = {
+      ...this.doctorState(snapshot),
+      ...(openCode ? { openCode } : {}),
+      ...(antigravity ? { antigravity } : {}),
+      ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
+    };
+    return runDoctor({ ...inputs, ...await this.doctorLauncher() });
+  }
+
+  private doctorState(snapshot: InventorySnapshot) {
+    return {
       now: () => this.clock.nowIso(),
       dataDir: this.config.SUPERVISOR_DATA_DIR,
       identity: { instanceId: this.instanceId, administrativeStatus: this.administrativeStatus },
       lease: { mode: this.lease.mode(), expiresAt: this.lease.current()?.expiresAt ?? null },
-      relay: this.relay?.status() ?? { state: "offline", lastError: "relay not configured", consecutiveFailures: 0 },
+      relay: this.relay?.status() ?? { state: "offline" as const, lastError: "relay not configured", consecutiveFailures: 0 },
       transport: this.transport.kind,
       reconciliationComplete: this.reconciliation.isComplete,
       ...(this.reconnectRefusal ? { reconciliationRefusal: this.reconnectRefusal } : {}),
       components: snapshot.components,
       agents: [...snapshot.agents, ...this.leftOutAgents(snapshot.agents)],
       // The snapshot may carry the site's "Not added" Google Antigravity view
-      // (only after a fresh collect, so a long-running release did not show
-      // it and a just-started one did): an update gate read it as a failure.
+      // (only after a fresh collect): an update gate must not read it as a failure.
       ...(this.options.native ? { listedAgents: [...this.recordedAgentIds()] } : {}),
       configRevision: this.control.configRevision,
       diskFreeBytes: snapshot.diskFreeBytes,
@@ -2534,13 +2542,20 @@ export class Supervisor {
       outboxDepth: this.outbox.depth,
       recoveryRequired: this.journal.recoveryRequired().length,
       coreSignatureConfigured: this.roots.some((root) => (root.coreControlKeys ?? []).length > 0),
-      preview: { advertised: this.previewCapable(), running: this.previews.health().running, lastFailureAt: this.previews.health().lastFailure?.at ?? null },
+      preview: this.previewDoctorReport(),
       browser: this.browserReport(),
-      ...(openCode ? { openCode } : {}),
-      ...(antigravity ? { antigravity } : {}),
-      ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
-      ...(this.options.native && process.platform === "win32" ? { launcher: await windowsInstalledLauncher().catch(() => null) } : {}),
-    });
+    };
+  }
+
+  private previewDoctorReport() {
+    const health = this.previews.health();
+    return { advertised: this.previewCapable(), running: health.running, lastFailureAt: health.lastFailure?.at ?? null };
+  }
+
+  /** The Windows installed launcher, for a native connector on Windows only. */
+  private async doctorLauncher() {
+    if (!this.options.native || process.platform !== "win32") return {};
+    return { launcher: await windowsInstalledLauncher().catch(() => null) };
   }
 
   /** The unattended update's channel for `doctor`: host only, never the full URL. */
@@ -2560,59 +2575,83 @@ export class Supervisor {
 
   /** The Google Antigravity doctor line's facts, when this installation lists it (running, updating, retried or given up). */
   private async antigravityDoctor(agents: Array<{ agentId: string; credentials?: Array<{ label: string; state: string; method?: string | undefined; reason?: string | undefined }> | undefined }>): Promise<AntigravityDoctorInputs | undefined> {
-    const running = this.nativeRunners.find(runner => runner.agentId === "antigravity" && this.runners.get("antigravity") === runner);
-    const retrying = this.nativeAgentRetry.parked().includes("antigravity");
-    const gaveUp = this.gaveUpRunners.get("antigravity");
-    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has("antigravity")) return undefined;
+    const listed = this.listedAgentRunner("antigravity");
+    if (!listed) return undefined;
     const root = dirname(this.config.SUPERVISOR_DATA_DIR);
-    let pin: ReturnType<typeof antigravityPin> | null = null;
-    try { pin = antigravityPin(); } catch { pin = null; }
-    const installation = (running ?? this.parkedRunners.get("antigravity") ?? gaveUp)?.hostInstallation() ?? null;
-    const record = this.antigravityRecordFields();
-    const download = record === null ? undefined : (await antigravityDownloadState(root, record).catch(() => undefined))?.state;
+    const pin = currentAntigravityPin();
+    const download = await antigravityDownloadStateOf(root, this.antigravityRecordFields());
     const failure = this.agentStartFailures.get("antigravity");
-    const updating = retrying && this.options.native?.unavailableAgents?.some(entry => entry.agentId === "antigravity" && entry.updating === true) === true;
+    const updating = listed.retrying && this.antigravityUpdating();
     const observation = await readAntigravityAdminObservation(join(root, "credentials", "antigravity")).catch(() => null);
     return {
-      state: running ? "running" : retrying ? "retrying" : "given_up",
+      state: listed.state,
       pinnedVersion: pin?.version ?? null,
       ...(download === undefined ? {} : { download }),
-      selfCheck: installation?.selfCheck ?? "not_run",
-      failure: failure instanceof RemoteInstanceError ? failure.diagnostic : undefined,
+      selfCheck: selfCheckOf(listed.installation),
+      failure: startFailureDiagnostic(failure),
       updating,
-      credentials: (agents.find(agent => agent.agentId === "antigravity")?.credentials ?? [])
+      credentials: agentCredentials(agents, "antigravity")
         .map(credential => ({ label: credential.label, state: credential.state, method: credential.method, reason: credential.reason })),
-      quarantine: running?.quarantineReason() ?? null,
+      quarantine: quarantineOf(listed.running),
       mcpServersOffAt: observation?.mcpServersOffAt ?? null,
-      diskBytes: pin && (download === "ready" || download === "update_available") ? antigravityDiskBytes(pin) : null,
-      browser: running ? running.browserVersion() !== null : this.connectorBrowser.available,
+      diskBytes: downloadedAntigravityDiskBytes(pin, download),
+      browser: this.agentBrowser(listed.running),
     };
+  }
+
+  /** A retried Google Antigravity is updating when the installation marks its left-out copy so. */
+  private antigravityUpdating(): boolean {
+    return this.options.native?.unavailableAgents?.some(entry => entry.agentId === "antigravity" && entry.updating === true) === true;
+  }
+
+  /**
+   * A listed agent's runner for its doctor line: running, retried or given up,
+   * or none of those but a start failure; undefined when the installation does not list it.
+   */
+  private listedAgentRunner(agentId: string): ListedAgentRunner | undefined {
+    const running = this.liveNativeRunner(agentId);
+    const retrying = this.nativeAgentRetry.parked().includes(agentId);
+    const gaveUp = this.gaveUpRunners.get(agentId);
+    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has(agentId)) return undefined;
+    return { running, retrying, state: doctorRunnerState(running, retrying), installation: this.runnerInstallation(agentId, running) ?? null };
+  }
+
+  /** The runner serving this agent now. */
+  private liveNativeRunner(agentId: string): NativeRunner | undefined {
+    return this.nativeRunners.find(runner => runner.agentId === agentId && this.runners.get(agentId) === runner);
+  }
+
+  /** The installation of the given runner, else the agent's parked one, else its given-up one. */
+  private runnerInstallation(agentId: string, runner: NativeRunner | undefined): HostInstallation | null | undefined {
+    return (runner ?? this.parkedRunners.get(agentId) ?? this.gaveUpRunners.get(agentId))?.hostInstallation();
+  }
+
+  /** A running agent reports its own browser; otherwise the connector's. */
+  private agentBrowser(running: NativeRunner | undefined): boolean {
+    return running ? running.browserVersion() !== null : this.connectorBrowser.available;
   }
 
   /** The OpenCode doctor line's facts, when this installation lists OpenCode (running, retried or given up). */
   private openCodeDoctor(agents: Array<{ agentId: string; credentials?: Array<{ label: string; state: string }> | undefined }>): OpenCodeDoctorInputs | undefined {
-    const running = this.nativeRunners.find(runner => runner.agentId === "opencode" && this.runners.get("opencode") === runner);
-    const retrying = this.nativeAgentRetry.parked().includes("opencode");
-    const gaveUp = this.gaveUpRunners.get("opencode");
-    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has("opencode")) return undefined;
-    const installation = (running ?? this.parkedRunners.get("opencode") ?? gaveUp)?.hostInstallation() ?? null;
-    const failure = this.agentStartFailures.get("opencode");
+    const listed = this.listedAgentRunner("opencode");
+    if (!listed) return undefined;
+    const { installation } = listed;
     return {
-      state: running ? "running" : retrying ? "retrying" : "given_up",
+      state: listed.state,
       version: installation?.version ?? null,
       installKind: installation?.executable ? openCodeInstallKind(installation.executable) : null,
-      selfCheck: installation?.selfCheck ?? "not_run",
-      failure: failure instanceof RemoteInstanceError ? failure.diagnostic : undefined,
-      credentials: (agents.find(agent => agent.agentId === "opencode")?.credentials ?? []).map(credential => ({ label: credential.label, state: credential.state })),
+      selfCheck: selfCheckOf(installation),
+      failure: startFailureDiagnostic(this.agentStartFailures.get("opencode")),
+      credentials: agentCredentials(agents, "opencode").map(credential => ({ label: credential.label, state: credential.state })),
       freeModels: this.hostSettings.openCodeFreeModels,
-      browser: running ? running.browserVersion() !== null : this.connectorBrowser.available,
+      browser: this.agentBrowser(listed.running),
     };
   }
 
   stop(): Promise<void> {
     this.leaseAuthorityEpoch++;
     this.stopping = true;
-    // Before anything that can outlast the daemon's exit watchdog (WS1-042).
+    // Before anything that can outlast the daemon's exit watchdog.
     this.nativeCodexOwner?.shutdownRequested();
     this.draining = true;
     this.heartbeat?.stop();
@@ -2629,93 +2668,127 @@ export class Supervisor {
   }
 
   private async stopImpl(): Promise<void> {
-    const note = async (phase: ShutdownProgress["phase"], state: ShutdownProgress["state"]): Promise<void> => {
-      // Diagnostics must never prevent cleanup or change the shutdown receipt.
-      if (!this.options.native) return;
-      await this.shutdownProgressStore.recordShutdownProgress(phase, state).catch((err: unknown) => {
-        this.logger.warn({ err }, "shutdown progress could not be recorded");
-      });
-    };
-    await note("supervisor_prelude", "entered");
-    // A stop that hung here (09-30 15:23) left no clue which wait held it:
-    // every wait that takes longer than a few seconds is named in the log.
-    const waitFor = async (step: string, pending: Promise<unknown> | null | undefined): Promise<void> => {
-      if (!pending) return;
-      const slow = setTimeout(() => this.logger.warn({ event: "shutdown.waiting", step }, "shutdown is still waiting"), 5_000);
-      slow.unref?.();
-      try { await pending; } finally { clearTimeout(slow); }
-    };
-    await waitFor("start", this.startPromise?.catch(() => undefined));
-    await waitFor("active_loop_start", this.activeLoopStarting);
-    if (this.pullTimer) clearInterval(this.pullTimer);
+    await this.noteShutdown("supervisor_prelude", "entered");
+    await this.stopLoopsForShutdown();
+    await this.noteShutdown("supervisor_prelude", "completed");
+    await this.drainForShutdown();
+    await this.noteShutdown("preview_close", "entered");
+    await this.previews.close();
+    await this.noteShutdown("preview_close", "completed");
+    this.previewChannel?.dispose();
+    const { runnerFailure, codexFailure } = await this.stopAgentsForShutdown();
+    for (const runner of this.runners.values()) runner.stopEvents();
+    this.transport?.stop();
+    await this.noteShutdown("state_close", "entered");
+    await this.stateMutations.close();
+    this.nativeOwnership?.release();
+    if (runnerFailure) throw runnerFailure.reason;
+    if (codexFailure) throw codexFailure.reason;
+  }
+
+  /** Diagnostics must never prevent cleanup or change the shutdown receipt. */
+  private async noteShutdown(phase: ShutdownProgress["phase"], state: ShutdownProgress["state"]): Promise<void> {
+    if (!this.options.native) return;
+    await this.shutdownProgressStore.recordShutdownProgress(phase, state).catch((err: unknown) => {
+      this.logger.warn({ err }, "shutdown progress could not be recorded");
+    });
+  }
+
+  /** Every shutdown wait that takes longer than a few seconds is named in the log, so a hung stop shows which wait holds it. */
+  private async waitForShutdownStep(step: string, pending: Promise<unknown> | null | undefined): Promise<void> {
+    if (!pending) return;
+    const slow = setTimeout(() => this.logger.warn({ event: "shutdown.waiting", step }, "shutdown is still waiting"), 5_000);
+    slow.unref?.();
+    try { await pending; } finally { clearTimeout(slow); }
+  }
+
+  /** Stop every timer and poller, and wait for what they already started. */
+  private async stopLoopsForShutdown(): Promise<void> {
+    await this.waitForShutdownStep("start", this.startPromise?.catch(() => undefined));
+    await this.waitForShutdownStep("active_loop_start", this.activeLoopStarting);
+    this.stopWorkTimers();
+    await this.waitForShutdownStep("cancellation_replay", this.cancellationReplay?.stop());
+    stopInterval(this.configurationTimer);
+    await this.settleControlLoops();
+    this.heartbeat?.stop();
+    await this.waitForShutdownStep("heartbeat", this.heartbeat?.settle());
+    await this.waitForShutdownStep("lease_acquisition", this.leaseAcquisition);
+    await this.waitForShutdownStep("lease_mutation", this.leaseMutation);
+    await this.waitForShutdownStep("lease_loss_cleanup", this.leaseLossCleanup);
+  }
+
+  private stopWorkTimers(): void {
+    stopInterval(this.pullTimer);
     for (const watch of this.onComputerWatches.values()) clearInterval(watch);
     this.onComputerWatches.clear();
-    if (this.turnActivityTimer) clearTimeout(this.turnActivityTimer);
+    stopTimeout(this.turnActivityTimer);
     this.turnActivityTimer = null;
-    if (this.reaperTimer) clearInterval(this.reaperTimer);
-    if (this.livenessTimer) clearInterval(this.livenessTimer);
+    stopInterval(this.reaperTimer);
+    stopInterval(this.livenessTimer);
     this.livenessTimer = null;
     this.updates?.stop();
-    if (this.muxTimer) clearInterval(this.muxTimer);
-    if (this.cancellationTimer) clearInterval(this.cancellationTimer);
-    await waitFor("cancellation_replay", this.cancellationReplay?.stop());
-    if (this.configurationTimer) clearInterval(this.configurationTimer);
-    await waitFor("configuration_refresh", this.configurationRefresh);
-    await waitFor("observation_delivery", this.observationDelivery?.stop());
-    await waitFor("configuration_acks", this.configurationAcks?.settle());
-    await waitFor("fence_receipts", this.executionRevisionFenceReceipts?.settle());
-    await waitFor("planning_directives", this.planningDirectivePoller?.stop());
-    this.heartbeat?.stop();
-    await waitFor("heartbeat", this.heartbeat?.settle());
-    await waitFor("lease_acquisition", this.leaseAcquisition);
-    await waitFor("lease_mutation", this.leaseMutation);
-    await waitFor("lease_loss_cleanup", this.leaseLossCleanup);
-    await note("supervisor_prelude", "completed");
-    await note("work_drain", "entered");
-    // stop() withdrew this process's recovery authority first, so a session
-    // whose close asserts it is refused ("Transport recovery generation is not
-    // currently accepted"). That must not abort the stop before the runners
-    // and the Codex owner below are stopped (D113: it orphaned Codex and no
-    // receipt was written); the session stays journaled for recovery.
+    stopInterval(this.muxTimer);
+    stopInterval(this.cancellationTimer);
+  }
+
+  private async settleControlLoops(): Promise<void> {
+    await this.waitForShutdownStep("configuration_refresh", this.configurationRefresh);
+    await this.waitForShutdownStep("observation_delivery", this.observationDelivery?.stop());
+    await this.waitForShutdownStep("configuration_acks", this.configurationAcks?.settle());
+    await this.waitForShutdownStep("fence_receipts", this.executionRevisionFenceReceipts?.settle());
+    await this.waitForShutdownStep("planning_directives", this.planningDirectivePoller?.stop());
+  }
+
+  /**
+   * stop() withdrew this process's recovery authority first, so a session
+   * whose close asserts it is refused ("Transport recovery generation is not
+   * currently accepted"). That must not abort the stop before the runners
+   * and the Codex owner are stopped, or Codex is orphaned and no receipt is
+   * written; the session stays journaled for recovery.
+   */
+  private async drainForShutdown(): Promise<void> {
+    await this.noteShutdown("work_drain", "entered");
     try {
       await this.work?.drainSessions("drain");
-      await note("work_drain", "completed");
+      await this.noteShutdown("work_drain", "completed");
     } catch (error) {
       this.logger.warn({ event: "shutdown.session_close_unconfirmed", code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" },
         "an open session could not close during shutdown; stopping its agent anyway, the next start recovers it");
     }
-    await note("preview_close", "entered");
-    await this.previews.close();
-    await note("preview_close", "completed");
-    this.previewChannel?.dispose();
-    await note("runner_stop", "entered");
-    // Side by side: one after another, an idle connector's bridges took 5 s,
-    // and launchd's SIGKILL came before the Codex owner was reached (D113b).
-    // A runner that cannot stop does not keep the others, the Codex owner or
-    // the state from stopping; its failure is reported once all are done.
+  }
+
+  /**
+   * Runners stop side by side: one after another, an idle connector's bridges
+   * take 5 s and launchd's SIGKILL comes before the Codex owner is reached.
+   * A runner that cannot stop does not keep the others, the Codex owner or
+   * the state from stopping; its failure is reported once all are done.
+   */
+  private async stopAgentsForShutdown(): Promise<{ runnerFailure: PromiseRejectedResult | undefined; codexFailure: { reason: unknown } | null }> {
+    await this.noteShutdown("runner_stop", "entered");
     const runnerStops = await Promise.allSettled(this.nativeRunners.map(runner => runner.stop()));
     const runnerFailure = runnerStops.find((stop): stop is PromiseRejectedResult => stop.status === "rejected");
     const codexUnstopped = runnerStops.some((stop, index) => stop.status === "rejected" && this.nativeRunners[index]?.agentId === "codex");
-    if (!runnerFailure) await note("runner_stop", "completed");
-    await note("codex_owner_stop", "entered");
-    // The shared Codex app-server is stopped here only once every Codex runner
-    // stopped; otherwise the exit reaper armed by stop() ends it with the process.
-    let codexFailure: { reason: unknown } | null = null;
-    if (!codexUnstopped) await this.nativeCodexOwner?.stop().catch((reason: unknown) => { codexFailure = { reason }; });
-    if (!codexFailure && !codexUnstopped) await note("codex_owner_stop", "completed");
-    if (this.codexRetryTimer) clearTimeout(this.codexRetryTimer);
+    if (!runnerFailure) await this.noteShutdown("runner_stop", "completed");
+    const codexFailure = await this.stopCodexOwnerForShutdown(codexUnstopped);
+    stopTimeout(this.codexRetryTimer);
     this.codexRetryTimer = null;
     this.parkedCodex = null;
     this.nativeAgentRetry.stop();
     for (const runner of this.parkedRunners.values()) await runner.stop().catch(() => undefined);
     this.parkedRunners.clear();
-    for (const runner of this.runners.values()) runner.stopEvents();
-    this.transport?.stop();
-    await note("state_close", "entered");
-    await this.stateMutations.close();
-    this.nativeOwnership?.release();
-    if (runnerFailure) throw runnerFailure.reason;
-    if (codexFailure) throw (codexFailure as { reason: unknown }).reason;
+    return { runnerFailure, codexFailure };
+  }
+
+  /**
+   * The shared Codex app-server is stopped here only once every Codex runner
+   * stopped; otherwise the exit reaper armed by stop() ends it with the process.
+   */
+  private async stopCodexOwnerForShutdown(codexUnstopped: boolean): Promise<{ reason: unknown } | null> {
+    await this.noteShutdown("codex_owner_stop", "entered");
+    if (codexUnstopped) return null;
+    const failure = await stopCodexOwner(this.nativeCodexOwner);
+    if (!failure) await this.noteShutdown("codex_owner_stop", "completed");
+    return failure;
   }
 
   /**
@@ -2754,6 +2827,78 @@ export class Supervisor {
 
 const channelOf = channelOfId;
 
+function stopInterval(timer: NodeJS.Timeout | null): void {
+  if (timer) clearInterval(timer);
+}
+
+function stopTimeout(timer: NodeJS.Timeout | null): void {
+  if (timer) clearTimeout(timer);
+}
+
+/** Stop the shared Codex owner: its refusal, or null once stopped (or when there is none). */
+async function stopCodexOwner(owner: NativeCodexAppServerOwner | null): Promise<{ reason: unknown } | null> {
+  try {
+    await owner?.stop();
+    return null;
+  } catch (reason) {
+    return { reason };
+  }
+}
+
+type HostInstallation = NonNullable<ReturnType<NativeRunner["hostInstallation"]>>;
+
+interface ListedAgentRunner {
+  readonly running: NativeRunner | undefined;
+  readonly retrying: boolean;
+  readonly state: "running" | "retrying" | "given_up";
+  readonly installation: HostInstallation | null;
+}
+
+function doctorRunnerState(running: NativeRunner | undefined, retrying: boolean): ListedAgentRunner["state"] {
+  if (running) return "running";
+  return retrying ? "retrying" : "given_up";
+}
+
+function selfCheckOf(installation: HostInstallation | null): HostInstallation["selfCheck"] {
+  return installation?.selfCheck ?? "not_run";
+}
+
+function startFailureDiagnostic(failure: unknown) {
+  return failure instanceof RemoteInstanceError ? failure.diagnostic : undefined;
+}
+
+function agentCredentials<Credential>(agents: ReadonlyArray<{ agentId: string; credentials?: Credential[] | undefined }>, agentId: string): Credential[] {
+  return agents.find(agent => agent.agentId === agentId)?.credentials ?? [];
+}
+
+function quarantineOf(running: NativeRunner | undefined) {
+  return running?.quarantineReason() ?? null;
+}
+
+/** The copy the installation's load named: a left-out agent's fetched copy, else its runner configuration's; null when unlisted. */
+function listedAntigravityFields(native: NonNullable<SupervisorOptions["native"]>): Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot"> | null {
+  const unavailable = native.unavailableAgents?.find(entry => entry.agentId === "antigravity");
+  if (unavailable) return unavailable.fetched ?? {};
+  const config = native.runners.find(candidate => candidate.RUNNER_AGENT_ID === "antigravity");
+  if (config?.RUNNER_NATIVE_ANTIGRAVITY_ROOT === undefined) return null;
+  return { antigravityVersion: config.RUNNER_BRIDGE_VERSION, antigravityRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT };
+}
+
+/** The pinned Google Antigravity copy, or null when this build names none. */
+function currentAntigravityPin(): ReturnType<typeof antigravityPin> | null {
+  try { return antigravityPin(); } catch { return null; }
+}
+
+async function antigravityDownloadStateOf(root: string, record: Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot"> | null) {
+  if (record === null) return undefined;
+  return (await antigravityDownloadState(root, record).catch(() => undefined))?.state;
+}
+
+/** Disk use is known once the pinned copy is downloaded. */
+function downloadedAntigravityDiskBytes(pin: ReturnType<typeof antigravityPin> | null, download: string | undefined): number | null {
+  return pin && (download === "ready" || download === "update_available") ? antigravityDiskBytes(pin) : null;
+}
+
 function flattenKeys(value: Record<string, unknown>, prefix = ""): string[] {
   const keys: string[] = [];
   for (const [key, entry] of Object.entries(value)) {
@@ -2764,17 +2909,22 @@ function flattenKeys(value: Record<string, unknown>, prefix = ""): string[] {
   return keys;
 }
 
-function mapLoginEvent(loginId: string, event: { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; visible?: true | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined; reason?: "no_license" | undefined }): ControlLoginEvent {
-  switch (event.type) {
-    case "display":
-      return { kind: "display", loginId, text: event.text ?? "" };
-    case "open_url":
-      return { kind: "open_url", loginId, url: event.url ?? "", ...(event.userCode ? { userCode: event.userCode } : {}) };
-    case "prompt":
-      return { kind: "prompt", loginId, label: event.label ?? "", secret: event.secret ?? true, ...(event.visible === true && event.secret === false ? { visible: true as const } : {}) };
-    case "completed":
-      return { kind: "completed", loginId, readiness: event.readiness ?? "unknown" };
-    default:
-      return { kind: "failed", loginId, code: event.code ?? "agent_auth_required", message: event.message ?? "login failed", ...(event.reason === "no_license" ? { reason: "no_license" as const } : {}) };
-  }
+interface RunnerLoginEvent { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; visible?: true | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined; reason?: "no_license" | undefined }
+
+const LOGIN_EVENTS = new Map<string, (loginId: string, event: RunnerLoginEvent) => ControlLoginEvent>([
+  ["display", (loginId, event) => ({ kind: "display", loginId, text: event.text ?? "" })],
+  ["open_url", (loginId, event) => ({ kind: "open_url", loginId, url: event.url ?? "", ...(event.userCode ? { userCode: event.userCode } : {}) })],
+  ["prompt", (loginId, event) => ({ kind: "prompt", loginId, label: event.label ?? "", secret: event.secret ?? true,
+    ...(event.visible === true && event.secret === false ? { visible: true as const } : {}) })],
+  ["completed", (loginId, event) => ({ kind: "completed", loginId, readiness: event.readiness ?? "unknown" })],
+]);
+
+/** Any other runner login event ends the sign-in as failed. */
+function failedLoginEvent(loginId: string, event: RunnerLoginEvent): ControlLoginEvent {
+  return { kind: "failed", loginId, code: event.code ?? "agent_auth_required", message: event.message ?? "login failed",
+    ...(event.reason === "no_license" ? { reason: "no_license" as const } : {}) };
+}
+
+function mapLoginEvent(loginId: string, event: RunnerLoginEvent): ControlLoginEvent {
+  return (LOGIN_EVENTS.get(event.type) ?? failedLoginEvent)(loginId, event);
 }
