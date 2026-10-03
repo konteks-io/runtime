@@ -47,6 +47,8 @@ export interface BrowserGatewayOptions {
   onActivity?: () => void;
   logger?: Logger;
   context?: Record<string, unknown>;
+  localPort?: number;
+  initiallyInactive?: boolean;
 }
 
 const HOP_BY_HOP = new Set(["proxy-connection", "proxy-authorization", "connection", "keep-alive", "te", "trailer", "transfer-encoding", "upgrade"]);
@@ -66,6 +68,7 @@ type Admitted = { ok: true; target: URL; url: URL; grant: Grant | null };
 export class PreviewBrowserGateway {
   private server: Server | null = null;
   private closed = false;
+  private active: boolean;
   private readonly sockets = new Set<Duplex>();
   private readonly logger: Logger;
   private readonly grants = new Map<string, Grant>();
@@ -73,6 +76,7 @@ export class PreviewBrowserGateway {
 
   constructor(private readonly options: BrowserGatewayOptions) {
     this.logger = options.logger ?? createLogger({ name: "preview-browser-gateway" });
+    this.active = !options.initiallyInactive;
   }
 
   /** Start listening; returns the proxy URL the browser is launched with. */
@@ -88,12 +92,17 @@ export class PreviewBrowserGateway {
     this.server = server;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+      server.listen(this.options.localPort ?? 0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
     });
     const address = server.address();
     if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The browser gateway did not bind a loopback port.");
     server.unref();
     return `http://127.0.0.1:${address.port}`;
+  }
+
+  enable(): void {
+    if (this.closed || !this.server) throw new RemoteInstanceError("execution_fenced", "The browser gateway is unavailable.");
+    this.active = true;
   }
 
   /**
@@ -133,6 +142,8 @@ export class PreviewBrowserGateway {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.active = false;
+    this.grants.clear();
     const server = this.server;
     this.server = null;
     for (const socket of this.sockets) socket.destroy();
@@ -170,7 +181,7 @@ export class PreviewBrowserGateway {
   }
 
   private onRequest(request: IncomingMessage, response: ServerResponse): void {
-    if (this.closed) return this.refuse(response, 503, "The session has ended.");
+    if (this.closed || !this.active) return this.refuse(response, 503, "The session is not active.");
     if (request.method === "GET" && request.url === BROWSER_ORIGINS_PATH) {
       response.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store", Connection: "close" });
       response.end(JSON.stringify({ origins: this.grantedOrigins() }));
@@ -218,11 +229,11 @@ export class PreviewBrowserGateway {
       if (status !== 404) this.logger.info({ event: "preview.browser_refused", status, ...this.options.context }, "the QA browser asked for something outside its preview");
       socket.end(`HTTP/1.1 ${status} Refused\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n${message}\n`);
     };
-    const verdict = this.closed ? { ok: false as const, status: 503, message: "The session has ended." } : this.admit(`http://${request.url ?? ""}`, true);
+    const verdict = this.closed || !this.active ? { ok: false as const, status: 503, message: "The session is not active." } : this.admit(`http://${request.url ?? ""}`, true);
     if (!verdict.ok) return refuse(verdict.status, verdict.message);
     void this.address(verdict).then(address => {
       if (address === null) return refuse(403, `${verdict.target.origin} resolves to this computer, which a registered application may not.`);
-      if (this.closed) return refuse(503, "The session has ended.");
+      if (this.closed || !this.active) return refuse(503, "The session is not active.");
       this.options.onActivity?.();
       this.counters.tunnels += 1;
       const upstream = this.dial(verdict.target, () => {
@@ -256,7 +267,7 @@ export class PreviewBrowserGateway {
   private onUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
     // As for CONNECT: an upgraded socket has no 'error' listener of its own.
     socket.on("error", () => undefined);
-    const verdict = this.closed ? { ok: false as const, status: 503, message: "The session has ended." } : this.admit(request.url);
+    const verdict = this.closed || !this.active ? { ok: false as const, status: 503, message: "The session is not active." } : this.admit(request.url);
     if (!verdict.ok) {
       this.counters.refused += 1;
       socket.end(`HTTP/1.1 ${verdict.status} Refused\r\nConnection: close\r\n\r\n`);

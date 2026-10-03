@@ -4,6 +4,7 @@ import { Ajv, type ErrorObject, type ValidateFunction } from "ajv";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { STRUCTURED_RESULT_MCP_SERVER_NAME, STRUCTURED_RESULT_TOOL_NAME } from "@konteks/agent-core";
 import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import type { McpLocalTransportIdentity } from "../mcp/local-transport.js";
 
 /**
  * The session's result tool, `submit_result`, as a connector-local loopback
@@ -115,21 +116,24 @@ interface JsonRpcRequest { jsonrpc?: unknown; id?: JsonRpcId; method?: unknown; 
 type ToolAnswer = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
 export class StructuredResultToolServer {
-  private readonly credential = randomBytes(32).toString("base64url");
+  private readonly credential: string;
   private readonly mcpSessionId = randomBytes(16).toString("hex");
   private readonly logger: Logger;
   private readonly relistWaitMs: number;
   private server: Server | null = null;
   private closed = false;
+  private active: boolean;
   private turn: BoundTurn | null = null;
   private readonly streams = new Set<ServerResponse>();
   private listWaiters: Array<() => void> = [];
   /** The agent was told the list changed and did not read it again: do not wait for it next time. */
   private relistIgnored = false;
 
-  constructor(private readonly options: { logger?: Logger; context?: Record<string, unknown>; relistWaitMs?: number } = {}) {
+  constructor(private readonly options: { logger?: Logger; context?: Record<string, unknown>; relistWaitMs?: number; localTransport?: McpLocalTransportIdentity; initiallyInactive?: boolean } = {}) {
     this.logger = options.logger ?? createLogger({ name: "structured-result" });
     this.relistWaitMs = options.relistWaitMs ?? DEFAULT_RELIST_WAIT_MS;
+    this.credential = options.localTransport?.credential ?? randomBytes(32).toString("base64url");
+    this.active = !options.initiallyInactive;
   }
 
   async start(): Promise<{ name: string; url: string; headers: Array<{ name: string; value: string }> }> {
@@ -138,7 +142,7 @@ export class StructuredResultToolServer {
     this.server = server;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+      server.listen(this.options.localTransport?.port ?? 0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
     });
     const address = server.address();
     if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The result tool did not bind a loopback port.");
@@ -146,9 +150,21 @@ export class StructuredResultToolServer {
     return { name: STRUCTURED_RESULT_MCP_SERVER_NAME, url: `http://127.0.0.1:${address.port}/mcp`, headers: [{ name: "authorization", value: `Bearer ${this.credential}` }] };
   }
 
+  localTransportIdentity(): McpLocalTransportIdentity {
+    const address = this.server?.address();
+    if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The result tool has no bound transport.");
+    return { port: address.port, credential: this.credential };
+  }
+
+  enable(): void {
+    if (this.closed || !this.server) throw new RemoteInstanceError("execution_fenced", "The result tool is unavailable.");
+    this.active = true;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.active = false;
     this.turn = null;
     for (const waiter of this.listWaiters.splice(0)) waiter();
     for (const stream of this.streams) stream.end();
@@ -221,6 +237,7 @@ export class StructuredResultToolServer {
     response.setHeader("Cache-Control", "no-store");
     if (this.closed) return this.fail(response, 503, "closed");
     if (!this.authorized(request.headers.authorization)) return this.fail(response, 401, "invalid_local_credential");
+    if (!this.active) return this.fail(response, 503, "assignment_not_active");
     if (request.method === "GET" && String(request.headers.accept ?? "").includes("text/event-stream")) return this.openStream(request, response);
     if (request.method !== "POST") {
       response.setHeader("Allow", "POST");
@@ -233,6 +250,7 @@ export class StructuredResultToolServer {
       return this.json(response, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error (or a result larger than 512 KiB)" } });
     }
     const batch = Array.isArray(payload);
+    if (this.closed || !this.active) return this.fail(response, 503, "assignment_not_active");
     const requests = (batch ? payload : [payload]) as JsonRpcRequest[];
     const answers: unknown[] = [];
     let listed = false;

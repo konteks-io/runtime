@@ -1,6 +1,6 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import { ObservabilityContextV1Schema, type ObservabilityContextV1 } from "@konteks/backstage-plugin-common";
 import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import {
@@ -37,6 +37,7 @@ import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/clien
 import type { AdmittedMcpTool, PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
+import { SessionToolTransportsSchema, type SessionToolTransports } from "../mcp/local-transport.js";
 import { BROWSER_WORK_KINDS, PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
@@ -104,9 +105,11 @@ export interface RelayedSessionDeps {
   redeemCapabilityToken: (assignment: RemoteWorkAssignment) => Promise<CapabilityTokenIssue>;
   /** Retained local address/header for the same provider thread, never Core delegation. */
   mcpLocalTransport?: McpLocalTransportIdentity;
+  sessionToolTransports?: SessionToolTransports;
   mcpLocalTransportReference?: string;
   /** Persist the local transport identity before the provider sees its MCP config. */
   recordMcpLocalTransport?: (identity: McpLocalTransportIdentity) => Promise<void>;
+  recordSessionToolTransports?: (identity: SessionToolTransports) => Promise<void>;
   /** Legacy first load only: the owner must prove this reference absent. */
   assertLegacyCodexThreadUnloaded?: (reference: string) => Promise<boolean>;
   /** The runner's workspace folder: the confinement root the tool policy judges against. */
@@ -368,6 +371,8 @@ export class RelayedSession {
     // it (runtime-view R11, R14): no platform tools even when a capability
     // is named, no preview or browser (not a preview kind), no result tool.
     const direct = isDirectAssignment(this.assignment);
+    const retainedTools = this.deps.sessionToolTransports ? SessionToolTransportsSchema.parse(this.deps.sessionToolTransports) : undefined;
+    const toolTransports: SessionToolTransports = { version: 1, ...retainedTools };
     if (this.assignment.agentRoute.mcpCapabilityTokenRef && !direct) {
       const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
       this.deps.assertExecutionOwned?.();
@@ -408,6 +413,8 @@ export class RelayedSession {
       if (browserVersion !== null && BROWSER_WORK_KINDS.has(this.assignment.kind) && preview.origin && preview.browsersPath) {
         const origin = preview.origin.bind(preview);
         const gateway = new PreviewBrowserGateway({
+          ...(retainedTools?.browser ? { localPort: retainedTools.browser.port } : {}),
+          initiallyInactive: true,
           target: () => origin(sessionId),
           onActivity: () => preview.touch(sessionId),
           logger: this.logger,
@@ -415,28 +422,41 @@ export class RelayedSession {
         });
         this.browserGateway = gateway;
         const proxyUrl = await this.bootstrapStage("browser_gateway", () => gateway.start());
-        this.browserOutputDir = await mkdtemp(join(tmpdir(), "konteks-browser-"));
+        if (retainedTools?.browser) {
+          const outputDir = join(tmpdir(), retainedTools.browser.outputDirectoryName);
+          await mkdir(outputDir, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
+          const stat = await lstat(outputDir);
+          if (!stat.isDirectory() || stat.isSymbolicLink() || (process.platform !== "win32" && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0))) {
+            throw new RemoteInstanceError("recovery_required", "The retained browser output directory is not private.");
+          }
+          this.browserOutputDir = outputDir;
+        } else this.browserOutputDir = await mkdtemp(join(tmpdir(), "konteks-browser-"));
+        toolTransports.browser = { port: Number(new URL(proxyUrl).port), outputDirectoryName: basename(this.browserOutputDir) };
         browser = { proxyUrl, outputDir: this.browserOutputDir, browsersPath: preview.browsersPath };
       }
       const tools = new PreviewMcpServer({
         start: () => preview.start(sessionId, cwd),
         stop: () => preview.stop(sessionId, "agent"),
         status: () => preview.status(sessionId),
-      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, observability: () => this.diagnosticContext, browser: browser !== undefined });
+      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, observability: () => this.diagnosticContext, browser: browser !== undefined,
+        ...(retainedTools?.preview ? { localTransport: retainedTools.preview } : {}), initiallyInactive: true });
       this.previewTools = tools;
       this.previewSessionId = sessionId;
       // A viewer may start this worktree's preview too (the same process
       // manager and inference as preview_start).
       preview.permit?.(sessionId, cwd);
       mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
+      toolTransports.preview = tools.localTransportIdentity();
     }
     // The turn result tool: every Konteks session gets it, so a turn that asks
     // for a structured result can be answered through a validated tool call.
     // A direct turn asks for none: it ends on the agent's own end_turn.
     if (!direct) {
-      const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt } });
+      const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+        ...(retainedTools?.result ? { localTransport: retainedTools.result } : {}), initiallyInactive: true });
       this.resultTools = resultTools;
       mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
+      toolTransports.result = resultTools.localTransportIdentity();
     }
     // Optional tool wiring (Graft) ran alongside redemption and the facade.
     // The agent must find it in place, and the ownership commit below must
@@ -474,14 +494,24 @@ export class RelayedSession {
       throw new RemoteInstanceError("recovery_required", "The retained MCP transport does not belong to the chosen provider session.",
         { diagnostic: "mcp_transport_reference_mismatch" });
     }
-    if (this.assignment.agentRoute.agentId === "codex" && this.assignment.agentRoute.mcpCapabilityTokenRef &&
-        (priorRef || restoreRef) && !this.deps.mcpLocalTransport) {
+    const missingRetainedTransport = (this.mcpFacade && !this.deps.mcpLocalTransport) ||
+      (this.previewTools && !retainedTools?.preview) || (this.resultTools && !retainedTools?.result) ||
+      (this.browserGateway && !retainedTools?.browser);
+    if (this.assignment.agentRoute.agentId === "codex" &&
+        (priorRef || restoreRef) && missingRetainedTransport) {
       const legacyReference = priorRef ?? restoreRef!;
       const unloaded = await this.deps.assertLegacyCodexThreadUnloaded?.(legacyReference).catch(() => false);
       if (!unloaded) throw new RemoteInstanceError("recovery_required", "The retained Codex thread cannot safely refresh its local MCP transport.",
         { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
     }
+    if (!direct && this.deps.recordSessionToolTransports) {
+      await this.bootstrapStage("session_tool_transport_identity", () => this.deps.recordSessionToolTransports!(toolTransports));
+      this.deps.assertExecutionOwned?.();
+    }
     this.mcpFacade?.enable();
+    this.previewTools?.enable();
+    this.resultTools?.enable();
+    this.browserGateway?.enable();
     if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
     this.deps.assertExecutionOwned?.();
     let reservedRef: string | undefined;

@@ -113,10 +113,17 @@ it.each(["fresh", "live"] as const)("binds a %s conversation bootstrap to the tr
   const address = listener.address();
   if (!address || typeof address === "string") throw new Error("missing listener port");
   const priorTransport = { port: address.port, credential: "p".repeat(43) };
+  const resultListener = createServer();
+  await new Promise<void>(resolve => resultListener.listen(0, "127.0.0.1", resolve));
+  const resultAddress = resultListener.address();
+  if (!resultAddress || typeof resultAddress === "string") throw new Error("missing result listener port");
+  const priorTools = { version: 1 as const, result: { port: resultAddress.port, credential: "r".repeat(43) } };
   await new Promise<void>(resolve => listener.close(() => resolve()));
+  await new Promise<void>(resolve => resultListener.close(() => resolve()));
   await journal.execution.open(previous, current, previous.openedAt);
   await journal.execution.bindReference(previous, "prior-ref", current);
   await journal.execution.bindMcpLocalTransport(previous, priorTransport, current);
+  await journal.execution.bindSessionToolTransports(previous, priorTools, current);
   await journal.execution.bindProcessOwner(previous, processOwner, current);
   await journal.execution.markCompletedTurnSettled(previous, "prior-ref", "2026-09-06T00:00:01.000Z", current);
   await journal.assignments.put({ assignmentId: previous.assignmentId, attempt: 1, claimId: previous.claimId,
@@ -169,6 +176,7 @@ it.each(["fresh", "live"] as const)("binds a %s conversation bootstrap to the tr
     expect(transport).toBeDefined();
     if (mode === "live") {
       expect(transport).toEqual(priorTransport);
+      expect(journal.execution.execution(successor)?.sessionToolTransports).toEqual(priorTools);
       expect(createSession.mock.calls[0]?.[0]).toMatchObject({ acpSessionRef: "prior-ref" });
     } else {
       expect(transport?.credential).not.toBe(priorTransport.credential);

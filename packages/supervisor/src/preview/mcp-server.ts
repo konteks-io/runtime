@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { ObservabilityContextV1 } from "@konteks/backstage-plugin-common";
 import { withNativeSpan, createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME } from "@konteks/remote-agent-runner";
+import type { McpLocalTransportIdentity } from "../mcp/local-transport.js";
 import type { PreviewStatus } from "./process-manager.js";
 import { CONVERSATION_HAS_NO_APP, CONVERSATION_HAS_NO_APP_AGENT_NOTE } from "./config.js";
 
@@ -89,13 +90,16 @@ type JsonRpcId = string | number | null;
 interface JsonRpcRequest { jsonrpc?: unknown; id?: JsonRpcId; method?: unknown; params?: unknown }
 
 export class PreviewMcpServer {
-  private readonly credential = randomBytes(32).toString("base64url");
+  private readonly credential: string;
   private readonly logger: Logger;
   private server: Server | null = null;
   private closed = false;
+  private active: boolean;
 
-  constructor(private readonly host: PreviewToolHost, private readonly options: { logger?: Logger; context?: Record<string, unknown>; observability?: () => ObservabilityContextV1 | undefined; browser?: boolean } = {}) {
+  constructor(private readonly host: PreviewToolHost, private readonly options: { logger?: Logger; context?: Record<string, unknown>; observability?: () => ObservabilityContextV1 | undefined; browser?: boolean; localTransport?: McpLocalTransportIdentity; initiallyInactive?: boolean } = {}) {
     this.logger = options.logger ?? createLogger({ name: "preview-mcp" });
+    this.credential = options.localTransport?.credential ?? randomBytes(32).toString("base64url");
+    this.active = !options.initiallyInactive;
   }
 
   async start(): Promise<{ name: string; url: string; headers: Array<{ name: string; value: string }> }> {
@@ -104,7 +108,7 @@ export class PreviewMcpServer {
     this.server = server;
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+      server.listen(this.options.localTransport?.port ?? 0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
     });
     const address = server.address();
     if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The preview tools did not bind a loopback port.");
@@ -112,9 +116,21 @@ export class PreviewMcpServer {
     return { name: PREVIEW_MCP_SERVER_NAME, url: `http://127.0.0.1:${address.port}/mcp`, headers: [{ name: "authorization", value: `Bearer ${this.credential}` }] };
   }
 
+  localTransportIdentity(): McpLocalTransportIdentity {
+    const address = this.server?.address();
+    if (!address || typeof address === "string") throw new RemoteInstanceError("capability_unavailable", "The preview tools have no bound transport.");
+    return { port: address.port, credential: this.credential };
+  }
+
+  enable(): void {
+    if (this.closed || !this.server) throw new RemoteInstanceError("execution_fenced", "The preview tools are unavailable.");
+    this.active = true;
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.active = false;
     const server = this.server;
     this.server = null;
     if (server) {
@@ -128,6 +144,7 @@ export class PreviewMcpServer {
     response.setHeader("Cache-Control", "no-store");
     if (this.closed) return this.fail(response, 503, "closed");
     if (!this.authorized(request.headers.authorization)) return this.fail(response, 401, "invalid_local_credential");
+    if (!this.active) return this.fail(response, 503, "assignment_not_active");
     if (request.method !== "POST") {
       response.setHeader("Allow", "POST");
       return this.fail(response, 405, "method_not_allowed");
@@ -144,6 +161,7 @@ export class PreviewMcpServer {
     for (const item of requests) {
       let answer: unknown | null;
       try {
+        if (this.closed || !this.active) return this.fail(response, 503, "assignment_not_active");
         answer = await this.dispatch(item);
       } catch {
         answer = { jsonrpc: "2.0", id: (item as JsonRpcRequest | null)?.id ?? null, error: { code: -32603, message: "Internal error" } };
@@ -240,7 +258,7 @@ export class PreviewMcpServer {
     response.end(JSON.stringify(body));
   }
 
-  private async fail(response: ServerResponse, status: number, code: "closed" | "invalid_local_credential" | "method_not_allowed"): Promise<void> {
+  private async fail(response: ServerResponse, status: number, code: "closed" | "invalid_local_credential" | "method_not_allowed" | "assignment_not_active"): Promise<void> {
     await withNativeSpan("native.preview.request", this.options.observability?.(), {
       assignmentId: this.options.context?.assignmentId, attempt: this.options.context?.attempt, stage: "request_validation",
     }, async () => {

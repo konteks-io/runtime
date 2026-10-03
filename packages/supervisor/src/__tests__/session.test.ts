@@ -218,8 +218,18 @@ describe("relayed session (D98/D113/D114)", () => {
     await session.close("cancelled");
   });
 
-  it.each(["live", "restored"] as const)("keeps a %s Codex thread's MCP transport bound to only the current fenced turn", async continuation => {
+  it.each([
+    ["live", "konteks-preview"], ["restored", "konteks-preview"],
+    ["live", "konteks-result"], ["restored", "konteks-result"],
+  ] as const)("keeps a %s Codex thread's MCP transport bound to only the current fenced turn (%s)", async (continuation, cachedToolName) => {
     const seen: string[] = [];
+    let retainedTransport: RelayedSessionDeps["mcpLocalTransport"];
+    let retainedTools: RelayedSessionDeps["sessionToolTransports"];
+    const previewStatus = { sessionId: "s", state: "running" as const, phase: null, url: null, port: null, command: null,
+      install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null,
+      readyAt: null, idleStopMinutes: 30, logTail: [] };
+    const preview = { start: vi.fn(async () => previewStatus), stop: vi.fn(async () => previewStatus),
+      status: vi.fn(() => previewStatus), touch: vi.fn() };
     let holdNext = false;
     let inFlightStarted!: () => void;
     let releaseInFlight!: () => void;
@@ -249,10 +259,16 @@ describe("relayed session (D98/D113/D114)", () => {
     let first: Awaited<ReturnType<typeof build>> | undefined;
     let second: Awaited<ReturnType<typeof build>> | undefined;
     try {
-      first = await build({ redeemCapabilityToken: async () => capability("turn-A"), recordCompletedSettlement: async () => undefined });
+      first = await build({ preview, redeemCapabilityToken: async () => capability("turn-A"), recordCompletedSettlement: async () => undefined,
+        recordMcpLocalTransport: async identity => { retainedTransport = identity; },
+        recordSessionToolTransports: async identity => { retainedTools = identity; } });
       vi.mocked(first.runner.closeSession).mockResolvedValue({ completion: "native_continuation_ready" });
       await first.session.bootstrap();
       const firstEntry = (first.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ url: string; headers: Array<{ name: string; value: string }> }> }).mcpServers[0]!;
+      const cachedTools = (first.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string; url: string; headers: Array<{ name: string; value: string }> }> }).mcpServers
+        .filter(entry => ["konteks-preview", "konteks-result"].includes(entry.name));
+      expect(cachedTools.map(entry => entry.name)).toEqual(["konteks-preview", "konteks-result"]);
+      for (const entry of cachedTools) expect((await call(entry)).status).toBe(200);
       expect((await call(firstEntry)).status).toBe(200);
       expect(seen).toEqual(["Bearer turn-A"]);
 
@@ -265,17 +281,26 @@ describe("relayed session (D98/D113/D114)", () => {
       await first.session.close("completed");
       const betweenTurns = await call(firstEntry).then(response => response.status, () => "connection_refused" as const);
       expect([503, "connection_refused"]).toContain(betweenTurns);
+      for (const entry of cachedTools) {
+        const inactive = await call(entry).then(response => response.status, () => "connection_refused" as const);
+        expect([503, "connection_refused"]).toContain(inactive);
+      }
       expect(seen).toEqual(["Bearer turn-A", "Bearer turn-A"]);
 
       const nextAssignment = { ...assignment, id: "asg-B", attempt: 2, source: { ...assignment.source, turnRef: "turn-B" } } as RemoteWorkAssignment;
-      second = await build({ redeemCapabilityToken: async () => capability("turn-B"),
-        mcpLocalTransport: { port: Number(new URL(firstEntry.url).port), credential: firstEntry.headers[0]!.value.slice("Bearer ".length) },
+      expect(retainedTransport).toBeDefined();
+      second = await build({ preview, redeemCapabilityToken: async () => capability("turn-B"),
+        mcpLocalTransport: retainedTransport, sessionToolTransports: retainedTools,
         activateExecution: async () => continuation === "live" ? { continueReference: "acp-1" } : { restoreReference: "acp-1" } }, nextAssignment);
       vi.mocked(second.runner.createSession).mockResolvedValue({ acpSessionRef: "acp-1", resumed: true, capabilities: { forkSession: false, sessionResume: true } });
       await second.session.bootstrap();
       // Codex app-server can accept thread/resume yet ignore the new MCP config
       // for a loaded thread. The provider therefore keeps calling firstEntry.
       expect((await call(firstEntry)).status).toBe(200);
+      // A loaded provider also retains preview and structured-result endpoints.
+      // All cached tool addresses must reach the newly admitted owner, while
+      // the old owner and the gap between owners remain unable to execute.
+      expect((await call(cachedTools.find(entry => entry.name === cachedToolName)!)).status).toBe(200);
       releaseInFlight();
       await inFlight;
       expect(seen).toEqual(["Bearer turn-A", "Bearer turn-A", "Bearer turn-B"]);
@@ -349,6 +374,45 @@ describe("relayed session (D98/D113/D114)", () => {
       });
       req.on("error", reject);
       req.end();
+    });
+
+    it.each(["live", "restored"] as const)("retains a %s provider browser's proxy and private output directory across owners", async mode => {
+      const upstream = createServer((_req, res) => res.end("current preview"));
+      await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+      const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+      const preview = access(() => origin);
+      let base: RelayedSessionDeps["mcpLocalTransport"];
+      let tools: RelayedSessionDeps["sessionToolTransports"];
+      let first: Awaited<ReturnType<typeof build>> | undefined;
+      let second: Awaited<ReturnType<typeof build>> | undefined;
+      const work = { ...assignment, kind: "validation" } as RemoteWorkAssignment;
+      try {
+        first = await build({ preview, recordCompletedSettlement: async () => undefined,
+          recordMcpLocalTransport: async identity => { base = identity; },
+          recordSessionToolTransports: async identity => { tools = identity; } }, work);
+        first.runner.browserVersion = () => "0.0.82";
+        vi.mocked(first.runner.closeSession).mockResolvedValue({ completion: "native_continuation_ready" });
+        await first.session.bootstrap();
+        const cached = (first.runnerCalls[0]?.[1][0] as { browser: { proxyUrl: string; outputDir: string } }).browser;
+        expect((await viaProxy(cached.proxyUrl, origin)).status).toBe(200);
+        await first.session.close("completed");
+        expect(existsSync(cached.outputDir)).toBe(false);
+        await expect(viaProxy(cached.proxyUrl, origin)).rejects.toThrow();
+        second = await build({ preview, mcpLocalTransport: base, sessionToolTransports: tools,
+          activateExecution: async () => mode === "live" ? { continueReference: "acp-1" } : { restoreReference: "acp-1" } },
+          { ...work, id: "asg-B", attempt: 2 });
+        second.runner.browserVersion = () => "0.0.82";
+        await second.session.bootstrap();
+        const current = (second.runnerCalls[0]?.[1][0] as { browser: { proxyUrl: string; outputDir: string } }).browser;
+        expect(current.proxyUrl).toBe(cached.proxyUrl);
+        expect(current.outputDir).toBe(cached.outputDir);
+        expect(existsSync(cached.outputDir)).toBe(true);
+        expect((await viaProxy(cached.proxyUrl, origin)).status).toBe(200);
+        expect((await viaProxy(cached.proxyUrl, "http://127.0.0.1:1/")).status).toBe(403);
+      } finally {
+        await second?.session.close("cancelled"); await first?.session.close("cancelled");
+        await new Promise<void>(resolve => upstream.close(() => resolve()));
+      }
     });
 
     it("gives a validation session a browser whose gateway reaches only the session's running preview", async () => {

@@ -767,10 +767,14 @@ export class WorkOrchestrator {
     const mcpLocalTransport = retainedReference && logicalSessionId
       ? this.deps.journal.execution.mcpLocalTransportForReference(retainedReference, logicalSessionId, assignment.agentRoute.agentId)
       : undefined;
+    const sessionToolTransports = retainedReference && logicalSessionId
+      ? this.deps.journal.execution.sessionToolTransportsForReference(retainedReference, logicalSessionId, assignment.agentRoute.agentId)
+      : undefined;
     const session = new RelayedSession(assignment, {
       ...this.deps.sessionDeps(assignment, runner),
       ...(mcpLocalTransport ? { mcpLocalTransport } : {}),
-      ...(mcpLocalTransport && retainedReference ? { mcpLocalTransportReference: retainedReference } : {}),
+      ...(sessionToolTransports ? { sessionToolTransports } : {}),
+      ...((mcpLocalTransport || sessionToolTransports) && retainedReference ? { mcpLocalTransportReference: retainedReference } : {}),
       assertLegacyCodexThreadUnloaded: async legacyReference => {
         const claimant = this.legacyCodexClaims.get(legacyReference);
         if (claimant && claimant !== key) return false;
@@ -832,6 +836,10 @@ export class WorkOrchestrator {
       recordMcpLocalTransport: async identity => {
         assertExecutionOwned();
         await this.deps.journal.execution.bindMcpLocalTransport(admission!, identity, assertExecutionOwned);
+      },
+      recordSessionToolTransports: async identity => {
+        assertExecutionOwned();
+        await this.deps.journal.execution.bindSessionToolTransports(admission!, identity, assertExecutionOwned);
       },
       reserveChannel: (channelId, owner) => {
         if (this.channelOwners.has(channelId)) throw new Error("the logical session channel already has a local owner");

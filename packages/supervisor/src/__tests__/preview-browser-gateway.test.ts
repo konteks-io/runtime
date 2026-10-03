@@ -175,3 +175,21 @@ describe("origins Core opened for the session (environment_open)", () => {
     expect(g.gw.counters.tunnels).toBe(1);
   });
 });
+
+
+it("rebinds a cached browser proxy only after its successor is enabled", async () => {
+  const firstPreview = await upstream("first-owner");
+  const secondPreview = await upstream("second-owner");
+  const first = await gateway(() => firstPreview);
+  expect((await viaProxy(first.proxyUrl, firstPreview)).status).toBe(200);
+  await first.gw.close();
+  await expect(viaProxy(first.proxyUrl, firstPreview)).rejects.toThrow();
+  const second = await gateway(() => secondPreview, { localPort: Number(new URL(first.proxyUrl).port), initiallyInactive: true });
+  expect(second.proxyUrl).toBe(first.proxyUrl);
+  expect((await viaProxy(first.proxyUrl, secondPreview)).status).toBe(503);
+  second.gw.enable();
+  expect(await viaProxy(first.proxyUrl, secondPreview)).toMatchObject({ status: 200, body: expect.stringContaining("second-owner") });
+  expect((await viaProxy(first.proxyUrl, firstPreview)).status).toBe(403);
+  await second.gw.close();
+  expect(() => second.gw.enable()).toThrow();
+});

@@ -138,3 +138,16 @@ describe("turn result tool (loopback MCP)", () => {
     expect(await list()).toEqual([GENERIC_RESULT_TOOL]);
   });
 });
+
+
+it("keeps a retained result endpoint inactive until its owner is enabled", async () => {
+  server = new StructuredResultToolServer({ initiallyInactive: true });
+  const entry = await server.start();
+  const call = () => fetch(entry.url, { method: "POST", headers: { authorization: entry.headers[0]!.value, "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+  expect((await call()).status).toBe(503);
+  server.enable();
+  expect((await call()).status).toBe(200);
+  await server.close();
+  expect(() => server!.enable()).toThrow();
+});

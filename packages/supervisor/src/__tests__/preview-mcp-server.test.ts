@@ -144,3 +144,19 @@ describe("session preview tools (loopback MCP)", () => {
     expect(describeStatus(running)).not.toContain("konteks-browser");
   });
 });
+
+
+it("keeps a retained preview endpoint inactive until its owner is enabled", async () => {
+  const host = { start: vi.fn(async () => running), stop: vi.fn(async () => running), status: vi.fn(() => running) };
+  server = new PreviewMcpServer(host, { initiallyInactive: true });
+  const entry = await server.start();
+  const call = () => fetch(entry.url, { method: "POST", headers: { authorization: entry.headers[0]!.value, "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview_start" } }) });
+  expect((await call()).status).toBe(503);
+  expect(host.start).not.toHaveBeenCalled();
+  server.enable();
+  expect((await call()).status).toBe(200);
+  expect(host.start).toHaveBeenCalledOnce();
+  await server.close();
+  expect(() => server!.enable()).toThrow();
+});
