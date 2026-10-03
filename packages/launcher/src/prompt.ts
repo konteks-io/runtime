@@ -17,13 +17,16 @@ interface SecretPromptOptions {
   maxLength?: number;
 }
 
+function assertInteractive(input: NodeJS.ReadableStream, label: string): void {
+  if ((input as NodeJS.ReadStream).isTTY !== true && input === process.stdin) {
+    throw new RemoteInstanceError("prerequisite_missing", `${label} must be entered interactively; run this command in a terminal`);
+  }
+}
+
 export async function promptSecret(options: SecretPromptOptions): Promise<string> {
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stderr;
-  const isTty = (input as NodeJS.ReadStream).isTTY === true;
-  if (!isTty && input === process.stdin) {
-    throw new RemoteInstanceError("prerequisite_missing", `${options.label} must be entered interactively; run this command in a terminal`);
-  }
+  assertInteractive(input, options.label);
   const muted = new Writable({ write: (_chunk, _encoding, callback) => callback() });
   const rl = createInterface({ input, output: muted, terminal: true });
   output.write(`${options.label} (input hidden): `);

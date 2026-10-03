@@ -32,6 +32,12 @@ function bounded(text: string): string {
   return trimmed.length > OUTPUT_LIMIT ? `${trimmed.slice(0, OUTPUT_LIMIT)}… (${trimmed.length - OUTPUT_LIMIT} more characters)` : trimmed;
 }
 
+function howItEnded(result: { code: number | null; error?: string; timedOut?: boolean }): string {
+  if (result.error) return `could not be run: ${result.error}`;
+  if (result.timedOut) return "did not finish in time";
+  return result.code === null ? "ended without an exit code" : `exited ${result.code}`;
+}
+
 /** One service command: what ran, how it ended and what it printed. */
 export function verboseCommand(
   command: { command: string; args: readonly string[] },
@@ -41,10 +47,7 @@ export function verboseCommand(
 ): void {
   if (!enabled) return;
   verbose(`${[command.command, ...command.args].join(" ")}`, stream);
-  const ended = result.error ? `could not be run: ${result.error}`
-    : result.timedOut ? "did not finish in time"
-      : result.code === null ? "ended without an exit code" : `exited ${result.code}`;
-  verbose(`  ${ended} after ${elapsedMs} ms`, stream);
+  verbose(`  ${howItEnded(result)} after ${elapsedMs} ms`, stream);
   for (const [name, text] of [["stdout", result.stdout], ["stderr", result.stderr]] as const) {
     if (text?.trim()) verbose(`  ${name}: ${bounded(text)}`, stream);
   }

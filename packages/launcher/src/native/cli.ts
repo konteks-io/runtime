@@ -132,11 +132,8 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--enterprise", "Google Antigravity: sign in with Gemini Enterprise in the browser on this computer", false)
     .option("--project <id>", "Google Antigravity: the Google Cloud project that holds the Gemini Enterprise licence", project)
     .option("--location <location>", "Google Antigravity: the licence's location, global, us or eu (default global)", location)
-    .action(async (value: string, options: { organization: boolean; provider?: string; method?: string; reuse: boolean; apiKey: boolean; enterprise: boolean; project?: string; location?: string }) => {
-      if (value !== "antigravity" && (options.apiKey || options.enterprise || options.project || options.location)) throw new InvalidArgumentError("--api-key, --enterprise, --project and --location are for antigravity");
-      if (options.apiKey && (options.enterprise || options.project || options.location)) throw new InvalidArgumentError("a Gemini API key and Gemini Enterprise are different sign-ins; choose one");
-      if (options.location && !options.project) throw new InvalidArgumentError("--location goes with --project");
-      const method = options.apiKey ? "gemini-api-key" : options.enterprise || options.project ? "oauth-business" : options.method;
+    .action(async (value: string, options: LoginOptions) => {
+      const method = loginMethod(value, options);
       await actions.control({ ...context(), operation: "auth.login", agent: value, organization: options.organization,
         ...(options.provider ? { provider: options.provider } : {}), ...(method ? { method } : {}), ...(options.reuse ? { reuse: true } : {}),
         ...(options.project ? { project: options.project, location: options.location ?? "global" } : {}) });
@@ -145,9 +142,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--api-key", "Google Antigravity: forget only the Gemini API key", false)
     .option("--enterprise", "Google Antigravity: sign out of Gemini Enterprise only", false)
     .action(async (value: string, options: { provider?: string; apiKey: boolean; enterprise: boolean }) => {
-      if (value !== "antigravity" && (options.apiKey || options.enterprise)) throw new InvalidArgumentError("--api-key and --enterprise are for antigravity");
-      if (options.apiKey && options.enterprise) throw new InvalidArgumentError("to sign out of both, leave out --api-key and --enterprise");
-      const method = options.apiKey ? "gemini-api-key" : options.enterprise ? "oauth-business" : undefined;
+      const method = logoutMethod(value, options);
       await actions.control({ ...context(), operation: "auth.logout", agent: value, ...(options.provider ? { provider: options.provider } : {}), ...(method ? { method } : {}) });
     });
   program.command("update").description("install the newest connector release and restart; running work finishes first, and a failed start goes back")
@@ -169,6 +164,33 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   program.command("uninstall").description("remove Konteks from this computer after running work finishes; your repositories and your agents' own sign-ins stay")
     .action(async () => actions.uninstall(context()));
   return program;
+}
+
+type LoginOptions = { organization: boolean; provider?: string; method?: string; reuse: boolean; apiKey: boolean; enterprise: boolean; project?: string; location?: string };
+
+/** The sign-in method `auth login` names: Google Antigravity's from its own options, otherwise `--method`. */
+function loginMethod(agent: string, options: LoginOptions): string | undefined {
+  assertAntigravityLoginOptions(agent, options);
+  if (options.apiKey) return "gemini-api-key";
+  return options.enterprise || options.project ? "oauth-business" : options.method;
+}
+
+function assertAntigravityLoginOptions(agent: string, options: LoginOptions): void {
+  const enterprise = enterpriseRequested(options);
+  if (agent !== "antigravity" && (options.apiKey || enterprise)) throw new InvalidArgumentError("--api-key, --enterprise, --project and --location are for antigravity");
+  if (options.apiKey && enterprise) throw new InvalidArgumentError("a Gemini API key and Gemini Enterprise are different sign-ins; choose one");
+  if (options.location && !options.project) throw new InvalidArgumentError("--location goes with --project");
+}
+
+function enterpriseRequested(options: LoginOptions): boolean {
+  return Boolean(options.enterprise || options.project || options.location);
+}
+
+function logoutMethod(agent: string, options: { apiKey: boolean; enterprise: boolean }): string | undefined {
+  if (agent !== "antigravity" && (options.apiKey || options.enterprise)) throw new InvalidArgumentError("--api-key and --enterprise are for antigravity");
+  if (options.apiKey && options.enterprise) throw new InvalidArgumentError("to sign out of both, leave out --api-key and --enterprise");
+  if (options.apiKey) return "gemini-api-key";
+  return options.enterprise ? "oauth-business" : undefined;
 }
 
 /** The bundle version of the release this root's runtime record points at, if one is installed. */

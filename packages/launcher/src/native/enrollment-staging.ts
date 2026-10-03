@@ -85,12 +85,17 @@ export async function enrollmentStagingStatus(
   if (await isStaged(root)) return { state: "done" };
   const progress = await readStagingProgress(root);
   if (!progress) return { state: "not_started" };
+  return stagingFailure(progress) ?? { state: "running", ...(progress.agent ? { agent: progress.agent } : {}), done: progress.done, total: progress.total };
+}
+
+/** A progress file that says it failed, a running one whose process has gone, or a finished one nothing recorded. */
+function stagingFailure(progress: NonNullable<Awaited<ReturnType<typeof readStagingProgress>>>): StagingStatus | null {
   if (progress.state === "failed") return { state: "failed", message: progress.message ?? "Unpacking the agent packages stopped." };
   if (progress.state === "running" && progress.pid !== undefined && !alive(progress.pid)) {
     return { state: "failed", message: "Unpacking the agent packages stopped before it finished." };
   }
   if (progress.state === "done") return { state: "failed", message: "The agent packages were unpacked but not recorded." };
-  return { state: "running", ...(progress.agent ? { agent: progress.agent } : {}), done: progress.done, total: progress.total };
+  return null;
 }
 
 /**

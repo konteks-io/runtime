@@ -99,15 +99,22 @@ function installerCommand(platform: NodeJS.Platform): [string, string[]] {
  */
 export async function setUpPersonalAgent(agentId: PersonalAgentId, output: Output, deps: AgentSetupDeps = productionAgentSetupDeps(output)): Promise<boolean> {
   if (!deps.interactive()) return false;
-  const later = `konteks-remote agent add ${agentId}`;
-  if (agentId === "codex") {
-    if (!await deps.ask("Codex is not set up here. It comes with Konteks, so nothing is downloaded. Set it up and sign in with your ChatGPT account?")) return false;
-    const home = deps.codexHome();
-    if (home) await mkdir(home, { recursive: true, mode: 0o700 }).catch(() => undefined);
-    if (home && await deps.found("codex")) return true;
-    output.line(`Codex could not be set up here: its folder (CODEX_HOME) must be yours and private. To try again: ${later}`);
-    return false;
-  }
+  return agentId === "codex" ? setUpCodex(output, deps) : installClaudeCode(output, deps);
+}
+
+/** Codex comes with Konteks: set up is its private folder, then found. */
+async function setUpCodex(output: Output, deps: AgentSetupDeps): Promise<boolean> {
+  if (!await deps.ask("Codex is not set up here. It comes with Konteks, so nothing is downloaded. Set it up and sign in with your ChatGPT account?")) return false;
+  const home = deps.codexHome();
+  if (home) await mkdir(home, { recursive: true, mode: 0o700 }).catch(() => undefined);
+  if (home && await deps.found("codex")) return true;
+  output.line("Codex could not be set up here: its folder (CODEX_HOME) must be yours and private. To try again: konteks-remote agent add codex");
+  return false;
+}
+
+/** Claude Code with Anthropic's official installer (and Git for Windows first, where it is missing). */
+async function installClaudeCode(output: Output, deps: AgentSetupDeps): Promise<boolean> {
+  const later = "konteks-remote agent add claude-code";
   const installer = claudeCodeInstaller(deps.platform);
   if (!await deps.ask(`Claude Code is not installed. Install it with Anthropic's official installer (${installer.url}) and sign in?`)) return false;
   if (deps.platform === "win32" && !deps.gitForWindows()) await offerGitForWindows(output, deps);
@@ -131,15 +138,18 @@ export async function setUpPersonalAgent(agentId: PersonalAgentId, output: Outpu
 export async function ensurePersonalAgent(agentId: PersonalAgentId, output: Output, deps: AgentSetupDeps = productionAgentSetupDeps(output)): Promise<"found" | "set_up"> {
   if (await deps.found(agentId)) return "found";
   const name = agentName(agentId);
-  if (!deps.interactive()) {
-    throw new RemoteInstanceError("prerequisite_missing", agentId === "claude-code"
-      ? `Claude Code is not installed for this user. Install it with Anthropic's installer (${claudeCodeInstaller(deps.platform).command}), then: konteks-remote agent add claude-code${deps.platform === "win32" && !deps.gitForWindows() ? `. ${GIT_HINT}` : ""}`
-      : "Codex is not set up for this user. Run this in a terminal to set it up and sign in: konteks-remote agent add codex");
-  }
+  if (!deps.interactive()) throw new RemoteInstanceError("prerequisite_missing", notSetUpMessage(agentId, deps));
   let yes = false;
   if (await setUpPersonalAgent(agentId, output, { ...deps, ask: async question => (yes = await deps.ask(question)) })) return "set_up";
   // A no changes nothing; a setup that failed has already said what to do.
   throw new RemoteInstanceError("agent_unavailable", yes ? `${name} was not added.` : `Nothing was ${agentId === "claude-code" ? "installed" : "changed"}: ${name} was not added.`);
+}
+
+/** Without a terminal to ask in: the one thing to do. */
+function notSetUpMessage(agentId: PersonalAgentId, deps: AgentSetupDeps): string {
+  if (agentId === "codex") return "Codex is not set up for this user. Run this in a terminal to set it up and sign in: konteks-remote agent add codex";
+  const git = deps.platform === "win32" && !deps.gitForWindows() ? `. ${GIT_HINT}` : "";
+  return `Claude Code is not installed for this user. Install it with Anthropic's installer (${claudeCodeInstaller(deps.platform).command}), then: konteks-remote agent add claude-code${git}`;
 }
 
 /** Where one agent stands right after the connector started, in the closing summary's words. */
@@ -205,47 +215,83 @@ export async function closeAgentSetup(
   input: { agents: readonly string[]; signInNow: readonly string[]; missing: readonly string[]; output: Output },
   deps: AgentClosingDeps,
 ): Promise<void> {
-  const attempted = new Set<string>();
-  const signIn = async (agent: string) => {
-    attempted.add(agent);
-    // A skipped or failed sign-in leaves the command in the summary.
-    await deps.signIn(agent).catch(() => undefined);
-  };
-  for (const agent of input.signInNow) if (input.agents.includes(agent)) await signIn(agent);
-  let said = false;
-  const settle = async (): Promise<Record<string, AgentState>> => {
-    if (input.agents.length === 0) return {};
-    const deadline = deps.now() + (deps.waitMs ?? 90_000);
+  const closing = new AgentClosing(input, deps);
+  for (const agent of input.signInNow) if (input.agents.includes(agent)) await closing.signIn(agent);
+  let states = await closing.settle();
+  if (deps.interactive() && await closing.offerSignIns(states)) states = await closing.settle();
+  closing.summarize(states);
+}
+
+/** What the close of a setup did and still has to say. */
+class AgentClosing {
+  private readonly attempted = new Set<string>();
+  private said = false;
+
+  constructor(
+    private readonly input: { agents: readonly string[]; signInNow: readonly string[]; missing: readonly string[]; output: Output },
+    private readonly deps: AgentClosingDeps,
+  ) {}
+
+  /** A skipped or failed sign-in leaves the command in the summary. */
+  async signIn(agent: string): Promise<void> {
+    this.attempted.add(agent);
+    await this.deps.signIn(agent).catch(() => undefined);
+  }
+
+  /** Every agent's state once none is still starting, or what is known at the deadline. */
+  async settle(): Promise<Record<string, AgentState>> {
+    if (this.input.agents.length === 0) return {};
+    const deadline = this.deps.now() + (this.deps.waitMs ?? 90_000);
     for (;;) {
-      const states = await deps.states().catch(() => null);
-      if (states && input.agents.every(agent => states[agent] !== undefined && states[agent] !== "starting")) return states;
-      if (deps.now() >= deadline) return states ?? {};
-      if (!said) { input.output.line("Checking which agents are ready…"); said = true; }
-      await deps.sleep(2_000);
+      const states = await this.deps.states().catch(() => null);
+      if (states && this.allSettled(states)) return states;
+      if (this.deps.now() >= deadline) return states ?? {};
+      this.sayChecking();
+      await this.deps.sleep(2_000);
     }
-  };
-  let states = await settle();
-  if (deps.interactive()) {
+  }
+
+  private sayChecking(): void {
+    if (this.said) return;
+    this.input.output.line("Checking which agents are ready…");
+    this.said = true;
+  }
+
+  private allSettled(states: Record<string, AgentState>): boolean {
+    return this.input.agents.every(agent => states[agent] !== undefined && states[agent] !== "starting");
+  }
+
+  /** Offers a sign-in, once, for each agent found without one; whether any was signed in. */
+  async offerSignIns(states: Record<string, AgentState>): Promise<boolean> {
     let asked = false;
-    for (const agent of input.agents) {
-      if (states[agent] !== "needs_sign_in" || attempted.has(agent)) continue;
-      if (!await deps.ask(`${agentName(agent)} is here but not signed in. Sign in now?`)) { attempted.add(agent); continue; }
+    for (const agent of this.input.agents) {
+      if (states[agent] !== "needs_sign_in" || this.attempted.has(agent)) continue;
+      if (!await this.deps.ask(`${agentName(agent)} is here but not signed in. Sign in now?`)) { this.attempted.add(agent); continue; }
       asked = true;
-      await signIn(agent);
+      await this.signIn(agent);
     }
-    if (asked) states = await settle();
+    return asked;
   }
-  const ready = input.agents.filter(agent => states[agent] === "ready");
-  input.output.line(ready.length > 0 ? `Ready to work here: ${names(ready)}.` : "No coding agent is ready here yet.");
-  for (const agent of input.agents) {
-    const name = agentName(agent);
-    switch (states[agent]) {
-      case "ready": break;
-      case "needs_sign_in": input.output.line(`${name} needs you to sign in: konteks-remote auth login ${agent}`); break;
-      case "failed": input.output.line(`${name} could not start here; to see why: konteks-remote doctor`); break;
-      default: input.output.line(`${name} is still starting; konteks-remote agents shows when it is ready.`);
+
+  summarize(states: Record<string, AgentState>): void {
+    const { input } = this;
+    const ready = input.agents.filter(agent => states[agent] === "ready");
+    input.output.line(ready.length > 0 ? `Ready to work here: ${names(ready)}.` : "No coding agent is ready here yet.");
+    for (const agent of input.agents) {
+      const line = notReadyLine(agent, states[agent]);
+      if (line) input.output.line(line);
     }
+    if (input.agents.includes("claude-code") && this.deps.gitForWindowsMissing?.()) input.output.line(GIT_HINT);
+    for (const agent of input.missing) input.output.line(`To add ${agentName(agent)}: konteks-remote agent add ${agent}`);
   }
-  if (input.agents.includes("claude-code") && deps.gitForWindowsMissing?.()) input.output.line(GIT_HINT);
-  for (const agent of input.missing) input.output.line(`To add ${agentName(agent)}: konteks-remote agent add ${agent}`);
+}
+
+function notReadyLine(agent: string, state: AgentState | undefined): string | null {
+  const name = agentName(agent);
+  switch (state) {
+    case "ready": return null;
+    case "needs_sign_in": return `${name} needs you to sign in: konteks-remote auth login ${agent}`;
+    case "failed": return `${name} could not start here; to see why: konteks-remote doctor`;
+    default: return `${name} is still starting; konteks-remote agents shows when it is ready.`;
+  }
 }

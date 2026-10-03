@@ -95,7 +95,7 @@ async function graftNode(root: string): Promise<string | null> {
  * Where Graft lives on this machine: in ~/.graft, the one place outside the
  * repository the offer names, with its own copy of Node. The person keeps
  * Graft's files in their repository if Konteks is ever removed, and they
- * keep working (WS1-091): inside Konteks's folder they broke with it.
+ * keep working; inside Konteks's folder they would break with it.
  */
 function toolDirectory(record: GraftRecord): string {
   return join(process.env.HOME ?? homedir(), ".graft", "konteks", `graft-${record.digest.slice(0, 16)}`);
@@ -118,13 +118,22 @@ export async function ensureGraft(
   const directory = toolDirectory(record);
   const ownNode = join(directory, "bin", "node");
   if ((await stat(cliOf(directory)).then(() => true, () => false)) && (await executable(ownNode))) return { node: ownNode, cli: cliOf(directory) };
+  await unpackGraft(record, await downloadGraft(record, deps.fetchFn ?? fetch), node, directory);
+  return { node: ownNode, cli: cliOf(directory) };
+}
 
-  const response = await (deps.fetchFn ?? fetch)(`${record.base.replace(/\/+$/, "")}/${record.name}`);
+/** The release's Graft package, refused unless its digest is the recorded one. */
+async function downloadGraft(record: GraftRecord, fetchFn: typeof fetch): Promise<Buffer> {
+  const response = await fetchFn(`${record.base.replace(/\/+$/, "")}/${record.name}`);
   if (!response.ok) throw new Error(`Graft could not be downloaded (HTTP ${response.status})`);
   const bytes = Buffer.from(await response.arrayBuffer());
   const digest = createHash("sha256").update(bytes).digest("hex");
   if (digest !== record.digest) throw new Error("the downloaded Graft package does not match this release's checksum, so it was not installed");
+  return bytes;
+}
 
+/** Unpacked beside its own copy of Node, then moved into place whole. */
+async function unpackGraft(record: GraftRecord, bytes: Buffer, node: string, directory: string): Promise<void> {
   const work = join(tmpdir(), `konteks-graft-${process.pid}-${Date.now()}`);
   await mkdir(work, { recursive: true, mode: 0o700 });
   try {
@@ -143,7 +152,6 @@ export async function ensureGraft(
   } finally {
     await rm(work, { recursive: true, force: true });
   }
-  return { node: ownNode, cli: cliOf(directory) };
 }
 
 /** Every Graft run: statistics off, and its own .gitignore edit off (we exclude locally). */
@@ -154,7 +162,7 @@ function graftEnv(): NodeJS.ProcessEnv {
 /**
  * Graft checks npm for a newer version of itself in the background (`npm
  * view`), which writes npm's own files in the home folder and calls the
- * registry: nothing the person was told about (WS1-081). The release pins
+ * registry: nothing the person was told about. The release pins
  * Graft's version, so its self-update check is answered here, once, in
  * ~/.graft, the one place outside the repository the offer names.
  */
@@ -266,7 +274,7 @@ async function wiredStampPath(repo: string): Promise<string> {
  * installer record remains the only authority to locate/download Graft.
  *
  * A worktree already wired by this Graft for this agent family is left as
- * it is (WS2-156): rewiring rebuilt the whole index every turn. Graft keeps
+ * it is: rewiring rebuilt the whole index every turn. Graft keeps
  * its own index current between turns; a revision reset cleans `graft/`,
  * which makes the next turn wire again. */
 export async function prepareDeliveryGraft(root: string, repo: string, family: string, deps: {
@@ -279,7 +287,7 @@ export async function prepareDeliveryGraft(root: string, repo: string, family: s
   const tool = await (deps.ensure ?? ensureGraft)(root);
   const stampPath = await wiredStampPath(repo);
   const stamp = `${JSON.stringify({ version: 1, family, node: tool.node, cli: tool.cli })}\n`;
-  if ((await graftAlreadyWired(repo)) && (await readFile(stampPath, "utf8").catch(() => null)) === stamp) return "skipped";
+  if (await wiredWith(repo, stampPath, stamp)) return "skipped";
   // An interrupted wiring must never read as finished.
   await rm(stampPath, { force: true });
   const wired = await (deps.wire ?? wireGraft)(root, repo, [family], tool);
@@ -288,6 +296,11 @@ export async function prepareDeliveryGraft(root: string, repo: string, family: s
   }
   await writeFile(stampPath, stamp, { mode: 0o600 });
   return "wired";
+}
+
+/** Wired already, by this Graft for this family. */
+async function wiredWith(repo: string, stampPath: string, stamp: string): Promise<boolean> {
+  return (await graftAlreadyWired(repo)) && (await readFile(stampPath, "utf8").catch(() => null)) === stamp;
 }
 
 /** `graft/a.md`, `graft/b.md` → `graft/`: exclude whole directories Graft owns. */
