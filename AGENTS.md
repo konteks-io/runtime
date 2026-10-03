@@ -32,6 +32,13 @@ supervisor accepts only `SUPERVISOR_DEPLOYMENT_KIND=native_connector` and
 runners only `agent_local_subscription`. Do not reintroduce Compose, images,
 `gateway_keyed` or a local component server.
 
+The relay socket rotates its lease (`RelayClient.armLeaseRotation`): Core holds
+a runtime's relay connection to the lease it handshook with (15 min), so the
+client re-handshakes with the current heartbeat lease 60 s before that one
+expires (`rehandshake("lease_rotation")`, close 1012, unacked frames kept).
+Without it the relay closed every socket with 4409 `relay_epoch_stale` once
+per lease lifetime (2026-10-03).
+
 Session previews are native (packages 7.0.0 `preview.dev_server`): the
 supervisor runs at most one dev server per session in that session's
 worktree (`packages/supervisor/src/preview/`), on a loopback port it picks,
