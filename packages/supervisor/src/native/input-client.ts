@@ -6,6 +6,7 @@ import {
   RemoteWorkAssignmentSchema,
   RemoteFileTreeSchema,
   RemoteInstanceError,
+  allEqual,
   createLogger,
   computeRemoteTransferManifestDigest,
   validateRemoteTransfer,
@@ -25,6 +26,7 @@ import { CoreSignatureVerifier } from "../control/core-signature.js";
 import { continuedSession } from "../work/continued-session.js";
 import { NATIVE_TRANSIENT_MAX_ATTEMPTS, logNativeRetryExhausted, transientHttpClassification, waitForNativeRetry,
   type NativeTransientClassification } from "./transient-retry.js";
+import { abortable, coreOrigin, LEASE_REFUSAL_STATUSES, mediaType } from "./core-transport.js";
 
 interface NativeInputClientOptions {
   baseUrl: string;
@@ -54,17 +56,9 @@ export class NativeInputClient {
   private busy = false;
 
   constructor(private readonly options: NativeInputClientOptions) {
-    const url = new URL(options.baseUrl);
-    if (
-      url.protocol !== "https:" ||
-      url.username ||
-      url.password ||
-      url.search ||
-      url.hash ||
-      (url.pathname !== "/" && url.pathname !== "")
-    )
-      throw unavailable("base_url_invalid");
-    this.origin = url.origin;
+    const origin = coreOrigin(options.baseUrl);
+    if (origin === null) throw unavailable("base_url_invalid");
+    this.origin = origin;
     this.verifier = new CoreSignatureVerifier(options.roots);
     this.fetchFn = options.fetchFn ?? fetch;
     this.logger = options.logger ?? createLogger({ name: "native-input" });
@@ -170,34 +164,13 @@ export class NativeInputClient {
     if (!parsed.success) throw unavailable("envelope_schema_invalid");
     const envelope = parsed.data;
     const { signature, ...unsigned } = envelope;
-    const binding = envelope.selection.binding;
     const now = this.options.clock.coreNow();
     if (!this.verifier.verify(unsigned as unknown as { [key: string]: JsonValue }, signature))
       throw unavailable("envelope_signature_invalid");
-    if (!Number.isFinite(now)) throw unavailable("clock_invalid");
-    if (Date.parse(envelope.issuedAt) > now + CORE_HTTP_DATE_UNCERTAINTY_MS)
-      throw unavailable("envelope_issued_future");
-    if (Date.parse(envelope.expiresAt) <= now) throw unavailable("envelope_expired");
-    if (Date.parse(envelope.expiresAt) > Date.parse(assignment.expiresAt))
-      throw unavailable("envelope_exceeds_assignment");
-    if (envelope.selection.claimId !== claimId) throw unavailable("envelope_claim_mismatch");
-    if (
-      binding.instanceId !== assignment.instanceId ||
-      binding.workspaceId !== assignment.workspaceId ||
-      binding.assignmentId !== assignment.id ||
-      binding.attempt !== assignment.attempt ||
-      (continuedSession(assignment.source) !== null &&
-        binding.sessionId !== continuedSession(assignment.source)!.sessionId)
-    )
-      throw unavailable("envelope_binding_mismatch");
-    if (
-      sourceRevision(assignment) !== undefined &&
-      sourceRevision(assignment) !== envelope.selection.source.revision
-    )
-      throw unavailable("envelope_source_revision_mismatch");
+    const refusal = envelopeWindowRefusal(envelope, assignment, now) ?? envelopeBindingRefusal(envelope, assignment, claimId);
+    if (refusal !== null) throw unavailable(refusal);
     return envelope;
   }
-
   private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
     if (this.busy) throw unavailable("request_concurrent");
     this.busy = true;
@@ -233,130 +206,108 @@ export class NativeInputClient {
     return this.withTransientRetry(`input.${operation}`, () => this.requestAttempt(assignment, operation, body, maxBytes));
   }
 
-  private async requestAttempt(
+  private requestAttempt(
     assignment: RemoteWorkAssignment,
     operation: "prepare" | "read",
     body: unknown,
     maxBytes: number,
   ): Promise<unknown> {
+    return this.postOnce(assignment, operation, body, "application/json", async (response, signal, held) => {
+      if (!response.ok || response.redirected || mediaType(response) !== "application/json" || !response.body) {
+        void response.body?.cancel().catch(() => undefined);
+        throw unavailable(jsonRefusal(response));
+      }
+      held.reader = response.body.getReader();
+      const bytes = await readAll(held.reader, signal, maxBytes);
+      try {
+        return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+      } catch {
+        throw unavailable("response_decode_invalid");
+      }
+    });
+  }
+
+  /**
+   * One authorized POST to an input endpoint and its answer, read by `take`.
+   * Lease renewal may invalidate the request while Core checks owner inputs:
+   * it is reauthorized once with the locally renewed lease, never with stale
+   * authority or unchanged credentials, and both attempts share a deadline.
+   */
+  private async postOnce<T>(
+    assignment: RemoteWorkAssignment,
+    endpoint: string,
+    body: unknown,
+    accept: string,
+    take: (response: Response, signal: AbortSignal, held: { reader?: ReadableStreamDefaultReader<Uint8Array> }) => Promise<T>,
+  ): Promise<T> {
     let credential = this.options.credential();
     if (!credential) throw unavailable("credential_missing");
     if (!this.verifier.configured) throw unavailable("trust_roots_missing");
-    const url = `${this.origin}/api/remote-instances/internal/remote-instances/${encodeURIComponent(assignment.instanceId)}/assignments/${encodeURIComponent(assignment.id)}/inputs/${operation}`;
+    const url = `${this.origin}/api/remote-instances/internal/remote-instances/${encodeURIComponent(assignment.instanceId)}/assignments/${encodeURIComponent(assignment.id)}/inputs/${endpoint}`;
     const abort = new AbortController();
     // Core's own preparation budget is 90 s (NATIVE_INPUT_REQUEST_TIMEOUT_MS):
     // the delivery Session is materialized and a repository snapshot pinned
     // inside it. The client deadline must outlive that budget, not race it.
     const timer = setTimeout(() => abort.abort(), 100_000);
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const held: { reader?: ReadableStreamDefaultReader<Uint8Array> } = {};
     try {
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        let responsePromise: Promise<Response>;
-        try {
-          responsePromise = this.fetchFn(url, {
-            method: "POST",
-            redirect: "error",
-            credentials: "omit",
-            signal: abort.signal,
-            headers: {
-              authorization: `Bearer ${credential}`,
-              accept: "application/json",
-              "content-type": "application/json",
-            },
-            body: JSON.stringify(body),
-          });
-        } catch {
-          throw unavailable("request_transport");
-        }
-        let response: Response;
-        try {
-          response = await abortable(responsePromise, abort.signal);
-        } catch {
-          throw unavailable(abort.signal.aborted ? "request_deadline" : "request_transport");
-        }
-        // Lease renewal may invalidate the request while Core checks owner inputs.
-        // Reauthorize once with the locally renewed lease; never accept stale
-        // authority or retry unchanged credentials. Both attempts share a deadline.
-        let renewed = this.options.credential();
-        // Core rotates the lease on a heartbeat and can refuse a request that
-        // raced that rotation before the response carrying the new lease was
-        // adopted here. Give the adoption a short, bounded chance rather than
-        // failing a whole slow input preparation; unchanged credentials still
-        // never retry.
-        if (
-          attempt === 0 &&
-          !response.redirected &&
-          [401, 403, 422].includes(response.status) &&
-          renewed === credential
-        ) {
-          renewed = await this.awaitRenewedCredential(credential, abort.signal);
-        }
-        if (
-          attempt === 0 &&
-          !response.redirected &&
-          [401, 403, 422].includes(response.status) &&
-          renewed &&
-          renewed !== credential
-        ) {
+        const response = await this.send(url, { credential, accept, body }, abort.signal);
+        const renewed = await this.renewedAfterRefusal(response, credential, attempt, abort.signal);
+        if (renewed !== null) {
           void response.body?.cancel().catch(() => undefined);
           credential = renewed;
           continue;
         }
-        if (
-          !response.redirected && transientHttpClassification(response.status)
-        ) {
-          void response.body?.cancel().catch(() => undefined);
-          throw unavailable(`response_transient_${response.status}`);
-        }
-        if (
-          !response.ok ||
-          response.redirected ||
-          response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !==
-            "application/json" ||
-          !response.body
-        ) {
-          void response.body?.cancel().catch(() => undefined);
-          throw unavailable(
-            !response.ok || response.redirected
-              ? "response_status_invalid"
-              : !response.body
-                ? "response_body_missing"
-                : "response_content_type_invalid",
-          );
-        }
-        reader = response.body.getReader();
-        const chunks: Uint8Array[] = [];
-        let size = 0;
-        while (true) {
-          let chunk: ReadableStreamReadResult<Uint8Array>;
-          try {
-            chunk = await abortable(reader.read(), abort.signal);
-          } catch {
-            throw unavailable(
-              abort.signal.aborted ? "request_deadline" : "response_body_read_failed",
-            );
-          }
-          if (chunk.done) break;
-          size += chunk.value.byteLength;
-          if (size > maxBytes) throw unavailable("response_body_too_large");
-          chunks.push(chunk.value);
-        }
-        try {
-          return JSON.parse(
-            new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)),
-          );
-        } catch {
-          throw unavailable("response_decode_invalid");
-        }
+        refuseTransient(response);
+        return await take(response, abort.signal, held);
       }
       throw unavailable("credential_renewal_exhausted");
     } finally {
       clearTimeout(timer);
       abort.abort();
-      if (reader) void reader.cancel().catch(() => undefined);
+      if (held.reader) void held.reader.cancel().catch(() => undefined);
     }
   }
 
+  private async send(url: string, request: { credential: string; accept: string; body: unknown }, signal: AbortSignal): Promise<Response> {
+    let pending: Promise<Response>;
+    try {
+      pending = this.fetchFn(url, {
+        method: "POST",
+        redirect: "error",
+        credentials: "omit",
+        signal,
+        headers: {
+          authorization: `Bearer ${request.credential}`,
+          accept: request.accept,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(request.body),
+      });
+    } catch {
+      throw unavailable("request_transport");
+    }
+    try {
+      return await abortable(pending, signal, () => unavailable("request_deadline"));
+    } catch {
+      throw unavailable(signal.aborted ? "request_deadline" : "request_transport");
+    }
+  }
+
+  /**
+   * The renewed lease to retry with, once, after a lease refusal. Core
+   * rotates the lease on a heartbeat and can refuse a request that raced
+   * that rotation before the response carrying the new lease was adopted
+   * here: the adoption gets a short, bounded chance rather than failing a
+   * whole slow input preparation. Unchanged credentials never retry.
+   */
+  private async renewedAfterRefusal(response: Response, credential: string, attempt: number, signal: AbortSignal): Promise<string | null> {
+    let renewed = this.options.credential();
+    if (attempt !== 0 || response.redirected || !LEASE_REFUSAL_STATUSES.includes(response.status)) return null;
+    if (renewed === credential) renewed = await this.awaitRenewedCredential(credential, signal);
+    return renewed && renewed !== credential ? renewed : null;
+  }
   private async requestBundle(
     assignment: RemoteWorkAssignment,
     body: unknown,
@@ -365,101 +316,40 @@ export class NativeInputClient {
     return this.withTransientRetry("input.fetch_repository", () => this.requestBundleAttempt(assignment, body, revision));
   }
 
-  private async requestBundleAttempt(
+  private requestBundleAttempt(
     assignment: RemoteWorkAssignment,
     body: unknown,
     revision: string,
   ): Promise<Uint8Array> {
-    let credential = this.options.credential();
-    if (!credential) throw unavailable("credential_missing");
-    if (!this.verifier.configured) throw unavailable("trust_roots_missing");
-    const url = `${this.origin}/api/remote-instances/internal/remote-instances/${encodeURIComponent(assignment.instanceId)}/assignments/${encodeURIComponent(assignment.id)}/inputs/fetch-repository`;
-    const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), 100_000);
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-    try {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        let response: Response;
-        try {
-          response = await abortable(
-            this.fetchFn(url, {
-              method: "POST",
-              redirect: "error",
-              credentials: "omit",
-              signal: abort.signal,
-              headers: {
-                authorization: `Bearer ${credential}`,
-                accept: "application/x-git-bundle",
-                "content-type": "application/json",
-              },
-              body: JSON.stringify(body),
-            }),
-            abort.signal,
-          );
-        } catch {
-          throw unavailable(abort.signal.aborted ? "request_deadline" : "request_transport");
-        }
-        let renewed = this.options.credential();
-        if (attempt === 0 && !response.redirected && [401, 403, 422].includes(response.status) && renewed === credential)
-          renewed = await this.awaitRenewedCredential(credential, abort.signal);
-        if (attempt === 0 && !response.redirected && [401, 403, 422].includes(response.status) && renewed && renewed !== credential) {
-          void response.body?.cancel().catch(() => undefined);
-          credential = renewed;
-          continue;
-        }
-        if (!response.redirected && transientHttpClassification(response.status)) {
-          void response.body?.cancel().catch(() => undefined);
-          throw unavailable(`response_transient_${response.status}`);
-        }
-        const contentLength = Number(response.headers.get("content-length"));
-        if (!response.ok || response.redirected ||
-            response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/x-git-bundle" ||
-            response.headers.get("x-konteks-revision") !== revision || !response.body ||
-            (Number.isFinite(contentLength) && contentLength > REMOTE_REPOSITORY_BUNDLE_MAX_BYTES)) {
-          void response.body?.cancel().catch(() => undefined);
-          throw unavailable("repository_response_invalid");
-        }
-        reader = response.body.getReader();
-        const chunks: Uint8Array[] = [];
-        let size = 0;
-        while (true) {
-          const chunk = await abortable(reader.read(), abort.signal).catch(() => {
-            throw unavailable(abort.signal.aborted ? "request_deadline" : "response_body_read_failed");
-          });
-          if (chunk.done) break;
-          size += chunk.value.byteLength;
-          if (size > REMOTE_REPOSITORY_BUNDLE_MAX_BYTES) throw unavailable("response_body_too_large");
-          chunks.push(chunk.value);
-        }
-        return Buffer.concat(chunks);
+    return this.postOnce(assignment, "fetch-repository", body, "application/x-git-bundle", async (response, signal, held) => {
+      if (!bundleResponse(response, revision)) {
+        void response.body?.cancel().catch(() => undefined);
+        throw unavailable("repository_response_invalid");
       }
-      throw unavailable("credential_renewal_exhausted");
-    } finally {
-      clearTimeout(timer);
-      abort.abort();
-      if (reader) void reader.cancel().catch(() => undefined);
-    }
+      held.reader = response.body!.getReader();
+      return readAll(held.reader, signal, REMOTE_REPOSITORY_BUNDLE_MAX_BYTES);
+    });
   }
-
   private async withTransientRetry<T>(operation: string, run: () => Promise<T>): Promise<T> {
     for (let attempt = 1; attempt <= NATIVE_TRANSIENT_MAX_ATTEMPTS; attempt += 1) {
       try { return await run(); }
-      catch (error) {
-        const classification = nativeInputTransientClassification(error);
-        if (!classification) throw error;
-        const status = error instanceof RemoteInstanceError && error.diagnostic?.startsWith("response_transient_")
-          ? Number(error.diagnostic.slice("response_transient_".length)) : undefined;
-        if (attempt === NATIVE_TRANSIENT_MAX_ATTEMPTS) {
-          logNativeRetryExhausted({ logger: this.logger, operation, classification, ...(status === undefined ? {} : { status }) });
-          throw error;
-        }
-        await waitForNativeRetry({ logger: this.logger, operation, attempt, classification,
-          ...(status === undefined ? {} : { status }), sleep: this.options.retrySleep, baseDelayMs: this.options.retryBaseDelayMs });
-      }
+      catch (error) { await this.afterFailure(operation, attempt, error); }
     }
     throw unavailable("retry_exhausted");
   }
-}
+
+  /** A transient failure waits and retries, until the last attempt; any other is thrown at once. */
+  private async afterFailure(operation: string, attempt: number, error: unknown): Promise<void> {
+    const classification = nativeInputTransientClassification(error);
+    if (!classification) throw error;
+    const status = transientStatus(error);
+    const retry = { logger: this.logger, operation, classification, ...(status === undefined ? {} : { status }) };
+    if (attempt === NATIVE_TRANSIENT_MAX_ATTEMPTS) {
+      logNativeRetryExhausted(retry);
+      throw error;
+    }
+    await waitForNativeRetry({ ...retry, attempt, sleep: this.options.retrySleep, baseDelayMs: this.options.retryBaseDelayMs });
+  }}
 
 function nativeInputTransientClassification(error: unknown): NativeTransientClassification | null {
   if (!(error instanceof RemoteInstanceError)) return null;
@@ -514,11 +404,75 @@ function sourceRevision(assignment: RemoteWorkAssignment): string | undefined {
   }
 }
 
-function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(unavailable("request_deadline"));
-    if (signal.aborted) abort();
-    else signal.addEventListener("abort", abort, { once: true });
-    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
-  });
+/** The status a `response_transient_<status>` refusal names. */
+function transientStatus(error: unknown): number | undefined {
+  return error instanceof RemoteInstanceError && error.diagnostic?.startsWith("response_transient_")
+    ? Number(error.diagnostic.slice("response_transient_".length)) : undefined;
+}
+
+/** A transient status is refused here; the caller's retry decides whether to send again. */
+function refuseTransient(response: Response): void {
+  if (response.redirected || !transientHttpClassification(response.status)) return;
+  void response.body?.cancel().catch(() => undefined);
+  throw unavailable(`response_transient_${response.status}`);
+}
+
+/** Why a JSON answer is not acceptable: its status, a missing body, or its content type. */
+function jsonRefusal(response: Response): string {
+  if (!response.ok || response.redirected) return "response_status_invalid";
+  return response.body ? "response_content_type_invalid" : "response_body_missing";
+}
+
+/** A Git bundle of exactly the expected revision, within the bundle limit when its length is declared. */
+function bundleResponse(response: Response, revision: string): boolean {
+  const contentLength = Number(response.headers.get("content-length"));
+  return response.ok && !response.redirected && mediaType(response) === "application/x-git-bundle" &&
+    response.headers.get("x-konteks-revision") === revision && response.body !== null &&
+    !(Number.isFinite(contentLength) && contentLength > REMOTE_REPOSITORY_BUNDLE_MAX_BYTES);
+}
+
+/** The whole body, refusing more than `maxBytes`; a read cut by the deadline says so. */
+async function readAll(reader: ReadableStreamDefaultReader<Uint8Array>, signal: AbortSignal, maxBytes: number): Promise<Buffer> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await abortable(reader.read(), signal, () => unavailable("request_deadline"));
+    } catch {
+      throw unavailable(signal.aborted ? "request_deadline" : "response_body_read_failed");
+    }
+    if (chunk.done) return Buffer.concat(chunks);
+    size += chunk.value.byteLength;
+    if (size > maxBytes) throw unavailable("response_body_too_large");
+    chunks.push(chunk.value);
+  }
+}
+
+/** SystemClock learns Core time from HTTP Date; an envelope outside its window, or the assignment's, is refused. */
+function envelopeWindowRefusal(envelope: RemoteAssignmentInputsEnvelope, assignment: RemoteWorkAssignment, now: number): string | null {
+  if (!Number.isFinite(now)) return "clock_invalid";
+  if (Date.parse(envelope.issuedAt) > now + CORE_HTTP_DATE_UNCERTAINTY_MS) return "envelope_issued_future";
+  if (Date.parse(envelope.expiresAt) <= now) return "envelope_expired";
+  if (Date.parse(envelope.expiresAt) > Date.parse(assignment.expiresAt)) return "envelope_exceeds_assignment";
+  return null;
+}
+
+/** The envelope must name this claim, this assignment's binding, and its source revision. */
+function envelopeBindingRefusal(envelope: RemoteAssignmentInputsEnvelope, assignment: RemoteWorkAssignment, claimId: string): string | null {
+  if (envelope.selection.claimId !== claimId) return "envelope_claim_mismatch";
+  if (!bindingMatchesAssignment(envelope.selection.binding, assignment)) return "envelope_binding_mismatch";
+  const revision = sourceRevision(assignment);
+  if (revision !== undefined && revision !== envelope.selection.source.revision) return "envelope_source_revision_mismatch";
+  return null;
+}
+
+function bindingMatchesAssignment(binding: RemoteAssignmentInputsEnvelope["selection"]["binding"], assignment: RemoteWorkAssignment): boolean {
+  const continued = continuedSession(assignment.source);
+  return allEqual([
+    [binding.instanceId, assignment.instanceId],
+    [binding.workspaceId, assignment.workspaceId],
+    [binding.assignmentId, assignment.id],
+    [binding.attempt, assignment.attempt],
+  ]) && (continued === null || binding.sessionId === continued.sessionId);
 }
