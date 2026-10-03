@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   RemoteInstanceError,
+  allEqual,
   type RemoteAuthorizedOperation,
   type RemoteExecutionOperationPermitClaims,
   ClaimResultSchema,
@@ -197,21 +198,38 @@ export class WorkOrchestrator {
   /** Resolve existing original ownership; absent maps never establish authority. */
   capturePendingClaimAuthority(admission: LocalAdmission): () => void {
     const key = `${admission.assignmentId}:${admission.attempt}`;
-    const original = this.pendingClaimFences.get(key), assignment = this.pendingClaims.get(key);
-    const start = this.deps.journal.execution.start(admission.assignmentId, admission.attempt);
-    const current = this.deps.journal.assignments.get(key);
-    if (!original || !assignment || !start || !current || this.recoveryFences.has(key) ||
-      jcsDigest(start.admission) !== jcsDigest(admission) || admission.runnerIncarnation !== this.deps.runnerIncarnation?.() ||
-      assignment.instanceId !== admission.instanceId || assignment.workspaceId !== admission.workspaceId || assignment.agentRoute.agentId !== admission.agentId ||
-      jcsDigest(current as JsonValue) !== jcsDigest(this.journalEntry(assignment, admission.claimId, "claimed", start.projectionCreatedAt, start.evidenceUpload) as JsonValue)) {
+    const original = this.pendingClaimFences.get(key);
+    const retained = this.retainedClaim(key, admission);
+    if (!original || !retained || !this.claimMatchesAdmission(retained, admission)) {
       this.fenceLostAuthority(key);
       throw new RemoteInstanceError("recovery_required", "Retained claim has no matching original local owner.");
     }
     const assertOriginal = () => {
       original(); this.requireNativeOwner(); this.deps.journal.execution.assertAdmission(admission);
-      if (this.recoveryFences.has(key) || admission.instanceId !== this.deps.instanceId() || admission.workspaceId !== this.deps.workspaceId() || admission.runnerIncarnation !== this.deps.runnerIncarnation?.()) throw new RemoteInstanceError("recovery_required", "Claim owner scope changed or its execution was fenced.");
+      if (this.recoveryFences.has(key) || !this.inOwnScope(admission)) throw new RemoteInstanceError("recovery_required", "Claim owner scope changed or its execution was fenced.");
     };
     assertOriginal(); return assertOriginal;
+  }
+
+  /** The pending claim's assignment, start and row, while none of them is missing or fenced. */
+  private retainedClaim(key: string, admission: LocalAdmission): RetainedClaim | null {
+    const assignment = this.pendingClaims.get(key);
+    const start = this.deps.journal.execution.start(admission.assignmentId, admission.attempt);
+    const current = this.deps.journal.assignments.get(key);
+    if (!assignment || !start || !current || this.recoveryFences.has(key)) return null;
+    return { assignment, start, current };
+  }
+
+  /** The admission is the one this process started, for the pending assignment, and its row is still the initial claimed one. */
+  private claimMatchesAdmission({ assignment, start, current }: RetainedClaim, admission: LocalAdmission): boolean {
+    return jcsDigest(start.admission) === jcsDigest(admission) && admission.runnerIncarnation === this.deps.runnerIncarnation?.() &&
+      allEqual([[assignment.instanceId, admission.instanceId], [assignment.workspaceId, admission.workspaceId], [assignment.agentRoute.agentId, admission.agentId]]) &&
+      jcsDigest(current as JsonValue) === jcsDigest(this.journalEntry(assignment, admission.claimId, "claimed", start.projectionCreatedAt, start.evidenceUpload) as JsonValue);
+  }
+
+  /** The admission belongs to this instance, workspace and runner incarnation. */
+  private inOwnScope(admission: LocalAdmission): boolean {
+    return admission.instanceId === this.deps.instanceId() && admission.workspaceId === this.deps.workspaceId() && admission.runnerIncarnation === this.deps.runnerIncarnation?.();
   }
 
   /** The pull gate: active lease, not draining, reconciliation done, headroom. */
@@ -265,25 +283,36 @@ export class WorkOrchestrator {
   validate(assignment: RemoteWorkAssignment): ClaimRejection | null {
     const gate = this.canPull();
     if (gate !== null) return gate;
-    if (isSearchAssignment(assignment) && !this.deps.searchController) return "unknown_kind";
+    for (const [refused, rejection] of this.claimChecks) if (refused(assignment)) return rejection;
+    return null;
+  }
+
+  /** The closed refusal list, in the order the first applicable reason is reported. */
+  private readonly claimChecks: ReadonlyArray<readonly [(assignment: RemoteWorkAssignment) => boolean, ClaimRejection]> = [
+    [assignment => isSearchAssignment(assignment) && !this.deps.searchController, "unknown_kind"],
     // A runtime without the onboard lane composed cannot serve either onboard
     // work kind, whatever Core placed. Refusing here is the same answer as
     // never having advertised the role.
-    if (isOnboardWorkAssignment(assignment) && !this.deps.onboardCarrier) return "unknown_kind";
-    if (assignment.kind === "integration" && (!this.deps.integrationCarrier || !isIntegrationWorkAssignment(assignment))) return "unknown_kind";
-    if (this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) return "stale_attempt";
-    if (this.deps.journal.execution.isCancelled(assignment.id, assignment.attempt)) return "stale_attempt";
-    if (!this.deps.acceptedKinds().includes(assignment.kind)) return "unknown_kind";
-    if (assignment.instanceId !== this.deps.instanceId()) return "instance_mismatch";
-    if (assignment.workspaceId !== this.deps.workspaceId()) return "workspace_mismatch";
+    [assignment => isOnboardWorkAssignment(assignment) && !this.deps.onboardCarrier, "unknown_kind"],
+    [assignment => assignment.kind === "integration" && (!this.deps.integrationCarrier || !isIntegrationWorkAssignment(assignment)), "unknown_kind"],
+    [assignment => this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`), "stale_attempt"],
+    [assignment => this.deps.journal.execution.isCancelled(assignment.id, assignment.attempt), "stale_attempt"],
+    [assignment => !this.deps.acceptedKinds().includes(assignment.kind), "unknown_kind"],
+    [assignment => assignment.instanceId !== this.deps.instanceId(), "instance_mismatch"],
+    [assignment => assignment.workspaceId !== this.deps.workspaceId(), "workspace_mismatch"],
+    [assignment => this.staleAttempt(assignment), "stale_attempt"],
+    [assignment => parseRfc3339(assignment.expiresAt) <= this.deps.clock.coreNow(), "expired"],
+    [assignment => assignment.source.kind === "harness_task_checkout" && assignment.source.ownerInstanceId !== this.deps.instanceId(), "checkout_owned_elsewhere"],
+    [assignment => !this.deps.advertisedRoles().includes(assignment.agentRoute.requiredRole), "role_not_advertised"],
+    [assignment => !placedAgentReady(this.deps.agents(), assignment.agentRoute.agentId, assignment.agentRoute.requiredRole, this.roleCapabilityInputs()), "agent_unavailable"],
+  ];
+
+  /** A later attempt exists, or this attempt is already live here. */
+  private staleAttempt(assignment: RemoteWorkAssignment): boolean {
     const latest = this.deps.journal.latestAttempt(assignment.id);
-    if (latest && latest.attempt > assignment.attempt) return "stale_attempt";
-    if (latest && latest.attempt === assignment.attempt && latest.state !== "recovery_required" && latest.state !== "cancelled") return "stale_attempt";
-    if (parseRfc3339(assignment.expiresAt) <= this.deps.clock.coreNow()) return "expired";
-    if (assignment.source.kind === "harness_task_checkout" && assignment.source.ownerInstanceId !== this.deps.instanceId()) return "checkout_owned_elsewhere";
-    if (!this.deps.advertisedRoles().includes(assignment.agentRoute.requiredRole)) return "role_not_advertised";
-    if (!placedAgentReady(this.deps.agents(), assignment.agentRoute.agentId, assignment.agentRoute.requiredRole, this.roleCapabilityInputs())) return "agent_unavailable";
-    return null;
+    if (!latest) return false;
+    if (latest.attempt > assignment.attempt) return true;
+    return latest.attempt === assignment.attempt && latest.state !== "recovery_required" && latest.state !== "cancelled";
   }
 
   private roleCapabilityInputs(): RoleCapabilityInputs {
@@ -295,23 +324,40 @@ export class WorkOrchestrator {
     if (!reference) {
       const directive = CancelDirectiveSchema.safeParse(body);
       if (directive.success) return this.onCancel(directive.data);
+      if (this.deps.assignmentSender) throw new RemoteInstanceError("assignment_channel_invalid", "D143 domain replies require their retained operation reference.");
+    } else if (await this.settledByRetainedReply(body, reference)) return;
+    return this.routeDomainReply(body, reference);
+  }
+
+  /**
+   * A reply to a retained operation must be exactly the durable reply. A
+   * claim refused (or claimed by another canonical claim) and a refused pull
+   * end here; true when the reply needs nothing more.
+   */
+  private async settledByRetainedReply(body: unknown, reference: AssignmentRequestReference): Promise<boolean> {
+    const workspaceId = this.deps.workspaceId();
+    const receipt = workspaceId ? this.deps.journal.assignmentStream.replyForRequest({ instanceId: this.deps.instanceId(), workspaceId }, reference) : undefined;
+    if (!receipt || jcsDigest(receipt.frame.body.body as JsonValue) !== jcsDigest(body as JsonValue)) throw new RemoteInstanceError("recovery_required", "Domain reply differs from its retained operation.");
+    if (receipt.frame.body.requestKind === "claim" && this.nonDispatchingClaim(receipt.frame.body.body, reference, workspaceId!)) {
+      await this.onClaimNonDispatch(reference);
+      return true;
     }
-    if (this.deps.assignmentSender && !reference) throw new RemoteInstanceError("assignment_channel_invalid", "D143 domain replies require their retained operation reference.");
-    if (reference) {
-      const workspaceId = this.deps.workspaceId();
-      const receipt = workspaceId ? this.deps.journal.assignmentStream.replyForRequest({ instanceId: this.deps.instanceId(), workspaceId }, reference) : undefined;
-      if (!receipt || jcsDigest(receipt.frame.body.body as JsonValue) !== jcsDigest(body as JsonValue)) throw new RemoteInstanceError("recovery_required", "Domain reply differs from its retained operation.");
-      if (receipt.frame.body.requestKind === "claim") {
-        const request = this.deps.journal.assignmentStream.request({ instanceId: this.deps.instanceId(), workspaceId: workspaceId! }, reference.requestSequence);
-        const verdict = receipt.frame.body.body;
-        if ("kind" in verdict || (verdict.outcome === "already_claimed" && verdict.claimId !== request?.admission?.claimId)) return this.onClaimNonDispatch(reference);
-      }
-      if (receipt.frame.body.requestKind === "pull" && "kind" in receipt.frame.body.body) {
-        if (receipt.frame.body.body.kind === "request_obsolete") throw new RemoteInstanceError("reconciliation_replay", "Pull origin was superseded; current recovery is required.");
-        this.logger.info({ reason: receipt.frame.body.body.reason }, "Core refused the pull; no assignments were admitted");
-        return;
-      }
+    if (receipt.frame.body.requestKind === "pull" && "kind" in receipt.frame.body.body) {
+      refusedPull(receipt.frame.body.body, this.logger);
+      return true;
     }
+    return false;
+  }
+
+  /** A refusal, or an `already_claimed` naming another canonical claim than this admission's. */
+  private nonDispatchingClaim(verdict: object, reference: AssignmentRequestReference, workspaceId: string): boolean {
+    if ("kind" in verdict) return true;
+    const request = this.deps.journal.assignmentStream.request({ instanceId: this.deps.instanceId(), workspaceId }, reference.requestSequence);
+    const claim = verdict as { outcome?: unknown; claimId?: unknown };
+    return claim.outcome === "already_claimed" && claim.claimId !== request?.admission?.claimId;
+  }
+
+  private async routeDomainReply(body: unknown, reference: AssignmentRequestReference | undefined): Promise<void> {
     const work = WorkAvailableSchema.safeParse(body);
     if (work.success) return this.onWorkAvailable(work.data.assignments);
     const claim = ClaimResultSchema.safeParse(body);
@@ -324,71 +370,92 @@ export class WorkOrchestrator {
   }
 
   private async onWorkAvailable(assignments: unknown[]): Promise<void> {
-    for (const raw of assignments) {
-      const parsed = RemoteWorkAssignmentSchema.safeParse(raw);
-      if (!parsed.success) {
-        this.counters.unknown_kind += 1;
-        continue;
-      }
-      const assignment = parsed.data;
-      if (isSearchAssignment(assignment) && !this.deps.searchController) {
-        throw new RemoteInstanceError("recovery_required", "Search assignment arrived without its dedicated controller boundary.");
-      }
-      const retained = this.deps.journal.execution.start(assignment.id, assignment.attempt);
-      if (retained) {
-        if (jcsDigest(withoutDisplayLabel(retained.assignment) as JsonValue) !== jcsDigest(withoutDisplayLabel(assignment) as JsonValue)) throw new RemoteInstanceError("recovery_required", "Retained admission assignment changed.");
-        await this.reconstructAdmissionProjections(assignment.id, assignment.attempt);
-        continue; // Repair is never transport or execution authority.
-      }
-      const rejection = this.validate(assignment);
-      if (rejection !== null) {
-        this.counters[rejection] += 1;
-        this.logger.info({ assignmentId: assignment.id, rejection }, "assignment not claimed");
-        continue;
-      }
-      if (this.pendingClaims.has(`${assignment.id}:${assignment.attempt}`)) continue;
-      const claim: AssignmentClaim = { assignmentId: assignment.id, attempt: assignment.attempt, claimId: randomUUID(), agentId: assignment.agentRoute.agentId };
-      const assertAuthority = this.captureNativeAuthority(assignment.id, assignment.attempt);
-      const incarnation = this.deps.runnerIncarnation?.();
-      const assertCurrent = () => {
-        assertAuthority();
-        this.requireNativeOwner();
-        if (incarnation !== this.deps.runnerIncarnation?.() || assignment.instanceId !== this.deps.instanceId() || assignment.workspaceId !== this.deps.workspaceId() || this.canPull() !== null || this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) throw new RemoteInstanceError("recovery_required", "Claim admission authority changed.");
-      };
-      await this.serializeAdmissionSetup(`${assignment.id}:${assignment.attempt}`, async () => {
-        assertCurrent();
-        await this.deps.journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1,
-          admission: { instanceId: assignment.instanceId, workspaceId: assignment.workspaceId, runnerIncarnation: incarnation, assignmentId: assignment.id, attempt: assignment.attempt, claimId: claim.claimId, agentId: claim.agentId, executionGeneration: randomUUID(), openedAt: this.deps.clock.nowIso() },
-          assignment, evidenceUpload: intersectEvidencePolicy(this.deps.instanceEvidencePolicy(), assignment.policy.evidenceUpload), projectionCreatedAt: this.deps.clock.nowIso(), claimCreatedAt: this.deps.clock.nowIso(),
-        }, assertCurrent);
-        assertCurrent();
-        await this.reconstructAdmissionProjectionsOwned(assignment.id, assignment.attempt, assertCurrent);
-        assertCurrent();
-        const start = this.deps.journal.execution.start(assignment.id, assignment.attempt)!;
-        const observability = createRuntimeAdmissionObservabilityContext({
-          runtimeIncarnationId: start.admission.runnerIncarnation,
-          assignmentId: start.admission.assignmentId,
-          attempt: start.admission.attempt,
-          claimId: start.admission.claimId,
-          executionId: start.admission.executionGeneration,
-        });
-        this.logger.info({ event: "runtime.admission.durable", observability }, "native claim admission persisted");
-        const initial = this.journalEntry(assignment, claim.claimId, "claimed", start.projectionCreatedAt, start.evidenceUpload);
-        const assertPrepared = () => {
-          assertCurrent();
-          const current = this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`);
-          const queued = this.deps.outbox.all("assignment").find(item => item.id === claim.claimId);
-          if (!current || jcsDigest(current as JsonValue) !== jcsDigest(initial as JsonValue) || !queued || queued.key !== `claim:${assignment.id}:${assignment.attempt}` || queued.createdAt !== start.claimCreatedAt || jcsDigest(queued.body as JsonValue) !== jcsDigest(claim as JsonValue)) throw new RemoteInstanceError("recovery_required", "Claim projections no longer prove initial prepared admission.");
-        };
-        if (this.deps.assignmentSender) await this.deps.assignmentSender.prepareClaim(start.admission, assertPrepared);
-        else await this.deps.journal.execution.reserveAllocation(start.admission, assertPrepared);
-        this.pendingClaims.set(`${assignment.id}:${assignment.attempt}`, assignment);
-        this.pendingClaimFences.set(`${assignment.id}:${assignment.attempt}`, assertAuthority);
-        assertPrepared();
-        if (this.deps.assignmentSender) this.deps.assignmentSender.scheduleRetained(message => { assertAuthority(); this.deps.transport.send(message); });
-        else this.deps.transport.send({ channel: "assignment", channelId: coreChannelId("assignment", this.deps.instanceId()), body: claim });
-      });
+    for (const raw of assignments) await this.admitOffered(raw);
+  }
+
+  private async admitOffered(raw: unknown): Promise<void> {
+    const parsed = RemoteWorkAssignmentSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.counters.unknown_kind += 1;
+      return;
     }
+    const assignment = parsed.data;
+    if (isSearchAssignment(assignment) && !this.deps.searchController) {
+      throw new RemoteInstanceError("recovery_required", "Search assignment arrived without its dedicated controller boundary.");
+    }
+    const retained = this.deps.journal.execution.start(assignment.id, assignment.attempt);
+    // Repair is never transport or execution authority.
+    if (retained) return this.repairRetained(assignment, retained.assignment);
+    const rejection = this.validate(assignment);
+    if (rejection !== null) {
+      this.counters[rejection] += 1;
+      this.logger.info({ assignmentId: assignment.id, rejection }, "assignment not claimed");
+      return;
+    }
+    if (this.pendingClaims.has(`${assignment.id}:${assignment.attempt}`)) return;
+    await this.admitClaim(assignment);
+  }
+
+  private async repairRetained(assignment: RemoteWorkAssignment, retained: RemoteWorkAssignment): Promise<void> {
+    if (jcsDigest(withoutDisplayLabel(retained) as JsonValue) !== jcsDigest(withoutDisplayLabel(assignment) as JsonValue)) throw new RemoteInstanceError("recovery_required", "Retained admission assignment changed.");
+    await this.reconstructAdmissionProjections(assignment.id, assignment.attempt);
+  }
+
+  /** Durably admit and claim an offered assignment under the authority captured now. */
+  private async admitClaim(assignment: RemoteWorkAssignment): Promise<void> {
+    const claim: AssignmentClaim = { assignmentId: assignment.id, attempt: assignment.attempt, claimId: randomUUID(), agentId: assignment.agentRoute.agentId };
+    const assertAuthority = this.captureNativeAuthority(assignment.id, assignment.attempt);
+    const incarnation = this.deps.runnerIncarnation?.();
+    const assertCurrent = () => {
+      assertAuthority();
+      this.requireNativeOwner();
+      if (incarnation !== this.deps.runnerIncarnation?.() || assignment.instanceId !== this.deps.instanceId() || assignment.workspaceId !== this.deps.workspaceId() || this.canPull() !== null || this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) throw new RemoteInstanceError("recovery_required", "Claim admission authority changed.");
+    };
+    await this.serializeAdmissionSetup(`${assignment.id}:${assignment.attempt}`, () => this.persistClaim({ assignment, claim, incarnation, assertAuthority, assertCurrent }));
+  }
+
+  private async persistClaim({ assignment, claim, incarnation, assertAuthority, assertCurrent }: ClaimAdmission): Promise<void> {
+    assertCurrent();
+    await this.deps.journal.execution.beginAdmission({ schemaVersion: 1, mandatoryOpenVersion: 1,
+      admission: { instanceId: assignment.instanceId, workspaceId: assignment.workspaceId, runnerIncarnation: incarnation, assignmentId: assignment.id, attempt: assignment.attempt, claimId: claim.claimId, agentId: claim.agentId, executionGeneration: randomUUID(), openedAt: this.deps.clock.nowIso() },
+      assignment, evidenceUpload: intersectEvidencePolicy(this.deps.instanceEvidencePolicy(), assignment.policy.evidenceUpload), projectionCreatedAt: this.deps.clock.nowIso(), claimCreatedAt: this.deps.clock.nowIso(),
+    }, assertCurrent);
+    assertCurrent();
+    await this.reconstructAdmissionProjectionsOwned(assignment.id, assignment.attempt, assertCurrent);
+    assertCurrent();
+    const start = this.deps.journal.execution.start(assignment.id, assignment.attempt)!;
+    this.logAdmission(start.admission);
+    const initial = this.journalEntry(assignment, claim.claimId, "claimed", start.projectionCreatedAt, start.evidenceUpload);
+    const assertPrepared = () => {
+      assertCurrent();
+      if (!this.initialClaimProjected(assignment, claim, initial, start.claimCreatedAt)) throw new RemoteInstanceError("recovery_required", "Claim projections no longer prove initial prepared admission.");
+    };
+    if (this.deps.assignmentSender) await this.deps.assignmentSender.prepareClaim(start.admission, assertPrepared);
+    else await this.deps.journal.execution.reserveAllocation(start.admission, assertPrepared);
+    this.pendingClaims.set(`${assignment.id}:${assignment.attempt}`, assignment);
+    this.pendingClaimFences.set(`${assignment.id}:${assignment.attempt}`, assertAuthority);
+    assertPrepared();
+    if (this.deps.assignmentSender) this.deps.assignmentSender.scheduleRetained(message => { assertAuthority(); this.deps.transport.send(message); });
+    else this.deps.transport.send({ channel: "assignment", channelId: coreChannelId("assignment", this.deps.instanceId()), body: claim });
+  }
+
+  private logAdmission(admission: LocalAdmission): void {
+    const observability = createRuntimeAdmissionObservabilityContext({
+      runtimeIncarnationId: admission.runnerIncarnation,
+      assignmentId: admission.assignmentId,
+      attempt: admission.attempt,
+      claimId: admission.claimId,
+      executionId: admission.executionGeneration,
+    });
+    this.logger.info({ event: "runtime.admission.durable", observability }, "native claim admission persisted");
+  }
+
+  /** The assignment row is still the initial claimed one and the claim is queued exactly as admitted. */
+  private initialClaimProjected(assignment: RemoteWorkAssignment, claim: AssignmentClaim, initial: JournalEntry, claimCreatedAt: string): boolean {
+    const current = this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`);
+    const queued = this.deps.outbox.all("assignment").find(item => item.id === claim.claimId);
+    return current !== undefined && jcsDigest(current as JsonValue) === jcsDigest(initial as JsonValue) && queued !== undefined &&
+      allEqual([[queued.key, `claim:${assignment.id}:${assignment.attempt}`], [queued.createdAt, claimCreatedAt]]) && jcsDigest(queued.body as JsonValue) === jcsDigest(claim as JsonValue);
   }
 
   /** Rebuild only provably missing projections; this never enrolls a pending callback or sends work. */
@@ -408,8 +475,28 @@ export class WorkOrchestrator {
   private async reconstructAdmissionProjectionsOwned(assignmentId: string, attempt: number, assertContinuation: () => void = () => undefined): Promise<void> {
     const start = this.deps.journal.execution.start(assignmentId, attempt);
     if (!start) throw new RemoteInstanceError("recovery_required", "No complete admission-start projection source.");
+    const check = this.projectionRepairCheck(start, assertContinuation);
+    check();
+    const key = `${assignmentId}:${attempt}`;
+    const initial = this.journalEntry(start.assignment, start.admission.claimId, "claimed", start.projectionCreatedAt, start.evidenceUpload);
+    const existing = this.deps.journal.assignments.get(key);
+    if (existing) verifyProjection(existing, initial);
+    if (!existing && start.delivery === "allocation_reserved") throw new RemoteInstanceError("recovery_required", "Reserved admission has unknown assignment projection history.");
+    await this.repairClaimOutbox(start, existing, initial, check);
+    await this.deps.journal.assignments.update(key, current => {
+      check();
+      if (current) { verifyProjection(current, initial); return current; }
+      if (start.delivery !== "unallocated") throw new RemoteInstanceError("recovery_required", "Unknown reserved assignment history.");
+      return initial;
+    });
+    check();
+  }
+
+  /** Repair ownership: the same runner incarnation and scope, the admission current and its start unchanged. */
+  private projectionRepairCheck(start: AdmissionStart, assertContinuation: () => void): () => void {
     const incarnation = this.deps.runnerIncarnation?.();
-    const check = () => {
+    const { assignmentId, attempt } = start.admission;
+    return () => {
       assertContinuation();
       this.requireNativeOwner();
       if (incarnation !== this.deps.runnerIncarnation?.() || start.admission.instanceId !== this.deps.instanceId() || start.admission.workspaceId !== this.deps.workspaceId()) throw new RemoteInstanceError("recovery_required", "Projection repair ownership changed.");
@@ -417,38 +504,21 @@ export class WorkOrchestrator {
       const current = this.deps.journal.execution.start(assignmentId, attempt);
       if (!current || jcsDigest(current as JsonValue) !== jcsDigest(start as JsonValue)) throw new RemoteInstanceError("recovery_required", "Complete admission changed during projection repair.");
     };
-    check();
-    const { assignment, admission } = start;
+  }
+
+  /** The admitted claim's outbox item: verified when present, queued again only for an unallocated, still-initial admission. */
+  private async repairClaimOutbox(start: AdmissionStart, existing: JournalEntry | undefined, initial: JournalEntry, check: () => void): Promise<void> {
+    const { assignmentId, attempt, claimId, agentId } = start.admission;
     const key = `${assignmentId}:${attempt}`;
-    const initial = this.journalEntry(assignment, admission.claimId, "claimed", start.projectionCreatedAt, start.evidenceUpload);
-    const verify = (entry: JournalEntry) => {
-      for (const field of ["assignmentId", "attempt", "claimId", "kind", "placementId", "workspaceId", "agentId", "evidenceUpload", "expiresAt", "latestResumeAt"] as const) {
-        if (entry[field] !== initial[field]) throw new RemoteInstanceError("recovery_required", "Existing projection identity conflicts with complete admission.");
-      }
-    };
-    const existing = this.deps.journal.assignments.get(key);
-    if (existing) verify(existing);
-    if (!existing && start.delivery === "allocation_reserved") throw new RemoteInstanceError("recovery_required", "Reserved admission has unknown assignment projection history.");
-    const claim: AssignmentClaim = { assignmentId, attempt, claimId: admission.claimId, agentId: admission.agentId };
-    const expected = { id: admission.claimId, channel: "assignment" as const, key: `claim:${key}`, group: `claim:${key}`, order: 0, body: claim, createdAt: start.claimCreatedAt };
-    const verifyOutbox = (item: ReturnType<DurableOutbox["all"]>[number]) => {
-      const { attempts: _attempts, lastAttemptAt: _lastAttemptAt, ...identity } = item;
-      if (jcsDigest(identity as JsonValue) !== jcsDigest(expected as JsonValue)) throw new RemoteInstanceError("recovery_required", "Existing claim outbox conflicts with complete admission.");
-    };
+    const claim: AssignmentClaim = { assignmentId, attempt, claimId, agentId };
+    const expected = { id: claimId, channel: "assignment" as const, key: `claim:${key}`, group: `claim:${key}`, order: 0, body: claim, createdAt: start.claimCreatedAt };
     const priorItems = this.deps.outbox.all().filter(item => item.key === expected.key || item.id === expected.id);
-    for (const item of priorItems) verifyOutbox(item);
+    for (const item of priorItems) verifyClaimOutbox(item, expected);
     const initialOnly = !existing || jcsDigest(existing as JsonValue) === jcsDigest(initial as JsonValue);
     if (!priorItems.length && start.delivery === "unallocated" && initialOnly) {
-      verifyOutbox(await this.deps.outbox.enqueue(expected));
+      verifyClaimOutbox(await this.deps.outbox.enqueue(expected), expected);
       check();
     }
-    await this.deps.journal.assignments.update(key, current => {
-      check();
-      if (current) { verify(current); return current; }
-      if (start.delivery !== "unallocated") throw new RemoteInstanceError("recovery_required", "Unknown reserved assignment history.");
-      return initial;
-    });
-    check();
   }
 
   private journalEntry(assignment: RemoteWorkAssignment, claimId: string, state: JournalEntry["state"], createdAt = this.deps.clock.nowIso(), evidenceUpload = intersectEvidencePolicy(this.deps.instanceEvidencePolicy(), assignment.policy.evidenceUpload)): JournalEntry {
@@ -473,77 +543,130 @@ export class WorkOrchestrator {
 
   private async onClaimResult(result: ClaimResult, reference?: AssignmentRequestReference): Promise<void> {
     const key = `${result.assignmentId}:${result.attempt}`;
-    const unhandled = () => {
-      if (this.deps.assignmentSender) {
-        this.fenceLostAuthority(key);
-        throw new RemoteInstanceError("recovery_required", "Claim effect has no exact current pending admission owner.");
-      }
-    };
-    if (this.deps.journal.execution.isCancelled(result.assignmentId, result.attempt) || this.recoveryFences.has(key)) return unhandled();
-    const assignment = this.pendingClaims.get(key);
-    let entry = this.deps.journal.assignments.get(key);
-    if (!assignment || !entry || entry.claimId !== result.claimId) {
-      if (result.outcome === "claimed") this.logger.warn({ assignmentId: result.assignmentId }, "claim result for an unknown pending claim");
-      return unhandled();
-    }
-    const assertAuthority = this.pendingClaimFences.get(key);
-    if (!assertAuthority) { this.fenceLostAuthority(key); throw new RemoteInstanceError("recovery_required", "Pending claim has no original accepted generation."); }
+    const pending = this.pendingClaimFor(key, result);
+    if (!pending) return;
+    const { assignment, assertAuthority } = pending;
     assertAuthority();
     this.requireNativeOwner();
-    const admission = this.deps.journal.execution.admission(result.assignmentId, result.attempt);
-    if (!admission || admission.claimId !== result.claimId || admission.instanceId !== assignment.instanceId || admission.workspaceId !== assignment.workspaceId || admission.agentId !== assignment.agentRoute.agentId || admission.runnerIncarnation !== this.deps.runnerIncarnation?.()) return unhandled();
-    this.deps.journal.execution.assertAdmission(admission);
-    const start = this.deps.journal.execution.start(result.assignmentId, result.attempt);
-    if (start && (this.deps.assignmentSender ? start.delivery !== "allocated" || !reference ||
-      jcsDigest(start.allocation as JsonValue) !== jcsDigest(reference) || start.claimEffect?.state !== "applying" : start.delivery !== "allocation_reserved")) return unhandled();
-    if (this.deps.assignmentSender && !start) return unhandled();
+    if (!this.claimResultAdmitted(result, assignment, reference)) return this.unhandledClaim(key);
     // Retire only the correlated claim, not all items sharing its assignment key.
     await this.deps.outbox.ack(result.claimId);
     assertAuthority();
-    if (this.deps.journal.execution.isCancelled(result.assignmentId, result.attempt) || this.recoveryFences.has(key) || this.pendingClaims.get(key) !== assignment || this.deps.journal.assignments.get(key)?.claimId !== result.claimId) return unhandled();
-    entry = this.deps.journal.assignments.get(key)!;
-    const retirePending = () => { this.pendingClaims.delete(key); this.pendingClaimFences.delete(key); };
-    if (entry.reports.terminalSequence !== undefined || !["claimed", "running", "checkpointed"].includes(entry.state)) { unhandled(); retirePending(); return; }
-    switch (result.outcome) {
+    const entry = this.stillPendingEntry(key, result, assignment);
+    if (!entry) return this.unhandledClaim(key);
+    if (!claimableState(entry)) {
+      this.unhandledClaim(key);
+      this.retirePending(key);
+      return;
+    }
+    return this.applyClaimOutcome({ key, result, assignment, entry, assertAuthority });
+  }
+
+  /**
+   * A claim effect needs an exact current pending admission owner. Without a
+   * retained sender a stray result is just ignored; with one it fences the
+   * claim for recovery.
+   */
+  private unhandledClaim(key: string): void {
+    if (!this.deps.assignmentSender) return;
+    this.fenceLostAuthority(key);
+    throw new RemoteInstanceError("recovery_required", "Claim effect has no exact current pending admission owner.");
+  }
+
+  /** The pending claim this result answers, with its original fence; null when the result is not this process's to apply. */
+  private pendingClaimFor(key: string, result: ClaimResult): { assignment: RemoteWorkAssignment; assertAuthority: () => void } | null {
+    if (this.deps.journal.execution.isCancelled(result.assignmentId, result.attempt) || this.recoveryFences.has(key)) return this.unhandledClaimNull(key);
+    const assignment = this.pendingClaims.get(key);
+    const entry = this.deps.journal.assignments.get(key);
+    if (!assignment || !entry || entry.claimId !== result.claimId) {
+      if (result.outcome === "claimed") this.logger.warn({ assignmentId: result.assignmentId }, "claim result for an unknown pending claim");
+      return this.unhandledClaimNull(key);
+    }
+    const assertAuthority = this.pendingClaimFences.get(key);
+    if (!assertAuthority) { this.fenceLostAuthority(key); throw new RemoteInstanceError("recovery_required", "Pending claim has no original accepted generation."); }
+    return { assignment, assertAuthority };
+  }
+
+  private unhandledClaimNull(key: string): null {
+    this.unhandledClaim(key);
+    return null;
+  }
+
+  /** The result names this process's current admission of the pending assignment, and its start allows the claim effect. */
+  private claimResultAdmitted(result: ClaimResult, assignment: RemoteWorkAssignment, reference: AssignmentRequestReference | undefined): boolean {
+    const admission = this.deps.journal.execution.admission(result.assignmentId, result.attempt);
+    if (!admission || !allEqual([[admission.claimId, result.claimId], [admission.instanceId, assignment.instanceId], [admission.workspaceId, assignment.workspaceId],
+      [admission.agentId, assignment.agentRoute.agentId], [admission.runnerIncarnation, this.deps.runnerIncarnation?.()]])) return false;
+    this.deps.journal.execution.assertAdmission(admission);
+    return this.startAllowsClaimEffect(this.deps.journal.execution.start(result.assignmentId, result.attempt), reference);
+  }
+
+  /** With a retained sender: an allocated start applying exactly this claim reply. Without one: a reserved allocation (or no start). */
+  private startAllowsClaimEffect(start: AdmissionStart | undefined, reference: AssignmentRequestReference | undefined): boolean {
+    if (!start) return !this.deps.assignmentSender;
+    if (!this.deps.assignmentSender) return start.delivery === "allocation_reserved";
+    return start.delivery === "allocated" && reference !== undefined && jcsDigest(start.allocation as JsonValue) === jcsDigest(reference) && start.claimEffect?.state === "applying";
+  }
+
+  /** The row still belongs to the pending claim after the outbox acknowledgement. */
+  private stillPendingEntry(key: string, result: ClaimResult, assignment: RemoteWorkAssignment): JournalEntry | undefined {
+    if (this.deps.journal.execution.isCancelled(result.assignmentId, result.attempt) || this.recoveryFences.has(key) || this.pendingClaims.get(key) !== assignment) return undefined;
+    const entry = this.deps.journal.assignments.get(key);
+    return entry?.claimId === result.claimId ? entry : undefined;
+  }
+
+  private retirePending(key: string): void {
+    this.pendingClaims.delete(key);
+    this.pendingClaimFences.delete(key);
+  }
+
+  private async applyClaimOutcome(claimed: PendingClaimResult): Promise<void> {
+    switch (claimed.result.outcome) {
       case "claimed":
       case "already_claimed":
-        retirePending();
-        if (isSearchAssignment(assignment)) {
-          if (!this.deps.searchController) throw new RemoteInstanceError("recovery_required", "Search controller boundary became unavailable.");
-          const start = this.deps.journal.execution.start(assignment.id, assignment.attempt);
-          if (!start) throw new RemoteInstanceError("recovery_required", "Search claim lost its durable admission.");
-          await this.deps.searchController.acceptClaimed({ assignment, admission: start.admission });
-          // Search remains cloud-controller-owned, but its selected ACP process
-          // is local. Reuse the canonical claim-bound RelayedSession bootstrap
-          // so readiness, input staging, MCP redemption and the execution
-          // session channel are established before the hosted controller can
-          // acquire prompt authority.
-          await this.dispatch(assignment, entry, assertAuthority);
-          return;
-        }
-        await this.dispatch(assignment, entry, assertAuthority);
-        return;
+        return this.dispatchClaimed(claimed);
       case "agent_unavailable_replaced":
       case "cancelled":
       case "expired":
       case "denied":
-        this.logger.info({ assignmentId: result.assignmentId, outcome: result.outcome, reason: result.reason }, "claim did not succeed");
-        await this.deps.journal.assignments.update(key, current => {
-          assertAuthority();
-          if (this.pendingClaims.get(key) !== assignment || !current || jcsDigest(current as JsonValue) !== jcsDigest(entry as JsonValue)) {
-            this.fenceLostAuthority(key);
-            throw new RemoteInstanceError("recovery_required", "Negative claim disposition no longer owns the current assignment row.");
-          }
-          return { ...current, state: "cancelled", updatedAt: this.deps.clock.nowIso() };
-        });
-        assertAuthority();
-        if (this.pendingClaims.get(key) !== assignment) {
-          this.fenceLostAuthority(key);
-          throw new RemoteInstanceError("recovery_required", "Pending claim changed while saving its disposition.");
-        }
-        retirePending();
-        return;
+        return this.refusedClaim(claimed);
     }
+  }
+
+  private async dispatchClaimed({ key, assignment, entry, assertAuthority }: PendingClaimResult): Promise<void> {
+    this.retirePending(key);
+    // Search remains cloud-controller-owned, but its selected ACP process
+    // is local. Reuse the canonical claim-bound RelayedSession bootstrap
+    // so readiness, input staging, MCP redemption and the execution
+    // session channel are established before the hosted controller can
+    // acquire prompt authority.
+    if (isSearchAssignment(assignment)) await this.acceptSearchClaim(assignment);
+    await this.dispatch(assignment, entry, assertAuthority);
+  }
+
+  private async acceptSearchClaim(assignment: Parameters<SearchControllerBoundary["acceptClaimed"]>[0]["assignment"]): Promise<void> {
+    if (!this.deps.searchController) throw new RemoteInstanceError("recovery_required", "Search controller boundary became unavailable.");
+    const start = this.deps.journal.execution.start(assignment.id, assignment.attempt);
+    if (!start) throw new RemoteInstanceError("recovery_required", "Search claim lost its durable admission.");
+    await this.deps.searchController.acceptClaimed({ assignment, admission: start.admission });
+  }
+
+  private async refusedClaim({ key, result, assignment, entry, assertAuthority }: PendingClaimResult): Promise<void> {
+    this.logger.info({ assignmentId: result.assignmentId, outcome: result.outcome, reason: result.reason }, "claim did not succeed");
+    await this.deps.journal.assignments.update(key, current => {
+      assertAuthority();
+      if (this.pendingClaims.get(key) !== assignment || !current || jcsDigest(current as JsonValue) !== jcsDigest(entry as JsonValue)) {
+        this.fenceLostAuthority(key);
+        throw new RemoteInstanceError("recovery_required", "Negative claim disposition no longer owns the current assignment row.");
+      }
+      return { ...current, state: "cancelled", updatedAt: this.deps.clock.nowIso() };
+    });
+    assertAuthority();
+    if (this.pendingClaims.get(key) !== assignment) {
+      this.fenceLostAuthority(key);
+      throw new RemoteInstanceError("recovery_required", "Pending claim changed while saving its disposition.");
+    }
+    this.retirePending(key);
   }
 
   /** A genuine refusal/foreign canonical claim is not authority to adopt it. */
@@ -621,37 +744,36 @@ export class WorkOrchestrator {
   private async handleDispatchFailure(assignment: RemoteWorkAssignment, entry: JournalEntry, assertAuthority: () => void, error: unknown): Promise<void> {
     try { assertAuthority(); } catch { /* Capture synchronously fenced the exact uncertain owner. */ }
     if (this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) return;
-    const current = this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`);
     // Cancellation/recovery may have won while bootstrap or cleanup awaited IO.
-    if (!current || current.claimId !== entry.claimId || current.recoveryEpoch !== entry.recoveryEpoch || current.reports.terminalSequence !== undefined) return;
-    // Bridge/bootstrap exceptions may contain expanded inputs or credentials.
-    // Keep the exact owner and bounded failure code, not arbitrary error text.
-    this.logger.warn({ workspaceId: assignment.workspaceId, instanceId: assignment.instanceId,
-      assignmentId: assignment.id, attempt: assignment.attempt, claimId: entry.claimId,
-      correlationId: assignment.correlationId, stage: "assignment_dispatch",
-      reason: error instanceof RemoteInstanceError ? error.code : "internal",
-      // Bounded identifiers only (never message text — a RemoteInstanceError
-      // message can embed bridge output): a refusal names the exact check
-      // through its `diagnostic`, since one code (`recovery_required`) is
-      // raised from a dozen distinct checks.
-      ...(error instanceof RemoteInstanceError
-        ? (error.diagnostic !== undefined ? { detail: error.diagnostic } : {})
-        : dispatchErrorIdentity(error)),
-      sessionContinuation: continuedSession(assignment.source)?.acpSessionRef !== undefined,
-    }, "dispatch failed; reporting");
+    if (!sameDispatchOwner(this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`), entry)) return;
+    this.logDispatchFailure(assignment, entry, error);
     if (assignment.kind === "planning" || isSearchAssignment(assignment)) {
       await this.deps.journal.assignments.update(`${assignment.id}:${assignment.attempt}`, latest => {
-        if (!latest || latest.claimId !== entry.claimId || latest.recoveryEpoch !== entry.recoveryEpoch || latest.reports.terminalSequence !== undefined) throw new RemoteInstanceError("recovery_required", "Hosted-controller dispatch ownership changed");
+        if (!sameDispatchOwner(latest, entry)) throw new RemoteInstanceError("recovery_required", "Hosted-controller dispatch ownership changed");
         return { ...latest, state: "recovery_required", recoveryReason: "agent_session_lost", updatedAt: this.deps.clock.nowIso() };
       });
       return;
     }
     // Preserve recovery semantics without copying a native exception into the
     // public report. An ownership refusal is not an agent execution failure.
-    const outcome = error instanceof RemoteInstanceError && error.code === "recovery_required"
-      ? { class: "interrupted" as const, reason: error.diagnostic === "agent_session_lost" ? "agent_session_lost" as const : "not_resumable" as const }
-      : { class: "failed" as const, reason: error instanceof RemoteInstanceError && error.code === "agent_auth_required" ? "agent_auth_required" as const : "internal" as const };
+    const outcome = dispatchFailureOutcome(error);
     await this.reports.submit({ assignmentId: assignment.id, attempt: assignment.attempt, claimId: entry.claimId, draft: { terminal: true, result: { ...outcome, terminalResultHash: jcsDigest(outcome) } } });
+  }
+
+  /**
+   * Bridge/bootstrap exceptions may contain expanded inputs or credentials.
+   * Keep the exact owner and bounded failure code, not arbitrary error text:
+   * a refusal names the exact check through its `diagnostic`, since one code
+   * (`recovery_required`) is raised from a dozen distinct checks.
+   */
+  private logDispatchFailure(assignment: RemoteWorkAssignment, entry: JournalEntry, error: unknown): void {
+    this.logger.warn({ workspaceId: assignment.workspaceId, instanceId: assignment.instanceId,
+      assignmentId: assignment.id, attempt: assignment.attempt, claimId: entry.claimId,
+      correlationId: assignment.correlationId, stage: "assignment_dispatch",
+      reason: error instanceof RemoteInstanceError ? error.code : "internal",
+      ...dispatchFailureDetail(error),
+      sessionContinuation: continuedSession(assignment.source)?.acpSessionRef !== undefined,
+    }, "dispatch failed; reporting");
   }
 
   /**
@@ -2045,6 +2167,56 @@ export class WorkOrchestrator {
 }
 
 /** An unexpected dispatch error's class and system-style code; never its message. */
+type AdmissionStart = NonNullable<ReturnType<SupervisorJournal["execution"]["start"]>>;
+type RetainedClaim = { assignment: RemoteWorkAssignment; start: AdmissionStart; current: JournalEntry };
+type ClaimAdmission = { assignment: RemoteWorkAssignment; claim: AssignmentClaim; incarnation: string | undefined; assertAuthority: () => void; assertCurrent: () => void };
+type PendingClaimResult = { key: string; result: ClaimResult; assignment: RemoteWorkAssignment; entry: JournalEntry; assertAuthority: () => void };
+
+const PROJECTED_FIELDS = ["assignmentId", "attempt", "claimId", "kind", "placementId", "workspaceId", "agentId", "evidenceUpload", "expiresAt", "latestResumeAt"] as const;
+
+/** An existing projection must carry the complete admission's identity. */
+function verifyProjection(entry: JournalEntry, initial: JournalEntry): void {
+  for (const field of PROJECTED_FIELDS) {
+    if (entry[field] !== initial[field]) throw new RemoteInstanceError("recovery_required", "Existing projection identity conflicts with complete admission.");
+  }
+}
+
+/** A claim outbox item is the admitted claim, apart from its delivery attempts. */
+function verifyClaimOutbox(item: { attempts?: unknown; lastAttemptAt?: unknown } & Record<string, unknown>, expected: object): void {
+  const { attempts: _attempts, lastAttemptAt: _lastAttemptAt, ...identity } = item;
+  if (jcsDigest(identity as JsonValue) !== jcsDigest(expected as JsonValue)) throw new RemoteInstanceError("recovery_required", "Existing claim outbox conflicts with complete admission.");
+}
+
+/** Core refused the pull: nothing was admitted; an obsolete pull origin needs current recovery. */
+function refusedPull(refusal: { kind: string; reason?: unknown }, logger: Logger): void {
+  if (refusal.kind === "request_obsolete") throw new RemoteInstanceError("reconciliation_replay", "Pull origin was superseded; current recovery is required.");
+  logger.info({ reason: refusal.reason }, "Core refused the pull; no assignments were admitted");
+}
+
+/** A claim still before its terminal report, in a state a claim result can act on. */
+function claimableState(entry: JournalEntry): boolean {
+  return entry.reports.terminalSequence === undefined && ["claimed", "running", "checkpointed"].includes(entry.state);
+}
+
+/** The row is still the dispatched claim's, at its recovery epoch, without a terminal report. */
+function sameDispatchOwner(current: JournalEntry | undefined, entry: JournalEntry): current is JournalEntry {
+  return current !== undefined && current.claimId === entry.claimId && current.recoveryEpoch === entry.recoveryEpoch && current.reports.terminalSequence === undefined;
+}
+
+/** An ownership refusal interrupts the attempt; anything else is a failed dispatch (agent sign-in named as such). */
+function dispatchFailureOutcome(error: unknown): { class: "interrupted"; reason: "agent_session_lost" | "not_resumable" } | { class: "failed"; reason: "agent_auth_required" | "internal" } {
+  if (error instanceof RemoteInstanceError && error.code === "recovery_required") {
+    return { class: "interrupted", reason: error.diagnostic === "agent_session_lost" ? "agent_session_lost" : "not_resumable" };
+  }
+  return { class: "failed", reason: error instanceof RemoteInstanceError && error.code === "agent_auth_required" ? "agent_auth_required" : "internal" };
+}
+
+/** Bounded identifiers only, never message text (a RemoteInstanceError message can embed bridge output). */
+function dispatchFailureDetail(error: unknown): Record<string, unknown> {
+  if (!(error instanceof RemoteInstanceError)) return dispatchErrorIdentity(error);
+  return error.diagnostic !== undefined ? { detail: error.diagnostic } : {};
+}
+
 export function dispatchErrorIdentity(error: unknown): { errorName?: string; errorCode?: string; schemaIssue?: string } {
   const identity: { errorName?: string; errorCode?: string; schemaIssue?: string } = {};
   const name = error instanceof Error ? error.name : undefined;
