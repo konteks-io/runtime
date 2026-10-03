@@ -25,7 +25,7 @@ const RELEASE_ID = /^release-[A-Za-z0-9_-]+$/;
 /** Values the release build's entry fills in itself; each release bakes its own (`build-launcher.mjs`). */
 const ENTRY_VALUES = ["KONTEKS_RELEASE_ROOTS_JSON", "KONTEKS_LAUNCHER_VERSION"] as const;
 
-export interface InstalledReleaseInput {
+interface InstalledReleaseInput {
   platform: NodeJS.Platform;
   /** This process's executable. */
   execPath: string;
@@ -152,7 +152,7 @@ export function runInstalledRelease(executable: string, args: readonly string[],
   });
 }
 
-export interface DelegateDeps {
+interface DelegateDeps {
   run?: (executable: string, args: readonly string[], options: { env: NodeJS.ProcessEnv }) => Promise<number | null>;
 }
 

@@ -2,7 +2,8 @@ import { createServer, request as httpRequest, type Server } from "node:http";
 import { connect, createServer as createTcpServer, type AddressInfo } from "node:net";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
-import { BROWSER_ORIGINS_PATH, NO_PREVIEW_MESSAGE, PreviewBrowserGateway } from "../preview/browser-gateway.js";
+import { BROWSER_ORIGINS_PATH } from "@konteks/remote-agent-runner";
+import { NO_PREVIEW_MESSAGE, PreviewBrowserGateway } from "../preview/browser-gateway.js";
 
 const servers: Array<{ close(): unknown }> = [];
 afterEach(() => { for (const server of servers.splice(0)) server.close(); });

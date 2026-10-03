@@ -7,7 +7,7 @@ import type { BridgeSpawnSpec } from "./spec.js";
 import { konteksSessionMetadata } from "../sessions/title.js";
 import { orderKnownFirst, recogniseNativeModel } from "@konteks/backstage-plugin-common/known-models";
 
-export interface DiscoverBridgeModelCapabilityOptions {
+interface DiscoverBridgeModelCapabilityOptions {
   configId: string;
   workspaceRoot: string;
   spec: BridgeSpawnSpec;

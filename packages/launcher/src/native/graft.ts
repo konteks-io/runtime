@@ -30,9 +30,9 @@ const run = promisify(execFile);
  * the repository's local exclude file, never committed on their behalf.
  */
 
-export const GRAFT_RECORD = "graft.json";
+const GRAFT_RECORD = "graft.json";
 
-export const GraftRecordSchema = z
+const GraftRecordSchema = z
   .object({
     /** The package's file name in the release, e.g. konteks-graft-macos-arm64.tgz. */
     name: z.string().regex(/^[A-Za-z0-9._-]+\.tgz$/),
@@ -42,7 +42,7 @@ export const GraftRecordSchema = z
     base: z.string().url(),
   })
   .strict();
-export type GraftRecord = z.infer<typeof GraftRecordSchema>;
+type GraftRecord = z.infer<typeof GraftRecordSchema>;
 
 export interface GraftTool {
   node: string;
@@ -52,7 +52,7 @@ export interface GraftTool {
 /** The agent families Graft knows how to wire, by Graft's own ids. */
 // Google Antigravity does not read AGENTS.md itself; the connector puts it
 // in each session's first prompt (antigravity A9), so it is wired like Codex.
-export const GRAFT_AGENT_IDS: Record<string, string> = { "claude-code": "claude", codex: "agents", dsh: "agents", opencode: "agents", antigravity: "agents" };
+const GRAFT_AGENT_IDS: Record<string, string> = { "claude-code": "claude", codex: "agents", dsh: "agents", opencode: "agents", antigravity: "agents" };
 
 /** What each wired agent adds to the repository, in words for the offer. */
 const GRAFT_FILES: Record<string, string[]> = { claude: [".claude/", ".mcp.json"], agents: ["AGENTS.md"] };
@@ -81,7 +81,7 @@ const executable = async (path: string) => access(path, constants.X_OK).then(() 
  * The Node Graft runs on: the one inside this release's staged agent
  * packages, which the connector already verified. Null when none is staged.
  */
-export async function graftNode(root: string): Promise<string | null> {
+async function graftNode(root: string): Promise<string | null> {
   const record = await readNativeRecord(root).catch(() => null);
   if (!record || record.releaseId === "pending") return null;
   for (const agent of record.agents) {
@@ -158,13 +158,13 @@ function graftEnv(): NodeJS.ProcessEnv {
  * Graft's version, so its self-update check is answered here, once, in
  * ~/.graft, the one place outside the repository the offer names.
  */
-export async function quietGraftUpdateCheck(home: string): Promise<void> {
+async function quietGraftUpdateCheck(home: string): Promise<void> {
   const file = join(home, ".graft", "update-check.json");
   await mkdir(dirname(file), { recursive: true, mode: 0o700 });
   await writeFile(file, `${JSON.stringify({ latest: null, checkedAt: 8_640_000_000_000_000 })}\n`, { mode: 0o600 });
 }
 
-export async function runGraft(tool: GraftTool, args: string[], cwd: string, timeoutMs = 10 * 60_000): Promise<string> {
+async function runGraft(tool: GraftTool, args: string[], cwd: string, timeoutMs = 10 * 60_000): Promise<string> {
   return await new Promise((resolveRun, reject) => {
     const child = spawn(tool.node, [tool.cli, ...args], { cwd, env: graftEnv(), stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
@@ -215,11 +215,6 @@ export async function planGraft(repo: string, families: string[]): Promise<{ age
   return { agents, adds, tracked: listed.filter(path => agents.some(id => (GRAFT_FILES[id] ?? []).some(add => path.startsWith(add.replace(/\/$/, ""))))), files };
 }
 
-/** Roughly how long the first build takes, for the note before it. */
-export function graftBuildSeconds(files: number): number {
-  return Math.max(5, Math.ceil(files / 150) * 5);
-}
-
 const EXCLUDE_MARK = "# Konteks: Graft's local files (set up by konteks-remote onboard)";
 
 /**
@@ -250,7 +245,7 @@ export async function wireGraft(
 }
 
 /** What delivery wiring did: nothing to wire, already wired, or wired now. */
-export type DeliveryGraftOutcome = "unavailable" | "skipped" | "wired";
+type DeliveryGraftOutcome = "unavailable" | "skipped" | "wired";
 
 /** Per-worktree record of a finished wiring, kept in that worktree's own git dir. */
 const WIRED_STAMP = "konteks-graft-wired.json";
@@ -357,7 +352,7 @@ async function pointWiringAtTool(repo: string, tool: GraftTool): Promise<void> {
 }
 
 /** A `graft` command next to `konteks-remote`, for the commands AGENTS.md teaches. */
-export async function installGraftShim(root: string, tool: GraftTool): Promise<string> {
+async function installGraftShim(root: string, tool: GraftTool): Promise<string> {
   const bin = join(resolve(root), "bin");
   await mkdir(bin, { recursive: true, mode: 0o700 });
   const shim = join(bin, "graft");

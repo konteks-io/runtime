@@ -25,7 +25,7 @@ export type LoginEvent = Extract<RunnerEvent, { kind: "login_event" }>["event"];
  * and pipes the operator's typed input back. The runner never parses, copies,
  * or reverse-engineers a token, and never automates a sign-in.
  */
-export interface LoginFlowOptions {
+interface LoginFlowOptions {
   config: RunnerConfig;
   family: AgentBridgeFamily;
   env: NodeJS.ProcessEnv;

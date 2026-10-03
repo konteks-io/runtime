@@ -37,7 +37,7 @@ import { instructionsInside } from "./working-copy-instructions.js";
 const CONTROL = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
 /** Where an Antigravity runner keeps its private state, all inside its credential directory. */
-export interface AntigravityRuntimePaths {
+interface AntigravityRuntimePaths {
   /** `<credentials>/antigravity`. */
   root: string;
   /** HOME (and USERPROFILE on Windows) of every Antigravity process. */
@@ -77,7 +77,7 @@ export function antigravityRuntimePaths(credentialDir: string, platform: NodeJS.
 /** The only settings the connector gives the server; any other `AGY_*`, `GEMINI_*` or `GOOGLE_*` name is refused. */
 export const ANTIGRAVITY_SETTING_NAMES: readonly string[] = Object.freeze(["AGY_ACP_FORCE_FILE_STORAGE", "GOOGLE_GEMINI_BASE_URL"]);
 
-export interface AntigravityEnvironmentOptions {
+interface AntigravityEnvironmentOptions {
   /** The private home and the GEMINI_HOME inside it (both absolute). */
   home: { home: string; geminiHome: string };
   /**
@@ -137,15 +137,15 @@ function relayRefused() { return new RemoteInstanceError("agent_unavailable", "T
 export const ANTIGRAVITY_ENABLED_TOOLS: readonly string[] = Object.freeze([
   "view_file", "list_directory", "search_directory", "find_file", "create_file", "edit_file", "run_command", "read_url_content", "search_web", "finish",
 ]);
-export const ANTIGRAVITY_DISABLED_TOOLS: readonly string[] = Object.freeze(["start_subagent", "generate_image", "ask_question"]);
+const ANTIGRAVITY_DISABLED_TOOLS: readonly string[] = Object.freeze(["start_subagent", "generate_image", "ask_question"]);
 export const ANTIGRAVITY_SESSION_META: Readonly<Record<string, unknown>> = Object.freeze({
   agy: Object.freeze({ enabledTools: ANTIGRAVITY_ENABLED_TOOLS, disabledTools: ANTIGRAVITY_DISABLED_TOOLS }),
 });
 
 /** Modes Konteks never lets Antigravity enter (A4): only `default` asks before commands and edits. */
-export const ANTIGRAVITY_REFUSED_MODES: readonly string[] = Object.freeze(["auto_edit", "yolo"]);
+const ANTIGRAVITY_REFUSED_MODES: readonly string[] = Object.freeze(["auto_edit", "yolo"]);
 /** Antigravity's own slash commands Konteks never sends (A4). */
-export const ANTIGRAVITY_REFUSED_COMMANDS: readonly string[] = Object.freeze(["plan", "logout"]);
+const ANTIGRAVITY_REFUSED_COMMANDS: readonly string[] = Object.freeze(["plan", "logout"]);
 
 /**
  * Which sign-in the connector holds for Antigravity: the file the connector
@@ -163,7 +163,7 @@ export const ANTIGRAVITY_REFUSED_COMMANDS: readonly string[] = Object.freeze(["p
  *   (the credential then reads "Needs sign-in" with that reason).
  */
 const TIER = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/);
-export const ANTIGRAVITY_SIGN_IN_METHODS = ["gemini-api-key", "oauth-business", "oauth-personal", "none"] as const;
+const ANTIGRAVITY_SIGN_IN_METHODS = ["gemini-api-key", "oauth-business", "oauth-personal", "none"] as const;
 export const AntigravitySignInSchema = z.object({
   method: z.enum(ANTIGRAVITY_SIGN_IN_METHODS),
   gcp: AgentLoginGcpSchema.optional(),
@@ -173,7 +173,6 @@ export const AntigravitySignInSchema = z.object({
   if (value.method === "oauth-business" && value.gcp === undefined) ctx.addIssue({ code: "custom", path: ["gcp"], message: "Gemini Enterprise names its Google Cloud project" });
 });
 export type AntigravitySignIn = z.infer<typeof AntigravitySignInSchema>;
-export type AntigravitySignInMethod = AntigravitySignIn["method"];
 
 /** The connector's sign-in record, or null when there is none or it is not one Konteks wrote. */
 export async function readAntigravitySignIn(credentialDir: string, platform: NodeJS.Platform = process.platform): Promise<AntigravitySignIn | null> {
@@ -390,13 +389,13 @@ export function antigravityStderrFailure(line: string, credentialDir?: string): 
  * that keeps ours, a new Gemini Enterprise sign-in or a sign-out clears it. Never a secret, never
  * the project.
  */
-export interface AntigravityAdminObservation {
+interface AntigravityAdminObservation {
   /** When a session last had the Konteks MCP servers dropped by the organisation's settings. */
   mcpServersOffAt: string;
 }
 
 /** Why an Antigravity session on Gemini Enterprise cannot run Konteks work while the organisation's MCP Servers setting is off. */
-export const ANTIGRAVITY_MCP_SERVERS_OFF = "Google Antigravity cannot use Konteks tools: MCP Servers is turned off in your Gemini Enterprise settings. Ask your admin to turn it on, or pick another agent in Customize → Models.";
+const ANTIGRAVITY_MCP_SERVERS_OFF = "Google Antigravity cannot use Konteks tools: MCP Servers is turned off in your Gemini Enterprise settings. Ask your admin to turn it on, or pick another agent in Customize → Models.";
 
 function recordMcpServersOff(credentialDir: string, at: Date): void {
   const paths = antigravityRuntimePaths(credentialDir);
@@ -465,7 +464,7 @@ export function antigravityAgentErrorText(text: string): HostTurnError | null {
 }
 
 /** The server's two programs (`agy_acp_server.par` runs `localharness_external`). */
-export const ANTIGRAVITY_PROGRAMS: readonly string[] = Object.freeze(["agy_acp_server", "localharness"]);
+const ANTIGRAVITY_PROGRAMS: readonly string[] = Object.freeze(["agy_acp_server", "localharness"]);
 
 /**
  * Stop every Antigravity process whose `HOME` is this runner's private home:
@@ -484,7 +483,7 @@ export async function sweepAntigravityProcesses(credentialDir: string, control: 
  * session's process stays five minutes for the next one, and the control
  * process (readiness, sign-in) stops after a minute with nothing to do.
  */
-export const ANTIGRAVITY_PROCESS_LIMITS = Object.freeze({ executionProcesses: 2, queueMs: 120_000, idleExecutionMs: 5 * 60_000, controlIdleMs: 60_000 });
+const ANTIGRAVITY_PROCESS_LIMITS = Object.freeze({ executionProcesses: 2, queueMs: 120_000, idleExecutionMs: 5 * 60_000, controlIdleMs: 60_000 });
 
 /** The relay of every live Antigravity process that runs on a Gemini API key. */
 const relays = new WeakMap<BridgeProcess, AntigravityRelay>();

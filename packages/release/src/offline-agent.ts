@@ -78,7 +78,7 @@ export async function verifyOfflineAgentPackage(directory: string, artifact: Rem
  * root's identity. Any write, rename, chmod, added or removed file moves at
  * least one of these; ctime cannot be set back by the owning user.
  */
-export async function offlineAgentPackageFingerprint(directory: string): Promise<string> {
+async function offlineAgentPackageFingerprint(directory: string): Promise<string> {
   const root = await lstat(directory, { bigint: true });
   if (!root.isDirectory()) throw offlinePackageInvalid();
   let entries = 0n, bytes = 0n, newest = root.mtimeNs > root.ctimeNs ? root.mtimeNs : root.ctimeNs;

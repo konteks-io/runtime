@@ -129,7 +129,7 @@ export const PendingRequestSchema = z.preprocess((candidate) => {
 }, CurrentPendingRequestSchema);
 export type PendingRequest = z.infer<typeof PendingRequestSchema>;
 
-export const DecisionRecordSchema = z
+const DecisionRecordSchema = z
   .object({ manifestId: z.string().min(1), assignmentId: z.string().min(1), attempt: z.number().int(), action: z.string().min(1), recoveryEpoch: z.number().int().nonnegative(), journaledAt: z.string(), executedAt: z.string().nullable(),
     /** Hash only: recovery authorization bytes never enter the journal. Older records cannot prove exact replay. */
     decisionDigest: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional(),
@@ -144,19 +144,19 @@ export const DecisionRecordSchema = z
       ctx.addIssue({ code: "custom", path: ["result"], message: "Decision result must match a durably applied identity" });
     }
   });
-export type DecisionRecord = z.infer<typeof DecisionRecordSchema>;
+type DecisionRecord = z.infer<typeof DecisionRecordSchema>;
 
 /** First-seen manifest identity, never its renewable lease or decision authorization. */
-export const ReconciliationManifestRecordSchema = z.object({
+const ReconciliationManifestRecordSchema = z.object({
   manifestId: z.string().min(1), instanceId: z.string().min(1),
   manifestDigest: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict();
-export type ReconciliationManifestRecord = z.infer<typeof ReconciliationManifestRecordSchema>;
+type ReconciliationManifestRecord = z.infer<typeof ReconciliationManifestRecordSchema>;
 
-export const EraseRecordSchema = z
+const EraseRecordSchema = z
   .object({ directiveId: z.string().min(1), scope: z.enum(["assignment_data", "all_konteks_data"]), status: z.enum(["pending", "completed", "partially_completed", "failed"]), receiptSent: z.boolean(), updatedAt: z.string() })
   .strict();
-export type EraseRecord = z.infer<typeof EraseRecordSchema>;
+type EraseRecord = z.infer<typeof EraseRecordSchema>;
 
 /**
  * An immutable C03 observation and its local delivery watermark. This is

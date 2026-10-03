@@ -23,7 +23,7 @@ export const BROWSER_ORIGINS_ENV = "KONTEKS_BROWSER_ORIGINS_URL";
  * Node process (outside the browser and its gateway), and the network tools
  * can rewrite what the page is served. Any other tool named `*_unsafe` too.
  */
-export const BROWSER_DENIED_TOOLS: readonly string[] = Object.freeze([
+const BROWSER_DENIED_TOOLS: readonly string[] = Object.freeze([
   "browser_run_code_unsafe", "browser_route", "browser_unroute", "browser_route_list", "browser_network_state_set",
 ]);
 

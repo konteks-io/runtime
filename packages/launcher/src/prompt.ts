@@ -9,7 +9,7 @@ import { RemoteInstanceError } from "@konteks/remote-common";
  * terminal never renders the characters; the value goes straight to the
  * consumer closure and is not retained by the launcher.
  */
-export interface SecretPromptOptions {
+interface SecretPromptOptions {
   label: string;
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;

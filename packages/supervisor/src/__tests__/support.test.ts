@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SECRET_CANARIES, containsCanary } from "@konteks/remote-common";
 import { buildSupportBundle } from "../support/bundle.js";
-import { assertDoctorHasNoSecrets, runDoctor } from "../support/doctor.js";
+import { runDoctor } from "../support/doctor.js";
+import { expectNoPath } from "./doctor-report.js";
 
 let dir = "";
 beforeEach(async () => {
@@ -80,7 +81,7 @@ describe("doctor and support bundle", () => {
     expect(healthy.checks.find(check => check.id === "preview")).toMatchObject({ status: "pass", detail: "preview capability advertised; 1 preview(s) running" });
     const failed = await runDoctor({ ...base, preview: { advertised: true, running: 0, lastFailureAt: "2026-09-06T00:00:00.000Z" } });
     expect(failed.checks.find(check => check.id === "preview")).toMatchObject({ status: "warn", detail: expect.stringContaining("the last preview failed to start") });
-    expect(assertDoctorHasNoSecrets(failed)).toBeUndefined();
+    expectNoPath(failed);
     const offline = await runDoctor({ ...base, preview: { advertised: false, running: 0, lastFailureAt: null } });
     expect(offline.checks.find(check => check.id === "preview")?.status).toBe("warn");
   });
@@ -116,7 +117,7 @@ describe("doctor and support bundle", () => {
     expect(chromium.checks.find(check => check.id === "browser")?.detail).toContain("Playwright's Chromium is installed on first use");
     const none = await runDoctor({ ...base, browser: { version: null, agents: [], chrome: true } });
     expect(none.checks.find(check => check.id === "browser")?.status).toBe("warn");
-    expect(assertDoctorHasNoSecrets(chrome)).toBeUndefined();
+    expectNoPath(chrome);
   });
 
   it("reports the person's own OpenCode: version, install, settings check, sign-ins by label, free models, browser, or why it is left out (opencode CP6)", async () => {
@@ -129,7 +130,7 @@ describe("doctor and support bundle", () => {
     const signedIn = await runDoctor({ ...base, openCode: { ...running, credentials: [{ label: "OpenCode Console account", state: "ready" }, { label: "OpenAI key", state: "needs_sign_in" }] } });
     expect(signedIn.checks.find(check => check.id === "opencode")).toMatchObject({ status: "pass", recoveryActions: [],
       detail: "OpenCode 2.0.18, installed with OpenCode's homepage installer; Konteks settings check passed; signed in with OpenCode Console account, OpenAI key (needs sign-in); OpenCode Zen free models off; its sessions get the QA browser" });
-    expect(assertDoctorHasNoSecrets(signedIn)).toBeUndefined();
+    expectNoPath(signedIn);
     // Nothing signed in, but Core's free-models switch on: it runs on Zen's free models.
     const free = await runDoctor({ ...base, openCode: { ...running, installKind: "another location", credentials: [], freeModels: true, browser: false } });
     expect(free.checks.find(check => check.id === "opencode")).toMatchObject({ status: "pass",
@@ -147,7 +148,7 @@ describe("doctor and support bundle", () => {
       expect(check).toMatchObject({ status: "fail", recoveryActions: [{ kind: "install_backend", agentId: "opencode" }] });
       expect(check?.detail).toContain(words);
       expect(check?.detail).toContain("tried again in the background");
-      expect(assertDoctorHasNoSecrets(left)).toBeUndefined();
+      expectNoPath(left);
     }
     const gaveUp = await runDoctor({ ...base, openCode: { ...running, state: "given_up", version: null, installKind: null, selfCheck: "not_run", failure: "opencode_not_found", credentials: [] } });
     expect(gaveUp.checks.find(check => check.id === "opencode")?.detail).toBe("OpenCode is not running Konteks work: OpenCode 2 is no longer installed where this computer found it; install it again from opencode.ai; it is no longer retried; restart the connector once it is fixed");
@@ -167,7 +168,7 @@ describe("doctor and support bundle", () => {
       credentials: [enterprise, key], quarantine: null, mcpServersOffAt: null, diskBytes: 397_584_640, browser: true };
     const check = async (antigravity: Record<string, unknown>) => {
       const report = await runDoctor({ ...base, antigravity: { ...running, ...antigravity } as never });
-      expect(assertDoctorHasNoSecrets(report)).toBeUndefined();
+      expectNoPath(report);
       return report.checks.find(entry => entry.id === "antigravity")!;
     };
     expect(await check({})).toMatchObject({ status: "pass", title: "Google Antigravity", recoveryActions: [],

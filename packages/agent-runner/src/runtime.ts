@@ -49,10 +49,10 @@ export interface AgentRuntimeOptions {
  * so a model the agent starts offering shows up without a restart. A sign-in
  * change re-reads at once: the account fingerprint is part of the cache key.
  */
-export const DEFAULT_MODEL_CAPABILITY_TTL_MS = 5 * 60_000;
+const DEFAULT_MODEL_CAPABILITY_TTL_MS = 5 * 60_000;
 
 /** A wedged agent process must not outlive the conversation it served. */
-export const DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS = 30 * 60_000;
+const DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS = 30 * 60_000;
 
 // `finalized` separates the two questions this record answers. A key is kept
 // forever so a reference is never reused, but a finalized owner no longer

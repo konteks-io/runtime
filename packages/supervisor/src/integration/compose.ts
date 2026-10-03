@@ -21,7 +21,7 @@ import { NativeIntegrationDiscovery, e2eFixtureServers, readFixtureInventory } f
 import { OfficialSetupRunner, type SetupCommandLaunch } from "./setup.js";
 import { journalWriteLedger } from "./tool-gate.js";
 
-export interface IntegrationCompositionInputs {
+interface IntegrationCompositionInputs {
   /** The installation's native runner configurations. */
   configs: readonly RunnerConfig[];
   runners: () => ReadonlyMap<string, RunnerPort>;

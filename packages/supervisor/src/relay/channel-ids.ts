@@ -9,7 +9,7 @@ import type { RelayChannel } from "@konteks/remote-common";
  * the first `:` is therefore always the authoritative `RelayChannel`.
  */
 export const CORE_BOUND_CHANNELS = Object.freeze(["control", "heartbeat", "assignment", "observation"] as const);
-export type CoreBoundChannel = (typeof CORE_BOUND_CHANNELS)[number] | "support";
+type CoreBoundChannel = (typeof CORE_BOUND_CHANNELS)[number] | "support";
 
 export function coreChannelId(channel: CoreBoundChannel, instanceId: string): string {
   return `${channel}:${instanceId}`;

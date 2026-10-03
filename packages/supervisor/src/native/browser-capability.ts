@@ -28,13 +28,13 @@ import { locatePersonNode, personNodeCandidates } from "./dsh-installation.js";
 export const BROWSER_TOOL_CAPABILITY = "browser_tool";
 
 /** Playwright (the browser MCP server's engine) needs Node 20 or newer. */
-export const BROWSER_NODE_MINIMUM_MAJOR = 20;
+const BROWSER_NODE_MINIMUM_MAJOR = 20;
 
 export type ConnectorBrowserStatus =
   | { available: true; browser: RunnerBrowser }
   | { available: false; reason: "no_package" | "no_node"; message: string };
 
-export interface ConnectorBrowserDeps {
+interface ConnectorBrowserDeps {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   /** `node --version` of a candidate (the person's Node only). */

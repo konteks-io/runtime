@@ -11,7 +11,7 @@ import { RecoveryAuthority } from "./recovery-authority.js";
  * session frames) are polled. Idempotency keys are the same as on the relay,
  * so a message duplicated across a transport switch converges.
  */
-export interface HttpsFallbackOptions {
+interface HttpsFallbackOptions {
   /** Exact accepted-generation identity; null/omitted keeps work traffic gated. */
   recoveryAuthority?: () => string | null;
   core: CoreClient;

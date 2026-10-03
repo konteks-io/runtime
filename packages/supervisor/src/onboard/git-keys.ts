@@ -18,7 +18,7 @@ import type { ManagedGitBinding } from "./remotes.js";
  */
 
 /** What the runtime keeps locally about a key it registered. */
-export const RegisteredGitKeySchema = z
+const RegisteredGitKeySchema = z
   .object({
     keyRef: z.string().min(1).max(200),
     title: z.string().min(1).max(256),
@@ -34,7 +34,7 @@ export const RegisteredGitKeySchema = z
     createdAt: z.string().min(1).max(64),
   })
   .strict();
-export type RegisteredGitKey = z.infer<typeof RegisteredGitKeySchema>;
+type RegisteredGitKey = z.infer<typeof RegisteredGitKeySchema>;
 
 const KeyFileSchema = z.object({ keys: z.array(RegisteredGitKeySchema).max(16) }).strict();
 
@@ -44,13 +44,13 @@ const KeyFileSchema = z.object({ keys: z.array(RegisteredGitKeySchema).max(16) }
  * `exactOptionalPropertyTypes` an absent optional and one set to `undefined`
  * are different types.
  */
-export interface GitKeyRegistrar {
+interface GitKeyRegistrar {
   register(input: { publicKey: string; title: string }): Promise<{ keyRef: string; fingerprint: string; host?: string | undefined; user?: string | undefined; createdAt?: string | undefined }>;
   list(): Promise<Array<{ keyRef: string; title: string; fingerprint: string; createdAt?: string | undefined; revokedAt?: string | undefined }>>;
   revoke(keyRef: string): Promise<void>;
 }
 
-export interface GitKeyStoreOptions {
+interface GitKeyStoreOptions {
   /** Private directory the key material lives in; 0700, never backed up. */
   directory: string;
   registrar: GitKeyRegistrar;

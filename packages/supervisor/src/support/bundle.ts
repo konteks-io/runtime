@@ -8,7 +8,7 @@ import { containsCanary, redactText, redactValue, sha256Hex, type DoctorReport, 
  * never contains agent volumes, checkpoint references,
  * task-checkout paths, prompts, model output, or a credential.
  */
-export interface SupportBundleInputs {
+interface SupportBundleInputs {
   bundleVersion: string;
   protocolVersion: string;
   instanceId: string | null;
@@ -20,7 +20,7 @@ export interface SupportBundleInputs {
   generatedAt: string;
 }
 
-export interface SupportBundle {
+interface SupportBundle {
   bundleId: string;
   document: Record<string, unknown>;
   chunks: SupportChunk[];

@@ -129,7 +129,7 @@ export type OnboardState = z.infer<typeof OnboardStateSchema>;
 
 const FILE = "onboard-state.json";
 
-export function onboardStatePath(root: string): string {
+function onboardStatePath(root: string): string {
   return join(root, FILE);
 }
 

@@ -5,7 +5,6 @@ import type { Duplex } from "node:stream";
 import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import { BROWSER_ORIGINS_PATH } from "@konteks/remote-agent-runner";
 
-export { BROWSER_ORIGINS_PATH };
 
 /**
  * A session's browser gateway: the HTTP proxy its QA browser is launched
@@ -37,7 +36,7 @@ export { BROWSER_ORIGINS_PATH };
  * in step. It binds 127.0.0.1 on an ephemeral port and closes with the
  * session.
  */
-export interface BrowserGatewayOptions {
+interface BrowserGatewayOptions {
   /** The preview origin the browser may reach now, or null when none runs. */
   target: () => string | null;
   /** Test seam for the registered-application address check. */
@@ -54,7 +53,7 @@ const HOP_BY_HOP = new Set(["proxy-connection", "proxy-authorization", "connecti
 export const NO_PREVIEW_MESSAGE = "No live preview is running for this session. Call preview_start (the konteks-preview tools), wait until preview_status says running, then open the URL it returns.";
 
 /** What a Core-issued origin is for: a Core-routed cloud preview, or a workspace's registered application. */
-export type BrowserGrantKind = "cloud_preview" | "external";
+type BrowserGrantKind = "cloud_preview" | "external";
 
 /** At most this many live grants per session; the oldest goes first. */
 const MAX_GRANTS = 32;

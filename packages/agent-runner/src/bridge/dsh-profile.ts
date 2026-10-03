@@ -49,9 +49,9 @@ const DISABLED_ROWS = [
 const ROWS_SINCE_0_1_7: ReadonlySet<string> = new Set(["deepseek-account", "llm-deepseek-account", "tool-plugin-manager"]);
 const ROWS_SINCE_0_1_7_VERSION = "0.1.7-rc.2";
 
-export const DSH_KONTEKS_MODEL = { provider: "deepseek-official", model: "deepseek-flash" } as const;
+const DSH_KONTEKS_MODEL = { provider: "deepseek-official", model: "deepseek-flash" } as const;
 
-export interface DshProfileRowExpectation {
+interface DshProfileRowExpectation {
   id: string;
   /** Expected module; checked only when set. */
   name?: string;

@@ -40,7 +40,7 @@ export interface OpenCodeServiceControl {
   stop(pids: number[]): Promise<void>;
 }
 
-export interface OpenCodeSelfCheckOptions {
+interface OpenCodeSelfCheckOptions {
   binary: string;
   version: string;
   /** The runner's credential directory; the private home is `<credentials>/opencode`. */
@@ -225,7 +225,7 @@ const NO_SERVICE_SCAN: OpenCodeServiceControl = { list: async () => [], stop: as
  * command). A process counts only when its own `XDG_STATE_HOME` or `HOME` is
  * exactly the private home's, so the person's own service never matches.
  */
-export function processServiceControl(platform: NodeJS.Platform = process.platform): OpenCodeServiceControl {
+function processServiceControl(platform: NodeJS.Platform = process.platform): OpenCodeServiceControl {
   return {
     async list(paths) {
       const listing = await capture("ps", platform === "linux" ? ["-e", "-ww", "-o", "pid=,args="] : ["-axww", "-o", "pid=,command="]);

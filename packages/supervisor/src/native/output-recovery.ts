@@ -12,7 +12,7 @@ const TURN_RECORD = /^\.delivery-output-[a-f0-9]{64}\.json$/;
 const MAX_WORKSPACES_PER_ROOT = 4096;
 const unavailable = () => new RemoteInstanceError("capability_unavailable", "Frozen native delivery output could not be recovered.");
 
-export interface RetainedDeliveryOutputRecoveryOptions {
+interface RetainedDeliveryOutputRecoveryOptions {
   roots: readonly string[];
   journal: SupervisorJournal;
   client: () => NativeOutputClient;

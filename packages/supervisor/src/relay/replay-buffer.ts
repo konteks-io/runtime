@@ -4,14 +4,14 @@
  * Bounds are bytes and age from Core configuration; once a frame the buffer
  * no longer holds would be needed for replay, the channel must `reset`.
  */
-export interface BufferedFrame<T> {
+interface BufferedFrame<T> {
   seq: number;
   frame: T;
   bytes: number;
   enqueuedAt: number;
 }
 
-export interface ReplayBufferOptions {
+interface ReplayBufferOptions {
   maxBytes: number;
   maxAgeMs: number;
 }
@@ -31,10 +31,6 @@ export class ReplayBuffer<T> {
 
   get unackedBytes(): number {
     return this.bytes;
-  }
-
-  get cumulativeAcked(): number {
-    return this.acked;
   }
 
   /** True once a frame that is still unacked has been evicted for size/age. */
@@ -93,10 +89,6 @@ export class ReplayBuffer<T> {
     if (cursor + 1 < this.lowestHeld && this.frames.length > 0) return null;
     if (cursor + 1 < this.lowestHeld && cursor < this.acked && this.overflowed) return null;
     return this.frames.filter((entry) => entry.seq > cursor);
-  }
-
-  halfFull(): boolean {
-    return this.bytes * 2 >= this.options.maxBytes;
   }
 
   private evict(now: number): void {

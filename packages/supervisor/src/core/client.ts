@@ -117,7 +117,7 @@ type RuntimeAgentLoginReport = ReturnType<typeof RuntimeAgentLoginReportSchema.p
 const CORE_BASE = "/api/remote-instances/internal/remote-instances";
 const instancePath = (instanceId: string, suffix: string): string => `${CORE_BASE}/${encodeURIComponent(instanceId)}/${suffix}`;
 
-export const CORE_PATHS = Object.freeze({
+const CORE_PATHS = Object.freeze({
   jwks: `${CORE_BASE}/jwks`,
   activationExchange: `${CORE_BASE}/activation-exchange`,
   provisioningCredential: (instanceId: string) => instancePath(instanceId, "provisioning-credential"),
@@ -165,7 +165,6 @@ export const CORE_PATHS = Object.freeze({
   workload: (instanceId: string, assignmentId: string) => instancePath(instanceId, `assignments/${encodeURIComponent(assignmentId)}/workload`),
   // CONTRACT-GAP: durable task-checkout affinity (invariant 15) had no route
   // for the owner to report a materialization. Added to Core with this seam.
-  taskCheckoutMaterialized: (instanceId: string, assignmentId: string) => instancePath(instanceId, `assignments/${encodeURIComponent(assignmentId)}/task-checkout/materialized`),
   // CONTRACT-GAP: control-poll and generic session-frame HTTPS routes are not
   // mounted by Core. Lease renewal uses only the signed heartbeat above.
   controlPoll: (instanceId: string) => instancePath(instanceId, "control/poll"),
@@ -186,7 +185,6 @@ export const LEASE_AUDIENCE: string = REMOTE_INSTANCE_LEASE_AUDIENCE;
 // CONTRACT-GAP: CP1 exports the readiness request but no response schema.
 // Match ProvisioningService's initial and idempotent response, remaining strict.
 const ReadinessResultSchema = z.object({ instanceId: z.string(), administrativeStatus: z.literal("active"), lease: z.string().min(1), leaseExpiresAt: z.string(), leaseMode: RemoteLeaseModeSchema, heartbeatIntervalSeconds: z.number().int().positive() }).strict();
-export type { HeartbeatResult } from "@konteks/remote-common";
 const ControlPollSchema = z.object({ frames: z.array(ToRuntimeRelayFrameSchema).max(64) }).strict();
 const ObservationReceiptSchema = z.object({ stored: z.boolean(), observationId: z.string().min(1), observationDigest: z.string().length(43) }).strict();
 const AckResultSchema = z.object({ accepted: z.boolean() }).strict();
@@ -210,8 +208,7 @@ export interface CapabilityTokenIssue {
   expiresAt: string;
 }
 const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "qa", "assistant_execution", "onboarding", "repository_relocation", "integration"]), workload: BoundedJsonValueSchema }).strict();
-export type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
-const TaskCheckoutMaterializedResultSchema = z.object({ workspaceRef: z.string().min(1) }).strict();
+type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
 
 /**
  * Managed-git key registration (ON16). Core answers with the reference it
@@ -258,7 +255,7 @@ export type DeferredPermissionBody =
   | { kind: "permission"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; permission: { title: string; toolKind?: string; options: Array<{ optionId: string; name: string; kind: string }> } }
   | { kind: "elicitation"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; elicitation: { message: string; requestedSchema: BoundedJsonValue; isSignIn: boolean } };
 
-export interface CoreClientOptions {
+interface CoreClientOptions {
   baseUrl: string;
   clock: Clock;
   key: () => InstanceKeyPair;
@@ -291,7 +288,7 @@ const RecoveryEvidenceIngressResultSchema = z.object({
   acceptedAt: z.string().datetime(),
   outcome: z.enum(["accepted", "duplicate"]),
 }).strict();
-export type RecoveryEvidenceIngressResult = z.infer<typeof RecoveryEvidenceIngressResultSchema>;
+type RecoveryEvidenceIngressResult = z.infer<typeof RecoveryEvidenceIngressResultSchema>;
 
 export class CoreClient {
   private readonly http: JsonClient;
@@ -848,12 +845,6 @@ export class CoreClient {
 
   async revokeGitKey(instanceId: string, keyRef: string): Promise<void> {
     await this.http.request({ method: "DELETE", path: CORE_PATHS.gitKey(instanceId, keyRef), schema: z.unknown() });
-  }
-
-  /** The Harness materialized a task checkout here; Core records the owner so exact-checkout work binds to this instance. */
-  async recordTaskCheckoutMaterialized(instanceId: string, assignmentId: string, body: { taskId: string; revision?: string }): Promise<{ workspaceRef: string }> {
-    return this.http.request({ method: "POST", path: CORE_PATHS.taskCheckoutMaterialized(instanceId, assignmentId), body, schema: TaskCheckoutMaterializedResultSchema,
-      idempotencyKey: `task-checkout:${instanceId}:${assignmentId}:${body.taskId}:${body.revision ?? "unversioned"}` });
   }
 
   /** A policy deferral (session- or component-raised), posted in Core's own `DeferredPermission` shape; Core answers the sanitized `PendingPermissionView`. Idempotent per assignment attempt and request id. */

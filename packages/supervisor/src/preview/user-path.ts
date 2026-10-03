@@ -11,7 +11,7 @@ import { isAbsolute, join } from "node:path";
  * usual toolchain folders. Only PATH is taken from the shell; nothing else
  * from its environment reaches the preview.
  */
-export interface UserPathDeps {
+interface UserPathDeps {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   home?: string;
@@ -40,7 +40,7 @@ export async function resolvePreviewPath(deps: UserPathDeps = {}): Promise<strin
 }
 
 /** `$SHELL -ilc` prints PATH between markers; 5 s bound; rc-file noise is ignored. */
-export function loginShellPath(shell: string): Promise<string | null> {
+function loginShellPath(shell: string): Promise<string | null> {
   return new Promise(resolve => {
     execFile(shell, ["-ilc", `printf '%s%s%s' '${MARKER}' "$PATH" '${MARKER}'`], {
       timeout: 5_000,

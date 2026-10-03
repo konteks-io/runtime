@@ -26,7 +26,7 @@ export const NativeGitReceiptSchema = z
     configDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   })
   .strict();
-export type NativeGitReceipt = z.infer<typeof NativeGitReceiptSchema>;
+type NativeGitReceipt = z.infer<typeof NativeGitReceiptSchema>;
 const pointer = "gitdir: ../git\n";
 const attributes = "* -filter -text -ident -working-tree-encoding\n";
 const config =

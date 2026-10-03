@@ -2,7 +2,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { assertDoctorHasNoSecrets, runDoctor } from "../support/doctor.js";
+import { runDoctor } from "../support/doctor.js";
+import { expectNoPath } from "./doctor-report.js";
 import { WINDOWS_LAUNCHER_MARKER, windowsInstalledLauncher } from "../native/windows-launcher.js";
 
 const roots: string[] = [];
@@ -32,7 +33,7 @@ describe("the Windows konteks-remote command the MSI installed (D131)", () => {
     expect(line).toMatchObject({ status: "warn", title: "konteks-remote command" });
     expect(line!.detail).toMatch(/older installer/);
     expect(line!.detail).toMatch(/-Update/);
-    expect(assertDoctorHasNoSecrets(older)).toBeUndefined();
+    expectNoPath(older);
     for (const launcher of ["current", null, undefined] as const) {
       const report = await runDoctor({ ...base, ...(launcher !== undefined ? { launcher } : {}) });
       expect(report.checks.find(check => check.id === "launcher")).toBeUndefined();

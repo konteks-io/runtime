@@ -10,7 +10,7 @@ export const CancellationInboxRecordSchema = z.object({
   }
 });
 export type CancellationInboxRecord = z.infer<typeof CancellationInboxRecordSchema>;
-export interface CancellationInboxLog {
+interface CancellationInboxLog {
   all(): CancellationInboxRecord[];
   update(key: string, derive: (existing: CancellationInboxRecord | undefined) => CancellationInboxRecord): Promise<void>;
 }

@@ -35,9 +35,9 @@ export const SessionContextSchema = z
     agentId: z.string().min(1),
   })
   .strict();
-export type SessionContext = z.infer<typeof SessionContextSchema>;
+type SessionContext = z.infer<typeof SessionContextSchema>;
 
-export interface CreateSessionArgs {
+interface CreateSessionArgs {
   context: SessionContext;
   /** Absolute outer readiness deadline supplied by the claim owner. */
   readinessDeadlineAt?: string;
@@ -69,7 +69,7 @@ export interface CreateSessionArgs {
   };
 }
 
-export interface IntegrationSessionAdmission {
+interface IntegrationSessionAdmission {
   /** Personal (or E2E) MCP servers the Codex bridge leaves enabled for this thread; none otherwise. */
   admittedMcpServerNames: string[];
   /** Claude only: this session may load the account's claude.ai connectors (every call still meets the gate). */
@@ -77,7 +77,7 @@ export interface IntegrationSessionAdmission {
 }
 
 /** The `_meta` an integration session's `session/new` carries, versioned for the bridge patches. */
-export function konteksIntegrationMeta(admission: IntegrationSessionAdmission) {
+function konteksIntegrationMeta(admission: IntegrationSessionAdmission) {
   return { konteksIntegration: { version: 1 as const, admittedMcpServerNames: [...admission.admittedMcpServerNames], accountConnectors: admission.accountConnectors } };
 }
 
@@ -386,10 +386,6 @@ export class SessionManager {
     } finally {
       if (timer) clearTimeout(timer);
     }
-  }
-
-  capabilities(): { forkSession: boolean; sessionResume: boolean } {
-    return capabilitiesOf(this.options.bridge());
   }
 
   /** `_meta` for `session/load` and `session/resume`: the agent's own (a persisted tool filter is overridden there). */

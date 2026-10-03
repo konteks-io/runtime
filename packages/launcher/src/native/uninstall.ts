@@ -28,7 +28,7 @@ export interface UninstallDeps {
   shutDown?(before: string | null): Promise<boolean>;
 }
 
-export interface UninstallResult {
+interface UninstallResult {
   state: "uninstalled";
   /** Whether Konteks removed this runtime, or the person still has to in Settings. */
   runtime: "removed" | "already_removed" | "not_told" | "never_connected";

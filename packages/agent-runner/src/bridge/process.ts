@@ -316,7 +316,7 @@ function openCodeProviderError(error: RequestError): BridgeErrorClass | null {
  * names that API and the command that turns it on.
  */
 export const ANTIGRAVITY_LICENCE_REASON = "Gemini Enterprise found no licence for this Google Cloud project. Turn on the Business AI Code API with `gcloud services enable businessaicode.googleapis.com --project <project id>`, then sign in again with `konteks-remote auth login antigravity`.";
-export const ANTIGRAVITY_ADMIN_SETTINGS_REASON = "Your organisation's Gemini Enterprise settings could not be checked. Sign in again or ask your Google Cloud admin.";
+const ANTIGRAVITY_ADMIN_SETTINGS_REASON = "Your organisation's Gemini Enterprise settings could not be checked. Sign in again or ask your Google Cloud admin.";
 const ANTIGRAVITY_SIGN_IN_AGAIN = "Google Antigravity needs to sign in again. Run `konteks-remote auth login antigravity`.";
 
 function antigravityError(error: RequestError): BridgeErrorClass | null {

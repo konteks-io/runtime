@@ -13,7 +13,6 @@ import {
   type AcpJsonRpcError,
   type AgentTurnUsageObservation,
   type Clock,
-  type JsonValue,
   type Logger,
   type PendingPermissionView,
   type RemoteWorkAssignment,
@@ -33,7 +32,7 @@ import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/clien
 import type { AdmittedMcpTool, PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
-import { BROWSER_WORK_KINDS, PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
+import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
   canonicalizeAcpToolActivity,
@@ -378,12 +377,12 @@ export class RelayedSession {
     if (preview && PREVIEW_WORK_KINDS.has(this.assignment.kind)) {
       const sessionId = binding.sessionId;
       const cwd = prepared.cwd;
-      // The session's browser: the connector's (O8), for every agent when the
+      // The session's browser: the connector's, for every agent when the
       // connector has one (Claude Code and Codex run their own package's,
       // DeepSeek Harness and OpenCode the connector's), reaching only this
       // session's running preview through its own gateway.
       const browserVersion = this.deps.runner.browserVersion?.() ?? null;
-      if (browserVersion !== null && BROWSER_WORK_KINDS.has(this.assignment.kind) && preview.origin && preview.browsersPath) {
+      if (browserVersion !== null && preview.origin && preview.browsersPath) {
         const origin = preview.origin.bind(preview);
         const gateway = new PreviewBrowserGateway({
           target: () => origin(sessionId),
@@ -1634,8 +1633,4 @@ function classify(error: unknown): AcpJsonRpcError {
     return { code: -32000, class: "agent_auth_required", message, retryable: false };
   }
   return { code: -32603, class: "internal", message, retryable: false };
-}
-
-export function toJson(value: unknown): JsonValue {
-  return JSON.parse(JSON.stringify(value)) as JsonValue;
 }

@@ -65,10 +65,10 @@ async function serviceDefinition(root: string) {
 /** A reload for the same definition within this window means it did not take; say so instead of restarting again. */
 export const SERVICE_RELOAD_WINDOW_MS = 10 * 60_000;
 /** How long a `serve` whose service is being reloaded waits to be stopped before it starts anyway. */
-export const SERVICE_RELOAD_GRACE_MS = 60_000;
-export const SERVICE_RELOAD_FILE = "service-reload.json";
+const SERVICE_RELOAD_GRACE_MS = 60_000;
+const SERVICE_RELOAD_FILE = "service-reload.json";
 
-export type OwnServiceDefinitionOutcome = "not_installed" | "current" | "next_start" | "restarting";
+type OwnServiceDefinitionOutcome = "not_installed" | "current" | "next_start" | "restarting";
 
 export interface OwnServiceDefinitionDeps {
   definition: (root: string) => Promise<NativeServiceDefinition>;

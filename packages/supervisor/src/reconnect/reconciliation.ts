@@ -39,7 +39,7 @@ export interface ReconciliationDeps {
   logger?: Logger;
 }
 
-export type DecisionOutcome = "executed" | "interrupted" | "rejected_wrong_instance" | "rejected_unknown_assignment" | "rejected_wrong_attempt" | "rejected_stale_epoch" | "rejected_conflicting_decision" | "rejected_report_missing" | "duplicate";
+type DecisionOutcome = "executed" | "interrupted" | "rejected_wrong_instance" | "rejected_unknown_assignment" | "rejected_wrong_attempt" | "rejected_stale_epoch" | "rejected_conflicting_decision" | "rejected_report_missing" | "duplicate";
 
 export class Reconciliation {
   private readonly logger: Logger;

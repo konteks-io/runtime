@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, readFile, realpath, rename, rm } from "node:fs/pro
 import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, findGitForWindows, RemoteInstanceError, SystemClock, writeSecretFile } from "@konteks/remote-common";
-import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, NATIVE_MANIFEST_URL, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
+import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, deleteNativeAntigravity, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, signOutNativeAntigravity, type HostAgentInstallAdapter, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
@@ -14,8 +14,7 @@ import { nativePlatform, type NativePlatform } from "./service.js";
 import { releaseStaged, writeStagingProgress } from "./enrollment-staging.js";
 import type { FetchConsent } from "./consent.js";
 
-export { NATIVE_MANIFEST_URL };
-export interface NativeInstallOptions {
+interface NativeInstallOptions {
   root: string; activationId: string; coreUrl: string; relayUrl: string;
   agents?: string[]; controlPort?: number; output: Output;
   deps?: {
@@ -33,7 +32,7 @@ export interface NativeInstallOptions {
     setupAgent?: (agentId: "claude-code" | "codex") => Promise<boolean>;
   };
 }
-export interface NativeAgentAddOptions {
+interface NativeAgentAddOptions {
   root: string;
   agentId: NativeRuntimeRecord["agents"][number];
   output: Output;
@@ -134,33 +133,6 @@ export async function installNative(options: NativeInstallOptions): Promise<Nati
     options.output.line("Installed. Starting Konteks on this computer next.");
     return record;
   } finally { lock.release(); }
-}
-
-/**
- * Prepare a machine for `konteks-remote onboard` (onboarding-simplified OS3).
- *
- * The activation install cannot serve the agent-first door: it consumes an
- * activation that does not exist yet and prompts for a code at a terminal the
- * person's coding agent does not have. This does everything that does not
- * need an identity — verify the signed release against the embedded roots,
- * stage it, install the agent bridges for the families this machine actually
- * has — and stops. No runtime record is written, because there is no instance
- * id to write; `onboard` binds and writes it.
- *
- * Agent families are detected rather than assumed (OS14). Someone who runs
- * only Claude Code is not refused for not also having Codex.
- */
-export async function prepareNativeEnrollment(options: {
-  root: string;
-  coreUrl: string;
-  relayUrl: string;
-  output: Output;
-  agents?: string[];
-  controlPort?: number;
-  deps?: NativeInstallOptions["deps"];
-}): Promise<{ agents: string[]; bundleVersion: string; releaseId: string }> {
-  await recordNativeEnrollment(options);
-  return stageNativeEnrollment({ root: options.root, ...(options.deps ? { deps: options.deps } : {}) });
 }
 
 const ENROLLMENT_MANIFEST = "enrollment-manifest.json";
@@ -405,7 +377,7 @@ export async function stageNativeEnrollment(options: {
 }
 
 /** What `install --enroll` remembered for `onboard`: endpoints, families, the staged release. */
-export const NativeEnrollmentRecordSchema = z.object({
+const NativeEnrollmentRecordSchema = z.object({
   schemaVersion: z.literal(1),
   coreUrl: z.string().min(1),
   relayUrl: z.string().min(1),
@@ -416,7 +388,7 @@ export const NativeEnrollmentRecordSchema = z.object({
   manifestDigest: z.string().min(1),
   controlPort: z.number().int().positive(),
 }).strict();
-export type NativeEnrollmentRecord = z.infer<typeof NativeEnrollmentRecordSchema>;
+type NativeEnrollmentRecord = z.infer<typeof NativeEnrollmentRecordSchema>;
 
 export async function readNativeEnrollment(root: string): Promise<NativeEnrollmentRecord> {
   const path = join(resolve(root), "native-enrollment.json");
@@ -626,7 +598,7 @@ async function fetchedAgentStale(root: string, record: NativeRuntimeRecord, agen
   return host.locate(undefined, { root }).then(() => true, () => false);
 }
 
-export interface NativeAgentRemoveOptions {
+interface NativeAgentRemoveOptions {
   root: string;
   agentId: NativeRuntimeRecord["agents"][number];
   output: Output;

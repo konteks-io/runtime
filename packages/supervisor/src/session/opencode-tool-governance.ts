@@ -133,7 +133,7 @@ function codeModeCallsRan(rawOutput: unknown): Array<{ tool: string; status: str
 }
 
 /** The path Code Mode lists for an approved call. */
-export function codeModeCallPath(call: CodeModeCall): string { return `${call.server}.${call.tool}`; }
+function codeModeCallPath(call: CodeModeCall): string { return `${call.server}.${call.tool}`; }
 
 export class OpenCodeToolGovernance implements HostToolGovernance {
   readonly agentName = "OpenCode";
@@ -147,8 +147,6 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
   private readonly refused = new Set<string>();
 
   constructor(private readonly limit = 512) {}
-
-  size(): number { return this.calls.size; }
 
   observe(update: unknown, cwd: string): HostToolBypass | null {
     const value = record(update);

@@ -119,7 +119,7 @@ export function sanitizeClaudeMcpStatus(raw: readonly ClaudeMcpStatusEntry[]): I
 /** The variable the E2E controller sets on its connector process: `{serverName: loopback url}`. */
 export const E2E_FIXTURE_SERVERS_VARIABLE = "KONTEKS_E2E_FIXTURE_MCP_SERVERS";
 
-export interface E2EFixtureServer {
+interface E2EFixtureServer {
   serverName: string;
   url: string;
 }
@@ -192,7 +192,7 @@ export interface IntegrationDiscovery {
 }
 
 /** Per-agent model-free readers (agent-runner `integration-mcp-status.ts`), composed by the supervisor. */
-export interface NativeIntegrationDiscoveryReaders {
+interface NativeIntegrationDiscoveryReaders {
   claude?: () => Promise<ClaudeMcpStatusEntry[]>;
   codex?: () => Promise<unknown[]>;
   /** E2E only: the `fixture_mcp` sources offered beside Claude's account connectors. */

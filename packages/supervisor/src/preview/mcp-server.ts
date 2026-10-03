@@ -39,20 +39,18 @@ export interface SessionPreviewAccess {
   browsersPath?: string;
 }
 
-/** Work kinds whose agent may run a preview: code that changes, is validated or is checked. */
+/**
+ * Work kinds whose agent may run a preview, and also gets a browser on it
+ * whenever the connector has one: code that changes, is validated or is
+ * checked. The validator checks the work in its UI; a QA-mode conversation is
+ * an `assistant_execution` turn whose agent exercises the preview and reports
+ * the run (`run_submit`); the executor and an ordinary chat can look at what
+ * they build. The browser reaches only the session's own preview, and it
+ * starts only when a tool is first used.
+ */
 export const PREVIEW_WORK_KINDS: ReadonlySet<string> = new Set(["delivery", "validation", "qa", "assistant_execution"]);
 
-/**
- * Work kinds whose agent also gets a browser on the preview (any agent while
- * the connector has the browser, O8): every kind that has a preview. The validator checks the work in its
- * UI; a QA-mode conversation is an `assistant_execution` turn whose agent
- * exercises the preview and reports the run (`run_submit`); the executor and
- * an ordinary chat can look at what they build. The browser reaches only the
- * session's own preview, and it starts only when a tool is first used.
- */
-export const BROWSER_WORK_KINDS: ReadonlySet<string> = PREVIEW_WORK_KINDS;
-
-export interface PreviewToolHost {
+interface PreviewToolHost {
   start(): Promise<PreviewStatus>;
   stop(): Promise<PreviewStatus>;
   status(): PreviewStatus;
@@ -60,7 +58,7 @@ export interface PreviewToolHost {
 
 const NO_ARGUMENTS = { type: "object", properties: {}, additionalProperties: false } as const;
 
-export const PREVIEW_TOOLS = [
+const PREVIEW_TOOLS = [
   {
     name: "preview_start",
     title: "Start the live preview",

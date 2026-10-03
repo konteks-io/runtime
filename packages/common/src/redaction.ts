@@ -18,7 +18,7 @@ const API_KEY_PATTERNS: RegExp[] = [
   /\bkxrp_[A-Za-z0-9_-]{4,}/g, // Konteks provisioning credential
 ];
 
-export const REDACTED = "[redacted]";
+const REDACTED = "[redacted]";
 
 export function isSecretKey(key: string): boolean {
   return SECRET_KEY_PATTERN.test(key);

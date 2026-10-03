@@ -23,13 +23,13 @@ export const HOST_INHERITED_VARIABLES: readonly string[] = Object.freeze([
 ]);
 
 /** Windows system variables a native program needs to start and reach the network; none carries a credential. */
-export const WINDOWS_SYSTEM_VARIABLES: readonly string[] = Object.freeze(["SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT"]);
+const WINDOWS_SYSTEM_VARIABLES: readonly string[] = Object.freeze(["SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT"]);
 
 /** A name that looks like it carries a credential is never passed, whatever put it there. */
-export const CREDENTIAL_VARIABLE_NAME = /TOKEN|SECRET|PASSW(OR)?D|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|AUTH|SESSION|COOKIE/i;
+const CREDENTIAL_VARIABLE_NAME = /TOKEN|SECRET|PASSW(OR)?D|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|AUTH|SESSION|COOKIE/i;
 const CONTROL = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
-export interface AllowListEnvironmentOptions {
+interface AllowListEnvironmentOptions {
   /** The agent's name in refusals ("OpenCode", "Google Antigravity"). */
   agentName: string;
   /** Private-home variables (HOME, XDG_*, GEMINI_HOME …): each an absolute path the connector owns. */

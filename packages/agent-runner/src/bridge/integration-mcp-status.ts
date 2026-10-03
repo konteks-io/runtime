@@ -136,7 +136,7 @@ if (out === undefined) process.exit(3);
 process.stdout.write(JSON.stringify(out), () => process.exit(0));
 `;
 
-export interface ClaudeMcpStatusLaunch {
+interface ClaudeMcpStatusLaunch {
   command: string;
   args: string[];
   env: NodeJS.ProcessEnv;

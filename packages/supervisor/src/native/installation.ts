@@ -31,7 +31,7 @@ function endpoint(protocol: "https:" | "wss:") {
  * connector fetches itself on the person's yes (host-agents.ts, offered since
  * antigravity CP6).
  */
-export const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode", "antigravity"] as const;
+const NATIVE_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode", "antigravity"] as const;
 
 /** Installer-owned metadata, not an environment file or arbitrary process configuration. */
 export const NativeRuntimeRecordSchema = z.object({

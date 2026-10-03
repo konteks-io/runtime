@@ -4,11 +4,17 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { decodeServiceDefinition, describeServiceFailure, encodeServiceDefinition, nativeServiceDefinition, NativeServiceCommandError, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
+import { describeServiceFailure, encodeServiceDefinition, nativeServiceDefinition, NativeServiceCommandError, startNativeServiceDefinition, type NativeServiceCommand } from "../native/service.js";
 import { keepServiceOnOwnDefinition, type OwnServiceDefinitionDeps } from "../native/commands.js";
 import { createNativeProgram, type NativeCliActions } from "../native/cli.js";
 import { isVerbose, setVerbose, verbose, verboseCommand } from "../verbose.js";
 import { localServiceReport, readServiceStartFailure, recordServiceStartFailure, clearServiceStartFailure } from "../native/service-report.js";
+
+/** A definition file's text: UTF-16LE after its byte-order mark, UTF-8 otherwise. */
+function decodeServiceDefinition(bytes: Uint8Array): string {
+  const buffer = Buffer.from(bytes);
+  return buffer[0] === 0xff && buffer[1] === 0xfe ? buffer.subarray(2).toString("utf16le") : buffer.toString("utf8");
+}
 
 const windowsRoot = "C:\\Users\\Test User\\AppData\\Local\\konteks-remote";
 const windows = () => nativeServiceDefinition({ os: "windows", home: "C:\\Users\\Test User", root: windowsRoot, executable: `${windowsRoot}\\releases\\r1\\konteks-connector.exe`, userId: "S-1-5-21-1-2-3-1001" });

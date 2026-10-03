@@ -22,7 +22,7 @@ const TOOL_CONTROL: Record<AgentBridgeFamily["agentId"], ConnectedAgentView["acp
   antigravity: "approve",
 };
 
-export interface ReadinessInputs {
+interface ReadinessInputs {
   family: AgentBridgeFamily;
   authMode: ConnectedAgentView["authMode"];
   connectionState: ConnectedAgentView["connectionState"];

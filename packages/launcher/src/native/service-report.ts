@@ -9,9 +9,9 @@ import { CONNECTOR_LOG_FILE } from "./service.js";
  * while nothing is running to ask (D129: a Windows start failed and doctor,
  * which asks the running connector, had nothing to show).
  */
-export const SERVICE_START_FAILURE_FILE = "service-start-failure.json";
+const SERVICE_START_FAILURE_FILE = "service-start-failure.json";
 
-export interface ServiceStartFailure { at: string; message: string }
+interface ServiceStartFailure { at: string; message: string }
 
 const failureFile = (root: string) => join(root, "supervisor", SERVICE_START_FAILURE_FILE);
 export const connectorLogFile = (root: string) => join(root, "logs", CONNECTOR_LOG_FILE);

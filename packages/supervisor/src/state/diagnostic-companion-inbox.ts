@@ -40,7 +40,7 @@ export type DiagnosticCompanionInboxRecord = z.infer<
 const DiagnosticCompanionInboxInputSchema =
   DiagnosticCompanionInboxRecordBaseSchema.omit({ version: true, receivedAt: true });
 
-export interface DiagnosticCompanionInboxLog {
+interface DiagnosticCompanionInboxLog {
   all(): DiagnosticCompanionInboxRecord[];
   update(
     key: string,

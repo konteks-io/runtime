@@ -12,7 +12,7 @@ import {
   type ConnectedAgentView,
 } from "@konteks/remote-common";
 
-export interface ResolvedModelCapabilityMapping { agentId: string; mapping: AgentModelCapabilityMapping }
+interface ResolvedModelCapabilityMapping { agentId: string; mapping: AgentModelCapabilityMapping }
 
 /**
  * What one snapshot is bound to: a reviewed signed mapping from the release,
@@ -37,7 +37,7 @@ interface DiscoveredOffer {
   observedAgoMs?: number;
 }
 
-export interface ModelCapabilitySnapshotProducerOptions {
+interface ModelCapabilitySnapshotProducerOptions {
   clock: Clock;
   instanceId: () => string;
   runnerIncarnation: () => string;

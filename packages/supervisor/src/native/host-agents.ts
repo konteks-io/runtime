@@ -78,7 +78,7 @@ export interface HostAgentInstallAdapter {
 }
 
 /** The person's own DeepSeek Harness (dsh-runtime-support CP1-CP5). */
-export const dshInstallAdapter: HostAgentInstallAdapter = {
+const dshInstallAdapter: HostAgentInstallAdapter = {
   agentId: "dsh",
   offered: true,
   locate: env => locateNativeDsh(env),

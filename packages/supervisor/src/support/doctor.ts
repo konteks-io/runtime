@@ -1,12 +1,12 @@
 import { stat } from "node:fs/promises";
-import { RemoteInstanceError, type DoctorCheck, type DoctorReport } from "@konteks/remote-common";
+import { type DoctorCheck, type DoctorReport } from "@konteks/remote-common";
 
 /**
  * Allowlisted doctor checks: versions, reachability, lease, components,
  * agents, disk, previews. Details carry statuses and
  * revisions — never a path, address, key, lease value, or raw probe output.
  */
-export interface DoctorInputs {
+interface DoctorInputs {
   now: () => string;
   dataDir: string;
   identity: { instanceId: string | null; administrativeStatus: string };
@@ -278,11 +278,4 @@ export async function runDoctor(inputs: DoctorInputs): Promise<DoctorReport> {
   if (inputs.launcher === "older") push({ id: "launcher", title: "konteks-remote command", status: "warn", detail: "konteks-remote is from an older installer and runs its old code, not this release's. Update it once: run the Windows install line with -Update in place of -ActivationId." });
   push({ id: "config", title: "Desired configuration", status: inputs.configRevision > 0 ? "pass" : "warn", detail: `revision ${inputs.configRevision}` });
   return { checks, generatedAt: inputs.now() };
-}
-
-export function assertDoctorHasNoSecrets(report: DoctorReport): void {
-  const text = JSON.stringify(report);
-  if (/\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\//.test(text)) {
-    throw new RemoteInstanceError("local_io_failure", "doctor report would contain a path");
-  }
 }

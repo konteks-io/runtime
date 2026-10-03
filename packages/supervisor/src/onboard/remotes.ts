@@ -35,7 +35,7 @@ export interface RepositoryLocation {
   repoName: string;
 }
 
-export type ManagedBindingSource = () => ManagedGitBinding | null;
+type ManagedBindingSource = () => ManagedGitBinding | null;
 
 export function createRemoteResolver(managed: ManagedBindingSource): (location: RepositoryLocation) => GitRemote {
   return location => resolveRemote(location, managed());

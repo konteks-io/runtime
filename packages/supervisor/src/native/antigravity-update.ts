@@ -20,7 +20,7 @@ import { acquireNativeRootLock } from "./root-lock.js";
  * folder, is tried again, and doctor says why.
  */
 
-export interface AntigravityUpdateDeps extends AntigravityInstallDeps {
+interface AntigravityUpdateDeps extends AntigravityInstallDeps {
   /** The start check on the new copy before switching (`antigravityInstallAdapter.selfCheck`). */
   selfCheck: (config: RunnerConfig) => Promise<void>;
   /** Log a record the connector could not write now (kept in memory, written on a later start). */

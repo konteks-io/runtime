@@ -36,7 +36,7 @@ import type { SupervisorJournal } from "../state/journal.js";
  * revision/nonce, and is acknowledged with a signed body. There is no
  * arbitrary directive; anything else is dropped and counted.
  */
-export interface ControlDeps {
+interface ControlDeps {
   store: SupervisorStore;
   journal: SupervisorJournal;
   clock: Clock;
@@ -58,7 +58,7 @@ export interface ControlDeps {
   logger?: Logger;
 }
 
-export interface ControlCounters {
+interface ControlCounters {
   rejectedSignature: number;
   rejectedStale: number;
   rejectedUnknown: number;

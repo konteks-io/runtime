@@ -48,7 +48,7 @@ export function integrationTerminalResult(outcome: IntegrationWorkOutcome): { cl
 }
 
 /** The agents an integration task can run on: the two with a certified permission gate (Stage 0). */
-export const INTEGRATION_AGENT_IDS: ReadonlySet<string> = new Set(["claude-code", "codex"]);
+const INTEGRATION_AGENT_IDS: ReadonlySet<string> = new Set(["claude-code", "codex"]);
 
 /** `integration-task-v1` for the `agent_runner` component when a Claude Code or Codex runner is installed. */
 export function integrationTaskCapabilities(agentIds: Iterable<string>): string[] {
@@ -61,7 +61,7 @@ export function integrationFixturesEnabled(env: NodeJS.ProcessEnv = process.env)
   return env.KONTEKS_E2E_NATIVE_CONNECTOR === "1";
 }
 
-export interface IntegrationTaskCarrierDeps {
+interface IntegrationTaskCarrierDeps {
   /** Core's frozen task for the claimed assignment (the workload route, assignment authority). */
   fetchWorkload: (assignment: IntegrationWorkAssignment) => Promise<WorkloadDefinition>;
   discovery: IntegrationDiscovery;

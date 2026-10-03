@@ -6,7 +6,8 @@ import { BROWSER_MCP_PACKAGE, NativeAgentPackageProfileSchema } from "@konteks/r
 import { RunnerConfigSchema, browserMcpServer, type RunnerConfig } from "@konteks/remote-agent-runner";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { BROWSER_NO_NODE_MESSAGE, BROWSER_NO_PACKAGE_MESSAGE, browserNodeSupported, resolveConnectorBrowser, withConnectorBrowser } from "../native/browser-capability.js";
-import { assertDoctorHasNoSecrets, runDoctor } from "../support/doctor.js";
+import { runDoctor } from "../support/doctor.js";
+import { expectNoPath } from "./doctor-report.js";
 
 const digest = `sha256:${"a".repeat(64)}`;
 function profileWithBrowser(agentId: "claude-code" | "codex") {
@@ -89,9 +90,9 @@ describe("the QA browser as a connector capability (O8)", () => {
       diskFreeBytes: 1, minimumDiskBytes: 0, outboxDepth: 0, recoveryRequired: 0, coreSignatureConfigured: true };
     const report = await runDoctor({ ...base, browser: { version: null, agents: [], chrome: true, unavailable: BROWSER_NO_NODE_MESSAGE } } as never);
     expect(report.checks.find(check => check.id === "browser")).toMatchObject({ status: "warn", detail: BROWSER_NO_NODE_MESSAGE });
-    expect(assertDoctorHasNoSecrets(report)).toBeUndefined();
+    expectNoPath(report);
     const noPackage = await runDoctor({ ...base, browser: { version: null, agents: [], chrome: true, unavailable: BROWSER_NO_PACKAGE_MESSAGE } } as never);
-    expect(assertDoctorHasNoSecrets(noPackage)).toBeUndefined();
+    expectNoPath(noPackage);
     const person = await runDoctor({ ...base, browser: { version: "0.0.82", agents: ["claude-code", "codex", "dsh", "opencode"], chrome: false, packageAgent: "claude-code", nodeSource: "person" } } as never);
     expect(person.checks.find(check => check.id === "browser")?.detail).toMatch(/^Playwright MCP 0\.0\.82 for claude-code, codex, dsh, opencode; runs on your own Node; no Google Chrome/);
     const bundledNode = await runDoctor({ ...base, browser: { version: "0.0.82", agents: ["codex", "opencode"], chrome: true, packageAgent: "codex", nodeSource: "agent_package" } } as never);

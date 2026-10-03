@@ -5,7 +5,7 @@
  *
  * An agent absent from this table deliberately publishes no model authority.
  */
-export const REVIEWED_NATIVE_MODEL_IDENTITIES = {
+const REVIEWED_NATIVE_MODEL_IDENTITIES = {
   "claude-code": [
     { value: "default", canonicalProviderId: "anthropic", canonicalModelId: "claude-opus-5[1m]" },
     { value: "opus[1m]", canonicalProviderId: "anthropic", canonicalModelId: "claude-opus-5[1m]" },
@@ -24,7 +24,7 @@ export const REVIEWED_NATIVE_MODEL_IDENTITIES = {
   ],
 } as const;
 
-export type ReviewedNativeAgentId = keyof typeof REVIEWED_NATIVE_MODEL_IDENTITIES;
+type ReviewedNativeAgentId = keyof typeof REVIEWED_NATIVE_MODEL_IDENTITIES;
 
 export function reviewedNativeModelIdentities(agentId: string) {
   return REVIEWED_NATIVE_MODEL_IDENTITIES[agentId as ReviewedNativeAgentId];

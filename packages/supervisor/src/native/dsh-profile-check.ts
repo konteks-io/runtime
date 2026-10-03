@@ -12,7 +12,7 @@ import type { NativeDshInstallation } from "./dsh-installation.js";
  * `--dump-config` boot is config-only and runs nothing the profile loads.
  */
 
-export interface DshDumpRow {
+interface DshDumpRow {
   name?: string;
   /** Raw `disabled` value: `true`, `false` or an unevaluated `!!js` expression. */
   disabled?: string;
@@ -20,9 +20,9 @@ export interface DshDumpRow {
   config: Record<string, string>;
 }
 
-export type DshDumpRunner = (command: string, args: string[], options: { env: NodeJS.ProcessEnv; timeoutMs: number }) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+type DshDumpRunner = (command: string, args: string[], options: { env: NodeJS.ProcessEnv; timeoutMs: number }) => Promise<{ code: number | null; stdout: string; stderr: string }>;
 
-export interface DshProfileCheckOptions {
+interface DshProfileCheckOptions {
   /** The runtime's own bundled Node, never the person's. */
   node: string;
   installation: NativeDshInstallation;

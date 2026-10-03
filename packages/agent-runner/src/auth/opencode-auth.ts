@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
@@ -50,10 +50,10 @@ export interface OpenCodeCommandContext {
   cwd: string;
 }
 
-export type OpenCodeRun = typeof runCommand;
+type OpenCodeRun = typeof runCommand;
 
 /** One way to sign an integration in, as the installed OpenCode offers it. */
-export interface OpenCodeLoginMethod {
+interface OpenCodeLoginMethod {
   /** OpenCode's `--method` id (`device`, `chatgpt-headless`, `key`, …). */
   id: string;
   kind: "sign_in" | "api_key";
@@ -63,7 +63,7 @@ export interface OpenCodeLoginMethod {
   answers: string[];
 }
 
-export interface OpenCodeIntegration {
+interface OpenCodeIntegration {
   /** OpenCode's integration id: the provider id its models use (`opencode`, `openai`, `deepseek`). */
   id: string;
   name: string;
@@ -264,14 +264,14 @@ export interface OpenCodeLoginRequest {
 }
 
 /** The person's own OpenCode, read only through its own `auth list`, only after their yes (O10). */
-export interface OpenCodePersonalHome {
+interface OpenCodePersonalHome {
   /** Their own OpenCode data exists on this computer (nothing is read to know it). */
   exists(): boolean;
   /** What their own OpenCode is signed in to (provider names and kinds). */
   list(): Promise<OpenCodeStoredCredential[]>;
 }
 
-export interface OpenCodeLoginOptions {
+interface OpenCodeLoginOptions {
   context: OpenCodeCommandContext;
   events: RunnerEventBus;
   request?: OpenCodeLoginRequest;
@@ -613,9 +613,4 @@ function personalOpenCodeFolders(inherited: NodeJS.ProcessEnv): { home: string; 
  */
 export function personalOpenCodeDataExists(inherited: NodeJS.ProcessEnv = process.env): boolean {
   return existsSync(join(personalOpenCodeFolders(inherited).data, "opencode", "opencode.db"));
-}
-
-/** Read back whether the one-time reuse offer was made (tests). */
-export async function openCodeReuseOffered(stateDir: string): Promise<boolean> {
-  return readFile(join(stateDir, REUSE_OFFERED_FILE), "utf8").then(() => true, () => false);
 }

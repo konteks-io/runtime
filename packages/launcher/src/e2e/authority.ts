@@ -3,7 +3,7 @@ import { dirname, isAbsolute, normalize, sep } from "node:path";
 import { RemoteInstanceError, type RemoteSignedBundleManifest } from "@konteks/remote-common";
 import { loadReleaseRootsFile, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
 
-export interface E2EInstallAuthorityInput {
+interface E2EInstallAuthorityInput {
   gate: string | undefined;
   directory: string;
   manifestFile: string;

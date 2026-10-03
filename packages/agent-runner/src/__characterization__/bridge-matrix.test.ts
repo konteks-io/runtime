@@ -8,11 +8,11 @@ import { resolveBridgeSpawnSpec, resolveToolingCommand } from "../bridge/spec.js
 import { spawnBridge } from "../bridge/process.js";
 
 /**
- * Characterization: each supported bridge at the CP0-pinned version —
- * spawn, `initialize` result, login/logout tooling presence, host-cache
- * documentation, and stdio framing. Runs against an unpacked offline agent
- * package (REMOTE_INSTANCE_CHARACTERIZE=1 with RUNNER_BRIDGE_PREFIX set) and
- * records the observed capabilities so the CP0 matrix can be diffed.
+ * Characterization: each supported bridge at its pinned version — spawn,
+ * `initialize` result, login/logout tooling presence, and stdio framing. Runs
+ * against an unpacked offline agent package (REMOTE_INSTANCE_CHARACTERIZE=1
+ * with RUNNER_BRIDGE_PREFIX set) and records the observed capabilities so the
+ * matrix can be diffed.
  */
 const prefix = process.env.RUNNER_BRIDGE_PREFIX ?? "/opt/konteks/bridges";
 
@@ -44,6 +44,6 @@ describe.each(SUPPORTED_AGENT_BRIDGES.map((bridge) => [bridge.agentId, bridge] a
     const login = resolveToolingCommand(config, family, family.tooling.login);
     const logout = resolveToolingCommand(config, family, family.tooling.logout);
     const present = await Promise.all([login, logout].map((tool) => access(tool.command).then(() => true, () => false)));
-    process.stdout.write(`${JSON.stringify({ agentId, loginTooling: present[0], logoutTooling: present[1], hostCacheImport: family.tooling.hostCacheImport ?? null, identitySignal: family.tooling.identitySignal ?? null })}\n`);
+    process.stdout.write(`${JSON.stringify({ agentId, loginTooling: present[0], logoutTooling: present[1], identitySignal: family.tooling.identitySignal ?? null })}\n`);
   });
 });

@@ -22,7 +22,7 @@ import { readNativeRecord } from "./install.js";
  * asked and nothing is installed; the closing summary names the command.
  */
 export const PERSONAL_AGENTS = ["claude-code", "codex"] as const;
-export type PersonalAgentId = (typeof PERSONAL_AGENTS)[number];
+type PersonalAgentId = (typeof PERSONAL_AGENTS)[number];
 
 export function isPersonalAgent(agentId: string): agentId is PersonalAgentId {
   return (PERSONAL_AGENTS as readonly string[]).includes(agentId);
@@ -47,7 +47,7 @@ export interface AgentSetupDeps {
 /** The one line for a person who needs Git for Windows and is not getting it from winget. */
 const GIT_HINT = `Claude Code needs Git for Windows: ${GIT_FOR_WINDOWS_DOWNLOAD}`;
 
-export function productionAgentSetupDeps(output: Pick<Output, "json">): AgentSetupDeps {
+function productionAgentSetupDeps(output: Pick<Output, "json">): AgentSetupDeps {
   return {
     interactive: () => process.stdin.isTTY === true && !output.json,
     ask: question => confirm(question),

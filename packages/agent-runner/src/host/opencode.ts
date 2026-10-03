@@ -5,7 +5,7 @@ import { OpenCodeLoginOptionIdSchema, RemoteInstanceError, keyedFingerprint, rea
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import type { HostAgentRunnerAdapter, HostLoginRequest, HostWorkingCopyBinding } from "./host-agent.js";
-import { allowListEnvironment, HOST_INHERITED_VARIABLES } from "./allow-list-environment.js";
+import { allowListEnvironment } from "./allow-list-environment.js";
 import { instructionsInside } from "./working-copy-instructions.js";
 import {
   isOpenCodeFreeModel,
@@ -34,9 +34,6 @@ const FINGERPRINT_KEY_FILE = "fingerprint.key";
  * `OPENCODE_*`. What OpenCode keeps lives in a private home the connector owns.
  */
 
-/** Inherited variables OpenCode may see (compared case-insensitively on Windows): the host-agent allow-list. */
-export const OPENCODE_INHERITED_VARIABLES: readonly string[] = HOST_INHERITED_VARIABLES;
-
 const CONTROL = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
 /** Where an OpenCode runner keeps its private state, all inside its credential directory. */
@@ -62,7 +59,7 @@ export function openCodeRuntimePaths(credentialDir: string, platform: NodeJS.Pla
   return { root, home: path.join(root, "home"), data: path.join(root, "data"), state: path.join(root, "state"), cache: path.join(root, "cache"), configs, controlConfig: path.join(configs, "control") };
 }
 
-export interface OpenCodeEnvironmentOptions {
+interface OpenCodeEnvironmentOptions {
   /** The private home: HOME and the XDG folders (all absolute). */
   home: { home: string; data: string; state: string; cache: string; config: string };
   /** Konteks' own `OPENCODE_*` settings (never inherited ones). */
@@ -205,9 +202,9 @@ export function openCodeWorkingCopyConfig(credentialDir: string, workingCopy: st
 }
 
 /** How a config folder carries the working copy's `AGENTS.md`. */
-export type OpenCodeInstructions = "link" | "copy" | "none";
+type OpenCodeInstructions = "link" | "copy" | "none";
 
-export interface OpenCodeInstructionsDeps {
+interface OpenCodeInstructionsDeps {
   /** Replaced only in tests (a Windows account without the symlink privilege). */
   symlink?: typeof symlink;
 }
@@ -298,7 +295,7 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
  * repository config is in reach and `--standalone` keeps its private server
  * to itself (it exits with the command; no background service is started).
  */
-export async function preparedOpenCodeCommandContext(config: RunnerConfig): Promise<OpenCodeCommandContext> {
+async function preparedOpenCodeCommandContext(config: RunnerConfig): Promise<OpenCodeCommandContext> {
   const context = openCodeCommandContext(config);
   await prepareOpenCodeHome(config);
   return context;

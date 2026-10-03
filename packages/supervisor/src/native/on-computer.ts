@@ -12,7 +12,7 @@ export type OnComputerAgent = (typeof ON_COMPUTER_AGENTS)[number];
 const NAMES: Readonly<Record<OnComputerAgent, string>> = { dsh: "DeepSeek Harness", opencode: "OpenCode", antigravity: "Google Antigravity" };
 
 /** Where an agent stands here, as the supported-agents report says it. */
-export interface OnComputerAgentFacts {
+interface OnComputerAgentFacts {
   agentId: OnComputerAgent;
   state: string;
   installCommand?: string;
@@ -130,7 +130,7 @@ export function onComputerScript(plan: OnComputerPlan, context: { agentId: OnCom
   ].join("\n");
 }
 
-export interface OnComputerOpenDeps {
+interface OnComputerOpenDeps {
   spawn?: (command: string, args: string[]) => void;
 }
 
@@ -179,7 +179,7 @@ export async function openOnComputer(input: { loginId: string; script: string; d
   return { file, opened: true };
 }
 
-export interface OnComputerOpened {
+interface OnComputerOpened {
   file: string;
   /** Whether a window came up; false when the script was only left for a stand-in's tester. */
   opened: boolean;

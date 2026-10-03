@@ -108,7 +108,7 @@ const LAUNCHD_RELOAD_SCRIPT = [
 ].join("\n");
 
 /** Seconds launchd waits after SIGTERM before SIGKILL; above the connector's 15 s shutdown watchdog. */
-export const LAUNCHD_EXIT_TIMEOUT_SECONDS = 30;
+const LAUNCHD_EXIT_TIMEOUT_SECONDS = 30;
 
 /**
  * The bytes of a definition file, the one encoding every writer uses: Task
@@ -123,17 +123,11 @@ export function encodeServiceDefinition(definition: Pick<NativeServiceDefinition
     : Buffer.from(definition.contents, "utf8");
 }
 
-/** A definition file's text: UTF-16LE after its byte-order mark, UTF-8 otherwise. */
-export function decodeServiceDefinition(bytes: Uint8Array): string {
-  const buffer = Buffer.from(bytes);
-  return buffer[0] === 0xff && buffer[1] === 0xfe ? buffer.subarray(2).toString("utf16le") : buffer.toString("utf8");
-}
-
 /** How a service command ended, with what it printed, so a failure can say why. */
 export interface NativeServiceRun { code: number | null; stdout?: string; stderr?: string; error?: string; timedOut?: boolean }
 /** A service command runner: a bare exit code, or the whole outcome. */
 export type NativeServiceExecute = (command: NativeServiceCommand) => Promise<number | null | NativeServiceRun>;
-export type NativeServiceStep = "status" | "write" | "register" | "start" | "stop";
+type NativeServiceStep = "status" | "write" | "register" | "start" | "stop";
 
 export function serviceRun(value: number | null | NativeServiceRun): NativeServiceRun {
   return value !== null && typeof value === "object" ? value : { code: value };
@@ -142,13 +136,13 @@ export function serviceRun(value: number | null | NativeServiceRun): NativeServi
 const EXCERPT_LIMIT = 300;
 
 /** The service manager's own words, bounded: stderr first, stdout when stderr is empty. */
-export function serviceOutputExcerpt(run: NativeServiceRun): string {
+function serviceOutputExcerpt(run: NativeServiceRun): string {
   const text = (run.stderr?.trim() || run.stdout?.trim() || "").replace(/\s+/g, " ");
   return text.length > EXCERPT_LIMIT ? `${text.slice(0, EXCERPT_LIMIT - 1)}…` : text;
 }
 
 /** `schtasks.exe /Create`, `launchctl bootstrap`, `systemctl enable`: the command and its verb, never its paths. */
-export function serviceCommandName(command: NativeServiceCommand): string {
+function serviceCommandName(command: NativeServiceCommand): string {
   const verb = command.args.find(arg => /^\/?[A-Za-z][A-Za-z-]*$/.test(arg) && !arg.startsWith("-"));
   return verb ? `${command.command} ${verb}` : command.command;
 }
@@ -317,7 +311,7 @@ export function nativeServiceDefinition(input: {
  * Task Scheduler's published schema types `RestartOnFailure/Count` as an
  * unsignedByte; 999, which its own dialog offers, is out of that range.
  */
-export const WINDOWS_TASK_RESTART_COUNT = 255;
+const WINDOWS_TASK_RESTART_COUNT = 255;
 /** The connector log's limit, as the supervisor keeps it on macOS and Linux (connector-log.ts). */
 const WINDOWS_LOG_MAX_BYTES = 20 * 1024 * 1024;
 

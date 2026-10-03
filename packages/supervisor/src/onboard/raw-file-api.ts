@@ -15,7 +15,7 @@ import { gitGap, gitOk, type GitAccess, type GitResult } from "./git.js";
 export const EVIDENCE_READ_PATHS = ["git_archive", "raw_file_api"] as const;
 export type EvidenceReadPath = (typeof EVIDENCE_READ_PATHS)[number];
 
-export interface RawFileRequest {
+interface RawFileRequest {
   provider: string;
   /** The repository's browse URL, as the inventory carries it. */
   url: string;
@@ -28,7 +28,7 @@ export interface RawFileRequest {
 /** Maximum bytes a single evidence read may pull; facts are small by design. */
 export const MAX_EVIDENCE_FILE_BYTES = 512 * 1024;
 
-export interface RawFileApiOptions {
+interface RawFileApiOptions {
   git: Pick<GitAccess, "credential">;
   fetchFn?: FetchFn;
   timeoutMs?: number;
@@ -78,7 +78,7 @@ export class RawFileApi {
  * vocabulary already names are built; anything else reports an evidence gap
  * rather than guessing a URL shape.
  */
-export function rawFileUrl(request: RawFileRequest): { url: string; accept?: string } | null {
+function rawFileUrl(request: RawFileRequest): { url: string; accept?: string } | null {
   const base = originOf(request.url);
   if (!base) return null;
   const owner = encodeURIComponent(request.repoOwner);

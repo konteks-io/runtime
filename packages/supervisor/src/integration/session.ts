@@ -20,7 +20,7 @@ import { IntegrationTaskError } from "./errors.js";
 import { buildIntegrationPrompt } from "./prompt.js";
 import { IntegrationToolGate, type IntegrationWriteLedger } from "./tool-gate.js";
 
-export interface IntegrationSessionDeps {
+interface IntegrationSessionDeps {
   runner: RunnerPort;
   instanceId: string;
   /** The agent runner's workspace folder; the session gets an empty private folder inside it. */
@@ -102,10 +102,6 @@ export class IntegrationSession {
     private readonly deps: IntegrationSessionDeps,
   ) {
     this.logger = deps.logger ?? createLogger({ name: "integration-session" });
-  }
-
-  get ref(): string | null {
-    return this.acpSessionRef;
   }
 
   async run(assertCurrent: () => void): Promise<IntegrationTaskResult> {

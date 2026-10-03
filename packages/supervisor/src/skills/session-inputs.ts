@@ -21,7 +21,7 @@ export interface PreparedSessionInputs {
 }
 
 /** Adapted from bb provider-bridge-acp's skill-root instruction construction. */
-export function organizationSkillInstructions(staged: StagedOrganizationSkills): string {
+function organizationSkillInstructions(staged: StagedOrganizationSkills): string {
   if (!staged.skills.length) return "";
   return [
     "Required organization skills are staged instruction folders. Read each selected SKILL.md before its applicable work, including the scripts/assets/references it requires. A missing or unreadable required file blocks the work; report that failure instead of silently omitting the skill.",

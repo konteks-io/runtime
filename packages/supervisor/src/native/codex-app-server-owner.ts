@@ -411,7 +411,7 @@ export async function prepareCodexSocket(socketPath: string, allowStaleCleanup =
  * generous; a server that exits fails at once, and other agents start
  * meanwhile (start-native-agents), so the wait only costs Codex itself.
  */
-export const CODEX_SOCKET_READY_TIMEOUT_MS = 60_000;
+const CODEX_SOCKET_READY_TIMEOUT_MS = 60_000;
 
 export async function waitForCodexSocket(socketPath: string, child: PipedChildProcess, timeoutMs = CODEX_SOCKET_READY_TIMEOUT_MS): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -459,7 +459,7 @@ function pause(ms: number): Promise<void> { return new Promise(resolve => setTim
 function unavailable(message: string): RemoteInstanceError { return new RemoteInstanceError("agent_unavailable", message); }
 
 /** `…/releases/<release>/…` → the releases folder and the release name. */
-export function releaseOf(command: string): { releasesDir: string; release: string } | null {
+function releaseOf(command: string): { releasesDir: string; release: string } | null {
   const match = /^(.*\/releases\/)([^/]+)\//.exec(command);
   return match ? { releasesDir: match[1]!, release: match[2]! } : null;
 }
@@ -485,7 +485,7 @@ async function listProcesses(): Promise<Array<{ pid: number; command: string }>>
 }
 
 /** The Codex app-server process listening on the shared socket, if it can be told. */
-export async function findCodexSocketHolder(socketPath: string): Promise<CodexSocketHolder | null> {
+async function findCodexSocketHolder(socketPath: string): Promise<CodexSocketHolder | null> {
   // lsof names a socket by where it was bound, not by a link to it (Codex 0.159+).
   const socket = await resolveCodexSocket(socketPath).catch(() => null);
   const { stdout } = await run("lsof", ["-t", socket?.kind === "socket" ? socket.target : socketPath], { timeout: 5_000 });

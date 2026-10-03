@@ -28,7 +28,7 @@ import { BROWSER_ORIGINS_ENV, isDeniedBrowserTool } from "./browser-tools.js";
 
 type Message = { jsonrpc?: string; id?: string | number | null; method?: string; params?: { name?: unknown }; result?: { tools?: Array<{ name?: unknown }> } };
 
-export interface BrowserLauncherOptions {
+interface BrowserLauncherOptions {
   cli: string;
   flags: string[];
   env: NodeJS.ProcessEnv;
@@ -71,7 +71,7 @@ export function sanitizeOrigins(value: unknown): string[] | null {
 }
 
 /** The gateway's list, asked over loopback; null when it does not answer in time. */
-export function fetchGatewayOrigins(url: string, timeoutMs = 2_000): Promise<string[] | null> {
+function fetchGatewayOrigins(url: string, timeoutMs = 2_000): Promise<string[] | null> {
   return new Promise(resolve => {
     const request = httpGet(url, { timeout: timeoutMs }, response => {
       let body = "";

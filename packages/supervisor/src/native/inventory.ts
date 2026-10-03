@@ -11,7 +11,7 @@ const readinessSchema = z.object({
   utilization: z.object({ activeSessions: z.number().int().nonnegative(), activeTurns: z.number().int().nonnegative() }).strict(),
 }).strict();
 
-export interface NativeInventoryOptions {
+interface NativeInventoryOptions {
   runners: ReadonlyMap<string, Pick<RunnerPort, "readiness">>;
   sampler: Pick<SignalSampler, "sample">;
   bundleVersion: string;

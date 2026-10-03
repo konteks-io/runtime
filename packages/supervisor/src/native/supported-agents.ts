@@ -12,7 +12,7 @@ import { resolveNativeOpenCodeInstallation } from "./opencode-installation.js";
  * whether or not it runs them.
  */
 export const SUPPORTED_AGENT_IDS = ["claude-code", "codex", "dsh", "opencode", "antigravity"] as const;
-export type SupportedAgentId = (typeof SUPPORTED_AGENT_IDS)[number];
+type SupportedAgentId = (typeof SUPPORTED_AGENT_IDS)[number];
 
 /**
  * How a person installs the agents the connector runs from their own
@@ -26,7 +26,7 @@ const BUNDLED_AGENT_INSTALL: Record<"claude-code" | "codex", { installCommand: s
 };
 
 /** What a refusal can mean to a person. */
-export type FailureState = Extract<SupportedAgentState, "not_installed" | "unsupported_version" | "not_added" | "not_supported_on_this_os" | "failed">;
+type FailureState = Extract<SupportedAgentState, "not_installed" | "unsupported_version" | "not_added" | "not_supported_on_this_os" | "failed">;
 
 /** Where an agent the installation does not list stands on this computer: only file checks, never an agent run with the person's environment. */
 export interface NotAddedAgentDetection {
@@ -46,7 +46,7 @@ export interface AddedAgentFacts {
   version?: string;
 }
 
-export interface SupportedAgentsInputs {
+interface SupportedAgentsInputs {
   /** The agents the installation lists (runners and those left out at load). */
   added: ReadonlyMap<string, AddedAgentFacts>;
   /** The cached detection for every agent the installation does not list. */
@@ -124,7 +124,7 @@ export function projectSupportedAgents(inputs: SupportedAgentsInputs): Supported
 }
 
 /** Replaceable checks, for tests only. */
-export interface NotAddedDetectionDeps {
+interface NotAddedDetectionDeps {
   claude?: () => Promise<unknown>;
   codex?: () => Promise<unknown>;
   dsh?: () => Promise<{ version: string }>;

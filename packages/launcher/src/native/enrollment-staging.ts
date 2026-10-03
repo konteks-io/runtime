@@ -19,7 +19,7 @@ import { z } from "zod";
  * no secret.
  */
 
-export const StagingProgressSchema = z
+const StagingProgressSchema = z
   .object({
     schemaVersion: z.literal(1),
     state: z.enum(["running", "done", "failed"]),
@@ -32,7 +32,7 @@ export const StagingProgressSchema = z
     updatedAt: z.string().min(1),
   })
   .strict();
-export type StagingProgress = z.infer<typeof StagingProgressSchema>;
+type StagingProgress = z.infer<typeof StagingProgressSchema>;
 
 export type StagingStatus =
   | { state: "done" }
@@ -42,7 +42,7 @@ export type StagingStatus =
 
 const FILE = "staging.json";
 
-export function stagingProgressPath(root: string): string {
+function stagingProgressPath(root: string): string {
   return join(resolve(root), "installer", FILE);
 }
 

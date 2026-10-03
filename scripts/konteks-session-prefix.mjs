@@ -1,7 +1,6 @@
 // A session a person starts directly keeps the agent's own title; Konteks only
-// puts "[konteks] " ahead of it, once (D130). Both ACP bridge patches inline
-// this function's source, so it must stay self-contained.
-export const KONTEKS_DIRECT_PREFIX = "[konteks]";
+// puts "[konteks] " ahead of it, once. Both ACP bridge patches inline this
+// function's source, so it must stay self-contained.
 
 export function konteksPrefixedName(prefix, title, max = 160) {
   if (prefix !== "[konteks]") return null;

@@ -10,7 +10,7 @@ import {
   type DiagnosticCompanionInboxRecord,
 } from "../state/diagnostic-companion-inbox.js";
 
-export interface CapturedDiagnosticCompanionConnection {
+interface CapturedDiagnosticCompanionConnection {
   instanceId: string;
   workspaceId: string;
   runnerIncarnation: string;

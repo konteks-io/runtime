@@ -41,8 +41,8 @@ function compareUtf16(a: string, b: string): number {
 }
 
 /**
- * Removes members before canonicalization — used to strip proof members
- * (`PROOF_MEMBERS`) so a body digest never depends on its own proof.
+ * Removes members before canonicalization — used to strip proof members so
+ * a body digest never depends on its own proof.
  */
 export function withoutMembers<T extends { [key: string]: JsonValue }>(
   value: T,
@@ -54,5 +54,3 @@ export function withoutMembers<T extends { [key: string]: JsonValue }>(
   }
   return out;
 }
-
-export const PROOF_MEMBERS = ["replicaAuth", "proof", "keyProof", "relayAuth"] as const;

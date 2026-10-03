@@ -32,7 +32,7 @@ export function claudeMcpServerSegment(name: string): string {
 }
 
 /** Codex's MCP server key for an ACP server name (codex-acp `sanitizeMcpServerName`): whitespace becomes `_`. */
-export function codexMcpServerName(name: string): string {
+function codexMcpServerName(name: string): string {
   return name.replace(/\s/g, "_");
 }
 
@@ -75,7 +75,7 @@ export class McpToolCallLedger {
   }
 }
 
-export interface PermissionIdentityInputs {
+interface PermissionIdentityInputs {
   /** The MCP servers this session gave its agent (their ACP names). */
   sessionServers?: ReadonlySet<string>;
   /** Codex's announced MCP calls (relayed-session observes every session update). */

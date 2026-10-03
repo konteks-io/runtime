@@ -13,25 +13,25 @@ import {
 import { EmbeddedReleaseRootSchema, HOST_AGENT_BRIDGES, installOfflineAgentPackage, reviewedNativeModelIdentities, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, verifyNativeRelease, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RemoteSignedBundleManifest } from "@konteks/remote-common";
 
-export interface E2ESmokeReleaseOptions {
+interface E2ESmokeReleaseOptions {
   gate: string | undefined;
   directory: string;
   origin: string;
   platform: { os: "macos" | "debian"; architecture: "amd64" | "arm64" };
 }
 
-export interface E2ERealReleaseOptions extends Omit<E2ESmokeReleaseOptions, "gate"> {
+interface E2ERealReleaseOptions extends Omit<E2ESmokeReleaseOptions, "gate"> {
   realAgentGate: string | undefined;
   bundleVersion?: string;
   packagePath: string | readonly string[];
   profilePath: string | readonly string[];
 }
 
-export interface E2EAdditionalPlatformOptions extends E2ESmokeReleaseOptions {
+interface E2EAdditionalPlatformOptions extends E2ESmokeReleaseOptions {
   bundleVersion: string;
 }
 
-export interface E2ERealAdditionalPlatformOptions extends Omit<E2EAdditionalPlatformOptions, "platform"> {
+interface E2ERealAdditionalPlatformOptions extends Omit<E2EAdditionalPlatformOptions, "platform"> {
   realAgentGate: string | undefined;
   platform: { os: "windows"; architecture: "amd64" | "arm64" };
   connectorPath: string;

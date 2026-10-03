@@ -1,7 +1,7 @@
 import { createRuntimeAdmissionObservabilityContext } from "@konteks/remote-common";
 import type { DiagnosticCompanionInboxRecord } from "../state/diagnostic-companion-inbox.js";
 
-export interface ActiveDiagnosticCompanionOperation {
+interface ActiveDiagnosticCompanionOperation {
   assignmentId: string;
   attempt: number;
   claimId: string;

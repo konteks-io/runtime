@@ -42,8 +42,8 @@ const TranscriptRecordSchema = z.object({
 
 export const PlanningTerminalRecordSchema = z.discriminatedUnion("kind", [CursorRecordSchema, DirectiveRecordSchema, TranscriptRecordSchema]);
 export type PlanningTerminalRecord = z.infer<typeof PlanningTerminalRecordSchema>;
-export type PlanningTranscriptState = z.infer<typeof TranscriptRecordSchema>;
-export type PlanningDirectiveRecord = z.infer<typeof DirectiveRecordSchema>;
+type PlanningTranscriptState = z.infer<typeof TranscriptRecordSchema>;
+type PlanningDirectiveRecord = z.infer<typeof DirectiveRecordSchema>;
 
 export function planningTerminalRecordKey(record: PlanningTerminalRecord): string {
   if (record.kind === "cursor") return JSON.stringify(["cursor", record.instanceId]);

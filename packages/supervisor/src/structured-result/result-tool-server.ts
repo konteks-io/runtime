@@ -34,7 +34,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "
 /** A plan or verdict is kilobytes; the completion frame that carries it is bounded at 1 MiB. */
 const MAX_REQUEST_BYTES = 512 * 1024;
 /** How long `bind` waits for the agent to read the new tool list (Claude Code takes milliseconds). */
-export const DEFAULT_RELIST_WAIT_MS = 2_000;
+const DEFAULT_RELIST_WAIT_MS = 2_000;
 /** Let the agent take in the new list before the prompt that relies on it arrives. */
 const RELIST_SETTLE_MS = 100;
 const MAX_REPORTED_ERRORS = 20;
@@ -67,7 +67,7 @@ export function compileResultSchema(schema: Record<string, unknown>): ValidateFu
 }
 
 /** One line per problem, bounded, naming where it is: what the agent reads to correct its call. */
-export function describeSchemaErrors(errors: readonly ErrorObject[] | null | undefined, prefix = ""): string[] {
+function describeSchemaErrors(errors: readonly ErrorObject[] | null | undefined, prefix = ""): string[] {
   const lines = (errors ?? []).map((issue) => {
     const where = `${prefix}${issue.instancePath}` || "/";
     const extra = issue.keyword === "additionalProperties" && typeof issue.params.additionalProperty === "string"

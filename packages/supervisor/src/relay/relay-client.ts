@@ -53,7 +53,7 @@ const HANDSHAKE_BUFFER_MAX_BYTES = SupervisorConfigSchema.shape.SUPERVISOR_REPLA
  * be a runtime handshake result including reconciliation authority. Channel
  * envelopes go to the mux; cancellation-only control has a separate receiver.
  */
-export type RelayState = "offline" | "connecting" | "handshaking" | "connected" | "reconnecting";
+type RelayState = "offline" | "connecting" | "handshaking" | "connected" | "reconnecting";
 
 export interface RelayClientOptions {
   relayUrl: string;

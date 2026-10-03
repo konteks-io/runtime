@@ -34,7 +34,7 @@ export interface NativeExecutionGateOptions {
 }
 type Authority = RemoteExecutionAuthorityView | RemoteDeliveryExecutionAuthorityView;
 const delivery = (value: Authority): value is RemoteDeliveryExecutionAuthorityView => "workloadKind" in value;
-export interface AuthorizedNativeOperation {
+interface AuthorizedNativeOperation {
   key: string;
   envelope: RemoteAuthorizedOperation;
   authority: Authority;

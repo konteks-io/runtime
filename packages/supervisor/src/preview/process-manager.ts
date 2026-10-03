@@ -61,7 +61,7 @@ export interface PreviewChild {
   once(event: "error", listener: (error: Error) => void): unknown;
 }
 
-export interface PreviewProcessManagerOptions {
+interface PreviewProcessManagerOptions {
   /** Starts `command` through the platform shell. */
   spawn?: (request: { command: string; cwd: string; env: NodeJS.ProcessEnv }) => PreviewChild;
   /** Stops the child and every process it started. */
@@ -83,9 +83,9 @@ export interface PreviewProcessManagerOptions {
   logger?: Logger;
 }
 
-export const PREVIEW_DEFAULT_IDLE_MS = 30 * 60_000;
-export const PREVIEW_DEFAULT_MAX_RUNNING = 3;
-export const PREVIEW_PORT_RANGE = { first: 43_100, last: 43_999 } as const;
+const PREVIEW_DEFAULT_IDLE_MS = 30 * 60_000;
+const PREVIEW_DEFAULT_MAX_RUNNING = 3;
+const PREVIEW_PORT_RANGE = { first: 43_100, last: 43_999 } as const;
 const PREVIEW_HOST = "127.0.0.1";
 const LOG_LINES = 200;
 const LOG_TAIL = 40;
@@ -98,7 +98,7 @@ const RETAINED_ENDED = 32;
  * package-manager homes. Everything else (provider keys, activation
  * material, KONTEKS_*) is left out by construction, not by a denylist.
  */
-export const PREVIEW_ENV_ALLOWLIST: readonly string[] = [
+const PREVIEW_ENV_ALLOWLIST: readonly string[] = [
   "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TMP", "TEMP",
   "NVM_DIR", "VOLTA_HOME", "PNPM_HOME", "BUN_INSTALL", "COREPACK_HOME", "npm_config_cache",
   "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
@@ -502,7 +502,7 @@ function stopMessage(reason: string): string {
 }
 
 /** The platform shell runs the command; POSIX children lead their own process group. */
-export function spawnShell(request: { command: string; cwd: string; env: NodeJS.ProcessEnv }): ChildProcess {
+function spawnShell(request: { command: string; cwd: string; env: NodeJS.ProcessEnv }): ChildProcess {
   if (process.platform === "win32") {
     return spawn(request.env.ComSpec ?? process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", request.command], {
       cwd: request.cwd, env: request.env, windowsHide: true, windowsVerbatimArguments: true, stdio: ["ignore", "pipe", "pipe"],
@@ -512,7 +512,7 @@ export function spawnShell(request: { command: string; cwd: string; env: NodeJS.
 }
 
 /** Leader first, then the surviving group, SIGKILL after the grace; `taskkill /T` on Windows. */
-export async function terminateTree(child: PreviewChild): Promise<void> {
+async function terminateTree(child: PreviewChild): Promise<void> {
   if (process.platform === "win32") {
     if (child.pid === undefined || child.exitCode !== null) return;
     await new Promise<void>(resolve => execFile("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, timeout: 10_000 }, () => resolve()));
@@ -521,7 +521,7 @@ export async function terminateTree(child: PreviewChild): Promise<void> {
   await stopProcessGroupLeaderFirst({ child: child as ChildProcess, timeoutMs: 5_000, killGraceMs: 2_000 });
 }
 
-export function probeHttp(host: string, port: number, path: string): Promise<boolean> {
+function probeHttp(host: string, port: number, path: string): Promise<boolean> {
   return new Promise(resolve => {
     const req = httpRequest({ host, port, path, method: "GET", timeout: 2_000, headers: { accept: "text/html,*/*" } }, response => {
       response.resume();
@@ -605,7 +605,7 @@ export class PreviewProcessRegistry {
 }
 
 /** Process start identity: `ps lstart` on macOS, `/proc/<pid>/stat` start time on Linux. */
-export function readStartToken(pid: number): string | null {
+function readStartToken(pid: number): string | null {
   if (process.platform === "darwin") {
     const identity = readDarwinProcessIdentity(pid);
     return identity && identity.processGroupId === pid ? identity.startToken : null;

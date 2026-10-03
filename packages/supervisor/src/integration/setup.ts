@@ -44,7 +44,7 @@ export const spawnSetupCommand: SetupCommandRunner = (command, args, env, timeou
   child.once("close", code => { clearTimeout(timer); resolve({ exitCode: stopped ? null : code }); });
 });
 
-export interface OfficialSetupRunnerDeps {
+interface OfficialSetupRunnerDeps {
   /** Codex's pinned CLI on this computer, or null when no Codex runner is installed. */
   codex: () => SetupCommandLaunch | null;
   run?: SetupCommandRunner;

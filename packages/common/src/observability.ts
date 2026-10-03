@@ -10,7 +10,7 @@ const TraceCarrierSchema = ObservabilityContextV1Schema.pick({
   tracestate: true,
 });
 
-export interface RuntimeAdmissionObservabilityInput {
+interface RuntimeAdmissionObservabilityInput {
   runtimeIncarnationId: string;
   assignmentId: string;
   attempt: number;

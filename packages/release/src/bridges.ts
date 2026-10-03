@@ -22,8 +22,6 @@ export interface AgentBridgeFamily {
     logout: readonly string[];
     /** Official identity signal; when absent every login counts as an identity change. */
     identitySignal?: readonly string[];
-    /** Documented file-backed cache eligible for a one-time consented copy. */
-    hostCacheImport?: { relativePath: string; documentedBy: string };
   };
   acpProtocol: { min: number; max: number };
   /**
@@ -82,10 +80,6 @@ export const SUPPORTED_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.free
       login: ["codex", "login", "--device-auth"],
       logout: ["codex", "logout"],
       identitySignal: ["codex", "login", "status"],
-      hostCacheImport: {
-        relativePath: ".codex/auth.json",
-        documentedBy: "https://github.com/openai/codex/blob/main/docs/authentication.md",
-      },
     },
     acpProtocol: { min: 1, max: 1 },
   },
@@ -211,11 +205,6 @@ export function hostAgentFamily(agentId: string): HostAgentFamily {
 export function hostInstallCommand(family: HostAgentFamily, platform: NodeJS.Platform): string {
   if (family.hostInstall.launch === "fetched") return `konteks-remote agent add ${family.agentId}`;
   return platform === "win32" ? family.hostInstall.windowsInstallCommand ?? family.hostInstall.installCommand : family.hostInstall.installCommand;
-}
-
-/** Whether a host-installed agent is one the connector fetches itself (on the person's yes), not one the person installed. */
-export function isFetchedAgentId(agentId: string): boolean {
-  return findAgentBridge(agentId)?.hostInstall?.launch === "fetched";
 }
 
 /** Whether an agent family is used from the person's own installation (nothing of it in the release). */

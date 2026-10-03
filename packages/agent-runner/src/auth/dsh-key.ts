@@ -11,7 +11,7 @@ import type { LoginFlow } from "./login-flow.js";
  * parsed behind the agent's back (D111). The key is never logged, never put in
  * an event and never passed through the environment.
  */
-export const DSH_KEY_REF = "DEEPSEEK_API_KEY";
+const DSH_KEY_REF = "DEEPSEEK_API_KEY";
 const MODELS_URL = "https://api.deepseek.com/models";
 const KEY_SHAPE = /^[\x21-\x7e]{16,512}$/;
 
@@ -57,7 +57,7 @@ export async function verifyDeepSeekApiKey(key: string, deps: { fetch?: typeof f
   }
 }
 
-export interface DshKeyLoginOptions {
+interface DshKeyLoginOptions {
   credentialsFile: string;
   events: RunnerEventBus;
   loginId?: string;

@@ -51,7 +51,7 @@ export interface PreviewForwarderLimits {
   idleStreamTimeoutMs: number;
 }
 
-export const DEFAULT_PREVIEW_FORWARDER_LIMITS: PreviewForwarderLimits = Object.freeze({
+const DEFAULT_PREVIEW_FORWARDER_LIMITS: PreviewForwarderLimits = Object.freeze({
   maxConcurrentStreams: PREVIEW_LIMITS.maxConcurrentStreams,
   maxRequestBodyBytes: PREVIEW_LIMITS.maxRequestBodyBytes,
   maxResponseBodyBytes: PREVIEW_LIMITS.maxResponseBodyBytes,
@@ -86,7 +86,7 @@ interface WsStream {
   lastActivityAt: number;
 }
 
-export interface PreviewForwarderCounters {
+interface PreviewForwarderCounters {
   streams: number;
   rejectedPaths: number;
   rejectedHeaders: number;

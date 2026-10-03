@@ -49,7 +49,7 @@ export type FetchedAgentPlatformPin = z.infer<typeof FetchedAgentPlatformPinSche
 export const FETCHED_AGENT_PLATFORM_KEYS = ["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64", "win32-x64", "win32-arm64"] as const;
 export type FetchedAgentPlatformKey = (typeof FETCHED_AGENT_PLATFORM_KEYS)[number];
 
-export const FetchedAgentPinSchema = z.object({
+const FetchedAgentPinSchema = z.object({
   agentId: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
   /** Where the vendor publishes the archive list (the weekly canary reads it; the connector never does). */
   source: z.string().url(),
@@ -58,9 +58,9 @@ export const FetchedAgentPinSchema = z.object({
   terms: z.string().url(),
   platforms: z.partialRecord(z.enum(FETCHED_AGENT_PLATFORM_KEYS), FetchedAgentPlatformPinSchema),
 }).strict();
-export type FetchedAgentPin = z.infer<typeof FetchedAgentPinSchema>;
+type FetchedAgentPin = z.infer<typeof FetchedAgentPinSchema>;
 
-export const FetchedAgentPinsSchema = z.object({
+const FetchedAgentPinsSchema = z.object({
   schemaVersion: z.literal(1),
   agents: z.array(FetchedAgentPinSchema).max(8).refine(agents => new Set(agents.map(agent => agent.agentId)).size === agents.length),
 }).strict();

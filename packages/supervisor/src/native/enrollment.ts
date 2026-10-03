@@ -35,7 +35,7 @@ import { acquireNativeRootLock } from "./root-lock.js";
 const CORE_AUDIENCE = "konteks:remote-instance";
 const BASE = "/api/remote-instances/internal/remote-instances/enrollment";
 
-export const ENROLLMENT_PATHS = Object.freeze({
+const ENROLLMENT_PATHS = Object.freeze({
   intents: `${BASE}/intents`,
   intent: (ref: string) => `${BASE}/intents/${encodeURIComponent(ref)}`,
   challenge: (ref: string) => `${BASE}/intents/${encodeURIComponent(ref)}/challenge`,
@@ -105,14 +105,14 @@ const AccessRestoredSchema = z
   })
   .strict();
 
-export type EnrollmentIntentOpened = z.infer<typeof IntentOpenedSchema>;
-export type EnrollmentAccessRestored = z.infer<typeof AccessRestoredSchema>;
-export type EnrollmentChallengeSent = z.infer<typeof ChallengeSentSchema>;
-export type EnrollmentVerified = z.infer<typeof VerifiedSchema>;
-export type EnrollmentBound = z.infer<typeof BoundSchema>;
-export type OwnerTokenGrant = z.infer<typeof OwnerTokenSchema>;
+type EnrollmentIntentOpened = z.infer<typeof IntentOpenedSchema>;
+type EnrollmentAccessRestored = z.infer<typeof AccessRestoredSchema>;
+type EnrollmentChallengeSent = z.infer<typeof ChallengeSentSchema>;
+type EnrollmentVerified = z.infer<typeof VerifiedSchema>;
+type EnrollmentBound = z.infer<typeof BoundSchema>;
+type OwnerTokenGrant = z.infer<typeof OwnerTokenSchema>;
 
-export interface NativeEnrollmentOptions {
+interface NativeEnrollmentOptions {
   dataDir: string;
   coreUrl: string;
   clock: Clock;

@@ -1,6 +1,6 @@
 import { PreviewToRuntimeChunkSchema, createLogger, type Logger, type PreviewToCoreChunk, type PreviewToRuntimeChunk, type RelayChannel } from "@konteks/remote-common";
 import type { OutboundMessage } from "../transport/transport.js";
-import { PreviewForwarder, type PreviewForwarderCounters, type PreviewForwarderOptions } from "./forwarder.js";
+import { PreviewForwarder, type PreviewForwarderOptions } from "./forwarder.js";
 
 /**
  * The supervisor's side of the governed `preview` relay channel.
@@ -12,7 +12,7 @@ import { PreviewForwarder, type PreviewForwarderCounters, type PreviewForwarderO
  * 503 too. Replay and acknowledgements are the mux's, exactly as for a
  * session channel.
  */
-export interface PreviewChannelDeps {
+interface PreviewChannelDeps {
   transport: { send(message: OutboundMessage): void; openChannel(channelId: string, channel: RelayChannel): void; closeChannel(channelId: string): void };
   lease: { canOpenChannel(channel: RelayChannel): boolean };
   previews: {
@@ -126,14 +126,6 @@ export class PreviewChannel {
     let total = 0;
     for (const forwarder of this.forwarders.values()) total += forwarder.activeStreams;
     return total;
-  }
-
-  counterTotals(): PreviewForwarderCounters & { channels: number; malformed: number; refusedDraining: number; autoStarted: number } {
-    const totals: PreviewForwarderCounters = { streams: 0, rejectedPaths: 0, rejectedHeaders: 0, refusedNoPreview: 0, refusedStreamCap: 0, oversized: 0, idleClosed: 0, upstreamFailures: 0 };
-    for (const forwarder of this.forwarders.values()) {
-      for (const key of Object.keys(totals) as Array<keyof PreviewForwarderCounters>) totals[key] += forwarder.counters[key];
-    }
-    return { ...totals, channels: this.forwarders.size, ...this.counters };
   }
 
   dispose(): void {

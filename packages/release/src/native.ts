@@ -121,7 +121,7 @@ export function verifyNativeRelease(payload: unknown, roots: readonly EmbeddedRe
   return Object.freeze({ manifest, [verified]: true as const });
 }
 
-export interface VerifiedNativeModelCapabilityMapping {
+interface VerifiedNativeModelCapabilityMapping {
   agentId: string;
   mapping: AgentModelCapabilityMapping;
 }
@@ -151,7 +151,7 @@ export function selectNativeModelCapabilityMappings(
   });
 }
 
-export interface NativeArtifactTarget {
+interface NativeArtifactTarget {
   os: "macos" | "windows" | "debian";
   architecture: "amd64" | "arm64";
   agentIds: readonly string[];
@@ -182,8 +182,8 @@ function freezeJson(value: object): void {
  * Konteks name first. `kind: "connector"` in the signed manifest is protocol
  * and is not a file name.
  */
-export const NATIVE_CONNECTOR_FILE = "konteks-connector";
-export const LEGACY_NATIVE_CONNECTOR_FILE = "connector";
+const NATIVE_CONNECTOR_FILE = "konteks-connector";
+const LEGACY_NATIVE_CONNECTOR_FILE = "connector";
 
 /**
  * While launchers from before the rename are still installed (a package's
@@ -193,7 +193,7 @@ export const LEGACY_NATIVE_CONNECTOR_FILE = "connector";
  * always runs the Konteks name. Drop the copy once no supported launcher
  * predates the rename.
  */
-export const STAGE_LEGACY_NATIVE_CONNECTOR_COPY = true;
+const STAGE_LEGACY_NATIVE_CONNECTOR_COPY = true;
 
 /** Both file names for an OS, the Konteks name first. */
 export function nativeConnectorFileNames(os: NativeArtifactTarget["os"]): [string, string] {

@@ -10,11 +10,11 @@ export type LeaseAcquisition = <T>(operation: () => Promise<T>) => Promise<T>;
  * authority and re-evaluates limits on every renew/assignment.
  */
 /** Canonical signed payload validation followed only by a local time projection. */
-export const LeaseClaimsSchema = RemoteInstanceLeaseClaimsSchema.transform(claims => {
+const LeaseClaimsSchema = RemoteInstanceLeaseClaimsSchema.transform(claims => {
   const { drain_deadline, ...rest } = claims;
   return { ...rest, ...(drain_deadline === undefined ? {} : { drain_deadline: parseRfc3339(drain_deadline) / 1000 }) };
 });
-export type LeaseClaims = ReturnType<typeof LeaseClaimsSchema.parse>;
+type LeaseClaims = ReturnType<typeof LeaseClaimsSchema.parse>;
 
 interface ExpectedLease { instanceId: string; audience: string }
 

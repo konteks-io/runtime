@@ -33,7 +33,7 @@ export function isOnboardWorkAssignment(assignment: RemoteWorkAssignment): assig
  * (`GET …/assignments/:id/workload`), which is where every other kind reads the
  * definition an assignment does not carry.
  */
-export const OnboardWorkloadSchema = z
+const OnboardWorkloadSchema = z
   .object({
     depth: z.enum(["inventory", "grouping", "deep"]).optional(),
     enrichment: z
@@ -45,9 +45,8 @@ export const OnboardWorkloadSchema = z
       .strict()
       .optional(),
   });
-export type OnboardWorkload = z.infer<typeof OnboardWorkloadSchema>;
 
-export interface OnboardCarrierDeps {
+interface OnboardCarrierDeps {
   /** Everything the collector needs except the facade, which is per-claim. */
   collector: Omit<OnboardEvidenceCollectorDeps, "facade">;
   relocation: Omit<RelocationWorkerDeps, "facade">;
@@ -61,7 +60,7 @@ export interface OnboardCarrierDeps {
 }
 
 /** What the orchestrator turns into a terminal report. */
-export interface OnboardWorkOutcome {
+interface OnboardWorkOutcome {
   structuredOutput: BoundedJsonValue;
 }
 

@@ -9,7 +9,7 @@ import { isDirectWorkKind, type RemoteWorkAssignment } from "@konteks/remote-com
  * (no instructions, no Konteks tools, the tighter file root) is asked with
  * {@link isDirectAssignment}.
  */
-export type ContinuedSessionSource = Extract<RemoteWorkAssignment["source"], { kind: "conversation" | "direct_session" }>;
+type ContinuedSessionSource = Extract<RemoteWorkAssignment["source"], { kind: "conversation" | "direct_session" }>;
 
 export function continuedSession(source: RemoteWorkAssignment["source"]): ContinuedSessionSource | null {
   return source.kind === "conversation" || source.kind === "direct_session" ? source : null;

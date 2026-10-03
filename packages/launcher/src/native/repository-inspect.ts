@@ -12,7 +12,7 @@ import { runCommand, sanitizeInheritedChildProcessEnv } from "@konteks/remote-co
  * are what to call it and where, if anywhere, it already lives.
  */
 
-export interface RepositoryFacts {
+interface RepositoryFacts {
   /** The repository root, or null when the directory is not a repository. */
   path: string | null;
   name: string;

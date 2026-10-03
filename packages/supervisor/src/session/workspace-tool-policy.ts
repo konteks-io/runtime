@@ -150,7 +150,7 @@ export function describeRefusedPath(rawPath: string, workspaceRoot: string, cwd:
 }
 
 /** The note the agent and Konteks see for a refused file change. */
-export function outsideWorkspaceMessage(outside: readonly RefusedPath[], pathCount: number, cwd: string): string {
+function outsideWorkspaceMessage(outside: readonly RefusedPath[], pathCount: number, cwd: string): string {
   const shown = outside.slice(0, MAX_SHOWN_PATHS).map(entry => entry.rootAnchored
     ? `\`${entry.path}\` starts at the filesystem root; inside the workspace it is \`${entry.suggestion}\``
     : `\`${entry.path}\` is outside it`);

@@ -19,7 +19,7 @@ const unavailable = () =>
     "Private Git repository cache or worktree is unavailable.",
   );
 
-export interface NativeRepositoryFetchContext {
+interface NativeRepositoryFetchContext {
   /** Private bare repository path. It has no configured remote or credentials. */
   gitDir: string;
   /** Exact signed revision that the authority owner must fetch. */
@@ -28,7 +28,7 @@ export interface NativeRepositoryFetchContext {
   haveRevisions: string[];
 }
 
-export interface NativeRepositoryCacheOptions {
+interface NativeRepositoryCacheOptions {
   /** Shared by every local agent, but never used as an agent working directory. */
   root: string;
   tool: NativeGitTool;
@@ -39,7 +39,7 @@ export interface NativeRepositoryCacheOptions {
   fetchRevision(context: NativeRepositoryFetchContext): Promise<void>;
 }
 
-export interface NativeRepositoryWorktree {
+interface NativeRepositoryWorktree {
   cwd: string;
   baselineCommit: string;
   verify(): Promise<void>;

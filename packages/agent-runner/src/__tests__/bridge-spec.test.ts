@@ -1,12 +1,11 @@
-import { chmod, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { offlineFixture } from "../../../release/src/__tests__/offline-agent-fixture.js";
 import { findAgentBridge, installOfflineAgentPackage } from "@konteks/remote-release";
 import { RunnerConfigSchema } from "../config.js";
 import { bridgeEnvironment, resolveBridgeSpawnSpec, resolveToolingCommand, verifyNativeRunnerPackage } from "../bridge/spec.js";
-import { importHostCache, planHostCacheImport } from "../auth/host-cache-import.js";
 import { RunnerEventSchema } from "../events.js";
 
 describe("bridge spawn spec", () => {
@@ -174,37 +173,6 @@ describe("native agent package verification (WS2-156)", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
-});
-
-describe("host-cache import (documented bridges only)", () => {
-  let dir = "";
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "kr-import-"));
-  });
-  afterEach(async () => {
-    await rm(dir, { recursive: true, force: true });
-  });
-
-  it("refuses clearly for a bridge with no documented import", () => {
-    expect(() => planHostCacheImport(findAgentBridge("claude-code")!)).toThrow(/no safe host-cache import/);
-  });
-
-  it("copies a private regular file once and never mutates the source", async () => {
-    const plan = planHostCacheImport(findAgentBridge("codex")!);
-    const source = join(dir, "auth.json");
-    await writeFile(source, "{}", { mode: 0o600 });
-    const credentialDir = join(dir, "credentials");
-    await importHostCache({ plan, sourcePath: source, credentialDir });
-    await expect(importHostCache({ plan, sourcePath: source, credentialDir })).rejects.toThrow(/already holds a login/);
-  });
-
-  it.skipIf(process.platform === "win32")("refuses a world-readable source", async () => {
-    const plan = planHostCacheImport(findAgentBridge("codex")!);
-    const source = join(dir, "auth.json");
-    await writeFile(source, "{}");
-    await chmod(source, 0o644);
-    await expect(importHostCache({ plan, sourcePath: source, credentialDir: join(dir, "c") })).rejects.toThrow(/readable by other users/);
   });
 });
 

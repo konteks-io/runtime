@@ -19,7 +19,7 @@ import type { FetchedAgentSigner } from "@konteks/remote-release";
  */
 
 /** Why a fetch or an unpack was refused (the agent's module words it for the person). */
-export type FetchedArchiveFailure = "download_failed" | "size_mismatch" | "digest_mismatch" | "unsafe_archive";
+type FetchedArchiveFailure = "download_failed" | "size_mismatch" | "digest_mismatch" | "unsafe_archive";
 
 export class FetchedArchiveError extends Error {
   constructor(readonly reason: FetchedArchiveFailure, message: string, options?: { cause?: unknown }) {
@@ -28,7 +28,7 @@ export class FetchedArchiveError extends Error {
   }
 }
 
-export interface FetchedDownloadOptions {
+interface FetchedDownloadOptions {
   /** The pinned https URL; redirects are followed only to https. */
   url: string;
   /** Absolute path of a file that must not exist yet (created 0600). */
@@ -133,7 +133,7 @@ async function tunnel(proxy: URL, target: URL, idle: number): Promise<import("no
 }
 
 /** One file entry of a zip, as its central directory and local header describe it. */
-export interface ZipFileEntry {
+interface ZipFileEntry {
   /** The plain relative path (checked). */
   path: string;
   method: 0 | 8;

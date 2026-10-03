@@ -22,13 +22,13 @@ const FORWARDED_RESPONSE_HEADERS = new Set([
 ]);
 
 /** Core's tool that opens a cloud preview or a registered application in the session's browser. */
-export const ENVIRONMENT_OPEN_TOOL = "platform__quality-assurance__environment_open";
+const ENVIRONMENT_OPEN_TOOL = "platform__quality-assurance__environment_open";
 const MAX_OBSERVED_RESPONSE_BYTES = 1024 * 1024;
 /** No Core grant is trusted for longer than a day, whatever it says. */
 const MAX_GRANT_MS = 24 * 60 * 60 * 1000;
 
 /** The origins Core opened for this session's browser, as Core answered `environment_open`. */
-export interface BrowserAccessGrant {
+interface BrowserAccessGrant {
   kind: "cloud_preview" | "external";
   origins: Array<{ origin: string; expiresAt: string }>;
 }
@@ -36,7 +36,7 @@ export interface BrowserAccessGrant {
 /** Local transport continuity only. This credential never grants Core authority. */
 export interface McpLocalTransportIdentity { port: number; credential: string }
 
-export interface McpCapabilityFacadeOptions {
+interface McpCapabilityFacadeOptions {
   initial: CapabilityTokenIssue;
   renew: () => Promise<CapabilityTokenIssue>;
   localTransport?: McpLocalTransportIdentity;
@@ -357,7 +357,7 @@ export class McpCapabilityFacade {
 }
 
 /** The JSON-RPC id of a single `tools/call` of `environment_open`, else undefined (batches and everything else pass through). */
-export function environmentOpenRequestId(body: Buffer): string | number | undefined {
+function environmentOpenRequestId(body: Buffer): string | number | undefined {
   let message: unknown;
   try { message = JSON.parse(body.toString("utf8")); } catch { return undefined; }
   if (!message || typeof message !== "object" || Array.isArray(message)) return undefined;
@@ -371,7 +371,7 @@ export function environmentOpenRequestId(body: Buffer): string | number | undefi
  * session: http(s) origins only, each with an expiry in the future (capped
  * at a day). Null when the answer grants nothing.
  */
-export function browserAccessFrom(text: string, requestId: string | number, sessionId: string, now: number): BrowserAccessGrant | null {
+function browserAccessFrom(text: string, requestId: string | number, sessionId: string, now: number): BrowserAccessGrant | null {
   const message = JSON.parse(text) as { id?: unknown; result?: { structuredContent?: unknown } };
   if (!message || message.id !== requestId) return null;
   const content = message.result?.structuredContent as { target?: { kind?: unknown }; browserAccess?: { sessionId?: unknown; origins?: unknown } } | undefined;

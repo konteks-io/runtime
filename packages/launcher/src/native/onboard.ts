@@ -45,7 +45,7 @@ export interface OnboardStep {
   };
 }
 
-export interface OnboardContext {
+interface OnboardContext {
   root: string;
   output: Output;
   /** The person's answer to the question the previous step asked; `""` is an answer too. */
@@ -209,7 +209,7 @@ export async function detectOpenCodeProblem(): Promise<string | null> {
  * said nothing about an unsupported DeepSeek Harness, the person's other own
  * install.
  */
-export async function detectDshProblem(): Promise<string | null> {
+async function detectDshProblem(): Promise<string | null> {
   const { resolveNativeDshInstallation } = await import("@konteks/remote-supervisor");
   return resolveNativeDshInstallation().then(() => null, (error: unknown) => {
     if (!(error instanceof RemoteInstanceError) || error.diagnostic !== "dsh_unsupported_version") return null;
@@ -1575,7 +1575,6 @@ function workspaceName(state: { workspaces?: Array<{ tenantId: string; displayNa
   return state.workspaces?.find(entry => entry.tenantId === tenantId)?.displayName ?? tenantId;
 }
 
-export { agentName } from "./agent-name.js";
 
 /**
  * Agents the connector does not ship: the person's own DeepSeek Harness and

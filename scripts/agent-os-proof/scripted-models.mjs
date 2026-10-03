@@ -239,7 +239,7 @@ const WRITE_TOOLS = ["write", "str_replace_editor", "apply_patch", "create_file"
 const lower = value => String(value ?? "").toLowerCase();
 
 /** The concrete call for an intent, from the tools and schemas this agent sent. */
-export function toolCall(intent, tools, windows) {
+function toolCall(intent, tools, windows) {
   const byName = names => names.map(name => tools.find(tool => lower(tool.name) === name)).find(Boolean);
   if (intent.type === "shell") {
     const tool = byName(SHELL_TOOLS);

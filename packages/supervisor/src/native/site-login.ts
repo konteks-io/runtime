@@ -30,7 +30,7 @@ export interface SiteLoginReport {
   failure?: Failure;
 }
 
-export interface SiteLoginRelayOptions {
+interface SiteLoginRelayOptions {
   loginId: string;
   agentId: Agent;
   /** OpenCode's or Antigravity's sign-in option; every report echoes it. */

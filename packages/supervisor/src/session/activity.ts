@@ -12,7 +12,7 @@ const ACP_TOOL_KINDS = new Set([
 const PLATFORM_MCP_TOOL_NAME = /^mcp__[A-Za-z0-9_-]+?__(platform__[A-Za-z0-9_-]+)$/;
 
 /** The federated `platform__*` tool name behind a Claude `mcp__<server>__<tool>` label, if that is what it is. */
-export function platformMcpToolName(value: string | undefined): string | undefined {
+function platformMcpToolName(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   return PLATFORM_MCP_TOOL_NAME.exec(value.trim())?.[1];
 }
@@ -129,7 +129,7 @@ function canonicalizeDshToolActivity(candidate: Record<string, unknown>, prior: 
 }
 
 /** OpenCode's Code Mode, named so policy and people never read it as a shell command. */
-export const OPENCODE_CODE_MODE_NAME = "code_mode";
+const OPENCODE_CODE_MODE_NAME = "code_mode";
 
 /**
  * OpenCode 2 names its tool only in a call's first `tool_call` title (later
@@ -289,7 +289,7 @@ export function contractIssue(issues: ReadonlyArray<ContractIssue>): { issuePath
   return best === undefined ? undefined : { issuePath: best.path.map(segment).join("."), issueCode: best.code };
 }
 
-export interface ActivityTextOptions {
+interface ActivityTextOptions {
   /**
    * False for a streamed chunk that continues a word: its first character is
    * not the start of a token, so `default` + `/name` or `componen` + `t:x/y`

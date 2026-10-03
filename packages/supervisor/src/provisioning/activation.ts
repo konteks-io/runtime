@@ -36,7 +36,7 @@ interface ActivationExchangeBase {
   roots: readonly EmbeddedReleaseRoot[];
   logger?: Logger;
 }
-export type ActivationExchangeArgs = ActivationExchangeBase & {
+type ActivationExchangeArgs = ActivationExchangeBase & {
   deploymentKind: "native_connector";
   platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64"; containerBackend: "none"; deploymentKind: "native_connector" };
   release: VerifiedNativeRelease;

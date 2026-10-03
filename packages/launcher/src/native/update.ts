@@ -14,7 +14,7 @@ export interface NativeUpdateDeps {
   fetchFn?: typeof fetch;
 }
 
-export type NativeUpdateCheck =
+type NativeUpdateCheck =
   | { status: "current"; current: NativeRuntimeRecord; bundleVersion: string }
   | { status: "available"; current: NativeRuntimeRecord; release: VerifiedNativeRelease };
 

@@ -36,7 +36,7 @@ export function journalWriteLedger(journal: SupervisorJournal): IntegrationWrite
   };
 }
 
-export type IntegrationDenyReason =
+type IntegrationDenyReason =
   | "not_admitted"
   | "args_mismatch"
   | "required_args_mismatch"
@@ -46,11 +46,11 @@ export type IntegrationDenyReason =
   | "nonce_consumed"
   | "no_allow_once";
 
-export type IntegrationGateDecision =
+type IntegrationGateDecision =
   | { kind: "allow"; optionId: string }
   | { kind: "deny"; optionId: string | null; reason: IntegrationDenyReason };
 
-export interface IntegrationToolGateDeps {
+interface IntegrationToolGateDeps {
   agentId: string;
   /** The MCP servers this integration session gave its agent (the result tool, an E2E fixture). */
   sessionServers: ReadonlySet<string>;
@@ -61,7 +61,7 @@ export interface IntegrationToolGateDeps {
 }
 
 /** An allowed provider call, by the ACP tool call id the gate allowed it under. */
-export interface AllowedIntegrationCall {
+interface AllowedIntegrationCall {
   server: string;
   tool: string;
   argsDigest: string;

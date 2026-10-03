@@ -13,7 +13,7 @@ import type { SupervisorJournal } from "../state/journal.js";
 import { allocationReference, type AssignmentRequestRecord, type AssignmentReplyRecordValue } from "../state/assignment-stream.js";
 import type { OutboundMessage } from "../transport/transport.js";
 
-export interface AssignmentSenderDeps {
+interface AssignmentSenderDeps {
   clock: Clock;
   journal: SupervisorJournal;
   core: Pick<CoreClient, "submitAssignment" | "acknowledgeAssignments">;

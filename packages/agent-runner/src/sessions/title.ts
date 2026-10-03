@@ -57,7 +57,7 @@ export function konteksCodingSessionTitle(label: KonteksSessionLabel | undefined
  * Code bridges apply it; DeepSeek Harness, OpenCode and Antigravity have no
  * naming API over ACP and keep their own title.
  */
-export const KONTEKS_DIRECT_PREFIX = "[konteks]";
+const KONTEKS_DIRECT_PREFIX = "[konteks]";
 
 export function konteksAgentTitledMetadata(agentId?: string) {
   return {

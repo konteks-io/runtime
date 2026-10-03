@@ -2,7 +2,7 @@ import { RemoteInstanceError, jcsDigest, type Clock, type JsonValue, type Remote
 import type { SupervisorJournal } from "../state/journal.js";
 import type { LocalAdmission } from "../state/local-admission.js";
 
-export type SearchAssignment = RemoteWorkAssignment & { kind: "search_generation" };
+type SearchAssignment = RemoteWorkAssignment & { kind: "search_generation" };
 
 export interface SearchClaimedHandoff {
   assignment: SearchAssignment;

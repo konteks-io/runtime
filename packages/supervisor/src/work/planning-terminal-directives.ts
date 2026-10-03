@@ -2,7 +2,7 @@ import { PlanningControllerTerminalDirectiveSchema, RemoteInstanceError, jcsDige
 import type { SupervisorJournal } from "../state/journal.js";
 import type { ReportSender } from "./report-sender.js";
 
-export interface PlanningTerminalDirectiveProcessorOptions {
+interface PlanningTerminalDirectiveProcessorOptions {
   clock: Clock; journal: SupervisorJournal; reports: ReportSender;
   instanceId: () => string; runnerIncarnation: () => string; assertOwned: () => void;
   verify: (directive: PlanningControllerTerminalDirective, tenantId: string, instanceId: string) => boolean;

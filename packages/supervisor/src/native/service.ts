@@ -13,7 +13,7 @@ import { writeSecretFile } from "@konteks/remote-common";
 
 export const NATIVE_SHUTDOWN_RECEIPT_FILE = "shutdown-complete";
 
-export interface NativeServiceOptions extends NativeInstallationOptions {
+interface NativeServiceOptions extends NativeInstallationOptions {
   root: string;
   /** Test/embedding override; production defaults to the claim-bound native preparer. */
   prepareInputs?: NonNullable<SupervisorOptions["native"]>["prepareInputs"];

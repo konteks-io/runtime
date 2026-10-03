@@ -58,7 +58,7 @@ const ExecutionRevisionFenceInboxInputSchema =
     receivedAt: true,
   });
 
-export interface ExecutionRevisionFenceInboxLog {
+interface ExecutionRevisionFenceInboxLog {
   all(): ExecutionRevisionFenceInboxRecord[];
   update(
     key: string,
@@ -72,7 +72,7 @@ export interface ExecutionRevisionFenceInboxLog {
  * A revision tuple is the authority target. A second digest for the same tuple
  * would make a retained native fence ambiguous, so it requires recovery.
  */
-export function executionRevisionFenceTuple(
+function executionRevisionFenceTuple(
   intent: RemoteExecutionRevisionControlIntent,
 ): string {
   return JSON.stringify([

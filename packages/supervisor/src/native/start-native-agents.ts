@@ -11,17 +11,17 @@
  * background, and every other agent starts as before.
  */
 
-export interface StartableOwner {
+interface StartableOwner {
   start(): Promise<void>;
   stop(): Promise<void>;
 }
 
-export interface StartableRunner {
+interface StartableRunner {
   agentId: string;
   start(): Promise<void>;
 }
 
-export interface NativeAgentsStartResult<R extends StartableRunner> {
+interface NativeAgentsStartResult<R extends StartableRunner> {
   started: R[];
   /** Runners whose own start failed; the caller leaves them out and retries them. */
   failed: R[];

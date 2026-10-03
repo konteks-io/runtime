@@ -55,16 +55,16 @@ export const IdentitySchema = z
     exchangeNonce: z.string().min(1),
   })
   .strict();
-export type Identity = z.infer<typeof IdentitySchema>;
+type Identity = z.infer<typeof IdentitySchema>;
 
 const ActivationAttemptSchema = z.object({
   activationId: z.string().min(1), nonce: z.string().min(1),
   keyDigest: z.string().min(1), manifestDigest: z.string().min(1),
   platformDigest: z.string().min(1), createdAt: z.string().datetime(),
 }).strict();
-export type ActivationAttempt = z.infer<typeof ActivationAttemptSchema>;
+type ActivationAttempt = z.infer<typeof ActivationAttemptSchema>;
 
-export const ProvisioningSchema = z
+const ProvisioningSchema = z
   .object({
     provisioningCredential: z.string().min(1),
     provisioningCredentialExpiresAt: z.string(),
@@ -73,7 +73,7 @@ export const ProvisioningSchema = z
     lastRefreshAt: z.string().nullable(),
   })
   .strict();
-export type Provisioning = z.infer<typeof ProvisioningSchema>;
+type Provisioning = z.infer<typeof ProvisioningSchema>;
 
 export const LeaseRecordSchema = z
   .object({
@@ -113,7 +113,7 @@ export const DEFAULT_CONFIG: ConfigRecord["configuration"] = {
 const CursorsSchema = z.record(z.string(), z.object({ to_core: z.number().int().nonnegative(), to_runtime: z.number().int().nonnegative(),
   /** Highest to_core sequence ever allocated; absent in files written before it existed. */
   allocated: z.number().int().nonnegative().optional() }).strict());
-export type Cursors = z.infer<typeof CursorsSchema>;
+type Cursors = z.infer<typeof CursorsSchema>;
 
 const RelayDurableStateSchema = z.object({
   cursors: CursorsSchema,
@@ -130,12 +130,12 @@ export const ControlledExitReasonSchema = z.enum([
   "liveness_lost", "uncaught_exception", "unhandled_rejection", "startup_failed", "shutdown_step_failed", "other",
 ]);
 export type ControlledExitReason = z.infer<typeof ControlledExitReasonSchema>;
-export const LastExitSchema = z.object({
+const LastExitSchema = z.object({
   schemaVersion: z.literal(1),
   reason: ControlledExitReasonSchema,
   occurredAt: z.string().datetime(),
 }).strict();
-export type LastExit = z.infer<typeof LastExitSchema>;
+type LastExit = z.infer<typeof LastExitSchema>;
 
 /** Diagnostic progress only. The shutdown-complete receipt remains the sole
  * attestation that every native shutdown step finished. */

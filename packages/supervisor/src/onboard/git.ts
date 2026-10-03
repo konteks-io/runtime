@@ -30,7 +30,7 @@ const NON_INTERACTIVE_ENV = {
   SSH_ASKPASS_REQUIRE: "never",
 } as const;
 
-export const CREDENTIAL_UNAVAILABLE_REMEDY =
+const CREDENTIAL_UNAVAILABLE_REMEDY =
   "sign in to this provider with git on the machine running this Konteks runtime";
 
 export type GitGapCode = "credential_unavailable" | "not_found" | "unavailable";
@@ -128,7 +128,7 @@ export function classifyGitFailure(stderr: string): GitGap {
   return { code: "unavailable", remedy: "retry when this machine can reach the provider" };
 }
 
-export interface LocalGitOptions {
+interface LocalGitOptions {
   /** Injected in tests; production runs the real subprocess. */
   run?: typeof runCommand;
   /** How long a single git invocation may take. */
@@ -203,9 +203,8 @@ export class LocalGit implements GitAccess {
   }
 
   async credential(url: string): Promise<GitResult<{ username: string; password: string }>> {
-    // Git credentials are read THROUGH git (the OB6 gotcha): never by importing
-    // a host login cache the way the agent lane's `host-cache-import` does, and
-    // never by reading a helper's private store directly.
+    // Git credentials are read THROUGH git: never by copying a host login
+    // cache, and never by reading a helper's private store directly.
     const parsed = safeUrl(url);
     if (!parsed) return gitGap("unavailable", "the repository URL is not an HTTP(S) location");
     const request = `protocol=${parsed.protocol.replace(":", "")}\nhost=${parsed.host}\npath=${parsed.pathname.replace(/^\//, "")}\n\n`;
@@ -285,7 +284,7 @@ export class LocalGit implements GitAccess {
 }
 
 /** Extract one file from an uncompressed tar stream produced by `git archive`. */
-export function firstTarEntry(tar: Buffer, path: string): Buffer | null {
+function firstTarEntry(tar: Buffer, path: string): Buffer | null {
   const wanted = path.replace(/^\.\//, "");
   for (let offset = 0; offset + 512 <= tar.length; ) {
     const header = tar.subarray(offset, offset + 512);

@@ -24,7 +24,7 @@ import {
 /** The sign-in methods antigravity-acp 1.2.x offers (`initialize.authMethods`). */
 export const ANTIGRAVITY_AUTH_METHODS: readonly string[] = Object.freeze(["oauth-personal", "oauth-business", "gemini-api-key", "agent-platform"]);
 
-export interface AntigravitySelfCheckOptions {
+interface AntigravitySelfCheckOptions {
   /** The Antigravity runner's configuration (the verified folder, version and credential directory). */
   config: RunnerConfig;
   spawn?: typeof spawnBridge;

@@ -66,7 +66,7 @@ export const ANTIGRAVITY_TOOL_KINDS: Readonly<Record<string, string>> = Object.f
 });
 
 /** Subagent tools: a subagent's own calls never ask, so any of these seen at all quarantines Antigravity. */
-export const ANTIGRAVITY_SUBAGENT_TOOLS: ReadonlySet<string> = new Set([
+const ANTIGRAVITY_SUBAGENT_TOOLS: ReadonlySet<string> = new Set([
   "invoke_subagent", "define_subagent", "manage_subagents", "start_subagent", "send_message", "browser_subagent",
 ]);
 
@@ -111,7 +111,7 @@ const PRIVATE_HOME_IN_COMMAND = [
 ];
 
 /** The Gemini Enterprise sign-in method (the credential A21's line is for). */
-export const ANTIGRAVITY_ENTERPRISE_METHOD = "oauth-business";
+const ANTIGRAVITY_ENTERPRISE_METHOD = "oauth-business";
 
 export const ANTIGRAVITY_QUARANTINE_MESSAGE = "Google Antigravity ran a tool without Konteks' approval. Update the connector, then restart it.";
 /** A21: the organisation's admin setting let a command run unasked. */
@@ -232,8 +232,6 @@ export class AntigravityToolGovernance implements HostToolGovernance {
   private readonly allowances: Allowance[] = [];
 
   constructor(private readonly limit = 512) {}
-
-  size(): number { return this.calls.size; }
 
   /** A21: a command that ran unasked on Gemini Enterprise names the organisation's setting. */
   quarantineMessageFor(bypass: HostToolBypass, credentialMethod: string | undefined): string {

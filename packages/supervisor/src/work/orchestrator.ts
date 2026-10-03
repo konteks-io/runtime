@@ -59,7 +59,7 @@ import { integrationTerminalResult, isIntegrationWorkAssignment, type Integratio
  * refuses the closed list of unacceptable work. It never runs peer election
  * or a global balancer.
  */
-export type ClaimRejection =
+type ClaimRejection =
   | "unknown_kind"
   | "stale_attempt"
   | "workspace_mismatch"
@@ -73,7 +73,7 @@ export type ClaimRejection =
   | "reconciliation_pending"
   | "no_headroom";
 
-export interface OrchestratorDeps {
+interface OrchestratorDeps {
   clock: Clock;
   journal: SupervisorJournal;
   outbox: DurableOutbox;

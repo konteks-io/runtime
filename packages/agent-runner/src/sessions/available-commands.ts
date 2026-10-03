@@ -10,7 +10,7 @@ const RELEARN_WRITE_INTERVAL_MS = 60 * 60_000;
 
 const StoredSchema = z.object({ commands: z.array(z.unknown()), learntAt: z.string().datetime() });
 
-export interface LearntCommands {
+interface LearntCommands {
   readonly commands: readonly AvailableCommand[];
   readonly learntAt: string;
 }

@@ -69,7 +69,7 @@ export const RunnerEventSchema = z.discriminatedUnion("kind", [
 ]);
 export type RunnerEvent = z.infer<typeof RunnerEventSchema>;
 
-export type RunnerEventListener = (event: RunnerEvent) => void;
+type RunnerEventListener = (event: RunnerEvent) => void;
 
 export class RunnerEventBus {
   private readonly listeners = new Set<RunnerEventListener>();

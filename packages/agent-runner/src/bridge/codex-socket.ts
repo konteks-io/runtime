@@ -2,7 +2,7 @@ import type { Stats } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export type CodexSocketEntry =
+type CodexSocketEntry =
   | { kind: "none" }
   /** A socket at the path, or reached through this user's link into a private directory of this user. */
   | { kind: "socket"; target: string; info: Pick<Stats, "mode" | "uid" | "dev" | "ino"> }

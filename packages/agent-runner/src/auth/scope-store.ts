@@ -19,9 +19,9 @@ export const AgentScopeStateSchema = z
   .strict();
 export type AgentScopeState = z.infer<typeof AgentScopeStateSchema>;
 
-export const SCOPE_FILE_NAME = "agent-scope.json";
+const SCOPE_FILE_NAME = "agent-scope.json";
 
-export type ScopeTransition =
+type ScopeTransition =
   | { kind: "unchanged"; state: AgentScopeState }
   | { kind: "attested"; state: AgentScopeState }
   | { kind: "reset"; state: AgentScopeState; previousScope: OwnershipScope };

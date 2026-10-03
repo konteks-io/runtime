@@ -10,7 +10,7 @@ import type { Socket } from "node:net";
  * target runs end to end inside it. Plain `http:` targets never use a proxy.
  */
 
-export class HttpsProxyError extends Error {
+class HttpsProxyError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = "HttpsProxyError";

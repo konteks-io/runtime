@@ -13,7 +13,7 @@ import { readNativeRecord, restoreNativeRecord } from "./install.js";
 import type { NativeServiceCommand, NativeServiceDefinition } from "./service.js";
 import { commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps, type NativeUpdateStage } from "./update.js";
 
-export interface UpdateControlClient {
+interface UpdateControlClient {
   call<T>(request: ControlRequest, schema: { parse(value: unknown): T }, options?: { timeoutMs?: number }): Promise<T>;
 }
 
@@ -59,13 +59,13 @@ export interface NativeUpdateTransactionDeps {
   pollMs?: number;
 }
 
-export interface NativeUpdateInput extends NativeCommandContext {
+interface NativeUpdateInput extends NativeCommandContext {
   /** Launched by the supervisor rather than typed by an operator; recorded in the ledger. */
   unattended?: boolean;
   deps?: NativeUpdateDeps;
 }
 
-export type NativeUpdateOutcome =
+type NativeUpdateOutcome =
   | { state: "current"; bundleVersion: string }
   | { state: "updated"; from: string; to: string; releaseId: string; previousReleaseId: string; restarted: boolean };
 
@@ -471,7 +471,7 @@ async function sameContents(a: string, b: string): Promise<boolean> {
   return x === y;
 }
 
-export interface KeepLauncherCurrentDeps {
+interface KeepLauncherCurrentDeps {
   /** This process: a release's `konteks-connector` (or `connector`), or node in development. */
   execPath: string;
   readRecord: (root: string) => Promise<NativeRuntimeRecord>;

@@ -26,11 +26,11 @@ const StoredTokenSchema = z
   })
   .strict();
 
-export type StoredOwnerToken = z.infer<typeof StoredTokenSchema>;
+type StoredOwnerToken = z.infer<typeof StoredTokenSchema>;
 
 const FILE = "owner-token.json";
 
-export function ownerTokenPath(supervisorData: string): string {
+function ownerTokenPath(supervisorData: string): string {
   return join(supervisorData, FILE);
 }
 
@@ -78,7 +78,7 @@ const FirstSystemSchema = z
   })
   .strict();
 
-export type FirstSystemRegistered = z.infer<typeof FirstSystemSchema>;
+type FirstSystemRegistered = z.infer<typeof FirstSystemSchema>;
 
 export class OwnerApiClient {
   constructor(
@@ -202,25 +202,6 @@ export class OwnerApiClient {
     return list
       .filter(entry => typeof entry.id === "string" && entry.id)
       .map(entry => ({ id: entry.id as string, title: typeof entry.title === "string" ? entry.title : "" }));
-  }
-
-  /** A project-management session scoped to that System (OS13). */
-  async createProjectManagementSession(input: {
-    systemId: string;
-    instanceId: string;
-    title: string;
-  }): Promise<{ sessionId: string }> {
-    const body = (await this.call("POST", "/api/app/sessions", {
-      mode: "project_management",
-      title: input.title,
-      system_id: input.systemId,
-      runtimeTarget: { kind: "specific_instance", instanceId: input.instanceId },
-    })) as Record<string, unknown>;
-    const sessionId = String(body.id ?? body.session_id ?? "");
-    if (!sessionId) {
-      throw new RemoteInstanceError("temporarily_unavailable", "Konteks did not answer with a session.");
-    }
-    return { sessionId };
   }
 
   /** The person's first sentence becomes the session's first turn. */

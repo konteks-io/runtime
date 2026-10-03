@@ -10,7 +10,7 @@ import type {
 } from "../state/execution-revision-fence-inbox.js";
 
 /** The current relay socket ownership captured at control delivery time. */
-export interface CapturedExecutionRevisionControlConnection {
+interface CapturedExecutionRevisionControlConnection {
   instanceId: string;
   workspaceId: string;
   runnerIncarnation: string;

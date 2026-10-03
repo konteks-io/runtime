@@ -109,7 +109,7 @@ interface PendingSend {
   generation: number;
 }
 
-export interface MuxCounters {
+interface MuxCounters {
   epochStale: number;
   invalidFrames: number;
   duplicates: number;
@@ -195,14 +195,6 @@ export class ChannelMux {
     void this.serialize(() => this.persist(this.durableState())).catch(error => {
       this.logger.warn({ err: error, channelId }, "closed relay channel state could not be retired durably");
     });
-  }
-
-  hasChannel(channelId: string): boolean {
-    return this.channels.has(channelId);
-  }
-
-  channelIds(): string[] {
-    return [...this.channels.keys()];
   }
 
   private ensure(channelId: string, channel: RelayChannel): ChannelState {

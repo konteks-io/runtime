@@ -35,7 +35,7 @@ export const KONTEKS_CODE_MODE_SERVERS: ReadonlySet<string> = new Set(["konteks-
 /** One approved call: the Konteks server (Code Mode namespace) and its tool. */
 export interface CodeModeCall { server: string; tool: string }
 
-export type CodeModeBlock = { ok: true; calls: CodeModeCall[] } | { ok: false; reason: string };
+type CodeModeBlock = { ok: true; calls: CodeModeCall[] } | { ok: false; reason: string };
 
 /** The only form Konteks runs, as the agent is told it (prompt line and refusal log). */
 export const CODE_MODE_ACCEPTED_FORM = "call Konteks tools only as `const result = await tools[\"<server>\"].<tool>({ ... });` with literal arguments, one call per statement, then `return result;`";

@@ -8,7 +8,7 @@ import { openCodeScratchEnvironment } from "@konteks/remote-agent-runner";
 import { hostAgentFamily, hostAgentVersionSupported, hostInstallCommand, type HostAgentFamily } from "@konteks/remote-release";
 
 /** The person's own installed OpenCode 2, as the runtime will launch it. */
-export interface NativeOpenCodeInstallation {
+interface NativeOpenCodeInstallation {
   /** Canonical path of the native executable (never a shim). */
   binary: string;
   version: string;
@@ -24,7 +24,7 @@ const CONTROL = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 /** npm packages whose `bin/opencode.exe` is OpenCode: 2.x, and 1.x (named so it can be refused by name). */
 const NPM_PACKAGES = ["@opencode/cli", "opencode-ai"] as const;
 
-export interface OpenCodeLocatorDeps {
+interface OpenCodeLocatorDeps {
   /** Runs `<binary> --version` (scrubbed environment, throwaway home); replaced only in tests. */
   versionOutput?: (binary: string) => Promise<string | null>;
 }
@@ -297,7 +297,7 @@ export async function openCodeVersionOutput(binary: string): Promise<string | nu
 }
 
 /** How the person installed the OpenCode the connector runs, in words for doctor (never the path). */
-export type OpenCodeInstallKind = "homepage installer" | "npm" | "Homebrew" | "scoop" | "Chocolatey" | "another location";
+type OpenCodeInstallKind = "homepage installer" | "npm" | "Homebrew" | "scoop" | "Chocolatey" | "another location";
 
 /** Read from the canonical executable path the locator returned (so a shim already points at its target). */
 export function openCodeInstallKind(binary: string): OpenCodeInstallKind {

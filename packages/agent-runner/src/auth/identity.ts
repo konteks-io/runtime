@@ -15,7 +15,7 @@ import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentSettings } from "../host/hos
  * meaningless outside this runner. Where no official signal is proven, every
  * login is an identity change (conservative fallback).
  */
-export const FINGERPRINT_KEY_FILE = "fingerprint.key";
+const FINGERPRINT_KEY_FILE = "fingerprint.key";
 
 export type IdentityProbe =
   // `credentials`: what an agent with several sign-ins reported (OpenCode's `auth list`), no secret.
@@ -25,7 +25,7 @@ export type IdentityProbe =
   | { kind: "logged_out"; credentials?: ConnectedAgentCredential[] }
   | { kind: "no_official_signal" };
 
-export interface IdentityProbeDeps {
+interface IdentityProbeDeps {
   run?: typeof runCommand;
   readAccount?: typeof readCodexAccount;
 }

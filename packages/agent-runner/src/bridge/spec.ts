@@ -21,7 +21,7 @@ export interface BridgeSpawnSpec {
 }
 
 /** How long Claude Code waits for a Konteks MCP server's tools at session start (its `MCP_TIMEOUT`). */
-export const CLAUDE_MCP_STARTUP_TIMEOUT_MS = "180000";
+const CLAUDE_MCP_STARTUP_TIMEOUT_MS = "180000";
 
 export function resolveBridgeFamily(agentId: string): AgentBridgeFamily {
   const family = findAgentBridge(agentId);

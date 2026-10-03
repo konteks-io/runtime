@@ -2,8 +2,8 @@ import { copyFile, stat, truncate } from "node:fs/promises";
 import { join } from "node:path";
 
 /** The connector's own log in `<root>/logs`, where the OS keeps none (macOS launchd, the Windows task). */
-export const CONNECTOR_LOG_FILE = "connector.log";
-export const CONNECTOR_LOG_MAX_BYTES = 20 * 1024 * 1024;
+const CONNECTOR_LOG_FILE = "connector.log";
+const CONNECTOR_LOG_MAX_BYTES = 20 * 1024 * 1024;
 const CHECK_EVERY_MS = 60 * 60_000;
 
 /**

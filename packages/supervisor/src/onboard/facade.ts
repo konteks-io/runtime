@@ -42,16 +42,16 @@ export type OnboardEvidenceSubmission = DiscoveryEvidenceSubmission;
  * spelled here verbatim, and belong in the shared package the moment OB2 lands
  * so neither side re-derives them.
  */
-export const DISCOVERY_RUN_GET_TOOL = "platform__catalog__discovery_run_get" as const;
-export const DISCOVERY_RUN_INVENTORY_LIST_TOOL = "platform__catalog__discovery_run_inventory_list" as const;
-export const DISCOVERY_RUN_EVIDENCE_SUBMIT_TOOL = "platform__catalog__discovery_run_evidence_submit" as const;
-export const DISCOVERY_RUN_ENRICHMENT_SUBMIT_TOOL = "platform__catalog__discovery_run_enrichment_submit" as const;
+const DISCOVERY_RUN_GET_TOOL = "platform__catalog__discovery_run_get" as const;
+const DISCOVERY_RUN_INVENTORY_LIST_TOOL = "platform__catalog__discovery_run_inventory_list" as const;
+const DISCOVERY_RUN_EVIDENCE_SUBMIT_TOOL = "platform__catalog__discovery_run_evidence_submit" as const;
+const DISCOVERY_RUN_ENRICHMENT_SUBMIT_TOOL = "platform__catalog__discovery_run_enrichment_submit" as const;
 /**
  * CONTRACT-GAP: OB2 §3b requires the report but names no tool. `cloning` is
  * reported BEFORE the clone and `extracted` with the submission, so Core's
  * per-repository ledger is never behind what is already on disk.
  */
-export const DISCOVERY_RUN_ENRICHMENT_PROGRESS_TOOL = "platform__catalog__discovery_run_enrichment_progress" as const;
+const DISCOVERY_RUN_ENRICHMENT_PROGRESS_TOOL = "platform__catalog__discovery_run_enrichment_progress" as const;
 
 /** What the collector needs off a run: its depth, its bounds, its connector. */
 export const OnboardRunViewSchema = z
@@ -69,7 +69,7 @@ export const OnboardRunViewSchema = z
   });
 export type OnboardRunView = z.infer<typeof OnboardRunViewSchema> & { bounds: DiscoveryRunBounds };
 
-export const OnboardInventoryPageSchema = z
+const OnboardInventoryPageSchema = z
   .object({
     items: z
       .array(
@@ -96,7 +96,7 @@ export type OnboardInventoryPage = z.infer<typeof OnboardInventoryPageSchema>;
  * clone URL and no managed flag, so the worker composes the remote itself from
  * `baseUrl`/`repoOwner`/`repoName` and decides the credential by host.
  */
-export const RelocationEndpointSchema = z
+const RelocationEndpointSchema = z
   .object({
     vcsConnectorId: z.string().min(1).max(200),
     provider: z.string().min(1).max(64),
@@ -137,7 +137,7 @@ export interface OnboardFacade {
   relocationReport(report: RepositoryRelocateReportInput): Promise<RelocationPlan>;
 }
 
-export interface McpOnboardFacadeOptions {
+interface McpOnboardFacadeOptions {
   /** The redeemed platform MCP entry for this claim. Never journaled. */
   endpoint: { url: string; headers: ReadonlyArray<{ name: string; value: string }> };
   fetchFn?: FetchFn;

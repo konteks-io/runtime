@@ -3,7 +3,7 @@ import type { CoreClient } from "../core/client.js";
 import type { SupervisorJournal } from "../state/journal.js";
 import type { PlanningTerminalDirectiveProcessor } from "./planning-terminal-directives.js";
 
-export interface ControllerDirectivePollerOptions { core: CoreClient; journal: SupervisorJournal; processor: PlanningTerminalDirectiveProcessor;
+interface ControllerDirectivePollerOptions { core: CoreClient; journal: SupervisorJournal; processor: PlanningTerminalDirectiveProcessor;
   instanceId: () => string; runnerIncarnation: () => string; canPoll: () => boolean; logger?: Logger; }
 export class ControllerDirectivePoller {
   private running = false; private flight: Promise<void> | null = null; private timer: NodeJS.Timeout | null = null; private pollAbort: AbortController | null = null; private readonly logger: Logger;

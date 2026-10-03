@@ -23,7 +23,7 @@ import type { AssignmentSender } from "./assignment-sender.js";
  * exponential backoff until it is durable. The claim frees itself instead of
  * halting until its deadline.
  */
-export interface ReportSenderOptions {
+interface ReportSenderOptions {
   journal: SupervisorJournal;
   outbox: DurableOutbox;
   transport: TransportManager;
@@ -48,9 +48,9 @@ const RESUBMIT_BASE_DELAY_MS = 500;
 const RESUBMIT_MAX_DELAY_MS = 30_000;
 const STOP_CONFIRMED_RESULT = { class: "interrupted" as const, reason: "not_resumable" as const };
 
-export type ReportDraft = Omit<AssignmentReport, "reportId" | "reportSequence" | "payloadDigest" | "reportedAt" | "assignmentId" | "attempt" | "claimId">;
+type ReportDraft = Omit<AssignmentReport, "reportId" | "reportSequence" | "payloadDigest" | "reportedAt" | "assignmentId" | "attempt" | "claimId">;
 
-export function reportGroup(assignmentId: string, attempt: number, claimId: string): string {
+function reportGroup(assignmentId: string, attempt: number, claimId: string): string {
   return `report:${assignmentId}:${attempt}:${claimId}`;
 }
 

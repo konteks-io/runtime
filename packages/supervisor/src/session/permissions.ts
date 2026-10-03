@@ -157,9 +157,6 @@ export class PermissionBroker {
     return cancelled;
   }
 
-  list(): PendingHumanRequest[] {
-    return [...this.pending.values()];
-  }
 }
 
 /** Core's `DeferredPermission` for one sanitized request raised on a session. */

@@ -33,13 +33,13 @@ export interface PreviewPlan {
 
 export type PreviewPlanResult = { ok: true; plan: PreviewPlan } | { ok: false; message: string; notes: string[] };
 
-export const PREVIEW_YAML = join(".konteks", "preview.yaml");
+const PREVIEW_YAML = join(".konteks", "preview.yaml");
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 /** The connector owns these; a repository file cannot override them. */
 const RESERVED_ENV = new Set(["PATH", "HOST", "PORT", "HOME", "USERPROFILE"]);
 const MAX_COMMAND = 2_000;
 
-export interface PlanReadDeps {
+interface PlanReadDeps {
   readText?: (path: string) => Promise<string | null>;
   exists?: (path: string) => Promise<boolean>;
   platform?: NodeJS.Platform;

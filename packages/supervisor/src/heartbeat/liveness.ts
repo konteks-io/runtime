@@ -1,6 +1,6 @@
 import type { HeartbeatLiveness } from "./heartbeat.js";
 
-export interface LivenessVerdict {
+interface LivenessVerdict {
   state: "live" | "quiet" | "stuck";
   /** Milliseconds since the publisher last attempted or settled a heartbeat (or since watching began). */
   quietMs: number;

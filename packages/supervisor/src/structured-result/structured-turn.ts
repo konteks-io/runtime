@@ -14,19 +14,17 @@ import type { ResultToolDefinition } from "./result-tool-server.js";
  * re-read its tools), the line carries the schema instead; the tool still
  * validates and corrects.
  */
-export const RESULT_TOOL_LINE = resultToolLine();
 
 /**
- * The tool line for an agent that calls tools in its own form (OpenCode's
- * Code Mode: `await tools["konteks-result"].submit_result({ ... })`).
+ * The tool line. An agent that calls tools in its own form passes its own
+ * `call` (OpenCode's Code Mode:
+ * `await tools["konteks-result"].submit_result({ ... })`).
  */
 export function resultToolLine(call = `\`${STRUCTURED_RESULT_TOOL_NAME}\``): string {
   return `When you are finished, call ${call} once with your result.`;
 }
 
 /** The one follow-up prompt, sent when the turn ended with neither a valid call nor a valid fenced result. */
-export const RESULT_FOLLOW_UP = resultFollowUp();
-
 export function resultFollowUp(call = `\`${STRUCTURED_RESULT_TOOL_NAME}\``): string {
   return `You did not call ${call} with a valid result. Call it now, once, with your whole result.`;
 }
@@ -42,7 +40,7 @@ export function resultToolLineWithSchema(schema: Record<string, unknown>, wrappe
   ].join("\n");
 }
 
-export interface StructuredContract {
+interface StructuredContract {
   schema: Record<string, unknown>;
   /** Index of the prompt block that carries the contract (always the last one). */
   index: number;

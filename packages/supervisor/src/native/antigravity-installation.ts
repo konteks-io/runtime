@@ -22,7 +22,7 @@ import { downloadPinnedFile, extractZipEntry, FetchedArchiveError, freeDiskBytes
  * file identity; any mismatch means the copy is never run.
  */
 
-export const ANTIGRAVITY_AGENT_ID = "antigravity";
+const ANTIGRAVITY_AGENT_ID = "antigravity";
 
 /** Asked before anything is downloaded (A20): onboarding, `agent add antigravity`, and the site's card. */
 export const ANTIGRAVITY_CONSENT_TEXT = "Konteks will download Google Antigravity from Google's server (dl.google.com, about 110 MB, 400 MB on disk), check Google's signature, and keep it updated with Konteks updates. Google's terms apply to its use (antigravity.google/terms). Download it now? [y/N]";
@@ -89,7 +89,7 @@ export function antigravityFolders(root: string, pin: Pick<AntigravityPin, "vers
 }
 
 /** The verified fetched server, as the runner launches it. */
-export interface NativeAntigravityInstallation {
+interface NativeAntigravityInstallation {
   root: string;
   version: string;
   /** The executable the registry's `cmd` names, inside `root`. */
@@ -285,7 +285,7 @@ export async function fetchNativeAntigravity(request: { root: string; consent: b
 const fetchesUnderWay = new Map<string, { receivedBytes: number; sizeBytes: number }>();
 
 /** The running fetch into `root`, if any: bytes received of the pinned zip's size. */
-export function antigravityFetchProgress(root: string): { receivedBytes: number; sizeBytes: number } | undefined {
+function antigravityFetchProgress(root: string): { receivedBytes: number; sizeBytes: number } | undefined {
   const running = fetchesUnderWay.get(root);
   return running ? { ...running } : undefined;
 }

@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RunnerConfigSchema } from "../config.js";
 import { RunnerEventBus, type RunnerEvent } from "../events.js";
 import {
-  isOpenCodeFreeModel, listOpenCodeCredentials, openCodeCredentialViews, openCodeIdentityMaterial, openCodeLogout, openCodePtyCommand, openCodeReuseOffered,
+  isOpenCodeFreeModel, listOpenCodeCredentials, openCodeCredentialViews, openCodeIdentityMaterial, openCodeLogout, openCodePtyCommand,
   openCodeSiteLoginOptions, parseOpenCodeAuthList, parseOpenCodeIntegrations, splitTerminalOutput, startOpenCodeLogin, type OpenCodeStoredCredential,
 } from "../auth/opencode-auth.js";
 import { openCodeCommandContext, openCodeRunnerAdapter, openCodeRuntimePaths } from "../host/opencode.js";
@@ -269,7 +269,6 @@ describe("signing OpenCode in (O2)", () => {
     // Their own providers come first in the menu.
     await waitFor(event => event.type === "display" && /1\. ChatGPT Plus or Pro \(your own OpenCode uses it\)/.test(event.text));
     await first.cancel();
-    expect(await openCodeReuseOffered(f.paths.root)).toBe(true);
     // Asked once: the next sign-in goes straight to the menu, unless --reuse asks again.
     const again = record(events);
     const second = startOpenCodeLogin({ context: f.context, events, stateDir: f.paths.root, personal });

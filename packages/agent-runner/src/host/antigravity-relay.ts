@@ -93,7 +93,7 @@ export interface GeminiRelayUpstream {
   ca?: string | Buffer;
 }
 
-export interface AntigravityRelayOptions {
+interface AntigravityRelayOptions {
   /** The person's Gemini API key (read from the connector's store, never from the environment). */
   key: string;
   logger?: Pick<Logger, "info" | "warn">;

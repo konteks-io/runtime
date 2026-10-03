@@ -18,7 +18,7 @@ import { BROWSER_MCP_SERVER_NAME, DSH_READ_ONLY_TOOLS, isDeniedBrowserTool } fro
  * treats a hook that cannot run as non-blocking. `observe` therefore also
  * trips when a gated tool completes without having asked.
  */
-export type DshPermissionDecision =
+type DshPermissionDecision =
   | { kind: "allow" }
   | { kind: "deny"; reason: string }
   | { kind: "evaluate"; request: RequestPermissionRequest };

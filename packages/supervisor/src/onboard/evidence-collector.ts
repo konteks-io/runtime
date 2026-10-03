@@ -35,11 +35,11 @@ export interface OnboardEvidenceCollectorDeps {
   logger?: Logger;
 }
 
-export const DEFAULT_ONBOARD_CONCURRENCY = 4;
+const DEFAULT_ONBOARD_CONCURRENCY = 4;
 const DEFAULT_BATCH_SIZE = 8;
 
 /** What one repository's read produced, including what it could not read. */
-export interface RepositoryEvidence {
+interface RepositoryEvidence {
   submission: DiscoveryEvidenceSubmission;
   /** Which path produced each ref (OB6 gotcha); diagnostics, never submitted. */
   readPaths: Record<string, EvidenceReadPath>;
@@ -47,7 +47,7 @@ export interface RepositoryEvidence {
   gaps: GitGap[];
 }
 
-export interface GroupingOutcome {
+interface GroupingOutcome {
   submitted: number;
   /** Canonical keys the machine's git could not read at all. */
   unreadable: Array<{ canonicalKey: string; gap: GitGap }>;
@@ -61,7 +61,7 @@ export interface EnrichmentScope {
   canonicalKeys: string[];
 }
 
-export interface EnrichmentOutcome {
+interface EnrichmentOutcome {
   cloned: number;
   submitted: number;
   /** `budget_exhausted` when the allowance was 0: the assignment is done. */
@@ -265,7 +265,7 @@ export class OnboardEvidenceCollector {
  * A ref names the file this fact came from and proves which bytes were read.
  * It is the ONLY thing about a file that leaves the machine besides the facts.
  */
-export function evidenceRef(item: Pick<DiscoveryInventoryItem, "canonicalKey" | "defaultBranch">, candidate: EvidenceCandidate, body: Buffer): CatalogLearningEvidence {
+function evidenceRef(item: Pick<DiscoveryInventoryItem, "canonicalKey" | "defaultBranch">, candidate: EvidenceCandidate, body: Buffer): CatalogLearningEvidence {
   return {
     ref: `${item.canonicalKey}@${item.defaultBranch}:${candidate.path}`,
     kind: candidate.kind,

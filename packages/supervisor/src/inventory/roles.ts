@@ -85,7 +85,7 @@ export function placedAgentReady(agents: readonly ConnectedAgentView[], agentId:
   return agent !== undefined && agentSatisfiesRole(agent, role, inputs);
 }
 
-export interface UtilizationInputs {
+interface UtilizationInputs {
   hostPressure: number; // 0..1 from sysmon
   activeSessions: number;
   activeTurns: number;

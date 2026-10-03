@@ -64,7 +64,7 @@ import type { LoginEvent, LoginFailureReason, LoginFlow } from "./login-flow.js"
 const KEY_SHAPE = /^[\x21-\x7e]{16,512}$/;
 const MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1";
 /** Google's own sign-in times out after 300 s (CP0); a little more for the licence page. */
-export const ANTIGRAVITY_SIGN_IN_TIMEOUT_MS = 330_000;
+const ANTIGRAVITY_SIGN_IN_TIMEOUT_MS = 330_000;
 const REQUIRE_REVIEW_LINE = "Your Google Cloud admin must set Terminal auto-execution to Require review. Otherwise Konteks stops Google Antigravity after its first command.";
 
 /** Where the connector keeps the person's Gemini API key: 0600, outside the agent's home. */
@@ -91,7 +91,7 @@ async function removeAntigravityApiKey(credentialDir: string): Promise<boolean> 
 }
 
 /** Check a key with Google's model list: free, no tokens spent. */
-export async function verifyGeminiApiKey(key: string, deps: { fetch?: typeof fetch; timeoutMs?: number } = {}): Promise<"valid" | "rejected" | "unreachable"> {
+async function verifyGeminiApiKey(key: string, deps: { fetch?: typeof fetch; timeoutMs?: number } = {}): Promise<"valid" | "rejected" | "unreachable"> {
   try {
     const response = await (deps.fetch ?? fetch)(MODELS_URL, {
       headers: { "x-goog-api-key": key, accept: "application/json" },
@@ -110,7 +110,7 @@ export async function verifyGeminiApiKey(key: string, deps: { fetch?: typeof fet
 // ── Gemini Enterprise over ACP ────────────────────────────────────────────────
 
 /** What the server printed during a Google sign-in, read line by line from its stderr. */
-export interface GoogleSignInSignals {
+interface GoogleSignInSignals {
   /** Google's own page (`accounts.google.com`), relayed to the person. */
   googleUrl?: string;
   /** The server's licence picker opened on loopback (never relayed). */
@@ -128,7 +128,7 @@ const PICKER = /Open the following link to choose your Gemini Enterprise license
 const RESOLVED = /Gemini Enterprise sign-in resolved: project=(\S+) location=(\S+) user_tier=(\S+)/;
 
 /** Read one stderr line of the server into `signals`; returns what changed, for the relay. */
-export function readGoogleSignInLine(line: string, signals: GoogleSignInSignals): "google_url" | "picker" | "no_licence" | "resolved" | null {
+function readGoogleSignInLine(line: string, signals: GoogleSignInSignals): "google_url" | "picker" | "no_licence" | "resolved" | null {
   const link = GOOGLE_LINK.exec(line)?.[1];
   if (link) {
     signals.googleUrl = link;
@@ -151,7 +151,7 @@ export interface GoogleSignInProcess {
   initializeTimeoutMs: number;
 }
 
-export type GoogleSignInOutcome =
+type GoogleSignInOutcome =
   | { outcome: "signed_in"; gcp?: AgentLoginGcp; tier?: string }
   | { outcome: "failed"; reason?: LoginFailureReason; message: string };
 
@@ -161,7 +161,7 @@ export type GoogleSignInOutcome =
  * lines). `settings.json` names the method (and Enterprise's project) while
  * the server signs in; the home is held so nothing rewrites it meanwhile.
  */
-export async function runGoogleSignIn(options: {
+async function runGoogleSignIn(options: {
   credentialDir: string;
   method: "oauth-business" | "oauth-personal";
   gcp?: AgentLoginGcp;
@@ -239,7 +239,7 @@ async function resolvedGcp(settingsFile: string, signals: GoogleSignInSignals, a
 
 // ── The login flow ────────────────────────────────────────────────────────────
 
-export interface AntigravityLoginOptions {
+interface AntigravityLoginOptions {
   credentialDir: string;
   events: RunnerEventBus;
   loginId?: string;
@@ -469,14 +469,14 @@ export async function markNoLicence(credentialDir: string, gcp?: AgentLoginGcp):
 /** Same file as `FINGERPRINT_KEY_FILE` in auth/identity.ts (kept literal to avoid an import cycle). */
 const FINGERPRINT_KEY_FILE = "fingerprint.key";
 
-export interface AntigravityHeld {
+interface AntigravityHeld {
   record: AntigravitySignIn | null;
   key: boolean;
   enterpriseToken: boolean;
 }
 
 /** What the connector holds for Antigravity: its sign-in record, whether a key is stored, whether the server kept an Enterprise token file (never read). */
-export async function antigravityHeld(credentialDir: string): Promise<AntigravityHeld> {
+async function antigravityHeld(credentialDir: string): Promise<AntigravityHeld> {
   const [record, key, enterpriseToken] = await Promise.all([
     readAntigravitySignIn(credentialDir),
     readAntigravityApiKey(credentialDir).then(value => value !== null),

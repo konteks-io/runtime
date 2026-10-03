@@ -63,7 +63,7 @@ const StartSchema = StartInputSchema.safeExtend({ delivery: z.enum(["unallocated
   if ((value.delivery === "allocated") !== (value.allocation !== undefined)) context.addIssue({ code: "custom", message: "Allocated admission requires exactly its immutable request reference" });
   if (value.claimEffect && value.delivery !== "allocated") context.addIssue({ code: "custom", message: "Only an allocated admission owns a claim reply effect" });
 });
-export type LocalAdmissionStart = z.infer<typeof StartSchema>;
+type LocalAdmissionStart = z.infer<typeof StartSchema>;
 const CancellationSchema = z.object({ ...scope, runnerIncarnation: id, manifestId: id, assignmentId: id, attempt: AdmissionSchema.shape.attempt, decisionDigest: digest, cancelledAt: z.string().datetime() }).strict();
 const ExecutionSchema = z.object({ schemaVersion: z.literal(1), admission: AdmissionSchema, openedAt: z.string().datetime(), acpSessionRef: id.nullable(), referenceFence: id.nullable(), processOwner: RetainedProcessOwnerSchema.optional(), mcpLocalTransport: McpLocalTransportIdentitySchema.optional(), legacyCodexAdmission: LegacyCodexAdmissionSchema.optional(), phase: z.enum(["opened", "stopping", "process_stopped", "acp_settled", "continued", "interrupted_unqualified"]), stoppingAt: z.string().datetime().nullable(), processStoppedAt: z.string().datetime().optional(), interruptedAt: z.string().datetime().optional(), acpSettledAt: z.string().datetime().nullable(), completedTurnSettledAt: z.string().datetime().optional(), continuedFromGeneration: id.optional(), restoredFromGeneration: id.optional(), restoreAcpSessionRef: id.optional(), continuedToGeneration: id.optional(), continuedAt: z.string().datetime().optional(), lifecycleProfileDigest: z.null(), executionProfileDigest: z.null() }).strict().superRefine((value, context) => {
   if ((value.acpSessionRef === null && value.referenceFence !== null) ||
@@ -98,10 +98,9 @@ const HarnessSessionHeadSchema = z.object({
   turn: z.object({ invocationId: id, dispatchGeneration: z.number().int().nonnegative().safe() }).strict(),
   completedAt: z.string().datetime(),
 }).strict();
-export type LocalExecutionState = z.infer<typeof ExecutionSchema>;
-export type { LocalAdmission } from "./local-admission.js";
-export type LocalAbsenceCancellation = z.infer<typeof CancellationSchema>;
-export interface LiveContinuationCandidate {
+type LocalExecutionState = z.infer<typeof ExecutionSchema>;
+type LocalAbsenceCancellation = z.infer<typeof CancellationSchema>;
+interface LiveContinuationCandidate {
   admission: LocalAdmission;
   acpSessionRef: string;
   processOwner: RetainedProcessOwner;

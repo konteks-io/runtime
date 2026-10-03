@@ -18,7 +18,7 @@ const ScopeSchema = z.object(scope).strict();
 type Scope = z.infer<typeof ScopeSchema>;
 const counter = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const ClaimFrameSchema = LogicalAssignmentRequestFrameSchema.safeExtend({ body: AssignmentClaimSchema });
-export const AssignmentStreamStateSchema = z.object({
+const AssignmentStreamStateSchema = z.object({
   schemaVersion: z.literal(1), ...scope, enrollmentId: id, channelId: id,
   allocatedThrough: counter,
   // Observation advances only through the explicit authenticated ACK owner.
@@ -32,7 +32,7 @@ export const AssignmentStreamStateSchema = z.object({
   .refine(value => value.observedCoreRequestAckSequence <= value.allocatedThrough, "Observed ACK exceeds retained allocation history")
   .refine(value => value.retiredThroughRequestSequence <= value.observedCoreRequestAckSequence, "Retirement exceeds explicit ACK")
   .refine(value => value.compactedThroughReplySequence <= value.nativeConsumedReplySequence, "Reply deletion exceeds consumption");
-export type AssignmentStreamState = z.infer<typeof AssignmentStreamStateSchema>;
+type AssignmentStreamState = z.infer<typeof AssignmentStreamStateSchema>;
 /**
  * One retained outbound request. A claim additionally binds the exact immutable
  * admission it was chosen for; a pull or report has no admission of its own, so
@@ -69,7 +69,7 @@ export const AssignmentRequestRecordSchema = z.object({
 export type AssignmentRequestRecord = z.infer<typeof AssignmentRequestRecordSchema>;
 
 /** The operation a retained frame carries; the body's own shape decides it. */
-export function requestKindOf(frame: z.infer<typeof LogicalAssignmentRequestFrameSchema>): "pull" | "claim" | "report" {
+function requestKindOf(frame: z.infer<typeof LogicalAssignmentRequestFrameSchema>): "pull" | "claim" | "report" {
   const body = frame.body as Record<string, unknown>;
   if ("maxItems" in body) return "pull";
   if ("reportId" in body) return "report";
@@ -97,11 +97,11 @@ const OperationEffectSchema = z.discriminatedUnion("state", [
 const RetryAfterSchema = z.object({ request: AssignmentRequestReferenceSchema, response: LocalResponseReferenceSchema }).strict();
 const operationBase = { schemaVersion: z.literal(1), ...scope, operationId: id,
   request: AssignmentRequestReferenceSchema, effect: OperationEffectSchema };
-export const AssignmentOperationSchema = z.discriminatedUnion("kind", [
+const AssignmentOperationSchema = z.discriminatedUnion("kind", [
   z.object({ ...operationBase, kind: z.literal("pull") }).strict(),
   z.object({ ...operationBase, kind: z.literal("report"), report: ReportOperationOwnerSchema, retryAfter: RetryAfterSchema.optional() }).strict(),
 ]);
-export type AssignmentOperation = z.infer<typeof AssignmentOperationSchema>;
+type AssignmentOperation = z.infer<typeof AssignmentOperationSchema>;
 export const AssignmentOperationRecordSchema = z.object({ kind: z.literal("assignment_operation"), value: AssignmentOperationSchema }).strict();
 export const AssignmentReplyRecordValueSchema = z.object({
   schemaVersion: z.literal(2), ...scope,
@@ -134,7 +134,7 @@ const OperationInputSchema = z.discriminatedUnion("kind", [
 ]);
 const FreshPullInputSchema = z.object({ ...scope, runnerIncarnation: id, origin: AssignmentRequestOriginSchema,
   issuedAt: z.string().datetime(), body: AssignmentPullSchema }).strict();
-export const LOCAL_ASSIGNMENT_ALLOCATION_LIMITS = { maxRequests: 2048, maxBytes: 16 * 1024 * 1024 } as const;
+const LOCAL_ASSIGNMENT_ALLOCATION_LIMITS = { maxRequests: 2048, maxBytes: 16 * 1024 * 1024 } as const;
 const TRANSPORT_RECEIPT_LIMITS = { maxRecords: 16_384, maxBytes: 64 * 1024 * 1024 } as const;
 const ReceiptLimitsSchema = z.object({
   maxRecords: z.number().int().min(1).max(TRANSPORT_RECEIPT_LIMITS.maxRecords),
@@ -566,13 +566,6 @@ export class AssignmentStreamJournal {
     const operation = request?.operationId ? state.operations.get(request.operationId) : undefined;
     if (!operation || !same(operation.request, reference)) throw recovery();
     return structuredClone(operation);
-  }
-
-  /** Bounded ordered work on retained intents, independent of domain outbox lifetime. */
-  unresolvedOperations(scopeInput: Scope): AssignmentOperation[] {
-    return structuredClone([...this.state(scopeInput).operations.values()]
-      .filter(operation => operation.effect.state !== "applied")
-      .sort((a, b) => a.request.requestSequence - b.request.requestSequence).slice(0, 32));
   }
 
   /** One ordered stream; claim ownership stays on its complete admission. */

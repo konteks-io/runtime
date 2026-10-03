@@ -18,9 +18,9 @@ import { cloneUrl, resolveRemote, type ManagedGitBinding, type RepositoryLocatio
  * `credential_unavailable` with its remedy — never as an exception.
  */
 
-export type RelocationStep = RelocationPlan["step"];
+type RelocationStep = RelocationPlan["step"];
 
-export interface RelocationOutcome {
+interface RelocationOutcome {
   step: RelocationStep;
   disposition: "settled" | "refused" | "awaiting_core";
   /** Present when a side could not be read or a step failed. */
