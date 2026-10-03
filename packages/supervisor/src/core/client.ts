@@ -1,4 +1,4 @@
-import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, createLogger, type Logger } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, allEqual, createLogger, type Logger } from "@konteks/remote-common";
 
 import { z } from "zod";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
@@ -290,6 +290,56 @@ const RecoveryEvidenceIngressResultSchema = z.object({
 }).strict();
 type RecoveryEvidenceIngressResult = z.infer<typeof RecoveryEvidenceIngressResultSchema>;
 
+const SIGNING_KEY_SCHEMA = z.object({ kty: z.literal("RSA"), kid: z.string().min(1).max(256),
+  alg: z.literal("RS256").optional(), use: z.literal("sig").optional(),
+  n: z.string().min(1).max(2048).regex(/^[A-Za-z0-9_-]+$/), e: z.string().min(1).max(16).regex(/^[A-Za-z0-9_-]+$/),
+}).strict();
+
+/** Distinct RSA keys of at least 2048 bits, by key id. */
+function signingKeyMap(jwks: ReadonlyArray<z.infer<typeof SIGNING_KEY_SCHEMA>>): ReadonlyMap<string, KeyObject> {
+  const keys = new Map<string, KeyObject>();
+  for (const jwk of jwks) {
+    if (keys.has(jwk.kid)) throw new Error("Duplicate signing key");
+    const key = createPublicKey({ key: jwk, format: "jwk" });
+    if (key.asymmetricKeyType !== "rsa" || (key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error("Invalid signing key");
+    keys.set(jwk.kid, key);
+  }
+  return keys;
+}
+
+function keySetDiagnostic(error: unknown): string {
+  if (error instanceof RemoteInstanceError) return error.code;
+  return error instanceof z.ZodError ? "schema_invalid" : "invalid_key_set";
+}
+
+/** A still-valid key set may be refreshed once for a key id it does not hold. */
+function unknownKidRefresh(cached: { keys: ReadonlyMap<string, KeyObject>; unknownKidRefreshUsed: boolean }, expectedKid: string | undefined): boolean {
+  return Boolean(expectedKid && !cached.keys.has(expectedKid) && !cached.unknownKidRefreshUsed);
+}
+
+/** A failure's code (and diagnostic) for the log, never its message. */
+function errorFields(error: unknown): { code: string; diagnostic?: string } {
+  if (!(error instanceof RemoteInstanceError)) return { code: "unexpected_error" };
+  return { code: error.code, ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}) };
+}
+
+function configurationAck(ack: unknown): boolean {
+  return typeof ack === "object" && ack !== null && "type" in ack && ack.type === "desired_configuration_ack";
+}
+
+function supersededAck<T extends { requestDigest: string; appliedRevision?: number | null }>(receipt: T, request: ReturnType<typeof DesiredConfigurationAckSchema.parse>): T {
+  if (receipt.requestDigest !== jcsDigest(request as unknown as JsonValue) || (receipt.appliedRevision === request.revision && request.status === "applied")) {
+    throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement disposition mismatch");
+  }
+  return receipt;
+}
+
+/** Schema, parser and server messages may contain secret-bearing input: only the code and retryability survive. */
+function undeliveredCapability(error: unknown): RemoteInstanceError {
+  const transient = error instanceof RemoteInstanceError && error.retryable;
+  return new RemoteInstanceError(error instanceof RemoteInstanceError ? error.code : "capability_unavailable", "Capability delivery was not accepted.", { retryable: transient });
+}
+
 export class CoreClient {
   private readonly http: JsonClient;
   /** Recovery is authenticated by a machine proof, independent of a predecessor bearer. */
@@ -352,8 +402,11 @@ export class CoreClient {
       idempotencyKey: `execution-ready:${request.assignmentId}:${request.attempt}:${request.claimId}:${request.recoveryEpoch}`,
       operationPolicy: "admissionPreparation",
       ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
-    if (result.instanceId !== instanceId || result.assignmentId !== request.assignmentId || result.attempt !== request.attempt || result.claimId !== request.claimId || result.recoveryEpoch !== request.recoveryEpoch ||
-        result.runnerIncarnation !== request.runnerIncarnation || result.agentId !== request.agentId || result.acpSessionRef !== request.acpSessionRef) {
+    if (!allEqual([
+      [result.instanceId, instanceId], [result.assignmentId, request.assignmentId], [result.attempt, request.attempt], [result.claimId, request.claimId],
+      [result.recoveryEpoch, request.recoveryEpoch], [result.runnerIncarnation, request.runnerIncarnation], [result.agentId, request.agentId],
+      [result.acpSessionRef, request.acpSessionRef],
+    ])) {
       throw new RemoteInstanceError("registration_mismatch", "Execution readiness response does not match the local claim.");
     }
     return result;
@@ -402,56 +455,66 @@ export class CoreClient {
   /** Trust comes only from the configured Core origin, never a token URL/header. */
   async executionSigningKeys(deadlineAtMs?: number, expectedKid?: string): Promise<ReadonlyMap<string, KeyObject>> {
     const cached = this.signingKeyCache;
-    let refreshUnknownKid = false;
-    if (cached && cached.expiresAtMs > Date.now()) {
-      refreshUnknownKid = Boolean(expectedKid && !cached.keys.has(expectedKid) && !cached.unknownKidRefreshUsed);
-      if (!refreshUnknownKid) return cached.keys;
-    }
+    const fresh = cached !== null && cached.expiresAtMs > Date.now();
+    const refreshUnknownKid = fresh && unknownKidRefresh(cached, expectedKid);
+    if (fresh && !refreshUnknownKid) return cached.keys;
     // Stale-while-revalidate during an outage: inside the backoff window after
     // a failed refresh, answer with the last confirmed keys at once instead of
     // making every admission and renewal wait out another timeout.
     const confirmed = this.confirmedSigningKeys(expectedKid);
     if (confirmed && Date.now() < this.signingKeyRetryAtMs) return confirmed;
-    if (!this.signingKeyRefresh) {
-      this.signingKeyRefresh = this.fetchExecutionSigningKeys().then(keys => {
-        // Core currently does not publish a shorter keyset max-age. Keep the
-        // configured-origin cache below the C05 60-second upper bound.
-        const now = Date.now();
-        this.signingKeyCache = {
-          keys,
-          expiresAtMs: now + 60_000,
-          confirmedAtMs: now,
-          // A signed-operation header can request one refresh of a still-valid
-          // configured-origin epoch. Further unknown identifiers fail closed
-          // until normal expiry, preventing attacker-controlled fetch loops.
-          unknownKidRefreshUsed: refreshUnknownKid,
-        };
-        if (this.signingKeyFailures > 0) {
-          this.logger.info({ event: "execution.signing_keys_recovered", failures: this.signingKeyFailures }, "Core signing keys readable again");
-        }
-        this.signingKeyFailures = 0;
-        this.signingKeyRetryAtMs = 0;
-        return keys;
-      }, (error: unknown) => {
-        this.signingKeyFailures += 1;
-        const retryInMs = Math.min(SIGNING_KEY_RETRY_MAX_MS, SIGNING_KEY_RETRY_BASE_MS * 2 ** (this.signingKeyFailures - 1));
-        this.signingKeyRetryAtMs = Date.now() + retryInMs;
-        const stale = this.signingKeyCache;
-        this.logger.warn({ event: "execution.signing_keys_refresh_failed", failures: this.signingKeyFailures, retryInMs,
-          code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
-          ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
-          servingConfirmedKeys: this.confirmedSigningKeys() !== null,
-          ...(stale ? { confirmedAgeMs: Date.now() - stale.confirmedAtMs } : {}) }, "Core signing keys could not be refreshed");
-        throw error;
-      }).finally(() => { this.signingKeyRefresh = null; });
-    }
+    this.signingKeyRefresh ??= this.refreshSigningKeys(refreshUnknownKid);
+    return this.refreshedOrConfirmed(this.signingKeyRefresh, deadlineAtMs, expectedKid);
+  }
+
+  /** The refreshed keys; if Core's keys cannot be read, the last confirmed ones while still within the stale bound. */
+  private async refreshedOrConfirmed(refresh: Promise<ReadonlyMap<string, KeyObject>>, deadlineAtMs: number | undefined, expectedKid: string | undefined): Promise<ReadonlyMap<string, KeyObject>> {
     try {
-      return await this.waitForSigningKeys(this.signingKeyRefresh, deadlineAtMs);
+      return await this.waitForSigningKeys(refresh, deadlineAtMs);
     } catch (error) {
       const fallback = this.confirmedSigningKeys(expectedKid);
       if (fallback && error instanceof RemoteInstanceError && error.code === "execution_authority_unavailable") return fallback;
       throw error;
     }
+  }
+
+  private refreshSigningKeys(refreshUnknownKid: boolean): Promise<ReadonlyMap<string, KeyObject>> {
+    return this.fetchExecutionSigningKeys()
+      .then(keys => this.signingKeysRefreshed(keys, refreshUnknownKid), (error: unknown) => this.signingKeysFailed(error))
+      .finally(() => { this.signingKeyRefresh = null; });
+  }
+
+  private signingKeysRefreshed(keys: ReadonlyMap<string, KeyObject>, refreshUnknownKid: boolean): ReadonlyMap<string, KeyObject> {
+    // Core currently does not publish a shorter keyset max-age. Keep the
+    // configured-origin cache below the 60-second upper bound.
+    const now = Date.now();
+    this.signingKeyCache = {
+      keys,
+      expiresAtMs: now + 60_000,
+      confirmedAtMs: now,
+      // A signed-operation header can request one refresh of a still-valid
+      // configured-origin epoch. Further unknown identifiers fail closed
+      // until normal expiry, preventing attacker-controlled fetch loops.
+      unknownKidRefreshUsed: refreshUnknownKid,
+    };
+    if (this.signingKeyFailures > 0) {
+      this.logger.info({ event: "execution.signing_keys_recovered", failures: this.signingKeyFailures }, "Core signing keys readable again");
+    }
+    this.signingKeyFailures = 0;
+    this.signingKeyRetryAtMs = 0;
+    return keys;
+  }
+
+  private signingKeysFailed(error: unknown): never {
+    this.signingKeyFailures += 1;
+    const retryInMs = Math.min(SIGNING_KEY_RETRY_MAX_MS, SIGNING_KEY_RETRY_BASE_MS * 2 ** (this.signingKeyFailures - 1));
+    this.signingKeyRetryAtMs = Date.now() + retryInMs;
+    const stale = this.signingKeyCache;
+    this.logger.warn({ event: "execution.signing_keys_refresh_failed", failures: this.signingKeyFailures, retryInMs,
+      ...errorFields(error),
+      servingConfirmedKeys: this.confirmedSigningKeys() !== null,
+      ...(stale ? { confirmedAgeMs: Date.now() - stale.confirmedAtMs } : {}) }, "Core signing keys could not be refreshed");
+    throw error;
   }
 
   /** The last key set Core confirmed, if still within the stale bound and holding the requested key. */
@@ -463,25 +526,13 @@ export class CoreClient {
   }
 
   private async fetchExecutionSigningKeys(): Promise<ReadonlyMap<string, KeyObject>> {
-    const keySchema = z.object({ kty: z.literal("RSA"), kid: z.string().min(1).max(256),
-      alg: z.literal("RS256").optional(), use: z.literal("sig").optional(),
-      n: z.string().min(1).max(2048).regex(/^[A-Za-z0-9_-]+$/), e: z.string().min(1).max(16).regex(/^[A-Za-z0-9_-]+$/),
-    }).strict();
     try {
       const result = await this.proofHttp.request({ method: "GET", path: CORE_PATHS.jwks,
-        schema: z.object({ keys: z.array(keySchema).min(1).max(32) }).strict(), operationPolicy: "progressRead" });
-      const keys = new Map<string, KeyObject>();
-      for (const jwk of result.keys) {
-        if (keys.has(jwk.kid)) throw new Error("Duplicate signing key");
-        const key = createPublicKey({ key: jwk, format: "jwk" });
-        if (key.asymmetricKeyType !== "rsa" || (key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error("Invalid signing key");
-        keys.set(jwk.kid, key);
-      }
-      return keys;
+        schema: z.object({ keys: z.array(SIGNING_KEY_SCHEMA).min(1).max(32) }).strict(), operationPolicy: "progressRead" });
+      return signingKeyMap(result.keys);
     } catch (error) {
       // The cause stays a bounded code for the log; message text never leaves.
-      throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.",
-        { diagnostic: error instanceof RemoteInstanceError ? error.code : error instanceof z.ZodError ? "schema_invalid" : "invalid_key_set" });
+      throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.", { diagnostic: keySetDiagnostic(error) });
     }
   }
 
@@ -596,11 +647,11 @@ export class CoreClient {
       schema: NativeExecutionRevisionFenceReceiptResultSchema,
       idempotencyKey: `execution-revision-fence-receipt:${parsed.intentDigest}:${parsed.runnerIncarnation}:${parsed.connectionRef}:${parsed.connectionEpoch}`,
     });
-    if (result.kind !== parsed.kind || result.intentDigest !== parsed.intentDigest ||
-        result.runnerIncarnation !== parsed.runnerIncarnation || result.connectionRef !== parsed.connectionRef ||
-        result.connectionEpoch !== parsed.connectionEpoch || result.fencedAt !== parsed.fencedAt ||
-        result.requestNonce !== parsed.proof.nonce ||
-        jcsDigest(result.intent) !== jcsDigest(parsed.intent)) {
+    if (!allEqual([
+      [result.kind, parsed.kind], [result.intentDigest, parsed.intentDigest], [result.runnerIncarnation, parsed.runnerIncarnation],
+      [result.connectionRef, parsed.connectionRef], [result.connectionEpoch, parsed.connectionEpoch], [result.fencedAt, parsed.fencedAt],
+      [result.requestNonce, parsed.proof.nonce], [jcsDigest(result.intent), jcsDigest(parsed.intent)],
+    ])) {
       throw new RemoteInstanceError("registration_mismatch", "Execution revision fence receipt does not match the submitted fence.");
     }
     return result;
@@ -724,21 +775,16 @@ export class CoreClient {
   }
 
   async controlAck(instanceId: string, ack: unknown): Promise<boolean | Extract<ReturnType<typeof DesiredConfigurationAckResultSchema.parse>, { status: "superseded" }>> {
-    if (typeof ack === "object" && ack !== null && "type" in ack && ack.type === "desired_configuration_ack") {
-      const request = DesiredConfigurationAckSchema.parse(ack);
-      if (request.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement instance mismatch");
-      const receipt = await this.http.request({ method: "POST", path: CORE_PATHS.controlAck(instanceId), body: request, schema: DesiredConfigurationAckResultSchema,
-        idempotencyKey: `configuration-ack:${instanceId}:${request.revision}:${request.status}` });
-      if (receipt.instanceId !== instanceId || receipt.revision !== request.revision) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement receipt mismatch");
-      if (receipt.status === "superseded") {
-        if (receipt.requestDigest !== jcsDigest(request as unknown as JsonValue) || (receipt.appliedRevision === request.revision && request.status === "applied")) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement disposition mismatch");
-        return receipt;
-      }
-      if (receipt.status !== request.status) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement receipt mismatch");
-      return true;
-    }
-    // Non-configuration control delivery remains a separate CP3 closure gate.
-    throw new RemoteInstanceError("protocol_incompatible", "This HTTPS endpoint accepts configuration acknowledgements only");
+    // Non-configuration control delivery is not accepted over HTTPS.
+    if (!configurationAck(ack)) throw new RemoteInstanceError("protocol_incompatible", "This HTTPS endpoint accepts configuration acknowledgements only");
+    const request = DesiredConfigurationAckSchema.parse(ack);
+    if (request.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement instance mismatch");
+    const receipt = await this.http.request({ method: "POST", path: CORE_PATHS.controlAck(instanceId), body: request, schema: DesiredConfigurationAckResultSchema,
+      idempotencyKey: `configuration-ack:${instanceId}:${request.revision}:${request.status}` });
+    if (receipt.instanceId !== instanceId || receipt.revision !== request.revision) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement receipt mismatch");
+    if (receipt.status === "superseded") return supersededAck(receipt, request);
+    if (receipt.status !== request.status) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement receipt mismatch");
+    return true;
   }
 
 
@@ -773,18 +819,20 @@ export class CoreClient {
         bodyFactory: () => RemoteAgentCapabilityRedeemRequestSchema.parse({ ...request, proof: this.proof("token_redeem", instanceId, request) }),
         schema: RemoteAgentCapabilityRedeemResultSchema, idempotencyKey: `capability-redeem:${instanceId}:${args.assignmentId}:${args.attempt}:${args.mcpCapabilityTokenRef}`,
         timeoutMs: 30_000, ...(deadline === undefined ? {} : { deadlineAtMs: deadline }) });
-      if ((deadline !== undefined && Date.now() >= deadline) || Date.parse(issued.expiresAt) <= this.options.clock.coreNow()) {
-        throw new RemoteInstanceError("capability_unavailable", "Capability delivery has expired.");
-      }
-      // /api/app/mcp is connection-management REST, not the MCP transport.
-      // The real /mcp owner still needs its capability admission integration.
-      const url = this.options.platformMcpUrl ?? new URL("/mcp", this.options.baseUrl).toString();
-      return { mcpServer: { name: "konteks-platform", url, headers: [{ name: "authorization", value: `Bearer ${issued.token}` }] }, expiresAt: issued.expiresAt };
+      return this.capabilityIssue(issued, deadline);
     } catch (error) {
-      const transient = error instanceof RemoteInstanceError && error.retryable;
-      // Schema/parser/server messages may contain secret-bearing input.
-      throw new RemoteInstanceError(error instanceof RemoteInstanceError ? error.code : "capability_unavailable", "Capability delivery was not accepted.", { retryable: transient });
+      throw undeliveredCapability(error);
     }
+  }
+
+  private capabilityIssue(issued: { token: string; expiresAt: string }, deadline: number | undefined): CapabilityTokenIssue {
+    if ((deadline !== undefined && Date.now() >= deadline) || Date.parse(issued.expiresAt) <= this.options.clock.coreNow()) {
+      throw new RemoteInstanceError("capability_unavailable", "Capability delivery has expired.");
+    }
+    // /api/app/mcp is connection-management REST, not the MCP transport.
+    // The real /mcp owner still needs its capability admission integration.
+    const url = this.options.platformMcpUrl ?? new URL("/mcp", this.options.baseUrl).toString();
+    return { mcpServer: { name: "konteks-platform", url, headers: [{ name: "authorization", value: `Bearer ${issued.token}` }] }, expiresAt: issued.expiresAt };
   }
 
   /** The claimed assignment's work definition (see `CORE_PATHS.workload`); `not_found` when Core has none. */
