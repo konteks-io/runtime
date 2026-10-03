@@ -49,14 +49,14 @@ const rpc = (method, params) => new Promise((resolve, reject) => {
   pending.set(id, { resolve, reject, timer, method });
   connection.write(JSON.stringify({ id, method, params }) + "\n");
 });
+const loadedListPage = page => Array.isArray(page?.data) && page.data.every(id => typeof id === "string") &&
+  (page.nextCursor === null || typeof page.nextCursor === "string");
 const loadedSnapshot = async () => {
   const ids = [];
   let cursor;
   do {
     const page = await rpc("thread/loaded/list", { limit: 1, ...(cursor ? { cursor } : {}) });
-    if (!Array.isArray(page?.data) || !page.data.every(id => typeof id === "string") ||
-        !(page.nextCursor === null || typeof page.nextCursor === "string"))
-      throw new Error(`Unknown loaded-list shape: ${Object.keys(page ?? {}).join(",")}`);
+    if (!loadedListPage(page)) throw new Error(`Unknown loaded-list shape: ${Object.keys(page ?? {}).join(",")}`);
     ids.push(...page.data);
     cursor = page.nextCursor;
     if (ids.length > 100) throw new Error("Loaded-list pagination did not terminate");

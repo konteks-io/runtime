@@ -25,20 +25,27 @@ function walk(dir) {
   for (const entry of readdirSync(dir)) {
     if (SKIP_DIRS.has(entry)) continue;
     const path = join(dir, entry);
-    const info = statSync(path);
-    if (info.isDirectory()) {
+    if (statSync(path).isDirectory()) {
       walk(path);
       continue;
     }
     const rel = relative(root, path);
-    if (ALLOWLIST.has(rel) || rel.endsWith(".md")) continue;
-    const dot = entry.lastIndexOf(".");
-    const ext = dot === -1 ? "" : entry.slice(dot);
-    if (!SCAN_EXTENSIONS.has(ext) && entry !== "Dockerfile") continue;
-    const text = readFileSync(path, "utf8");
-    for (const pattern of PATTERNS) {
-      if (pattern.regex.test(text)) hits.push(`${rel}: ${pattern.name}`);
-    }
+    if (scanned(entry, rel)) scan(path, rel);
+  }
+}
+
+/** Source files only, outside the allowlist and every Markdown file. */
+function scanned(entry, rel) {
+  if (ALLOWLIST.has(rel) || rel.endsWith(".md")) return false;
+  const dot = entry.lastIndexOf(".");
+  const ext = dot === -1 ? "" : entry.slice(dot);
+  return SCAN_EXTENSIONS.has(ext) || entry === "Dockerfile";
+}
+
+function scan(path, rel) {
+  const text = readFileSync(path, "utf8");
+  for (const pattern of PATTERNS) {
+    if (pattern.regex.test(text)) hits.push(`${rel}: ${pattern.name}`);
   }
 }
 walk(root);

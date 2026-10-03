@@ -30,6 +30,12 @@ export async function startScriptedModels(options) {
   const toolResults = new Map(); // step → [text]
   const calls = [];
   let dumped = 0;
+  const POST_ROUTES = [
+    [/\/messages\/count_tokens$/, res => json(res, { input_tokens: 12 })],
+    [/\/chat\/completions$/, chatCompletions],
+    [/\/messages$/, anthropicMessages],
+    [/\/responses$/, responses],
+  ];
   const server = createServer((req, res) => {
     let raw = "";
     req.on("data", chunk => { raw += chunk; });
@@ -47,13 +53,16 @@ export async function startScriptedModels(options) {
     if (req.method === "GET" && /\/models$/.test(path)) return json(res, modelsList(path));
     if (req.method === "HEAD" || req.method === "GET") return json(res, {});
     const body = raw ? JSON.parse(raw) : {};
-    if (process.env.KONTEKS_PROOF_DUMP_DIR) writeFileSync(join(process.env.KONTEKS_PROOF_DUMP_DIR, `${String(++dumped).padStart(3, "0")}-${path.split("/").pop()}.json`), JSON.stringify(body, null, 2));
-    if (/\/messages\/count_tokens$/.test(path)) return json(res, { input_tokens: 12 });
-    if (/\/chat\/completions$/.test(path)) return chatCompletions(res, body);
-    if (/\/messages$/.test(path)) return anthropicMessages(res, body);
-    if (/\/responses$/.test(path)) return responses(res, body);
+    dump(path, body);
+    const route = POST_ROUTES.find(([pattern]) => pattern.test(path));
+    if (route) return route[1](res, body);
     log(`scripted model: unknown ${req.method} ${path}`);
     res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "not found" } }));
+  }
+
+  function dump(path, body) {
+    if (!process.env.KONTEKS_PROOF_DUMP_DIR) return;
+    writeFileSync(join(process.env.KONTEKS_PROOF_DUMP_DIR, `${String(++dumped).padStart(3, "0")}-${path.split("/").pop()}.json`), JSON.stringify(body, null, 2));
   }
 
   function modelsList(path) {
@@ -68,7 +77,6 @@ export async function startScriptedModels(options) {
     return step;
   }
 
-  /** Decide the answer: a tool call for the first call of a step with tools, text otherwise. */
   /** Every tool call this model issued, by call id → its step; each result is recorded once, wherever it appears in the history. */
   const issued = new Map();
   const recorded = new Set();
@@ -78,16 +86,27 @@ export async function startScriptedModels(options) {
     recorded.add(id);
     toolResults.set(step, [...(toolResults.get(step) ?? []), text]);
   }
-  function harvest(protocol, body) {
-    if (protocol === "chat") for (const message of body.messages ?? []) { if (message?.role === "tool") record(message.tool_call_id, textOf(message.content)); }
-    if (protocol === "anthropic") for (const message of body.messages ?? []) for (const block of Array.isArray(message?.content) ? message.content : []) { if (block?.type === "tool_result") record(block.tool_use_id, textOf(block.content)); }
-    if (protocol === "responses") for (const item of body.input ?? []) { if (typeof item?.type === "string" && item.type.endsWith("_output")) record(item.call_id, typeof item.output === "string" ? item.output : textOf(item.output?.content ?? item.output)); }
+  function harvestChat(body) {
+    for (const message of body.messages ?? []) {
+      if (message?.role === "tool") record(message.tool_call_id, textOf(message.content));
+    }
+  }
+  function harvestAnthropic(body) {
+    for (const message of body.messages ?? []) {
+      for (const block of toolResultBlocks(message)) record(block.tool_use_id, textOf(block.content));
+    }
+  }
+  function harvestResponses(body) {
+    for (const item of body.input ?? []) {
+      if (typeof item?.type === "string" && item.type.endsWith("_output")) record(item.call_id, outputText(item.output));
+    }
   }
 
+  /** Decide the answer: a tool call for the first call of a step with tools, text otherwise. */
   function decide(protocol, step, tools, afterTool) {
     const intent = step ? options.intents.get(step) : undefined;
     calls.push({ protocol, step, tools: tools.map(tool => tool.name), afterTool });
-    if (!intent || intent.type === "text" || afterTool || tools.length === 0 || (served.get(step) ?? 0) > 0) return { text: `DONE ${step ?? ""}`.trim() };
+    if (answersWithText(intent, step, tools, afterTool)) return { text: `DONE ${step ?? ""}`.trim() };
     const call = toolCall(intent, tools, options.windows === true);
     if (!call) { log(`scripted model: step ${step} found no tool for ${intent.type} among ${tools.map(tool => tool.name).join(",")}`); return { text: `NO TOOL ${step}` }; }
     served.set(step, 1);
@@ -97,9 +116,14 @@ export async function startScriptedModels(options) {
     return { call };
   }
 
+  /** Text for a step without a tool intent, after its tool result, without tools, or once its one tool call was served. */
+  function answersWithText(intent, step, tools, afterTool) {
+    return !intent || intent.type === "text" || afterTool || tools.length === 0 || (served.get(step) ?? 0) > 0;
+  }
+
   // ── OpenAI chat completions ───────────────────────────────────────────────
   function chatCompletions(res, body) {
-    harvest("chat", body);
+    harvestChat(body);
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const texts = messages.filter(message => message.role === "user").map(message => textOf(message.content));
     const last = messages.at(-1);
@@ -126,14 +150,12 @@ export async function startScriptedModels(options) {
 
   // ── Anthropic Messages ────────────────────────────────────────────────────
   function anthropicMessages(res, body) {
-    harvest("anthropic", body);
+    harvestAnthropic(body);
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const texts = messages.filter(message => message.role === "user").map(message => textOf(message.content, block => block.type === "text"));
     const last = messages.at(-1);
-    const results = Array.isArray(last?.content) ? last.content.filter(block => block?.type === "tool_result") : [];
-    const afterTool = last?.role === "user" && results.length > 0;
-    const tools = (body.tools ?? []).filter(tool => tool?.name && tool.input_schema).map(tool => ({ name: tool.name, schema: tool.input_schema, kind: "function" }));
-    const answer = decide("anthropic", stepOf(texts), tools, afterTool, afterTool ? results.map(block => textOf(block.content)).join("\n") : undefined);
+    const afterTool = last?.role === "user" && toolResultBlocks(last).length > 0;
+    const answer = decide("anthropic", stepOf(texts), anthropicTools(body), afterTool);
     const id = `msg_${callId()}`;
     const model = body.model ?? "konteks-probe";
     const content = answer.call ? [{ type: "tool_use", id: answer.call.id, name: answer.call.name, input: answer.call.input }] : [{ type: "text", text: answer.text }];
@@ -141,10 +163,13 @@ export async function startScriptedModels(options) {
     if (body.stream !== true) {
       return json(res, { id, type: "message", role: "assistant", model, content, stop_reason: stopReason, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } });
     }
+    streamAnthropic(res, { id, model, block: content[0], stopReason });
+  }
+
+  function streamAnthropic(res, { id, model, block, stopReason }) {
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
     const event = (name, data) => res.write(`event: ${name}\ndata: ${JSON.stringify({ type: name, ...data })}\n\n`);
     event("message_start", { message: { id, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } });
-    const block = content[0];
     if (block.type === "tool_use") {
       event("content_block_start", { index: 0, content_block: { type: "tool_use", id: block.id, name: block.name, input: {} } });
       event("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
@@ -160,36 +185,31 @@ export async function startScriptedModels(options) {
 
   // ── OpenAI Responses ──────────────────────────────────────────────────────
   function responses(res, body) {
-    harvest("responses", body);
+    harvestResponses(body);
     const input = Array.isArray(body.input) ? body.input : [];
     const texts = input.filter(item => item?.role === "user").map(item => textOf(item.content));
     const last = input.at(-1);
-    const describe = tool => tool?.type === "function" ? { name: tool.name, schema: tool.parameters, kind: "function", ...(tool.namespace ? { namespace: tool.namespace } : {}) }
-      : tool?.type === "custom" ? { name: tool.name, kind: "custom" }
-        : tool?.type === "local_shell" ? { name: "local_shell", kind: "local_shell" }
-          : tool?.type === "tool_search" ? { name: "tool_search", kind: "tool_search" }
-            : tool?.type === "namespace" && Array.isArray(tool.tools) ? tool.tools.map(inner => describe({ ...inner, namespace: tool.name })) : null;
     // Codex defers MCP tools behind `tool_search` (executed by the client):
     // the tools a search returned count as offered from then on.
     const searched = input.filter(item => item?.type === "tool_search_output").flatMap(item => item.tools ?? []);
-    const tools = [...(body.tools ?? []), ...searched].map(describe).flat().filter(tool => tool && tool.name);
+    const tools = [...(body.tools ?? []), ...searched].map(describeResponsesTool).flat().filter(tool => tool && tool.name);
     const step = stepOf(texts);
-    const intent = step ? options.intents.get(step) : undefined;
     const searchedLast = last?.type === "tool_search_output";
-    if (intent?.type === "mcp" && !searchedLast && (served.get(step) ?? 0) === 0 && !toolCall(intent, tools.filter(tool => tool.kind !== "tool_search" && tool.name !== "execute"), false)
-        && tools.some(tool => tool.kind === "tool_search")) {
-      log(`scripted model (responses) step ${step}: tool_search(${intent.tool})`);
-      return streamResponse(res, body, { type: "tool_search_call", id: `tsc_${callId()}`, call_id: `call_${callId()}`, status: "completed", execution: "client", arguments: { query: `${intent.server} ${intent.tool}`, limit: 8 } });
+    const search = searchFirst(mcpIntentUnserved(step, searchedLast), tools);
+    if (search) {
+      log(`scripted model (responses) step ${step}: tool_search(${search.tool})`);
+      return streamResponse(res, body, { type: "tool_search_call", id: `tsc_${callId()}`, call_id: `call_${callId()}`, status: "completed", execution: "client", arguments: { query: `${search.server} ${search.tool}`, limit: 8 } });
     }
     const afterTool = typeof last?.type === "string" && last.type.endsWith("_output") && !searchedLast;
-    const outputText = afterTool ? (typeof last.output === "string" ? last.output : textOf(last.output?.content ?? last.output)) : undefined;
-    const answer = decide("responses", step, tools.filter(tool => tool.kind !== "tool_search"), afterTool, outputText);
-    let item;
-    if (answer.call?.kind === "custom") item = { type: "custom_tool_call", id: `ctc_${callId()}`, call_id: answer.call.id, name: answer.call.name, input: answer.call.input, status: "completed" };
-    else if (answer.call?.kind === "local_shell") item = { type: "local_shell_call", id: `lsh_${callId()}`, call_id: answer.call.id, status: "completed", action: { type: "exec", command: answer.call.input.command, env: {} } };
-    else if (answer.call) item = { type: "function_call", id: `fc_${callId()}`, call_id: answer.call.id, name: answer.call.name, ...(answer.call.namespace ? { namespace: answer.call.namespace } : {}), arguments: JSON.stringify(answer.call.input), status: "completed" };
-    else item = { type: "message", id: `msg_${callId()}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: answer.text, annotations: [] }] };
-    return streamResponse(res, body, item);
+    const answer = decide("responses", step, tools.filter(tool => tool.kind !== "tool_search"), afterTool);
+    return streamResponse(res, body, responseItem(answer));
+  }
+
+  /** The step's MCP intent while its tool call is not served and the last input is not a search result. */
+  function mcpIntentUnserved(step, searchedLast) {
+    const intent = step ? options.intents.get(step) : undefined;
+    if (intent?.type !== "mcp" || searchedLast || (served.get(step) ?? 0) !== 0) return undefined;
+    return intent;
   }
 
   function streamResponse(res, body, item) {
@@ -220,6 +240,47 @@ export async function startScriptedModels(options) {
   };
 }
 
+/** An MCP intent whose tool is not offered directly is searched for first, when the agent offers `tool_search`. */
+function searchFirst(intent, tools) {
+  if (!intent) return undefined;
+  const offered = tools.filter(tool => tool.kind !== "tool_search" && tool.name !== "execute");
+  return !toolCall(intent, offered, false) && tools.some(tool => tool.kind === "tool_search") ? intent : undefined;
+}
+
+function describeResponsesTool(tool) {
+  const type = tool?.type;
+  if (type === "function") return functionTool(tool);
+  if (type === "custom") return { name: tool.name, kind: "custom" };
+  if (type === "local_shell" || type === "tool_search") return { name: type, kind: type };
+  if (type === "namespace" && Array.isArray(tool.tools)) return tool.tools.map(inner => describeResponsesTool({ ...inner, namespace: tool.name }));
+  return null;
+}
+
+function functionTool(tool) {
+  return { name: tool.name, schema: tool.parameters, kind: "function", ...(tool.namespace ? { namespace: tool.namespace } : {}) };
+}
+
+/** The Responses output item for an answer: a custom, local shell or function call, else a message. */
+function responseItem(answer) {
+  const call = answer.call;
+  if (call?.kind === "custom") return { type: "custom_tool_call", id: `ctc_${callId()}`, call_id: call.id, name: call.name, input: call.input, status: "completed" };
+  if (call?.kind === "local_shell") return { type: "local_shell_call", id: `lsh_${callId()}`, call_id: call.id, status: "completed", action: { type: "exec", command: call.input.command, env: {} } };
+  if (call) return { type: "function_call", id: `fc_${callId()}`, call_id: call.id, name: call.name, ...(call.namespace ? { namespace: call.namespace } : {}), arguments: JSON.stringify(call.input), status: "completed" };
+  return { type: "message", id: `msg_${callId()}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: answer.text, annotations: [] }] };
+}
+
+function anthropicTools(body) {
+  return (body.tools ?? []).filter(tool => tool?.name && tool.input_schema).map(tool => ({ name: tool.name, schema: tool.input_schema, kind: "function" }));
+}
+
+function toolResultBlocks(message) {
+  return Array.isArray(message?.content) ? message.content.filter(block => block?.type === "tool_result") : [];
+}
+
+function outputText(output) {
+  return typeof output === "string" ? output : textOf(output?.content ?? output);
+}
+
 function json(res, value) {
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify(value));
@@ -240,64 +301,91 @@ const lower = value => String(value ?? "").toLowerCase();
 
 /** The concrete call for an intent, from the tools and schemas this agent sent. */
 function toolCall(intent, tools, windows) {
-  const byName = names => names.map(name => tools.find(tool => lower(tool.name) === name)).find(Boolean);
-  if (intent.type === "shell") {
-    const tool = byName(SHELL_TOOLS);
-    if (!tool) return null;
-    const powershell = /pwsh|powershell/.test(lower(tool.name)) || (windows && intent.pwshCommand !== undefined && /^(shell|shell_command|exec_command)$/.test(lower(tool.name)));
-    const command = powershell && intent.pwshCommand !== undefined ? intent.pwshCommand : intent.command;
-    if (tool.kind === "local_shell") return { name: tool.name, kind: "local_shell", input: { command: windows ? ["powershell.exe", "-NoProfile", "-Command", command] : ["bash", "-lc", command] } };
-    return { name: tool.name, kind: tool.kind, input: fill(tool.schema, {
-      command: prop => prop?.type === "array" ? (windows ? ["powershell.exe", "-NoProfile", "-Command", command] : ["bash", "-lc", command]) : command,
-      cmd: () => command,
-      description: () => "Konteks OS proof step",
-      // Escalation (Codex, dsh): ask for the command outside the agent's own sandbox, so the request reaches Konteks.
-      ...(intent.escalate ? { sandbox_permissions: () => "require_escalated", with_escalated_permissions: () => true, justification: () => "The Konteks OS proof asks for this on purpose." } : {}),
-    }) };
-  }
-  if (intent.type === "write") {
-    const tool = byName(WRITE_TOOLS);
-    if (!tool) return null;
-    if (lower(tool.name) === "apply_patch") {
-      const patch = `*** Begin Patch\n*** Add File: ${intent.path}\n+${intent.content}\n*** End Patch\n`;
-      return tool.kind === "custom" ? { name: tool.name, kind: "custom", input: patch } : { name: tool.name, kind: tool.kind, input: fill(tool.schema, { input: () => patch, patch: () => patch }) };
-    }
-    return { name: tool.name, kind: tool.kind, input: fill(tool.schema, {
-      command: prop => Array.isArray(prop?.enum) && prop.enum.includes("create") ? "create" : undefined,
-      file_path: () => intent.path, filePath: () => intent.path, path: () => intent.path, target_file: () => intent.path,
-      content: () => intent.content, file_text: () => intent.content, text: () => intent.content, contents: () => intent.content,
-    }) };
-  }
-  if (intent.type === "mcp") {
-    const direct = tools.find(tool => lower(tool.name).includes(lower(intent.tool)) && lower(tool.name).includes(lower(intent.server).replace(/-/g, "")) )
-      ?? tools.find(tool => lower(tool.name).includes(lower(intent.tool)) && lower(tool.name).includes(lower(intent.server)))
-      ?? tools.find(tool => lower(tool.name).endsWith(lower(intent.tool)));
-    if (direct) return { name: direct.name, kind: direct.kind, ...(direct.namespace ? { namespace: direct.namespace } : {}), input: direct.kind === "custom" ? JSON.stringify(intent.args) : intent.args };
-    // OpenCode 2 reaches MCP tools only through Code Mode's `execute`.
-    const execute = byName(["execute"]);
-    if (!execute) return null;
-    const code = `return await tools[${JSON.stringify(intent.server)}].${intent.tool}(${JSON.stringify(intent.args)});`;
-    return { name: execute.name, kind: execute.kind, input: fill(execute.schema, { code: () => code, description: () => "Konteks OS proof step" }) };
-  }
+  if (intent.type === "shell") return shellCall(intent, tools, windows);
+  if (intent.type === "write") return writeCall(intent, tools);
+  if (intent.type === "mcp") return mcpCall(intent, tools);
   return null;
+}
+
+const byName = (tools, names) => names.map(name => tools.find(tool => lower(tool.name) === name)).find(Boolean);
+
+function shellCall(intent, tools, windows) {
+  const tool = byName(tools, SHELL_TOOLS);
+  if (!tool) return null;
+  const command = usesPowerShell(tool, intent, windows) && intent.pwshCommand !== undefined ? intent.pwshCommand : intent.command;
+  const argv = windows ? ["powershell.exe", "-NoProfile", "-Command", command] : ["bash", "-lc", command];
+  if (tool.kind === "local_shell") return { name: tool.name, kind: "local_shell", input: { command: argv } };
+  return { name: tool.name, kind: tool.kind, input: fill(tool.schema, {
+    command: prop => prop?.type === "array" ? argv : command,
+    cmd: () => command,
+    description: () => "Konteks OS proof step",
+    // Escalation (Codex, dsh): ask for the command outside the agent's own sandbox, so the request reaches Konteks.
+    ...(intent.escalate ? { sandbox_permissions: () => "require_escalated", with_escalated_permissions: () => true, justification: () => "The Konteks OS proof asks for this on purpose." } : {}),
+  }) };
+}
+
+function usesPowerShell(tool, intent, windows) {
+  return /pwsh|powershell/.test(lower(tool.name)) || (windows && intent.pwshCommand !== undefined && /^(shell|shell_command|exec_command)$/.test(lower(tool.name)));
+}
+
+function writeCall(intent, tools) {
+  const tool = byName(tools, WRITE_TOOLS);
+  if (!tool) return null;
+  if (lower(tool.name) === "apply_patch") return applyPatchCall(intent, tool);
+  return { name: tool.name, kind: tool.kind, input: fill(tool.schema, {
+    command: prop => Array.isArray(prop?.enum) && prop.enum.includes("create") ? "create" : undefined,
+    file_path: () => intent.path, filePath: () => intent.path, path: () => intent.path, target_file: () => intent.path,
+    content: () => intent.content, file_text: () => intent.content, text: () => intent.content, contents: () => intent.content,
+  }) };
+}
+
+function applyPatchCall(intent, tool) {
+  const patch = `*** Begin Patch\n*** Add File: ${intent.path}\n+${intent.content}\n*** End Patch\n`;
+  return tool.kind === "custom" ? { name: tool.name, kind: "custom", input: patch } : { name: tool.name, kind: tool.kind, input: fill(tool.schema, { input: () => patch, patch: () => patch }) };
+}
+
+function mcpCall(intent, tools) {
+  const direct = directMcpTool(intent, tools);
+  if (direct) return { name: direct.name, kind: direct.kind, ...(direct.namespace ? { namespace: direct.namespace } : {}), input: direct.kind === "custom" ? JSON.stringify(intent.args) : intent.args };
+  // OpenCode 2 reaches MCP tools only through Code Mode's `execute`.
+  const execute = byName(tools, ["execute"]);
+  if (!execute) return null;
+  const code = `return await tools[${JSON.stringify(intent.server)}].${intent.tool}(${JSON.stringify(intent.args)});`;
+  return { name: execute.name, kind: execute.kind, input: fill(execute.schema, { code: () => code, description: () => "Konteks OS proof step" }) };
+}
+
+/** The tool naming the intent's tool and server (dashes dropped, then as written), else any tool ending in its name. */
+function directMcpTool(intent, tools) {
+  const names = tool => lower(tool.name).includes(lower(intent.tool));
+  return tools.find(tool => names(tool) && lower(tool.name).includes(lower(intent.server).replace(/-/g, "")))
+    ?? tools.find(tool => names(tool) && lower(tool.name).includes(lower(intent.server)))
+    ?? tools.find(tool => lower(tool.name).endsWith(lower(intent.tool)));
 }
 
 /** Arguments for a JSON schema: the provided keys, then any other required key with a harmless value. */
 function fill(schema, provided) {
   const properties = schema?.properties ?? {};
+  const input = providedArguments(properties, provided);
+  for (const key of schema?.required ?? []) {
+    if (!(key in input)) input[key] = harmlessValue(properties[key] ?? {});
+  }
+  return input;
+}
+
+function providedArguments(properties, provided) {
   const input = {};
   for (const [key, make] of Object.entries(provided)) {
     if (!(key in properties)) continue;
     const value = make(properties[key]);
     if (value !== undefined) input[key] = value;
   }
-  for (const key of schema?.required ?? []) {
-    if (key in input) continue;
-    const prop = properties[key] ?? {};
-    input[key] = Array.isArray(prop.enum) ? prop.enum[0]
-      : prop.type === "number" || prop.type === "integer" ? 120000
-        : prop.type === "boolean" ? false
-          : prop.type === "array" ? [] : prop.type === "object" ? {} : "Konteks OS proof step";
-  }
   return input;
+}
+
+function harmlessValue(prop) {
+  if (Array.isArray(prop.enum)) return prop.enum[0];
+  if (prop.type === "number" || prop.type === "integer") return 120000;
+  if (prop.type === "boolean") return false;
+  if (prop.type === "array") return [];
+  return prop.type === "object" ? {} : "Konteks OS proof step";
 }

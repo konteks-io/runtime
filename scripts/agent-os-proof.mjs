@@ -111,15 +111,16 @@ function finish(code) {
   mkdirSync(dirname(OUT), { recursive: true });
   writeFileSync(OUT, `${JSON.stringify(result, null, 2)}\n`);
   log(`result ${result.outcome}${failed.length ? ` (${failed.map(entry => entry.id).join(", ")})` : ""} -> ${OUT}`);
-  if (process.env.GITHUB_ACTIONS === "true") {
-    // Annotations are readable through the public checks API, without a login.
-    const escape = text => String(text).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
-    const count = status => result.checks.filter(entry => entry.status === status).map(entry => entry.id);
-    const title = `${AGENT} on ${process.env.KONTEKS_PROOF_OS ?? `${process.platform}-${osArch()}`}`;
-    console.log(`::notice title=${escape(title)}::${escape(`${result.outcome.toUpperCase()} ${AGENT} ${result.agentVersion ?? "?"}: pass ${count("pass").length}, fail ${count("fail").join(",") || 0}, not proven ${count("not_proven").join(",") || 0}, skipped ${count("skipped").join(",") || 0}`)}`);
-    for (const entry of failed.slice(0, 8)) console.log(`::error title=${escape(`${title}: ${entry.id}`)}::${escape(String(entry.observed).slice(0, 900))}`);
-  }
+  if (process.env.GITHUB_ACTIONS === "true") annotate(failed);
   process.exit(code ?? (failed.length > 0 ? 1 : 0));
+}
+/** Annotations are readable through the public checks API, without a login. */
+function annotate(failed) {
+  const escape = text => String(text).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+  const count = status => result.checks.filter(entry => entry.status === status).map(entry => entry.id);
+  const title = `${AGENT} on ${process.env.KONTEKS_PROOF_OS ?? `${process.platform}-${osArch()}`}`;
+  console.log(`::notice title=${escape(title)}::${escape(`${result.outcome.toUpperCase()} ${AGENT} ${result.agentVersion ?? "?"}: pass ${count("pass").length}, fail ${count("fail").join(",") || 0}, not proven ${count("not_proven").join(",") || 0}, skipped ${count("skipped").join(",") || 0}`)}`);
+  for (const entry of failed.slice(0, 8)) console.log(`::error title=${escape(`${title}: ${entry.id}`)}::${escape(String(entry.observed).slice(0, 900))}`);
 }
 process.on("unhandledRejection", error => { note(`unhandled rejection: ${error?.stack ?? error}`); });
 // The connector's own warnings (pino JSON on stdout), kept to explain a failed check.
@@ -127,12 +128,17 @@ const warnings = [];
 {
   const write = process.stdout.write.bind(process.stdout);
   process.stdout.write = (chunk, ...rest) => {
-    for (const line of String(chunk).split("\n")) {
-      if (!line.startsWith("{\"level\":")) continue;
-      try { const entry = JSON.parse(line); if (entry.level >= 40) { warnings.push(`${entry.msg}${entry.err ? `: ${String(entry.err.message ?? entry.err.type ?? "").slice(0, 200)}` : ""}${entry.code ? ` (${entry.code})` : ""}${entry.stderr ? ` stderr: ${String(entry.stderr).slice(0, 300)}` : ""}`); if (warnings.length > 40) warnings.shift(); } } catch { /* not JSON */ }
-    }
+    for (const line of String(chunk).split("\n")) keepWarning(line);
     return write(chunk, ...rest);
   };
+}
+/** A pino line at warn level or above, kept among the last 40. */
+function keepWarning(line) {
+  if (!line.startsWith("{\"level\":")) return;
+  try { const entry = JSON.parse(line); if (entry.level >= 40) { warnings.push(warningText(entry)); if (warnings.length > 40) warnings.shift(); } } catch { /* not JSON */ }
+}
+function warningText(entry) {
+  return `${entry.msg}${entry.err ? `: ${String(entry.err.message ?? entry.err.type ?? "").slice(0, 200)}` : ""}${entry.code ? ` (${entry.code})` : ""}${entry.stderr ? ` stderr: ${String(entry.stderr).slice(0, 300)}` : ""}`;
 }
 // The runners log through this pino instance, so their lines pass the hook above.
 const { default: pino } = await import("pino");
@@ -203,13 +209,17 @@ let installed = null; // { settings, version, kind, executable }
 let codexSocketRoots = 0;
 async function locate() {
   const started = Date.now();
-  if (host) {
-    const record = await host.locate(process.env);
-    const settings = await host.runnerSettings(record);
-    const executable = settings.RUNNER_NATIVE_OPENCODE_BINARY ?? settings.RUNNER_NATIVE_DSH_ENTRY;
-    const kind = AGENT === "opencode" ? S.openCodeInstallKind(executable) : "npm";
-    return { settings, version: settings.RUNNER_BRIDGE_VERSION, kind, executable, ms: Date.now() - started, extra: AGENT === "dsh" ? { node: settings.RUNNER_NATIVE_DSH_NODE } : {} };
-  }
+  if (host) return locateHostAgent(started);
+  return locateOfflinePackage(started);
+}
+async function locateHostAgent(started) {
+  const record = await host.locate(process.env);
+  const settings = await host.runnerSettings(record);
+  const executable = settings.RUNNER_NATIVE_OPENCODE_BINARY ?? settings.RUNNER_NATIVE_DSH_ENTRY;
+  const kind = AGENT === "opencode" ? S.openCodeInstallKind(executable) : "npm";
+  return { settings, version: settings.RUNNER_BRIDGE_VERSION, kind, executable, ms: Date.now() - started, extra: AGENT === "dsh" ? { node: settings.RUNNER_NATIVE_DSH_NODE } : {} };
+}
+async function locateOfflinePackage(started) {
   if (!args.package || !args.artifact) throw new Error(`${AGENT} needs --package and --artifact (an offline agent package, as the release builds it)`);
   // `native-artifact-index.mjs` writes `{ artifacts: [...] }`; a bare descriptor is accepted too.
   const index = JSON.parse(readFileSync(resolve(args.artifact), "utf8"));
@@ -307,26 +317,35 @@ async function konteksSession(runner, events, name, repo, sessionConfig) {
   async function turn(step, text, options = {}) {
     const id = `${name}-${step}-${++n}`;
     const before = { permissions: permissions.length, sent: sent.length };
-    const prompt = [{ type: "text", text: `${STEP_MARKER} ${step}: ${text}` }, ...(options.contract ? [{ type: "text", text: renderStructuredOutputContract(options.contract) }] : [])];
     const started = Date.now();
-    await session.onToRuntime({ kind: "acp", method: "session/prompt", id, params: { sessionId: ref, prompt } });
+    await session.onToRuntime({ kind: "acp", method: "session/prompt", id, params: { sessionId: ref, prompt: turnPrompt(step, text, options.contract) } });
     for (;;) {
       const bodies = sent.slice(before.sent).map(message => message.body);
       const done = bodies.find(body => (body.kind === "acp_result" || body.kind === "acp_error") && body.id === id);
-      if (done || closed.length || Date.now() - started > (options.timeoutMs ?? 180_000)) {
-        const asked = permissions.slice(before.permissions).map(request => {
-          const response = events.answers.find(answer => answer.id === request.requestId)?.response;
-          const optionId = response?.outcome?.optionId;
-          const kind = request.options.find(option => option.optionId === optionId)?.kind ?? response?.outcome?.outcome ?? "none";
-          return { kind: request.kind, title: request.title, answer: kind };
-        });
-        const reply = bodies.filter(body => body.method === "session/update" && body.params?.update?.sessionUpdate === "agent_message_chunk").map(body => body.params.update.content?.text ?? "").join("");
-        return { id, done: done ?? null, timedOut: !done && !closed.length, closed: [...closed], asked, reply, ms: Date.now() - started };
-      }
+      if (done || closed.length || Date.now() - started > (options.timeoutMs ?? 180_000)) return turnResult(id, done, bodies, before, started);
       await new Promise(resolve => setTimeout(resolve, 200));
     }
   }
+  function turnResult(id, done, bodies, before, started) {
+    const asked = permissions.slice(before.permissions).map(request => {
+      const response = events.answers.find(answer => answer.id === request.requestId)?.response;
+      return { kind: request.kind, title: request.title, answer: answerKind(request, response) };
+    });
+    return { id, done: done ?? null, timedOut: !done && !closed.length, closed: [...closed], asked, reply: agentReply(bodies), ms: Date.now() - started };
+  }
   return { session, ref, turn, closed, close: async () => { await session.close("cancelled").catch(() => undefined); events.current = null; } };
+}
+
+function turnPrompt(step, text, contract) {
+  return [{ type: "text", text: `${STEP_MARKER} ${step}: ${text}` }, ...(contract ? [{ type: "text", text: renderStructuredOutputContract(contract) }] : [])];
+}
+/** The option kind the answer chose, else its outcome, else "none". */
+function answerKind(request, response) {
+  const optionId = response?.outcome?.optionId;
+  return request.options.find(option => option.optionId === optionId)?.kind ?? response?.outcome?.outcome ?? "none";
+}
+function agentReply(bodies) {
+  return bodies.filter(body => body.method === "session/update" && body.params?.update?.sessionUpdate === "agent_message_chunk").map(body => body.params.update.content?.text ?? "").join("");
 }
 
 /** The runner as a session sees it, recording each answer and quarantine. */
@@ -349,63 +368,75 @@ function runnerPort(runner) {
 
 // ── process environments (Linux /proc, macOS ps eww) ─────────────────────────
 function agentProcessEnvironments(markers) {
+  if (process.platform === "linux") return linuxProcessEnvironments(markers);
+  if (process.platform === "darwin") return macProcessEnvironments(markers);
+  return null;
+}
+function linuxProcessEnvironments(markers) {
   const found = [];
-  if (process.platform === "linux") {
-    for (const pid of readdirSync("/proc").filter(entry => /^\d+$/.test(entry))) {
-      try {
-        const command = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
-        if (!markers.some(marker => command.includes(marker)) || Number(pid) === process.pid) continue;
-        found.push({ pid, command: command.slice(0, 160), env: readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").join("\n") });
-      } catch { /* gone, or not ours */ }
-    }
-  } else if (process.platform === "darwin") {
-    const listing = exec("ps", ["-Aww", "-o", "pid=,command="]);
-    for (const line of listing.split("\n")) {
-      const match = /^\s*(\d+)\s+(.*)$/.exec(line);
-      if (!match || Number(match[1]) === process.pid || !markers.some(marker => match[2].includes(marker))) continue;
-      try { found.push({ pid: match[1], command: match[2].slice(0, 160), env: exec("ps", ["eww", "-o", "command=", "-p", match[1]]) }); } catch { /* gone */ }
-    }
-  } else return null;
+  for (const pid of readdirSync("/proc").filter(entry => /^\d+$/.test(entry))) {
+    try {
+      const command = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
+      if (!markers.some(marker => command.includes(marker)) || Number(pid) === process.pid) continue;
+      found.push({ pid, command: command.slice(0, 160), env: readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").join("\n") });
+    } catch { /* gone, or not ours */ }
+  }
+  return found;
+}
+function macProcessEnvironments(markers) {
+  const found = [];
+  const listing = exec("ps", ["-Aww", "-o", "pid=,command="]);
+  for (const line of listing.split("\n")) {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!match || Number(match[1]) === process.pid || !markers.some(marker => match[2].includes(marker))) continue;
+    try { found.push({ pid: match[1], command: match[2].slice(0, 160), env: exec("ps", ["eww", "-o", "command=", "-p", match[1]]) }); } catch { /* gone */ }
+  }
   return found;
 }
 
 /** Why locating failed, in detail the connector's own refusal leaves out on purpose. */
 async function locateDiagnosis(error) {
-  if (AGENT === "dsh" && /Node/.test(String(error?.message))) {
-    // The person's Node must be theirs (or root's) and not group/world writable.
-    const { realpathSync, statSync } = await import("node:fs");
-    const candidates = [...new Set(S.personNodeCandidates(process.env))].slice(0, 12);
-    return { nodes: candidates.map(candidate => {
-      try { const real = realpathSync(candidate); const info = statSync(real); return { candidate: scrub(candidate), real: scrub(real), uid: info.uid, mode: (info.mode & 0o777).toString(8), version: versionOf(real, ["--version"]) }; }
-      catch { return null; }
-    }).filter(Boolean), processUid: process.getuid?.() };
-  }
-  if (!host && args.package && error?.code === "bundle_untrusted") {
-    // Re-extract with the system tar and compare every file with the signed profile.
-    const { createHash } = await import("node:crypto");
-    const { lstatSync, readFileSync: read } = await import("node:fs");
-    const profile = JSON.parse(readFileSync(resolve(args.package.replace(/\.tgz$/, ".profile.json")), "utf8"));
-    const target = join(WORK, "diagnose");
-    rmSync(target, { recursive: true, force: true });
-    mkdirSync(target, { recursive: true });
-    // Windows: the system bsdtar (Git's GNU tar reads "D:" as a remote host).
-    exec(WINDOWS ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar", ["-xzf", resolve(args.package), "-C", target]);
-    const problems = [];
-    let longest = 0;
-    for (const file of profile.files) {
-      const path = join(WORK, "releases", "proof", "agents", AGENT, ...file.path.split("/"));
-      longest = Math.max(longest, path.length);
-      try {
-        const extracted = join(target, ...file.path.split("/"));
-        const info = lstatSync(extracted);
-        const digest = `sha256:${createHash("sha256").update(read(extracted)).digest("hex")}`;
-        if (!info.isFile() || info.size !== file.sizeBytes || digest !== file.digest) problems.push({ path: file.path, size: info.size, expected: file.sizeBytes, digestMatches: digest === file.digest });
-      } catch (failure) { problems.push({ path: file.path, error: String(failure.code ?? failure.message) }); }
-      if (problems.length >= 8) break;
-    }
-    return { files: profile.files.length, problems, longestInstalledPath: longest };
-  }
+  if (AGENT === "dsh" && /Node/.test(String(error?.message))) return dshNodeDiagnosis();
+  if (!host && args.package && error?.code === "bundle_untrusted") return packageDiagnosis();
   return {};
+}
+/** The person's Node must be theirs (or root's) and not group/world writable. */
+async function dshNodeDiagnosis() {
+  const { realpathSync, statSync } = await import("node:fs");
+  const candidates = [...new Set(S.personNodeCandidates(process.env))].slice(0, 12);
+  return { nodes: candidates.map(candidate => {
+    try { const real = realpathSync(candidate); const info = statSync(real); return { candidate: scrub(candidate), real: scrub(real), uid: info.uid, mode: (info.mode & 0o777).toString(8), version: versionOf(real, ["--version"]) }; }
+    catch { return null; }
+  }).filter(Boolean), processUid: process.getuid?.() };
+}
+/** Re-extract with the system tar and compare every file with the signed profile. */
+async function packageDiagnosis() {
+  const { createHash } = await import("node:crypto");
+  const { lstatSync, readFileSync: read } = await import("node:fs");
+  const profile = JSON.parse(readFileSync(resolve(args.package.replace(/\.tgz$/, ".profile.json")), "utf8"));
+  const target = join(WORK, "diagnose");
+  rmSync(target, { recursive: true, force: true });
+  mkdirSync(target, { recursive: true });
+  // Windows: the system bsdtar (Git's GNU tar reads "D:" as a remote host).
+  exec(WINDOWS ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar", ["-xzf", resolve(args.package), "-C", target]);
+  const problems = [];
+  let longest = 0;
+  for (const file of profile.files) {
+    const path = join(WORK, "releases", "proof", "agents", AGENT, ...file.path.split("/"));
+    longest = Math.max(longest, path.length);
+    const problem = extractedFileProblem(join(target, ...file.path.split("/")), file, { createHash, lstatSync, read });
+    if (problem) problems.push(problem);
+    if (problems.length >= 8) break;
+  }
+  return { files: profile.files.length, problems, longestInstalledPath: longest };
+}
+function extractedFileProblem(extracted, file, { createHash, lstatSync, read }) {
+  try {
+    const info = lstatSync(extracted);
+    const digest = `sha256:${createHash("sha256").update(read(extracted)).digest("hex")}`;
+    if (!info.isFile() || info.size !== file.sizeBytes || digest !== file.digest) return { path: file.path, size: info.size, expected: file.sizeBytes, digestMatches: digest === file.digest };
+    return null;
+  } catch (failure) { return { path: file.path, error: String(failure.code ?? failure.message) }; }
 }
 
 /**
@@ -588,22 +619,23 @@ try {
     const refusedAnswer = turn => turn.asked.some(entry => /^reject/.test(entry.answer));
     const askedLine = turn => turn ? (turn.asked.length ? turn.asked.map(entry => `${entry.kind ?? "?"} asked → ${entry.answer}`).join("; ") : "not asked") : "step not run";
     const reached = turn => turn && turn.served > 0;
+    const neverCalled = turn => `the agent never made the call (${turn ? `${turn.done?.kind ?? "timeout"}` : "step not run"})`;
     const mustRun = (id, ok, expected, observed) => {
       const turn = turns[id];
-      check(`gov_${id}`, { status: !reached(turn) ? "fail" : ok(turn) ? "pass" : "fail", expected, observed: !reached(turn) ? `the agent never made the call (${turn ? `${turn.done?.kind ?? "timeout"}` : "step not run"})` : `${observed(turn)}; ${askedLine(turn)}` });
+      check(`gov_${id}`, { status: !reached(turn) ? "fail" : ok(turn) ? "pass" : "fail", expected, observed: !reached(turn) ? neverCalled(turn) : `${observed(turn)}; ${askedLine(turn)}` });
     };
+    const refusalWhy = (turn, happened, agentReviewer) => agentReviewer ? " (decided by Codex's own automatic reviewer, a model, not by Konteks' policy; here the scripted reviewer failed closed)"
+      : !turn.asked.length && !happened ? " (stopped before Konteks was asked: the agent's own sandbox or the locked config)" : "";
     const mustRefuse = (id, effect, expected) => {
       const turn = turns[id];
-      if (!reached(turn)) { check(`gov_${id}`, { status: "fail", expected, observed: `the agent never made the call (${turn ? `${turn.done?.kind ?? "timeout"}` : "step not run"})` }); return; }
+      if (!reached(turn)) { check(`gov_${id}`, { status: "fail", expected, observed: neverCalled(turn) }); return; }
       const happened = effect(turn);
       // Codex (codex-acp's default "agent" mode) sends a sandbox escalation to
       // its own automatic reviewer, a model, instead of asking the client:
       // Konteks' policy never sees it, and a real model may approve it.
       const agentReviewer = !turn.asked.length && /Automatic approval review|guardian/i.test(turn.toolOutput);
       const status = !happened && !allowedAnswer(turn) && !agentReviewer ? "pass" : "fail";
-      const why = agentReviewer ? " (decided by Codex's own automatic reviewer, a model, not by Konteks' policy; here the scripted reviewer failed closed)"
-        : !turn.asked.length && !happened ? " (stopped before Konteks was asked: the agent's own sandbox or the locked config)" : "";
-      check(`gov_${id}`, { status, expected, observed: `${happened ? "EFFECT HAPPENED" : "no effect"}; ${askedLine(turn)}${why}`, ...(agentReviewer ? { detail: { decidedBy: "codex_auto_review" } } : {}) });
+      check(`gov_${id}`, { status, expected, observed: `${happened ? "EFFECT HAPPENED" : "no effect"}; ${askedLine(turn)}${refusalWhy(turn, happened, agentReviewer)}`, ...(agentReviewer ? { detail: { decidedBy: "codex_auto_review" } } : {}) });
     };
     mustRun("echo", turn => turn.toolOutput.includes("konteks-probe-echo-ok"), "an allowed command runs", turn => turn.toolOutput.includes("konteks-probe-echo-ok") ? "ran" : `no output (${JSON.stringify(scrub(turn.toolOutput).slice(0, 400))})`);
     {

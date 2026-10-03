@@ -121,12 +121,32 @@ function checkCommands(commands) {
   if (!Array.isArray(commands) || commands.length === 0 || commands.length > 64) fail("connector commands must be 1 to 64 entries");
   const ids = new Set();
   for (const entry of commands) {
-    if (!entry || typeof entry.id !== "string" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(entry.id) || ids.has(entry.id)) fail(`connector command id ${JSON.stringify(entry?.id)} is invalid or repeated`);
+    if (!validCommandId(entry, ids)) fail(`connector command id ${JSON.stringify(entry?.id)} is invalid or repeated`);
     ids.add(entry.id);
-    if (typeof entry.command !== "string" || !entry.command.startsWith("konteks-remote") || entry.command.length > 512 || /[\u0000-\u001f\u007f]/.test(entry.command)) fail(`connector command ${entry.id} is not one konteks-remote line`);
-    if (typeof entry.description !== "string" || entry.description.length === 0 || entry.description.length > 200 || /[\u0000-\u001f\u007f]/.test(entry.description)) fail(`connector command ${entry.id} needs one plain line`);
-    if (!Array.isArray(entry.os) || entry.os.length === 0 || new Set(entry.os).size !== entry.os.length || entry.os.some(os => !["macos", "windows", "debian"].includes(os))) fail(`connector command ${entry.id} names unknown systems`);
+    const problem = commandProblem(entry);
+    if (problem) fail(`connector command ${entry.id} ${problem}`);
   }
+}
+
+function validCommandId(entry, ids) {
+  return Boolean(entry) && typeof entry.id === "string" && /^[a-z][a-z0-9_.-]{0,63}$/.test(entry.id) && !ids.has(entry.id);
+}
+
+/** What is wrong with one command's line, description or systems; null when nothing is. */
+function commandProblem(entry) {
+  if (!(plainLine(entry.command, 512) && entry.command.startsWith("konteks-remote"))) return "is not one konteks-remote line";
+  if (!(plainLine(entry.description, 200) && entry.description.length > 0)) return "needs one plain line";
+  if (!knownSystems(entry.os)) return "names unknown systems";
+  return null;
+}
+
+/** One line of at most `max` characters with no control characters. */
+function plainLine(value, max) {
+  return typeof value === "string" && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function knownSystems(os) {
+  return Array.isArray(os) && os.length > 0 && new Set(os).size === os.length && os.every(system => ["macos", "windows", "debian"].includes(system));
 }
 
 function walk(directory) { return readdirSync(directory).flatMap(name => { const path = join(directory, name); return statSync(path).isDirectory() ? walk(path) : [path]; }); }
