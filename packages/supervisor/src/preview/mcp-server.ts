@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import type { ObservabilityContextV1 } from "@konteks/backstage-plugin-common";
+import { withNativeSpan, createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME } from "@konteks/remote-agent-runner";
 import type { PreviewStatus } from "./process-manager.js";
 import { CONVERSATION_HAS_NO_APP, CONVERSATION_HAS_NO_APP_AGENT_NOTE } from "./config.js";
@@ -93,7 +94,7 @@ export class PreviewMcpServer {
   private server: Server | null = null;
   private closed = false;
 
-  constructor(private readonly host: PreviewToolHost, private readonly options: { logger?: Logger; context?: Record<string, unknown>; browser?: boolean } = {}) {
+  constructor(private readonly host: PreviewToolHost, private readonly options: { logger?: Logger; context?: Record<string, unknown>; observability?: () => ObservabilityContextV1 | undefined; browser?: boolean } = {}) {
     this.logger = options.logger ?? createLogger({ name: "preview-mcp" });
   }
 
@@ -190,6 +191,19 @@ export class PreviewMcpServer {
   }
 
   private async call(name: string): Promise<{ content: Array<{ type: "text"; text: string }>; structuredContent?: PreviewStatus; isError?: boolean }> {
+    return withNativeSpan("native.preview.tool", this.options.observability?.(), {
+      assignmentId: this.options.context?.assignmentId, attempt: this.options.context?.attempt,
+      tool: ["preview_start", "preview_stop", "preview_status"].includes(name) ? name : "unsupported",
+    }, () => this.callImpl(name), result => {
+      const failure = result.structuredContent?.failure;
+      return {
+        outcome: failure?.code === "no_app" ? "unavailable" : result.isError ? "failed" : "succeeded",
+        ...(failure ? { errorCode: failure.code, ...(failure.exitCode != null ? { exitCode: failure.exitCode } : {}), timedOut: failure.timedOut } : {}),
+      };
+    });
+  }
+
+  private async callImpl(name: string): Promise<{ content: Array<{ type: "text"; text: string }>; structuredContent?: PreviewStatus; isError?: boolean }> {
     let status: PreviewStatus;
     try {
       switch (name) {
@@ -226,8 +240,13 @@ export class PreviewMcpServer {
     response.end(JSON.stringify(body));
   }
 
-  private fail(response: ServerResponse, status: number, code: string): void {
-    this.json(response, status, { error: code });
+  private async fail(response: ServerResponse, status: number, code: "closed" | "invalid_local_credential" | "method_not_allowed"): Promise<void> {
+    await withNativeSpan("native.preview.request", this.options.observability?.(), {
+      assignmentId: this.options.context?.assignmentId, attempt: this.options.context?.attempt, stage: "request_validation",
+    }, async () => {
+      this.logger.warn({ event: "preview.request_refused", ...this.options.context, outcome: "refused", code, httpStatus: status }, "preview request refused");
+      this.json(response, status, { error: code });
+    }, () => ({ outcome: "refused", errorCode: code, httpStatus: status }));
   }
 }
 

@@ -1,4 +1,5 @@
 import { pino, type Logger as PinoLogger, type LoggerOptions } from "pino";
+import { nativeSpanLogContext } from "./tracing.js";
 import { redactText, redactValue } from "./redaction.js";
 
 export type Logger = PinoLogger;
@@ -22,7 +23,10 @@ export function createLogger(options: CreateLoggerOptions): Logger {
     // No pid/hostname: a host identifier is a forbidden public field.
     base: null,
     formatters: {
-      log: (object) => redactValue(object) as Record<string, unknown>,
+      log: (object) => {
+        const context = nativeSpanLogContext();
+        return redactValue({ ...object, ...(context ? { context } : {}) }) as Record<string, unknown>;
+      },
     },
     hooks: {
       logMethod(args, method) {

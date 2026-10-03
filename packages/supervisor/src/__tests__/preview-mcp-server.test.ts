@@ -1,3 +1,5 @@
+import { context, propagation, trace, SpanStatusCode } from "@opentelemetry/api";
+import { NodeTracerProvider, SimpleSpanProcessor, InMemorySpanExporter } from "@opentelemetry/sdk-trace-node";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PREVIEW_MCP_SERVER_NAME, PreviewMcpServer, describeStatus } from "../preview/mcp-server.js";
 import { CONVERSATION_HAS_NO_APP, CONVERSATION_HAS_NO_APP_AGENT_NOTE } from "../preview/config.js";
@@ -80,6 +82,54 @@ describe("session preview tools (loopback MCP)", () => {
     expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: "preview.tool_called", assignmentId: "assignment", attempt: 2, sessionId: "s", state: "failed", failureCode: "step_failed", phase: "install", exitCode: 7, timedOut: false }), "preview tool called");
     expect(info).not.toHaveBeenCalled();
     expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private-message-canary|private-output-canary|Bearer|pnpm run/);
+  });
+
+  it("exports the failed preview call under its diagnostic parent without private payloads", async () => {
+    const exporter = new InMemorySpanExporter();
+    const provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+    provider.register();
+    const parent = { schemaVersion: "observability-context-v1", traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", assignmentId: "assignment", attempt: 2 };
+    const failed: PreviewStatus = { ...running, state: "failed", url: null, message: "private-message-canary", logTail: ["private-output-canary"], failure: { code: "step_failed", phase: "install", exitCode: 7, timedOut: false } };
+    try {
+      server = new PreviewMcpServer({ start: async () => failed, stop: async () => running, status: () => running },
+        { context: { assignmentId: "assignment", attempt: 2 }, observability: () => parent } as never);
+      const entry = await server.start();
+      const response = await fetch(entry.url, { method: "POST", headers: { authorization: entry.headers[0]!.value, "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview_start" } }) });
+      expect(await response.json()).toMatchObject({ result: { isError: true } });
+      await provider.forceFlush();
+      const spans = exporter.getFinishedSpans();
+      expect(spans).toHaveLength(1);
+      expect(spans[0]!.name).toBe("native.preview.tool");
+      expect(spans[0]!.spanContext().traceId).toBe("0123456789abcdef0123456789abcdef");
+      expect(spans[0]!.parentSpanContext?.spanId).toBe("0123456789abcdef");
+      expect(spans[0]!.status.code).toBe(SpanStatusCode.ERROR);
+      expect(spans[0]!.attributes).toMatchObject({ "konteks.outcome": "failed", "konteks.error.code": "step_failed", "process.exit.code": 7 });
+      expect(JSON.stringify(spans.map(span => ({ attributes: span.attributes, events: span.events, status: span.status })))).not.toMatch(/private-message-canary|private-output-canary|pnpm run|Bearer/);
+    } finally {
+      await provider.shutdown(); trace.disable(); context.disable(); propagation.disable();
+    }
+  });
+
+  it("captures refused credentials without starting the preview or retaining the credential", async () => {
+    const exporter = new InMemorySpanExporter();
+    const provider = new NodeTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+    provider.register();
+    const start = vi.fn(async () => running);
+    try {
+      server = new PreviewMcpServer({ start, stop: async () => running, status: () => running });
+      const entry = await server.start();
+      const response = await fetch(entry.url, { method: "POST", headers: { authorization: "Bearer private-credential-canary", "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "preview_start" } }) });
+      expect(response.status).toBe(401);
+      expect(start).not.toHaveBeenCalled();
+      await provider.forceFlush();
+      const spans = exporter.getFinishedSpans();
+      expect(spans).toHaveLength(1);
+      expect(spans[0]!.name).toBe("native.preview.request");
+      expect(spans[0]!.attributes).toMatchObject({ "konteks.outcome": "refused", "konteks.error.code": "invalid_local_credential", "http.response.status_code": 401 });
+      expect(JSON.stringify(spans.map(span => ({ attributes: span.attributes, events: span.events, status: span.status })))).not.toContain("private-credential-canary");
+    } finally { await provider.shutdown(); trace.disable(); context.disable(); propagation.disable(); }
   });
 
   it("describes a starting preview with the next step", () => {

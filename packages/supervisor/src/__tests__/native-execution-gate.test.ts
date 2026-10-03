@@ -393,7 +393,7 @@ it.each(["valid", "lost-during-keys", "lost-during-admission", "wrong-producer",
 });
 
 async function sessionFixture(work: RemoteWorkAssignment = assignment, acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>,
-  logger?: { warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void }) {
+  logger?: { child: (...args: unknown[]) => unknown; warn: (...args: unknown[]) => void; info: (...args: unknown[]) => void; error: (...args: unknown[]) => void; debug: (...args: unknown[]) => void }) {
   const f = work.source.kind === "harness_delivery" ? await deliveryFixture() : await fixture();
   const entry = f.journal.assignments.get(`${work.id}:${work.attempt}`)!;
   await f.journal.assignments.put({ ...entry, kind: work.kind });
@@ -479,7 +479,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     const acceptDeliveryOutput = vi.fn<(authority: { claimId: string; invocationRef: string }) => Promise<RemoteDeliveryAcceptanceReceipt>>()
       .mockRejectedValueOnce(new RemoteInstanceError("capability_unavailable", "refused", { diagnostic: "response_status_invalid" }))
       .mockResolvedValueOnce(receipt);
-    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const logger = { child: vi.fn().mockReturnThis(), warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
     const work = { ...assignment, kind: "delivery" as const, taskId: "task", correlationId: "invocation",
       agentRoute: { agentId: "codex", requiredRole: "generator" as const, sessionConfig: { model: "model-a" } },
       source: { kind: "harness_delivery" as const, portability: "instance_bound" as const, ownerInstanceId: "instance", executionSessionId: "session",

@@ -12,6 +12,8 @@ import {
   RemoteInstanceError,
   createLogger,
   redactValue,
+  nativeSpanLogContext,
+  withNativeSpan,
   type AcpJsonRpcError,
   type AgentTurnUsageObservation,
   type Clock,
@@ -241,10 +243,10 @@ export class RelayedSession {
     // Bound only after input preparation proves Core's claim-bound session.
     this.boundChannelId = null;
     this.logger = (deps.logger ?? createLogger({ name: "relayed-session" })).child({}, {
-      formatters: { log: object => redactValue({
-        ...object,
-        ...(this.diagnosticContext ? { context: this.diagnosticContext } : {}),
-      }) as Record<string, unknown> },
+      formatters: { log: object => {
+        const context = nativeSpanLogContext(this.diagnosticContext);
+        return redactValue({ ...object, ...(context ? { context } : {}) }) as Record<string, unknown>;
+      } },
     });
     this.executionGate = isNativeTurn(assignment) && deps.executionAuthority
       ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, logger: this.logger, journal: deps.journal, clock: deps.clock,
@@ -313,31 +315,33 @@ export class RelayedSession {
    */
   private async bootstrapStage<T>(stage: string, operation: () => Promise<T>): Promise<T> {
     const startedAt = Date.now();
-    try {
-      const result = await operation();
-      // One line per finished stage, so a slow bootstrap says where (WS2-156).
-      this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
-        stage, outcome: "succeeded", durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
-      return result;
-    } catch (error) {
-      const known = error instanceof RemoteInstanceError;
-      this.logger.warn({
-        event: "native.bootstrap.stage.failed",
-        outcome: "failed",
-        assignmentId: this.assignment.id,
-        attempt: this.assignment.attempt,
-        stage,
-        code: known ? error.code : "unexpected_error",
-        retryable: known ? error.retryable : false,
-        ...(known && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
-        // An unknown error still names its class and, for an agent's JSON-RPC
-        // refusal, its numeric code: no message text, but enough to tell
-        // "method not found" from "invalid params" (WS1-168).
-        ...(!known && error instanceof Error ? { errorName: error.name } : {}),
-        ...(!known && typeof (error as { code?: unknown } | null)?.code === "number" ? { rpcCode: (error as { code: number }).code } : {}),
-      }, "native session bootstrap stage failed");
-      throw error;
-    }
+    return withNativeSpan("native.bootstrap.stage", this.diagnosticContext, { assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage }, async () => {
+      try {
+        const result = await operation();
+        // One line per finished stage, so a slow bootstrap says where (WS2-156).
+        this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
+          stage, outcome: "succeeded", durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
+        return result;
+      } catch (error) {
+        const known = error instanceof RemoteInstanceError;
+        this.logger.warn({
+          event: "native.bootstrap.stage.failed",
+          outcome: "failed",
+          assignmentId: this.assignment.id,
+          attempt: this.assignment.attempt,
+          stage,
+          code: known ? error.code : "unexpected_error",
+          retryable: known ? error.retryable : false,
+          ...(known && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+          // An unknown error still names its class and, for an agent's JSON-RPC
+          // refusal, its numeric code: no message text, but enough to tell
+          // "method not found" from "invalid params" (WS1-168).
+          ...(!known && error instanceof Error ? { errorName: error.name } : {}),
+          ...(!known && typeof (error as { code?: unknown } | null)?.code === "number" ? { rpcCode: (error as { code: number }).code } : {}),
+        }, "native session bootstrap stage failed");
+        throw error;
+      }
+    });
   }
 
   private async bootstrapImpl(): Promise<{ acpSessionRef: string; resumed: boolean }> {
@@ -418,7 +422,7 @@ export class RelayedSession {
         start: () => preview.start(sessionId, cwd),
         stop: () => preview.stop(sessionId, "agent"),
         status: () => preview.status(sessionId),
-      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, browser: browser !== undefined });
+      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, observability: () => this.diagnosticContext, browser: browser !== undefined });
       this.previewTools = tools;
       this.previewSessionId = sessionId;
       // A viewer may start this worktree's preview too (the same process
