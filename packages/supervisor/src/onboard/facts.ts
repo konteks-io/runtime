@@ -31,6 +31,9 @@ export function extractFacts(files: readonly ReadFile[]): DiscoveryEvidenceFacts
   for (const file of files) {
     const text = file.body.toString("utf8");
     switch (file.candidate.family) {
+      case "documentation":
+        // Prose is evidence of a file, not a verified implementation fact.
+        break;
       case "codeowners":
         for (const handle of parseCodeowners(text)) if (handles.size < MAX_HANDLES) handles.add(handle);
         break;

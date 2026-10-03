@@ -13,7 +13,7 @@ export interface EvidenceCandidate {
   path: string;
   kind: CatalogLearningEvidenceKind;
   /** Which fact family this file feeds, for the extractor. */
-  family: "descriptor" | "codeowners" | "manifest" | "workspace" | "release";
+  family: "descriptor" | "codeowners" | "documentation" | "manifest" | "workspace" | "release";
 }
 
 const STATIC_CANDIDATES: readonly EvidenceCandidate[] = [
@@ -23,6 +23,9 @@ const STATIC_CANDIDATES: readonly EvidenceCandidate[] = [
   { path: ".github/CODEOWNERS", kind: "codeowners", family: "codeowners" },
   { path: "CODEOWNERS", kind: "codeowners", family: "codeowners" },
   { path: "docs/CODEOWNERS", kind: "codeowners", family: "codeowners" },
+  // A bootstrap repository may have no manifests yet. Keep its README as a
+  // file-backed ref without deriving implementation or ownership claims.
+  { path: "README.md", kind: "readme", family: "documentation" },
   { path: "package.json", kind: "project-manifest", family: "manifest" },
   { path: "pyproject.toml", kind: "project-manifest", family: "manifest" },
   { path: "go.mod", kind: "project-manifest", family: "manifest" },
@@ -53,6 +56,7 @@ export function evidenceCandidates(repoName: string, limit: number): EvidenceCan
     : [];
   const ordered = [
     ...STATIC_CANDIDATES.filter(candidate => candidate.family === "descriptor" || candidate.family === "codeowners"),
+    ...STATIC_CANDIDATES.filter(candidate => candidate.family === "documentation"),
     ...STATIC_CANDIDATES.filter(candidate => candidate.family === "manifest"),
     ...csproj,
     ...STATIC_CANDIDATES.filter(candidate => candidate.family === "workspace"),

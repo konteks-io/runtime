@@ -74,6 +74,36 @@ function scratch() {
 }
 
 describe("grouping depth", () => {
+  it("retains README-only bootstrap evidence through the bounded raw-file fallback without inventing facts or copying the body", async () => {
+    const items = inventory(1);
+    const { facade: port, recorded } = facade(items);
+    const body = Buffer.from("# Todo list\nPRIVATE-README-BODY: bootstrap only, no implemented features.\n");
+    const disk = scratch();
+    const cloneShallow = vi.fn();
+    const reads: string[] = [];
+    const collector = new OnboardEvidenceCollector({
+      git: { archiveFile: async () => gitGap<Buffer>("not_found", "remote archive unavailable"), cloneShallow } as never,
+      rawFiles: { read: async input => {
+        reads.push(input.path);
+        return input.path === "README.md" ? gitOk(body) : gitGap<Buffer>("not_found", "absent");
+      } },
+      scratch: disk as never,
+      facade: port,
+      resolveRemote: item => ({ url: item.url }),
+    });
+
+    await collector.collectGrouping({ runRef: "run-1", kind: "discovery", depth: "grouping", bounds });
+
+    expect(reads).toHaveLength(bounds.maxFilesPerRepository);
+    expect(recorded.submitted[0]?.refs).toEqual([expect.objectContaining({
+      ref: `${items[0]!.canonicalKey}@main:README.md`, path: "README.md", kind: "readme", sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+    })]);
+    expect(recorded.submitted[0]?.facts).toEqual({});
+    expect(JSON.stringify(recorded.submitted)).not.toContain("PRIVATE-README-BODY");
+    expect(cloneShallow).not.toHaveBeenCalled();
+    expect(disk.reserveClone).not.toHaveBeenCalled();
+  });
+
   it("reads at most maxFilesPerRepository files per repository and never clones", async () => {
     const items = inventory(50);
     const { facade: port, recorded } = facade(items);
