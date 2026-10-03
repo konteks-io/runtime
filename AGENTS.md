@@ -1,4 +1,5 @@
-Follow [HARDENING.md](HARDENING.md): Graft freshness remains required; broader C00 cleanup is deferred.
+Follow [HARDENING.md](HARDENING.md): its standing rules (no dead code,
+complexity of 8 at most, the code is the source of truth) bind every change.
 
 # Runtime repository guidance
 
@@ -121,6 +122,15 @@ Node 22 (`.nvmrc`; CI and releases use 22.23.2). From the repo root:
 - Nested `AGENTS.md` files listed in the Map.
 - No HTTP API spec lives here: wire contracts are in the sibling `packages`
   repo; the connector's own command list is `packages/release/src/connector-commands.json`.
+
+Graft setup: resolve `graft` from PATH (`command -v graft`, or
+`Get-Command graft` in PowerShell); MCP launches `graft mcp` and
+`./scripts/hardening/graft` uses the same executable. Install the agreed
+version (0.18.0), then wire the repository with
+`graft init --agents agents claude --no-build --no-global --no-statusline`,
+keeping other hooks and MCP servers. Keep telemetry off,
+`GRAFT_NO_REFRESH=1` on hooks and MCP, and Graft's Stop hook disabled; set
+the generated helpers' BAKED fallback to null so no machine path is stored.
 
 <!-- graft:start -->
 ## Graft — repo context graph
