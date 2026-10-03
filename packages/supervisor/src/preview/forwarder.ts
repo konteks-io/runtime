@@ -162,46 +162,63 @@ export class PreviewForwarder {
 
   private onRequest(chunk: RequestChunk): void {
     const existing = this.streams.get(chunk.streamId);
-    if (existing) {
-      // A continuation chunk of a request body; anything else on a live
-      // stream id (a second request, a request on a WebSocket) is refused.
-      if (existing.kind !== "http" || existing.executing) {
-        this.drop(chunk.streamId, 1002, "unexpected request chunk");
-        return this.reply(chunk.streamId, 400, "unexpected request chunk on an open stream");
-      }
-      if (!this.appendBody(chunk.streamId, existing, chunk)) return;
-      if (chunk.final) void this.execute(chunk.streamId, existing);
+    if (existing) return this.continueRequest(chunk, existing);
+    const admitted = this.admitRequest(chunk);
+    if (!admitted) return;
+    this.counters.streams += 1;
+    if (chunk.method === "GET" && admitted.headers["sec-websocket-version"] !== undefined) {
+      this.openWebSocket(chunk.streamId, admitted.origin, admitted.path, admitted.headers);
       return;
     }
+    const stream: HttpStream = { kind: "http", chunks: [], bytes: 0, method: chunk.method, path: admitted.path, headers: admitted.headers, cancel: () => { stream.cancelled = true; }, cancelled: false, executing: false, lastActivityAt: this.now() };
+    this.streams.set(chunk.streamId, stream);
+    this.receiveBody(chunk, stream);
+  }
+
+  /**
+   * A continuation chunk of a request body; anything else on a live stream
+   * id (a second request, a request on a WebSocket) is refused.
+   */
+  private continueRequest(chunk: RequestChunk, existing: HttpStream | WsStream): void {
+    if (existing.kind !== "http" || existing.executing) {
+      this.drop(chunk.streamId, 1002, "unexpected request chunk");
+      return this.reply(chunk.streamId, 400, "unexpected request chunk on an open stream");
+    }
+    this.receiveBody(chunk, existing);
+  }
+
+  private receiveBody(chunk: RequestChunk, stream: HttpStream): void {
+    if (!this.appendBody(chunk.streamId, stream, chunk)) return;
+    if (chunk.final) void this.execute(chunk.streamId, stream);
+  }
+
+  /** A new request the forwarder may serve: a preview runs, a stream is free, and its path and headers pass; else it is answered here. */
+  private admitRequest(chunk: RequestChunk): { origin: string; path: string; headers: Record<string, string> } | null {
     const origin = this.loopbackOrigin();
     if (origin === null) {
       this.counters.refusedNoPreview += 1;
-      return this.reply(chunk.streamId, 503, "No preview is running for this session. Ask the agent to start one with preview_start.");
+      this.reply(chunk.streamId, 503, "No preview is running for this session. Ask the agent to start one with preview_start.");
+      return null;
     }
     if (this.streams.size >= this.limits.maxConcurrentStreams) {
       this.counters.refusedStreamCap += 1;
-      return this.reply(chunk.streamId, 429, "Too many concurrent preview requests; retry shortly.");
+      this.reply(chunk.streamId, 429, "Too many concurrent preview requests; retry shortly.");
+      return null;
     }
     const path = validatePreviewPath(chunk.path);
     if (!path.ok) {
       this.counters.rejectedPaths += 1;
-      return this.reply(chunk.streamId, 400, `Preview path refused (${path.reason}).`);
+      this.reply(chunk.streamId, 400, `Preview path refused (${path.reason}).`);
+      return null;
     }
     const headers = chunk.headers as Record<string, string>;
     const rejected = validatePreviewHeaders("request", headers);
     if (rejected) {
       this.counters.rejectedHeaders += 1;
-      return this.reply(chunk.streamId, 400, `Preview request header refused (${rejected.reason}).`);
+      this.reply(chunk.streamId, 400, `Preview request header refused (${rejected.reason}).`);
+      return null;
     }
-    this.counters.streams += 1;
-    if (chunk.method === "GET" && headers["sec-websocket-version"] !== undefined) {
-      this.openWebSocket(chunk.streamId, origin, path.path, headers);
-      return;
-    }
-    const stream: HttpStream = { kind: "http", chunks: [], bytes: 0, method: chunk.method, path: path.path, headers, cancel: () => { stream.cancelled = true; }, cancelled: false, executing: false, lastActivityAt: this.now() };
-    this.streams.set(chunk.streamId, stream);
-    if (!this.appendBody(chunk.streamId, stream, chunk)) return;
-    if (chunk.final) void this.execute(chunk.streamId, stream);
+    return { origin, path: path.path, headers };
   }
 
   private appendBody(streamId: string, stream: HttpStream, chunk: RequestChunk): boolean {
@@ -227,13 +244,21 @@ export class PreviewForwarder {
       this.counters.refusedNoPreview += 1;
       return this.reply(streamId, 503, "No preview is running for this session.");
     }
+    const response = await this.dial(streamId, stream, origin);
+    if (response === null) return;
+    const status = response.statusCode ?? 502;
+    const headers = this.responseHeaders(streamId, response, status, origin);
+    if (headers === null) return;
+    await this.relayBody(streamId, stream, response, new ResponseSink(this.options.send, streamId, status, headers));
+  }
+
+  /** Sends the buffered request to the preview; null when it could not be sent or was cancelled meanwhile. */
+  private async dial(streamId: string, stream: HttpStream, origin: string): Promise<IncomingMessage | null> {
     const requestFn = this.options.requestFn ?? httpRequest;
     const body = stream.chunks.length > 0 ? Buffer.concat(stream.chunks) : undefined;
     stream.chunks = [];
     const url = new URL(stream.path, origin);
-    const outgoing: Record<string, string> = { ...stream.headers, host: url.host };
-    if (body) outgoing["content-length"] = String(body.byteLength);
-    else if (stream.method !== "GET" && stream.method !== "HEAD") outgoing["content-length"] = "0";
+    const outgoing = outgoingHeaders(stream, url, body);
     let response: IncomingMessage;
     try {
       response = await new Promise<IncomingMessage>((resolve, reject) => {
@@ -251,72 +276,85 @@ export class PreviewForwarder {
         this.logger.warn({ event: "preview.forward.unreachable", code: (error as { code?: string }).code }, "loopback preview request failed");
         this.reply(streamId, 502, "The preview dev server did not answer.");
       }
-      return;
+      return null;
     }
     response.on("error", () => undefined);
     const dialed = stream.cancel;
     stream.cancel = () => { dialed(); response.destroy(); };
-    if (stream.cancelled) { response.destroy(); return; }
-    const status = response.statusCode ?? 502;
+    if (stream.cancelled) { response.destroy(); return null; }
+    return response;
+  }
+
+  /** The response headers the viewer may see; null (answered 502) when the preview redirects anywhere but itself. */
+  private responseHeaders(streamId: string, response: IncomingMessage, status: number, origin: string): Record<string, string> | null {
     const headers = sanitizePreviewHeaders("response", response.headers as Record<string, string | string[] | undefined>);
-    if (REDIRECT_STATUSES.has(status) && headers.location !== undefined) {
-      const rewrite = rewritePreviewLocation(loopbackLocation(headers.location, origin), origin);
-      if (rewrite.kind === "replace_with_502") {
-        response.resume();
-        this.streams.delete(streamId);
-        return this.reply(streamId, 502, "The preview redirected somewhere other than itself.");
-      }
-      headers.location = rewrite.location;
-    } else if (headers.location !== undefined && !REDIRECT_STATUSES.has(status)) {
-      delete headers.location;
+    if (!rewriteLocation(headers, status, origin)) {
+      response.resume();
+      this.streams.delete(streamId);
+      this.reply(streamId, 502, "The preview redirected somewhere other than itself.");
+      return null;
     }
     if (validatePreviewHeaders("response", headers)) {
       // sanitizePreviewHeaders only emits allowlisted, bounded headers; this is the belt.
       this.counters.rejectedHeaders += 1;
       for (const name of Object.keys(headers)) delete headers[name];
     }
-    let sent = 0;
-    let headSent = false;
-    const emit = (piece: string | undefined, final: boolean): void => {
-      this.options.send({ streamId, kind: "response", status, headers: (headSent ? {} : headers) as never, ...(piece === undefined ? {} : { body: piece }), final });
-      headSent = true;
-    };
+    return headers;
+  }
+
+  private async relayBody(streamId: string, stream: HttpStream, response: IncomingMessage, sink: ResponseSink): Promise<void> {
     try {
-      for await (const raw of response) {
-        if (!this.streams.has(streamId)) { stream.cancel(); return; }
-        const value = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
-        sent += value.byteLength;
-        if (sent > this.limits.maxResponseBodyBytes) {
-          this.counters.oversized += 1;
-          stream.cancel();
-          this.streams.delete(streamId);
-          if (!headSent) return this.reply(streamId, 502, "The preview response exceeds the preview limit.");
-          this.options.send({ streamId, kind: "close", code: 1009, final: true });
-          return;
-        }
-        for (let offset = 0; offset < value.byteLength; offset += this.limits.maxChunkBytes) {
-          if (this.options.waitForCapacity && !(await this.options.waitForCapacity())) {
-            stream.cancel();
-            this.streams.delete(streamId);
-            return;
-          }
-          if (!this.streams.has(streamId)) { stream.cancel(); return; }
-          emit(value.subarray(offset, Math.min(offset + this.limits.maxChunkBytes, value.byteLength)).toString("base64url"), false);
-          stream.lastActivityAt = this.now();
-        }
-      }
-      if (!this.streams.has(streamId)) return;
-      emit(undefined, true);
+      if (await this.relayChunks(streamId, stream, response, sink)) sink.emit(undefined, true);
     } catch (error) {
-      if (!stream.cancelled) {
-        this.counters.upstreamFailures += 1;
-        this.logger.warn({ event: "preview.forward.stream_failed", code: (error as { code?: string }).code }, "loopback preview stream failed");
-        if (!headSent) this.reply(streamId, 502, "The preview dev server stream failed.");
-        else this.options.send({ streamId, kind: "close", code: 1011, final: true });
-      }
+      if (!stream.cancelled) this.streamFailed(streamId, sink, error);
     } finally {
       if (this.streams.get(streamId) === stream) this.streams.delete(streamId);
     }
+  }
+
+  /** Streams the body in bounded chunks; true when it ended with the stream still open. */
+  private async relayChunks(streamId: string, stream: HttpStream, response: IncomingMessage, sink: ResponseSink): Promise<boolean> {
+    let sent = 0;
+    for await (const raw of response) {
+      if (!this.streams.has(streamId)) { stream.cancel(); return false; }
+      const value = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as Uint8Array);
+      sent += value.byteLength;
+      if (sent > this.limits.maxResponseBodyBytes) {
+        this.oversizedResponse(streamId, stream, sink);
+        return false;
+      }
+      if (!await this.sendPieces(streamId, stream, value, sink)) return false;
+    }
+    return this.streams.has(streamId);
+  }
+
+  private oversizedResponse(streamId: string, stream: HttpStream, sink: ResponseSink): void {
+    this.counters.oversized += 1;
+    stream.cancel();
+    this.streams.delete(streamId);
+    if (!sink.headSent) return this.reply(streamId, 502, "The preview response exceeds the preview limit.");
+    this.options.send({ streamId, kind: "close", code: 1009, final: true });
+  }
+
+  private async sendPieces(streamId: string, stream: HttpStream, value: Buffer, sink: ResponseSink): Promise<boolean> {
+    for (let offset = 0; offset < value.byteLength; offset += this.limits.maxChunkBytes) {
+      if (this.options.waitForCapacity && !(await this.options.waitForCapacity())) {
+        stream.cancel();
+        this.streams.delete(streamId);
+        return false;
+      }
+      if (!this.streams.has(streamId)) { stream.cancel(); return false; }
+      sink.emit(value.subarray(offset, Math.min(offset + this.limits.maxChunkBytes, value.byteLength)).toString("base64url"), false);
+      stream.lastActivityAt = this.now();
+    }
+    return true;
+  }
+
+  private streamFailed(streamId: string, sink: ResponseSink, error: unknown): void {
+    this.counters.upstreamFailures += 1;
+    this.logger.warn({ event: "preview.forward.stream_failed", code: (error as { code?: string }).code }, "loopback preview stream failed");
+    if (!sink.headSent) this.reply(streamId, 502, "The preview dev server stream failed.");
+    else this.options.send({ streamId, kind: "close", code: 1011, final: true });
   }
 
   private openWebSocket(streamId: string, origin: string, path: string, headers: Record<string, string>): void {
@@ -343,12 +381,7 @@ export class PreviewForwarder {
     });
     socket.on("message", (data: Buffer | ArrayBuffer | Buffer[], isBinary: boolean) => {
       const payload = Buffer.isBuffer(data) ? data : Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data);
-      if (payload.byteLength > this.limits.maxWsFrameBytes) {
-        this.counters.oversized += 1;
-        this.drop(streamId, 1009, "frame too large");
-        this.options.send({ streamId, kind: "close", code: 1009, final: true });
-        return;
-      }
+      if (payload.byteLength > this.limits.maxWsFrameBytes) return this.frameTooLarge(streamId);
       stream.lastActivityAt = this.now();
       this.options.send({ streamId, kind: "ws_frame", opcode: isBinary ? "binary" : "text", body: payload.toString("base64url"), final: true });
     });
@@ -376,30 +409,30 @@ export class PreviewForwarder {
   private onWsFrame(chunk: WsFrameChunk): void {
     const stream = this.streams.get(chunk.streamId);
     if (!stream || stream.kind !== "ws") return;
-    if (!stream.open) {
-      if (stream.buffered.length >= 64) {
-        this.drop(chunk.streamId, 1008, "too many frames before open");
-        this.options.send({ streamId: chunk.streamId, kind: "close", code: 1008, final: true });
-        return;
-      }
-      stream.buffered.push(chunk);
-      return;
-    }
+    if (!stream.open) return this.bufferWsFrame(chunk, stream);
     const payload = Buffer.from(chunk.body, "base64url");
-    if (payload.byteLength > this.limits.maxWsFrameBytes) {
-      this.counters.oversized += 1;
-      this.drop(chunk.streamId, 1009, "frame too large");
-      this.options.send({ streamId: chunk.streamId, kind: "close", code: 1009, final: true });
-      return;
-    }
+    if (payload.byteLength > this.limits.maxWsFrameBytes) return this.frameTooLarge(chunk.streamId);
     stream.lastActivityAt = this.now();
     try {
-      if (chunk.opcode === "ping") stream.socket.ping(payload);
-      else if (chunk.opcode === "pong") stream.socket.pong(payload);
-      else stream.socket.send(chunk.opcode === "binary" ? payload : payload.toString("utf8"));
+      sendToSocket(stream.socket, chunk.opcode, payload);
     } catch {
       this.drop(chunk.streamId, 1011, "send failed");
     }
+  }
+
+  private bufferWsFrame(chunk: WsFrameChunk, stream: WsStream): void {
+    if (stream.buffered.length >= 64) {
+      this.drop(chunk.streamId, 1008, "too many frames before open");
+      this.options.send({ streamId: chunk.streamId, kind: "close", code: 1008, final: true });
+      return;
+    }
+    stream.buffered.push(chunk);
+  }
+
+  private frameTooLarge(streamId: string): void {
+    this.counters.oversized += 1;
+    this.drop(streamId, 1009, "frame too large");
+    this.options.send({ streamId, kind: "close", code: 1009, final: true });
   }
 
   private drop(streamId: string, code: number, reason: string): void {
@@ -420,14 +453,7 @@ export class PreviewForwarder {
   private loopbackOrigin(): string | null {
     if (this.disposed) return null;
     const origin = this.options.origin();
-    if (origin === null) return null;
-    try {
-      const url = new URL(origin);
-      if (url.protocol !== "http:" || !LOOPBACK_HOSTS.has(url.hostname) || url.port === "" || url.pathname !== "/" || url.username || url.password) return null;
-      return url.origin;
-    } catch {
-      return null;
-    }
+    return origin === null ? null : loopbackOriginOf(origin);
   }
 
   private sweepIdle(): void {
@@ -460,8 +486,68 @@ function loopbackLocation(location: string, origin: string): string {
 
 /** A close code the wire schema accepts (1000–4999) that also means something to a browser. */
 function sendableCloseCode(code: number): number {
-  if (code === 1000 || code === 1001 || code === 1002 || code === 1003 || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999)) return code;
+  if (SENDABLE_CLOSE_CODES.has(code) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999)) return code;
   return 1000;
+}
+
+const SENDABLE_CLOSE_CODES: ReadonlySet<number> = new Set([1000, 1001, 1002, 1003]);
+
+/** A plain `http://<loopback>:<port>/` origin, else null. */
+function loopbackOriginOf(origin: string): string | null {
+  let url: URL;
+  try { url = new URL(origin); } catch { return null; }
+  return plainLoopbackUrl(url) ? url.origin : null;
+}
+
+function plainLoopbackUrl(url: URL): boolean {
+  return url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname) && url.port !== "" && url.pathname === "/" && !url.username && !url.password;
+}
+
+function outgoingHeaders(stream: HttpStream, url: URL, body: Buffer | undefined): Record<string, string> {
+  const outgoing: Record<string, string> = { ...stream.headers, host: url.host };
+  if (body) outgoing["content-length"] = String(body.byteLength);
+  else if (stream.method !== "GET" && stream.method !== "HEAD") outgoing["content-length"] = "0";
+  return outgoing;
+}
+
+/**
+ * A redirect keeps a `Location` only when it points at the preview itself
+ * (rewritten for the viewer); any other response drops it. False when a
+ * redirect leads elsewhere.
+ */
+function rewriteLocation(headers: Record<string, string>, status: number, origin: string): boolean {
+  if (headers.location === undefined) return true;
+  if (!REDIRECT_STATUSES.has(status)) {
+    delete headers.location;
+    return true;
+  }
+  const rewrite = rewritePreviewLocation(loopbackLocation(headers.location, origin), origin);
+  if (rewrite.kind === "replace_with_502") return false;
+  headers.location = rewrite.location;
+  return true;
+}
+
+function sendToSocket(socket: NodeWebSocket, opcode: WsFrameChunk["opcode"], payload: Buffer): void {
+  if (opcode === "ping") socket.ping(payload);
+  else if (opcode === "pong") socket.pong(payload);
+  else socket.send(opcode === "binary" ? payload : payload.toString("utf8"));
+}
+
+/** One HTTP response to the viewer: the status and headers go with the first piece only. */
+class ResponseSink {
+  headSent = false;
+
+  constructor(
+    private readonly send: PreviewForwarderOptions["send"],
+    private readonly streamId: string,
+    private readonly status: number,
+    private readonly headers: Record<string, string>,
+  ) {}
+
+  emit(piece: string | undefined, final: boolean): void {
+    this.send({ streamId: this.streamId, kind: "response", status: this.status, headers: (this.headSent ? {} : this.headers) as never, ...(piece === undefined ? {} : { body: piece }), final });
+    this.headSent = true;
+  }
 }
 
 /** `ws` refuses to send reserved codes; map everything else onto 1000. */
