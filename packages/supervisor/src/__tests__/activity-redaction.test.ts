@@ -5,9 +5,44 @@ import {
   contractIssue,
   continuesAtBoundary,
   endsInsidePath,
+  omitPrivateAcpToolPayload,
   redactActivity,
   redactSessionMessage,
 } from "../session/activity.js";
+
+describe("public tool diagnostics", () => {
+  it("retains reported command failure facts without forwarding private results", () => {
+    const update = omitPrivateAcpToolPayload({
+      sessionUpdate: "tool_call_update", toolCallId: "tool-1", kind: "execute", status: "failed",
+      rawInput: { command: "private-command" },
+      rawOutput: { exitCode: 127, stderr: "private-output", token: "secret-canary" },
+      _meta: { private: "private-metadata" },
+    });
+    expect(update).toMatchObject({ diagnostics: { exitCode: 127, errorCode: "command_failed", availability: "reported" } });
+    const serialized = JSON.stringify(update);
+    for (const value of ["private-command", "private-output", "secret-canary", "private-metadata", "rawInput", "rawOutput", "_meta"]) {
+      expect(serialized).not.toContain(value);
+    }
+  });
+
+  it("drops injected diagnostics and malformed result facts instead of leaking free-form content", () => {
+    const update = omitPrivateAcpToolPayload({ sessionUpdate: "tool_call_update", toolCallId: "t4", status: "failed",
+      diagnostics: { availability: "reported", stderr: "PRIVATE", errorCode: "PRIVATE" },
+      rawOutput: { exitCode: Infinity, signal: "PRIVATE", timed_out: "PRIVATE" } });
+    expect(update).toMatchObject({ diagnostics: { availability: "status_only", errorCode: "tool_reported_failed" } });
+    expect(JSON.stringify(update)).not.toContain("PRIVATE");
+  });
+
+  it("distinguishes a reported timeout from a failure with no diagnostic facts", () => {
+    expect(omitPrivateAcpToolPayload({ sessionUpdate: "tool_call_update", toolCallId: "tool-2", status: "failed",
+      rawOutput: { timed_out: true, signal: "SIGTERM" } })).toMatchObject({
+      diagnostics: { timedOut: true, signal: "SIGTERM", errorCode: "command_timed_out", availability: "reported" },
+    });
+    expect(omitPrivateAcpToolPayload({ sessionUpdate: "tool_call_update", toolCallId: "tool-3", status: "failed" })).toMatchObject({
+      diagnostics: { errorCode: "tool_reported_failed", availability: "status_only" },
+    });
+  });
+});
 
 /** Redact a stream chunk by chunk the way RelayedSession does. */
 function redactStream(chunks: string[], root = "/Users/me/work"): string {
