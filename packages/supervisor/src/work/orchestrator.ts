@@ -50,7 +50,7 @@ import type { AssignmentSender } from "./assignment-sender.js";
 import { coreChannelId } from "../relay/channel-ids.js";
 import { isSearchAssignment, type SearchControllerBoundary } from "./search-assignment-carrier.js";
 import { isOnboardWorkAssignment, onboardTerminalResult, type OnboardWorkAssignment, type OnboardWorkCarrier } from "../onboard/carrier.js";
-import { continuedSession } from "./continued-session.js";
+import { continuedSession, logicalSessionId } from "./continued-session.js";
 import { integrationTerminalResult, isIntegrationWorkAssignment, type IntegrationWorkAssignment, type IntegrationWorkCarrier } from "../integration/carrier.js";
 
 /**
@@ -810,143 +810,21 @@ export class WorkOrchestrator {
   }
 
   private async startRelayedSession(assignment: RemoteWorkAssignment, entry: JournalEntry, assertAuthority: () => void): Promise<void> {
-    const admission = this.deps.journal.execution.admission(assignment.id, assignment.attempt);
-    let reference: string | undefined;
-    let takeover: { reference: string; mode: "live" | "restore" } | undefined;
-    let executionActivated = false;
-    const admissionOwned = () => admission !== undefined && this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`)?.claimId === entry.claimId && admission.claimId === entry.claimId && admission.runnerIncarnation === this.deps.runnerIncarnation?.() && admission.instanceId === this.deps.instanceId() && admission.workspaceId === this.deps.workspaceId() && admission.agentId === assignment.agentRoute.agentId;
-    const noCurrentAdmission = () => new RemoteInstanceError("recovery_required", "Native execution has no current durable admission.");
-    const assertAdmissionCurrent = () => {
-      assertAuthority();
-      this.requireNativeOwner();
-      if (!admissionOwned() || this.recoveryFences.has(`${assignment.id}:${assignment.attempt}`)) throw noCurrentAdmission();
-      this.deps.journal.execution.assertAdmission(admission!);
-    };
-    // The session's own recovery stop: the recovery fence is that stop's mark
-    // and the accepted generation it dispatched under may already have moved
-    // on (a new recovery epoch is usually why it is being stopped), so neither
-    // is a refusal here. Ownership of the exact admission still is.
-    const assertRecoveryOwned = () => {
-      this.requireNativeOwner();
-      if (!admissionOwned()) throw noCurrentAdmission();
-      this.deps.journal.execution.assertAdmission(admission!);
-    };
-    assertAdmissionCurrent();
-    const assertExecutionOwned = () => {
-      assertAdmissionCurrent();
-      if (executionActivated) this.deps.journal.execution.assertExecutable(admission!, reference);
-    };
-    assertExecutionOwned();
-    const pendingEvidence = this.recoveringPredecessors(assignment).flatMap(prior => this.pendingRecoveryEvidence(prior));
-    if (pendingEvidence.length > 0) {
-      await this.settleRecoveryEvidence(pendingEvidence);
-      assertExecutionOwned();
-    }
+    const dispatch = this.newNativeDispatch(assignment, entry, assertAuthority);
+    dispatch.assertAdmissionCurrent();
+    dispatch.assertExecutionOwned();
+    await this.settlePredecessorEvidence(dispatch);
     this.assertNoRecoveringPredecessor(assignment);
     const key = `${assignment.id}:${assignment.attempt}`;
     if (this.sessions.has(key)) throw new Error("the assignment already has a local session owner");
     const runner = this.deps.runners.get(assignment.agentRoute.agentId);
     if (!runner) throw new Error("no runner for the placed agent");
-    // A conversation turn or a direct session prompt continues its session (runtime-view R11).
-    const continued = continuedSession(assignment.source);
-    const restoreReference = reference === undefined && continued ? continued.acpSessionRef : undefined;
-    const logicalSessionId = continued ? continued.sessionId
-      : assignment.source.kind === "harness_delivery" ? assignment.source.executionSessionId : undefined;
-    // A conversation may have a live local predecessor but still request a
-    // fresh turn. Only Core's exact requested reference may carry its old MCP
-    // transport into bootstrap; takeover can otherwise stop that predecessor.
-    let retainedReference = logicalSessionId && (continued
-      ? restoreReference
-      : this.channelOwners.get(`session:${logicalSessionId}`)?.acpSessionRef ?? restoreReference);
-    if (!retainedReference && assignment.source.kind === "harness_delivery") {
-      try { retainedReference = this.deps.journal.execution.liveContinuation(assignment)?.acpSessionRef; }
-      catch (error) { if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error; }
-    }
-    const mcpLocalTransport = retainedReference && logicalSessionId
-      ? this.deps.journal.execution.mcpLocalTransportForReference(retainedReference, logicalSessionId, assignment.agentRoute.agentId)
-      : undefined;
-    const session = new RelayedSession(assignment, {
-      ...this.deps.sessionDeps(assignment, runner),
-      ...(mcpLocalTransport ? { mcpLocalTransport } : {}),
-      ...(mcpLocalTransport && retainedReference ? { mcpLocalTransportReference: retainedReference } : {}),
-      assertLegacyCodexThreadUnloaded: async legacyReference => {
-        const claimant = this.legacyCodexClaims.get(legacyReference);
-        if (claimant && claimant !== key) return false;
-        this.legacyCodexClaims.set(legacyReference, key);
-        try {
-          const inspection = await this.deps.inspectLegacyCodexThread?.(legacyReference);
-          if (!inspection?.unloaded || !inspection.ownerGeneration) return false;
-          const scopedReference = `${inspection.ownerGeneration}:${legacyReference}`;
-          if (this.legacyCodexConsumed.has(scopedReference) || this.deps.journal.execution.legacyCodexLoadPreviouslyAdmitted(legacyReference, inspection.ownerGeneration, admission!.executionGeneration)) return false;
-          await this.deps.journal.execution.bindLegacyCodexAdmission(admission!, legacyReference, inspection.ownerGeneration, assertExecutionOwned);
-          this.legacyCodexConsumed.add(scopedReference);
-          return true;
-        }
-        catch { return false; }
-      },
-      assertExecutionOwned,
-      assertRecoveryOwned,
-      ...(assignment.kind === "planning" ? {
-        beforeSendToCore: async (message) => {
-          assertExecutionOwned();
-          const state = await this.deps.journal.planning.append(admission!, message);
-          assertExecutionOwned();
-          return state.sourceSequence;
-        },
-        assertPromptAllowed: () => { assertExecutionOwned(); this.deps.journal.planning.assertPromptAllowed(admission!); },
-      } : {}),
-      ...(restoreReference !== undefined ? { restoreReference } : {}),
-      activateExecution: async () => {
-        assertAdmissionCurrent();
-        // Deliberately after input preparation and capability redemption. A
-        // transient cloud failure must leave an idle live ACP predecessor
-        // untouched and available to the next attempt.
-        takeover = await this.takeOverCompletedChannel(assignment, admission!, assertAdmissionCurrent);
-        if (takeover?.mode === "live") reference = takeover.reference;
-        if (takeover === undefined) await this.deps.journal.execution.open(admission!, assertAdmissionCurrent, this.deps.clock.nowIso());
-        if (assignment.kind === "planning") await this.deps.journal.planning.start(admission!, entry.recoveryEpoch);
-        executionActivated = true;
-        assertExecutionOwned();
-        return {
-          ...(takeover?.mode === "live" ? { continueReference: takeover.reference } : {}),
-          ...(takeover?.mode === "restore" ? { restoreReference: takeover.reference } : {}),
-        };
-      },
-      recordCompletedSettlement: async (ref: string) => {
-        assertExecutionOwned();
-        await this.deps.journal.execution.markCompletedTurnSettled(admission!, ref, this.deps.clock.nowIso(), assertExecutionOwned);
-      }, reserveExecutionReference: async (ref: string) => {
-        if (takeover?.mode === "live" && ref === reference) return void assertExecutionOwned();
-        await this.deps.journal.execution.bindReference(admission!, ref, assertExecutionOwned);
-        reference = ref;
-        assertExecutionOwned();
-      }, recordExecutionProcessOwner: async owner => {
-        await this.deps.journal.execution.bindProcessOwner(admission!, owner, assertExecutionOwned);
-        assertExecutionOwned();
-      }, replaceExecutionProcessOwner: async (previous, replacement) => {
-        await this.deps.journal.execution.replaceBootstrapProcessOwner(admission!, previous, replacement, assertExecutionOwned);
-        assertExecutionOwned();
-      },
-      recordMcpLocalTransport: async identity => {
-        assertExecutionOwned();
-        await this.deps.journal.execution.bindMcpLocalTransport(admission!, identity, assertExecutionOwned);
-      },
-      reserveChannel: (channelId, owner) => {
-        if (this.channelOwners.has(channelId)) throw new Error("the logical session channel already has a local owner");
-        this.channelOwners.set(channelId, owner);
-        return () => {
-          if (this.channelOwners.get(channelId) === owner) this.channelOwners.delete(channelId);
-        };
-      },
-      onUsage: this.deps.onUsage,
-      onExecutionAuthorityLost: () => this.recoverLostExecutionAuthority(assignment.id, assignment.attempt),
-      onClosed: async (closed, reason) => this.onSessionClosed(closed, reason, assertAuthority),
-    });
+    const session = new RelayedSession(assignment, this.relayedSessionDeps(dispatch, runner));
     this.sessions.set(key, session);
     // Bootstrap runs off-lane. Its cloud/file preflight may take arbitrarily
     // long without holding assignment delivery; durable local execution
     // activation happens only after that preflight succeeds.
-    const bootstrap = this.bootstrapRelayedSession(session, assignment, entry, admission, assertAuthority, assertExecutionOwned);
+    const bootstrap = this.bootstrapRelayedSession(session, assignment, entry, dispatch.admission, assertAuthority, dispatch.assertExecutionOwned);
     this.bootstrapping.set(key, bootstrap);
     void bootstrap.catch(error => this.handleDispatchFailure(assignment, entry, assertAuthority, error))
       .finally(() => {
@@ -955,12 +833,197 @@ export class WorkOrchestrator {
       });
   }
 
+  /** One native dispatch: its admission, the execution reference it binds, and the ownership checks its session runs under. */
+  private newNativeDispatch(assignment: RemoteWorkAssignment, entry: JournalEntry, assertAuthority: () => void): NativeDispatch {
+    const dispatch: NativeDispatch = {
+      assignment, entry, assertAuthority,
+      admission: this.deps.journal.execution.admission(assignment.id, assignment.attempt),
+      reference: undefined, takeover: undefined, executionActivated: false,
+      assertAdmissionCurrent: () => this.assertDispatchAdmission(dispatch, true),
+      // The session's own recovery stop: the recovery fence is that stop's mark
+      // and the accepted generation it dispatched under may already have moved
+      // on (a new recovery epoch is usually why it is being stopped), so neither
+      // is a refusal here. Ownership of the exact admission still is.
+      assertRecoveryOwned: () => this.assertDispatchAdmission(dispatch, false),
+      assertExecutionOwned: () => {
+        dispatch.assertAdmissionCurrent();
+        if (dispatch.executionActivated) this.deps.journal.execution.assertExecutable(dispatch.admission!, dispatch.reference);
+      },
+    };
+    return dispatch;
+  }
+
+  private assertDispatchAdmission(dispatch: NativeDispatch, current: boolean): void {
+    if (current) dispatch.assertAuthority();
+    this.requireNativeOwner();
+    if (!this.admissionOwned(dispatch) || (current && this.recoveryFences.has(`${dispatch.assignment.id}:${dispatch.assignment.attempt}`))) {
+      throw new RemoteInstanceError("recovery_required", "Native execution has no current durable admission.");
+    }
+    this.deps.journal.execution.assertAdmission(dispatch.admission!);
+  }
+
+  /** The admission is the dispatched claim's, in this process and scope, for the placed agent. */
+  private admissionOwned({ assignment, entry, admission }: NativeDispatch): boolean {
+    return admission !== undefined && allEqual([
+      [this.deps.journal.assignments.get(`${assignment.id}:${assignment.attempt}`)?.claimId, entry.claimId], [admission.claimId, entry.claimId],
+      [admission.runnerIncarnation, this.deps.runnerIncarnation?.()], [admission.instanceId, this.deps.instanceId()],
+      [admission.workspaceId, this.deps.workspaceId()], [admission.agentId, assignment.agentRoute.agentId],
+    ]);
+  }
+
+  private async settlePredecessorEvidence(dispatch: NativeDispatch): Promise<void> {
+    const pendingEvidence = this.recoveringPredecessors(dispatch.assignment).flatMap(prior => this.pendingRecoveryEvidence(prior));
+    if (pendingEvidence.length === 0) return;
+    await this.settleRecoveryEvidence(pendingEvidence);
+    dispatch.assertExecutionOwned();
+  }
+
+  private relayedSessionDeps(dispatch: NativeDispatch, runner: RunnerPort): RelayedSessionDeps {
+    const { assignment } = dispatch;
+    const { restoreReference, sessionId, retainedReference } = this.sessionContinuation(assignment);
+    const mcpLocalTransport = retainedReference && sessionId
+      ? this.deps.journal.execution.mcpLocalTransportForReference(retainedReference, sessionId, assignment.agentRoute.agentId)
+      : undefined;
+    return {
+      ...this.deps.sessionDeps(assignment, runner),
+      ...(mcpLocalTransport ? { mcpLocalTransport, mcpLocalTransportReference: retainedReference! } : {}),
+      assertLegacyCodexThreadUnloaded: legacyReference => this.legacyCodexThreadUnloaded(dispatch, legacyReference),
+      assertExecutionOwned: dispatch.assertExecutionOwned,
+      assertRecoveryOwned: dispatch.assertRecoveryOwned,
+      ...(assignment.kind === "planning" ? this.planningDeps(dispatch) : {}),
+      ...(restoreReference !== undefined ? { restoreReference } : {}),
+      activateExecution: () => this.activateExecution(dispatch),
+      ...this.executionRecordDeps(dispatch),
+      reserveChannel: (channelId, owner) => this.reserveChannel(channelId, owner),
+      onUsage: this.deps.onUsage,
+      onExecutionAuthorityLost: () => this.recoverLostExecutionAuthority(assignment.id, assignment.attempt),
+      onClosed: async (closed, reason) => this.onSessionClosed(closed, reason, dispatch.assertAuthority),
+    };
+  }
+
+  /**
+   * A conversation turn or a direct session prompt continues its session. A
+   * conversation may have a live local predecessor but still request a fresh
+   * turn. Only Core's exact requested reference may carry its old MCP
+   * transport into bootstrap; takeover can otherwise stop that predecessor.
+   */
+  private sessionContinuation(assignment: RemoteWorkAssignment): { restoreReference: string | undefined; sessionId: string | undefined; retainedReference: string | undefined } {
+    const continued = continuedSession(assignment.source);
+    const restoreReference = continued ? continued.acpSessionRef : undefined;
+    const sessionId = logicalSessionId(assignment.source);
+    return { restoreReference, sessionId, retainedReference: this.retainedReferenceFor(assignment, sessionId, restoreReference) };
+  }
+
+  private retainedReferenceFor(assignment: RemoteWorkAssignment, sessionId: string | undefined, restoreReference: string | undefined): string | undefined {
+    if (!sessionId) return undefined;
+    const retained = continuedSession(assignment.source) ? restoreReference : this.channelOwners.get(`session:${sessionId}`)?.acpSessionRef ?? restoreReference;
+    if (retained || assignment.source.kind !== "harness_delivery") return retained;
+    return this.liveContinuationReference(assignment);
+  }
+
+  /** A retained live owner of the delivery's session head, when the journal can prove one. */
+  private liveContinuationReference(assignment: RemoteWorkAssignment): string | undefined {
+    try { return this.deps.journal.execution.liveContinuation(assignment)?.acpSessionRef; }
+    catch (error) {
+      if (!(error instanceof RemoteInstanceError) || error.code !== "recovery_required") throw error;
+      return undefined;
+    }
+  }
+
+  /** One dispatch at a time may claim a legacy Codex thread, and only one never loaded under its owner generation. */
+  private async legacyCodexThreadUnloaded(dispatch: NativeDispatch, legacyReference: string): Promise<boolean> {
+    const key = `${dispatch.assignment.id}:${dispatch.assignment.attempt}`;
+    const claimant = this.legacyCodexClaims.get(legacyReference);
+    if (claimant && claimant !== key) return false;
+    this.legacyCodexClaims.set(legacyReference, key);
+    try { return await this.bindLegacyCodexThread(dispatch, legacyReference); }
+    catch { return false; }
+  }
+
+  private async bindLegacyCodexThread(dispatch: NativeDispatch, legacyReference: string): Promise<boolean> {
+    const inspection = await this.deps.inspectLegacyCodexThread?.(legacyReference);
+    if (!inspection?.unloaded || !inspection.ownerGeneration) return false;
+    const scopedReference = `${inspection.ownerGeneration}:${legacyReference}`;
+    if (this.legacyCodexConsumed.has(scopedReference) || this.deps.journal.execution.legacyCodexLoadPreviouslyAdmitted(legacyReference, inspection.ownerGeneration, dispatch.admission!.executionGeneration)) return false;
+    await this.deps.journal.execution.bindLegacyCodexAdmission(dispatch.admission!, legacyReference, inspection.ownerGeneration, dispatch.assertExecutionOwned);
+    this.legacyCodexConsumed.add(scopedReference);
+    return true;
+  }
+
+  /** A planning turn folds each outbound message into its durable planning journal before transport. */
+  private planningDeps(dispatch: NativeDispatch): Pick<RelayedSessionDeps, "beforeSendToCore" | "assertPromptAllowed"> {
+    return {
+      beforeSendToCore: async (message) => {
+        dispatch.assertExecutionOwned();
+        const state = await this.deps.journal.planning.append(dispatch.admission!, message);
+        dispatch.assertExecutionOwned();
+        return state.sourceSequence;
+      },
+      assertPromptAllowed: () => { dispatch.assertExecutionOwned(); this.deps.journal.planning.assertPromptAllowed(dispatch.admission!); },
+    };
+  }
+
+  /**
+   * Deliberately after input preparation and capability redemption. A
+   * transient cloud failure must leave an idle live ACP predecessor untouched
+   * and available to the next attempt.
+   */
+  private async activateExecution(dispatch: NativeDispatch): Promise<{ continueReference?: string; restoreReference?: string }> {
+    dispatch.assertAdmissionCurrent();
+    const admission = dispatch.admission!;
+    const takeover = await this.takeOverCompletedChannel(dispatch.assignment, admission, dispatch.assertAdmissionCurrent);
+    dispatch.takeover = takeover;
+    if (takeover?.mode === "live") dispatch.reference = takeover.reference;
+    if (takeover === undefined) await this.deps.journal.execution.open(admission, dispatch.assertAdmissionCurrent, this.deps.clock.nowIso());
+    if (dispatch.assignment.kind === "planning") await this.deps.journal.planning.start(admission, dispatch.entry.recoveryEpoch);
+    dispatch.executionActivated = true;
+    dispatch.assertExecutionOwned();
+    return takeoverReferences(takeover);
+  }
+
+  /** The execution's durable bindings, each recorded under the dispatch's ownership checks. */
+  private executionRecordDeps(dispatch: NativeDispatch): Pick<RelayedSessionDeps, "recordCompletedSettlement" | "reserveExecutionReference" | "recordExecutionProcessOwner" | "replaceExecutionProcessOwner" | "recordMcpLocalTransport"> {
+    const execution = this.deps.journal.execution;
+    const owned = dispatch.assertExecutionOwned;
+    return {
+      recordCompletedSettlement: async (ref: string) => {
+        owned();
+        await execution.markCompletedTurnSettled(dispatch.admission!, ref, this.deps.clock.nowIso(), owned);
+      },
+      reserveExecutionReference: async (ref: string) => {
+        if (dispatch.takeover?.mode === "live" && ref === dispatch.reference) return void owned();
+        await execution.bindReference(dispatch.admission!, ref, owned);
+        dispatch.reference = ref;
+        owned();
+      },
+      recordExecutionProcessOwner: async owner => {
+        await execution.bindProcessOwner(dispatch.admission!, owner, owned);
+        owned();
+      },
+      replaceExecutionProcessOwner: async (previous, replacement) => {
+        await execution.replaceBootstrapProcessOwner(dispatch.admission!, previous, replacement, owned);
+        owned();
+      },
+      recordMcpLocalTransport: async identity => {
+        owned();
+        await execution.bindMcpLocalTransport(dispatch.admission!, identity, owned);
+      },
+    };
+  }
+
+  /** One local owner per logical session channel; the release only frees it for that owner. */
+  private reserveChannel(channelId: string, owner: RelayedSession): () => void {
+    if (this.channelOwners.has(channelId)) throw new Error("the logical session channel already has a local owner");
+    this.channelOwners.set(channelId, owner);
+    return () => {
+      if (this.channelOwners.get(channelId) === owner) this.channelOwners.delete(channelId);
+    };
+  }
+
   /** Refuse before input preparation, then recheck at activation to close races. */
   private assertNoRecoveringPredecessor(assignment: RemoteWorkAssignment): void {
-    const source = assignment.source;
-    const continued = continuedSession(source);
-    if (!continued && source.kind !== "harness_delivery") return;
-    const sessionId = source.kind === "harness_delivery" ? source.executionSessionId : continued!.sessionId;
+    const sessionId = logicalSessionId(assignment.source);
+    if (sessionId === undefined) return;
     const channelId = `session:${sessionId}`;
     const predecessor = this.channelOwners.get(channelId);
     if (!predecessor) return;
@@ -968,27 +1031,41 @@ export class WorkOrchestrator {
     const execution = prior && this.deps.journal.execution.execution(prior);
     if (!execution || execution.phase === "opened") return;
     if (this.releaseRecoveredPredecessor(channelId, predecessor, prior, assignment)) return;
-    const priorEntry = this.deps.journal.assignments.get(`${predecessor.assignment.id}:${predecessor.assignment.attempt}`);
-    this.logger.warn({ event: "execution.successor_blocked", assignmentId: assignment.id, attempt: assignment.attempt,
-      sessionId, predecessorAssignmentId: predecessor.assignment.id, predecessorAttempt: predecessor.assignment.attempt,
-      predecessorClaimId: prior?.claimId, phase: execution.phase, acpSessionRef: execution.acpSessionRef,
-      terminalSequence: priorEntry?.reports.terminalSequence ?? null,
-      // What is still missing before this session can start fresh: a proven
-      // process stop, Core's settlement of the claim, Core's answer to the stop observation.
-      processStopped: execution.processStoppedAt !== undefined,
-      terminalAcknowledged: prior ? this.reports.acknowledgedTerminalReport(prior.assignmentId, prior.attempt, prior.claimId) !== undefined : false,
-      pendingRecoveryEvidence: prior ? this.pendingRecoveryEvidence(prior).length : 0,
-      lifecycleProfileDigest: execution.lifecycleProfileDigest ?? null,
-      executionProfileDigest: execution.executionProfileDigest ?? null,
-      diagnostic: "predecessor_recovery_unqualified" }, "Previous execution requires recovery before this session can run again");
+    this.logBlockedSuccessor(assignment, sessionId, predecessor, prior, execution);
     throw new RemoteInstanceError("recovery_required",
       "The previous execution stopped unexpectedly and its background work could not be confirmed stopped. This session requires recovery before retrying.",
       { diagnostic: "predecessor_recovery_unqualified" });
   }
 
   /**
+   * What is still missing before this session can start fresh: a proven
+   * process stop, Core's settlement of the claim, Core's answer to the stop
+   * observation.
+   */
+  private logBlockedSuccessor(assignment: RemoteWorkAssignment, sessionId: string, predecessor: RelayedSession, prior: LocalAdmission | undefined, execution: LocalExecution): void {
+    const priorEntry = this.deps.journal.assignments.get(`${predecessor.assignment.id}:${predecessor.assignment.attempt}`);
+    this.logger.warn({ event: "execution.successor_blocked", assignmentId: assignment.id, attempt: assignment.attempt,
+      sessionId, predecessorAssignmentId: predecessor.assignment.id, predecessorAttempt: predecessor.assignment.attempt,
+      predecessorClaimId: prior?.claimId, phase: execution.phase, acpSessionRef: execution.acpSessionRef,
+      terminalSequence: priorEntry?.reports.terminalSequence ?? null,
+      processStopped: execution.processStoppedAt !== undefined,
+      ...this.predecessorSettlement(prior),
+      lifecycleProfileDigest: execution.lifecycleProfileDigest ?? null,
+      executionProfileDigest: execution.executionProfileDigest ?? null,
+      diagnostic: "predecessor_recovery_unqualified" }, "Previous execution requires recovery before this session can run again");
+  }
+
+  private predecessorSettlement(prior: LocalAdmission | undefined): { terminalAcknowledged: boolean; pendingRecoveryEvidence: number } {
+    if (!prior) return { terminalAcknowledged: false, pendingRecoveryEvidence: 0 };
+    return {
+      terminalAcknowledged: this.reports.acknowledgedTerminalReport(prior.assignmentId, prior.attempt, prior.claimId) !== undefined,
+      pendingRecoveryEvidence: this.pendingRecoveryEvidence(prior).length,
+    };
+  }
+
+  /**
    * A fenced execution is finished with, and its logical session may start a
-   * fresh ACP session, once three facts hold (WS2-159): its exact process
+   * fresh ACP session, once three facts hold: its exact process
    * group is proven gone (`interrupted_unqualified` is written only after that
    * proof), Core acknowledged the claim's terminal report (Core settled the
    * work), and no stop observation for it still awaits Core (accepted, or
@@ -1028,9 +1105,8 @@ export class WorkOrchestrator {
   /** The fenced executions a turn of this logical session would wait on. */
   private recoveringPredecessors(assignment: RemoteWorkAssignment): LocalAdmission[] {
     const source = assignment.source;
-    const continued = continuedSession(source);
-    if (!continued && source.kind !== "harness_delivery") return [];
-    const sessionId = source.kind === "harness_delivery" ? source.executionSessionId : continued!.sessionId;
+    const sessionId = logicalSessionId(source);
+    if (sessionId === undefined) return [];
     const owner = this.channelOwners.get(`session:${sessionId}`);
     const candidates = [
       owner && this.deps.journal.execution.admission(owner.assignment.id, owner.assignment.attempt),
@@ -2215,6 +2291,27 @@ function dispatchFailureOutcome(error: unknown): { class: "interrupted"; reason:
 function dispatchFailureDetail(error: unknown): Record<string, unknown> {
   if (!(error instanceof RemoteInstanceError)) return dispatchErrorIdentity(error);
   return error.diagnostic !== undefined ? { detail: error.diagnostic } : {};
+}
+
+/** What a dispatch shares with the session it starts: its admission, chosen reference and ownership checks. */
+interface NativeDispatch {
+  assignment: RemoteWorkAssignment;
+  entry: JournalEntry;
+  assertAuthority: () => void;
+  admission: LocalAdmission | undefined;
+  reference: string | undefined;
+  takeover: { reference: string; mode: "live" | "restore" } | undefined;
+  executionActivated: boolean;
+  assertAdmissionCurrent: () => void;
+  assertRecoveryOwned: () => void;
+  assertExecutionOwned: () => void;
+}
+
+type LocalExecution = NonNullable<ReturnType<SupervisorJournal["execution"]["execution"]>>;
+
+function takeoverReferences(takeover: NativeDispatch["takeover"]): { continueReference?: string; restoreReference?: string } {
+  if (takeover === undefined) return {};
+  return takeover.mode === "live" ? { continueReference: takeover.reference } : { restoreReference: takeover.reference };
 }
 
 export function dispatchErrorIdentity(error: unknown): { errorName?: string; errorCode?: string; schemaIssue?: string } {
