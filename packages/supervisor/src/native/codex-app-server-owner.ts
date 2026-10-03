@@ -152,6 +152,7 @@ export class NativeCodexAppServerOwner {
   private ownerPid(): number | undefined {
     return this.child?.pid ?? this.adoptedHolder?.pid;
   }
+
   async stop(): Promise<void> {
     this.shutdownRequested();
     this.stopping = true;
@@ -215,6 +216,7 @@ export class NativeCodexAppServerOwner {
       throw unavailable("The signed Codex app-server process group did not finish stopping.");
     }
   }
+
   private async spawnAndAwaitReady(): Promise<void> {
     const generation = ++this.generation;
     const { config } = this.options;
@@ -278,6 +280,7 @@ export class NativeCodexAppServerOwner {
     this.stableTimer = setTimeout(() => { this.restartAttempt = 0; this.stableTimer = null; }, 60_000);
     this.stableTimer.unref();
   }
+
   /**
    * A live socket is adopted only from this connector's current release. A
    * server left running by an older release of the same connector keeps the
@@ -305,6 +308,7 @@ export class NativeCodexAppServerOwner {
     this.options.onStaleReplaced?.({ pid: holder.pid, staleRelease: stale.release, currentRelease: current.release });
     return "spawn";
   }
+
   /**
    * Codex app-servers an older release of THIS installation left behind on
    * another socket (a release folder deleted days earlier can still have its
@@ -351,6 +355,7 @@ export class NativeCodexAppServerOwner {
     try { this.options.onStaleReplaced?.({ pid, staleRelease: stray.release, currentRelease }); } catch { /* reported only */ }
     return true;
   }
+
   /** A healthy same-user socket is local-user authority and can survive a
    * connector restart. Polling retains supervision without spawning a racing
    * second server; loss atomically returns to the normal signed spawn path. */
@@ -391,6 +396,7 @@ export class NativeCodexAppServerOwner {
     }
     if (this.watching(generation)) await this.spawnAndAwaitReady();
   }
+
   private onExit(child: PipedChildProcess, generation: number): void {
     if (this.child !== child || generation !== this.generation) return;
     this.child = null;
@@ -453,6 +459,7 @@ async function privateSocketDirectory(directory: string): Promise<void> {
 function notOurSocket(socket: Awaited<ReturnType<typeof resolveCodexSocket>>): boolean {
   return socket.kind === "foreign" || (socket.kind === "socket" && !privateOwner(socket.info));
 }
+
 /**
  * How long a starting Codex app-server may take to listen. A first start of a
  * newer Codex can migrate the state in its home before it binds, so this is
@@ -480,6 +487,7 @@ async function securedWhenListening(socketPath: string): Promise<boolean> {
   if (secured.kind === "socket" && secured.target === socket.target && privateOwner(secured.info)) return true;
   throw unavailable("The shared Codex socket could not be secured.");
 }
+
 export async function cleanupCodexSocket(socketPath: string): Promise<void> {
   const socket = await resolveCodexSocket(socketPath);
   if (socket.kind === "none" || socket.kind === "foreign" || (socket.kind === "socket" && !privateOwner(socket.info))) return;

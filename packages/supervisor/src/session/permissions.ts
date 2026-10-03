@@ -71,6 +71,7 @@ function elicitationAnswerValid(pending: SanitizedElicitation, answer: unknown):
   const content = (answer as { content?: unknown }).content;
   return content === undefined || content === null || BoundedJsonValueSchema.safeParse(content).success;
 }
+
 export interface PendingHumanRequest {
   acpSessionRef: string;
   requestId: string;

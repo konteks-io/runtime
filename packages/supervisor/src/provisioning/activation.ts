@@ -37,6 +37,7 @@ interface ActivationExchangeBase {
   roots: readonly EmbeddedReleaseRoot[];
   logger?: Logger;
 }
+
 type ActivationExchangeArgs = ActivationExchangeBase & {
   deploymentKind: "native_connector";
   platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64"; containerBackend: "none"; deploymentKind: "native_connector" };
@@ -157,6 +158,7 @@ async function recordExchange(args: ActivationExchangeArgs, result: Awaited<Retu
   logger.info({ instanceId: result.instanceId }, "activation exchanged; instance is provisioning");
   return { instanceId: result.instanceId, manifest: result.bundleManifest, manifestDigest, provisioningWindowExpiresAt: result.provisioningWindowExpiresAt };
 }
+
 const NEW_CODE = "Get a new one on the site (Customize → Runtimes → Connect a runtime) and paste the new command here.";
 
 export function activationFailureMessage(code: string): string {
@@ -213,6 +215,7 @@ async function refreshedCredential(core: CoreClient, instanceId: string, manifes
     throw error;
   }
 }
+
 export function provisioningCredentialIsExpired(provisioning: { provisioningCredentialExpiresAt: string }, clock: Clock, marginMs = 60_000): boolean {
   return parseRfc3339(provisioning.provisioningCredentialExpiresAt) - marginMs <= clock.coreNow();
 }

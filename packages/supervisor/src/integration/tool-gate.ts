@@ -202,6 +202,7 @@ export class IntegrationToolGate {
       argsDigest, toolCallId, consumedAt: this.deps.now() });
     return verdict === "consumed_elsewhere";
   }
+
   /** The provider call the gate allowed under this ACP tool call id, if any. */
   allowedCall(toolCallId: string): AllowedIntegrationCall | undefined {
     return this.allowed.get(toolCallId);

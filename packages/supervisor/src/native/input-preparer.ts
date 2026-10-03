@@ -78,9 +78,11 @@ function privateNode(stat: Stats, directory: boolean): void {
   if (stat.isSymbolicLink() || !expectedKind(stat, directory)) throw unavailable();
   if (process.platform !== "win32" && !privateMode(stat, directory)) throw unavailable();
 }
+
 function expectedKind(stat: Stats, directory: boolean): boolean {
   return directory ? stat.isDirectory() : stat.isFile() && stat.nlink === 1;
 }
+
 function privateMode(stat: Stats, directory: boolean): boolean {
   return (stat.mode & 0o7777) === (directory ? 0o700 : 0o600) && stat.uid === process.getuid?.();
 }

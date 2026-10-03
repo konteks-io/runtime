@@ -96,6 +96,7 @@ function declaredOverInferred(inferred: PreviewPlan, declared: Partial<PreviewPl
     notes: [...notes, ...inferred.notes],
   };
 }
+
 type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
 interface PackageJson { scripts?: Record<string, unknown>; packageManager?: unknown }
@@ -161,6 +162,7 @@ function nodePlan(found: { script: string; manager: PackageManager; evidence: st
     notes,
   };
 }
+
 /** What a conversation's agent is told when asked for a preview it cannot run itself. */
 export const CONVERSATION_HAS_NO_APP = "This conversation has no copy of the project's code, so nothing runs here. "
   + "When a delivery on this ticket built the app, Open preview at the top of the session shows it and starts it on this computer by itself.";

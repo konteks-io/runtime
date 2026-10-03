@@ -83,6 +83,7 @@ function releasePin(): AntigravityPin {
   if (!hostAgentVersionSupported(hostAgentFamily(ANTIGRAVITY_AGENT_ID), pin.version)) throw refuse("antigravity_unsupported_version");
   return { version: pin.version, key, platform };
 }
+
 /** Where the connector keeps Antigravity: `<root>/agents/antigravity/` and the pinned version's folder in it. */
 export function antigravityFolders(root: string, pin: Pick<AntigravityPin, "version" | "key">): { agents: string; base: string; version: string } {
   const agents = join(root, "agents");
@@ -145,6 +146,7 @@ async function pinnedFileIntact(
   if (await cachedSha256(path, info) !== file.sha256) return false;
   return cachedSignature(path, info, signer, verifySignature);
 }
+
 /** Every file under `folder` as a `/`-separated relative path; a link or special file refuses. */
 async function listFiles(folder: string): Promise<string[]> {
   const files: string[] = [];
@@ -306,6 +308,7 @@ function fetchFailure(error: unknown): unknown {
   const diagnostic: Diagnostic = error instanceof FetchedArchiveError && error.reason === "download_failed" ? "antigravity_not_fetched" : "antigravity_unsafe_install";
   return refuse(diagnostic, error);
 }
+
 /** Fetches running in this process, by connector root: what the site's "Downloading" line shows. */
 const fetchesUnderWay = new Map<string, { receivedBytes: number; sizeBytes: number }>();
 
@@ -347,6 +350,7 @@ async function newestStagingDownload(base: string, now: number): Promise<Stats |
 function recentDownload(info: Stats | undefined, now: number): info is Stats {
   return info?.isFile() === true && now - info.mtimeMs <= FETCH_ACTIVE_MS;
 }
+
 /** What the pinned copy takes on disk once unpacked (doctor's "disk used"). */
 export function antigravityDiskBytes(pin: Pick<AntigravityPin, "platform">): number {
   return pin.platform.files.reduce((total, file) => total + file.size, 0);

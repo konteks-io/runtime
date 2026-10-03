@@ -115,6 +115,7 @@ export class OnboardWorkCarrier {
     const outcome = await collector.collectGrouping(run, assertCurrent);
     return { structuredOutput: { grouping: { submitted: outcome.submitted, unreadable: outcome.unreadable.length } } };
   }
+
   private async enrichmentScope(assignment: OnboardWorkAssignment): Promise<EnrichmentScope | null> {
     const workload = await this.deps.fetchWorkload(assignment);
     const parsed = OnboardWorkloadSchema.safeParse(workload.workload);

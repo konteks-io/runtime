@@ -67,6 +67,7 @@ function withIsoDrainDeadline(candidate: unknown): unknown {
   }
   return candidate;
 }
+
 export function leaseRecordFromClaims(lease: string, claims: LeaseClaims): LeaseRecord {
   return {
     lease,

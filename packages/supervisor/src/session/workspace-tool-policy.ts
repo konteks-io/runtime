@@ -174,6 +174,7 @@ function changedPaths(input: Record<string, unknown>): string[] {
 function nonBlankString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
+
 export function createWorkspaceToolPolicy(options: { bashBlocklist?: readonly string[] } = {}): PolicyEvaluator {
   const blocklist = options.bashBlocklist ?? DEFAULT_BASH_BLOCKLIST;
   return {

@@ -74,6 +74,7 @@ export class McpToolCallLedger {
     this.calls.set(value.toolCallId, call);
     while (this.calls.size > this.limit) this.calls.delete(this.calls.keys().next().value!);
   }
+
   get(toolCallId: string): { server: string; tool: string } | undefined {
     const call = this.calls.get(toolCallId);
     return call ? { server: call.server, tool: call.tool } : undefined;

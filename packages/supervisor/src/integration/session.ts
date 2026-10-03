@@ -131,6 +131,7 @@ function isMcpCall(meta: Record<string, unknown> | undefined, claudeTool: unknow
 function isOwnResultCall(codexServer: unknown, claudeTool: unknown): boolean {
   return codexServer === STRUCTURED_RESULT_MCP_SERVER_NAME || (typeof claudeTool === "string" && claudeTool.startsWith(`mcp__${STRUCTURED_RESULT_MCP_SERVER_NAME}__`));
 }
+
 /** Cut a string to at most `maxBytes` UTF-8 bytes without splitting a character. */
 function boundedUtf8(text: string, maxBytes: number): { content: string; truncated: boolean } {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return { content: text, truncated: false };
@@ -249,6 +250,7 @@ export class IntegrationSession {
     await resultTools.close().catch(() => undefined);
     await rm(cwd, { recursive: true, force: true }).catch(() => undefined);
   }
+
   /** Runner events for this session only. */
   async onRunnerEvent(event: RunnerEvent): Promise<void> {
     if (this.acpSessionRef === null || !("acpSessionRef" in event) || event.acpSessionRef !== this.acpSessionRef) return;
@@ -283,6 +285,7 @@ export class IntegrationSession {
     }
     await this.deps.runner.answer(ref, requestId, permissionResponse(decision));
   }
+
   /** Track MCP calls and capture what the connector returned for the calls the gate allowed. */
   private observe(update: Record<string, unknown> | undefined): void {
     if (!isToolCallUpdate(update)) return;
@@ -330,6 +333,7 @@ export class IntegrationSession {
     this.observedBytes += Buffer.byteLength(content, "utf8");
     this.observations.push({ server: allowed.server, tool: allowed.tool, content, contentDigest: sha256Hex(content), truncated, evidenceClass: "connector_observed" });
   }
+
   private result(end: TurnEnd, reported: unknown): IntegrationTaskResult {
     const toolCalls = this.gate?.records() ?? [];
     const error = this.taskError(end, toolCalls);

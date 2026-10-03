@@ -70,4 +70,5 @@ async function verifyOpenedContent(handle: FileHandle, info: Stats, artifact: Re
   }
   if (size !== artifact.sizeBytes || `sha256:${hash.digest("hex")}` !== artifact.digest) throw untrusted();
 }
+
 function untrusted() { return new RemoteInstanceError("bundle_untrusted", "Installed native bridges do not match the signed executable release."); }

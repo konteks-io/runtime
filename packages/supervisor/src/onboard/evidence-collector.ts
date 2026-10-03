@@ -123,6 +123,7 @@ export class OnboardEvidenceCollector {
       outcome.submitted += submissions.length;
     }
   }
+
   /**
    * `deep` enrichment for ONE accepted System. Every clone is
    * announced to Core BEFORE it starts and reported `extracted` with its
@@ -172,6 +173,7 @@ export class OnboardEvidenceCollector {
       await this.deps.facade.enrichmentProgress(run.runRef, { canonicalKey: submission.canonicalKey, state: "extracted" });
     }
   }
+
   private async enrichOne(
     run: OnboardRunView,
     item: DiscoveryInventoryItem,

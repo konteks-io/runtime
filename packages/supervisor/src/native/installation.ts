@@ -94,6 +94,7 @@ function explicitSocket(requested: string): string {
   if (!plainAbsolutePath(requested) || resolve(requested) !== requested || Buffer.byteLength(requested) > 96) throw invalid();
   return requested;
 }
+
 /**
  * Read a stored record. One written before 7.0.0 may still list Pi or the
  * old bundled OpenCode: those agents are not run, so they are dropped (and
@@ -305,6 +306,7 @@ function supervisorConfig(record: NativeRuntimeRecord, dataDir: string, releaseD
     ...previewTuning(options.env ?? process.env),
   });
 }
+
 /** The stored runtime record of `root` (private, checked like every load), without loading the release. */
 export async function readNativeRuntimeRecord(root: string): Promise<NativeRuntimeRecord> {
   try {

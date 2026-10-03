@@ -254,6 +254,7 @@ export class NativeRunner implements RunnerPort {
       assertCurrent: () => { this.requireReady(); lifecycle?.assertCurrent(); },
     };
   }
+
   private request(ref: string, id: string, method: "session/prompt" | "session/set_mode" | "session/set_config_option", params: unknown) {
     this.requireReady();
     const parsed = SessionToRuntimeMessageSchema.safeParse({ kind: "acp", method, id, params });
@@ -352,6 +353,7 @@ export class NativeRunner implements RunnerPort {
     this.requireStarted();
     return { loginId: this.runtime.startLogin({ organization, loginId, personal, ...(loginRequest ? { request: loginRequest } : {}) }).loginId };
   }
+
   async applyHostSettings(settings: RunnerHostSettings): Promise<void> {
     await this.runtime.applyHostSettings({ openCodeFreeModels: settings.openCodeFreeModels === true, coreAcceptsRouteBilling: settings.coreAcceptsRouteBilling === true });
   }

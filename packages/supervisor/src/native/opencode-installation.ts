@@ -105,6 +105,7 @@ function pathCandidates(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): stri
   return (hostInstall.pathNames ?? [hostInstall.bin])
     .flatMap(name => directories.flatMap(directory => extensions.map(extension => join(directory, `${name}${extension}`))));
 }
+
 /** Re-verify a recorded executable before every start (ownership, kind and version). */
 export async function verifyNativeOpenCodeBinary(binary: string, platform: NodeJS.Platform = process.platform, deps: OpenCodeLocatorDeps = {}): Promise<NativeOpenCodeInstallation> {
   if (!plainAbsolutePath(binary)) throw refuse(notFound(platform));
@@ -159,6 +160,7 @@ function posixFallbacks(env: NodeJS.ProcessEnv, operatorHome: string, perUser: b
     ...["/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin"].flatMap(directory => ["opencode2", "opencode"].map(name => join(directory, name))),
   ];
 }
+
 /** Executables a candidate may stand for, in trust order, found without running or parsing any script. */
 async function binariesFor(candidate: string, platform: NodeJS.Platform): Promise<string[]> {
   if (!(await lstat(candidate).then(() => true, () => false))) return [];
@@ -197,6 +199,7 @@ async function besideLayouts(candidate: string, canonical: string | null, platfo
   if (windows && basename(beside).toLowerCase() === "bin") out.push(...await chocolateyTargets(dirname(beside)));
   return [...new Set(out)];
 }
+
 async function scoopShimTarget(file: string): Promise<string | null> {
   try {
     const info = await stat(file);
@@ -260,6 +263,7 @@ async function versionVerdict(binary: string, posixOwnership: boolean, platform:
   if (version === null || !hostAgentVersionSupported(family(), version)) return unsupported(version, platform);
   return { binary, version };
 }
+
 /**
  * The version npm recorded beside its shim: `<package>/bin/opencode.exe` with
  * `<package>/package.json` naming `@opencode/cli` (or 1.x's `opencode-ai`).

@@ -90,6 +90,7 @@ async function writePinnedBytes(response: IncomingMessage, handle: FileHandle, o
   if (size !== options.expected.size) throw new FetchedArchiveError("size_mismatch", `received ${size} bytes, the pin ${options.expected.size}`);
   if (hash.digest("hex") !== options.expected.sha256) throw new FetchedArchiveError("digest_mismatch", "the download does not match the pinned sha256");
 }
+
 async function get(url: URL, options: FetchedDownloadOptions, redirectsLeft: number): Promise<IncomingMessage> {
   if (url.protocol !== "https:" || url.username || url.password) throw new FetchedArchiveError("download_failed", "only plain https downloads are allowed");
   const idle = options.idleTimeoutMs ?? 60_000;
@@ -134,6 +135,7 @@ function followOrAccept(response: IncomingMessage, url: URL, options: FetchedDow
   }
   return response;
 }
+
 /** The proxy for an https URL from the standard variables, unless `NO_PROXY` covers its host. */
 export function proxyFor(url: URL, env: NodeJS.ProcessEnv): URL | null {
   try { return httpsProxyFor(url, env); } catch (error) { throw new FetchedArchiveError("download_failed", error instanceof Error ? error.message : "the proxy setting is not usable", { cause: error }); }
@@ -352,6 +354,7 @@ function plainPath(name: string, directory: boolean): { path: string } {
   if (!safeArchivePath(path)) throw unsafe(`${JSON.stringify(name)} is not a plain relative path`);
   return { path };
 }
+
 /**
  * Unpack one entry to `destination` (created exclusively, parents 0700),
  * never writing more than `expected.size` bytes, and check its size, CRC and
@@ -414,6 +417,7 @@ async function copyEntry(
   }
   return { size, crcValue };
 }
+
 /** Free bytes for this user on the volume holding `path`. */
 export async function freeDiskBytes(path: string): Promise<number> {
   const stats = await statfs(path);

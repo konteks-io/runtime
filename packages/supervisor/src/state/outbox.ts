@@ -120,6 +120,7 @@ export class DurableOutbox {
     try { await file.truncate(bytes); await file.sync(); }
     finally { await file.close(); }
   }
+
   get depth(): number {
     return this.items.size;
   }
@@ -205,6 +206,7 @@ export class DurableOutbox {
       throw new Error("outbox configuration supersession receipt mismatch");
     }
   }
+
   private async ackInternal(id: string): Promise<void> {
     if (!this.items.has(id)) return;
     await this.append({ op: "ack", id });

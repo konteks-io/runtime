@@ -117,6 +117,7 @@ function nextBlob(output: Buffer, offset: number, expected: string): { bytes: Bu
   if (!Number.isSafeInteger(size) || size < 0 || start + size >= output.length || output[start + size] !== 0x0a) throw unavailable();
   return { bytes: Buffer.from(output.subarray(start, start + size)), next: start + size + 1 };
 }
+
 /** Capture a repeatable Git tree in an isolated index/object store. This is
  * adapted from bb's temporary-index technique but emits exact bounded bytes,
  * never patches, VCS credentials, or a mutable host path. */

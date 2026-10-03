@@ -211,6 +211,7 @@ export class NativeUpdateCoordinator {
       throw new RemoteInstanceError("temporarily_unavailable", "The native update could not be launched; the running release is unchanged.", { cause: error });
     }
   }
+
   private backoffReason(ledger: NativeUpdateLedger, manifestDigest: string): string | null {
     const now = this.now();
     const window = this.options.attemptWindowMs ?? DEFAULT_ATTEMPT_WINDOW_MS;

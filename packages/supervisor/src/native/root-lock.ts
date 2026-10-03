@@ -124,6 +124,7 @@ class HeldRootLock {
 function sameEntry(a: Stats, b: Stats): boolean {
   return a.ino === b.ino && a.dev === b.dev;
 }
+
 function restricted(stat: Stats): boolean {
   return process.platform === "win32" || ((Number(stat.mode) & 0o077) === 0 && Number(stat.uid) === process.getuid?.());
 }

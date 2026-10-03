@@ -87,6 +87,7 @@ async function initializeOnce(options: AntigravitySelfCheckOptions, config: Retu
     await sweep(config.RUNNER_CREDENTIAL_DIR).catch(() => 0);
   }
 }
+
 function unsupported(version: string, drift: readonly string[]): RemoteInstanceError {
   return new RemoteInstanceError("prerequisite_missing",
     `Unsupported Google Antigravity version: ${version} does not answer as Konteks expects (${drift.slice(0, 4).join("; ")}${drift.length > 4 ? "; …" : ""}). Update the connector.`,

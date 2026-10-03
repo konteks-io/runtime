@@ -67,6 +67,7 @@ export class NativeOutputStore {
       throw unavailable();
     }
   }
+
   async savePending(candidate: RemoteDeliveryResultCandidate, completion: SessionToCoreMessage): Promise<void> {
     const parsed = RemoteDeliveryResultCandidateSchema.parse(candidate);
     const parsedCompletion = SessionToCoreMessageSchema.parse(completion);
@@ -79,6 +80,7 @@ export class NativeOutputStore {
     }
     await this.write({ version: 1, state: "pending", candidate: parsed, completion: parsedCompletion });
   }
+
   async saveAccepted(candidate: RemoteDeliveryResultCandidate, receipt: RemoteDeliveryAcceptanceReceipt): Promise<void> {
     const existing = await this.read();
     if (!existing) throw unavailable();
@@ -170,6 +172,7 @@ export class NativeOutputSessionHeadStore {
     if (abandoned?.state === "accepted") throw unavailable();
     if (abandoned) await rmRecord(this.record(pending));
   }
+
   async verifyExpected(expected: ExpectedAcceptance, current: Omit<TurnIdentity, "sessionId">): Promise<void> {
     let head = await this.required();
     await this.cleanup(head);
@@ -199,6 +202,7 @@ export class NativeOutputSessionHeadStore {
     if (!record || record.state !== "accepted" || record.receipt.acceptanceId !== expected.acceptanceId ||
         record.receipt.resultDigest !== expected.resultDigest) throw unavailable();
   }
+
   async promote(current: Omit<TurnIdentity, "sessionId">): Promise<void> {
     const identity = TurnIdentitySchema.parse({ sessionId: this.sessionId, ...current });
     const before = await this.read();
@@ -213,6 +217,7 @@ export class NativeOutputSessionHeadStore {
     await this.write(next);
     await this.cleanup(next);
   }
+
   private async cleanup(head: z.infer<typeof SessionHeadSchema>): Promise<void> {
     if (!head.cleanup) return;
     const record = new NativeOutputStore(this.root, head.cleanup);
@@ -237,6 +242,7 @@ export class NativeOutputSessionHeadStore {
       throw unavailable();
     }
   }
+
   private async write(value: z.infer<typeof SessionHeadSchema>): Promise<void> {
     const temporary = `${this.path}.new-${randomUUID()}`;
     try {

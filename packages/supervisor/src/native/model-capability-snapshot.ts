@@ -142,6 +142,7 @@ export class ModelCapabilitySnapshotProducer {
     void operation.finally(() => { if (this.inFlight.get(key) === operation) this.inFlight.delete(key); }).catch(() => undefined);
     return operation;
   }
+
   snapshots(): AgentModelOfferedValuesSnapshot[] {
     this.invalidateForAgents(this.agents);
     return [...this.cache.values()].map(value => structuredClone(value.snapshot)).sort((a, b) => a.agentId.localeCompare(b.agentId) || a.mappingId.localeCompare(b.mappingId));
@@ -223,6 +224,7 @@ export class ModelCapabilitySnapshotProducer {
     if (!cached || cached.authorityKey !== key
       || parseRfc3339(cached.snapshot.expiresAt) <= this.options.clock.now()) this.cache.delete(id);
   }
+
   private authorityKey(value: OfferedAuthority, agent: ConnectedAgentView & { authIdentityFingerprint: string }, manifestId: string): string {
     return JSON.stringify([manifestId, value.mappingId, value.mappingRevision, value.mappingDigest,
       agent.authIdentityFingerprint, this.options.runnerIncarnation(), this.agentEpochs.get(value.agentId) ?? 0]);

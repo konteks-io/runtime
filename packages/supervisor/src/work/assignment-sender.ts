@@ -222,6 +222,7 @@ export class AssignmentSender {
   private assertTerminalEvidence(request: AssignmentRequestRecord, receipt: AssignmentReplyRecordValue | undefined, message: string): void {
     if (!receipt || !this.savedTerminalMatches(request, receipt)) throw new RemoteInstanceError("recovery_required", message);
   }
+
   /** Only the existing idempotent terminal-ACK cleanup may resume an applying effect. */
   private savedTerminalMatches(request: AssignmentRequestRecord, receipt: AssignmentReplyRecordValue): boolean {
     const report = AssignmentReportSchema.safeParse(request.frame.body);
@@ -241,6 +242,7 @@ export class AssignmentSender {
       [jcsDigest(saved as JsonValue), jcsDigest(result as JsonValue)],
     ]);
   }
+
   private async deliverClaim(reference: AssignmentRequestReference, captured: Captured, apply: ApplyReply): Promise<void> {
     const { scope, origin } = captured;
     const request = this.deps.journal.assignmentStream.request(scope, reference.requestSequence);
@@ -262,6 +264,7 @@ export class AssignmentSender {
     if (state === "applying") throw new RemoteInstanceError("recovery_required", "Uncertain claim handoff requires recovery.");
     return state === "applied";
   }
+
   /**
    * Send the frozen frame, then durably handle its correlated reply before
    * returning it. A gap or a retired slot is a local history problem: neither

@@ -97,6 +97,7 @@ export class CancellationReplay {
     ]) && cancellationNamesAssignment(start.assignment, record.intent.sessionId);
     if (!owned) throw new Error("Retained cancellation has no exact current execution owner");
   }
+
   tick(): void {
     if (this.stopped) return;
     const records = this.deps.journal.cancellations.pending();

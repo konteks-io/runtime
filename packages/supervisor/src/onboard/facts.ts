@@ -82,6 +82,7 @@ const FAMILY_READERS: Record<ReadFile["candidate"]["family"], (draft: FactsDraft
     if (found) draft.descriptor = found;
   },
 };
+
 /**
  * CODEOWNERS handles only. Patterns are deliberately dropped: a path pattern is
  * a fact about the repository's layout that nobody asked for, and the owner

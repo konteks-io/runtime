@@ -276,6 +276,7 @@ function redactedRecord(value: object, workspaceRoot: string, options: ActivityT
   }
   return result;
 }
+
 /**
  * Redact a relayed session message. A streamed chunk's continuation options
  * describe that chunk's text alone: applied to every string they turned the

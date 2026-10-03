@@ -86,6 +86,7 @@ function configDrift(expected: DshProfileExpectation, row: DshDumpRow): string[]
     .filter(([key, value]) => row.config[key] !== value)
     .map(([key, value]) => `${expected.id}: config ${key} is ${JSON.stringify(row.config[key] ?? null)}, expected ${JSON.stringify(value)}`);
 }
+
 function olderThan(version: string, than: string): boolean {
   try { return compareAgentVersions(version, than) < 0; } catch { return false; }
 }
@@ -156,6 +157,7 @@ class DumpConfigReader {
     return style === ">" ? body.join(" ") : body.join("\n");
   }
 }
+
 function scalar(raw: string): string {
   const value = raw.trim();
   if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) return value.slice(1, -1).replace(/''/g, "'");

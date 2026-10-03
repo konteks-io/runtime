@@ -129,6 +129,7 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
     const identity = message.body as { reportId?: string; claimId?: string };
     return queuedAssignment(this.pending, "reportId", identity.reportId) || queuedAssignment(this.pending, "claimId", identity.claimId);
   }
+
   /** Owner calls only after durable receipt acceptance; the predicate is rechecked. */
   resumeAfterRecovery(): void { this.preparedRetryBlocked = false; void this.drain(); }
 
@@ -202,6 +203,7 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
       return this.deliveryPriority(candidate.message) < this.deliveryPriority(best.message) ? candidate : best;
     }, undefined);
   }
+
   private deliveryPriority(message: OutboundMessage): number {
     if (message.channel === "heartbeat" || message.channel === "control") return 0;
     if (message.channel !== "assignment") return message.channel === "session" ? 3 : 5;
@@ -310,6 +312,7 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
     await this.options.core.sessionOutbound(instanceId, [{ channelId: message.channelId, ...(message.sourceSequence === undefined ? {} : { sourceSequence: message.sourceSequence }), body: message.body }]);
     context.assertRecovery();
   }
+
   /** Coalesces direct wakeups and scheduled polls onto one in-flight cycle. */
   private poll(): Promise<void> {
     if (this.pollFlight) return this.pollFlight;
@@ -367,6 +370,7 @@ export class HttpsFallbackTransport implements ControlPlaneTransport {
       assertRecovery();
     }
   }
+
   /**
    * HTTPS has no socket ACK callback, so it must explicitly publish the two
    * durable cursors. One startup attempt recovers a previous process's pending

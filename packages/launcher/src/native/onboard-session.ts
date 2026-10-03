@@ -72,6 +72,7 @@ export interface OnboardDeps {
     ensure?: (root: string) => Promise<GraftTool>;
     wire?: typeof wireGraft;
   };
+
   /** The background unpacking of the agent packages. */
   staging?: {
     status: (root: string) => Promise<StagingStatus>;

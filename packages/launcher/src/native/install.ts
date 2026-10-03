@@ -32,6 +32,7 @@ interface NativeInstallOptions {
     setupAgent?: (agentId: "claude-code" | "codex") => Promise<boolean>;
   };
 }
+
 interface NativeAgentAddOptions {
   root: string;
   agentId: NativeRuntimeRecord["agents"][number];

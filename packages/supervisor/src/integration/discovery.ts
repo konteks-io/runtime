@@ -166,6 +166,7 @@ function fixtureServerMap(env: NodeJS.ProcessEnv): Record<string, unknown> {
   }
   return isPlainObject(parsed) ? parsed as Record<string, unknown> : {};
 }
+
 /**
  * Model-free listing of one fixture server: MCP `initialize` then
  * `tools/list` over loopback streamable HTTP. Only tool names come back.

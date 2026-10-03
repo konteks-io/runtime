@@ -212,6 +212,7 @@ export class NativeExecutionGate {
       admissionId, outcome: admissionFailure ? "refused_before_dispatch" : "admitted",
       ...(admissionFailure ? { diagnostic: admissionFailure.diagnostic } : {}) }, "Native operation admission retained");
   }
+
   /**
    * Core's key endpoint answering slowly must not refuse a prompt and drop the
    * relay socket. Retry with backoff
@@ -250,6 +251,7 @@ export class NativeExecutionGate {
   private permitRemainingMs(permitExpiresAtMs: number | undefined): number | null {
     return permitExpiresAtMs === undefined ? null : Math.max(0, permitExpiresAtMs - this.options.clock.coreNow());
   }
+
   /** Called immediately before the bridge call, after any local preparation IO. */
   async begin(operation: AuthorizedNativeOperation): Promise<boolean> {
     if (operation.replay) return false;
@@ -281,6 +283,7 @@ export class NativeExecutionGate {
     }
     return started;
   }
+
   complete(key: string, completion?: SessionToCoreMessage): Promise<void> {
     return this.operations.complete(key, completion);
   }
@@ -343,6 +346,7 @@ export class NativeExecutionGate {
   private claimRunning(entry: JournalEntry, deadline: boolean): boolean {
     return LIVE_CLAIM_STATES.includes(entry.state) && !(deadline && Date.parse(entry.expiresAt) <= this.options.clock.coreNow());
   }
+
   private assertDispatchCurrent(authority: Authority): void {
     this.localAuthority(authority);
     if (this.authority?.executionId !== authority.executionId || this.authority.executionRevision !== authority.executionRevision ||
@@ -493,6 +497,7 @@ export class NativeExecutionGate {
       ...(lapsedMs > 0 ? { leaseLapsedMs: Math.round(lapsedMs) } : {}),
       skewMs: this.options.clock.skewMs() }, "Native execution lease verified");
   }
+
   private async tick(): Promise<void> {
     if (this.stopped || !this.authority) return;
     try {
@@ -541,6 +546,7 @@ export class NativeExecutionGate {
       remainingLeaseMs: Math.max(0, Math.round(this.monotonicDeadline - now)), ...errorFields(error) },
     leaseExpired ? "Execution lease lapsed while Core is unreachable; the agent keeps running and renewal retries" : "Retrying within the verified execution lease");
   }
+
   /**
    * The latest instant this assignment is known to be live: its own expiry,
    * or later where Core's verified checks have carried the local record

@@ -165,6 +165,7 @@ export class TransportManager {
     if (!this.relay) throw new RemoteInstanceError("protocol_incompatible", "Session delivery requires the configured relay.");
     this.relay.send(message);
   }
+
   resumeAfterRecovery(): void {
     // Resume the selected carrier and the session relay; neither creates authority.
     this.active.resumeAfterRecovery?.();

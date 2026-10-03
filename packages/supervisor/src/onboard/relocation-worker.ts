@@ -104,6 +104,7 @@ export class RepositoryRelocationWorker {
     if (next.step !== "cutover" && next.step !== "settle") return { step: next.step, disposition: "awaiting_core" };
     return next;
   }
+
   /**
    * `propose`: count the source's refs, confirm the target is empty, and prove
    * both sides are readable from this machine. Some providers pre-create a
@@ -229,6 +230,7 @@ export class RepositoryRelocationWorker {
     await this.report({ relocationRef: plan.relocationRef, step: "cutover", ...(reverified.verification ? { verification: reverified.verification } : {}) });
     return null;
   }
+
   /** `settle` removes the scratch. The source is retained; that is Core's act. */
   private async settle(plan: RelocationPlan): Promise<RelocationOutcome> {
     await this.deps.scratch.releaseClone(scratchName(plan.relocationRef));

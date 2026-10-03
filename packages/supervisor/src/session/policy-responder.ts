@@ -173,6 +173,7 @@ export class EvaluatorPolicyResponder implements PolicyResponder {
     if (!evaluation.allowed) return deniedBy(evaluation, options.deny);
     return this.deferOrDeny(options.deny);
   }
+
   async evaluateElicitation(request: CreateElicitationRequest): Promise<{ kind: "defer" } | { kind: "decline" }> {
     if (isSignInElicitation(request)) return { kind: "decline" };
     return this.humanDeferralAllowed() ? { kind: "defer" } : { kind: "decline" };

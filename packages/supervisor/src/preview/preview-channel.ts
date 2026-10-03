@@ -86,6 +86,7 @@ export class PreviewChannel {
     return chunk.kind === "request" && chunk.final === true && this.deps.previews.autoStart !== undefined &&
       this.deps.previews.originFor(sessionId) === null && !this.forwarders.get(channelId)?.hasStream(chunk.streamId);
   }
+
   private async startForViewer(channelId: string, sessionId: string, chunk: Extract<PreviewToRuntimeChunk, { kind: "request" }>): Promise<void> {
     let starting = false;
     try {

@@ -110,6 +110,7 @@ class DshSearch {
     if (PRIORITY[refusal.diagnostic] > PRIORITY[this.best.diagnostic]) this.best = refusal;
   }
 }
+
 /** Re-verify a recorded package root before every start. */
 export async function verifyNativeDshRoot(root: string, platform: NodeJS.Platform = process.platform): Promise<NativeDshInstallation> {
   if (!plainAbsolutePath(root)) throw refuse(notFound());
@@ -169,6 +170,7 @@ function npmCacheFolder(env: NodeJS.ProcessEnv, operatorHome: string, platform: 
   if (platform !== "win32") return join(operatorHome, ".npm");
   return env.LOCALAPPDATA && isAbsolute(env.LOCALAPPDATA) ? join(env.LOCALAPPDATA, "npm-cache") : undefined;
 }
+
 async function inspect(candidateRoot: string, platform: NodeJS.Platform): Promise<NativeDshInstallation | Refusal> {
   const dsh = family();
   const found = await readPackage(candidateRoot);
@@ -232,6 +234,7 @@ async function unsafeInstall(root: string, entry: string, platform: NodeJS.Platf
   }
   return null;
 }
+
 /**
  * The Node that runs the person's DeepSeek Harness. The connector is a Node
  * single-executable app and cannot run another script, so dsh runs on the
@@ -263,6 +266,7 @@ function dshNodeCandidates(installation: NativeDshInstallation, env: NodeJS.Proc
   return [platform === "win32" ? resolve(installation.root, "..", "..", "..", binary) : resolve(installation.root, "..", "..", "..", "..", "bin", binary),
     ...personNodeCandidates(env, platform)];
 }
+
 /** Where a person's own Node usually is: every PATH folder, then the usual install locations. */
 export function personNodeCandidates(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string[] {
   const binary = platform === "win32" ? "node.exe" : "node";
@@ -276,6 +280,7 @@ function usualNodeLocations(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, b
     .filter((programs): programs is string => Boolean(programs && isAbsolute(programs)))
     .map(programs => join(programs, "nodejs", binary));
 }
+
 /**
  * The first candidate that is a safely owned executable (the person's or
  * root's, not group or world writable) reporting a version `supported`
@@ -324,6 +329,7 @@ async function runnableNode(candidate: string, platform: NodeJS.Platform): Promi
     return null;
   }
 }
+
 function nodeSupported(reported: string): boolean {
   const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(reported.trim());
   if (!match) return false;

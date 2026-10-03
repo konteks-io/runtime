@@ -136,6 +136,7 @@ async function readTree(root: string, modes: Record<string, 384 | 448>): Promise
   if (reader.entries.length !== Object.keys(modes).length) throw unavailable();
   return { format: "konteks-file-tree-v1", entries: reader.entries, treeDigest: computeRemoteFileTreeDigest(reader.entries) };
 }
+
 function result(root: string, catalog: RemoteSkillCatalog): StagedOrganizationSkills {
   return {
     root, catalogDigest: catalog.catalogDigest,

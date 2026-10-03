@@ -250,6 +250,7 @@ async function flushTree(path: string): Promise<void> {
     await handle.close();
   }
 }
+
 /** Read-only verification: dirty files and later local commits are never reset. */
 export async function verifyNativeGitWorkspace(container: string, value: unknown): Promise<void> {
   try {

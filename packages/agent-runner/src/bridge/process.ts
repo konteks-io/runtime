@@ -160,6 +160,7 @@ function stderrReader(options: SpawnBridgeOptions, logger: Logger, child: PipedC
       if (tail.length > STDERR_TAIL_MAX_LINES) tail.shift();
     }
   };
+
   /** True once a line ended the agent's run. */
   const observe = (line: string) => {
     if (!line || !options.onStderrLine) return;

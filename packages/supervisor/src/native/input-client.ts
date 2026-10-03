@@ -171,6 +171,7 @@ export class NativeInputClient {
     if (refusal !== null) throw unavailable(refusal);
     return envelope;
   }
+
   private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
     if (this.busy) throw unavailable("request_concurrent");
     this.busy = true;
@@ -308,6 +309,7 @@ export class NativeInputClient {
     if (renewed === credential) renewed = await this.awaitRenewedCredential(credential, signal);
     return renewed && renewed !== credential ? renewed : null;
   }
+
   private async requestBundle(
     assignment: RemoteWorkAssignment,
     body: unknown,
@@ -330,6 +332,7 @@ export class NativeInputClient {
       return readAll(held.reader, signal, REMOTE_REPOSITORY_BUNDLE_MAX_BYTES);
     });
   }
+
   private async withTransientRetry<T>(operation: string, run: () => Promise<T>): Promise<T> {
     for (let attempt = 1; attempt <= NATIVE_TRANSIENT_MAX_ATTEMPTS; attempt += 1) {
       try { return await run(); }

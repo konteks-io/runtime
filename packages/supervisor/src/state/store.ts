@@ -338,6 +338,7 @@ export class SupervisorStore {
     }
     return unseen;
   }
+
   async heartbeatSequence(): Promise<number> {
     return (await this.readJson("heartbeat.json", HeartbeatSeqSchema))?.sequence ?? 0;
   }

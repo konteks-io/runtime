@@ -109,6 +109,7 @@ function subagentToolName(raw: string, toolCallId: string): string | undefined {
   const at = raw.lastIndexOf(": ");
   return at > 0 ? raw.slice(at + 2).trim() : undefined;
 }
+
 /** Every file a file-changing (or reading) call names: `files[].file`/`movePath` and the single-path keys. */
 function namedPaths(input: Record<string, unknown>): string[] {
   const paths: string[] = [];
@@ -282,6 +283,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     if (!UNGATED.has(observed.tool)) return { toolCallId, title: observed.tool };
     return ungatedOverreach(toolCallId, observed, cwd);
   }
+
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision {
     const toolCallId = request.toolCall.toolCallId;
     this.asked.add(toolCallId);
@@ -320,6 +322,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     this.approved.set(r.toolCallId, block.calls.map(codeModeCallPath));
     return { kind: "allow" };
   }
+
   private terminal(status: unknown): boolean {
     return status === "completed" || status === "failed" || status === "cancelled";
   }

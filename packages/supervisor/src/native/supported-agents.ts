@@ -85,6 +85,7 @@ function diagnosticState(diagnostic: string): FailureState {
 function bundledToolingMissing(agentId: string, error: unknown): boolean {
   return (agentId === "claude-code" || agentId === "codex") && error instanceof RemoteInstanceError && error.code === "prerequisite_missing";
 }
+
 function stateForView(facts: AddedAgentFacts): SupportedAgentState {
   const view = facts.view!;
   if (view.readiness === "ready" && view.connectionState === "ready") return "ready";
@@ -138,6 +139,7 @@ function addedStanding(agentId: SupportedAgentId, added: AddedAgentFacts): Agent
   const state = added.view ? stateForView(added) : stateForFailure(agentId, added.failure);
   return { state, versionFound: added.version ?? (state === "unsupported_version" ? versionFromRefusal(added.failure) : undefined) };
 }
+
 /** Replaceable checks, for tests only. */
 interface NotAddedDetectionDeps {
   claude?: () => Promise<unknown>;
@@ -191,6 +193,7 @@ function antigravityPinnedHere(deps: NotAddedDetectionDeps): boolean {
   const pinned = deps.antigravityPinned ?? (() => { try { antigravityPin(); return true; } catch { return false; } });
   return pinned();
 }
+
 /**
  * Every minute. It is a look at a few folders and at most a `--version`, and
  * a person who installs an agent expects to see it within about a minute; the

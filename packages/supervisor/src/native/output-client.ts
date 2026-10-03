@@ -191,12 +191,14 @@ export class NativeOutputClient {
     if (final?.state !== "accepted" || !final.receipt) throw unavailable();
     return this.accepted(call, final.receipt, "commit_status_hit");
   }
+
   private accepted(call: OutputCall, value: unknown, cacheOutcome: string): RemoteDeliveryAcceptanceReceipt {
     const receipt = this.verifyReceipt(value, call.candidate);
     this.logger.info({ event: "native.output.accept_completed", ...call.telemetry, stage: "accept", outcome: "success", cacheOutcome,
       durationMs: Date.now() - call.startedAt }, "native delivery output accepted");
     return receipt;
   }
+
   private async status(owner: { instanceId: string; assignmentId: string; attempt: number }, body: ReturnType<typeof RemoteDeliveryOutputStatusRequestSchema.parse>,
     deadlineAtMs: number, telemetry: { correlationId: string; resultDigest: string; bytes: number }) {
     try { return RemoteDeliveryOutputStatusResultSchema.parse(await this.request(owner, "status", body, deadlineAtMs, telemetry)); }
@@ -217,6 +219,7 @@ export class NativeOutputClient {
     if (!same) throw unavailable();
     return receipt;
   }
+
   private async request(owner: { instanceId: string; assignmentId: string; attempt: number }, operation: OutputOperation, body: unknown,
     deadlineAtMs: number, telemetry: OutputTelemetry): Promise<unknown> {
     const startedAt = Date.now();

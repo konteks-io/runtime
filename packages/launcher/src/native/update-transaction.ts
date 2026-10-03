@@ -355,6 +355,7 @@ class ServiceExitWait {
     return true;
   }
 }
+
 /** A stopped service is gone once its process is, or once it wrote a shutdown receipt newer than the one before the stop. */
 async function stopConfirmed(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, gone: boolean, previousReceipt: string | null): Promise<boolean> {
   if (gone || !deps.readStopReceipt) return true;
@@ -366,6 +367,7 @@ async function stopConfirmed(input: NativeUpdateInput, deps: NativeUpdateTransac
 function cappedPoll(deps: NativeUpdateTransactionDeps, cap: number): number {
   return Math.min(deps.pollMs ?? cap, cap);
 }
+
 /**
  * An update that stopped the connector but did not swap it: start the same
  * release and return only once it answers, or say plainly that it has not.
@@ -394,6 +396,7 @@ async function endLingeringService(input: NativeUpdateInput, definition: NativeS
   else await deps.forceStop?.(definition).catch(() => undefined);
   for (let poll = 0; poll < 10 && await running(); poll += 1) await deps.sleep(cappedPoll(deps, 1_000));
 }
+
 function processAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
@@ -501,6 +504,7 @@ async function onceReleased<T>(input: NativeUpdateInput, deps: NativeUpdateTrans
     }
   }
 }
+
 async function drain(input: NativeUpdateInput, control: UpdateControlClient, deps: NativeUpdateTransactionDeps): Promise<void> {
   await control.call({ op: "drain", reason: "update" }, z.unknown());
   const deadline = deps.now() + (deps.drainDeadlineMs ?? 15 * 60_000);
@@ -622,6 +626,7 @@ function stillChecking(attempts: readonly NativeUpdateAttempt[], record: NativeR
   const staleMs = deps.staleAttemptMs ?? 45 * 60_000;
   return attempts.some(attempt => attempt.outcome === "in_progress" && attempt.releaseId === record.releaseId && deps.now() - Date.parse(attempt.startedAt) < staleMs);
 }
+
 interface GateVersions {
   previous: NativeRuntimeRecord;
   successor: NativeRuntimeRecord;

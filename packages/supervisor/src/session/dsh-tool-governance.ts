@@ -134,6 +134,7 @@ export class DshToolGovernance {
     if (observed && status === "completed" && !askedFirst && !READ_ONLY.has(observed.title)) return { toolCallId, title: observed.title };
     return null;
   }
+
   decide(request: RequestPermissionRequest, cwd: string, options: { browserTools?: boolean } = {}): DshPermissionDecision {
     const toolCallId = request.toolCall.toolCallId;
     this.asked.add(toolCallId);

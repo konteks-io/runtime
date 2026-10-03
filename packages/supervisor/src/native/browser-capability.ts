@@ -91,6 +91,7 @@ async function personBrowserNode(runners: readonly RunnerConfig[], deps: Connect
     deps.version ? { version: deps.version } : {});
   return person.node;
 }
+
 /**
  * Hand the connector's browser to every runner whose own package carries
  * none (DeepSeek Harness, OpenCode). Claude Code and Codex keep their own,

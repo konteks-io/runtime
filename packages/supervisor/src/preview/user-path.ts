@@ -54,6 +54,7 @@ function searchPath(fromShell: string | null, current: string, home: string): st
     .filter(entry => entry.length > 0 && isAbsolute(entry) && !/[\p{Cc}]/u.test(entry));
   return [...new Set(entries)].join(":");
 }
+
 /** `$SHELL -ilc` prints PATH between markers; 5 s bound; rc-file noise is ignored. */
 function loginShellPath(shell: string): Promise<string | null> {
   return new Promise(resolve => {

@@ -123,6 +123,7 @@ export class IntegrationTaskCarrier implements IntegrationWorkCarrier {
       observations: result.observations.length, error: result.error?.code }, "integration task finished");
     return { structuredOutput: IntegrationTaskResultSchema.parse(result) as BoundedJsonValue };
   }
+
   async onRunnerEvent(event: RunnerEvent): Promise<void> {
     for (const session of this.sessions) await session.onRunnerEvent(event);
   }

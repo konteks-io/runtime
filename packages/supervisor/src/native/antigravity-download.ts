@@ -47,6 +47,7 @@ async function unverifiedState(error: unknown, root: string, pin: ReturnType<typ
   if (diagnostic === "antigravity_unsafe_install") return { state: "integrity_failed" };
   return { state: "not_downloaded", sizeBytes: pin.platform.archive.size };
 }
+
 /**
  * Google Antigravity's download state on the agents the connector reports:
  * on its connected agent when a runner of it reports one, otherwise as an

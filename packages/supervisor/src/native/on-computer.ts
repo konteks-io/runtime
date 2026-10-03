@@ -60,6 +60,7 @@ function installPlan(agent: OnComputerAgentFacts, platform: NodeJS.Platform, add
   if (!install || install === add) return { step: "add", ...after([add]) };
   return { step: "install", ...after([install, add]) };
 }
+
 /**
  * The running release's own `konteks-remote`, when this connector runs as one
  * (a release folder's `konteks-connector`, or `connector` before the rename).
@@ -187,6 +188,7 @@ function detachedSpawn(command: string, args: string[]): void {
   child.on("error", () => undefined);
   child.unref();
 }
+
 interface OnComputerOpened {
   file: string;
   /** Whether a window came up; false when the script was only left for a stand-in's tester. */

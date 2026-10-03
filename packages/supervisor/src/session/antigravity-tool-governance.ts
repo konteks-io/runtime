@@ -400,6 +400,7 @@ export class AntigravityToolGovernance implements HostToolGovernance {
   private commandFlag(call: ObservedCall): { unaskedCommand?: true } {
     return this.isCommand(call) ? { unaskedCommand: true } : {};
   }
+
   /** Konteks' answer to a request (after policy or a person): an allowed command or file change may be carried out once. */
   answered(toolCallId: string, allowed: boolean): void {
     if (!this.asked.has(toolCallId)) return;
@@ -466,6 +467,7 @@ export class AntigravityToolGovernance implements HostToolGovernance {
     this.pending.set(r.toolCallId, { kind: "edit", paths });
     return rebuiltRequest(r.request, r.toolCallId, { kind: "edit", title: tool, rawInput: { file_path: paths[0] }, locations: paths.map(path => ({ path })) });
   }
+
   private trip(toolCallId: string, title: string): HostToolBypass {
     this.forget(toolCallId);
     return { toolCallId, title };

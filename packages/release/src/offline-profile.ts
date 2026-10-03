@@ -95,6 +95,7 @@ function checkCodexLocalProxy(profile: ProfileShape, fail: Fail): void {
   const file = profile.files.find(candidate => candidate.path === proxy.entrypoint);
   if (profile.agentId !== "codex" || profile.os === "windows" || !profile.node || !file?.executable) fail("Codex local proxy requires an inventoried Unix executable and bundled Node");
 }
+
 export type NativeAgentPackageProfile = z.infer<typeof NativeAgentPackageProfileSchema>;
 
 export function readNativeAgentProfile(bytes: Buffer, artifact: RemoteNativeArtifact): NativeAgentPackageProfile {
@@ -104,5 +105,6 @@ export function readNativeAgentProfile(bytes: Buffer, artifact: RemoteNativeArti
   if (profile.agentId !== artifact.agentId || profile.os !== artifact.os || profile.architecture !== artifact.architecture) throw offlinePackageInvalid();
   return profile;
 }
+
 function sha256(bytes: Buffer): string { return `sha256:${createHash("sha256").update(bytes).digest("hex")}`; }
 export function offlinePackageInvalid() { return new RemoteInstanceError("bundle_untrusted", "The offline agent package or its complete signed dependency inventory is invalid."); }

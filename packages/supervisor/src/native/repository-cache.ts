@@ -123,6 +123,7 @@ function privateJsonFile(info: Stats): boolean {
 function fsCode(error: unknown): unknown {
   return error && typeof error === "object" && "code" in error ? error.code : undefined;
 }
+
 function receipt(value: unknown): WorktreeReceipt {
   if (!value || typeof value !== "object") throw unavailable();
   const candidate = value as Partial<WorktreeReceipt>;
@@ -146,6 +147,7 @@ function wellFormedReceipt(candidate: Partial<WorktreeReceipt>): boolean {
 function matches(value: unknown, pattern: RegExp): boolean {
   return typeof value === "string" && pattern.test(value);
 }
+
 function sameReceipt(left: WorktreeReceipt, right: WorktreeReceipt): boolean {
   return (
     left.format === right.format &&
@@ -236,6 +238,7 @@ async function releaseRepositoryLock(lock: string, token: string): Promise<void>
     // Never delete a lock whose ownership can no longer be proved.
   }
 }
+
 /**
  * One object store per canonical repository, many agent-owned worktrees.
  * Network authority stays outside this class and nothing secret is durable here.

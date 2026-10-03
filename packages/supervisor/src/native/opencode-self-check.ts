@@ -104,6 +104,7 @@ async function listAgentsPrivately(options: OpenCodeSelfCheckOptions, platform: 
     await stopServices();
   }
 }
+
 /**
  * A freshly started service first lists no agents, then OpenCode's DEFAULT
  * agents (plan and title included, none of our rules) for about a second,
@@ -153,6 +154,7 @@ function listingSettled(parsed: unknown, last: ListingSeen | null, now: number, 
 function seenSince(last: ListingSeen | null, text: string, now: number): ListingSeen {
   return last && last.text === text ? last : { text, since: now };
 }
+
 /** What each resolved agent must satisfy; plain lines naming what drifted, empty when in force. */
 export function openCodeAgentsDrift(agents: unknown): string[] {
   if (!Array.isArray(agents)) return ["the agent list is not in the expected form"];
@@ -177,6 +179,7 @@ function probeDrift(id: string, rules: readonly OpenCodePermissionRule[]): strin
     return decision === expected ? [] : [`agent ${id}: ${what} is ${decision ?? "unset"}, expected ${expected}`];
   });
 }
+
 /** Resolved decisions the Konteks configuration must produce for every agent. */
 const PROBES: ReadonlyArray<readonly [string, string, OpenCodePermissionRule["effect"], string]> = [
   ["bash", "git push origin main", "ask", "a shell command"],
