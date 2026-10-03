@@ -7,6 +7,8 @@ import { SupervisorJournal } from "../state/journal.js";
 import { DurableOutbox } from "../state/outbox.js";
 import { AssignmentSender } from "../work/assignment-sender.js";
 import { WorkOrchestrator } from "../work/orchestrator.js";
+import { RelayedSession } from "../session/relayed-session.js";
+import type { DiagnosticCompanionInboxRecord } from "../state/diagnostic-companion-inbox.js";
 import { RecoveryAuthority } from "../transport/recovery-authority.js";
 import type { OutboundMessage } from "../transport/transport.js";
 import type { ExecutionLog } from "../state/local-execution.js";
@@ -221,4 +223,39 @@ it("keeps the durable claim handoff applied when its execution owner is later fe
   }
   expect(f.journal.execution.start("assignment", 1)?.claimEffect?.state).toBe("applied");
   expect(f.journal.assignments.get("assignment:1")?.reports.terminalSequence).toBeUndefined();
+});
+
+it("joins late diagnostic intake to the live admission without changing execution authority", async () => {
+  let release!: () => void;
+  const preparing = vi.fn(() => new Promise<never>((_resolve, reject) => { release = () => reject(new Error("fixture unavailable")); }));
+  const bind = vi.spyOn(RelayedSession.prototype, "bindDiagnosticContext");
+  const f = await fixture("claimed", { runners: new Map([["codex", {} as never]]),
+    sessionDeps: () => ({ instanceId: "instance", prepareInputs: preparing, registerReady: vi.fn() } as never) });
+  await f.deliver(f.reference());
+  await vi.waitFor(() => expect(preparing).toHaveBeenCalledOnce());
+  const before = f.journal.execution.start("assignment", 1);
+  const sentBefore = f.sent.length;
+  const record = {
+    runnerIncarnation: "process", deliveryDigest: "a".repeat(43),
+    companion: {
+      deliveryId: "diagnostic", match: { assignmentId: "assignment", attempt: 1, invocationId: "invocation", executionSessionId: "session", dispatchGeneration: 1 },
+      carrier: {
+        context: { schemaVersion: "observability-context-v1", traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", tenantId: "workspace", assignmentId: "assignment", attempt: 1, invocationId: "invocation" },
+        build: { service: "core", component: "admission", sourceRevision: "a".repeat(40) }, protocol: { remoteInstanceProtocolVersion: "2.0" },
+      },
+    },
+  } as DiagnosticCompanionInboxRecord;
+  try {
+    expect(f.work.observeDiagnosticCompanion({ ...record, runnerIncarnation: "replacement" }).event).toBe("runtime.diagnostic_companion.coverage_incomplete");
+    expect(bind).not.toHaveBeenCalled();
+    expect(f.work.observeDiagnosticCompanion(record).event).toBe("runtime.diagnostic_companion.persisted");
+    expect(bind).toHaveBeenCalledWith(expect.objectContaining({ assignmentId: "assignment", claimId: before!.admission.claimId, executionId: before!.admission.executionGeneration }));
+    expect(f.journal.execution.start("assignment", 1)).toEqual(before);
+    expect(f.journal.execution.execution(before!.admission)).toBeUndefined();
+    expect(f.sent).toHaveLength(sentBefore);
+  } finally {
+    release();
+    await vi.waitFor(() => expect((f.work as unknown as { bootstrapping: Map<string, unknown> }).bootstrapping.size).toBe(0));
+    bind.mockRestore();
+  }
 });

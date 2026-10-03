@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { ObservabilityContextV1Schema, type ObservabilityContextV1 } from "@konteks/backstage-plugin-common";
 import type { CreateElicitationRequest, RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import {
   SessionToCoreMessageSchema,
@@ -10,6 +11,7 @@ import {
   RemoteExecutionReadyResultSchema,
   RemoteInstanceError,
   createLogger,
+  redactValue,
   type AcpJsonRpcError,
   type AgentTurnUsageObservation,
   type Clock,
@@ -228,6 +230,7 @@ export class RelayedSession {
   /** The QA browser's gateway (validation, QA, delivery and conversation sessions of any agent, O8) and its output folder. */
   private browserGateway: PreviewBrowserGateway | null = null;
   private browserOutputDir: string | null = null;
+  private diagnosticContext: ObservabilityContextV1 | undefined;
   /** The logical session whose preview this session's agent drives. */
   private previewSessionId: string | null = null;
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
@@ -237,13 +240,26 @@ export class RelayedSession {
     this.mcpCalls = assignment.agentRoute.agentId === "codex" ? new McpToolCallLedger() : null;
     // Bound only after input preparation proves Core's claim-bound session.
     this.boundChannelId = null;
-    this.logger = deps.logger ?? createLogger({ name: "relayed-session" });
+    this.logger = (deps.logger ?? createLogger({ name: "relayed-session" })).child({}, {
+      formatters: { log: object => redactValue({
+        ...object,
+        ...(this.diagnosticContext ? { context: this.diagnosticContext } : {}),
+      }) as Record<string, unknown> },
+    });
     this.executionGate = isNativeTurn(assignment) && deps.executionAuthority
       ? new NativeExecutionGate({ ...deps.executionAuthority, assignment, logger: this.logger, journal: deps.journal, clock: deps.clock,
         assertOwned: () => {
           if (!deps.assertExecutionOwned) throw new RemoteInstanceError("execution_fenced", "Execution ownership is unavailable.");
           deps.assertExecutionOwned();
         }, onAuthorityLost: () => this.onExecutionAuthorityLost() }) : null;
+  }
+
+  /** Diagnostic-only late binding; it never grants execution or tool access. */
+  bindDiagnosticContext(candidate: unknown): boolean {
+    const parsed = ObservabilityContextV1Schema.safeParse(candidate);
+    if (!parsed.success || parsed.data.assignmentId !== this.assignment.id || parsed.data.attempt !== this.assignment.attempt || this.closed) return false;
+    this.diagnosticContext = parsed.data;
+    return true;
   }
 
   private async onExecutionAuthorityLost(): Promise<void> {
@@ -301,11 +317,13 @@ export class RelayedSession {
       const result = await operation();
       // One line per finished stage, so a slow bootstrap says where (WS2-156).
       this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
-        stage, durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
+        stage, outcome: "succeeded", durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
       return result;
     } catch (error) {
       const known = error instanceof RemoteInstanceError;
       this.logger.warn({
+        event: "native.bootstrap.stage.failed",
+        outcome: "failed",
         assignmentId: this.assignment.id,
         attempt: this.assignment.attempt,
         stage,

@@ -52,6 +52,9 @@ import { isOnboardWorkAssignment, onboardTerminalResult, type OnboardWorkAssignm
 import { continuedSession } from "./continued-session.js";
 import { integrationTerminalResult, isIntegrationWorkAssignment, type IntegrationWorkAssignment, type IntegrationWorkCarrier } from "../integration/carrier.js";
 
+import type { DiagnosticCompanionInboxRecord } from "../state/diagnostic-companion-inbox.js";
+import { diagnosticCompanionOperationalObservation } from "../control/diagnostic-companion-observability.js";
+
 /**
  * Pull → claim → dispatch → report. Core owns admission and placement; the
  * supervisor validates every assignment locally, claims exactly the agent
@@ -182,6 +185,27 @@ export class WorkOrchestrator {
 
   activeCount(): number {
     return this.deps.journal.activeAssignments().length;
+  }
+
+  /** Join diagnostic intake to existing ownership; never create an admission. */
+  observeDiagnosticCompanion(record: DiagnosticCompanionInboxRecord) {
+    const match = record.companion.match;
+    const active = this.deps.journal.activeAssignments().find(entry =>
+      entry.assignmentId === match.assignmentId && entry.attempt === match.attempt,
+    );
+    const retained = active ? this.deps.journal.execution.start(match.assignmentId, match.attempt) : undefined;
+    const operation = active && retained && active.claimId === retained.admission.claimId
+      ? {
+          assignmentId: active.assignmentId, attempt: active.attempt,
+          claimId: retained.admission.claimId, executionId: retained.admission.executionGeneration,
+          runtimeIncarnationId: retained.admission.runnerIncarnation,
+        }
+      : null;
+    const observation = diagnosticCompanionOperationalObservation(record, operation);
+    if (observation.event === "runtime.diagnostic_companion.persisted") {
+      this.sessions.get(`${match.assignmentId}:${match.attempt}`)?.bindDiagnosticContext(observation.context);
+    }
+    return observation;
   }
 
   /** Logical session ids with an open (not yet closed) session on this machine. */
@@ -821,6 +845,10 @@ export class WorkOrchestrator {
       onClosed: async (closed, reason) => this.onSessionClosed(closed, reason, assertAuthority),
     });
     this.sessions.set(key, session);
+    // Intake can precede bootstrap; replay only the retained diagnostic join.
+    for (const record of this.deps.journal.diagnosticCompanions.all()) {
+      if (record.companion.match.assignmentId === assignment.id && record.companion.match.attempt === assignment.attempt) this.observeDiagnosticCompanion(record);
+    }
     // Bootstrap runs off-lane. Its cloud/file preflight may take arbitrarily
     // long without holding assignment delivery; durable local execution
     // activation happens only after that preflight succeeds.

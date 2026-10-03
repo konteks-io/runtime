@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { pino } from "pino";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -161,6 +162,30 @@ describe("relayed session (D98/D113/D114)", () => {
     });
     return { session, sent, runner, runnerCalls, journal, closed, transport };
   }
+
+  it("correlates a late diagnostic carrier on bootstrap failures without leaking it to other sessions", async () => {
+    const lines: Array<Record<string, unknown>> = [];
+    const logger = pino({ base: null }, { write: text => { lines.push(JSON.parse(text)); } });
+    const f = await build({ logger, prepareInputs: async () => { throw new RemoteInstanceError("workspace_binding_invalid", "invalid fixture binding"); } });
+    const context = {
+      schemaVersion: "observability-context-v1" as const,
+      traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+      tenantId: "tenant", sessionId: "s", assignmentId: assignment.id, attempt: assignment.attempt,
+      invocationId: "invocation", runtimeIncarnationId: "runtime", claimId: "claim", executionId: "execution",
+    };
+    expect(f.session.bindDiagnosticContext({ ...context, assignmentId: "other" })).toBe(false);
+    expect(f.session.bindDiagnosticContext({ ...context, traceparent: "invalid" })).toBe(false);
+    expect(f.session.bindDiagnosticContext(context)).toBe(true);
+    await expect(f.session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable" });
+    const failed = lines.find(line => line.event === "native.bootstrap.stage.failed");
+    expect(failed?.context).toEqual(context);
+    expect(failed).toMatchObject({ outcome: "failed", stage: "input_preparation", code: "workspace_binding_invalid" });
+    logger.info({ event: "unrelated" });
+    expect(lines.at(-1)).not.toHaveProperty("context");
+    const other = await build({ logger, prepareInputs: async () => { throw new RemoteInstanceError("workspace_binding_invalid", "other binding"); } });
+    await expect(other.session.bootstrap()).rejects.toMatchObject({ code: "capability_unavailable" });
+    expect(lines.filter(line => line.event === "native.bootstrap.stage.failed").at(-1)).not.toHaveProperty("context");
+  });
 
   it.each([false, true])("admits a legacy Codex reference only when the pinned owner proves it unloaded (unloaded=%s)", async unloaded => {
     const assertLegacyCodexThreadUnloaded = vi.fn(async () => unloaded);
@@ -540,7 +565,7 @@ describe("relayed session (D98/D113/D114)", () => {
         prepareInputs: async (target: RemoteWorkAssignment) => ({ binding: { workspaceId: target.workspaceId, sessionId: "s", assignmentId: target.id, instanceId: target.instanceId, attempt: target.attempt },
           cwd: own, skillInstructions: "", beforePrompt: async () => undefined }),
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false),
-        logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
+        logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn().mockReturnThis() } as never,
       });
       try {
         await f.session.bootstrap();
@@ -922,7 +947,7 @@ describe("relayed session (D98/D113/D114)", () => {
     const warn = vi.fn();
     const failed = await build({
       prepareInputs: async () => { throw new Error("input delivery failed secret-body"); },
-      logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
+      logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn().mockReturnThis() } as never,
     });
     await expect(failed.session.bootstrap()).rejects.toThrow();
     expect(failed.runner.createSession).not.toHaveBeenCalled();
@@ -969,7 +994,7 @@ describe("relayed session (D98/D113/D114)", () => {
     const toolWiring = new Promise<void>(resolve => { finishWiring = resolve; });
     const info = vi.fn();
     const { session, runner } = await build({
-      logger: { warn: vi.fn(), info, error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never,
+      logger: { warn: vi.fn(), info, error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn().mockReturnThis() } as never,
       prepareInputs: async () => {
         order.push("inputs");
         return { binding: { workspaceId: "ws", sessionId: "s", assignmentId: "asg", instanceId: "inst", attempt: 1 }, cwd: "/private/native/checkout",
@@ -1254,7 +1279,7 @@ describe("relayed session (D98/D113/D114)", () => {
 
   it("relays every streamed chunk after one that ends inside a local path (D121)", async () => {
     const warn = vi.fn();
-    const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never });
+    const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn().mockReturnThis() } as never });
     await session.bootstrap();
     const before = sent.length;
     const chunk = (text: string) => session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: {
@@ -1283,7 +1308,7 @@ describe("relayed session (D98/D113/D114)", () => {
 
   it("names the refused field when a redacted update still fails the relay contract (D121)", async () => {
     const warn = vi.fn();
-    const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never });
+    const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn().mockReturnThis() } as never });
     await session.bootstrap();
     const before = sent.length;
     // Within the 2048-character title bound before redaction, past it after.
