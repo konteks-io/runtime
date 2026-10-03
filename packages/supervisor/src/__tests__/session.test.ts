@@ -406,6 +406,51 @@ describe("relayed session (D98/D113/D114)", () => {
       }
       upstream.close();
     });
+
+    it("refuses every MCP server's tool but the session's own: account connectors, a repository's, the person's (S0-2)", async () => {
+      const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+      const f = await build({ policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) },
+        { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } } as RemoteWorkAssignment);
+      await f.session.bootstrap();
+      const names = (f.runnerCalls[0]?.[1][0] as { mcpServers: Array<{ name: string }> }).mcpServers.map(server => server.name);
+      const ask = (requestId: string, toolName: string) => f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId,
+        params: { sessionId: "acp-1", options, toolCall: { toolCallId: requestId, kind: "other", title: toolName, _meta: { claudeCode: { toolName } } } } } as never);
+      await ask("own", `mcp__${names[0]}__platform__builtin__list_sessions`);
+      await ask("connector", "mcp__claude_ai_Atlassian__getJiraIssue");
+      await ask("repository", "mcp__project_fixture__echo_allowed");
+      const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId ?? "none";
+      expect({ own: answer("own"), connector: answer("connector"), repository: answer("repository") }).toEqual({ own: "once", connector: "reject", repository: "reject" });
+      expect(f.sent.some(message => (message.body as { method?: string }).method === "session/request_permission")).toBe(false);
+      await f.session.close("cancelled");
+    });
+
+    it("decides Claude Code's and Codex's browser calls by the tool's structured identity, never by a title (S0-4)", async () => {
+      const options = [{ optionId: "always", name: "Always", kind: "allow_always" }, { optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
+      for (const agentId of ["claude-code", "codex"] as const) {
+        const f = await build({ preview: access(() => "http://127.0.0.1:9"), policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false) },
+          { ...assignment, kind: "qa", agentRoute: { requiredRole: "qa", agentId } } as RemoteWorkAssignment);
+        (f.runner as { browserVersion?: () => string | null }).browserVersion = () => "0.0.82";
+        await f.session.bootstrap();
+        const update = (value: Record<string, unknown>) => f.session.onRunnerEvent({ kind: "session_update", acpSessionRef: "acp-1", params: { sessionId: "acp-1", update: value } });
+        const ask = (requestId: string, params: Record<string, unknown>) =>
+          f.session.onRunnerEvent({ kind: "permission_request", acpSessionRef: "acp-1", requestId, params: { sessionId: "acp-1", options, ...params } } as never);
+        const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId ?? "none";
+        if (agentId === "claude-code") {
+          const tool = (toolName: string, toolCall: Record<string, unknown> = {}) => ({ toolCall: { toolCallId: toolName, kind: "other", title: toolName, ...toolCall, _meta: { claudeCode: { toolName } } } });
+          await ask("navigate", tool("mcp__konteks-browser__browser_navigate"));
+          await ask("spoof", tool("Bash", { kind: "execute", title: "mcp__konteks-browser__browser_navigate", rawInput: { command: "git push origin main" } }));
+          await ask("bare", { toolCall: { toolCallId: "bare", kind: "other", title: "mcp__konteks-browser__browser_navigate" } });
+        } else {
+          await update({ sessionUpdate: "tool_call", toolCallId: "item-1", kind: "execute", title: "mcp.konteks-browser.browser_navigate", status: "in_progress",
+            rawInput: { server: "konteks-browser", tool: "browser_navigate", arguments: {} }, _meta: { is_mcp_tool_call: true } });
+          await ask("navigate", { toolCall: { toolCallId: "item-1", kind: "execute", status: "pending" }, _meta: { is_mcp_tool_approval: true } });
+          await ask("spoof", { toolCall: { toolCallId: "never-announced", kind: "execute", status: "pending", title: "mcp.konteks-browser.browser_navigate" }, _meta: { is_mcp_tool_approval: true } });
+          await ask("bare", { toolCall: { toolCallId: "bare", kind: "other", title: "mcp__konteks-browser__browser_navigate" } });
+        }
+        expect({ agentId, navigate: answer("navigate"), spoof: answer("spoof"), bare: answer("bare") }).toEqual({ agentId, navigate: "once", spoof: "reject", bare: "reject" });
+        await f.session.close("cancelled");
+      }
+    });
   });
 
   it("reports native interruption even when the broken relay cannot carry session_closed", async () => {

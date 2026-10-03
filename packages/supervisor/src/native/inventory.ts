@@ -41,6 +41,12 @@ export interface NativeInventoryOptions {
   decorateAgents?: (agents: ConnectedAgentView[]) => Promise<ConnectedAgentView[]>;
   /** The machine's git probe (OB6 §1); omitted, the runtime is not `onboard`. */
   gitVersion?: () => Promise<string | null>;
+  /**
+   * The personal Claude Code executable's identity
+   * (`claude-code-executable:<version>:sha256:<hex>`, `claude-executable-identity.ts`):
+   * a change invalidates anything certified against the previous one (S0-5).
+   */
+  claudeExecutable?: () => Promise<string | null>;
   now?: () => Date;
 }
 
@@ -71,6 +77,7 @@ export class NativeInventoryCollector {
   async collect(): Promise<InventorySnapshot> {
     const at = this.now().toISOString();
     const gitVersion = await (this.options.gitVersion?.().catch(() => null) ?? Promise.resolve(null));
+    const claudeExecutable = await (this.options.claudeExecutable?.().catch(() => null) ?? Promise.resolve(null));
     const [signals, results] = await Promise.all([
       this.options.sampler.sample(this.now).then(value => UtilizationSignalsSchema.safeParse(value)).catch(() => null),
       Promise.all([...this.options.runners].map(async ([agentId, runner]) => {
@@ -111,6 +118,7 @@ export class NativeInventoryCollector {
     // capabilities are advertised whenever git answers, and withheld the moment
     // it does not (OB6 §1).
     capabilities.push(...onboardCapabilities(gitVersion));
+    if (claudeExecutable !== null) capabilities.push(claudeExecutable);
     // This build names the person's coding sessions from Core's display label;
     // an older one rejects the field, so Core sends it only on this signal.
     if (agents.some(agent => agent.readiness === "ready" && agent.connectionState === "ready")) capabilities.push(REMOTE_SESSION_LABEL_CAPABILITY);

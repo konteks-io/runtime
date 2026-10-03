@@ -34,3 +34,27 @@ export async function isolateClaudeInstructions(settings, cwd, userConfigDir) {
   }
   return { ...base, claudeMdExcludes: [...excluded], autoMemoryEnabled: false };
 }
+
+// Stage 0 (S0-1): the repository a Konteks session works in chose its hooks,
+// not the person who started the session. As flag settings these outrank the
+// project's own, and they switch off only settings hooks: the SDK's callback
+// hooks (the bridge's PostToolUse, Stop, Task and model-switch hooks) still run.
+// S0-2: the account's claude.ai connectors are not fetched or connected (the
+// bridge's strictMcpConfig already leaves them out; this holds on its own).
+//
+// CP2 (external-integration): an integration task's own session admits the
+// account connectors so the bound one can be called; every call still meets
+// the connector's integration gate, and its hooks stay off.
+export function hardenClaudeSession(settings, accountConnectors = false) {
+  const hardened = { ...(settings ?? {}), disableAllHooks: true };
+  if (accountConnectors) delete hardened.disableClaudeAiConnectors;
+  else hardened.disableClaudeAiConnectors = true;
+  return hardened;
+}
+
+// Only the connector's integration session/new carries this, versioned; any
+// other shape (or a client option) admits nothing.
+export function konteksAccountConnectors(meta) {
+  const integration = meta && typeof meta === 'object' ? meta.konteksIntegration : undefined;
+  return Boolean(integration && typeof integration === 'object' && integration.version === 1 && integration.accountConnectors === true);
+}

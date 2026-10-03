@@ -49,6 +49,15 @@ describe("native in-process runner (A4)", () => {
     expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: { konteksSession: { version: 1,
       title: `[konteks/Todo List/initiative] [v3] Stand up the todo list API ${acpSessionRef.slice(-8)}` } } }));
   });
+  it("passes an integration session's admission to the bridge, bounded, and only on a new session", async () => {
+    const f = fixture(); await f.runner.start();
+    await f.runner.createSession({ ...f.input, integration: { admittedMcpServerNames: ["atlassian"], accountConnectors: false } });
+    expect(f.connection.newSession).toHaveBeenCalledWith(expect.objectContaining({ _meta: expect.objectContaining({
+      konteksIntegration: { version: 1, admittedMcpServerNames: ["atlassian"], accountConnectors: false } }) }));
+    await expect(f.runner.createSession({ ...f.input, integration: { admittedMcpServerNames: ["a b; rm"], accountConnectors: false } })).rejects.toThrow();
+    await expect(f.runner.createSession({ ...f.input, integration: { admittedMcpServerNames: Array.from({ length: 9 }, (_, i) => `s${i}`), accountConnectors: false } })).rejects.toThrow();
+  });
+
   it("asks a direct session's agent only for the [konteks] prefix ahead of its own title", async () => {
     const f = fixture(); await f.runner.start();
     await f.runner.createSession({ ...f.input, agentTitled: true });

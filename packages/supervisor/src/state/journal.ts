@@ -189,6 +189,24 @@ export type RecoveryEvidenceRecord = z.infer<typeof RecoveryEvidenceRecordSchema
 export const recoveryEvidenceRecordKey = (record: Pick<RecoveryEvidenceRecord, "evidence"> | RemoteRecoveryEvidence): string =>
   remoteRecoveryEvidenceIdentityKey("evidence" in record ? record.evidence : record);
 
+/**
+ * One consumed integration write grant (external-integration CP2): the gate
+ * records it BEFORE it answers `allow_once`, so a nonce allows at most one
+ * provider call even across a crash or a repeated assignment. Identifiers and
+ * digests only, never arguments or credentials (N05: the attempt journal
+ * survives restart without storing credentials).
+ */
+export const IntegrationWriteRecordSchema = z.object({
+  nonce: z.string().min(1).max(256),
+  taskId: z.string().min(1).max(256),
+  actionId: z.string().min(1).max(256),
+  attemptId: z.string().min(1).max(256),
+  argsDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  toolCallId: z.string().min(1).max(256),
+  consumedAt: z.string(),
+}).strict();
+export type IntegrationWriteRecord = z.infer<typeof IntegrationWriteRecordSchema>;
+
 const MAX_JOURNAL_ENTRIES = 2_000;
 const COMPACT_EVERY_APPENDS = 500;
 
@@ -439,6 +457,8 @@ export class SupervisorJournal {
   readonly erase: AppendLog<EraseRecord>;
   /** C03 local durable evidence. Never use this table as a terminal owner. */
   readonly recoveryEvidence: AppendLog<RecoveryEvidenceRecord>;
+  /** Consumed integration write nonces (external-integration CP2); never pruned with assignments. */
+  readonly integrationWrites: AppendLog<IntegrationWriteRecord>;
   readonly planning: PlanningTerminalJournal;
   private readonly planningLog: AppendLog<PlanningTerminalRecord>;
   readonly cancellations: CancellationInbox;
@@ -476,13 +496,14 @@ export class SupervisorJournal {
     this.decisions = new AppendLog(dir, { name: "decisions", schema: DecisionRecordSchema, key: (entry) => `${entry.manifestId}:${entry.assignmentId}:${entry.attempt}` }, MAX_JOURNAL_ENTRIES, mutate);
     this.manifests = new AppendLog(dir, { name: "reconciliation-manifests", schema: ReconciliationManifestRecordSchema, key: entry => entry.manifestId }, MAX_JOURNAL_ENTRIES, mutate);
     this.erase = new AppendLog(dir, { name: "erase", schema: EraseRecordSchema, key: (entry) => entry.directiveId }, 500, mutate);
+    this.integrationWrites = new AppendLog(dir, { name: "integration-writes", schema: IntegrationWriteRecordSchema, key: entry => entry.nonce }, MAX_JOURNAL_ENTRIES * 4, mutate);
     this.recoveryEvidence = new AppendLog(dir, { name: "recovery-evidence", schema: RecoveryEvidenceRecordSchema, key: recoveryEvidenceRecordKey }, MAX_JOURNAL_ENTRIES, mutate);
     this.planningLog = new AppendLog(dir, { name: "planning-terminal", schema: PlanningTerminalRecordSchema, key: planningTerminalRecordKey, atomicBatches: true }, MAX_JOURNAL_ENTRIES * 4, mutate);
     this.planning = new PlanningTerminalJournal(this.planningLog);
   }
 
   async load(): Promise<void> {
-    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryEvidence.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load(), this.executionRevisionFenceLog.load(), this.diagnosticCompanionLog.load()]);
+    await Promise.all([this.assignments.load(), this.pendingRequests.load(), this.decisions.load(), this.manifests.load(), this.erase.load(), this.recoveryEvidence.load(), this.integrationWrites.load(), this.recoveryLog.load(), this.executionLog.load(), this.planningLog.load(), this.cancellationLog.load(), this.executionRevisionFenceLog.load(), this.diagnosticCompanionLog.load()]);
   }
 
   /** Bounded pruning: completed/cancelled entries beyond the bound go first, oldest first. */

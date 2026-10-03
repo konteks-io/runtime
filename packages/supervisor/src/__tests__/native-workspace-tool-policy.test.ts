@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
+import { McpToolCallLedger } from "../session/permission-tool-identity.js";
 import { EvaluatorPolicyResponder } from "../session/policy-responder.js";
 import { DEFAULT_BASH_BLOCKLIST, POLICY_REFUSAL_PREFIX, blockedCommandPattern, createWorkspaceToolPolicy, describeRefusedPath, isWithinWorkspace, type WorkspaceToolPolicyEvaluation } from "../session/workspace-tool-policy.js";
 
@@ -35,16 +36,23 @@ describe("native workspace tool policy", () => {
 
   it("allows the QA browser's tools only on a session given the browser, and never the unsafe ones", async () => {
     const browser = { ...context, browserTools: true };
-    await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-browser__browser_navigate", rawInput: { url: "http://127.0.0.1:43100/" } }), browser))
+    // Identity is the bridge's structured tool name (S0-4), never the title.
+    const claude = (toolName: string, rest: Record<string, unknown> = {}) => request({ kind: "other", title: toolName, ...rest, _meta: { claudeCode: { toolName } } });
+    await expect(responder.evaluatePermission(claude("mcp__konteks-browser__browser_navigate", { rawInput: { url: "http://127.0.0.1:43100/" } }), browser))
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
-    await expect(responder.evaluatePermission(request({ kind: "other", title: "konteks-browser.browser_click" }), browser))
+    const ledger = new McpToolCallLedger();
+    ledger.observe({ sessionUpdate: "tool_call", toolCallId: "t1", rawInput: { server: "konteks-browser", tool: "browser_click", arguments: {} }, _meta: { is_mcp_tool_call: true } });
+    await expect(responder.evaluatePermission({ ...request({ kind: "execute", status: "pending" }), _meta: { is_mcp_tool_approval: true } } as RequestPermissionRequest, { ...browser, agentId: "codex", ledger }))
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
-    await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-browser__browser_navigate" }), context))
+    await expect(responder.evaluatePermission(claude("mcp__konteks-browser__browser_navigate"), context))
       .resolves.toEqual({ kind: "deny", optionId: "reject" });
-    await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-browser__browser_run_code_unsafe" }), browser))
+    await expect(responder.evaluatePermission(claude("mcp__konteks-browser__browser_run_code_unsafe"), browser))
+      .resolves.toEqual({ kind: "deny", optionId: "reject" });
+    // A title alone allows nothing.
+    await expect(responder.evaluatePermission(request({ kind: "other", title: "mcp__konteks-browser__browser_navigate" }), browser))
       .resolves.toEqual({ kind: "deny", optionId: "reject" });
     // Human deferral is never how a browser call is decided.
-    await expect(new EvaluatorPolicyResponder(null, () => true).evaluatePermission(request({ kind: "other", title: "mcp__konteks-browser__browser_route" }), browser))
+    await expect(new EvaluatorPolicyResponder(null, () => true).evaluatePermission(claude("mcp__konteks-browser__browser_route"), browser))
       .resolves.toEqual({ kind: "deny", optionId: "reject" });
   });
 
