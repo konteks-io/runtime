@@ -191,7 +191,7 @@ export class NativeEnrollment {
         {
           email: input.email,
           ...(input.tenantId ? { tenantId: input.tenantId } : {}),
-          // The runtime this machine was before it lost its key (W1-L1).
+          // The runtime this machine was before it lost its key.
           ...(input.replacesInstanceId ? { replacesInstanceId: input.replacesInstanceId } : {}),
         },
         key,
@@ -200,43 +200,53 @@ export class NativeEnrollment {
         BoundSchema,
         // Binding a new address creates its workspace, which takes tens of
         // seconds; Core allows two minutes for it, so this waits longer still
-        // rather than give up on a bind that is about to succeed (WS1-014).
+        // rather than give up on a bind that is about to succeed.
         BIND_TIMEOUT_MS,
       );
       const release = verifyNativeRelease(bound.bundleManifest, this.options.roots ?? EMBEDDED_RELEASE_ROOTS, this.options.clock.now());
       if (release.manifest.digest !== input.expectedManifestDigest) {
         throw new RemoteInstanceError("bundle_untrusted", "The bound bundle differs from the independently verified release this machine staged.");
       }
-      const activationId = bound.activationId ?? `enrollment:${intentRef}`;
-      const exchangeNonce = randomUUID();
-      await store.saveIdentity({
-        instanceId: bound.identity.instanceId,
-        workspaceId: bound.identity.workspaceId,
-        activationId,
-        activatedAt: this.options.clock.nowIso(),
-        administrativeStatus: "provisioning",
-        exchangeNonce,
-      });
-      await store.saveProvisioning({
-        provisioningCredential: bound.provisioningCredential,
-        provisioningCredentialExpiresAt: bound.provisioningCredentialExpiresAt,
-        provisioningWindowExpiresAt: bound.provisioningWindowExpiresAt,
-        manifestDigest: release.manifest.digest,
-        lastRefreshAt: null,
-      });
-      await store.saveManifest(release.manifest, release.manifest.digest);
-      const journal = new SupervisorJournal(store.path("journal"), mutations.run);
-      await journal.load();
-      const keyDigest = jcsDigest(key.publicKeyJwk as never);
-      if (!journal.execution.enrollment()) {
-        await journal.execution.seedEnrollment({ enrollmentId: randomUUID(), activationId, keyDigest, createdAt: this.options.clock.nowIso() });
-      }
-      const seed = journal.execution.enrollment();
-      if (seed && !("instanceId" in seed)) {
-        await journal.execution.bindEnrollment({ ...seed, instanceId: bound.identity.instanceId, workspaceId: bound.identity.workspaceId, exchangeNonce });
-      }
+      await this.recordBound(bound, release, { intentRef, key, store, mutations });
       return bound;
     });
+  }
+
+  /** Identity, provisioning state and manifest record, then the journal's enrollment lineage seeded and bound. */
+  private async recordBound(
+    bound: z.infer<typeof BoundSchema>,
+    release: ReturnType<typeof verifyNativeRelease>,
+    held: { intentRef: string; key: { publicKeyJwk: unknown }; store: SupervisorStore; mutations: StateMutationGate },
+  ): Promise<void> {
+    const { intentRef, key, store, mutations } = held;
+    const activationId = bound.activationId ?? `enrollment:${intentRef}`;
+    const exchangeNonce = randomUUID();
+    await store.saveIdentity({
+      instanceId: bound.identity.instanceId,
+      workspaceId: bound.identity.workspaceId,
+      activationId,
+      activatedAt: this.options.clock.nowIso(),
+      administrativeStatus: "provisioning",
+      exchangeNonce,
+    });
+    await store.saveProvisioning({
+      provisioningCredential: bound.provisioningCredential,
+      provisioningCredentialExpiresAt: bound.provisioningCredentialExpiresAt,
+      provisioningWindowExpiresAt: bound.provisioningWindowExpiresAt,
+      manifestDigest: release.manifest.digest,
+      lastRefreshAt: null,
+    });
+    await store.saveManifest(release.manifest, release.manifest.digest);
+    const journal = new SupervisorJournal(store.path("journal"), mutations.run);
+    await journal.load();
+    const keyDigest = jcsDigest(key.publicKeyJwk as never);
+    if (!journal.execution.enrollment()) {
+      await journal.execution.seedEnrollment({ enrollmentId: randomUUID(), activationId, keyDigest, createdAt: this.options.clock.nowIso() });
+    }
+    const seed = journal.execution.enrollment();
+    if (seed && !("instanceId" in seed)) {
+      await journal.execution.bindEnrollment({ ...seed, instanceId: bound.identity.instanceId, workspaceId: bound.identity.workspaceId, exchangeNonce });
+    }
   }
 
   /**

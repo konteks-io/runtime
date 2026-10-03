@@ -18,62 +18,112 @@ export interface NativeRootLock {
  */
 export function acquireNativeRootLock(dataDir: string, options: { onLost?: () => void; checkIntervalMs?: number } = {}): NativeRootLock {
   if (!isAbsolute(dataDir)) throw new RemoteInstanceError("install_state_corrupt", "Native state requires an absolute private directory.");
-  let sqlite: typeof import("node:sqlite");
-  try { sqlite = loadSqlite(); }
-  catch { throw new RemoteInstanceError("prerequisite_missing", "Native ownership requires the bundled Node runtime with SQLite support."); }
+  const sqlite = sqliteModule();
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const directory = lstatSync(dataDir);
   if (!directory.isDirectory() || !restricted(directory)) throw unsafe();
   const canonicalRoot = realpathSync(dataDir);
   const path = join(canonicalRoot, NATIVE_ROOT_LOCK_FILE);
+  const original = lockFile(path);
+  const db = exclusiveTransaction(sqlite, path);
+  return new HeldRootLock({ path, original, canonicalRoot, directory, db }, options).start();
+}
+
+function sqliteModule(): typeof import("node:sqlite") {
+  try {
+    return loadSqlite();
+  } catch {
+    throw new RemoteInstanceError("prerequisite_missing", "Native ownership requires the bundled Node runtime with SQLite support.");
+  }
+}
+
+/** The lock file, created once and never replaced: a single private link of bounded size. */
+function lockFile(path: string): Stats {
   try { closeSync(openSync(path, "wx", 0o600)); }
   catch (error) { if (!isFsErrorWithCode(error, "EEXIST")) throw unsafe(); }
   const original = lstatSync(path);
   if (!original.isFile() || original.nlink !== 1 || !restricted(original) || original.size > 65_536) throw unsafe();
-  let db: DatabaseSync | undefined;
-  try {
-    // Loaded only for native mode. Distribution must supply the tested Node
-    // runtime with node:sqlite; an unavailable module is a preflight failure.
-    db = new sqlite.DatabaseSync(path);
-    db.exec("PRAGMA busy_timeout=0; PRAGMA journal_mode=DELETE; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;");
-  } catch (error) {
-    db?.close();
-    if (typeof error === "object" && error !== null && "errcode" in error && (error.errcode === 5 || error.errcode === 6)) {
-      throw new RemoteInstanceError("temporarily_unavailable", "Another connector owns this native data directory.");
-    }
-    throw unsafe();
-  }
-  let released = false;
-  let lost = false;
-  let timer: NodeJS.Timeout | null = null;
-  const assertOwned = (): void => {
-    if (released || lost) throw unsafe();
-    try {
-      const current = lstatSync(path);
-      const root = lstatSync(canonicalRoot);
-      if (!current.isFile() || current.ino !== original.ino || current.dev !== original.dev || current.nlink !== 1 || !restricted(current) || !root.isDirectory() || root.ino !== directory.ino || root.dev !== directory.dev || !restricted(root)) throw unsafe();
-    } catch {
-      lost = true;
-      if (timer) clearInterval(timer);
-      options.onLost?.();
-      throw unsafe();
-    }
-  };
-  try { assertOwned(); }
-  catch (error) { db.close(); throw error; }
-  timer = setInterval(() => { try { assertOwned(); } catch { /* The owner is notified once; never reacquire. */ } }, options.checkIntervalMs ?? 1_000);
-  timer.unref();
-  return {
-    assertOwned,
-    release() {
-      if (released) return;
-      released = true;
-      if (timer) clearInterval(timer);
-      db.close();
-    },
-  };
+  return original;
 }
 
+/**
+ * Loaded only for native mode. Distribution must supply the tested Node
+ * runtime with node:sqlite; an unavailable module is a preflight failure.
+ */
+function exclusiveTransaction(sqlite: typeof import("node:sqlite"), path: string): DatabaseSync {
+  let db: DatabaseSync | undefined;
+  try {
+    db = new sqlite.DatabaseSync(path);
+    db.exec("PRAGMA busy_timeout=0; PRAGMA journal_mode=DELETE; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;");
+    return db;
+  } catch (error) {
+    db?.close();
+    if (sqliteBusy(error)) throw new RemoteInstanceError("temporarily_unavailable", "Another connector owns this native data directory.");
+    throw unsafe();
+  }
+}
+
+/** SQLITE_BUSY or SQLITE_LOCKED: another process holds the exclusive transaction. */
+function sqliteBusy(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "errcode" in error && (error.errcode === 5 || error.errcode === 6);
+}
+
+interface HeldLock {
+  path: string;
+  original: Stats;
+  canonicalRoot: string;
+  directory: Stats;
+  db: DatabaseSync;
+}
+
+/** An acquired lock, checked every interval; once lost it is never reacquired. */
+class HeldRootLock {
+  private released = false;
+  private lost = false;
+  private timer: NodeJS.Timeout | null = null;
+
+  constructor(private readonly held: HeldLock, private readonly options: { onLost?: () => void; checkIntervalMs?: number }) {}
+
+  start(): NativeRootLock {
+    try { this.assertOwned(); }
+    catch (error) { this.held.db.close(); throw error; }
+    this.timer = setInterval(() => { try { this.assertOwned(); } catch { /* The owner is notified once; never reacquire. */ } }, this.options.checkIntervalMs ?? 1_000);
+    this.timer.unref();
+    return { assertOwned: () => this.assertOwned(), release: () => this.release() };
+  }
+
+  private assertOwned(): void {
+    if (this.released || this.lost) throw unsafe();
+    try {
+      if (!this.stillHeld()) throw unsafe();
+    } catch {
+      this.lost = true;
+      if (this.timer) clearInterval(this.timer);
+      this.options.onLost?.();
+      throw unsafe();
+    }
+  }
+
+  /** The same private lock file in the same private root directory. */
+  private stillHeld(): boolean {
+    const current = lstatSync(this.held.path);
+    const root = lstatSync(this.held.canonicalRoot);
+    const { original, directory } = this.held;
+    return current.isFile() && sameEntry(current, original) && current.nlink === 1 && restricted(current) &&
+      root.isDirectory() && sameEntry(root, directory) && restricted(root);
+  }
+
+  private release(): void {
+    if (this.released) return;
+    this.released = true;
+    if (this.timer) clearInterval(this.timer);
+    this.held.db.close();
+  }
+}
+
+function sameEntry(a: Stats, b: Stats): boolean {
+  return a.ino === b.ino && a.dev === b.dev;
+}
 function restricted(stat: Stats): boolean {
   return process.platform === "win32" || ((Number(stat.mode) & 0o077) === 0 && Number(stat.uid) === process.getuid?.());
 }

@@ -2,7 +2,7 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
 import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServer, runnerBrowserVersion, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
-import { AgentLoginGcpSchema, AgentLoginOptionIdSchema, RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, type RetainedProcessOwner } from "@konteks/remote-common";
+import { AgentLoginGcpSchema, AgentLoginOptionIdSchema, RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, withoutUndefined, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { RunnerHostSettings, RunnerLoginRequest, RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 import type { checkDshKonteksProfile } from "./dsh-profile-check.js";
 import type { checkOpenCodeKonteksConfig } from "./opencode-self-check.js";
@@ -17,9 +17,6 @@ const loginRequestSchema = z.object({
   reuse: z.boolean().optional(),
   gcp: AgentLoginGcpSchema.optional(),
 }).strict();
-function withoutUndefined<T extends object>(value: T): { [K in keyof T]: Exclude<T[K], undefined> } {
-  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as { [K in keyof T]: Exclude<T[K], undefined> };
-}
 const inputSchema = z.object({
   context: SessionContextSchema,
   readinessDeadlineAt: z.string().datetime({ offset: true }),
@@ -63,6 +60,13 @@ export interface NativeRunnerOptions {
 }
 
 /** Host-only runtime adapter. It never starts the legacy runner HTTP/WS API. */
+function parsedLoginRequest(request: RunnerLoginRequest | undefined) {
+  if (request === undefined) return undefined;
+  const parsed = loginRequestSchema.safeParse(request);
+  if (!parsed.success) throw invalid();
+  return withoutUndefined(parsed.data);
+}
+
 export class NativeRunner implements RunnerPort {
   readonly agentId: string;
   private readonly runtime: AgentRuntime;
@@ -217,15 +221,30 @@ export class NativeRunner implements RunnerPort {
     const parsed = inputSchema.safeParse(input);
     if (!parsed.success) throw invalid();
     if (parsed.data.context.instanceId !== this.options.instanceId || parsed.data.context.agentId !== this.agentId) throw bindingInvalid();
-    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, restoreAcpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser, integration } = parsed.data;
+    const args = this.sessionArgs(parsed.data, lifecycle);
+    if (parsed.data.acpSessionRef !== undefined) return this.runtime.sessions.continueLive(args);
+    if (parsed.data.restoreAcpSessionRef !== undefined) return this.runtime.sessions.restore(args, parsed.data.restoreAcpSessionRef);
+    return this.runtime.sessions.create(args);
+  }
+
+  private sessionArgs(data: z.infer<typeof inputSchema>, lifecycle: RunnerSessionLifecycle | undefined) {
+    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser, integration } = data;
     // The session's browser is a stdio MCP server the agent launches (its own
     // package's, or the connector's for an agent without one); composed here,
     // where the paths are known.
     const browserServer = browser === undefined ? null : browserMcpServer(this.options.config, browser);
-    const mcpServers = browserServer === null ? parsed.data.mcpServers : [...parsed.data.mcpServers, browserServer];
-    const args = { context, readinessDeadlineAt, cwd, mcpServers, ...(sessionConfig === undefined ? {} : { sessionConfig }), ...(acpSessionRef === undefined ? {} : { acpSessionRef }),
-      ...(freshProviderSessionOnRestore === undefined ? {} : { freshProviderSessionOnRestore }),
-      ...(sessionLabel === undefined ? {} : { sessionLabel }), ...(agentTitled ? { agentTitled } : {}), ...(integration === undefined ? {} : { integration }), lifecycle: {
+    const mcpServers = browserServer === null ? data.mcpServers : [...data.mcpServers, browserServer];
+    return {
+      context, readinessDeadlineAt, cwd, mcpServers,
+      ...withoutUndefined({ sessionConfig, acpSessionRef, freshProviderSessionOnRestore, sessionLabel }),
+      ...(agentTitled ? { agentTitled } : {}),
+      ...withoutUndefined({ integration }),
+      lifecycle: this.sessionLifecycle(lifecycle),
+    };
+  }
+
+  private sessionLifecycle(lifecycle: RunnerSessionLifecycle | undefined) {
+    return {
       beforeCreate: async (ref: string) => { await lifecycle?.beforeCreate(ref); },
       recordProcessOwner: async (owner: RetainedProcessOwner) => { await lifecycle?.recordProcessOwner(owner); },
       replaceProcessOwner: async (previous: RetainedProcessOwner, replacement: RetainedProcessOwner) => {
@@ -233,12 +252,8 @@ export class NativeRunner implements RunnerPort {
         await lifecycle.replaceProcessOwner(previous, replacement);
       },
       assertCurrent: () => { this.requireReady(); lifecycle?.assertCurrent(); },
-    } };
-    if (acpSessionRef !== undefined) return this.runtime.sessions.continueLive(args);
-    if (restoreAcpSessionRef !== undefined) return this.runtime.sessions.restore(args, restoreAcpSessionRef);
-    return this.runtime.sessions.create(args);
+    };
   }
-
   private request(ref: string, id: string, method: "session/prompt" | "session/set_mode" | "session/set_config_option", params: unknown) {
     this.requireReady();
     const parsed = SessionToRuntimeMessageSchema.safeParse({ kind: "acp", method, id, params });
@@ -332,13 +347,11 @@ export class NativeRunner implements RunnerPort {
   async login(organization: boolean, loginId: string, personal = false, request?: RunnerLoginRequest) {
     this.requireStarted();
     if (typeof organization !== "boolean" || typeof personal !== "boolean" || !idSchema.safeParse(loginId).success) throw invalid();
-    const parsed = request === undefined ? undefined : loginRequestSchema.safeParse(request);
-    if (parsed && !parsed.success) throw invalid();
+    const loginRequest = parsedLoginRequest(request);
     await verifyNativeRunnerPackage(this.options.config);
     this.requireStarted();
-    return { loginId: this.runtime.startLogin({ organization, loginId, personal, ...(parsed?.data ? { request: withoutUndefined(parsed.data) } : {}) }).loginId };
+    return { loginId: this.runtime.startLogin({ organization, loginId, personal, ...(loginRequest ? { request: loginRequest } : {}) }).loginId };
   }
-
   async applyHostSettings(settings: RunnerHostSettings): Promise<void> {
     await this.runtime.applyHostSettings({ openCodeFreeModels: settings.openCodeFreeModels === true, coreAcceptsRouteBilling: settings.coreAcceptsRouteBilling === true });
   }

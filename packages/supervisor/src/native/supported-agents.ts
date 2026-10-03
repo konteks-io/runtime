@@ -64,15 +64,27 @@ export function versionFromRefusal(error: unknown): string | undefined {
 /** The state a refusal (a locator's, or a runner's failed start) means to a person. */
 export function stateForFailure(agentId: string, error: unknown): FailureState {
   const diagnostic = error instanceof RemoteInstanceError ? error.diagnostic : undefined;
-  if (diagnostic === "antigravity_unsupported_platform") return "not_supported_on_this_os";
-  if (diagnostic === "antigravity_not_fetched") return "not_added";
-  if (diagnostic?.endsWith("_not_found")) return "not_installed";
-  if (diagnostic?.endsWith("_unsupported_version")) return "unsupported_version";
+  if (diagnostic !== undefined) return diagnosticState(diagnostic);
   // Claude Code's and Codex's own tooling missing: their locators name no diagnostic.
-  if ((agentId === "claude-code" || agentId === "codex") && error instanceof RemoteInstanceError && error.code === "prerequisite_missing" && diagnostic === undefined) return "not_installed";
-  return "failed";
+  return bundledToolingMissing(agentId, error) ? "not_installed" : "failed";
 }
 
+/** Refusals whose diagnostic names a state of their own. */
+const DIAGNOSTIC_STATES = new Map<string, FailureState>([
+  ["antigravity_unsupported_platform", "not_supported_on_this_os"],
+  ["antigravity_not_fetched", "not_added"],
+]);
+
+function diagnosticState(diagnostic: string): FailureState {
+  const named = DIAGNOSTIC_STATES.get(diagnostic);
+  if (named) return named;
+  if (diagnostic.endsWith("_not_found")) return "not_installed";
+  return diagnostic.endsWith("_unsupported_version") ? "unsupported_version" : "failed";
+}
+
+function bundledToolingMissing(agentId: string, error: unknown): boolean {
+  return (agentId === "claude-code" || agentId === "codex") && error instanceof RemoteInstanceError && error.code === "prerequisite_missing";
+}
 function stateForView(facts: AddedAgentFacts): SupportedAgentState {
   const view = facts.view!;
   if (view.readiness === "ready" && view.connectionState === "ready") return "ready";
@@ -95,34 +107,37 @@ function installFacts(agentId: SupportedAgentId): Pick<SupportedAgentEntry, "sup
 
 /**
  * The five supported agents and their real state on this computer
- * (runtime-view R21), from what the connector already knows: a listed agent
+ * from what the connector already knows: a listed agent
  * from its runner (ready, needs or lost its sign-in, or failed) or from why it
  * is left out; an agent the installation does not list from the cached
  * detection. Every entry is checked against the heartbeat schema, and the
  * whole list always parses, so it can never cost a heartbeat.
  */
 export function projectSupportedAgents(inputs: SupportedAgentsInputs): SupportedAgentEntry[] {
-  const entries: SupportedAgentEntry[] = [];
-  for (const agentId of SUPPORTED_AGENT_IDS) {
-    const install = installFacts(agentId);
-    const added = inputs.added.get(agentId);
-    let state: SupportedAgentState;
-    let versionFound: string | undefined;
-    if (added) {
-      state = added.view ? stateForView(added) : stateForFailure(agentId, added.failure);
-      versionFound = added.version ?? (state === "unsupported_version" ? versionFromRefusal(added.failure) : undefined);
-    } else {
-      const detected = inputs.notAdded.get(agentId);
-      state = detected?.state ?? (agentId === "antigravity" ? "not_added" : "not_installed");
-      versionFound = detected?.versionFound;
-    }
-    const entry = { agentId, state, ...(versionFound ? { versionFound } : {}), ...install };
-    const parsed = SupportedAgentEntrySchema.safeParse(entry);
-    entries.push(parsed.success ? parsed.data : { agentId, state });
-  }
-  return SupportedAgentListSchema.parse(entries);
+  return SupportedAgentListSchema.parse(SUPPORTED_AGENT_IDS.map(agentId => supportedEntry(agentId, inputs)));
 }
 
+function supportedEntry(agentId: SupportedAgentId, inputs: SupportedAgentsInputs): SupportedAgentEntry {
+  const install = installFacts(agentId);
+  const { state, versionFound } = agentStanding(agentId, inputs);
+  const parsed = SupportedAgentEntrySchema.safeParse({ agentId, state, ...(versionFound ? { versionFound } : {}), ...install });
+  return parsed.success ? parsed.data : { agentId, state };
+}
+
+interface AgentStanding { state: SupportedAgentState; versionFound: string | undefined }
+
+/** A listed agent from its runner or why it is left out; any other from the cached detection. */
+function agentStanding(agentId: SupportedAgentId, inputs: SupportedAgentsInputs): AgentStanding {
+  const added = inputs.added.get(agentId);
+  if (added) return addedStanding(agentId, added);
+  const detected = inputs.notAdded.get(agentId);
+  return { state: detected?.state ?? (agentId === "antigravity" ? "not_added" : "not_installed"), versionFound: detected?.versionFound };
+}
+
+function addedStanding(agentId: SupportedAgentId, added: AddedAgentFacts): AgentStanding {
+  const state = added.view ? stateForView(added) : stateForFailure(agentId, added.failure);
+  return { state, versionFound: added.version ?? (state === "unsupported_version" ? versionFromRefusal(added.failure) : undefined) };
+}
 /** Replaceable checks, for tests only. */
 interface NotAddedDetectionDeps {
   claude?: () => Promise<unknown>;
@@ -142,34 +157,40 @@ interface NotAddedDetectionDeps {
  * whether this release pins a copy for this computer. Nothing is downloaded.
  */
 export async function detectNotAddedAgent(agentId: SupportedAgentId, deps: NotAddedDetectionDeps = {}): Promise<NotAddedAgentDetection> {
-  const outcome = async (locate: () => Promise<unknown>, found: (value: unknown) => string | undefined): Promise<NotAddedAgentDetection> => {
-    try {
-      const value = await locate();
-      const version = found(value);
-      return { state: "installed_not_added", ...(version ? { versionFound: version } : {}) };
-    } catch (error) {
-      // Installed but unsafe or unusable here (other users can change it, no Node for it) reads `failed`: adding it would refuse.
-      const state = stateForFailure(agentId, error);
-      const version = state === "unsupported_version" ? versionFromRefusal(error) : undefined;
-      return { state, ...(version ? { versionFound: version } : {}) };
-    }
+  if (agentId === "antigravity") return { state: antigravityPinnedHere(deps) ? "not_added" : "not_supported_on_this_os" };
+  const [locate, found] = notAddedLocators(deps)[agentId];
+  return locatedOutcome(agentId, locate, found);
+}
+
+type Locator = readonly [locate: () => Promise<unknown>, version: (value: unknown) => string | undefined];
+
+function notAddedLocators(deps: NotAddedDetectionDeps): Record<Exclude<SupportedAgentId, "antigravity">, Locator> {
+  const none = () => undefined;
+  const reported = (value: unknown) => (value as { version?: string }).version;
+  return {
+    "claude-code": [deps.claude ?? (() => resolveNativeClaudeExecutable()), none],
+    codex: [deps.codex ?? (() => resolveNativeCodexHome()), none],
+    dsh: [deps.dsh ?? (() => resolveNativeDshInstallation()), reported],
+    opencode: [deps.opencode ?? (() => resolveNativeOpenCodeInstallation()), reported],
   };
-  switch (agentId) {
-    case "claude-code":
-      return outcome(deps.claude ?? (() => resolveNativeClaudeExecutable()), () => undefined);
-    case "codex":
-      return outcome(deps.codex ?? (() => resolveNativeCodexHome()), () => undefined);
-    case "dsh":
-      return outcome(deps.dsh ?? (() => resolveNativeDshInstallation()), value => (value as { version?: string }).version);
-    case "opencode":
-      return outcome(deps.opencode ?? (() => resolveNativeOpenCodeInstallation()), value => (value as { version?: string }).version);
-    case "antigravity": {
-      const pinned = deps.antigravityPinned ?? (() => { try { antigravityPin(); return true; } catch { return false; } });
-      return { state: pinned() ? "not_added" : "not_supported_on_this_os" };
-    }
+}
+
+async function locatedOutcome(agentId: SupportedAgentId, locate: () => Promise<unknown>, found: (value: unknown) => string | undefined): Promise<NotAddedAgentDetection> {
+  try {
+    const version = found(await locate());
+    return { state: "installed_not_added", ...(version ? { versionFound: version } : {}) };
+  } catch (error) {
+    // Installed but unsafe or unusable here (other users can change it, no Node for it) reads `failed`: adding it would refuse.
+    const state = stateForFailure(agentId, error);
+    const version = state === "unsupported_version" ? versionFromRefusal(error) : undefined;
+    return { state, ...(version ? { versionFound: version } : {}) };
   }
 }
 
+function antigravityPinnedHere(deps: NotAddedDetectionDeps): boolean {
+  const pinned = deps.antigravityPinned ?? (() => { try { antigravityPin(); return true; } catch { return false; } });
+  return pinned();
+}
 /**
  * Every minute. It is a look at a few folders and at most a `--version`, and
  * a person who installs an agent expects to see it within about a minute; the
