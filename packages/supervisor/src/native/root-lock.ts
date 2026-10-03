@@ -92,3 +92,8 @@ function loadSqlite(): typeof import("node:sqlite") {
   if (builtin) return builtin as typeof import("node:sqlite");
   return createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 }
+
+/** Whether an error is this lock refusing because another connector holds the data directory. */
+export function ownedByAnotherConnector(error: unknown): boolean {
+  return error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message);
+}

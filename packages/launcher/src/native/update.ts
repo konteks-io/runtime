@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { basename, join, parse, resolve } from "node:path";
 import { RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
-import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, ownedByAnotherConnector, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
 import { moveRecordAndManifest, withRuntimeLocks } from "./install.js";
@@ -48,7 +48,7 @@ export type NativeUpdateStage =
 function installerLockForUpdate(root: string): ReturnType<typeof acquireNativeRootLock> {
   try { return acquireNativeRootLock(join(root, "installer")); }
   catch (error) {
-    if (error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message)) {
+    if (ownedByAnotherConnector(error)) {
       throw new RemoteInstanceError("temporarily_unavailable", "Another update or install of this connector is still running (it may be downloading a release). Wait for it to finish, then run `konteks-remote status`.", { cause: error });
     }
     throw error;

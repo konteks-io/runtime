@@ -5,7 +5,7 @@ import { mkdir, open, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { EMBEDDED_RELEASE_ROOTS, findAgentBridge, resolveNativeConnectorExecutable, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { createNativeService, hostAgentInstallAdapter, loadNativeInstallation, ownedByAnotherConnector, readNativeUpdateLedger, verifyInstalledNativeConnector, NATIVE_SHUTDOWN_RECEIPT_FILE, type HostAgentInstallAdapter, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { ReleaseAcceptedSchema, RemoteInstanceError, SupervisorStatusSchema, runCommand, sanitizeInheritedChildProcessEnv, writeSecretFile } from "@konteks/remote-common";
 import { agents, authLogin, authLogout, authStatus, doctor, gitKeyAdd, gitKeyList, gitKeyRemove, previewStatus, status, supportBundle, type ControlContext } from "./control-commands.js";
 import { SupervisorControl } from "../control.js";
@@ -14,7 +14,8 @@ import { terminalFetchConsent, type FetchConsent } from "./consent.js";
 import { closeAgentSetup, ensurePersonalAgent, isPersonalAgent, PERSONAL_AGENTS, productionAgentClosingDeps, setUpPersonalAgent } from "./agent-setup.js";
 import { confirm } from "../prompt.js";
 import { spawnEnrollmentStaging } from "./enrollment-staging.js";
-import { onboardCoreUrl, onboardFailureStep, runOnboard, type OnboardStep } from "./onboard.js";
+import { onboardCoreUrl, onboardFailureStep, runOnboard } from "./onboard.js";
+import type { OnboardStep } from "./onboard-session.js";
 import { describeServiceFailure, encodeServiceDefinition, nativePlatform, nativeServiceDefinition, NativeServiceCommandError, parseLoadedService, parseServiceExits, serviceRun, startNativeServiceDefinition, type HostOs, type NativeServiceCommand, type NativeServiceDefinition, type NativeServiceExecute, type NativeServiceRun } from "./service.js";
 import { clearServiceStartFailure, connectorLogFile, connectorLogTail, localServiceReport, readServiceStartFailure, recordServiceStartFailure } from "./service-report.js";
 import { verbose, verboseCommand } from "../verbose.js";
@@ -863,10 +864,6 @@ const DrainStatusSchema = z.object({ draining: z.boolean(), reason: z.string().n
 type ServiceCycleDeps = Pick<NativeAgentRemoveDeps, "execute" | "sleep" | "now" | "platform" | "stopDeadlineMs" | "pollMs">;
 
 /** True for the refusal a connector still holding the native data directory answers with. */
-function ownsDataDirectory(error: unknown): boolean {
-  return error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" && /owns this native data directory/.test(error.message);
-}
-
 /** The installation's service around a change to its record: drained and stopped first, the change retried while it lets go. */
 class ServiceCycle {
   private readonly stoppedCodes: readonly number[];
@@ -939,7 +936,7 @@ class ServiceCycle {
     for (;;) {
       try { return await operation(); }
       catch (error) {
-        if (!ownsDataDirectory(error)) throw error;
+        if (!ownedByAnotherConnector(error)) throw error;
         on.owned();
         if (this.deps.now() >= this.stopDeadline) throw error;
         on.beforeWait();

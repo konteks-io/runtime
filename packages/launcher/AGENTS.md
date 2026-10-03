@@ -13,7 +13,10 @@ uninstall. It talks to the running supervisor over the local control socket
 - `src/native/cli.ts`: `createNativeProgram`, the command table.
 - `src/native/commands.ts`: command actions, `serve`, service refresh.
 - `src/native/install.ts`, `agent-setup.ts`, `consent.ts`: install, agent add/remove.
-- `src/native/onboard.ts`, `graft.ts`: agent-first onboarding and Graft wiring.
+- `src/native/onboard.ts`: agent-first onboarding, one step per run (`STEPS`
+  table, retry and failure replies); `onboard-session.ts` holds what every
+  step shares, `onboard-connect.ts` / `onboard-system.ts` / `onboard-closing.ts`
+  the steps; `graft.ts`: Graft wiring.
 - `src/native/service.ts`: service definitions and errors.
 - `src/native/update-transaction.ts`, `update.ts`: stage, drain, swap, verify, roll back.
 - `src/native/launcher-delegate.ts`: the Windows MSI launcher hand-off.

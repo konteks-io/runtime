@@ -174,22 +174,23 @@ describe("native update transaction", () => {
     let serving: NativeRuntimeRecord | null = running ? input.previous : null;
     const ledger: unknown[] = [];
     const definition = { label: "svc", path: "/svc", contents: "", install: [], start: { command: "start", args: [] }, stop: { command: "stop", args: [] }, remove: [], status: { command: "status", args: [] }, requiresLinger: false };
+    // What the release being served answers, per control op.
+    const replies: Record<string, (served: NativeRuntimeRecord) => unknown> = {
+      drain: () => ({ activeAssignments: 0 }),
+      "drain.status": () => ({ draining: true, reason: "update", activeAssignments: 0, openSessions: 0 }),
+      "drain.cancel": () => ({ draining: false, reason: null, activeAssignments: 0, openSessions: 0 }),
+      status: served => ({ version: { bundle: input.gate === "wrong_version" ? "1.0.0" : served.bundleVersion } }),
+      agents: served => ({ agents: served.agents.map(agentId => ({ agentId, readiness: "ready" })) }),
+      doctor: served => ({ generatedAt: "2026-09-15T00:00:00Z", checks: [
+        { id: "agent_login", title: "login", status: "fail", detail: "pre-existing", recoveryActions: [] },
+        input.gate === "new_failure" && served.releaseId === "release-next" ? { id: "runner_spawn", title: "spawn", status: "fail", detail: "new", recoveryActions: [] } : { id: "runner_spawn", title: "spawn", status: "pass", detail: "ok", recoveryActions: [] },
+      ] }),
+    };
     const control = (_root: string, record: NativeRuntimeRecord) => ({
       call: async (request: { op: string }) => {
         calls.push(`control:${request.op}@${record.releaseId}`);
         if (!serving) throw new RemoteInstanceError("temporarily_unavailable", "socket closed");
-        switch (request.op) {
-          case "drain": return { activeAssignments: 0 };
-          case "drain.status": return { draining: true, reason: "update", activeAssignments: 0, openSessions: 0 };
-          case "drain.cancel": return { draining: false, reason: null, activeAssignments: 0, openSessions: 0 };
-          case "status": return { version: { bundle: input.gate === "wrong_version" ? "1.0.0" : serving.bundleVersion } };
-          case "agents": return { agents: serving.agents.map(agentId => ({ agentId, readiness: "ready" })) };
-          case "doctor": return { generatedAt: "2026-09-15T00:00:00Z", checks: [
-            { id: "agent_login", title: "login", status: "fail", detail: "pre-existing", recoveryActions: [] },
-            input.gate === "new_failure" && serving.releaseId === "release-next" ? { id: "runner_spawn", title: "spawn", status: "fail", detail: "new", recoveryActions: [] } : { id: "runner_spawn", title: "spawn", status: "pass", detail: "ok", recoveryActions: [] },
-          ] };
-          default: return {};
-        }
+        return (replies[request.op] ?? (() => ({})))(serving);
       },
     });
     const deps: NativeUpdateTransactionDeps = {
