@@ -45,6 +45,8 @@ describe("native background service definitions", () => {
     expect(script).toContain(`$env:KONTEKS_SERVICE_PROGRAM = '${executable.replace(/'/g, "''")}'`);
     expect(script).toContain(`$env:KONTEKS_SERVICE_ROOT = '${root.replace(/'/g, "''")}'`);
     expect(script).toContain('serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1');
+    expect(script).toContain('$start.UseShellExecute = $false');
+    expect(script).toContain('$start.CreateNoWindow = $true');
     expect(script).toContain('exit $connector.ExitCode');
     const run = vi.fn(() => 17), quit = vi.fn();
     runInNewContext(helper!.contents, { WScript: { CreateObject: () => ({ Run: run }), Quit: quit } });

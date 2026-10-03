@@ -360,6 +360,8 @@ function windowsServiceHost(input: { executable: string; root: string; logFile: 
     "  $start.FileName = [System.IO.Path]::Combine($env:SystemRoot, 'System32\\cmd.exe')",
     `  $start.Arguments = '/d /v:off /s /c ""%KONTEKS_SERVICE_PROGRAM%" serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1"'`,
     "  $start.UseShellExecute = $false",
+    // Suppress the child console too; the outer hidden host alone is not its contract.
+    "  $start.CreateNoWindow = $true",
     "  $connector = [System.Diagnostics.Process]::Start($start)",
     "  $connector.WaitForExit()",
     "  exit $connector.ExitCode",
