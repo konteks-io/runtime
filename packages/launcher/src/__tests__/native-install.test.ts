@@ -77,6 +77,28 @@ async function personOpenCode(root: string, version = "2.0.18", name = "@opencod
 }
 
 describe("native install composition", () => {
+  it("adds bundled Codex to a host-only DeepSeek installation without changing its identity, credentials or work", async () => {
+    const f = await fixture();
+    const dsh = await personDsh(f.root);
+    const installed = await installNative({ ...f.options, agents: ["dsh"] } as never);
+    const identity = await readFile(join(f.root, "supervisor", "identity.json"), "utf8");
+    await writeSecretFile(join(f.root, "credentials", "dsh", "keep"), "credential");
+    await writeFile(join(f.root, "workspaces", "dsh", "keep"), "work");
+    f.fetchFn.mockClear();
+
+    const added = await addNativeAgent({ root: f.root, agentId: "codex", output: f.options.output, deps: f.options.deps } as never);
+    const loaded = await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform });
+    expect(added).toMatchObject({ instanceId: installed.instanceId, workspaceId: installed.workspaceId, agents: ["dsh", "codex"], dshRoot: dsh.pkg });
+    expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["dsh", "codex"]);
+    expect(await readdir(join(f.root, "releases", added.releaseId, "agents"))).toEqual(["codex"]);
+    expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(identity);
+    expect(await readFile(join(f.root, "credentials", "dsh", "keep"), "utf8")).toBe("credential");
+    expect(await readFile(join(f.root, "workspaces", "dsh", "keep"), "utf8")).toBe("work");
+    expect(f.activate).toHaveBeenCalledTimes(1);
+    f.fetchFn.mockClear();
+    expect(await addNativeAgent({ root: f.root, agentId: "codex", output: f.options.output, deps: f.options.deps } as never)).toEqual(added);
+    expect(f.fetchFn).not.toHaveBeenCalled();
+  });
   it("moves a stopped installation off a port owned by another process without changing durable identity or work", async () => {
     const f = await fixture();
     const holder = createServer();
