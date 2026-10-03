@@ -1,9 +1,10 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Ajv, type ErrorObject, type ValidateFunction } from "ajv";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { STRUCTURED_RESULT_MCP_SERVER_NAME, STRUCTURED_RESULT_TOOL_NAME } from "@konteks/agent-core";
 import { createLogger, plainRecord, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import { bearerMatches, negotiatedProtocolVersion, readJsonBody, sendJson } from "../loopback-http.js";
 
 /**
  * The session's result tool, `submit_result`, as a connector-local loopback
@@ -122,23 +123,13 @@ function isStreamRequest(request: IncomingMessage): boolean {
   return request.method === "GET" && String(request.headers.accept ?? "").includes("text/event-stream");
 }
 
-/** The request body as JSON; null when it is not JSON or is larger than the limit. */
-async function jsonBody(request: IncomingMessage): Promise<{ value: unknown } | null> {
-  try {
-    return { value: JSON.parse((await readBounded(request, MAX_REQUEST_BYTES)).toString("utf8")) };
-  } catch {
-    return null;
-  }
-}
-
 function validRequest(request: JsonRpcRequest): boolean {
   return Boolean(request) && typeof request === "object" && typeof request.method === "string";
 }
 
 function initializeResult(params: unknown): Record<string, unknown> {
-  const asked = (params as { protocolVersion?: unknown } | undefined)?.protocolVersion;
   return {
-    protocolVersion: typeof asked === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(asked) ? asked : SUPPORTED_PROTOCOL_VERSIONS[0],
+    protocolVersion: negotiatedProtocolVersion(params, SUPPORTED_PROTOCOL_VERSIONS),
     capabilities: { tools: { listChanged: true } },
     serverInfo: { name: STRUCTURED_RESULT_MCP_SERVER_NAME, title: "Konteks turn result", version: "1.0.0" },
     instructions: `When a Konteks turn asks for a structured result, call ${STRUCTURED_RESULT_TOOL_NAME} once with it when you are finished. Do not call it otherwise.`,
@@ -251,15 +242,15 @@ export class StructuredResultToolServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     response.setHeader("Cache-Control", "no-store");
     if (this.closed) return this.fail(response, 503, "closed");
-    if (!this.authorized(request.headers.authorization)) return this.fail(response, 401, "invalid_local_credential");
+    if (!bearerMatches(request.headers.authorization, this.credential)) return this.fail(response, 401, "invalid_local_credential");
     if (isStreamRequest(request)) return this.openStream(request, response);
     if (request.method !== "POST") {
       response.setHeader("Allow", "POST");
       return this.fail(response, 405, "method_not_allowed");
     }
-    const payload = await jsonBody(request);
+    const payload = await readJsonBody(request, MAX_REQUEST_BYTES);
     if (payload === null) {
-      return this.json(response, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error (or a result larger than 512 KiB)" } });
+      return sendJson(response, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error (or a result larger than 512 KiB)" } });
     }
     return this.answerRpc(response, payload.value);
   }
@@ -274,7 +265,7 @@ export class StructuredResultToolServer {
       return void response.end();
     }
     response.setHeader("Mcp-Session-Id", this.mcpSessionId);
-    return this.json(response, 200, batch ? answers : answers[0]);
+    return sendJson(response, 200, batch ? answers : answers[0]);
   }
 
   private answerAll(requests: JsonRpcRequest[]): { answers: unknown[]; listed: boolean } {
@@ -295,6 +286,7 @@ export class StructuredResultToolServer {
       return { jsonrpc: "2.0", id: (item as JsonRpcRequest | null)?.id ?? null, error: { code: -32603, message: "Internal error" } };
     }
   }
+
   private settleListWaiters(): void {
     const waiters = this.listWaiters.splice(0);
     if (waiters.length === 0) return;
@@ -334,6 +326,7 @@ export class StructuredResultToolServer {
     const call = (params ?? {}) as { name?: unknown; arguments?: unknown };
     return this.call(typeof call.name === "string" ? call.name : "", call.arguments);
   }
+
   private call(name: string, args: unknown): ToolAnswer {
     if (name !== STRUCTURED_RESULT_TOOL_NAME) return toolAnswer(`Unknown tool ${name}. This server has one tool, ${STRUCTURED_RESULT_TOOL_NAME}.`, true);
     const turn = this.turn;
@@ -368,32 +361,9 @@ export class StructuredResultToolServer {
   private logCall(outcome: string, extra: Record<string, unknown> = {}): void {
     this.logger.info({ event: "structured_result.call", outcome, ...extra, ...this.options.context }, "result tool called");
   }
-  private authorized(value: string | undefined): boolean {
-    if (!value?.startsWith("Bearer ")) return false;
-    const received = Buffer.from(value.slice(7));
-    const expected = Buffer.from(this.credential);
-    return received.length === expected.length && timingSafeEqual(received, expected);
-  }
-
-  private json(response: ServerResponse, status: number, body: unknown): void {
-    response.statusCode = status;
-    response.setHeader("Content-Type", "application/json");
-    response.end(JSON.stringify(body));
-  }
 
   private fail(response: ServerResponse, status: number, code: string): void {
-    this.json(response, status, { error: code });
+    sendJson(response, status, { error: code });
   }
 }
 
-async function readBounded(request: IncomingMessage, limit: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const value of request) {
-    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value as Uint8Array);
-    size += chunk.length;
-    if (size > limit) throw new Error("request too large");
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
-}
