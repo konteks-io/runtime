@@ -117,7 +117,8 @@ Node 22 (`.nvmrc`; CI and releases use 22.23.2). From the repo root:
 ## Where to look
 
 - The Graft graph (below) for any "where/how/who calls" question.
-- `HARDENING.md`: maintenance policy (Graft freshness).
+- `HARDENING.md`: standing rules (no dead code, complexity 8 at most, the
+  code wins), the checks to run and how to use Graft.
 - `README.md`: install, day-to-day commands, agent setup, release trust.
 - Nested `AGENTS.md` files listed in the Map.
 - No HTTP API spec lives here: wire contracts are in the sibling `packages`

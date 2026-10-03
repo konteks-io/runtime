@@ -73,7 +73,14 @@ CI (`.github/workflows/ci.yaml`) is the gate. Run the same commands locally
 from the repository root:
 
 - **Lint:** `npm run lint` (ESLint over `packages/*/src`, with
-  `complexity: ["error", 8]`).
+  `complexity: ["error", 8]` in every package). The only rule exception is
+  `no-control-regex`, scoped in `eslint.config.js` to the five files that
+  strip or refuse terminal escapes and control bytes on purpose.
+- **Script complexity:** `npm run lint` does not cover `scripts/`; check it
+  with `npx eslint --no-config-lookup --rule '{"complexity":["error",8]}' scripts`.
+  Three functions stay above 8 because the bridge patches inline their source
+  into the pinned bridges (`konteksPrefixedName`, `missingCodexToolTerminals`,
+  `konteksAdmittedMcpServerNames`); change them only with a patch review.
 - **Typecheck and build:** `npm run typecheck` (`tsc --build`, which also
   emits `packages/*/dist`).
 - **Tests:** `npm test` runs the `node --test` script suites, then Vitest.

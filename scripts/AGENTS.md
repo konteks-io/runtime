@@ -23,8 +23,8 @@ and the agent-on-every-OS proof. Most are called from `.github/workflows/`
 - CI: `ci-vendored-contracts.mjs`, `check-agpl.mjs`, `check-secret-canary.mjs`.
 - Proof and probes: `agent-os-proof.mjs` (+ `agent-os-proof/` scripted model),
   `probe-*.mjs`, `codex-acp-terminal-reconciliation.integration.mjs`.
-- `export-public.mjs`: legacy mirror into a separate public checkout (drops
-  every `.md` except `THIRD_PARTY_NOTICES.md`, regenerates the lockfile).
+- Operator helper: `native-control-call.mjs` sends one control-socket request
+  to an installed connector (for example `update.status`) and prints the reply.
 - `hardening/graft`: the pinned Graft wrapper (`HARDENING.md`).
 - Tests run by `npm test`: `offline-agent-files`, `codex-acp-live-user-patch`,
   `claude-acp-settings-patch`, `claude-instruction-scope` (+ `.integration`),
