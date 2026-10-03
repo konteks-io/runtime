@@ -840,8 +840,17 @@ coherent verified checkpoints.
 
 ## Maintenance
 
-Follow [HARDENING.md](HARDENING.md): keep Graft fresh before graph use and
-after edits; broader C00 cleanup is deferred.
+Follow [HARDENING.md](HARDENING.md): its standing rules (no dead code,
+complexity of 8 at most, the code is the source of truth) bind every change.
+
+Graft setup: resolve `graft` from PATH (`command -v graft`, or
+`Get-Command graft` in PowerShell); MCP launches `graft mcp` and
+`./scripts/hardening/graft` uses the same executable. Install the agreed
+version (0.18.0), then wire the repository with
+`graft init --agents agents claude --no-build --no-global --no-statusline`,
+keeping other hooks and MCP servers. Keep telemetry off,
+`GRAFT_NO_REFRESH=1` on hooks and MCP, and Graft's Stop hook disabled; set
+the generated helpers' BAKED fallback to null so no machine path is stored.
 
 <!-- graft:start -->
 ## Graft — repo context graph

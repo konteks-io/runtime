@@ -1,9 +1,7 @@
-Follow [HARDENING.md](HARDENING.md): Graft freshness remains required; broader C00 cleanup is deferred.
-
 # Runtime agent entry point
 
 Read [AGENTS.md](AGENTS.md) and [HARDENING.md](HARDENING.md) before editing.
-The hardening policy is mandatory for all maintenance work.
+HARDENING.md's standing rules bind every change.
 Customer-visible file names are in AGENTS.md: resolve the connector with
 `resolveNativeConnectorExecutable`, never a literal `connector`.
 The runtime is native-only (the appliance is retired and deleted) and runs
@@ -11,7 +9,7 @@ Claude Code, Codex, DeepSeek Harness, OpenCode 2 and Google Antigravity; Pi is r
 stored values stay readable). On the development branch the
 workspaces link the sibling `../packages` sources (`file:../packages/...`,
 restored after every merge from `main`, as in Core and the App); `main` and
-public exports use the 7.2.0 tarballs in `vendor/` (`export-public.mjs` reads
+public exports use the tarballs in `vendor/` (`export-public.mjs` reads
 `konteksContracts`). To refresh `vendor/`, `npm pack` from packages and keep
 `konteksContracts` at that version; never regenerate the whole lockfile. CI
 (`ci.yaml`, `release.yaml`, `agent-os-proof.yaml`) runs
