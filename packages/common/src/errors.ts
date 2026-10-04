@@ -55,7 +55,7 @@ export const RemoteInstanceErrorCodeSchema = z.enum([
   "active_work",
   "ownership_promotion_denied",
   "limit_exceeded",
-  // D143 assignment transport dispositions, mirrored from the shared taxonomy.
+  // Assignment transport dispositions, mirrored from the shared taxonomy.
   "assignment_channel_invalid",
   "assignment_sequence_gap",
   "assignment_replay_conflict",
@@ -70,7 +70,7 @@ export const RemoteInstanceErrorCodeSchema = z.enum([
   "install_state_corrupt",
   "local_io_failure",
 ]);
-export type RemoteInstanceErrorCode = z.infer<typeof RemoteInstanceErrorCodeSchema>;
+type RemoteInstanceErrorCode = z.infer<typeof RemoteInstanceErrorCodeSchema>;
 
 export const RecoveryActionSchema = z
   .object({
@@ -125,10 +125,6 @@ export class RemoteInstanceError extends Error {
   toJSON(): { code: RemoteInstanceErrorCode; message: string; recoveryActions: RecoveryAction[] } {
     return { code: this.code, message: this.message, recoveryActions: this.recoveryActions };
   }
-}
-
-export function isRemoteInstanceError(error: unknown): error is RemoteInstanceError {
-  return error instanceof RemoteInstanceError;
 }
 
 export function normalizeCaughtError(error: unknown): Error {

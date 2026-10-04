@@ -6,7 +6,7 @@ import { NativeAgentPackageProfileSchema } from "@konteks/remote-release";
 const absolutePath = z.string().min(1).max(4096).refine(value => isAbsolute(value) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value));
 
 /**
- * The QA browser (Playwright MCP) as a connector capability (O8): the
+ * The QA browser (Playwright MCP) as a connector capability: the
  * pinned package and the connector's launcher inside an installed Claude
  * Code or Codex package (`packageAgent`), run on `node`, which is that
  * package's own Node or, when none is usable, the person's own (`nodeSource`).
@@ -62,7 +62,7 @@ export const RunnerConfigSchema = z
     /**
      * The connector's QA browser for an agent whose own package carries none
      * (DeepSeek Harness, OpenCode): resolved by the supervisor from an
-     * installed Claude Code or Codex package and a usable Node (O8). Never
+     * installed Claude Code or Codex package and a usable Node. Never
      * loaded from an assignment.
      */
     RUNNER_BROWSER: RunnerBrowserSchema.optional(),

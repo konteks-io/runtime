@@ -1,4 +1,4 @@
-import { context, propagation, ROOT_CONTEXT, trace, isSpanContextValid, SpanStatusCode } from "@opentelemetry/api";
+import { context, propagation, ROOT_CONTEXT, trace, isSpanContextValid, SpanStatusCode, type Span } from "@opentelemetry/api";
 import { NodeTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-node";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { resourceFromAttributes } from "@opentelemetry/resources";
@@ -16,10 +16,7 @@ export function initializeNativeTracing(env: NodeJS.ProcessEnv = process.env): N
   const endpoint = env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
   const disabled = (reason: NonNullable<NativeTracing["reason"]>): NativeTracing => ({ enabled: false, reason, shutdown: async () => undefined });
   if (!endpoint || env.OTEL_SDK_DISABLED === "true") return disabled("not_configured");
-  try {
-    const url = new URL(endpoint);
-    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) return disabled("invalid_endpoint");
-  } catch { return disabled("invalid_endpoint"); }
+  if (!validTraceEndpoint(endpoint)) return disabled("invalid_endpoint");
   try {
     const revision = env.KONTEKS_BUILD_GIT_SHA;
     const provider = new NodeTracerProvider({
@@ -33,6 +30,13 @@ export function initializeNativeTracing(env: NodeJS.ProcessEnv = process.env): N
     provider.register();
     return { enabled: true, shutdown: () => provider.shutdown() };
   } catch { return disabled("initialization_failed"); }
+}
+
+function validTraceEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint);
+    return ["http:", "https:"].includes(url.protocol) && ![url.username, url.password, url.search, url.hash].some(Boolean);
+  } catch { return false; }
 }
 
 export interface NativeSpanFacts {
@@ -59,42 +63,68 @@ export async function withNativeSpan<T>(
   classify?: (result: T) => NativeSpanOutcome,
 ): Promise<T> {
   const parsed = ObservabilityContextV1Schema.safeParse(parent);
+  const validated = parsed.success ? parsed.data : undefined;
+  return trace.getTracer("konteks-native").startActiveSpan(name,
+    { attributes: nativeAttributes(facts, validated) }, nativeParentScope(validated),
+    span => executeNativeSpan(span, operation, classify));
+}
+
+function nativeParentScope(parent: ObservabilityContextV1 | undefined) {
   const active = trace.getSpanContext(context.active());
-  const parentTraceId = parsed.success ? parsed.data.traceparent.split("-")[1] : undefined;
-  const scope = active && isSpanContextValid(active) && (!parentTraceId || active.traceId === parentTraceId)
-    ? context.active()
-    : parsed.success ? propagation.extract(ROOT_CONTEXT, {
-        traceparent: parsed.data.traceparent, ...(parsed.data.tracestate ? { tracestate: parsed.data.tracestate } : {}),
-      }) : ROOT_CONTEXT;
-  const attributes: Record<string, string | number | boolean> = { "konteks.diagnostic.coverage": parsed.success ? "correlated" : "local_only" };
-  for (const [key, value] of Object.entries({ assignmentId: facts.assignmentId, stage: facts.stage, tool: facts.tool,
-    tenantId: parsed.success ? parsed.data.tenantId : undefined, sessionId: parsed.success ? parsed.data.sessionId : undefined,
-    invocationId: parsed.success ? parsed.data.invocationId : undefined })) {
-    if (typeof value === "string" && value.length > 0 && value.length <= 200 && !/[\p{Cc}\p{Cf}]/u.test(value)) attributes[`konteks.${key}`] = value;
+  const parentTraceId = parent?.traceparent.split("-")[1];
+  if (active && isSpanContextValid(active) && (!parentTraceId || active.traceId === parentTraceId)) return context.active();
+  if (!parent) return ROOT_CONTEXT;
+  return propagation.extract(ROOT_CONTEXT, {
+    traceparent: parent.traceparent, ...(parent.tracestate ? { tracestate: parent.tracestate } : {}),
+  });
+}
+
+function safeSpanIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 200 && !/[\p{Cc}\p{Cf}]/u.test(value);
+}
+
+function nativeAttributes(facts: NativeSpanFacts, parent: ObservabilityContextV1 | undefined) {
+  const attributes: Record<string, string | number | boolean> = {
+    "konteks.diagnostic.coverage": parent ? "correlated" : "local_only",
+  };
+  const identifiers = { assignmentId: facts.assignmentId, stage: facts.stage, tool: facts.tool,
+    tenantId: parent?.tenantId, sessionId: parent?.sessionId, invocationId: parent?.invocationId };
+  for (const [key, value] of Object.entries(identifiers)) {
+    if (safeSpanIdentifier(value)) attributes[`konteks.${key}`] = value;
   }
-  // Keep assignment diagnostics even before the cloud context is bound. The
-  // collector retains this audit attribute instead of sampling successful work.
+  return withAuditAttributes(attributes, facts.attempt);
+}
+
+function withAuditAttributes(attributes: Record<string, string | number | boolean>, attempt: unknown) {
   if (attributes["konteks.assignmentId"]) attributes["konteks.audit.required"] = true;
   if (attributes["konteks.sessionId"]) attributes["konteks.session.id"] = attributes["konteks.sessionId"];
-  if (typeof facts.attempt === "number" && Number.isSafeInteger(facts.attempt) && facts.attempt > 0) attributes["konteks.attempt"] = facts.attempt;
-  return trace.getTracer("konteks-native").startActiveSpan(name, { attributes }, scope, async span => {
-    try {
-      const result = await operation();
-      const outcome = classify?.(result) ?? { outcome: "succeeded" as const };
-      span.setAttribute("konteks.outcome", outcome.outcome);
-      if (outcome.errorCode) span.setAttribute("konteks.error.code", outcome.errorCode);
-      if (outcome.exitCode !== undefined) span.setAttribute("process.exit.code", outcome.exitCode);
-      if (outcome.timedOut !== undefined) span.setAttribute("konteks.timed_out", outcome.timedOut);
-      if (outcome.httpStatus !== undefined) span.setAttribute("http.response.status_code", outcome.httpStatus);
-      span.setStatus({ code: outcome.outcome === "failed" || outcome.outcome === "refused" ? SpanStatusCode.ERROR : outcome.outcome === "succeeded" ? SpanStatusCode.OK : SpanStatusCode.UNSET });
-      return result;
-    } catch (error) {
-      span.setAttribute("konteks.outcome", "failed");
-      span.setAttribute("konteks.error.code", error instanceof RemoteInstanceError ? error.code : "unexpected_error");
-      span.setStatus({ code: SpanStatusCode.ERROR });
-      throw error;
-    } finally { span.end(); }
-  });
+  if (typeof attempt === "number" && Number.isSafeInteger(attempt) && attempt > 0) attributes["konteks.attempt"] = attempt;
+  return attributes;
+}
+
+const OUTCOME_STATUS: Record<NativeSpanOutcome["outcome"], SpanStatusCode> = {
+  failed: SpanStatusCode.ERROR, refused: SpanStatusCode.ERROR,
+  succeeded: SpanStatusCode.OK, unavailable: SpanStatusCode.UNSET,
+};
+
+function recordNativeOutcome(span: Span, outcome: NativeSpanOutcome): void {
+  span.setAttribute("konteks.outcome", outcome.outcome);
+  if (outcome.errorCode) span.setAttribute("konteks.error.code", outcome.errorCode);
+  if (outcome.exitCode !== undefined) span.setAttribute("process.exit.code", outcome.exitCode);
+  if (outcome.timedOut !== undefined) span.setAttribute("konteks.timed_out", outcome.timedOut);
+  if (outcome.httpStatus !== undefined) span.setAttribute("http.response.status_code", outcome.httpStatus);
+  span.setStatus({ code: OUTCOME_STATUS[outcome.outcome] });
+}
+
+async function executeNativeSpan<T>(span: Span, operation: () => Promise<T>, classify?: (result: T) => NativeSpanOutcome): Promise<T> {
+  try {
+    const result = await operation();
+    recordNativeOutcome(span, classify?.(result) ?? { outcome: "succeeded" });
+    return result;
+  } catch (error) {
+    recordNativeOutcome(span, { outcome: "failed", errorCode: error instanceof RemoteInstanceError ? error.code : "unexpected_error" });
+    throw error;
+  } finally { span.end(); }
 }
 
 /** Correlate an event with the actual active span, preserving only validated causal identifiers. */

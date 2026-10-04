@@ -54,7 +54,7 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     await publisher.start(); const message = await publisher.publish();
     expect(message.modelCapabilitySnapshots).toEqual([snapshot]);
   });
-  it("carries every supported agent's state inside the signed body, and a failing projection never costs the heartbeat (runtime-view R21)", async () => {
+  it("carries every supported agent's state inside the signed body, and a failing projection never costs the heartbeat", async () => {
     const f = await fixture();
     const supported = [{ agentId: "claude-code", state: "ready" as const }, { agentId: "antigravity", state: "not_added" as const, installCommand: "konteks-remote agent add antigravity" }];
     f.options.supportedAgents = () => supported;
@@ -70,7 +70,7 @@ describe("signed HTTPS heartbeat lifecycle", () => {
     await older.start();
     expect(Object.keys(await older.publish())).not.toContain("supportedAgents");
   });
-  it("sends the release's connector commands on the first accepted heartbeat of an incarnation and again only when they change (runtime-view R20)", async () => {
+  it("sends the release's connector commands on the first accepted heartbeat of an incarnation and again only when they change", async () => {
     const f = await fixture();
     let manifest: { version: string; commands: Array<{ id: string; command: string; description: string; os: Array<"macos" | "windows" | "debian"> }> } | undefined =
       { version: "0.4.1", commands: [{ id: "status", command: "konteks-remote status", description: "Shows whether this computer is connected.", os: ["macos"] }] };

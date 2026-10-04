@@ -8,7 +8,7 @@ import { NativeInventoryCollector } from "../native/inventory.js";
 
 const sha = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
 
-describe("the personal Claude executable's identity (S0-5)", () => {
+describe("the personal Claude executable's identity", () => {
   const dirs: string[] = [];
   afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
   function executable(version: string): string {

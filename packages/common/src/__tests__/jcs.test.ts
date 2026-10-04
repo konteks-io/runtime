@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canonicalize, withoutMembers, PROOF_MEMBERS } from "../jcs.js";
+import { canonicalize, withoutMembers } from "../jcs.js";
 
 describe("RFC 8785 canonicalization", () => {
   it("sorts members by UTF-16 code unit and drops whitespace", () => {
@@ -22,7 +22,7 @@ describe("RFC 8785 canonicalization", () => {
     expect(canonicalize({ a: 1, b: undefined as unknown as null })).toBe('{"a":1}');
   });
 
-  it("strips every PROOF_MEMBERS entry regardless of which proof is being produced", () => {
+  it("strips every named proof member regardless of which proof is being produced", () => {
     const body = {
       grantId: "g",
       replicaAuth: { nonce: "n" },
@@ -30,6 +30,6 @@ describe("RFC 8785 canonicalization", () => {
       keyProof: {},
       relayAuth: {},
     };
-    expect(withoutMembers(body, PROOF_MEMBERS)).toEqual({ grantId: "g" });
+    expect(withoutMembers(body, ["replicaAuth", "proof", "keyProof", "relayAuth"])).toEqual({ grantId: "g" });
   });
 });

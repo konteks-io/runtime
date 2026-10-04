@@ -12,13 +12,12 @@ import {
   type ConnectedAgentView,
 } from "@konteks/remote-common";
 
-export interface ResolvedModelCapabilityMapping { agentId: string; mapping: AgentModelCapabilityMapping }
+interface ResolvedModelCapabilityMapping { agentId: string; mapping: AgentModelCapabilityMapping }
 
 /**
  * What one snapshot is bound to: a reviewed signed mapping from the release,
  * or, for an agent the release signed nothing for, the fixed catalogue
- * authority Core resolves through its own known-model catalogue (System One
- * §6a, KM5). A catalogue authority has no expiry of its own.
+ * authority Core resolves through its own known-model catalogue. A catalogue authority has no expiry of its own.
  */
 interface OfferedAuthority {
   agentId: string;
@@ -37,7 +36,7 @@ interface DiscoveredOffer {
   observedAgoMs?: number;
 }
 
-export interface ModelCapabilitySnapshotProducerOptions {
+interface ModelCapabilitySnapshotProducerOptions {
   clock: Clock;
   instanceId: () => string;
   runnerIncarnation: () => string;
@@ -48,7 +47,7 @@ export interface ModelCapabilitySnapshotProducerOptions {
   discover: (agentId: string, configId: string) => Promise<DiscoveredOffer>;
   /**
    * How one offered value is billed on this machine (OpenCode: by route
-   * provider and the credential that serves it; CP3). Undefined leaves the
+   * provider and the credential that serves it). Undefined leaves the
    * option unlabelled, which an older Core requires.
    */
   optionBilling?: (agentId: string, value: string, agent: ConnectedAgentView) => "subscription" | "pay_per_use" | undefined;
@@ -61,7 +60,7 @@ export interface ModelCapabilitySnapshotProducerOptions {
 interface CacheEntry { authorityKey: string; snapshot: AgentModelOfferedValuesSnapshot }
 interface RetryEntry { failures: number; nextAt: number }
 
-/** Incremental, bounded owner for D150 snapshots; it never scans history. */
+/** Incremental, bounded owner for model capability snapshots; it never scans history. */
 export class ModelCapabilitySnapshotProducer {
   private readonly cache = new Map<string, CacheEntry>();
   private readonly inFlight = new Map<string, Promise<void>>();
@@ -115,21 +114,32 @@ export class ModelCapabilitySnapshotProducer {
       const agent = agents.find(candidate => candidate.agentId === resolved.agentId);
       if (!eligible(agent)) continue;
       const id = identity(resolved), key = this.authorityKey(resolved, agent, manifestId);
-      const cached = this.cache.get(id);
-      const refreshAheadMs = this.options.refreshAheadMs ?? Math.min(2 * 60_000, (this.options.ttlMs ?? 5 * 60_000) / 2);
-      if (cached?.authorityKey === key
-        && parseRfc3339(cached.snapshot.expiresAt) - this.options.clock.now() > refreshAheadMs) continue;
-      const retry = this.retry.get(key);
-      if (retry && retry.nextAt > this.options.clock.now()) continue;
-      let operation = this.inFlight.get(key);
-      if (!operation) {
-        operation = this.discoverOne(id, key, resolved, agent, manifestId);
-        this.inFlight.set(key, operation);
-        void operation.finally(() => { if (this.inFlight.get(key) === operation) this.inFlight.delete(key); }).catch(() => undefined);
-      }
-      work.push(operation);
+      if (this.fresh(id, key) || this.backingOff(key)) continue;
+      work.push(this.discovery(id, key, resolved, agent, manifestId));
     }
     await Promise.all(work);
+  }
+
+  /** A cached snapshot of the same authority that is not yet due for its refresh-ahead. */
+  private fresh(id: string, key: string): boolean {
+    const cached = this.cache.get(id);
+    const refreshAheadMs = this.options.refreshAheadMs ?? Math.min(2 * 60_000, (this.options.ttlMs ?? 5 * 60_000) / 2);
+    return cached?.authorityKey === key && parseRfc3339(cached.snapshot.expiresAt) - this.options.clock.now() > refreshAheadMs;
+  }
+
+  private backingOff(key: string): boolean {
+    const retry = this.retry.get(key);
+    return Boolean(retry && retry.nextAt > this.options.clock.now());
+  }
+
+  /** The discovery under way for this authority, or a new one. */
+  private discovery(id: string, key: string, resolved: OfferedAuthority, agent: ConnectedAgentView & { authIdentityFingerprint: string }, manifestId: string): Promise<void> {
+    const running = this.inFlight.get(key);
+    if (running) return running;
+    const operation = this.discoverOne(id, key, resolved, agent, manifestId);
+    this.inFlight.set(key, operation);
+    void operation.finally(() => { if (this.inFlight.get(key) === operation) this.inFlight.delete(key); }).catch(() => undefined);
+    return operation;
   }
 
   snapshots(): AgentModelOfferedValuesSnapshot[] {
@@ -143,47 +153,75 @@ export class ModelCapabilitySnapshotProducer {
       const currentAgent = this.agents.find(candidate => candidate.agentId === resolved.agentId);
       if (!eligible(currentAgent) || key !== this.authorityKey(resolved, currentAgent, this.options.manifestId() ?? "")) return;
       const now = this.options.clock.now();
-      // A kept answer is advertised with the time the agent actually gave it
-      // and a fresh validity window from now: Core takes any observedAt not
-      // after its own time with expiresAt still ahead, so the offer stays
-      // placeable while the agent is read again, and nothing claims it was
-      // observed later than it was.
-      const ageMs = typeof observed.observedAgoMs === "number" && Number.isFinite(observed.observedAgoMs) && observed.observedAgoMs > 0 ? observed.observedAgoMs : 0;
-      const observedAt = now - ageMs;
-      const ttlEnd = now + (this.options.ttlMs ?? 5 * 60_000);
-      const expires = resolved.expiresAt ? Math.min(parseRfc3339(resolved.expiresAt), ttlEnd) : ttlEnd;
-      if (expires <= now) return;
+      const window = this.validity(observed, resolved, now);
+      if (window.expires <= now) return;
       const snapshotRevision = (this.revisions.get(id) ?? 0) + 1;
-      const offeredOptions = this.options.optionBilling
-        ? (observed.offeredOptions?.length ? observed.offeredOptions : observed.offeredValues.map(value => ({ value }))).map(option => {
-          const billing = this.options.optionBilling!(resolved.agentId, option.value, currentAgent);
-          return billing === undefined ? option : { ...option, billing };
-        })
-        : observed.offeredOptions;
-      const labelled = offeredOptions?.some(option => "billing" in option) ? offeredOptions : observed.offeredOptions;
-      const body = {
-        version: 1 as const, snapshotId: (this.options.newId ?? randomUUID)(), snapshotRevision,
-        instanceId: this.options.instanceId(), agentId: resolved.agentId,
-        authIdentityFingerprint: currentAgent.authIdentityFingerprint,
-        runnerIncarnation: this.options.runnerIncarnation(), manifestId,
-        mappingId: resolved.mappingId, mappingRevision: resolved.mappingRevision,
-        mappingDigest: resolved.mappingDigest, configId: resolved.configId,
-        currentValue: observed.currentValue, offeredValues: observed.offeredValues,
-        ...(labelled?.length ? { offeredOptions: labelled } : {}),
-        observedAt: new Date(observedAt).toISOString(), expiresAt: new Date(expires).toISOString(),
-      };
-      const snapshot = AgentModelOfferedValuesSnapshotSchema.parse({ ...body, snapshotDigest: computeAgentModelOfferedValuesSnapshotDigest(body) });
+      const snapshot = this.snapshotFor({ resolved, observed, currentAgent, manifestId, window, snapshotRevision });
       this.revisions.set(id, snapshotRevision); this.cache.set(id, { authorityKey: key, snapshot }); this.retry.delete(key);
     } catch {
-      const previous = this.retry.get(key)?.failures ?? 0, failures = Math.min(previous + 1, 8);
-      this.retry.set(key, { failures, nextAt: this.options.clock.now() + Math.min(300_000, 5_000 * 2 ** (failures - 1)) });
-      // A transient discovery failure must not punch a readiness hole. The
-      // existing same-authority snapshot remains usable until its signed
-      // expiry; `snapshots()` removes it at that boundary.
-      const cached = this.cache.get(id);
-      if (!cached || cached.authorityKey !== key
-        || parseRfc3339(cached.snapshot.expiresAt) <= this.options.clock.now()) this.cache.delete(id);
+      this.recordFailure(id, key);
     }
+  }
+
+  /**
+   * A kept answer is advertised with the time the agent actually gave it and
+   * a fresh validity window from now: Core takes any observedAt not after its
+   * own time with expiresAt still ahead, so the offer stays placeable while
+   * the agent is read again, and nothing claims it was observed later than it
+   * was.
+   */
+  private validity(observed: DiscoveredOffer, resolved: OfferedAuthority, now: number): { observedAt: number; expires: number } {
+    const ageMs = typeof observed.observedAgoMs === "number" && Number.isFinite(observed.observedAgoMs) && observed.observedAgoMs > 0 ? observed.observedAgoMs : 0;
+    const ttlEnd = now + (this.options.ttlMs ?? 5 * 60_000);
+    const expires = resolved.expiresAt ? Math.min(parseRfc3339(resolved.expiresAt), ttlEnd) : ttlEnd;
+    return { observedAt: now - ageMs, expires };
+  }
+
+  private snapshotFor(input: {
+    resolved: OfferedAuthority;
+    observed: DiscoveredOffer;
+    currentAgent: ConnectedAgentView & { authIdentityFingerprint: string };
+    manifestId: string;
+    window: { observedAt: number; expires: number };
+    snapshotRevision: number;
+  }): AgentModelOfferedValuesSnapshot {
+    const { resolved, observed, currentAgent, manifestId, window, snapshotRevision } = input;
+    const labelled = this.offeredOptions(observed, resolved, currentAgent);
+    const body = {
+      version: 1 as const, snapshotId: (this.options.newId ?? randomUUID)(), snapshotRevision,
+      instanceId: this.options.instanceId(), agentId: resolved.agentId,
+      authIdentityFingerprint: currentAgent.authIdentityFingerprint,
+      runnerIncarnation: this.options.runnerIncarnation(), manifestId,
+      mappingId: resolved.mappingId, mappingRevision: resolved.mappingRevision,
+      mappingDigest: resolved.mappingDigest, configId: resolved.configId,
+      currentValue: observed.currentValue, offeredValues: observed.offeredValues,
+      ...(labelled?.length ? { offeredOptions: labelled } : {}),
+      observedAt: new Date(window.observedAt).toISOString(), expiresAt: new Date(window.expires).toISOString(),
+    };
+    return AgentModelOfferedValuesSnapshotSchema.parse({ ...body, snapshotDigest: computeAgentModelOfferedValuesSnapshotDigest(body) });
+  }
+
+  /** The offered options, each labelled with its billing when the connector knows it; unlabelled options as the agent gave them. */
+  private offeredOptions(observed: DiscoveredOffer, resolved: OfferedAuthority, currentAgent: ConnectedAgentView): DiscoveredOffer["offeredOptions"] {
+    if (!this.options.optionBilling) return observed.offeredOptions;
+    const options = (observed.offeredOptions?.length ? observed.offeredOptions : observed.offeredValues.map(value => ({ value }))).map(option => {
+      const billing = this.options.optionBilling!(resolved.agentId, option.value, currentAgent);
+      return billing === undefined ? option : { ...option, billing };
+    });
+    return options.some(option => "billing" in option) ? options : observed.offeredOptions;
+  }
+
+  /**
+   * Back off this authority. A transient discovery failure must not punch a
+   * readiness hole: the existing same-authority snapshot remains usable until
+   * its signed expiry; `snapshots()` removes it at that boundary.
+   */
+  private recordFailure(id: string, key: string): void {
+    const previous = this.retry.get(key)?.failures ?? 0, failures = Math.min(previous + 1, 8);
+    this.retry.set(key, { failures, nextAt: this.options.clock.now() + Math.min(300_000, 5_000 * 2 ** (failures - 1)) });
+    const cached = this.cache.get(id);
+    if (!cached || cached.authorityKey !== key
+      || parseRfc3339(cached.snapshot.expiresAt) <= this.options.clock.now()) this.cache.delete(id);
   }
 
   private authorityKey(value: OfferedAuthority, agent: ConnectedAgentView & { authIdentityFingerprint: string }, manifestId: string): string {
@@ -193,7 +231,7 @@ export class ModelCapabilitySnapshotProducer {
 }
 
 /**
- * How one offered OpenCode value is billed on this machine (CP3, O7/O11):
+ * How one offered OpenCode value is billed on this machine:
  * its route provider (`openai` in `openai/gpt-5.5`) and the credential kind
  * the agent reports for that provider. Undefined for every other agent (Core
  * classifies those by agent) and for a value without a provider.
@@ -208,7 +246,7 @@ export function openCodeOptionBilling(agent: Pick<ConnectedAgentView, "agentId" 
 }
 
 /**
- * How Google Antigravity's offered models are billed (antigravity CP3): by how
+ * How Google Antigravity's offered models are billed: by how
  * Google is signed in, i.e. the credential in use, which the connector lists
  * first among the ready ones (Gemini Enterprise: a subscription, or
  * pay-per-use for its Pay-as-you-go edition; a Gemini API key: pay-per-use).

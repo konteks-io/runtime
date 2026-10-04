@@ -9,6 +9,7 @@ import {
   RuntimeCancellationDeliveryRequestSchema,
   RuntimePermissionAnswerDeliveryRequestSchema,
   RuntimeAgentLoginDeliveryRequestSchema,
+  RuntimeUpdateDeliveryRequestSchema,
 } from "@konteks/remote-common";
 
 /**
@@ -50,9 +51,20 @@ export class CoreSignatureVerifier {
     catch { return false; }
   }
 
-  /** A login the person started from the site, signed by Core for this socket (WS1-115). */
+  /** A login the person started from the site, signed by Core for this socket. */
   verifyAgentLoginDelivery(candidate: unknown): boolean {
     const parsed = RuntimeAgentLoginDeliveryRequestSchema.safeParse(candidate);
+    if (!parsed.success) return false;
+    const request = parsed.data, key = this.keys.get(request.keyId);
+    if (!key || !/^[A-Za-z0-9_-]{86}$/.test(request.signature) ||
+      Buffer.from(request.signature, "base64url").toString("base64url") !== request.signature) return false;
+    try { return ed25519Verify(key, remoteControlSigningBytes(request), request.signature); }
+    catch { return false; }
+  }
+
+  /** A fixed runtime update the person requested on the site for this owner. */
+  verifyRuntimeUpdateDelivery(candidate: unknown): boolean {
+    const parsed = RuntimeUpdateDeliveryRequestSchema.safeParse(candidate);
     if (!parsed.success) return false;
     const request = parsed.data, key = this.keys.get(request.keyId);
     if (!key || !/^[A-Za-z0-9_-]{86}$/.test(request.signature) ||
@@ -76,7 +88,7 @@ export class CoreSignatureVerifier {
     } catch { return false; }
   }
 
-  /** C02 is a distinct signed control carrier. Its canonical bytes are not
+  /** Execution revision control is a distinct signed control carrier. Its canonical bytes are not
    * interchangeable with legacy cancellation control bytes. */
   verifyExecutionRevisionControlDelivery(candidate: unknown): boolean {
     const parsed =
@@ -103,7 +115,7 @@ export class CoreSignatureVerifier {
     }
   }
 
-  /** C01 uses detached diagnostic-only signing bytes so it cannot be
+  /** The diagnostic companion uses detached diagnostic-only signing bytes so it cannot be
    * confused with authority, work, or cancellation control. */
   verifyDiagnosticCarrierCompanionDelivery(candidate: unknown): boolean {
     const parsed = DiagnosticCarrierCompanionDeliveryRequestSchema.safeParse(candidate);

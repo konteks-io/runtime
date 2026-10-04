@@ -4,7 +4,7 @@ import { redactText, redactValue } from "./redaction.js";
 
 export type Logger = PinoLogger;
 
-export interface CreateLoggerOptions {
+interface CreateLoggerOptions {
   name: string;
   level?: "error" | "warn" | "info" | "debug";
   silent?: boolean;

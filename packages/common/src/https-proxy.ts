@@ -10,7 +10,7 @@ import type { Socket } from "node:net";
  * target runs end to end inside it. Plain `http:` targets never use a proxy.
  */
 
-export class HttpsProxyError extends Error {
+class HttpsProxyError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = "HttpsProxyError";
@@ -20,19 +20,29 @@ export class HttpsProxyError extends Error {
 /** The proxy for an https URL from the standard variables, unless `NO_PROXY` covers its host; null for none. */
 export function httpsProxyFor(url: URL, env: NodeJS.ProcessEnv = process.env): URL | null {
   if (url.protocol !== "https:") return null;
-  const value = env.HTTPS_PROXY ?? env.https_proxy ?? env.ALL_PROXY ?? env.all_proxy;
-  if (!value) return null;
-  const noProxy = (env.NO_PROXY ?? env.no_proxy ?? "").split(/[\s,]+/).map(entry => entry.trim().toLowerCase()).filter(Boolean);
-  const host = url.hostname.toLowerCase();
-  for (const entry of noProxy) {
-    if (entry === "*") return null;
-    const bare = entry.replace(/:\d+$/, "").replace(/^\*?\./, "");
-    if (host === bare || host.endsWith(`.${bare}`)) return null;
-  }
+  const value = proxySetting(env);
+  if (!value || noProxyCovers(url.hostname.toLowerCase(), env.NO_PROXY ?? env.no_proxy ?? "")) return null;
+  return parseProxy(value);
+}
+
+function proxySetting(env: NodeJS.ProcessEnv): string | undefined {
+  return env.HTTPS_PROXY ?? env.https_proxy ?? env.ALL_PROXY ?? env.all_proxy;
+}
+
+function parseProxy(value: string): URL {
   let proxy: URL;
   try { proxy = new URL(value.includes("://") ? value : `http://${value}`); } catch { throw new HttpsProxyError("the proxy setting is not a URL"); }
   if (proxy.protocol !== "http:" && proxy.protocol !== "https:") throw new HttpsProxyError("only http and https proxies are supported");
   return proxy;
+}
+
+/** Whether a `NO_PROXY` list names the host: `*`, the host itself or a parent domain, any port. */
+function noProxyCovers(host: string, noProxy: string): boolean {
+  return noProxy.split(/[\s,]+/).map(entry => entry.trim().toLowerCase()).filter(Boolean).some(entry => {
+    if (entry === "*") return true;
+    const bare = entry.replace(/:\d+$/, "").replace(/^\*?\./, "");
+    return host === bare || host.endsWith(`.${bare}`);
+  });
 }
 
 /** An HTTP CONNECT tunnel to `target` through `proxy`; the caller runs its TLS session to the target inside it. */

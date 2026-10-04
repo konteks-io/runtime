@@ -9,14 +9,18 @@ import { resolveBridgeSpawnSpec } from "../bridge/spec.js";
 import { spawnBridge, type BridgeStopOwner } from "../bridge/process.js";
 
 /** Real installed bytes, no mocked ACP, no login or prompt. Manifest inventory
- * matching here is not independent release-root trust or D142 qualification.
+ * matching here is not independent release-root trust or qualification.
  * Explicit opt-in avoids reporting an absent installation as a passed probe. */
 const releaseRoot = process.env.NATIVE_CODEX_CHARACTERIZATION_RELEASE;
+
+async function codexBridgeArtifacts(root: string) {
+  const manifest = RemoteSignedBundleManifestSchema.parse(JSON.parse(await readFile(join(root, "manifest.json"), "utf8")));
+  return manifest.nativeArtifacts?.filter(artifact => artifact.agentId === "codex" && artifact.kind === "agent_bridge") ?? [];
+}
 const modes = ["direct", ...(process.platform === "linux" && process.env.NATIVE_LINUX_CONTAINMENT_CHARACTERIZE === "1" ? ["linux-owned"] : [])];
 it.skipIf(!releaseRoot).each(modes)("characterizes the installed native Codex lifecycle handshake without user credentials (%s)", async mode => {
   expect(isAbsolute(releaseRoot!)).toBe(true);
-  const manifest = RemoteSignedBundleManifestSchema.parse(JSON.parse(await readFile(join(releaseRoot!, "manifest.json"), "utf8")));
-  const artifacts = manifest.nativeArtifacts?.filter(artifact => artifact.agentId === "codex" && artifact.kind === "agent_bridge") ?? [];
+  const artifacts = await codexBridgeArtifacts(releaseRoot!);
   expect(artifacts).toHaveLength(1);
   const prefix = join(releaseRoot!, "agents", "codex");
   const profile = await verifyOfflineAgentPackage(prefix, artifacts[0]!);

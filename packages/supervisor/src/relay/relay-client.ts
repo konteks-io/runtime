@@ -10,6 +10,8 @@ import {
   RuntimePermissionAnswerDeliveryRequestSchema,
   RuntimeAgentLoginDeliveryRequestSchema,
   type RuntimeAgentLoginDeliveryRequest,
+  RuntimeUpdateDeliveryRequestSchema,
+  type RuntimeUpdateDeliveryRequest,
   type RemoteExecutionRevisionControlDeliveryRequest,
   type RuntimePermissionAnswerDeliveryRequest,
   type DiagnosticCarrierCompanionDeliveryRequest,
@@ -44,7 +46,7 @@ const HANDSHAKE_BUFFER_MAX_BYTES = SupervisorConfigSchema.shape.SUPERVISOR_REPLA
 
 /**
  * The single outbound mutually-authenticated WebSocket to the runtime relay
- * (A2 §5). Adapted from bb `apps/host-daemon/connect-tunnel` +
+ * Adapted from bb `apps/host-daemon/connect-tunnel` +
  * `tunnel-client` reconnect mechanics: one socket, exponential backoff with
  * jitter, an epoch-stamped connection attempt so a late socket cannot win.
  *
@@ -53,7 +55,67 @@ const HANDSHAKE_BUFFER_MAX_BYTES = SupervisorConfigSchema.shape.SUPERVISOR_REPLA
  * be a runtime handshake result including reconciliation authority. Channel
  * envelopes go to the mux; cancellation-only control has a separate receiver.
  */
-export type RelayState = "offline" | "connecting" | "handshaking" | "connected" | "reconnecting";
+type RelayState = "offline" | "connecting" | "handshaking" | "connected" | "reconnecting";
+
+/** What the relay may send once its handshake result has arrived, buffered until the handshake is adopted. */
+type InboundEnvelope = ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest
+  | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest | RuntimeUpdateDeliveryRequest;
+
+type DeliveryReceiver<R> = (request: R, connection: { connectionEpoch: number; assertCurrent(): void }) => Promise<void>;
+
+/** One connection attempt: its socket and handshake progress. */
+interface SocketAttempt {
+  socket: NodeWebSocket;
+  lease: string;
+  handshook: boolean;
+  handshakeProcessing: boolean;
+  validatedEpoch: number | null;
+  pending: InboundEnvelope[];
+  pendingBytes: number;
+  receiveFailed: boolean;
+  handshakeTimer: NodeJS.Timeout | undefined;
+  /** This attempt still owns the client's socket. */
+  current(): boolean;
+  discardPending(): void;
+}
+
+/** Post-handshake envelopes in the order they are recognised; anything else must be a channel frame. */
+const POST_HANDSHAKE_SCHEMAS: ReadonlyArray<{ safeParse(value: unknown): { success: boolean; data?: unknown } }> = [
+  RuntimePermissionAnswerDeliveryRequestSchema, RuntimeAgentLoginDeliveryRequestSchema, RuntimeUpdateDeliveryRequestSchema, RuntimeCancellationDeliveryRequestSchema,
+  RemoteExecutionRevisionControlDeliveryRequestSchema, RelayReplayRequestSchema, RelayAckSchema, AssignmentReplyFrameSchema,
+];
+
+function postHandshakeEnvelope(parsed: unknown): InboundEnvelope | null {
+  for (const schema of POST_HANDSHAKE_SCHEMAS) {
+    const result = schema.safeParse(parsed);
+    if (result.success) return result.data as InboundEnvelope;
+  }
+  const frame = ToRuntimeRelayFrameSchema.safeParse(parsed);
+  return frame.success ? frame.data : null;
+}
+
+function rawDataBytes(data: NodeWebSocket.RawData | string): number {
+  if (typeof data === "string") return Buffer.byteLength(data);
+  return Array.isArray(data) ? data.reduce((total, part) => total + part.byteLength, 0) : data.byteLength;
+}
+
+function rawDataText(data: NodeWebSocket.RawData | string): string {
+  if (typeof data === "string") return data;
+  if (Buffer.isBuffer(data)) return data.toString("utf8");
+  return Array.isArray(data) ? Buffer.concat(data).toString("utf8") : Buffer.from(data).toString("utf8");
+}
+
+function parsedMessage(data: NodeWebSocket.RawData | string): { value: unknown } | null {
+  try {
+    return { value: JSON.parse(rawDataText(data)) };
+  } catch {
+    return null;
+  }
+}
+
+function deliveryType(value: unknown): unknown {
+  return typeof value === "object" && value !== null && "type" in value ? value.type : undefined;
+}
 
 export interface RelayClientOptions {
   relayUrl: string;
@@ -81,17 +143,19 @@ export interface RelayClientOptions {
     connectionEpoch: number;
     assertCurrent(): void;
   }) => Promise<void>;
-  /** A coding agent login the person started from the site (WS1-115). */
+  /** A coding agent login the person started from the site. */
   onAgentLogin?: (request: RuntimeAgentLoginDeliveryRequest, connection: {
     connectionEpoch: number;
     assertCurrent(): void;
   }) => Promise<void>;
-  /** Dedicated C02 safety-control intake; never a mux cursor or receipt ACK. */
+  /** A fixed signed runtime update, outside the work channel and its cursors. */
+  onRuntimeUpdate?: DeliveryReceiver<RuntimeUpdateDeliveryRequest>;
+  /** Dedicated safety-control intake; never a mux cursor or receipt ACK. */
   onExecutionRevisionControl?: (request: RemoteExecutionRevisionControlDeliveryRequest, connection: {
     connectionEpoch: number;
     assertCurrent(): void;
   }) => Promise<void>;
-  /** C01 diagnostic-only sidecar; its failure must not interrupt work transport. */
+  /** Diagnostic-only sidecar; its failure must not interrupt work transport. */
   onDiagnosticCompanion?: (request: DiagnosticCarrierCompanionDeliveryRequest, connection: {
     connectionEpoch: number;
     assertCurrent(): void;
@@ -178,24 +242,13 @@ export class RelayClient {
 
   /** Serialize on the current socket; false when not connected. */
   emit(envelope: ToCoreRelayFrame | AssignmentRequestFrame | RelayAck): boolean {
-    if (!this.socket || this.socket.readyState !== NodeWebSocket.OPEN || (this.state !== "connected" && this.replaySocket !== this.socket)) return false;
+    const socket = this.writableSocket();
+    if (!socket) return false;
     const payload = JSON.stringify(envelope);
     const bytes = Buffer.byteLength(payload);
-    const highWater = this.options.outboundHighWaterBytes ?? HANDSHAKE_BUFFER_MAX_BYTES / 2;
-    if (this.outboundQueue.length > 0 || this.socket.bufferedAmount + bytes > highWater) {
-      const maxFrames = this.options.outboundMaxFrames ?? HANDSHAKE_BUFFER_MAX_FRAMES;
-      const maxBytes = this.options.outboundMaxBytes ?? HANDSHAKE_BUFFER_MAX_BYTES;
-      if (this.outboundQueue.length >= maxFrames || this.outboundQueuedBytes + bytes > maxBytes) {
-        this.logger.warn({ queuedFrames: this.outboundQueue.length, queuedBytes: this.outboundQueuedBytes }, "relay socket backpressure queue is full; durable owner retains the envelope");
-        return false;
-      }
-      this.outboundQueue.push({ socket: this.socket, payload, bytes });
-      this.outboundQueuedBytes += bytes;
-      this.scheduleDrain();
-      return true;
-    }
+    if (this.outboundQueue.length > 0 || socket.bufferedAmount + bytes > this.highWater()) return this.enqueue(socket, payload, bytes);
     try {
-      this.socket.send(payload, error => {
+      socket.send(payload, error => {
         if (error) {
           this.lastError = "relay send failed";
           this.logger.warn({ err: error }, "relay send failed; durable owner retains the envelope");
@@ -210,32 +263,65 @@ export class RelayClient {
     }
   }
 
+  /** The open socket that may carry frames: the connected one, or the validated handshake's while it replays. */
+  private writableSocket(): NodeWebSocket | null {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== NodeWebSocket.OPEN) return null;
+    return this.state === "connected" || this.replaySocket === socket ? socket : null;
+  }
+
+  private highWater(): number {
+    return this.options.outboundHighWaterBytes ?? HANDSHAKE_BUFFER_MAX_BYTES / 2;
+  }
+
+  /** Queues behind backpressure; false when the bounded queue is full (the durable owner keeps the envelope). */
+  private enqueue(socket: NodeWebSocket, payload: string, bytes: number): boolean {
+    const maxFrames = this.options.outboundMaxFrames ?? HANDSHAKE_BUFFER_MAX_FRAMES;
+    const maxBytes = this.options.outboundMaxBytes ?? HANDSHAKE_BUFFER_MAX_BYTES;
+    if (this.outboundQueue.length >= maxFrames || this.outboundQueuedBytes + bytes > maxBytes) {
+      this.logger.warn({ queuedFrames: this.outboundQueue.length, queuedBytes: this.outboundQueuedBytes }, "relay socket backpressure queue is full; durable owner retains the envelope");
+      return false;
+    }
+    this.outboundQueue.push({ socket, payload, bytes });
+    this.outboundQueuedBytes += bytes;
+    this.scheduleDrain();
+    return true;
+  }
+
   /** Resume queued writes after the socket drops below the configured low-water mark. */
   drain(): void {
-    const socket = this.socket;
-    if (!socket || socket.readyState !== NodeWebSocket.OPEN || (this.state !== "connected" && this.replaySocket !== socket)) return;
-    const highWater = this.options.outboundHighWaterBytes ?? HANDSHAKE_BUFFER_MAX_BYTES / 2;
-    const lowWater = Math.min(this.options.outboundLowWaterBytes ?? highWater / 2, highWater);
+    const socket = this.writableSocket();
+    if (!socket) return;
+    const lowWater = Math.min(this.options.outboundLowWaterBytes ?? this.highWater() / 2, this.highWater());
     while (this.outboundQueue.length > 0 && socket.bufferedAmount <= lowWater) {
-      const next = this.outboundQueue[0];
-      if (!next || next.socket !== socket) { this.clearOutboundQueue(); return; }
-      this.outboundQueue.shift();
-      this.outboundQueuedBytes -= next.bytes;
-      try {
-        socket.send(next.payload, error => {
-          if (error) {
-            this.lastError = "relay send failed";
-            this.logger.warn({ err: error }, "relay queued send failed; durable owner retains replay");
-          }
-          this.drain();
-        });
-      } catch (error) {
-        this.lastError = "relay send failed";
-        this.logger.warn({ err: error }, "relay queued send failed; durable owner retains replay");
-        return;
-      }
+      if (!this.sendQueued(socket)) return;
     }
     if (this.outboundQueue.length > 0) this.scheduleDrain();
+  }
+
+  /** Sends the oldest queued frame; false when the queue belonged to another socket or the send threw. */
+  private sendQueued(socket: NodeWebSocket): boolean {
+    const next = this.outboundQueue[0];
+    if (!next || next.socket !== socket) {
+      this.clearOutboundQueue();
+      return false;
+    }
+    this.outboundQueue.shift();
+    this.outboundQueuedBytes -= next.bytes;
+    try {
+      socket.send(next.payload, error => {
+        if (error) {
+          this.lastError = "relay send failed";
+          this.logger.warn({ err: error }, "relay queued send failed; durable owner retains replay");
+        }
+        this.drain();
+      });
+      return true;
+    } catch (error) {
+      this.lastError = "relay send failed";
+      this.logger.warn({ err: error }, "relay queued send failed; durable owner retains replay");
+      return false;
+    }
   }
 
   private scheduleDrain(): void {
@@ -267,273 +353,17 @@ export class RelayClient {
       this.scheduleReconnect(0);
       return;
     }
-    const attempt = ++this.attemptEpoch;
+    const attemptNumber = ++this.attemptEpoch;
     const fence = this.connectionFence;
     this.setState(this.state === "offline" ? "connecting" : "reconnecting");
-    let socket: NodeWebSocket;
-    try {
-      socket = (this.options.createWebSocket ?? ((url) => new NodeWebSocket(url, { perMessageDeflate: false, maxPayload: REMOTE_INSTANCE_LIMITS.maxFrameBytes })))(this.options.relayUrl);
-    } catch (error) {
-      this.lastError = error instanceof Error ? error.message : String(error);
-      this.scheduleReconnect(0);
-      return;
-    }
+    const socket = this.openSocket();
+    if (!socket) return;
     this.socket = socket;
-    let handshook = false;
-    let handshakeProcessing = false;
-    let validatedEpoch: number | null = null;
-    const pending: Array<ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest> = [];
-    let pendingBytes = 0;
-    const discardPending = () => { pending.length = 0; pendingBytes = 0; };
-    this.discardHandshakeBuffer = discardPending;
-    let receiveFailed = false;
-    const current = () => attempt === this.attemptEpoch && fence === this.connectionFence && !this.stopped && this.socket === socket && !receiveFailed;
-    const rejectProtocol = (reason: string, message: string) => {
-      if (!current()) return;
-      receiveFailed = true;
-      this.replaySocket = null;
-      discardPending();
-      this.lastError = message;
-      this.options.mux.disconnected();
-      this.setState("reconnecting");
-      this.localCloseReasons.set(socket, `protocol:${reason}`);
-      socket.close(1002, reason);
-    };
-    const failReceive = (error: unknown) => {
-      if (!current()) return;
-      receiveFailed = true;
-      this.replaySocket = null;
-      discardPending();
-      this.lastError = "relay durable receive failed";
-      this.logger.warn({ err: error }, "relay durable receive failed; retaining replay for reconnect");
-      this.options.mux.disconnected();
-      this.setState("reconnecting");
-      this.localCloseReasons.set(socket, "durable_receive_failed");
-      socket.close(1011, "durable_receive_failed");
-    };
-    const receive = async (value: unknown) => {
-      const replay = RelayReplayRequestSchema.safeParse(value);
-      if (replay.success) {
-        if (replay.data.connectionEpoch !== validatedEpoch) {
-          throw new RemoteInstanceError("relay_epoch_stale", "Replay request socket ownership is not current");
-        }
-        await this.options.mux.requestReplay(replay.data);
-        return;
-      }
-      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_permission_answer_delivery") {
-        const request = RuntimePermissionAnswerDeliveryRequestSchema.parse(value);
-        const epoch = validatedEpoch;
-        const assertCurrent = () => {
-          if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
-            validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
-            throw new RemoteInstanceError("recovery_required", "Answer socket ownership is not current");
-          }
-        };
-        assertCurrent();
-        if (!this.options.onPermissionAnswer) throw new RemoteInstanceError("recovery_required", "Permission answer receiver is unavailable");
-        await this.options.onPermissionAnswer(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
-        assertCurrent();
-        return;
-      }
-      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_agent_login_delivery") {
-        // A login is the person's convenience, never work transport: whatever
-        // goes wrong with it is logged and dropped, and the socket stays up.
-        try {
-          const request = RuntimeAgentLoginDeliveryRequestSchema.parse(value);
-          const epoch = validatedEpoch;
-          const assertCurrent = () => {
-            if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
-              validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
-              throw new RemoteInstanceError("recovery_required", "Login socket ownership is not current");
-            }
-          };
-          assertCurrent();
-          if (!this.options.onAgentLogin) throw new RemoteInstanceError("recovery_required", "Agent login receiver is unavailable");
-          await this.options.onAgentLogin(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
-        } catch (error) {
-          this.logger.warn({ err: error }, "agent login delivery dropped");
-        }
-        return;
-      }
-      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_cancellation_delivery") {
-        const request = RuntimeCancellationDeliveryRequestSchema.parse(value);
-        const epoch = validatedEpoch;
-        const assertCurrent = () => {
-          if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
-              validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
-            throw new RemoteInstanceError("recovery_required", "Cancellation socket ownership is not current");
-          }
-        };
-        assertCurrent();
-        if (!this.options.onCancellation) throw new RemoteInstanceError("recovery_required", "Cancellation receiver is unavailable");
-        await this.options.onCancellation(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
-        assertCurrent();
-        return;
-      }
-      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_diagnostic_carrier_companion_delivery") {
-        // Diagnostics are deliberately best effort: malformed, stale, or
-        // unavailable sidecars become a coverage signal, never a work outage.
-        try {
-          const request = DiagnosticCarrierCompanionDeliveryRequestSchema.parse(value);
-          const epoch = validatedEpoch;
-          const assertCurrent = () => {
-            if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
-              validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
-              throw new RemoteInstanceError("recovery_required", "Diagnostic companion socket ownership is not current");
-            }
-          };
-          assertCurrent();
-          if (!this.options.onDiagnosticCompanion) {
-            this.logger.warn({
-              event: "runtime.diagnostic_companion.coverage_incomplete",
-              outcome: "unknown",
-              reason: "receiver_unavailable",
-              deliveryId: request.companion.deliveryId,
-            }, "diagnostic companion coverage is incomplete");
-            return;
-          }
-          await this.options.onDiagnosticCompanion(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
-          assertCurrent();
-        } catch (error) {
-          this.logger.warn({ err: error }, "diagnostic companion delivery was not retained");
-        }
-        return;
-      }
-      if (typeof value === "object" && value !== null && "type" in value && value.type === "runtime_execution_revision_control_delivery") {
-        const request = RemoteExecutionRevisionControlDeliveryRequestSchema.parse(value);
-        const epoch = validatedEpoch;
-        const assertCurrent = () => {
-          if (!current() || socket.readyState !== NodeWebSocket.OPEN || epoch === null ||
-              validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
-            throw new RemoteInstanceError("recovery_required", "Revision-control socket ownership is not current");
-          }
-        };
-        assertCurrent();
-        if (!this.options.onExecutionRevisionControl) throw new RemoteInstanceError("recovery_required", "Revision-control receiver is unavailable");
-        await this.options.onExecutionRevisionControl(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
-        assertCurrent();
-        return;
-      }
-      await this.options.mux.receive(value);
-    };
-    const handshakeTimer = setTimeout(() => {
-      if (!handshook && current()) {
-        receiveFailed = true;
-        this.replaySocket = null;
-        discardPending();
-        this.lastError = "relay handshake timed out";
-        this.options.mux.disconnected();
-        this.setState("reconnecting");
-        this.localCloseReasons.set(socket, "handshake_timeout");
-        socket.terminate();
-      }
-    }, this.options.handshakeTimeoutMs ?? 15_000);
-    handshakeTimer.unref();
-
-    socket.on("open", () => {
-      if (!current()) {
-        socket.terminate();
-        return;
-      }
-      this.setState("handshaking");
-      const appliedManifestId = this.options.appliedManifestId?.();
-      const body = { instanceId: this.options.instanceId(), runnerIncarnation: this.options.runnerIncarnation(), lease, lastAckedSeq: this.options.mux.handshakeCursors(), ...(appliedManifestId == null ? {} : { appliedManifestId }) };
-      const request: RelayHandshakeRequest = {
-        ...body,
-        proof: signInstanceProof(this.options.key(), { method: "relay_handshake", audience: CORE_AUDIENCE, subject: body.instanceId, body: body as unknown as { [key: string]: JsonValue } }),
-      };
-      socket.send(JSON.stringify(request));
-    });
-    socket.on("message", (data) => {
-      if (!current()) return;
-      if (handshakeProcessing && validatedEpoch === null) {
-        rejectProtocol("not_ready", "relay sent data before handshake authority validation completed");
-        return;
-      }
-      const bytes = typeof data === "string" ? Buffer.byteLength(data) : Array.isArray(data)
-        ? data.reduce((total, part) => total + part.byteLength, 0) : data.byteLength;
-      if (bytes > REMOTE_INSTANCE_LIMITS.maxFrameBytes) {
-        rejectProtocol("frame_too_large", "relay message exceeded the frame size limit");
-        return;
-      }
-      let parsed: unknown;
-      try {
-        const text = typeof data === "string" ? data : Buffer.isBuffer(data) ? data.toString("utf8")
-          : Array.isArray(data) ? Buffer.concat(data).toString("utf8") : Buffer.from(data).toString("utf8");
-        parsed = JSON.parse(text);
-      } catch {
-        rejectProtocol("protocol", "relay sent a non-JSON message");
-        return;
-      }
-      if (handshakeProcessing) {
-        const ack = RelayAckSchema.safeParse(parsed);
-        const assignment = ack.success ? null : AssignmentReplyFrameSchema.safeParse(parsed);
-        const cancellation = RuntimeCancellationDeliveryRequestSchema.safeParse(parsed);
-        const revisionControl = RemoteExecutionRevisionControlDeliveryRequestSchema.safeParse(parsed);
-        const answer = RuntimePermissionAnswerDeliveryRequestSchema.safeParse(parsed);
-        const login = RuntimeAgentLoginDeliveryRequestSchema.safeParse(parsed);
-        const replay = RelayReplayRequestSchema.safeParse(parsed);
-        const frame = answer.success ? answer : login.success ? login : cancellation.success ? cancellation : revisionControl.success ? revisionControl : replay.success ? replay : ack.success ? ack : assignment?.success ? assignment : ToRuntimeRelayFrameSchema.safeParse(parsed);
-        if (!frame.success || frame.data.connectionEpoch !== validatedEpoch) {
-          rejectProtocol("protocol", "relay sent an invalid post-handshake envelope");
-          return;
-        }
-        if (pending.length >= HANDSHAKE_BUFFER_MAX_FRAMES || pendingBytes + bytes > HANDSHAKE_BUFFER_MAX_BYTES) {
-          rejectProtocol("handshake_buffer_full", "relay post-handshake buffer exceeded its bounded capacity");
-          return;
-        }
-        pending.push(frame.data);
-        pendingBytes += bytes;
-        return;
-      }
-      if (!handshook) {
-        const result = RelayRuntimeHandshakeResultSchema.safeParse(parsed);
-        if (!result.success) {
-          rejectProtocol("handshake", "relay handshake result did not match the runtime schema");
-          return;
-        }
-        handshakeProcessing = true;
-        void (async () => {
-          const validation = this.options.validateHandshake?.(result.data);
-          // A synchronous durable-owner check and mux adoption stay in the
-          // same turn; do not introduce an avoidable authority-change gap.
-          if (validation !== undefined) await validation;
-          if (!current() || socket.readyState !== NodeWebSocket.OPEN) return;
-          validatedEpoch = result.data.connectionEpoch;
-          this.replaySocket = socket;
-          await this.options.mux.applyHandshake(result.data);
-          if (!current() || socket.readyState !== NodeWebSocket.OPEN) return;
-          // Cursor fsync yielded. A queued envelope cannot inherit a later
-          // generation just because that new generation is now authorized.
-          const revalidation = this.options.validateHandshake?.(result.data);
-          if (revalidation !== undefined) await revalidation;
-          if (!current() || socket.readyState !== NodeWebSocket.OPEN) return;
-          // Admission is synchronous; mux.receive captures its per-channel
-          // authority before awaiting its lane. Never await a whole agent turn
-          // here: another channel may carry that turn's permission response.
-          for (const envelope of pending) {
-            const admission = this.options.validateHandshake?.(result.data);
-            if (admission !== undefined) await admission;
-            if (!current() || socket.readyState !== NodeWebSocket.OPEN) return;
-            void receive(envelope).catch(failReceive);
-          }
-          discardPending();
-          this.replaySocket = null;
-          handshook = true;
-          handshakeProcessing = false;
-          clearTimeout(handshakeTimer);
-          this.connectedAt = Date.now();
-          this.lastConnectedAt = this.options.clock.nowIso();
-          this.consecutiveFailures = 0;
-          this.lastError = null;
-          this.setState("connected");
-          this.armLeaseRotation(lease);
-          if (current()) await this.options.onConnected?.(result.data);
-        })().catch(failReceive);
-        return;
-      }
-      void receive(parsed).catch(failReceive);
-    });
+    const attempt = this.newAttempt(socket, lease, () => attemptNumber === this.attemptEpoch && fence === this.connectionFence);
+    attempt.handshakeTimer = setTimeout(() => this.handshakeTimedOut(attempt), this.options.handshakeTimeoutMs ?? 15_000);
+    attempt.handshakeTimer.unref();
+    socket.on("open", () => this.onOpen(attempt));
+    socket.on("message", data => this.onMessage(attempt, data));
     socket.on("unexpected-response", (_request, response) => {
       this.lastError = `relay rejected the connection: HTTP ${response.statusCode ?? 0}`;
       response.resume();
@@ -541,35 +371,294 @@ export class RelayClient {
       socket.terminate();
     });
     socket.on("error", (error: Error) => {
-      if (attempt !== this.attemptEpoch) return;
+      if (attemptNumber !== this.attemptEpoch) return;
       this.lastError = humanizeTransportError(error, new URL(this.options.relayUrl).host);
     });
-    socket.on("close", (code, reason) => {
-      clearTimeout(handshakeTimer);
-      if (attempt !== this.attemptEpoch) return;
-      this.clearLeaseRotation();
-      this.socket = null;
-      this.clearOutboundQueue();
-      this.replaySocket = null;
-      discardPending();
-      this.discardHandshakeBuffer = null;
-      this.options.mux.disconnected();
-      if (this.stopped) {
-        this.setState("offline");
-        return;
+    socket.on("close", (code, reason) => this.onClose(attempt, attemptNumber, code, reason));
+  }
+
+  private openSocket(): NodeWebSocket | null {
+    try {
+      return (this.options.createWebSocket ?? ((url) => new NodeWebSocket(url, { perMessageDeflate: false, maxPayload: REMOTE_INSTANCE_LIMITS.maxFrameBytes })))(this.options.relayUrl);
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error);
+      this.scheduleReconnect(0);
+      return null;
+    }
+  }
+
+  private newAttempt(socket: NodeWebSocket, lease: string, ownsAttempt: () => boolean): SocketAttempt {
+    const attempt: SocketAttempt = {
+      socket, lease, handshook: false, handshakeProcessing: false, validatedEpoch: null, pending: [], pendingBytes: 0, receiveFailed: false, handshakeTimer: undefined,
+      current: () => ownsAttempt() && !this.stopped && this.socket === socket && !attempt.receiveFailed,
+      discardPending: () => { attempt.pending.length = 0; attempt.pendingBytes = 0; },
+    };
+    this.discardHandshakeBuffer = attempt.discardPending;
+    return attempt;
+  }
+
+  /** The attempt still owns an open socket. */
+  private socketCurrent(attempt: SocketAttempt): boolean {
+    return attempt.current() && attempt.socket.readyState === NodeWebSocket.OPEN;
+  }
+
+  /** Gives up this socket: no further receive, no buffered envelopes, a reconnect follows its close. */
+  private abandon(attempt: SocketAttempt, lastError: string, localReason: string, close: (socket: NodeWebSocket) => void): void {
+    attempt.receiveFailed = true;
+    this.replaySocket = null;
+    attempt.discardPending();
+    this.lastError = lastError;
+    this.options.mux.disconnected();
+    this.setState("reconnecting");
+    this.localCloseReasons.set(attempt.socket, localReason);
+    close(attempt.socket);
+  }
+
+  private rejectProtocol(attempt: SocketAttempt, reason: string, message: string): void {
+    if (!attempt.current()) return;
+    this.abandon(attempt, message, `protocol:${reason}`, socket => socket.close(1002, reason));
+  }
+
+  private failReceive(attempt: SocketAttempt, error: unknown): void {
+    if (!attempt.current()) return;
+    this.logger.warn({ err: error }, "relay durable receive failed; retaining replay for reconnect");
+    this.abandon(attempt, "relay durable receive failed", "durable_receive_failed", socket => socket.close(1011, "durable_receive_failed"));
+  }
+
+  private handshakeTimedOut(attempt: SocketAttempt): void {
+    if (attempt.handshook || !attempt.current()) return;
+    this.abandon(attempt, "relay handshake timed out", "handshake_timeout", socket => socket.terminate());
+  }
+
+  private onOpen(attempt: SocketAttempt): void {
+    if (!attempt.current()) {
+      attempt.socket.terminate();
+      return;
+    }
+    this.setState("handshaking");
+    const appliedManifestId = this.options.appliedManifestId?.();
+    const body = { instanceId: this.options.instanceId(), runnerIncarnation: this.options.runnerIncarnation(), lease: attempt.lease, lastAckedSeq: this.options.mux.handshakeCursors(), ...(appliedManifestId == null ? {} : { appliedManifestId }) };
+    const request: RelayHandshakeRequest = {
+      ...body,
+      proof: signInstanceProof(this.options.key(), { method: "relay_handshake", audience: CORE_AUDIENCE, subject: body.instanceId, body: body as unknown as { [key: string]: JsonValue } }),
+    };
+    attempt.socket.send(JSON.stringify(request));
+  }
+
+  private onMessage(attempt: SocketAttempt, data: NodeWebSocket.RawData): void {
+    if (!attempt.current()) return;
+    if (attempt.handshakeProcessing && attempt.validatedEpoch === null) {
+      return this.rejectProtocol(attempt, "not_ready", "relay sent data before handshake authority validation completed");
+    }
+    const bytes = rawDataBytes(data);
+    if (bytes > REMOTE_INSTANCE_LIMITS.maxFrameBytes) return this.rejectProtocol(attempt, "frame_too_large", "relay message exceeded the frame size limit");
+    const parsed = parsedMessage(data);
+    if (parsed === null) return this.rejectProtocol(attempt, "protocol", "relay sent a non-JSON message");
+    if (attempt.handshakeProcessing) return this.bufferDuringHandshake(attempt, parsed.value, bytes);
+    if (!attempt.handshook) return this.handshakeResult(attempt, parsed.value);
+    void this.receive(attempt, parsed.value).catch(error => this.failReceive(attempt, error));
+  }
+
+  /** Envelopes that arrive while the handshake is being adopted wait, bounded, for that adoption. */
+  private bufferDuringHandshake(attempt: SocketAttempt, parsed: unknown, bytes: number): void {
+    const envelope = postHandshakeEnvelope(parsed);
+    if (envelope === null || envelope.connectionEpoch !== attempt.validatedEpoch) {
+      return this.rejectProtocol(attempt, "protocol", "relay sent an invalid post-handshake envelope");
+    }
+    if (attempt.pending.length >= HANDSHAKE_BUFFER_MAX_FRAMES || attempt.pendingBytes + bytes > HANDSHAKE_BUFFER_MAX_BYTES) {
+      return this.rejectProtocol(attempt, "handshake_buffer_full", "relay post-handshake buffer exceeded its bounded capacity");
+    }
+    attempt.pending.push(envelope);
+    attempt.pendingBytes += bytes;
+  }
+
+  private handshakeResult(attempt: SocketAttempt, parsed: unknown): void {
+    const result = RelayRuntimeHandshakeResultSchema.safeParse(parsed);
+    if (!result.success) return this.rejectProtocol(attempt, "handshake", "relay handshake result did not match the runtime schema");
+    attempt.handshakeProcessing = true;
+    void this.adoptHandshake(attempt, result.data).catch(error => this.failReceive(attempt, error));
+  }
+
+  /**
+   * Validate, then adopt the epoch and the mux cursors. A synchronous
+   * durable-owner check and mux adoption stay in the same turn; do not
+   * introduce an avoidable authority-change gap.
+   */
+  private async adoptHandshake(attempt: SocketAttempt, handshake: RelayRuntimeHandshakeResult): Promise<void> {
+    const validation = this.options.validateHandshake?.(handshake);
+    if (validation !== undefined) await validation;
+    if (!this.socketCurrent(attempt)) return;
+    attempt.validatedEpoch = handshake.connectionEpoch;
+    this.replaySocket = attempt.socket;
+    await this.options.mux.applyHandshake(handshake);
+    if (!this.socketCurrent(attempt)) return;
+    return this.revalidateHandshake(attempt, handshake);
+  }
+
+  /**
+   * Cursor fsync yielded. A queued envelope cannot inherit a later generation
+   * just because that new generation is now authorized.
+   */
+  private async revalidateHandshake(attempt: SocketAttempt, handshake: RelayRuntimeHandshakeResult): Promise<void> {
+    const revalidation = this.options.validateHandshake?.(handshake);
+    if (revalidation !== undefined) await revalidation;
+    if (!this.socketCurrent(attempt)) return;
+    return this.admitPendingAndConnect(attempt, handshake);
+  }
+
+  /**
+   * Admission is synchronous; mux.receive captures its per-channel authority
+   * before awaiting its lane. Never await a whole agent turn here: another
+   * channel may carry that turn's permission response.
+   */
+  private async admitPendingAndConnect(attempt: SocketAttempt, handshake: RelayRuntimeHandshakeResult): Promise<void> {
+    for (const envelope of attempt.pending) {
+      const admission = this.options.validateHandshake?.(handshake);
+      if (admission !== undefined) await admission;
+      if (!this.socketCurrent(attempt)) return;
+      void this.receive(attempt, envelope).catch(error => this.failReceive(attempt, error));
+    }
+    attempt.discardPending();
+    this.replaySocket = null;
+    attempt.handshook = true;
+    attempt.handshakeProcessing = false;
+    clearTimeout(attempt.handshakeTimer);
+    this.connectedAt = Date.now();
+    this.lastConnectedAt = this.options.clock.nowIso();
+    this.consecutiveFailures = 0;
+    this.lastError = null;
+    this.setState("connected");
+    this.armLeaseRotation(attempt.lease);
+    if (attempt.current()) await this.options.onConnected?.(handshake);
+  }
+
+  private async receive(attempt: SocketAttempt, value: unknown): Promise<void> {
+    const replay = RelayReplayRequestSchema.safeParse(value);
+    if (replay.success) {
+      if (replay.data.connectionEpoch !== attempt.validatedEpoch) {
+        throw new RemoteInstanceError("relay_epoch_stale", "Replay request socket ownership is not current");
       }
-      // Say who closed it and why, every time (WS2-157): a close with no
-      // local reason came from the relay or the network (1006: no close frame).
-      const localReason = this.localCloseReasons.get(socket) ?? null;
-      this.logger.warn({ event: "relay.socket.closed", code, reason: reason.toString("utf8").slice(0, 120),
-        closedBy: localReason ? "runtime" : "peer_or_network", localReason, handshook,
-        connectedForMs: handshook ? Date.now() - this.connectedAt : null, lastError: this.lastError,
-        connectionEpoch: this.options.mux.connectionEpoch }, "relay socket closed");
-      if (this.lastError === null) this.lastError = `relay socket closed (code ${code}${reason.length > 0 ? `, ${reason.toString()}` : ""})`;
-      this.consecutiveFailures += handshook ? 0 : 1;
-      this.setState("reconnecting");
-      this.scheduleReconnect(handshook ? Date.now() - this.connectedAt : 0);
-    });
+      await this.options.mux.requestReplay(replay.data);
+      return;
+    }
+    return this.dispatch(attempt, value);
+  }
+
+  /** A control delivery to its own receiver; anything else is a channel envelope for the mux. */
+  private async dispatch(attempt: SocketAttempt, value: unknown): Promise<void> {
+    switch (deliveryType(value)) {
+      case "runtime_permission_answer_delivery":
+        return this.deliver(attempt, RuntimePermissionAnswerDeliveryRequestSchema.parse(value), "Answer", this.receiverFor(this.options.onPermissionAnswer), "Permission answer receiver is unavailable");
+      case "runtime_agent_login_delivery":
+        return this.deliverLogin(attempt, value);
+      case "runtime_update_delivery":
+        return this.deliverRuntimeUpdate(attempt, value);
+      case "runtime_cancellation_delivery":
+        return this.deliver(attempt, RuntimeCancellationDeliveryRequestSchema.parse(value), "Cancellation", this.receiverFor(this.options.onCancellation), "Cancellation receiver is unavailable");
+      case "runtime_diagnostic_carrier_companion_delivery":
+        return this.deliverDiagnostic(attempt, value);
+      case "runtime_execution_revision_control_delivery":
+        return this.deliver(attempt, RemoteExecutionRevisionControlDeliveryRequestSchema.parse(value), "Revision-control", this.receiverFor(this.options.onExecutionRevisionControl), "Revision-control receiver is unavailable");
+      default:
+        await this.options.mux.receive(value);
+    }
+  }
+
+  /** The options' receiver, called as the options' own method. */
+  private receiverFor<R>(receiver: DeliveryReceiver<R> | undefined): DeliveryReceiver<R> | undefined {
+    return receiver?.bind(this.options);
+  }
+
+  /** A check that this socket and the epoch the request was delivered on are still current. */
+  private deliveryGuard(attempt: SocketAttempt, request: { connectionEpoch: number }, label: string): () => void {
+    const epoch = attempt.validatedEpoch;
+    return () => {
+      if (!this.socketCurrent(attempt) || epoch === null || attempt.validatedEpoch !== epoch || request.connectionEpoch !== epoch) {
+        throw new RemoteInstanceError("recovery_required", `${label} socket ownership is not current`);
+      }
+    };
+  }
+
+  /** A control delivery outside the channel cursors, checked current before and after its receiver. */
+  private async deliver<R extends { connectionEpoch: number }>(attempt: SocketAttempt, request: R, label: string, receiver: DeliveryReceiver<R> | undefined, unavailable: string, checkAfter = true): Promise<void> {
+    const assertCurrent = this.deliveryGuard(attempt, request, label);
+    assertCurrent();
+    if (!receiver) throw new RemoteInstanceError("recovery_required", unavailable);
+    await receiver(request, { connectionEpoch: request.connectionEpoch, assertCurrent });
+    if (checkAfter) assertCurrent();
+  }
+
+  /**
+   * A login is the person's convenience, never work transport: whatever goes
+   * wrong with it is logged and dropped, and the socket stays up.
+   */
+  private async deliverLogin(attempt: SocketAttempt, value: unknown): Promise<void> {
+    try {
+      await this.deliver(attempt, RuntimeAgentLoginDeliveryRequestSchema.parse(value), "Login", this.receiverFor(this.options.onAgentLogin), "Agent login receiver is unavailable", false);
+    } catch (error) {
+      this.logger.warn({ err: error }, "agent login delivery dropped");
+    }
+  }
+
+  private async deliverRuntimeUpdate(attempt: SocketAttempt, value: unknown): Promise<void> {
+    try {
+      await this.deliver(attempt, RuntimeUpdateDeliveryRequestSchema.parse(value), "Runtime update", this.receiverFor(this.options.onRuntimeUpdate), "Runtime update receiver is unavailable", false);
+    } catch {
+      // The operation carries no diagnostics or secrets back to the browser.
+      // A refusal never tears down ordinary work transport.
+      this.logger.warn({ event: "runtime.update_delivery_refused" }, "runtime update delivery refused");
+    }
+  }
+
+  /**
+   * Diagnostics are deliberately best effort: malformed, stale, or
+   * unavailable sidecars become a coverage signal, never a work outage.
+   */
+  private async deliverDiagnostic(attempt: SocketAttempt, value: unknown): Promise<void> {
+    try {
+      const request = DiagnosticCarrierCompanionDeliveryRequestSchema.parse(value);
+      const receiver = this.receiverFor(this.options.onDiagnosticCompanion);
+      if (receiver) return await this.deliver(attempt, request, "Diagnostic companion", receiver, "");
+      this.deliveryGuard(attempt, request, "Diagnostic companion")();
+      this.logger.warn({
+        event: "runtime.diagnostic_companion.coverage_incomplete",
+        outcome: "unknown",
+        reason: "receiver_unavailable",
+        deliveryId: request.companion.deliveryId,
+      }, "diagnostic companion coverage is incomplete");
+    } catch (error) {
+      this.logger.warn({ err: error }, "diagnostic companion delivery was not retained");
+    }
+  }
+
+  private onClose(attempt: SocketAttempt, attemptNumber: number, code: number, reason: Buffer): void {
+    clearTimeout(attempt.handshakeTimer);
+    if (attemptNumber !== this.attemptEpoch) return;
+    this.clearLeaseRotation();
+    this.socket = null;
+    this.clearOutboundQueue();
+    this.replaySocket = null;
+    attempt.discardPending();
+    this.discardHandshakeBuffer = null;
+    this.options.mux.disconnected();
+    if (this.stopped) {
+      this.setState("offline");
+      return;
+    }
+    this.logClose(attempt, code, reason);
+    if (this.lastError === null) this.lastError = `relay socket closed (code ${code}${reason.length > 0 ? `, ${reason.toString()}` : ""})`;
+    this.consecutiveFailures += attempt.handshook ? 0 : 1;
+    this.setState("reconnecting");
+    this.scheduleReconnect(attempt.handshook ? Date.now() - this.connectedAt : 0);
+  }
+
+  /** Who closed the socket and why, every time: a close with no local reason came from the relay or the network (1006: no close frame). */
+  private logClose(attempt: SocketAttempt, code: number, reason: Buffer): void {
+    const localReason = this.localCloseReasons.get(attempt.socket) ?? null;
+    this.logger.warn({ event: "relay.socket.closed", code, reason: reason.toString("utf8").slice(0, 120),
+      closedBy: localReason ? "runtime" : "peer_or_network", localReason, handshook: attempt.handshook,
+      connectedForMs: attempt.handshook ? Date.now() - this.connectedAt : null, lastError: this.lastError,
+      connectionEpoch: this.options.mux.connectionEpoch }, "relay socket closed");
   }
 
   /**
@@ -577,7 +666,7 @@ export class RelayClient {
    * while heartbeats keep adopting fresh ones. Before that first lease
    * expires, re-handshake with the current one (unacked frames stay
    * buffered); otherwise Core calls the socket stale and the relay closes it
-   * with 4409 every lease lifetime (2026-10-03: every ~15 min, all day).
+   * with 4409 once per lease lifetime.
    */
   private armLeaseRotation(lease: string): void {
     this.clearLeaseRotation();
@@ -609,6 +698,16 @@ export class RelayClient {
   }
 }
 
+const FAILURE_CLASSIFICATIONS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/timed out|timeout/i, "timeout"],
+  [/certificate|tls/i, "tls"],
+  [/refused/i, "connection_refused"],
+  [/not found/i, "dns"],
+  [/reset/i, "connection_reset"],
+  [/HTTP 429/i, "rate_limited"],
+  [/HTTP 5\d\d/i, "upstream"],
+];
+
 /** How long before the connected lease expires the socket re-handshakes, and the least it waits. */
 const LEASE_ROTATION_MARGIN_MS = 60_000;
 const LEASE_ROTATION_MIN_DELAY_MS = 5_000;
@@ -627,12 +726,5 @@ function leaseExpiryMs(lease: string): number | null {
 
 function relayFailureClassification(error: string | null): string {
   if (!error) return "socket_closed";
-  if (/timed out|timeout/i.test(error)) return "timeout";
-  if (/certificate|tls/i.test(error)) return "tls";
-  if (/refused/i.test(error)) return "connection_refused";
-  if (/not found/i.test(error)) return "dns";
-  if (/reset/i.test(error)) return "connection_reset";
-  if (/HTTP 429/i.test(error)) return "rate_limited";
-  if (/HTTP 5\d\d/i.test(error)) return "upstream";
-  return "socket_closed";
+  return FAILURE_CLASSIFICATIONS.find(([pattern]) => pattern.test(error))?.[1] ?? "socket_closed";
 }

@@ -34,7 +34,6 @@
     "@konteks/remote-release": "*",
     "@konteks/remote-supervisor": "*",
     "commander": "^13.0.0",
-    "ws": "^8.18.0",
     "zod": "^4.0.0"
   }
 }

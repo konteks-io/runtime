@@ -69,7 +69,7 @@ describe("closed native runtime installation", () => {
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, git: { ...git, digest: "sha256:" + "f".repeat(64) } }));
     await expect(loadNativeInstallation(root, f.options)).rejects.toThrow();
   });
-  it("loads and starts an installation with no agent yet (OS14, D116)", async () => {
+  it("loads and starts an installation with no agent yet", async () => {
     const f = await fixture();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: [] }));
     const loaded = await loadNativeInstallation(root, f.options);
@@ -200,7 +200,7 @@ describe("closed native runtime installation", () => {
     await expect(verifyInstalledNativeBridges(hostOnly.release, hostOnly.runners, f.options.platform)).resolves.toBeUndefined();
     // An upgrade out of the tested range never runs silently: dsh is left out
     // with the install hint (retried by the supervisor), and Codex still loads
-    // (opencode-runtime-support CP6 start isolation).
+    // (start isolation).
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, agents: ["codex", "dsh"], dshRoot: await dsh("0.1.8"), dshNode: node }));
     const outOfRange = await loadNativeInstallation(root, f.options);
     expect(outOfRange.runners.map(entry => entry.RUNNER_AGENT_ID)).toEqual(["codex"]);
@@ -211,7 +211,7 @@ describe("closed native runtime installation", () => {
     await expect(verifyInstalledNativeBridges(loaded.release, loaded.runners, f.options.platform)).rejects.toMatchObject({ code: "bundle_untrusted" });
     expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, agents: ["claude-code", "codex", "dsh"] }).success).toBe(true);
   });
-  it("still loads a record written before 7.0.0 that lists Pi or the old OpenCode: Pi is dropped, OpenCode reads as the person's own OpenCode 2 (O13)", async () => {
+  it("still loads a record written before 7.0.0 that lists Pi or the old OpenCode: Pi is dropped, OpenCode reads as the person's own OpenCode 2", async () => {
     const f = await fixture();
     // The old bundled OpenCode had its private folders; no OpenCode 2 is installed here.
     for (const dir of ["credentials", "workspaces"]) await mkdir(join(root, dir, "opencode"), { recursive: true, mode: 0o700 });
@@ -248,7 +248,7 @@ describe("closed native runtime installation", () => {
     await packageJson("1.18.33");
     await expect(openCodeInstallAdapter.runnerSettings(record)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_unsupported_version" });
     await packageJson("2.0.18");
-    // The gate is lifted (CP6): a stored record naming it builds its runner.
+    // The gate is lifted: a stored record naming it builds its runner.
     expect(openCodeInstallAdapter.offered).toBe(true);
     expect(nativeAgentOffered("opencode")).toBe(true);
     expect(nativeAgentOffered("dsh")).toBe(true);
@@ -271,7 +271,7 @@ describe("closed native runtime installation", () => {
     // A runner built directly still proves the locked configuration first.
     await expect(openCodeInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "opencode_not_found" });
   });
-  it("records Google Antigravity's fetched copy, re-verifies it through its adapter, and leaves a missing copy out to be fetched again on the first yes (CP6)", async () => {
+  it("records Google Antigravity's fetched copy, re-verifies it through its adapter, and leaves a missing copy out to be fetched again on the first yes", async () => {
     const f = await fixture();
     const folder = join(root, "agents", "antigravity", "1.2.1-darwin-arm64");
     const record = NativeRuntimeRecordSchema.parse({ ...f.record, agents: ["codex", "antigravity"], antigravityVersion: "1.2.1", antigravityRoot: folder });
@@ -290,7 +290,7 @@ describe("closed native runtime installation", () => {
     expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex"]);
     expect(loaded.unavailableAgents).toEqual([expect.objectContaining({ agentId: "antigravity", fetched: { antigravityVersion: "1.2.1", antigravityRoot: folder } })]);
     const [entry] = loaded.unavailableAgents;
-    // Where this release pins a copy, the missing one is fetched again at once (A17: the first yes covers it).
+    // Where this release pins a copy, the missing one is fetched again at once (the first yes covers it).
     if (entry!.error.diagnostic === "antigravity_not_fetched") expect(entry!.updating).toBe(true);
     else expect(entry!.updating).toBeUndefined();
     await expect(antigravityInstallAdapter.selfCheck({} as never)).rejects.toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_not_fetched" });

@@ -9,6 +9,7 @@ import {
   GoogleCloudProjectIdSchema,
   RemoteInstanceError,
   agentLoginUrlAllowed,
+  withoutUndefined,
   deleteSecretFile,
   keyedFingerprint,
   readOrCreateSecretFile,
@@ -38,10 +39,10 @@ import {
   type AntigravitySignIn,
 } from "../host/antigravity.js";
 import type { LoginEvent, LoginFailureReason, LoginFlow } from "./login-flow.js";
+import { checkApiKey, type KeyVerdict } from "./key-check.js";
 
 /**
- * Google Antigravity's sign-ins (antigravity-runtime-support A6, A7, A10,
- * CP3), driven by the connector the way the other agents' are:
+ * Google Antigravity's sign-ins, driven by the connector the way the other agents' are:
  * - **Gemini API key** (as DeepSeek Harness's): typed into the launcher's
  *   hidden prompt, checked with Google's free model list, kept in the
  *   connector's own store outside the agent's home (`<root>/relay`), never an
@@ -57,14 +58,14 @@ import type { LoginEvent, LoginFailureReason, LoginFlow } from "./login-flow.js"
  *   private home (forced file storage); the connector checks it exists and
  *   never reads it.
  * - **Personal Google sign-in** exists only behind packages'
- *   `ANTIGRAVITY_LOGIN_OPTIONS['google-account'].released`, which is off
- *   (A10): never offered, never started.
+ *   `ANTIGRAVITY_LOGIN_OPTIONS['google-account'].released`, which is off:
+ *   never offered, never started.
  */
 
 const KEY_SHAPE = /^[\x21-\x7e]{16,512}$/;
 const MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1";
-/** Google's own sign-in times out after 300 s (CP0); a little more for the licence page. */
-export const ANTIGRAVITY_SIGN_IN_TIMEOUT_MS = 330_000;
+/** Google's own sign-in times out after 300 s; a little more for the licence page. */
+const ANTIGRAVITY_SIGN_IN_TIMEOUT_MS = 330_000;
 const REQUIRE_REVIEW_LINE = "Your Google Cloud admin must set Terminal auto-execution to Require review. Otherwise Konteks stops Google Antigravity after its first command.";
 
 /** Where the connector keeps the person's Gemini API key: 0600, outside the agent's home. */
@@ -90,27 +91,18 @@ async function removeAntigravityApiKey(credentialDir: string): Promise<boolean> 
   return held;
 }
 
-/** Check a key with Google's model list: free, no tokens spent. */
-export async function verifyGeminiApiKey(key: string, deps: { fetch?: typeof fetch; timeoutMs?: number } = {}): Promise<"valid" | "rejected" | "unreachable"> {
-  try {
-    const response = await (deps.fetch ?? fetch)(MODELS_URL, {
-      headers: { "x-goog-api-key": key, accept: "application/json" },
-      signal: AbortSignal.timeout(deps.timeoutMs ?? 15_000),
-    });
-    await response.body?.cancel().catch(() => undefined);
-    if (response.ok) return "valid";
-    // Google answers a key it does not know with 400 API_KEY_INVALID.
-    if (response.status === 400 || response.status === 401 || response.status === 403) return "rejected";
-    return "unreachable";
-  } catch {
-    return "unreachable";
-  }
+/**
+ * Check a key with Google's model list: free, no tokens spent. Google answers
+ * a key it does not know with 400 API_KEY_INVALID.
+ */
+function verifyGeminiApiKey(key: string, deps: { fetch?: typeof fetch; timeoutMs?: number } = {}): Promise<KeyVerdict> {
+  return checkApiKey(MODELS_URL, { "x-goog-api-key": key, accept: "application/json" }, [400, 401, 403], deps);
 }
 
 // ── Gemini Enterprise over ACP ────────────────────────────────────────────────
 
 /** What the server printed during a Google sign-in, read line by line from its stderr. */
-export interface GoogleSignInSignals {
+interface GoogleSignInSignals {
   /** Google's own page (`accounts.google.com`), relayed to the person. */
   googleUrl?: string;
   /** The server's licence picker opened on loopback (never relayed). */
@@ -128,7 +120,7 @@ const PICKER = /Open the following link to choose your Gemini Enterprise license
 const RESOLVED = /Gemini Enterprise sign-in resolved: project=(\S+) location=(\S+) user_tier=(\S+)/;
 
 /** Read one stderr line of the server into `signals`; returns what changed, for the relay. */
-export function readGoogleSignInLine(line: string, signals: GoogleSignInSignals): "google_url" | "picker" | "no_licence" | "resolved" | null {
+function readGoogleSignInLine(line: string, signals: GoogleSignInSignals): "google_url" | "picker" | "no_licence" | "resolved" | null {
   const link = GOOGLE_LINK.exec(line)?.[1];
   if (link) {
     signals.googleUrl = link;
@@ -151,17 +143,11 @@ export interface GoogleSignInProcess {
   initializeTimeoutMs: number;
 }
 
-export type GoogleSignInOutcome =
+type GoogleSignInOutcome =
   | { outcome: "signed_in"; gcp?: AgentLoginGcp; tier?: string }
   | { outcome: "failed"; reason?: LoginFailureReason; message: string };
 
-/**
- * One Google sign-in over ACP on a process of the connector's own (never an
- * execution process, whose stderr reading ends a session at these very
- * lines). `settings.json` names the method (and Enterprise's project) while
- * the server signs in; the home is held so nothing rewrites it meanwhile.
- */
-export async function runGoogleSignIn(options: {
+type GoogleSignInRun = {
   credentialDir: string;
   method: "oauth-business" | "oauth-personal";
   gcp?: AgentLoginGcp;
@@ -169,7 +155,15 @@ export async function runGoogleSignIn(options: {
   onLine: (change: ReturnType<typeof readGoogleSignInLine>, signals: GoogleSignInSignals) => void;
   signal: AbortSignal;
   timeoutMs?: number;
-}): Promise<GoogleSignInOutcome> {
+};
+
+/**
+ * One Google sign-in over ACP on a process of the connector's own (never an
+ * execution process, whose stderr reading ends a session at these very
+ * lines). `settings.json` names the method (and Enterprise's project) while
+ * the server signs in; the home is held so nothing rewrites it meanwhile.
+ */
+async function runGoogleSignIn(options: GoogleSignInRun): Promise<GoogleSignInOutcome> {
   const release = holdAntigravityHomeForSignIn(options.credentialDir);
   const paths = antigravityRuntimePaths(options.credentialDir);
   const signals: GoogleSignInSignals = { licencePicker: false, noLicence: false, fileStore: false };
@@ -179,51 +173,77 @@ export async function runGoogleSignIn(options: {
     const settings: AntigravitySignIn = options.method === "oauth-business" ? { method: "oauth-business", gcp: options.gcp! } : { method: "oauth-personal" };
     await writeSecretFile(paths.settingsFile, renderAntigravitySettings(settings));
     if (options.signal.aborted) return { outcome: "failed", message: "The sign-in was stopped." };
-    const refuse = async (): Promise<never> => { throw new RemoteInstanceError("permission_denied", "Nothing runs during a sign-in."); };
-    const spawnOptions: SpawnBridgeOptions = {
-      spec: { ...options.process.spec, cwd: paths.home },
-      initializeTimeoutMs: options.process.initializeTimeoutMs,
-      clientVersion: options.process.clientVersion,
-      handlers: { onSessionUpdate: () => undefined, onRequestPermission: refuse, onCreateElicitation: refuse, onExit: () => undefined },
-      onStderrLine: line => { const change = readGoogleSignInLine(line, signals); if (change) options.onLine(change, signals); },
-    };
-    bridge = await options.process.spawn(spawnOptions);
-    const started = bridge;
-    let timer: NodeJS.Timeout | undefined;
-    const stopped = new Promise<never>((_resolve, reject) => {
-      const stop = () => reject(new RemoteInstanceError("temporarily_unavailable", "The sign-in was stopped."));
-      if (options.signal.aborted) stop();
-      options.signal.addEventListener("abort", stop, { once: true });
-      timer = setTimeout(() => reject(new RemoteInstanceError("temporarily_unavailable", "The sign-in timed out.", { diagnostic: "antigravity_sign_in_timed_out" })), options.timeoutMs ?? ANTIGRAVITY_SIGN_IN_TIMEOUT_MS);
-      timer.unref();
-    });
-    void stopped.catch(() => undefined);
-    try {
-      await Promise.race([started.connection.authenticate({ methodId: options.method }), stopped]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-    // The file store, never the keychain (A5): the token is a file in the private home.
-    const tokenFile = options.method === "oauth-business" ? antigravityTokenFiles(options.credentialDir).business : antigravityTokenFiles(options.credentialDir).personal;
-    if (!await antigravityTokenPresent(tokenFile)) {
-      return { outcome: "failed", message: "Google Antigravity did not keep its sign-in in the connector's private folder, so it was not used." };
-    }
-    if (options.method === "oauth-personal") return { outcome: "signed_in" };
-    // Its "resolved" line (the tier) travels on stderr, which may trail the answer by a moment.
-    for (let waited = 0; signals.resolved === undefined && waited < 1_000; waited += 50) await new Promise(resolve => setTimeout(resolve, 50));
-    return { outcome: "signed_in", gcp: await resolvedGcp(paths.settingsFile, signals, options.gcp!), ...(signals.resolved ? { tier: signals.resolved.tier } : {}) };
+    bridge = await options.process.spawn(signInSpawnOptions(options, paths.home, signals));
+    await authenticateWithin(bridge, options);
+    return await signedInOutcome(options, paths.settingsFile, signals);
   } catch (error) {
-    const reason = (error as RequestError | undefined)?.data as { reason?: unknown } | undefined;
-    const licence = signals.noLicence || reason?.reason === "ge_license_failed";
-    if (error instanceof RemoteInstanceError && /stopped/.test(error.message)) return { outcome: "failed", message: "The sign-in was stopped." };
-    if (error instanceof RemoteInstanceError && error.diagnostic === "antigravity_sign_in_timed_out") return { outcome: "failed", ...(licence ? { reason: "no_license" as const } : {}), message: "The sign-in timed out. Run it again when you can finish it in the browser." };
-    if (licence) return { outcome: "failed", reason: "no_license", message: "Gemini Enterprise found no licence for this Google Cloud project." };
-    if (reason?.reason === "ge_license_cancelled") return { outcome: "failed", message: "The licence page was closed before a licence was chosen. Sign in again to choose one." };
-    return { outcome: "failed", message: "Google Antigravity did not finish signing in." };
+    return signInFailure(error, signals);
   } finally {
     await bridge?.stop().catch(() => undefined);
     release();
   }
+}
+
+/** A process that runs nothing: every permission or elicitation is refused. */
+function signInSpawnOptions(options: GoogleSignInRun, home: string, signals: GoogleSignInSignals): SpawnBridgeOptions {
+  const refuse = async (): Promise<never> => { throw new RemoteInstanceError("permission_denied", "Nothing runs during a sign-in."); };
+  return {
+    spec: { ...options.process.spec, cwd: home },
+    initializeTimeoutMs: options.process.initializeTimeoutMs,
+    clientVersion: options.process.clientVersion,
+    handlers: { onSessionUpdate: () => undefined, onRequestPermission: refuse, onCreateElicitation: refuse, onExit: () => undefined },
+    onStderrLine: line => { const change = readGoogleSignInLine(line, signals); if (change) options.onLine(change, signals); },
+  };
+}
+
+/** ACP `authenticate`, until the person stops the sign-in or Google's own timeout passes. */
+async function authenticateWithin(bridge: BridgeProcess, options: GoogleSignInRun): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const stopped = new Promise<never>((_resolve, reject) => {
+    const stop = () => reject(new RemoteInstanceError("temporarily_unavailable", "The sign-in was stopped."));
+    if (options.signal.aborted) stop();
+    options.signal.addEventListener("abort", stop, { once: true });
+    timer = setTimeout(() => reject(new RemoteInstanceError("temporarily_unavailable", "The sign-in timed out.", { diagnostic: "antigravity_sign_in_timed_out" })), options.timeoutMs ?? ANTIGRAVITY_SIGN_IN_TIMEOUT_MS);
+    timer.unref();
+  });
+  void stopped.catch(() => undefined);
+  try {
+    await Promise.race([bridge.connection.authenticate({ methodId: options.method }), stopped]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function signedInOutcome(options: GoogleSignInRun, settingsFile: string, signals: GoogleSignInSignals): Promise<GoogleSignInOutcome> {
+  // The file store, never the keychain: the token is a file in the private home.
+  const tokenFiles = antigravityTokenFiles(options.credentialDir);
+  const tokenFile = options.method === "oauth-business" ? tokenFiles.business : tokenFiles.personal;
+  if (!await antigravityTokenPresent(tokenFile)) {
+    return { outcome: "failed", message: "Google Antigravity did not keep its sign-in in the connector's private folder, so it was not used." };
+  }
+  if (options.method === "oauth-personal") return { outcome: "signed_in" };
+  // Its "resolved" line (the tier) travels on stderr, which may trail the answer by a moment.
+  for (let waited = 0; signals.resolved === undefined && waited < 1_000; waited += 50) await new Promise(resolve => setTimeout(resolve, 50));
+  return { outcome: "signed_in", gcp: await resolvedGcp(settingsFile, signals, options.gcp!), ...(signals.resolved ? { tier: signals.resolved.tier } : {}) };
+}
+
+/** The connector stopped the sign-in, or Google's own time ran out. */
+function endedByConnector(error: RemoteInstanceError, licence: boolean): GoogleSignInOutcome | null {
+  if (/stopped/.test(error.message)) return { outcome: "failed", message: "The sign-in was stopped." };
+  if (error.diagnostic !== "antigravity_sign_in_timed_out") return null;
+  return { outcome: "failed", ...(licence ? { reason: "no_license" as const } : {}), message: "The sign-in timed out. Run it again when you can finish it in the browser." };
+}
+
+function signInFailure(error: unknown, signals: GoogleSignInSignals): GoogleSignInOutcome {
+  const reason = ((error as RequestError | undefined)?.data as { reason?: unknown } | undefined)?.reason;
+  const licence = signals.noLicence || reason === "ge_license_failed";
+  if (error instanceof RemoteInstanceError) {
+    const ended = endedByConnector(error, licence);
+    if (ended) return ended;
+  }
+  if (licence) return { outcome: "failed", reason: "no_license", message: "Gemini Enterprise found no licence for this Google Cloud project." };
+  if (reason === "ge_license_cancelled") return { outcome: "failed", message: "The licence page was closed before a licence was chosen. Sign in again to choose one." };
+  return { outcome: "failed", message: "Google Antigravity did not finish signing in." };
 }
 
 /** The project the server settled on: its own `settings.json` after the picker, else its "resolved" line, else what was asked. */
@@ -239,7 +259,7 @@ async function resolvedGcp(settingsFile: string, signals: GoogleSignInSignals, a
 
 // ── The login flow ────────────────────────────────────────────────────────────
 
-export interface AntigravityLoginOptions {
+interface AntigravityLoginOptions {
   credentialDir: string;
   events: RunnerEventBus;
   loginId?: string;
@@ -247,33 +267,43 @@ export interface AntigravityLoginOptions {
   request?: HostLoginRequest;
   /** How the Google sign-in process is started. */
   process: GoogleSignInProcess;
-  verifyKey?: (key: string) => Promise<"valid" | "rejected" | "unreachable">;
+  verifyKey?: (key: string) => Promise<KeyVerdict>;
   /** The whole flow, prompts included (the runner's login timeout). */
   timeoutMs?: number;
   /** Google's own sign-in (300 s). */
   signInTimeoutMs?: number;
-  /** Test seam: packages' switch for personal Google sign-in (A10). */
+  /** Test seam: packages' switch for personal Google sign-in. */
   googleSignInReleased?: boolean;
 }
 
 type Choice = "key" | "enterprise" | "personal";
 type Step = "choose" | "key" | "project" | "location" | "running" | "done";
 
+const METHOD_CHOICES: ReadonlyMap<string, Choice> = new Map([
+  ["gemini-api-key", "key"], ["key", "key"], ["api-key", "key"],
+  ["oauth-business", "enterprise"], ["enterprise", "enterprise"], ["gemini-enterprise", "enterprise"],
+  ["oauth-personal", "personal"], ["google", "personal"],
+]);
+
 /** Which sign-in a request names, or null when the person is asked. Refuses another agent's option and anything held back. */
 export function antigravityLoginChoice(request: HostLoginRequest | undefined, googleSignInReleased = ANTIGRAVITY_LOGIN_OPTIONS["google-account"].released): Choice | null {
-  const personalRefused = () => new RemoteInstanceError("prerequisite_missing", "Signing Google Antigravity in with a personal Google account is not available on Konteks. Use a Gemini API key or Gemini Enterprise.");
-  if (request?.loginOption !== undefined) {
-    if (request.loginOption === "gemini-enterprise") return "enterprise";
-    if (request.loginOption === "google-account") { if (!googleSignInReleased) throw personalRefused(); return "personal"; }
-    throw new RemoteInstanceError("agent_unavailable", "That sign-in is not one of Google Antigravity's.");
-  }
-  switch (request?.method) {
-    case undefined: return request?.gcp !== undefined ? "enterprise" : null;
-    case "gemini-api-key": case "key": case "api-key": return "key";
-    case "oauth-business": case "enterprise": case "gemini-enterprise": return "enterprise";
-    case "oauth-personal": case "google": if (!googleSignInReleased) throw personalRefused(); return "personal";
-    default: throw new RemoteInstanceError("agent_unavailable", "Google Antigravity signs in with a Gemini API key or Gemini Enterprise.");
-  }
+  if (!request) return null;
+  if (request.loginOption !== undefined) return optionChoice(request.loginOption, googleSignInReleased);
+  if (request.method === undefined) return request.gcp !== undefined ? "enterprise" : null;
+  const choice = METHOD_CHOICES.get(request.method);
+  if (!choice) throw new RemoteInstanceError("agent_unavailable", "Google Antigravity signs in with a Gemini API key or Gemini Enterprise.");
+  return choice === "personal" ? personalChoice(googleSignInReleased) : choice;
+}
+
+function optionChoice(loginOption: string, googleSignInReleased: boolean): Choice {
+  if (loginOption === "gemini-enterprise") return "enterprise";
+  if (loginOption === "google-account") return personalChoice(googleSignInReleased);
+  throw new RemoteInstanceError("agent_unavailable", "That sign-in is not one of Google Antigravity's.");
+}
+
+function personalChoice(googleSignInReleased: boolean): Choice {
+  if (!googleSignInReleased) throw new RemoteInstanceError("prerequisite_missing", "Signing Google Antigravity in with a personal Google account is not available on Konteks. Use a Gemini API key or Gemini Enterprise.");
+  return "personal";
 }
 
 /**
@@ -285,18 +315,15 @@ export function antigravityLoginChoice(request: HostLoginRequest | undefined, go
  * sends both, so it is never asked a question).
  */
 export function startAntigravityLogin(options: AntigravityLoginOptions): LoginFlow {
-  const loginId = options.loginId ?? `login-${randomUUID()}`;
-  const verify = options.verifyKey ?? (key => verifyGeminiApiKey(key));
-  const released = options.googleSignInReleased ?? ANTIGRAVITY_LOGIN_OPTIONS["google-account"].released;
-  const choice = antigravityLoginChoice(options.request, released);
+  const { loginId, verify, choice, timeoutMs, gcp: requested } = loginSetup(options);
   const abort = new AbortController();
   let step: Step = "choose";
   let busy = false;
   let finished = false;
   let keyAttempts = 0;
   let asks = 0;
-  let project: string | undefined = options.request?.gcp?.project;
-  let location: string | undefined = options.request?.gcp?.location;
+  let project: string | undefined = requested?.project;
+  let location: string | undefined = requested?.location;
   let suggested: AgentLoginGcp | undefined;
   let resolveDone!: (value: { code: number | null; reason?: LoginFailureReason }) => void;
   const done = new Promise<{ code: number | null; reason?: LoginFailureReason }>(resolve => { resolveDone = resolve; });
@@ -311,7 +338,7 @@ export function startAntigravityLogin(options: AntigravityLoginOptions): LoginFl
     abort.abort();
     resolveDone({ code, ...(reason ? { reason } : {}) });
   };
-  const timer = setTimeout(() => { display("The sign-in timed out. Run it again when you are ready."); finish(1); }, options.timeoutMs ?? 15 * 60_000);
+  const timer = setTimeout(() => { display("The sign-in timed out. Run it again when you are ready."); finish(1); }, timeoutMs);
   timer.unref();
 
   const askChoice = () => { step = "choose"; ask("Sign Google Antigravity in with: 1 a Gemini API key, 2 Gemini Enterprise (type 1 or 2)", false); };
@@ -413,31 +440,51 @@ export function startAntigravityLogin(options: AntigravityLoginOptions): LoginFl
   if (choice === null) askChoice();
   else begin(choice);
 
+  /** An answer that did not fit is asked again, until there have been too many. */
+  const askAgain = (hint: string, again: () => void) => { if (!tooMany()) { display(hint); again(); } };
+  const onChoice = (answer: string) => {
+    if (answer === "1") begin("key");
+    else if (answer === "2") begin("enterprise");
+    else askAgain("Type 1 for a Gemini API key or 2 for Gemini Enterprise.", askChoice);
+  };
+  const onProject = (answer: string) => {
+    const value = answer === "" && suggested ? suggested.project : answer;
+    if (!GoogleCloudProjectIdSchema.safeParse(value).success) return askAgain("A Google Cloud project ID is 6 to 30 lower-case letters, digits or hyphens, starting with a letter.", askProject);
+    project = value;
+    if (location === undefined) askLocation(); else runEnterprise("oauth-business");
+  };
+  const onLocation = (answer: string) => {
+    const value = answer === "" ? suggested?.location ?? "global" : answer.toLowerCase();
+    if (!GeminiEnterpriseLocationSchema.safeParse(value).success) return askAgain("Type global, us or eu.", askLocation);
+    location = value;
+    runEnterprise("oauth-business");
+  };
+  const answers: Partial<Record<Step, (text: string) => void>> = {
+    choose: text => onChoice(text.trim()),
+    key: onKey,
+    project: text => onProject(text.trim()),
+    location: text => onLocation(text.trim()),
+  };
+
   return {
     loginId,
     input(text) {
       if (finished || busy) return;
-      const answer = text.trim();
-      if (step === "choose") {
-        if (answer === "1") begin("key");
-        else if (answer === "2") begin("enterprise");
-        else if (!tooMany()) { display("Type 1 for a Gemini API key or 2 for Gemini Enterprise."); askChoice(); }
-      } else if (step === "key") {
-        onKey(text);
-      } else if (step === "project") {
-        const value = answer === "" && suggested ? suggested.project : answer;
-        if (!GoogleCloudProjectIdSchema.safeParse(value).success) { if (!tooMany()) { display("A Google Cloud project ID is 6 to 30 lower-case letters, digits or hyphens, starting with a letter."); askProject(); } return; }
-        project = value;
-        if (location === undefined) askLocation(); else runEnterprise("oauth-business");
-      } else if (step === "location") {
-        const value = answer === "" ? suggested?.location ?? "global" : answer.toLowerCase();
-        if (!GeminiEnterpriseLocationSchema.safeParse(value).success) { if (!tooMany()) { display("Type global, us or eu."); askLocation(); } return; }
-        location = value;
-        runEnterprise("oauth-business");
-      }
+      answers[step]?.(text);
     },
     cancel: async () => { finish(1); },
     done,
+  };
+}
+
+function loginSetup(options: AntigravityLoginOptions) {
+  const released = options.googleSignInReleased ?? ANTIGRAVITY_LOGIN_OPTIONS["google-account"].released;
+  return {
+    loginId: options.loginId ?? `login-${randomUUID()}`,
+    verify: options.verifyKey ?? ((key: string) => verifyGeminiApiKey(key)),
+    choice: antigravityLoginChoice(options.request, released),
+    timeoutMs: options.timeoutMs ?? 15 * 60_000,
+    gcp: options.request?.gcp,
   };
 }
 
@@ -469,14 +516,14 @@ export async function markNoLicence(credentialDir: string, gcp?: AgentLoginGcp):
 /** Same file as `FINGERPRINT_KEY_FILE` in auth/identity.ts (kept literal to avoid an import cycle). */
 const FINGERPRINT_KEY_FILE = "fingerprint.key";
 
-export interface AntigravityHeld {
+interface AntigravityHeld {
   record: AntigravitySignIn | null;
   key: boolean;
   enterpriseToken: boolean;
 }
 
 /** What the connector holds for Antigravity: its sign-in record, whether a key is stored, whether the server kept an Enterprise token file (never read). */
-export async function antigravityHeld(credentialDir: string): Promise<AntigravityHeld> {
+async function antigravityHeld(credentialDir: string): Promise<AntigravityHeld> {
   const [record, key, enterpriseToken] = await Promise.all([
     readAntigravitySignIn(credentialDir),
     readAntigravityApiKey(credentialDir).then(value => value !== null),
@@ -486,7 +533,7 @@ export async function antigravityHeld(credentialDir: string): Promise<Antigravit
 }
 
 /**
- * The credentials the connected agent reports (CP3 prep): the one in use
+ * The credentials the connected agent reports: the one in use
  * first. Gemini Enterprise (`google`, `sign_in`, `oauth-business`, labelled
  * by its tier, billed by `classifyAgentBilling` with that tier: a
  * subscription, or pay-per-use for the Pay-as-you-go edition) is ready while
@@ -495,24 +542,41 @@ export async function antigravityHeld(credentialDir: string): Promise<Antigravit
  * `reason: 'no_license'` rides only to a Core that takes it.
  */
 export function antigravityCredentialViews(held: AntigravityHeld, settings: Pick<HostAgentSettings, "coreAcceptsRouteBilling">): ConnectedAgentCredential[] {
-  const { record } = held;
-  const views: Array<ConnectedAgentCredential & { active: boolean }> = [];
-  const enterprise = record?.gcp !== undefined && (record.method === "oauth-business" || held.enterpriseToken || record.licence === "none");
-  if (enterprise) {
-    const ready = held.enterpriseToken && record!.licence !== "none";
-    views.push({
-      providerId: "google", label: geminiEnterpriseCredentialLabel(record!.tier), kind: "sign_in", method: "oauth-business",
-      billing: classifyAgentBilling({ agentId: "antigravity", providerId: "google", credential: "sign_in", ...(record!.tier ? { tier: record!.tier } : {}) }),
-      state: ready ? "ready" : "needs_sign_in",
-      ...(!ready && record!.licence === "none" && settings.coreAcceptsRouteBilling ? { reason: "no_license" as const } : {}),
-      active: record!.method === "oauth-business",
-    });
-  }
-  if (held.key) {
-    views.push({ providerId: "google", label: "Gemini API key", kind: "api_key", method: "gemini-api-key",
-      billing: classifyAgentBilling({ agentId: "antigravity", providerId: "google", credential: "api_key" }), state: "ready", active: record?.method === "gemini-api-key" });
-  }
+  const views = [enterpriseCredential(held, settings), keyCredential(held)].filter(view => view !== null);
   return views.sort((a, b) => Number(b.active) - Number(a.active)).map(({ active: _active, ...view }) => view);
+}
+
+type CredentialEntry = ConnectedAgentCredential & { active: boolean };
+
+function enterpriseCredential(held: AntigravityHeld, settings: Pick<HostAgentSettings, "coreAcceptsRouteBilling">): CredentialEntry | null {
+  const { record } = held;
+  if (record?.gcp === undefined || !holdsEnterprise(held)) return null;
+  const ready = held.enterpriseToken && record.licence !== "none";
+  // `reason: 'no_license'` rides only to a Core that takes it.
+  const noLicence = record.licence === "none" && settings.coreAcceptsRouteBilling;
+  return {
+    providerId: "google", label: geminiEnterpriseCredentialLabel(record.tier), kind: "sign_in", method: "oauth-business",
+    billing: enterpriseBilling(record.tier),
+    state: ready ? "ready" : "needs_sign_in",
+    ...(noLicence ? { reason: "no_license" as const } : {}),
+    active: record.method === "oauth-business",
+  };
+}
+
+/** Gemini Enterprise is billed by its tier: a subscription, or pay-per-use for the Pay-as-you-go edition. */
+function enterpriseBilling(tier: string | undefined) {
+  return classifyAgentBilling({ agentId: "antigravity", providerId: "google", credential: "sign_in", ...(tier ? { tier } : {}) });
+}
+
+/** Anything of Gemini Enterprise the connector holds: its token, its method in use, or a licence found missing. */
+function holdsEnterprise(held: AntigravityHeld): boolean {
+  return held.enterpriseToken || held.record?.method === "oauth-business" || held.record?.licence === "none";
+}
+
+function keyCredential(held: AntigravityHeld): CredentialEntry | null {
+  if (!held.key) return null;
+  return { providerId: "google", label: "Gemini API key", kind: "api_key", method: "gemini-api-key",
+    billing: classifyAgentBilling({ agentId: "antigravity", providerId: "google", credential: "api_key" }), state: "ready", active: held.record?.method === "gemini-api-key" };
 }
 
 /** The sign-in the server uses, when what it needs is in place; null otherwise. */
@@ -524,7 +588,7 @@ export function antigravityActiveSignIn(held: AntigravityHeld): "gemini-api-key"
 }
 
 /**
- * The identity signal (D111) of what the connector holds, never a secret:
+ * The identity signal of what the connector holds, never a secret:
  * a keyed hash of the method in use and, for Gemini Enterprise, the project,
  * location and tier. Nothing ready: signed out, so readiness reads
  * `not_configured` with `login_locally`.
@@ -556,24 +620,44 @@ export async function antigravityIdentity(credentialDir: string, settings: Pick<
  */
 export async function antigravityLogout(options: { credentialDir: string; request?: HostLoginRequest; process: GoogleSignInProcess }): Promise<void> {
   const which = options.request?.method;
+  const { enterprise, apiKey } = logoutTargets(which);
+  const held = await antigravityHeld(options.credentialDir);
+  if (which !== undefined) assertHeldForLogout(held, enterprise, apiKey);
+  if (enterprise) await signOutEnterprise(options, held);
+  if (apiKey) await removeAntigravityApiKey(options.credentialDir);
+  await writeAntigravitySignIn(options.credentialDir, remainingSignIn(await antigravityHeld(options.credentialDir), enterprise));
+}
+
+/** What a sign-out names: both when neither is named. */
+function logoutTargets(which: string | undefined): { enterprise: boolean; apiKey: boolean } {
   const enterprise = which === undefined || which === "oauth-business" || which === "enterprise";
   const apiKey = which === undefined || which === "gemini-api-key" || which === "key" || which === "api-key";
   if (!enterprise && !apiKey) throw new RemoteInstanceError("agent_unavailable", "Google Antigravity signs out of its Gemini API key or Gemini Enterprise.");
-  const held = await antigravityHeld(options.credentialDir);
-  const holdsEnterprise = held.enterpriseToken || held.record?.method === "oauth-business" || held.record?.licence === "none";
-  if (which !== undefined && enterprise && !holdsEnterprise) throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity is not signed in to Gemini Enterprise on this computer.");
-  if (which !== undefined && apiKey && !held.key) throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity holds no Gemini API key on this computer.");
-  if (enterprise && held.enterpriseToken && held.record?.gcp) await acpLogout(options.credentialDir, held.record.gcp, options.process).catch(() => undefined);
-  if (enterprise) await rm(antigravityTokenFiles(options.credentialDir).business, { force: true });
-  if (enterprise) await clearAntigravityAdminObservation(options.credentialDir);
-  if (apiKey) await removeAntigravityApiKey(options.credentialDir);
-  const after = await antigravityHeld(options.credentialDir);
-  const method = after.key ? "gemini-api-key" : after.enterpriseToken && after.record?.gcp ? "oauth-business" : "none";
+  return { enterprise, apiKey };
+}
+
+function assertHeldForLogout(held: AntigravityHeld, enterprise: boolean, apiKey: boolean): void {
+  if (enterprise && !holdsEnterprise(held)) throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity is not signed in to Gemini Enterprise on this computer.");
+  if (apiKey && !held.key) throw new RemoteInstanceError("prerequisite_missing", "Google Antigravity holds no Gemini API key on this computer.");
+}
+
+/** ACP `logout` when the server holds a token, then the token file goes whatever the server did. */
+async function signOutEnterprise(options: { credentialDir: string; process: GoogleSignInProcess }, held: AntigravityHeld): Promise<void> {
+  if (held.enterpriseToken && held.record?.gcp) await acpLogout(options.credentialDir, held.record.gcp, options.process).catch(() => undefined);
+  await rm(antigravityTokenFiles(options.credentialDir).business, { force: true });
+  await clearAntigravityAdminObservation(options.credentialDir);
+}
+
+/** The project is kept so the next sign-in offers it; the method in use falls back to what is still held. */
+function remainingSignIn(after: AntigravityHeld, enterpriseSignedOut: boolean): AntigravitySignIn {
   const record = after.record;
-  await writeAntigravitySignIn(options.credentialDir, {
-    method, ...(record?.gcp ? { gcp: record.gcp } : {}),
-    ...(!enterprise && record?.tier ? { tier: record.tier } : {}), ...(!enterprise && record?.licence ? { licence: record.licence } : {}),
-  });
+  const kept = enterpriseSignedOut ? {} : withoutUndefined({ tier: record?.tier || undefined, licence: record?.licence || undefined });
+  return { method: remainingMethod(after), ...withoutUndefined({ gcp: record?.gcp }), ...kept } as AntigravitySignIn;
+}
+
+function remainingMethod(after: AntigravityHeld): AntigravitySignIn["method"] {
+  if (after.key) return "gemini-api-key";
+  return after.enterpriseToken && after.record?.gcp ? "oauth-business" : "none";
 }
 
 /** ACP `logout` on a process of the connector's own, with Enterprise's settings in place. */

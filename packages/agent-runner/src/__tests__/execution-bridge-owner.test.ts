@@ -36,7 +36,7 @@ it("does not change the normal local Codex login through connector auth actions"
   expect(startLoginFlow).toHaveBeenCalledTimes(loginCalls);
   expect(spawn).not.toHaveBeenCalled();
 });
-it("runs the device login the person asked for in their own Codex profile (WS1-115)", () => {
+it("runs the device login the person asked for in their own Codex profile", () => {
   const config = RunnerConfigSchema.parse({
     RUNNER_AGENT_ID: "codex", RUNNER_NATIVE_CODEX_HOME: "/operator/.codex",
     RUNNER_NATIVE_PACKAGE_PROFILE: offlineFixture().profile,

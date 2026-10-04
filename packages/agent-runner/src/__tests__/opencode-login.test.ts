@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { RunnerConfigSchema } from "../config.js";
 import { RunnerEventBus, type RunnerEvent } from "../events.js";
 import {
-  isOpenCodeFreeModel, listOpenCodeCredentials, openCodeCredentialViews, openCodeIdentityMaterial, openCodeLogout, openCodePtyCommand, openCodeReuseOffered,
+  isOpenCodeFreeModel, listOpenCodeCredentials, openCodeCredentialViews, openCodeIdentityMaterial, openCodeLogout, openCodePtyCommand,
   openCodeSiteLoginOptions, parseOpenCodeAuthList, parseOpenCodeIntegrations, splitTerminalOutput, startOpenCodeLogin, type OpenCodeStoredCredential,
 } from "../auth/opencode-auth.js";
 import { openCodeCommandContext, openCodeRunnerAdapter, openCodeRuntimePaths } from "../host/opencode.js";
@@ -89,7 +89,7 @@ describe("what the installed OpenCode can sign in to", () => {
 });
 
 describe("what the private home is signed in to", () => {
-  // The owner's CP0 sign-in, as `auth list --format json` printed it, plus a key and an environment credential.
+  // A real sign-in, as `auth list --format json` printed it, plus a key and an environment credential.
   const AUTH_LIST = JSON.stringify([
     { id: "opencode", name: "OpenCode Console", connections: [{ type: "credential", id: "cred_0e79a18cd0018mhkAVqUItFMIk", label: "Personal", method: "oauth" }] },
     { id: "openai", name: "OpenAI", connections: [{ type: "credential", id: "cred_chatgpt", label: "Plus", method: "oauth" }, { type: "credential", id: "cred_openai_key", label: "OpenAI", method: "key" }] },
@@ -162,7 +162,7 @@ describe("what the private home is signed in to", () => {
   });
 });
 
-describe("signing OpenCode in (O2)", () => {
+describe("signing OpenCode in", () => {
   it("relays a subscription's link and device code from OpenCode's own login, and names the option the site started", async () => {
     const f = await fixture();
     const events = new RunnerEventBus();
@@ -253,7 +253,7 @@ describe("signing OpenCode in (O2)", () => {
     expect(await startOpenCodeLogin({ context: f.context, events, stateDir: f.paths.root, request: { provider: "unknown-provider" } }).done).toEqual({ code: 1 });
   });
 
-  it("offers once to repeat the person's own OpenCode sign-ins (O10), reading them only through its `auth list` after a yes", async () => {
+  it("offers once to repeat the person's own OpenCode sign-ins, reading them only through its `auth list` after a yes", async () => {
     const f = await fixture();
     const list = vi.fn(async () => [{ integrationId: "openai", integrationName: "OpenAI", credentialId: "c1", method: "oauth" }, { integrationId: "deepseek", integrationName: "DeepSeek", credentialId: "c2", method: "key" }]);
     const personal = { exists: () => true, list };
@@ -269,7 +269,6 @@ describe("signing OpenCode in (O2)", () => {
     // Their own providers come first in the menu.
     await waitFor(event => event.type === "display" && /1\. ChatGPT Plus or Pro \(your own OpenCode uses it\)/.test(event.text));
     await first.cancel();
-    expect(await openCodeReuseOffered(f.paths.root)).toBe(true);
     // Asked once: the next sign-in goes straight to the menu, unless --reuse asks again.
     const again = record(events);
     const second = startOpenCodeLogin({ context: f.context, events, stateDir: f.paths.root, personal });

@@ -64,7 +64,7 @@ switch (args.os ?? layout.os) {
     run(tool("candle"), [`-dProductVersion=${version}`, "-o", join("dist", "launcher-build", "launcher.wixobj"), "packaging/windows/launcher.wxs"]);
     run(tool("light"), ["-o", artifact, join("dist", "launcher-build", "launcher.wixobj")]);
     // No Windows code-signing certificate yet: install.ps1 trusts an unsigned
-    // MSI through the Ed25519-signed SHA256SUMS instead (owner, 2026-10-02).
+    // MSI through the Ed25519-signed SHA256SUMS instead.
     if (pfx) signtool(artifact); else console.warn("WARNING: Windows installer is NOT Authenticode-signed; install.ps1 accepts it on the signed SHA256SUMS and Windows shows 'Unknown publisher'");
     break;
   }

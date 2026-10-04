@@ -3,7 +3,7 @@ import type { KeyObject } from "node:crypto";
 import type { EmbeddedReleaseRoot } from "./manifest.js";
 
 /** Test fixture shared across packages: a throwaway release root and its signing key. */
-export interface ReleaseFixture {
+interface ReleaseFixture {
   root: EmbeddedReleaseRoot;
   privateKey: KeyObject;
   keyId: string;

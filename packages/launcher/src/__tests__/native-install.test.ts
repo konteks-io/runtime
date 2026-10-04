@@ -292,7 +292,7 @@ describe("native install composition", () => {
     }
   });
 
-  it("says which service step failed, with the service manager's own words, and keeps it for doctor (D129)", async () => {
+  it("says which service step failed, with the service manager's own words, and keeps it for doctor", async () => {
     const f = await fixture();
     await installNative(f.options as never);
     const status = { command: "service-status", args: [] };
@@ -313,7 +313,7 @@ describe("native install composition", () => {
     await expect(readFile(join(f.root, "supervisor", "service-start-failure.json"), "utf8")).rejects.toThrow();
   });
 
-  it("says a connector that stopped as soon as it started, with its log, where the service manager can tell (D129)", async () => {
+  it("says a connector that stopped as soon as it started, with its log, where the service manager can tell", async () => {
     const f = await fixture();
     await installNative(f.options as never);
     await mkdir(join(f.root, "logs"), { recursive: true });
@@ -447,7 +447,7 @@ describe("native install composition", () => {
     expect(await readNativeRecord(f.root)).toEqual(before);
     expect(f.activate).toHaveBeenCalledTimes(1);
   });
-  it("connects a computer with no agent at all, offering Claude Code and Codex instead of refusing (D116)", async () => {
+  it("connects a computer with no agent at all, offering Claude Code and Codex instead of refusing", async () => {
     const f = await fixture();
     vi.stubEnv("CLAUDE_CODE_EXECUTABLE", join(f.root, "no-claude", "claude"));
     vi.stubEnv("CODEX_HOME", join(f.root, "no-codex"));
@@ -473,7 +473,7 @@ describe("native install composition", () => {
     await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).resolves.toMatchObject({ record: { agents: ["codex"] }, runners: [{ RUNNER_AGENT_ID: "codex" }] });
     expect(f.activate).toHaveBeenCalledTimes(1);
   });
-  it("connects with the agents found here plus the ones the person set up when asked (D116)", async () => {
+  it("connects with the agents found here plus the ones the person set up when asked", async () => {
     const f = await fixture();
     vi.stubEnv("CLAUDE_CODE_EXECUTABLE", join(f.root, "no-claude", "claude"));
     vi.stubEnv("CODEX_HOME", join(f.root, "new-codex"));
@@ -490,7 +490,7 @@ describe("native install composition", () => {
     expect(record.codexHome).toBe(await realpath(join(f.root, "new-codex")));
     expect(setupAgent.mock.invocationCallOrder[1]!).toBeLessThan(f.activate.mock.invocationCallOrder[0]!);
   });
-  it("still refuses a missing agent the operator named in --agents (D116)", async () => {
+  it("still refuses a missing agent the operator named in --agents", async () => {
     const f = await fixture();
     vi.stubEnv("CLAUDE_CODE_EXECUTABLE", join(f.root, "no-claude", "claude"));
     f.options.agents = ["claude-code"];
@@ -533,7 +533,7 @@ describe("native install composition", () => {
     expect(f.activate).not.toHaveBeenCalled();
     expect(f.options.deps.fetchFn).not.toHaveBeenCalled();
   });
-  it("never detects Google Antigravity at enrollment, and adds it there only after onboarding (antigravity CP6)", async () => {
+  it("never detects Google Antigravity at enrollment, and adds it there only after onboarding", async () => {
     const adapter = hostAgentInstallAdapter("antigravity")!;
     expect(adapter.offered).toBe(true);
     const locate = vi.spyOn(adapter, "locate").mockResolvedValue({ antigravityVersion: "1.2.1", antigravityRoot: "/nowhere" });
@@ -550,7 +550,7 @@ describe("native install composition", () => {
       expect(fetch).not.toHaveBeenCalled();
     } finally { locate.mockRestore(); fetch.mockRestore(); }
   });
-  it("installs, adds and removes Google Antigravity only on the person's yes, never consuming an activation on a no (antigravity CP6)", async () => {
+  it("installs, adds and removes Google Antigravity only on the person's yes, never consuming an activation on a no", async () => {
     const f = await fixture();
     const adapter = hostAgentInstallAdapter("antigravity")!;
     const folder = join(f.root, "agents", "antigravity", "1.2.1-darwin-arm64");
@@ -607,7 +607,7 @@ describe("native install composition", () => {
       await expect(removeNativeAgent({ root: f.root, agentId: "codex", output, deps: { roots: f.trust, platform: f.platform, signOut } })).rejects.toMatchObject({ code: "agent_unavailable" });
     } finally { for (const spy of spies) spy.mockRestore(); }
   });
-  it.runIf(process.platform !== "win32")("installs the person's own OpenCode 2 beside bundled agents, with no package of it, and enrollment detects it (CP6)", async () => {
+  it.runIf(process.platform !== "win32")("installs the person's own OpenCode 2 beside bundled agents, with no package of it, and enrollment detects it", async () => {
     const f = await fixture();
     const opencode = await personOpenCode(f.root);
     vi.stubEnv("DSH_EXECUTABLE", join(f.root, "no-dsh"));
@@ -654,7 +654,7 @@ describe("native install composition", () => {
     expect(loaded.runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(["codex", "opencode"]);
     await expect(addNativeAgent({ root: f.root, agentId: "opencode", output: createOutput({ json: true }), deps: { roots: f.trust, platform: f.platform } } as never)).resolves.toMatchObject({ agents: ["codex", "opencode"] });
   });
-  it.runIf(process.platform !== "win32")("keeps loading when the person's OpenCode went away or became OpenCode 1: OpenCode is left out with the reason, Codex runs (CP6)", async () => {
+  it.runIf(process.platform !== "win32")("keeps loading when the person's OpenCode went away or became OpenCode 1: OpenCode is left out with the reason, Codex runs", async () => {
     const f = await fixture();
     await personOpenCode(f.root);
     await installNative({ ...f.options, agents: ["codex", "opencode"] } as never);

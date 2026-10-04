@@ -33,7 +33,7 @@ afterEach(async () => {
 const clock = new FixedClock(Date.parse("2026-09-06T00:00:00Z"));
 const permissionRequest = { sessionId: "bridge", toolCall: { toolCallId: "t1", title: "Run `rm -rf` in /home/user/secret‮", kind: "execute", rawInput: { command: "rm" } }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" as const }, { optionId: "reject", name: "Reject", kind: "reject_once" as const }] };
 
-describe("sanitized permission facts (D102)", () => {
+describe("sanitized permission facts", () => {
   it("keeps title/kind/options only, strips directional overrides, and digests the sanitized view", () => {
     const sanitized = sanitizePermissionRequest(permissionRequest as never);
     expect(sanitized.params.title).not.toContain("‮");
@@ -51,7 +51,7 @@ describe("sanitized permission facts (D102)", () => {
   });
 });
 
-describe("policy responder (D87 step 1)", () => {
+describe("policy responder", () => {
   it("answers allow/deny locally from the PolicyEvaluator and defers only when policy defers", async () => {
     const allow = new EvaluatorPolicyResponder({ evaluateToolUse: async () => ({ allowed: true }) }, () => true);
     expect(await allow.evaluatePermission(permissionRequest as never, { assignmentId: "a", agentId: "codex", workspaceRoot: "/w" })).toEqual({ kind: "allow", optionId: "allow" });
@@ -111,7 +111,7 @@ describe("Core deferral registration (bb interactive-request registration)", () 
   });
 });
 
-describe("relayed session (D98/D113/D114)", () => {
+describe("relayed session", () => {
   const assignment: RemoteWorkAssignment = {
     id: "asg", kind: "assistant_execution", placementId: "pl", instanceId: "inst", workspaceId: "ws", taskId: "2026-09-06T00:00:00Z", correlationId: "c", attempt: 1, expiresAt: "2026-09-07T00:00:00Z", requiredCapabilities: [],
     agentRoute: { requiredRole: "assistant", agentId: "codex", mcpCapabilityTokenRef: "ref-1" },
@@ -359,7 +359,7 @@ describe("relayed session (D98/D113/D114)", () => {
     });
   });
 
-  describe("QA browser (a connector capability: every agent, O8)", () => {
+  describe("QA browser (a connector capability: every agent)", () => {
     function access(origin: () => string | null) {
       const status = (sessionId: string) => ({ sessionId, state: "running" as const, phase: null, url: null, port: null, command: null, install: null, prepare: null, source: null, explanation: null, notes: [], message: "running", startedAt: null, readyAt: null, idleStopMinutes: 30, logTail: [], startedBy: null });
       return { start: vi.fn(async (sessionId: string) => status(sessionId)), stop: vi.fn(async (sessionId: string) => status(sessionId)), status: vi.fn(status), touch: vi.fn(), permit: vi.fn(), forget: vi.fn(),
@@ -454,7 +454,7 @@ describe("relayed session (D98/D113/D114)", () => {
       await none.session.close("cancelled");
     });
 
-    it("gives DeepSeek Harness and OpenCode the connector's browser, behind the same gateway, and lets them use it (O8)", async () => {
+    it("gives DeepSeek Harness and OpenCode the connector's browser, behind the same gateway, and lets them use it", async () => {
       const upstream = createServer((_req, res) => res.end("the preview"));
       await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
       const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
@@ -496,7 +496,7 @@ describe("relayed session (D98/D113/D114)", () => {
       upstream.close();
     });
 
-    it("refuses every MCP server's tool but the session's own: account connectors, a repository's, the person's (S0-2)", async () => {
+    it("refuses every MCP server's tool but the session's own: account connectors, a repository's, the person's", async () => {
       const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
       const f = await build({ policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) },
         { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "claude-code" } } as RemoteWorkAssignment);
@@ -513,7 +513,7 @@ describe("relayed session (D98/D113/D114)", () => {
       await f.session.close("cancelled");
     });
 
-    it("decides Claude Code's and Codex's browser calls by the tool's structured identity, never by a title (S0-4)", async () => {
+    it("decides Claude Code's and Codex's browser calls by the tool's structured identity, never by a title", async () => {
       const options = [{ optionId: "always", name: "Always", kind: "allow_always" }, { optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
       for (const agentId of ["claude-code", "codex"] as const) {
         const f = await build({ preview: access(() => "http://127.0.0.1:9"), policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false) },
@@ -555,7 +555,7 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(f.closed).toHaveLength(1);
   });
 
-  describe("a person's direct session (runtime-view R11, R13, R14)", () => {
+  describe("a person's direct session", () => {
     const directWork: RemoteWorkAssignment = { ...assignment, kind: "direct",
       agentRoute: { requiredRole: "assistant", agentId: "claude-code", mcpCapabilityTokenRef: "ref-1" },
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "inst", sessionId: "s", turnRef: "turn-2", acpSessionRef: "acp-0" } };
@@ -579,7 +579,7 @@ describe("relayed session (D98/D113/D114)", () => {
       } finally { await f.session.close("cancelled"); }
     });
 
-    it("lets the agent title the session itself and asks only for the [konteks] prefix (D130)", async () => {
+    it("lets the agent title the session itself and asks only for the [konteks] prefix", async () => {
       const f = await build({ activateExecution: async () => ({ restoreReference: "acp-0" }) }, directWork);
       try {
         await f.session.bootstrap();
@@ -617,9 +617,9 @@ describe("relayed session (D98/D113/D114)", () => {
       expect((await decide({ ...assignment, agentRoute: { ...assignment.agentRoute, mcpCapabilityTokenRef: undefined } } as RemoteWorkAssignment)).other).toBe("allow");
     });
 
-    // T1 (2026-10-02): a Codex "Edit files" call named four paths, one written
+    // A Codex "Edit files" call named four paths, one written
     // from the filesystem root; the connector refused the whole call and said
-    // nothing about which path or why (D114).
+    // nothing about which path or why.
     it("refuses a multi-path edit naming the outside path, notes why on the call, and logs it without host paths", async () => {
       const own = join(dir, "own"), page = "/storefront/app/checkout/confirmation/[orderId]/page.tsx";
       await mkdir(join(own, "storefront", "lib"), { recursive: true });
@@ -670,7 +670,7 @@ describe("relayed session (D98/D113/D114)", () => {
     });
   });
 
-  describe("DeepSeek Harness tool governance (dsh-runtime-support CP3)", () => {
+  describe("DeepSeek Harness tool governance", () => {
     const dshWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "dsh" } };
     const options = [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }, { optionId: "reject-once", name: "Reject", kind: "reject_once" }];
     async function dshSession() {
@@ -724,7 +724,7 @@ describe("relayed session (D98/D113/D114)", () => {
     });
   });
 
-  describe("OpenCode tool governance (opencode-runtime-support CP4)", () => {
+  describe("OpenCode tool governance", () => {
     const openCodeWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "opencode" } };
     // OpenCode 2 always offers once / always / reject; Konteks never picks "always".
     const options = [{ optionId: "once", name: "Allow once", kind: "allow_once" }, { optionId: "always", name: "Always allow", kind: "allow_always" }, { optionId: "reject", name: "Reject", kind: "reject_once" }];
@@ -831,7 +831,7 @@ describe("relayed session (D98/D113/D114)", () => {
     });
   });
 
-  describe("Google Antigravity tool governance (antigravity-runtime-support CP4)", () => {
+  describe("Google Antigravity tool governance", () => {
     const agyWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "antigravity" } };
     // antigravity-acp 1.2.1 with an API key offers allow_always too; Gemini Enterprise only once / reject.
     const options = [{ optionId: "allow_always", name: "Allow Always (risky)", kind: "allow_always" }, { optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }];
@@ -906,7 +906,7 @@ describe("relayed session (D98/D113/D114)", () => {
       expect(f.closed).toEqual(["agent_exited"]);
     });
 
-    it("A21: a command that ran with no request on Gemini Enterprise names the Require review setting", async () => {
+    it("a command that ran with no request on Gemini Enterprise names the Require review setting", async () => {
       const f = await agySession(agyWork, "oauth-business");
       await f.update({ sessionUpdate: "tool_call", status: "in_progress", ...f.command("auto", "echo unasked") });
       await f.update({ sessionUpdate: "tool_call_update", toolCallId: "auto", status: "completed", rawOutput: { exitCode: 0, combinedOutput: "unasked\n" } });
@@ -1052,7 +1052,7 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(vi.mocked(runner.createSession).mock.calls[0]?.[0]).toEqual(expect.objectContaining({ acpSessionRef: "continued-ref" }));
   });
 
-  it("runs tool wiring alongside redemption, settles it before activation and the agent, and logs every stage (WS2-156)", async () => {
+  it("runs tool wiring alongside redemption, settles it before activation and the agent, and logs every stage", async () => {
     const order: string[] = [];
     let finishWiring!: () => void;
     const toolWiring = new Promise<void>(resolve => { finishWiring = resolve; });
@@ -1170,7 +1170,7 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(sent.at(-1)?.body).toMatchObject({ kind: "session_closed", assignmentId: "asg", reason: "agent_exited" });
   });
 
-  it("says when a turn ends, so the computer's busy state reaches Core at once (WS1-179)", async () => {
+  it("says when a turn ends, so the computer's busy state reaches Core at once", async () => {
     const onTurnActivity = vi.fn();
     const { session, runner, journal } = await build({
       onTurnActivity,
@@ -1341,7 +1341,7 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(session.counters.malformedResponses).toBe(2);
   });
 
-  it("relays every streamed chunk after one that ends inside a local path (D121)", async () => {
+  it("relays every streamed chunk after one that ends inside a local path", async () => {
     const warn = vi.fn();
     const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn().mockReturnThis() } as never });
     await session.bootstrap();
@@ -1370,7 +1370,7 @@ describe("relayed session (D98/D113/D114)", () => {
     expect(JSON.stringify(bodies)).not.toContain("private-person");
   });
 
-  it("names the refused field when a redacted update still fails the relay contract (D121)", async () => {
+  it("names the refused field when a redacted update still fails the relay contract", async () => {
     const warn = vi.fn();
     const { session, sent } = await build({ logger: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn().mockReturnThis() } as never });
     await session.bootstrap();

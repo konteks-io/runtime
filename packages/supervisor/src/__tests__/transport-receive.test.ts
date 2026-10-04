@@ -10,7 +10,8 @@ import type { InboundMessage } from "../transport/transport.js";
 describe("awaitable transport receipt", () => {
   it.each(["session", "assignment", "control"] as const)("propagates the production %s routing promise and durability rejection", async channel => {
     const gate = Promise.withResolvers<void>(), handler = vi.fn(() => gate.promise);
-    const receiver = { stopping: false, work: { onSessionMessage: handler, onAssignmentMessage: handler }, control: { handle: handler } };
+    const receiver = Object.assign(Object.create(Supervisor.prototype) as object,
+      { stopping: false, work: { onSessionMessage: handler, onAssignmentMessage: handler }, control: { handle: handler } });
     const inbound = (Supervisor.prototype as unknown as { onInbound(message: InboundMessage): Promise<void> }).onInbound;
     const received = inbound.call(receiver, { channel, channelId: `${channel}:i`, body: {} as never });
     let settled = false; void received.then(() => { settled = true; }, () => { settled = true; });

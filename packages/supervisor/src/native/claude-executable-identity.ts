@@ -11,9 +11,9 @@ import { createLogger, type Logger } from "@konteks/remote-common";
  * release's pinned package is not runnable. Its version and sha256 ride the
  * `agent_runner` component's capabilities as one string, so anything bound to
  * one executable (a compatibility certificate) is invalidated when the person
- * updates or replaces it (external-integration Stage 0, S0-5; finding C1).
+ * updates or replaces it.
  */
-export const CLAUDE_EXECUTABLE_CAPABILITY_PREFIX = "claude-code-executable:";
+const CLAUDE_EXECUTABLE_CAPABILITY_PREFIX = "claude-code-executable:";
 
 const VERSION = /^([0-9][0-9A-Za-z.+-]{0,31}) \(Claude Code\)\s*$/;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -39,12 +39,12 @@ function sha256File(path: string): Promise<string> {
 /** Runs `<executable> --version` with a minimal environment: no Konteks state, bounded output and time. */
 function readVersion(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(path, ["--version"], { timeout: 15_000, maxBuffer: 4096, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: homedir() } },
+    execFile(path, ["--version"], { timeout: 15_000, maxBuffer: 4096, windowsHide: true, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: homedir() } },
       (error, stdout) => error ? reject(error) : resolve(String(stdout)));
   });
 }
 
-export interface ClaudeExecutableIdentityDeps {
+interface ClaudeExecutableIdentityDeps {
   version?: (path: string) => Promise<string>;
   logger?: Logger;
 }

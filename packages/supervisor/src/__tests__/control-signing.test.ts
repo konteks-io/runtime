@@ -42,7 +42,7 @@ describe.skipIf(coreSigning === null)("Core/connector detached control signature
     expect(() => new CoreSignatureVerifier([{ ...old.root, coreControlKeys: [old.root.coreControlKeys[0]!, { ...next.root.coreControlKeys[0]!, keyId: "control-1" }] }])).toThrow();
   });
 });
-describe.skipIf(coreSigning === null)("site-started agent login delivery (WS1-115)", () => {
+describe.skipIf(coreSigning === null)("site-started agent login delivery", () => {
   const unsigned = {
     type: "runtime_agent_login_delivery", method: "POST", path: { instanceId: "instance" }, nodeId: "node-1",
     connectionRef: "conn-1", connectionEpoch: 3, keyId: "control-1", nonce: "A".repeat(22),
@@ -58,5 +58,25 @@ describe.skipIf(coreSigning === null)("site-started agent login delivery (WS1-11
     expect(f.verifier.verifyAgentLoginDelivery({ ...unsigned, intent: { ...unsigned.intent, agentId: "claude-code" }, signature })).toBe(false);
     expect(f.verifier.verifyAgentLoginDelivery({ ...unsigned, keyId: "control-2", signature })).toBe(false);
     expect(f.verifier.verifyAgentLoginDelivery({ ...unsigned, signature: `${signature}==` })).toBe(false);
+  });
+});
+
+describe.skipIf(coreSigning === null)("site-started fixed runtime update delivery", () => {
+  const unsigned = { type: "runtime_update_delivery", method: "POST", path: { instanceId: "instance" }, nodeId: "node",
+    connectionRef: "connection", connectionEpoch: 3, keyId: "control-1", nonce: "A".repeat(22),
+    intent: { updateId: "update", tenantId: "tenant", instanceId: "instance", leaseId: "lease", runnerIncarnation: "runner",
+      targetBundle: "1.1.0", manifestDigest: "a".repeat(43), deadlineAt: "2026-10-01T00:30:00.000Z" },
+    issuedAt: "2026-10-01T00:00:00.000Z", expiresAt: "2026-10-01T00:00:10.000Z" };
+  it("accepts the actual Core producer and refuses changed owner, target, signing key or executable input", async () => {
+    const f = fixture();
+    const signature = await f.signer.sign(unsigned) as string;
+    expect(f.verifier.verifyRuntimeUpdateDelivery({ ...unsigned, signature })).toBe(true);
+    for (const change of [{ updateId: "other" }, { leaseId: "other" }, { runnerIncarnation: "other" }, { targetBundle: "1.2.0" }, { manifestDigest: "b".repeat(43) }]) {
+      expect(f.verifier.verifyRuntimeUpdateDelivery({ ...unsigned, intent: { ...unsigned.intent, ...change }, signature })).toBe(false);
+    }
+    expect(f.verifier.verifyRuntimeUpdateDelivery({ ...unsigned, keyId: "other", signature })).toBe(false);
+    expect(f.verifier.verifyRuntimeUpdateDelivery({ ...unsigned, command: "arbitrary", signature })).toBe(false);
+    expect(f.verifier.verifyRuntimeUpdateDelivery({ ...unsigned, url: "https://other.example", signature })).toBe(false);
+    expect(f.verifier.verifyRuntimeUpdateDelivery({ ...unsigned, signature: `${signature}==` })).toBe(false);
   });
 });

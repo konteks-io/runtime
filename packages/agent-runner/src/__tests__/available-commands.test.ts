@@ -25,7 +25,7 @@ afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { re
 
 const update = (availableCommands: unknown) => ({ sessionUpdate: "available_commands_update", availableCommands });
 
-describe("learnt slash commands (runtime-view R19)", () => {
+describe("learnt slash commands", () => {
   it("keeps the latest update without refused commands, one line each, and always a list the heartbeat takes", async () => {
     const store = new AvailableCommandsStore(join(await tempDir(), AVAILABLE_COMMANDS_FILE), ["plan", "logout"]);
     store.learn(update([
@@ -95,7 +95,7 @@ describe("learnt slash commands (runtime-view R19)", () => {
     expect(published).toEqual([expect.objectContaining({ kind: "session_update", params: expect.objectContaining({ update: commands }) })]);
   });
 
-  it("learns commands an agent announces while it is still creating the session (WS1-176)", async () => {
+  it("learns commands an agent announces while it is still creating the session", async () => {
     const seen: unknown[] = [];
     const managerRef: { current?: SessionManager } = {};
     const commands = update([{ name: "init", description: "Create AGENTS.md" }]);

@@ -5,10 +5,9 @@
  * The development branch links the sibling `../packages` checkout
  * (`file:../packages/...`), which does not exist on a CI runner, so `npm ci`
  * cannot resolve `@konteks/agent-core` or `@konteks/backstage-plugin-common`
- * there. `main` and public exports already use `vendor/*.tgz`
- * (`konteksContracts` names the version). This rewrites the checked-out
- * manifests the way `export-public.mjs` does, in the runner's working tree
- * only, and never commits anything; on a tree that is already vendored it
+ * there. Releases use `vendor/*.tgz` (`konteksContracts` names the
+ * version). This rewrites the checked-out manifests to those tarballs, in the
+ * runner's working tree only, and never commits anything; on a tree that is already vendored it
  * changes nothing. Afterwards install with `npm install` (the lockfile still
  * names the sibling links), never `npm ci`.
  *

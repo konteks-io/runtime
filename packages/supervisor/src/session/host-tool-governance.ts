@@ -27,7 +27,7 @@ export interface HostPermissionContext {
   browserTools?: boolean;
 }
 
-/** A gated call that ran without Konteks' approval; `unaskedCommand`: it was a command that never asked (Antigravity's A21 line). */
+/** A gated call that ran without Konteks' approval; `unaskedCommand`: it was a command that never asked (Antigravity's Gemini Enterprise line). */
 export interface HostToolBypass { toolCallId: string; title: string; unaskedCommand?: boolean }
 
 export interface HostToolGovernance {

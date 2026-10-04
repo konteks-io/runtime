@@ -1,6 +1,6 @@
 /* global process, setTimeout */
 // A stand-in for OpenCode 2.0.18's `auth` and `api integration.list`, shaped
-// like the real binary's output (opencode-runtime-support proof/CP3.md). It
+// like the real binary's output. It
 // keeps its credentials in `$XDG_DATA_HOME/fake-opencode.json` and records
 // every call's argv and environment in `$XDG_DATA_HOME/calls.jsonl`, so tests
 // can prove what reached it (and what never did).

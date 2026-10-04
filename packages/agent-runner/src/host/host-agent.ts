@@ -51,11 +51,11 @@ export interface HostAgentRunnerAdapter {
   logout?(config: RunnerConfig, request?: HostLoginRequest, spawn?: HostSpawn): Promise<void>;
   /** Plain line shown when this agent's sign-in did not complete. */
   readonly loginFailedMessage?: string;
-  /** The identity signal (D111) when it is not an official tooling command; may carry the credentials it read. */
+  /** The identity signal when it is not an official tooling command; may carry the credentials it read. */
   identity?(config: RunnerConfig, settings: HostAgentSettings): Promise<IdentityProbe>;
   /** The reviewed sign-ins the site may start for this agent, as its installation offers them (OpenCode, Antigravity). */
   siteLoginOptions?(config: RunnerConfig): Promise<readonly AgentLoginOptionId[]>;
-  /** Whether a model value may be offered under `settings` (OpenCode: Zen's free models only when switched on, O6). */
+  /** Whether a model value may be offered under `settings` (OpenCode: Zen's free models only when switched on). */
   offersModel?(value: string, settings: HostAgentSettings): boolean;
   /** The verified installed version to report with readiness, when known. */
   hostVersion(config: RunnerConfig): string | undefined;
@@ -88,12 +88,12 @@ export interface HostAgentRunnerAdapter {
   /**
    * Content the connector puts in front of a prompt, or null when there is
    * none (Antigravity: the working copy's `AGENTS.md`, which its server never
-   * loads, A9). `delivered` is called once that prompt reached the agent.
+   * loads). `delivered` is called once that prompt reached the agent.
    */
   promptPrelude?(config: RunnerConfig, session: HostPromptSession): Promise<HostPromptPrelude | null>;
   /**
    * How many processes of this agent may live at once and for how long an
-   * unused one is kept (Antigravity: about 350 MB per process pair, A12).
+   * unused one is kept (Antigravity: about 350 MB per process pair).
    * Absent: the runtime's own limits.
    */
   readonly processLimits?: HostProcessLimits;
@@ -122,7 +122,7 @@ export interface HostAgentRunnerAdapter {
    * How every process of this agent is spawned, given the runtime's own spawn
    * (control, execution and discovery alike): an agent may start something
    * beside each process and finish signing it in after `initialize`
-   * (Antigravity with a Gemini API key: its own loopback relay, A7).
+   * (Antigravity with a Gemini API key: its own loopback relay).
    */
   wrapSpawn?(config: RunnerConfig, spawn: HostSpawn): HostSpawn;
   /**
@@ -199,7 +199,7 @@ export interface HostLoginRequest {
   loginOption?: AgentLoginOptionId;
   /** Gemini Enterprise: the licence's Google Cloud project and location (Antigravity). */
   gcp?: AgentLoginGcp;
-  /** Offer to repeat the sign-ins of the person's own installation (OpenCode O10). */
+  /** Offer to repeat the sign-ins of the person's own installation. */
   reuse?: boolean;
 }
 
@@ -208,7 +208,7 @@ export interface HostLoginRequest {
  * agents on this computer. Applied by the supervisor; absent fields are off.
  */
 export interface HostAgentSettings {
-  /** The person switched on OpenCode Zen's free models for this computer (O6). */
+  /** The person switched on OpenCode Zen's free models for this computer. */
   openCodeFreeModels: boolean;
   /**
    * Core takes pay-per-use turns and route billing on offered options (a 7.1.0

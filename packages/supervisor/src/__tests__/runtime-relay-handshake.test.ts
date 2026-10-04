@@ -86,6 +86,48 @@ describe("relay socket lease rotation (2026-10-03)", () => {
 });
 
 describe("native runtime relay handshake validation boundary", () => {
+  const runtimeUpdate = () => ({ type: "runtime_update_delivery", method: "POST", path: { instanceId: "instance" },
+    nodeId: "node", connectionRef: "connection", connectionEpoch: 7,
+    intent: { updateId: "update", tenantId: "tenant", instanceId: "instance", leaseId: "lease", runnerIncarnation: "process",
+      targetBundle: "1.1.0", manifestDigest: "a".repeat(43), deadlineAt: "2026-09-06T00:10:00.000Z" },
+    keyId: "control", nonce: "N".repeat(22), issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+    expiresAt: "2026-09-06T00:00:30.000Z", signature: "A".repeat(86) });
+
+  it.each(["current", "epoch", "refused"] as const)("routes a fixed runtime update outside mux/ACKs and keeps work transport available: %s", async mode => {
+    const onRuntimeUpdate = vi.fn<NonNullable<RelayClientOptions["onRuntimeUpdate"]>>(async (_request, connection) => {
+      connection.assertCurrent();
+      if (mode === "refused") throw new Error("update unavailable");
+    });
+    const f = fixture({ onRuntimeUpdate });
+    try {
+      f.socket.message(confirmed); await flush(); f.socket.send.mockClear();
+      f.socket.message({ ...runtimeUpdate(), connectionEpoch: mode === "epoch" ? 8 : 7 }); await flush();
+      expect(f.mux.receive).not.toHaveBeenCalled();
+      expect(f.socket.send).not.toHaveBeenCalled();
+      expect(f.socket.close).not.toHaveBeenCalled();
+      if (mode === "epoch") expect(onRuntimeUpdate).not.toHaveBeenCalled();
+      else {
+        expect(onRuntimeUpdate).toHaveBeenCalledOnce();
+        const guard = onRuntimeUpdate.mock.calls[0]![1].assertCurrent;
+        f.client.rehandshake("replacement");
+        expect(guard).toThrow("Runtime update socket ownership");
+      }
+    } finally { f.client.stop(); }
+  });
+
+  it("buffers a fixed runtime update until durable handshake adoption completes", async () => {
+    const onRuntimeUpdate = vi.fn<NonNullable<RelayClientOptions["onRuntimeUpdate"]>>(async (_request, connection) => connection.assertCurrent());
+    const f = delayedAdoption({ onRuntimeUpdate });
+    try {
+      await flush(); f.socket.message(runtimeUpdate()); await flush();
+      expect(onRuntimeUpdate).not.toHaveBeenCalled();
+      f.adoption.resolve(); await flush();
+      expect(onRuntimeUpdate).toHaveBeenCalledOnce();
+      expect(f.onFrame).not.toHaveBeenCalled();
+      expect(f.socket.send).not.toHaveBeenCalled();
+    } finally { f.client.stop(); }
+  });
+
   it("routes a current relay replay request to the mux without treating it as an ack or data frame", async () => {
     const f = fixture();
     try {
@@ -167,7 +209,7 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); }
   });
 
-  it("routes C02 revision control only to its current dedicated receiver", async () => {
+  it("routes execution revision control only to its current dedicated receiver", async () => {
     const onExecutionRevisionControl = vi.fn(async (_request, connection) => connection.assertCurrent());
     const f = fixture({ onExecutionRevisionControl } as never);
     const intent = {
@@ -247,7 +289,7 @@ describe("native runtime relay handshake validation boundary", () => {
     signature: "A".repeat(86),
   });
 
-  it("isolates C01 diagnostic sidecar failure from mux and work transport", async () => {
+  it("isolates a diagnostic companion failure from mux and work transport", async () => {
     const onDiagnosticCompanion = vi.fn(async () => { throw new Error("diagnostic journal unavailable"); });
     const f = fixture({ onDiagnosticCompanion } as never);
     try {
@@ -260,7 +302,7 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); }
   });
 
-  it("records an explicit C01 coverage gap when a legacy runtime lacks the diagnostic receiver", async () => {
+  it("records an explicit diagnostic coverage gap when a legacy runtime lacks the diagnostic receiver", async () => {
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const f = fixture({ logger: logger as never });
     try {
@@ -476,7 +518,7 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); vi.useRealTimers(); }
   });
 
-  it("logs who closed the relay socket and why (WS2-157)", async () => {
+  it("logs who closed the relay socket and why", async () => {
     const warn = vi.fn();
     const logger = { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never;
     const closed = () => warn.mock.calls.filter(call => (call[0] as { event?: string }).event === "relay.socket.closed").map(call => call[0]);

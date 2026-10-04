@@ -41,11 +41,14 @@ describe("native background service definitions", () => {
     const script = Buffer.from(encoded, 'base64').toString('utf16le');
     // Single-quoted PowerShell literals keep percent variables, metacharacters
     // and apostrophes in the installation paths literal, not executable input;
-    // cmd reads them from the environment and appends the output to the log (D129).
+    // cmd reads them from the environment and appends the output to the log.
     expect(script).toContain(`$env:KONTEKS_SERVICE_PROGRAM = '${executable.replace(/'/g, "''")}'`);
     expect(script).toContain(`$env:KONTEKS_SERVICE_ROOT = '${root.replace(/'/g, "''")}'`);
     expect(script).toContain('serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1');
     expect(script).toContain('exit $connector.ExitCode');
+    // A hidden PowerShell host still creates a console for cmd unless this
+    // ProcessStartInfo option is set (Windows installation RCA 2026-10-04).
+    expect(script).toContain('$start.CreateNoWindow = $true');
     const run = vi.fn(() => 17), quit = vi.fn();
     runInNewContext(helper!.contents, { WScript: { CreateObject: () => ({ Run: run }), Quit: quit } });
     expect(run).toHaveBeenCalledWith(expect.stringContaining('-EncodedCommand'), 0, true);
@@ -67,14 +70,14 @@ describe("native background service definitions", () => {
     expect(service.contents).toContain('<string>--root</string>');
     expect(service.start.command).toBe('launchctl');
     expect(service.start.args).toEqual(['bootstrap', 'gui/501', service.path]);
-    // launchd keeps nothing the connector prints unless the plist names a file (WS1-163).
+    // launchd keeps nothing the connector prints unless the plist names a file.
     expect(service.contents).toContain(`<key>StandardOutPath</key><string>${root}/logs/connector.log</string>`);
     expect(service.contents).toContain(`<key>StandardErrorPath</key><string>${root}/logs/connector.log</string>`);
     // The home it was started from, not the login's (09-30).
     expect(service.contents).toContain('<key>EnvironmentVariables</key><dict><key>HOME</key><string>/Users/Test User</string></dict>');
     expect(service.contents).not.toMatch(/Docker|docker|postgres|harness|validation-runtime|activationCode|TOKEN|PRIVATE KEY/);
-    // launchd SIGKILLs a booted-out job 5 s after SIGTERM unless told otherwise
-    // (D113b): the connector's own 15 s shutdown and exit watchdog need the room.
+    // launchd SIGKILLs a booted-out job 5 s after SIGTERM unless told otherwise:
+    // the connector's own 15 s shutdown and exit watchdog need the room.
     expect(service.contents).toContain('<key>ExitTimeOut</key><integer>30</integer>');
   });
 
@@ -104,7 +107,13 @@ describe("native background service definitions", () => {
     // Status means running, not registered: `schtasks /Query` succeeds for a stopped task too.
     expect(service.status.command).toBe('powershell.exe');
     expect(service.status.args.slice(0, 3)).toEqual(['-NoProfile', '-NonInteractive', '-Command']);
-    expect(service.status.args[3]).toBe(`$task = Get-ScheduledTask -TaskPath '\\' -TaskName '${service.label}' -ErrorAction SilentlyContinue; if ($task -and $task.State -eq 'Running') { exit 0 }; exit 1`);
+    expect(service.status.args[3]).toContain("-ErrorAction Stop");
+    expect(service.status.args[3]).toContain("$task.State -in @('Running', 'Queued')");
+    expect(service.status.args[3]).toContain("$task.State -in @('Ready', 'Disabled')");
+    // Failure to query a task must not masquerade as a stopped task whose
+    // RestartOnFailure ownership it is safe to leave registered.
+    expect(service.status.args[3]).toContain("CmdletizationQuery_NotFound*");
+    expect(service.status.args[3]).toContain("exit 2");
   });
 
   it("starts by rewriting and re-registering the definition, so a start after an update runs the new release", async () => {
@@ -143,7 +152,7 @@ describe("native background service definitions", () => {
   });
 });
 
-describe("service exits (W1-Z7)", () => {
+describe("service exits", () => {
   it("reads launchd's run count and last exit code", () => {
     const print = (runs: number, last: string) => `gui/501/dev.konteks.remote.x = {\n\tactive count = 1\n\tstate = running\n\truns = ${runs}\n\tpid = 81413\n\tlast exit code = ${last}\n\tendpoints = {\n\t\tstate = active\n\t}\n}\n`;
     expect(parseServiceExits("macos", print(1, "(never exited)"))).toEqual({ runs: 1, lastExitCode: null });
@@ -157,7 +166,7 @@ describe("service exits (W1-Z7)", () => {
   });
 });
 
-/** RCA 2026-10-01: launchd reads a plist only at bootstrap, so a rewritten one needs a reload, not `kickstart -k`. */
+/** Launchd reads a plist only at bootstrap, so a rewritten one needs a reload, not `kickstart -k`. */
 describe("reloading a service onto a rewritten definition", () => {
   const root = '/Users/Test User/Library/Application Support/konteks-remote';
   const executable = `${root}/releases/release-new/konteks-connector`;

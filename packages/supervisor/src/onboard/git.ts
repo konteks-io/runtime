@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { RemoteInstanceError, createLogger, runCommand, sanitizeInheritedChildProcessEnv, sha256Hex, type Logger } from "@konteks/remote-common";
 
 /**
- * The onboard role's git access (OB6 §5, invariant 3, amendments A5/A10).
+ * The onboard role's git access.
  *
  * The runtime uses **the machine's own git access** for a customer's VCS —
  * whatever `git` on this machine already authenticates with, exactly as native
@@ -30,12 +30,12 @@ const NON_INTERACTIVE_ENV = {
   SSH_ASKPASS_REQUIRE: "never",
 } as const;
 
-export const CREDENTIAL_UNAVAILABLE_REMEDY =
+const CREDENTIAL_UNAVAILABLE_REMEDY =
   "sign in to this provider with git on the machine running this Konteks runtime";
 
 export type GitGapCode = "credential_unavailable" | "not_found" | "unavailable";
 
-/** An evidence gap, never an exception text (OB6 §5). */
+/** An evidence gap, never an exception text. */
 export interface GitGap {
   code: GitGapCode;
   /** What a person does about it. Bounded prose; never command output. */
@@ -56,7 +56,7 @@ export interface GitRef {
 /**
  * How this machine reaches one repository. `identityFile` is present only for
  * managed git, where the runtime's own registered key IS the person's
- * credential (A10); for a customer connector it is absent and git resolves
+ * credential; for a customer connector it is absent and git resolves
  * whatever it already has.
  */
 export interface GitRemote {
@@ -83,7 +83,7 @@ export interface GitAccess {
 }
 
 /**
- * The digest both sides of a relocation are compared on (G6): sha256 over the
+ * The digest both sides of a relocation are compared on: sha256 over the
  * sorted `"<ref> <sha>"` lines. Sorting is what makes two providers that
  * enumerate refs in different orders comparable at all.
  */
@@ -109,26 +109,21 @@ export function parseLsRemote(stdout: string): GitRef[] {
  */
 export function classifyGitFailure(stderr: string): GitGap {
   const text = stderr.toLowerCase();
-  if (
-    text.includes("authentication failed") ||
-    text.includes("could not read username") ||
-    text.includes("could not read password") ||
-    text.includes("permission denied") ||
-    text.includes("terminal prompts disabled") ||
-    text.includes("access denied") ||
-    text.includes("403 forbidden") ||
-    text.includes("401 unauthorized") ||
-    text.includes("invalid username or token")
-  ) {
+  if (CREDENTIAL_PHRASES.some(phrase => text.includes(phrase))) {
     return { code: "credential_unavailable", remedy: CREDENTIAL_UNAVAILABLE_REMEDY };
   }
-  if (text.includes("repository not found") || text.includes("not found") || text.includes("does not exist") || text.includes("404")) {
+  if (NOT_FOUND_PHRASES.some(phrase => text.includes(phrase))) {
     return { code: "not_found", remedy: "confirm the repository still exists and this machine may see it" };
   }
   return { code: "unavailable", remedy: "retry when this machine can reach the provider" };
 }
 
-export interface LocalGitOptions {
+const CREDENTIAL_PHRASES = [
+  "authentication failed", "could not read username", "could not read password", "permission denied", "terminal prompts disabled",
+  "access denied", "403 forbidden", "401 unauthorized", "invalid username or token",
+];
+const NOT_FOUND_PHRASES = ["repository not found", "not found", "does not exist", "404"];
+interface LocalGitOptions {
   /** Injected in tests; production runs the real subprocess. */
   run?: typeof runCommand;
   /** How long a single git invocation may take. */
@@ -203,9 +198,8 @@ export class LocalGit implements GitAccess {
   }
 
   async credential(url: string): Promise<GitResult<{ username: string; password: string }>> {
-    // Git credentials are read THROUGH git (the OB6 gotcha): never by importing
-    // a host login cache the way the agent lane's `host-cache-import` does, and
-    // never by reading a helper's private store directly.
+    // Git credentials are read THROUGH git: never by copying a host login
+    // cache, and never by reading a helper's private store directly.
     const parsed = safeUrl(url);
     if (!parsed) return gitGap("unavailable", "the repository URL is not an HTTP(S) location");
     const request = `protocol=${parsed.protocol.replace(":", "")}\nhost=${parsed.host}\npath=${parsed.pathname.replace(/^\//, "")}\n\n`;
@@ -241,7 +235,7 @@ export class LocalGit implements GitAccess {
   async pushMirror(directory: string, remote: GitRemote): Promise<GitResult<void>> {
     // A mirror push is idempotent: re-running it after a worker died between
     // `sync` and `verify` converges on the same refs rather than duplicating
-    // anything (G6, OB6 §3).
+    // anything.
     const result = await this.git(remote, ["push", "--mirror", "--quiet", "--", remote.url], { cwd: directory });
     return result.ok ? gitOk(undefined) : result;
   }
@@ -275,8 +269,8 @@ export class LocalGit implements GitAccess {
     const env = sanitizeInheritedChildProcessEnv({ env: process.env });
     Object.assign(env, NON_INTERACTIVE_ENV);
     if (identityFile) {
-      // Managed git is the one place the runtime's own key is the credential
-      // (A10). `IdentitiesOnly` stops ssh from offering every agent key first
+      // Managed git is the one place the runtime's own key is the credential.
+      // `IdentitiesOnly` stops ssh from offering every agent key first
       // and being refused before it reaches ours.
       env.GIT_SSH_COMMAND = `ssh -i ${identityFile} -o IdentitiesOnly=yes -o BatchMode=yes`;
     }
@@ -285,7 +279,7 @@ export class LocalGit implements GitAccess {
 }
 
 /** Extract one file from an uncompressed tar stream produced by `git archive`. */
-export function firstTarEntry(tar: Buffer, path: string): Buffer | null {
+function firstTarEntry(tar: Buffer, path: string): Buffer | null {
   const wanted = path.replace(/^\.\//, "");
   for (let offset = 0; offset + 512 <= tar.length; ) {
     const header = tar.subarray(offset, offset + 512);
@@ -311,8 +305,7 @@ function safeUrl(value: string): URL | null {
 /**
  * The scratch the onboard lane owns, split in two on purpose. **Clones** live
  * under `clones/` and nowhere else, so "the clones directory stayed empty" is a
- * checkable proof that a `grouping` pass never cloned anything (OB6 acceptance
- * criteria); the short-lived tar a single-file `git archive` writes lives under
+ * checkable proof that a `grouping` pass never cloned anything; the short-lived tar a single-file `git archive` writes lives under
  * `archives/` so it cannot be mistaken for one.
  */
 export class OnboardScratch {

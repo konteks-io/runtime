@@ -1,12 +1,12 @@
-import { isAbsolute, resolve } from "node:path";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { isDeniedBrowserTool } from "@konteks/remote-agent-runner";
 import { isWithinWorkspace } from "./workspace-tool-policy.js";
+import { rebuiltRequest, refusal, resolveIn } from "./host-decisions.js";
 import { CODE_MODE_ACCEPTED_FORM, parseKonteksCodeModeBlock, type CodeModeCall } from "./opencode-code-mode.js";
 import type { HostPermissionContext, HostPermissionDecision, HostToolBypass, HostToolGovernance } from "./host-tool-governance.js";
 
 /**
- * Permission parity for OpenCode 2 (opencode-runtime-support CP4).
+ * Permission parity for OpenCode 2.
  *
  * OpenCode runs with the locked Konteks configuration (`* ask` first, reads
  * and searches allowed, `external_directory` and the built-in browser denied;
@@ -36,7 +36,7 @@ import type { HostPermissionContext, HostPermissionDecision, HostToolBypass, Hos
  * read of `.env` or outside the working copy that ran unasked, all report a
  * bypass and the session quarantines OpenCode on this connector.
  *
- * What 2.0.18 does NOT let Konteks judge beforehand (live, CP4): Code Mode
+ * What 2.0.18 does NOT let Konteks judge beforehand: Code Mode
  * asks at a block's first MCP call, not before the block runs, and only for
  * MCP tools. OpenCode's own Code Mode tools and its built-in browser never
  * ask, so the locked configuration removes them from the catalogue (`deny`
@@ -63,8 +63,8 @@ const UNGATED = new Set(["read", "grep", "glob", "list", "todowrite", "todoread"
 /** The Code Mode catalogue lookup (`tools.search`): it runs without asking and calls nothing. */
 const CATALOGUE_LOOKUPS = new Set(["search", "tools.search"]);
 /**
- * Code Mode's `fetch` runs without any permission request in 2.0.18 (live,
- * CP4), even before the block's first Konteks call asks. It is a web fetch,
+ * Code Mode's `fetch` runs without any permission request in 2.0.18, even
+ * before the block's first Konteks call asks. It is a web fetch,
  * which the runtime policy allows every agent (`createWorkspaceToolPolicy`),
  * so it is at parity and never trips; it just cannot be judged beforehand.
  */
@@ -92,15 +92,22 @@ function text(value: unknown): string | undefined {
 export function openCodeToolName(toolCallId: string, title: unknown, meta?: unknown): string | undefined {
   const raw = text(title)?.trim();
   if (raw === undefined) return undefined;
+  return (childToolName(raw, meta) ?? subagentToolName(raw, toolCallId) ?? raw).toLowerCase();
+}
+
+/** A subagent's call titled with the child session's own title as prefix. */
+function childToolName(raw: string, meta: unknown): string | undefined {
   const child = record(record(meta)[CHILD_SESSION_META]);
   const prefix = typeof child.title === "string" && child.title.length > 0 ? `${child.title}: ` : undefined;
-  if (prefix !== undefined && raw.startsWith(prefix)) return raw.slice(prefix.length).trim().toLowerCase();
+  return prefix !== undefined && raw.startsWith(prefix) ? raw.slice(prefix.length).trim() : undefined;
+}
+
+/** A subagent's call (`<childSessionId>:<callId>`) titled `<subagent>: <tool>`. */
+function subagentToolName(raw: string, toolCallId: string): string | undefined {
   const colon = toolCallId.indexOf(":");
-  if (colon > 0 && colon < toolCallId.length - 1) {
-    const at = raw.lastIndexOf(": ");
-    if (at > 0) return raw.slice(at + 2).trim().toLowerCase();
-  }
-  return raw.toLowerCase();
+  if (colon <= 0 || colon >= toolCallId.length - 1) return undefined;
+  const at = raw.lastIndexOf(": ");
+  return at > 0 ? raw.slice(at + 2).trim() : undefined;
 }
 
 /** Every file a file-changing (or reading) call names: `files[].file`/`movePath` and the single-path keys. */
@@ -132,8 +139,95 @@ function codeModeCallsRan(rawOutput: unknown): Array<{ tool: string; status: str
   }));
 }
 
+/** What Konteks decided for a Code Mode block before it ran. */
+interface BlockDecision { askedFirst: boolean; approved: string[] | undefined; refusedBlock: boolean }
+
+/**
+ * A listed call that needs no approval: Code Mode's web fetch, a catalogue
+ * lookup in a block that never asked, or, in a refused block, the call that
+ * asked (listed as an error, Permission.DeclinedError: it never ran).
+ */
+function uncheckedCall(tool: string, status: string, block: BlockDecision): boolean {
+  return tool === CODE_MODE_WEB_FETCH || (!block.askedFirst && CATALOGUE_LOOKUPS.has(tool)) || (block.refusedBlock && status === "error");
+}
+
+/** A call a Code Mode block ran without Konteks having approved it. A block may have run some of its calls even when it then failed. */
+function unapprovedCodeModeCall(toolCallId: string, rawOutput: unknown, block: BlockDecision): HostToolBypass | null {
+  const allowed = [...(block.approved ?? [])];
+  for (const { tool, status } of codeModeCallsRan(rawOutput)) {
+    if (uncheckedCall(tool, status, block)) continue;
+    const index = allowed.indexOf(tool);
+    if (index === -1) return { toolCallId, title: `execute: ${tool}` };
+    allowed.splice(index, 1);
+  }
+  return null;
+}
+
+function privateEnvFile(path: string): boolean {
+  return ENV_FILE.test(path) && !ENV_EXAMPLE.test(path);
+}
+
+/** An allowed read or search that reached a `.env` file or left the working copy should have asked or been refused. */
+function ungatedOverreach(toolCallId: string, observed: ObservedCall, cwd: string): HostToolBypass | null {
+  for (const path of namedPaths(observed.rawInput)) {
+    const absolute = resolveIn(cwd, path);
+    if ((observed.tool === "read" && privateEnvFile(absolute)) || !isWithinWorkspace(absolute, cwd)) return { toolCallId, title: observed.tool };
+  }
+  return null;
+}
+
+/** A permission request next to the input its call reported. */
+interface AskedRequest {
+  request: RequestPermissionRequest;
+  toolCallId: string;
+  asked: Record<string, unknown>;
+  seen: Record<string, unknown>;
+  context: HostPermissionContext;
+}
+
+/** The value both the request and its call give (either may omit it); null when they disagree. */
+function agreed(r: AskedRequest, key: string): string | null | undefined {
+  const a = text(r.asked[key]);
+  const b = text(r.seen[key]);
+  if (a !== undefined && b !== undefined && a !== b) return null;
+  return a ?? b;
+}
+
+function namedAbsolutePaths(r: AskedRequest): string[] {
+  return [...new Set([...namedPaths(r.asked), ...namedPaths(r.seen)])].map(path => resolveIn(r.context.cwd, path));
+}
+
+function shellDecision(r: AskedRequest): HostPermissionDecision {
+  const command = agreed(r, "command");
+  if (command === null) return refusal("the command asked for is not the command the call reported");
+  if (command === undefined) return refusal("the shell call has no command to judge");
+  const folders = [text(r.asked.cwd), text(r.asked.workdir), text(r.seen.workdir), text(r.seen.cwd)];
+  if (folders.some(folder => folder !== undefined && !isWithinWorkspace(resolveIn(r.context.cwd, folder), r.context.cwd))) return refusal("a command run outside the working copy");
+  return rebuiltRequest(r.request, r.toolCallId, { kind: "execute", title: command, rawInput: { command } });
+}
+
+function editDecision(r: AskedRequest, tool: string): HostPermissionDecision {
+  const paths = namedAbsolutePaths(r);
+  if (paths.length === 0) return refusal(`the ${tool} call names no file to judge`);
+  if (paths.some(path => !isWithinWorkspace(path, r.context.cwd))) return refusal("a file outside the working copy");
+  return rebuiltRequest(r.request, r.toolCallId, { kind: "edit", title: tool, rawInput: { file_path: paths[0] }, locations: paths.map(path => ({ path })) });
+}
+
+function searchDecision(r: AskedRequest, tool: string): HostPermissionDecision {
+  const paths = namedAbsolutePaths(r);
+  if (paths.some(path => !isWithinWorkspace(path, r.context.cwd))) return refusal("a path outside the working copy");
+  if (tool === "read" && paths.some(privateEnvFile)) return refusal("reading a .env file is not allowed");
+  return rebuiltRequest(r.request, r.toolCallId, { kind: "read", title: tool, rawInput: {}, locations: paths.map(path => ({ path })) });
+}
+
+function fetchDecision(r: AskedRequest, tool: string): HostPermissionDecision {
+  const target = agreed(r, "url") ?? agreed(r, "query");
+  if (!target) return refusal(`the ${tool} call names nothing to fetch`);
+  return rebuiltRequest(r.request, r.toolCallId, { kind: "fetch", title: tool, rawInput: { url: target } });
+}
+
 /** The path Code Mode lists for an approved call. */
-export function codeModeCallPath(call: CodeModeCall): string { return `${call.server}.${call.tool}`; }
+function codeModeCallPath(call: CodeModeCall): string { return `${call.server}.${call.tool}`; }
 
 export class OpenCodeToolGovernance implements HostToolGovernance {
   readonly agentName = "OpenCode";
@@ -148,131 +242,85 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
 
   constructor(private readonly limit = 512) {}
 
-  size(): number { return this.calls.size; }
-
   observe(update: unknown, cwd: string): HostToolBypass | null {
     const value = record(update);
     const toolCallId = typeof value.toolCallId === "string" ? value.toolCallId : undefined;
     if (toolCallId === undefined) return null;
     const input = record(value.rawInput);
-    if (value.sessionUpdate === "tool_call" || (value.sessionUpdate === "tool_call_update" && !this.terminal(value.status))) {
-      const known = this.calls.get(toolCallId);
-      if (known) {
-        // A retitle (the command, the path) never renames the tool; input fills in as it streams.
-        if (Object.keys(input).length > 0) known.rawInput = input;
-        return null;
-      }
-      if (value.sessionUpdate !== "tool_call") return null;
-      const tool = openCodeToolName(toolCallId, value.title, value._meta);
-      if (tool === undefined) return null;
-      this.calls.set(toolCallId, { tool, rawInput: input });
-      while (this.calls.size > this.limit) {
-        const oldest = this.calls.keys().next().value!;
-        this.forget(oldest);
-      }
+    if (value.sessionUpdate === "tool_call" || (value.sessionUpdate === "tool_call_update" && !this.terminal(value.status))) return this.observeRunning(toolCallId, value, input);
+    if (value.sessionUpdate !== "tool_call_update") return null;
+    return this.observeEnd(toolCallId, value, input, cwd);
+  }
+
+  private observeRunning(toolCallId: string, value: Record<string, unknown>, input: Record<string, unknown>): null {
+    const known = this.calls.get(toolCallId);
+    if (known) {
+      // A retitle (the command, the path) never renames the tool; input fills in as it streams.
+      if (Object.keys(input).length > 0) known.rawInput = input;
       return null;
     }
-    if (value.sessionUpdate !== "tool_call_update") return null;
+    if (value.sessionUpdate !== "tool_call") return null;
+    const tool = openCodeToolName(toolCallId, value.title, value._meta);
+    if (tool === undefined) return null;
+    this.calls.set(toolCallId, { tool, rawInput: input });
+    while (this.calls.size > this.limit) {
+      const oldest = this.calls.keys().next().value!;
+      this.forget(oldest);
+    }
+    return null;
+  }
+
+  private observeEnd(toolCallId: string, value: Record<string, unknown>, input: Record<string, unknown>, cwd: string): HostToolBypass | null {
     const status = value.status;
     const observed = this.calls.get(toolCallId);
-    const askedFirst = this.asked.has(toolCallId);
-    const approved = this.approved.get(toolCallId);
-    const refusedBlock = this.refused.has(toolCallId);
+    const block: BlockDecision = { askedFirst: this.asked.has(toolCallId), approved: this.approved.get(toolCallId), refusedBlock: this.refused.has(toolCallId) };
     this.forget(toolCallId);
     if (!observed || status === "cancelled") return null;
     if (Object.keys(input).length > 0) observed.rawInput = input;
-    if (observed.tool === "execute") {
-      // A block may have run some of its calls even when it then failed.
-      const allowed = [...(approved ?? [])];
-      for (const { tool, status } of codeModeCallsRan(value.rawOutput)) {
-        if (tool === CODE_MODE_WEB_FETCH || (!askedFirst && CATALOGUE_LOOKUPS.has(tool))) continue;
-        // In a refused block the call that asked is listed as an error (Permission.DeclinedError): it never ran.
-        if (refusedBlock && status === "error") continue;
-        const index = allowed.indexOf(tool);
-        if (index === -1) return { toolCallId, title: `execute: ${tool}` };
-        allowed.splice(index, 1);
-      }
-      return null;
-    }
+    if (observed.tool === "execute") return unapprovedCodeModeCall(toolCallId, value.rawOutput, block);
     // Only a call that ran to completion did something.
-    if (status !== "completed" || askedFirst) return null;
+    if (status !== "completed" || block.askedFirst) return null;
     if (!UNGATED.has(observed.tool)) return { toolCallId, title: observed.tool };
-    // An allowed read or search that reached a `.env` file or left the working copy should have asked or been refused.
-    for (const path of namedPaths(observed.rawInput)) {
-      const absolute = isAbsolute(path) ? path : resolve(cwd, path);
-      if ((observed.tool === "read" && ENV_FILE.test(absolute) && !ENV_EXAMPLE.test(absolute)) || !isWithinWorkspace(absolute, cwd)) {
-        return { toolCallId, title: observed.tool };
-      }
-    }
-    return null;
+    return ungatedOverreach(toolCallId, observed, cwd);
   }
 
   decide(request: RequestPermissionRequest, context: HostPermissionContext): HostPermissionDecision {
     const toolCallId = request.toolCall.toolCallId;
     this.asked.add(toolCallId);
     const observed = this.calls.get(toolCallId);
-    if (!observed) return { kind: "deny", reason: "no tool call precedes this permission request" };
+    if (!observed) return refusal("no tool call precedes this permission request");
     const { tool } = observed;
     const kind = OPENCODE_TOOL_KINDS[tool];
-    if (kind === undefined) return { kind: "deny", reason: `${tool} is not a tool Konteks allows OpenCode to use` };
+    if (kind === undefined) return refusal(`${tool} is not a tool Konteks allows OpenCode to use`);
     const requested = request.toolCall.kind;
-    if (typeof requested === "string" && requested !== kind) return { kind: "deny", reason: `the request (${requested}) does not match its ${tool} call` };
-    const asked = record(request.toolCall.rawInput);
-    const seen = observed.rawInput;
-    const same = (key: string): string | null | undefined => {
-      const a = text(asked[key]);
-      const b = text(seen[key]);
-      if (a !== undefined && b !== undefined && a !== b) return null;
-      return a ?? b;
-    };
+    if (typeof requested === "string" && requested !== kind) return refusal(`the request (${requested}) does not match its ${tool} call`);
+    return this.toolDecision({ request, toolCallId, asked: record(request.toolCall.rawInput), seen: observed.rawInput, context }, tool, kind);
+  }
 
-    if (SHELL.has(tool)) {
-      const command = same("command");
-      if (command === null) return { kind: "deny", reason: "the command asked for is not the command the call reported" };
-      if (command === undefined) return { kind: "deny", reason: "the shell call has no command to judge" };
-      for (const folder of [text(asked.cwd), text(asked.workdir), text(seen.workdir), text(seen.cwd)]) {
-        if (folder !== undefined && !isWithinWorkspace(isAbsolute(folder) ? folder : resolve(context.cwd, folder), context.cwd)) {
-          return { kind: "deny", reason: "a command run outside the working copy" };
-        }
-      }
-      return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "execute", title: command, rawInput: { command } } } };
-    }
-    if (EDIT.has(tool)) {
-      const paths = [...new Set([...namedPaths(asked), ...namedPaths(seen)])].map(path => (isAbsolute(path) ? path : resolve(context.cwd, path)));
-      if (paths.length === 0) return { kind: "deny", reason: `the ${tool} call names no file to judge` };
-      if (paths.some(path => !isWithinWorkspace(path, context.cwd))) return { kind: "deny", reason: "a file outside the working copy" };
-      return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "edit", title: tool, rawInput: { file_path: paths[0] }, locations: paths.map(path => ({ path })) } } };
-    }
-    if (tool === "execute") {
-      this.approved.set(toolCallId, []);
-      this.refused.add(toolCallId);
-      const code = same("code");
-      if (code === null) return { kind: "deny", reason: "the code asked for is not the code the call reported" };
-      const block = parseKonteksCodeModeBlock(code ?? "", context.servers);
-      if (!block.ok) return { kind: "deny", reason: `Code Mode block refused (${block.reason}): ${CODE_MODE_ACCEPTED_FORM}` };
-      for (const call of block.calls) {
-        if (call.server === "konteks-browser" && (context.browserTools !== true || isDeniedBrowserTool(call.tool))) {
-          return { kind: "deny", reason: `the browser tool ${call.tool} is not allowed in this session` };
-        }
-      }
-      this.refused.delete(toolCallId);
-      this.approved.set(toolCallId, block.calls.map(codeModeCallPath));
-      return { kind: "allow" };
-    }
-    if (SEARCH.has(tool)) {
-      const paths = [...new Set([...namedPaths(asked), ...namedPaths(seen)])].map(path => (isAbsolute(path) ? path : resolve(context.cwd, path)));
-      if (paths.some(path => !isWithinWorkspace(path, context.cwd))) return { kind: "deny", reason: "a path outside the working copy" };
-      if (tool === "read" && paths.some(path => ENV_FILE.test(path) && !ENV_EXAMPLE.test(path))) return { kind: "deny", reason: "reading a .env file is not allowed" };
-      return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "read", title: tool, rawInput: {}, locations: paths.map(path => ({ path })) } } };
-    }
-    if (kind === "fetch") {
-      const target = same("url") ?? same("query");
-      if (!target) return { kind: "deny", reason: `the ${tool} call names nothing to fetch` };
-      return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "fetch", title: tool, rawInput: { url: target } } } };
-    }
+  private toolDecision(r: AskedRequest, tool: string, kind: string): HostPermissionDecision {
+    if (SHELL.has(tool)) return shellDecision(r);
+    if (EDIT.has(tool)) return editDecision(r, tool);
+    if (tool === "execute") return this.codeModeDecision(r);
+    if (SEARCH.has(tool)) return searchDecision(r, tool);
+    if (kind === "fetch") return fetchDecision(r, tool);
     // A subagent's own calls ask and are judged like these; a todo list touches nothing.
     if (kind === "think") return { kind: "allow" };
-    return { kind: "deny", reason: `${tool} is not a tool Konteks allows OpenCode to use` };
+    return refusal(`${tool} is not a tool Konteks allows OpenCode to use`);
+  }
+
+  /** A Code Mode block counts as refused until every call in it is approved. */
+  private codeModeDecision(r: AskedRequest): HostPermissionDecision {
+    this.approved.set(r.toolCallId, []);
+    this.refused.add(r.toolCallId);
+    const code = agreed(r, "code");
+    if (code === null) return refusal("the code asked for is not the code the call reported");
+    const block = parseKonteksCodeModeBlock(code ?? "", r.context.servers);
+    if (!block.ok) return refusal(`Code Mode block refused (${block.reason}): ${CODE_MODE_ACCEPTED_FORM}`);
+    const browser = block.calls.find(call => call.server === "konteks-browser" && (r.context.browserTools !== true || isDeniedBrowserTool(call.tool)));
+    if (browser) return refusal(`the browser tool ${browser.tool} is not allowed in this session`);
+    this.refused.delete(r.toolCallId);
+    this.approved.set(r.toolCallId, block.calls.map(codeModeCallPath));
+    return { kind: "allow" };
   }
 
   private terminal(status: unknown): boolean {

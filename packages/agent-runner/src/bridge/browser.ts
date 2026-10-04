@@ -5,7 +5,7 @@ import { BROWSER_MCP_PACKAGE } from "@konteks/remote-release";
 import type { RunnerBrowser, RunnerConfig } from "../config.js";
 import { BROWSER_MCP_SERVER_NAME, BROWSER_ORIGINS_ENV, BROWSER_ORIGINS_PATH } from "./browser-tools.js";
 
-export { BROWSER_MCP_SERVER_NAME, BROWSER_DENIED_TOOLS, BROWSER_ORIGINS_ENV, BROWSER_ORIGINS_PATH, browserToolFromTitle, isDeniedBrowserTool } from "./browser-tools.js";
+export { BROWSER_MCP_SERVER_NAME, BROWSER_ORIGINS_PATH, browserToolFromTitle, isDeniedBrowserTool } from "./browser-tools.js";
 
 /**
  * What the supervisor asks for when a session gets a browser: the session's
@@ -13,7 +13,7 @@ export { BROWSER_MCP_SERVER_NAME, BROWSER_DENIED_TOOLS, BROWSER_ORIGINS_ENV, BRO
  * running preview), a folder for screenshots and the like, and where
  * Playwright's own Chromium lives when there is no Chrome.
  */
-export interface BrowserSessionRequest {
+interface BrowserSessionRequest {
   proxyUrl: string;
   outputDir: string;
   browsersPath: string;
@@ -54,7 +54,7 @@ export function packageBrowser(config: RunnerConfig): RunnerBrowser | null {
 }
 
 /**
- * The QA browser a session of this runner gets (O8: a connector capability,
+ * The QA browser a session of this runner gets (a connector capability,
  * not an agent package feature). Claude Code and Codex keep the one in their
  * own package; any other agent gets the one the supervisor resolved for the
  * connector (`RUNNER_BROWSER`); null when the connector has none.

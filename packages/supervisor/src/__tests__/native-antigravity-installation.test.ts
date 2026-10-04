@@ -152,7 +152,7 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     expect(fields).toEqual({ antigravityVersion: "1.2.1", antigravityRoot: folder });
     expect(hits).toEqual(["/good.zip"]);
     expect((await readdir(folder)).sort()).toEqual(["agy_acp_server.par", "localharness_external"]);
-    // The zip and the staging folder are gone (A19); only the version folder stays.
+    // The zip and the staging folder are gone; only the version folder stays.
     expect(await readdir(join(root, "agents", "antigravity"))).toEqual(["1.2.1-darwin-arm64"]);
     expect(await readFile(join(folder, "agy_acp_server.par"))).toEqual(SERVER);
     if (posix) {
@@ -216,7 +216,7 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     expect(await readdir(root)).toEqual(["agents"]);
   });
 
-  it("refuses to start a fetch without 1.5 GB free, before downloading anything (A19)", async () => {
+  it("refuses to start a fetch without 1.5 GB free, before downloading anything", async () => {
     await fresh();
     const refusal = await fetchNativeAntigravity({ root, consent: true }, deps(pinFor(GOOD), { freeBytes: async () => ANTIGRAVITY_MIN_FREE_BYTES - 1 })).catch(error => error);
     expect(refusal).toMatchObject({ code: "prerequisite_missing", diagnostic: "antigravity_no_disk_space", recoveryActions: [{ kind: "free_disk", agentId: "antigravity" }] });
@@ -244,7 +244,7 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     const folder = fields.antigravityRoot!;
     const config = RunnerConfigSchema.parse({ RUNNER_AGENT_ID: "antigravity", RUNNER_CREDENTIAL_DIR: join(root, "credentials", "antigravity"), RUNNER_WORKSPACE_DIR: join(root, "workspaces", "antigravity"),
       RUNNER_BRIDGE_PREFIX: folder, RUNNER_BRIDGE_VERSION: "1.2.1", RUNNER_NATIVE_ANTIGRAVITY_ROOT: folder });
-    // Verified, then the `initialize` start check (CP2) runs on that exact folder.
+    // Verified, then the `initialize` start check runs on that exact folder.
     const initialize = vi.fn(async () => undefined);
     await antigravityInstallAdapter.selfCheck(config, { antigravity: deps(pin), antigravitySelfCheck: initialize });
     expect(initialize).toHaveBeenCalledWith({ config });
@@ -286,7 +286,7 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     await expect(verifyNativeAntigravityRecord({ ...fields, antigravityRoot: join(root, "elsewhere") }, root, deps(pin))).rejects.toMatchObject({ diagnostic: "antigravity_unsafe_install" });
   });
 
-  it("says on the connected agent where the download stands, as the site reads it (CP3 prep)", async () => {
+  it("says on the connected agent where the download stands, as the site reads it", async () => {
     await fresh();
     const pin = pinFor(GOOD, "/slow.zip");
     let releaseSecondHalf!: () => void;
@@ -314,7 +314,7 @@ describe.runIf(haveOpenssl)("fetching Google Antigravity (A2, A14–A20)", () =>
     }
     const fields = await fetching;
     expect(await antigravityDownloadState(root, fields, deps(pin))).toEqual({ state: "ready" });
-    // A newer pin already fetched while the record still names the old copy: an update waits (A17).
+    // A newer pin already fetched while the record still names the old copy: an update waits.
     expect(await antigravityDownloadState(root, { ...fields, antigravityVersion: "1.2.0" }, deps(pin))).toEqual({ state: "update_available", availableVersion: "1.2.1" });
     // The record names a folder that is not the pinned one, or the copy stopped matching Google's release.
     expect(await antigravityDownloadState(root, { ...fields, antigravityRoot: join(root, "elsewhere") }, deps(pin))).toEqual({ state: "integrity_failed" });
@@ -397,6 +397,33 @@ describe("the zip reader and the signature check", () => {
     for (const name of ["agy_acp_server.par", "bin/agy", "a.b/c-d_e"]) expect(safeArchivePath(name), name).toBe(true);
   });
 
+  it("refuses links, special files, duplicate names, a local header that disagrees, overlapping data and zip64 or spanned markers", async () => {
+    dir = await mkdtemp(join(tmpdir(), "agy-zip-"));
+    const write = async (name: string, data: Buffer) => { const path = join(dir, name); await writeFile(path, data); return path; };
+    const refused = async (name: string, data: Buffer) => expect(readZipEntries(await write(name, data))).rejects.toMatchObject({ reason: "unsafe_archive" });
+    await refused("link.zip", zip([{ name: "a", data: SERVER, mode: 0o120777 }]));
+    await refused("fifo.zip", zip([{ name: "a", data: SERVER, mode: 0o010644 }]));
+    await refused("twice.zip", zip([{ name: "a", data: SERVER }, { name: "A", data: HARNESS }]));
+    await refused("folder-with-data.zip", zip([{ name: "bin/", data: SERVER, mode: 0o040755 }]));
+    const renamed = zip([{ name: "a", data: SERVER }]);
+    renamed.write("b", 30);
+    await refused("renamed.zip", renamed);
+    const stored = zip([{ name: "a", data: SERVER }]);
+    stored.writeUInt16LE(0, stored.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02])) + 10);
+    await refused("method.zip", stored);
+    const overlapping = zip([{ name: "a", data: SERVER }, { name: "b", data: SERVER }]);
+    const second = overlapping.lastIndexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    overlapping.writeUInt32LE(0, second + 42);
+    await refused("overlap.zip", overlapping);
+    const zip64 = zip([{ name: "a", data: SERVER }]);
+    zip64.writeUInt32LE(0xffffffff, zip64.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02])) + 24);
+    await refused("zip64.zip", zip64);
+    const spanned = zip([{ name: "a", data: SERVER }]);
+    spanned.writeUInt16LE(1, spanned.length - 22 + 4);
+    await refused("spanned.zip", spanned);
+    await expect(readZipEntries(await write("good-again.zip", GOOD))).resolves.toHaveLength(2);
+  });
+
   it("never passes a signer for another operating system", async () => {
     await expect(verifyFetchedSignature("/nonexistent", { kind: "apple_team_id", teamId: "EQHXZ8M8AV" }, "linux")).resolves.toBe(false);
     await expect(verifyFetchedSignature("/nonexistent", { kind: "authenticode", subject: "CN=Google LLC" }, "darwin")).resolves.toBe(false);
@@ -428,7 +455,7 @@ describe("the zip reader and the signature check", () => {
 });
 
 describe("the Antigravity install adapter", () => {
-  it("is registered, fetched, offered since CP6, and refuses without the connector's folder", async () => {
+  it("is registered, fetched, offered, and refuses without the connector's folder", async () => {
     expect(hostAgentInstallAdapter("antigravity")).toBe(antigravityInstallAdapter);
     expect(antigravityInstallAdapter.offered).toBe(true);
     expect(nativeAgentOffered("antigravity")).toBe(true);
@@ -456,7 +483,7 @@ describe("the Antigravity install adapter", () => {
   });
 });
 
-describe.runIf(haveOpenssl)("keeping Google Antigravity current and removing it (A17, A18, CP6)", () => {
+describe.runIf(haveOpenssl)("keeping Google Antigravity current and removing it", () => {
   let root = "";
   const signature = vi.fn(async () => true);
   const deps = (pin: AntigravityPin = pinFor(GOOD)): AntigravityInstallDeps => ({

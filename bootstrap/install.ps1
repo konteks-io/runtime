@@ -34,7 +34,7 @@ anything; CI dot-sources the script that way to test it.
 #>
 [CmdletBinding()]
 param(
-  # Agent-first onboarding (onboarding-simplified R17): the user-local install
+  # Agent-first onboarding: the user-local install
   # arrives for Windows in a later release. Until then these switches say so
   # instead of failing on a missing activation id.
   [switch]$User,
@@ -185,7 +185,8 @@ if ($Update -and $ActivationId) {
   Write-Error '-Update and -ActivationId are different doors; choose one'
   exit 2
 }
-if ($Update -and -not (Test-Path (Join-Path ${env:USERPROFILE} 'AppData\Local\konteks-remote\native-runtime.json'))) {
+$RuntimeRoot = Join-Path ${env:USERPROFILE} 'AppData\Local\konteks-remote'
+if ($Update -and -not (Test-Path (Join-Path $RuntimeRoot 'native-runtime.json'))) {
   Write-Host 'Konteks is not installed on this computer yet. Create an activation in Konteks (Customize -> Runtimes) and run this script with -ActivationId <id>.'
   exit 2
 }
@@ -239,6 +240,7 @@ try {
   $expected = @([Text.Encoding]::UTF8.GetString($sums) -split "`r?`n" | Where-Object { $_ -match "^[0-9a-fA-F]{64}\s+\*?$([regex]::Escape($msi))$" } | ForEach-Object { ($_ -split '\s+')[0].ToLowerInvariant() })
   if ($expected.Count -ne 1) { throw "the release manifest lists no single $msi; nothing was installed" }
   $msiPath = Join-Path $work $msi
+  Write-Host 'Downloading the Windows installer...'
   Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$msi" -OutFile $msiPath
   $actual = (Get-FileHash -Algorithm SHA256 -Path $msiPath).Hash.ToLowerInvariant()
   if ($expected[0] -ne $actual) { throw 'package checksum mismatch; nothing was installed' }
@@ -254,9 +256,39 @@ try {
     if ($ExpectedThumbprint -and $authenticode.SignerCertificate.Thumbprint -ne $ExpectedThumbprint) { throw 'package signer thumbprint mismatch; nothing was installed' }
   }
 
-  Write-Host "installing $msi (an elevation prompt may appear)"
-  $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$msiPath`"", '/qn', '/norestart') -Verb RunAs -Wait -PassThru
-  if ($proc.ExitCode -ne 0) { throw "msiexec exited with $($proc.ExitCode)" }
+  Write-Host 'Verified the Windows installer and signed release manifest.'
+  # Windows Installer does not create the log's directory. Keep diagnostics
+  # outside the temporary download folder so a failed install is inspectable.
+  $logDirectory = Join-Path $RuntimeRoot 'logs'
+  New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+  $installerLog = Join-Path $logDirectory ("installer-" + [Guid]::NewGuid().ToString('n') + '.log')
+  Write-Host 'Installing the Konteks command. Approve the Windows elevation prompt if it appears; installation can take a minute.'
+  try {
+    $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$msiPath`"", '/qn', '/norestart', '/L*v', "`"$installerLog`"") -Verb RunAs -Wait -PassThru
+  } catch {
+    $failure = $_.Exception
+    while ($null -ne $failure -and -not ($failure -is [System.ComponentModel.Win32Exception])) { $failure = $failure.InnerException }
+    if ($null -ne $failure -and $failure.NativeErrorCode -eq 1223) {
+      throw 'The installation was cancelled at the Windows elevation prompt. Run this command again and approve the prompt to continue.'
+    }
+    throw "Windows Installer could not start: $($_.Exception.Message). Run this command again to retry."
+  }
+  # Both reboot codes mean the MSI succeeded; do not report a successful
+  # install as a failure or skip enrollment. /norestart requests no restart.
+  if ($proc.ExitCode -eq 3010) {
+    Write-Host 'The Konteks command was installed. Restart Windows when convenient to finish the Windows Installer changes.'
+  } elseif ($proc.ExitCode -eq 1641) {
+    Write-Host 'The Konteks command was installed. Windows Installer reported that it will restart Windows; if this window closes, run this command again after Windows restarts.'
+  } elseif ($proc.ExitCode -ne 0) {
+    $nextStep = switch ($proc.ExitCode) {
+      1602 { 'The installation was cancelled. Run this command again to continue.' }
+      1618 { 'Another Windows installation is running. Wait for it to finish, then run this command again.' }
+      1638 { 'Windows already has a newer Konteks command installed. Run konteks-remote update instead.' }
+      default { 'Check the installer log for the cause, then run this command again after resolving it.' }
+    }
+    Write-Host "Windows Installer log: $installerLog"
+    throw "Windows Installer failed (exit $($proc.ExitCode)). $nextStep"
+  }
 }
 finally {
   Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
@@ -266,16 +298,22 @@ $launcher = Join-Path ${env:ProgramFiles} 'konteks-remote\konteks-remote.exe'
 if (-not (Test-Path $launcher)) { $launcher = 'konteks-remote' }
 if ($Update) {
   # This launcher runs the newer of its own code and the installed release's
-  # (D131). A connector that could not start stays stopped through an update,
+  # code. A connector that could not start stays stopped through an update,
   # so start it after; start leaves a running one alone.
+  Write-Host 'Updating the connected runtime. Downloading and checking the release can take a few minutes...'
   & $launcher update
   $code = $LASTEXITCODE
+  Write-Host 'Starting the runtime...'
   & $launcher start
   if ($code -eq 0) { $code = $LASTEXITCODE }
 } else {
   # The activation code is prompted by the launcher without echo; it is never an argument.
+  Write-Host 'Connecting this computer to Konteks...'
   & $launcher install --activation-id $ActivationId
   $code = $LASTEXITCODE
+}
+if ($code -eq 0) {
+  if ($Update) { Write-Host 'Konteks runtime update completed.' } else { Write-Host 'Konteks runtime installation completed.' }
 }
 # The MSI put konteks-remote on the machine PATH, which this window cannot see
 # yet; the commands the launcher just named work in a new one.

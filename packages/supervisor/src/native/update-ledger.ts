@@ -27,7 +27,7 @@ export type NativeUpdateAttempt = z.infer<typeof NativeUpdateAttemptSchema>;
 export const NativeUpdateLedgerSchema = z.object({ schemaVersion: z.literal(1), attempts: z.array(NativeUpdateAttemptSchema).max(50) }).strict();
 export type NativeUpdateLedger = z.infer<typeof NativeUpdateLedgerSchema>;
 
-export const NATIVE_UPDATE_LEDGER_FILE = "update-ledger.json";
+const NATIVE_UPDATE_LEDGER_FILE = "update-ledger.json";
 const MAX_ATTEMPTS = 50;
 
 export async function readNativeUpdateLedger(root: string): Promise<NativeUpdateLedger> {

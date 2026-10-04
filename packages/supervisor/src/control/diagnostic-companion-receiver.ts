@@ -1,4 +1,5 @@
 import {
+  allEqual,
   DiagnosticCarrierCompanionDeliveryRequestSchema,
   RemoteInstanceError,
   type DiagnosticCarrierCompanionDeliveryRequest,
@@ -10,7 +11,7 @@ import {
   type DiagnosticCompanionInboxRecord,
 } from "../state/diagnostic-companion-inbox.js";
 
-export interface CapturedDiagnosticCompanionConnection {
+interface CapturedDiagnosticCompanionConnection {
   instanceId: string;
   workspaceId: string;
   runnerIncarnation: string;
@@ -21,7 +22,7 @@ export interface CapturedDiagnosticCompanionConnection {
 }
 
 /**
- * Receives the C01 sidecar independently from assignment and control traffic.
+ * Receives the diagnostic companion independently from assignment and control traffic.
  * Failure is deliberately diagnosable but cannot alter business delivery.
  */
 export class DiagnosticCompanionReceiver {
@@ -76,7 +77,7 @@ export class DiagnosticCompanionReceiver {
     try {
       await this.deps.onAccepted?.(record);
     } catch {
-      // C01 observation failure is explicitly non-fatal to work transport.
+      // A diagnostic companion's observation failure is explicitly non-fatal to work transport.
     }
     assertCurrent();
     return record;
@@ -89,20 +90,15 @@ export class DiagnosticCompanionReceiver {
     const now = this.deps.now();
     const issuedAt = Date.parse(request.issuedAt);
     const expiresAt = Date.parse(request.expiresAt);
-    if (
-      !Number.isFinite(now) ||
-      !Number.isFinite(issuedAt) ||
-      !Number.isFinite(expiresAt) ||
-      issuedAt > now + 300_000 ||
-      expiresAt <= now ||
-      request.path.instanceId !== scope.instanceId ||
-      request.nodeId !== scope.nodeId ||
-      request.connectionRef !== scope.connectionRef ||
-      request.connectionEpoch !== scope.connectionEpoch ||
-      request.companion.carrier.context.tenantId !== scope.workspaceId
-    ) {
-      throw this.unavailable();
-    }
+    const window = [now, issuedAt, expiresAt].every(Number.isFinite) && issuedAt <= now + 300_000 && expiresAt > now;
+    const owned = allEqual([
+      [request.path.instanceId, scope.instanceId],
+      [request.nodeId, scope.nodeId],
+      [request.connectionRef, scope.connectionRef],
+      [request.connectionEpoch, scope.connectionEpoch],
+      [request.companion.carrier.context.tenantId, scope.workspaceId],
+    ]);
+    if (!window || !owned) throw this.unavailable();
   }
 
   private unavailable(): RemoteInstanceError {

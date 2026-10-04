@@ -10,8 +10,8 @@ const PHASE_LINES: Readonly<Record<Exclude<IntegrationTaskSpec["phase"], "discov
 };
 
 /**
- * The integration session's one prompt, built locally from the frozen spec
- * (DESIGN §2): the phase, the exact admitted tools, the resources it may
+ * The integration session's one prompt, built locally from the frozen spec:
+ * the phase, the exact admitted tools, the resources it may
  * touch, the exact approved write, Konteks's bounded instructions fenced as
  * such, and how to hand in the result. Nothing in it widens what the gate
  * allows; it only tells the agent what the gate will allow, so a well-behaved

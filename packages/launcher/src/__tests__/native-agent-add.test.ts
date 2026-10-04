@@ -52,6 +52,35 @@ async function fixture() {
 }
 
 describe("native agent-add ownership lifecycle", () => {
+  it.each([0, 1])("uses the shared Windows connector stop before adding an agent while the task status is %s", async statusCode => {
+    const f = await fixture();
+    const stop = vi.fn(async () => { f.calls.push("owned-stop"); f.owner.release(); });
+    f.deps.execute = async command => { f.calls.push(command.command); return statusCode; };
+    try {
+      await runNativeAgentAdd({ root: f.root, agent: "dsh", output: createOutput({ json: true }) }, {
+        ...f.deps, platform: { ...f.deps.platform, os: "windows" },
+        serviceOwner: async () => ({ pid: 42, alive: async () => true, terminate: vi.fn() }), stop,
+      } as never);
+      expect(stop).toHaveBeenCalledOnce();
+      expect(f.calls.indexOf("drain.status")).toBeLessThan(f.calls.indexOf("owned-stop"));
+      expect(f.calls.indexOf("owned-stop")).toBeLessThan(f.calls.indexOf("add"));
+      expect(f.calls).not.toContain("stop");
+      expect(f.start).toHaveBeenCalledOnce();
+    } finally { f.owner.release(); }
+  });
+  it("resumes the existing Windows connector when the shared stop is refused before adding an agent", async () => {
+    const f = await fixture();
+    try {
+      await expect(runNativeAgentAdd({ root: f.root, agent: "dsh", output: createOutput({ json: true }) }, {
+        ...f.deps, platform: { ...f.deps.platform, os: "windows" },
+        serviceOwner: async () => ({ pid: 42, alive: async () => true, terminate: vi.fn() }),
+        stop: async () => { throw new Error("Windows refused the stop"); },
+      } as never)).rejects.toThrow("Windows refused the stop");
+      expect(f.calls).toContain("drain.cancel");
+      expect(f.add).not.toHaveBeenCalled();
+      expect(f.start).not.toHaveBeenCalled();
+    } finally { f.owner.release(); }
+  });
   it("waits for the stopped supervisor to release ownership before adding dsh and restarting", async () => {
     const f = await fixture();
     const sleep = f.deps.sleep;
@@ -64,7 +93,7 @@ describe("native agent-add ownership lifecycle", () => {
     expect(f.restore).not.toHaveBeenCalled();
   });
 
-  it("stops a connector running in a terminal, not as the service, adds the agent and says how to start it again (W1-D3)", async () => {
+  it("stops a connector running in a terminal, not as the service, adds the agent and says how to start it again", async () => {
     const f = await fixture();
     const lines: string[] = [];
     // The service manager reports it stopped, yet the connector answers.
@@ -82,7 +111,7 @@ describe("native agent-add ownership lifecycle", () => {
     expect(lines.join("")).toContain("is added. Konteks stopped to add it; konteks-remote start starts it again, in the background.");
   });
 
-  it("refuses an install it cannot run before stopping anything (W1-D3)", async () => {
+  it("refuses an install it cannot run before stopping anything", async () => {
     const f = await fixture();
     const { RemoteInstanceError } = await import("@konteks/remote-common");
     (f.deps as Record<string, unknown>).locate = async () => { throw new RemoteInstanceError("prerequisite_missing" as never, "DeepSeek Harness 0.2.0-rc.2 is not a version Konteks supports."); };
@@ -95,7 +124,7 @@ describe("native agent-add ownership lifecycle", () => {
     } finally { f.owner.release(); }
   });
 
-  it("offers Claude Code's official installer before stopping anything, and changes nothing on a no (D116)", async () => {
+  it("offers Claude Code's official installer before stopping anything, and changes nothing on a no", async () => {
     const f = await fixture();
     const { RemoteInstanceError } = await import("@konteks/remote-common");
     const ensurePersonal = vi.fn(async () => { throw new RemoteInstanceError("agent_unavailable", "Nothing was installed: Claude Code was not added."); });
@@ -108,7 +137,7 @@ describe("native agent-add ownership lifecycle", () => {
     } finally { f.owner.release(); }
   });
 
-  it("signs a just-installed Claude Code in once the connector is back (D116)", async () => {
+  it("signs a just-installed Claude Code in once the connector is back", async () => {
     const f = await fixture();
     const sleep = f.deps.sleep;
     f.deps.sleep = async () => { await sleep(); f.owner.release(); };
@@ -196,7 +225,7 @@ describe("native agent-add ownership lifecycle", () => {
   });
 });
 
-describe("Google Antigravity's add and remove (antigravity CP6)", () => {
+describe("Google Antigravity's add and remove", () => {
   const quiet = () => { const lines: string[] = []; return { lines, output: { ...createOutput({ json: false, stdout: { write: () => true } as never }), line: (text: string) => { lines.push(text); } } }; };
 
   it("asks the consent line and downloads while the service keeps running, then stops, adds and restarts", async () => {

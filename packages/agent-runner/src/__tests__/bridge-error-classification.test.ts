@@ -3,7 +3,7 @@ import { RequestError } from "@agentclientprotocol/sdk";
 import { classifyBridgeError } from "../bridge/process.js";
 
 describe("a Codex sign-in that can no longer refresh", () => {
-  it("reads as sign-in required, not an internal error (WS2-141)", () => {
+  it("reads as sign-in required, not an internal error", () => {
     const lapsed = new RequestError(-32603, "Internal error", { codexErrorInfo: "unauthorized", message: "Your access token could not be refreshed because you have since logged out or signed in to another account." });
     expect(classifyBridgeError(lapsed)).toMatchObject({ class: "agent_auth_required", retryable: false });
   });
@@ -14,7 +14,7 @@ describe("a Codex sign-in that can no longer refresh", () => {
   });
 });
 
-describe("a DeepSeek Harness turn without a usable API key (dsh-runtime-support CP0 #7)", () => {
+describe("a DeepSeek Harness turn without a usable API key", () => {
   // Exact messages dsh 0.1.7-rc.2 rejects session/prompt with (-32603).
   it.each([
     "Internal error: turn failed: llm-deepseek: no API key for provider route \"deepseek-official\"; store DEEPSEEK_API_KEY through the credentials service (the web Models page writes it), or export DEEPSEEK_API_KEY in the launching environment",
@@ -41,7 +41,7 @@ describe("a DeepSeek Harness turn that failed on the provider after dsh's own re
   });
 });
 
-describe("OpenCode 2 turn failures (JSON-RPC -32603 with data.errorName, CP0-v2)", () => {
+describe("OpenCode 2 turn failures (JSON-RPC -32603 with data.errorName)", () => {
   const failed = (safeMessage: string, errorName: string) => new RequestError(-32603, `Internal error: ${safeMessage}`, { service: "session", errorName });
 
   it("reads an empty balance as out of credit, never retried", () => {
@@ -90,7 +90,7 @@ describe("OpenCode 2 turn failures (JSON-RPC -32603 with data.errorName, CP0-v2)
 });
 
 describe("Google Antigravity's sign-in, licence and organisation failures (antigravity-acp 1.2.1)", () => {
-  // Shapes from the server's own sources (server.py, admin_controls_manager.py) and CP0 part 2.
+  // Shapes from the server's own sources (server.py, admin_controls_manager.py) and a live run.
   const licence = "Gemini Enterprise found no licence for this Google Cloud project. Turn on the Business AI Code API with `gcloud services enable businessaicode.googleapis.com --project <project id>`, then sign in again with `konteks-remote auth login antigravity`.";
 
   it("a missing licence names the Business AI Code API and the command that turns it on, never Google's text", () => {

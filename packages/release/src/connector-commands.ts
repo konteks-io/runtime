@@ -3,7 +3,7 @@ import table from "./connector-commands.json" with { type: "json" };
 
 /**
  * The `konteks-remote` commands a person runs on a connected computer, with
- * one plain line each and the systems each applies to (runtime-view R20).
+ * one plain line each and the systems each applies to.
  * The table travels inside the connector executable, so what a connector
  * reports is exactly what that release has; the release job also publishes
  * it as `commands.json`. `launcher/src/__tests__/connector-commands.test.ts`

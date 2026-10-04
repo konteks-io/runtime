@@ -21,7 +21,7 @@ import { NativeIntegrationDiscovery, e2eFixtureServers, readFixtureInventory } f
 import { OfficialSetupRunner, type SetupCommandLaunch } from "./setup.js";
 import { journalWriteLedger } from "./tool-gate.js";
 
-export interface IntegrationCompositionInputs {
+interface IntegrationCompositionInputs {
   /** The installation's native runner configurations. */
   configs: readonly RunnerConfig[];
   runners: () => ReadonlyMap<string, RunnerPort>;
@@ -41,7 +41,7 @@ export function codexSetupLaunch(config: RunnerConfig): SetupCommandLaunch {
 }
 
 /**
- * The integration lane for a native installation (external-integration CP2):
+ * The integration lane for a native installation:
  * discovery through each agent's reviewed listing interface, the reviewed
  * setup catalogue, the runners for gated sessions, and the journal's
  * one-use write grants.

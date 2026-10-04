@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { constants, createReadStream } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, rm } from "node:fs/promises";
+import { constants, createReadStream, type Stats } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, readdir, rm, type FileHandle } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { createGunzip } from "node:zlib";
 import type { RemoteNativeArtifact } from "@konteks/remote-common";
@@ -15,31 +15,8 @@ export async function installOfflineAgentPackage(archive: string, destination: s
   input.on("error", error => unzip.destroy(error)); input.pipe(unzip);
   const reader = new TarReader(unzip[Symbol.asyncIterator]());
   try {
-    const first = header(await reader.read(512));
-    if (first.path !== OFFLINE_AGENT_PROFILE_FILE || first.size > OFFLINE_AGENT_LIMITS.profileBytes) throw offlinePackageInvalid();
-    const receipt = await reader.read(first.size);
-    await reader.padding(first.size);
-    const profile = readNativeAgentProfile(receipt, artifact);
-    await writeFileChunks(join(destination, OFFLINE_AGENT_PROFILE_FILE), receipt);
-    for (const file of profile.files) {
-      const next = header(await reader.read(512));
-      if (next.path !== file.path || next.size !== file.sizeBytes) throw offlinePackageInvalid();
-      const target = join(destination, ...file.path.split("/"));
-      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-      const handle = await open(target, "wx", 0o600);
-      const digest = createHash("sha256");
-      try {
-        let remaining = file.sizeBytes;
-        while (remaining > 0) {
-          const chunk = await reader.read(Math.min(64 * 1024, remaining));
-          digest.update(chunk); await handle.writeFile(chunk); remaining -= chunk.length;
-        }
-        if (`sha256:${digest.digest("hex")}` !== file.digest) throw offlinePackageInvalid();
-        await handle.sync();
-      } finally { await handle.close(); }
-      await chmod(target, file.executable ? 0o700 : 0o600);
-      await reader.padding(file.sizeBytes);
-    }
+    const profile = await extractProfile(reader, destination, artifact);
+    for (const file of profile.files) await extractInventoryFile(reader, destination, file);
     if ((await reader.read(1024)).some(byte => byte !== 0)) throw offlinePackageInvalid();
     await reader.end();
     return await verifyOfflineAgentPackage(destination, artifact);
@@ -49,27 +26,70 @@ export async function installOfflineAgentPackage(archive: string, destination: s
   } finally { input.destroy(); unzip.destroy(); }
 }
 
+/** The profile entry, which must come first, read against the signed artifact. */
+async function extractProfile(reader: TarReader, destination: string, artifact: RemoteNativeArtifact): Promise<NativeAgentPackageProfile> {
+  const first = header(await reader.read(512));
+  if (first.path !== OFFLINE_AGENT_PROFILE_FILE || first.size > OFFLINE_AGENT_LIMITS.profileBytes) throw offlinePackageInvalid();
+  const receipt = await reader.read(first.size);
+  await reader.padding(first.size);
+  const profile = readNativeAgentProfile(receipt, artifact);
+  await writeFileChunks(join(destination, OFFLINE_AGENT_PROFILE_FILE), receipt);
+  return profile;
+}
+
+/** The next archive entry, which must be exactly this inventoried file. */
+async function extractInventoryFile(reader: TarReader, destination: string, file: NativeAgentPackageProfile["files"][number]): Promise<void> {
+  const next = header(await reader.read(512));
+  if (next.path !== file.path || next.size !== file.sizeBytes) throw offlinePackageInvalid();
+  const target = join(destination, ...file.path.split("/"));
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  const handle = await open(target, "wx", 0o600);
+  const digest = createHash("sha256");
+  try {
+    let remaining = file.sizeBytes;
+    while (remaining > 0) {
+      const chunk = await reader.read(Math.min(64 * 1024, remaining));
+      digest.update(chunk); await handle.writeFile(chunk); remaining -= chunk.length;
+    }
+    if (`sha256:${digest.digest("hex")}` !== file.digest) throw offlinePackageInvalid();
+    await handle.sync();
+  } finally { await handle.close(); }
+  await chmod(target, file.executable ? 0o700 : 0o600);
+  await reader.padding(file.sizeBytes);
+}
+
 /** Rehash every dependency, not just the bridge/auth entrypoint or a local marker. */
 export async function verifyOfflineAgentPackage(directory: string, artifact: RemoteNativeArtifact): Promise<NativeAgentPackageProfile> {
   try {
     await privateDirectory(directory);
-    const receiptPath = join(directory, OFFLINE_AGENT_PROFILE_FILE);
-    const info = await lstat(receiptPath);
-    if (!info.isFile() || info.nlink !== 1 || info.size > OFFLINE_AGENT_LIMITS.profileBytes) throw offlinePackageInvalid();
-    const receipt = await readFile(receiptPath);
-    const profile = readNativeAgentProfile(receipt, artifact);
-    await verifyFile(receiptPath, artifact.profileDigest!, receipt.length, false);
+    const profile = await readInstalledProfile(directory, artifact);
     const expected = new Set([OFFLINE_AGENT_PROFILE_FILE, ...profile.files.map(file => file.path)]);
-    const directories = new Set<string>();
-    for (const path of expected) {
-      const parts = path.split("/");
-      for (let length = 1; length < parts.length; length++) directories.add(parts.slice(0, length).join("/"));
-    }
+    const directories = parentDirectories(expected);
     await walk(directory, "", expected, directories);
     if (expected.size !== 0 || directories.size !== 0) throw offlinePackageInvalid();
     for (const file of profile.files) await verifyFile(join(directory, ...file.path.split("/")), file.digest, file.sizeBytes, file.executable);
     return profile;
   } catch { throw offlinePackageInvalid(); }
+}
+
+async function readInstalledProfile(directory: string, artifact: RemoteNativeArtifact): Promise<NativeAgentPackageProfile> {
+  const receiptPath = join(directory, OFFLINE_AGENT_PROFILE_FILE);
+  const info = await lstat(receiptPath);
+  if (!info.isFile() || info.nlink !== 1 || info.size > OFFLINE_AGENT_LIMITS.profileBytes) throw offlinePackageInvalid();
+  const receipt = await readFile(receiptPath);
+  const profile = readNativeAgentProfile(receipt, artifact);
+  await verifyFile(receiptPath, artifact.profileDigest!, receipt.length, false);
+  return profile;
+}
+
+/** Every directory the inventoried paths need. */
+function parentDirectories(paths: Iterable<string>): Set<string> {
+  const directories = new Set<string>();
+  for (const path of paths) {
+    const parts = path.split("/");
+    for (let length = 1; length < parts.length; length++) directories.add(parts.slice(0, length).join("/"));
+  }
+  return directories;
 }
 
 /**
@@ -78,10 +98,10 @@ export async function verifyOfflineAgentPackage(directory: string, artifact: Rem
  * root's identity. Any write, rename, chmod, added or removed file moves at
  * least one of these; ctime cannot be set back by the owning user.
  */
-export async function offlineAgentPackageFingerprint(directory: string): Promise<string> {
+async function offlineAgentPackageFingerprint(directory: string): Promise<string> {
   const root = await lstat(directory, { bigint: true });
   if (!root.isDirectory()) throw offlinePackageInvalid();
-  let entries = 0n, bytes = 0n, newest = root.mtimeNs > root.ctimeNs ? root.mtimeNs : root.ctimeNs;
+  let entries = 0n, bytes = 0n, newest = latest(root.mtimeNs, root.ctimeNs);
   const pending = [directory];
   while (pending.length > 0) {
     const current = pending.pop()!;
@@ -90,12 +110,15 @@ export async function offlineAgentPackageFingerprint(directory: string): Promise
       const info = await lstat(path, { bigint: true });
       entries += 1n;
       if (info.isFile()) bytes += info.size;
-      if (info.mtimeNs > newest) newest = info.mtimeNs;
-      if (info.ctimeNs > newest) newest = info.ctimeNs;
+      newest = latest(newest, info.mtimeNs, info.ctimeNs);
       if (info.isDirectory()) pending.push(path);
     }
   }
   return `${root.dev}:${root.ino}:${entries}:${bytes}:${newest}`;
+}
+
+function latest(...values: bigint[]): bigint {
+  return values.reduce((max, value) => (value > max ? value : max));
 }
 
 /** Successful full verifications this process has made, per package and digest. */
@@ -103,7 +126,7 @@ const verifiedPackages = new Map<string, { fingerprint: string; profile: NativeA
 
 /**
  * Full integrity check on first use, then only while the package is unchanged
- * a stat fingerprint (WS2-156): rehashing a 400 MB agent every turn cost ~12 s.
+ * a stat fingerprint: rehashing a 400 MB agent every turn cost ~12 s.
  * A changed fingerprint, another artifact (digest) or another path verifies in
  * full again; a failure is never remembered.
  */
@@ -144,18 +167,40 @@ async function privateDirectory(path: string): Promise<void> {
 
 async function verifyFile(path: string, digest: string, size: number, executable: boolean): Promise<void> {
   const before = await lstat(path);
-  if (!before.isFile() || before.nlink !== 1 || before.size !== size || process.platform !== "win32" && ((before.mode & 0o077) !== 0 || before.uid !== process.getuid?.() || executable && !(before.mode & 0o100))) throw offlinePackageInvalid();
-  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  if (!before.isFile() || before.nlink !== 1 || before.size !== size || !privateFileMode(before, executable)) throw offlinePackageInvalid();
+  const handle = await open(path, OPEN_NO_FOLLOW);
   try {
-    const opened = await handle.stat();
-    if (opened.ino !== before.ino || opened.dev !== before.dev) throw offlinePackageInvalid();
-    const hash = createHash("sha256"); let actual = 0;
-    for await (const chunk of handle.createReadStream({ autoClose: false })) {
-      actual += chunk.length; if (actual > size) throw offlinePackageInvalid(); hash.update(chunk);
-    }
-    const after = await handle.stat(), named = await lstat(path);
-    if (actual !== size || `sha256:${hash.digest("hex")}` !== digest || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs || named.ino !== before.ino || named.dev !== before.dev) throw offlinePackageInvalid();
+    if (!sameFile(await handle.stat(), before)) throw offlinePackageInvalid();
+    const actual = await hashOpenFile(handle, size);
+    if (actual !== digest || !unchangedSince(before, await handle.stat(), await lstat(path))) throw offlinePackageInvalid();
   } finally { await handle.close(); }
+}
+
+const OPEN_NO_FOLLOW = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+
+/** Neither the open file nor the name changed while it was hashed. */
+function unchangedSince(before: Stats, after: Stats, named: Stats): boolean {
+  return after.mtimeMs === before.mtimeMs && after.ctimeMs === before.ctimeMs && sameFile(named, before);
+}
+
+/** Owner-only and owned by this user (an executable also owner-executable); Windows has no such modes. */
+function privateFileMode(info: Stats, executable: boolean): boolean {
+  if (process.platform === "win32") return true;
+  return (info.mode & 0o077) === 0 && info.uid === process.getuid?.() && (!executable || (info.mode & 0o100) !== 0);
+}
+
+function sameFile(a: Stats, b: Stats): boolean {
+  return a.ino === b.ino && a.dev === b.dev;
+}
+
+/** The file's digest, refusing more or fewer than `size` bytes. */
+async function hashOpenFile(handle: FileHandle, size: number): Promise<string> {
+  const hash = createHash("sha256"); let actual = 0;
+  for await (const chunk of handle.createReadStream({ autoClose: false })) {
+    actual += chunk.length; if (actual > size) throw offlinePackageInvalid(); hash.update(chunk);
+  }
+  if (actual !== size) throw offlinePackageInvalid();
+  return `sha256:${hash.digest("hex")}`;
 }
 
 async function writeFileChunks(path: string, bytes: Buffer) {

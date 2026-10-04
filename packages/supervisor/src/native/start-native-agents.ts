@@ -1,5 +1,5 @@
 /**
- * Starting the agents a native runtime hosts (WS1-018, dsh-runtime-support CP5).
+ * Starting the agents a native runtime hosts.
  *
  * Codex runs behind one shared app-server. When that server cannot start (a
  * broken login, a socket it cannot bind), the runtime used to fail its whole
@@ -11,17 +11,17 @@
  * background, and every other agent starts as before.
  */
 
-export interface StartableOwner {
+interface StartableOwner {
   start(): Promise<void>;
   stop(): Promise<void>;
 }
 
-export interface StartableRunner {
+interface StartableRunner {
   agentId: string;
   start(): Promise<void>;
 }
 
-export interface NativeAgentsStartResult<R extends StartableRunner> {
+interface NativeAgentsStartResult<R extends StartableRunner> {
   started: R[];
   /** Runners whose own start failed; the caller leaves them out and retries them. */
   failed: R[];
@@ -29,39 +29,51 @@ export interface NativeAgentsStartResult<R extends StartableRunner> {
   codexOwnerStarted: boolean;
 }
 
-export async function startNativeAgents<R extends StartableRunner>(input: {
-  codexOwner: StartableOwner | null;
-  runners: R[];
-  onUnavailable?: (agentId: string, error: unknown) => void;
-}): Promise<NativeAgentsStartResult<R>> {
-  const unavailable: Array<{ agentId: string; reason: string }> = [];
+export async function startNativeAgents<R extends StartableRunner>(input: NativeAgentsStartInput<R>): Promise<NativeAgentsStartResult<R>> {
+  const outcome: StartOutcome<R> = { started: [], failed: [], unavailable: [] };
   // Codex's shared server may take a while on a first start (a newer Codex
   // migrating its home); the other agents start meanwhile instead of waiting.
   const owner = input.codexOwner
     ? input.codexOwner.start().then(() => ({ started: true as const }), (error: unknown) => ({ started: false as const, error }))
     : Promise.resolve(null);
-  const started: R[] = [];
-  const failed: R[] = [];
-  const start = async (runner: R) => {
-    try {
-      await runner.start();
-      started.push(runner);
-    } catch (error) {
-      input.onUnavailable?.(runner.agentId, error);
-      unavailable.push({ agentId: runner.agentId, reason: error instanceof Error ? error.message : `${runner.agentId} could not start.` });
-      failed.push(runner);
-    }
-  };
   const behindOwner = (runner: R) => runner.agentId === "codex" && input.codexOwner !== null;
-  for (const runner of input.runners) if (!behindOwner(runner)) await start(runner);
-  const ownerResult = await owner;
-  const codexOwnerStarted = ownerResult?.started === true;
-  if (ownerResult && !ownerResult.started) {
-    input.onUnavailable?.("codex", ownerResult.error);
-    unavailable.unshift({ agentId: "codex", reason: ownerResult.error instanceof Error ? ownerResult.error.message : "Codex could not start." });
+  for (const runner of input.runners) if (!behindOwner(runner)) await startRunner(runner, input, outcome);
+  const codexOwnerStarted = await settleCodexOwner(owner, input, outcome);
+  if (codexOwnerStarted) for (const runner of input.runners) if (behindOwner(runner)) await startRunner(runner, input, outcome);
+  return { ...outcome, codexOwnerStarted };
+}
+
+interface NativeAgentsStartInput<R extends StartableRunner> {
+  codexOwner: StartableOwner | null;
+  runners: R[];
+  onUnavailable?: (agentId: string, error: unknown) => void;
+}
+
+type StartOutcome<R extends StartableRunner> = Omit<NativeAgentsStartResult<R>, "codexOwnerStarted">;
+
+async function startRunner<R extends StartableRunner>(runner: R, input: NativeAgentsStartInput<R>, outcome: StartOutcome<R>): Promise<void> {
+  try {
+    await runner.start();
+    outcome.started.push(runner);
+  } catch (error) {
+    input.onUnavailable?.(runner.agentId, error);
+    outcome.unavailable.push({ agentId: runner.agentId, reason: error instanceof Error ? error.message : `${runner.agentId} could not start.` });
+    outcome.failed.push(runner);
   }
-  if (codexOwnerStarted) for (const runner of input.runners) if (behindOwner(runner)) await start(runner);
-  return { started, failed, unavailable, codexOwnerStarted };
+}
+
+/** Whether Codex's shared server started; a failure is reported first among the unavailable agents. */
+async function settleCodexOwner<R extends StartableRunner>(
+  owner: Promise<{ started: true } | { started: false; error: unknown } | null>,
+  input: NativeAgentsStartInput<R>,
+  outcome: StartOutcome<R>,
+): Promise<boolean> {
+  const result = await owner;
+  if (result && !result.started) {
+    input.onUnavailable?.("codex", result.error);
+    outcome.unavailable.unshift({ agentId: "codex", reason: result.error instanceof Error ? result.error.message : "Codex could not start." });
+  }
+  return result?.started === true;
 }
 
 /**

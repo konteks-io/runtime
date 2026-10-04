@@ -17,10 +17,10 @@ describe("native customer entry point", () => {
     expect(program.commands.map(command => command.name())).not.toContain("gateway");
     expect(program.helpInformation()).not.toMatch(/Docker|Compose|gateway-keyed/);
   });
-  it("offers an uninstall an agent can find in --help (W1-L2)", async () => {
+  it("offers an uninstall an agent can find in --help", async () => {
     const { program, actions } = fixture();
     expect(program.helpInformation()).toMatch(/uninstall\s+remove Konteks from this computer/);
-    // Every command a person runs says in plain words what it does (WS1-158).
+    // Every command a person runs says in plain words what it does.
     expect(program.helpInformation()).toMatch(/status\s+show whether this computer is connected/);
     await program.parseAsync(["--json", "uninstall"], { from: "user" });
     expect(actions.uninstall).toHaveBeenCalledWith(expect.objectContaining({ root: expect.any(String) }));
@@ -46,13 +46,13 @@ describe("native customer entry point", () => {
     const { program, actions } = fixture();
     await program.parseAsync(["auth", "login", "codex", "--organization"], { from: "user" });
     expect(actions.control).toHaveBeenCalledWith(expect.objectContaining({ operation: "auth.login", agent: "codex", organization: true }));
-    // OpenCode names which sign-in (CP3); it is not installable yet, but its sign-in commands parse.
+    // OpenCode names which sign-in; it is not installable yet, but its sign-in commands parse.
     await program.parseAsync(["auth", "login", "opencode", "--provider", "deepseek", "--method", "key", "--reuse"], { from: "user" });
     expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.login", agent: "opencode", organization: false, provider: "deepseek", method: "key", reuse: true }));
     await program.parseAsync(["auth", "logout", "opencode", "--provider", "openai"], { from: "user" });
     expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.logout", agent: "opencode", provider: "openai" }));
   });
-  it("signs Google Antigravity in and out with a Gemini API key or Gemini Enterprise (antigravity CP3)", async () => {
+  it("signs Google Antigravity in and out with a Gemini API key or Gemini Enterprise", async () => {
     const { program, actions } = fixture();
     await program.parseAsync(["auth", "login", "antigravity"], { from: "user" });
     expect(actions.control).toHaveBeenLastCalledWith(expect.objectContaining({ operation: "auth.login", agent: "antigravity", organization: false }));
@@ -79,7 +79,7 @@ describe("native customer entry point", () => {
     await program.parseAsync(["auth", "logout", "antigravity"], { from: "user" });
     expect(actions.control.mock.calls.at(-1)?.[0]).not.toHaveProperty("method");
   });
-  it("adds Google Antigravity on the person's yes, installs it, removes it, and its help names it (antigravity CP6)", async () => {
+  it("adds Google Antigravity on the person's yes, installs it, removes it, and its help names it", async () => {
     const { program, actions } = fixture();
     await program.parseAsync(["--root", "/private/native-root", "agent", "add", "antigravity"], { from: "user" });
     expect(actions.addAgent).toHaveBeenLastCalledWith(expect.objectContaining({ root: "/private/native-root", agent: "antigravity" }));
@@ -108,7 +108,7 @@ describe("native customer entry point", () => {
     const preview = program.commands.find(command => command.name() === "preview");
     expect(preview?.commands.map(command => command.name())).toEqual(["status"]);
   });
-  it("reports the installed release as its version, so it matches status after an update (W1-L4)", async () => {
+  it("reports the installed release as its version, so it matches status after an update", async () => {
     const root = await mkdtemp(join(tmpdir(), "konteks-version-"));
     try {
       expect(installedReleaseVersion(root)).toBeNull();
@@ -149,7 +149,7 @@ describe("native customer entry point", () => {
     expect(stderr).toMatch(new RegExp(`${retired} is no longer supported\\. Choose Claude Code, Codex, DeepSeek Harness(,| or) OpenCode( or Google Antigravity)? on your computer\\.`));
     expect(actions.addAgent).not.toHaveBeenCalled();
   });
-  it("adds, installs, signs in and out the person's own OpenCode 2, and its help names it (CP6)", async () => {
+  it("adds, installs, signs in and out the person's own OpenCode 2, and its help names it", async () => {
     const { program, actions } = fixture();
     await program.parseAsync(["--root", "/private/native-root", "agent", "add", "opencode"], { from: "user" });
     expect(actions.addAgent).toHaveBeenCalledWith(expect.objectContaining({ agent: "opencode" }));

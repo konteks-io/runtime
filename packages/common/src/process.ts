@@ -160,7 +160,7 @@ export function sanitizeInheritedChildProcessEnv(args: {
   return out;
 }
 
-export interface CommandResult {
+interface CommandResult {
   code: number | null;
   signal: NodeJS.Signals | null;
   stdout: string;

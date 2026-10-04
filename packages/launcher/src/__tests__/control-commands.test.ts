@@ -21,6 +21,46 @@ const supervisorStatus: SupervisorStatus = {
   journal: { assignments: 0, outboxDepth: 0, recoveryRequired: 0 },
 };
 
+const PREVIEWS = {
+  capabilityAdvertised: true, idleStopMinutes: 30, maxRunning: 3, lastFailure: null, previews: [
+    { sessionId: "sess-1", state: "running", url: "http://127.0.0.1:43100", port: 43100, command: "npm run dev", source: "inferred", explanation: "Inferred from package.json.", message: "Running.", startedAt: null, readyAt: null, viewerConnected: true },
+  ],
+};
+
+/** The running supervisor's answer to one control request; a login streams its events through `emit`. */
+function fakeReply(request: ControlRequest, emit: (event: unknown) => void, loginFailure: boolean | undefined): unknown {
+  if (request.op === "status") return supervisorStatus;
+  if (request.op === "preview.status") return PREVIEWS;
+  if (request.op !== "auth.login") return {};
+  emit({ kind: "started", loginId: "l1", agentId: request.agentId });
+  if (loginFailure) {
+    emit({ kind: "failed", loginId: "l1", code: "agent_auth_required", message: "the DeepSeek API key was not saved" });
+    return { loginId: "l1" };
+  }
+  emit({ kind: "open_url", loginId: "l1", url: "https://login.example/device", userCode: "ABCD-1234" });
+  emit({ kind: "prompt", loginId: "l1", label: "Paste the code", secret: true });
+  emit({ kind: "completed", loginId: "l1", readiness: "ready" });
+  return { loginId: "l1" };
+}
+
+/** Yields once between two scripted login events. */
+const TICK = Symbol("tick");
+type ControlCall = (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => Promise<unknown>;
+
+/** A control call whose `auth.login` emits `events` in order; every other op answers `{}`. Requests are recorded in `seen`. */
+function scriptedLogin(events: unknown[] | ((request: ControlRequest) => unknown[]), seen?: ControlRequest[]): ControlCall {
+  return async (request, schema, options) => {
+    seen?.push(request);
+    if (request.op !== "auth.login") return schema.parse({});
+    const emit = options?.onEvent ?? (() => undefined);
+    for (const event of typeof events === "function" ? events(request) : events) {
+      if (event === TICK) await new Promise(resolve => setTimeout(resolve, 0));
+      else emit(event);
+    }
+    return schema.parse({ loginId: "l1" });
+  };
+}
+
 function fake(options: { json?: boolean; confirm?: boolean; loginFailure?: boolean } = {}) {
   const calls: ControlRequest[] = [];
   let text = "";
@@ -28,24 +68,7 @@ function fake(options: { json?: boolean; confirm?: boolean; loginFailure?: boole
   const control = {
     call: async <T,>(request: ControlRequest, schema: { parse: (value: unknown) => T }, callOptions?: { onEvent?: (event: unknown) => void }): Promise<T> => {
       calls.push(request);
-      if (request.op === "status") return schema.parse(supervisorStatus);
-      if (request.op === "preview.status") {
-        return schema.parse({ capabilityAdvertised: true, idleStopMinutes: 30, maxRunning: 3, lastFailure: null, previews: [
-          { sessionId: "sess-1", state: "running", url: "http://127.0.0.1:43100", port: 43100, command: "npm run dev", source: "inferred", explanation: "Inferred from package.json.", message: "Running.", startedAt: null, readyAt: null, viewerConnected: true },
-        ] });
-      }
-      if (request.op === "auth.login") {
-        callOptions?.onEvent?.({ kind: "started", loginId: "l1", agentId: request.agentId });
-        if (options.loginFailure) {
-          callOptions?.onEvent?.({ kind: "failed", loginId: "l1", code: "agent_auth_required", message: "the DeepSeek API key was not saved" });
-          return schema.parse({ loginId: "l1" });
-        }
-        callOptions?.onEvent?.({ kind: "open_url", loginId: "l1", url: "https://login.example/device", userCode: "ABCD-1234" });
-        callOptions?.onEvent?.({ kind: "prompt", loginId: "l1", label: "Paste the code", secret: true });
-        callOptions?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
-        return schema.parse({ loginId: "l1" });
-      }
-      return schema.parse({});
+      return schema.parse(fakeReply(request, callOptions?.onEvent ?? (() => undefined), options.loginFailure));
     },
   };
   const context: ControlContext = {
@@ -63,18 +86,16 @@ describe("native control commands", () => {
     await expect(authLogin(f.context, "dsh", false)).rejects.toMatchObject({ code: "agent_auth_required", message: "the DeepSeek API key was not saved" });
     expect(f.text()).not.toContain("pasted-secret-value");
   });
-  it("names the agent when a sign-in finishes, with no internal start line (WS1-153)", async () => {
+  it("names the agent when a sign-in finishes, with no internal start line", async () => {
     const f = fake();
-    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
-      if (request.op !== "auth.login") return schema.parse({});
-      options?.onEvent?.({ kind: "display", loginId: "l1", text: "Paste your DeepSeek API key." });
-      options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "DeepSeek API key", secret: true });
-      options?.onEvent?.({ kind: "started", loginId: "l1", agentId: "dsh" });
-      await new Promise(resolve => setTimeout(resolve, 0));
-      options?.onEvent?.({ kind: "display", loginId: "l1", text: "Checking the key with DeepSeek…" });
-      options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
-      return schema.parse({ loginId: "l1" });
-    }) as typeof f.context.control.call;
+    f.context.control.call = scriptedLogin([
+      { kind: "display", loginId: "l1", text: "Paste your DeepSeek API key." },
+      { kind: "prompt", loginId: "l1", label: "DeepSeek API key", secret: true },
+      { kind: "started", loginId: "l1", agentId: "dsh" },
+      TICK,
+      { kind: "display", loginId: "l1", text: "Checking the key with DeepSeek…" },
+      { kind: "completed", loginId: "l1", readiness: "ready" },
+    ]) as typeof f.context.control.call;
     await authLogin(f.context, "dsh", false);
     expect(f.text()).toBe("Paste your DeepSeek API key.\nChecking the key with DeepSeek…\nDeepSeek Harness is ready.\n");
     expect(f.text()).not.toMatch(/\bdsh\b|official tooling|login (started|complete)/i);
@@ -93,13 +114,11 @@ describe("native control commands", () => {
       const f = fake();
       const output = createOutput({ json: false, stdout: sink, stderr: sink });
       f.context.output = output;
-      f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
-        if (request.op !== "auth.login") return schema.parse({});
-        options?.onEvent?.({ kind: "started", loginId: "l1", agentId: "dsh" });
-        for (const line of lines) options?.onEvent?.({ kind: "display", loginId: "l1", text: line });
-        options?.onEvent?.({ kind: "failed", loginId: "l1", code: "agent_auth_required", message: "the DeepSeek API key was not saved" });
-        return schema.parse({ loginId: "l1" });
-      }) as typeof f.context.control.call;
+      f.context.control.call = scriptedLogin([
+        { kind: "started", loginId: "l1", agentId: "dsh" },
+        ...lines.map(line => ({ kind: "display", loginId: "l1", text: line })),
+        { kind: "failed", loginId: "l1", code: "agent_auth_required", message: "the DeepSeek API key was not saved" },
+      ]) as typeof f.context.control.call;
       const error = await authLogin(f.context, "dsh", false).then(() => null, (failure: unknown) => failure);
       expect(error).toMatchObject({ code: "agent_auth_required" });
       output.error(error);
@@ -115,21 +134,18 @@ describe("native control commands", () => {
     await authLogin(f.context, "codex", false);
     expect(f.text().split("\n")[0]).toBe("Starting Codex's own sign-in. Follow its steps below.");
   });
-  it("asks OpenCode's provider choice in the open and its key hidden, and passes the chosen sign-in on (CP3)", async () => {
+  it("asks OpenCode's provider choice in the open and its key hidden, and passes the chosen sign-in on", async () => {
     const f = fake();
     const typed: string[] = [];
     const hidden: string[] = [];
     f.context.promptLine = async label => { typed.push(label); return "deepseek"; };
     f.context.promptSecret = async label => { hidden.push(label); return "sk-typed-key-never-shown"; };
-    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
-      f.calls.push(request);
-      if (request.op !== "auth.login") return schema.parse({});
-      options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "Number or provider id", secret: false, visible: true });
-      options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "DeepSeek API key", secret: true });
-      await new Promise(resolve => setTimeout(resolve, 0));
-      options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
-      return schema.parse({ loginId: "l1" });
-    }) as typeof f.context.control.call;
+    f.context.control.call = scriptedLogin([
+      { kind: "prompt", loginId: "l1", label: "Number or provider id", secret: false, visible: true },
+      { kind: "prompt", loginId: "l1", label: "DeepSeek API key", secret: true },
+      TICK,
+      { kind: "completed", loginId: "l1", readiness: "ready" },
+    ], f.calls) as typeof f.context.control.call;
     await authLogin(f.context, "opencode", false, { provider: "deepseek", method: "key", reuse: true });
     expect(typed).toEqual(["Number or provider id"]);
     expect(hidden).toEqual(["DeepSeek API key"]);
@@ -137,19 +153,17 @@ describe("native control commands", () => {
     expect(f.calls.slice(1)).toEqual([{ op: "auth.input", loginId: "l1", text: "deepseek" }, { op: "auth.input", loginId: "l1", text: "sk-typed-key-never-shown" }]);
     expect(f.text()).not.toContain("sk-typed-key-never-shown");
   });
-  it("passes Google Antigravity's Gemini Enterprise project and location on, and its key only through the hidden prompt (antigravity CP3)", async () => {
+  it("passes Google Antigravity's Gemini Enterprise project and location on, and its key only through the hidden prompt", async () => {
     const f = fake();
     const hidden: string[] = [];
     f.context.promptSecret = async label => { hidden.push(label); return "AIzaSyTYPED-never-shown-000000000000"; };
-    f.context.control.call = (async (request: ControlRequest, schema: { parse: (value: unknown) => unknown }, options?: { onEvent?: (event: unknown) => void }) => {
-      f.calls.push(request);
-      if (request.op !== "auth.login") return schema.parse({});
-      if (request.method === "gemini-api-key") options?.onEvent?.({ kind: "prompt", loginId: "l1", label: "Gemini API key", secret: true });
-      else options?.onEvent?.({ kind: "open_url", loginId: "l1", url: "https://accounts.google.com/o/oauth2/v2/auth?client_id=x" });
-      await new Promise(resolve => setTimeout(resolve, 0));
-      options?.onEvent?.({ kind: "completed", loginId: "l1", readiness: "ready" });
-      return schema.parse({ loginId: "l1" });
-    }) as typeof f.context.control.call;
+    f.context.control.call = scriptedLogin(request => [
+      request.op === "auth.login" && request.method === "gemini-api-key"
+        ? { kind: "prompt", loginId: "l1", label: "Gemini API key", secret: true }
+        : { kind: "open_url", loginId: "l1", url: "https://accounts.google.com/o/oauth2/v2/auth?client_id=x" },
+      TICK,
+      { kind: "completed", loginId: "l1", readiness: "ready" },
+    ], f.calls) as typeof f.context.control.call;
     await authLogin(f.context, "antigravity", false, { method: "oauth-business", project: "gemini-enterprise-qa-25d3", location: "global" });
     expect(f.calls[0]).toEqual({ op: "auth.login", agentId: "antigravity", organization: false, method: "oauth-business", project: "gemini-enterprise-qa-25d3", location: "global" });
     expect(f.text()).toContain("open this URL to sign in: https://accounts.google.com/");
@@ -180,7 +194,7 @@ describe("native control commands", () => {
     expect(f.text()).toContain("Customize → Runtimes");
   });
 
-  it("names Google Antigravity's download state in the agent list, with the command that changes it (antigravity CP6)", async () => {
+  it("names Google Antigravity's download state in the agent list, with the command that changes it", async () => {
     let text = "";
     const sink = new Writable({ write(chunk, _encoding, done) { text += chunk.toString(); done(); } });
     const view = (state: string) => ({ agentId: "antigravity", readiness: "unavailable", authMode: "agent_local_subscription", accountScope: "personal", hostAgentDownload: { state } });

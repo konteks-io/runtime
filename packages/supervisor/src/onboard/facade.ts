@@ -18,12 +18,12 @@ import {
 
 /**
  * What the runtime sends for one repository: the shared submission, plus why
- * the repository read nothing when it did (W2-O3).
+ * the repository read nothing when it did.
  */
 export type OnboardEvidenceSubmission = DiscoveryEvidenceSubmission;
 
 /**
- * The onboard MCP facade as this runtime sees it (OB6 §2, §3; OB2 §5).
+ * The onboard MCP facade as this runtime sees it.
  *
  * The runtime holds exactly one credential for Core's onboard surface: the
  * capability token the supervisor redeems per claim, presented as the platform
@@ -32,26 +32,26 @@ export type OnboardEvidenceSubmission = DiscoveryEvidenceSubmission;
  * second authority path to review.
  *
  * The facade is a PORT here. Every method is named for the tool it calls, so a
- * reader can check the call site against OB2 §5 without following an HTTP
+ * reader can check the call site against the tool without following an HTTP
  * client, and the workers are testable without a Core.
  */
 
 /**
- * CONTRACT-GAP: OB1 published the relocation and managed-repository tool names
- * as constants; the discovery-run tools are named only in OB2 §5 prose. They are
- * spelled here verbatim, and belong in the shared package the moment OB2 lands
- * so neither side re-derives them.
+ * CONTRACT-GAP: the shared package publishes the relocation and
+ * managed-repository tool names as constants, but not the discovery-run tools.
+ * They are spelled here verbatim, and belong in the shared package so neither
+ * side re-derives them.
  */
-export const DISCOVERY_RUN_GET_TOOL = "platform__catalog__discovery_run_get" as const;
-export const DISCOVERY_RUN_INVENTORY_LIST_TOOL = "platform__catalog__discovery_run_inventory_list" as const;
-export const DISCOVERY_RUN_EVIDENCE_SUBMIT_TOOL = "platform__catalog__discovery_run_evidence_submit" as const;
-export const DISCOVERY_RUN_ENRICHMENT_SUBMIT_TOOL = "platform__catalog__discovery_run_enrichment_submit" as const;
+const DISCOVERY_RUN_GET_TOOL = "platform__catalog__discovery_run_get" as const;
+const DISCOVERY_RUN_INVENTORY_LIST_TOOL = "platform__catalog__discovery_run_inventory_list" as const;
+const DISCOVERY_RUN_EVIDENCE_SUBMIT_TOOL = "platform__catalog__discovery_run_evidence_submit" as const;
+const DISCOVERY_RUN_ENRICHMENT_SUBMIT_TOOL = "platform__catalog__discovery_run_enrichment_submit" as const;
 /**
- * CONTRACT-GAP: OB2 §3b requires the report but names no tool. `cloning` is
+ * CONTRACT-GAP: the onboarding contract requires the report but names no tool. `cloning` is
  * reported BEFORE the clone and `extracted` with the submission, so Core's
  * per-repository ledger is never behind what is already on disk.
  */
-export const DISCOVERY_RUN_ENRICHMENT_PROGRESS_TOOL = "platform__catalog__discovery_run_enrichment_progress" as const;
+const DISCOVERY_RUN_ENRICHMENT_PROGRESS_TOOL = "platform__catalog__discovery_run_enrichment_progress" as const;
 
 /** What the collector needs off a run: its depth, its bounds, its connector. */
 export const OnboardRunViewSchema = z
@@ -60,7 +60,7 @@ export const OnboardRunViewSchema = z
     kind: z.literal("discovery"),
     depth: DiscoveryDepthSchema,
     /**
-     * ON30: a run states its bounds before anything is read. Optional HERE so a
+     * A run states its bounds before anything is read. Optional HERE so a
      * run that omits them is refused by name rather than as a parse failure —
      * the collector must never invent a ceiling, and a reader of the log should
      * see which rule refused.
@@ -69,7 +69,7 @@ export const OnboardRunViewSchema = z
   });
 export type OnboardRunView = z.infer<typeof OnboardRunViewSchema> & { bounds: DiscoveryRunBounds };
 
-export const OnboardInventoryPageSchema = z
+const OnboardInventoryPageSchema = z
   .object({
     items: z
       .array(
@@ -92,11 +92,11 @@ export const OnboardInventoryPageSchema = z
 export type OnboardInventoryPage = z.infer<typeof OnboardInventoryPageSchema>;
 
 /**
- * One endpoint of a relocation as the revision records it (G2). It carries no
+ * One endpoint of a relocation as the revision records it. It carries no
  * clone URL and no managed flag, so the worker composes the remote itself from
  * `baseUrl`/`repoOwner`/`repoName` and decides the credential by host.
  */
-export const RelocationEndpointSchema = z
+const RelocationEndpointSchema = z
   .object({
     vcsConnectorId: z.string().min(1).max(200),
     provider: z.string().min(1).max(64),
@@ -119,7 +119,7 @@ export const RelocationPlanSchema = z
   });
 export type RelocationPlan = z.infer<typeof RelocationPlanSchema>;
 
-/** ON30 / OB6 §2: a run whose bounds are absent is refused, never defaulted. */
+/** A run whose bounds are absent is refused, never defaulted. */
 export function requireBounds(run: z.infer<typeof OnboardRunViewSchema>): OnboardRunView {
   if (!run.bounds) {
     throw new RemoteInstanceError("schema_invalid", "A discovery run states its bounds before anything is read.", { diagnostic: "onboard_bounds_absent" });
@@ -137,7 +137,7 @@ export interface OnboardFacade {
   relocationReport(report: RepositoryRelocateReportInput): Promise<RelocationPlan>;
 }
 
-export interface McpOnboardFacadeOptions {
+interface McpOnboardFacadeOptions {
   /** The redeemed platform MCP entry for this claim. Never journaled. */
   endpoint: { url: string; headers: ReadonlyArray<{ name: string; value: string }> };
   fetchFn?: FetchFn;
@@ -198,6 +198,19 @@ export class McpOnboardFacade implements OnboardFacade {
   }
 
   private async call(tool: string, args: Record<string, unknown>): Promise<unknown> {
+    const response = await this.post(tool, args);
+    const envelope = McpResponseSchema.safeParse(await response.json());
+    if (!envelope.success) throw new RemoteInstanceError("schema_invalid", `The onboard facade answered ${tool} off contract.`, { diagnostic: "onboard_facade_envelope" });
+    if (envelope.data.error) {
+      // A tool-level refusal is Core's decision (budget exhausted, run out of
+      // scope, submission beyond the allowance). It is surfaced with its own
+      // code so the worker can tell "refused" from "unreachable".
+      throw new RemoteInstanceError("conflict", `The onboard facade refused ${tool}: ${envelope.data.error.code}.`, { diagnostic: "onboard_facade_refused" });
+    }
+    return toolContent(tool, envelope.data.result);
+  }
+
+  private async post(tool: string, args: Record<string, unknown>): Promise<Response> {
     const headers: Record<string, string> = { "content-type": "application/json", accept: "application/json" };
     for (const header of this.options.endpoint.headers) headers[header.name] = header.value;
     let response: Response;
@@ -217,27 +230,22 @@ export class McpOnboardFacade implements OnboardFacade {
     if (!response.ok) {
       throw new RemoteInstanceError("temporarily_unavailable", `The onboard facade refused ${tool}.`, { retryable: true, diagnostic: "onboard_facade_http" });
     }
-    const envelope = McpResponseSchema.safeParse(await response.json());
-    if (!envelope.success) throw new RemoteInstanceError("schema_invalid", `The onboard facade answered ${tool} off contract.`, { diagnostic: "onboard_facade_envelope" });
-    if (envelope.data.error) {
-      // A tool-level refusal is Core's decision (budget exhausted, run out of
-      // scope, submission beyond the allowance). It is surfaced with its own
-      // code so the worker can tell "refused" from "unreachable".
-      throw new RemoteInstanceError("conflict", `The onboard facade refused ${tool}: ${envelope.data.error.code}.`, { diagnostic: "onboard_facade_refused" });
-    }
-    const result = envelope.data.result;
-    if (result?.isError) throw new RemoteInstanceError("conflict", `The onboard facade refused ${tool}.`, { diagnostic: "onboard_tool_error" });
-    if (result?.structuredContent !== undefined) return result.structuredContent;
-    const text = result?.content?.find(entry => entry.type === "text")?.text;
-    if (text === undefined) return {};
-    try {
-      return JSON.parse(text) as unknown;
-    } catch {
-      throw new RemoteInstanceError("schema_invalid", `The onboard facade answered ${tool} with unparseable content.`, { diagnostic: "onboard_facade_content" });
-    }
+    return response;
+  }}
+
+/** A tool result's structured content, or its first text part parsed as JSON; `{}` when it has neither. */
+function toolContent(tool: string, result: z.infer<typeof McpResponseSchema>["result"]): unknown {
+  if (!result) return {};
+  if (result.isError) throw new RemoteInstanceError("conflict", `The onboard facade refused ${tool}.`, { diagnostic: "onboard_tool_error" });
+  if (result.structuredContent !== undefined) return result.structuredContent;
+  const text = result.content?.find(entry => entry.type === "text")?.text;
+  if (text === undefined) return {};
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new RemoteInstanceError("schema_invalid", `The onboard facade answered ${tool} with unparseable content.`, { diagnostic: "onboard_facade_content" });
   }
 }
-
 const McpResponseSchema = z
   .object({
     error: z.object({ code: z.union([z.number(), z.string()]), message: z.string().max(2_048).optional() }).passthrough().optional(),

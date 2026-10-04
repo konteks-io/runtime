@@ -227,7 +227,7 @@ it("makes cross-incarnation restore succession durable and exactly retryable bef
   expect(journal.execution.pendingRestore(successor, correction)).toBeUndefined();
 });
 
-// Production 2026-10-01: a connector restart restored the QA role session
+// A connector restart restored the QA role session
 // for one re-check, which completed. The next re-check of the same kept
 // changes then failed at activation with a ZodError on every try, and the
 // idle reaper could never release the session, because the journal refused
@@ -425,7 +425,7 @@ it("persists exact opened ownership and reference before execution; never rebind
   await expect(reopened.execution.bindReference(admission, "ref", current)).rejects.toThrow();
 });
 
-it("stopping fences execution and ACP settlement never authorizes D139 quiescence", async () => {
+it("stopping fences execution and ACP settlement never authorizes quiescence", async () => {
   const journal = new SupervisorJournal(dir); await journal.load(); await journal.execution.admit(admission, current);
   await journal.execution.open(admission, current, admission.openedAt); await journal.execution.bindReference(admission, "ref", current);
   await journal.execution.markStopping(admission, now, current);

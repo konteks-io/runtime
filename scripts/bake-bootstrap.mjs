@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Release pipeline: pin this release's connector executables inside the POSIX
- * bootstrap (onboarding-simplified OS3, R10).
+ * bootstrap.
  *
  * `install.sh --user` runs on machines whose `openssl` may not speak Ed25519
  * (macOS ships LibreSSL, which refuses the key), so the user-local path cannot

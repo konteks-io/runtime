@@ -6,7 +6,7 @@ import { isFsErrorWithCode, writeSecretFile } from "@konteks/remote-common";
 import { z } from "zod";
 
 /**
- * The agent packages an enrollment install unpacks (WS1-012).
+ * The agent packages an enrollment install unpacks.
  *
  * A release carries an offline package per agent family, each with its own
  * Node and dependency tree: hundreds of megabytes and thousands of files. The
@@ -19,7 +19,7 @@ import { z } from "zod";
  * no secret.
  */
 
-export const StagingProgressSchema = z
+const StagingProgressSchema = z
   .object({
     schemaVersion: z.literal(1),
     state: z.enum(["running", "done", "failed"]),
@@ -32,7 +32,7 @@ export const StagingProgressSchema = z
     updatedAt: z.string().min(1),
   })
   .strict();
-export type StagingProgress = z.infer<typeof StagingProgressSchema>;
+type StagingProgress = z.infer<typeof StagingProgressSchema>;
 
 export type StagingStatus =
   | { state: "done" }
@@ -42,7 +42,7 @@ export type StagingStatus =
 
 const FILE = "staging.json";
 
-export function stagingProgressPath(root: string): string {
+function stagingProgressPath(root: string): string {
   return join(resolve(root), "installer", FILE);
 }
 
@@ -85,12 +85,17 @@ export async function enrollmentStagingStatus(
   if (await isStaged(root)) return { state: "done" };
   const progress = await readStagingProgress(root);
   if (!progress) return { state: "not_started" };
+  return stagingFailure(progress) ?? { state: "running", ...(progress.agent ? { agent: progress.agent } : {}), done: progress.done, total: progress.total };
+}
+
+/** A progress file that says it failed, a running one whose process has gone, or a finished one nothing recorded. */
+function stagingFailure(progress: NonNullable<Awaited<ReturnType<typeof readStagingProgress>>>): StagingStatus | null {
   if (progress.state === "failed") return { state: "failed", message: progress.message ?? "Unpacking the agent packages stopped." };
   if (progress.state === "running" && progress.pid !== undefined && !alive(progress.pid)) {
     return { state: "failed", message: "Unpacking the agent packages stopped before it finished." };
   }
   if (progress.state === "done") return { state: "failed", message: "The agent packages were unpacked but not recorded." };
-  return { state: "running", ...(progress.agent ? { agent: progress.agent } : {}), done: progress.done, total: progress.total };
+  return null;
 }
 
 /**
@@ -110,6 +115,7 @@ export async function spawnEnrollmentStaging(root: string): Promise<number | und
       [...(packaged ? [] : [script!]), "--root", resolve(root), "stage-enrollment"],
       {
         detached: true,
+        windowsHide: true,
         stdio: ["ignore", log, log],
         // The same connector finishing its own install, not a bridge or a
         // tool: it keeps the environment it was installed with, including the

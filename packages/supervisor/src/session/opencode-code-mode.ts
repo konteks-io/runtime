@@ -1,7 +1,11 @@
-import { parse, type Expression, type Node, type Program, type SpreadElement } from "acorn";
+import {
+  parse,
+  type Expression, type MemberExpression, type ModuleDeclaration, type Node, type Program, type ReturnStatement,
+  type SpreadElement, type Statement, type Super, type VariableDeclaration,
+} from "acorn";
 
 /**
- * OpenCode 2's Code Mode gate (opencode-runtime-support CP4).
+ * OpenCode 2's Code Mode gate.
  *
  * OpenCode 2.0.18 reaches MCP tools ONLY through its `execute` tool, which
  * runs model-written JavaScript in OpenCode's own interpreter. It asks once
@@ -35,7 +39,7 @@ export const KONTEKS_CODE_MODE_SERVERS: ReadonlySet<string> = new Set(["konteks-
 /** One approved call: the Konteks server (Code Mode namespace) and its tool. */
 export interface CodeModeCall { server: string; tool: string }
 
-export type CodeModeBlock = { ok: true; calls: CodeModeCall[] } | { ok: false; reason: string };
+type CodeModeBlock = { ok: true; calls: CodeModeCall[] } | { ok: false; reason: string };
 
 /** The only form Konteks runs, as the agent is told it (prompt line and refusal log). */
 export const CODE_MODE_ACCEPTED_FORM = "call Konteks tools only as `const result = await tools[\"<server>\"].<tool>({ ... });` with literal arguments, one call per statement, then `return result;`";
@@ -50,6 +54,13 @@ class Refusal extends Error {}
 
 function refuse(reason: string): never { throw new Refusal(reason); }
 
+const PLAIN_DATA = "arguments are plain data";
+const OWN_RESULTS = "return only what the block's calls produced";
+const TOOL_CALL_FORM = "call a tool as tools[\"<server>\"].<tool>(…)";
+
+type AnyNode = Node & Record<string, unknown>;
+type PropertyNode = Node & { type: string; computed?: boolean; kind?: string; method?: boolean; shorthand?: boolean; key: Node; value: Node };
+
 /**
  * Reads `code` and returns the Konteks calls it makes, or why it is not in
  * the accepted form. `servers` are the Code Mode namespaces this session may
@@ -58,49 +69,128 @@ function refuse(reason: string): never { throw new Refusal(reason); }
 export function parseKonteksCodeModeBlock(code: string, servers: ReadonlySet<string>): CodeModeBlock {
   if (typeof code !== "string" || code.trim().length === 0) return { ok: false, reason: "the block is empty" };
   if (code.length > MAX_CODE_LENGTH) return { ok: false, reason: "the block is too long" };
-  let program: Program;
+  const program = parsedModule(code);
+  if (program === null) return { ok: false, reason: "the block is not valid JavaScript" };
   try {
-    // A module: top-level `await` is native and HTML-style comments are not
-    // comments, so nothing can hide behind a comment the interpreter would run.
-    program = parse(code, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true, allowHashBang: false });
-  } catch {
-    return { ok: false, reason: "the block is not valid JavaScript" };
-  }
-  try {
-    const calls: CodeModeCall[] = [];
-    const bound = new Set<string>();
-    program.body.forEach((statement, index) => {
-      const last = index === program.body.length - 1;
-      switch (statement.type) {
-        case "VariableDeclaration": {
-          if (statement.kind !== "const" && statement.kind !== "let") refuse("only `const` or `let` may hold a result");
-          if (statement.declarations.length !== 1) refuse("declare one result per statement");
-          const declaration = statement.declarations[0]!;
-          if (declaration.id.type !== "Identifier") refuse("a result is held in a plain name");
-          const name = declaration.id.name;
-          if (RESERVED.has(name) || bound.has(name)) refuse(`the name ${name} cannot hold a result`);
-          if (!declaration.init) refuse("a result must come from a Konteks tool call");
-          calls.push(awaitedCall(declaration.init, servers));
-          bound.add(name);
-          return;
-        }
-        case "ExpressionStatement":
-          calls.push(awaitedCall(statement.expression, servers));
-          return;
-        case "ReturnStatement":
-          if (!last) refuse("`return` must be the last statement");
-          if (statement.argument) returnValue(statement.argument, bound, servers, calls);
-          return;
-        default:
-          refuse(`a ${statement.type} is not a Konteks tool call`);
-      }
-    });
-    if (calls.length === 0) refuse("the block calls no Konteks tool");
-    return { ok: true, calls };
+    const reader = new BlockReader(servers);
+    program.body.forEach((statement, index) => reader.statement(statement, index === program.body.length - 1));
+    if (reader.calls.length === 0) refuse("the block calls no Konteks tool");
+    return { ok: true, calls: reader.calls };
   } catch (error) {
     if (error instanceof Refusal) return { ok: false, reason: error.message };
     throw error;
   }
+}
+
+function parsedModule(code: string): Program | null {
+  try {
+    // A module: top-level `await` is native and HTML-style comments are not
+    // comments, so nothing can hide behind a comment the interpreter would run.
+    return parse(code, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true, allowHashBang: false });
+  } catch {
+    return null;
+  }
+}
+
+/** Reads a block statement by statement: the calls it makes and the names that hold their results. */
+class BlockReader {
+  readonly calls: CodeModeCall[] = [];
+  private readonly bound = new Set<string>();
+
+  constructor(private readonly servers: ReadonlySet<string>) {}
+
+  statement(statement: Statement | ModuleDeclaration, last: boolean): void {
+    switch (statement.type) {
+      case "VariableDeclaration":
+        return this.declaration(statement);
+      case "ExpressionStatement":
+        this.calls.push(awaitedCall(statement.expression, this.servers));
+        return;
+      case "ReturnStatement":
+        return this.returnStatement(statement, last);
+      default:
+        refuse(`a ${statement.type} is not a Konteks tool call`);
+    }
+  }
+
+  private declaration(statement: VariableDeclaration): void {
+    if (statement.kind !== "const" && statement.kind !== "let") refuse("only `const` or `let` may hold a result");
+    if (statement.declarations.length !== 1) refuse("declare one result per statement");
+    const declaration = statement.declarations[0]!;
+    if (declaration.id.type !== "Identifier") refuse("a result is held in a plain name");
+    const name = declaration.id.name;
+    if (RESERVED.has(name) || this.bound.has(name)) refuse(`the name ${name} cannot hold a result`);
+    if (!declaration.init) refuse("a result must come from a Konteks tool call");
+    this.calls.push(awaitedCall(declaration.init, this.servers));
+    this.bound.add(name);
+  }
+
+  private returnStatement(statement: ReturnStatement, last: boolean): void {
+    if (!last) refuse("`return` must be the last statement");
+    if (statement.argument) this.returnValue(statement.argument);
+  }
+
+  /** What a block may return: its results, literal data, those in an object or array, or `JSON.stringify` of them. */
+  private returnValue(node: Expression | SpreadElement | Node): void {
+    const value = node as AnyNode;
+    switch (value.type) {
+      case "Identifier":
+        if (!this.bound.has(value.name as string)) refuse(OWN_RESULTS);
+        return;
+      case "MemberExpression":
+        return this.boundMember(value);
+      case "AwaitExpression":
+        this.calls.push(awaitedCall(value as unknown as Expression, this.servers));
+        return;
+      case "ArrayExpression":
+        return this.returnedElements(value.elements as Array<Node | null>);
+      case "ObjectExpression":
+        return this.returnedProperties(value.properties as Node[]);
+      case "CallExpression":
+        return this.returnedJson(value);
+      default:
+        literal(value);
+    }
+  }
+
+  private boundMember(value: AnyNode): void {
+    let object = value;
+    while (object.type === "MemberExpression") {
+      if (object.computed || object.optional || (object.property as Node).type !== "Identifier") refuse(OWN_RESULTS);
+      object = object.object as AnyNode;
+    }
+    if (object.type !== "Identifier" || !this.bound.has(object.name as string)) refuse(OWN_RESULTS);
+  }
+
+  private returnedElements(elements: Array<Node | null>): void {
+    for (const element of elements) {
+      if (element === null) refuse(OWN_RESULTS);
+      this.returnValue(element);
+    }
+  }
+
+  private returnedProperties(properties: Node[]): void {
+    for (const property of properties) {
+      const entry = property as PropertyNode;
+      if (!initProperty(entry)) refuse(OWN_RESULTS);
+      this.returnValue(entry.value);
+    }
+  }
+
+  private returnedJson(value: AnyNode): void {
+    const args = value.arguments as Node[];
+    if (!jsonStringify(value) || args.length === 0 || args.length > 3) refuse(OWN_RESULTS);
+    this.returnValue(args[0]!);
+    for (const extra of args.slice(1)) literal(extra);
+  }
+}
+
+/** `JSON.stringify(…)`, called plainly. */
+function jsonStringify(value: AnyNode): boolean {
+  const callee = value.callee as AnyNode;
+  return callee.type === "MemberExpression" && !callee.computed && !callee.optional && !value.optional &&
+    (callee.object as Node & { name?: string }).type === "Identifier" && (callee.object as { name?: string }).name === "JSON" &&
+    (callee.property as { name?: string }).name === "stringify";
 }
 
 /** `await tools["konteks-<server>"].<tool>(<literals>)` or `…["<tool>"](…)`. */
@@ -109,109 +199,87 @@ function awaitedCall(node: Expression, servers: ReadonlySet<string>): CodeModeCa
   const call = node.argument;
   if (call.type !== "CallExpression" || call.optional) refuse("only a Konteks tool call may be awaited");
   const callee = call.callee;
-  if (callee.type !== "MemberExpression" || callee.optional) refuse("call a tool as tools[\"<server>\"].<tool>(…)");
-  const namespace = callee.object;
+  if (callee.type !== "MemberExpression" || callee.optional) refuse(TOOL_CALL_FORM);
+  const server = calledServer(callee.object, servers);
+  const tool = calledTool(callee);
+  for (const argument of call.arguments) literal(argument);
+  return { server, tool };
+}
+
+/** The server in `tools["<server>"]`: a plain string naming one of this session's servers. */
+function calledServer(namespace: Expression | Super, servers: ReadonlySet<string>): string {
   if (namespace.type !== "MemberExpression" || namespace.optional || !namespace.computed ||
       namespace.object.type !== "Identifier" || namespace.object.name !== "tools") {
-    refuse("call a tool as tools[\"<server>\"].<tool>(…)");
+    refuse(TOOL_CALL_FORM);
   }
   const server = stringLiteral(namespace.property);
   if (server === null) refuse("the server is named with a plain string");
   if (!servers.has(server)) refuse(`${server} is not a Konteks server of this session`);
+  return server;
+}
+
+function calledTool(callee: MemberExpression): string {
   const tool = callee.computed ? stringLiteral(callee.property) : callee.property.type === "Identifier" ? callee.property.name : null;
   if (tool === null || !TOOL_NAME.test(tool)) refuse("the tool is named with a plain name or string");
-  for (const argument of call.arguments) literal(argument);
-  return { server, tool };
+  return tool;
 }
 
 function stringLiteral(node: Node): string | null {
   const value = node as { type: string; value?: unknown; regex?: unknown; bigint?: unknown };
   if (value.type === "Literal" && typeof value.value === "string") return value.value;
+  return templateString(node);
+}
+
+/** A template literal with no substitutions, by its cooked text. */
+function templateString(node: Node): string | null {
   const template = node as { type: string; expressions?: unknown[]; quasis?: Array<{ value: { cooked?: string | null } }> };
-  if (template.type === "TemplateLiteral" && template.expressions?.length === 0 && template.quasis?.length === 1) {
-    return template.quasis[0]!.value.cooked ?? null;
-  }
-  return null;
+  if (template.type !== "TemplateLiteral" || template.expressions?.length !== 0 || template.quasis?.length !== 1) return null;
+  return template.quasis[0]!.value.cooked ?? null;
+}
+
+/** An object property written as `key: value` (no computed key, getter, setter or method). */
+function initProperty(entry: PropertyNode): boolean {
+  return entry.type === "Property" && !entry.computed && entry.kind === "init" && !entry.method;
+}
+
+/** A property key written out: a name, a plain string or a number. */
+function plainKey(key: Node): boolean {
+  return key.type === "Identifier" || stringLiteral(key) !== null || (key.type === "Literal" && typeof (key as { value?: unknown }).value === "number");
 }
 
 /** Arguments are data written out in full: no names, calls or spreads. */
 function literal(node: Expression | SpreadElement | Node): void {
-  const value = node as Node & Record<string, unknown>;
-  switch (value.type) {
-    case "Literal":
-      if (value.regex !== undefined || value.bigint !== undefined) refuse("arguments are plain data");
-      return;
-    case "TemplateLiteral":
-      if (stringLiteral(value) === null) refuse("arguments are plain data");
-      return;
-    case "UnaryExpression":
-      if (value.operator !== "-" || (value.argument as { type: string; value?: unknown }).type !== "Literal" ||
-          typeof (value.argument as { value?: unknown }).value !== "number") refuse("arguments are plain data");
-      return;
-    case "ArrayExpression":
-      for (const element of value.elements as Array<Node | null>) {
-        if (element === null) refuse("arguments are plain data");
-        literal(element);
-      }
-      return;
-    case "ObjectExpression":
-      for (const property of value.properties as Node[]) {
-        const entry = property as Node & { type: string; computed?: boolean; kind?: string; method?: boolean; shorthand?: boolean; key: Node; value: Node };
-        if (entry.type !== "Property" || entry.computed || entry.kind !== "init" || entry.method || entry.shorthand) refuse("arguments are plain data");
-        if (entry.key.type !== "Identifier" && stringLiteral(entry.key) === null &&
-            !(entry.key.type === "Literal" && typeof (entry.key as { value?: unknown }).value === "number")) refuse("arguments are plain data");
-        literal(entry.value);
-      }
-      return;
-    default:
-      refuse("arguments are plain data");
+  const value = node as AnyNode;
+  const check = LITERAL_CHECKS.get(value.type);
+  if (check === undefined) refuse(PLAIN_DATA);
+  check(value);
+}
+
+function negativeNumber(value: AnyNode): void {
+  const argument = value.argument as { type: string; value?: unknown };
+  if (value.operator !== "-" || argument.type !== "Literal" || typeof argument.value !== "number") refuse(PLAIN_DATA);
+}
+
+function literalElements(value: AnyNode): void {
+  for (const element of value.elements as Array<Node | null>) {
+    if (element === null) refuse(PLAIN_DATA);
+    literal(element);
   }
 }
 
-/** What a block may return: its results, literal data, those in an object or array, or `JSON.stringify` of them. */
-function returnValue(node: Expression | SpreadElement | Node, bound: ReadonlySet<string>, servers: ReadonlySet<string>, calls: CodeModeCall[]): void {
-  const value = node as Node & Record<string, unknown>;
-  switch (value.type) {
-    case "Identifier":
-      if (!bound.has(value.name as string)) refuse("return only what the block's calls produced");
-      return;
-    case "MemberExpression": {
-      let object = value as Node & Record<string, unknown>;
-      while (object.type === "MemberExpression") {
-        if (object.computed || object.optional || (object.property as Node).type !== "Identifier") refuse("return only what the block's calls produced");
-        object = object.object as Node & Record<string, unknown>;
-      }
-      if (object.type !== "Identifier" || !bound.has(object.name as string)) refuse("return only what the block's calls produced");
-      return;
-    }
-    case "AwaitExpression":
-      calls.push(awaitedCall(value as unknown as Expression, servers));
-      return;
-    case "ArrayExpression":
-      for (const element of value.elements as Array<Node | null>) {
-        if (element === null) refuse("return only what the block's calls produced");
-        returnValue(element, bound, servers, calls);
-      }
-      return;
-    case "ObjectExpression":
-      for (const property of value.properties as Node[]) {
-        const entry = property as Node & { type: string; computed?: boolean; kind?: string; method?: boolean; key: Node; value: Node };
-        if (entry.type !== "Property" || entry.computed || entry.kind !== "init" || entry.method) refuse("return only what the block's calls produced");
-        returnValue(entry.value, bound, servers, calls);
-      }
-      return;
-    case "CallExpression": {
-      const callee = value.callee as Node & Record<string, unknown>;
-      const json = callee.type === "MemberExpression" && !callee.computed && !callee.optional && !value.optional &&
-        (callee.object as Node & { name?: string }).type === "Identifier" && (callee.object as { name?: string }).name === "JSON" &&
-        (callee.property as { name?: string }).name === "stringify";
-      const args = value.arguments as Node[];
-      if (!json || args.length === 0 || args.length > 3) refuse("return only what the block's calls produced");
-      returnValue(args[0]!, bound, servers, calls);
-      for (const extra of args.slice(1)) literal(extra);
-      return;
-    }
-    default:
-      literal(value);
+function literalProperties(value: AnyNode): void {
+  for (const property of value.properties as Node[]) {
+    const entry = property as PropertyNode;
+    if (!initProperty(entry) || entry.shorthand) refuse(PLAIN_DATA);
+    if (!plainKey(entry.key)) refuse(PLAIN_DATA);
+    literal(entry.value);
   }
 }
+
+const LITERAL_CHECKS: ReadonlyMap<string, (value: AnyNode) => void> = new Map<string, (value: AnyNode) => void>([
+  ["Literal", value => { if (value.regex !== undefined || value.bigint !== undefined) refuse(PLAIN_DATA); }],
+  ["TemplateLiteral", value => { if (stringLiteral(value) === null) refuse(PLAIN_DATA); }],
+  ["UnaryExpression", negativeNumber],
+  ["ArrayExpression", literalElements],
+  ["ObjectExpression", literalProperties],
+]);

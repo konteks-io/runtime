@@ -4,7 +4,7 @@ import {
   AssignmentClaimSchema, AssignmentPullSchema, AssignmentReportSchema,
   AssignmentRequestKindSchema, AssignmentRequestOriginSchema, AssignmentRequestReferenceSchema,
   AssignmentResponseReferenceSchema, AssignmentTransportReplySchema, LogicalAssignmentRequestFrameSchema, LogicalAssignmentReplyFrameSchema,
-  PendingClaimRequestSchema, RemoteInstanceError, canonicalize, jcsDigest, logicalAssignmentRequestDigest,
+  PendingClaimRequestSchema, RemoteInstanceError, allEqual, canonicalize, jcsDigest, logicalAssignmentRequestDigest,
   NativeCoreRequestAckSchema,
   logicalAssignmentResponseDigest, type AssignmentRequestReference, type PendingClaimRequest,
 } from "@konteks/remote-common";
@@ -18,7 +18,7 @@ const ScopeSchema = z.object(scope).strict();
 type Scope = z.infer<typeof ScopeSchema>;
 const counter = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const ClaimFrameSchema = LogicalAssignmentRequestFrameSchema.safeExtend({ body: AssignmentClaimSchema });
-export const AssignmentStreamStateSchema = z.object({
+const AssignmentStreamStateSchema = z.object({
   schemaVersion: z.literal(1), ...scope, enrollmentId: id, channelId: id,
   allocatedThrough: counter,
   // Observation advances only through the explicit authenticated ACK owner.
@@ -32,44 +32,49 @@ export const AssignmentStreamStateSchema = z.object({
   .refine(value => value.observedCoreRequestAckSequence <= value.allocatedThrough, "Observed ACK exceeds retained allocation history")
   .refine(value => value.retiredThroughRequestSequence <= value.observedCoreRequestAckSequence, "Retirement exceeds explicit ACK")
   .refine(value => value.compactedThroughReplySequence <= value.nativeConsumedReplySequence, "Reply deletion exceeds consumption");
-export type AssignmentStreamState = z.infer<typeof AssignmentStreamStateSchema>;
+type AssignmentStreamState = z.infer<typeof AssignmentStreamStateSchema>;
 /**
  * One retained outbound request. A claim additionally binds the exact immutable
  * admission it was chosen for; a pull or report has no admission of its own, so
  * requiring one would force the sender to invent identity it does not have.
  */
-export const AssignmentRequestRecordSchema = z.object({
+const AssignmentRequestRecordFieldsSchema = z.object({
   schemaVersion: z.literal(1), ...scope, frame: LogicalAssignmentRequestFrameSchema, digest,
   admission: LocalAdmissionSchema.optional(), admissionDigest: digest.optional(),
   /** Absent only on historical unowned operation allocations. */
   operationId: id.optional(),
-}).strict().superRefine((value, context) => {
+}).strict();
+type AssignmentRequestRecordFields = z.infer<typeof AssignmentRequestRecordFieldsSchema>;
+
+/** Why a stored allocation does not bind its frame (and, for a claim, its admission); empty when it does. */
+function requestRecordProblems(value: AssignmentRequestRecordFields): string[] {
   const { admission, frame } = value;
-  const fail = (message: string) => context.addIssue({ code: "custom", message });
   if (value.digest !== logicalAssignmentRequestDigest(frame) || frame.channelId !== `assignment:${value.instanceId}`) {
-    fail("Stored allocation must bind its exact immutable frame");
-    return;
+    return ["Stored allocation must bind its exact immutable frame"];
   }
   const kind = requestKindOf(frame);
-  if (kind === "claim" && value.operationId !== undefined) fail("Claim ownership belongs to its admission, not an operation");
-  if ((kind === "claim") !== (admission !== undefined)) {
-    fail("Exactly a claim allocation carries its admission");
-    return;
-  }
-  if (!admission) return;
-  const body = frame.body as z.infer<typeof AssignmentClaimSchema>;
-  if (value.admissionDigest !== jcsDigest(admission) ||
-    admission.instanceId !== value.instanceId || admission.workspaceId !== value.workspaceId ||
-    frame.origin.runnerIncarnation !== admission.runnerIncarnation ||
-    body.assignmentId !== admission.assignmentId || body.attempt !== admission.attempt ||
-    body.claimId !== admission.claimId || body.agentId !== admission.agentId) {
-    fail("Stored claim allocation must bind its exact immutable admission and frame");
-  }
+  const problems = kind === "claim" && value.operationId !== undefined ? ["Claim ownership belongs to its admission, not an operation"] : [];
+  if ((kind === "claim") !== (admission !== undefined)) return [...problems, "Exactly a claim allocation carries its admission"];
+  if (admission && !claimBindsAdmission(value, admission)) problems.push("Stored claim allocation must bind its exact immutable admission and frame");
+  return problems;
+}
+
+function claimBindsAdmission(value: AssignmentRequestRecordFields, admission: NonNullable<AssignmentRequestRecordFields["admission"]>): boolean {
+  const body = value.frame.body as z.infer<typeof AssignmentClaimSchema>;
+  return allEqual([
+    [value.admissionDigest, jcsDigest(admission)], [admission.instanceId, value.instanceId], [admission.workspaceId, value.workspaceId],
+    [value.frame.origin.runnerIncarnation, admission.runnerIncarnation], [body.assignmentId, admission.assignmentId],
+    [body.attempt, admission.attempt], [body.claimId, admission.claimId], [body.agentId, admission.agentId],
+  ]);
+}
+
+export const AssignmentRequestRecordSchema = AssignmentRequestRecordFieldsSchema.superRefine((value, context) => {
+  for (const message of requestRecordProblems(value)) context.addIssue({ code: "custom", message });
 });
 export type AssignmentRequestRecord = z.infer<typeof AssignmentRequestRecordSchema>;
 
 /** The operation a retained frame carries; the body's own shape decides it. */
-export function requestKindOf(frame: z.infer<typeof LogicalAssignmentRequestFrameSchema>): "pull" | "claim" | "report" {
+function requestKindOf(frame: z.infer<typeof LogicalAssignmentRequestFrameSchema>): "pull" | "claim" | "report" {
   const body = frame.body as Record<string, unknown>;
   if ("maxItems" in body) return "pull";
   if ("reportId" in body) return "report";
@@ -97,11 +102,11 @@ const OperationEffectSchema = z.discriminatedUnion("state", [
 const RetryAfterSchema = z.object({ request: AssignmentRequestReferenceSchema, response: LocalResponseReferenceSchema }).strict();
 const operationBase = { schemaVersion: z.literal(1), ...scope, operationId: id,
   request: AssignmentRequestReferenceSchema, effect: OperationEffectSchema };
-export const AssignmentOperationSchema = z.discriminatedUnion("kind", [
+const AssignmentOperationSchema = z.discriminatedUnion("kind", [
   z.object({ ...operationBase, kind: z.literal("pull") }).strict(),
   z.object({ ...operationBase, kind: z.literal("report"), report: ReportOperationOwnerSchema, retryAfter: RetryAfterSchema.optional() }).strict(),
 ]);
-export type AssignmentOperation = z.infer<typeof AssignmentOperationSchema>;
+type AssignmentOperation = z.infer<typeof AssignmentOperationSchema>;
 export const AssignmentOperationRecordSchema = z.object({ kind: z.literal("assignment_operation"), value: AssignmentOperationSchema }).strict();
 export const AssignmentReplyRecordValueSchema = z.object({
   schemaVersion: z.literal(2), ...scope,
@@ -134,7 +139,7 @@ const OperationInputSchema = z.discriminatedUnion("kind", [
 ]);
 const FreshPullInputSchema = z.object({ ...scope, runnerIncarnation: id, origin: AssignmentRequestOriginSchema,
   issuedAt: z.string().datetime(), body: AssignmentPullSchema }).strict();
-export const LOCAL_ASSIGNMENT_ALLOCATION_LIMITS = { maxRequests: 2048, maxBytes: 16 * 1024 * 1024 } as const;
+const LOCAL_ASSIGNMENT_ALLOCATION_LIMITS = { maxRequests: 2048, maxBytes: 16 * 1024 * 1024 } as const;
 const TRANSPORT_RECEIPT_LIMITS = { maxRecords: 16_384, maxBytes: 64 * 1024 * 1024 } as const;
 const ReceiptLimitsSchema = z.object({
   maxRecords: z.number().int().min(1).max(TRANSPORT_RECEIPT_LIMITS.maxRecords),
@@ -161,108 +166,224 @@ function bytes(value: unknown): number { return Buffer.byteLength(canonicalize(v
 function recovery(): RemoteInstanceError { return new RemoteInstanceError("recovery_required", "Assignment stream recovery requires complete, consistent retained allocation history."); }
 function retired(): RemoteInstanceError { return new RemoteInstanceError("assignment_replay_retired", "The submitted sequence is below the durable retirement floor; no retained digest comparison is asserted."); }
 
+type StreamIndex = {
+  head?: AssignmentStreamState;
+  requests: Map<number, AssignmentRequestRecord>;
+  replies: Map<number, StoredAssignmentReplyRecordValue>;
+  repliesByRequest: Map<number, StoredAssignmentReplyRecordValue>;
+  operations: Map<string, AssignmentOperation>;
+  retainedBytes: number;
+  receiptBytes: number;
+  receiptCount: number;
+};
+type StreamState = StreamIndex & { head: AssignmentStreamState };
+type ExecutionRow<K extends LocalExecutionRecord["kind"]> = Extract<LocalExecutionRecord, { kind: K }>;
+type StartRow = ExecutionRow<"admission_start">;
+type ReportOperation = Extract<AssignmentOperation, { kind: "report" }>;
+
+function emptyStreamIndex(): StreamIndex {
+  return { requests: new Map(), replies: new Map(), repliesByRequest: new Map(), operations: new Map(), retainedBytes: 0, receiptBytes: 0, receiptCount: 0 };
+}
+
+function inStreamScope(value: Scope, head: AssignmentStreamState): boolean {
+  return value.instanceId === head.instanceId && value.workspaceId === head.workspaceId;
+}
+
+/** Every sequence in `from..through` is present. */
+function assertContiguous(from: number, through: number, present: (sequence: number) => boolean): void {
+  for (let sequence = from; sequence <= through; sequence++) if (!present(sequence)) throw recovery();
+}
+
 /** Validate all retained relations before a stream or execution guard can authorize.
  * Only the durable floors permit absent transport records. Required domain
  * evidence below those floors remains fully validated and is never evicted.
  */
-export function validateAssignmentStreamRecords(records: readonly LocalExecutionRecord[]): { head?: AssignmentStreamState; requests: Map<number, AssignmentRequestRecord>; replies: Map<number, StoredAssignmentReplyRecordValue>; repliesByRequest: Map<number, StoredAssignmentReplyRecordValue>; operations: Map<string, AssignmentOperation>; retainedBytes: number; receiptBytes: number; receiptCount: number } {
-  const enrollment = records.find(record => record.kind === "enrollment_bound");
-  const heads = records.filter(record => record.kind === "assignment_stream");
-  const allocations = records.filter(record => record.kind === "assignment_request");
-  const handled = records.filter(record => record.kind === "assignment_reply");
-  const starts = records.filter(record => record.kind === "admission_start");
-  const operationRows = records.filter(record => record.kind === "assignment_operation");
-  const versioned = enrollment?.kind === "enrollment_bound" && enrollment.value.assignmentStreamVersion === 1;
-  if (!versioned) {
-    if (heads.length || allocations.length || handled.length || operationRows.length || starts.some(record => record.value.delivery === "allocated")) throw recovery();
-    return { requests: new Map(), replies: new Map(), repliesByRequest: new Map(), operations: new Map(), retainedBytes: 0, receiptBytes: 0, receiptCount: 0 };
+export function validateAssignmentStreamRecords(records: readonly LocalExecutionRecord[]): StreamIndex {
+  return new StreamValidation(records).validate();
+}
+
+/** One pass over the execution log's stream rows, in the order the checks must fail. */
+class StreamValidation {
+  private readonly enrollment: LocalExecutionRecord | undefined;
+  private readonly heads: LocalExecutionRecord[];
+  private readonly allocations: LocalExecutionRecord[];
+  private readonly handled: LocalExecutionRecord[];
+  private readonly starts: StartRow[];
+  private readonly operationRows: Array<ExecutionRow<"assignment_operation">>;
+
+  constructor(records: readonly LocalExecutionRecord[]) {
+    this.enrollment = records.find(record => record.kind === "enrollment_bound");
+    this.heads = records.filter(record => record.kind === "assignment_stream");
+    this.allocations = records.filter(record => record.kind === "assignment_request");
+    this.handled = records.filter(record => record.kind === "assignment_reply");
+    this.starts = records.filter((record): record is StartRow => record.kind === "admission_start");
+    this.operationRows = records.filter((record): record is ExecutionRow<"assignment_operation"> => record.kind === "assignment_operation");
   }
-  if (heads.length !== 1) throw recovery();
-  const head = AssignmentStreamStateSchema.parse(heads[0]!.value);
-  if (head.instanceId !== enrollment.value.instanceId || head.workspaceId !== enrollment.value.workspaceId || head.enrollmentId !== enrollment.value.enrollmentId ||
-    head.allocatedThrough - head.retiredThroughRequestSequence > LOCAL_ASSIGNMENT_ALLOCATION_LIMITS.maxRequests) throw recovery();
-  const requests = new Map<number, AssignmentRequestRecord>();
-  const admissions = new Set<string>();
-  let retainedBytes = 0;
-  for (const record of allocations) {
-    const request = AssignmentRequestRecordSchema.parse(record.value);
-    if (request.instanceId !== head.instanceId || request.workspaceId !== head.workspaceId || request.frame.seq > head.allocatedThrough || requests.has(request.frame.seq)) throw recovery();
-    // Only a claim occupies an admission identity; a pull or report names none,
-    // so at most one acceptance-unresolved claim exists per admission.
-    if (request.admission) {
-      const identity = JSON.stringify([request.admission.assignmentId, request.admission.attempt]);
-      if (admissions.has(identity)) throw recovery();
-      const start = starts.find(row => same(row.value.admission, request.admission));
-      if (!start || start.value.delivery !== "allocated" || !same(start.value.allocation, allocationReference(request))) throw recovery();
-      admissions.add(identity);
+
+  validate(): StreamIndex {
+    const enrollment = this.enrollment?.kind === "enrollment_bound" && this.enrollment.value.assignmentStreamVersion === 1 ? this.enrollment.value : null;
+    if (enrollment === null) {
+      this.assertNoStreamHistory();
+      return emptyStreamIndex();
     }
-    requests.set(request.frame.seq, request);
-    if (request.frame.seq > head.retiredThroughRequestSequence) retainedBytes += bytes(request);
+    const head = this.boundHead(enrollment);
+    const { requests, retainedBytes } = this.retainedRequests(head);
+    this.assertAllocatedStarts(requests);
+    const { replies, repliesByRequest } = this.consumedReplies(head, requests);
+    const { receiptBytes, receiptCount } = receiptUsage(head, replies);
+    this.assertClaimEffects(repliesByRequest);
+    const operations = this.retainedOperations(head, requests, repliesByRequest);
+    return { head, requests, replies, repliesByRequest, operations, retainedBytes, receiptBytes, receiptCount };
   }
-  if (retainedBytes > LOCAL_ASSIGNMENT_ALLOCATION_LIMITS.maxBytes) throw recovery();
-  for (let sequence = head.retiredThroughRequestSequence + 1; sequence <= head.allocatedThrough; sequence++) if (!requests.has(sequence)) throw recovery();
-  for (const start of starts) {
-    if (start.value.delivery !== "allocated") continue;
-    const request = start.value.allocation && requests.get(start.value.allocation.requestSequence);
-    if (!request || !same(request.admission, start.value.admission) || !same(allocationReference(request), start.value.allocation)) throw recovery();
+
+  private assertNoStreamHistory(): void {
+    if (this.heads.length || this.allocations.length || this.handled.length || this.operationRows.length ||
+      this.starts.some(record => record.value.delivery === "allocated")) throw recovery();
   }
-  // Consumed replies are contiguous from 1 and each names a retained request.
-  const replies = new Map<number, StoredAssignmentReplyRecordValue>();
-  const repliesByRequest = new Map<number, StoredAssignmentReplyRecordValue>();
-  const correlated = new Set<number>();
-  for (const record of handled) {
-    const value = StoredAssignmentReplyRecordValueSchema.parse(record.value);
-    const request = requests.get(value.request.requestSequence);
-    if (value.instanceId !== head.instanceId || value.workspaceId !== head.workspaceId || !request ||
-      request.digest !== value.request.requestDigest || replies.has(value.response.sequence) ||
-      correlated.has(value.request.requestSequence) || value.response.sequence > head.nativeConsumedReplySequence) throw recovery();
-    assertReplyIdentity(request, value);
-    replies.set(value.response.sequence, value); correlated.add(value.request.requestSequence);
-    repliesByRequest.set(value.request.requestSequence, value);
+
+  private boundHead(enrollment: ExecutionRow<"enrollment_bound">["value"]): AssignmentStreamState {
+    if (this.heads.length !== 1) throw recovery();
+    const head = AssignmentStreamStateSchema.parse(this.heads[0]!.value);
+    if (!allEqual([[head.instanceId, enrollment.instanceId], [head.workspaceId, enrollment.workspaceId], [head.enrollmentId, enrollment.enrollmentId]]) ||
+      head.allocatedThrough - head.retiredThroughRequestSequence > LOCAL_ASSIGNMENT_ALLOCATION_LIMITS.maxRequests) throw recovery();
+    return head;
   }
-  if (head.nativeConsumedReplySequence - head.compactedThroughReplySequence > TRANSPORT_RECEIPT_LIMITS.maxRecords) throw recovery();
+
+  private retainedRequests(head: AssignmentStreamState): { requests: Map<number, AssignmentRequestRecord>; retainedBytes: number } {
+    const requests = new Map<number, AssignmentRequestRecord>();
+    const admissions = new Set<string>();
+    let retainedBytes = 0;
+    for (const record of this.allocations) {
+      const request = AssignmentRequestRecordSchema.parse(record.value);
+      if (!inStreamScope(request, head) || request.frame.seq > head.allocatedThrough || requests.has(request.frame.seq)) throw recovery();
+      // Only a claim occupies an admission identity; a pull or report names none,
+      // so at most one acceptance-unresolved claim exists per admission.
+      if (request.admission) this.assertClaimAdmission(request, request.admission, admissions);
+      requests.set(request.frame.seq, request);
+      if (request.frame.seq > head.retiredThroughRequestSequence) retainedBytes += bytes(request);
+    }
+    if (retainedBytes > LOCAL_ASSIGNMENT_ALLOCATION_LIMITS.maxBytes) throw recovery();
+    assertContiguous(head.retiredThroughRequestSequence + 1, head.allocatedThrough, sequence => requests.has(sequence));
+    return { requests, retainedBytes };
+  }
+
+  private assertClaimAdmission(request: AssignmentRequestRecord, admission: NonNullable<AssignmentRequestRecord["admission"]>, admissions: Set<string>): void {
+    const identity = JSON.stringify([admission.assignmentId, admission.attempt]);
+    if (admissions.has(identity)) throw recovery();
+    const start = this.starts.find(row => same(row.value.admission, admission));
+    if (!start || start.value.delivery !== "allocated" || !same(start.value.allocation, allocationReference(request))) throw recovery();
+    admissions.add(identity);
+  }
+
+  private assertAllocatedStarts(requests: Map<number, AssignmentRequestRecord>): void {
+    for (const start of this.starts) {
+      if (start.value.delivery !== "allocated") continue;
+      const request = start.value.allocation && requests.get(start.value.allocation.requestSequence);
+      if (!request || !same(request.admission, start.value.admission) || !same(allocationReference(request), start.value.allocation)) throw recovery();
+    }
+  }
+
+  /** Consumed replies are contiguous from 1 and each names a retained request. */
+  private consumedReplies(head: AssignmentStreamState, requests: Map<number, AssignmentRequestRecord>): { replies: Map<number, StoredAssignmentReplyRecordValue>; repliesByRequest: Map<number, StoredAssignmentReplyRecordValue> } {
+    const replies = new Map<number, StoredAssignmentReplyRecordValue>();
+    const repliesByRequest = new Map<number, StoredAssignmentReplyRecordValue>();
+    for (const record of this.handled) {
+      const value = StoredAssignmentReplyRecordValueSchema.parse(record.value);
+      const request = requests.get(value.request.requestSequence);
+      if (!request || foreignReply(value, request, head) || replies.has(value.response.sequence) || repliesByRequest.has(value.request.requestSequence)) throw recovery();
+      assertReplyIdentity(request, value);
+      replies.set(value.response.sequence, value);
+      repliesByRequest.set(value.request.requestSequence, value);
+    }
+    if (head.nativeConsumedReplySequence - head.compactedThroughReplySequence > TRANSPORT_RECEIPT_LIMITS.maxRecords) throw recovery();
+    return { replies, repliesByRequest };
+  }
+
+  private assertClaimEffects(repliesByRequest: Map<number, StoredAssignmentReplyRecordValue>): void {
+    for (const start of this.starts) {
+      if (!start.value.claimEffect) continue;
+      const receipt = start.value.allocation && repliesByRequest.get(start.value.allocation.requestSequence);
+      if (!receipt || !verified(receipt) || receipt.request.requestKind !== "claim" || !same(receipt.response, start.value.claimEffect.response)) throw recovery();
+    }
+  }
+
+  private retainedOperations(head: AssignmentStreamState, requests: Map<number, AssignmentRequestRecord>, repliesByRequest: Map<number, StoredAssignmentReplyRecordValue>): Map<string, AssignmentOperation> {
+    const operations = new Map<string, AssignmentOperation>();
+    const reportHeads = new Map<string, ReportOperation>();
+    let pendingPulls = 0;
+    for (const row of this.operationRows.sort((a, b) => a.value.request.requestSequence - b.value.request.requestSequence)) {
+      const operation = AssignmentOperationSchema.parse(row.value);
+      const request = operationRequest(operation, requests, head, operations);
+      assertOperationEffect(operation.effect, repliesByRequest.get(request.frame.seq));
+      if (operation.kind === "pull") pendingPulls += operation.effect.state === "applied" ? 0 : 1;
+      else assertReportChain(operation, request, reportHeads, { requests, repliesByRequest });
+      operations.set(operation.operationId, operation);
+    }
+    assertOperationOwners(operations, requests, pendingPulls);
+    return operations;
+  }
+}
+
+/** A stored reply outside the stream's scope, for another request's bytes, or beyond the consumed cursor. */
+function foreignReply(value: StoredAssignmentReplyRecordValue, request: AssignmentRequestRecord, head: AssignmentStreamState): boolean {
+  return !inStreamScope(value, head) || request.digest !== value.request.requestDigest || value.response.sequence > head.nativeConsumedReplySequence;
+}
+
+/** Retained receipts of unretired requests, by bytes and count, within their limits and contiguous past the compaction floor. */
+function receiptUsage(head: AssignmentStreamState, replies: Map<number, StoredAssignmentReplyRecordValue>): { receiptBytes: number; receiptCount: number } {
   let receiptBytes = 0;
   let receiptCount = 0;
   for (const value of replies.values()) {
-    if (value.response.sequence <= head.compactedThroughReplySequence && value.request.requestSequence > head.retiredThroughRequestSequence) throw recovery();
-    if (value.request.requestSequence > head.retiredThroughRequestSequence) { receiptBytes += bytes(value); receiptCount++; }
+    const retainedRequest = value.request.requestSequence > head.retiredThroughRequestSequence;
+    if (value.response.sequence <= head.compactedThroughReplySequence && retainedRequest) throw recovery();
+    if (retainedRequest) { receiptBytes += bytes(value); receiptCount++; }
   }
   if (receiptBytes > TRANSPORT_RECEIPT_LIMITS.maxBytes) throw recovery();
-  for (let sequence = head.compactedThroughReplySequence + 1; sequence <= head.nativeConsumedReplySequence; sequence++) if (!replies.has(sequence)) throw recovery();
-  for (const start of starts) {
-    if (!start.value.claimEffect) continue;
-    const receipt = start.value.allocation && repliesByRequest.get(start.value.allocation.requestSequence);
-    if (!receipt || !verified(receipt) || receipt.request.requestKind !== "claim" || !same(receipt.response, start.value.claimEffect.response)) throw recovery();
-  }
-  const operations = new Map<string, AssignmentOperation>();
-  let pendingPulls = 0;
-  const reportHeads = new Map<string, AssignmentOperation>();
-  for (const row of operationRows.sort((a, b) => a.value.request.requestSequence - b.value.request.requestSequence)) {
-    const operation = AssignmentOperationSchema.parse(row.value);
-    const request = requests.get(operation.request.requestSequence);
-    if (operations.has(operation.operationId) || operation.instanceId !== head.instanceId || operation.workspaceId !== head.workspaceId ||
-      !request || request.operationId !== operation.operationId || !same(operation.request, allocationReference(request)) || operation.kind !== requestKindOf(request.frame)) throw recovery();
-    const receipt = repliesByRequest.get(request.frame.seq);
-    if (operation.effect.state !== "pending" && (!receipt || !verified(receipt) || !same(operation.effect.response, receipt.response))) throw recovery();
-    if (operation.kind === "pull") {
-      if (operation.effect.state !== "applied") pendingPulls++;
-    } else {
-      assertReportOwner(operation.report, request.frame.body as z.infer<typeof AssignmentReportSchema>);
-      const previous = reportHeads.get(operation.report.reportId);
-      if (operation.retryAfter) {
-        if (!previous || previous.kind !== "report" || !same(previous.report, operation.report) || !same(previous.request, operation.retryAfter.request) ||
-          previous.request.requestSequence >= operation.request.requestSequence) throw recovery();
-        const previousReply = repliesByRequest.get(previous.request.requestSequence);
-        if (!previousReply || !verified(previousReply) || !same(previousReply.response, operation.retryAfter.response) || !isReportGap(previousReply) ||
-          !same(requests.get(previous.request.requestSequence)?.frame.body, request.frame.body)) throw recovery();
-      } else if (previous) throw recovery();
-      reportHeads.set(operation.report.reportId, operation);
-    }
-    operations.set(operation.operationId, operation);
-  }
+  assertContiguous(head.compactedThroughReplySequence + 1, head.nativeConsumedReplySequence, sequence => replies.has(sequence));
+  return { receiptBytes, receiptCount };
+}
+
+/** The retained request an operation owns, with its exact reference and kind. */
+function operationRequest(operation: AssignmentOperation, requests: Map<number, AssignmentRequestRecord>, head: AssignmentStreamState, operations: Map<string, AssignmentOperation>): AssignmentRequestRecord {
+  const request = requests.get(operation.request.requestSequence);
+  if (operations.has(operation.operationId) || !inStreamScope(operation, head) || !request || request.operationId !== operation.operationId ||
+    !same(operation.request, allocationReference(request)) || operation.kind !== requestKindOf(request.frame)) throw recovery();
+  return request;
+}
+
+/** An effect past pending names the verified reply it applies. */
+function assertOperationEffect(effect: AssignmentOperation["effect"], receipt: StoredAssignmentReplyRecordValue | undefined): void {
+  if (effect.state !== "pending" && (!receipt || !verified(receipt) || !same(effect.response, receipt.response))) throw recovery();
+}
+
+/** A report's operations form one chain: each retry follows the previous attempt's sequence-gap reply with the same body. */
+function assertReportChain(operation: ReportOperation, request: AssignmentRequestRecord, reportHeads: Map<string, ReportOperation>, retained: Pick<StreamIndex, "requests" | "repliesByRequest">): void {
+  assertReportOwner(operation.report, request.frame.body as z.infer<typeof AssignmentReportSchema>);
+  const previous = reportHeads.get(operation.report.reportId);
+  if (operation.retryAfter) assertRetryOf(operation, operation.retryAfter, previous, request, retained);
+  else if (previous) throw recovery();
+  reportHeads.set(operation.report.reportId, operation);
+}
+
+function assertRetryOf(operation: ReportOperation, retryAfter: NonNullable<ReportOperation["retryAfter"]>, previous: ReportOperation | undefined, request: AssignmentRequestRecord, retained: Pick<StreamIndex, "requests" | "repliesByRequest">): void {
+  if (!previous || !same(previous.report, operation.report) || !same(previous.request, retryAfter.request) ||
+    previous.request.requestSequence >= operation.request.requestSequence) throw recovery();
+  assertGapReply(previous.request.requestSequence, retryAfter, request, retained);
+}
+
+/** The retried attempt's verified reply was a sequence gap, and the retry sends the same report body. */
+function assertGapReply(previousSequence: number, retryAfter: NonNullable<ReportOperation["retryAfter"]>, request: AssignmentRequestRecord, retained: Pick<StreamIndex, "requests" | "repliesByRequest">): void {
+  const previousReply = retained.repliesByRequest.get(previousSequence);
+  if (!previousReply || !verified(previousReply) || !same(previousReply.response, retryAfter.response)) throw recovery();
+  if (!isReportGap(previousReply) || !same(retained.requests.get(previousSequence)?.frame.body, request.frame.body)) throw recovery();
+}
+
+/** At most one pull in flight, and every operation-owned request is that operation's own. */
+function assertOperationOwners(operations: Map<string, AssignmentOperation>, requests: Map<number, AssignmentRequestRecord>, pendingPulls: number): void {
   if (pendingPulls > 1 || operations.size > requests.size) throw recovery();
-  for (const request of requests.values()) if (request.operationId && operations.get(request.operationId)?.request.requestSequence !== request.frame.seq) throw recovery();
-  return { head, requests, replies, repliesByRequest, operations, retainedBytes, receiptBytes, receiptCount };
+  for (const request of requests.values()) {
+    if (request.operationId && operations.get(request.operationId)?.request.requestSequence !== request.frame.seq) throw recovery();
+  }
 }
 
 function assertReportOwner(owner: z.infer<typeof ReportOperationOwnerSchema>, body: z.infer<typeof AssignmentReportSchema>): void {
@@ -276,7 +397,7 @@ function isReportGap(reply: AssignmentReplyRecordValue): boolean {
 /** Facade on the SAME local execution log; no independent file, lock or send owner. */
 export class AssignmentStreamJournal {
   private revision = -1;
-  private indexed: ReturnType<typeof validateAssignmentStreamRecords> = { requests: new Map(), replies: new Map(), repliesByRequest: new Map(), operations: new Map(), retainedBytes: 0, receiptBytes: 0, receiptCount: 0 };
+  private indexed: StreamIndex = emptyStreamIndex();
   private readonly limits: z.infer<typeof AllocationLimitsSchema>;
   private readonly receiptLimits: z.infer<typeof ReceiptLimitsSchema>;
   constructor(private readonly log: ExecutionLog, private readonly execution: LocalExecutionJournal,
@@ -286,7 +407,7 @@ export class AssignmentStreamJournal {
     this.receiptLimits = ReceiptLimitsSchema.parse(receiptLimits);
   }
 
-  private index(scopeInput: Scope): ReturnType<typeof validateAssignmentStreamRecords> {
+  private index(scopeInput: Scope): StreamIndex {
     const wanted = ScopeSchema.parse(scopeInput);
     if (this.revision !== this.log.revision) {
       // This also checks existing admission/execution/reference invariants.
@@ -297,7 +418,7 @@ export class AssignmentStreamJournal {
     return this.indexed;
   }
 
-  private state(scopeInput: Scope, allowLegacyForReplay = false): ReturnType<typeof validateAssignmentStreamRecords> & { head: AssignmentStreamState } {
+  private state(scopeInput: Scope, allowLegacyForReplay = false): StreamState {
     const indexed = this.index(scopeInput);
     if (!indexed.head || (!allowLegacyForReplay && [...indexed.replies.values()].some(value => !verified(value)))) throw recovery();
     return { ...indexed, head: indexed.head };
@@ -360,52 +481,50 @@ export class AssignmentStreamJournal {
     await this.log.rewrite(() => {
       assertOriginalAuthority();
       const state = this.state(wanted);
-      let floor = state.head.retiredThroughRequestSequence;
-      while (floor < state.head.observedCoreRequestAckSequence) {
-        const request = state.requests.get(floor + 1);
-        const receipt = state.repliesByRequest.get(floor + 1);
-        if (!request || !receipt || !verified(receipt) || receipt.response.sequence > state.head.nativeConsumedReplySequence) break;
-        const effect = request.admission
-          ? this.execution.start(request.admission.assignmentId, request.admission.attempt)?.claimEffect
-          : request.operationId ? state.operations.get(request.operationId)?.effect : undefined;
-        // This first slice deliberately blocks on uncertain domain work rather
-        // than invent an independent effect archive or imply it was applied.
-        if (effect?.state !== "applied" || !same(effect.response, receipt.response)) break;
-        floor++;
-      }
-      let replyFloor = state.head.compactedThroughReplySequence;
-      while (replyFloor < state.head.nativeConsumedReplySequence) {
-        const receipt = state.replies.get(replyFloor + 1);
-        if (!receipt || !verified(receipt) || receipt.request.requestSequence > floor) break;
-        replyFloor++;
-      }
-      const removedRequests = new Set<number>();
-      const removedReplies = new Set<number>();
-      const removedOperations = new Set<string>();
-      for (const operation of state.operations.values()) {
-        if (operation.kind !== "pull" || operation.effect.state !== "applied" || operation.request.requestSequence > floor) continue;
-        const receipt = state.repliesByRequest.get(operation.request.requestSequence);
-        if (!receipt || !verified(receipt) || receipt.response.sequence > replyFloor) continue;
-        // A work-bearing pull's durable handoff is not, by itself, a proof
-        // that its offered assignment identities survive independent of it.
-        // This slice reclaims empty polls only; required offers stay retained.
-        if (receipt.frame.body.requestKind !== "pull" || !("assignments" in receipt.frame.body.body) || receipt.frame.body.body.assignments.length !== 0) continue;
-        removedRequests.add(operation.request.requestSequence);
-        removedReplies.add(receipt.response.sequence);
-        removedOperations.add(operation.operationId);
-      }
-      if (floor === state.head.retiredThroughRequestSequence && replyFloor === state.head.compactedThroughReplySequence && !removedRequests.size) return undefined;
-      const next: LocalExecutionRecord[] = this.log.all().filter(record =>
-        !(record.kind === "assignment_request" && removedRequests.has(record.value.frame.seq)) &&
-        !(record.kind === "assignment_reply" && removedReplies.has(record.value.response.sequence)) &&
-        !(record.kind === "assignment_operation" && removedOperations.has(record.value.operationId)),
-      ).map(record => record.kind === "assignment_stream" ? { kind: "assignment_stream", value: {
-        ...state.head, retiredThroughRequestSequence: floor, compactedThroughReplySequence: replyFloor,
-      } } : record);
+      const floor = this.retirementFloor(state);
+      const replyFloor = compactionFloor(state, floor);
+      const removed = emptyPolls(state, floor, replyFloor);
+      if (floor === state.head.retiredThroughRequestSequence && replyFloor === state.head.compactedThroughReplySequence && !removed.requests.size) return undefined;
+      const next = this.retiredLog(state, { floor, replyFloor, removed });
       validateAssignmentStreamRecords(next);
       return next;
     });
     assertOriginalAuthority();
+  }
+
+  /** The highest request sequence below the explicit ACK whose reply and domain effect are both settled. */
+  private retirementFloor(state: StreamState): number {
+    let floor = state.head.retiredThroughRequestSequence;
+    while (floor < state.head.observedCoreRequestAckSequence && this.retirable(state, floor + 1)) floor++;
+    return floor;
+  }
+
+  private retirable(state: StreamState, sequence: number): boolean {
+    const request = state.requests.get(sequence);
+    const receipt = state.repliesByRequest.get(sequence);
+    if (!request || !receipt || !verified(receipt) || receipt.response.sequence > state.head.nativeConsumedReplySequence) return false;
+    const effect = this.effectOf(state, request);
+    // This first slice deliberately blocks on uncertain domain work rather
+    // than invent an independent effect archive or imply it was applied.
+    return effect?.state === "applied" && same(effect.response, receipt.response);
+  }
+
+  /** The domain effect a request's reply drives: its claim's handoff, or its operation's effect. */
+  private effectOf(state: StreamState, request: AssignmentRequestRecord): { state: string; response?: unknown } | undefined {
+    if (request.admission) return this.execution.start(request.admission.assignmentId, request.admission.attempt)?.claimEffect;
+    return request.operationId ? state.operations.get(request.operationId)?.effect : undefined;
+  }
+
+  /** The log without the reclaimed pulls, with the head's floors advanced. */
+  private retiredLog(state: StreamState, retirement: { floor: number; replyFloor: number; removed: ReclaimedPolls }): LocalExecutionRecord[] {
+    const { removed } = retirement;
+    return this.log.all().filter(record =>
+      !(record.kind === "assignment_request" && removed.requests.has(record.value.frame.seq)) &&
+      !(record.kind === "assignment_reply" && removed.replies.has(record.value.response.sequence)) &&
+      !(record.kind === "assignment_operation" && removed.operations.has(record.value.operationId)),
+    ).map(record => record.kind === "assignment_stream" ? { kind: "assignment_stream", value: {
+      ...state.head, retiredThroughRequestSequence: retirement.floor, compactedThroughReplySequence: retirement.replyFloor,
+    } } : record);
   }
 
   request(scopeInput: Scope, sequence: number): AssignmentRequestRecord | undefined {
@@ -446,37 +565,32 @@ export class AssignmentStreamJournal {
       const existing = state.repliesByRequest.get(input.request.requestSequence);
       // New receipts and authority-backed legacy upgrades must fit BEFORE
       // append. Exact verified replay changes no retained facts or byte usage.
-      if (!existing || !verified(existing)) {
-        const nextCount = state.receiptCount + (existing ? 0 : 1);
-        const nextBytes = state.receiptBytes - (existing ? bytes(existing) : 0) + bytes(input);
-        if (nextCount > this.receiptLimits.maxRecords || nextBytes > this.receiptLimits.maxBytes) {
-          throw new RemoteInstanceError("assignment_transport_capacity", "Assignment reply retention is full; authenticated maintenance remains available.");
-        }
-      }
-      if (existing) {
-        // An exact retry publishes no new facts; changed content is a conflict.
-        if (verified(existing)) {
-          if (!same(existing, input)) throw recovery();
-        } else if (!same(existing.request, input.request) || existing.response.sequence !== input.response.sequence ||
-          existing.response.digest !== input.response.digest || !same(existing.body, input.frame.body)) {
-          throw recovery();
-        }
-        // Exact authenticated replay upgrades old evidence with its original
-        // verifiable frame; retain the historical cursor, never fabricate time.
-        accepted = input;
-        return [{ kind: "assignment_reply", value: input }];
-      }
-      if ([...state.replies.values()].some(value => !verified(value))) throw recovery();
-      if (state.replies.has(input.response.sequence) || input.response.sequence !== state.head.nativeConsumedReplySequence + 1) throw recovery();
-      assertReplyIdentity(request, input);
+      if (!existing || !verified(existing)) this.assertReceiptRoom(state, existing, input);
+      const records = existing ? replayedReply(existing, input) : this.appendedReply(state, request, input);
       accepted = input;
-      return [{ kind: "assignment_stream", value: { ...state.head, nativeConsumedReplySequence: input.response.sequence } },
-        { kind: "assignment_reply", value: input },
-        ...(request.admission ? [this.execution.prepareClaimEffect(request.admission, { state: "pending", response: input.response })] : [])];
+      return records;
     });
     assertOriginalAuthority();
     if (!accepted) throw recovery();
     return structuredClone(accepted);
+  }
+
+  private assertReceiptRoom(state: StreamState, existing: StoredAssignmentReplyRecordValue | undefined, input: AssignmentReplyRecordValue): void {
+    const nextCount = state.receiptCount + (existing ? 0 : 1);
+    const nextBytes = state.receiptBytes - (existing ? bytes(existing) : 0) + bytes(input);
+    if (nextCount > this.receiptLimits.maxRecords || nextBytes > this.receiptLimits.maxBytes) {
+      throw new RemoteInstanceError("assignment_transport_capacity", "Assignment reply retention is full; authenticated maintenance remains available.");
+    }
+  }
+
+  /** A new reply: the next consumed sequence, committed with its cursor (and a claim's pending effect). */
+  private appendedReply(state: StreamState, request: AssignmentRequestRecord, input: AssignmentReplyRecordValue): LocalExecutionRecord[] {
+    if ([...state.replies.values()].some(value => !verified(value))) throw recovery();
+    if (state.replies.has(input.response.sequence) || input.response.sequence !== state.head.nativeConsumedReplySequence + 1) throw recovery();
+    assertReplyIdentity(request, input);
+    return [{ kind: "assignment_stream", value: { ...state.head, nativeConsumedReplySequence: input.response.sequence } },
+      { kind: "assignment_reply", value: input },
+      ...(request.admission ? [this.execution.prepareClaimEffect(request.admission, { state: "pending", response: input.response })] : [])];
   }
 
   /**
@@ -505,59 +619,39 @@ export class AssignmentStreamJournal {
     await this.log.batch(() => {
       assertOriginalAuthority();
       const state = this.state({ instanceId: input.instanceId, workspaceId: input.workspaceId });
-      if (input.kind === "pull" && !freshPull && state.head.retiredThroughRequestSequence > 0) throw retired();
-      if (input.origin.runnerIncarnation !== input.runnerIncarnation) throw recovery();
-      if ([...state.requests.values()].some(request => requestKindOf(request.frame) === input.kind && !request.operationId)) throw recovery();
-      const rows = [...state.operations.values()];
-      let existing: AssignmentOperation | undefined;
-      let retryAfter: z.infer<typeof RetryAfterSchema> | undefined;
-      if (input.kind === "pull") {
-        if (input.body.instanceId !== input.instanceId) throw recovery();
-        existing = rows.find(row => row.kind === "pull" && row.effect.state !== "applied");
-      } else {
-        assertReportOwner(input.report, input.body);
-        const owned = rows.filter(row => row.kind === "report" && row.report.reportId === input.report.reportId)
-          .sort((a, b) => b.request.requestSequence - a.request.requestSequence);
-        const latest = owned[0];
-        if (input.retryAfter) {
-          existing = owned.find(row => row.kind === "report" && same(row.retryAfter?.request, input.retryAfter));
-          if (!existing) {
-            if (!latest || latest.kind !== "report" || !same(latest.request, input.retryAfter) || !same(latest.report, input.report)) throw recovery();
-            const receipt = state.repliesByRequest.get(latest.request.requestSequence);
-            if (!receipt || !verified(receipt) || !isReportGap(receipt) || !same(state.requests.get(latest.request.requestSequence)?.frame.body, input.body)) throw recovery();
-            retryAfter = { request: latest.request, response: receipt.response };
-          }
-        } else existing = latest;
-      }
+      assertOperationInput(state, input, freshPull);
+      const { existing, retryAfter } = priorOperation(state, input);
       if (existing) {
-        if (existing.request.requestSequence <= state.head.retiredThroughRequestSequence) throw retired();
-        const request = state.requests.get(existing.request.requestSequence);
-        if (!request || !same(request.frame.origin, input.origin) ||
-          (input.kind === "report" && (existing.kind !== "report" || !same(existing.report, input.report) || !same(request.frame.body, input.body)))) throw recovery();
-        allocated = request;
-        return [{ kind: "assignment_request", value: request }];
+        allocated = reallocated(state, input, existing);
+        return [{ kind: "assignment_request", value: allocated }];
       }
-      if (state.operations.has(input.operationId)) throw recovery();
-      if (state.head.allocatedThrough >= Number.MAX_SAFE_INTEGER || state.head.allocatedThrough - state.head.retiredThroughRequestSequence >= this.limits.maxRequests) throw recovery();
-      const frame = LogicalAssignmentRequestFrameSchema.parse({
-        channel: "assignment", direction: "to_core", channelId: state.head.channelId,
-        seq: state.head.allocatedThrough + 1, issuedAt: input.issuedAt, origin: input.origin, body: input.body,
-      });
-      if (requestKindOf(frame) === "claim") throw recovery();
-      allocated = AssignmentRequestRecordSchema.parse({
-        schemaVersion: 1, instanceId: state.head.instanceId, workspaceId: state.head.workspaceId,
-        frame, digest: logicalAssignmentRequestDigest(frame), operationId: input.operationId,
-      });
-      if (state.retainedBytes + bytes(allocated) > this.limits.maxBytes) throw recovery();
-      const operation = AssignmentOperationSchema.parse({ schemaVersion: 1, instanceId: input.instanceId, workspaceId: input.workspaceId,
-        operationId: input.operationId, kind: input.kind, request: allocationReference(allocated), effect: { state: "pending" },
-        ...(input.kind === "report" ? { report: input.report, ...(retryAfter ? { retryAfter } : {}) } : {}) });
-      return [{ kind: "assignment_stream", value: { ...state.head, allocatedThrough: frame.seq } },
-        { kind: "assignment_request", value: allocated }, { kind: "assignment_operation", value: operation }];
+      const fresh = this.newOperation(state, input, retryAfter);
+      allocated = fresh.allocated;
+      return fresh.records;
     });
     assertOriginalAuthority();
     if (!allocated) throw recovery();
     return structuredClone(allocated);
+  }
+
+  private newOperation(state: StreamState, input: OperationInput, retryAfter: z.infer<typeof RetryAfterSchema> | undefined): { allocated: AssignmentRequestRecord; records: LocalExecutionRecord[] } {
+    if (state.operations.has(input.operationId)) throw recovery();
+    assertAllocationRoom(state, this.limits);
+    const frame = LogicalAssignmentRequestFrameSchema.parse({
+      channel: "assignment", direction: "to_core", channelId: state.head.channelId,
+      seq: state.head.allocatedThrough + 1, issuedAt: input.issuedAt, origin: input.origin, body: input.body,
+    });
+    if (requestKindOf(frame) === "claim") throw recovery();
+    const allocated = AssignmentRequestRecordSchema.parse({
+      schemaVersion: 1, instanceId: state.head.instanceId, workspaceId: state.head.workspaceId,
+      frame, digest: logicalAssignmentRequestDigest(frame), operationId: input.operationId,
+    });
+    if (state.retainedBytes + bytes(allocated) > this.limits.maxBytes) throw recovery();
+    const operation = AssignmentOperationSchema.parse({ schemaVersion: 1, instanceId: input.instanceId, workspaceId: input.workspaceId,
+      operationId: input.operationId, kind: input.kind, request: allocationReference(allocated), effect: { state: "pending" },
+      ...(input.kind === "report" ? { report: input.report, ...(retryAfter ? { retryAfter } : {}) } : {}) });
+    return { allocated, records: [{ kind: "assignment_stream", value: { ...state.head, allocatedThrough: frame.seq } },
+      { kind: "assignment_request", value: allocated }, { kind: "assignment_operation", value: operation }] };
   }
 
   operation(scopeInput: Scope, candidate: AssignmentRequestReference): AssignmentOperation {
@@ -568,26 +662,24 @@ export class AssignmentStreamJournal {
     return structuredClone(operation);
   }
 
-  /** Bounded ordered work on retained intents, independent of domain outbox lifetime. */
-  unresolvedOperations(scopeInput: Scope): AssignmentOperation[] {
-    return structuredClone([...this.state(scopeInput).operations.values()]
-      .filter(operation => operation.effect.state !== "applied")
-      .sort((a, b) => a.request.requestSequence - b.request.requestSequence).slice(0, 32));
-  }
-
   /** One ordered stream; claim ownership stays on its complete admission. */
   unresolvedRequests(scopeInput: Scope): AssignmentRequestRecord[] {
     const state = this.state(scopeInput);
-    return structuredClone([...state.requests.values()].filter(request => {
-      if (request.admission) {
-        const start = this.execution.start(request.admission.assignmentId, request.admission.attempt);
-        if (!start || !same(start.allocation, allocationReference(request))) throw recovery();
-        return start.claimEffect?.state !== "applied";
-      }
-      const operation = request.operationId && state.operations.get(request.operationId);
-      if (!operation) throw recovery();
-      return operation.effect.state !== "applied";
-    }).sort((a, b) => a.frame.seq - b.frame.seq).slice(0, 32));
+    return structuredClone([...state.requests.values()].filter(request => this.unresolved(state, request))
+      .sort((a, b) => a.frame.seq - b.frame.seq).slice(0, 32));
+  }
+
+  private unresolved(state: StreamState, request: AssignmentRequestRecord): boolean {
+    if (request.admission) return this.claimUnresolved(request, request.admission);
+    const operation = request.operationId && state.operations.get(request.operationId);
+    if (!operation) throw recovery();
+    return operation.effect.state !== "applied";
+  }
+
+  private claimUnresolved(request: AssignmentRequestRecord, admission: NonNullable<AssignmentRequestRecord["admission"]>): boolean {
+    const start = this.execution.start(admission.assignmentId, admission.attempt);
+    if (!start || !same(start.allocation, allocationReference(request))) throw recovery();
+    return start.claimEffect?.state !== "applied";
   }
 
   replyForRequest(scopeInput: Scope, candidate: AssignmentRequestReference): AssignmentReplyRecordValue | undefined {
@@ -599,16 +691,22 @@ export class AssignmentStreamJournal {
     return receipt && structuredClone(receipt);
   }
 
+  /** A claim request with its durable reply, and its admission's current effect. */
+  private claimWithReply(scopeInput: Scope, reference: AssignmentRequestReference) {
+    const request = this.request(scopeInput, reference.requestSequence), receipt = this.replyForRequest(scopeInput, reference);
+    if (!request?.admission || !receipt) throw recovery();
+    const effect = this.execution.start(request.admission.assignmentId, request.admission.attempt)?.claimEffect;
+    return { admission: request.admission, receipt, effect };
+  }
+
   async beginClaimEffect(scopeInput: Scope, reference: AssignmentRequestReference, assertCurrent: () => void): Promise<boolean> {
     let apply = false;
     await this.log.batch(() => {
       assertCurrent();
-      const request = this.request(scopeInput, reference.requestSequence), receipt = this.replyForRequest(scopeInput, reference);
-      if (!request?.admission || !receipt) throw recovery();
-      const start = this.execution.start(request.admission.assignmentId, request.admission.attempt);
-      if (!start?.claimEffect || start.claimEffect.state === "applying" || !same(start.claimEffect.response, receipt.response)) throw recovery();
-      apply = start.claimEffect.state === "pending";
-      return [this.execution.prepareClaimEffect(request.admission, { state: apply ? "applying" : "applied", response: receipt.response })];
+      const { admission, receipt, effect } = this.claimWithReply(scopeInput, reference);
+      if (!effect || effect.state === "applying" || !same(effect.response, receipt.response)) throw recovery();
+      apply = effect.state === "pending";
+      return [this.execution.prepareClaimEffect(admission, { state: apply ? "applying" : "applied", response: receipt.response })];
     });
     assertCurrent(); return apply;
   }
@@ -616,11 +714,9 @@ export class AssignmentStreamJournal {
   async finishClaimEffect(scopeInput: Scope, reference: AssignmentRequestReference, assertCurrent: () => void): Promise<void> {
     await this.log.batch(() => {
       assertCurrent();
-      const request = this.request(scopeInput, reference.requestSequence), receipt = this.replyForRequest(scopeInput, reference);
-      if (!request?.admission || !receipt) throw recovery();
-      const start = this.execution.start(request.admission.assignmentId, request.admission.attempt);
-      if (start?.claimEffect?.state !== "applying") throw recovery();
-      return [this.execution.prepareClaimEffect(request.admission, { state: "applied", response: receipt.response })];
+      const { admission, receipt, effect } = this.claimWithReply(scopeInput, reference);
+      if (effect?.state !== "applying") throw recovery();
+      return [this.execution.prepareClaimEffect(admission, { state: "applied", response: receipt.response })];
     });
     assertCurrent();
   }
@@ -654,6 +750,23 @@ export class AssignmentStreamJournal {
     assertCurrent();
   }
 
+  /** An unallocated start with no execution yet, framed by the admission's own runner. */
+  private assertClaimAllocatable(start: { delivery: string }, input: z.infer<typeof AllocationInputSchema>): void {
+    if (start.delivery !== "unallocated" || this.execution.execution(input.admission) || input.origin.runnerIncarnation !== input.admission.runnerIncarnation) throw recovery();
+  }
+
+  private newClaim(state: StreamState, input: z.infer<typeof AllocationInputSchema>): { allocated: AssignmentRequestRecord; records: LocalExecutionRecord[] } {
+    const { assignmentId, attempt, claimId, agentId } = input.admission;
+    const frame = ClaimFrameSchema.parse({ channel: "assignment", direction: "to_core", channelId: state.head.channelId,
+      seq: state.head.allocatedThrough + 1, issuedAt: input.issuedAt, origin: input.origin, body: { assignmentId, attempt, claimId, agentId } });
+    const allocated = AssignmentRequestRecordSchema.parse({ schemaVersion: 1, instanceId: state.head.instanceId, workspaceId: state.head.workspaceId,
+      frame, digest: logicalAssignmentRequestDigest(frame), admission: input.admission, admissionDigest: jcsDigest(input.admission) });
+    if (state.retainedBytes + bytes(allocated) > this.limits.maxBytes) throw recovery();
+    const updatedStart = this.execution.prepareAllocatedStart(input.admission, allocationReference(allocated));
+    return { allocated, records: [{ kind: "assignment_stream", value: { ...state.head, allocatedThrough: frame.seq } },
+      { kind: "assignment_request", value: allocated }, updatedStart] };
+  }
+
   /** Durable allocation only. The caller still owns current send/replay/claim authority. */
   async allocateClaim(candidate: unknown, assertOriginalAuthority: () => void): Promise<AssignmentRequestRecord> {
     const input = AllocationInputSchema.parse(candidate);
@@ -665,29 +778,136 @@ export class AssignmentStreamJournal {
       const start = this.execution.start(input.admission.assignmentId, input.admission.attempt);
       if (!start) throw recovery();
       if (start.delivery === "allocated" && start.allocation) {
-        if (start.allocation.requestSequence <= state.head.retiredThroughRequestSequence) throw retired();
-        const existing = state.requests.get(start.allocation.requestSequence);
-        if (!existing || !same(existing.admission, input.admission) || !same(existing.frame.origin, input.origin) || existing.frame.issuedAt !== input.issuedAt) throw recovery();
-        allocated = existing;
+        allocated = existingClaim(state, start.allocation, input);
         // A retry publishes no new facts, but traverses the same ownership gate.
-        return [{ kind: "assignment_request", value: existing }];
+        return [{ kind: "assignment_request", value: allocated }];
       }
-      if (start.delivery !== "unallocated" || this.execution.execution(input.admission) || input.origin.runnerIncarnation !== input.admission.runnerIncarnation ||
-        state.head.allocatedThrough >= Number.MAX_SAFE_INTEGER || state.head.allocatedThrough - state.head.retiredThroughRequestSequence >= this.limits.maxRequests) throw recovery();
-      const { assignmentId, attempt, claimId, agentId } = input.admission;
-      const frame = ClaimFrameSchema.parse({ channel: "assignment", direction: "to_core", channelId: state.head.channelId,
-        seq: state.head.allocatedThrough + 1, issuedAt: input.issuedAt, origin: input.origin, body: { assignmentId, attempt, claimId, agentId } });
-      allocated = AssignmentRequestRecordSchema.parse({ schemaVersion: 1, instanceId: state.head.instanceId, workspaceId: state.head.workspaceId,
-        frame, digest: logicalAssignmentRequestDigest(frame), admission: input.admission, admissionDigest: jcsDigest(input.admission) });
-      if (state.retainedBytes + bytes(allocated) > this.limits.maxBytes) throw recovery();
-      const updatedStart = this.execution.prepareAllocatedStart(input.admission, allocationReference(allocated));
-      return [{ kind: "assignment_stream", value: { ...state.head, allocatedThrough: frame.seq } },
-        { kind: "assignment_request", value: allocated }, updatedStart];
+      this.assertClaimAllocatable(start, input);
+      assertAllocationRoom(state, this.limits);
+      const fresh = this.newClaim(state, input);
+      allocated = fresh.allocated;
+      return fresh.records;
     });
     assertOriginalAuthority();
     if (!allocated) throw recovery();
     return structuredClone(allocated);
   }
+}
+
+type OperationInput = z.infer<typeof OperationInputSchema>;
+type ReportInput = Extract<OperationInput, { kind: "report" }>;
+type ReclaimedPolls = { requests: Set<number>; replies: Set<number>; operations: Set<string> };
+
+/** The highest consumed reply whose request is retired: everything up to it may be compacted. */
+function compactionFloor(state: StreamState, floor: number): number {
+  let replyFloor = state.head.compactedThroughReplySequence;
+  while (replyFloor < state.head.nativeConsumedReplySequence) {
+    const receipt = state.replies.get(replyFloor + 1);
+    if (!receipt || !verified(receipt) || receipt.request.requestSequence > floor) break;
+    replyFloor++;
+  }
+  return replyFloor;
+}
+
+/** Completed empty polls at or below both floors: the only triples retirement deletes. */
+function emptyPolls(state: StreamState, floor: number, replyFloor: number): ReclaimedPolls {
+  const removed: ReclaimedPolls = { requests: new Set(), replies: new Set(), operations: new Set() };
+  for (const operation of state.operations.values()) {
+    const receipt = reclaimablePoll(state, operation, floor, replyFloor);
+    if (!receipt) continue;
+    removed.requests.add(operation.request.requestSequence);
+    removed.replies.add(receipt.response.sequence);
+    removed.operations.add(operation.operationId);
+  }
+  return removed;
+}
+
+function reclaimablePoll(state: StreamState, operation: AssignmentOperation, floor: number, replyFloor: number): AssignmentReplyRecordValue | null {
+  if (operation.kind !== "pull" || operation.effect.state !== "applied" || operation.request.requestSequence > floor) return null;
+  const receipt = state.repliesByRequest.get(operation.request.requestSequence);
+  if (!receipt || !verified(receipt) || receipt.response.sequence > replyFloor) return null;
+  // A work-bearing pull's durable handoff is not, by itself, a proof
+  // that its offered assignment identities survive independent of it.
+  // This slice reclaims empty polls only; required offers stay retained.
+  return emptyPoll(receipt) ? receipt : null;
+}
+
+function emptyPoll(receipt: AssignmentReplyRecordValue): boolean {
+  const body = receipt.frame.body;
+  return body.requestKind === "pull" && "assignments" in body.body && body.body.assignments.length === 0;
+}
+
+/** An exact retry publishes no new facts; changed content is a conflict. Replay upgrades old evidence with its verifiable frame. */
+function replayedReply(existing: StoredAssignmentReplyRecordValue, input: AssignmentReplyRecordValue): LocalExecutionRecord[] {
+  if (verified(existing)) {
+    if (!same(existing, input)) throw recovery();
+  } else if (!same(existing.request, input.request) || !allEqual([[existing.response.sequence, input.response.sequence], [existing.response.digest, input.response.digest]]) ||
+    !same(existing.body, input.frame.body)) {
+    throw recovery();
+  }
+  // Exact authenticated replay upgrades old evidence with its original
+  // verifiable frame; retain the historical cursor, never fabricate time.
+  return [{ kind: "assignment_reply", value: input }];
+}
+
+function assertOperationInput(state: StreamState, input: OperationInput, freshPull: boolean): void {
+  if (input.kind === "pull" && !freshPull && state.head.retiredThroughRequestSequence > 0) throw retired();
+  if (input.origin.runnerIncarnation !== input.runnerIncarnation) throw recovery();
+  if ([...state.requests.values()].some(request => requestKindOf(request.frame) === input.kind && !request.operationId)) throw recovery();
+}
+
+/** The operation this input repeats, if any; for a business retry of a report, the gap it retries after. */
+function priorOperation(state: StreamState, input: OperationInput): { existing?: AssignmentOperation | undefined; retryAfter?: z.infer<typeof RetryAfterSchema> } {
+  const rows = [...state.operations.values()];
+  if (input.kind === "pull") {
+    if (input.body.instanceId !== input.instanceId) throw recovery();
+    return { existing: rows.find(row => row.kind === "pull" && row.effect.state !== "applied") };
+  }
+  assertReportOwner(input.report, input.body);
+  const owned = rows.filter(row => row.kind === "report" && row.report.reportId === input.report.reportId)
+    .sort((a, b) => b.request.requestSequence - a.request.requestSequence);
+  const latest = owned[0];
+  if (!input.retryAfter) return { existing: latest };
+  const existing = owned.find(row => row.kind === "report" && same(row.retryAfter?.request, input.retryAfter));
+  return existing ? { existing } : { retryAfter: retryAfterGap(state, latest, input) };
+}
+
+function retryAfterGap(state: StreamState, candidate: AssignmentOperation | undefined, input: ReportInput): z.infer<typeof RetryAfterSchema> {
+  const latest = retriedReport(candidate, input);
+  const receipt = state.repliesByRequest.get(latest.request.requestSequence);
+  if (!receipt || !verified(receipt) || !isReportGap(receipt)) throw recovery();
+  if (!same(state.requests.get(latest.request.requestSequence)?.frame.body, input.body)) throw recovery();
+  return { request: latest.request, response: receipt.response };
+}
+
+/** The report's latest attempt, which a business retry must name exactly. */
+function retriedReport(latest: AssignmentOperation | undefined, input: ReportInput): ReportOperation {
+  if (!latest || latest.kind !== "report" || !same(latest.request, input.retryAfter) || !same(latest.report, input.report)) throw recovery();
+  return latest;
+}
+
+/** The retained request of an operation this input repeats: same origin and, for a report, the same owner and body. */
+function reallocated(state: StreamState, input: OperationInput, existing: AssignmentOperation): AssignmentRequestRecord {
+  if (existing.request.requestSequence <= state.head.retiredThroughRequestSequence) throw retired();
+  const request = state.requests.get(existing.request.requestSequence);
+  if (!request || !same(request.frame.origin, input.origin) || (input.kind === "report" && !sameReport(existing, input, request))) throw recovery();
+  return request;
+}
+
+function sameReport(existing: AssignmentOperation, input: ReportInput, request: AssignmentRequestRecord): boolean {
+  return existing.kind === "report" && same(existing.report, input.report) && same(request.frame.body, input.body);
+}
+
+function existingClaim(state: StreamState, allocation: AssignmentRequestReference, input: z.infer<typeof AllocationInputSchema>): AssignmentRequestRecord {
+  if (allocation.requestSequence <= state.head.retiredThroughRequestSequence) throw retired();
+  const existing = state.requests.get(allocation.requestSequence);
+  if (!existing || !same(existing.admission, input.admission) || !same(existing.frame.origin, input.origin) || existing.frame.issuedAt !== input.issuedAt) throw recovery();
+  return existing;
+}
+
+/** Room for one more request: a safe next sequence and fewer than the retained-request limit above the floor. */
+function assertAllocationRoom(state: StreamState, limits: { maxRequests: number }): void {
+  if (state.head.allocatedThrough >= Number.MAX_SAFE_INTEGER || state.head.allocatedThrough - state.head.retiredThroughRequestSequence >= limits.maxRequests) throw recovery();
 }
 
 /**
@@ -703,19 +923,25 @@ function assertReplyIdentity(request: AssignmentRequestRecord, value: StoredAssi
   const body = correlated.body;
   // A refusal or obsolescence is correlated by the transport reference alone.
   if ("kind" in body) return;
-  if (kind === "claim") {
-    const sent = request.frame.body as { assignmentId: string; attempt: number; claimId: string };
-    const verdict = body as { assignmentId: string; attempt: number; claimId: string; outcome: string };
-    if (verdict.assignmentId !== sent.assignmentId || verdict.attempt !== sent.attempt) throw recovery();
-    if (verdict.outcome !== "already_claimed" && verdict.claimId !== sent.claimId) throw recovery();
-    return;
-  }
-  if (kind === "report") {
-    const sent = request.frame.body as { assignmentId: string; attempt: number; claimId: string; reportId: string; reportSequence: number };
-    const ack = body as { assignmentId: string; attempt: number; claimId: string; acknowledged: { reportId: string; reportSequence: number } };
-    if (ack.assignmentId !== sent.assignmentId || ack.attempt !== sent.attempt || ack.claimId !== sent.claimId) throw recovery();
-    if (ack.acknowledged.reportId !== sent.reportId || ack.acknowledged.reportSequence !== sent.reportSequence) throw recovery();
-  }
+  if (kind === "claim") return assertClaimVerdict(request.frame.body as ClaimIdentity, body as ClaimIdentity & { outcome: string });
+  if (kind === "report") assertReportAck(request.frame.body as ReportIdentity, body as ReportAckIdentity);
   // A pull result carries no operation identity beyond its correlation, so a
   // concurrent pull cannot consume another's result by sequence alone.
+}
+
+type ClaimIdentity = { assignmentId: string; attempt: number; claimId: string };
+type ReportIdentity = ClaimIdentity & { reportId: string; reportSequence: number };
+type ReportAckIdentity = ClaimIdentity & { acknowledged: { reportId: string; reportSequence: number } };
+
+/** An `already_claimed` may name another claim; any other verdict is for this exact claim. */
+function assertClaimVerdict(sent: ClaimIdentity, verdict: ClaimIdentity & { outcome: string }): void {
+  if (verdict.assignmentId !== sent.assignmentId || verdict.attempt !== sent.attempt) throw recovery();
+  if (verdict.outcome !== "already_claimed" && verdict.claimId !== sent.claimId) throw recovery();
+}
+
+function assertReportAck(sent: ReportIdentity, ack: ReportAckIdentity): void {
+  if (!allEqual([
+    [ack.assignmentId, sent.assignmentId], [ack.attempt, sent.attempt], [ack.claimId, sent.claimId],
+    [ack.acknowledged.reportId, sent.reportId], [ack.acknowledged.reportSequence, sent.reportSequence],
+  ])) throw recovery();
 }

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { assertInboxCapacity, INBOX_MAX_BYTES, INBOX_MAX_ENTRIES } from "./inbox-capacity.js";
 import { z } from "zod";
 import {
   DiagnosticCarrierCompanionSchema,
@@ -8,7 +9,7 @@ import {
 
 const DeliveryDigestSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 
-/** A bounded, redacted join record for a separately delivered C01 companion. */
+/** A bounded, redacted join record for a separately delivered diagnostic companion. */
 const DiagnosticCompanionInboxRecordBaseSchema = z
   .object({
     version: z.literal(1),
@@ -40,7 +41,7 @@ export type DiagnosticCompanionInboxRecord = z.infer<
 const DiagnosticCompanionInboxInputSchema =
   DiagnosticCompanionInboxRecordBaseSchema.omit({ version: true, receivedAt: true });
 
-export interface DiagnosticCompanionInboxLog {
+interface DiagnosticCompanionInboxLog {
   all(): DiagnosticCompanionInboxRecord[];
   update(
     key: string,
@@ -60,25 +61,16 @@ export function diagnosticCompanionDigest(
 }
 
 /**
- * Durable C01 diagnostic intake. The record is a correlation aid only: it
+ * Durable diagnostic companion intake. The record is a correlation aid only: it
  * cannot admit, retry, acknowledge, fence, or terminate an assignment.
  */
 export class DiagnosticCompanionInbox {
   constructor(
     private readonly log: DiagnosticCompanionInboxLog,
-    private readonly maxEntries = 2_000,
-    private readonly maxBytes = 8 * 1024 * 1024,
+    private readonly maxEntries = INBOX_MAX_ENTRIES,
+    private readonly maxBytes = INBOX_MAX_BYTES,
   ) {
-    if (
-      !Number.isSafeInteger(maxEntries) ||
-      maxEntries < 1 ||
-      maxEntries > 2_000 ||
-      !Number.isSafeInteger(maxBytes) ||
-      maxBytes < 1 ||
-      maxBytes > 8 * 1024 * 1024
-    ) {
-      throw new Error("Diagnostic companion inbox capacity must be bounded");
-    }
+    assertInboxCapacity(maxEntries, maxBytes, "Diagnostic companion inbox capacity must be bounded");
   }
 
   all(): DiagnosticCompanionInboxRecord[] {

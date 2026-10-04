@@ -47,7 +47,7 @@ async function orchestrator(overrides: Partial<ConstructorParameters<typeof Work
   return { work, journal };
 }
 
-describe("integration work kind (external-integration CP2)", () => {
+describe("integration work kind", () => {
   it("is asked for only from a Core that signs contract 7.3 or later", () => {
     expect(acceptedWorkKinds(undefined)).not.toContain("integration");
     expect(acceptedWorkKinds(undefined)).not.toContain("direct");

@@ -70,7 +70,7 @@ export interface PreviewChild {
   once(event: "error", listener: (error: Error) => void): unknown;
 }
 
-export interface PreviewProcessManagerOptions {
+interface PreviewProcessManagerOptions {
   /** Starts `command` through the platform shell. */
   spawn?: (request: { command: string; cwd: string; env: NodeJS.ProcessEnv }) => PreviewChild;
   /** Stops the child and every process it started. */
@@ -92,9 +92,9 @@ export interface PreviewProcessManagerOptions {
   logger?: Logger;
 }
 
-export const PREVIEW_DEFAULT_IDLE_MS = 30 * 60_000;
-export const PREVIEW_DEFAULT_MAX_RUNNING = 3;
-export const PREVIEW_PORT_RANGE = { first: 43_100, last: 43_999 } as const;
+const PREVIEW_DEFAULT_IDLE_MS = 30 * 60_000;
+const PREVIEW_DEFAULT_MAX_RUNNING = 3;
+const PREVIEW_PORT_RANGE = { first: 43_100, last: 43_999 } as const;
 const PREVIEW_HOST = "127.0.0.1";
 const LOG_LINES = 200;
 const LOG_TAIL = 40;
@@ -107,7 +107,7 @@ const RETAINED_ENDED = 32;
  * package-manager homes. Everything else (provider keys, activation
  * material, KONTEKS_*) is left out by construction, not by a denylist.
  */
-export const PREVIEW_ENV_ALLOWLIST: readonly string[] = [
+const PREVIEW_ENV_ALLOWLIST: readonly string[] = [
   "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TMP", "TEMP",
   "NVM_DIR", "VOLTA_HOME", "PNPM_HOME", "BUN_INSTALL", "COREPACK_HOME", "npm_config_cache",
   "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
@@ -117,16 +117,9 @@ export const PREVIEW_ENV_ALLOWLIST: readonly string[] = [
 ];
 
 export function buildPreviewEnv(base: NodeJS.ProcessEnv, path: string, port: number, extra: Record<string, string>): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const name of PREVIEW_ENV_ALLOWLIST) if (base[name] !== undefined) env[name] = base[name];
-  for (const [name, value] of Object.entries(base)) if (value !== undefined && /^LC_[A-Z_]+$/.test(name)) env[name] = value;
-  for (const [name, value] of Object.entries(extra)) {
-    const upper = name.toUpperCase();
-    if (upper === "PATH" || upper === "HOST" || upper === "PORT") continue;
-    env[name] = value;
-  }
   return {
-    ...env,
+    ...inheritedEnv(base),
+    ...repositoryEnv(extra),
     PATH: path,
     HOST: PREVIEW_HOST,
     PORT: String(port),
@@ -135,6 +128,29 @@ export function buildPreviewEnv(base: NodeJS.ProcessEnv, path: string, port: num
     FORCE_COLOR: "0",
     TERM: "dumb",
   };
+}
+
+/** The allowlisted variables and the locale (`LC_*`) of the connector's own environment. */
+function inheritedEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of PREVIEW_ENV_ALLOWLIST) if (base[name] !== undefined) env[name] = base[name];
+  for (const [name, value] of Object.entries(base)) if (value !== undefined && /^LC_[A-Z_]+$/.test(name)) env[name] = value;
+  return env;
+}
+
+/** preview.yaml's `serve.env`, never overriding PATH, HOST or PORT. */
+function repositoryEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(extra)) {
+    const upper = name.toUpperCase();
+    if (upper === "PATH" || upper === "HOST" || upper === "PORT") continue;
+    env[name] = value;
+  }
+  return env;
+}
+
+function activeState(state: PreviewState): boolean {
+  return state === "starting" || state === "running";
 }
 
 interface Entry {
@@ -194,12 +210,12 @@ export class PreviewProcessManager {
   async start(sessionId: string, cwd: string, startedBy: PreviewStarter = "agent"): Promise<PreviewStatus> {
     if (this.closed) return this.refusal(sessionId, "The connector is stopping; previews cannot start now.", "connector_stopping");
     const current = this.entries.get(sessionId);
-    if (current && (current.state === "starting" || current.state === "running") && current.cwd === cwd && !current.stopping) {
+    if (current && reusable(current, cwd)) {
       current.lastActivityAt = this.now();
       return this.view(current);
     }
     if (current) await this.stop(sessionId, "restart");
-    const active = [...this.entries.values()].filter(entry => entry.state === "starting" || entry.state === "running");
+    const active = [...this.entries.values()].filter(entry => activeState(entry.state));
     if (active.length >= this.maxRunning) {
       return this.refusal(sessionId, `${active.length} previews are already running on this computer (the limit is ${this.maxRunning}, to keep it responsive). Stop one with preview_stop, or wait until one stops after ${Math.round(this.idleMs / 60_000)} idle minutes.`, "capacity_exceeded");
     }
@@ -286,7 +302,7 @@ export class PreviewProcessManager {
   async sweepIdle(): Promise<void> {
     const cutoff = this.now() - this.idleMs;
     for (const entry of [...this.entries.values()]) {
-      if ((entry.state === "running" || entry.state === "starting") && entry.lastActivityAt < cutoff && !entry.stopping) {
+      if (activeState(entry.state) && entry.lastActivityAt < cutoff && !entry.stopping) {
         this.logger.info({ event: "preview.idle_stop", idleMs: this.now() - entry.lastActivityAt }, "stopping an idle preview");
         await this.stop(entry.sessionId, "idle");
       }
@@ -294,80 +310,124 @@ export class PreviewProcessManager {
   }
 
   private async launch(entry: Entry): Promise<void> {
-    const current = () => this.entries.get(entry.sessionId) === entry && !entry.stopping && entry.state === "starting";
+    const plan = await this.launchPlan(entry);
+    if (plan === null) return;
+    const address = await this.launchAddress(entry);
+    if (address === null) return;
+    const env = buildPreviewEnv(this.options.env ?? process.env, address.path, address.port, plan.env);
+    const values = { host: PREVIEW_HOST, port: address.port };
+    if (!await this.runSetupPhases(entry, plan, values, env)) return;
+    entry.phase = "serve";
+    entry.message = `Starting the dev server on ${PREVIEW_HOST}:${address.port}.`;
+    const watch = this.serve(entry, substitutePreviewVariables(plan.command, values), env);
+    await this.awaitReady(entry, plan, address.port, watch);
+  }
+
+  /** Still the session's preview, starting, and not being stopped. */
+  private isCurrent(entry: Entry): boolean {
+    return this.entries.get(entry.sessionId) === entry && !entry.stopping && entry.state === "starting";
+  }
+
+  /** How to serve the working copy; null once it failed (or the attempt was replaced). */
+  private async launchPlan(entry: Entry): Promise<PreviewPlan | null> {
     const planned = await (this.options.resolvePlan ?? resolvePreviewPlan)(entry.cwd);
-    if (!current()) return;
+    if (!this.isCurrent(entry)) return null;
     if (!planned.ok) {
       entry.notes = planned.notes;
-      return this.fail(entry, planned.message, { code: planned.message === CONVERSATION_HAS_NO_APP ? "no_app" : "plan_unavailable", phase: null });
+      this.fail(entry, planned.message, { code: planned.message === CONVERSATION_HAS_NO_APP ? "no_app" : "plan_unavailable", phase: null });
+      return null;
     }
-    const plan = planned.plan;
-    entry.plan = plan;
-    entry.notes = plan.notes;
-    for (const [phase, command] of [["install", plan.install], ["prepare", plan.prepare], ["serve", plan.command]] as const) {
-      if (command === undefined) continue;
-      const hit = blockedCommandPattern(command, DEFAULT_BASH_BLOCKLIST);
-      if (hit) return this.fail(entry, `The ${phase} command is refused by this computer's command policy ("${hit.trim()}"). Change it in .konteks/preview.yaml.`, { code: "command_refused", phase });
+    entry.plan = planned.plan;
+    entry.notes = planned.plan.notes;
+    const refused = refusedPhase(planned.plan);
+    if (refused !== undefined) {
+      this.fail(entry, refused.message, { code: "command_refused", phase: refused.phase });
+      return null;
     }
+    return planned.plan;
+  }
+
+  /** The person's PATH and a free port; null when the attempt was replaced meanwhile. */
+  private async launchAddress(entry: Entry): Promise<{ path: string; port: number } | null> {
     const path = await this.userPath();
-    if (!current()) return;
+    if (!this.isCurrent(entry)) return null;
     const inUse = new Set([...this.entries.values()].map(candidate => candidate.port).filter((port): port is number => port !== null));
     const port = await (this.options.allocatePort ?? allocatePreviewPort)(inUse);
-    if (!current()) return;
+    if (!this.isCurrent(entry)) return null;
     entry.port = port;
-    const env = buildPreviewEnv(this.options.env ?? process.env, path, port, plan.env);
-    const values = { host: PREVIEW_HOST, port };
+    return { path, port };
+  }
+
+  /** Install, then prepare, when the plan has them; false once one failed or the attempt was replaced. */
+  private async runSetupPhases(entry: Entry, plan: PreviewPlan, values: { host: string; port: number }, env: NodeJS.ProcessEnv): Promise<boolean> {
     for (const phase of ["install", "prepare"] as const) {
       const command = plan[phase];
       if (command === undefined) continue;
       entry.phase = phase;
       entry.message = phase === "install" ? "Installing dependencies before the dev server starts." : "Running the prepare step before the dev server starts.";
       const code = await this.runPhase(entry, substitutePreviewVariables(command, values), env);
-      if (!current()) return;
-      if (code !== 0) return this.fail(entry, `The ${phase} step (${command}) ${code === null ? "timed out" : `exited with code ${code}`}. See the log lines.`, { code: "step_failed", phase, exitCode: code, timedOut: code === null });
+      if (!this.isCurrent(entry)) return false;
+      if (code !== 0) {
+        this.fail(entry, `The ${phase} step (${command}) ${code === null ? "timed out" : `exited with code ${code}`}. See the log lines.`, { code: "step_failed", phase, exitCode: code, timedOut: code === null });
+        return false;
+      }
     }
-    entry.phase = "serve";
-    entry.message = `Starting the dev server on ${PREVIEW_HOST}:${port}.`;
-    const child = this.spawnChild(entry, substitutePreviewVariables(plan.command, values), env);
+    return true;
+  }
+
+  /** Starts the dev server; the returned watch records its exit. */
+  private serve(entry: Entry, command: string, env: NodeJS.ProcessEnv): ServeWatch {
+    const child = this.spawnChild(entry, command, env);
     entry.child = child;
-    let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    const watch: ServeWatch = { exited: null };
     child.once("exit", (code, signal) => {
-      exited = { code, signal };
+      watch.exited = { code, signal };
       void this.options.registry?.forget(child.pid);
       if (this.entries.get(entry.sessionId) !== entry || entry.stopping) return;
       if (entry.state === "running") this.fail(entry, `The dev server stopped unexpectedly (${describeExit(code, signal)}). Call preview_start to start it again.`, { code: "server_exited", phase: "serve", exitCode: code });
     });
     child.once("error", error => {
-      exited ??= { code: null, signal: null };
+      watch.exited ??= { code: null, signal: null };
       this.appendLog(entry, `[connector] ${error.message}`);
     });
     if (child.pid !== undefined) void this.options.registry?.record(child.pid);
+    return watch;
+  }
+
+  /** Probes until the dev server answers, exits, or misses its readiness deadline. */
+  private async awaitReady(entry: Entry, plan: PreviewPlan, port: number, watch: ServeWatch): Promise<void> {
     const readiness = plan.readinessTimeoutMs ?? this.options.readinessTimeoutMs ?? 180_000;
     const deadline = this.now() + readiness;
-    const probe = this.options.probe ?? probeHttp;
     const interval = this.options.probeIntervalMs ?? 500;
-    while (current()) {
-      if (exited) {
-        const ended = exited as { code: number | null; signal: NodeJS.Signals | null };
-        return this.fail(entry, `The dev server exited before it answered (${describeExit(ended.code, ended.signal)}). See the log lines.`, { code: "server_exited", phase: "serve", exitCode: ended.code });
-      }
-      for (const host of [PREVIEW_HOST, "::1"]) {
-        if (await probe(host, port, plan.healthPath).catch(() => false)) {
-          if (!current()) return;
-          entry.host = host;
-          entry.state = "running";
-          entry.readyAt = this.now();
-          entry.message = `Running. Open http://${PREVIEW_HOST}:${port}${plan.healthPath === "/" ? "" : plan.healthPath} on this computer, or open the preview from the session in Konteks.`;
-          this.logger.info({ event: "preview.ready", sessionId: entry.sessionId, source: plan.source, startupMs: entry.readyAt - (entry.startedAt ?? entry.readyAt) }, "preview answered its health probe");
-          return;
-        }
-      }
+    while (this.isCurrent(entry)) {
+      const ended = watch.exited;
+      if (ended) return this.fail(entry, `The dev server exited before it answered (${describeExit(ended.code, ended.signal)}). See the log lines.`, { code: "server_exited", phase: "serve", exitCode: ended.code });
+      if (await this.answered(entry, plan, port)) return;
       if (this.now() >= deadline) {
         await this.kill(entry);
         return this.fail(entry, `The dev server did not answer on ${PREVIEW_HOST}:${port} within ${Math.round(readiness / 1000)} s. If it listens on a fixed port or host, set serve.command in .konteks/preview.yaml to use $HOST and $PORT.`, { code: "readiness_timeout", phase: "serve", timedOut: true });
       }
       await new Promise(resolve => setTimeout(resolve, interval));
     }
+  }
+
+  /** True once the health probe answered on either loopback address (the preview is then running, if still current). */
+  private async answered(entry: Entry, plan: PreviewPlan, port: number): Promise<boolean> {
+    const probe = this.options.probe ?? probeHttp;
+    for (const host of [PREVIEW_HOST, "::1"]) {
+      if (!await probe(host, port, plan.healthPath).catch(() => false)) continue;
+      if (this.isCurrent(entry)) this.markRunning(entry, plan, host, port);
+      return true;
+    }
+    return false;
+  }
+
+  private markRunning(entry: Entry, plan: PreviewPlan, host: string, port: number): void {
+    entry.host = host;
+    entry.state = "running";
+    entry.readyAt = this.now();
+    entry.message = `Running. Open http://${PREVIEW_HOST}:${port}${plan.healthPath === "/" ? "" : plan.healthPath} on this computer, or open the preview from the session in Konteks.`;
+    this.logger.info({ event: "preview.ready", source: plan.source, startupMs: entry.readyAt - (entry.startedAt ?? entry.readyAt) }, "preview answered its health probe");
   }
 
   private runPhase(entry: Entry, command: string, env: NodeJS.ProcessEnv): Promise<number | null> {
@@ -404,7 +464,6 @@ export class PreviewProcessManager {
   }
 
   private appendLog(entry: Entry, line: string): void {
-    // eslint-disable-next-line no-control-regex
     const clean = line.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").trimEnd();
     if (clean.length === 0) return;
     entry.logs.push(clean.length > LOG_LINE_CHARS ? `${clean.slice(0, LOG_LINE_CHARS)}…` : clean);
@@ -412,10 +471,10 @@ export class PreviewProcessManager {
   }
 
   private async stopEntry(entry: Entry, reason: string): Promise<void> {
-    const wasActive = entry.state === "starting" || entry.state === "running";
+    const wasActive = activeState(entry.state);
     await this.kill(entry);
     await entry.settled.catch(() => undefined);
-    if (entry.state === "starting" || entry.state === "running") {
+    if (activeState(entry.state)) {
       entry.state = "stopped";
       entry.message = stopMessage(reason);
     }
@@ -446,11 +505,11 @@ export class PreviewProcessManager {
     entry.phase = null;
     entry.message = message;
     // A conversation with no app of its own is an answer, not a broken preview:
-    // doctor would otherwise warn about it (09-30).
+    // doctor would otherwise warn about it.
     const expected = message === CONVERSATION_HAS_NO_APP;
     if (!expected) this.lastFailure = { at: this.now(), message: message.slice(0, 200) };
     if (expected) this.logger.info({ event: "preview.no_app_in_conversation", sessionId: entry.sessionId }, "a conversation has no app of its own to preview");
-    else this.logger.warn({ event: "preview.failed", sessionId: entry.sessionId, source: entry.plan?.source ?? null, failureCode: failure.code, phase: failure.phase, ...(failure.exitCode !== undefined ? { exitCode: failure.exitCode } : {}), ...(failure.timedOut !== undefined ? { timedOut: failure.timedOut } : {}) }, "preview did not start");
+    else this.logger.warn({ event: "preview.failed", sessionId: entry.sessionId, ...previewFailureLog(entry, failure) }, "preview did not start");
     // Whatever is left of the process tree goes with the failure.
     if (entry.child) void this.kill(entry);
     this.options.onStopped?.(entry.sessionId);
@@ -475,7 +534,6 @@ export class PreviewProcessManager {
   }
 
   private view(entry: Entry): PreviewStatus {
-    const plan = entry.plan;
     return {
       sessionId: entry.sessionId,
       state: entry.state,
@@ -483,20 +541,41 @@ export class PreviewProcessManager {
       phase: entry.phase,
       url: entry.state === "running" && entry.port !== null ? `http://${PREVIEW_HOST}:${entry.port}` : null,
       port: entry.port,
-      command: plan?.command ?? null,
-      install: plan?.install ?? null,
-      prepare: plan?.prepare ?? null,
-      source: plan?.source ?? null,
-      explanation: plan?.explanation ?? null,
+      ...planView(entry.plan),
       notes: [...entry.notes],
       message: entry.message,
-      startedAt: entry.startedAt === null ? null : new Date(entry.startedAt).toISOString(),
-      readyAt: entry.readyAt === null ? null : new Date(entry.readyAt).toISOString(),
+      startedAt: isoOrNull(entry.startedAt),
+      readyAt: isoOrNull(entry.readyAt),
       idleStopMinutes: Math.round(this.idleMs / 60_000),
       logTail: entry.logs.slice(-LOG_TAIL),
       startedBy: entry.startedBy,
     };
   }
+}
+
+type ServeWatch = { exited: { code: number | null; signal: NodeJS.Signals | null } | null };
+
+function reusable(entry: Entry, cwd: string): boolean {
+  return activeState(entry.state) && entry.cwd === cwd && !entry.stopping;
+}
+
+/** The first install, prepare or serve command the command policy refuses, as the person reads it. */
+function refusedPhase(plan: PreviewPlan): { message: string; phase: "install" | "prepare" | "serve" } | undefined {
+  for (const [phase, command] of [["install", plan.install], ["prepare", plan.prepare], ["serve", plan.command]] as const) {
+    if (command === undefined) continue;
+    const hit = blockedCommandPattern(command, DEFAULT_BASH_BLOCKLIST);
+    if (hit) return { phase, message: `The ${phase} command is refused by this computer's command policy ("${hit.trim()}"). Change it in .konteks/preview.yaml.` };
+  }
+  return undefined;
+}
+
+function planView(plan: PreviewPlan | null): Pick<PreviewStatus, "command" | "install" | "prepare" | "source" | "explanation"> {
+  if (plan === null) return { command: null, install: null, prepare: null, source: null, explanation: null };
+  return { command: plan.command, install: plan.install ?? null, prepare: plan.prepare ?? null, source: plan.source, explanation: plan.explanation };
+}
+
+function isoOrNull(at: number | null): string | null {
+  return at === null ? null : new Date(at).toISOString();
 }
 
 function describeExit(code: number | null, signal: NodeJS.Signals | null): string {
@@ -515,7 +594,7 @@ function stopMessage(reason: string): string {
 }
 
 /** The platform shell runs the command; POSIX children lead their own process group. */
-export function spawnShell(request: { command: string; cwd: string; env: NodeJS.ProcessEnv }): ChildProcess {
+function spawnShell(request: { command: string; cwd: string; env: NodeJS.ProcessEnv }): ChildProcess {
   if (process.platform === "win32") {
     return spawn(request.env.ComSpec ?? process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", request.command], {
       cwd: request.cwd, env: request.env, windowsHide: true, windowsVerbatimArguments: true, stdio: ["ignore", "pipe", "pipe"],
@@ -525,7 +604,7 @@ export function spawnShell(request: { command: string; cwd: string; env: NodeJS.
 }
 
 /** Leader first, then the surviving group, SIGKILL after the grace; `taskkill /T` on Windows. */
-export async function terminateTree(child: PreviewChild): Promise<void> {
+async function terminateTree(child: PreviewChild): Promise<void> {
   if (process.platform === "win32") {
     if (child.pid === undefined || child.exitCode !== null) return;
     await new Promise<void>(resolve => execFile("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, timeout: 10_000 }, () => resolve()));
@@ -534,7 +613,7 @@ export async function terminateTree(child: PreviewChild): Promise<void> {
   await stopProcessGroupLeaderFirst({ child: child as ChildProcess, timeoutMs: 5_000, killGraceMs: 2_000 });
 }
 
-export function probeHttp(host: string, port: number, path: string): Promise<boolean> {
+function probeHttp(host: string, port: number, path: string): Promise<boolean> {
   return new Promise(resolve => {
     const req = httpRequest({ host, port, path, method: "GET", timeout: 2_000, headers: { accept: "text/html,*/*" } }, response => {
       response.resume();
@@ -593,18 +672,30 @@ export class PreviewProcessRegistry {
 
   /** Kill what a previous connector process left behind; call before serving. */
   async sweep(signal: (pid: number) => void = pid => process.kill(-pid, "SIGKILL")): Promise<number> {
-    let previous: Array<{ pid: number; token: string }> = [];
-    try { previous = JSON.parse(await readFile(this.file, "utf8")) as Array<{ pid: number; token: string }>; } catch { previous = []; }
+    const previous = await this.previousRecords();
     let killed = 0;
-    for (const record of Array.isArray(previous) ? previous : []) {
-      if (!Number.isSafeInteger(record?.pid) || record.pid <= 1 || typeof record.token !== "string") continue;
-      if (this.readIdentity(record.pid) !== record.token) continue;
-      try { signal(record.pid); killed += 1; } catch { /* already gone */ }
-    }
+    for (const record of previous) if (this.stopOrphan(record, signal)) killed += 1;
     if (killed > 0) this.logger.warn({ event: "preview.orphans_stopped", count: killed }, "stopped preview dev servers a previous connector process left running");
     this.records.clear();
-    if (Array.isArray(previous) && previous.length > 0) await this.persist();
+    if (previous.length > 0) await this.persist();
     return killed;
+  }
+
+  private async previousRecords(): Promise<unknown[]> {
+    try {
+      const previous = JSON.parse(await readFile(this.file, "utf8")) as unknown;
+      return Array.isArray(previous) ? previous : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Signals a recorded group whose leader is still exactly the recorded process; false when it is gone or not that process. */
+  private stopOrphan(record: unknown, signal: (pid: number) => void): boolean {
+    const { pid, token } = (record ?? {}) as { pid?: unknown; token?: unknown };
+    if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 1 || typeof token !== "string") return false;
+    if (this.readIdentity(pid) !== token) return false;
+    try { signal(pid); return true; } catch { return false; /* already gone */ }
   }
 
   private persist(): Promise<void> {
@@ -618,7 +709,7 @@ export class PreviewProcessRegistry {
 }
 
 /** Process start identity: `ps lstart` on macOS, `/proc/<pid>/stat` start time on Linux. */
-export function readStartToken(pid: number): string | null {
+function readStartToken(pid: number): string | null {
   if (process.platform === "darwin") {
     const identity = readDarwinProcessIdentity(pid);
     return identity && identity.processGroupId === pid ? identity.startToken : null;
@@ -633,4 +724,10 @@ export function readStartToken(pid: number): string | null {
     }
   }
   return null;
+}
+
+function previewFailureLog(entry: Entry, failure: PreviewFailure) {
+  return { source: entry.plan?.source ?? null, failureCode: failure.code, phase: failure.phase,
+    ...(failure.exitCode !== undefined ? { exitCode: failure.exitCode } : {}),
+    ...(failure.timedOut !== undefined ? { timedOut: failure.timedOut } : {}) };
 }

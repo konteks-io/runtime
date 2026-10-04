@@ -1,6 +1,6 @@
 import { z } from "zod";
 import {
-  RemoteInstanceError, RemoteReconnectIntentSnapshotSchema,
+  RemoteInstanceError, RemoteReconnectIntentSnapshotSchema, allEqual,
   RemoteInstanceReconciliationManifestSchema, RemoteReconciliationReceiptSnapshotSchema,
   RemoteReconciliationAppliedResultSchema, computeRemoteReconnectSnapshotDigest,
   computeRemoteReconciliationManifestDigest, computeRemoteReconciliationReceiptSnapshotDigest,
@@ -14,8 +14,7 @@ const ManifestRecordSchema = z.object({
   digest: RemoteReconciliationAppliedResultSchema.shape.receiptDigest,
 }).strict();
 
-/** Local persistence only. No proof, bearer or decision authorization is stored. */
-export const RuntimeRecoveryRecordSchema = z.object({
+const RecordFieldsSchema = z.object({
   intent: RemoteReconnectIntentSnapshotSchema,
   intentDigest: RemoteReconciliationAppliedResultSchema.shape.receiptDigest,
   state: z.enum(["pending", "applied", "expired", "superseded", "establishment_conflict"]),
@@ -25,16 +24,41 @@ export const RuntimeRecoveryRecordSchema = z.object({
     digest: RemoteReconciliationAppliedResultSchema.shape.receiptDigest,
   }).strict().nullable(),
   acceptedAt: RemoteReconciliationAppliedResultSchema.shape.acceptedAt.nullable(),
-}).strict().superRefine((record, ctx) => {
-  const fail = () => ctx.addIssue({ code: "custom", message: "Recovery record identity or state is inconsistent" });
-  if (record.intentDigest !== computeRemoteReconnectSnapshotDigest(record.intent)) fail();
-  if (record.receipt) {
-    const snapshot = record.receipt.snapshot;
-    if (!record.manifest || snapshot.instanceId !== record.intent.instanceId || snapshot.runnerIncarnation !== record.intent.runnerIncarnation || snapshot.manifestId !== record.manifest.manifestId || record.receipt.digest !== computeRemoteReconciliationReceiptSnapshotDigest(snapshot)) fail();
+}).strict();
+type ParsedRecord = z.infer<typeof RecordFieldsSchema>;
+
+/** The receipt belongs to this intent's generation and bound manifest, by its own digest. */
+function receiptInconsistent(record: ParsedRecord): boolean {
+  if (!record.receipt) return false;
+  const snapshot = record.receipt.snapshot;
+  return !record.manifest || !allEqual([
+    [snapshot.instanceId, record.intent.instanceId], [snapshot.runnerIncarnation, record.intent.runnerIncarnation],
+    [snapshot.manifestId, record.manifest.manifestId], [record.receipt.digest, computeRemoteReconciliationReceiptSnapshotDigest(snapshot)],
+  ]);
+}
+
+/** Accepted only with a receipt, as applied or later superseded; applied only once accepted. */
+function acceptanceInconsistent(record: ParsedRecord): boolean {
+  if (!record.acceptedAt) return record.state === "applied";
+  return !record.receipt || (record.state !== "applied" && record.state !== "superseded");
+}
+
+function establishmentInconsistent(record: ParsedRecord): boolean {
+  return record.state === "establishment_conflict" && (record.manifest !== null || record.receipt !== null || !record.intent.establishment);
+}
+
+const RECORD_INCONSISTENCIES: ReadonlyArray<(record: ParsedRecord) => boolean> = [
+  record => record.intentDigest !== computeRemoteReconnectSnapshotDigest(record.intent),
+  receiptInconsistent,
+  acceptanceInconsistent,
+  establishmentInconsistent,
+];
+
+/** Local persistence only. No proof, bearer or decision authorization is stored. */
+export const RuntimeRecoveryRecordSchema = RecordFieldsSchema.superRefine((record, ctx) => {
+  for (const inconsistent of RECORD_INCONSISTENCIES) {
+    if (inconsistent(record)) ctx.addIssue({ code: "custom", message: "Recovery record identity or state is inconsistent" });
   }
-  if (record.acceptedAt && (!record.receipt || (record.state !== "applied" && record.state !== "superseded"))) fail();
-  if (record.state === "applied" && !record.acceptedAt) fail();
-  if (record.state === "establishment_conflict" && (record.manifest || record.receipt || !record.intent.establishment)) fail();
 });
 export type RuntimeRecoveryRecord = z.infer<typeof RuntimeRecoveryRecordSchema>;
 type TerminalDisposition = "expired" | "superseded" | "establishment_conflict";
@@ -46,6 +70,20 @@ interface RecoveryLog {
 }
 export const recoveryRecordKey = (record: Pick<RuntimeRecoveryRecord, "intent">): string =>
   JSON.stringify([record.intent.instanceId, record.intent.runnerIncarnation, record.intent.reconnectIntentId]);
+
+function openState(state: RuntimeRecoveryRecord["state"]): boolean {
+  return state === "pending" || state === "applied";
+}
+
+/**
+ * Whether an owner's disposition may replace the durable state: a pending
+ * intent ends any way (an establishment conflict only before a manifest, for
+ * an establishment intent); an applied one can only be superseded.
+ */
+function dispositionReplaces(record: RuntimeRecoveryRecord, state: TerminalDisposition, intent: RemoteReconnectIntentSnapshot): boolean {
+  if (record.state === "pending") return state !== "establishment_conflict" || (!record.manifest && Boolean(intent.establishment));
+  return record.state === "applied" && state === "superseded";
+}
 
 /** Immutable retries; these facts alone never grant process or execution authority. */
 export class RuntimeRecoveryJournal {
@@ -105,7 +143,8 @@ export class RuntimeRecoveryJournal {
     await this.log.update(recoveryRecordKey({ intent }), existing => {
       const record = this.requireCurrent(intent, existing);
       if (!record.receipt) throw new RemoteInstanceError("recovery_required", "Recovery has no durable receipt.");
-      if (result.instanceId !== intent.instanceId || result.runnerIncarnation !== intent.runnerIncarnation || result.manifestId !== record.manifest?.manifestId || result.receiptDigest !== record.receipt.digest) this.mismatch();
+      if (!allEqual([[result.instanceId, intent.instanceId], [result.runnerIncarnation, intent.runnerIncarnation],
+        [result.manifestId, record.manifest?.manifestId], [result.receiptDigest, record.receipt.digest]])) this.mismatch();
       if (record.acceptedAt && record.acceptedAt !== result.acceptedAt) this.changed();
       return { ...record, state: "applied", acceptedAt: result.acceptedAt };
     });
@@ -117,7 +156,7 @@ export class RuntimeRecoveryJournal {
     await this.log.update(recoveryRecordKey({ intent }), existing => {
       const record = this.requireCurrent(intent, existing, true);
       if (record.state === state) return record;
-      if ((record.state !== "pending" && record.state !== "applied") || (record.state === "applied" && state !== "superseded") || (state === "establishment_conflict" && (record.manifest || !intent.establishment))) {
+      if (!dispositionReplaces(record, state, intent)) {
         throw new RemoteInstanceError("recovery_required", "Recovery disposition cannot replace this durable state.");
       }
       return { ...record, state };
@@ -127,10 +166,14 @@ export class RuntimeRecoveryJournal {
   private requireCurrent(intent: RemoteReconnectIntentSnapshot, record: RuntimeRecoveryRecord | undefined, allowTerminal = false): RuntimeRecoveryRecord {
     if (!record) throw new RemoteInstanceError("recovery_required", "Recovery intent must be persisted first.");
     if (record.intentDigest !== computeRemoteReconnectSnapshotDigest(intent)) this.changed();
-    if (this.current(intent.instanceId, intent.runnerIncarnation)?.intent.reconnectIntentId !== intent.reconnectIntentId || (!allowTerminal && record.state !== "pending" && record.state !== "applied")) {
+    if (!this.isCurrentIntent(intent) || (!allowTerminal && !openState(record.state))) {
       throw new RemoteInstanceError("reconciliation_replay", "Recovery intent is no longer current.");
     }
     return record;
+  }
+
+  private isCurrentIntent(intent: RemoteReconnectIntentSnapshot): boolean {
+    return this.current(intent.instanceId, intent.runnerIncarnation)?.intent.reconnectIntentId === intent.reconnectIntentId;
   }
 
   private changed(): never { throw new RemoteInstanceError("idempotency_conflict", "Recovery semantic identity changed."); }

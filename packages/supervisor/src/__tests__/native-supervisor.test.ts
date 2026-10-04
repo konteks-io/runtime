@@ -85,7 +85,7 @@ describe("native Supervisor composition", () => {
     expect(roster.agents[0]?.readiness).toBe("ready");
     expect((supervisor as unknown as { lastSnapshot: { agents: Array<{ readiness: string }> } }).lastSnapshot.agents[0]?.readiness).toBe("ready");
   });
-  it("starts Google Antigravity's Gemini Enterprise sign-in from the site with its project, and says no_license only to a 7.1.0 Core (antigravity CP3)", async () => {
+  it("starts Google Antigravity's Gemini Enterprise sign-in from the site with its project, and says no_license only to a 7.1.0 Core", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);
     await supervisor.start();
@@ -113,7 +113,7 @@ describe("native Supervisor composition", () => {
       expect(reports.at(-1)).toEqual({ loginId, agentId: "antigravity", loginOption: "gemini-enterprise", state: "failed", failure });
     }
     expect(JSON.stringify(reports)).not.toContain("gemini-enterprise-qa-25d3");
-    // No project, or personal Google sign-in (held back, A10): refused, never started.
+    // No project, or personal Google sign-in (held back): refused, never started.
     const calls = login.mock.calls.length;
     await internals.onAgentLogin({ intent: { ...intent, loginId: "login-agy-3", gcp: undefined } }, verifier);
     await internals.onAgentLogin({ intent: { ...intent, loginId: "login-agy-4", loginOption: "google-account", gcp: undefined } }, verifier);
@@ -125,7 +125,7 @@ describe("native Supervisor composition", () => {
     internals.runners.delete("antigravity");
   });
 
-  it("takes Core's 7.1 fields from the signed contract version alone, never from OpenCode's free-models switch (antigravity CP6)", async () => {
+  it("takes Core's 7.1 fields from the signed contract version alone, never from OpenCode's free-models switch", async () => {
     const f = await fixture(), supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);
     await supervisor.start();
@@ -174,7 +174,7 @@ describe("native Supervisor composition", () => {
     if (String(REMOTE_INSTANCE_PROTOCOL_VERSION) === "2.0") expect(pull).toThrow("retained logical frame owner");
     else expect(pull()).toBe(1);
   });
-  it("stops and says so when its key is gone, instead of making a new one Core would refuse (W1-L1)", async () => {
+  it("stops and says so when its key is gone, instead of making a new one Core would refuse", async () => {
     const f = await fixture();
     const { rm } = await import("node:fs/promises");
     await rm(join(f.config.SUPERVISOR_DATA_DIR, "instance-key.jwk"));
@@ -183,7 +183,7 @@ describe("native Supervisor composition", () => {
     expect(await f.store.loadInstanceKey()).toBeNull();
     expect(f.spawn).not.toHaveBeenCalled();
   });
-  it("asks Konteks to remove it on uninstall, then ends the whole process once removed (W1-L2)", async () => {
+  it("asks Konteks to remove it on uninstall, then ends the whole process once removed", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout"] });
     try {
       const f = await fixture();
@@ -205,7 +205,7 @@ describe("native Supervisor composition", () => {
       vi.useRealTimers();
     }
   });
-  it("stops on a local shutdown request after answering it, whatever runs it (W1-D3)", async () => {
+  it("stops on a local shutdown request after answering it, whatever runs it", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout"] });
     try {
       const f = await fixture();
@@ -472,8 +472,8 @@ describe("native Supervisor composition", () => {
     expect(f.stop).toHaveBeenCalledOnce();
   });
 
-  it("still stops its runners when an open session cannot close under the authority the stop itself withdrew (D113)", async () => {
-    // 2026-10-02 09:27: a claim admitted seconds before SIGTERM; stop() makes the
+  it("still stops its runners when an open session cannot close under the authority the stop itself withdrew", async () => {
+    // A claim admitted seconds before SIGTERM; stop() makes the
     // recovery authority null, the session's drain close then asserted it and the
     // whole shutdown aborted before the runners and Codex owner were stopped.
     const f = await fixture();
@@ -485,8 +485,8 @@ describe("native Supervisor composition", () => {
     expect(f.stop).toHaveBeenCalledOnce();
   });
 
-  it("stops its agents side by side, and still stops the Codex owner and its state when one agent cannot stop (D113b)", async () => {
-    // 2026-10-02 15:43Z: an idle connector stopped its agents' bridges one after
+  it("stops its agents side by side, and still stops the Codex owner and its state when one agent cannot stop", async () => {
+    // An idle connector stopping its agents' bridges one after
     // another for 5 s and launchd killed it before the Codex owner was reached.
     const f = await fixture();
     const supervisor = new Supervisor(f.config, f.options);
@@ -506,8 +506,8 @@ describe("native Supervisor composition", () => {
     expect(codexOwner.stop).toHaveBeenCalledOnce();
   });
 
-  it("takes no new work while an update is still checking this release, and takes it once the update kept it (D113b)", async () => {
-    // D113: during the 0.10.8 health gate the successor claimed work; the
+  it("takes no new work while an update is still checking this release, and takes it once the update kept it", async () => {
+    // During the 0.10.8 health gate the successor claimed work; the
     // rollback then stopped it under that claim.
     const f = await fixture();
     let outcome: "in_progress" | "applied" = "in_progress";
@@ -521,7 +521,7 @@ describe("native Supervisor composition", () => {
     await vi.waitFor(() => expect(deps.draining()).toBe(false));
   });
 
-  it("is on no probation when the update in progress is another release's (D113b)", async () => {
+  it("is on no probation when the update in progress is another release's", async () => {
     const f = await fixture();
     const ledger = { schemaVersion: 1 as const, attempts: [{ id: "update-1", bundleVersion: "1.1.0", manifestDigest: "digest", releaseId: "release-next", reason: "operator", startedAt: new Date().toISOString(), finishedAt: null, outcome: "in_progress" as const, detail: null }] };
     const supervisor = new Supervisor(f.config, { native: { ...f.options.native, updateProbation: { releaseId: "release-prev", readLedger: async () => ledger, pollMs: 10 } } });
@@ -578,7 +578,7 @@ describe("native Supervisor composition", () => {
     expect(doctor.checks.find(check => check.id === "preview")).toMatchObject({ status: "warn" });
   });
 
-  it("composes the integration carrier: advertises integration-task-v1 and asks for integration work only from a 7.3 Core (CP2)", async () => {
+  it("composes the integration carrier: advertises integration-task-v1 and asks for integration work only from a 7.3 Core", async () => {
     const f = await fixture();
     const supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);
@@ -590,7 +590,7 @@ describe("native Supervisor composition", () => {
     expect(internal.work.deps.acceptedKinds()).toEqual(expect.arrayContaining(["direct", "integration"]));
   });
 
-  it("offers the connector's QA browser to its agents and advertises browser_tool while previews can run (O8)", async () => {
+  it("offers the connector's QA browser to its agents and advertises browser_tool while previews can run", async () => {
     const f = await fixture();
     const browser = { version: "0.0.82", packageAgent: "claude-code" as const, nodeSource: "person" as const, node: "/usr/local/bin/node", launcher: "/pkg/konteks/browser-mcp.js", entrypoint: "/pkg/node_modules/@playwright/mcp/cli.js" };
     const supervisor = new Supervisor(f.config, { native: { ...f.options.native, browser: { available: true, browser } } });
@@ -605,7 +605,7 @@ describe("native Supervisor composition", () => {
     expect(doctor.checks.find(check => check.id === "browser")).toMatchObject({ status: "pass", detail: expect.stringMatching(/^Playwright MCP 0\.0\.82 for codex; runs on your own Node;/) });
   });
 
-  it("has no QA browser without a package or Node that can run it, and says so in doctor (O8)", async () => {
+  it("has no QA browser without a package or Node that can run it, and says so in doctor", async () => {
     const none = await fixture();
     const without = new Supervisor(none.config, { native: { ...none.options.native, browser: { available: false, reason: "no_package", message: BROWSER_NO_PACKAGE_MESSAGE } } });
     supervisors.push(without);
@@ -617,7 +617,7 @@ describe("native Supervisor composition", () => {
     expect(report.checks.find(check => check.id === "browser")).toMatchObject({ status: "warn", detail: BROWSER_NO_PACKAGE_MESSAGE });
   });
 
-  describe("the person's own OpenCode (opencode-runtime-support CP6)", () => {
+  describe("the person's own OpenCode", () => {
     const openCodeConfig = () => RunnerConfigSchema.parse({
       RUNNER_AGENT_ID: "opencode", RUNNER_CREDENTIAL_DIR: join(root, "opencode-credentials"), RUNNER_WORKSPACE_DIR: join(root, "opencode-work"),
       RUNNER_BRIDGE_PREFIX: "/Users/person/.nvm/versions/node/v22/lib/node_modules/@opencode/cli/bin",
@@ -682,7 +682,7 @@ describe("native Supervisor composition", () => {
     });
     const doctorOf = async (supervisor: Supervisor) => (await supervisor.controlHandler()({ op: "doctor" }, { event: () => undefined } as never) as { checks: Array<{ id: string; status: string; detail: string; recoveryActions: unknown[] }> }).checks;
 
-    it("runs beside Codex; doctor names it, its start check and sign-in commands without a path, and the Require review line after an A21 quarantine", async () => {
+    it("runs beside Codex; doctor names it, its start check and sign-in commands without a path, and the Require review line after an MCP-servers-off quarantine", async () => {
       const f = await fixture();
       vi.spyOn(antigravityInstallAdapter, "selfCheck").mockResolvedValue(undefined);
       const supervisor = new Supervisor(f.config, { native: { ...f.options.native, runners: [...f.options.native.runners, antigravityConfig()] } });
@@ -712,7 +712,7 @@ describe("native Supervisor composition", () => {
       expect(check!.detail).toContain("is not running Konteks work: the downloaded copy does not match Google's release, so it never runs (konteks-remote agent add antigravity downloads it again); it is tried again in the background, and the other agents keep running");
     });
 
-    it("shows the site's add card as Not added, then the launcher's download as it grows, only to a 7.1 Core (A20)", async () => {
+    it("shows the site's add card as Not added, then the launcher's download as it grows, only to a 7.1 Core", async () => {
       const f = await fixture();
       const supervisor = new Supervisor(f.config, f.options);
       supervisors.push(supervisor);
@@ -731,7 +731,7 @@ describe("native Supervisor composition", () => {
       expect((await supervisor.inventory.collect()).components[0]?.capabilities).not.toContain("agent:antigravity");
     });
 
-    it("reports all five supported agents' states only to a 7.1 Core, once the not-added ones were detected (runtime-view R21)", async () => {
+    it("reports all five supported agents' states only to a 7.1 Core, once the not-added ones were detected", async () => {
       const f = await fixture();
       const supervisor = new Supervisor(f.config, f.options);
       supervisors.push(supervisor);
@@ -747,7 +747,7 @@ describe("native Supervisor composition", () => {
         opencode: async () => ({ version: "2.0.18" }), antigravityPinned: () => true } });
       const agents = (await supervisor.inventory.collect()).agents;
       expect(internals.supportedAgents(agents)).toBeUndefined();
-      // The release's connector commands ride the heartbeat only to a 7.1 Core too (R20).
+      // The release's connector commands ride the heartbeat only to a 7.1 Core too.
       const commands = () => (supervisor.heartbeat as unknown as { options: { connectorCommands: () => { version: string; commands: unknown[] } | undefined } }).options.connectorCommands();
       expect(commands()).toBeUndefined();
       internals.hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: true };
@@ -763,7 +763,7 @@ describe("native Supervisor composition", () => {
       ]);
     });
 
-    it("fetches an update's new pin at once on the first yes, and joins when it is switched to (A17)", async () => {
+    it("fetches an update's new pin at once on the first yes, and joins when it is switched to", async () => {
       const f = await fixture();
       vi.spyOn(antigravityInstallAdapter, "selfCheck").mockResolvedValue(undefined);
       let finish: (() => void) | undefined;
@@ -790,7 +790,7 @@ describe("native Supervisor composition", () => {
     });
   });
 
-  it("tells the local operator which release Konteks accepts for this machine (WS1-093)", async () => {
+  it("tells the local operator which release Konteks accepts for this machine", async () => {
     const f = await fixture();
     const supervisor = new Supervisor(f.config, f.options);
     supervisors.push(supervisor);

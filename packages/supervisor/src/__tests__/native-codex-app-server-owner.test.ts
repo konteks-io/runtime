@@ -102,7 +102,7 @@ describe("native shared Codex app-server owner", () => {
     await owner.stop();
   });
 
-  it("can be started again after a start that failed (WS1-018)", async () => {
+  it("can be started again after a start that failed", async () => {
     const f = fixture();
     f.waitUntilReady.mockRejectedValueOnce(new Error("socket never came up"));
     await expect(f.owner.start()).rejects.toThrow("socket never came up");
@@ -111,7 +111,7 @@ describe("native shared Codex app-server owner", () => {
     await f.owner.stop();
   });
 
-  it("ends its app-server group if the process exits after a stop was asked for, and only then (WS1-042)", async () => {
+  it("ends its app-server group if the process exits after a stop was asked for, and only then", async () => {
     const f = fixture();
     await f.owner.start();
     const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
@@ -218,7 +218,7 @@ describe("native shared Codex app-server owner", () => {
     expect(stopHolder).toHaveBeenCalledWith(4411);
   });
 
-  it("replaces a live server left by an older release of this connector instead of adopting it (WS2-141)", async () => {
+  it("replaces a live server left by an older release of this connector instead of adopting it", async () => {
     const releases = "/operator/connector/releases/";
     const f = fixture();
     const stopHolder = vi.fn(async () => undefined);
@@ -330,8 +330,8 @@ describe("stray app-servers of this installation (RCA 2026-09-30)", () => {
 
 /**
  * Codex 0.159+ binds its socket in a private directory of its own and leaves a
- * link at the `--listen unix://PATH` it was given (RCA 2026-10-01: 0.10.3's
- * Codex never counted as started, so its update rolled back every time).
+ * link at the `--listen unix://PATH` it was given (otherwise
+ * Codex never counts as started, and its update rolls back every time).
  */
 describe.skipIf(process.platform === "win32")("a Codex socket reached through a link", () => {
   const cleanup: Array<() => Promise<void>> = [];

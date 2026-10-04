@@ -12,7 +12,7 @@ export interface InventorySnapshot {
   activeTurns: number;
   /**
    * The machine's git version, or `null` when git is not on PATH. The `onboard`
-   * role is derived from it (OB6 §1); nothing else reads it.
+   * role is derived from it; nothing else reads it.
    */
   gitVersion: string | null;
   diskFreeBytes: number;

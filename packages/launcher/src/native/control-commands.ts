@@ -44,16 +44,35 @@ export async function status(context: ControlContext): Promise<void> {
   context.output.table([
     ["instance", value.instanceId ?? "(not activated)"],
     ["status", value.administrativeStatus],
-    ["connectivity", `${value.connectivity.transport}${value.connectivity.relayConnected ? " (relay connected)" : ""}${value.connectivity.reconciliationComplete ? "" : " — reconciling"}`],
+    ["connectivity", connectivityLine(value.connectivity)],
     ["lease", `${value.lease.mode}${value.lease.expiresAt ? `, expires ${value.lease.expiresAt}` : ""}`],
-    ["bundle", `${value.version.bundle} (protocol ${value.version.protocol})${value.version.updateAvailable ? ` — update available: ${value.version.targetBundle}` : ""}`],
+    ["bundle", bundleLine(value.version)],
     ...(channel ? [["updates", releaseChannelLine(channel)] as [string, string]] : []),
     ["roles", value.roles.join(", ") || "(none advertised — log in an agent and tag roles in App/MCP)"],
-    ["utilization", `${value.utilization.activeSessions} sessions, ${value.utilization.activeTurns} turns, ratio ${value.utilization.utilizationRatio}${value.utilization.acceptingWork ? "" : " — not accepting work"}`],
+    ["utilization", utilizationLine(value.utilization)],
     ["components", value.components.map((component) => `${component.kind}=${component.healthStatus}`).join(" ")],
-    ["preview", value.previewEnabled ? `running on 127.0.0.1:${value.previewExposure?.port ?? "?"}${value.previewExposure?.grantPresent ? " (a viewer is connected)" : ""}` : "none running"],
+    ["preview", previewExposureLine(value)],
     ["journal", `${value.journal.assignments} active, ${value.journal.outboxDepth} queued, ${value.journal.recoveryRequired} recovery required`],
   ]);
+}
+
+type SupervisorStatus = z.infer<typeof SupervisorStatusSchema>;
+
+function connectivityLine(connectivity: SupervisorStatus["connectivity"]): string {
+  return `${connectivity.transport}${connectivity.relayConnected ? " (relay connected)" : ""}${connectivity.reconciliationComplete ? "" : " — reconciling"}`;
+}
+
+function bundleLine(version: SupervisorStatus["version"]): string {
+  return `${version.bundle} (protocol ${version.protocol})${version.updateAvailable ? ` — update available: ${version.targetBundle}` : ""}`;
+}
+
+function utilizationLine(utilization: SupervisorStatus["utilization"]): string {
+  return `${utilization.activeSessions} sessions, ${utilization.activeTurns} turns, ratio ${utilization.utilizationRatio}${utilization.acceptingWork ? "" : " — not accepting work"}`;
+}
+
+function previewExposureLine(value: SupervisorStatus): string {
+  if (!value.previewEnabled) return "none running";
+  return `running on 127.0.0.1:${value.previewExposure?.port ?? "?"}${value.previewExposure?.grantPresent ? " (a viewer is connected)" : ""}`;
 }
 
 /** `preview status`: read-only; the per-machine on/off switch lives in Konteks. */
@@ -65,11 +84,17 @@ export async function previewStatus(context: ControlContext): Promise<void> {
     : "Previews: not offered (this connector has no relay connection configured).");
   if (value.previews.length === 0) context.output.line("No session preview is running now.");
   for (const preview of value.previews) {
-    context.output.line(`${preview.sessionId}: ${preview.state}${preview.url ? ` at ${preview.url}` : ""}${preview.startedBy === "viewer" ? " (started by a viewer)" : ""}${preview.viewerConnected ? " (a viewer is connected)" : ""}`);
-    if (preview.command) context.output.line(`  command: ${preview.command}${preview.explanation ? ` — ${preview.explanation}` : ""}`);
-    context.output.line(`  ${preview.message}`);
+    for (const line of previewLines(preview)) context.output.line(line);
   }
   if (value.lastFailure) context.output.line(`Last failure (${value.lastFailure.at}): ${value.lastFailure.message}`);
+}
+
+function previewLines(preview: z.infer<typeof PreviewStatusReportSchema>["previews"][number]): string[] {
+  return [
+    `${preview.sessionId}: ${preview.state}${preview.url ? ` at ${preview.url}` : ""}${preview.startedBy === "viewer" ? " (started by a viewer)" : ""}${preview.viewerConnected ? " (a viewer is connected)" : ""}`,
+    ...(preview.command ? [`  command: ${preview.command}${preview.explanation ? ` — ${preview.explanation}` : ""}`] : []),
+    `  ${preview.message}`,
+  ];
 }
 
 export async function agents(context: ControlContext): Promise<void> {
@@ -108,71 +133,103 @@ export async function authStatus(context: ControlContext, agentId?: string): Pro
  * tool asks for a secret. `--organization` records the operator's attestation.
  */
 export async function authLogin(context: ControlContext, agentId: string, organization: boolean, which: { provider?: string; method?: string; reuse?: boolean; project?: string; location?: string } = {}): Promise<void> {
-  const ask = context.confirm ?? ((question: string) => confirm(question, context.input ? { input: context.input } : {}));
-  const secret = context.promptSecret ?? ((label: string) => promptSecret({ label, minLength: 1, ...(context.input ? { input: context.input } : {}) }));
-  const line = context.promptLine ?? ((label: string) => promptLine(label, context.input ? { input: context.input } : {}));
+  const prompts = loginPrompts(context);
   if (organization) {
-    const ok = await ask(`Attest that the ${agentId} account you are about to log in is owned by your organization and may serve colleagues' work?`);
+    const ok = await prompts.ask(`Attest that the ${agentId} account you are about to log in is owned by your organization and may serve colleagues' work?`);
     if (!ok) throw new RemoteInstanceError("ownership_promotion_denied", "organization attestation declined; log in without --organization for a personal account");
   }
-  const interrupted = new AbortController();
-  const name = agentName(agentId);
-  const inWindow = context.onComputer ?? process.env.KONTEKS_ON_COMPUTER === "1";
-  let promptsOpen = 0;
-  // The flow's own last line since the last prompt.
-  let lastLine: string | null = null;
-  let promptError: unknown = null;
-  let loginFailure: Extract<ControlLoginEvent, { kind: "failed" }> | null = null;
-  const onEvent = (event: ControlLoginEvent): void => {
-    switch (event.kind) {
-      case "started":
-        // An agent the connector asks for itself (a key, a provider) says
-        // what to do in its own lines; a start line there landed on the
-        // hidden key prompt (WS1-153). Only an agent whose own sign-in takes
-        // over gets one, and never over an open prompt.
-        if (!isHostAgentId(event.agentId) && promptsOpen === 0) context.output.line(`Starting ${agentName(event.agentId)}'s own sign-in. Follow its steps below.`);
-        return;
-      case "display":
-        context.output.line(event.text);
-        lastLine = event.text;
-        return;
-      case "open_url":
-        context.output.line(`open this URL to sign in: ${event.url}${event.userCode ? `\nenter code: ${event.userCode}` : ""}`);
-        return;
-      case "prompt":
-        // A choice (OpenCode's provider) is typed in the open; anything else,
-        // an API key included, with the hidden prompt, never echoed.
-        promptsOpen += 1;
-        lastLine = null;
-        void (event.visible === true && !event.secret ? line(event.label) : secret(event.label))
-          .finally(() => { promptsOpen -= 1; })
-          .then((text) => context.control.call({ op: "auth.input", loginId: event.loginId, text }, z.unknown()))
-          .catch((error: unknown) => { promptError = error; interrupted.abort(); });
-        return;
-      case "completed":
-        context.output.line((event.readiness === "ready"
-          ? `${name} is ready${organization ? " for your organization" : ""}.`
-          : `${name} is signed in but not ready yet; konteks-remote doctor says why.`) + (inWindow ? " You can close this window." : ""));
-        return;
-      case "failed":
-        loginFailure = event;
-        return;
-    }
-  };
+  const relay = new LoginRelay(context, prompts, agentName(agentId), organization);
   try {
-    await context.control.call({ op: "auth.login", agentId, organization, ...which }, z.object({ loginId: z.string() }), { onEvent, signal: interrupted.signal, timeoutMs: 20 * 60_000 });
+    await context.control.call({ op: "auth.login", agentId, organization, ...which }, z.object({ loginId: z.string() }), { onEvent: event => relay.onEvent(event), signal: relay.interrupted.signal, timeoutMs: 20 * 60_000 });
   } catch (error) {
-    if (promptError !== null) throw promptError;
+    if (relay.promptError !== null) throw relay.promptError;
     throw error;
   }
-  if (loginFailure !== null) {
-    const failure: Extract<ControlLoginEvent, { kind: "failed" }> = loginFailure;
-    // A connector-asked sign-in ends a failure with one plain line (what is
-    // wrong, what to do); a coded second line would only repeat it. A
-    // progress line ("Checking the key…") explains nothing, so the error shows.
-    const last = lastLine as string | null;
+  if (relay.loginFailure !== null) throw relay.failureError(agentId, relay.loginFailure);
+}
+
+interface LoginPrompts {
+  ask: (question: string) => Promise<boolean>;
+  secret: (label: string) => Promise<string>;
+  line: (label: string) => Promise<string>;
+}
+
+function loginPrompts(context: ControlContext): LoginPrompts {
+  const input = context.input ? { input: context.input } : {};
+  return {
+    ask: context.confirm ?? ((question: string) => confirm(question, input)),
+    secret: context.promptSecret ?? ((label: string) => promptSecret({ label, minLength: 1, ...input })),
+    line: context.promptLine ?? ((label: string) => promptLine(label, input)),
+  };
+}
+
+/** Relays one sign-in's events: lines and links shown, prompts answered, the outcome kept. */
+class LoginRelay {
+  readonly interrupted = new AbortController();
+  promptError: unknown = null;
+  loginFailure: Extract<ControlLoginEvent, { kind: "failed" }> | null = null;
+  private promptsOpen = 0;
+  /** The flow's own last line since the last prompt. */
+  private lastLine: string | null = null;
+  private readonly inWindow: boolean;
+
+  constructor(private readonly context: ControlContext, private readonly prompts: LoginPrompts, private readonly name: string, private readonly organization: boolean) {
+    this.inWindow = context.onComputer ?? process.env.KONTEKS_ON_COMPUTER === "1";
+  }
+
+  onEvent(event: ControlLoginEvent): void {
+    switch (event.kind) {
+      case "started": return this.started(event.agentId);
+      case "display":
+        this.context.output.line(event.text);
+        this.lastLine = event.text;
+        return;
+      case "open_url":
+        this.context.output.line(`open this URL to sign in: ${event.url}${event.userCode ? `\nenter code: ${event.userCode}` : ""}`);
+        return;
+      case "prompt": return this.prompt(event);
+      case "completed": return this.completed(event.readiness);
+      case "failed":
+        this.loginFailure = event;
+        return;
+    }
+  }
+
+  /**
+   * An agent the connector asks for itself (a key, a provider) says what to
+   * do in its own lines; a start line there would land on the hidden key
+   * prompt. Only an agent whose own sign-in takes over gets one, and never
+   * over an open prompt.
+   */
+  private started(agentId: string): void {
+    if (!isHostAgentId(agentId) && this.promptsOpen === 0) this.context.output.line(`Starting ${agentName(agentId)}'s own sign-in. Follow its steps below.`);
+  }
+
+  /** A choice (OpenCode's provider) is typed in the open; anything else, an API key included, with the hidden prompt, never echoed. */
+  private prompt(event: Extract<ControlLoginEvent, { kind: "prompt" }>): void {
+    this.promptsOpen += 1;
+    this.lastLine = null;
+    void (event.visible === true && !event.secret ? this.prompts.line(event.label) : this.prompts.secret(event.label))
+      .finally(() => { this.promptsOpen -= 1; })
+      .then((text) => this.context.control.call({ op: "auth.input", loginId: event.loginId, text }, z.unknown()))
+      .catch((error: unknown) => { this.promptError = error; this.interrupted.abort(); });
+  }
+
+  private completed(readiness: string): void {
+    this.context.output.line((readiness === "ready"
+      ? `${this.name} is ready${this.organization ? " for your organization" : ""}.`
+      : `${this.name} is signed in but not ready yet; konteks-remote doctor says why.`) + (this.inWindow ? " You can close this window." : ""));
+  }
+
+  /**
+   * A connector-asked sign-in ends a failure with one plain line (what is
+   * wrong, what to do); a coded second line would only repeat it. A
+   * progress line ("Checking the key…") explains nothing, so the error shows.
+   */
+  failureError(agentId: string, failure: Extract<ControlLoginEvent, { kind: "failed" }>): RemoteInstanceError {
+    const last = this.lastLine;
     const told = isHostAgentId(agentId) && last !== null && !last.endsWith("…");
-    throw told ? new AlreadyToldError("agent_auth_required", failure.message) : new RemoteInstanceError("agent_auth_required", failure.message);
+    return told ? new AlreadyToldError("agent_auth_required", failure.message) : new RemoteInstanceError("agent_auth_required", failure.message);
   }
 }
 
@@ -183,7 +240,7 @@ export async function authLogout(context: ControlContext, agentId: string, provi
 }
 
 /**
- * `git key add [--title]` (ON16, OB6 §4): the runtime generates (or reuses) an
+ * `git key add [--title]`: the runtime generates (or reuses) an
  * ed25519 key, registers its PUBLIC half through Core, and writes an SSH config
  * stanza for the managed host. The private half never leaves the machine, which
  * is why this is a launcher command on the trusted machine and not a field in

@@ -79,7 +79,7 @@ describe("bootstrap/install.ps1", () => {
 
   // The MSI adds konteks-remote to the machine PATH, which this window does
   // not see: the closing summary's commands ("konteks-remote agent add …")
-  // would fail here (D116). Said once, after the launcher, keeping its exit code.
+  // would fail here. Said once, after the launcher, keeping its exit code.
   it("says to open a new window when this one cannot run konteks-remote yet, and keeps the launcher's exit code", () => {
     const launched = script.indexOf("& $launcher install --activation-id $ActivationId");
     expect(launched).toBeGreaterThan(-1);
@@ -90,23 +90,26 @@ describe("bootstrap/install.ps1", () => {
     expect(tail.trimEnd().endsWith("exit $code")).toBe(true);
   });
 
-  // D131: an MSI from before 0.10.11 runs its own old code for every command
+  // An MSI from before 0.10.11 runs its own old code for every command
   // and no connector update replaces it. -Update installs this release's
   // launcher on a connected computer, then updates and starts the connector.
   it("updates a connected computer's launcher with -Update: no activation, the MSI first, then update and start", () => {
     expect(script).toMatch(/^\s*\[switch\]\$Update,$/m);
     const refuseBoth = script.indexOf("if ($Update -and $ActivationId) {");
-    const notInstalled = script.indexOf("if ($Update -and -not (Test-Path (Join-Path ${env:USERPROFILE} 'AppData\\Local\\konteks-remote\\native-runtime.json'))) {");
+    const runtimeRoot = script.indexOf("$RuntimeRoot = Join-Path ${env:USERPROFILE} 'AppData\\Local\\konteks-remote'");
+    const notInstalled = script.indexOf("if ($Update -and -not (Test-Path (Join-Path $RuntimeRoot 'native-runtime.json'))) {");
     const requireId = script.indexOf("if (-not $Update -and -not $ActivationId) {");
     expect(refuseBoth).toBeGreaterThan(script.indexOf("if ($VerifyOnly) { return }"));
-    expect(notInstalled).toBeGreaterThan(refuseBoth);
+    expect(runtimeRoot).toBeGreaterThan(refuseBoth);
+    expect(notInstalled).toBeGreaterThan(runtimeRoot);
     expect(requireId).toBeGreaterThan(notInstalled);
-    const msiexec = script.indexOf("msiexec.exe");
+    const msiexec = script.indexOf("Start-Process -FilePath 'msiexec.exe'");
     const update = script.indexOf("& $launcher update");
     const start = script.indexOf("& $launcher start");
     expect(msiexec).toBeGreaterThan(requireId);
     expect(update).toBeGreaterThan(msiexec);
     expect(start).toBeGreaterThan(update);
+    expect(script.slice(msiexec, update)).toContain("-Verb RunAs -Wait -PassThru");
     expect(script.slice(update, start)).toMatch(/\$code = \$LASTEXITCODE/);
   });
 });

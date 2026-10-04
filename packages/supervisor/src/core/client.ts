@@ -1,4 +1,4 @@
-import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, createLogger, type Logger } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema, allEqual, createLogger, type Logger, type RuntimeUpdateReport } from "@konteks/remote-common";
 
 import { z } from "zod";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
@@ -101,7 +101,7 @@ import { decodeLeaseClaims } from "../lease/lease.js";
 type RuntimeAgentLoginReport = ReturnType<typeof RuntimeAgentLoginReportSchema.parse>;
 
 /**
- * Core's private supervisor endpoints over TLS. CP3 mounts the
+ * Core's private supervisor endpoints over TLS. Core mounts the
  * `remote-instance-backend` plugin at `/api/remote-instances`; its
  * supervisor-private table is exactly: `jwks`, `activation-exchange`,
  * `:id/provisioning-credential`, `:id/desired-configuration[/ack]`,
@@ -117,7 +117,7 @@ type RuntimeAgentLoginReport = ReturnType<typeof RuntimeAgentLoginReportSchema.p
 const CORE_BASE = "/api/remote-instances/internal/remote-instances";
 const instancePath = (instanceId: string, suffix: string): string => `${CORE_BASE}/${encodeURIComponent(instanceId)}/${suffix}`;
 
-export const CORE_PATHS = Object.freeze({
+const CORE_PATHS = Object.freeze({
   jwks: `${CORE_BASE}/jwks`,
   activationExchange: `${CORE_BASE}/activation-exchange`,
   provisioningCredential: (instanceId: string) => instancePath(instanceId, "provisioning-credential"),
@@ -128,7 +128,7 @@ export const CORE_PATHS = Object.freeze({
   deliveryExecutionCheck: (instanceId: string, executionId: string) => instancePath(instanceId, `delivery-executions/${encodeURIComponent(executionId)}/check`),
   executionCheck: (instanceId: string, executionId: string) => instancePath(instanceId, `executions/${encodeURIComponent(executionId)}/check`),
   desiredConfiguration: (instanceId: string) => instancePath(instanceId, "desired-configuration"),
-  /** CP3 exposes this route for configuration acknowledgements only. */
+  /** Core exposes this route for configuration acknowledgements only. */
   controlAck: (instanceId: string) => instancePath(instanceId, "desired-configuration/ack"),
   reconnect: (instanceId: string) => instancePath(instanceId, "reconnect"),
   runtimeOwnerResolve: (instanceId: string) => instancePath(instanceId, "runtime-owner/resolve"),
@@ -146,26 +146,26 @@ export const CORE_PATHS = Object.freeze({
   observations: (instanceId: string) => instancePath(instanceId, "observations"),
   permissionsDeferred: (instanceId: string) => instancePath(instanceId, "permissions/deferred"),
   capabilityTokenRedeem: (instanceId: string) => instancePath(instanceId, "capability-tokens/redeem"),
-  // CONTRACT-GAP: OB6 §4 names the App BFF route
+  // CONTRACT-GAP: the onboarding contract names the App BFF route
   // `POST /api/app/remote-instances/:id/git-keys`, but a runtime holds a lease,
   // not a person's session, and cannot authenticate against an App route. The
   // registration therefore sits on the supervisor-private table beside every
   // other route the runtime calls; Core forwards it to managed-git with the
   // instance id exactly as the contract describes.
   gitKeys: (instanceId: string) => instancePath(instanceId, "git-keys"),
-  // A coding agent login the person started from the site (WS1-115).
+  // A coding agent login the person started from the site.
   agentLoginReport: (instanceId: string) => instancePath(instanceId, "agent-logins/report"),
+  runtimeUpdateReport: (instanceId: string) => instancePath(instanceId, "runtime-updates/report"),
   acceptedRelease: (instanceId: string) => instancePath(instanceId, "accepted-release"),
-  // Uninstall: the runtime removes itself (W1-L2), lease-authenticated like the rest.
+  // Uninstall: the runtime removes itself, lease-authenticated like the rest.
   retire: (instanceId: string) => instancePath(instanceId, "retire"),
   gitKey: (instanceId: string, keyRef: string) => instancePath(instanceId, `git-keys/${encodeURIComponent(keyRef)}`),
   // CONTRACT-GAP: `RemoteWorkAssignment` carries no delivery/validation/qa
   // definition, so the supervisor reads it for a CLAIMED assignment from
   // this lease-guarded route (added to Core with this seam).
   workload: (instanceId: string, assignmentId: string) => instancePath(instanceId, `assignments/${encodeURIComponent(assignmentId)}/workload`),
-  // CONTRACT-GAP: durable task-checkout affinity (invariant 15) had no route
+  // CONTRACT-GAP: durable task-checkout affinity had no route
   // for the owner to report a materialization. Added to Core with this seam.
-  taskCheckoutMaterialized: (instanceId: string, assignmentId: string) => instancePath(instanceId, `assignments/${encodeURIComponent(assignmentId)}/task-checkout/materialized`),
   // CONTRACT-GAP: control-poll and generic session-frame HTTPS routes are not
   // mounted by Core. Lease renewal uses only the signed heartbeat above.
   controlPoll: (instanceId: string) => instancePath(instanceId, "control/poll"),
@@ -174,7 +174,7 @@ export const CORE_PATHS = Object.freeze({
 });
 
 /**
- * Audience of every instance-key proof (CP3 `instanceProof.ts`): the proof
+ * Audience of every instance-key proof (Core's `instanceProof.ts`): the proof
  * bytes are JCS of `{v:'konteks-instance-proof-v1', method, audience:
  * 'konteks:remote-instance', subject, nonce, bodyDigest}`, ES256. The lease
  * itself carries the distinct `REMOTE_INSTANCE_LEASE_AUDIENCE`.
@@ -183,10 +183,9 @@ export const CORE_PATHS = Object.freeze({
 export const CORE_AUDIENCE = REMOTE_INSTANCE_PROOF_AUDIENCE;
 export const LEASE_AUDIENCE: string = REMOTE_INSTANCE_LEASE_AUDIENCE;
 
-// CONTRACT-GAP: CP1 exports the readiness request but no response schema.
+// CONTRACT-GAP: the shared contract exports the readiness request but no response schema.
 // Match ProvisioningService's initial and idempotent response, remaining strict.
 const ReadinessResultSchema = z.object({ instanceId: z.string(), administrativeStatus: z.literal("active"), lease: z.string().min(1), leaseExpiresAt: z.string(), leaseMode: RemoteLeaseModeSchema, heartbeatIntervalSeconds: z.number().int().positive() }).strict();
-export type { HeartbeatResult } from "@konteks/remote-common";
 const ControlPollSchema = z.object({ frames: z.array(ToRuntimeRelayFrameSchema).max(64) }).strict();
 const ObservationReceiptSchema = z.object({ stored: z.boolean(), observationId: z.string().min(1), observationDigest: z.string().length(43) }).strict();
 const AckResultSchema = z.object({ accepted: z.boolean() }).strict();
@@ -200,7 +199,7 @@ const ControllerDirectivePullInputSchema = z.object({
 type ControllerDirectivePullInput = Omit<PlanningControllerDirectivePullRequest, "proof">;
 /**
  * Core answers a redemption with the bearer token itself (`{token, expiresAt,
- * toolScopes}`, CP3 `TokenService.redeemAgentCapabilityToken`); the supervisor
+ * toolScopes}`, Core's `TokenService.redeemAgentCapabilityToken`); the supervisor
  * composes the ACP `mcpServers` entry from it and the configured platform MCP
  * URL. The response cannot substitute an MCP endpoint or headers.
  */
@@ -210,16 +209,15 @@ export interface CapabilityTokenIssue {
   expiresAt: string;
 }
 const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "qa", "assistant_execution", "onboarding", "repository_relocation", "integration"]), workload: BoundedJsonValueSchema }).strict();
-export type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
-const TaskCheckoutMaterializedResultSchema = z.object({ workspaceRef: z.string().min(1) }).strict();
+type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
 
 /**
- * Managed-git key registration (ON16). Core answers with the reference it
+ * Managed-git key registration. Core answers with the reference it
  * minted, the fingerprint managed-git stored, and the SSH host this key opens —
  * the runtime cannot know the managed host on its own, and guessing one would
  * make the machine offer its key to whatever answered.
  *
- * CONTRACT-GAP: `ManagedGitKeyRegisterRequest` (OB1 §6) also carries
+ * CONTRACT-GAP: `ManagedGitKeyRegisterRequest` also carries
  * `userEntityRef`. A runtime does not know which person it belongs to; Core
  * derives it from the instance, which is also what binds the key to this
  * runtime so removing the runtime revokes exactly this key.
@@ -228,7 +226,7 @@ const TaskCheckoutMaterializedResultSchema = z.object({ workspaceRef: z.string()
  * What Core answers with. Managed git registers a key for the PERSON, so its
  * record names them and the instance and carries no host; a runtime reads the
  * parts it needs and ignores the rest, rather than refusing its own
- * registration as malformed (WS1-026).
+ * registration as malformed.
  */
 const GitKeyRegisterResultSchema = z.object({
   keyRef: z.string().min(1).max(200),
@@ -253,12 +251,12 @@ const GitKeyListResultSchema = z.object({
   })).max(64),
 }).strict();
 
-/** Core's `DeferredPermission` (CP3 `PendingPermissionService`): what the supervisor posts for a component-raised deferral. */
+/** Core's `DeferredPermission` (Core's `PendingPermissionService`): what the supervisor posts for a component-raised deferral. */
 export type DeferredPermissionBody =
   | { kind: "permission"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; permission: { title: string; toolKind?: string; options: Array<{ optionId: string; name: string; kind: string }> } }
   | { kind: "elicitation"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; elicitation: { message: string; requestedSchema: BoundedJsonValue; isSignIn: boolean } };
 
-export interface CoreClientOptions {
+interface CoreClientOptions {
   baseUrl: string;
   clock: Clock;
   key: () => InstanceKeyPair;
@@ -272,7 +270,7 @@ export interface CoreClientOptions {
 
 /**
  * How long a key set Core confirmed stays usable while Core's key endpoint
- * cannot be reached (D110: the endpoint timed out for minutes and every prompt
+ * cannot be reached (the endpoint timed out for minutes and every prompt
  * was refused). Every use of these keys is paired with a direct Core call over
  * TLS (consumption, check), so a stale set never admits work Core refuses; a
  * set missing the requested key id is never served stale.
@@ -291,7 +289,57 @@ const RecoveryEvidenceIngressResultSchema = z.object({
   acceptedAt: z.string().datetime(),
   outcome: z.enum(["accepted", "duplicate"]),
 }).strict();
-export type RecoveryEvidenceIngressResult = z.infer<typeof RecoveryEvidenceIngressResultSchema>;
+type RecoveryEvidenceIngressResult = z.infer<typeof RecoveryEvidenceIngressResultSchema>;
+
+const SIGNING_KEY_SCHEMA = z.object({ kty: z.literal("RSA"), kid: z.string().min(1).max(256),
+  alg: z.literal("RS256").optional(), use: z.literal("sig").optional(),
+  n: z.string().min(1).max(2048).regex(/^[A-Za-z0-9_-]+$/), e: z.string().min(1).max(16).regex(/^[A-Za-z0-9_-]+$/),
+}).strict();
+
+/** Distinct RSA keys of at least 2048 bits, by key id. */
+function signingKeyMap(jwks: ReadonlyArray<z.infer<typeof SIGNING_KEY_SCHEMA>>): ReadonlyMap<string, KeyObject> {
+  const keys = new Map<string, KeyObject>();
+  for (const jwk of jwks) {
+    if (keys.has(jwk.kid)) throw new Error("Duplicate signing key");
+    const key = createPublicKey({ key: jwk, format: "jwk" });
+    if (key.asymmetricKeyType !== "rsa" || (key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error("Invalid signing key");
+    keys.set(jwk.kid, key);
+  }
+  return keys;
+}
+
+function keySetDiagnostic(error: unknown): string {
+  if (error instanceof RemoteInstanceError) return error.code;
+  return error instanceof z.ZodError ? "schema_invalid" : "invalid_key_set";
+}
+
+/** A still-valid key set may be refreshed once for a key id it does not hold. */
+function unknownKidRefresh(cached: { keys: ReadonlyMap<string, KeyObject>; unknownKidRefreshUsed: boolean }, expectedKid: string | undefined): boolean {
+  return Boolean(expectedKid && !cached.keys.has(expectedKid) && !cached.unknownKidRefreshUsed);
+}
+
+/** A failure's code (and diagnostic) for the log, never its message. */
+function errorFields(error: unknown): { code: string; diagnostic?: string } {
+  if (!(error instanceof RemoteInstanceError)) return { code: "unexpected_error" };
+  return { code: error.code, ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}) };
+}
+
+function configurationAck(ack: unknown): boolean {
+  return typeof ack === "object" && ack !== null && "type" in ack && ack.type === "desired_configuration_ack";
+}
+
+function supersededAck<T extends { requestDigest: string; appliedRevision?: number | null }>(receipt: T, request: ReturnType<typeof DesiredConfigurationAckSchema.parse>): T {
+  if (receipt.requestDigest !== jcsDigest(request as unknown as JsonValue) || (receipt.appliedRevision === request.revision && request.status === "applied")) {
+    throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement disposition mismatch");
+  }
+  return receipt;
+}
+
+/** Schema, parser and server messages may contain secret-bearing input: only the code and retryability survive. */
+function undeliveredCapability(error: unknown): RemoteInstanceError {
+  const transient = error instanceof RemoteInstanceError && error.retryable;
+  return new RemoteInstanceError(error instanceof RemoteInstanceError ? error.code : "capability_unavailable", "Capability delivery was not accepted.", { retryable: transient });
+}
 
 export class CoreClient {
   private readonly http: JsonClient;
@@ -355,8 +403,11 @@ export class CoreClient {
       idempotencyKey: `execution-ready:${request.assignmentId}:${request.attempt}:${request.claimId}:${request.recoveryEpoch}`,
       operationPolicy: "admissionPreparation",
       ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
-    if (result.instanceId !== instanceId || result.assignmentId !== request.assignmentId || result.attempt !== request.attempt || result.claimId !== request.claimId || result.recoveryEpoch !== request.recoveryEpoch ||
-        result.runnerIncarnation !== request.runnerIncarnation || result.agentId !== request.agentId || result.acpSessionRef !== request.acpSessionRef) {
+    if (!allEqual([
+      [result.instanceId, instanceId], [result.assignmentId, request.assignmentId], [result.attempt, request.attempt], [result.claimId, request.claimId],
+      [result.recoveryEpoch, request.recoveryEpoch], [result.runnerIncarnation, request.runnerIncarnation], [result.agentId, request.agentId],
+      [result.acpSessionRef, request.acpSessionRef],
+    ])) {
       throw new RemoteInstanceError("registration_mismatch", "Execution readiness response does not match the local claim.");
     }
     return result;
@@ -405,56 +456,66 @@ export class CoreClient {
   /** Trust comes only from the configured Core origin, never a token URL/header. */
   async executionSigningKeys(deadlineAtMs?: number, expectedKid?: string): Promise<ReadonlyMap<string, KeyObject>> {
     const cached = this.signingKeyCache;
-    let refreshUnknownKid = false;
-    if (cached && cached.expiresAtMs > Date.now()) {
-      refreshUnknownKid = Boolean(expectedKid && !cached.keys.has(expectedKid) && !cached.unknownKidRefreshUsed);
-      if (!refreshUnknownKid) return cached.keys;
-    }
+    const fresh = cached !== null && cached.expiresAtMs > Date.now();
+    const refreshUnknownKid = fresh && unknownKidRefresh(cached, expectedKid);
+    if (fresh && !refreshUnknownKid) return cached.keys;
     // Stale-while-revalidate during an outage: inside the backoff window after
     // a failed refresh, answer with the last confirmed keys at once instead of
     // making every admission and renewal wait out another timeout.
     const confirmed = this.confirmedSigningKeys(expectedKid);
     if (confirmed && Date.now() < this.signingKeyRetryAtMs) return confirmed;
-    if (!this.signingKeyRefresh) {
-      this.signingKeyRefresh = this.fetchExecutionSigningKeys().then(keys => {
-        // Core currently does not publish a shorter keyset max-age. Keep the
-        // configured-origin cache below the C05 60-second upper bound.
-        const now = Date.now();
-        this.signingKeyCache = {
-          keys,
-          expiresAtMs: now + 60_000,
-          confirmedAtMs: now,
-          // A signed-operation header can request one refresh of a still-valid
-          // configured-origin epoch. Further unknown identifiers fail closed
-          // until normal expiry, preventing attacker-controlled fetch loops.
-          unknownKidRefreshUsed: refreshUnknownKid,
-        };
-        if (this.signingKeyFailures > 0) {
-          this.logger.info({ event: "execution.signing_keys_recovered", failures: this.signingKeyFailures }, "Core signing keys readable again");
-        }
-        this.signingKeyFailures = 0;
-        this.signingKeyRetryAtMs = 0;
-        return keys;
-      }, (error: unknown) => {
-        this.signingKeyFailures += 1;
-        const retryInMs = Math.min(SIGNING_KEY_RETRY_MAX_MS, SIGNING_KEY_RETRY_BASE_MS * 2 ** (this.signingKeyFailures - 1));
-        this.signingKeyRetryAtMs = Date.now() + retryInMs;
-        const stale = this.signingKeyCache;
-        this.logger.warn({ event: "execution.signing_keys_refresh_failed", failures: this.signingKeyFailures, retryInMs,
-          code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
-          ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
-          servingConfirmedKeys: this.confirmedSigningKeys() !== null,
-          ...(stale ? { confirmedAgeMs: Date.now() - stale.confirmedAtMs } : {}) }, "Core signing keys could not be refreshed");
-        throw error;
-      }).finally(() => { this.signingKeyRefresh = null; });
-    }
+    this.signingKeyRefresh ??= this.refreshSigningKeys(refreshUnknownKid);
+    return this.refreshedOrConfirmed(this.signingKeyRefresh, deadlineAtMs, expectedKid);
+  }
+
+  /** The refreshed keys; if Core's keys cannot be read, the last confirmed ones while still within the stale bound. */
+  private async refreshedOrConfirmed(refresh: Promise<ReadonlyMap<string, KeyObject>>, deadlineAtMs: number | undefined, expectedKid: string | undefined): Promise<ReadonlyMap<string, KeyObject>> {
     try {
-      return await this.waitForSigningKeys(this.signingKeyRefresh, deadlineAtMs);
+      return await this.waitForSigningKeys(refresh, deadlineAtMs);
     } catch (error) {
       const fallback = this.confirmedSigningKeys(expectedKid);
       if (fallback && error instanceof RemoteInstanceError && error.code === "execution_authority_unavailable") return fallback;
       throw error;
     }
+  }
+
+  private refreshSigningKeys(refreshUnknownKid: boolean): Promise<ReadonlyMap<string, KeyObject>> {
+    return this.fetchExecutionSigningKeys()
+      .then(keys => this.signingKeysRefreshed(keys, refreshUnknownKid), (error: unknown) => this.signingKeysFailed(error))
+      .finally(() => { this.signingKeyRefresh = null; });
+  }
+
+  private signingKeysRefreshed(keys: ReadonlyMap<string, KeyObject>, refreshUnknownKid: boolean): ReadonlyMap<string, KeyObject> {
+    // Core currently does not publish a shorter keyset max-age. Keep the
+    // configured-origin cache below the 60-second upper bound.
+    const now = Date.now();
+    this.signingKeyCache = {
+      keys,
+      expiresAtMs: now + 60_000,
+      confirmedAtMs: now,
+      // A signed-operation header can request one refresh of a still-valid
+      // configured-origin epoch. Further unknown identifiers fail closed
+      // until normal expiry, preventing attacker-controlled fetch loops.
+      unknownKidRefreshUsed: refreshUnknownKid,
+    };
+    if (this.signingKeyFailures > 0) {
+      this.logger.info({ event: "execution.signing_keys_recovered", failures: this.signingKeyFailures }, "Core signing keys readable again");
+    }
+    this.signingKeyFailures = 0;
+    this.signingKeyRetryAtMs = 0;
+    return keys;
+  }
+
+  private signingKeysFailed(error: unknown): never {
+    this.signingKeyFailures += 1;
+    const retryInMs = Math.min(SIGNING_KEY_RETRY_MAX_MS, SIGNING_KEY_RETRY_BASE_MS * 2 ** (this.signingKeyFailures - 1));
+    this.signingKeyRetryAtMs = Date.now() + retryInMs;
+    const stale = this.signingKeyCache;
+    this.logger.warn({ event: "execution.signing_keys_refresh_failed", failures: this.signingKeyFailures, retryInMs,
+      ...errorFields(error),
+      servingConfirmedKeys: this.confirmedSigningKeys() !== null,
+      ...(stale ? { confirmedAgeMs: Date.now() - stale.confirmedAtMs } : {}) }, "Core signing keys could not be refreshed");
+    throw error;
   }
 
   /** The last key set Core confirmed, if still within the stale bound and holding the requested key. */
@@ -466,25 +527,13 @@ export class CoreClient {
   }
 
   private async fetchExecutionSigningKeys(): Promise<ReadonlyMap<string, KeyObject>> {
-    const keySchema = z.object({ kty: z.literal("RSA"), kid: z.string().min(1).max(256),
-      alg: z.literal("RS256").optional(), use: z.literal("sig").optional(),
-      n: z.string().min(1).max(2048).regex(/^[A-Za-z0-9_-]+$/), e: z.string().min(1).max(16).regex(/^[A-Za-z0-9_-]+$/),
-    }).strict();
     try {
       const result = await this.proofHttp.request({ method: "GET", path: CORE_PATHS.jwks,
-        schema: z.object({ keys: z.array(keySchema).min(1).max(32) }).strict(), operationPolicy: "progressRead" });
-      const keys = new Map<string, KeyObject>();
-      for (const jwk of result.keys) {
-        if (keys.has(jwk.kid)) throw new Error("Duplicate signing key");
-        const key = createPublicKey({ key: jwk, format: "jwk" });
-        if (key.asymmetricKeyType !== "rsa" || (key.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error("Invalid signing key");
-        keys.set(jwk.kid, key);
-      }
-      return keys;
+        schema: z.object({ keys: z.array(SIGNING_KEY_SCHEMA).min(1).max(32) }).strict(), operationPolicy: "progressRead" });
+      return signingKeyMap(result.keys);
     } catch (error) {
       // The cause stays a bounded code for the log; message text never leaves.
-      throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.",
-        { diagnostic: error instanceof RemoteInstanceError ? error.code : error instanceof z.ZodError ? "schema_invalid" : "invalid_key_set" });
+      throw new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.", { diagnostic: keySetDiagnostic(error) });
     }
   }
 
@@ -558,13 +607,13 @@ export class CoreClient {
   }
 
   /**
-   * Submit an already-durable C03 stop observation. This route is a private,
+   * Submit an already-durable recovery-evidence stop observation. This route is a private,
    * machine-proof boundary; its acknowledgement records only acceptance of
    * observation bytes and never a terminal result or quiescence decision.
    */
   // The identity key joins its fields with NUL, which no HTTP header may carry:
   // sent raw, fetch refused every submission locally, so a fenced session could
-  // never be recovered over HTTPS (WS2-159). The header carries its digest.
+  // never be recovered over HTTPS. The header carries its digest.
   async submitRecoveryEvidence(input: { evidence: RemoteRecoveryEvidence; connection: RemoteReconciliationConnection }): Promise<RecoveryEvidenceIngressResult> {
     const evidence = RemoteRecoveryEvidenceSchema.parse(structuredClone(input.evidence));
     const connection = RemoteReconciliationConnectionSchema.parse(structuredClone(input.connection));
@@ -599,11 +648,11 @@ export class CoreClient {
       schema: NativeExecutionRevisionFenceReceiptResultSchema,
       idempotencyKey: `execution-revision-fence-receipt:${parsed.intentDigest}:${parsed.runnerIncarnation}:${parsed.connectionRef}:${parsed.connectionEpoch}`,
     });
-    if (result.kind !== parsed.kind || result.intentDigest !== parsed.intentDigest ||
-        result.runnerIncarnation !== parsed.runnerIncarnation || result.connectionRef !== parsed.connectionRef ||
-        result.connectionEpoch !== parsed.connectionEpoch || result.fencedAt !== parsed.fencedAt ||
-        result.requestNonce !== parsed.proof.nonce ||
-        jcsDigest(result.intent) !== jcsDigest(parsed.intent)) {
+    if (!allEqual([
+      [result.kind, parsed.kind], [result.intentDigest, parsed.intentDigest], [result.runnerIncarnation, parsed.runnerIncarnation],
+      [result.connectionRef, parsed.connectionRef], [result.connectionEpoch, parsed.connectionEpoch], [result.fencedAt, parsed.fencedAt],
+      [result.requestNonce, parsed.proof.nonce], [jcsDigest(result.intent), jcsDigest(parsed.intent)],
+    ])) {
       throw new RemoteInstanceError("registration_mismatch", "Execution revision fence receipt does not match the submitted fence.");
     }
     return result;
@@ -613,7 +662,7 @@ export class CoreClient {
    * `HeartbeatMessage` plus a detached instance-proof signature binding the
    * heartbeat operation, instance, audience and body digest. Core derives
    * the replay nonce as `seq:<sequence>`, so
-   * the message carries no nonce of its own (CP3 integration note).
+   * the message carries no nonce of its own.
    */
   async heartbeat(message: HeartbeatMessage & { signature: string }): Promise<HeartbeatResult> {
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.heartbeat(message.instanceId), body: message, schema: HeartbeatResultSchema, idempotencyKey: `heartbeat:${message.instanceId}:${message.sequence}` });
@@ -727,21 +776,16 @@ export class CoreClient {
   }
 
   async controlAck(instanceId: string, ack: unknown): Promise<boolean | Extract<ReturnType<typeof DesiredConfigurationAckResultSchema.parse>, { status: "superseded" }>> {
-    if (typeof ack === "object" && ack !== null && "type" in ack && ack.type === "desired_configuration_ack") {
-      const request = DesiredConfigurationAckSchema.parse(ack);
-      if (request.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement instance mismatch");
-      const receipt = await this.http.request({ method: "POST", path: CORE_PATHS.controlAck(instanceId), body: request, schema: DesiredConfigurationAckResultSchema,
-        idempotencyKey: `configuration-ack:${instanceId}:${request.revision}:${request.status}` });
-      if (receipt.instanceId !== instanceId || receipt.revision !== request.revision) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement receipt mismatch");
-      if (receipt.status === "superseded") {
-        if (receipt.requestDigest !== jcsDigest(request as unknown as JsonValue) || (receipt.appliedRevision === request.revision && request.status === "applied")) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement disposition mismatch");
-        return receipt;
-      }
-      if (receipt.status !== request.status) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement receipt mismatch");
-      return true;
-    }
-    // Non-configuration control delivery remains a separate CP3 closure gate.
-    throw new RemoteInstanceError("protocol_incompatible", "This HTTPS endpoint accepts configuration acknowledgements only");
+    // Non-configuration control delivery is not accepted over HTTPS.
+    if (!configurationAck(ack)) throw new RemoteInstanceError("protocol_incompatible", "This HTTPS endpoint accepts configuration acknowledgements only");
+    const request = DesiredConfigurationAckSchema.parse(ack);
+    if (request.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement instance mismatch");
+    const receipt = await this.http.request({ method: "POST", path: CORE_PATHS.controlAck(instanceId), body: request, schema: DesiredConfigurationAckResultSchema,
+      idempotencyKey: `configuration-ack:${instanceId}:${request.revision}:${request.status}` });
+    if (receipt.instanceId !== instanceId || receipt.revision !== request.revision) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement receipt mismatch");
+    if (receipt.status === "superseded") return supersededAck(receipt, request);
+    if (receipt.status !== request.status) throw new RemoteInstanceError("registration_mismatch", "Configuration acknowledgement receipt mismatch");
+    return true;
   }
 
 
@@ -776,18 +820,20 @@ export class CoreClient {
         bodyFactory: () => RemoteAgentCapabilityRedeemRequestSchema.parse({ ...request, proof: this.proof("token_redeem", instanceId, request) }),
         schema: RemoteAgentCapabilityRedeemResultSchema, idempotencyKey: `capability-redeem:${instanceId}:${args.assignmentId}:${args.attempt}:${args.mcpCapabilityTokenRef}`,
         timeoutMs: 30_000, ...(deadline === undefined ? {} : { deadlineAtMs: deadline }) });
-      if ((deadline !== undefined && Date.now() >= deadline) || Date.parse(issued.expiresAt) <= this.options.clock.coreNow()) {
-        throw new RemoteInstanceError("capability_unavailable", "Capability delivery has expired.");
-      }
-      // /api/app/mcp is connection-management REST, not the MCP transport.
-      // The real /mcp owner still needs its capability admission integration.
-      const url = this.options.platformMcpUrl ?? new URL("/mcp", this.options.baseUrl).toString();
-      return { mcpServer: { name: "konteks-platform", url, headers: [{ name: "authorization", value: `Bearer ${issued.token}` }] }, expiresAt: issued.expiresAt };
+      return this.capabilityIssue(issued, deadline);
     } catch (error) {
-      const transient = error instanceof RemoteInstanceError && error.retryable;
-      // Schema/parser/server messages may contain secret-bearing input.
-      throw new RemoteInstanceError(error instanceof RemoteInstanceError ? error.code : "capability_unavailable", "Capability delivery was not accepted.", { retryable: transient });
+      throw undeliveredCapability(error);
     }
+  }
+
+  private capabilityIssue(issued: { token: string; expiresAt: string }, deadline: number | undefined): CapabilityTokenIssue {
+    if ((deadline !== undefined && Date.now() >= deadline) || Date.parse(issued.expiresAt) <= this.options.clock.coreNow()) {
+      throw new RemoteInstanceError("capability_unavailable", "Capability delivery has expired.");
+    }
+    // /api/app/mcp is connection-management REST, not the MCP transport.
+    // The real /mcp owner still needs its capability admission integration.
+    const url = this.options.platformMcpUrl ?? new URL("/mcp", this.options.baseUrl).toString();
+    return { mcpServer: { name: "konteks-platform", url, headers: [{ name: "authorization", value: `Bearer ${issued.token}` }] }, expiresAt: issued.expiresAt };
   }
 
   /** The claimed assignment's work definition (see `CORE_PATHS.workload`); `not_found` when Core has none. */
@@ -809,8 +855,17 @@ export class CoreClient {
     });
   }
 
+  async reportRuntimeUpdate(instanceId: string, report: RuntimeUpdateReport): Promise<{ accepted: boolean }> {
+    const body = RuntimeUpdateReportSchema.parse(report);
+    return this.http.request({
+      method: "POST", path: CORE_PATHS.runtimeUpdateReport(instanceId), body,
+      schema: z.object({ accepted: z.boolean() }).strict(),
+      idempotencyKey: `runtime-update:${body.updateId}:${body.state}`,
+    });
+  }
+
   /**
-   * The release this Core accepts right now (WS1-093). An update to anything
+   * The release this Core accepts right now. An update to anything
    * else would be refused by Core and leave the machine offline until it
    * rolls back. Null from a Core that does not say.
    */
@@ -848,12 +903,6 @@ export class CoreClient {
 
   async revokeGitKey(instanceId: string, keyRef: string): Promise<void> {
     await this.http.request({ method: "DELETE", path: CORE_PATHS.gitKey(instanceId, keyRef), schema: z.unknown() });
-  }
-
-  /** The Harness materialized a task checkout here; Core records the owner so exact-checkout work binds to this instance. */
-  async recordTaskCheckoutMaterialized(instanceId: string, assignmentId: string, body: { taskId: string; revision?: string }): Promise<{ workspaceRef: string }> {
-    return this.http.request({ method: "POST", path: CORE_PATHS.taskCheckoutMaterialized(instanceId, assignmentId), body, schema: TaskCheckoutMaterializedResultSchema,
-      idempotencyKey: `task-checkout:${instanceId}:${assignmentId}:${body.taskId}:${body.revision ?? "unversioned"}` });
   }
 
   /** A policy deferral (session- or component-raised), posted in Core's own `DeferredPermission` shape; Core answers the sanitized `PendingPermissionView`. Idempotent per assignment attempt and request id. */

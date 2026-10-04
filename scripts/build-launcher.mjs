@@ -39,7 +39,7 @@ writeFileSync(
   // no URL, so a release must know which Konteks it belongs to. An explicit
   // KONTEKS_CORE_URL / KONTEKS_RELAY_URL in the environment still wins at run
   // time (the e2e stack relies on that). The ones filled in here are listed,
-  // so the Windows command hands a release only what the person set (D131).
+  // so the Windows command hands a release only what the person set.
   `process.env.KONTEKS_RELEASE_ROOTS_JSON = ${JSON.stringify(roots)};\nprocess.env.KONTEKS_LAUNCHER_VERSION = ${JSON.stringify(process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0")};\nglobalThis.__konteksLauncherBakedEnv = [];\nif (process.env.KONTEKS_CORE_URL === undefined) { process.env.KONTEKS_CORE_URL = ${JSON.stringify(process.env.KONTEKS_DEFAULT_CORE_URL ?? "https://api.konteks.io")}; globalThis.__konteksLauncherBakedEnv.push("KONTEKS_CORE_URL"); }\nif (process.env.KONTEKS_RELAY_URL === undefined) { process.env.KONTEKS_RELAY_URL = ${JSON.stringify(process.env.KONTEKS_DEFAULT_RELAY_URL ?? "wss://relay.konteks.io/relay/runtime")}; globalThis.__konteksLauncherBakedEnv.push("KONTEKS_RELAY_URL"); }\nimport("../../packages/launcher/dist/cli.js");\n`,
 );
 execFileSync(npx, [
@@ -66,7 +66,7 @@ execFileSync(npx, ["postject", executable, "NODE_SEA_BLOB", join(work, "launcher
 // replaces this with the Developer ID signature when one is configured.
 if (os === "macos") execFileSync("codesign", ["--force", "--sign", "-", executable], { stdio: "inherit" });
 // The MSI installs this beside konteks-remote.exe: the connector's doctor
-// reads it as "this launcher runs the installed release's code" (D131).
+// reads it as "this launcher runs the installed release's code".
 if (os === "windows") writeFileSync(join(work, "launcher.json"), `${JSON.stringify({ runsInstalledRelease: true, version: process.env.KONTEKS_LAUNCHER_VERSION ?? "0.0.0" })}\n`);
 mkdirSync(dirname(out), { recursive: true });
 writeFileSync(join(work, "PACKAGE_LAYOUT.json"), JSON.stringify({ os, executable, out, install: os === "windows" ? "C:\\Program Files\\konteks-remote\\konteks-remote.exe" : "/usr/local/bin/konteks-remote" }));

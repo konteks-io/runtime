@@ -4,7 +4,7 @@
 # Usage (copied verbatim from the Konteks App or MCP activation response):
 #   curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --activation-id <id>
 #
-# Agent-first onboarding (onboarding-simplified OS3, R10) instead:
+# Agent-first onboarding instead:
 #   curl -fsSL -o "${TMPDIR:-/tmp}/konteks-install.sh" .../install.sh && sh "${TMPDIR:-/tmp}/konteks-install.sh" --user --enroll
 #
 # `--user` installs the verified connector executable into the private user
@@ -160,7 +160,7 @@ if [ "$user_install" -eq 1 ]; then
   chmod 700 "$root"
   install -m 0755 "$workdir/$connector" "$root/bin/konteks-remote"
   echo "konteks-remote installed for this user at $root/bin/konteks-remote"
-  # Graft (W1-G1) is offered later, and downloaded only after a yes. Record
+  # Graft is offered later, and downloaded only after a yes. Record
   # the digest the verified checksums give its package now, so the connector
   # installs exactly this release's bytes then, and nothing else.
   graft="konteks-graft-${os_id}-${arch}.tgz"

@@ -1,16 +1,15 @@
-import { isAbsolute, resolve } from "node:path";
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { BROWSER_MCP_SERVER_NAME, DSH_READ_ONLY_TOOLS, isDeniedBrowserTool } from "@konteks/remote-agent-runner";
+import { resolveIn } from "./host-decisions.js";
 
 /**
- * Permission parity for DeepSeek Harness (dsh-runtime-support CP3).
+ * Permission parity for DeepSeek Harness.
  *
  * dsh reports every tool call as ACP kind `other`, titled with its own tool
- * name, and its `session/request_permission` carries only the tool call id
- * (CP0 s4). The runtime policy judges a kind plus raw input, so on its own it
+ * name, and its `session/request_permission` carries only the tool call id. The runtime policy judges a kind plus raw input, so on its own it
  * would see nothing: a shell `git push` or a write outside the workspace
  * would pass unjudged. dsh always sends the `tool_call` update before the
- * request (CP0: 13 of 13), so this keeps each session's recent tool calls and
+ * request (13 of 13), so this keeps each session's recent tool calls and
  * rebuilds the request the policy needs. A request it cannot rebuild is
  * denied, never allowed by default.
  *
@@ -18,7 +17,7 @@ import { BROWSER_MCP_SERVER_NAME, DSH_READ_ONLY_TOOLS, isDeniedBrowserTool } fro
  * treats a hook that cannot run as non-blocking. `observe` therefore also
  * trips when a gated tool completes without having asked.
  */
-export type DshPermissionDecision =
+type DshPermissionDecision =
   | { kind: "allow" }
   | { kind: "deny"; reason: string }
   | { kind: "evaluate"; request: RequestPermissionRequest };
@@ -36,7 +35,7 @@ const READ_ONLY = new Set(DSH_READ_ONLY_TOOLS);
  */
 const KONTEKS_MCP = /^mcp__konteks-(platform|preview|result)__[A-Za-z0-9_-]+$/;
 /**
- * The QA browser (O8: a connector capability, so dsh gets it too), allowed
+ * The QA browser (a connector capability, so dsh gets it too), allowed
  * only on a session given it and never for a tool the launcher hides
  * (`browser_run_code_unsafe`, the route tools): its gateway confines it to
  * the session's preview and the origins Core opened.
@@ -53,6 +52,43 @@ export const DSH_TOOL_KINDS: Readonly<Record<string, string>> = Object.freeze({
   web_fetch: "fetch", web_search: "fetch",
 });
 
+/** A sandbox escalation beyond the workspace. */
+function widerSandbox(escalation: unknown): boolean {
+  return escalation !== undefined && !(typeof escalation === "string" && SANDBOX_WITHIN_WORKSPACE.has(escalation));
+}
+
+/** Read-only and Konteks tools are allowed; the browser only where given; shell and edits go to policy with what they would touch. */
+function toolDecision(request: RequestPermissionRequest, observed: ObservedCall, cwd: string, browserTools: boolean): DshPermissionDecision {
+  const { title, rawInput } = observed;
+  const toolCallId = request.toolCall.toolCallId;
+  if (READ_ONLY.has(title) || KONTEKS_MCP.test(title)) return { kind: "allow" };
+  const browserTool = BROWSER_MCP.exec(title)?.[1];
+  if (browserTool !== undefined) return browserDecision(browserTool, browserTools);
+  if (EXECUTE.has(title)) return executeDecision(request, toolCallId, title, rawInput.command);
+  if (EDIT.has(title)) return editDecision(request, toolCallId, title, editPath(rawInput), cwd);
+  return { kind: "deny", reason: `${title || "an unnamed tool"} is not a tool Konteks allows DeepSeek Harness to use` };
+}
+
+function browserDecision(browserTool: string, browserTools: boolean): DshPermissionDecision {
+  return browserTools && !isDeniedBrowserTool(browserTool) ? { kind: "allow" } : { kind: "deny", reason: `the browser tool ${browserTool} is not allowed in this session` };
+}
+
+function executeDecision(request: RequestPermissionRequest, toolCallId: string, title: string, command: unknown): DshPermissionDecision {
+  if (typeof command !== "string" || command.trim().length === 0) return { kind: "deny", reason: `${title} call has no command to judge` };
+  return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "execute", title: command, rawInput: { command } } } };
+}
+
+function editPath(rawInput: Record<string, unknown>): string | undefined {
+  if (typeof rawInput.file_path === "string") return rawInput.file_path;
+  return typeof rawInput.path === "string" ? rawInput.path : undefined;
+}
+
+function editDecision(request: RequestPermissionRequest, toolCallId: string, title: string, path: string | undefined, cwd: string): DshPermissionDecision {
+  if (path === undefined || path.length === 0) return { kind: "deny", reason: `${title} call has no path to judge` };
+  const filePath = resolveIn(cwd, path);
+  return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "edit", title, rawInput: { file_path: filePath } } } };
+}
+
 export class DshToolGovernance {
   private readonly calls = new Map<string, ObservedCall>();
   private readonly asked = new Set<string>();
@@ -68,24 +104,32 @@ export class DshToolGovernance {
     const toolCallId = typeof value.toolCallId === "string" ? value.toolCallId : undefined;
     if (toolCallId === undefined) return null;
     if (value.sessionUpdate === "tool_call") {
-      const rawInput = value.rawInput !== null && typeof value.rawInput === "object" && !Array.isArray(value.rawInput) ? value.rawInput as Record<string, unknown> : {};
-      this.calls.delete(toolCallId);
-      this.calls.set(toolCallId, { title: typeof value.title === "string" ? value.title : "", rawInput });
-      while (this.calls.size > this.limit) {
-        const oldest = this.calls.keys().next().value!;
-        this.calls.delete(oldest);
-        this.asked.delete(oldest);
-      }
+      this.recordCall(toolCallId, value);
       return null;
     }
     if (value.sessionUpdate !== "tool_call_update") return null;
-    const status = value.status;
+    return this.finishedWithoutAsking(toolCallId, value.status);
+  }
+
+  /** A newly announced call, newest last; the oldest are forgotten past the limit. */
+  private recordCall(toolCallId: string, value: Record<string, unknown>): void {
+    const rawInput = value.rawInput !== null && typeof value.rawInput === "object" && !Array.isArray(value.rawInput) ? value.rawInput as Record<string, unknown> : {};
+    this.calls.delete(toolCallId);
+    this.calls.set(toolCallId, { title: typeof value.title === "string" ? value.title : "", rawInput });
+    while (this.calls.size > this.limit) {
+      const oldest = this.calls.keys().next().value!;
+      this.calls.delete(oldest);
+      this.asked.delete(oldest);
+    }
+  }
+
+  /** Only a call that ran to completion did something; a gated one must have asked. */
+  private finishedWithoutAsking(toolCallId: string, status: unknown): { toolCallId: string; title: string } | null {
     if (status !== "completed" && status !== "failed" && status !== "cancelled") return null;
     const observed = this.calls.get(toolCallId);
     const askedFirst = this.asked.has(toolCallId);
     this.calls.delete(toolCallId);
     this.asked.delete(toolCallId);
-    // Only a call that ran to completion did something; a gated one must have asked.
     if (observed && status === "completed" && !askedFirst && !READ_ONLY.has(observed.title)) return { toolCallId, title: observed.title };
     return null;
   }
@@ -95,27 +139,6 @@ export class DshToolGovernance {
     this.asked.add(toolCallId);
     const observed = this.calls.get(toolCallId);
     if (!observed) return { kind: "deny", reason: "no tool call precedes this permission request" };
-    const { title, rawInput } = observed;
-    const escalation = rawInput.sandbox_permissions;
-    if (escalation !== undefined && !(typeof escalation === "string" && SANDBOX_WITHIN_WORKSPACE.has(escalation))) {
-      return { kind: "deny", reason: "a wider sandbox than workspace-write is never granted" };
-    }
-    if (READ_ONLY.has(title) || KONTEKS_MCP.test(title)) return { kind: "allow" };
-    const browserTool = BROWSER_MCP.exec(title)?.[1];
-    if (browserTool !== undefined) {
-      return options.browserTools === true && !isDeniedBrowserTool(browserTool) ? { kind: "allow" } : { kind: "deny", reason: `the browser tool ${browserTool} is not allowed in this session` };
-    }
-    if (EXECUTE.has(title)) {
-      const command = rawInput.command;
-      if (typeof command !== "string" || command.trim().length === 0) return { kind: "deny", reason: `${title} call has no command to judge` };
-      return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "execute", title: command, rawInput: { command } } } };
-    }
-    if (EDIT.has(title)) {
-      const path = typeof rawInput.file_path === "string" ? rawInput.file_path : typeof rawInput.path === "string" ? rawInput.path : undefined;
-      if (path === undefined || path.length === 0) return { kind: "deny", reason: `${title} call has no path to judge` };
-      const filePath = isAbsolute(path) ? path : resolve(cwd, path);
-      return { kind: "evaluate", request: { ...request, toolCall: { toolCallId, kind: "edit", title, rawInput: { file_path: filePath } } } };
-    }
-    return { kind: "deny", reason: `${title || "an unnamed tool"} is not a tool Konteks allows DeepSeek Harness to use` };
-  }
-}
+    if (widerSandbox(observed.rawInput.sandbox_permissions)) return { kind: "deny", reason: "a wider sandbox than workspace-write is never granted" };
+    return toolDecision(request, observed, cwd, options.browserTools === true);
+  }}

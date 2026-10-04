@@ -7,7 +7,7 @@ import {
   type IntegrationTaskSpec,
   type IntegrationToolCallRecord,
 } from "@konteks/backstage-plugin-common";
-import { RemoteInstanceError } from "@konteks/remote-common";
+import { RemoteInstanceError, plainRecord } from "@konteks/remote-common";
 import { STRUCTURED_RESULT_MCP_SERVER_NAME, STRUCTURED_RESULT_TOOL_NAME } from "../structured-result/result-tool-server.js";
 import { permissionToolIdentity, type McpToolCallLedger, type PermissionToolIdentity } from "../session/permission-tool-identity.js";
 import type { IntegrationWriteRecord, SupervisorJournal } from "../state/journal.js";
@@ -36,7 +36,7 @@ export function journalWriteLedger(journal: SupervisorJournal): IntegrationWrite
   };
 }
 
-export type IntegrationDenyReason =
+type IntegrationDenyReason =
   | "not_admitted"
   | "args_mismatch"
   | "required_args_mismatch"
@@ -46,11 +46,11 @@ export type IntegrationDenyReason =
   | "nonce_consumed"
   | "no_allow_once";
 
-export type IntegrationGateDecision =
+type IntegrationGateDecision =
   | { kind: "allow"; optionId: string }
   | { kind: "deny"; optionId: string | null; reason: IntegrationDenyReason };
 
-export interface IntegrationToolGateDeps {
+interface IntegrationToolGateDeps {
   agentId: string;
   /** The MCP servers this integration session gave its agent (the result tool, an E2E fixture). */
   sessionServers: ReadonlySet<string>;
@@ -61,7 +61,7 @@ export interface IntegrationToolGateDeps {
 }
 
 /** An allowed provider call, by the ACP tool call id the gate allowed it under. */
-export interface AllowedIntegrationCall {
+interface AllowedIntegrationCall {
   server: string;
   tool: string;
   argsDigest: string;
@@ -75,20 +75,65 @@ const token = (value: string, pattern: RegExp, fallback: string): string => {
   return pattern.test(cleaned) ? cleaned : fallback;
 };
 
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
 
 function safeDigest(args: unknown): string {
   try { return argsDigest(args); } catch { return argsDigest(null); }
 }
 
+type GateCall = { server: string; tool: string; args: unknown };
+type Deny = (reason: IntegrationDenyReason, call?: GateCall) => IntegrationGateDecision;
+
+/** One permission request as the gate judges it. */
+interface GateRequest {
+  toolCallId: string;
+  identity: PermissionToolIdentity;
+  call: GateCall;
+  allowOnce: string | null;
+  deny: Deny;
+}
+
+function optionIds(request: RequestPermissionRequest): { allowOnce: string | null; reject: string | null } {
+  return {
+    allowOnce: request.options.find(option => option.kind === "allow_once")?.optionId ?? null,
+    reject: request.options.find(option => option.kind === "reject_once")?.optionId ?? null,
+  };
+}
+
 /**
- * The integration sub-assignment's permission gate (capabilities-and-execution
- * "Required integration assignment policy", DESIGN §2). It is the WHOLE policy
+ * A repeated callback for an allowed call is the same grant, never a second
+ * one, and only for the exact same identity and arguments.
+ */
+function repeatedGrant(repeated: AllowedIntegrationCall, call: GateCall, allowOnce: string | null, deny: Deny): IntegrationGateDecision {
+  if (repeated.server !== call.server || repeated.tool !== call.tool || safeDigest(call.args) !== repeated.argsDigest) return deny("args_mismatch", call);
+  return allowOnce === null ? deny("no_allow_once", call) : { kind: "allow", optionId: allowOnce };
+}
+
+/** Whether the arguments have a canonical form within the size limit. */
+function canonicalWithinLimit(args: unknown): boolean {
+  try {
+    return Buffer.byteLength(canonicalArgs(args), "utf8") <= INTEGRATION_TASK_LIMITS.maxCanonicalArgsBytes;
+  } catch {
+    return false;
+  }
+}
+
+/** The bounded server and tool names, and the argument digest, a judged call is recorded with. */
+function judgedCall(identity: PermissionToolIdentity, call: GateCall | undefined): { server: string; tool: string; argsDigest: string } {
+  if (call) return { server: token(call.server, SERVER_TOKEN, "unknown"), tool: token(call.tool, TOOL_TOKEN, "unknown"), argsDigest: safeDigest(call.args ?? null) };
+  return { ...identityNames(identity), argsDigest: safeDigest(null) };
+}
+
+function identityNames(identity: PermissionToolIdentity): { server: string; tool: string } {
+  if (identity.kind === "native") return { server: "native", tool: token(identity.tool, TOOL_TOKEN, "unknown") };
+  if (identity.kind === "mcp") return { server: token(identity.server, SERVER_TOKEN, "unknown"), tool: token(identity.tool, TOOL_TOKEN, "unknown") };
+  return { server: "unidentified", tool: "unknown" };
+}
+
+/**
+ * The integration sub-assignment's permission gate. It is the WHOLE policy
  * of an integration session, not a layer over the general one:
  *
- * - the tool is read only from structured fields (Stage 0 S0-4); a title can
+ * - the tool is read only from structured fields; a title can
  *   never grant;
  * - only the spec's admitted tools pass, by server and tool identity
  *   (`checkIntegrationToolCall`), and only up to `limits.maxToolCalls`; a
@@ -115,50 +160,47 @@ export class IntegrationToolGate {
   }
 
   async evaluate(request: RequestPermissionRequest): Promise<IntegrationGateDecision> {
-    const allowOnce = request.options.find(option => option.kind === "allow_once")?.optionId ?? null;
-    const reject = request.options.find(option => option.kind === "reject_once")?.optionId ?? null;
+    const { allowOnce, reject } = optionIds(request);
     const toolCallId = request.toolCall.toolCallId;
     this.judged.add(toolCallId);
     const identity = permissionToolIdentity(request, this.deps.agentId, { sessionServers: this.deps.sessionServers, ledger: this.deps.ledger });
-    const deny = (reason: IntegrationDenyReason, call?: { server: string; tool: string; args: unknown }): IntegrationGateDecision => {
+    const deny: Deny = (reason, call) => {
       this.note(toolCallId, identity, call, "denied");
       return { kind: "deny", optionId: reject, reason };
     };
     if (identity.kind !== "mcp") return deny("not_admitted");
     if (identity.server === STRUCTURED_RESULT_MCP_SERVER_NAME) {
-      if (identity.tool !== STRUCTURED_RESULT_TOOL_NAME || allowOnce === null) return deny("not_admitted");
-      return { kind: "allow", optionId: allowOnce };
+      return identity.tool !== STRUCTURED_RESULT_TOOL_NAME || allowOnce === null ? deny("not_admitted") : { kind: "allow", optionId: allowOnce };
     }
-    const args = this.deps.agentId === "codex" ? this.deps.ledger.arguments(toolCallId) : record(request.toolCall)?.rawInput;
+    const args = this.deps.agentId === "codex" ? this.deps.ledger.arguments(toolCallId) : plainRecord(request.toolCall)?.rawInput;
     const call = { server: identity.server, tool: identity.tool, args };
     const repeated = this.allowed.get(toolCallId);
-    if (repeated) {
-      // A repeated callback for an allowed call is the same grant, never a
-      // second one, and only for the exact same identity and arguments.
-      if (repeated.server !== call.server || repeated.tool !== call.tool || safeDigest(args) !== repeated.argsDigest) return deny("args_mismatch", call);
-      return allowOnce === null ? deny("no_allow_once", call) : { kind: "allow", optionId: allowOnce };
-    }
-    if (args === undefined) return deny("missing_args", call);
-    try {
-      if (Buffer.byteLength(canonicalArgs(args), "utf8") > INTEGRATION_TASK_LIMITS.maxCanonicalArgsBytes) return deny("non_canonical_args", call);
-    } catch {
-      return deny("non_canonical_args", call);
-    }
+    if (repeated) return repeatedGrant(repeated, call, allowOnce, deny);
+    return this.admit({ toolCallId, identity, call, allowOnce, deny });
+  }
+
+  /** A first request for a provider call: admitted only by the spec, within its limits, once. */
+  private async admit({ toolCallId, identity, call, allowOnce, deny }: GateRequest): Promise<IntegrationGateDecision> {
+    if (call.args === undefined) return deny("missing_args", call);
+    if (!canonicalWithinLimit(call.args)) return deny("non_canonical_args", call);
     const check = checkIntegrationToolCall(this.spec, call);
     if (!check.allowed) return deny(check.reason, call);
     if (allowOnce === null) return deny("no_allow_once", call);
     if (this.allowedCount >= this.spec.limits.maxToolCalls) return deny("limit", call);
     const mode = this.spec.admittedTools.find(tool => tool.server === call.server && tool.tool === call.tool)!.mode;
-    if (mode === "write") {
-      const write = this.spec.write!;
-      const verdict = await this.deps.writes.consume({ nonce: write.nonce, taskId: this.spec.taskId, actionId: write.actionId, attemptId: write.attemptId,
-        argsDigest: check.argsDigest, toolCallId, consumedAt: this.deps.now() });
-      if (verdict === "consumed_elsewhere") return deny("nonce_consumed", call);
-    }
+    if (mode === "write" && await this.writeConsumedElsewhere(check.argsDigest, toolCallId)) return deny("nonce_consumed", call);
     this.allowedCount += 1;
     this.allowed.set(toolCallId, { server: call.server, tool: call.tool, argsDigest: check.argsDigest, mode });
     this.note(toolCallId, identity, call, "allowed");
     return { kind: "allow", optionId: allowOnce };
+  }
+
+  /** Records the write's one-use grant for this call; true when the nonce already belongs to another call. */
+  private async writeConsumedElsewhere(argsDigest: string, toolCallId: string): Promise<boolean> {
+    const write = this.spec.write!;
+    const verdict = await this.deps.writes.consume({ nonce: write.nonce, taskId: this.spec.taskId, actionId: write.actionId, attemptId: write.attemptId,
+      argsDigest, toolCallId, consumedAt: this.deps.now() });
+    return verdict === "consumed_elsewhere";
   }
 
   /** The provider call the gate allowed under this ACP tool call id, if any. */
@@ -182,13 +224,8 @@ export class IntegrationToolGate {
     return [...this.calls.values()];
   }
 
-  private note(toolCallId: string, identity: PermissionToolIdentity, call: { server: string; tool: string; args: unknown } | undefined, status: "allowed" | "denied"): void {
+  private note(toolCallId: string, identity: PermissionToolIdentity, call: GateCall | undefined, status: "allowed" | "denied"): void {
     if (this.calls.has(toolCallId) && status === "denied") return;
     if (!this.calls.has(toolCallId) && this.calls.size >= INTEGRATION_TASK_LIMITS.maxToolCalls) return;
-    const server = call ? token(call.server, SERVER_TOKEN, "unknown")
-      : identity.kind === "native" ? "native" : identity.kind === "mcp" ? token(identity.server, SERVER_TOKEN, "unknown") : "unidentified";
-    const tool = call ? token(call.tool, TOOL_TOKEN, "unknown")
-      : identity.kind === "native" ? token(identity.tool, TOOL_TOKEN, "unknown") : identity.kind === "mcp" ? token(identity.tool, TOOL_TOKEN, "unknown") : "unknown";
-    this.calls.set(toolCallId, { server, tool, argsDigest: safeDigest(call?.args ?? null), status, outcome: status === "allowed" ? "unknown" : "not_run" });
-  }
-}
+    this.calls.set(toolCallId, { ...judgedCall(identity, call), status, outcome: status === "allowed" ? "unknown" : "not_run" });
+  }}

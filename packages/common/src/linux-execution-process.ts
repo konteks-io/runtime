@@ -1,7 +1,7 @@
 import { isAbsolute, normalize } from "node:path";
 import { spawnPiped, type SpawnRequest, type PipedChildProcess } from "./process.js";
 
-export interface LinuxExecutionMountPolicy {
+interface LinuxExecutionMountPolicy {
   /** Caller must authenticate/pin this executable before selecting the owner. */
   executable: string;
   /** Same-path writable mounts over a read-only host view. No implicit HOME. */

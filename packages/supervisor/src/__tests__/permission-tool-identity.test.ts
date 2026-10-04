@@ -19,7 +19,7 @@ function claude(toolName: string, toolCall: Record<string, unknown> = {}): Reque
   return request({ kind: "other", title: toolName, ...toolCall, _meta: { claudeCode: { toolName } } });
 }
 
-describe("permission tool identity (S0-4)", () => {
+describe("permission tool identity", () => {
   it("reads a Claude tool's server and name from the bridge's structured field, never its title", () => {
     expect(permissionToolIdentity(claude("mcp__konteks-browser__browser_navigate"), "claude-code"))
       .toEqual({ kind: "mcp", server: "konteks-browser", tool: "browser_navigate" });
@@ -59,7 +59,7 @@ describe("permission tool identity (S0-4)", () => {
   });
 });
 
-describe("browser allow keyed on structured identity (S0-4, X05)", () => {
+describe("browser allow keyed on structured identity", () => {
   const context = { assignmentId: "a", agentId: "claude-code", workspaceRoot: "/w", browserTools: true };
   const responder = new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false);
 
@@ -91,7 +91,7 @@ describe("browser allow keyed on structured identity (S0-4, X05)", () => {
   });
 });
 
-describe("only the session's own MCP servers are callable (S0-2)", () => {
+describe("only the session's own MCP servers are callable", () => {
   const servers = new Set(["konteks-1787206951837-gjy9xi", "konteks-preview", "konteks-result"]);
   const context = { assignmentId: "a", agentId: "claude-code", workspaceRoot: "/w", sessionServers: servers };
   const responder = new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true);
@@ -118,7 +118,7 @@ describe("only the session's own MCP servers are callable (S0-2)", () => {
     await expect(responder.evaluatePermission(approval("i2"), codex)).resolves.toEqual({ kind: "allow", optionId: "allow" });
   });
 
-  it("leaves an admitted integration tool to its gate, asked once, never allowed by the general policy (CP2 seam)", async () => {
+  it("leaves an admitted integration tool to its gate, asked once, never allowed by the general policy", async () => {
     const admitted = { ...context, admittedMcpTools: [{ server: "claude_ai_Atlassian", tools: ["addCommentToJiraIssue"] }] };
     await expect(responder.evaluatePermission(claude("mcp__claude_ai_Atlassian__addCommentToJiraIssue"), admitted)).resolves.toEqual({ kind: "defer", allowOnceOnly: true });
     await expect(responder.evaluatePermission(claude("mcp__claude_ai_Atlassian__deleteJiraIssue"), admitted)).resolves.toEqual({ kind: "deny", optionId: "reject" });

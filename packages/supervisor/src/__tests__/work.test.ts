@@ -58,7 +58,7 @@ async function settleBootstrap(work: WorkOrchestrator, id: string): Promise<void
   await vi.waitFor(() => expect(internal.bootstrapping.has(`${id}:1`)).toBe(false));
 }
 
-describe("report sender (D125 sender-side state machine)", () => {
+describe("report sender state machine", () => {
   it.each(['assistant_execution', 'delivery'] as const)('includes only journal-derived operation dispositions in a terminal %s report digest', async kind => {
     const f = await senderHarness();
     await f.journal.assignments.put({ ...f.journal.assignments.get('a:1')!, kind });
@@ -347,7 +347,7 @@ describe("report sender (D125 sender-side state machine)", () => {
     expect(reports(sent).map((report) => report.reportSequence)).toEqual([2, 3]);
   });
 
-  it("operation_conflict on a terminal report resubmits it as interrupted(not_resumable) once the session is stopped, backing off, and frees the claim (WS2-153)", async () => {
+  it("operation_conflict on a terminal report resubmits it as interrupted(not_resumable) once the session is stopped, backing off, and frees the claim", async () => {
     const delays: number[] = [];
     const confirmStopped = vi.fn()
       .mockRejectedValueOnce(new RemoteInstanceError("recovery_required", "The session is still open."))
@@ -374,7 +374,7 @@ describe("report sender (D125 sender-side state machine)", () => {
     expect(outbox.depth).toBe(0);
   });
 
-  it("heals a claim halted over a refused terminal before this fix existed, once per process (WS2-153)", async () => {
+  it("heals a claim halted over a refused terminal before this fix existed, once per process", async () => {
     const confirmStopped = vi.fn(async () => undefined);
     const { sender, sent, journal, outbox } = await senderHarness(() => true, { confirmStopped, sleep: async () => undefined });
     await journal.assignments.update("a:1", current => ({ ...current!, state: "recovery_required", recoveryReason: "assignment_conflict",

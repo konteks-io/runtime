@@ -1,3 +1,4 @@
+import type { Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readlink, rm, symlink } from "node:fs/promises";
 import { isAbsolute, posix, resolve, win32 } from "node:path";
@@ -5,7 +6,7 @@ import { OpenCodeLoginOptionIdSchema, RemoteInstanceError, keyedFingerprint, rea
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import type { RunnerConfig } from "../config.js";
 import type { HostAgentRunnerAdapter, HostLoginRequest, HostWorkingCopyBinding } from "./host-agent.js";
-import { allowListEnvironment, HOST_INHERITED_VARIABLES } from "./allow-list-environment.js";
+import { allowListEnvironment } from "./allow-list-environment.js";
 import { instructionsInside } from "./working-copy-instructions.js";
 import {
   isOpenCodeFreeModel,
@@ -26,16 +27,13 @@ const FINGERPRINT_KEY_FILE = "fingerprint.key";
 
 /**
  * The person's own OpenCode 2 (opencode-runtime-support). OpenCode signs in
- * from its environment (CP0: `auth list` showed "GitHub Copilot ·
+ * from its environment (`auth list` showed "GitHub Copilot ·
  * GITHUB_TOKEN · environment"), so every execution of the binary by the
  * connector (sessions, `--version`, `debug`, `auth`) gets an environment built
  * from an ALLOW-LIST: nothing inherited but what is named below, never a
  * provider key, token or other credential variable, never an inherited
  * `OPENCODE_*`. What OpenCode keeps lives in a private home the connector owns.
  */
-
-/** Inherited variables OpenCode may see (compared case-insensitively on Windows): the host-agent allow-list. */
-export const OPENCODE_INHERITED_VARIABLES: readonly string[] = HOST_INHERITED_VARIABLES;
 
 const CONTROL = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
@@ -49,7 +47,7 @@ export interface OpenCodeRuntimePaths {
   data: string;
   state: string;
   cache: string;
-  /** Parent of the per-working-copy XDG_CONFIG_HOME folders (CP2). */
+  /** Parent of the per-working-copy XDG_CONFIG_HOME folders. */
   configs: string;
   /** XDG_CONFIG_HOME of the control process (discovery, sign-in), which has no working copy. */
   controlConfig: string;
@@ -62,7 +60,7 @@ export function openCodeRuntimePaths(credentialDir: string, platform: NodeJS.Pla
   return { root, home: path.join(root, "home"), data: path.join(root, "data"), state: path.join(root, "state"), cache: path.join(root, "cache"), configs, controlConfig: path.join(configs, "control") };
 }
 
-export interface OpenCodeEnvironmentOptions {
+interface OpenCodeEnvironmentOptions {
   /** The private home: HOME and the XDG folders (all absolute). */
   home: { home: string; data: string; state: string; cache: string; config: string };
   /** Konteks' own `OPENCODE_*` settings (never inherited ones). */
@@ -104,7 +102,7 @@ export interface OpenCodePermissionRule {
 
 /**
  * The Konteks permission rules, in order. OpenCode applies the LAST matching
- * rule and puts its own defaults before ours (CP0-v2, verified with `opencode
+ * rule and puts its own defaults before ours (verified with `opencode
  * debug agents`), so the leading `* ask` overrides every default, and the
  * `.env` rows are restated after our `read` allow, which would otherwise
  * re-open them. `external_directory`, Code Mode's built-in browser and
@@ -129,7 +127,7 @@ export const OPENCODE_KONTEKS_PERMISSIONS: readonly OpenCodePermissionRule[] = O
   // `browser`) and OpenCode's own (`tools.opencode.session_move`, which moves
   // the session to another folder, `session_rename`, `models`, the MCP
   // resource readers; permission `opencode_<tool>`). A deny drops a tool from
-  // the catalogue (live on 2.0.18, CP4: `browser.*` and `opencode.*` do not).
+  // the catalogue (live on 2.0.18: `browser.*` and `opencode.*` do not).
   { action: "browser", resource: "*", effect: "deny" },
   { action: "opencode_*", resource: "*", effect: "deny" },
 ].map(rule => Object.freeze(rule as OpenCodePermissionRule)));
@@ -160,7 +158,7 @@ export function renderOpenCodeKonteksConfig(): Record<string, unknown> {
 /**
  * Konteks' own `OPENCODE_*` settings for every OpenCode process: the locked
  * configuration, the repository's own config switched off (a repo
- * `opencode.json` or `.opencode/agent` re-allowed everything in CP0), and no
+ * `opencode.json` or `.opencode/agent` would otherwise re-allow everything), and no
  * file watcher (it otherwise watches every parent folder up to `/`).
  */
 export function openCodeKonteksSettings(): Record<string, string> {
@@ -205,9 +203,9 @@ export function openCodeWorkingCopyConfig(credentialDir: string, workingCopy: st
 }
 
 /** How a config folder carries the working copy's `AGENTS.md`. */
-export type OpenCodeInstructions = "link" | "copy" | "none";
+type OpenCodeInstructions = "link" | "copy" | "none";
 
-export interface OpenCodeInstructionsDeps {
+interface OpenCodeInstructionsDeps {
   /** Replaced only in tests (a Windows account without the symlink privilege). */
   symlink?: typeof symlink;
 }
@@ -215,7 +213,7 @@ export interface OpenCodeInstructionsDeps {
 /**
  * OpenCode loads a repository's `AGENTS.md` only while project config is on,
  * which the lock switches off, but always loads the `AGENTS.md` in its own
- * config folder (CP0-v2 row 6). So each working copy's process gets a config
+ * config folder. So each working copy's process gets a config
  * folder whose `opencode/AGENTS.md` is a symlink to the working copy's, or a
  * copy where symlinks are not allowed (Windows without the privilege). Only a
  * regular file inside the working copy is ever linked, so a repository cannot
@@ -228,17 +226,25 @@ export async function syncOpenCodeInstructions(configHome: string, workingCopy: 
   const target = posixOrWin(configHome).join(folder, "AGENTS.md");
   const source = await instructionsInside(workingCopy);
   const current = await lstat(target).catch(() => null);
-  if (source === null) {
-    if (current) await rm(target, { recursive: true, force: true });
-    return "none";
-  }
-  if (current?.isSymbolicLink() && await readlink(target).catch(() => null) === source) return "link";
+  if (source !== null && await linksTo(target, current, source)) return "link";
   if (current) await rm(target, { recursive: true, force: true });
+  if (source === null) return "none";
+  return linkOrCopy(source, target, deps.symlink ?? symlink);
+}
+
+async function linksTo(target: string, current: Stats | null, source: string): Promise<boolean> {
+  return current !== null && current.isSymbolicLink() && await readlink(target).catch(() => null) === source;
+}
+
+/** Codes of a symlink the account may not make (Windows without the privilege): the file is copied instead. */
+const SYMLINK_REFUSED = ["EPERM", "EACCES", "ENOTSUP", "EINVAL", "UNKNOWN"];
+
+async function linkOrCopy(source: string, target: string, link: typeof symlink): Promise<OpenCodeInstructions> {
   try {
-    await (deps.symlink ?? symlink)(source, target, "file");
+    await link(source, target, "file");
     return "link";
   } catch (error) {
-    if (!["EPERM", "EACCES", "ENOTSUP", "EINVAL", "UNKNOWN"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    if (!SYMLINK_REFUSED.includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
     await copyFile(source, target);
     return "copy";
   }
@@ -298,7 +304,7 @@ export async function bindOpenCodeWorkingCopy(credentialDir: string, workingCopy
  * repository config is in reach and `--standalone` keeps its private server
  * to itself (it exits with the command; no background service is started).
  */
-export async function preparedOpenCodeCommandContext(config: RunnerConfig): Promise<OpenCodeCommandContext> {
+async function preparedOpenCodeCommandContext(config: RunnerConfig): Promise<OpenCodeCommandContext> {
   const context = openCodeCommandContext(config);
   await prepareOpenCodeHome(config);
   return context;
@@ -345,7 +351,7 @@ function openCodeLoginRequest(request: HostLoginRequest): OpenCodeLoginRequest {
  * every OpenCode process of this runner (sign-ins and sessions). The control
  * process (discovery, sign-in) uses a config folder with no instructions;
  * each execution process gets its working copy's own (`bindWorkingCopy`).
- * Offered on the install side since CP6 (`openCodeInstallAdapter.offered`).
+ * Offered on the install side (`openCodeInstallAdapter.offered`).
  */
 export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   agentId: "opencode",
@@ -367,8 +373,8 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
     binary(config, family);
     return bindOpenCodeWorkingCopy(config.RUNNER_CREDENTIAL_DIR, workingCopy);
   },
-  // O2: OpenCode's own `auth login`, driven and relayed (link and code for a
-  // subscription, OpenCode's own key prompt for an API key); O10's one-time
+  // OpenCode's own `auth login`, driven and relayed (link and code for a
+  // subscription, OpenCode's own key prompt for an API key); the one-time
   // offer to repeat the person's own OpenCode sign-ins.
   startLogin: ({ config, events, logger, loginId, request }) => {
     const context = openCodeCommandContext(config);
@@ -383,7 +389,7 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   async identity(config, settings) {
     // What OpenCode's own `auth list` reports in the private home: provider,
     // method and credential id, never a secret. With nothing signed in, Zen's
-    // free models make it ready only when the person switched them on (O6).
+    // free models make it ready only when the person switched them on.
     const stored = await listOpenCodeCredentials(await preparedOpenCodeCommandContext(config));
     const credentials = openCodeCredentialViews(stored);
     const material = openCodeIdentityMaterial(stored, settings.openCodeFreeModels);
@@ -394,9 +400,9 @@ export const openCodeRunnerAdapter: HostAgentRunnerAdapter = {
   siteLoginOptions: async config => openCodeSiteLoginOptions(await listOpenCodeIntegrations(await preparedOpenCodeCommandContext(config))),
   offersModel: (value, settings) => settings.openCodeFreeModels || !isOpenCodeFreeModel(value),
   hostVersion: config => config.RUNNER_BRIDGE_VERSION !== "unknown" ? config.RUNNER_BRIDGE_VERSION : undefined,
-  // OpenCode returns usage with each prompt response (CP0-v2).
+  // OpenCode returns usage with each prompt response.
   tokenUsageObservable: true,
   // ACP still offers `plan` with the plan agent switched off, accepts it, and
-  // a prompt in that mode hangs (CP2); plan mode also runs shell unasked.
+  // a prompt in that mode hangs; plan mode also runs shell unasked.
   refusedSessionModes: { modeIds: ["plan"], message: "OpenCode's plan mode is not available on Konteks." },
 };

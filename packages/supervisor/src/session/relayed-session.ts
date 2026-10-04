@@ -1,3 +1,4 @@
+import { SessionToolTransportsSchema, type SessionToolTransports } from "../mcp/local-transport.js";
 import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
@@ -10,6 +11,7 @@ import {
   RemoteTransferBindingSchema,
   RemoteExecutionReadyResultSchema,
   RemoteInstanceError,
+  allEqual,
   createLogger,
   redactValue,
   nativeSpanLogContext,
@@ -17,7 +19,6 @@ import {
   type AcpJsonRpcError,
   type AgentTurnUsageObservation,
   type Clock,
-  type JsonValue,
   type Logger,
   type PendingPermissionView,
   type RemoteWorkAssignment,
@@ -29,16 +30,15 @@ import {
   type SessionToRuntimeMessage,
 } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME, type RunnerEvent } from "@konteks/remote-agent-runner";
-import type { RunnerPort } from "../runner-port.js";
-import type { SupervisorJournal } from "../state/journal.js";
+import type { RunnerPort, RunnerSessionCreated, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
+import type { PendingRequest, SupervisorJournal } from "../state/journal.js";
 import type { TransportManager } from "../transport/relay-transport.js";
 import { deferredPermissionBody, PermissionBroker, registerDeferral, sanitizeElicitationRequest, sanitizePermissionRequest, type PendingHumanRequest, type SanitizedElicitation, type SanitizedPermission } from "./permissions.js";
 import type { CapabilityTokenIssue, DeferredPermissionBody } from "../core/client.js";
-import type { AdmittedMcpTool, PolicyResponder } from "./policy-responder.js";
+import type { AdmittedMcpTool, PolicyDecision, PolicyResponder } from "./policy-responder.js";
 import type { PreparedSessionInputs } from "../skills/session-inputs.js";
 import { McpCapabilityFacade, type McpLocalTransportIdentity } from "../mcp/capability-facade.js";
-import { SessionToolTransportsSchema, type SessionToolTransports } from "../mcp/local-transport.js";
-import { BROWSER_WORK_KINDS, PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
+import { PREVIEW_WORK_KINDS, PreviewMcpServer, type SessionPreviewAccess } from "../preview/mcp-server.js";
 import { PreviewBrowserGateway } from "../preview/browser-gateway.js";
 import {
   canonicalizeAcpToolActivity,
@@ -71,7 +71,7 @@ import {
 } from "../structured-result/structured-turn.js";
 
 /**
- * One relayed ACP session (D98/D113/D114): bootstrapped by the supervisor as a
+ * One relayed ACP session: bootstrapped by the supervisor as a
  * consequence of a claim, announced with `session_ready`, driven by the grant
  * holder / orchestrator through `SessionToRuntimeMessage`s, and closed with
  * `session_closed`. The supervisor's durable pending-request journal is the
@@ -88,8 +88,8 @@ export interface RelayedSessionDeps {
   policy: PolicyResponder;
   /**
    * MCP tools of servers other than the session's own that an integration
-   * binding admitted into this assignment (external-integration CP2 seam).
-   * Absent or empty, as in Stage 0: every other server's tool is refused.
+   * binding admitted into this assignment (a seam no production caller sets
+   * today). Absent or empty: every other server's tool is refused.
    */
   admittedMcpTools?: (assignment: RemoteWorkAssignment) => readonly AdmittedMcpTool[];
   broker: PermissionBroker;
@@ -160,7 +160,7 @@ export interface RelayedSessionDeps {
   /** Rechecked immediately before a local prompt crosses into the bridge. */
   assertPromptAllowed?: () => void;
   onUsage: (observation: AgentTurnUsageObservation) => Promise<void>;
-  /** A turn started or ended: the computer's busy state changed (WS1-179). */
+  /** A turn started or ended: the computer's busy state changed. */
   onTurnActivity?: () => void;
   onClosed: (session: RelayedSession, reason: SessionClosedReason) => Promise<void>;
   /**
@@ -213,7 +213,7 @@ export class RelayedSession {
   private readonly toolGovernance: HostToolGovernance | null;
   /** The MCP servers this session gave its agent (the only Code Mode namespaces an OpenCode block may call, the only servers Antigravity may reach). */
   private sessionServers: ReadonlySet<string> = new Set();
-  /** Codex's announced MCP calls: its approvals name only the tool call id (S0-4). */
+  /** Codex's announced MCP calls: its approvals name only the tool call id. */
   private readonly mcpCalls: McpToolCallLedger | null;
   /** A governed permission request's tool call and options, until Konteks answers it. */
   private readonly governedPermissions = new Map<string, { toolCallId: string; options: RequestPermissionRequest["options"] }>();
@@ -232,10 +232,12 @@ export class RelayedSession {
   private resultTools: StructuredResultToolServer | null = null;
   /** The turn that asked for a structured result, while it (or its one follow-up) runs. */
   private structuredTurn: StructuredTurnState | null = null;
-  /** The QA browser's gateway (validation, QA, delivery and conversation sessions of any agent, O8) and its output folder. */
+  /** The QA browser's gateway (validation, QA, delivery and conversation sessions of any agent) and its output folder. */
   private browserGateway: PreviewBrowserGateway | null = null;
   private browserOutputDir: string | null = null;
   private diagnosticContext: ObservabilityContextV1 | undefined;
+  private readonly toolTransports: SessionToolTransports = { version: 1 };
+  private retainedTools: SessionToolTransports | undefined;
   /** The logical session whose preview this session's agent drives. */
   private previewSessionId: string | null = null;
   readonly counters = { unknownCompletions: 0, malformedResponses: 0 };
@@ -283,7 +285,7 @@ export class RelayedSession {
     try { await (this.deps.onExecutionAuthorityLost?.() ?? this.stopForRecovery()); }
     catch (error) {
       // A non-Konteks error was logged as `recovery_required`, which hid
-      // where the stop failed (2026-10-02). The orchestrator retries it.
+      // where the stop failed. The orchestrator retries it.
       this.logger.warn({ event: "execution.recovery_stop_unconfirmed", assignmentId: this.assignment.id,
         attempt: this.assignment.attempt, code: error instanceof RemoteInstanceError ? error.code : "unexpected_error",
         ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}), err: error },
@@ -292,7 +294,7 @@ export class RelayedSession {
     }
   }
 
-  /** D98 bootstrap: initialize is runner-local; token → mcpServers; load/resume when proven; else session/new. */
+  /** Bootstrap: initialize is runner-local; token → mcpServers; load/resume when proven; else session/new. */
   bootstrap(): Promise<{ acpSessionRef: string; resumed: boolean }> {
     return this.track(async () => {
       try { return await this.bootstrapImpl(); }
@@ -321,205 +323,285 @@ export class RelayedSession {
     return withNativeSpan("native.bootstrap.stage", this.diagnosticContext, { assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage }, async () => {
       try {
         const result = await operation();
-        // One line per finished stage, so a slow bootstrap says where (WS2-156).
+        // One line per finished stage, so a slow bootstrap says where.
         this.logger.info({ event: "native.bootstrap.stage", assignmentId: this.assignment.id, attempt: this.assignment.attempt,
           stage, outcome: "succeeded", durationMs: Date.now() - startedAt }, "native session bootstrap stage finished");
         return result;
       } catch (error) {
-        const known = error instanceof RemoteInstanceError;
-        this.logger.warn({
-          event: "native.bootstrap.stage.failed",
-          outcome: "failed",
-          assignmentId: this.assignment.id,
-          attempt: this.assignment.attempt,
-          stage,
-          code: known ? error.code : "unexpected_error",
-          retryable: known ? error.retryable : false,
-          ...(known && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
-          // An unknown error still names its class and, for an agent's JSON-RPC
-          // refusal, its numeric code: no message text, but enough to tell
-          // "method not found" from "invalid params" (WS1-168).
-          ...(!known && error instanceof Error ? { errorName: error.name } : {}),
-          ...(!known && typeof (error as { code?: unknown } | null)?.code === "number" ? { rpcCode: (error as { code: number }).code } : {}),
-        }, "native session bootstrap stage failed");
+        this.logger.warn({ event: "native.bootstrap.stage.failed", outcome: "failed", assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage, ...stageFailure(error) },
+          "native session bootstrap stage failed");
         throw error;
       }
     });
   }
 
   private async bootstrapImpl(): Promise<{ acpSessionRef: string; resumed: boolean }> {
+    const { prepared, binding } = await this.prepareSessionInputs();
+    const mcpServers: SessionMcpServer[] = [];
+    // A direct session is the person's own agent with nothing of Konteks in
+    // it: no platform tools even when a capability is named, no preview or
+    // browser (not a preview kind), no result tool.
+    const direct = isDirectAssignment(this.assignment);
+    this.retainedTools = this.deps.sessionToolTransports ? SessionToolTransportsSchema.parse(this.deps.sessionToolTransports) : undefined;
+    await this.startCapabilityFacade(binding.sessionId, direct, mcpServers);
+    const browser = await this.startPreviewTools(binding.sessionId, prepared.cwd, mcpServers);
+    // The turn result tool: every Konteks session gets it, so a turn that asks
+    // for a structured result can be answered through a validated tool call.
+    // A direct turn asks for none: it ends on the agent's own end_turn.
+    if (!direct) await this.startResultTool(mcpServers);
+    await this.awaitToolWiring();
+    const activation = await this.activate();
+    const references = await this.chosenReferences(activation);
+    const reserved: { ref?: string } = {};
+    const lifecycle = this.sessionLifecycle(reserved);
+    // The browser is a stdio server the runner adds; OpenCode's Code Mode
+    // gate and its tools line need its name too.
+    this.sessionServers = new Set([...mcpServers.map(server => server.name), ...(browser ? [BROWSER_MCP_SERVER_NAME] : [])]);
+    const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession(
+      this.sessionRequest(prepared.cwd, mcpServers, references, browser), lifecycle));
+    await this.adoptCreated(created, lifecycle !== undefined, reserved);
+    const readyProjection = await this.registerReadiness(created);
+    await this.announceReady(created, readyProjection);
+    return { acpSessionRef: created.acpSessionRef, resumed: created.resumed };
+  }
+
+  /** Core's claim-bound local inputs, verified against this assignment; binds the session channel. */
+  private async prepareSessionInputs(): Promise<{ prepared: PreparedSessionInputs; binding: RemoteTransferBinding }> {
     this.deps.assertExecutionOwned?.();
-    if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+    if (this.closed) throw sessionClosed();
     let prepared: PreparedSessionInputs;
     try { prepared = await this.bootstrapStage("input_preparation", () => this.deps.prepareInputs(this.assignment)); }
     catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
     this.deps.assertExecutionOwned?.();
-    const parsedBinding = RemoteTransferBindingSchema.safeParse(prepared.binding);
-    if (!parsedBinding.success) throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
-    const binding = parsedBinding.data;
-    if (binding.workspaceId !== this.assignment.workspaceId || binding.assignmentId !== this.assignment.id || binding.attempt !== this.assignment.attempt || binding.instanceId !== this.assignment.instanceId || binding.instanceId !== this.deps.instanceId ||
-        (continuedSession(this.assignment.source) !== null && binding.sessionId !== continuedSession(this.assignment.source)!.sessionId) || !isAbsolute(prepared.cwd) || /[\p{Cc}\p{Cf}\p{Cs}]/u.test(prepared.cwd)) {
-      throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
-    }
+    const binding = this.verifiedBinding(prepared);
     this.preparedInputs = prepared;
     // Input preparation verifies Core's claim-bound selection. Use its logical
     // session identity, never a bridge ref or an assignment-local random ID.
     this.boundChannelId = `session:${binding.sessionId}`;
-    if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-    const mcpServers: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }> = [];
-    // A direct session is the person's own agent with nothing of Konteks in
-    // it (runtime-view R11, R14): no platform tools even when a capability
-    // is named, no preview or browser (not a preview kind), no result tool.
-    const direct = isDirectAssignment(this.assignment);
-    const retainedTools = this.deps.sessionToolTransports ? SessionToolTransportsSchema.parse(this.deps.sessionToolTransports) : undefined;
-    const toolTransports: SessionToolTransports = { version: 1, ...retainedTools };
-    if (this.assignment.agentRoute.mcpCapabilityTokenRef && !direct) {
-      const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
-      this.deps.assertExecutionOwned?.();
-      const facade = new McpCapabilityFacade({
-        initial: issue,
-        ...(this.deps.mcpLocalTransport ? { localTransport: this.deps.mcpLocalTransport } : {}),
-        initiallyInactive: true,
-        renew: () => {
-          this.deps.assertExecutionOwned?.();
-          if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
-          return this.deps.redeemCapabilityToken(this.assignment);
-        },
-        onUnavailable: () => this.close("agent_exited"),
-        // Core's answer to environment_open is the only thing that widens
-        // this session's browser, and only to what Core named.
-        onBrowserAccess: grant => { this.browserGateway?.grant(grant.origins, grant.kind); },
-        context: {
-          assignmentId: this.assignment.id,
-          attempt: this.assignment.attempt,
-          sessionId: binding.sessionId,
-        },
-        logger: this.logger,
-        now: () => this.deps.clock.coreNow(),
-      });
-      this.mcpFacade = facade;
-      mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
+    if (this.closed) throw sessionClosed();
+    return { prepared, binding };
+  }
+
+  private verifiedBinding(prepared: PreparedSessionInputs): RemoteTransferBinding {
+    const parsed = RemoteTransferBindingSchema.safeParse(prepared.binding);
+    if (!parsed.success || !this.bindingMatches(parsed.data, prepared.cwd)) {
+      throw new RemoteInstanceError("workspace_binding_invalid", "Prepared local inputs do not match the assignment.");
     }
+    return parsed.data;
+  }
+
+  /** The binding is this assignment's (and this computer's), in its continued session, with a plain absolute working copy. */
+  private bindingMatches(binding: RemoteTransferBinding, cwd: string): boolean {
+    const continued = continuedSession(this.assignment.source);
+    return allEqual([
+      [binding.workspaceId, this.assignment.workspaceId], [binding.assignmentId, this.assignment.id], [binding.attempt, this.assignment.attempt],
+      [binding.instanceId, this.assignment.instanceId], [binding.instanceId, this.deps.instanceId],
+    ]) && (continued === null || binding.sessionId === continued.sessionId) && isAbsolute(cwd) && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(cwd);
+  }
+
+  /** The platform tools, through a session-scoped loopback facade that holds Core's bearer. */
+  private async startCapabilityFacade(sessionId: string, direct: boolean, mcpServers: SessionMcpServer[]): Promise<void> {
+    if (!this.assignment.agentRoute.mcpCapabilityTokenRef || direct) return;
+    const issue = await this.bootstrapStage("capability_redemption", () => this.deps.redeemCapabilityToken(this.assignment));
+    this.deps.assertExecutionOwned?.();
+    const facade = new McpCapabilityFacade({
+      initial: issue,
+      ...(this.deps.mcpLocalTransport ? { localTransport: this.deps.mcpLocalTransport } : {}),
+      initiallyInactive: true,
+      renew: () => {
+        this.deps.assertExecutionOwned?.();
+        if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
+        return this.deps.redeemCapabilityToken(this.assignment);
+      },
+      onUnavailable: () => this.close("agent_exited"),
+      // Core's answer to environment_open is the only thing that widens
+      // this session's browser, and only to what Core named.
+      onBrowserAccess: grant => { this.browserGateway?.grant(grant.origins, grant.kind); },
+      context: {
+        assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt,
+        sessionId,
+      },
+      logger: this.logger,
+      now: () => this.deps.clock.coreNow(),
+    });
+    this.mcpFacade = facade;
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("facade", () => facade.start()) });
+  }
+
+  /** The preview tools (and the browser, when this computer has one) for a kind of work that runs a preview. */
+  private async startPreviewTools(sessionId: string, cwd: string, mcpServers: SessionMcpServer[]): Promise<SessionBrowser | undefined> {
     const preview = this.deps.preview;
-    let browser: { proxyUrl: string; outputDir: string; browsersPath: string } | undefined;
-    if (preview && PREVIEW_WORK_KINDS.has(this.assignment.kind)) {
-      const sessionId = binding.sessionId;
-      const cwd = prepared.cwd;
-      // The session's browser: the connector's (O8), for every agent when the
-      // connector has one (Claude Code and Codex run their own package's,
-      // DeepSeek Harness and OpenCode the connector's), reaching only this
-      // session's running preview through its own gateway.
-      const browserVersion = this.deps.runner.browserVersion?.() ?? null;
-      if (browserVersion !== null && BROWSER_WORK_KINDS.has(this.assignment.kind) && preview.origin && preview.browsersPath) {
-        const origin = preview.origin.bind(preview);
-        const gateway = new PreviewBrowserGateway({
-          ...(retainedTools?.browser ? { localPort: retainedTools.browser.port } : {}),
-          initiallyInactive: true,
-          target: () => origin(sessionId),
-          onActivity: () => preview.touch(sessionId),
-          logger: this.logger,
-          context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
-          observability: () => this.diagnosticContext,
-        });
-        this.browserGateway = gateway;
-        const proxyUrl = await this.bootstrapStage("browser_gateway", () => gateway.start());
-        if (retainedTools?.browser) {
-          const outputDir = join(tmpdir(), retainedTools.browser.outputDirectoryName);
-          await mkdir(outputDir, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
-          const stat = await lstat(outputDir);
-          if (!stat.isDirectory() || stat.isSymbolicLink() || (process.platform !== "win32" && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0))) {
-            throw new RemoteInstanceError("recovery_required", "The retained browser output directory is not private.");
-          }
-          this.browserOutputDir = outputDir;
-        } else this.browserOutputDir = await mkdtemp(join(tmpdir(), "konteks-browser-"));
-        toolTransports.browser = { port: Number(new URL(proxyUrl).port), outputDirectoryName: basename(this.browserOutputDir) };
-        browser = { proxyUrl, outputDir: this.browserOutputDir, browsersPath: preview.browsersPath };
-      }
-      const tools = new PreviewMcpServer({
-        start: () => preview.start(sessionId, cwd),
-        stop: () => preview.stop(sessionId, "agent"),
-        status: () => preview.status(sessionId),
-      }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, observability: () => this.diagnosticContext, browser: browser !== undefined,
-        ...(retainedTools?.preview ? { localTransport: retainedTools.preview } : {}), initiallyInactive: true });
-      this.previewTools = tools;
-      this.previewSessionId = sessionId;
-      // A viewer may start this worktree's preview too (the same process
-      // manager and inference as preview_start).
-      preview.permit?.(sessionId, cwd);
-      mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
-      toolTransports.preview = tools.localTransportIdentity();
+    if (!preview || !PREVIEW_WORK_KINDS.has(this.assignment.kind)) return undefined;
+    const browser = await this.startBrowserGateway(preview, sessionId);
+    const tools = new PreviewMcpServer({
+      start: () => preview.start(sessionId, cwd),
+      stop: () => preview.stop(sessionId, "agent"),
+      status: () => preview.status(sessionId),
+    }, { logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt }, browser: browser !== undefined,
+      observability: () => this.diagnosticContext, initiallyInactive: true,
+      ...(this.retainedTools?.preview ? { localTransport: this.retainedTools.preview } : {}) });
+    this.previewTools = tools;
+    this.previewSessionId = sessionId;
+    // A viewer may start this worktree's preview too (the same process
+    // manager and inference as preview_start).
+    preview.permit?.(sessionId, cwd);
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("preview_tools", () => tools.start()) });
+    this.toolTransports.preview = tools.localTransportIdentity();
+    return browser;
+  }
+
+  /**
+   * The session's browser: the connector's, for every agent when the
+   * connector has one (Claude Code and Codex run their own package's,
+   * DeepSeek Harness and OpenCode the connector's), reaching only this
+   * session's running preview through its own gateway.
+   */
+  private async startBrowserGateway(preview: SessionPreviewAccess, sessionId: string): Promise<SessionBrowser | undefined> {
+    const browserVersion = this.deps.runner.browserVersion?.() ?? null;
+    if (browserVersion === null || !preview.origin || !preview.browsersPath) return undefined;
+    const origin = preview.origin.bind(preview);
+    const gateway = new PreviewBrowserGateway({
+      ...(this.retainedTools?.browser ? { localPort: this.retainedTools.browser.port } : {}),
+      initiallyInactive: true, observability: () => this.diagnosticContext,
+      target: () => origin(sessionId),
+      onActivity: () => preview.touch(sessionId),
+      logger: this.logger,
+      context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+    });
+    this.browserGateway = gateway;
+    const proxyUrl = await this.bootstrapStage("browser_gateway", () => gateway.start());
+    this.browserOutputDir = await this.prepareBrowserOutput();
+    this.toolTransports.browser = { port: Number(new URL(proxyUrl).port), outputDirectoryName: basename(this.browserOutputDir) };
+    return { proxyUrl, outputDir: this.browserOutputDir, browsersPath: preview.browsersPath };
+  }
+
+  private async prepareBrowserOutput(): Promise<string> {
+    if (!this.retainedTools?.browser) return mkdtemp(join(tmpdir(), "konteks-browser-"));
+    const outputDir = join(tmpdir(), this.retainedTools.browser.outputDirectoryName);
+    await mkdir(outputDir, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
+    const stat = await lstat(outputDir);
+    const privateOwner = process.platform === "win32" || (stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0);
+    if (![stat.isDirectory(), !stat.isSymbolicLink(), privateOwner].every(Boolean)) {
+      throw new RemoteInstanceError("recovery_required", "The retained browser output directory is not private.");
     }
-    // The turn result tool: every Konteks session gets it, so a turn that asks
-    // for a structured result can be answered through a validated tool call.
-    // A direct turn asks for none: it ends on the agent's own end_turn.
-    if (!direct) {
-      const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
-        ...(retainedTools?.result ? { localTransport: retainedTools.result } : {}), initiallyInactive: true });
-      this.resultTools = resultTools;
-      mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
-      toolTransports.result = resultTools.localTransportIdentity();
-    }
-    // Optional tool wiring (Graft) ran alongside redemption and the facade.
-    // The agent must find it in place, and the ownership commit below must
-    // stay a short step from runner adoption, so settle it here. It never
-    // rejects: a failed wiring is logged and the delivery continues.
-    if (this.preparedInputs?.toolWiring) {
-      await this.bootstrapStage("tool_wiring_wait", () => this.preparedInputs!.toolWiring!);
-      this.deps.assertExecutionOwned?.();
-      if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-    }
-    // Keep every fallible cloud/file input ahead of the local ownership
-    // commit. Once activation succeeds, only local channel reservation and
-    // runner adoption stand between the old and new ACP generations.
+    return outputDir;
+  }
+
+  private async startResultTool(mcpServers: SessionMcpServer[]): Promise<void> {
+    const resultTools = new StructuredResultToolServer({ logger: this.logger, context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+      ...(this.retainedTools?.result ? { localTransport: this.retainedTools.result } : {}), initiallyInactive: true });
+    this.resultTools = resultTools;
+    mcpServers.push({ type: "http", ...await this.bootstrapStage("result_tool", () => resultTools.start()) });
+    this.toolTransports.result = resultTools.localTransportIdentity();
+  }
+
+  /**
+   * Optional tool wiring (Graft) ran alongside redemption and the facade.
+   * The agent must find it in place, and the ownership commit below must
+   * stay a short step from runner adoption, so settle it here. It never
+   * rejects: a failed wiring is logged and the delivery continues.
+   */
+  private async awaitToolWiring(): Promise<void> {
+    if (!this.preparedInputs?.toolWiring) return;
+    await this.bootstrapStage("tool_wiring_wait", () => this.preparedInputs!.toolWiring!);
+    this.deps.assertExecutionOwned?.();
+    if (this.closed) throw sessionClosed();
+  }
+
+  /**
+   * Keep every fallible cloud/file input ahead of the local ownership
+   * commit. Once activation succeeds, only local channel reservation and
+   * runner adoption stand between the old and new ACP generations.
+   */
+  private async activate(): Promise<ExecutionActivation | undefined> {
     const activation = this.deps.activateExecution
       ? await this.bootstrapStage("activation", () => this.deps.activateExecution!())
       : undefined;
     this.deps.assertExecutionOwned?.();
-    if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-    if (this.mcpFacade && this.deps.recordMcpLocalTransport) {
-      await this.bootstrapStage("mcp_transport_identity", () => this.deps.recordMcpLocalTransport!(this.mcpFacade!.localTransportIdentity()));
-      this.deps.assertExecutionOwned?.();
-    }
+    if (this.closed) throw sessionClosed();
+    await this.recordTransportIdentity();
     if (this.boundChannelId !== null && this.deps.reserveChannel) {
       this.releaseChannel = this.deps.reserveChannel(this.boundChannelId, this);
     }
-    const source = this.assignment.source;
-    const priorRef = activation?.continueReference ?? this.deps.continueReference;
-    // A live in-process owner is strictly stronger than Core's restart-only
-    // restore fallback. Passing both references is ambiguous and rejected by
-    // the native runner; once live continuation wins, suppress the fallback.
-    const restoreRef = priorRef === undefined
-      ? activation?.restoreReference ?? this.deps.restoreReference
-      : undefined;
-    if (this.deps.mcpLocalTransportReference && priorRef !== this.deps.mcpLocalTransportReference && restoreRef !== this.deps.mcpLocalTransportReference) {
-      throw new RemoteInstanceError("recovery_required", "The retained MCP transport does not belong to the chosen provider session.",
-        { diagnostic: "mcp_transport_reference_mismatch" });
-    }
-    const missingRetainedTransport = (this.mcpFacade && !this.deps.mcpLocalTransport) ||
-      (this.previewTools && !retainedTools?.preview) || (this.resultTools && !retainedTools?.result) ||
-      (this.browserGateway && !retainedTools?.browser);
-    if (this.assignment.agentRoute.agentId === "codex" &&
-        (priorRef || restoreRef) && missingRetainedTransport) {
-      const legacyReference = priorRef ?? restoreRef!;
-      const unloaded = await this.deps.assertLegacyCodexThreadUnloaded?.(legacyReference).catch(() => false);
-      if (!unloaded) throw new RemoteInstanceError("recovery_required", "The retained Codex thread cannot safely refresh its local MCP transport.",
-        { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
-    }
-    if (!direct && this.deps.recordSessionToolTransports) {
-      await this.bootstrapStage("session_tool_transport_identity", () => this.deps.recordSessionToolTransports!(toolTransports));
-      this.deps.assertExecutionOwned?.();
-    }
+    return activation;
+  }
+
+  private async recordTransportIdentity(): Promise<void> {
+    if (!this.mcpFacade || !this.deps.recordMcpLocalTransport) return;
+    await this.bootstrapStage("mcp_transport_identity", () => this.deps.recordMcpLocalTransport!(this.mcpFacade!.localTransportIdentity()));
+    this.deps.assertExecutionOwned?.();
+  }
+
+  /** The provider session to continue or restore, checked against the retained transport; then the facade opens. */
+  private async chosenReferences(activation: ExecutionActivation | undefined): Promise<SessionReferences> {
+    const references = this.referencesFor(activation);
+    this.assertTransportReference(references);
+    await this.assertLegacyCodexThread(references);
+    await this.recordToolTransports();
     this.mcpFacade?.enable();
     this.previewTools?.enable();
     this.resultTools?.enable();
     this.browserGateway?.enable();
-    if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+    if (this.closed) throw sessionClosed();
     this.deps.assertExecutionOwned?.();
-    let reservedRef: string | undefined;
-    const lifecycle = this.deps.reserveExecutionReference ? {
+    return references;
+  }
+
+  private async recordToolTransports(): Promise<void> {
+    if (isDirectAssignment(this.assignment) || !this.deps.recordSessionToolTransports) return;
+    await this.bootstrapStage("session_tool_transport_identity", () => this.deps.recordSessionToolTransports!(this.toolTransports));
+    this.deps.assertExecutionOwned?.();
+  }
+
+  /**
+   * A live in-process owner is strictly stronger than Core's restart-only
+   * restore fallback. Passing both references is ambiguous and rejected by
+   * the native runner; once live continuation wins, suppress the fallback.
+   */
+  private referencesFor(activation: ExecutionActivation | undefined): SessionReferences {
+    const priorRef = activation?.continueReference ?? this.deps.continueReference;
+    const restoreRef = priorRef === undefined ? activation?.restoreReference ?? this.deps.restoreReference : undefined;
+    return { priorRef, restoreRef };
+  }
+
+  private assertTransportReference({ priorRef, restoreRef }: SessionReferences): void {
+    const retained = this.deps.mcpLocalTransportReference;
+    if (retained && priorRef !== retained && restoreRef !== retained) {
+      throw new RemoteInstanceError("recovery_required", "The retained MCP transport does not belong to the chosen provider session.",
+        { diagnostic: "mcp_transport_reference_mismatch" });
+    }
+  }
+
+  /** A Codex thread from before the retained local transport must not be loaded while its MCP transport is refreshed. */
+  private async assertLegacyCodexThread({ priorRef, restoreRef }: SessionReferences): Promise<void> {
+    if (!this.legacyCodexTransport(priorRef || restoreRef)) return;
+    const legacyReference = priorRef ?? restoreRef!;
+    const unloaded = await this.deps.assertLegacyCodexThreadUnloaded?.(legacyReference).catch(() => false);
+    if (!unloaded) throw new RemoteInstanceError("recovery_required", "The retained Codex thread cannot safely refresh its local MCP transport.",
+      { diagnostic: "legacy_mcp_thread_loaded_or_unverified" });
+  }
+
+  private legacyCodexTransport(reference: string | undefined): boolean {
+    return this.assignment.agentRoute.agentId === "codex" && Boolean(reference) && this.missingRetainedTransport();
+  }
+
+  private missingRetainedTransport(): boolean {
+    return [
+      [this.mcpFacade, this.deps.mcpLocalTransport],
+      [this.previewTools, this.retainedTools?.preview],
+      [this.resultTools, this.retainedTools?.result],
+      [this.browserGateway, this.retainedTools?.browser],
+    ].some(([server, identity]) => Boolean(server) && !identity);
+  }
+
+  /** Durable reference and process ownership around the runner's session creation. */
+  private sessionLifecycle(reserved: { ref?: string }): RunnerSessionLifecycle | undefined {
+    if (!this.deps.reserveExecutionReference) return undefined;
+    return {
       beforeCreate: async (ref: string) => {
         await this.deps.reserveExecutionReference!(ref);
-        reservedRef = ref;
+        reserved.ref = ref;
         // This is an opaque ownership reservation, NOT a confirmed bridge
         // creation. Unknown creation still fails the runner settlement lookup.
         this.acpSessionRef = ref;
@@ -532,72 +614,107 @@ export class RelayedSession {
         if (!this.deps.replaceExecutionProcessOwner) throw new RemoteInstanceError("recovery_required", "Durable bootstrap process-owner replacement is unavailable.");
         await this.deps.replaceExecutionProcessOwner(previous, replacement);
       },
-      assertCurrent: () => {
-        // The runner's recovery stop asserts this fence first. The fence is
-        // this session's own recovery mark, not a stale owner, so answer with
-        // admission ownership for that one settlement operation only.
-        if (this.recoverySettlementInProgress) return void this.assertRecoveryOwned();
-        if (this.closed && !this.completedSettlementInProgress) {
-          throw new RemoteInstanceError("recovery_required", "Session generation is fenced.", { diagnostic: "session_generation_fenced" });
-        }
-        this.deps.assertExecutionOwned?.();
-      },
-    } : undefined;
-    // The browser is a stdio server the runner adds; OpenCode's Code Mode
-    // gate and its tools line need its name too.
-    this.sessionServers = new Set([...mcpServers.map(server => server.name), ...(browser ? [BROWSER_MCP_SERVER_NAME] : [])]);
-    const created = await this.bootstrapStage("acp_session_bootstrap", () => this.deps.runner.createSession({
+      assertCurrent: () => this.assertLifecycleCurrent(),
+    };
+  }
+
+  /**
+   * The runner's recovery stop asserts this fence first. The fence is this
+   * session's own recovery mark, not a stale owner, so answer with admission
+   * ownership for that one settlement operation only.
+   */
+  private assertLifecycleCurrent(): void {
+    if (this.recoverySettlementInProgress) return void this.assertRecoveryOwned();
+    if (this.closed && !this.completedSettlementInProgress) {
+      throw new RemoteInstanceError("recovery_required", "Session generation is fenced.", { diagnostic: "session_generation_fenced" });
+    }
+    this.deps.assertExecutionOwned?.();
+  }
+
+  private sessionRequest(cwd: string, mcpServers: SessionMcpServer[], { priorRef, restoreRef }: SessionReferences, browser: SessionBrowser | undefined): RunnerSessionInput {
+    return {
       context: { instanceId: this.deps.instanceId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId },
       readinessDeadlineAt: new Date(Date.now() + Math.max(0, Date.parse(this.assignment.expiresAt) - this.deps.clock.coreNow())).toISOString(),
-      cwd: prepared.cwd,
+      cwd,
       mcpServers,
       ...(this.assignment.agentRoute.sessionConfig ? { sessionConfig: this.assignment.agentRoute.sessionConfig } : {}),
       ...(priorRef ? { acpSessionRef: priorRef } : {}),
-      ...(restoreRef ? { restoreAcpSessionRef: restoreRef } : {}),
-      // A conversation's context is Konteks's to restage; a direct session's is
-      // only the agent's own transcript, so that one is loaded.
-      ...(restoreRef && source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code" ? { freshProviderSessionOnRestore: true } : {}),
-      // A person's direct session keeps the agent's own title behind "[konteks] ";
-      // engineering work is named from Core's label (D130).
-      ...(isDirectAssignment(this.assignment) ? { agentTitled: true as const }
-        : this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {}),
+      ...this.restoreOptions(restoreRef),
+      ...this.titleOptions(),
       ...(browser ? { browser } : {}),
-    }, lifecycle));
+    };
+  }
+
+  /**
+   * A conversation's context is Konteks's to restage; a direct session's is
+   * only the agent's own transcript, so that one is loaded.
+   */
+  private restoreOptions(restoreRef: string | undefined): Partial<RunnerSessionInput> {
+    if (!restoreRef) return {};
+    const fresh = this.assignment.source.kind === "conversation" && this.assignment.agentRoute.agentId === "claude-code";
+    return { restoreAcpSessionRef: restoreRef, ...(fresh ? { freshProviderSessionOnRestore: true } : {}) };
+  }
+
+  /** A person's direct session keeps the agent's own title behind "[konteks] "; engineering work is named from Core's label. */
+  private titleOptions(): Partial<RunnerSessionInput> {
+    if (isDirectAssignment(this.assignment)) return { agentTitled: true as const };
+    return this.assignment.sessionLabel ? { sessionLabel: this.assignment.sessionLabel } : {};
+  }
+
+  /** The runner created the session: it must keep the reserved reference, and a session closed meanwhile is closed again. */
+  private async adoptCreated(created: RunnerSessionCreated, reserving: boolean, reserved: { ref?: string }): Promise<void> {
     this.creationReturned = true;
-    if (lifecycle && reservedRef !== created.acpSessionRef) throw new RemoteInstanceError("recovery_required", "Runner did not preserve durable reference ownership.");
+    if (reserving && reserved.ref !== created.acpSessionRef) throw new RemoteInstanceError("recovery_required", "Runner did not preserve durable reference ownership.");
     this.acpSessionRef = created.acpSessionRef;
     this.deps.assertExecutionOwned?.();
     if (this.closed) {
-      if (!this.recoveryStopping) {
-        await this.deps.runner.cancel(created.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-        await this.deps.runner.closeSession(created.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-      }
-      throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+      await this.abandonCreated(created.acpSessionRef);
+      throw sessionClosed();
     }
-    let readyProjection: Pick<RemoteExecutionReadyResult, "attempt" | "recoveryEpoch" | "readyRevision"> | undefined;
+  }
+
+  /** Cancel and close a session this bootstrap created but cannot keep (unless recovery owns stopping it). */
+  private async abandonCreated(ref: string): Promise<void> {
+    if (this.recoveryStopping) return;
+    await this.cancelAndClose(ref);
+  }
+
+  private async cancelAndClose(ref: string): Promise<void> {
+    await this.deps.runner.cancel(ref).catch(() => undefined);
+    this.deps.assertExecutionOwned?.();
+    await this.deps.runner.closeSession(ref).catch(() => undefined);
+    this.deps.assertExecutionOwned?.();
+  }
+
+  /** Core registers the created session as ready, for exactly the prepared binding and channel. */
+  private async registerReadiness(created: RunnerSessionCreated): Promise<ReadyProjection> {
     try {
       const binding = this.preparedInputs!.binding;
       const ready = RemoteExecutionReadyResultSchema.parse(await this.bootstrapStage("readiness", () =>
         this.deps.registerReady(this.assignment, binding, created.acpSessionRef)));
       this.deps.assertExecutionOwned?.();
-      if (ready.workspaceId !== binding.workspaceId || ready.instanceId !== binding.instanceId || ready.sessionId !== binding.sessionId || ready.assignmentId !== binding.assignmentId || ready.attempt !== binding.attempt ||
-          ready.agentId !== this.assignment.agentRoute.agentId || ready.acpSessionRef !== created.acpSessionRef || ready.channelId !== this.boundChannelId) {
+      if (!this.readyMatches(ready, binding, created.acpSessionRef)) {
         throw new RemoteInstanceError("workspace_binding_invalid", "Core readiness does not match the prepared local session.");
       }
-      if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-      readyProjection = { attempt: ready.attempt, recoveryEpoch: ready.recoveryEpoch, readyRevision: ready.readyRevision };
+      if (this.closed) throw sessionClosed();
+      return { attempt: ready.attempt, recoveryEpoch: ready.recoveryEpoch, readyRevision: ready.readyRevision };
     } catch (error) {
       this.deps.assertExecutionOwned?.();
-      if (!this.recoveryStopping) {
-        await this.deps.runner.cancel(created.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-        await this.deps.runner.closeSession(created.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-      }
+      await this.abandonCreated(created.acpSessionRef);
       throw error;
     }
+  }
+
+  private readyMatches(ready: RemoteExecutionReadyResult, binding: RemoteTransferBinding, acpSessionRef: string): boolean {
+    return allEqual([
+      [ready.workspaceId, binding.workspaceId], [ready.instanceId, binding.instanceId], [ready.sessionId, binding.sessionId],
+      [ready.assignmentId, binding.assignmentId], [ready.attempt, binding.attempt], [ready.agentId, this.assignment.agentRoute.agentId],
+      [ready.acpSessionRef, acpSessionRef], [ready.channelId, this.boundChannelId],
+    ]);
+  }
+
+  /** Open the session channel and announce `session_ready`; a delivery resumes any durable output it left. */
+  private async announceReady(created: RunnerSessionCreated, readyProjection: ReadyProjection): Promise<void> {
     if (this.boundChannelId === null) throw new RemoteInstanceError("workspace_binding_invalid", "The session channel has no authorized binding.");
     this.deps.assertExecutionOwned?.();
     this.deps.transport.openChannel(this.boundChannelId, "session");
@@ -609,7 +726,6 @@ export class RelayedSession {
           code: error instanceof RemoteInstanceError ? error.code : "delivery_output_recovery_failed" }, "durable delivery output recovery stopped");
       });
     }
-    return { acpSessionRef: created.acpSessionRef, resumed: created.resumed };
   }
 
   private deliveryAuthority(requestId: string) {
@@ -626,7 +742,7 @@ export class RelayedSession {
     const ref = this.acpSessionRef;
     if (ref === null || !this.preparedInputs?.resumeDeliveryOutput) return;
     for (const pending of this.deps.journal.openRequests(ref)) {
-      if (pending.direction !== "received" || pending.method !== "session/prompt" || !("deliveryIdentity" in (pending.authorization?.claims ?? {}))) continue;
+      if (!receivedDeliveryPrompt(pending)) continue;
       await this.completeDeliveryOutput(pending.id, undefined, true);
       if (this.closed) return;
     }
@@ -638,144 +754,155 @@ export class RelayedSession {
   private async completeDeliveryOutput(requestId: string, completion?: SessionToCoreMessage, resumeOnly = false): Promise<void> {
     let attempt = 0;
     while (!this.closed) {
-      this.deps.assertExecutionOwned?.();
-      if (this.deps.clock.coreNow() >= this.liveUntil()) throw new RemoteInstanceError("execution_fenced", "Delivery output authority expired before acceptance.");
+      this.assertDeliveryLive();
       const authority = this.deliveryAuthority(requestId);
       try {
-        const result = resumeOnly
-          ? await this.preparedInputs!.resumeDeliveryOutput!(authority)
-          : { receipt: await this.preparedInputs!.acceptDeliveryOutput!({ ...authority, completion: completion! }), completion: completion! };
-        if (!result) return;
-        this.deps.assertExecutionOwned?.();
-        this.deliveryAcceptance = result.receipt;
-        const parsed = SessionToCoreMessageSchema.parse(result.completion);
-        if (parsed.kind !== "acp_result" || parsed.method !== "session/prompt" || parsed.id !== requestId) throw new RemoteInstanceError("capability_unavailable", "Durable delivery output completion does not match its prompt.");
-        const accepted = await this.completeReceived(requestId, "session/prompt", parsed);
-        if (accepted && (parsed.result as { stopReason?: string }).stopReason === "end_turn") await this.close("completed");
+        await this.transferDeliveryOutput(requestId, authority, completion, resumeOnly);
         return;
       } catch (error) {
         this.deps.assertExecutionOwned?.();
         if (this.deps.clock.coreNow() >= this.liveUntil()) throw error;
         attempt += 1;
-        // Name the refusal (D112): without it a Core 422 repeated 120+ times
-        // read as a transport stall. Codes and statuses only, never messages.
-        if (attempt === 1 || attempt % 12 === 0) {
-          const status = error && typeof error === "object" && "status" in error && typeof error.status === "number" ? error.status : undefined;
-          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, transferAttempt: attempt,
-            code: error instanceof RemoteInstanceError ? error.code : "delivery_output_transfer_failed",
-            ...(error instanceof RemoteInstanceError && error.diagnostic ? { diagnostic: error.diagnostic } : {}),
-            ...(status === undefined ? {} : { status }) }, "durable delivery output retained for retry");
-        }
+        this.logDeliveryRetry(error, attempt);
         await new Promise<void>(resolve => setTimeout(resolve, Math.min(5_000, 250 * 2 ** Math.min(attempt, 5))));
       }
     }
   }
 
-  /** The assignment's lifetime, or the later one Core renewed a delivery turn to (D115). */
+  private assertDeliveryLive(): void {
+    this.deps.assertExecutionOwned?.();
+    if (this.deps.clock.coreNow() >= this.liveUntil()) throw new RemoteInstanceError("execution_fenced", "Delivery output authority expired before acceptance.");
+  }
+
+  /** One attempt to hand the frozen output to Core, then complete the prompt it answers. */
+  private async transferDeliveryOutput(requestId: string, authority: ReturnType<RelayedSession["deliveryAuthority"]>, completion: SessionToCoreMessage | undefined, resumeOnly: boolean): Promise<void> {
+    const result = resumeOnly
+      ? await this.preparedInputs!.resumeDeliveryOutput!(authority)
+      : { receipt: await this.preparedInputs!.acceptDeliveryOutput!({ ...authority, completion: completion! }), completion: completion! };
+    if (!result) return;
+    this.deps.assertExecutionOwned?.();
+    this.deliveryAcceptance = result.receipt;
+    const parsed = promptCompletion(result.completion, requestId);
+    const accepted = await this.completeReceived(requestId, "session/prompt", parsed);
+    if (accepted && (parsed.result as { stopReason?: string }).stopReason === "end_turn") await this.close("completed");
+  }
+
+  /** Name the refusal: without it a Core 422 repeated 120+ times read as a transport stall. Codes and statuses only, never messages. */
+  private logDeliveryRetry(error: unknown, attempt: number): void {
+    if (attempt !== 1 && attempt % 12 !== 0) return;
+    const status = httpStatus(error);
+    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, transferAttempt: attempt,
+      ...errorCode(error, "delivery_output_transfer_failed"), ...(status === undefined ? {} : { status }) }, "durable delivery output retained for retry");
+  }
+
+  /** The assignment's lifetime, or the later one Core renewed a delivery turn to. */
   private liveUntil(): number {
     return this.executionGate?.liveUntil() ?? Date.parse(this.assignment.expiresAt);
   }
 
   private async sendToCore(message: SessionToCoreMessage): Promise<void> {
-    if (this.recoveryStopping) return;
-    this.deps.assertExecutionOwned?.();
-    const channelId = this.boundChannelId;
-    if (channelId === null || !this.channelOpened) return;
+    const channelId = this.outboundChannel();
+    if (channelId === null) return;
     // Canonicalize while the bridge's private metadata is still present. The
     // strict relay schema deliberately discards `_meta`; doing this after its
     // first parse would permanently lose Claude's safe Agent/ToolSearch name.
-    let canonicalMessage: unknown = message;
-    let canonicalIdentity: {
-      toolCallId: string;
-      identity: CanonicalAcpToolIdentity;
-      terminal: boolean;
-    } | undefined;
-    if (message.kind === "acp" && message.method === "session/update") {
-      const rawUpdate = message.params.update as unknown as Record<string, unknown>;
-      const toolCallId = typeof rawUpdate.toolCallId === "string" ? rawUpdate.toolCallId : undefined;
-      const canonicalUpdate = canonicalizeAcpToolActivity(
-        rawUpdate,
-        this.assignment.agentRoute.agentId,
-        toolCallId === undefined ? undefined : this.toolActivityIdentity.get(toolCallId),
-      ) as Record<string, unknown>;
-      if (toolCallId !== undefined) {
-        const identity: CanonicalAcpToolIdentity = {
-          ...(typeof canonicalUpdate.name === "string" ? { name: canonicalUpdate.name } : {}),
-          ...(typeof canonicalUpdate.kind === "string" ? { kind: canonicalUpdate.kind } : {}),
-          ...(typeof canonicalUpdate.title === "string" ? { title: canonicalUpdate.title } : {}),
-        };
-        canonicalIdentity = {
-          toolCallId,
-          identity,
-          terminal: canonicalUpdate.status === "completed" || canonicalUpdate.status === "failed" || canonicalUpdate.status === "cancelled",
-        };
-      }
-      canonicalMessage = {
-        ...message,
-        params: { ...message.params, update: omitPrivateAcpToolPayload(canonicalUpdate) },
-      };
-    }
+    const { canonicalMessage, canonicalIdentity } = this.canonicalized(message);
     const parsed = SessionToCoreMessageSchema.safeParse(canonicalMessage);
-    if (!parsed.success) {
-      // A bridge payload that fails the vendored ACP schema is converted, never forwarded (D113).
-      this.counters.malformedResponses += 1;
-      this.logger.warn({
-        event: "session.acp_message_rejected",
-        assignmentId: this.assignment.id,
-        acpSessionRef: this.acpSessionRef,
-        toolCallId: canonicalIdentity?.toolCallId,
-        stage: "wire_schema",
-        ...sessionUpdateKind(canonicalMessage),
-        ...contractIssue(parsed.error.issues),
-      }, "Native session update did not match the relay contract");
-      if ("id" in message && typeof message.id === "string" && "method" in message && message.kind !== "acp") {
-        await this.sendToCore({ kind: "acp_error", id: message.id, method: message.method as "session/prompt", error: malformed() });
-      }
-      return;
-    }
-    let body = parsed.data;
-    if (body.kind === "acp" && body.method === "session/update") {
-      if (body.params.sessionId !== this.acpSessionRef) {
-        this.counters.malformedResponses += 1;
-        return;
-      }
-      if (body.params.update.sessionUpdate === "agent_thought_chunk") return;
-      if (canonicalIdentity) {
-        if (canonicalIdentity.terminal) this.toolActivityIdentity.delete(canonicalIdentity.toolCallId);
-        else if (Object.keys(canonicalIdentity.identity).length > 0) {
-          this.toolActivityIdentity.set(canonicalIdentity.toolCallId, canonicalIdentity.identity);
-        }
-      }
-      const update = body.params.update as { sessionUpdate: string; content?: { type?: string; text?: unknown } };
-      const chunkText = (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "user_message_chunk") &&
-        update.content?.type === "text" && typeof update.content.text === "string" ? update.content.text : undefined;
-      // Streamed text is split at arbitrary points; judge a chunk's first
-      // character against the previous chunk of the same stream.
-      const previous = chunkText === undefined ? undefined : this.lastChunkText.get(update.sessionUpdate);
-      const startsAtBoundary = continuesAtBoundary(previous?.text);
-      const continuesPath = previous?.inPath ?? false;
-      if (chunkText === undefined) this.lastChunkText.clear();
-      else this.lastChunkText.set(update.sessionUpdate, { text: chunkText, inPath: endsInsidePath(chunkText, continuesPath, startsAtBoundary) });
-      const safe = SessionToCoreMessageSchema.safeParse(redactSessionMessage(body, this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`,
-        { startsAtBoundary, continuesPath }));
-      if (!safe.success) {
-        this.counters.malformedResponses += 1;
-        this.logger.warn({
-          event: "session.acp_message_rejected",
-          assignmentId: this.assignment.id,
-          acpSessionRef: this.acpSessionRef,
-          toolCallId: canonicalIdentity?.toolCallId,
-          stage: "redacted_schema",
-          sessionUpdate: update.sessionUpdate,
-          ...contractIssue(safe.error.issues),
-        }, "Redacted native session update did not match the relay contract");
-        return;
-      }
-      body = safe.data;
-    }
+    if (!parsed.success) return this.rejectMalformed(message, canonicalMessage, canonicalIdentity, parsed.error.issues);
+    const body = this.outboundBody(parsed.data, canonicalIdentity);
+    if (body === null) return;
     const sourceSequence = await this.deps.beforeSendToCore?.(body);
     this.deps.assertExecutionOwned?.();
     this.deps.transport.send({ channel: "session", channelId, body, ...(sourceSequence === undefined ? {} : { sourceSequence }) });
+  }
+
+  /** The open session channel to send on; null while recovery stops the session or before the channel opened. */
+  private outboundChannel(): string | null {
+    if (this.recoveryStopping) return null;
+    this.deps.assertExecutionOwned?.();
+    const channelId = this.boundChannelId;
+    return channelId === null || !this.channelOpened ? null : channelId;
+  }
+
+  private canonicalized(message: SessionToCoreMessage): { canonicalMessage: unknown; canonicalIdentity: CanonicalIdentity | undefined } {
+    if (message.kind !== "acp" || message.method !== "session/update") return { canonicalMessage: message, canonicalIdentity: undefined };
+    const rawUpdate = message.params.update as unknown as Record<string, unknown>;
+    const toolCallId = typeof rawUpdate.toolCallId === "string" ? rawUpdate.toolCallId : undefined;
+    const canonicalUpdate = canonicalizeAcpToolActivity(
+      rawUpdate,
+      this.assignment.agentRoute.agentId,
+      toolCallId === undefined ? undefined : this.toolActivityIdentity.get(toolCallId),
+    ) as Record<string, unknown>;
+    return {
+      canonicalMessage: { ...message, params: { ...message.params, update: omitPrivateAcpToolPayload(canonicalUpdate) } },
+      canonicalIdentity: toolCallId === undefined ? undefined : toolIdentity(toolCallId, canonicalUpdate),
+    };
+  }
+
+  /** A bridge payload that fails the vendored ACP schema is converted, never forwarded. */
+  private async rejectMalformed(message: SessionToCoreMessage, canonicalMessage: unknown, canonicalIdentity: CanonicalIdentity | undefined, issues: Parameters<typeof contractIssue>[0]): Promise<void> {
+    this.counters.malformedResponses += 1;
+    this.logger.warn({
+      event: "session.acp_message_rejected",
+      assignmentId: this.assignment.id,
+      acpSessionRef: this.acpSessionRef,
+      toolCallId: canonicalIdentity?.toolCallId,
+      stage: "wire_schema",
+      ...sessionUpdateKind(canonicalMessage),
+      ...contractIssue(issues),
+    }, "Native session update did not match the relay contract");
+    if ("id" in message && typeof message.id === "string" && "method" in message && message.kind !== "acp") {
+      await this.sendToCore({ kind: "acp_error", id: message.id, method: message.method as "session/prompt", error: malformed() });
+    }
+  }
+
+  /** The frame to send: a session update only for this session, without thought chunks, redacted; null to drop it. */
+  private outboundBody(body: SessionToCoreMessage, canonicalIdentity: CanonicalIdentity | undefined): SessionToCoreMessage | null {
+    if (body.kind !== "acp" || body.method !== "session/update") return body;
+    if (body.params.sessionId !== this.acpSessionRef) {
+      this.counters.malformedResponses += 1;
+      return null;
+    }
+    if (body.params.update.sessionUpdate === "agent_thought_chunk") return null;
+    if (canonicalIdentity) this.rememberToolIdentity(canonicalIdentity);
+    return this.redactedUpdate(body, canonicalIdentity);
+  }
+
+  private rememberToolIdentity({ toolCallId, identity, terminal }: CanonicalIdentity): void {
+    if (terminal) this.toolActivityIdentity.delete(toolCallId);
+    else if (Object.keys(identity).length > 0) this.toolActivityIdentity.set(toolCallId, identity);
+  }
+
+  private redactedUpdate(body: SessionToCoreMessage, canonicalIdentity: CanonicalIdentity | undefined): SessionToCoreMessage | null {
+    const update = (body as { params: { update: { sessionUpdate: string; content?: { type?: string; text?: unknown } } } }).params.update;
+    const chunk = this.chunkContext(update);
+    const safe = SessionToCoreMessageSchema.safeParse(redactSessionMessage(body, this.sessionCwd(), chunk));
+    if (safe.success) return safe.data;
+    this.counters.malformedResponses += 1;
+    this.logger.warn({
+      event: "session.acp_message_rejected",
+      assignmentId: this.assignment.id,
+      acpSessionRef: this.acpSessionRef,
+      toolCallId: canonicalIdentity?.toolCallId,
+      stage: "redacted_schema",
+      sessionUpdate: update.sessionUpdate,
+      ...contractIssue(safe.error.issues),
+    }, "Redacted native session update did not match the relay contract");
+    return null;
+  }
+
+  /**
+   * Streamed text is split at arbitrary points; judge a chunk's first
+   * character against the previous chunk of the same stream.
+   */
+  private chunkContext(update: { sessionUpdate: string; content?: { type?: string; text?: unknown } }): { startsAtBoundary: boolean; continuesPath: boolean } {
+    const chunkText = streamedText(update);
+    const previous = chunkText === undefined ? undefined : this.lastChunkText.get(update.sessionUpdate);
+    const startsAtBoundary = continuesAtBoundary(previous?.text);
+    const continuesPath = previous?.inPath ?? false;
+    if (chunkText === undefined) this.lastChunkText.clear();
+    else this.lastChunkText.set(update.sessionUpdate, { text: chunkText, inPath: endsInsidePath(chunkText, continuesPath, startsAtBoundary) });
+    return { startsAtBoundary, continuesPath };
   }
 
   /** Inbound from the grant holder / orchestrator. */
@@ -798,8 +925,8 @@ export class RelayedSession {
   }
 
   private async onToRuntimeImpl(body: unknown): Promise<void> {
-    const channelId = this.boundChannelId;
-    if (this.closed || this.acpSessionRef === null || channelId === null || !this.channelOpened) return;
+    const ref = this.openSessionRef();
+    if (ref === null) return;
     this.deps.assertExecutionOwned?.();
     if (isNativeTurn(this.assignment)) {
       // Prepared Harness delivery must never fall back to bare ACP. The gate
@@ -813,65 +940,96 @@ export class RelayedSession {
       return;
     }
     const message = parsed.data;
-    const ref = this.acpSessionRef;
-    if (message.kind === "acp") {
-      if (message.params.sessionId !== ref) {
-        if ("id" in message) await this.sendToCore({ kind: "acp_error", id: message.id, method: message.method, error: { code: -32602, class: "invalid_params", message: "request session does not match the channel", retryable: false } });
-        return;
-      }
-      if (message.method === "session/cancel") {
-        await this.deps.runner.cancel(ref).catch(() => undefined);
-        return;
-      }
-      if (!HOLDER_REQUEST_METHODS.has(message.method)) return;
-      const request = message as Extract<SessionToRuntimeMessage, { kind: "acp"; id: string }>;
-      // A terminal planning directive fences the input lane before this prompt
-      // can create any durable request or outbound transcript fact. Keep the
-      // later check as well to close a race while input preparation awaits I/O.
-      if (request.method === "session/prompt") this.deps.assertPromptAllowed?.();
-      const existing = this.deps.journal.pendingRequests.get(`${ref}:received:${request.id}`);
-      if (existing) {
-        this.counters.unknownCompletions += 1;
-        await this.sendToCore({ kind: "acp_error", id: request.id, method: request.method as "session/prompt", error: { code: -32600, class: "unknown_request", message: "duplicate request id", retryable: false } });
-        return;
-      }
-      await this.deps.journal.pendingRequests.put({ acpSessionRef: ref, id: request.id, method: request.method as "session/prompt", direction: "received", openedAt: this.deps.clock.nowIso(), closedAt: null, deadlineAt: null, requestDigest: null });
-      if (this.closed) return;
-      this.deps.assertExecutionOwned?.();
-      try {
-        if (request.method === "session/prompt") {
-          this.deps.assertPromptAllowed?.();
-          if (this.preparedInputs) {
-            try { await this.preparedInputs.beforePrompt(); }
-            catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
-          }
-          if (this.closed) throw new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
-          this.deps.assertExecutionOwned?.();
-          this.deps.assertPromptAllowed?.();
-          if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
-          const instructions = this.promptInstructions();
-          const params = instructions ? { ...request.params, prompt: [{ type: "text" as const, text: instructions }, ...request.params.prompt] } : request.params;
-          const prompt = await this.prepareAgentPrompt(request.id, params.prompt);
-          try { await this.deps.runner.prompt(ref, request.id, { ...params, prompt }); }
-          catch (error) { this.endStructuredTurn(request.id); throw error; }
-          this.deps.onTurnActivity?.();
-        }
-        else if (request.method === "session/set_mode") await this.deps.runner.setMode(ref, request.id, request.params);
-        else await this.deps.runner.setConfigOption(ref, request.id, request.params);
-      } catch (error) {
-        await this.completeReceived(request.id, request.method as "session/prompt", { kind: "acp_error", id: request.id, method: request.method as "session/prompt", error: classify(error) });
-      }
+    if (message.kind === "acp") return this.onHolderRequest(ref, message);
+    return this.onIssuedCompletion(ref, message);
+  }
+
+  /** The session reference while the session is open with its channel, else null. */
+  private openSessionRef(): string | null {
+    if (this.closed || this.boundChannelId === null || !this.channelOpened) return null;
+    return this.acpSessionRef;
+  }
+
+  private async onHolderRequest(ref: string, message: Extract<SessionToRuntimeMessage, { kind: "acp" }>): Promise<void> {
+    if (message.params.sessionId !== ref) {
+      if ("id" in message) await this.sendToCore({ kind: "acp_error", id: message.id, method: message.method, error: { code: -32602, class: "invalid_params", message: "request session does not match the channel", retryable: false } });
       return;
     }
-    // Completions of OUR issued requests (permission / elicitation answers).
+    if (message.method === "session/cancel") {
+      await this.deps.runner.cancel(ref).catch(() => undefined);
+      return;
+    }
+    if (!HOLDER_REQUEST_METHODS.has(message.method)) return;
+    const request = message as HolderRequest;
+    // A terminal planning directive fences the input lane before this prompt
+    // can create any durable request or outbound transcript fact. Keep the
+    // later check as well to close a race while input preparation awaits I/O.
+    if (request.method === "session/prompt") this.deps.assertPromptAllowed?.();
+    if (!await this.journalReceived(ref, request)) return;
+    await this.dispatchHolderRequest(ref, request);
+  }
+
+  /** Journal a holder's request; false for a duplicate id (answered with an error) or a session closed meanwhile. */
+  private async journalReceived(ref: string, request: HolderRequest): Promise<boolean> {
+    const existing = this.deps.journal.pendingRequests.get(`${ref}:received:${request.id}`);
+    if (existing) {
+      this.counters.unknownCompletions += 1;
+      await this.sendToCore({ kind: "acp_error", id: request.id, method: request.method as "session/prompt", error: { code: -32600, class: "unknown_request", message: "duplicate request id", retryable: false } });
+      return false;
+    }
+    await this.deps.journal.pendingRequests.put({ acpSessionRef: ref, id: request.id, method: request.method as "session/prompt", direction: "received", openedAt: this.deps.clock.nowIso(), closedAt: null, deadlineAt: null, requestDigest: null });
+    if (this.closed) return false;
+    this.deps.assertExecutionOwned?.();
+    return true;
+  }
+
+  private async dispatchHolderRequest(ref: string, request: HolderRequest): Promise<void> {
+    try {
+      if (request.method === "session/prompt") await this.promptFromHolder(ref, request);
+      else if (request.method === "session/set_mode") await this.deps.runner.setMode(ref, request.id, request.params);
+      else await this.deps.runner.setConfigOption(ref, request.id, request.params);
+    } catch (error) {
+      await this.completeReceived(request.id, request.method as "session/prompt", { kind: "acp_error", id: request.id, method: request.method as "session/prompt", error: classify(error) });
+    }
+  }
+
+  private async promptFromHolder(ref: string, request: HolderRequest): Promise<void> {
+    this.deps.assertPromptAllowed?.();
+    if (this.preparedInputs) await this.runBeforePrompt();
+    if (this.closed) throw sessionClosed();
+    this.deps.assertExecutionOwned?.();
+    this.deps.assertPromptAllowed?.();
+    if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
+    await this.promptRunner(ref, request.id, this.withInstructions(request.params as PromptParams));
+  }
+
+  private async runBeforePrompt(): Promise<void> {
+    try { await this.preparedInputs?.beforePrompt(); }
+    catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
+  }
+
+  /** The staged skills line goes in front of the person's text. */
+  private withInstructions<P extends PromptParams>(params: P): P {
+    const instructions = this.promptInstructions();
+    return instructions ? { ...params, prompt: [{ type: "text" as const, text: instructions }, ...params.prompt] } : params;
+  }
+
+  private async promptRunner(ref: string, requestId: string, params: PromptParams): Promise<void> {
+    const prompt = await this.prepareAgentPrompt(requestId, params.prompt);
+    try { await this.deps.runner.prompt(ref, requestId, { ...params, prompt }); }
+    catch (error) { this.endStructuredTurn(requestId); throw error; }
+    this.deps.onTurnActivity?.();
+  }
+
+  /** Completions of OUR issued requests (permission / elicitation answers). */
+  private async onIssuedCompletion(ref: string, message: Exclude<SessionToRuntimeMessage, { kind: "acp" }>): Promise<void> {
     const journaled = this.deps.journal.pendingRequests.get(`${ref}:issued:${message.id}`);
     if (!journaled || journaled.closedAt !== null || journaled.method !== message.method) {
       this.counters.unknownCompletions += 1;
       this.logger.warn({ id: message.id }, "rejected a completion for an unknown, closed, or mismatched request");
       return;
     }
-    const answer = message.kind === "acp_result" ? message.result : { outcome: { outcome: "cancelled" } };
-    const verdict = this.deps.broker.answer(ref, message.id, message.kind === "acp_result" ? answer : journaled.method === "elicitation/create" ? { action: "cancel" } : answer);
+    const verdict = this.deps.broker.answer(ref, message.id, issuedAnswer(message, journaled.method));
     if (!verdict.ok) {
       this.logger.warn({ id: message.id, reason: verdict.reason }, "answer rejected");
       return;
@@ -879,7 +1037,7 @@ export class RelayedSession {
     await this.deps.journal.pendingRequests.put({ ...journaled, closedAt: this.deps.clock.nowIso() });
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
-    await this.deps.runner.answer(ref, message.id, message.kind === "acp_result" ? message.result : journaled.method === "elicitation/create" ? { action: "cancel" } : { outcome: { outcome: "cancelled" } });
+    await this.deps.runner.answer(ref, message.id, issuedAnswer(message, journaled.method));
   }
 
   private async onAuthorizedOperation(body: unknown, assertDeliveryCurrent: () => void = () => {}): Promise<void> {
@@ -893,91 +1051,115 @@ export class RelayedSession {
     }
     const message = operation.envelope.message;
     const ref = this.acpSessionRef!;
-    if (message.kind === "acp" && message.method === "session/prompt") {
+    if (isPromptMessage(message)) {
       // Check and reserve with no await between them: exactly one prompt may
       // be admitted or running on this ACP session at a time.
-      if (this.promptBusy(operation.key)) {
-        await this.refuseConcurrentPrompt(gate, operation.key, message.id);
-        return;
-      }
+      if (this.promptBusy(operation.key)) return this.refuseConcurrentPrompt(gate, operation.key, message.id);
       this.promptReservation = operation.key;
     }
-    let params = message.kind === "acp" ? message.params : null;
-    try {
-      if (message.kind === "acp" && message.method === "session/prompt") {
-        this.deps.assertPromptAllowed?.();
-        try { await this.preparedInputs?.beforePrompt(); }
-        catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
-        this.deps.assertPromptAllowed?.();
-        const instructions = this.promptInstructions();
-        params = instructions ? { ...message.params, prompt: [{ type: "text" as const, text: instructions }, ...message.params.prompt] } : message.params;
-      }
-      if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
-      if (!(await gate.begin(operation))) return;
-      assertDeliveryCurrent();
-    } catch (error) {
-      const state = this.deps.journal.pendingRequests.get(operation.key)?.authorization?.state;
-      // Only a proven pre-dispatch refusal can become a replayable rejection.
-      // A started operation remains unresolved for explicit recovery.
-      if (state !== "admitted" && state !== "denied") throw error;
-      const completion: SessionToCoreMessage | undefined = message.kind === "acp" && "id" in message
-        ? { kind: "acp_error", id: message.id, method: message.method, error: classify(error) } : undefined;
-      await gate.denyBeforeDispatch(operation.key, completion);
-      const terminalTurnFailure =
-        isNativeTurn(this.assignment) &&
-        message.kind === "acp" &&
-        message.method === "session/prompt" &&
-        completion?.kind === "acp_error";
-      try {
-        if (completion && !this.closed) await this.sendToCore(completion);
-      } finally {
-        // No runner prompt exists to produce a later terminal event. Close the
-        // failed turn locally so its durable assignment report and capacity
-        // release do not depend on a best-effort cloud cancellation round trip.
-        if (terminalTurnFailure && !this.closed) await this.close("agent_exited");
-      }
-      return;
-    }
+    const begun = await this.beginAuthorized(gate, operation, assertDeliveryCurrent);
+    if (!begun.started) return;
     // Do not convert a bridge transport exception into proof of completion.
-    if (message.kind === "acp") {
-      if (message.method === "session/prompt") {
-        try {
-          const current = params as typeof message.params;
-          const prompt = await this.prepareAgentPrompt(message.id, current.prompt);
-          await this.deps.runner.prompt(ref, message.id, { ...current, prompt });
-          this.deps.onTurnActivity?.();
-        }
-        catch (error) {
-          this.endStructuredTurn(message.id);
-          // The runner's backstop: it refused because a prompt already runs
-          // on this session. Nothing reached the agent, so this is a known
-          // denial and the running turn is left alone.
-          if (!(error instanceof RemoteInstanceError) || error.code !== "operation_conflict") throw error;
-          const completion = concurrentPromptError(message.id);
-          await gate.refuseAtDispatch(operation.key, completion);
-          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "prompt_dispatch",
-            outcome: "denied_concurrent_prompt", source: "runner" }, "runner refused a second prompt on a busy session");
-          if (!this.closed) await this.sendToCore(completion);
-        }
-      }
-      else if (message.method === "session/set_mode") await this.deps.runner.setMode(ref, message.id, params);
-      else if (message.method === "session/set_config_option") await this.deps.runner.setConfigOption(ref, message.id, params);
-      else {
-        if (this.assignment.source.kind === "harness_delivery") {
-          // Harness owns whether its delivery invocation can proceed. An exact
-          // Core-permitted cancellation (including before the first prompt)
-          // closes this assignment through the normal local terminal-report
-          // path so a stale claim cannot consume native runtime capacity.
-          await gate.complete(operation.key);
-          await this.close("cancelled");
-        } else {
-          await this.deps.runner.cancel(ref);
-          await gate.complete(operation.key);
-        }
-      }
+    return this.dispatchAuthorized({ gate, operation, ref }, begun.params);
+  }
+
+  /** Prepare a prompt's inputs and start the operation; a proven pre-dispatch refusal becomes a replayable rejection. */
+  private async beginAuthorized(gate: NativeExecutionGate, operation: AuthorizedOperation, assertDeliveryCurrent: () => void): Promise<{ started: boolean; params: unknown }> {
+    const message = operation.envelope.message;
+    let params: unknown = message.kind === "acp" ? message.params : null;
+    try {
+      if (isPromptMessage(message)) params = await this.authorizedPromptParams(message.params);
+      if (this.closed) throw new RemoteInstanceError("execution_fenced", "The execution session is closed.");
+      if (!(await gate.begin(operation))) return { started: false, params };
+      assertDeliveryCurrent();
+      return { started: true, params };
+    } catch (error) {
+      await this.refuseBeforeDispatch(gate, operation, error);
+      return { started: false, params };
+    }
+  }
+
+  private async authorizedPromptParams(params: PromptParams): Promise<PromptParams> {
+    this.deps.assertPromptAllowed?.();
+    await this.runBeforePrompt();
+    this.deps.assertPromptAllowed?.();
+    return this.withInstructions(params);
+  }
+
+  /**
+   * Only a proven pre-dispatch refusal can become a replayable rejection. A
+   * started operation remains unresolved for explicit recovery.
+   */
+  private async refuseBeforeDispatch(gate: NativeExecutionGate, operation: AuthorizedOperation, error: unknown): Promise<void> {
+    const state = this.deps.journal.pendingRequests.get(operation.key)?.authorization?.state;
+    if (state !== "admitted" && state !== "denied") throw error;
+    const message = operation.envelope.message;
+    const completion = deniedCompletion(message, error);
+    await gate.denyBeforeDispatch(operation.key, completion);
+    await this.reportDenied(completion, this.terminalTurnFailure(message, completion));
+  }
+
+  private terminalTurnFailure(message: AuthorizedMessage, completion: SessionToCoreMessage | undefined): boolean {
+    return isNativeTurn(this.assignment) && isPromptMessage(message) && completion?.kind === "acp_error";
+  }
+
+  private async reportDenied(completion: SessionToCoreMessage | undefined, terminalTurnFailure: boolean): Promise<void> {
+    try {
+      if (completion && !this.closed) await this.sendToCore(completion);
+    } finally {
+      // No runner prompt exists to produce a later terminal event. Close the
+      // failed turn locally so its durable assignment report and capacity
+      // release do not depend on a best-effort cloud cancellation round trip.
+      if (terminalTurnFailure && !this.closed) await this.close("agent_exited");
+    }
+  }
+
+  private async dispatchAuthorized(context: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, params: unknown): Promise<void> {
+    const message = context.operation.envelope.message;
+    if (message.kind !== "acp") return this.answerAuthorized(context, message);
+    if (message.method === "session/prompt") return this.promptAuthorized(context, message.id, params as PromptParams);
+    if (message.method === "session/set_mode") return void await this.deps.runner.setMode(context.ref, message.id, params);
+    if (message.method === "session/set_config_option") return void await this.deps.runner.setConfigOption(context.ref, message.id, params);
+    return this.cancelAuthorized(context);
+  }
+
+  private async promptAuthorized({ gate, operation, ref }: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, id: string, params: PromptParams): Promise<void> {
+    try {
+      const prompt = await this.prepareAgentPrompt(id, params.prompt);
+      await this.deps.runner.prompt(ref, id, { ...params, prompt });
+      this.deps.onTurnActivity?.();
+    } catch (error) {
+      this.endStructuredTurn(id);
+      // The runner's backstop: it refused because a prompt already runs
+      // on this session. Nothing reached the agent, so this is a known
+      // denial and the running turn is left alone.
+      if (!(error instanceof RemoteInstanceError) || error.code !== "operation_conflict") throw error;
+      const completion = concurrentPromptError(id);
+      await gate.refuseAtDispatch(operation.key, completion);
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "prompt_dispatch",
+        outcome: "denied_concurrent_prompt", source: "runner" }, "runner refused a second prompt on a busy session");
+      if (!this.closed) await this.sendToCore(completion);
+    }
+  }
+
+  /**
+   * Harness owns whether its delivery invocation can proceed. An exact
+   * Core-permitted cancellation (including before the first prompt) closes
+   * this assignment through the normal local terminal-report path so a stale
+   * claim cannot consume native runtime capacity.
+   */
+  private async cancelAuthorized({ gate, operation, ref }: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }): Promise<void> {
+    if (this.assignment.source.kind === "harness_delivery") {
+      await gate.complete(operation.key);
+      await this.close("cancelled");
       return;
     }
-    const answer = message.kind === "acp_result" ? message.result : message.method === "elicitation/create" ? { action: "cancel" } : { outcome: { outcome: "cancelled" } };
+    await this.deps.runner.cancel(ref);
+    await gate.complete(operation.key);
+  }
+
+  private async answerAuthorized({ gate, operation, ref }: { gate: NativeExecutionGate; operation: AuthorizedOperation; ref: string }, message: Exclude<AuthorizedMessage, { kind: "acp" }>): Promise<void> {
+    const answer = issuedAnswer(message, message.method);
     const verdict = this.deps.broker.answer(ref, message.id, answer);
     if (!verdict.ok) throw new RemoteInstanceError("operation_conflict", "The pending human answer is no longer admissible.");
     this.notePermissionAnswer(message.id, answer);
@@ -1018,11 +1200,16 @@ export class RelayedSession {
       this.counters.unknownCompletions += 1;
       return false;
     }
-    if (journaled.authorization && this.executionGate) await this.executionGate.complete(`${ref}:received:${id}`, completion);
-    else await this.deps.journal.pendingRequests.put({ ...journaled, closedAt: this.deps.clock.nowIso() });
+    await this.closeReceived(`${ref}:received:${id}`, journaled, completion);
     this.deps.assertExecutionOwned?.();
     await this.sendToCore(completion);
     return true;
+  }
+
+  /** An authorized operation completes through its gate; any other request just closes. */
+  private async closeReceived(key: string, journaled: PendingRequest, completion: SessionToCoreMessage): Promise<void> {
+    if (journaled.authorization && this.executionGate) await this.executionGate.complete(key, completion);
+    else await this.deps.journal.pendingRequests.put({ ...journaled, closedAt: this.deps.clock.nowIso() });
   }
 
   /** Runner events for this session. */
@@ -1031,99 +1218,115 @@ export class RelayedSession {
   private async onRunnerEventImpl(event: RunnerEvent): Promise<void> {
     if (this.closed || this.acpSessionRef === null || !("acpSessionRef" in event) || event.acpSessionRef !== this.acpSessionRef) return;
     this.deps.assertExecutionOwned?.();
-    switch (event.kind) {
-      case "session_update": {
-        // A working agent keeps its preview from stopping as idle.
-        if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
-        this.observeStructuredText((event.params as { update?: unknown } | null)?.update);
-        this.mcpCalls?.observe((event.params as { update?: unknown } | null)?.update);
-        const bypass = this.toolGovernance?.observe((event.params as { update?: unknown } | null)?.update, this.sessionCwd()) ?? null;
-        await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
-        if (bypass) await this.onToolGovernanceBypass(bypass);
-        return;
-      }
-      case "prompt_result": {
-        const settled = await this.settleStructuredTurn(event.requestId, event.result as Record<string, unknown>);
-        if (settled === null) return;
-        await this.onPromptResult(settled.requestId, settled.result);
-        return;
-      }
-      case "set_mode_result":
-        await this.completeReceived(event.requestId, "session/set_mode", { kind: "acp_result", id: event.requestId, method: "session/set_mode", result: event.result as never });
-        return;
-      case "set_config_option_result":
-        await this.completeReceived(event.requestId, "session/set_config_option", { kind: "acp_result", id: event.requestId, method: "session/set_config_option", result: event.result as never });
-        return;
-      case "request_error": {
-        if (event.method === "session/prompt") {
-          const settled = await this.settleStructuredTurnError(event.requestId);
-          if (settled === null) return;
-          if (settled !== undefined) {
-            await this.onPromptResult(settled.requestId, settled.result);
-            return;
-          }
-        }
-        if (event.method === "session/prompt") this.deps.onTurnActivity?.();
-        const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
-        if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
-          // Say why before the close: its SIGTERM on the bridge was the only
-          // trace of a Codex sign-in that could not refresh (WS2-141).
-          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable },
-            "native turn failed with a request error; closing the assignment as an agent exit");
-          await this.close("agent_exited");
-        }
-        return;
-      }
-      case "usage_observation":
-        this.lastPromptCompletion = { usage: event.observation };
-        await this.deps.onUsage(event.observation);
-        return;
-      case "permission_request":
-        await this.onPermissionRequest(event.requestId, event.params as RequestPermissionRequest);
-        return;
-      case "elicitation_request":
-        await this.onElicitationRequest(event.requestId, event.params as CreateElicitationRequest);
-        return;
-      case "elicitation_complete":
-        await this.sendToCore({ kind: "acp", method: "elicitation/complete", params: event.params as never });
-        return;
-      case "session_exited":
-        await this.close(event.reason === "agent_exited" ? "agent_exited" : "completed");
-        return;
-      default:
-        return;
+    await this.runnerEventHandlers.get(event.kind)?.(event);
+  }
+
+  /** What each runner event does to this session; other events are ignored. */
+  private readonly runnerEventHandlers: ReadonlyMap<string, (event: RunnerEvent) => Promise<void>> = new Map<string, (event: RunnerEvent) => Promise<void>>([
+    ["session_update", event => this.onSessionUpdate(event as RunnerEventOf<"session_update">)],
+    ["prompt_result", event => this.onPromptCompletion(event as RunnerEventOf<"prompt_result">)],
+    ["set_mode_result", async event => {
+      const { requestId, result } = event as RunnerEventOf<"set_mode_result">;
+      await this.completeReceived(requestId, "session/set_mode", { kind: "acp_result", id: requestId, method: "session/set_mode", result: result as never });
+    }],
+    ["set_config_option_result", async event => {
+      const { requestId, result } = event as RunnerEventOf<"set_config_option_result">;
+      await this.completeReceived(requestId, "session/set_config_option", { kind: "acp_result", id: requestId, method: "session/set_config_option", result: result as never });
+    }],
+    ["request_error", event => this.onRequestError(event as RunnerEventOf<"request_error">)],
+    ["usage_observation", async event => {
+      const { observation } = event as RunnerEventOf<"usage_observation">;
+      this.lastPromptCompletion = { usage: observation };
+      await this.deps.onUsage(observation);
+    }],
+    ["permission_request", async event => {
+      const { requestId, params } = event as RunnerEventOf<"permission_request">;
+      await this.onPermissionRequest(requestId, params as RequestPermissionRequest);
+    }],
+    ["elicitation_request", async event => {
+      const { requestId, params } = event as RunnerEventOf<"elicitation_request">;
+      await this.onElicitationRequest(requestId, params as CreateElicitationRequest);
+    }],
+    ["elicitation_complete", async event => {
+      await this.sendToCore({ kind: "acp", method: "elicitation/complete", params: (event as RunnerEventOf<"elicitation_complete">).params as never });
+    }],
+    ["session_exited", async event => {
+      await this.close((event as RunnerEventOf<"session_exited">).reason === "agent_exited" ? "agent_exited" : "completed");
+    }],
+  ]);
+
+  private async onSessionUpdate(event: RunnerEventOf<"session_update">): Promise<void> {
+    const update = (event.params as { update?: unknown } | null)?.update;
+    // A working agent keeps its preview from stopping as idle.
+    if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
+    this.observeStructuredText(update);
+    this.mcpCalls?.observe(update);
+    const bypass = this.toolGovernance?.observe(update, this.sessionCwd()) ?? null;
+    await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
+    if (bypass) await this.onToolGovernanceBypass(bypass);
+  }
+
+  private async onPromptCompletion(event: RunnerEventOf<"prompt_result">): Promise<void> {
+    const settled = await this.settleStructuredTurn(event.requestId, event.result as Record<string, unknown>);
+    if (settled === null) return;
+    await this.onPromptResult(settled.requestId, settled.result);
+  }
+
+  private async onRequestError(event: RunnerEventOf<"request_error">): Promise<void> {
+    if (event.method === "session/prompt" && await this.settledPromptError(event.requestId)) return;
+    const accepted = await this.completeReceived(event.requestId, event.method, { kind: "acp_error", id: event.requestId, method: event.method, error: { code: event.code, class: event.class, message: event.message, retryable: event.retryable } });
+    if (accepted && event.method === "session/prompt" && isNativeTurn(this.assignment)) {
+      // Say why before the close: its SIGTERM on the bridge was the only
+      // trace of a Codex sign-in that could not refresh.
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, code: event.code, errorClass: event.class, retryable: event.retryable },
+        "native turn failed with a request error; closing the assignment as an agent exit");
+      await this.close("agent_exited");
     }
+  }
+
+  /** A failed prompt that a structured follow-up settles (or that is its follow-up still running); false for an ordinary failure. */
+  private async settledPromptError(requestId: string): Promise<boolean> {
+    const settled = await this.settleStructuredTurnError(requestId);
+    if (settled === null) return true;
+    if (settled !== undefined) {
+      await this.onPromptResult(settled.requestId, settled.result);
+      return true;
+    }
+    this.deps.onTurnActivity?.();
+    return false;
   }
 
   /** A prompt's completion (with any structured result already attached) goes to its holder. */
   private async onPromptResult(requestId: string, result: Record<string, unknown>): Promise<void> {
     this.deps.onTurnActivity?.();
-    if (this.assignment.kind === "delivery" && this.assignment.source.kind === "harness_delivery") {
-      if (!this.preparedInputs?.acceptDeliveryOutput) {
-        throw new RemoteInstanceError("capability_unavailable", "Generated delivery output cannot be accepted without current delivery authority.");
-      }
-      await this.completeDeliveryOutput(requestId, { kind: "acp_result", id: requestId, method: "session/prompt", result: result as never });
-      return;
-    }
+    if (this.assignment.kind === "delivery" && this.assignment.source.kind === "harness_delivery") return this.deliverPromptResult(requestId, result);
     const accepted = await this.completeReceived(requestId, "session/prompt", { kind: "acp_result", id: requestId, method: "session/prompt", result: result as never });
-    // Assistant admission creates one assignment per turn. A persistent
-    // native Codex thread does not exit when its turn ends, so waiting for
-    // session_exited leaks a claimed assignment and blocks the next turn.
-    // Close this assignment, not the shared native server or its history.
-    const stopReason = (result as { stopReason?: string })?.stopReason;
-    const nativeTurn = accepted && isNativeTurn(this.assignment);
-    if (nativeTurn && stopReason === "end_turn") await this.close("completed");
-    else if (nativeTurn && typeof stopReason === "string" && !this.closed) {
-      // A turn that ends any other way has still ENDED: a rejected tool
-      // interrupts Claude Code's turn as `cancelled`, a refusal or token
-      // cap ends it likewise. Left open, the claimed assignment kept
-      // heartbeating until the harness deadline (2026-09-15, 27 minutes
-      // for a turn that had stopped at minute ten). Close it so a
-      // terminal reaches Core now.
-      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stopReason },
-        "native turn ended without end_turn; closing the assignment as an agent exit");
-      await this.close("agent_exited");
+    if (accepted && isNativeTurn(this.assignment)) await this.closeEndedTurn((result as { stopReason?: string })?.stopReason);
+  }
+
+  private async deliverPromptResult(requestId: string, result: Record<string, unknown>): Promise<void> {
+    if (!this.preparedInputs?.acceptDeliveryOutput) {
+      throw new RemoteInstanceError("capability_unavailable", "Generated delivery output cannot be accepted without current delivery authority.");
     }
+    await this.completeDeliveryOutput(requestId, { kind: "acp_result", id: requestId, method: "session/prompt", result: result as never });
+  }
+
+  /**
+   * Assistant admission creates one assignment per turn. A persistent native
+   * Codex thread does not exit when its turn ends, so waiting for
+   * session_exited leaks a claimed assignment and blocks the next turn. Close
+   * this assignment, not the shared native server or its history.
+   */
+  private async closeEndedTurn(stopReason: string | undefined): Promise<void> {
+    if (stopReason === "end_turn") return this.close("completed");
+    if (typeof stopReason !== "string" || this.closed) return;
+    // A turn that ends any other way has still ENDED: a rejected tool
+    // interrupts Claude Code's turn as `cancelled`, a refusal or token cap
+    // ends it likewise. Left open, the claimed assignment kept heartbeating
+    // until the harness deadline. Close it so a terminal reaches Core now.
+    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stopReason },
+      "native turn ended without end_turn; closing the assignment as an agent exit");
+    await this.close("agent_exited");
   }
 
   /**
@@ -1186,10 +1389,9 @@ export class RelayedSession {
   /** The agent's own message text during a structured turn, for the fenced fallback. */
   private observeStructuredText(update: unknown): void {
     const turn = this.structuredTurn;
-    if (!turn || update === null || typeof update !== "object") return;
-    const value = update as { sessionUpdate?: unknown; content?: { type?: unknown; text?: unknown } };
-    if (value.sessionUpdate !== "agent_message_chunk" || value.content?.type !== "text" || typeof value.content.text !== "string") return;
-    if (turn.text.length < MAX_STRUCTURED_TURN_TEXT) turn.text += value.content.text;
+    const text = turn ? agentMessageText(update) : undefined;
+    if (!turn || text === undefined) return;
+    if (turn.text.length < MAX_STRUCTURED_TURN_TEXT) turn.text += text;
   }
 
   /**
@@ -1202,31 +1404,51 @@ export class RelayedSession {
   private async settleStructuredTurn(requestId: string, result: Record<string, unknown>): Promise<{ requestId: string; result: Record<string, unknown> } | null> {
     const turn = this.structuredTurn;
     if (!turn) return { requestId, result };
-    const context = { assignmentId: this.assignment.id, attempt: this.assignment.attempt };
-    if (turn.followUp && requestId === turn.followUp.requestId) {
-      const original = turn.followUp.original;
-      const found = this.resultTools?.result() ?? parseFencedResult(turn.text, turn.validate);
-      this.endStructuredTurn(requestId);
-      this.logger.info({ event: "structured_result.settled", ...context, source: found ? "follow_up" : "none" }, "structured turn settled after its follow-up");
-      const usage = sumPromptUsage(original.usage as Record<string, unknown> | null | undefined, result.usage as Record<string, unknown> | null | undefined);
-      return { requestId: turn.requestId, result: { ...original, ...(usage ? { usage } : {}), ...(found ? { structuredOutput: { source: "follow_up", value: found.value } } : {}) } };
-    }
+    if (turn.followUp && requestId === turn.followUp.requestId) return this.settleFollowUp(turn, turn.followUp, result);
     if (requestId !== turn.requestId) return { requestId, result };
+    const found = this.structuredResult(turn);
+    const ref = this.followUpRef(found, result);
+    if (ref === null) return this.settleTurn(requestId, result, found);
+    return this.askFollowUp(turn, ref, requestId, result);
+  }
+
+  private settleFollowUp(turn: StructuredTurnState, followUp: NonNullable<StructuredTurnState["followUp"]>, result: Record<string, unknown>): { requestId: string; result: Record<string, unknown> } {
+    const original = followUp.original;
+    const found = this.resultTools?.result() ?? parseFencedResult(turn.text, turn.validate);
+    this.endStructuredTurn(followUp.requestId);
+    this.logger.info({ event: "structured_result.settled", assignmentId: this.assignment.id, attempt: this.assignment.attempt, source: found ? "follow_up" : "none" }, "structured turn settled after its follow-up");
+    const usage = sumPromptUsage(original.usage as Record<string, unknown> | null | undefined, result.usage as Record<string, unknown> | null | undefined);
+    return { requestId: turn.requestId, result: { ...original, ...(usage ? { usage } : {}), ...(found ? { structuredOutput: { source: "follow_up", value: found.value } } : {}) } };
+  }
+
+  /** The tool's recorded value, else a valid fenced result in the agent's text. */
+  private structuredResult(turn: StructuredTurnState): { source: "tool" | "fence"; value: unknown } | null {
     const recorded = this.resultTools?.result();
-    const fenced = recorded ? null : parseFencedResult(turn.text, turn.validate);
-    const found = recorded ? { source: "tool" as const, value: recorded.value } : fenced ? { source: "fence" as const, value: fenced.value } : null;
-    if (found || result.stopReason !== "end_turn" || this.closed || !this.acpSessionRef) {
-      this.endStructuredTurn(requestId);
-      this.logger.info({ event: "structured_result.settled", ...context, source: found?.source ?? "none", stopReason: result.stopReason }, "structured turn settled");
-      return { requestId, result: found ? { ...result, structuredOutput: found } : result };
-    }
-    // Neither a valid call nor a valid fenced result: ask once, in the same session.
+    if (recorded) return { source: "tool", value: recorded.value };
+    const fenced = parseFencedResult(turn.text, turn.validate);
+    return fenced ? { source: "fence", value: fenced.value } : null;
+  }
+
+  /** The session to ask the follow-up in: only when the turn ended normally without a result and the session is still open. */
+  private followUpRef(found: unknown, result: Record<string, unknown>): string | null {
+    if (found || result.stopReason !== "end_turn" || this.closed) return null;
+    return this.acpSessionRef || null;
+  }
+
+  private settleTurn(requestId: string, result: Record<string, unknown>, found: { source: "tool" | "fence"; value: unknown } | null): { requestId: string; result: Record<string, unknown> } {
+    this.endStructuredTurn(requestId);
+    this.logger.info({ event: "structured_result.settled", assignmentId: this.assignment.id, attempt: this.assignment.attempt, source: found?.source ?? "none", stopReason: result.stopReason }, "structured turn settled");
+    return { requestId, result: found ? { ...result, structuredOutput: found } : result };
+  }
+
+  /** Neither a valid call nor a valid fenced result: ask once, in the same session. */
+  private async askFollowUp(turn: StructuredTurnState, ref: string, requestId: string, result: Record<string, unknown>): Promise<{ requestId: string; result: Record<string, unknown> } | null> {
     const followUpId = followUpRequestId(requestId);
     turn.followUp = { requestId: followUpId, original: result };
     turn.text = "";
-    this.logger.info({ event: "structured_result.follow_up", ...context }, "structured turn ended without a result; asking once more");
+    this.logger.info({ event: "structured_result.follow_up", assignmentId: this.assignment.id, attempt: this.assignment.attempt }, "structured turn ended without a result; asking once more");
     try {
-      await this.deps.runner.prompt(this.acpSessionRef, followUpId, { prompt: [{ type: "text", text: resultFollowUp(this.resultToolCall()) }] });
+      await this.deps.runner.prompt(ref, followUpId, { prompt: [{ type: "text", text: resultFollowUp(this.resultToolCall()) }] });
     } catch {
       this.endStructuredTurn(followUpId);
       return { requestId, result };
@@ -1252,61 +1474,89 @@ export class RelayedSession {
     return undefined;
   }
 
-  /** D87: policy first; defer to a human via the relay when policy allows; fail closed at the deadline. */
+  /** Policy first; defer to a human via the relay when policy allows; fail closed at the deadline. */
   private async onPermissionRequest(requestId: string, params: RequestPermissionRequest): Promise<void> {
     const ref = this.acpSessionRef;
     if (ref === null) return;
-    if (this.toolGovernance) {
-      // A host agent is never answered "always", by policy or by a person:
-      // OpenCode would store it and stop asking; Antigravity would stop asking
-      // for that command in this workspace.
-      params = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
-      this.governedPermissions.set(requestId, { toolCallId: params.toolCall.toolCallId, options: params.options });
-      // A host agent's request is judged by the call it names, or refused.
-      const verdict = this.toolGovernance.decide(params, { cwd: this.sessionCwd(), servers: this.sessionServers, browserTools: this.browserGateway !== null });
-      if (verdict.kind !== "evaluate") {
-        if (this.closed) return;
-        this.deps.assertExecutionOwned?.();
-        const optionId = params.options.find(option => option.kind === (verdict.kind === "allow" ? "allow_once" : "reject_once"))?.optionId;
-        if (verdict.kind === "deny") {
-          this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId, reason: verdict.reason.slice(0, 512) },
-            `${this.toolGovernance.agentName} tool call refused by policy`);
-        }
-        return void (await this.answerPermission(ref, requestId, optionId === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
-      }
-      params = verdict.request;
-    }
-    const decision = await this.deps.policy.evaluatePermission(params, { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
-      cwd: this.sessionCwd(), browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
-      admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] });
+    const request = this.toolGovernance ? await this.governPermission(ref, requestId, params, this.toolGovernance) : params;
+    if (request === null) return;
+    const decision = await this.deps.policy.evaluatePermission(request, this.permissionContext());
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
-    if (decision.kind === "allow") return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "selected", optionId: decision.optionId } }));
-    // A refused tool ends the agent's turn on Claude Code and Codex; the log
-    // named nothing about it, so a turn that stopped at a build command read
-    // as a hung agent, and a refused "Edit files" call (T1, 2026-10-02) never
-    // said which path was wrong. Bounded, sanitized title, and the refusal's
-    // reason with each refused path workspace-relative (never a host path).
-    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: params.toolCall.toolCallId,
-      title: sanitizePermissionRequest(params).params.title, decision: decision.kind,
+    if (decision.kind === "allow") return void (await this.answerPermission(ref, requestId, selectedOption(decision.optionId)));
+    this.logPolicyRefusal(request, decision);
+    if (decision.kind === "deny") return this.denyByPolicy(ref, requestId, request, decision);
+    return this.deferPermission(ref, requestId, request, decision);
+  }
+
+  /**
+   * A host agent is never answered "always", by policy or by a person:
+   * OpenCode would store it and stop asking; Antigravity would stop asking
+   * for that command in this workspace. Its request is judged by the call it
+   * names, or refused. Returns the request for policy to judge, or null once
+   * it is answered here.
+   */
+  private async governPermission(ref: string, requestId: string, params: RequestPermissionRequest, governance: HostToolGovernance): Promise<RequestPermissionRequest | null> {
+    const request = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
+    this.governedPermissions.set(requestId, { toolCallId: request.toolCall.toolCallId, options: request.options });
+    const verdict = governance.decide(request, { cwd: this.sessionCwd(), servers: this.sessionServers, browserTools: this.browserGateway !== null });
+    if (verdict.kind === "evaluate") return verdict.request;
+    if (this.closed) return null;
+    this.deps.assertExecutionOwned?.();
+    await this.answerGoverned(ref, requestId, request, verdict, governance);
+    return null;
+  }
+
+  private async answerGoverned(ref: string, requestId: string, request: RequestPermissionRequest, verdict: Exclude<ReturnType<HostToolGovernance["decide"]>, { kind: "evaluate" }>, governance: HostToolGovernance): Promise<void> {
+    const wanted = verdict.kind === "allow" ? "allow_once" : "reject_once";
+    const optionId = request.options.find(option => option.kind === wanted)?.optionId;
+    if (verdict.kind === "deny") {
+      this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: request.toolCall.toolCallId, reason: verdict.reason.slice(0, 512) },
+        `${governance.agentName} tool call refused by policy`);
+    }
+    await this.answerPermission(ref, requestId, optionId === undefined ? cancelledPermission() : selectedOption(optionId));
+  }
+
+  private permissionContext(): Parameters<PolicyResponder["evaluatePermission"]>[1] {
+    return { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
+      cwd: this.sessionCwd(), browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
+      admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] };
+  }
+
+  /**
+   * A refused tool ends the agent's turn on Claude Code and Codex; without a
+   * log line a turn that stopped at a build command read as a hung agent, and
+   * a refused "Edit files" call never said which path was wrong. Bounded,
+   * sanitized title, and the refusal's reason with each refused path
+   * workspace-relative (never a host path).
+   */
+  private logPolicyRefusal(request: RequestPermissionRequest, decision: Exclude<PolicyDecision, { kind: "allow" }>): void {
+    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: request.toolCall.toolCallId,
+      title: sanitizePermissionRequest(request).params.title, decision: decision.kind,
       ...(decision.kind === "deny" && decision.refusal ? { refusal: decision.refusal } : {}),
       humanDeferralAllowed: this.assignment.policy.humanDeferralAllowed }, "tool permission not allowed by policy");
-    if (decision.kind === "deny") {
-      // The refused call carries the note before it is answered, so it reaches
-      // Konteks inside this turn: the person sees why, and Harness repeats it to
-      // the agent when it continues the stopped turn (D114).
-      if (decision.message && decision.refusal?.reason === "outside_workspace") {
-        await this.noteRefusedToolCall(ref, params.toolCall.toolCallId, decision.message);
-      }
-      return void (await this.answerPermission(ref, requestId, decision.optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: decision.optionId } }));
+  }
+
+  /**
+   * The refused call carries the note before it is answered, so it reaches
+   * Konteks inside this turn: the person sees why, and Harness repeats it to
+   * the agent when it continues the stopped turn.
+   */
+  private async denyByPolicy(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "deny" }>): Promise<void> {
+    if (decision.message && decision.refusal?.reason === "outside_workspace") {
+      await this.noteRefusedToolCall(ref, request.toolCall.toolCallId, decision.message);
     }
-    if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
-    // An integration gate's question is answered once, never "always".
-    if (decision.allowOnceOnly) params = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
-    const sanitized = sanitizePermissionRequest(params);
+    await this.answerPermission(ref, requestId, decision.optionId === null ? cancelledPermission() : selectedOption(decision.optionId));
+  }
+
+  /** Ask a person through Konteks, when the assignment allows it; an integration gate's question is answered once, never "always". */
+  private async deferPermission(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "defer" }>): Promise<void> {
+    if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
+    const asked = decision.allowOnceOnly ? { ...request, options: request.options.filter(option => option.kind !== "allow_always") } : request;
+    const sanitized = sanitizePermissionRequest(asked);
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
-    if (!pending) return void (await this.answerPermission(ref, requestId, { outcome: { outcome: "cancelled" } }));
-    await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: params.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
+    if (!pending) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
+    await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: asked.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
   }
 
   /** Put the policy's note on a refused tool call (an ACP `tool_call_update` carrying only content). */
@@ -1333,23 +1583,22 @@ export class RelayedSession {
     this.toolGovernance?.answered?.(governed.toolCallId, option?.kind === "allow_once");
   }
 
-  /** The working copy the session's agent runs in. */
   /**
    * The folder the tool policy judges file changes against: the runner's
    * workspace, except for a direct session, whose agent may change files only
-   * in its own private session folder, never another session's (runtime-view
-   * R13). Kept to direct sessions: Konteks's own kinds are proven against the
+   * in its own private session folder, never another session's. Kept to direct sessions: Konteks's own kinds are proven against the
    * workspace root today, and their tighter root is a change of its own.
    */
   private policyRoot(): string {
     return isDirectAssignment(this.assignment) ? this.sessionCwd() : this.deps.workspaceRoot;
   }
 
-  /** What goes in front of the person's text: the staged skills line; nothing for a direct session, so a leading `/command` stays first (R11). */
+  /** What goes in front of the person's text: the staged skills line; nothing for a direct session, so a leading `/command` stays first. */
   private promptInstructions(): string | undefined {
     return isDirectAssignment(this.assignment) ? undefined : this.preparedInputs?.skillInstructions || undefined;
   }
 
+  /** The working copy the session's agent runs in. */
   private sessionCwd(): string {
     return this.preparedInputs?.cwd ?? `${this.deps.workspaceRoot}/${this.assignment.id}`;
   }
@@ -1366,19 +1615,25 @@ export class RelayedSession {
     const ref = this.acpSessionRef;
     this.logger.error({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, toolCallId: bypass.toolCallId, tool: bypass.title.slice(0, 128), diagnostic: governance.bypassDiagnostic },
       `${governance.agentName} ran a gated tool without approval; stopping the turn and taking it out of service`);
-    // The line names what to fix: for Antigravity on Gemini Enterprise, a
-    // command that never asked is the organisation's admin setting (A21).
-    let credentialMethod: string | undefined;
-    if (governance.quarantineMessageFor) {
-      // The connector lists the credential in use first.
-      try { credentialMethod = (await this.deps.runner.readiness()).agent.credentials?.[0]?.method; }
-      catch { credentialMethod = undefined; }
-    }
-    const message = governance.quarantineMessageFor?.(bypass, credentialMethod) ?? governance.quarantineMessage;
+    const message = await this.quarantineMessage(governance, bypass);
     if (ref !== null) await this.deps.runner.cancel(ref).catch(error => this.logger.warn({ err: error }, "cancel after a governance bypass failed"));
     await this.deps.runner.quarantine?.(message)
       .catch(error => this.logger.warn({ err: error }, "quarantine after a governance bypass failed"));
     await this.close("agent_exited");
+  }
+
+  /**
+   * The line names what to fix: for Antigravity on Gemini Enterprise, a
+   * command that never asked is the organisation's admin setting. The
+   * connector lists the credential in use first.
+   */
+  private async quarantineMessage(governance: HostToolGovernance, bypass: HostToolBypass): Promise<string> {
+    let credentialMethod: string | undefined;
+    if (governance.quarantineMessageFor) {
+      try { credentialMethod = (await this.deps.runner.readiness()).agent.credentials?.[0]?.method; }
+      catch { credentialMethod = undefined; }
+    }
+    return governance.quarantineMessageFor?.(bypass, credentialMethod) ?? governance.quarantineMessage;
   }
 
   private async onElicitationRequest(requestId: string, params: CreateElicitationRequest): Promise<void> {
@@ -1388,15 +1643,16 @@ export class RelayedSession {
     const decision = await this.deps.policy.evaluateElicitation(params);
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
-    if (decision.kind === "decline" || sanitized.isSignIn || !this.assignment.policy.humanDeferralAllowed) {
-      // Sign-in elicitations are surfaced to the operator, never automated or remotely answered; a headless run fails closed.
-      if (sanitized.isSignIn) this.logger.warn({ assignmentId: this.assignment.id }, "agent asked for a sign-in; failing closed with agent_auth_required");
-      await this.deps.runner.answer(ref, requestId, { action: "decline" });
-      return;
-    }
+    if (decision.kind === "decline" || sanitized.isSignIn || !this.assignment.policy.humanDeferralAllowed) return this.declineElicitation(ref, requestId, sanitized.isSignIn);
     const pending = await this.deferToHuman(ref, requestId, "elicitation/create", sanitized);
     if (!pending) return void (await this.deps.runner.answer(ref, requestId, { action: "decline" }));
     await this.sendToCore({ kind: "acp", method: "elicitation/create", id: requestId, params: { mode: "form", message: sanitized.params.message, requestedSchema: sanitized.params.requestedSchema } as never });
+  }
+
+  /** Sign-in elicitations are surfaced to the operator, never automated or remotely answered; a headless run fails closed. */
+  private async declineElicitation(ref: string, requestId: string, signIn: boolean): Promise<void> {
+    if (signIn) this.logger.warn({ assignmentId: this.assignment.id }, "agent asked for a sign-in; failing closed with agent_auth_required");
+    await this.deps.runner.answer(ref, requestId, { action: "decline" });
   }
 
   /**
@@ -1408,35 +1664,47 @@ export class RelayedSession {
   private async deferToHuman(ref: string, requestId: string, method: "session/request_permission" | "elicitation/create",
     sanitized: SanitizedPermission | SanitizedElicitation): Promise<PendingHumanRequest | null> {
     const args = { acpSessionRef: ref, requestId, assignmentId: this.assignment.id, attempt: this.assignment.attempt, agentId: this.assignment.agentRoute.agentId, sanitized };
-    let registered: PendingPermissionView | null = null;
-    if (this.deps.registerDeferral) {
-      const source = this.assignment.source;
-      // Core threads a request onto the assignment's own session: the
-      // conversation, a native delivery's execution session, else the assignment.
-      const sessionId = continuedSession(source)?.sessionId
-        ?? (source.kind === "harness_delivery" ? source.executionSessionId : this.assignment.id);
-      registered = await registerDeferral(this.deps.registerDeferral, deferredPermissionBody({ ...args, sessionId }), { logger: this.logger });
-      if (!registered) return null;
-      if (this.closed) return null;
-      this.deps.assertExecutionOwned?.();
-    }
+    const registered = await this.registeredDeferral(args);
+    if (registered === null) return null;
     const pending = this.deps.broker.defer(args, registered?.deadlineAt);
     await this.deps.journal.pendingRequests.put({ acpSessionRef: ref, id: requestId, method, direction: "issued", openedAt: pending.raisedAt, closedAt: null,
       deadlineAt: pending.deadlineAt, requestDigest: registered?.requestDigest ?? sanitized.requestDigest });
     return pending;
   }
 
-  /** Deadline reached with no authorized answer: fail closed (D87 step 3). */
+  /**
+   * Core's registration of a deferred request: undefined when this connector
+   * registers nothing, null when Core never confirmed it (or the session
+   * closed meanwhile). Core threads a request onto the assignment's own
+   * session: the conversation, a native delivery's execution session, else
+   * the assignment.
+   */
+  private async registeredDeferral(args: Omit<Parameters<typeof deferredPermissionBody>[0], "sessionId">): Promise<PendingPermissionView | null | undefined> {
+    if (!this.deps.registerDeferral) return undefined;
+    const source = this.assignment.source;
+    const sessionId = continuedSession(source)?.sessionId
+      ?? (source.kind === "harness_delivery" ? source.executionSessionId : this.assignment.id);
+    const registered = await registerDeferral(this.deps.registerDeferral, deferredPermissionBody({ ...args, sessionId }), { logger: this.logger });
+    if (!registered || this.closed) return null;
+    this.deps.assertExecutionOwned?.();
+    return registered;
+  }
+
+  /** Deadline reached with no authorized answer: fail closed. */
   onDeadline(request: PendingHumanRequest): Promise<void> { return this.track(() => this.onDeadlineImpl(request)); }
 
   private async onDeadlineImpl(request: PendingHumanRequest): Promise<void> {
     const ref = this.acpSessionRef;
     if (this.closed || ref === null || request.acpSessionRef !== ref) return;
-    const journaled = this.deps.journal.pendingRequests.get(`${ref}:issued:${request.requestId}`);
-    if (journaled && journaled.closedAt === null) await this.deps.journal.pendingRequests.put({ ...journaled, closedAt: this.deps.clock.nowIso() });
+    await this.closeIssued(ref, request.requestId);
     if (this.closed) return;
     this.deps.assertExecutionOwned?.();
-    await this.deps.runner.answer(ref, request.requestId, request.sanitized.kind === "permission" ? { outcome: { outcome: "cancelled" } } : { action: "cancel" }).catch(() => undefined);
+    await this.deps.runner.answer(ref, request.requestId, cancelAnswer(request)).catch(() => undefined);
+  }
+
+  private async closeIssued(ref: string, requestId: string): Promise<void> {
+    const journaled = this.deps.journal.pendingRequests.get(`${ref}:issued:${requestId}`);
+    if (journaled && journaled.closedAt === null) await this.deps.journal.pendingRequests.put({ ...journaled, closedAt: this.deps.clock.nowIso() });
   }
 
   usage(): AgentTurnUsageObservation | null {
@@ -1519,22 +1787,21 @@ export class RelayedSession {
     this.closed = true;
     try {
       await this.closeMcpFacade();
-      if (this.acpSessionRef !== null) {
-        await this.deps.runner.cancel(this.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-        await this.deps.runner.closeSession(this.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-      }
+      if (this.acpSessionRef !== null) await this.cancelAndClose(this.acpSessionRef);
       // A post-ready journal failure must also close the advertised session.
       // No readiness announcement means there is no remote session to close.
       if (this.channelOpened) await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason: "agent_exited" });
     } finally {
-      if (!this.recoveryStopping) {
-        this.deps.assertExecutionOwned?.();
-        this.releaseChannel?.();
-        this.releaseChannel = null;
-      }
+      this.releaseUnlessRecovering();
     }
+  }
+
+  /** Recovery keeps the channel; any other end releases it. */
+  private releaseUnlessRecovering(): void {
+    if (this.recoveryStopping) return;
+    this.deps.assertExecutionOwned?.();
+    this.releaseChannel?.();
+    this.releaseChannel = null;
   }
 
   close(reason: SessionClosedReason): Promise<void> {
@@ -1549,62 +1816,87 @@ export class RelayedSession {
 
   private async finishClose(reason: SessionClosedReason): Promise<void> {
     const nativeCompletion = reason === "completed";
-    let settlementRecorded = false;
+    const settlement = { recorded: false };
     try {
       if (nativeCompletion && this.acpSessionRef === null) throw new RemoteInstanceError("recovery_required", "Native completed closure requires its exact session reference.");
-      if (this.acpSessionRef !== null) {
-        // Defensive cancellation of this exact retained reference remains
-        // possible after lease loss; it is not qualified stop or release.
-        if (reason === "relay_replay_gap" || reason === "lease_lost" || reason === "drain" || reason === "cancelled") await this.deps.runner.cancel(this.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-        for (const pending of this.deps.broker.cancelSession(this.acpSessionRef)) {
-          this.deps.assertExecutionOwned?.();
-          await this.deps.runner.answer(this.acpSessionRef, pending.requestId, pending.sanitized.kind === "permission" ? { outcome: { outcome: "cancelled" } } : { action: "cancel" }).catch(() => undefined);
-          this.deps.assertExecutionOwned?.();
-        }
-        this.deps.assertExecutionOwned?.();
-        if (nativeCompletion) {
-          const receipt = await this.deps.runner.closeSession(this.acpSessionRef, { completed: true });
-          if (!receipt || typeof receipt !== "object" || !("completion" in receipt) || receipt.completion !== "native_continuation_ready" || !this.deps.recordCompletedSettlement) {
-            throw new RemoteInstanceError("recovery_required", "Native completed-turn settlement is unavailable.");
-          }
-          this.deps.assertExecutionOwned?.();
-          await this.deps.recordCompletedSettlement(this.acpSessionRef);
-          settlementRecorded = true;
-          this.logger.info({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, acpSessionRef: this.acpSessionRef, stage: "completed_turn_settlement", outcome: "recorded" }, "native ACP settlement recorded; generation ownership retained");
-        } else await this.deps.runner.closeSession(this.acpSessionRef).catch(() => undefined);
-        this.deps.assertExecutionOwned?.();
-      }
-      try {
-        await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason });
-      } catch (error) {
-        // A broken transcript channel must not suppress the independent durable
-        // terminal report. Ownership and native completion checks still apply.
-        this.deps.assertExecutionOwned?.();
-        this.logger.warn({ event: "session.close.relay_unavailable", assignmentId: this.assignment.id,
-          attempt: this.assignment.attempt, channelId: this.boundChannelId, reason,
-          stage: "terminal_report", code: error instanceof RemoteInstanceError ? error.code : "transport_failed" },
-          "session closure could not use relay; continuing durable terminal reporting");
-      }
+      if (this.acpSessionRef !== null) await this.settleClosedRef(this.acpSessionRef, reason, settlement);
+      await this.announceClosed(reason);
       // Native assignment closure is not logical-session channel retirement:
       // its final frame, replay buffer and sequence space stay for the next turn.
       if (!this.recoveryStopping) await this.deps.onClosed(this, reason);
       this.deps.assertExecutionOwned?.();
     } catch (error) {
-      if (nativeCompletion) this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "completed_turn_settlement", outcome: settlementRecorded ? "report_failed" : "unconfirmed", code: "recovery_required" }, "native completed closure remains unconfirmed");
+      if (nativeCompletion) this.logUnconfirmedCompletion(settlement.recorded);
       throw error;
     } finally {
-      await this.closeMcpFacade();
-      if (!nativeCompletion) this.stopPreview(reason);
-      this.completedSettlementInProgress = false;
-      // The completed receipt is not qualified handoff. Keep the channel's
-      // retry owner even after its terminal report has been persisted.
-      if (!this.recoveryStopping && !nativeCompletion) {
-        this.deps.assertExecutionOwned?.();
-        this.releaseChannel?.();
-        this.releaseChannel = null;
-      }
+      await this.afterClose(reason, nativeCompletion);
     }
+  }
+
+  private logUnconfirmedCompletion(recorded: boolean): void {
+    this.logger.warn({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, stage: "completed_turn_settlement", outcome: recorded ? "report_failed" : "unconfirmed", code: "recovery_required" }, "native completed closure remains unconfirmed");
+  }
+
+  /**
+   * Defensive cancellation of this exact retained reference remains possible
+   * after lease loss; it is not qualified stop or release. Pending human
+   * requests are cancelled; a completed turn records its native settlement.
+   */
+  private async settleClosedRef(ref: string, reason: SessionClosedReason, settlement: { recorded: boolean }): Promise<void> {
+    if (CANCELLING_CLOSE_REASONS.has(reason)) await this.deps.runner.cancel(ref).catch(() => undefined);
+    this.deps.assertExecutionOwned?.();
+    await this.cancelPendingHumanRequests(ref);
+    this.deps.assertExecutionOwned?.();
+    if (reason === "completed") await this.recordCompletedSettlement(ref, settlement);
+    else await this.deps.runner.closeSession(ref).catch(() => undefined);
+    this.deps.assertExecutionOwned?.();
+  }
+
+  private async cancelPendingHumanRequests(ref: string): Promise<void> {
+    for (const pending of this.deps.broker.cancelSession(ref)) {
+      this.deps.assertExecutionOwned?.();
+      await this.deps.runner.answer(ref, pending.requestId, cancelAnswer(pending)).catch(() => undefined);
+      this.deps.assertExecutionOwned?.();
+    }
+  }
+
+  private async recordCompletedSettlement(ref: string, settlement: { recorded: boolean }): Promise<void> {
+    const receipt = await this.deps.runner.closeSession(ref, { completed: true });
+    if (!continuationReady(receipt) || !this.deps.recordCompletedSettlement) {
+      throw new RemoteInstanceError("recovery_required", "Native completed-turn settlement is unavailable.");
+    }
+    this.deps.assertExecutionOwned?.();
+    await this.deps.recordCompletedSettlement(ref);
+    settlement.recorded = true;
+    this.logger.info({ assignmentId: this.assignment.id, attempt: this.assignment.attempt, acpSessionRef: ref, stage: "completed_turn_settlement", outcome: "recorded" }, "native ACP settlement recorded; generation ownership retained");
+  }
+
+  /**
+   * A broken transcript channel must not suppress the independent durable
+   * terminal report. Ownership and native completion checks still apply.
+   */
+  private async announceClosed(reason: SessionClosedReason): Promise<void> {
+    try {
+      await this.sendToCore({ kind: "session_closed", assignmentId: this.assignment.id, reason });
+    } catch (error) {
+      this.deps.assertExecutionOwned?.();
+      this.logger.warn({ event: "session.close.relay_unavailable", assignmentId: this.assignment.id,
+        attempt: this.assignment.attempt, channelId: this.boundChannelId, reason,
+        stage: "terminal_report", code: error instanceof RemoteInstanceError ? error.code : "transport_failed" },
+        "session closure could not use relay; continuing durable terminal reporting");
+    }
+  }
+
+  /**
+   * The completed receipt is not qualified handoff: a completed turn keeps
+   * its preview and the channel's retry owner even after its terminal report
+   * has been persisted.
+   */
+  private async afterClose(reason: SessionClosedReason, nativeCompletion: boolean): Promise<void> {
+    await this.closeMcpFacade();
+    if (!nativeCompletion) this.stopPreview(reason);
+    this.completedSettlementInProgress = false;
+    if (!nativeCompletion) this.releaseUnlessRecovering();
   }
 
   private async closeMcpFacade(): Promise<void> {
@@ -1652,7 +1944,7 @@ export class RelayedSession {
   /**
    * A recovery-fenced owner keeps its channel reservation until the
    * orchestrator has proven its exact process stopped and Core settled the
-   * claim (WS2-159). Only then may the next turn take the channel, always
+   * claim. Only then may the next turn take the channel, always
    * with a fresh ACP session. Its own recovery stop must have run to the end.
    */
   releaseRecoveredChannel(): void {
@@ -1664,6 +1956,117 @@ export class RelayedSession {
   }
 
   waitForAuthorityStop(): Promise<void> { return this.executionGate?.waitForAuthorityStop() ?? Promise.resolve(); }
+}
+
+/** Close reasons that cancel the agent's running turn first. */
+const CANCELLING_CLOSE_REASONS: ReadonlySet<string> = new Set(["relay_replay_gap", "lease_lost", "drain", "cancelled"]);
+
+function cancelledPermission(): { outcome: { outcome: string; optionId?: string } } {
+  return { outcome: { outcome: "cancelled" } };
+}
+
+function selectedOption(optionId: string): { outcome: { outcome: string; optionId?: string } } {
+  return { outcome: { outcome: "selected", optionId } };
+}
+
+/** The fail-closed answer to a pending human request, in its own shape. */
+function cancelAnswer(pending: { sanitized: { kind: string } }): unknown {
+  return pending.sanitized.kind === "permission" ? { outcome: { outcome: "cancelled" } } : { action: "cancel" };
+}
+
+function continuationReady(receipt: unknown): boolean {
+  return Boolean(receipt) && typeof receipt === "object" && "completion" in (receipt as object) && (receipt as { completion?: unknown }).completion === "native_continuation_ready";
+}
+
+type RunnerEventOf<K extends RunnerEvent["kind"]> = Extract<RunnerEvent, { kind: K }>;
+
+/** The text of an agent message chunk, if that is what the update is. */
+function agentMessageText(update: unknown): string | undefined {
+  if (update === null || typeof update !== "object") return undefined;
+  const value = update as { sessionUpdate?: unknown; content?: { type?: unknown; text?: unknown } };
+  return value.sessionUpdate === "agent_message_chunk" && value.content?.type === "text" && typeof value.content.text === "string" ? value.content.text : undefined;
+}
+
+type AuthorizedOperation = Awaited<ReturnType<NativeExecutionGate["admit"]>>;
+type AuthorizedMessage = AuthorizedOperation["envelope"]["message"];
+type HolderRequest = Extract<SessionToRuntimeMessage, { kind: "acp"; id: string }>;
+type PromptParams = { prompt: PromptBlock[] } & Record<string, unknown>;
+
+function isPromptMessage(message: AuthorizedMessage): message is Extract<AuthorizedMessage, { kind: "acp"; method: "session/prompt" }> {
+  return message.kind === "acp" && message.method === "session/prompt";
+}
+
+/** The answer an issued request gets: the person's result, else a cancellation in that request's own shape. */
+function issuedAnswer(message: { kind: string; result?: unknown }, method: string): unknown {
+  if (message.kind === "acp_result") return message.result;
+  return method === "elicitation/create" ? { action: "cancel" } : { outcome: { outcome: "cancelled" } };
+}
+
+function deniedCompletion(message: AuthorizedMessage, error: unknown): SessionToCoreMessage | undefined {
+  if (message.kind !== "acp" || !("id" in message)) return undefined;
+  return { kind: "acp_error", id: message.id, method: message.method, error: classify(error) } as SessionToCoreMessage;
+}
+
+type CanonicalIdentity = { toolCallId: string; identity: CanonicalAcpToolIdentity; terminal: boolean };
+const TERMINAL_TOOL_STATUSES: ReadonlySet<unknown> = new Set(["completed", "failed", "cancelled"]);
+
+/** The safe tool identity a canonical update carries, kept for its later sparse updates. */
+function toolIdentity(toolCallId: string, update: Record<string, unknown>): CanonicalIdentity {
+  const identity: CanonicalAcpToolIdentity = {
+    ...(typeof update.name === "string" ? { name: update.name } : {}),
+    ...(typeof update.kind === "string" ? { kind: update.kind } : {}),
+    ...(typeof update.title === "string" ? { title: update.title } : {}),
+  };
+  return { toolCallId, identity, terminal: TERMINAL_TOOL_STATUSES.has(update.status) };
+}
+
+/** The text of an agent or user message chunk, if that is what the update is. */
+function streamedText(update: { sessionUpdate: string; content?: { type?: string; text?: unknown } }): string | undefined {
+  const message = update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "user_message_chunk";
+  return message && update.content?.type === "text" && typeof update.content.text === "string" ? update.content.text : undefined;
+}
+
+/** A received prompt that carries delivery authority (its output goes through the durable delivery path). */
+function receivedDeliveryPrompt(pending: { direction: string; method: string; authorization?: { claims?: object } | undefined }): boolean {
+  return pending.direction === "received" && pending.method === "session/prompt" && "deliveryIdentity" in (pending.authorization?.claims ?? {});
+}
+
+/** The durable completion must be this prompt's result. */
+function promptCompletion(completion: unknown, requestId: string): Extract<SessionToCoreMessage, { kind: "acp_result" }> {
+  const parsed = SessionToCoreMessageSchema.parse(completion);
+  if (parsed.kind !== "acp_result" || parsed.method !== "session/prompt" || parsed.id !== requestId) throw new RemoteInstanceError("capability_unavailable", "Durable delivery output completion does not match its prompt.");
+  return parsed;
+}
+
+function httpStatus(error: unknown): number | undefined {
+  return error && typeof error === "object" && "status" in error && typeof error.status === "number" ? error.status : undefined;
+}
+
+/** An error's stable code (and diagnostic) for a log line, never its message. */
+function errorCode(error: unknown, fallback: string): { code: string; diagnostic?: string } {
+  if (!(error instanceof RemoteInstanceError)) return { code: fallback };
+  return { code: error.code, ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}) };
+}
+
+type SessionMcpServer = { type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> };
+type SessionBrowser = { proxyUrl: string; outputDir: string; browsersPath: string };
+type SessionReferences = { priorRef: string | undefined; restoreRef: string | undefined };
+type ExecutionActivation = Awaited<ReturnType<NonNullable<RelayedSessionDeps["activateExecution"]>>>;
+type ReadyProjection = Pick<RemoteExecutionReadyResult, "attempt" | "recoveryEpoch" | "readyRevision">;
+
+function sessionClosed(): RemoteInstanceError {
+  return new RemoteInstanceError("assignment_conflict", "The assignment session is closed.");
+}
+
+/**
+ * Why a bootstrap stage failed, without copying provider/Core error messages
+ * into logs: the stable code and retryability, and for an unknown error its
+ * class and, for an agent's JSON-RPC refusal, its numeric code.
+ */
+function stageFailure(error: unknown): Record<string, unknown> {
+  if (error instanceof RemoteInstanceError) return { code: error.code, retryable: error.retryable, ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}) };
+  const rpcCode = (error as { code?: unknown } | null)?.code;
+  return { code: "unexpected_error", retryable: false, ...(error instanceof Error ? { errorName: error.name } : {}), ...(typeof rpcCode === "number" ? { rpcCode } : {}) };
 }
 
 /** A refused session update's kind for the log, only when it reads as an ACP update name. */
@@ -1687,8 +2090,4 @@ function classify(error: unknown): AcpJsonRpcError {
     return { code: -32000, class: "agent_auth_required", message, retryable: false };
   }
   return { code: -32603, class: "internal", message, retryable: false };
-}
-
-export function toJson(value: unknown): JsonValue {
-  return JSON.parse(JSON.stringify(value)) as JsonValue;
 }

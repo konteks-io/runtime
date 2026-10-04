@@ -21,11 +21,11 @@ import { instructionsInside } from "./working-copy-instructions.js";
 
 /**
  * Google Antigravity (antigravity-runtime-support): Google's own
- * `antigravity-acp` server, fetched by the connector (A2) and run from its own
- * folder. Everything the server gets reaches its `run_command` tool (CP0: a
+ * `antigravity-acp` server, fetched by the connector and run from its own
+ * folder. Everything the server gets reaches its `run_command` tool (a
  * planted `GITHUB_TOKEN` did), and it signs in from its environment unless
  * told otherwise, so every execution of it by the connector gets an
- * ALLOW-LIST environment (A5): nothing inherited but PATH, locale, temporary
+ * ALLOW-LIST environment: nothing inherited but PATH, locale, temporary
  * folders, proxies and extra CA trust; a private `HOME` and `GEMINI_HOME` the
  * connector owns; `AGY_ACP_FORCE_FILE_STORAGE=1` so it never touches the
  * macOS keychain service `gemini`; and never `GEMINI_*`, `GOOGLE_*`,
@@ -37,24 +37,24 @@ import { instructionsInside } from "./working-copy-instructions.js";
 const CONTROL = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
 /** Where an Antigravity runner keeps its private state, all inside its credential directory. */
-export interface AntigravityRuntimePaths {
+interface AntigravityRuntimePaths {
   /** `<credentials>/antigravity`. */
   root: string;
   /** HOME (and USERPROFILE on Windows) of every Antigravity process. */
   home: string;
   /** GEMINI_HOME: everything the server reads or writes (`antigravity-acp/`, `config/`, …). */
   geminiHome: string;
-  /** `<GEMINI_HOME>/antigravity-acp/settings.json`: the sign-in method (and Gemini Enterprise's project), written by the connector (CP2/CP3). */
+  /** `<GEMINI_HOME>/antigravity-acp/settings.json`: the sign-in method (and Gemini Enterprise's project), written by the connector. */
   settingsFile: string;
-  /** `<GEMINI_HOME>/antigravity-acp/trusted_workspaces.json`: removed before each spawn (nothing trusted, CP2). */
+  /** `<GEMINI_HOME>/antigravity-acp/trusted_workspaces.json`: removed before each spawn (nothing trusted). */
   trustFile: string;
-  /** Where the connector keeps an API key: outside the agent's home, never in its environment (CP3). */
+  /** Where the connector keeps an API key: outside the agent's home, never in its environment. */
   relay: string;
   /** Which sign-in this connector holds (`AntigravitySignIn`): outside the agent's home; `settings.json` is written from it. */
   signIn: string;
-  /** What each session was last given as its `AGENTS.md` (A9), by the agent's own session id. */
+  /** What each session was last given as its `AGENTS.md`, by the agent's own session id. */
   instructions: string;
-  /** What a Gemini Enterprise session showed of the organisation's admin settings (MCP Servers off, A21), for doctor. */
+  /** What a Gemini Enterprise session showed of the organisation's admin settings (MCP Servers off), for doctor. */
   adminControls: string;
 }
 
@@ -77,11 +77,11 @@ export function antigravityRuntimePaths(credentialDir: string, platform: NodeJS.
 /** The only settings the connector gives the server; any other `AGY_*`, `GEMINI_*` or `GOOGLE_*` name is refused. */
 export const ANTIGRAVITY_SETTING_NAMES: readonly string[] = Object.freeze(["AGY_ACP_FORCE_FILE_STORAGE", "GOOGLE_GEMINI_BASE_URL"]);
 
-export interface AntigravityEnvironmentOptions {
+interface AntigravityEnvironmentOptions {
   /** The private home and the GEMINI_HOME inside it (both absolute). */
   home: { home: string; geminiHome: string };
   /**
-   * API-key sign-in only (A7, CP3): the connector's loopback relay, which
+   * API-key sign-in only: the connector's loopback relay, which
    * the server reaches through `GOOGLE_GEMINI_BASE_URL`. Never the key.
    */
   relayBaseUrl?: string;
@@ -119,17 +119,22 @@ export function antigravityProcessEnvironment(credentialDir: string, options: { 
 function loopbackRelayUrl(value: string): string {
   let url: URL;
   try { url = new URL(value); } catch { throw relayRefused(); }
-  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.port === "" || url.username || url.password || url.search || url.hash || (url.pathname !== "/" && url.pathname !== "")) throw relayRefused();
+  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.port === "" || !bareOrigin(url)) throw relayRefused();
   return `http://127.0.0.1:${url.port}`;
+}
+
+/** No credentials, query, fragment or path beyond `/`. */
+function bareOrigin(url: URL): boolean {
+  return !url.username && !url.password && !url.search && !url.hash && (url.pathname === "/" || url.pathname === "");
 }
 function relayRefused() { return new RemoteInstanceError("agent_unavailable", "The Google Antigravity relay must listen on 127.0.0.1."); }
 
 /**
- * The built-in tools a Konteks session of Google Antigravity may have (A4):
+ * The built-in tools a Konteks session of Google Antigravity may have:
  * `session/new` `_meta.agy.enabledTools`, re-sent on `session/load` and
  * `session/resume` because a persisted filter can be overridden there
  * (`tool_filter.py`). Everything outside it is off, `start_subagent` (whose
- * subagents' own calls never ask, CP0 B8), `generate_image` and
+ * subagents' own calls never ask), `generate_image` and
  * `ask_question` among them; `disabledTools` names those again so a server
  * that ever stopped honouring the allowlist still drops them. A runtime copy
  * of packages' `ANTIGRAVITY_ENABLED_TOOLS` (agent-adapters), as for OpenCode.
@@ -137,20 +142,20 @@ function relayRefused() { return new RemoteInstanceError("agent_unavailable", "T
 export const ANTIGRAVITY_ENABLED_TOOLS: readonly string[] = Object.freeze([
   "view_file", "list_directory", "search_directory", "find_file", "create_file", "edit_file", "run_command", "read_url_content", "search_web", "finish",
 ]);
-export const ANTIGRAVITY_DISABLED_TOOLS: readonly string[] = Object.freeze(["start_subagent", "generate_image", "ask_question"]);
+const ANTIGRAVITY_DISABLED_TOOLS: readonly string[] = Object.freeze(["start_subagent", "generate_image", "ask_question"]);
 export const ANTIGRAVITY_SESSION_META: Readonly<Record<string, unknown>> = Object.freeze({
   agy: Object.freeze({ enabledTools: ANTIGRAVITY_ENABLED_TOOLS, disabledTools: ANTIGRAVITY_DISABLED_TOOLS }),
 });
 
-/** Modes Konteks never lets Antigravity enter (A4): only `default` asks before commands and edits. */
-export const ANTIGRAVITY_REFUSED_MODES: readonly string[] = Object.freeze(["auto_edit", "yolo"]);
-/** Antigravity's own slash commands Konteks never sends (A4). */
-export const ANTIGRAVITY_REFUSED_COMMANDS: readonly string[] = Object.freeze(["plan", "logout"]);
+/** Modes Konteks never lets Antigravity enter: only `default` asks before commands and edits. */
+const ANTIGRAVITY_REFUSED_MODES: readonly string[] = Object.freeze(["auto_edit", "yolo"]);
+/** Antigravity's own slash commands Konteks never sends. */
+const ANTIGRAVITY_REFUSED_COMMANDS: readonly string[] = Object.freeze(["plan", "logout"]);
 
 /**
  * Which sign-in the connector holds for Antigravity: the file the connector
  * writes `settings.json` from before every spawn (the server treats
- * `auth.type` there as the single source of truth). CP3's sign-in and
+ * `auth.type` there as the single source of truth). The sign-in and
  * sign-out write it; without one the settings name no method and a session
  * reads "Needs sign-in". Never read from the person's `~/.gemini`.
  * - `method`: the sign-in the server uses (`none` after signing out of all);
@@ -163,7 +168,7 @@ export const ANTIGRAVITY_REFUSED_COMMANDS: readonly string[] = Object.freeze(["p
  *   (the credential then reads "Needs sign-in" with that reason).
  */
 const TIER = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/);
-export const ANTIGRAVITY_SIGN_IN_METHODS = ["gemini-api-key", "oauth-business", "oauth-personal", "none"] as const;
+const ANTIGRAVITY_SIGN_IN_METHODS = ["gemini-api-key", "oauth-business", "oauth-personal", "none"] as const;
 export const AntigravitySignInSchema = z.object({
   method: z.enum(ANTIGRAVITY_SIGN_IN_METHODS),
   gcp: AgentLoginGcpSchema.optional(),
@@ -173,7 +178,6 @@ export const AntigravitySignInSchema = z.object({
   if (value.method === "oauth-business" && value.gcp === undefined) ctx.addIssue({ code: "custom", path: ["gcp"], message: "Gemini Enterprise names its Google Cloud project" });
 });
 export type AntigravitySignIn = z.infer<typeof AntigravitySignInSchema>;
-export type AntigravitySignInMethod = AntigravitySignIn["method"];
 
 /** The connector's sign-in record, or null when there is none or it is not one Konteks wrote. */
 export async function readAntigravitySignIn(credentialDir: string, platform: NodeJS.Platform = process.platform): Promise<AntigravitySignIn | null> {
@@ -198,7 +202,7 @@ export async function writeAntigravitySignIn(credentialDir: string, signIn: Anti
  * `settings.json` exactly as the contract names it: `{"auth": {"type":
  * "gemini-api-key"}}`, or `{"auth": {"type": "oauth-business"}, "gcp":
  * {"project": …, "location": …}}`; `{}` when nothing is signed in. Personal
- * Google sign-in (`oauth-personal`, A10) is written only while its switch is
+ * Google sign-in (`oauth-personal`) is written only while its switch is
  * on, which it is not.
  */
 export function renderAntigravitySettings(signIn: AntigravitySignIn | null): string {
@@ -241,7 +245,7 @@ export async function antigravityTokenPresent(file: string): Promise<boolean> {
  * Before every Antigravity process starts: the private folders exist and are
  * the person's alone (0700), `settings.json` says exactly what the connector
  * holds, nothing is trusted (the trust file is removed, so a repository's
- * `.agents/hooks.json` never runs, A4), and the global `config/` and the
+ * `.agents/hooks.json` never runs), and the global `config/` and the
  * CLI's skills folder are empty folders the connector owns (no global hooks,
  * MCP servers or skills from anyone else). Token files are the server's; the
  * connector never reads them.
@@ -252,12 +256,7 @@ export async function prepareAntigravityHome(credentialDir: string, platform: No
   const acp = path.join(paths.geminiHome, "antigravity-acp");
   const config = path.join(paths.geminiHome, "config");
   const cliSkills = path.join(paths.geminiHome, "antigravity-cli", "skills");
-  for (const folder of [paths.root, paths.home, paths.geminiHome, acp]) {
-    await mkdir(folder, { recursive: true, mode: 0o700 });
-    const found = await lstat(folder);
-    if (!found.isDirectory() || found.isSymbolicLink()) throw new RemoteInstanceError("agent_unavailable", "Google Antigravity's private folder is not a folder.", { diagnostic: "antigravity_home_unsafe" });
-    if (platform !== "win32") await chmod(folder, 0o700);
-  }
+  for (const folder of [paths.root, paths.home, paths.geminiHome, acp]) await ensurePrivateFolder(folder, platform);
   // A sign-in under way owns settings.json until it ends (the server writes it too).
   if (!signInsUnderWay.has(paths.home)) await writeSecretFile(paths.settingsFile, renderAntigravitySettings(await readAntigravitySignIn(credentialDir, platform)));
   await rm(paths.trustFile, { force: true, recursive: true });
@@ -267,6 +266,13 @@ export async function prepareAntigravityHome(credentialDir: string, platform: No
   }
   await mkdir(path.join(config, "skills"), { recursive: true, mode: 0o700 });
   return paths;
+}
+
+async function ensurePrivateFolder(folder: string, platform: NodeJS.Platform): Promise<void> {
+  await mkdir(folder, { recursive: true, mode: 0o700 });
+  const found = await lstat(folder);
+  if (!found.isDirectory() || found.isSymbolicLink()) throw new RemoteInstanceError("agent_unavailable", "Google Antigravity's private folder is not a folder.", { diagnostic: "antigravity_home_unsafe" });
+  if (platform !== "win32") await chmod(folder, 0o700);
 }
 
 /** Larger than this, a working copy's `AGENTS.md` is not sent (a prompt is not the place for a book). */
@@ -288,8 +294,8 @@ async function readDelivered(file: string): Promise<Record<string, string>> {
 }
 
 /**
- * The working copy's `AGENTS.md` for a prompt of one session (A9): the
- * server loads no rules file at all (CP0 B7), so the connector sends it
+ * The working copy's `AGENTS.md` for a prompt of one session: the
+ * server loads no rules file at all, so the connector sends it
  * itself as an embedded resource, in the session's first prompt and, after a
  * load or resume (or an edit), again only when the file changed since it was
  * last delivered to that session. Only a regular file whose real path is
@@ -326,7 +332,7 @@ export async function antigravityPromptPrelude(credentialDir: string, session: H
 }
 
 /**
- * What a new, loaded or resumed session must report (A3/A4): a `model`
+ * What a new, loaded or resumed session must report: a `model`
  * select (model discovery and Customize read it) and the `default` mode, the
  * only one that asks before commands and edits. Anything else is a server
  * Konteks does not know how to govern.
@@ -337,38 +343,36 @@ export function verifyAntigravitySession(response: { configOptions?: unknown; mo
   if (!model || model.type !== "select" || typeof model.currentValue !== "string") {
     throw new RemoteInstanceError("agent_unavailable", "Unsupported Google Antigravity version: its session offers no model choice. Update the connector.", { diagnostic: "antigravity_unsupported_version" });
   }
-  const modeOption = options.find(option => option?.id === "mode");
-  const modes = response.modes as { currentModeId?: unknown } | null | undefined;
-  const current = typeof modeOption?.currentValue === "string" ? modeOption.currentValue : typeof modes?.currentModeId === "string" ? modes.currentModeId : undefined;
+  const current = sessionModeId(options.find(option => option?.id === "mode"), response.modes as { currentModeId?: unknown } | null | undefined);
   if (current !== undefined && current !== "default") {
     throw new RemoteInstanceError("agent_unavailable", "Google Antigravity started a session outside its default mode, where it would not ask before commands. Update the connector.", { diagnostic: "antigravity_session_mode" });
   }
 }
 
+/** The session's mode: its `mode` config option, else its ACP modes. */
+function sessionModeId(modeOption: { currentValue?: unknown } | undefined, modes: { currentModeId?: unknown } | null | undefined): string | undefined {
+  if (typeof modeOption?.currentValue === "string") return modeOption.currentValue;
+  return typeof modes?.currentModeId === "string" ? modes.currentModeId : undefined;
+}
+
 /**
  * Lines the server prints when it cannot go on without the person: a licence
- * it cannot find (its Business AI Code API off, CP0 part 2), or a sign-in or
+ * it cannot find (its Business AI Code API off), or a sign-in or
  * licence page it would open in a browser on this computer. A session must
  * not wait on them: it fails at once as "Needs sign-in" with a plain reason.
  * Only execution and discovery processes are read this way; the sign-in flow
- * (CP3) expects these lines.
+ * expects these lines.
  */
 export function antigravityStderrFailure(line: string, credentialDir?: string): RemoteInstanceError | null {
   // The organisation dropped the Konteks servers this session asked for: no
   // Konteks tool can run in it, so it ends now as an access error instead of
-  // a turn that cannot read its own discussion (WS1-196). The observation is
+  // a turn that cannot read its own discussion. The observation is
   // written before this returns, so the identity read that follows sees it.
-  const dropped = MCP_DROPPED.exec(line);
-  if (dropped && Number(dropped[1]) > 0) {
-    if (credentialDir !== undefined) {
-      try { recordMcpServersOff(credentialDir, new Date()); } catch { /* doctor and readiness then miss it; the session still ends */ }
-    }
-    return new RemoteInstanceError("agent_unavailable", ANTIGRAVITY_MCP_SERVERS_OFF, { diagnostic: "antigravity_mcp_servers_off" });
-  }
+  if (droppedServerCount(line) > 0) return mcpServersOff(credentialDir);
   if (credentialDir !== undefined) void observeAntigravityAdminLine(line, credentialDir).catch(() => undefined);
   const auth = (message: string, diagnostic: string) => new RemoteInstanceError("agent_auth_required", message, { diagnostic, recoveryActions: [{ kind: "login_agent", agentId: "antigravity" }] });
   if (/has no available license/i.test(line)) {
-    // The Enterprise credential reads "Needs sign-in" with this reason until the next sign-in (CP3).
+    // The Enterprise credential reads "Needs sign-in" with this reason until the next sign-in.
     if (credentialDir !== undefined) void markNoLicence(credentialDir).catch(() => undefined);
     return auth(ANTIGRAVITY_LICENCE_REASON, "antigravity_no_licence");
   }
@@ -378,9 +382,21 @@ export function antigravityStderrFailure(line: string, credentialDir?: string): 
   return null;
 }
 
+function droppedServerCount(line: string): number {
+  const dropped = MCP_DROPPED.exec(line);
+  return dropped ? Number(dropped[1]) : 0;
+}
+
+function mcpServersOff(credentialDir: string | undefined): RemoteInstanceError {
+  if (credentialDir !== undefined) {
+    try { recordMcpServersOff(credentialDir, new Date()); } catch { /* doctor and readiness then miss it; the session still ends */ }
+  }
+  return new RemoteInstanceError("agent_unavailable", ANTIGRAVITY_MCP_SERVERS_OFF, { diagnostic: "antigravity_mcp_servers_off" });
+}
+
 /**
  * The organisation's "MCP Servers" setting as a Gemini Enterprise session
- * showed it (A21, CP4 found it off on the owner's organisation): the server
+ * showed it (an organisation may switch it off): the server
  * logs "Admin MCP control active: dropping N client-requested custom MCP
  * server(s)" when it drops the servers a session asked for (every Konteks
  * session asks for `konteks-result` at least), or an allowlist that leaves
@@ -390,13 +406,13 @@ export function antigravityStderrFailure(line: string, credentialDir?: string): 
  * that keeps ours, a new Gemini Enterprise sign-in or a sign-out clears it. Never a secret, never
  * the project.
  */
-export interface AntigravityAdminObservation {
+interface AntigravityAdminObservation {
   /** When a session last had the Konteks MCP servers dropped by the organisation's settings. */
   mcpServersOffAt: string;
 }
 
 /** Why an Antigravity session on Gemini Enterprise cannot run Konteks work while the organisation's MCP Servers setting is off. */
-export const ANTIGRAVITY_MCP_SERVERS_OFF = "Google Antigravity cannot use Konteks tools: MCP Servers is turned off in your Gemini Enterprise settings. Ask your admin to turn it on, or pick another agent in Customize → Models.";
+const ANTIGRAVITY_MCP_SERVERS_OFF = "Google Antigravity cannot use Konteks tools: MCP Servers is turned off in your Gemini Enterprise settings. Ask your admin to turn it on, or pick another agent in Customize → Models.";
 
 function recordMcpServersOff(credentialDir: string, at: Date): void {
   const paths = antigravityRuntimePaths(credentialDir);
@@ -410,14 +426,21 @@ const MCP_ALLOWLIST = /Admin MCP allowlist active: custom MCP servers (.*?) -> (
 
 /** Read one stderr line of an execution or discovery process for the admin settings it shows; writes the observation. */
 export async function observeAntigravityAdminLine(line: string, credentialDir: string, now: () => Date = () => new Date()): Promise<void> {
+  const verdict = adminLineVerdict(line);
+  if (verdict === "allowed") await clearAntigravityAdminObservation(credentialDir);
+  if (verdict !== "off") return;
+  const paths = antigravityRuntimePaths(credentialDir);
+  await mkdir(paths.root, { recursive: true, mode: 0o700 });
+  await writeSecretFile(paths.adminControls, `${JSON.stringify({ mcpServersOffAt: now().toISOString() } satisfies AntigravityAdminObservation)}\n`);
+}
+
+/** "off": servers were dropped, or an allowlist left `konteks-result` out; "allowed": an allowlist keeps it; null: neither line. */
+function adminLineVerdict(line: string): "off" | "allowed" | null {
   const dropped = MCP_DROPPED.exec(line);
-  const allowlist = dropped ? null : MCP_ALLOWLIST.exec(line);
-  if (!dropped && !allowlist) return;
-  const file = antigravityRuntimePaths(credentialDir).adminControls;
-  if (allowlist && /konteks-result/.test(allowlist[2] ?? "")) { await clearAntigravityAdminObservation(credentialDir); return; }
-  if (dropped && Number(dropped[1]) === 0) return;
-  await mkdir(antigravityRuntimePaths(credentialDir).root, { recursive: true, mode: 0o700 });
-  await writeSecretFile(file, `${JSON.stringify({ mcpServersOffAt: now().toISOString() } satisfies AntigravityAdminObservation)}\n`);
+  if (dropped) return Number(dropped[1]) === 0 ? null : "off";
+  const allowlist = MCP_ALLOWLIST.exec(line);
+  if (!allowlist) return null;
+  return /konteks-result/.test(allowlist[2] ?? "") ? "allowed" : "off";
 }
 
 /** The last observation, or null (none, or unreadable). */
@@ -465,7 +488,7 @@ export function antigravityAgentErrorText(text: string): HostTurnError | null {
 }
 
 /** The server's two programs (`agy_acp_server.par` runs `localharness_external`). */
-export const ANTIGRAVITY_PROGRAMS: readonly string[] = Object.freeze(["agy_acp_server", "localharness"]);
+const ANTIGRAVITY_PROGRAMS: readonly string[] = Object.freeze(["agy_acp_server", "localharness"]);
 
 /**
  * Stop every Antigravity process whose `HOME` is this runner's private home:
@@ -479,12 +502,12 @@ export async function sweepAntigravityProcesses(credentialDir: string, control: 
 }
 
 /**
- * About 350 MB per process pair (the server and its harness, CP0 B15), so at
- * most two sessions run at once and a third waits for one (A12); a finished
+ * About 350 MB per process pair (the server and its harness), so at
+ * most two sessions run at once and a third waits for one; a finished
  * session's process stays five minutes for the next one, and the control
  * process (readiness, sign-in) stops after a minute with nothing to do.
  */
-export const ANTIGRAVITY_PROCESS_LIMITS = Object.freeze({ executionProcesses: 2, queueMs: 120_000, idleExecutionMs: 5 * 60_000, controlIdleMs: 60_000 });
+const ANTIGRAVITY_PROCESS_LIMITS = Object.freeze({ executionProcesses: 2, queueMs: 120_000, idleExecutionMs: 5 * 60_000, controlIdleMs: 60_000 });
 
 /** The relay of every live Antigravity process that runs on a Gemini API key. */
 const relays = new WeakMap<BridgeProcess, AntigravityRelay>();
@@ -497,7 +520,7 @@ export function setAntigravityRelayUpstreamForTests(upstream: GeminiRelayUpstrea
 
 /**
  * Every Antigravity process (control, execution, discovery) spawned while
- * the connector holds a Gemini API key and uses it (A7): a relay of its own
+ * the connector holds a Gemini API key and uses it: a relay of its own
  * starts first on 127.0.0.1, the server gets only its address
  * (`GOOGLE_GEMINI_BASE_URL`) and, once initialized, a per-process token
  * through `authenticate` `_meta["api-key"]`; the relay stops when the process
@@ -546,11 +569,14 @@ function signInProcess(config: RunnerConfig, spawn: HostSpawn | undefined): Goog
   };
 }
 
+function fetchedAntigravityRunner(config: RunnerConfig, family: AgentBridgeFamily): boolean {
+  return family.agentId === "antigravity" && family.hostInstall?.launch === "fetched" && config.RUNNER_AUTH_MODE === "agent_local_subscription";
+}
+
 /** The verified fetched folder of an Antigravity runner and this platform's pin; refuses anything else. */
 function fetched(config: RunnerConfig, family: AgentBridgeFamily): { root: string; pin: FetchedAgentPlatformPin } {
   const root = config.RUNNER_NATIVE_ANTIGRAVITY_ROOT;
-  if (family.agentId !== "antigravity" || family.hostInstall?.launch !== "fetched" || config.RUNNER_AUTH_MODE !== "agent_local_subscription"
-      || root === undefined || !isAbsolute(root) || CONTROL.test(root)) {
+  if (!fetchedAntigravityRunner(config, family) || root === undefined || !isAbsolute(root) || CONTROL.test(root)) {
     throw new RemoteInstanceError("agent_unavailable", "A Google Antigravity runner requires the copy the connector fetched, at an absolute local path.");
   }
   const pin = fetchedAgentPlatformPin("antigravity");
@@ -561,12 +587,12 @@ function fetched(config: RunnerConfig, family: AgentBridgeFamily): { root: strin
 /**
  * Google's Antigravity ACP server, launched as `<fetched folder>/<pinned
  * command> <pinned args>` with the allow-list environment, from the private
- * home the connector prepares before every spawn (CP2): the locked
+ * home the connector prepares before every spawn: the locked
  * configuration (settings, no trust, owned `config/`), the tool filter on
  * every session, `default` mode only, the working copy's `AGENTS.md` in the
- * prompt, at most two sessions at once. CP3: signs in with a Gemini API key
- * (through a loopback relay per process) or Gemini Enterprise. Not offered
- * until CP4 (`antigravityInstallAdapter.offered` in the supervisor).
+ * prompt, at most two sessions at once. Signs in with a Gemini API key (through a
+ * loopback relay per process) or Gemini Enterprise. The install side offers
+ * it through `antigravityInstallAdapter.offered` in the supervisor.
  */
 export const antigravityRunnerAdapter: HostAgentRunnerAdapter = {
   agentId: "antigravity",
@@ -588,7 +614,7 @@ export const antigravityRunnerAdapter: HostAgentRunnerAdapter = {
     }
     await prepareAntigravityHome(config.RUNNER_CREDENTIAL_DIR);
   },
-  // CP3: a Gemini API key typed on this computer, or Gemini Enterprise
+  // A Gemini API key typed on this computer, or Gemini Enterprise
   // through Google's own sign-in on this computer (from here or the site).
   startLogin: ({ config, events, logger, loginId, request, spawn }) => {
     // Request policy is platform-independent. Refuse a held-back or foreign
@@ -606,11 +632,11 @@ export const antigravityRunnerAdapter: HostAgentRunnerAdapter = {
   loginFailedMessage: "Google Antigravity did not finish signing in",
   identity: (config, settings) => antigravityIdentity(config.RUNNER_CREDENTIAL_DIR, settings),
   // Gemini Enterprise is the one sign-in the site may start (a browser on this
-  // computer); personal Google sign-in stays held back (A10).
+  // computer); personal Google sign-in stays held back.
   siteLoginOptions: async () => Object.values(ANTIGRAVITY_LOGIN_OPTIONS).filter(option => option.released).map(option => option.id),
   hostVersion: config => config.RUNNER_BRIDGE_VERSION !== "unknown" ? config.RUNNER_BRIDGE_VERSION : undefined,
-  // The server reports no usage (CP0 B11). On a Gemini API key the relay
-  // counts it (the identity says so, A7); Gemini Enterprise reports none (A8).
+  // The server reports no usage. On a Gemini API key the relay
+  // counts it (the identity says so); Gemini Enterprise reports none.
   tokenUsageObservable: false,
   wrapSpawn: (config, spawn) => antigravitySpawn(config.RUNNER_CREDENTIAL_DIR, spawn),
   measureTurn: bridge => {
@@ -621,13 +647,13 @@ export const antigravityRunnerAdapter: HostAgentRunnerAdapter = {
   },
   refusedSessionModes: { modeIds: ANTIGRAVITY_REFUSED_MODES, message: "Google Antigravity runs only in its default mode on Konteks, where it asks before commands and edits." },
   // `/plan` waits on its own approval outside Konteks' governance; `/logout`
-  // would sign the connector's Antigravity out (A4: never sent).
+  // would sign the connector's Antigravity out (never sent).
   refusedPromptCommands: { commands: ANTIGRAVITY_REFUSED_COMMANDS, message: "Google Antigravity's /plan and /logout commands are not available on Konteks." },
   sessionMeta: ANTIGRAVITY_SESSION_META,
   verifySession: verifyAntigravitySession,
   promptPrelude: (config, session) => antigravityPromptPrelude(config.RUNNER_CREDENTIAL_DIR, session),
   processLimits: ANTIGRAVITY_PROCESS_LIMITS,
-  // Enterprise `session/new` fetches the organisation's settings first (3 to 7 s live, CP2).
+  // Enterprise `session/new` fetches the organisation's settings first (3 to 7 s live).
   sessionBootstrapTimeoutMs: 30_000,
   stderrFailure: (line, config) => antigravityStderrFailure(line, config.RUNNER_CREDENTIAL_DIR),
   agentErrorText: antigravityAgentErrorText,

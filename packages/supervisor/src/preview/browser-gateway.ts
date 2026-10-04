@@ -1,12 +1,11 @@
 import { lookup as dnsLookup } from "node:dns/promises";
-import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { connect, isIPv4, isIPv6, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import { createLogger, RemoteInstanceError, withNativeSpan, type Logger } from "@konteks/remote-common";
 import type { ObservabilityContextV1 } from "@konteks/backstage-plugin-common";
 import { BROWSER_ORIGINS_PATH } from "@konteks/remote-agent-runner";
 
-export { BROWSER_ORIGINS_PATH };
 
 /**
  * A session's browser gateway: the HTTP proxy its QA browser is launched
@@ -38,7 +37,7 @@ export { BROWSER_ORIGINS_PATH };
  * in step. It binds 127.0.0.1 on an ephemeral port and closes with the
  * session.
  */
-export interface BrowserGatewayOptions {
+interface BrowserGatewayOptions {
   /** The preview origin the browser may reach now, or null when none runs. */
   target: () => string | null;
   /** Test seam for the registered-application address check. */
@@ -58,7 +57,7 @@ const HOP_BY_HOP = new Set(["proxy-connection", "proxy-authorization", "connecti
 export const NO_PREVIEW_MESSAGE = "No live preview is running for this session. Call preview_start (the konteks-preview tools), wait until preview_status says running, then open the URL it returns.";
 
 /** What a Core-issued origin is for: a Core-routed cloud preview, or a workspace's registered application. */
-export type BrowserGrantKind = "cloud_preview" | "external";
+type BrowserGrantKind = "cloud_preview" | "external";
 
 /** At most this many live grants per session; the oldest goes first. */
 const MAX_GRANTS = 32;
@@ -66,6 +65,7 @@ const MAX_GRANTS = 32;
 interface Grant { origin: URL; kind: BrowserGrantKind; expiresAt: number }
 
 type Admitted = { ok: true; target: URL; url: URL; grant: Grant | null };
+type Refused = { ok: false; status: number; message: string };
 
 export class PreviewBrowserGateway {
   private server: Server | null = null;
@@ -116,14 +116,12 @@ export class PreviewBrowserGateway {
     const now = this.now();
     const admitted: string[] = [];
     for (const entry of entries) {
-      const origin = parseOrigin(entry.origin);
-      const expiresAt = Date.parse(entry.expiresAt);
-      if (!origin || !Number.isFinite(expiresAt) || expiresAt <= now) continue;
-      if (kind === "external" && origin.protocol !== "https:") continue;
-      const key = originKey(origin);
+      const grant = admissibleGrant(entry, kind, now);
+      if (!grant) continue;
+      const key = originKey(grant.origin);
       this.grants.delete(key);
-      this.grants.set(key, { origin, kind, expiresAt });
-      admitted.push(origin.origin);
+      this.grants.set(key, grant);
+      admitted.push(grant.origin.origin);
     }
     while (this.grants.size > MAX_GRANTS) this.grants.delete(this.grants.keys().next().value!);
     if (admitted.length > 0) this.logger.info({ event: "preview.browser_origins_granted", kind, origins: admitted, ...this.options.context }, "Core opened origins for this session's browser");
@@ -157,24 +155,33 @@ export class PreviewBrowserGateway {
    * is a CONNECT, which names only host:port: it matches an admitted origin
    * of either scheme on that host and port.
    */
-  private admit(raw: string | undefined, tunnel = false): Admitted | { ok: false; status: number; message: string } {
-    let url: URL;
-    try {
-      url = new URL(raw ?? "");
-    } catch {
-      return { ok: false, status: 400, message: "This is the browser's gateway to the session preview, not a page. Open the preview URL from preview_status." };
-    }
-    const sameAuthority = (a: URL, b: URL) => normalizeHost(a.hostname) === normalizeHost(b.hostname) && effectivePort(a) === effectivePort(b);
+  private admit(raw: string | undefined, tunnel = false): Admitted | Refused {
+    const url = parsedUrl(raw ?? "");
+    if (!url) return { ok: false, status: 400, message: "This is the browser's gateway to the session preview, not a page. Open the preview URL from preview_status." };
+    const preview = this.previewTarget();
+    if (preview && previewAdmits(preview, url, tunnel)) return { ok: true, target: preview, url, grant: null };
+    const grant = this.matchingGrant(url, tunnel);
+    if (grant) return { ok: true, target: grant.origin, url, grant };
+    return this.outside(url, preview);
+  }
+
+  private previewTarget(): URL | null {
     const current = this.options.target();
-    const preview = current === null ? null : new URL(current);
-    if (preview && (tunnel || url.protocol === "http:") && sameAuthority(url, preview)) return { ok: true, target: preview, url, grant: null };
+    return current === null ? null : new URL(current);
+  }
+
+  private matchingGrant(url: URL, tunnel: boolean): Grant | null {
     const now = this.now();
     for (const grant of this.grants.values()) {
       if (grant.expiresAt <= now) continue;
       if (!sameAuthority(url, grant.origin)) continue;
       if (!tunnel && url.protocol !== grant.origin.protocol) continue;
-      return { ok: true, target: grant.origin, url, grant };
+      return grant;
     }
+    return null;
+  }
+
+  private outside(url: URL, preview: URL | null): Refused {
     const granted = this.grantedOrigins();
     if (!preview && granted.length === 0) return { ok: false, status: 404, message: NO_PREVIEW_MESSAGE };
     const allowed = [...(preview ? [`this session's live preview (${preview.origin})`] : []), ...granted].join(", ");
@@ -193,21 +200,15 @@ export class PreviewBrowserGateway {
     if (!verdict.ok) return this.refuse(response, verdict.status, verdict.message);
     this.options.onActivity?.();
     this.counters.forwarded += 1;
-    const headers: Record<string, string | string[]> = {};
-    for (const [name, value] of Object.entries(request.headers)) {
-      if (value === undefined || HOP_BY_HOP.has(name)) continue;
-      headers[name] = value;
-    }
+    this.forward(request, response, verdict);
+  }
+
+  private forward(request: IncomingMessage, response: ServerResponse, verdict: Admitted): void {
     const upstream = httpRequest({
-      host: verdict.target.hostname.replace(/^\[|\]$/g, ""), port: effectivePort(verdict.target), method: request.method,
-      path: `${verdict.url.pathname}${verdict.url.search}`, headers,
+      host: bareHost(verdict.target.hostname), port: effectivePort(verdict.target), method: request.method,
+      path: `${verdict.url.pathname}${verdict.url.search}`, headers: endToEndHeaders(request.headers),
     }, answer => {
-      const out: Record<string, string | string[]> = {};
-      for (const [name, value] of Object.entries(answer.headers)) {
-        if (value === undefined || HOP_BY_HOP.has(name)) continue;
-        out[name] = value;
-      }
-      response.writeHead(answer.statusCode ?? 502, answer.statusMessage, out);
+      response.writeHead(answer.statusCode ?? 502, answer.statusMessage, endToEndHeaders(answer.headers));
       answer.pipe(response);
     });
     upstream.on("error", () => {
@@ -257,12 +258,14 @@ export class PreviewBrowserGateway {
    */
   private async address(verdict: Admitted): Promise<string | undefined | null> {
     if (verdict.grant?.kind !== "external") return undefined;
-    const host = verdict.target.hostname.replace(/^\[|\]$/g, "");
-    const addresses = isIPv4(host) || isIPv6(host)
-      ? [{ address: host, family: isIPv6(host) ? 6 : 4 }]
-      : await (this.options.resolve ?? (name => dnsLookup(name, { all: true })))(host);
+    const addresses = await this.resolved(bareHost(verdict.target.hostname));
     if (addresses.length === 0 || addresses.some(entry => localAddress(entry.address))) return null;
     return addresses[0]!.address;
+  }
+
+  private async resolved(host: string): Promise<Array<{ address: string; family: number }>> {
+    if (isIPv4(host) || isIPv6(host)) return [{ address: host, family: isIPv6(host) ? 6 : 4 }];
+    return (this.options.resolve ?? (name => dnsLookup(name, { all: true })))(host);
   }
 
   /** An absolute-form WebSocket upgrade sent to the proxy (not tunnelled): relay it raw. */
@@ -295,7 +298,7 @@ export class PreviewBrowserGateway {
   }
 
   private dial(target: URL, onConnect: () => void, address?: string): Socket {
-    const upstream = connect({ host: address ?? target.hostname.replace(/^\[|\]$/g, ""), port: effectivePort(target) }, onConnect);
+    const upstream = connect({ host: address ?? bareHost(target.hostname), port: effectivePort(target) }, onConnect);
     this.sockets.add(upstream);
     upstream.once("close", () => this.sockets.delete(upstream));
     return upstream;
@@ -332,15 +335,58 @@ function originKey(origin: URL): string {
 /** Loopback, link-local, unspecified or multicast: this computer or its link, never a registered application. */
 function localAddress(address: string): boolean {
   const bare = address.toLowerCase().replace(/^::ffff:/, "");
-  if (isIPv4(bare)) {
-    const [a, b] = bare.split(".").map(Number) as [number, number];
-    return a === 127 || a === 0 || (a === 169 && b === 254) || a >= 224;
+  return isIPv4(bare) ? localIPv4(bare) : localIPv6(bare);
+}
+
+function localIPv4(address: string): boolean {
+  const [a, b] = address.split(".").map(Number) as [number, number];
+  return a === 127 || a === 0 || (a === 169 && b === 254) || a >= 224;
+}
+
+function localIPv6(address: string): boolean {
+  return address === "::1" || address === "::" || /^fe[89ab]/.test(address) || address.startsWith("ff");
+}
+
+/** A host name without the brackets of an IPv6 literal. */
+function bareHost(hostname: string): string {
+  return hostname.replace(/^\[|\]$/g, "");
+}
+
+function parsedUrl(raw: string): URL | null {
+  try { return new URL(raw); } catch { return null; }
+}
+
+/** The same host and port; `localhost` is 127.0.0.1. */
+function sameAuthority(a: URL, b: URL): boolean {
+  return normalizeHost(a.hostname) === normalizeHost(b.hostname) && effectivePort(a) === effectivePort(b);
+}
+
+/** The preview is reached over plain http, or by a CONNECT tunnel to its host and port. */
+function previewAdmits(preview: URL, url: URL, tunnel: boolean): boolean {
+  return (tunnel || url.protocol === "http:") && sameAuthority(url, preview);
+}
+
+/** An origin Core granted, still unexpired; an external application only over https. */
+function admissibleGrant(entry: { origin: string; expiresAt: string }, kind: BrowserGrantKind, now: number): Grant | null {
+  const origin = parseOrigin(entry.origin);
+  const expiresAt = Date.parse(entry.expiresAt);
+  if (!origin || !Number.isFinite(expiresAt) || expiresAt <= now) return null;
+  if (kind === "external" && origin.protocol !== "https:") return null;
+  return { origin, kind, expiresAt };
+}
+
+/** Headers without the hop-by-hop ones a proxy must not forward. */
+function endToEndHeaders(headers: IncomingHttpHeaders): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined || HOP_BY_HOP.has(name)) continue;
+    out[name] = value;
   }
-  return bare === "::1" || bare === "::" || /^fe[89ab]/.test(bare) || bare.startsWith("ff");
+  return out;
 }
 
 function normalizeHost(host: string): string {
-  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  const bare = bareHost(host).toLowerCase();
   return bare === "localhost" ? "127.0.0.1" : bare;
 }
 
