@@ -39,7 +39,7 @@ function sha256File(path: string): Promise<string> {
 /** Runs `<executable> --version` with a minimal environment: no Konteks state, bounded output and time. */
 function readVersion(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(path, ["--version"], { timeout: 15_000, maxBuffer: 4096, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: homedir() } },
+    execFile(path, ["--version"], { timeout: 15_000, maxBuffer: 4096, windowsHide: true, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: homedir() } },
       (error, stdout) => error ? reject(error) : resolve(String(stdout)));
   });
 }

@@ -3,6 +3,34 @@ import { stopNativeConnector } from "../native/commands.js";
 import { createOutput } from "../output.js";
 
 describe("ordinary native stop completion", () => {
+  it("gracefully stops an owned Windows connector even when its task is Ready", async () => {
+    const stop = { command: "stop", args: [] }, status = { command: "status", args: [] };
+    let now = 0, alive = true;
+    const terminate = vi.fn(async () => { alive = false; });
+    const shutdown = vi.fn(async () => undefined);
+    const execute = vi.fn(async () => 1); // Ready, while the descendant is alive.
+    await stopNativeConnector({ root: "C:\\private\\remote", output: createOutput({ json: true }) }, {
+      definition: async () => ({ stop, status }) as never, execute, readReceipt: async () => "old-receipt",
+      serviceOwner: async () => ({ pid: 42, alive: async () => alive, terminate }), shutdown,
+      sleep: async () => { now += 100; }, now: () => now, platform: { os: "windows" },
+      deadlineMs: 1_000, stopGraceMs: 200, pollMs: 100,
+    } as never);
+    expect(shutdown).toHaveBeenCalledWith("C:\\private\\remote");
+    expect(terminate).toHaveBeenCalledOnce();
+    expect(execute).not.toHaveBeenCalledWith(stop);
+  });
+  it("does not terminate Windows processes when unknown task state cannot be ended", async () => {
+    const stop = { command: "stop", args: [] }, status = { command: "status", args: [] };
+    let now = 0;
+    const terminate = vi.fn();
+    await expect(stopNativeConnector({ root: "C:\\private\\remote", output: createOutput({ json: true }) }, {
+      definition: async () => ({ stop, status }) as never, execute: async () => 2, readReceipt: async () => "old-receipt",
+      serviceOwner: async () => ({ pid: 42, alive: async () => true, terminate }), shutdown: async () => undefined,
+      sleep: async () => { now += 100; }, now: () => now, platform: { os: "windows" },
+      deadlineMs: 1_000, stopGraceMs: 200, pollMs: 100,
+    } as never)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(terminate).not.toHaveBeenCalled();
+  });
   it("does not claim success until this installation reports completed cleanup and stopped service", async () => {
     const stop = { command: "stop", args: [] };
     const status = { command: "status", args: [] };

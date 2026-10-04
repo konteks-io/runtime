@@ -164,7 +164,7 @@ const CLAUDE_MAX_OUTPUT = 1024 * 1024;
  */
 export async function readClaudeMcpStatus(launch: ClaudeMcpStatusLaunch, spawn: typeof spawnChild = spawnChild): Promise<ClaudeMcpStatusEntry[]> {
   const failed = () => new Error("Claude MCP status discovery failed");
-  const child = spawn(launch.command, launch.args, { env: launch.env, stdio: ["ignore", "pipe", "ignore"], detached: false });
+  const child = spawn(launch.command, launch.args, { env: launch.env, stdio: ["ignore", "pipe", "ignore"], detached: false, windowsHide: true });
   let output = "";
   let overflow = false;
   child.stdout!.setEncoding("utf8");

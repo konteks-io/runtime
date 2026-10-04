@@ -12,6 +12,7 @@ import type { NativeCommandContext } from "./cli.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
 import { CONNECTOR_LOG_FILE, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps, type NativeUpdateStage } from "./update.js";
+import { captureWindowsServiceOwner, type NativeServiceProcessOwner } from "./windows-service-owner.js";
 
 export interface UpdateControlClient {
   call<T>(request: ControlRequest, schema: { parse(value: unknown): T }, options?: { timeoutMs?: number }): Promise<T>;
@@ -47,6 +48,8 @@ export interface NativeUpdateTransactionDeps {
    * shutdown receipt (D113b): its process being gone is then the proof.
    */
   servicePid?: (definition: NativeServiceDefinition) => Promise<number | null>;
+  /** Windows captures the connector and its descendants, independent of the task host's state. */
+  serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
   processAlive?: (pid: number) => boolean;
   /** Ends a process and its own process group, only while it is still this root's connector. */
   killProcessGroup?: (pid: number, root: string) => Promise<void>;
@@ -86,6 +89,7 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
     ...rest,
     ...(forceStop ? { forceStop } : {}),
     ...(servicePid ? { servicePid, processAlive, killProcessGroup: endProcessGroup } : {}),
+    ...(process.platform === "win32" ? { serviceOwner: captureWindowsServiceOwner } : {}),
     refreshLauncher: refreshInstalledLauncher,
     readRecord: readNativeRecord,
     control: (root, record) => new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort),
@@ -143,10 +147,26 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
   const finish = async (outcome: NativeUpdateAttempt["outcome"], detail: string | null) => {
     await deps.recordAttempt(input.root, { ...attempt, outcome, detail: detail?.slice(0, 1_024) ?? null, finishedAt: new Date(deps.now()).toISOString() }).catch(() => undefined);
   };
-  const definition = await deps.serviceDefinition(input.root);
-  const wasRunning = await deps.execute(definition.status) === 0;
+  let definition: NativeServiceDefinition;
+  let initialStatus: number | null;
+  let oldOwner: NativeServiceProcessOwner | null;
+  try {
+    definition = await deps.serviceDefinition(input.root);
+    initialStatus = await deps.execute(definition.status);
+    oldOwner = await deps.serviceOwner?.(input.root) ?? null;
+  } catch (error) {
+    await finish("failed", error instanceof Error ? error.message : String(error));
+    throw error;
+  }
+  const taskRunning = initialStatus === 0;
+  if (deps.serviceOwner && !oldOwner && initialStatus !== 0 && initialStatus !== 1) {
+    await finish("failed", "Windows could not confirm this connector's task state.");
+    throw new RemoteInstanceError("temporarily_unavailable", "Windows could not confirm this connector's task state; its installation was not changed.");
+  }
+  const wasRunning = taskRunning || oldOwner !== null;
   const control = deps.control(input.root, previous);
   let stopped = false;
+  let drained = false;
   let oldPid: number | null = null;
   let successor: NativeRuntimeRecord | undefined;
   try {
@@ -154,6 +174,7 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     // could not be read, and then only the successor's own agents can count.
     const baseline = wasRunning ? await doctorStatuses(control).catch(() => null) : null;
     if (wasRunning) {
+      drained = true;
       await drain(input, control, deps);
       if (previous.agents.includes("codex")) {
         try { await control.call({ op: "codex.maintenance.preflight" }, CodexMaintenanceSchema); }
@@ -171,7 +192,16 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       }
       const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
       oldPid = await deps.servicePid?.(definition).catch(() => null) ?? null;
-      if (await deps.execute(definition.stop) !== 0) {
+      // /End stops Windows' wscript host, leaving its PowerShell, cmd and
+      // connector descendants alive. Ask the drained connector to close first;
+      // the exact owner captured above supplies independent exit proof.
+      if (oldOwner) await control.call({ op: "shutdown" }, z.unknown()).catch(() => {
+        // Older connectors and an exiting control socket may not acknowledge
+        // shutdown. Drain and maintenance preflight already proved no work;
+        // the captured owner is still bounded by the graceful stop deadline.
+        input.output.line("The connector did not acknowledge shutdown; waiting for its owned processes to close before continuing…");
+      });
+      if (!oldOwner && await deps.execute(definition.stop) !== 0) {
         await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
         throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
       }
@@ -179,7 +209,7 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       // launchd and Task Scheduler acknowledge a stop before the process has
       // finished its graceful shutdown; the record may only move once the old
       // service is gone and has released the runtime directory.
-      await waitForServiceExit(input, definition, deps, previousReceipt, oldPid);
+      await waitForServiceExit(input, definition, deps, previousReceipt, oldPid, oldOwner);
     }
     successor = await commitOnceReleased(input, staged.releaseId, deps);
     if (wasRunning) {
@@ -227,7 +257,11 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
       // Stopped but not swapped: the installation is unchanged, so the same
       // release comes back, confirmed or not (RCA 2026-09-30, D113b: 0.8.0's
       // launcher left an unconfirmed stop unloaded and the computer offline).
-      if (stopped && wasRunning) await restartUnchanged(input, definition, deps, previous, oldPid);
+      if (stopped && wasRunning) await restartUnchanged(input, definition, deps, previous, oldPid, oldOwner).catch(async () => {
+        await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
+        input.output.line("The unchanged connector could not be restarted; run `konteks-remote start`.");
+      });
+      else if (drained) await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
       await finish("failed", detail);
     }
     throw error;
@@ -242,7 +276,7 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
  * no lock, and the next start recovers what it journaled. One that outlives
  * the grace has its processes ended.
  */
-async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null, pid: number | null): Promise<void> {
+async function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null, pid: number | null, owner: NativeServiceProcessOwner | null = null): Promise<void> {
   const stopMs = deps.stopDeadlineMs ?? 90_000;
   const started = deps.now();
   const deadline = started + stopMs;
@@ -251,9 +285,30 @@ async function waitForServiceExit(input: NativeUpdateInput, definition: NativeSe
   const progress = progressLines(input, deps, "Stopping the connector: it closes its agent sessions and relay first, which usually takes under a minute…", "still stopping the connector");
   let forced = false;
   for (;;) {
-    const running = await deps.execute(definition.status) === 0;
+    const status = await deps.execute(definition.status);
+    const running = status === 0;
+    if (owner) {
+      const alive = await owner.alive();
+      if (!alive) {
+        if (status !== 1 && await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The connector exited but Windows could not end its task; its installation was not changed.");
+        return;
+      }
+      if (!forced && deps.now() - started >= graceMs) {
+        input.output.line(`The connector did not stop within ${spoken(graceMs)}; ending its processes.`);
+        // Stop the task's restart ownership before terminating captured children.
+        if (status !== 1 && await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "Windows could not end this connector's task; its installation was not changed.");
+        await owner.terminate();
+        forced = true;
+        continue;
+      }
+      if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
+      progress();
+      await deps.sleep(Math.min(deps.pollMs ?? 1_000, 1_000));
+      continue;
+    }
     const gone = watched !== null && !watched.alive(watched.pid);
-    if (!running && (gone || !deps.readStopReceipt || await deps.readStopReceipt(input.root).then(receipt => receipt !== null && receipt !== previousReceipt))) return;
+    const confirmedStopped = deps.serviceOwner ? status === 1 : !running;
+    if (confirmedStopped && (gone || !deps.readStopReceipt || await deps.readStopReceipt(input.root).then(receipt => receipt !== null && receipt !== previousReceipt))) return;
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
     if (watched && !gone && !forced && deps.killProcessGroup && deps.now() - started >= graceMs) {
       input.output.line(`The connector did not stop within ${spoken(graceMs)}; ending its processes.`);
@@ -272,7 +327,11 @@ async function waitForServiceExit(input: NativeUpdateInput, definition: NativeSe
  * A process still running after the whole stop deadline is ended first, so
  * the start is not mistaken for "already running".
  */
-async function restartUnchanged(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previous: NativeRuntimeRecord, pid: number | null): Promise<void> {
+async function restartUnchanged(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previous: NativeRuntimeRecord, pid: number | null, owner: NativeServiceProcessOwner | null = null): Promise<void> {
+  if (owner && await owner.alive()) {
+    if (await deps.execute(definition.status) !== 1 && await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "Windows could not end this connector's task; its processes were preserved.");
+    await owner.terminate();
+  }
   const running = async () => await deps.execute(definition.status).catch(() => 0) === 0;
   if (await running()) {
     if (pid !== null && deps.killProcessGroup) await deps.killProcessGroup(pid, input.root).catch(() => undefined);
@@ -317,8 +376,18 @@ async function endProcessGroup(pid: number, root: string): Promise<void> {
  * that does not finish ends the service's process group.
  */
 async function stopForRollback(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
+  const owner = await deps.serviceOwner?.(input.root) ?? null;
+  if (owner) {
+    const record = await deps.readRecord(input.root);
+    await deps.control(input.root, record).call({ op: "shutdown" }, z.unknown()).catch(() => undefined);
+    await waitForServiceExit(input, definition, deps, null, owner.pid, owner);
+    return;
+  }
   await deps.execute(definition.stop).catch(() => null);
-  const running = async () => await deps.execute(definition.status).catch(() => 0) === 0;
+  const running = async () => {
+    const status = await deps.execute(definition.status).catch(() => null);
+    return deps.serviceOwner ? status !== 1 : status === 0;
+  };
   const stopMs = deps.stopDeadlineMs ?? 90_000;
   const deadline = deps.now() + stopMs;
   const progress = progressLines(input, deps, "Stopping the updated connector before restoring the previous release…", "still stopping the updated connector");

@@ -59,7 +59,8 @@ export interface NativeServiceDefinition {
   stop: NativeServiceCommand;
   remove: NativeServiceCommand[];
   /**
-   * Exits 0 only while the service is RUNNING, never merely registered:
+   * Exits 0 while the service is running (or queued to run on Windows),
+   * never merely registered and Ready:
    * `start` returns early on it, and the update transaction waits on it for a
    * stopped service to exit.
    */
@@ -308,7 +309,7 @@ export function nativeServiceDefinition(input: {
     // updates waited out the stop deadline and `start` never re-created the
     // task for the new release. The task's state enum reads the same in every
     // Windows language, unlike schtasks' text; the label is hex, so it quotes safely.
-    status: { command: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-Command", `$task = Get-ScheduledTask -TaskPath '\\' -TaskName '${label}' -ErrorAction SilentlyContinue; if ($task -and $task.State -eq 'Running') { exit 0 }; exit 1`] },
+    status: { command: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; try { $task = Get-ScheduledTask -TaskPath '\\' -TaskName '${label}' -ErrorAction Stop; if ($task.State -in @('Running', 'Queued')) { exit 0 }; if ($task.State -in @('Ready', 'Disabled')) { exit 1 }; exit 2 } catch { if ($_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound*') { exit 1 }; exit 2 }`] },
     registered: { command: "powershell.exe", args: ["-NoProfile", "-NonInteractive", "-Command", `if (Get-ScheduledTask -TaskPath '\\' -TaskName '${label}' -ErrorAction SilentlyContinue) { exit 0 }; exit 1`] },
   };
 }
@@ -360,6 +361,7 @@ function windowsServiceHost(input: { executable: string; root: string; logFile: 
     "  $start.FileName = [System.IO.Path]::Combine($env:SystemRoot, 'System32\\cmd.exe')",
     `  $start.Arguments = '/d /v:off /s /c ""%KONTEKS_SERVICE_PROGRAM%" serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1"'`,
     "  $start.UseShellExecute = $false",
+    "  $start.CreateNoWindow = $true",
     "  $connector = [System.Diagnostics.Process]::Start($start)",
     "  $connector.WaitForExit()",
     "  exit $connector.ExitCode",

@@ -143,7 +143,7 @@ export function startBrowserLauncher(options: BrowserLauncherOptions): void {
   const spawnChild = (allowed: string): ChildProcessWithoutNullStreams => {
     const mine = ++generation;
     const flags = allowed === baseAllowed ? options.flags : withAllowedOrigins(options.flags, allowed);
-    const spawned = spawn(execPath, [options.cli, ...flags], { stdio: ["pipe", "pipe", "pipe"], env });
+    const spawned = spawn(execPath, [options.cli, ...flags], { stdio: ["pipe", "pipe", "pipe"], env, windowsHide: true });
     spawned.stderr.pipe(options.stderr, { end: false });
     // Only the current child ends the launcher; one replaced by a restart does not.
     spawned.on("exit", (code, signal) => { if (mine === generation) options.onExit(code ?? (signal ? 1 : 0)); });
@@ -161,7 +161,7 @@ export function startBrowserLauncher(options: BrowserLauncherOptions): void {
   const ensureChromium = (): Promise<string | null> => {
     installed ??= new Promise(resolve => {
       options.stderr.write("konteks browser: installing Playwright's Chromium (no Google Chrome on this computer); this happens once.\n");
-      const run = spawn(execPath, [options.cli, "install-browser", "chromium"], { stdio: ["ignore", "ignore", "pipe"], env });
+      const run = spawn(execPath, [options.cli, "install-browser", "chromium"], { stdio: ["ignore", "ignore", "pipe"], env, windowsHide: true });
       run.stderr.pipe(options.stderr, { end: false });
       run.on("error", error => resolve(error.message));
       run.on("exit", code => resolve(code === 0 ? null : `the install exited with code ${code}`));

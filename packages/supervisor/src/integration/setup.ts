@@ -32,7 +32,7 @@ export type SetupCommandRunner = (command: string, args: string[], env: NodeJS.P
 export const spawnSetupCommand: SetupCommandRunner = (command, args, env, timeoutMs) => new Promise(resolve => {
   let child: ReturnType<typeof spawn>;
   try {
-    child = spawn(command, args, { env, stdio: ["ignore", "ignore", "ignore"], shell: false });
+    child = spawn(command, args, { env, stdio: ["ignore", "ignore", "ignore"], shell: false, windowsHide: true });
   } catch {
     resolve({ exitCode: null });
     return;

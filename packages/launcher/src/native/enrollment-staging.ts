@@ -110,6 +110,7 @@ export async function spawnEnrollmentStaging(root: string): Promise<number | und
       [...(packaged ? [] : [script!]), "--root", resolve(root), "stage-enrollment"],
       {
         detached: true,
+        windowsHide: true,
         stdio: ["ignore", log, log],
         // The same connector finishing its own install, not a bridge or a
         // tool: it keeps the environment it was installed with, including the

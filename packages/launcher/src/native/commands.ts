@@ -23,6 +23,7 @@ import { prepareDeliveryGraft } from "./graft.js";
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, productionUpdateDeps, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
+import { captureWindowsServiceOwner, type NativeServiceProcessOwner } from "./windows-service-owner.js";
 
 const environment = () => sanitizeInheritedChildProcessEnv({ env: process.env });
 /** Runs one service or OS command and keeps how it ended; `--verbose` prints it (D129). */
@@ -179,6 +180,12 @@ export async function keepServiceOnOwnDefinition(root: string, deps: OwnServiceD
  * the one the service manager runs; nothing where it names none.
  */
 async function forceStopService(definition: NativeServiceDefinition): Promise<void> {
+  if (nativePlatform().os === "windows") {
+    const owner = await captureWindowsServiceOwner(dirname(definition.path));
+    if (await execute(definition.status) !== 1 && await execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "Windows could not end this connector's task; its processes were preserved.");
+    await owner?.terminate();
+    return;
+  }
   const pid = await servicePid(definition);
   if (!pid) return;
   try { process.kill(-pid, "SIGKILL"); }
@@ -243,6 +250,9 @@ interface NativeStopDeps {
   platform: ReturnType<typeof nativePlatform>;
   deadlineMs?: number;
   pollMs?: number;
+  serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
+  shutdown?: (root: string) => Promise<void>;
+  stopGraceMs?: number;
 }
 
 /** How long a command waits for a connector that is still starting (a fresh start takes about a minute). */
@@ -289,6 +299,13 @@ const productionNativeStopDeps: NativeStopDeps = {
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   now: Date.now,
   platform: nativePlatform(),
+  ...(process.platform === "win32" ? {
+    serviceOwner: captureWindowsServiceOwner,
+    shutdown: async (root: string) => {
+      const record = await readNativeRecord(root);
+      await new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort).call({ op: "shutdown" }, z.unknown());
+    },
+  } : {}),
 };
 
 /** launchctl bootout acknowledges deregistration before asynchronous owned
@@ -298,19 +315,41 @@ export async function stopNativeConnector(input: NativeCommandContext, deps: Nat
   const definition = await deps.definition(input.root);
   const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
   const initialStatus = await deps.execute(definition.status);
-  if (initialStatus !== 0) {
+  const owner = await deps.serviceOwner?.(input.root) ?? null;
+  if (initialStatus !== 0 && !owner) {
     if (initialStatus !== null && stoppedCodes.includes(initialStatus)) throw new RemoteInstanceError("temporarily_unavailable", "Konteks is already stopped on this computer.");
     throw new RemoteInstanceError("temporarily_unavailable", "Konteks could not tell whether it is running on this computer, so nothing was stopped; konteks-remote doctor says why.");
   }
   const previousReceipt = await deps.readReceipt(input.root);
-  const stopRun = serviceRun(await (deps.run ?? deps.execute)(definition.stop));
-  if (stopRun.code !== 0) throw new RemoteInstanceError("temporarily_unavailable", `Konteks could not be stopped on this computer (${new NativeServiceCommandError("stop", definition.stop, stopRun).message}); konteks-remote --verbose stop shows every step.`);
+  const stopTask = async () => {
+    const stopRun = serviceRun(await (deps.run ?? deps.execute)(definition.stop));
+    if (stopRun.code !== 0) throw new RemoteInstanceError("temporarily_unavailable", `Konteks could not be stopped on this computer (${new NativeServiceCommandError("stop", definition.stop, stopRun).message}); konteks-remote --verbose stop shows every step.`);
+  };
+  if (owner && deps.shutdown) await deps.shutdown(input.root).catch(() => {
+    input.output.line("The connector did not acknowledge shutdown; waiting for its owned processes to close…");
+  });
+  else await stopTask();
   input.output.line("Stopping Konteks on this computer…");
-  const deadline = deps.now() + (deps.deadlineMs ?? 30_000);
+  const started = deps.now();
+  const deadline = started + (deps.deadlineMs ?? 30_000);
+  let forced = false;
   for (;;) {
     const receipt = await deps.readReceipt(input.root);
     const status = await deps.execute(definition.status);
-    if (receipt !== null && receipt !== previousReceipt && status !== null && stoppedCodes.includes(status)) break;
+    if (owner) {
+      if (!await owner.alive()) {
+        if (status !== 1) await stopTask();
+        break;
+      }
+      if (!forced && deps.now() - started >= Math.min(deps.stopGraceMs ?? 15_000, deps.deadlineMs ?? 30_000)) {
+        if (status !== 1) await stopTask();
+        input.output.line("The connector is still closing; ending this installation's remaining processes…");
+        await owner.terminate();
+        forced = true;
+        continue;
+      }
+    }
+    if (!owner && receipt !== null && receipt !== previousReceipt && status !== null && stoppedCodes.includes(status)) break;
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "Konteks stopped, but its agents may still be closing. Wait a moment, then check with konteks-remote status.");
     await deps.sleep(deps.pollMs ?? 250);
   }
@@ -327,6 +366,7 @@ export async function startNativeConnector(
     /** How long the service is watched after it starts (default 3 s where its status says it runs: Windows, systemd; none on macOS). */
     settleMs?: number;
     sleep?: (ms: number) => Promise<void>;
+    serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
   } = {},
 ): Promise<void> {
   const platform = deps.platform ?? nativePlatform();
@@ -349,6 +389,7 @@ export async function startNativeConnector(
     catch { code = null; }
     verbose(`service state: ${code === 0 ? "running" : code !== null && stoppedCodes.includes(code) ? "stopped" : `unknown (status exited ${code ?? "without a code"})`}`);
     if (code === 0) return "running";
+    if (platform.os === "windows" && await (deps.serviceOwner ?? captureWindowsServiceOwner)(input.root)) return "running";
     if (code !== null && stoppedCodes.includes(code)) return "stopped";
     throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation is stopped. Inspect and stop only this installation's service before retrying start; identity and local work are unchanged.");
   };
@@ -470,6 +511,9 @@ interface NativeAgentAddDeps {
   ensurePersonal?: typeof ensurePersonalAgent;
   /** After the restart: sign the agent in and say whether it is ready (D116). */
   closeAgents?: (input: Parameters<typeof closeAgentSetup>[0]) => Promise<void>;
+  /** Windows stops the connector's exact tree, rather than only the task host. */
+  stop?: (input: NativeCommandContext) => Promise<void>;
+  serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
 }
 
 const productionAgentAddDeps: NativeAgentAddDeps = {
@@ -484,6 +528,7 @@ const productionAgentAddDeps: NativeAgentAddDeps = {
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   now: Date.now,
   platform: nativePlatform(),
+  ...(process.platform === "win32" ? { stop: stopNativeConnector, serviceOwner: captureWindowsServiceOwner } : {}),
 };
 
 /**
@@ -517,7 +562,8 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
   const stoppedCodes = deps.platform.os === "macos" ? [113] : deps.platform.os === "debian" ? [3, 4] : [1];
   const initialStatus = await deps.execute(definition.status);
   if (initialStatus !== 0 && (initialStatus === null || !stoppedCodes.includes(initialStatus))) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation's service state. Inspect only this installation's service before adding an agent; identity and local work are unchanged.");
-  const wasRunning = initialStatus === 0;
+  const serviceOwner = await deps.serviceOwner?.(input.root) ?? null;
+  const wasRunning = initialStatus === 0 || serviceOwner !== null;
   const drain = z.object({ draining: z.boolean(), reason: z.string().nullable(), activeAssignments: z.number().int().min(0), openSessions: z.number().int().min(0) }).strict();
   // A connector the service manager does not run (`konteks-remote serve` in a
   // terminal) still owns this folder. Waiting for it to let go only timed out
@@ -545,7 +591,13 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       input.output.line(`waiting for ${state.activeAssignments} active assignment(s) before installing ${input.agent}…`);
       await deps.sleep(deps.pollMs ?? 5_000);
     }
-    if (foreground) {
+    if (deps.platform.os === "windows" && deps.stop) {
+      await deps.stop(input).catch(async error => {
+        await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
+        throw error;
+      });
+      stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+    } else if (foreground) {
       await control.call({ op: "shutdown" }, z.unknown());
       input.output.line("Konteks is running in a terminal here, not as its background service; stopping it there to add the agent…");
       stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
@@ -590,12 +642,17 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
       try {
         if (wasRunning) {
           const code = await deps.execute(definition.status);
-          if (code === 0 && await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The new service could not be stopped before agent rollback.");
-          if (code !== 0 && (code === null || !stoppedCodes.includes(code))) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm the new service stopped before agent rollback.");
-          stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
-          while (!await stopped()) {
-            if (deps.now() >= stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", "The new service did not finish stopping before agent rollback.");
-            await wait();
+          if (deps.platform.os === "windows" && deps.stop) {
+            if (code !== 1 || await deps.serviceOwner?.(input.root)) await deps.stop(input);
+            stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+          } else {
+            if (code === 0 && await deps.execute(definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The new service could not be stopped before agent rollback.");
+            if (code !== 0 && (code === null || !stoppedCodes.includes(code))) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm the new service stopped before agent rollback.");
+            stopDeadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
+            while (!await stopped()) {
+              if (deps.now() >= stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", "The new service did not finish stopping before agent rollback.");
+              await wait();
+            }
           }
         }
         for (;;) {

@@ -1,5 +1,6 @@
 name: ci
 on:
+  workflow_call:
   pull_request:
   push:
     branches: [main]
@@ -45,15 +46,31 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
       - name: Ed25519 verifier in Windows PowerShell 5.1 (RFC 8032 vectors, a real release manifest)
         shell: powershell
         run: .\scripts\test-bootstrap-verifier.ps1
       - name: The same in PowerShell 7
         shell: pwsh
         run: .\scripts\test-bootstrap-verifier.ps1
+      - name: Windows installation and update outcomes in PowerShell 5.1
+        shell: powershell
+        run: node --test --test-name-pattern="Windows bootstrap" scripts/bootstrap-install.test.mjs
+      - name: The same installation and update outcomes in PowerShell 7
+        shell: pwsh
+        env:
+          KONTEKS_TEST_POWERSHELL: pwsh.exe
+        run: node --test --test-name-pattern="Windows bootstrap" scripts/bootstrap-install.test.mjs
 
   windows-native:
-    runs-on: windows-2022
+    name: native runtime on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm, windows-2022]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -68,9 +85,11 @@ jobs:
         run: npm ci --ignore-scripts --legacy-peer-deps
       - name: Build workspace packages
         run: npm run build
-      - name: Verify Windows service and process ownership
-        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts
+      - name: Verify native service, updates and background process ownership
+        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-stop-completion.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/native-agent-add.test.ts packages/launcher/src/__tests__/windows-service-owner.test.ts packages/launcher/src/__tests__/windows-background-setup.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts packages/supervisor/src/__tests__/windows-background-probes.test.ts packages/agent-runner/src/__tests__/windows-background-spawn.test.ts
       - name: Verify signed Windows local release
+        if: runner.os == 'Windows'
         run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/e2e-smoke-release.test.ts -t "adds a real Windows connector and Codex package to the signed local release"
       - name: Verify organization Skill staging on Windows
+        if: runner.os == 'Windows'
         run: npx vitest run --maxWorkers=1 packages/supervisor/src/__tests__/skill-staging.test.ts -t "retains digest-bound executable metadata on Windows instead of guessing it from stat"

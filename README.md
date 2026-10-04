@@ -494,6 +494,16 @@ own old code; `doctor` says so, and running the Windows install line once with
 `-Update` in place of `-ActivationId` replaces it, updates and starts the
 connector.
 
+The Windows bootstrap shows its download, verification, installation and
+runtime update stages. Approve the Windows elevation prompt to install the
+command; cancelling it gives a retry instruction. If Windows Installer fails,
+the bootstrap prints its error code and a retained `logs/installer-*.log` path
+under `%USERPROFILE%\AppData\Local\konteks-remote`. A successful MSI that
+requires a Windows restart continues to connect or update the runtime and
+says to restart Windows when convenient. Routine runtime updates use
+`konteks-remote update`; the bootstrap's `-Update` also refreshes the MSI
+command and can require elevation.
+
 On macOS and Windows the connector logs to `logs/connector.log` in its
 folder, from its first line (on Windows the file is kept under 20 MB at each
 start); on Linux, to the user journal. When the connector is not running,

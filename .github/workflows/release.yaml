@@ -12,7 +12,11 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    uses: ./.github/workflows/ci.yaml
+
   build:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
