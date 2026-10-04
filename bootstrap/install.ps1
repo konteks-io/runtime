@@ -176,45 +176,75 @@ function ConvertFrom-Ed25519Spki([string]$Text) {
 if ($VerifyOnly) { return }
 # --- end of the verifier -------------------------------------------------------
 
+function Write-SetupDetail([string]$Text) {
+  foreach ($line in ($Text -split "`r?`n")) { Write-Host "  $line" }
+}
+
+function Write-SetupStage([string]$Title, [string[]]$Details) {
+  Write-Host ''
+  Write-Host $Title
+  foreach ($detail in $Details) { Write-SetupDetail $detail }
+}
+
+$setupAction = if ($Update) { "Updating this computer's existing Konteks connection." } else { 'Connecting this computer to Konteks.' }
+$stageCount = if ($Update) { 4 } else { 3 }
+$restartNotice = $null
+Write-SetupStage 'Konteks runtime setup' @($setupAction, 'Keep this window open until setup finishes.')
+
 if ($User -or $Enroll) {
-  Write-Host "The user-local (agent-first) install is not available on Windows yet; it arrives in a later release."
-  Write-Host "For now, create an activation in Konteks (Customize -> Runtimes) and run this script with -ActivationId <id>."
+  Write-SetupStage 'Setup needs an activation' @(
+    'The user-local install is not available on Windows yet.',
+    'Return to Konteks -> Customize -> Runtimes and connect this computer.',
+    'Download and open the Windows setup file offered there.'
+  )
   exit 3
 }
 if ($Update -and $ActivationId) {
-  Write-Error '-Update and -ActivationId are different doors; choose one'
+  Write-SetupStage 'Setup needs attention' @(
+    'Choose either an update or a new connection in Konteks.',
+    'Then download and open its setup file.'
+  )
+  Write-Error '-Update and -ActivationId cannot be used together'
   exit 2
 }
 $RuntimeRoot = Join-Path ${env:USERPROFILE} 'AppData\Local\konteks-remote'
 if ($Update -and -not (Test-Path (Join-Path $RuntimeRoot 'native-runtime.json'))) {
-  Write-Host 'Konteks is not installed on this computer yet. Create an activation in Konteks (Customize -> Runtimes) and run this script with -ActivationId <id>.'
+  Write-SetupStage 'This computer is not connected yet' @(
+    'Return to Konteks -> Customize -> Runtimes and connect this computer.',
+    'Download and open its Windows setup file.'
+  )
   exit 2
 }
 if (-not $Update -and -not $ActivationId) {
-  Write-Error "-ActivationId <id> is required (copy the command from the Konteks App or MCP)"
+  Write-SetupStage 'Setup needs an activation' @(
+    'Return to Konteks -> Customize -> Runtimes.',
+    'Download and open the setup file for this connection.'
+  )
+  Write-Error '-ActivationId <id> is required for a new connection'
   exit 2
 }
 $ErrorActionPreference = 'Stop'
-$BootstrapVersion = '1'
 $ReleaseBase = if ($env:KONTEKS_RELEASE_BASE) { $env:KONTEKS_RELEASE_BASE } else { 'https://github.com/konteks-io/runtime/releases/latest/download' }
 $ExpectedPublisher = if ($env:KONTEKS_MSI_PUBLISHER) { $env:KONTEKS_MSI_PUBLISHER } else { 'CN=Konteks' }
 $ExpectedThumbprint = $env:KONTEKS_MSI_THUMBPRINT
 
 if ([Environment]::Is64BitOperatingSystem -eq $false -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+  Write-SetupStage 'This Windows computer is not supported' @('Setup requires Windows 10/11 x64. Windows on ARM is not supported.')
   throw 'konteks-remote supports Windows 10/11 x64 only (Windows on ARM is not supported)'
 }
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ("konteks-remote-" + [Guid]::NewGuid().ToString('n'))
-New-Item -ItemType Directory -Path $work | Out-Null
+$activeStage = 'Prepare secure downloads'
+$failureActions = @()
 try {
+  New-Item -ItemType Directory -Path $work | Out-Null
   # TLS 1.2 always; TLS 1.3 only where this .NET knows it (older Windows 10
   # builds do not, and naming it there threw before anything ran).
   $protocols = [Net.SecurityProtocolType]::Tls12
   if ([Enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') { $protocols = $protocols -bor [Net.SecurityProtocolType]'Tls13' }
   [Net.ServicePointManager]::SecurityProtocol = $protocols
-  # Braces: a variable followed by a colon inside double quotes parses as a
-  # drive-qualified name, and the whole script failed to load on Windows.
-  Write-Host "konteks-remote bootstrap v${BootstrapVersion}: fetching the signed checksum manifest"
+  $activeStage = 'Download and verify'
+  Write-SetupStage "1 of $stageCount - $activeStage" @('Fetching the signed release manifest...')
   $sumsPath = Join-Path $work 'SHA256SUMS'
   $sigPath = Join-Path $work 'SHA256SUMS.sig'
   Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/SHA256SUMS" -OutFile $sumsPath
@@ -240,7 +270,7 @@ try {
   $expected = @([Text.Encoding]::UTF8.GetString($sums) -split "`r?`n" | Where-Object { $_ -match "^[0-9a-fA-F]{64}\s+\*?$([regex]::Escape($msi))$" } | ForEach-Object { ($_ -split '\s+')[0].ToLowerInvariant() })
   if ($expected.Count -ne 1) { throw "the release manifest lists no single $msi; nothing was installed" }
   $msiPath = Join-Path $work $msi
-  Write-Host 'Downloading the Windows installer...'
+  Write-SetupDetail 'Downloading the Windows installer...'
   Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$msi" -OutFile $msiPath
   $actual = (Get-FileHash -Algorithm SHA256 -Path $msiPath).Hash.ToLowerInvariant()
   if ($expected[0] -ne $actual) { throw 'package checksum mismatch; nothing was installed' }
@@ -249,75 +279,141 @@ try {
   # is already proven by the signed checksums above.
   $authenticode = Get-AuthenticodeSignature -FilePath $msiPath
   if ($authenticode.Status -eq 'NotSigned') {
-    Write-Host "This release is verified by Konteks' signed checksums; Windows may show 'Unknown publisher'."
+    Write-SetupDetail "This release is verified by Konteks' signed checksums."
+    Write-SetupDetail "Windows may show 'Unknown publisher' at the approval prompt."
   } else {
     if ($authenticode.Status -ne 'Valid') { throw "package Authenticode signature is $($authenticode.Status); nothing was installed" }
     if ($authenticode.SignerCertificate.Subject -notlike "*$ExpectedPublisher*") { throw 'package signer is not the expected publisher; nothing was installed' }
     if ($ExpectedThumbprint -and $authenticode.SignerCertificate.Thumbprint -ne $ExpectedThumbprint) { throw 'package signer thumbprint mismatch; nothing was installed' }
   }
 
-  Write-Host 'Verified the Windows installer and signed release manifest.'
+  Write-SetupDetail 'Verified the Windows installer and signed release manifest.'
+  $activeStage = 'Install the Konteks command'
   # Windows Installer does not create the log's directory. Keep diagnostics
   # outside the temporary download folder so a failed install is inspectable.
   $logDirectory = Join-Path $RuntimeRoot 'logs'
   New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
   $installerLog = Join-Path $logDirectory ("installer-" + [Guid]::NewGuid().ToString('n') + '.log')
-  Write-Host 'Installing the Konteks command. Approve the Windows elevation prompt if it appears; installation can take a minute.'
+  Write-SetupStage "2 of $stageCount - $activeStage" @(
+    'Approve the Windows elevation prompt if it appears.',
+    'Installation can take a minute.',
+    'Keep this setup window open.'
+  )
   try {
     $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$msiPath`"", '/qn', '/norestart', '/L*v', "`"$installerLog`"") -Verb RunAs -Wait -PassThru
   } catch {
     $failure = $_.Exception
     while ($null -ne $failure -and -not ($failure -is [System.ComponentModel.Win32Exception])) { $failure = $failure.InnerException }
     if ($null -ne $failure -and $failure.NativeErrorCode -eq 1223) {
-      throw 'The installation was cancelled at the Windows elevation prompt. Run this command again and approve the prompt to continue.'
+      $failureActions = @('Open the downloaded setup file again and approve the prompt to continue.')
+      throw 'The installation was cancelled at the Windows elevation prompt.'
     }
-    throw "Windows Installer could not start: $($_.Exception.Message). Run this command again to retry."
+    $failureActions = @('Open the downloaded setup file again to retry.')
+    throw "Windows Installer could not start: $($_.Exception.Message)"
   }
   # Both reboot codes mean the MSI succeeded; do not report a successful
   # install as a failure or skip enrollment. /norestart requests no restart.
   if ($proc.ExitCode -eq 3010) {
-    Write-Host 'The Konteks command was installed. Restart Windows when convenient to finish the Windows Installer changes.'
+    $restartNotice = 'Restart Windows when convenient to finish the Windows Installer changes.'
+    Write-SetupDetail 'The Konteks command was installed.'
+    Write-SetupDetail $restartNotice
   } elseif ($proc.ExitCode -eq 1641) {
-    Write-Host 'The Konteks command was installed. Windows Installer reported that it will restart Windows; if this window closes, run this command again after Windows restarts.'
+    $restartNotice = 'Restart Windows as requested by Windows Installer.'
+    Write-SetupDetail 'The Konteks command was installed.'
+    Write-SetupDetail 'Windows Installer reported that it will restart Windows.'
+    Write-SetupDetail 'If this window closes, wait for Windows to restart.'
+    Write-SetupDetail 'Then open the downloaded setup file again.'
   } elseif ($proc.ExitCode -ne 0) {
-    $nextStep = switch ($proc.ExitCode) {
-      1602 { 'The installation was cancelled. Run this command again to continue.' }
-      1618 { 'Another Windows installation is running. Wait for it to finish, then run this command again.' }
-      1638 { 'Windows already has a newer Konteks command installed. Run konteks-remote update instead.' }
-      default { 'Check the installer log for the cause, then run this command again after resolving it.' }
+    $failureActions = switch ($proc.ExitCode) {
+      1602 { @('The installation was cancelled.', 'Open the downloaded setup file again to continue.') }
+      1618 { @('Another Windows installation is running.', 'Wait for it to finish, then open the downloaded setup file again.') }
+      1638 { @('Windows already has a newer Konteks command installed.', 'Return to Konteks and check this computer.', 'Use its current setup file if an update is still offered.') }
+      default { @('Check the installer log for the cause.', 'After resolving it, open the downloaded setup file again.') }
     }
-    Write-Host "Windows Installer log: $installerLog"
-    throw "Windows Installer failed (exit $($proc.ExitCode)). $nextStep"
+    Write-SetupDetail 'Installer log:'
+    Write-Host "    $installerLog"
+    throw "Windows Installer failed (exit $($proc.ExitCode))."
   }
-}
-finally {
+} catch {
+  Write-SetupStage 'Setup could not finish' (@(
+    $_.Exception.Message,
+    "Stopped during: $activeStage."
+  ) + $failureActions + @(
+    'Keep this window open to review the message above.',
+    'Return to Konteks and download a fresh setup file if a retry is needed.'
+  ))
+  # This bootstrap is a process entry point: return failure without a raw
+  # PowerShell ErrorRecord burying the actions. finally still removes downloads.
+  exit 1
+} finally {
   Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
 
 $launcher = Join-Path ${env:ProgramFiles} 'konteks-remote\konteks-remote.exe'
 if (-not (Test-Path $launcher)) { $launcher = 'konteks-remote' }
-if ($Update) {
-  # This launcher runs the newer of its own code and the installed release's
-  # code. A connector that could not start stays stopped through an update,
-  # so start it after; start leaves a running one alone.
-  Write-Host 'Updating the connected runtime. Downloading and checking the release can take a few minutes...'
-  & $launcher update
-  $code = $LASTEXITCODE
-  Write-Host 'Starting the runtime...'
-  & $launcher start
-  if ($code -eq 0) { $code = $LASTEXITCODE }
-} else {
-  # The activation code is prompted by the launcher without echo; it is never an argument.
-  Write-Host 'Connecting this computer to Konteks...'
-  & $launcher install --activation-id $ActivationId
-  $code = $LASTEXITCODE
+$code = 0
+$commandFailure = $null
+try {
+  if ($Update) {
+    # This launcher runs the newer of its own code and the installed release's
+    # code. A connector that could not start stays stopped through an update,
+    # so start it after; start leaves a running one alone.
+    $activeStage = 'Update the connected runtime'
+    $failedStage = $activeStage
+    Write-SetupStage '3 of 4 - Update the connected runtime' @(
+      'Updating the connected runtime...',
+      'Downloading and checking the release can take a few minutes.'
+    )
+    & $launcher update
+    $code = $LASTEXITCODE
+    $failedStage = if ($code -eq 0) { 'Start and reconnect' } else { 'Update the connected runtime' }
+    $activeStage = 'Start and reconnect'
+    Write-SetupStage '4 of 4 - Start and reconnect' @('Starting the runtime...')
+    & $launcher start
+    if ($code -eq 0) { $code = $LASTEXITCODE }
+  } else {
+    # The activation code is prompted by the launcher without echo; it is never an argument.
+    $activeStage = 'Connect this computer'
+    $failedStage = $activeStage
+    Write-SetupStage '3 of 3 - Connect this computer' @(
+      'Connecting this computer to Konteks...',
+      'Enter the activation code when asked.',
+      'It is hidden while you type.'
+    )
+    & $launcher install --activation-id $ActivationId
+    $code = $LASTEXITCODE
+    $failedStage = 'Connect this computer'
+  }
+} catch {
+  $commandFailure = $_.Exception.Message
+  if ($code -eq 0) { $code = 1; $failedStage = $activeStage }
 }
 if ($code -eq 0) {
-  if ($Update) { Write-Host 'Konteks runtime update completed.' } else { Write-Host 'Konteks runtime installation completed.' }
+  $resultText = if ($Update) { 'Konteks runtime update completed.' } else { 'Konteks runtime installation completed.' }
+  Write-SetupStage 'Setup complete' @(
+    $resultText,
+    'Return to Konteks -> Customize -> Runtimes.',
+    'Confirm this computer is online.'
+  )
+  if ($restartNotice) { Write-SetupDetail $restartNotice }
+  Write-SetupDetail 'You can close this setup window.'
+} else {
+  $resultText = if ($Update) { "The runtime update did not complete (exit $code)." } else { "The runtime connection did not complete (exit $code)." }
+  Write-SetupStage 'Setup needs attention' @(
+    $resultText,
+    "Failure in: $failedStage."
+  )
+  if ($commandFailure) {
+    Write-SetupDetail "Could not run the command for: $activeStage."
+    Write-SetupDetail $commandFailure
+  }
+  Write-SetupDetail 'Keep this window open to review the message above.'
+  Write-SetupDetail 'Return to Konteks and check this computer before trying setup again.'
+  Write-SetupDetail 'If a retry is needed, open the downloaded setup file again.'
 }
 # The MSI put konteks-remote on the machine PATH, which this window cannot see
 # yet; the commands the launcher just named work in a new one.
 if (-not (Get-Command konteks-remote -ErrorAction SilentlyContinue)) {
-  Write-Host 'To run konteks-remote commands, open a new PowerShell window.'
+  Write-SetupDetail 'Optional terminal commands: open a new PowerShell window.'
 }
 exit $code

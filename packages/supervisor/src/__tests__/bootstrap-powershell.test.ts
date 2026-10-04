@@ -63,7 +63,8 @@ describe("bootstrap/install.ps1", () => {
   });
 
   it("holds a signed MSI to Valid and the expected publisher, and lets an unsigned one through on the signed checksums", () => {
-    expect(script).toContain("This release is verified by Konteks' signed checksums; Windows may show 'Unknown publisher'.");
+    expect(script).toContain("This release is verified by Konteks' signed checksums.");
+    expect(script).toContain("Windows may show 'Unknown publisher' at the approval prompt.");
     expect(script).toMatch(/\$authenticode\.Status -ne 'Valid'/);
     expect(script).toMatch(/SignerCertificate\.Subject -notlike "\*\$ExpectedPublisher\*"/);
     expect(script).toMatch(/SignerCertificate\.Thumbprint -ne \$ExpectedThumbprint/);

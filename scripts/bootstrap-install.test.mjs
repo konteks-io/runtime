@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -57,11 +57,22 @@ const windowsOnly = { skip: process.platform !== "win32" };
 const psLiteral = value => `'${value.replaceAll("'", "''")}'`;
 const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
 
+function saveFixtureTranscript(scenario, output, status) {
+  const directory = process.env.KONTEKS_BOOTSTRAP_FIXTURE_OUTPUT_DIR;
+  if (!directory) return;
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, `${scenario}.txt`), `SIGNED FIXTURE OUTPUT ONLY - no actual installation or connected runtime\nShell: ${powershell}\nFixture exit: ${status}\n\n${output}`);
+}
+
 function runWindowsBootstrap(options = {}) {
-  const { msiCode, cancelled, tampered, update, updateCode, startCode } = {
+  const { msiCode, cancelled, tampered, downloadFailed, downloadError, directoryFailed, launcherThrow, update, updateCode, startCode } = {
     msiCode: 0,
     cancelled: false,
     tampered: false,
+    downloadFailed: false,
+    downloadError: "Fixture download unavailable",
+    directoryFailed: false,
+    launcherThrow: "none",
     update: true,
     updateCode: 0,
     startCode: 0,
@@ -69,6 +80,8 @@ function runWindowsBootstrap(options = {}) {
   };
   const fixture = mkdtempSync(join(root, "windows bootstrap "));
   const profile = join(fixture, "profile");
+  const temporaryRoot = join(fixture, "temporary downloads");
+  mkdirSync(temporaryRoot);
   const runtimeRoot = join(profile, "AppData", "Local", "konteks-remote");
   mkdirSync(runtimeRoot, { recursive: true });
   writeFileSync(join(runtimeRoot, "native-runtime.json"), "{}\n");
@@ -98,7 +111,13 @@ $env:KONTEKS_RELEASE_BASE = 'https://fixture.invalid/release'
 $env:KONTEKS_RELEASE_PUBKEY_SHA256 = '${sha256(key)}'
 function Invoke-WebRequest {
   param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile)
+  if ($${downloadFailed}) { throw ${psLiteral(downloadError)} }
   Copy-Item -LiteralPath (Join-Path ${psLiteral(fixture)} ([Uri]$Uri).Segments[-1]) -Destination $OutFile
+}
+function New-Item {
+  param([string]$ItemType, [string]$Path, [switch]$Force)
+  if ($${directoryFailed} -and $Path.StartsWith(${psLiteral(temporaryRoot)})) { throw 'Fixture temporary directory unavailable' }
+  Microsoft.PowerShell.Management\\New-Item @PSBoundParameters
 }
 function Get-AuthenticodeSignature { param([string]$FilePath); return @{ Status = 'NotSigned' } }
 function Start-Process {
@@ -111,19 +130,24 @@ function Start-Process {
 }
 function konteks-remote {
   ConvertTo-Json -InputObject @($args) -Compress | Add-Content -LiteralPath ${psLiteral(callsPath)} -Encoding UTF8
+  if ($args[0] -eq ${psLiteral(launcherThrow)}) { throw 'Fixture launcher could not start' }
   $global:LASTEXITCODE = switch ($args[0]) { 'update' { ${updateCode} }; 'start' { ${startCode} }; default { 0 } }
 }
-try {
-  & ${psLiteral(join(process.cwd(), "bootstrap", "install.ps1"))} ${update ? "-Update" : "-ActivationId activation-test-id"}
-  exit $LASTEXITCODE
-} catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }
+# Match the App starter's inline scriptblock entry; no catch may hide raw errors.
+& ([scriptblock]::Create([IO.File]::ReadAllText(${psLiteral(join(process.cwd(), "bootstrap", "install.ps1"))}))) ${update ? "-Update" : "-ActivationId activation-test-id"}
 `);
-  const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", harnessPath], { encoding: "utf8", timeout: 60_000 });
+  const command = `& ([scriptblock]::Create([IO.File]::ReadAllText(${psLiteral(harnessPath)})))`;
+  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], { encoding: "utf8", timeout: 60_000, windowsHide: true, env: { ...process.env, TEMP: temporaryRoot, TMP: temporaryRoot } });
   if (result.error) throw result.error;
+  const output = `${result.stdout}${result.stderr}`.replaceAll("\r\n", "\n");
+  const scenario = `msi-${msiCode}-cancel-${cancelled}-tampered-${tampered}-download-failed-${downloadFailed}-update-${update}-update-exit-${updateCode}-start-exit-${startCode}-${sha256(JSON.stringify(options)).slice(0, 8)}`;
+  saveFixtureTranscript(scenario, output, result.status);
   const json = path => JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
   return {
     status: result.status,
-    output: `${result.stdout}${result.stderr}`,
+    output,
+    stderr: result.stderr,
+    remainingDownloadDirectories: readdirSync(temporaryRoot).filter(name => name.startsWith("konteks-remote-")),
     calls: existsSync(callsPath) ? readFileSync(callsPath, "utf8").trim().split(/\r?\n/).map(line => JSON.parse(line.replace(/^\uFEFF/, ""))) : [],
     msiCall: existsSync(msiCallPath) ? json(msiCallPath) : null,
     runtimeRoot,
@@ -136,6 +160,8 @@ for (const msiCode of [3010, 1641]) {
     assert.equal(result.status, 0, result.output);
     assert.deepEqual(result.calls, [["update"], ["start"]], result.output);
     assert.match(result.output, /restart Windows/i);
+    assert.match(result.output, /\n\nSetup complete\n  Konteks runtime update completed\./);
+    assert.match(result.output, /\n  Restart Windows/);
   });
 }
 
@@ -150,6 +176,10 @@ test("Windows bootstrap retains an MSI failure log with a useful recovery messag
   assert.ok(logPath.startsWith(result.runtimeRoot));
   assert.ok(result.output.includes(logPath), result.output);
   assert.match(result.output, /1603/);
+  assert.match(result.output, /\n\nSetup could not finish\n  Windows Installer failed \(exit 1603\)/);
+  assert.match(result.output, /\n  Installer log:\n    /);
+  assert.match(result.output, /open the downloaded setup file again/i);
+  assert.match(result.output, /\n  Check the installer log for the cause\.\n  After resolving it, open the downloaded setup file again\./);
 });
 
 test("Windows bootstrap explains a cancelled elevation prompt", windowsOnly, () => {
@@ -157,6 +187,8 @@ test("Windows bootstrap explains a cancelled elevation prompt", windowsOnly, () 
   assert.notEqual(result.status, 0, result.output);
   assert.deepEqual(result.calls, []);
   assert.match(result.output, /installation was cancel(?:led|ed).*elevation prompt/i);
+  assert.match(result.output, /\n\nSetup could not finish\n  /);
+  assert.match(result.output, /open the downloaded setup file again and approve/i);
 });
 
 test("Windows bootstrap shows the stages of an update", windowsOnly, () => {
@@ -167,6 +199,13 @@ test("Windows bootstrap shows the stages of an update", windowsOnly, () => {
   assert.match(result.output, /verified the Windows installer/i);
   assert.match(result.output, /updating the connected runtime/i);
   assert.match(result.output, /starting the runtime/i);
+  assert.match(result.output, /\n\n1 of 4 - Download and verify\n  Fetching the signed release manifest/);
+  assert.match(result.output, /\n\n2 of 4 - Install the Konteks command\n  Approve the Windows elevation prompt/);
+  assert.match(result.output, /\n\n3 of 4 - Update the connected runtime\n  Updating the connected runtime/);
+  assert.match(result.output, /\n\n4 of 4 - Start and reconnect\n  Starting the runtime/);
+  assert.match(result.output, /\n\nSetup complete\n  Konteks runtime update completed\./);
+  assert.match(result.output, /\n  Return to Konteks -> Customize -> Runtimes\.\n  Confirm this computer is online\./);
+  assert.match(result.output, /\n  You can close this setup window\./);
 });
 
 test("Windows bootstrap rejects a changed MSI before installation", windowsOnly, () => {
@@ -175,13 +214,78 @@ test("Windows bootstrap rejects a changed MSI before installation", windowsOnly,
   assert.equal(result.msiCall, null);
   assert.deepEqual(result.calls, []);
   assert.match(result.output, /package checksum mismatch/);
+  assert.match(result.output, /\n\nSetup could not finish\n  package checksum mismatch/);
+  assert.match(result.output, /\n  Stopped during: Download and verify\./);
+  assert.match(result.output, /\n  Return to Konteks and download a fresh setup file if a retry is needed\./);
 });
+
+test("Windows bootstrap formats a failed download with a safe return action", windowsOnly, () => {
+  const result = runWindowsBootstrap({ downloadFailed: true });
+  assert.notEqual(result.status, 0, result.output);
+  assert.equal(result.msiCall, null);
+  assert.deepEqual(result.calls, []);
+  assert.match(result.output, /\n\nSetup could not finish\n  Fixture download unavailable/);
+  assert.match(result.output, /\n  Stopped during: Download and verify\./);
+  assert.match(result.output, /\n  Return to Konteks and download a fresh setup file if a retry is needed\./);
+});
+
+for (const [name, options] of Object.entries({ download: { downloadFailed: true }, checksum: { tampered: true }, cancellation: { cancelled: true }, installer: { msiCode: 1603 } })) {
+  test(`Windows bootstrap keeps production ${name} failure free of raw PowerShell errors`, windowsOnly, () => {
+    const result = runWindowsBootstrap(options);
+    assert.equal(result.status, 1, result.output);
+    assert.equal(result.stderr, "", "the real starter must not append a raw ErrorRecord after recovery guidance");
+    assert.doesNotMatch(result.output, /CategoryInfo|FullyQualifiedErrorId|At line:\d+ char:/);
+    assert.match(result.output, /\n\nSetup could not finish\n  /);
+    assert.deepEqual(result.calls, []);
+    assert.deepEqual(result.remainingDownloadDirectories, [], "finally must remove temporary downloads on explicit failure exit");
+  });
+}
+
+test("Windows bootstrap preserves diagnostic paths and indents physical error lines", windowsOnly, () => {
+  const message = "Fixture could not read C:\\Users\\Dr. Smith\\release.log\nThe next physical line has no period";
+  const result = runWindowsBootstrap({ downloadFailed: true, downloadError: message });
+  assert.equal(result.status, 1, result.output);
+  assert.match(result.output, /\n  Fixture could not read C:\\Users\\Dr\. Smith\\release\.log\n  The next physical line has no period\n/);
+  assert.equal(result.stderr, "");
+  assert.deepEqual(result.remainingDownloadDirectories, []);
+});
+
+test("Windows bootstrap explains temporary directory creation failure", windowsOnly, () => {
+  const result = runWindowsBootstrap({ directoryFailed: true });
+  assert.equal(result.status, 1, result.output);
+  assert.match(result.output, /\n\nSetup could not finish\n  Fixture temporary directory unavailable/);
+  assert.match(result.output, /\n  Stopped during: Prepare secure downloads\./);
+  assert.equal(result.stderr, "");
+  assert.equal(result.msiCall, null);
+  assert.deepEqual(result.calls, []);
+});
+
+for (const [name, options, code, calls] of [
+  ["update", { launcherThrow: "update" }, 1, [["update"]]],
+  ["start", { launcherThrow: "start" }, 1, [["update"], ["start"]]],
+  ["failed update then start", { updateCode: 8, launcherThrow: "start" }, 8, [["update"], ["start"]]],
+  ["connection", { update: false, launcherThrow: "install" }, 1, [["install", "--activation-id", "activation-test-id"]]],
+]) {
+  test(`Windows bootstrap explains ${name} command-start failure`, windowsOnly, () => {
+    const result = runWindowsBootstrap(options);
+    assert.equal(result.status, code, result.output);
+    assert.match(result.output, /\n\nSetup needs attention\n  /);
+    assert.match(result.output, /\n  Fixture launcher could not start\n/);
+    assert.equal(result.stderr, "");
+    assert.deepEqual(result.calls, calls);
+    assert.deepEqual(result.remainingDownloadDirectories, []);
+  });
+}
 
 test("Windows bootstrap connects a new installation after verifying the MSI", windowsOnly, () => {
   const result = runWindowsBootstrap({ update: false });
   assert.equal(result.status, 0, result.output);
   assert.deepEqual(result.calls, [["install", "--activation-id", "activation-test-id"]], result.output);
   assert.match(result.output, /installation completed/i);
+  assert.match(result.output, /\n\n1 of 3 - Download and verify\n  /);
+  assert.match(result.output, /\n\n2 of 3 - Install the Konteks command\n  /);
+  assert.match(result.output, /\n\n3 of 3 - Connect this computer\n  /);
+  assert.match(result.output, /\n  Enter the activation code when asked\.\n  It is hidden while you type\./);
 });
 
 test("Windows bootstrap preserves a failed update while recovering the runtime", windowsOnly, () => {
@@ -189,6 +293,10 @@ test("Windows bootstrap preserves a failed update while recovering the runtime",
   assert.equal(result.status, 8, result.output);
   assert.deepEqual(result.calls, [["update"], ["start"]], result.output);
   assert.doesNotMatch(result.output, /update completed/i);
+  assert.match(result.output, /\n\nSetup needs attention\n  The runtime update did not complete \(exit 8\)\./);
+  assert.match(result.output, /\n  Failure in: Update the connected runtime\./);
+  assert.match(result.output, /\n  Keep this window open to review the message above\./);
+  assert.match(result.output, /\n  If a retry is needed, open the downloaded setup file again\./);
 });
 
 test("Windows bootstrap reports a failed runtime start after an update", windowsOnly, () => {
@@ -196,6 +304,8 @@ test("Windows bootstrap reports a failed runtime start after an update", windows
   assert.equal(result.status, 9, result.output);
   assert.deepEqual(result.calls, [["update"], ["start"]], result.output);
   assert.doesNotMatch(result.output, /update completed/i);
+  assert.match(result.output, /\n\nSetup needs attention\n  The runtime update did not complete \(exit 9\)\./);
+  assert.match(result.output, /\n  Failure in: Start and reconnect\./);
 });
 
 test.after(() => rmSync(root, { recursive: true, force: true }));
