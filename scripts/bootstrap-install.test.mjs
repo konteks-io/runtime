@@ -65,13 +65,14 @@ function saveFixtureTranscript(scenario, output, status) {
 }
 
 function runWindowsBootstrap(options = {}) {
-  const { msiCode, cancelled, tampered, downloadFailed, downloadError, directoryFailed, launcherThrow, update, updateCode, startCode } = {
+  const { msiCode, cancelled, tampered, downloadFailed, downloadError, directoryFailed, temporaryCase, launcherThrow, update, updateCode, startCode } = {
     msiCode: 0,
     cancelled: false,
     tampered: false,
     downloadFailed: false,
     downloadError: "Fixture download unavailable",
     directoryFailed: false,
+    temporaryCase: "original",
     launcherThrow: "none",
     update: true,
     updateCode: 0,
@@ -81,6 +82,7 @@ function runWindowsBootstrap(options = {}) {
   const fixture = mkdtempSync(join(root, "windows bootstrap "));
   const profile = join(fixture, "profile");
   const temporaryRoot = join(fixture, "temporary downloads");
+  const temporaryPath = { original: temporaryRoot, uppercase: temporaryRoot.toUpperCase() }[temporaryCase];
   mkdirSync(temporaryRoot);
   const runtimeRoot = join(profile, "AppData", "Local", "konteks-remote");
   mkdirSync(runtimeRoot, { recursive: true });
@@ -116,7 +118,9 @@ function Invoke-WebRequest {
 }
 function New-Item {
   param([string]$ItemType, [string]$Path, [switch]$Force)
-  if ($${directoryFailed} -and $Path.StartsWith(${psLiteral(temporaryRoot)})) { throw 'Fixture temporary directory unavailable' }
+  # The first New-Item prepares downloads. Equivalent Windows path spellings
+  # must not prevent this explicit fault from being injected.
+  if ($${directoryFailed}) { throw 'Fixture temporary directory unavailable' }
   Microsoft.PowerShell.Management\\New-Item @PSBoundParameters
 }
 function Get-AuthenticodeSignature { param([string]$FilePath); return @{ Status = 'NotSigned' } }
@@ -137,7 +141,7 @@ function konteks-remote {
 & ([scriptblock]::Create([IO.File]::ReadAllText(${psLiteral(join(process.cwd(), "bootstrap", "install.ps1"))}))) ${update ? "-Update" : "-ActivationId activation-test-id"}
 `);
   const command = `& ([scriptblock]::Create([IO.File]::ReadAllText(${psLiteral(harnessPath)})))`;
-  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], { encoding: "utf8", timeout: 60_000, windowsHide: true, env: { ...process.env, TEMP: temporaryRoot, TMP: temporaryRoot } });
+  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], { encoding: "utf8", timeout: 60_000, windowsHide: true, env: { ...process.env, TEMP: temporaryPath, TMP: temporaryPath } });
   if (result.error) throw result.error;
   const output = `${result.stdout}${result.stderr}`.replaceAll("\r\n", "\n");
   const scenario = `msi-${msiCode}-cancel-${cancelled}-tampered-${tampered}-download-failed-${downloadFailed}-update-${update}-update-exit-${updateCode}-start-exit-${startCode}-${sha256(JSON.stringify(options)).slice(0, 8)}`;
@@ -258,6 +262,17 @@ test("Windows bootstrap explains temporary directory creation failure", windowsO
   assert.equal(result.stderr, "");
   assert.equal(result.msiCall, null);
   assert.deepEqual(result.calls, []);
+});
+
+test("Windows bootstrap directory failure fixture accepts equivalent uppercase TEMP paths", windowsOnly, () => {
+  const result = runWindowsBootstrap({ directoryFailed: true, temporaryCase: "uppercase" });
+  assert.equal(result.status, 1, result.output);
+  assert.match(result.output, /\n\nSetup could not finish\n  Fixture temporary directory unavailable/);
+  assert.match(result.output, /\n  Stopped during: Prepare secure downloads\./);
+  assert.equal(result.stderr, "");
+  assert.equal(result.msiCall, null);
+  assert.deepEqual(result.calls, []);
+  assert.deepEqual(result.remainingDownloadDirectories, []);
 });
 
 for (const [name, options, code, calls] of [
