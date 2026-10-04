@@ -57,10 +57,14 @@ release carries. Covers `release/`, `packaging/`, `packages/release/` and
 - `connector-commands.json` must match the launcher's command table
   (`packages/launcher/src/__tests__/connector-commands.test.ts`);
   `release-assets.mjs commands` writes it and `verify` requires it.
-- **CI.** `ci.yaml` runs on pull requests and pushes to `main`: lint,
-  typecheck, test, AGPL and secret-canary checks, bootstrap syntax checks, and
-  Windows jobs (Ed25519 verifier in PowerShell 5.1 and 7, service and process
-  tests). Every job runs `scripts/ci-vendored-contracts.mjs` before `npm ci`.
+- **CI.** `ci.yaml` runs on pull requests and pushes to `main`, and is the
+  reusable gate before release builds: lint, typecheck, test, AGPL and
+  secret-canary checks, bootstrap syntax checks, and native service, update
+  and process-ownership tests on all five release coordinates (macOS
+  arm64/amd64, Linux arm64/amd64, Windows amd64). Windows bootstrap verification
+  and installation/update outcomes run in PowerShell 5.1 and 7. Every job that
+  installs workspace dependencies runs `scripts/ci-vendored-contracts.mjs`
+  before `npm ci`.
 - `agent-os-proof.yaml` (manual, or pushes to `chore/quality-assurance`
   touching runtime paths) runs `scripts/agent-os-proof.mjs` per agent and OS.
   An agent is enabled on an OS only when its job there passes.

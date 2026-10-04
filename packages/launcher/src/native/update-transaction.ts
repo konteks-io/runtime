@@ -4,7 +4,7 @@ import { createReadStream } from "node:fs";
 import { chmod, copyFile, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
+import { DoctorReportSchema, NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
 import { isHostAgentId, nativeConnectorFileNames, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, ownedByAnotherConnector, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
@@ -12,6 +12,7 @@ import type { NativeCommandContext } from "./cli.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
 import { CONNECTOR_LOG_FILE, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps, type NativeUpdateStage } from "./update.js";
+import { captureWindowsServiceOwner, endWindowsServiceTask, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
 
 interface UpdateControlClient {
   call<T>(request: ControlRequest, schema: { parse(value: unknown): T }, options?: { timeoutMs?: number }): Promise<T>;
@@ -47,6 +48,7 @@ export interface NativeUpdateTransactionDeps {
    * shutdown receipt: its process being gone is then the proof.
    */
   servicePid?: (definition: NativeServiceDefinition) => Promise<number | null>;
+  serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
   processAlive?: (pid: number) => boolean;
   /** Ends a process and its own process group, only while it is still this root's connector. */
   killProcessGroup?: (pid: number, root: string) => Promise<void>;
@@ -86,6 +88,7 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
     ...rest,
     ...(forceStop ? { forceStop } : {}),
     ...(servicePid ? { servicePid, processAlive, killProcessGroup: endProcessGroup } : {}),
+    ...(process.platform === "win32" ? { serviceOwner: captureWindowsServiceOwner } : {}),
     refreshLauncher: refreshInstalledLauncher,
     readRecord: readNativeRecord,
     control: (root, record) => new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort),
@@ -131,9 +134,29 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
     reason: attemptReason(input), startedAt: new Date(deps.now()).toISOString(), finishedAt: null, outcome: "in_progress", detail: null,
   };
   await deps.recordAttempt(input.root, attempt);
-  const definition = await deps.serviceDefinition(input.root);
-  const wasRunning = await deps.execute(definition.status) === 0;
-  return new UpdateTransaction(input, deps, { previous, staged, attempt, definition, wasRunning }).run();
+  const service = await readUpdateService(input, deps, attempt);
+  return new UpdateTransaction(input, deps, { previous, staged, attempt, ...service }).run();
+}
+
+async function readUpdateService(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, attempt: NativeUpdateAttempt): Promise<{ definition: NativeServiceDefinition; wasRunning: boolean; owner: NativeServiceProcessOwner | null }> {
+  try {
+    const definition = await deps.serviceDefinition(input.root);
+    const status = await deps.execute(definition.status);
+    const owner = await deps.serviceOwner?.(input.root) ?? null;
+    assertUpdateTaskState(status, owner, deps);
+    return { definition, wasRunning: status === 0 || owner !== null, owner };
+  } catch (error) {
+    await finishUpdateAttempt(input.root, deps, attempt, "failed", errorText(error));
+    throw error;
+  }
+}
+
+function assertUpdateTaskState(status: number | null, owner: NativeServiceProcessOwner | null, deps: NativeUpdateTransactionDeps): void {
+  if (deps.serviceOwner && !owner && status !== 0 && status !== 1) throw new RemoteInstanceError("temporarily_unavailable", "Windows could not confirm this connector's task state; its installation was not changed.");
+}
+
+async function finishUpdateAttempt(root: string, deps: NativeUpdateTransactionDeps, attempt: NativeUpdateAttempt, outcome: NativeUpdateAttempt["outcome"], detail: string | null): Promise<void> {
+  await deps.recordAttempt(root, { ...attempt, outcome, detail: detail?.slice(0, 1_024) ?? null, finishedAt: new Date(deps.now()).toISOString() }).catch(() => undefined);
 }
 
 function attemptReason(input: NativeUpdateInput): NativeUpdateAttempt["reason"] {
@@ -150,9 +173,16 @@ async function stageOrRecordFailure(input: NativeUpdateInput, deps: NativeUpdate
     return await deps.stage({ root: input.root, output: input.output, ...(input.deps ? { deps: input.deps } : {}) });
   } catch (error) {
     const startedAt = new Date(deps.now()).toISOString();
-    await deps.recordAttempt(input.root, { id: `update-${randomUUID()}`, bundleVersion: "unknown", manifestDigest: "unknown", releaseId: null, reason: attemptReason(input), startedAt, finishedAt: startedAt, outcome: "failed", detail: errorText(error).slice(0, 1_024) }).catch(() => undefined);
+    await deps.recordAttempt(input.root, { id: `update-${randomUUID()}`, ...failedStageTarget(), releaseId: null, reason: attemptReason(input), startedAt, finishedAt: startedAt, outcome: "failed", detail: errorText(error).slice(0, 1_024) }).catch(() => undefined);
     throw error;
   }
+}
+
+/** The fixed local hand-off also identifies failures before staging succeeds,
+ * so the successor can report the outcome of the person's exact request. */
+function failedStageTarget(): { bundleVersion: string; manifestDigest: string } {
+  try { return NativeUpdateTargetSchema.parse(JSON.parse(process.env[NATIVE_UPDATE_TARGET_ENV] ?? "null")); }
+  catch { return { bundleVersion: "unknown", manifestDigest: "unknown" }; }
 }
 
 function errorText(error: unknown): string {
@@ -163,6 +193,7 @@ function errorText(error: unknown): string {
 class UpdateTransaction {
   private readonly control: UpdateControlClient;
   private stopped = false;
+  private drained = false;
   private oldPid: number | null = null;
   private successor: NativeRuntimeRecord | undefined;
 
@@ -171,7 +202,7 @@ class UpdateTransaction {
     private readonly deps: NativeUpdateTransactionDeps,
     private readonly update: {
       previous: NativeRuntimeRecord; staged: Extract<NativeUpdateStage, { status: "staged" }>; attempt: NativeUpdateAttempt;
-      definition: NativeServiceDefinition; wasRunning: boolean;
+      definition: NativeServiceDefinition; wasRunning: boolean; owner: NativeServiceProcessOwner | null;
     },
   ) {
     this.control = deps.control(input.root, update.previous);
@@ -215,16 +246,33 @@ class UpdateTransaction {
    */
   private async stopPrevious(): Promise<void> {
     const { input, deps, update } = this;
+    this.drained = true;
     await drain(input, this.control, deps);
     if (update.previous.agents.includes("codex")) await this.codexPreflight();
+    await this.captureStartedOwner();
     const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
     this.oldPid = await deps.servicePid?.(update.definition).catch(() => null) ?? null;
-    if (await deps.execute(update.definition.stop) !== 0) {
+    await this.requestStop();
+    this.stopped = true;
+    await waitForServiceExit(input, update.definition, deps, previousReceipt, this.oldPid, update.owner);
+  }
+
+  private async captureStartedOwner(): Promise<void> {
+    if (this.update.owner !== null) return;
+    this.update.owner = await this.deps.serviceOwner?.(this.input.root) ?? null;
+  }
+
+  private async requestStop(): Promise<void> {
+    if (this.update.owner) {
+      await this.control.call({ op: "shutdown" }, z.unknown()).catch(() => {
+        this.input.output.line("The connector did not acknowledge shutdown; waiting for its owned processes to close before continuing…");
+      });
+      return;
+    }
+    if (await this.deps.execute(this.update.definition.stop) !== 0) {
       await this.cancelDrain();
       throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
     }
-    this.stopped = true;
-    await waitForServiceExit(input, update.definition, deps, previousReceipt, this.oldPid);
   }
 
   /** The running connector's Codex owner must be idle; an older one without the control op is checked directly. */
@@ -246,7 +294,7 @@ class UpdateTransaction {
   }
 
   private async finish(outcome: NativeUpdateAttempt["outcome"], detail: string | null): Promise<void> {
-    await this.deps.recordAttempt(this.input.root, { ...this.update.attempt, outcome, detail: detail?.slice(0, 1_024) ?? null, finishedAt: new Date(this.deps.now()).toISOString() }).catch(() => undefined);
+    await finishUpdateAttempt(this.input.root, this.deps, this.update.attempt, outcome, detail);
   }
 
   /**
@@ -266,8 +314,16 @@ class UpdateTransaction {
     // Stopped but not swapped: the installation is unchanged, so the same
     // release comes back, confirmed or not (an unconfirmed stop left unloaded
     // would leave the computer offline).
-    if (this.stopped && this.update.wasRunning) await restartUnchanged(this.input, this.update.definition, this.deps, this.update.previous, this.oldPid);
+    if (this.stopped && this.update.wasRunning) await this.restartUnchanged();
+    else if (this.drained) await this.cancelDrain();
     await this.finish("failed", detail);
+  }
+
+  private async restartUnchanged(): Promise<void> {
+    await restartUnchanged(this.input, this.update.definition, this.deps, this.update.previous, this.oldPid, this.update.owner).catch(async () => {
+      await this.cancelDrain();
+      this.input.output.line("The unchanged connector could not be restarted; run `konteks-remote start`.");
+    });
   }
 
   private async rollBack(successor: NativeRuntimeRecord, detail: string): Promise<void> {
@@ -313,7 +369,10 @@ function closedProtocolRefusal(error: unknown): boolean {
  * no lock, and the next start recovers what it journaled. One that outlives
  * the grace has its processes ended.
  */
-function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null, pid: number | null): Promise<void> {
+function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null, pid: number | null, owner: NativeServiceProcessOwner | null = null): Promise<void> {
+  if (owner) return waitForWindowsServiceExit(owner, definition, {
+    ...deps, waiting: progressLines(input, deps, "Stopping the connector: it closes its agent sessions and relay first, which usually takes under a minute…", "still stopping the connector"),
+  }, input.output);
   return new ServiceExitWait(input, definition, deps, previousReceipt, pid).run();
 }
 
@@ -351,9 +410,9 @@ class ServiceExitWait {
   }
 
   private async exited(): Promise<boolean> {
-    const running = await this.deps.execute(this.definition.status) === 0;
+    const status = await this.deps.execute(this.definition.status);
     this.gone = this.watched !== null && !this.watched.alive(this.watched.pid);
-    return !running && await stopConfirmed(this.input, this.deps, this.gone, this.previousReceipt);
+    return serviceIsStopped(status, this.deps) && await stopConfirmed(this.input, this.deps, this.gone, this.previousReceipt);
   }
 
   /** One that outlives the grace has its processes ended, once. */
@@ -365,6 +424,10 @@ class ServiceExitWait {
     this.forced = true;
     return true;
   }
+}
+
+function serviceIsStopped(status: number | null, deps: NativeUpdateTransactionDeps): boolean {
+  return deps.serviceOwner ? status === 1 : status !== 0;
 }
 
 /** A stopped service is gone once its process is, or once it wrote a shutdown receipt newer than the one before the stop. */
@@ -385,7 +448,8 @@ function cappedPoll(deps: NativeUpdateTransactionDeps, cap: number): number {
  * A process still running after the whole stop deadline is ended first, so
  * the start is not mistaken for "already running".
  */
-async function restartUnchanged(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previous: NativeRuntimeRecord, pid: number | null): Promise<void> {
+async function restartUnchanged(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previous: NativeRuntimeRecord, pid: number | null, owner: NativeServiceProcessOwner | null = null): Promise<void> {
+  if (owner) await endOwnedForRestart(owner, definition, deps);
   await endLingeringService(input, definition, deps, pid);
   input.output.line("The update did not go ahead; starting this computer's connector again on the release it had.");
   try {
@@ -398,6 +462,12 @@ async function restartUnchanged(input: NativeUpdateInput, definition: NativeServ
   input.output.line(back
     ? `${previous.bundleVersion} is running and answering again; nothing was changed.`
     : `${previous.bundleVersion} was started again but has not answered yet; run \`konteks-remote status\` in a minute.`);
+}
+
+async function endOwnedForRestart(owner: NativeServiceProcessOwner, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
+  if (!await owner.alive()) return;
+  await endWindowsServiceTask(definition, deps.execute);
+  await owner.terminate();
 }
 
 async function endLingeringService(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, pid: number | null): Promise<void> {
@@ -432,8 +502,20 @@ async function endProcessGroup(pid: number, root: string): Promise<void> {
  * receipt. A stop that does not finish ends the service's process group.
  */
 async function stopForRollback(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
+  const owner = await deps.serviceOwner?.(input.root) ?? null;
+  if (owner) return stopOwnedForRollback(input, definition, deps, owner);
+  await stopManagedForRollback(input, definition, deps);
+}
+
+async function stopOwnedForRollback(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, owner: NativeServiceProcessOwner): Promise<void> {
+  const record = await deps.readRecord(input.root);
+  await deps.control(input.root, record).call({ op: "shutdown" }, z.unknown()).catch(() => undefined);
+  await waitForServiceExit(input, definition, deps, null, owner.pid, owner);
+}
+
+async function stopManagedForRollback(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
   await deps.execute(definition.stop).catch(() => null);
-  const running = async () => await deps.execute(definition.status).catch(() => 0) === 0;
+  const running = async () => !serviceIsStopped(await deps.execute(definition.status).catch(() => deps.serviceOwner ? null : 0), deps);
   const stopMs = deps.stopDeadlineMs ?? 90_000;
   const deadline = deps.now() + stopMs;
   const progress = progressLines(input, deps, "Stopping the updated connector before restoring the previous release…", "still stopping the updated connector");

@@ -10,6 +10,8 @@ import {
   RuntimePermissionAnswerDeliveryRequestSchema,
   RuntimeAgentLoginDeliveryRequestSchema,
   type RuntimeAgentLoginDeliveryRequest,
+  RuntimeUpdateDeliveryRequestSchema,
+  type RuntimeUpdateDeliveryRequest,
   type RemoteExecutionRevisionControlDeliveryRequest,
   type RuntimePermissionAnswerDeliveryRequest,
   type DiagnosticCarrierCompanionDeliveryRequest,
@@ -57,7 +59,7 @@ type RelayState = "offline" | "connecting" | "handshaking" | "connected" | "reco
 
 /** What the relay may send once its handshake result has arrived, buffered until the handshake is adopted. */
 type InboundEnvelope = ToRuntimeRelayFrame | AssignmentReplyFrame | RelayAck | RelayReplayRequest | RuntimeCancellationDeliveryRequest
-  | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest;
+  | RuntimePermissionAnswerDeliveryRequest | RemoteExecutionRevisionControlDeliveryRequest | RuntimeAgentLoginDeliveryRequest | RuntimeUpdateDeliveryRequest;
 
 type DeliveryReceiver<R> = (request: R, connection: { connectionEpoch: number; assertCurrent(): void }) => Promise<void>;
 
@@ -79,7 +81,7 @@ interface SocketAttempt {
 
 /** Post-handshake envelopes in the order they are recognised; anything else must be a channel frame. */
 const POST_HANDSHAKE_SCHEMAS: ReadonlyArray<{ safeParse(value: unknown): { success: boolean; data?: unknown } }> = [
-  RuntimePermissionAnswerDeliveryRequestSchema, RuntimeAgentLoginDeliveryRequestSchema, RuntimeCancellationDeliveryRequestSchema,
+  RuntimePermissionAnswerDeliveryRequestSchema, RuntimeAgentLoginDeliveryRequestSchema, RuntimeUpdateDeliveryRequestSchema, RuntimeCancellationDeliveryRequestSchema,
   RemoteExecutionRevisionControlDeliveryRequestSchema, RelayReplayRequestSchema, RelayAckSchema, AssignmentReplyFrameSchema,
 ];
 
@@ -146,6 +148,8 @@ export interface RelayClientOptions {
     connectionEpoch: number;
     assertCurrent(): void;
   }) => Promise<void>;
+  /** A fixed signed runtime update, outside the work channel and its cursors. */
+  onRuntimeUpdate?: DeliveryReceiver<RuntimeUpdateDeliveryRequest>;
   /** Dedicated safety-control intake; never a mux cursor or receipt ACK. */
   onExecutionRevisionControl?: (request: RemoteExecutionRevisionControlDeliveryRequest, connection: {
     connectionEpoch: number;
@@ -547,6 +551,8 @@ export class RelayClient {
         return this.deliver(attempt, RuntimePermissionAnswerDeliveryRequestSchema.parse(value), "Answer", this.receiverFor(this.options.onPermissionAnswer), "Permission answer receiver is unavailable");
       case "runtime_agent_login_delivery":
         return this.deliverLogin(attempt, value);
+      case "runtime_update_delivery":
+        return this.deliverRuntimeUpdate(attempt, value);
       case "runtime_cancellation_delivery":
         return this.deliver(attempt, RuntimeCancellationDeliveryRequestSchema.parse(value), "Cancellation", this.receiverFor(this.options.onCancellation), "Cancellation receiver is unavailable");
       case "runtime_diagnostic_carrier_companion_delivery":
@@ -591,6 +597,16 @@ export class RelayClient {
       await this.deliver(attempt, RuntimeAgentLoginDeliveryRequestSchema.parse(value), "Login", this.receiverFor(this.options.onAgentLogin), "Agent login receiver is unavailable", false);
     } catch (error) {
       this.logger.warn({ err: error }, "agent login delivery dropped");
+    }
+  }
+
+  private async deliverRuntimeUpdate(attempt: SocketAttempt, value: unknown): Promise<void> {
+    try {
+      await this.deliver(attempt, RuntimeUpdateDeliveryRequestSchema.parse(value), "Runtime update", this.receiverFor(this.options.onRuntimeUpdate), "Runtime update receiver is unavailable", false);
+    } catch {
+      // The operation carries no diagnostics or secrets back to the browser.
+      // A refusal never tears down ordinary work transport.
+      this.logger.warn({ event: "runtime.update_delivery_refused" }, "runtime update delivery refused");
     }
   }
 

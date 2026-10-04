@@ -141,7 +141,7 @@ async function unpackGraft(record: GraftRecord, bytes: Buffer, node: string, dir
     await writeFile(archive, bytes, { mode: 0o600 });
     const unpacked = join(work, "graft");
     await mkdir(unpacked, { mode: 0o700 });
-    await run("tar", ["-xzf", archive, "-C", unpacked]);
+    await run("tar", ["-xzf", archive, "-C", unpacked], { windowsHide: true });
     if (!(await stat(cliOf(unpacked)).then(() => true, () => false))) throw new Error("the Graft package has no command in it");
     await mkdir(join(unpacked, "bin"), { recursive: true, mode: 0o700 });
     await copyFile(node, join(unpacked, "bin", "node"));
@@ -174,7 +174,7 @@ async function quietGraftUpdateCheck(home: string): Promise<void> {
 
 async function runGraft(tool: GraftTool, args: string[], cwd: string, timeoutMs = 10 * 60_000): Promise<string> {
   return await new Promise((resolveRun, reject) => {
-    const child = spawn(tool.node, [tool.cli, ...args], { cwd, env: graftEnv(), stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(tool.node, [tool.cli, ...args], { cwd, env: graftEnv(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let out = "";
     child.stdout.on("data", chunk => (out += String(chunk)));
     child.stderr.on("data", chunk => (out += String(chunk)));
@@ -201,7 +201,7 @@ function lastLine(text: string): string | undefined {
 }
 
 async function git(repo: string, args: string[]): Promise<string> {
-  return (await run("git", ["-C", repo, ...args], { maxBuffer: 16 * 1024 * 1024 })).stdout;
+  return (await run("git", ["-C", repo, ...args], { maxBuffer: 16 * 1024 * 1024, windowsHide: true })).stdout;
 }
 
 /** Whether this repository already has the Graft wiring onboarding sets up. */

@@ -1,4 +1,4 @@
-import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, allEqual, createLogger, type Logger } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema, allEqual, createLogger, type Logger, type RuntimeUpdateReport } from "@konteks/remote-common";
 
 import { z } from "zod";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
@@ -155,6 +155,7 @@ const CORE_PATHS = Object.freeze({
   gitKeys: (instanceId: string) => instancePath(instanceId, "git-keys"),
   // A coding agent login the person started from the site.
   agentLoginReport: (instanceId: string) => instancePath(instanceId, "agent-logins/report"),
+  runtimeUpdateReport: (instanceId: string) => instancePath(instanceId, "runtime-updates/report"),
   acceptedRelease: (instanceId: string) => instancePath(instanceId, "accepted-release"),
   // Uninstall: the runtime removes itself, lease-authenticated like the rest.
   retire: (instanceId: string) => instancePath(instanceId, "retire"),
@@ -851,6 +852,15 @@ export class CoreClient {
       method: "POST", path: CORE_PATHS.agentLoginReport(instanceId), body,
       schema: z.object({ accepted: z.boolean() }).strict(),
       idempotencyKey: `agent-login:${body.loginId}:${body.state}:${body.userCode ?? ""}:${body.verificationUrl ? createHash("sha256").update(body.verificationUrl).digest("base64url").slice(0, 16) : ""}`,
+    });
+  }
+
+  async reportRuntimeUpdate(instanceId: string, report: RuntimeUpdateReport): Promise<{ accepted: boolean }> {
+    const body = RuntimeUpdateReportSchema.parse(report);
+    return this.http.request({
+      method: "POST", path: CORE_PATHS.runtimeUpdateReport(instanceId), body,
+      schema: z.object({ accepted: z.boolean() }).strict(),
+      idempotencyKey: `runtime-update:${body.updateId}:${body.state}`,
     });
   }
 

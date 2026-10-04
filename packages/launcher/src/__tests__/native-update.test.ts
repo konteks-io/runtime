@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
+import { NATIVE_UPDATE_TARGET_ENV, bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { acquireNativeRootLock, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
@@ -61,6 +61,36 @@ async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0", openCode =
 }
 
 describe("native update staging and commit", () => {
+  it("refuses a changed fixed target before acquiring the installer lock, downloading, or staging files", async () => {
+    const f = await fixture();
+    const before = await readdir(join(f.root, "releases"));
+    const lock = acquireNativeRootLock(join(f.root, "installer"));
+    f.fetchFn.mockClear();
+    vi.stubEnv(NATIVE_UPDATE_TARGET_ENV, JSON.stringify({ bundleVersion: "1.2.0", manifestDigest: f.manifest.digest }));
+    try {
+      await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } })).rejects.toMatchObject({ code: "update_required" });
+      expect(f.fetchFn).not.toHaveBeenCalled();
+      expect(await readdir(join(f.root, "releases"))).toEqual(before);
+      expect(await readNativeRecord(f.root)).toEqual(f.installed);
+    } finally { lock.release(); }
+  });
+
+  it("pins the verified channel bytes across the installer lock so a moving latest release cannot change the requested update", async () => {
+    const f = await fixture();
+    vi.stubEnv(NATIVE_UPDATE_TARGET_ENV, JSON.stringify({ bundleVersion: "1.1.0", manifestDigest: f.manifest.digest }));
+    let channelReads = 0;
+    const fetchFn = vi.fn(async (url: string) => {
+      if (String(url).endsWith("native-manifest.json")) {
+        channelReads += 1;
+        return new Response(JSON.stringify(channelReads === 1 ? f.manifest : f.oldManifest));
+      }
+      return f.fetchFn(url);
+    });
+    const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, fetchFn: fetchFn as never } });
+    expect(staged).toMatchObject({ status: "staged", release: { manifest: { bundleVersion: "1.1.0", digest: f.manifest.digest } } });
+    expect(channelReads).toBe(1);
+  });
+
   it("offers a newer signed rc build with the same release core", async () => {
     const f = await fixture({ oldVersion: "0.7.6-rc.1", nextVersion: "0.7.6-rc.2" });
     expect(await checkNativeUpdate({ root: f.root, deps: { ...f.deps, manifest: f.manifest } })).toMatchObject({
@@ -592,6 +622,88 @@ describe("native update transaction", () => {
     const h = harness({ previous, running: false });
     await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: false });
     expect(h.calls).toEqual(["status", "commit"]);
+  });
+  it("drains and stops a Windows connector left running after Task Scheduler reports Ready", async () => {
+    const h = harness({ previous });
+    const execute = h.deps.execute;
+    h.deps.execute = async command => command.command === "status" ? 1 : execute(command);
+    let alive = true;
+    h.deps.serviceOwner = async () => ({ pid: 4242, alive: async () => alive, terminate: async () => { alive = false; h.calls.push("terminate-owned"); } });
+    h.deps.readStopReceipt = async () => "prior-stop";
+    h.deps.stopGraceMs = 2_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+    expect(h.calls).toContain("control:drain@release-prev");
+    expect(h.calls.indexOf("control:shutdown@release-prev")).toBeLessThan(h.calls.indexOf("terminate-owned"));
+    expect(h.calls.indexOf("terminate-owned")).toBeLessThan(h.calls.indexOf("commit"));
+  });
+  it("captures a queued Windows connector that starts while the update drains", async () => {
+    const h = harness({ previous });
+    let captures = 0, alive = true;
+    h.deps.serviceOwner = async () => {
+      h.calls.push("capture-owner");
+      if (++captures === 1) return null;
+      return { pid: 42, alive: async () => alive, terminate: async () => { alive = false; h.calls.push("terminate-owned"); } };
+    };
+    h.deps.stopGraceMs = 2_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated", restarted: true });
+    expect(captures).toBe(2);
+    expect(h.calls.indexOf("control:drain.status@release-prev")).toBeLessThan(h.calls.lastIndexOf("capture-owner"));
+    expect(h.calls.indexOf("control:shutdown@release-prev")).toBeLessThan(h.calls.indexOf("terminate-owned"));
+    expect(h.calls.indexOf("terminate-owned")).toBeLessThan(h.calls.indexOf("commit"));
+  });
+  it("lets Windows shutdown finish before ending the scheduled task", async () => {
+    const h = harness({ previous });
+    let alive = true;
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request, schema, options) => {
+        const result = await inner.call(request, schema, options);
+        if (request.op === "shutdown") alive = false;
+        return result;
+      } };
+    };
+    const terminate = vi.fn(async () => undefined);
+    h.deps.serviceOwner = async () => ({ pid: 4242, alive: async () => alive, terminate });
+    await runNativeUpdate({ root: "/root", output: h.output }, h.deps);
+    expect(h.calls.indexOf("control:shutdown@release-prev")).toBeLessThan(h.calls.indexOf("stop"));
+    expect(terminate).not.toHaveBeenCalled();
+  });
+  it("bounds an unacknowledged Windows shutdown by the captured process owner", async () => {
+    const h = harness({ previous });
+    let alive = true;
+    const control = h.deps.control;
+    h.deps.control = (root, record) => {
+      const inner = control(root, record);
+      return { call: async (request, schema, options) => {
+        if (request.op === "shutdown") throw new Error("socket closed before acknowledgement");
+        return inner.call(request, schema, options);
+      } };
+    };
+    h.deps.serviceOwner = async () => ({ pid: 42, alive: async () => alive, terminate: async () => { alive = false; h.calls.push("terminate-owned"); } });
+    h.deps.stopGraceMs = 2_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).resolves.toMatchObject({ state: "updated" });
+    expect(h.calls.indexOf("terminate-owned")).toBeLessThan(h.calls.indexOf("commit"));
+  });
+  it("terminalizes an update whose Windows ownership query cannot prove safety", async () => {
+    const h = harness({ previous });
+    h.deps.serviceOwner = async () => { throw new Error("ownership query failed"); };
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toThrow("ownership query failed");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed", detail: "ownership query failed" });
+    expect(h.calls).not.toContain("commit");
+    expect(h.calls).not.toContain("control:drain@release-prev");
+  });
+  it("preserves Windows processes and resumes a drain when the task cannot be queried or ended", async () => {
+    const h = harness({ previous });
+    const terminate = vi.fn();
+    h.deps.serviceOwner = async () => ({ pid: 42, alive: async () => true, terminate });
+    h.deps.execute = async command => { h.calls.push(command.command); return command.command === "status" ? 2 : command.command === "stop" ? 1 : 0; };
+    h.deps.stopGraceMs = 2_000;
+    await expect(runNativeUpdate({ root: "/root", output: h.output }, h.deps)).rejects.toMatchObject({ code: "temporarily_unavailable" });
+    expect(terminate).not.toHaveBeenCalled();
+    expect(h.calls).not.toContain("commit");
+    expect(h.calls).toContain("control:drain.cancel@release-prev");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "failed" });
   });
   it.each(["no_answer", "wrong_version", "new_failure"] as const)("rolls back to the previous release and restarts it when the gate fails (%s)", async gate => {
     const h = harness({ previous, gate });

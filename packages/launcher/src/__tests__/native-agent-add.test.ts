@@ -52,6 +52,35 @@ async function fixture() {
 }
 
 describe("native agent-add ownership lifecycle", () => {
+  it.each([0, 1])("uses the shared Windows connector stop before adding an agent while the task status is %s", async statusCode => {
+    const f = await fixture();
+    const stop = vi.fn(async () => { f.calls.push("owned-stop"); f.owner.release(); });
+    f.deps.execute = async command => { f.calls.push(command.command); return statusCode; };
+    try {
+      await runNativeAgentAdd({ root: f.root, agent: "dsh", output: createOutput({ json: true }) }, {
+        ...f.deps, platform: { ...f.deps.platform, os: "windows" },
+        serviceOwner: async () => ({ pid: 42, alive: async () => true, terminate: vi.fn() }), stop,
+      } as never);
+      expect(stop).toHaveBeenCalledOnce();
+      expect(f.calls.indexOf("drain.status")).toBeLessThan(f.calls.indexOf("owned-stop"));
+      expect(f.calls.indexOf("owned-stop")).toBeLessThan(f.calls.indexOf("add"));
+      expect(f.calls).not.toContain("stop");
+      expect(f.start).toHaveBeenCalledOnce();
+    } finally { f.owner.release(); }
+  });
+  it("resumes the existing Windows connector when the shared stop is refused before adding an agent", async () => {
+    const f = await fixture();
+    try {
+      await expect(runNativeAgentAdd({ root: f.root, agent: "dsh", output: createOutput({ json: true }) }, {
+        ...f.deps, platform: { ...f.deps.platform, os: "windows" },
+        serviceOwner: async () => ({ pid: 42, alive: async () => true, terminate: vi.fn() }),
+        stop: async () => { throw new Error("Windows refused the stop"); },
+      } as never)).rejects.toThrow("Windows refused the stop");
+      expect(f.calls).toContain("drain.cancel");
+      expect(f.add).not.toHaveBeenCalled();
+      expect(f.start).not.toHaveBeenCalled();
+    } finally { f.owner.release(); }
+  });
   it("waits for the stopped supervisor to release ownership before adding dsh and restarting", async () => {
     const f = await fixture();
     const sleep = f.deps.sleep;

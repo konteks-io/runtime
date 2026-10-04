@@ -24,6 +24,7 @@ import { prepareDeliveryGraft } from "./graft.js";
 import { earlierFailure, earlierFailureNote, keepLauncherCurrent, productionUpdateDeps, refreshInstalledLauncher, runNativeUpdate, selfUpdateNote } from "./update-transaction.js";
 import { productionUninstallDeps, uninstallNative } from "./uninstall.js";
 import type { NativeCliActions, NativeCommandContext } from "./cli.js";
+import { captureWindowsServiceOwner, endWindowsServiceTask, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
 
 const environment = () => sanitizeInheritedChildProcessEnv({ env: process.env });
 /** Runs one service or OS command and keeps how it ended; `--verbose` prints it. */
@@ -221,12 +222,19 @@ async function runReload(reload: NonNullable<NativeServiceDefinition["reload"]>,
  * the one the service manager runs; nothing where it names none.
  */
 async function forceStopService(definition: NativeServiceDefinition): Promise<void> {
+  if (nativePlatform().os === "windows") return forceStopWindowsService(definition);
   const pid = await servicePid(definition);
   if (!pid) return;
   try { process.kill(-pid, "SIGKILL"); }
   catch {
     try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
   }
+}
+
+async function forceStopWindowsService(definition: NativeServiceDefinition): Promise<void> {
+  const owner = await captureWindowsServiceOwner(dirname(definition.path));
+  await endWindowsServiceTask(definition, execute);
+  await owner?.terminate();
 }
 
 /** The pid the service manager runs for this service; null where it names none. */
@@ -285,6 +293,9 @@ interface NativeStopDeps {
   platform: ReturnType<typeof nativePlatform>;
   deadlineMs?: number;
   pollMs?: number;
+  serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
+  shutdown?: (root: string) => Promise<void>;
+  stopGraceMs?: number;
 }
 
 /** How long a command waits for a connector that is still starting (a fresh start takes about a minute). */
@@ -473,25 +484,61 @@ const productionNativeStopDeps: NativeStopDeps = {
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   now: Date.now,
   platform: nativePlatform(),
+  ...(process.platform === "win32" ? { serviceOwner: captureWindowsServiceOwner, shutdown: shutdownNativeConnector } : {}),
 };
+
+async function shutdownNativeConnector(root: string): Promise<void> {
+  const record = await readNativeRecord(root);
+  await new SupervisorControl({ supervisorData: join(root, "supervisor") }, record.controlPort).call({ op: "shutdown" }, z.unknown());
+}
 
 /** launchctl bootout acknowledges deregistration before asynchronous owned
  * process cleanup has necessarily finished. A new private receipt is written
  * only after every daemon shutdown step succeeds. */
 export async function stopNativeConnector(input: NativeCommandContext, deps: NativeStopDeps = productionNativeStopDeps): Promise<void> {
   const definition = await deps.definition(input.root);
+  const owner = await deps.serviceOwner?.(input.root) ?? null;
+  if (owner) return stopOwnedNativeConnector(input, definition, deps, owner);
   const stoppedCodes = stoppedExitCodes(deps.platform.os);
   assertRunningBeforeStop(await deps.execute(definition.status), stoppedCodes);
   const previousReceipt = await deps.readReceipt(input.root);
+  await executeNativeStop(definition, deps);
+  input.output.line("Stopping Konteks on this computer…");
+  await waitForStopReceipt(input.root, definition, deps, { previousReceipt, stoppedCodes });
+  input.output.line(STOPPED_CONNECTOR);
+}
+
+const STOPPED_CONNECTOR = "Konteks is stopped on this computer. Your sign-ins and work are kept; konteks-remote start starts it again.";
+
+async function executeNativeStop(definition: NativeServiceDefinition, deps: NativeStopDeps): Promise<void> {
   const stopRun = serviceRun(await (deps.run ?? deps.execute)(definition.stop));
   if (stopRun.code !== 0) throw new RemoteInstanceError("temporarily_unavailable", `Konteks could not be stopped on this computer (${new NativeServiceCommandError("stop", definition.stop, stopRun).message}); konteks-remote --verbose stop shows every step.`);
+}
+
+async function stopOwnedNativeConnector(input: NativeCommandContext, definition: NativeServiceDefinition, deps: NativeStopDeps, owner: NativeServiceProcessOwner): Promise<void> {
+  await requestOwnedShutdown(input, definition, deps);
   input.output.line("Stopping Konteks on this computer…");
+  await waitForWindowsServiceExit(owner, definition, {
+    execute: deps.run ?? deps.execute, now: deps.now, sleep: deps.sleep,
+    stopDeadlineMs: deps.deadlineMs ?? 30_000, stopGraceMs: deps.stopGraceMs ?? 15_000,
+    ...(deps.pollMs === undefined ? {} : { pollMs: deps.pollMs }),
+  }, input.output);
+  input.output.line(STOPPED_CONNECTOR);
+}
+
+async function requestOwnedShutdown(input: NativeCommandContext, definition: NativeServiceDefinition, deps: NativeStopDeps): Promise<void> {
+  if (!deps.shutdown) return executeNativeStop(definition, deps);
+  await deps.shutdown(input.root).catch(() => {
+    input.output.line("The connector did not acknowledge shutdown; waiting for its owned processes to close…");
+  });
+}
+
+async function waitForStopReceipt(root: string, definition: NativeServiceDefinition, deps: NativeStopDeps, before: { previousReceipt: string | null; stoppedCodes: readonly number[] }): Promise<void> {
   const deadline = deps.now() + (deps.deadlineMs ?? 30_000);
-  while (!await stopConfirmed(input.root, definition, deps, { previousReceipt, stoppedCodes })) {
+  while (!await stopConfirmed(root, definition, deps, before)) {
     if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "Konteks stopped, but its agents may still be closing. Wait a moment, then check with konteks-remote status.");
     await deps.sleep(deps.pollMs ?? 250);
   }
-  input.output.line("Konteks is stopped on this computer. Your sign-ins and work are kept; konteks-remote start starts it again.");
 }
 
 /**
@@ -527,6 +574,7 @@ export async function startNativeConnector(
     /** How long the service is watched after it starts (default 3 s where its status says it runs: Windows, systemd; none on macOS). */
     settleMs?: number;
     sleep?: (ms: number) => Promise<void>;
+    serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
   } = {},
 ): Promise<void> {
   const { platform, roots, executeService, definitionOf } = startDefaults(deps);
@@ -538,7 +586,7 @@ export async function startNativeConnector(
   );
   const definition = await definitionOf(input.root);
   const stoppedCodes = stoppedExitCodes(platform.os);
-  const serviceState = () => readServiceState(executeService, definition, stoppedCodes);
+  const serviceState = () => readServiceState(executeService, definition, stoppedCodes, windowsOwnerReader(input.root, platform.os, deps.serviceOwner));
   if ((await serviceState()) === "running") {
     await assertControlAnswers(input.root, installation.record.controlPort);
     input.output.line(ALREADY_RUNNING);
@@ -585,15 +633,25 @@ function startDefaults(deps: { roots?: readonly EmbeddedReleaseRoot[]; platform?
 const ALREADY_RUNNING = "Konteks is already running on this computer; konteks-remote status shows how it is doing.";
 
 /** Running or stopped as the service manager says; anything else cannot prove this root is safe to rewrite. */
-async function readServiceState(executeService: NativeServiceExecute, definition: NativeServiceDefinition, stoppedCodes: readonly number[]): Promise<"running" | "stopped"> {
+async function readServiceState(executeService: NativeServiceExecute, definition: NativeServiceDefinition, stoppedCodes: readonly number[], owner?: () => Promise<NativeServiceProcessOwner | null>): Promise<"running" | "stopped"> {
   let code: number | null;
   try { code = serviceRun(await executeService(definition.status)).code; }
   catch { code = null; }
   const stopped = code !== null && stoppedCodes.includes(code);
-  verbose(`service state: ${code === 0 ? "running" : stopped ? "stopped" : `unknown (status exited ${code ?? "without a code"})`}`);
+  logServiceState(code, stopped);
   if (code === 0) return "running";
+  if (owner && await owner()) return "running";
   if (stopped) return "stopped";
   throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation is stopped. Inspect and stop only this installation's service before retrying start; identity and local work are unchanged.");
+}
+
+function windowsOwnerReader(root: string, os: HostOs, owner: ((root: string) => Promise<NativeServiceProcessOwner | null>) | undefined): (() => Promise<NativeServiceProcessOwner | null>) | undefined {
+  if (os !== "windows") return undefined;
+  return () => (owner ?? captureWindowsServiceOwner)(root);
+}
+
+function logServiceState(code: number | null, stopped: boolean): void {
+  verbose(`service state: ${code === 0 ? "running" : stopped ? "stopped" : `unknown (status exited ${code ?? "without a code"})`}`);
 }
 
 /** A registered or starting service whose control socket does not answer holds the port; stopping it is the person's step. */
@@ -679,6 +737,8 @@ interface NativeAgentAddDeps {
   ensurePersonal?: typeof ensurePersonalAgent;
   /** After the restart: sign the agent in and say whether it is ready. */
   closeAgents?: (input: Parameters<typeof closeAgentSetup>[0]) => Promise<void>;
+  stop?: (input: NativeCommandContext) => Promise<void>;
+  serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
 }
 
 const productionAgentAddDeps: NativeAgentAddDeps = {
@@ -693,6 +753,7 @@ const productionAgentAddDeps: NativeAgentAddDeps = {
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   now: Date.now,
   platform: nativePlatform(),
+  ...(process.platform === "win32" ? { stop: stopNativeConnector, serviceOwner: captureWindowsServiceOwner } : {}),
 };
 
 /**
@@ -711,11 +772,16 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
   }
   const setUp = await prepareAgent(input, deps, host, listed);
   const cycle = new ServiceCycle(deps, await deps.serviceDefinition(input.root));
-  const wasRunning = await cycle.running("The service manager cannot confirm this installation's service state. Inspect only this installation's service before adding an agent; identity and local work are unchanged.");
+  const wasRunning = await agentServiceRunning(input.root, deps, cycle);
   const foreground = !wasRunning && await runsInTerminal(deps, input.root, previous);
   cycle.resetStopDeadline();
   if (wasRunning || foreground) await stopForAgentAdd(input, deps, cycle, previous, foreground);
   await new AgentAddition(input, deps, cycle, previous, { wasRunning, foreground, setUp }).run();
+}
+
+async function agentServiceRunning(root: string, deps: NativeAgentAddDeps, cycle: ServiceCycle): Promise<boolean> {
+  if (await cycle.running("The service manager cannot confirm this installation's service state. Inspect only this installation's service before adding an agent; identity and local work are unchanged.")) return true;
+  return (await deps.serviceOwner?.(root) ?? null) !== null;
 }
 
 /**
@@ -763,6 +829,7 @@ async function stopForAgentAdd(input: NativeCommandContext & { agent: string }, 
     waiting: count => `waiting for ${count} active assignment(s) before installing ${input.agent}…`,
     timedOut: "Agent installation waited 15 minutes for active work; the runtime remains running and drained so it can be inspected safely.",
   });
+  if (await stopWindowsForAgentChange(input, deps, cycle, control)) return;
   if (!foreground) {
     await cycle.stop("The native runtime drained but could not stop; its installation was not changed.", "The native runtime did not finish stopping; its installed agents were not changed.");
     return;
@@ -770,6 +837,20 @@ async function stopForAgentAdd(input: NativeCommandContext & { agent: string }, 
   await control.call({ op: "shutdown" }, z.unknown());
   input.output.line("Konteks is running in a terminal here, not as its background service; stopping it there to add the agent…");
   cycle.resetStopDeadline();
+}
+
+async function stopWindowsForAgentChange(input: NativeCommandContext, deps: NativeAgentAddDeps, cycle: ServiceCycle, control: Pick<SupervisorControl, "call">): Promise<boolean> {
+  if (!usesWindowsStop(deps)) return false;
+  await deps.stop!(input).catch(async error => {
+    await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
+    throw error;
+  });
+  cycle.resetStopDeadline();
+  return true;
+}
+
+function usesWindowsStop(deps: NativeAgentAddDeps): boolean {
+  return deps.platform.os === "windows" && deps.stop !== undefined;
 }
 
 /** The record change of `agent add`, and its rollback to the previous record when anything after it fails. */
@@ -851,11 +932,18 @@ class AgentAddition {
   }
 
   private async stopNewService(): Promise<void> {
+    if (usesWindowsStop(this.deps)) return this.stopNewWindowsService();
     const { cycle, deps } = this;
     const code = await deps.execute(cycle.definition.status);
     if (code === 0 && await deps.execute(cycle.definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The new service could not be stopped before agent rollback.");
     if (code !== 0 && !cycle.stoppedCode(code)) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm the new service stopped before agent rollback.");
     await cycle.awaitStopped("The new service did not finish stopping before agent rollback.");
+  }
+
+  private async stopNewWindowsService(): Promise<void> {
+    const code = await this.deps.execute(this.cycle.definition.status);
+    if (code !== 1 || await this.deps.serviceOwner?.(this.input.root)) await this.deps.stop!(this.input);
+    this.cycle.resetStopDeadline();
   }
 }
 

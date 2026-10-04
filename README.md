@@ -59,9 +59,18 @@ statistics are off, and its files stay out of your commits through
 
 ### Install from the Konteks app
 
-Create a runtime in the Konteks app (Runtimes, Connect) and copy the command
-it shows. It carries only a non-secret activation id; the activation code is
-asked for without echo.
+Create a runtime in the Konteks app (Runtimes, Connect). On Windows, choose
+**Download Windows installer** and open `konteks-runtime-setup.cmd` from
+Downloads on the computer you want to connect. Follow the setup window and
+approve Windows' installation prompt; it may show "Unknown publisher".
+Enter the one-time code shown in the app when setup asks for it. The file
+contains only the non-secret activation id, and code entry is not echoed.
+Keep setup open until it finishes, then return to the app to check that the
+computer is ready. If setup fails, the window stays open with its error and
+retry instructions.
+
+On macOS and Linux, or with **Use a terminal instead**, copy the command
+shown in the app. These are the terminal entry points:
 
 ```sh
 curl -fsSL https://github.com/konteks-io/runtime/releases/latest/download/install.sh | sh -s -- --activation-id <id>
@@ -380,6 +389,23 @@ transactionally: the new release is staged, work is drained, the service is
 swapped and health-gated, and the previous release is restored if the gate
 fails. A release that is being checked takes no new work. Konteks can also
 require an update when a release is below its minimum.
+
+On a connected runtime's page, choose **Update this computer** to request the
+signed release Konteks accepts. The computer must remain on and connected;
+the update waits for active work and may briefly disconnect it. The app shows
+**Update complete** only after a healthy replacement reconnects and Konteks
+confirms the requested version and signed release. A refused or failed update
+shows a retry instruction. Older runtimes need the installer run once to
+enable this action. `konteks-remote update` remains available in a terminal.
+
+The Windows bootstrap shows its download, verification, installation and
+runtime update stages. Approve the Windows elevation prompt to install the
+command; cancelling it gives a retry instruction. If Windows Installer fails,
+the bootstrap prints its error code and a retained `logs/installer-*.log` path
+under `%USERPROFILE%\AppData\Local\konteks-remote`. A successful MSI that
+requests a Windows restart continues to connect or update the runtime and
+reports the restart requirement. The bootstrap's `-Update` also refreshes the
+MSI command and can require elevation.
 
 ### Releasing
 

@@ -46,6 +46,9 @@ describe("native background service definitions", () => {
     expect(script).toContain(`$env:KONTEKS_SERVICE_ROOT = '${root.replace(/'/g, "''")}'`);
     expect(script).toContain('serve --root "%KONTEKS_SERVICE_ROOT%" >> "%KONTEKS_SERVICE_LOG%" 2>&1');
     expect(script).toContain('exit $connector.ExitCode');
+    // A hidden PowerShell host still creates a console for cmd unless this
+    // ProcessStartInfo option is set (Windows installation RCA 2026-10-04).
+    expect(script).toContain('$start.CreateNoWindow = $true');
     const run = vi.fn(() => 17), quit = vi.fn();
     runInNewContext(helper!.contents, { WScript: { CreateObject: () => ({ Run: run }), Quit: quit } });
     expect(run).toHaveBeenCalledWith(expect.stringContaining('-EncodedCommand'), 0, true);
@@ -104,7 +107,13 @@ describe("native background service definitions", () => {
     // Status means running, not registered: `schtasks /Query` succeeds for a stopped task too.
     expect(service.status.command).toBe('powershell.exe');
     expect(service.status.args.slice(0, 3)).toEqual(['-NoProfile', '-NonInteractive', '-Command']);
-    expect(service.status.args[3]).toBe(`$task = Get-ScheduledTask -TaskPath '\\' -TaskName '${service.label}' -ErrorAction SilentlyContinue; if ($task -and $task.State -eq 'Running') { exit 0 }; exit 1`);
+    expect(service.status.args[3]).toContain("-ErrorAction Stop");
+    expect(service.status.args[3]).toContain("$task.State -in @('Running', 'Queued')");
+    expect(service.status.args[3]).toContain("$task.State -in @('Ready', 'Disabled')");
+    // Failure to query a task must not masquerade as a stopped task whose
+    // RestartOnFailure ownership it is safe to leave registered.
+    expect(service.status.args[3]).toContain("CmdletizationQuery_NotFound*");
+    expect(service.status.args[3]).toContain("exit 2");
   });
 
   it("starts by rewriting and re-registering the definition, so a start after an update runs the new release", async () => {

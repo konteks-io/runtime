@@ -86,6 +86,48 @@ describe("relay socket lease rotation (2026-10-03)", () => {
 });
 
 describe("native runtime relay handshake validation boundary", () => {
+  const runtimeUpdate = () => ({ type: "runtime_update_delivery", method: "POST", path: { instanceId: "instance" },
+    nodeId: "node", connectionRef: "connection", connectionEpoch: 7,
+    intent: { updateId: "update", tenantId: "tenant", instanceId: "instance", leaseId: "lease", runnerIncarnation: "process",
+      targetBundle: "1.1.0", manifestDigest: "a".repeat(43), deadlineAt: "2026-09-06T00:10:00.000Z" },
+    keyId: "control", nonce: "N".repeat(22), issuedAt: confirmed.runtimeReconciliation.acceptedAt,
+    expiresAt: "2026-09-06T00:00:30.000Z", signature: "A".repeat(86) });
+
+  it.each(["current", "epoch", "refused"] as const)("routes a fixed runtime update outside mux/ACKs and keeps work transport available: %s", async mode => {
+    const onRuntimeUpdate = vi.fn<NonNullable<RelayClientOptions["onRuntimeUpdate"]>>(async (_request, connection) => {
+      connection.assertCurrent();
+      if (mode === "refused") throw new Error("update unavailable");
+    });
+    const f = fixture({ onRuntimeUpdate });
+    try {
+      f.socket.message(confirmed); await flush(); f.socket.send.mockClear();
+      f.socket.message({ ...runtimeUpdate(), connectionEpoch: mode === "epoch" ? 8 : 7 }); await flush();
+      expect(f.mux.receive).not.toHaveBeenCalled();
+      expect(f.socket.send).not.toHaveBeenCalled();
+      expect(f.socket.close).not.toHaveBeenCalled();
+      if (mode === "epoch") expect(onRuntimeUpdate).not.toHaveBeenCalled();
+      else {
+        expect(onRuntimeUpdate).toHaveBeenCalledOnce();
+        const guard = onRuntimeUpdate.mock.calls[0]![1].assertCurrent;
+        f.client.rehandshake("replacement");
+        expect(guard).toThrow("Runtime update socket ownership");
+      }
+    } finally { f.client.stop(); }
+  });
+
+  it("buffers a fixed runtime update until durable handshake adoption completes", async () => {
+    const onRuntimeUpdate = vi.fn<NonNullable<RelayClientOptions["onRuntimeUpdate"]>>(async (_request, connection) => connection.assertCurrent());
+    const f = delayedAdoption({ onRuntimeUpdate });
+    try {
+      await flush(); f.socket.message(runtimeUpdate()); await flush();
+      expect(onRuntimeUpdate).not.toHaveBeenCalled();
+      f.adoption.resolve(); await flush();
+      expect(onRuntimeUpdate).toHaveBeenCalledOnce();
+      expect(f.onFrame).not.toHaveBeenCalled();
+      expect(f.socket.send).not.toHaveBeenCalled();
+    } finally { f.client.stop(); }
+  });
+
   it("routes a current relay replay request to the mux without treating it as an ack or data frame", async () => {
     const f = fixture();
     try {

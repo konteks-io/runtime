@@ -12,6 +12,7 @@ import {
   AgentLoginOptionIdSchema,
   ON_COMPUTER_LOGIN_OPTION,
   REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
+  REMOTE_RUNTIME_UPDATE_CAPABILITY,
   SystemClock,
   createLogger,
   parseRfc3339,
@@ -117,6 +118,8 @@ import { PlanningTerminalDirectiveProcessor } from "./work/planning-terminal-dir
 import { ControllerDirectivePoller } from "./work/controller-directive-poller.js";
 import { DurableSearchAssignmentCarrier } from "./work/search-assignment-carrier.js";
 import { NativeUpdateCoordinator, type NativeUpdateCoordinatorOptions } from "./native/update.js";
+import { RuntimeUpdateReceiver, type RuntimeUpdateScope } from "./native/runtime-update.js";
+import { RuntimeUpdateStore } from "./native/runtime-update-store.js";
 import type { NativeUpdateLedger } from "./native/update-ledger.js";
 import { evaluateHeartbeatLiveness, isCredentialRefusal, leaseLapseNeedsRestart } from "./heartbeat/liveness.js";
 
@@ -290,6 +293,7 @@ export class Supervisor {
   private pullTimer: NodeJS.Timeout | null = null;
   private reaperTimer: NodeJS.Timeout | null = null;
   private updates: NativeUpdateCoordinator | null = null;
+  private runtimeUpdates: RuntimeUpdateReceiver | null = null;
   private muxTimer: NodeJS.Timeout | null = null;
   private cancellationTimer: NodeJS.Timeout | null = null;
   private cancellationReplay: CancellationReplay | null = null;
@@ -530,7 +534,7 @@ export class Supervisor {
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
       additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : []),
-        ...(this.integrationCarrier ? integrationTaskCapabilities(this.runners.keys()) : [])],
+        ...(this.integrationCarrier ? integrationTaskCapabilities(this.runners.keys()) : []), ...this.runtimeUpdateCapabilities()],
       decorateAgents: agents => this.withAntigravityDownload(agents),
       // Previews reach a viewer only over the relay's preview channel.
       previewReady: () => this.previewCapable(),
@@ -642,6 +646,7 @@ export class Supervisor {
       validateHandshake: result => this.validateRelayHandshake(result),
       onConnected: result => this.onRelayConnected(result),
       onAgentLogin: request => this.onAgentLogin(request, verifier),
+      onRuntimeUpdate: (request, connection) => this.receiveRuntimeUpdate(request, connection, verifier),
       onPermissionAnswer: (request, connection) => this.receivePermissionAnswer(request, connection, verifier),
       onCancellation: (request, connection) => this.receiveCancellation(request, connection, verifier),
       onDiagnosticCompanion: (request, connection) => this.receiveDiagnosticCompanion(request, connection, verifier),
@@ -787,6 +792,66 @@ export class Supervisor {
   private ownerUnchanged(owner: CapturedOwner): boolean {
     return !this.stopping && this.nativeOwnership === owner.ownership && this.lease.current() === owner.lease &&
       this.instanceId === owner.instanceId && this.workspaceId === owner.workspaceId && this.runnerIncarnation === owner.runnerIncarnation;
+  }
+
+  private receiveRuntimeUpdate(request: RelayRequestOf<"onRuntimeUpdate">, connection: RelayConnectionOf<"onRuntimeUpdate">, verifier: CoreSignatureVerifier): Promise<void> {
+    const scope = this.runtimeUpdateScope(connection);
+    const receiver = this.ensureRuntimeUpdates(verifier);
+    if (!scope || !receiver) throw new RemoteInstanceError("recovery_required", "Runtime update ownership is unavailable.");
+    return receiver.receive(request, scope);
+  }
+
+  private runtimeUpdateScope(connection: RelayConnectionOf<"onRuntimeUpdate">): RuntimeUpdateScope | null {
+    const owner = this.captureOwner();
+    const accepted = this.recoveryAuthority();
+    if (!owner.lease || !owner.instanceId || !owner.workspaceId || !accepted) return null;
+    const claims = decodeLeaseClaims(owner.lease.lease, { instanceId: owner.instanceId, audience: LEASE_AUDIENCE });
+    return { instanceId: owner.instanceId, tenantId: owner.workspaceId, leaseId: claims.jti,
+      runnerIncarnation: owner.runnerIncarnation, connectionEpoch: connection.connectionEpoch, leaseExpiresAt: owner.lease.expiresAt,
+      assertCurrent: () => this.assertRuntimeUpdateOwner(owner, accepted, connection) };
+  }
+
+  private assertRuntimeUpdateOwner(owner: CapturedOwner, accepted: string, connection: RelayConnectionOf<"onRuntimeUpdate">): void {
+    connection.assertCurrent();
+    this.assertRuntimeUpdateAuthority(owner, accepted);
+  }
+
+  private assertRuntimeUpdateAuthority(owner: CapturedOwner, accepted: string): void {
+    if (!this.ownerUnchanged(owner) || !this.leaseUsable() || this.recoveryAuthority() !== accepted) {
+      throw new RemoteInstanceError("recovery_required", "Runtime update ownership is no longer current.");
+    }
+    owner.ownership?.assertOwned();
+  }
+
+  private captureRuntimeUpdateReportOwner(): () => void {
+    const owner = this.captureOwner();
+    const accepted = this.recoveryAuthority();
+    if (!accepted) throw new RemoteInstanceError("recovery_required", "Runtime update reporting ownership is unavailable.");
+    const assertCurrent = () => this.assertRuntimeUpdateAuthority(owner, accepted);
+    assertCurrent();
+    return assertCurrent;
+  }
+
+  private runtimeUpdateCapabilities(): string[] {
+    if (!this.options.native?.update || !this.relay || !this.recoveryAuthority()) return [];
+    return new CoreSignatureVerifier(this.roots).configured ? [REMOTE_RUNTIME_UPDATE_CAPABILITY] : [];
+  }
+
+  private ensureRuntimeUpdates(verifier = new CoreSignatureVerifier(this.roots)): RuntimeUpdateReceiver | null {
+    const update = this.options.native?.update;
+    if (!update || !verifier.configured) return null;
+    this.runtimeUpdates ??= new RuntimeUpdateReceiver({
+      verifier,
+      store: new RuntimeUpdateStore(this.store.path("runtime-updates.json"), this.stateMutations.run),
+      coordinator: () => this.ensureUpdates(),
+      now: () => this.clock.coreNow(),
+      proof: () => ({ bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION, manifestDigest: this.manifestDigest,
+        runnerIncarnation: this.runnerIncarnation, ready: this.nativeRelease !== null && !this.onUpdateProbation && this.recoveryAuthority() !== null }),
+      readLedger: update.readLedger,
+      captureReportOwner: () => this.captureRuntimeUpdateReportOwner(),
+      report: report => this.core.reportRuntimeUpdate(this.instanceId!, report),
+    });
+    return this.runtimeUpdates;
   }
 
   private composeTransport(): void {
@@ -1599,6 +1664,7 @@ export class Supervisor {
     this.reaperTimer.unref();
     this.previews.startIdleSweep();
     this.ensureUpdates()?.start();
+    this.ensureRuntimeUpdates()?.start();
   }
 
   /**
@@ -1631,6 +1697,9 @@ export class Supervisor {
       this.validateRelayHandshake(result);
       this.transport.resumeAfterRecovery();
       await this.work.reports.flushAll();
+      void this.ensureRuntimeUpdates()?.recover().catch(() => {
+        this.logger.warn({ event: "runtime.update_report_pending" }, "runtime update outcome will be retried");
+      });
     } catch (error) {
       this.logger.warn({ err: error }, "reconciliation failed after relay connect; retrying on next handshake");
       this.relay?.rehandshake("reconciliation-failed");
@@ -2931,6 +3000,7 @@ export class Supervisor {
     stopInterval(this.livenessTimer);
     this.livenessTimer = null;
     this.updates?.stop();
+    this.runtimeUpdates?.stop();
     stopInterval(this.muxTimer);
     stopInterval(this.cancellationTimer);
   }

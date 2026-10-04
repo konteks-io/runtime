@@ -1,9 +1,10 @@
 import { sign } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bundleManifestSigningBytes, computeBundleManifestDigest, createLogger } from "@konteks/remote-common";
+import { NATIVE_UPDATE_TARGET_ENV, bundleManifestSigningBytes, computeBundleManifestDigest, createLogger } from "@konteks/remote-common";
 import { buildReleaseFixture } from "@konteks/remote-release";
 import { NativeUpdateCoordinator } from "../native/update.js";
 import { readNativeUpdateLedger, recordNativeUpdateAttempt, type NativeUpdateAttempt, type NativeUpdateLedger } from "../native/update-ledger.js";
@@ -24,7 +25,7 @@ function manifests() {
   return { trust, same: signed("1.0.0"), newer: signed("1.1.0") };
 }
 
-function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdateLedger; canApply?: boolean; trust?: unknown[]; now?: () => number; acceptedRelease?: () => Promise<{ bundleVersion: string } | null> }) {
+function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdateLedger; canApply?: boolean; trust?: unknown[]; now?: () => number; acceptedRelease?: () => Promise<{ bundleVersion: string; manifestDigest?: string } | null> }) {
   const m = manifests();
   const launch = vi.fn(async () => ({ pid: 4242 }));
   const fetchManifest = vi.fn(async () => input.manifest === "same" ? m.same : m.newer);
@@ -41,6 +42,29 @@ function coordinator(input: { manifest?: "same" | "newer"; ledger?: NativeUpdate
 const attempt = (over: Partial<NativeUpdateAttempt>): NativeUpdateAttempt => ({ id: `a-${Math.random()}`, bundleVersion: "1.1.0", manifestDigest: "d", releaseId: "release-x", reason: "unattended", startedAt: "2026-09-15T11:00:00Z", finishedAt: "2026-09-15T11:05:00Z", outcome: "rolled_back", detail: null, ...over });
 
 describe("native update coordinator", () => {
+  it("refuses a site update when the verified channel no longer names its frozen target", async () => {
+    const f = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.1.0", manifestDigest: "another-manifest" }) });
+    expect(await f.c.apply("operator", { bundleVersion: "1.1.0", manifestDigest: "another-manifest" })).toMatchObject({ started: false, reason: "stale_target" });
+    expect(f.launch).not.toHaveBeenCalled();
+  });
+  it("refuses a site update when Core accepts another digest of the same bundle", async () => {
+    const f = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.1.0", manifestDigest: "another-manifest" }) });
+    expect(await f.c.apply("operator", { bundleVersion: "1.1.0", manifestDigest: f.m.newer.digest })).toMatchObject({ started: false, reason: "stale_target" });
+    expect(f.launch).not.toHaveBeenCalled();
+  });
+  it("revalidates the signed delivery's owner after asynchronous update checks and before launch", async () => {
+    let digest = "";
+    const f = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.1.0", manifestDigest: digest }) });
+    digest = f.m.newer.digest;
+    await expect(f.c.apply("operator", { bundleVersion: "1.1.0", manifestDigest: f.m.newer.digest }, () => { throw new Error("owner changed"); })).rejects.toThrow("owner changed");
+    expect(f.launch).not.toHaveBeenCalled();
+  });
+  it("withdraws launch permission when another drain starts during asynchronous Core checks", async () => {
+    const state = { canApply: true, acceptedRelease: async (): Promise<{ bundleVersion: string }> => { state.canApply = false; return { bundleVersion: "1.1.0" }; } };
+    const f = coordinator(state);
+    expect(await f.c.apply("periodic")).toMatchObject({ started: false, reason: "draining (user)" });
+    expect(f.launch).not.toHaveBeenCalled();
+  });
   it("installs unattended only the release Core accepts", async () => {
     const ahead = coordinator({ acceptedRelease: async () => ({ bundleVersion: "1.0.0" }) });
     expect(await ahead.c.apply("periodic")).toMatchObject({ started: false, reason: "Konteks accepts 1.0.0, not 1.1.0 yet; staying on this one until it does" });
@@ -186,12 +210,69 @@ describe("native update ledger", () => {
 });
 
 describe("native updater launch", () => {
+  it("waits for asynchronous spawn admission and reports a denied spawn without an unhandled child error", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-update-spawn-refusal-")); roots.push(root);
+    const child = Object.assign(new EventEmitter(), { pid: undefined, unref: vi.fn() });
+    const spawnFn = vi.fn(() => {
+      queueMicrotask(() => {
+        // Observe the missing listener safely in the pre-fix baseline.
+        if (child.listenerCount("error") > 0) child.emit("error", new Error("spawn denied"));
+      });
+      return child;
+    });
+    await expect(launchNativeUpdater({ root, executable: join(root, "missing-connector"), os: "windows",
+      logPath: join(root, "update.log"), spawnFn: spawnFn as never })).rejects.toThrow("spawn denied");
+    expect(child.unref).not.toHaveBeenCalled();
+  });
+
+  it("retains an immediate updater exit until the coordinator attaches its observer", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-update-immediate-exit-")); roots.push(root);
+    const child = Object.assign(new EventEmitter(), { pid: 77, unref: vi.fn() });
+    const spawnFn = vi.fn(() => {
+      queueMicrotask(() => { child.emit("spawn"); child.emit("exit", 7); });
+      return child;
+    });
+    const launched = await launchNativeUpdater({ root, executable: join(root, "konteks-connector"), os: "windows",
+      logPath: join(root, "update.log"), spawnFn: spawnFn as never });
+    const onExit = vi.fn();
+    launched.onExit(onExit);
+    await vi.waitFor(() => expect(onExit).toHaveBeenCalledWith(7));
+  });
+
+  it("reports a real missing updater executable without ending the serving process", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-update-real-spawn-refusal-")); roots.push(root);
+    await expect(launchNativeUpdater({ root, executable: join(root, "missing-updater-executable"), os: "windows",
+      logPath: join(root, "update.log") })).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["windows", "macos", "debian"] as const)("hands the fixed verified target to the quiet %s launcher and rechecks ownership immediately at spawn", async os => {
+    const root = await mkdtemp(join(tmpdir(), "native-update-frozen-")); roots.push(root);
+    const target = { bundleVersion: "1.1.0", manifestDigest: "a".repeat(43) };
+    const assertCurrent = vi.fn();
+    const spawnFn = vi.fn((_command: string, _args: string[], _options: Record<string, unknown>) => {
+      expect(assertCurrent).toHaveBeenCalledTimes(1);
+      return admittedChild();
+    });
+    await launchNativeUpdater({ root, executable: join(root, "konteks-connector"), os, target, assertCurrent, logPath: join(root, "update.log"), spawnFn: spawnFn as never });
+    const options = spawnFn.mock.calls[0]?.[2] as unknown as { env: Record<string, string>; windowsHide?: boolean };
+    expect(JSON.parse(options.env[NATIVE_UPDATE_TARGET_ENV]!)).toEqual(target);
+    if (os === "windows") expect(options.windowsHide).toBe(true);
+    if (os === "debian") {
+      expect(spawnFn.mock.calls[0]?.[1]).toContain(`--setenv=${NATIVE_UPDATE_TARGET_ENV}`);
+      expect(spawnFn.mock.calls[0]?.[1].join(" ")).not.toContain(target.manifestDigest);
+    }
+    spawnFn.mockClear();
+    await expect(launchNativeUpdater({ root, executable: join(root, "konteks-connector"), os, target,
+      assertCurrent: () => { throw new Error("socket changed"); }, logPath: join(root, "update.log"), spawnFn: spawnFn as never })).rejects.toThrow("socket changed");
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+
   it("runs the installer transaction detached from the service process group, as a transient unit on systemd", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-update-launch-")); roots.push(root);
     const children: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
     vi.stubEnv("NODE_EXTRA_CA_CERTS", "/corp/ca.pem");
     vi.stubEnv("KONTEKS_RELEASE_MANIFEST_URL", "https://channel.example/latest/native-manifest.json");
-    const spawnFn = ((command: string, args: string[], options: Record<string, unknown>) => { children.push({ command, args, options }); return { pid: 77, unref: () => {}, once: () => {} }; }) as never;
+    const spawnFn = ((command: string, args: string[], options: Record<string, unknown>) => { children.push({ command, args, options }); return admittedChild(); }) as never;
     await launchNativeUpdater({ root, executable: join(root, "releases", "release-a", "konteks-connector"), os: "macos", logPath: join(root, "update.log"), spawnFn });
     expect(children[0]).toMatchObject({ command: join(root, "releases", "release-a", "konteks-connector"), args: ["--root", root, "--json", "update", "--unattended"], options: { detached: true } });
     expect((children[0]!.options.env as Record<string, string>)).not.toHaveProperty("KONTEKS_ACTIVATION_CODE");
@@ -200,6 +281,14 @@ describe("native updater launch", () => {
     await launchNativeUpdater({ root, executable: join(root, "releases", "release-a", "konteks-connector"), os: "debian", spawnFn });
     expect(children[1]!.command).toBe("systemd-run");
     expect(children[1]!.args).toEqual(expect.arrayContaining(["--user", "--collect", "--property=KillMode=process", join(root, "releases", "release-a", "konteks-connector"), "update", "--unattended"]));
+    expect(children[1]!.args).toEqual(expect.arrayContaining(["--setenv=NODE_EXTRA_CA_CERTS", "--setenv=KONTEKS_RELEASE_MANIFEST_URL"]));
+    expect(children[1]!.args).not.toContain("--setenv=KONTEKS_ACTIVATION_CODE");
     await expect(launchNativeUpdater({ root: "relative", executable: "/x", os: "macos", spawnFn })).rejects.toThrow(/absolute/);
   });
 });
+
+function admittedChild() {
+  const child = Object.assign(new EventEmitter(), { pid: 77, unref: () => {} });
+  queueMicrotask(() => child.emit("spawn"));
+  return child;
+}

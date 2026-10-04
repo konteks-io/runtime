@@ -57,10 +57,12 @@ uninstall. It talks to the running supervisor over the local control socket
 - A failed service step is a `NativeServiceCommandError` (step, command, exit
   code, output excerpt), told by `describeServiceFailure`, and recorded in
   `supervisor/service-start-failure.json` for `doctor` and `support`.
-- **Update transaction.** It reads the service pid before stopping and
-  accepts that process being gone as proof; it ends the process group after
-  `stopGraceMs`; any abort after the stop and before the swap restarts the
-  unchanged release (`restartUnchanged`). `keepLauncherCurrent` keeps
+- **Update transaction.** It captures service ownership before stopping. On
+  Windows, verified connector and descendant identities prove exit even when
+  Task Scheduler is Ready; shutdown excludes the updater's own branch and
+  refuses ambiguous or reused process identities. Other platforms watch the
+  service pid and process group. An abort cancels draining or restarts the
+  unchanged release. `keepLauncherCurrent` keeps
   `<root>/bin/konteks-remote` on the running release.
 - **Windows launcher.** The MSI's `konteks-remote.exe` (not writable without
   elevation) runs `releases\<id>\konteks-connector.exe` from
@@ -75,4 +77,6 @@ uninstall. It talks to the running supervisor over the local control socket
 ## Gotchas
 
 - Windows has no `<root>\bin` launcher; the MSI command is the person's command.
-- Windows tests run in CI only (`.github/workflows/ci.yaml` `windows-native`).
+- Native service and update tests run across the supported OS and architecture
+  matrix in CI (`.github/workflows/ci.yaml` `windows-native`); Windows bootstrap
+  outcomes also run under PowerShell 5.1 and 7.
