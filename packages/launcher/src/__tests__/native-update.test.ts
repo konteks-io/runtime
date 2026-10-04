@@ -244,6 +244,28 @@ describe("native update transaction", () => {
   }
   const previous: NativeRuntimeRecord = { schemaVersion: 1, deploymentKind: "native_connector", instanceId: "instance", workspaceId: "tenant", releaseId: "release-prev", manifestDigest: "sha256:prev", bundleVersion: "1.0.0", coreUrl: "https://core.example", relayUrl: "wss://relay.example/runtime", controlPort: 47_311, agents: ["claude-code"] };
 
+  it.each([
+    ["en", 180_000, "3 min", "s so far"],
+    ["id", 180_000, "3 menit", "dtk"],
+    ["en", 90_000, "90 s", "s so far"],
+    ["id", 90_000, "90 dtk", "dtk"],
+  ] as const)("presents %s human durations (%s ms) during an actual failed update and retains canonical ledger/JSON", async (locale, deadlineMs, duration, elapsed) => {
+    const h = harness({ previous, gate: "no_answer" });
+    h.deps.healthDeadlineMs = deadlineMs;
+    vi.stubEnv("KONTEKS_SETUP_LOCALE", locale);
+    const lines: string[] = [];
+    const output = createOutput({ json: false, stdout: { write: (text: string) => { lines.push(text.trimEnd()); return true; } } as never });
+    vi.stubEnv("KONTEKS_SETUP_LOCALE", "en");
+    const failure = await runNativeUpdate({ root: "/root", output }, h.deps).catch(error => error);
+    expect(lines.some(line => line.includes(duration))).toBe(true);
+    expect(lines.some(line => line.includes(elapsed))).toBe(true);
+    expect(h.currentRecord().releaseId).toBe("release-prev");
+    expect(h.ledger.at(-1)).toMatchObject({ outcome: "rolled_back", detail: "The updated connector stopped making progress before it answered on its control socket." });
+    const json: string[] = [];
+    createOutput({ json: true, stderr: { write: (text: string) => { json.push(text); return true; } } as never }).error(failure);
+    expect(JSON.parse(json.join(""))).toMatchObject({ error: { message: "The updated connector stopped making progress before it answered on its control socket." } });
+  });
+
   it("drains, stops, commits, restarts and gates the successor, recording an applied attempt", async () => {
     const h = harness({ previous });
     const outcome = await runNativeUpdate({ root: "/root", output: h.output }, h.deps);

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
+import { setupText, type SetupCopyKey, type SetupLocale } from "../setup-locale.js";
 
 /** The connector's own log in `<root>/logs`, where the OS keeps none (macOS); the supervisor keeps it small. */
 export const CONNECTOR_LOG_FILE = "connector.log";
@@ -179,55 +180,45 @@ function serviceRunEnding(run: NativeServiceRun, ran: boolean): string {
 }
 
 /** A failed service step in plain words, with the one next step where it can be known. */
-export function describeServiceFailure(os: HostOs, error: NativeServiceCommandError): string {
+export function describeServiceFailure(os: HostOs, error: NativeServiceCommandError, locale: SetupLocale = "en"): string {
   const output = `${error.run.stderr ?? ""}\n${error.run.stdout ?? ""}`;
   const what = error.step === "write"
-    ? `The service definition could not be written to ${error.path ?? "its folder"} (${error.run.error ?? "unknown error"}).`
-    : `${serviceStepWords(os, error.step)} (${error.message}).`;
-  return `${what} ${serviceNextStep(os, error, output)}`;
+    ? setupText("serviceWriteFailed", { path: error.path ?? "its folder", detail: error.run.error ?? "unknown error" }, locale)
+    : `${serviceStepWords(os, error.step, locale)} (${error.message}).`;
+  return `${what} ${serviceNextStep(os, error, output, locale)}`;
 }
 
 /** What a failed step means on each service manager; `status` is the fallback for any other step. */
-const SERVICE_STEP_WORDS: Readonly<Record<HostOs, Partial<Record<NativeServiceStep, string>> & { status: string }>> = {
+const SERVICE_STEP_WORDS: Readonly<Record<HostOs, Partial<Record<NativeServiceStep, SetupCopyKey>> & { status: SetupCopyKey }>> = {
   windows: {
-    register: "Windows refused to create the Konteks task",
-    start: "Windows did not run the Konteks task",
-    stop: "Windows did not end the Konteks task",
-    status: "Windows could not say whether the Konteks task is running",
+    register: "serviceWindowsRegister", start: "serviceWindowsStart", stop: "serviceWindowsStop", status: "serviceWindowsStatus",
   },
   macos: {
-    register: "macOS did not load the Konteks launch agent",
-    start: "macOS did not load the Konteks launch agent",
-    stop: "macOS did not unload the Konteks launch agent",
-    status: "macOS could not say whether the Konteks launch agent is running",
+    register: "serviceMacLoad", start: "serviceMacLoad", stop: "serviceMacStop", status: "serviceMacStatus",
   },
   debian: {
-    register: "systemd did not reload its user services",
-    start: "systemd did not start the Konteks user service",
-    stop: "systemd did not stop the Konteks user service",
-    status: "systemd could not say whether the Konteks user service is running",
+    register: "serviceLinuxRegister", start: "serviceLinuxStart", stop: "serviceLinuxStop", status: "serviceLinuxStatus",
   },
 };
 
-function serviceStepWords(os: HostOs, step: NativeServiceStep): string {
+function serviceStepWords(os: HostOs, step: NativeServiceStep, locale: SetupLocale): string {
   const words = SERVICE_STEP_WORDS[os];
-  return words[step] ?? words.status;
+  return setupText(words[step] ?? words.status, {}, locale);
 }
 
 /** What the service manager printed, read for the one next step it points to. */
-const SERVICE_REMEDIES: ReadonlyArray<{ os: HostOs; output: RegExp; next: string }> = [
-  { os: "windows", output: /access is denied/i, next: "Run konteks-remote start once from an administrator PowerShell (right-click PowerShell, Run as administrator); Konteks still runs as you." },
-  { os: "windows", output: /malformed|incorrectly formatted|out of range|switch the encoding/i, next: "This copy of konteks-remote wrote a task Windows does not accept; run konteks-remote update, then konteks-remote start. If it stays, send konteks-remote support to Konteks support." },
-  { os: "windows", output: /service is not available|not running|0x80041315/i, next: "Start the Task Scheduler service (services.msc), then run konteks-remote start again." },
-  { os: "macos", output: /Input\/output error|already loaded|service already/i, next: "Run konteks-remote stop, then konteks-remote start." },
+const SERVICE_REMEDIES: ReadonlyArray<{ os: HostOs; output: RegExp; next: SetupCopyKey }> = [
+  { os: "windows", output: /access is denied/i, next: "serviceAdminRemedy" },
+  { os: "windows", output: /malformed|incorrectly formatted|out of range|switch the encoding/i, next: "serviceTaskRemedy" },
+  { os: "windows", output: /service is not available|not running|0x80041315/i, next: "serviceSchedulerRemedy" },
+  { os: "macos", output: /Input\/output error|already loaded|service already/i, next: "serviceMacRemedy" },
 ];
 
-function serviceNextStep(os: HostOs, error: NativeServiceCommandError, output: string): string {
-  if (error.run.timedOut) return "Run konteks-remote start again; if it keeps timing out, restart the computer.";
+function serviceNextStep(os: HostOs, error: NativeServiceCommandError, output: string, locale: SetupLocale): string {
+  if (error.run.timedOut) return setupText("serviceTimeoutRemedy", {}, locale);
   const remedy = SERVICE_REMEDIES.find(entry => entry.os === os && entry.output.test(output));
-  if (remedy) return remedy.next;
-  if (error.step === "write") return "Check that this folder is yours and the disk has space, then run konteks-remote start again.";
-  return "To see every step, run konteks-remote --verbose start.";
+  if (remedy) return setupText(remedy.next, {}, locale);
+  return setupText(error.step === "write" ? "serviceFolderRemedy" : "serviceVerboseRemedy", {}, locale);
 }
 
 /**

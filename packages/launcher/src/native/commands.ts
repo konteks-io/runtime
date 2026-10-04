@@ -17,6 +17,7 @@ import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard } from "./onboard.js";
 import type { OnboardStep } from "./onboard-session.js";
 import { describeServiceFailure, encodeServiceDefinition, nativePlatform, nativeServiceDefinition, NativeServiceCommandError, parseLoadedService, parseServiceExits, serviceRun, startNativeServiceDefinition, type HostOs, type NativeServiceCommand, type NativeServiceDefinition, type NativeServiceExecute, type NativeServiceRun } from "./service.js";
+import { outputLocale, setupError, setupFailureText, setupLine, setupLocale, setupText, setupWords, type SetupLocale } from "../setup-locale.js";
 import { clearServiceStartFailure, connectorLogFile, connectorLogTail, localServiceReport, readServiceStartFailure, recordServiceStartFailure } from "./service-report.js";
 import { verbose, verboseCommand } from "../verbose.js";
 import { checkNativeUpdate } from "./update.js";
@@ -320,7 +321,7 @@ export async function waitWhileStarting(
       return;
     } catch (error) {
       if (!await stillStarting(error, deps, deadline)) return;
-      if (!said) input.output.line("Konteks is still starting on this computer; waiting for it…");
+      if (!said) setupLine(input.output, "serviceStillStarting");
       said = true;
       await deps.sleep(2_000);
     }
@@ -362,20 +363,18 @@ async function reportUpdateCheck(input: UpdateInput): Promise<void> {
   const check = await checkNativeUpdate({ root: input.root });
   if (check.status === "current") {
     const attempts = await updateAttempts(input.root);
-    input.output.line([`Installed release ${check.bundleVersion} is current.`, selfUpdateNote(attempts, check.bundleVersion)].filter(Boolean).join(" "));
+    input.output.line([setupWords(input.output, "updateCheckCurrent", { version: check.bundleVersion }), selfUpdateNote(attempts, check.bundleVersion, outputLocale(input.output))].filter(Boolean).join(" "));
     input.output.result({ state: "current", bundleVersion: check.bundleVersion });
     return;
   }
   const acceptedOther = await acceptedInstead(input.root, check);
   if (acceptedOther) {
-    input.output.line(`Release ${check.release.manifest.bundleVersion} is published, but Konteks accepts ${acceptedOther} for this machine, so it stays on ${check.current.bundleVersion} until Konteks accepts the new one.`);
+    setupLine(input.output, "updateNotAcceptedCheck", { version: check.release.manifest.bundleVersion, accepted: acceptedOther, current: check.current.bundleVersion });
     input.output.result({ state: "not_accepted", installed: check.current.bundleVersion, available: check.release.manifest.bundleVersion, accepted: acceptedOther });
     return;
   }
   const failed = earlierFailure(await updateAttempts(input.root), check.release.manifest.digest);
-  input.output.line(failed
-    ? `Release ${check.release.manifest.bundleVersion} is available (installed: ${check.current.bundleVersion}), but ${earlierFailureNote(failed)}`
-    : `Release ${check.release.manifest.bundleVersion} is available (installed: ${check.current.bundleVersion}); run \`konteks-remote update\` to install it.`);
+  setupLine(input.output, failed ? "updateAvailableFailed" : "updateAvailable", { version: check.release.manifest.bundleVersion, current: check.current.bundleVersion, note: failed ? earlierFailureNote(failed, outputLocale(input.output)) : "" });
   input.output.result({ state: "available", installed: check.current.bundleVersion, available: check.release.manifest.bundleVersion, manifestDigest: check.release.manifest.digest, ...(failed ? { failedHere: { outcome: failed.outcome, at: failed.finishedAt ?? failed.startedAt, detail: failed.detail } } : {}) });
 }
 
@@ -384,7 +383,7 @@ async function notAcceptedByKonteks(input: UpdateInput): Promise<boolean> {
   const check = await checkNativeUpdate({ root: input.root }).catch(() => null);
   const acceptedOther = await acceptedInstead(input.root, check);
   if (acceptedOther && check && check.status !== "current") {
-    input.output.line(`Release ${check.release.manifest.bundleVersion} is published, but Konteks accepts ${acceptedOther} for this machine, so nothing was changed; ${check.current.bundleVersion} keeps running until Konteks accepts the new one.`);
+    setupLine(input.output, "updateNotAccepted", { version: check.release.manifest.bundleVersion, accepted: acceptedOther, current: check.current.bundleVersion });
     input.output.result({ state: "not_accepted", installed: check.current.bundleVersion, available: check.release.manifest.bundleVersion, accepted: acceptedOther });
     return true;
   }
@@ -396,12 +395,12 @@ async function notAcceptedByKonteks(input: UpdateInput): Promise<boolean> {
 async function sayEarlierAttempts(input: UpdateInput, check: UpdateCheck): Promise<void> {
   const attempts = await updateAttempts(input.root);
   if (check.status === "current") {
-    const selfUpdated = selfUpdateNote(attempts, check.bundleVersion);
+    const selfUpdated = selfUpdateNote(attempts, check.bundleVersion, outputLocale(input.output));
     if (selfUpdated) input.output.line(selfUpdated);
     return;
   }
   const failed = earlierFailure(attempts, check.release.manifest.digest);
-  if (failed) input.output.line(`Trying again as asked: ${earlierFailureNote(failed)}`);
+  if (failed) setupLine(input.output, "updateRetry", { note: earlierFailureNote(failed, outputLocale(input.output)) });
 }
 
 type ControlInput = Parameters<NativeCliActions["control"]>[0];
@@ -421,7 +420,7 @@ async function statusOrStopped(context: ControlContext, input: ControlInput): Pr
     return await status(context);
   } catch (error) {
     if (!controlSocketUnavailable(error) || await serviceRunning(input.root)) throw error;
-    input.output.line("Konteks is stopped on this computer. konteks-remote start starts it again.");
+    setupLine(input.output, "serviceStoppedStatus");
   }
 }
 
@@ -496,6 +495,7 @@ async function shutdownNativeConnector(root: string): Promise<void> {
  * process cleanup has necessarily finished. A new private receipt is written
  * only after every daemon shutdown step succeeds. */
 export async function stopNativeConnector(input: NativeCommandContext, deps: NativeStopDeps = productionNativeStopDeps): Promise<void> {
+  setupLocale();
   const definition = await deps.definition(input.root);
   const owner = await deps.serviceOwner?.(input.root) ?? null;
   if (owner) return stopOwnedNativeConnector(input, definition, deps, owner);
@@ -503,40 +503,38 @@ export async function stopNativeConnector(input: NativeCommandContext, deps: Nat
   assertRunningBeforeStop(await deps.execute(definition.status), stoppedCodes);
   const previousReceipt = await deps.readReceipt(input.root);
   await executeNativeStop(definition, deps);
-  input.output.line("Stopping Konteks on this computer…");
+  setupLine(input.output, "serviceStopping");
   await waitForStopReceipt(input.root, definition, deps, { previousReceipt, stoppedCodes });
-  input.output.line(STOPPED_CONNECTOR);
+  setupLine(input.output, "serviceStopped");
 }
-
-const STOPPED_CONNECTOR = "Konteks is stopped on this computer. Your sign-ins and work are kept; konteks-remote start starts it again.";
 
 async function executeNativeStop(definition: NativeServiceDefinition, deps: NativeStopDeps): Promise<void> {
   const stopRun = serviceRun(await (deps.run ?? deps.execute)(definition.stop));
-  if (stopRun.code !== 0) throw new RemoteInstanceError("temporarily_unavailable", `Konteks could not be stopped on this computer (${new NativeServiceCommandError("stop", definition.stop, stopRun).message}); konteks-remote --verbose stop shows every step.`);
+  if (stopRun.code !== 0) throw setupError("temporarily_unavailable", "serviceStopFailed", { detail: new NativeServiceCommandError("stop", definition.stop, stopRun).message });
 }
 
 async function stopOwnedNativeConnector(input: NativeCommandContext, definition: NativeServiceDefinition, deps: NativeStopDeps, owner: NativeServiceProcessOwner): Promise<void> {
   await requestOwnedShutdown(input, definition, deps);
-  input.output.line("Stopping Konteks on this computer…");
+  setupLine(input.output, "serviceStopping");
   await waitForWindowsServiceExit(owner, definition, {
     execute: deps.run ?? deps.execute, now: deps.now, sleep: deps.sleep,
     stopDeadlineMs: deps.deadlineMs ?? 30_000, stopGraceMs: deps.stopGraceMs ?? 15_000,
     ...(deps.pollMs === undefined ? {} : { pollMs: deps.pollMs }),
   }, input.output);
-  input.output.line(STOPPED_CONNECTOR);
+  setupLine(input.output, "serviceStopped");
 }
 
 async function requestOwnedShutdown(input: NativeCommandContext, definition: NativeServiceDefinition, deps: NativeStopDeps): Promise<void> {
   if (!deps.shutdown) return executeNativeStop(definition, deps);
   await deps.shutdown(input.root).catch(() => {
-    input.output.line("The connector did not acknowledge shutdown; waiting for its owned processes to close…");
+    setupLine(input.output, "serviceStopUnacknowledged");
   });
 }
 
 async function waitForStopReceipt(root: string, definition: NativeServiceDefinition, deps: NativeStopDeps, before: { previousReceipt: string | null; stoppedCodes: readonly number[] }): Promise<void> {
   const deadline = deps.now() + (deps.deadlineMs ?? 30_000);
   while (!await stopConfirmed(root, definition, deps, before)) {
-    if (deps.now() >= deadline) throw new RemoteInstanceError("temporarily_unavailable", "Konteks stopped, but its agents may still be closing. Wait a moment, then check with konteks-remote status.");
+    if (deps.now() >= deadline) throw setupError("temporarily_unavailable", "serviceStoppedAgentsClosing");
     await deps.sleep(deps.pollMs ?? 250);
   }
 }
@@ -553,8 +551,8 @@ function stoppedExitCodes(os: HostOs): readonly number[] {
 
 function assertRunningBeforeStop(status: number | null, stoppedCodes: readonly number[]): void {
   if (status === 0) return;
-  if (status !== null && stoppedCodes.includes(status)) throw new RemoteInstanceError("temporarily_unavailable", "Konteks is already stopped on this computer.");
-  throw new RemoteInstanceError("temporarily_unavailable", "Konteks could not tell whether it is running on this computer, so nothing was stopped; konteks-remote doctor says why.");
+  if (status !== null && stoppedCodes.includes(status)) throw setupError("temporarily_unavailable", "serviceAlreadyStopped");
+  throw setupError("temporarily_unavailable", "serviceUnconfirmedRunning");
 }
 
 /** A new shutdown receipt and a stopped service. */
@@ -577,6 +575,7 @@ export async function startNativeConnector(
     serviceOwner?: (root: string) => Promise<NativeServiceProcessOwner | null>;
   } = {},
 ): Promise<void> {
+  setupLocale();
   const { platform, roots, executeService, definitionOf } = startDefaults(deps);
   const installation = await loadNativeInstallation(input.root, { roots, platform });
   await verifyInstalledNativeConnector(
@@ -589,7 +588,7 @@ export async function startNativeConnector(
   const serviceState = () => readServiceState(executeService, definition, stoppedCodes, windowsOwnerReader(input.root, platform.os, deps.serviceOwner));
   if ((await serviceState()) === "running") {
     await assertControlAnswers(input.root, installation.record.controlPort);
-    input.output.line(ALREADY_RUNNING);
+    setupLine(input.output, "serviceAlreadyRunning");
     return;
   }
   await moveOffOccupiedPort(input, { roots, platform }, serviceState);
@@ -597,19 +596,19 @@ export async function startNativeConnector(
   const started = await startNativeServiceDefinition(definition, {
     execute: command => command === definition.status ? serviceState().then(state => state === "running" ? 0 : stoppedCodes[0]!) : executeService(command),
     write: writeSecretFile,
-  }).catch((error: unknown) => startFailed(input.root, startFailureDetail(error, platform.os), error));
+  }).catch((error: unknown) => startFailed(input.root, locale => startFailureDetail(error, platform.os, locale), error));
   if (started === "already_running") {
-    input.output.line(ALREADY_RUNNING);
+    setupLine(input.output, "serviceAlreadyRunning");
     return;
   }
   await watchStartedService(input.root, platform.os, serviceState, deps);
   await clearServiceStartFailure(input.root).catch(() => undefined);
-  if (definition.requiresLinger) input.output.line("This Linux user service needs user lingering to remain available after logout. Configure it explicitly if required.");
+  if (definition.requiresLinger) setupLine(input.output, "serviceLinger");
   // Starting the process is not the same as being open for work: the service
   // finishes unpacking and opens its control port about a minute later. Saying
   // only "started" invited a second and third `start` against a service that
   // was already coming up.
-  input.output.line("Konteks is starting on this computer and is ready for work within a minute; konteks-remote status shows how it is doing.");
+  setupLine(input.output, "serviceStarting");
 }
 
 async function moveOffOccupiedPort(input: NativeCommandContext, release: { roots: readonly EmbeddedReleaseRoot[]; platform: ReturnType<typeof nativePlatform> }, serviceState: () => Promise<"running" | "stopped">): Promise<void> {
@@ -618,7 +617,7 @@ async function moveOffOccupiedPort(input: NativeCommandContext, release: { roots
     ...release,
     serviceStopped: async () => (await serviceState()) === "stopped",
   });
-  if (moved) input.output.line(`Another program uses port ${moved.previousPort}, so Konteks uses port ${moved.controlPort} on this computer instead.`);
+  if (moved) setupLine(input.output, "servicePortMoved", { previous: moved.previousPort, current: moved.controlPort });
 }
 
 function startDefaults(deps: { roots?: readonly EmbeddedReleaseRoot[]; platform?: ReturnType<typeof nativePlatform>; definition?: (root: string) => Promise<NativeServiceDefinition>; execute?: NativeServiceExecute }) {
@@ -630,8 +629,6 @@ function startDefaults(deps: { roots?: readonly EmbeddedReleaseRoot[]; platform?
   };
 }
 
-const ALREADY_RUNNING = "Konteks is already running on this computer; konteks-remote status shows how it is doing.";
-
 /** Running or stopped as the service manager says; anything else cannot prove this root is safe to rewrite. */
 async function readServiceState(executeService: NativeServiceExecute, definition: NativeServiceDefinition, stoppedCodes: readonly number[], owner?: () => Promise<NativeServiceProcessOwner | null>): Promise<"running" | "stopped"> {
   let code: number | null;
@@ -642,7 +639,7 @@ async function readServiceState(executeService: NativeServiceExecute, definition
   if (code === 0) return "running";
   if (owner && await owner()) return "running";
   if (stopped) return "stopped";
-  throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation is stopped. Inspect and stop only this installation's service before retrying start; identity and local work are unchanged.");
+  throw setupError("temporarily_unavailable", "serviceUnconfirmedStopped");
 }
 
 function windowsOwnerReader(root: string, os: HostOs, owner: ((root: string) => Promise<NativeServiceProcessOwner | null>) | undefined): (() => Promise<NativeServiceProcessOwner | null>) | undefined {
@@ -659,25 +656,22 @@ async function assertControlAnswers(root: string, controlPort: number): Promise<
   try {
     await new SupervisorControl({ supervisorData: join(root, "supervisor") }, controlPort).call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 2_000 });
   } catch {
-    throw new RemoteInstanceError(
-      "temporarily_unavailable",
-      `This installation's service is registered or starting, but its control socket on port ${controlPort} is unavailable. Stop only this installation's service, then run start again to repair an occupied port; identity and local work are preserved.`,
-    );
+    throw setupError("temporarily_unavailable", "serviceSocketUnavailable", { port: controlPort });
   }
 }
 
 /** Which step failed, in the service manager's own words, with the one next step. */
-function startFailureDetail(error: unknown, os: HostOs): string {
-  if (error instanceof RemoteInstanceError) return `${error.message}`;
-  if (error instanceof NativeServiceCommandError) return describeServiceFailure(os, error);
-  return `${error instanceof Error ? error.message : String(error)}. To see every step, run konteks-remote --verbose start.`;
+function startFailureDetail(error: unknown, os: HostOs, locale: SetupLocale): string {
+  if (error instanceof RemoteInstanceError) return setupFailureText(error, locale);
+  if (error instanceof NativeServiceCommandError) return describeServiceFailure(os, error, locale);
+  return `${error instanceof Error ? error.message : String(error)}. ${setupText("serviceVerboseRemedy", {}, locale)}`;
 }
 
 /** A failed start is kept for doctor and support, never just "could not start". */
-async function startFailed(root: string, detail: string, cause: unknown): Promise<never> {
-  const message = `The native user service could not start: ${detail} Installed identity and credentials were preserved.`;
-  await recordServiceStartFailure(root, { at: new Date().toISOString(), message }).catch(() => undefined);
-  throw new RemoteInstanceError("temporarily_unavailable", message, { cause });
+async function startFailed(root: string, detail: (locale: SetupLocale) => string, cause: unknown): Promise<never> {
+  const error = setupError("temporarily_unavailable", "serviceStartFailed", locale => ({ detail: detail(locale) }), { cause });
+  await recordServiceStartFailure(root, { at: new Date().toISOString(), message: error.message }).catch(() => undefined);
+  throw error;
 }
 
 /**
@@ -693,7 +687,7 @@ async function watchStartedService(root: string, os: HostOs, serviceState: () =>
   const state = await serviceState().catch(() => "running" as const);
   if (state !== "stopped") return;
   const tail = await connectorLogTail(root, 3).catch(() => null);
-  await startFailed(root, `it started and stopped again at once.${tail?.length ? ` The connector log ends: ${tail.join(" | ")}` : ""} The whole log: ${connectorLogFile(root)}.`, null);
+  await startFailed(root, locale => setupText("serviceExited", { tail: tail?.length ? setupText("serviceLogTail", { tail: tail.join(" | ") }, locale) : "", path: connectorLogFile(root) }, locale), null);
 }
 
 /** One onboarding step, with a failure said as a step too, never a crash. */
@@ -763,11 +757,12 @@ const productionAgentAddDeps: NativeAgentAddDeps = {
  * nothing and stops nothing.
  */
 export async function runNativeAgentAdd(input: NativeCommandContext & { agent: string; yes?: boolean }, deps: NativeAgentAddDeps = productionAgentAddDeps): Promise<void> {
+  setupLocale();
   const previous = await deps.readRecord(input.root);
   const host = hostAgentInstallAdapter(input.agent);
   const listed = previous.agents.includes(input.agent as NativeRuntimeRecord["agents"][number]);
   if (await alreadyInstalled(input.root, previous, host, listed)) {
-    input.output.line(`${findAgentBridge(input.agent)?.displayName ?? input.agent} is already installed; no restart is needed.`);
+    setupLine(input.output, "agentNoRestart", { name: findAgentBridge(input.agent)?.displayName ?? input.agent });
     return;
   }
   const setUp = await prepareAgent(input, deps, host, listed);
@@ -780,7 +775,7 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
 }
 
 async function agentServiceRunning(root: string, deps: NativeAgentAddDeps, cycle: ServiceCycle): Promise<boolean> {
-  if (await cycle.running("The service manager cannot confirm this installation's service state. Inspect only this installation's service before adding an agent; identity and local work are unchanged.")) return true;
+  if (await cycle.running(setupError("temporarily_unavailable", "agentStateUnconfirmed"))) return true;
   return (await deps.serviceOwner?.(root) ?? null) !== null;
 }
 
@@ -819,23 +814,23 @@ async function fetchOrLocate(input: NativeCommandContext & { yes?: boolean }, de
     if (deps.locate) await deps.locate(host, input.root);
     return;
   }
-  const consent = deps.consent ?? terminalFetchConsent({ ...(input.yes === undefined ? {} : { yes: input.yes }), line: text => input.output.line(text) });
+  const consent = deps.consent ?? terminalFetchConsent({ ...(input.yes === undefined ? {} : { yes: input.yes }), line: text => input.output.line(text), locale: outputLocale(input.output) });
   await (deps.fetchAgent ?? fetchHostAgent)(host, input.root, consent, input.output);
 }
 
 async function stopForAgentAdd(input: NativeCommandContext & { agent: string }, deps: NativeAgentAddDeps, cycle: ServiceCycle, previous: NativeRuntimeRecord, foreground: boolean): Promise<void> {
   const control = deps.control(input.root, previous);
   await cycle.drain(control, input.output, {
-    waiting: count => `waiting for ${count} active assignment(s) before installing ${input.agent}…`,
-    timedOut: "Agent installation waited 15 minutes for active work; the runtime remains running and drained so it can be inspected safely.",
+    waiting: count => setupWords(input.output, "agentWaitingAssignments", { number: count, agent: input.agent }),
+    timedOut: setupError("active_work", "agentDrainTimedOut"),
   });
   if (await stopWindowsForAgentChange(input, deps, cycle, control)) return;
   if (!foreground) {
-    await cycle.stop("The native runtime drained but could not stop; its installation was not changed.", "The native runtime did not finish stopping; its installed agents were not changed.");
+    await cycle.stop(setupError("temporarily_unavailable", "updateStopFailed"), setupError("temporarily_unavailable", "agentStopTimedOut"));
     return;
   }
   await control.call({ op: "shutdown" }, z.unknown());
-  input.output.line("Konteks is running in a terminal here, not as its background service; stopping it there to add the agent…");
+  setupLine(input.output, "agentForegroundStopping");
   cycle.resetStopDeadline();
 }
 
@@ -884,7 +879,7 @@ class AgentAddition {
     if (state.wasRunning) await deps.start(input);
     if (state.wasRunning && isPersonalAgent(input.agent)) await this.closeSetup();
     // Its terminal is not this one, so it is not started again here.
-    if (state.foreground) input.output.line(`${findAgentBridge(input.agent)?.displayName ?? input.agent} is added. Konteks stopped to add it; konteks-remote start starts it again, in the background.`);
+    if (state.foreground) setupLine(input.output, "agentForegroundAdded", { name: findAgentBridge(input.agent)?.displayName ?? input.agent });
     input.output.result({ instanceId: successor.instanceId, agents: successor.agents, state: "installed" });
   }
 
@@ -902,12 +897,12 @@ class AgentAddition {
 
   private sayWaiting(): void {
     if (this.saidWaiting) return;
-    this.input.output.line("Waiting for the stopped connector to release its private data before adding the agent…");
+    setupLine(this.input.output, "agentWaitingFiles");
     this.saidWaiting = true;
   }
 
   private async assertStillStopped(): Promise<void> {
-    if (this.state.wasRunning && !await this.cycle.stopped()) throw new RemoteInstanceError("temporarily_unavailable", "This connector started again before agent installation; stop only this installation's service and retry.");
+    if (this.state.wasRunning && !await this.cycle.stopped()) throw setupError("temporarily_unavailable", "agentStartedAgain");
   }
 
   private async closeSetup(): Promise<void> {
@@ -919,7 +914,7 @@ class AgentAddition {
   private async rollBack(): Promise<void> {
     if (this.successor) await this.restorePrevious(this.successor);
     if (this.state.wasRunning && !this.ownershipUnsettled) await this.deps.start(this.input).catch(() => undefined);
-    if (this.state.foreground) this.input.output.line("Konteks stopped to add the agent and stays stopped; konteks-remote start starts it again, in the background.");
+    if (this.state.foreground) setupLine(this.input.output, "agentForegroundStopped");
   }
 
   private async restorePrevious(successor: NativeRuntimeRecord): Promise<void> {
@@ -927,7 +922,7 @@ class AgentAddition {
       if (this.state.wasRunning) await this.stopNewService();
       await this.cycle.whileOwned(() => this.deps.restore(this.input.root, successor.releaseId, this.previous));
     } catch (rollbackError) {
-      throw new RemoteInstanceError("temporarily_unavailable", "Agent installation failed and automatic rollback could not restore the previous record; identity and local work were preserved.", { cause: rollbackError });
+      throw setupError("temporarily_unavailable", "agentRollbackFailed", {}, { cause: rollbackError });
     }
   }
 
@@ -935,9 +930,9 @@ class AgentAddition {
     if (usesWindowsStop(this.deps)) return this.stopNewWindowsService();
     const { cycle, deps } = this;
     const code = await deps.execute(cycle.definition.status);
-    if (code === 0 && await deps.execute(cycle.definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", "The new service could not be stopped before agent rollback.");
-    if (code !== 0 && !cycle.stoppedCode(code)) throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm the new service stopped before agent rollback.");
-    await cycle.awaitStopped("The new service did not finish stopping before agent rollback.");
+    if (code === 0 && await deps.execute(cycle.definition.stop) !== 0) throw setupError("temporarily_unavailable", "agentRollbackCannotStop");
+    if (code !== 0 && !cycle.stoppedCode(code)) throw setupError("temporarily_unavailable", "agentRollbackUnconfirmed");
+    await cycle.awaitStopped(setupError("temporarily_unavailable", "agentRollbackStopTimedOut"));
   }
 
   private async stopNewWindowsService(): Promise<void> {
@@ -975,9 +970,9 @@ class ServiceCycle {
   }
 
   /** Whether the service runs; a state the service manager cannot confirm refuses with `refusal`. */
-  async running(refusal: string): Promise<boolean> {
+  async running(refusal: string | RemoteInstanceError): Promise<boolean> {
     const status = await this.deps.execute(this.definition.status);
-    if (status !== 0 && !this.stoppedCode(status)) throw new RemoteInstanceError("temporarily_unavailable", refusal);
+    if (status !== 0 && !this.stoppedCode(status)) throw cycleFailure("temporarily_unavailable", refusal);
     return status === 0;
   }
 
@@ -985,7 +980,7 @@ class ServiceCycle {
     const code = await this.deps.execute(this.definition.status);
     if (code === 0) return false;
     if (this.stoppedCode(code)) return true;
-    throw new RemoteInstanceError("temporarily_unavailable", "The service manager cannot confirm this installation stopped; its identity and local work are unchanged.");
+    throw setupError("temporarily_unavailable", "agentStoppedUnconfirmed");
   }
 
   wait(): Promise<void> {
@@ -993,27 +988,27 @@ class ServiceCycle {
   }
 
   /** Drains the connector and waits up to 15 minutes for its active work to finish. */
-  async drain(control: Pick<SupervisorControl, "call">, output: { line(text: string): void }, words: { waiting: (count: number) => string; timedOut: string }): Promise<void> {
+  async drain(control: Pick<SupervisorControl, "call">, output: { line(text: string): void }, words: { waiting: (count: number) => string; timedOut: string | RemoteInstanceError }): Promise<void> {
     await control.call({ op: "drain", reason: "update" }, z.unknown());
     const drainDeadline = this.deps.now() + 15 * 60_000;
     for (;;) {
       const state = await control.call({ op: "drain.status" }, DrainStatusSchema);
       if (state.activeAssignments === 0) return;
-      if (this.deps.now() >= drainDeadline) throw new RemoteInstanceError("active_work", words.timedOut);
+      if (this.deps.now() >= drainDeadline) throw cycleFailure("active_work", words.timedOut);
       output.line(words.waiting(state.activeAssignments));
       await this.deps.sleep(this.deps.pollMs ?? 5_000);
     }
   }
 
-  async stop(couldNotStop: string, didNotFinish: string): Promise<void> {
-    if (await this.deps.execute(this.definition.stop) !== 0) throw new RemoteInstanceError("temporarily_unavailable", couldNotStop);
+  async stop(couldNotStop: string | RemoteInstanceError, didNotFinish: string | RemoteInstanceError): Promise<void> {
+    if (await this.deps.execute(this.definition.stop) !== 0) throw cycleFailure("temporarily_unavailable", couldNotStop);
     await this.awaitStopped(didNotFinish);
   }
 
-  async awaitStopped(didNotFinish: string): Promise<void> {
+  async awaitStopped(didNotFinish: string | RemoteInstanceError): Promise<void> {
     this.resetStopDeadline();
     while (!await this.stopped()) {
-      if (this.deps.now() >= this.stopDeadline) throw new RemoteInstanceError("temporarily_unavailable", didNotFinish);
+      if (this.deps.now() >= this.stopDeadline) throw cycleFailure("temporarily_unavailable", didNotFinish);
       await this.wait();
     }
   }
@@ -1033,6 +1028,10 @@ class ServiceCycle {
       }
     }
   }
+}
+
+function cycleFailure(code: "active_work" | "temporarily_unavailable", failure: string | RemoteInstanceError): RemoteInstanceError {
+  return typeof failure === "string" ? new RemoteInstanceError(code, failure) : failure;
 }
 
 interface NativeAgentRemoveDeps {
@@ -1143,7 +1142,7 @@ export const nativeCliActions: NativeCliActions = {
       return;
     }
     // A fetched agent in --agents (Google Antigravity) asks its consent line in this terminal before anything is activated.
-    const consent = terminalFetchConsent({ line: text => input.output.line(text) });
+    const consent = terminalFetchConsent({ line: text => input.output.line(text), locale: outputLocale(input.output) });
     // Without --agents, a missing Claude Code or Codex is offered before the code is asked.
     const setUp: string[] = [];
     const setupAgent = async (agent: "claude-code" | "codex") => { const done = await setUpPersonalAgent(agent, input.output); if (done) setUp.push(agent); return done; };
