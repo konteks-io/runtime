@@ -2,7 +2,8 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { connect, isIPv4, isIPv6, type Socket } from "node:net";
 import type { Duplex } from "node:stream";
-import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import { createLogger, RemoteInstanceError, withNativeSpan, type Logger } from "@konteks/remote-common";
+import type { ObservabilityContextV1 } from "@konteks/backstage-plugin-common";
 import { BROWSER_ORIGINS_PATH } from "@konteks/remote-agent-runner";
 
 export { BROWSER_ORIGINS_PATH };
@@ -47,6 +48,7 @@ export interface BrowserGatewayOptions {
   onActivity?: () => void;
   logger?: Logger;
   context?: Record<string, unknown>;
+  observability?: () => ObservabilityContextV1 | undefined;
   localPort?: number;
   initiallyInactive?: boolean;
 }
@@ -226,7 +228,7 @@ export class PreviewBrowserGateway {
     socket.on("error", () => undefined);
     const refuse = (status: number, message: string) => {
       this.counters.refused += 1;
-      if (status !== 404) this.logger.info({ event: "preview.browser_refused", status, ...this.options.context }, "the QA browser asked for something outside its preview");
+      this.recordRefusal(status);
       socket.end(`HTTP/1.1 ${status} Refused\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n${message}\n`);
     };
     const verdict = this.closed || !this.active ? { ok: false as const, status: 503, message: "The session is not active." } : this.admit(`http://${request.url ?? ""}`, true);
@@ -270,6 +272,7 @@ export class PreviewBrowserGateway {
     const verdict = this.closed || !this.active ? { ok: false as const, status: 503, message: "The session is not active." } : this.admit(request.url);
     if (!verdict.ok) {
       this.counters.refused += 1;
+      this.recordRefusal(verdict.status);
       socket.end(`HTTP/1.1 ${verdict.status} Refused\r\nConnection: close\r\n\r\n`);
       return;
     }
@@ -300,9 +303,17 @@ export class PreviewBrowserGateway {
 
   private refuse(response: ServerResponse, status: number, message: string): void {
     this.counters.refused += 1;
-    if (status !== 404) this.logger.info({ event: "preview.browser_refused", status, ...this.options.context }, "the QA browser asked for something outside its preview");
+    this.recordRefusal(status);
     response.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", Connection: "close" });
     response.end(`<!doctype html><html><head><title>Konteks preview</title></head><body><p>${escapeHtml(message)}</p></body></html>\n`);
+  }
+
+  private recordRefusal(status: number): void {
+    void withNativeSpan("native.preview.request", this.options.observability?.(), {
+      assignmentId: this.options.context?.assignmentId, attempt: this.options.context?.attempt, stage: "browser_request",
+    }, async () => {
+      this.logger.info({ event: "preview.browser_refused", status, ...this.options.context }, "the QA browser request was refused");
+    }, () => ({ outcome: "refused", errorCode: "browser_request_refused", httpStatus: status }));
   }
 }
 

@@ -17,6 +17,14 @@ const parent = { schemaVersion: "observability-context-v1" as const,
   traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01", tenantId: "tenant", assignmentId: "assignment", attempt: 1 };
 
 describe("native tracing", () => {
+  it("retains assignment diagnostics under the collector audit policy and uses canonical session attributes", async () => {
+    await withNativeSpan("native.preview.tool", { ...parent, sessionId: "session" }, { assignmentId: "assignment", tool: "preview_start" }, async () => undefined);
+    await withNativeSpan("native.bootstrap.stage", undefined, { assignmentId: "assignment", stage: "browser_gateway" }, async () => undefined);
+    await provider.forceFlush();
+    const spans = exporter.getFinishedSpans();
+    expect(spans[0]!.attributes["konteks.session.id"]).toBe("session");
+    expect(spans.every(span => span.attributes["konteks.audit.required"] === true)).toBe(true);
+  });
   it("requires an explicit safe destination and never treats bad telemetry configuration as execution authority", async () => {
     expect(initializeNativeTracing({})).toMatchObject({ enabled: false, reason: "not_configured" });
     expect(initializeNativeTracing({ OTEL_SDK_DISABLED: "true", OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://127.0.0.1:4318/v1/traces" }).enabled).toBe(false);

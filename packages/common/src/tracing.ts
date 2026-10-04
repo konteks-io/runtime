@@ -66,12 +66,16 @@ export async function withNativeSpan<T>(
     : parsed.success ? propagation.extract(ROOT_CONTEXT, {
         traceparent: parsed.data.traceparent, ...(parsed.data.tracestate ? { tracestate: parsed.data.tracestate } : {}),
       }) : ROOT_CONTEXT;
-  const attributes: Record<string, string | number> = { "konteks.diagnostic.coverage": parsed.success ? "correlated" : "local_only" };
+  const attributes: Record<string, string | number | boolean> = { "konteks.diagnostic.coverage": parsed.success ? "correlated" : "local_only" };
   for (const [key, value] of Object.entries({ assignmentId: facts.assignmentId, stage: facts.stage, tool: facts.tool,
     tenantId: parsed.success ? parsed.data.tenantId : undefined, sessionId: parsed.success ? parsed.data.sessionId : undefined,
     invocationId: parsed.success ? parsed.data.invocationId : undefined })) {
     if (typeof value === "string" && value.length > 0 && value.length <= 200 && !/[\p{Cc}\p{Cf}]/u.test(value)) attributes[`konteks.${key}`] = value;
   }
+  // Keep assignment diagnostics even before the cloud context is bound. The
+  // collector retains this audit attribute instead of sampling successful work.
+  if (attributes["konteks.assignmentId"]) attributes["konteks.audit.required"] = true;
+  if (attributes["konteks.sessionId"]) attributes["konteks.session.id"] = attributes["konteks.sessionId"];
   if (typeof facts.attempt === "number" && Number.isSafeInteger(facts.attempt) && facts.attempt > 0) attributes["konteks.attempt"] = facts.attempt;
   return trace.getTracer("konteks-native").startActiveSpan(name, { attributes }, scope, async span => {
     try {

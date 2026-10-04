@@ -419,6 +419,7 @@ export class RelayedSession {
           onActivity: () => preview.touch(sessionId),
           logger: this.logger,
           context: { assignmentId: this.assignment.id, attempt: this.assignment.attempt },
+          observability: () => this.diagnosticContext,
         });
         this.browserGateway = gateway;
         const proxyUrl = await this.bootstrapStage("browser_gateway", () => gateway.start());
