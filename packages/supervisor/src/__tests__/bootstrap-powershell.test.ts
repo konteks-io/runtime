@@ -96,17 +96,20 @@ describe("bootstrap/install.ps1", () => {
   it("updates a connected computer's launcher with -Update: no activation, the MSI first, then update and start", () => {
     expect(script).toMatch(/^\s*\[switch\]\$Update,$/m);
     const refuseBoth = script.indexOf("if ($Update -and $ActivationId) {");
-    const notInstalled = script.indexOf("if ($Update -and -not (Test-Path (Join-Path ${env:USERPROFILE} 'AppData\\Local\\konteks-remote\\native-runtime.json'))) {");
+    const runtimeRoot = script.indexOf("$RuntimeRoot = Join-Path ${env:USERPROFILE} 'AppData\\Local\\konteks-remote'");
+    const notInstalled = script.indexOf("if ($Update -and -not (Test-Path (Join-Path $RuntimeRoot 'native-runtime.json'))) {");
     const requireId = script.indexOf("if (-not $Update -and -not $ActivationId) {");
     expect(refuseBoth).toBeGreaterThan(script.indexOf("if ($VerifyOnly) { return }"));
-    expect(notInstalled).toBeGreaterThan(refuseBoth);
+    expect(runtimeRoot).toBeGreaterThan(refuseBoth);
+    expect(notInstalled).toBeGreaterThan(runtimeRoot);
     expect(requireId).toBeGreaterThan(notInstalled);
-    const msiexec = script.indexOf("msiexec.exe");
+    const msiexec = script.indexOf("Start-Process -FilePath 'msiexec.exe'");
     const update = script.indexOf("& $launcher update");
     const start = script.indexOf("& $launcher start");
     expect(msiexec).toBeGreaterThan(requireId);
     expect(update).toBeGreaterThan(msiexec);
     expect(start).toBeGreaterThan(update);
+    expect(script.slice(msiexec, update)).toContain("-Verb RunAs -Wait -PassThru");
     expect(script.slice(update, start)).toMatch(/\$code = \$LASTEXITCODE/);
   });
 });
