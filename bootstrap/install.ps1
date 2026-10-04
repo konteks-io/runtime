@@ -228,6 +228,7 @@ $SetupIndonesian = @{
   "This release is verified by Konteks' signed checksums." = 'Rilis ini diverifikasi dengan checksum bertanda tangan milik Konteks.'
   "Windows may show 'Unknown publisher' at the approval prompt." = "Windows mungkin menampilkan 'Unknown publisher' pada permintaan persetujuan."
   'package Authenticode signature is {0}; nothing was installed' = 'tanda tangan Authenticode paket berstatus {0}; tidak ada yang dipasang'
+  'Windows cannot verify the installer Authenticode signature; nothing was installed' = 'Windows tidak dapat memverifikasi tanda tangan Authenticode pemasang; tidak ada yang dipasang'
   'package signer is not the expected publisher; nothing was installed' = 'penandatangan paket bukan penerbit yang diharapkan; tidak ada yang dipasang'
   'package signer thumbprint mismatch; nothing was installed' = 'thumbprint penandatangan paket tidak cocok; tidak ada yang dipasang'
   'Verified the Windows installer and signed release manifest.' = 'Pemasang Windows dan manifes rilis bertanda tangan sudah diverifikasi.'
@@ -392,7 +393,16 @@ try {
 
   # A signed MSI is still held to its signature and publisher; an unsigned one
   # is already proven by the signed checksums above.
-  $authenticode = Get-AuthenticodeSignature -FilePath $msiPath
+  $authenticodeCommand = Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue
+  if ($null -eq $authenticodeCommand) {
+    # A different PowerShell parent's module path may hide this host's cmdlet.
+    # Import only this engine's native module, without changing its search path.
+    $securityPath = Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1'
+    $securityModule = Import-Module -Name $securityPath -Scope Local -PassThru -ErrorAction Stop
+    $authenticodeCommand = $securityModule.ExportedCmdlets['Get-AuthenticodeSignature']
+    if ($null -eq $authenticodeCommand) { throw (Get-SetupText 'Windows cannot verify the installer Authenticode signature; nothing was installed') }
+  }
+  $authenticode = & $authenticodeCommand -FilePath $msiPath
   if ($authenticode.Status -eq 'NotSigned') {
     Write-SetupDetail (Get-SetupText "This release is verified by Konteks' signed checksums.")
     Write-SetupDetail (Get-SetupText "Windows may show 'Unknown publisher' at the approval prompt.")
