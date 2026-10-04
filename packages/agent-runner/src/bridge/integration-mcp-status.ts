@@ -123,9 +123,15 @@ const ask = () => Promise.race([q.mcpServerStatus(), new Promise((_, reject) => 
 const text = (value, max) => typeof value === "string" ? value.slice(0, max) : "";
 let out;
 try {
+  // Claude loads the account's connectors asynchronously: its first answer is
+  // often an empty list. Keep asking while the list is still empty (within a
+  // short settle window) or any server is still pending.
+  const settleUntil = Date.now() + 15000;
+  const unsettled = status => Array.isArray(status) &&
+    ((status.length === 0 && Date.now() < settleUntil) || status.some(server => server && server.status === "pending"));
   let status = await ask();
-  while (Array.isArray(status) && status.some(server => server && server.status === "pending") && Date.now() + 3000 < deadline) {
-    await new Promise(resolve => setTimeout(resolve, 3000));
+  while (unsettled(status) && Date.now() + 1500 < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 1500));
     status = await ask();
   }
   out = (Array.isArray(status) ? status : []).slice(0, 64).map(server => ({

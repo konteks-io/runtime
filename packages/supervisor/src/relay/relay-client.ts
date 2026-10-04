@@ -185,6 +185,8 @@ export class RelayClient {
   private readonly outboundQueue: Array<{ socket: NodeWebSocket; payload: string; bytes: number }> = [];
   private outboundQueuedBytes = 0;
   private drainTimer: NodeJS.Timeout | null = null;
+  /** Re-handshakes with the current lease before the one this socket handshook with expires. */
+  private leaseRotationTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly options: RelayClientOptions) {
     this.logger = options.logger ?? createLogger({ name: "relay-client" });
@@ -205,6 +207,7 @@ export class RelayClient {
 
   stop(): void {
     this.stopped = true;
+    this.clearLeaseRotation();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.clearOutboundQueue();
@@ -221,6 +224,7 @@ export class RelayClient {
   /** Forces a fresh handshake (stall, sequence gap, lease change). Unacked frames stay buffered. */
   rehandshake(reason: string): void {
     this.logger.info({ reason }, "re-handshaking the relay socket");
+    this.clearLeaseRotation();
     this.connectionFence += 1;
     this.clearOutboundQueue();
     this.replaySocket = null;
@@ -520,6 +524,7 @@ export class RelayClient {
     this.consecutiveFailures = 0;
     this.lastError = null;
     this.setState("connected");
+    this.armLeaseRotation(attempt.lease);
     if (attempt.current()) await this.options.onConnected?.(handshake);
   }
 
@@ -613,6 +618,7 @@ export class RelayClient {
   private onClose(attempt: SocketAttempt, attemptNumber: number, code: number, reason: Buffer): void {
     clearTimeout(attempt.handshakeTimer);
     if (attemptNumber !== this.attemptEpoch) return;
+    this.clearLeaseRotation();
     this.socket = null;
     this.clearOutboundQueue();
     this.replaySocket = null;
@@ -639,6 +645,30 @@ export class RelayClient {
       connectionEpoch: this.options.mux.connectionEpoch }, "relay socket closed");
   }
 
+  /**
+   * Core holds a runtime's relay connection to the lease it handshook with,
+   * while heartbeats keep adopting fresh ones. Before that first lease
+   * expires, re-handshake with the current one (unacked frames stay
+   * buffered); otherwise Core calls the socket stale and the relay closes it
+   * with 4409 once per lease lifetime.
+   */
+  private armLeaseRotation(lease: string): void {
+    this.clearLeaseRotation();
+    const expiresAt = leaseExpiryMs(lease);
+    if (expiresAt === null) return;
+    const delay = Math.max(LEASE_ROTATION_MIN_DELAY_MS, expiresAt - Date.now() - LEASE_ROTATION_MARGIN_MS);
+    this.leaseRotationTimer = setTimeout(() => {
+      this.leaseRotationTimer = null;
+      if (!this.stopped && this.state === "connected") this.rehandshake("lease_rotation");
+    }, delay);
+    this.leaseRotationTimer.unref();
+  }
+
+  private clearLeaseRotation(): void {
+    if (this.leaseRotationTimer) clearTimeout(this.leaseRotationTimer);
+    this.leaseRotationTimer = null;
+  }
+
   private scheduleReconnect(connectedForMs: number): void {
     if (this.stopped || this.reconnectTimer) return;
     const delay = withJitter(this.backoff.nextDelayAfterClose(connectedForMs));
@@ -661,6 +691,22 @@ const FAILURE_CLASSIFICATIONS: ReadonlyArray<readonly [RegExp, string]> = [
   [/HTTP 429/i, "rate_limited"],
   [/HTTP 5\d\d/i, "upstream"],
 ];
+
+/** How long before the connected lease expires the socket re-handshakes, and the least it waits. */
+const LEASE_ROTATION_MARGIN_MS = 60_000;
+const LEASE_ROTATION_MIN_DELAY_MS = 5_000;
+
+/** The `exp` of a lease token, read only to schedule the rotation (Core verifies the lease itself). */
+function leaseExpiryMs(lease: string): number | null {
+  const payload = lease.split(".")[1];
+  if (!payload) return null;
+  try {
+    const exp = (JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: unknown }).exp;
+    return typeof exp === "number" && Number.isFinite(exp) ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
 
 function relayFailureClassification(error: string | null): string {
   if (!error) return "socket_closed";

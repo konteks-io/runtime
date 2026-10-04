@@ -41,6 +41,50 @@ function delayedAdoption(overrides: Partial<RelayClientOptions> = {}) {
   return { ...f, mux, adoption, onFrame, persistCursors, frame, replaceGeneration: () => { authority = "replacement"; } };
 }
 
+/** A lease-shaped token whose payload names only its expiry (the relay client reads nothing else). */
+function leaseToken(expiresAtMs: number): string {
+  const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${part({ alg: "EdDSA" })}.${part({ exp: Math.floor(expiresAtMs / 1000) })}.signature`;
+}
+
+describe("relay socket lease rotation (2026-10-03)", () => {
+  // Production: Core ties a runtime's relay connection to the lease it
+  // handshook with (15 min). Heartbeats renewed the lease, the socket kept the
+  // old one, and the relay closed it with 4409 relay_epoch_stale every ~15 min.
+  it("re-handshakes with the current lease shortly before the connected lease expires", async () => {
+    vi.useFakeTimers({ now: Date.parse("2026-10-03T07:00:00.000Z") });
+    let lease = leaseToken(Date.parse("2026-10-03T07:15:00.000Z"));
+    const f = fixture({ lease: () => lease });
+    try {
+      f.socket.message(confirmed); await flush();
+      expect(f.client.connected).toBe(true);
+      lease = leaseToken(Date.parse("2026-10-03T07:30:00.000Z"));
+      await vi.advanceTimersByTimeAsync(13 * 60_000);
+      expect(f.socket.close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(f.socket.close).toHaveBeenCalledTimes(1);
+      expect(f.socket.close).toHaveBeenCalledWith(1012, "lease_rotation");
+    } finally { f.client.stop(); vi.useRealTimers(); }
+  });
+
+  it("arms nothing for a lease without a readable expiry, and nothing survives stop", async () => {
+    vi.useFakeTimers({ now: Date.parse("2026-10-03T07:00:00.000Z") });
+    const opaque = fixture();
+    try {
+      opaque.socket.message(confirmed); await flush();
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(opaque.socket.close).not.toHaveBeenCalled();
+    } finally { opaque.client.stop(); }
+    const stopped = fixture({ lease: () => leaseToken(Date.parse("2026-10-03T08:15:00.000Z")) });
+    try {
+      stopped.socket.message(confirmed); await flush();
+      stopped.client.stop();
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      expect(stopped.socket.close).not.toHaveBeenCalledWith(1012, "lease_rotation");
+    } finally { vi.useRealTimers(); }
+  });
+});
+
 describe("native runtime relay handshake validation boundary", () => {
   it("routes a current relay replay request to the mux without treating it as an ack or data frame", async () => {
     const f = fixture();

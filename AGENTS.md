@@ -99,6 +99,12 @@ Node 22 (`.nvmrc`; CI and releases use 22.23.2). From the repo root:
   (`packages/supervisor/src/control/handlers.ts`, `native/update.ts`). Raising
   the minimum together with the target cuts off every live older runtime; the
   two-step pin is in `ci-cd/RELEASE_PROCEDURE.md` (Stage 4, step 7).
+- **Relay lease rotation.** Core holds a runtime's relay connection to the
+  lease it handshook with (15 min), so `RelayClient.armLeaseRotation`
+  re-handshakes with the current heartbeat lease 60 s before that one expires
+  (`rehandshake("lease_rotation")`, close 1012, unacked frames kept); without
+  it the relay closes the socket with 4409 `relay_epoch_stale` once per lease
+  lifetime.
 - **Release channel overrides are per process.** Test overrides
   (`KONTEKS_RELEASE_MANIFEST_URL`, `NODE_EXTRA_CA_CERTS`) go on ONE process;
   never `launchctl setenv` or a shell profile, which silently points the

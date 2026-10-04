@@ -10,7 +10,7 @@ import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, ownedByAnothe
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
-import type { NativeServiceCommand, NativeServiceDefinition } from "./service.js";
+import { CONNECTOR_LOG_FILE, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps, type NativeUpdateStage } from "./update.js";
 
 interface UpdateControlClient {
@@ -50,7 +50,14 @@ export interface NativeUpdateTransactionDeps {
   processAlive?: (pid: number) => boolean;
   /** Ends a process and its own process group, only while it is still this root's connector. */
   killProcessGroup?: (pid: number, root: string) => Promise<void>;
+  /**
+   * A mark that changes whenever the starting connector shows progress (its
+   * log grows); null where it cannot say. The health deadline counts from the
+   * last change, so a slow start on a busy computer is not rolled back.
+   */
+  startupProgress?: (root: string) => Promise<string | null>;
   drainDeadlineMs?: number;
+  /** How long the successor may show no progress before it is rolled back. */
   healthDeadlineMs?: number;
   /** How long the old service may take to exit and release the runtime directory after its stop command returned. */
   stopDeadlineMs?: number;
@@ -88,6 +95,10 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
     recordAttempt: recordNativeUpdateAttempt,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     now: Date.now,
+    startupProgress: async root => {
+      const log = await stat(join(root, "logs", CONNECTOR_LOG_FILE)).catch(() => null);
+      return log ? `${log.size}:${log.mtimeMs}` : null;
+    },
     readStopReceipt: async root => readFile(join(root, "supervisor", NATIVE_SHUTDOWN_RECEIPT_FILE), "utf8").catch(error => {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
@@ -184,7 +195,7 @@ class UpdateTransaction {
     const successor = await commitOnceReleased(input, update.staged.releaseId, deps);
     this.successor = successor;
     if (update.wasRunning) {
-      input.output.line(`Starting ${successor.bundleVersion} and checking it is healthy before keeping it (up to ${spoken(deps.healthDeadlineMs ?? 180_000)})…`);
+      input.output.line(`Starting ${successor.bundleVersion} and checking it is healthy before keeping it (rolled back if it makes no progress for ${spoken(deps.healthDeadlineMs ?? 180_000)})…`);
       await deps.start(input);
       await healthGate(input, deps.control(input.root, successor), { previous: update.previous, successor, baseline }, deps, update.definition);
     }
@@ -640,10 +651,13 @@ interface GateVersions {
  * present; a pre-existing failure (an agent awaiting login) is not the update's.
  */
 async function healthGate(input: NativeUpdateInput, control: UpdateControlClient, versions: GateVersions, deps: NativeUpdateTransactionDeps, definition: NativeServiceDefinition): Promise<void> {
-  const deadline = deps.now() + (deps.healthDeadlineMs ?? 180_000);
-  const poll = deps.pollMs ?? 3_000;
-  await agentsSettled(input, control, versions.successor, { deps, definition, deadline, poll });
-  await noIntroducedFailures(input, control, versions, { deps, definition, deadline, poll });
+  const quietMs = deps.healthDeadlineMs ?? 180_000;
+  const clock: GateClock = { deps, definition, root: input.root, quietMs, deadline: deps.now() + quietMs, poll: deps.pollMs ?? 3_000 };
+  await agentsSettled(input, control, versions.successor, clock);
+  // Connectivity checks (relay, lease) settle seconds after start; they get a
+  // full quiet window after the agents settled.
+  clock.deadline = Math.max(clock.deadline, deps.now() + quietMs);
+  await noIntroducedFailures(input, control, versions, clock);
   for (const agent of (await control.call({ op: "agents" }, AgentsSchema)).agents) {
     if (agent.readiness === "reconnect_required") input.output.line(`agent ${agent.agentId} needs a fresh login after this update: run \`konteks-remote auth login ${agent.agentId}\`.`);
   }
@@ -652,8 +666,14 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
 interface GateClock {
   deps: NativeUpdateTransactionDeps;
   definition: NativeServiceDefinition;
+  root: string;
+  /** How long the successor may show no progress. */
+  quietMs: number;
+  /** Moves forward whenever the successor shows progress while starting. */
   deadline: number;
   poll: number;
+  /** The last startup progress mark seen; undefined before the first. */
+  progressMark?: string;
 }
 
 interface ProbeState {
@@ -708,12 +728,25 @@ function unsettledAgents(successor: NativeRuntimeRecord, probed: readonly { agen
 async function giveUpIfHopeless(state: ProbeState, clock: GateClock): Promise<void> {
   const exits = state.answered ? null : await clock.deps.serviceExits?.(clock.definition).catch(() => null);
   if (exits && exits.runs >= 3 && exits.lastExitCode) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector stopped as soon as it started, ${exits.runs} times (exit code ${exits.lastExitCode}).`);
+  await extendOnProgress(clock);
   if (clock.deps.now() >= clock.deadline) throw new RemoteInstanceError("temporarily_unavailable", probeTimeoutMessage(state));
 }
 
+/**
+ * A connector still starting (QA browser, agent packages, model discovery)
+ * keeps writing its log, and on a loaded computer that alone can take over
+ * three minutes. Only a successor that stops making progress is rolled back.
+ */
+async function extendOnProgress(clock: GateClock): Promise<void> {
+  const mark = await clock.deps.startupProgress?.(clock.root).catch(() => null) ?? null;
+  if (mark === null) return;
+  if (clock.progressMark !== undefined && mark !== clock.progressMark) clock.deadline = clock.deps.now() + clock.quietMs;
+  clock.progressMark = mark;
+}
+
 function probeTimeoutMessage(state: ProbeState): string {
-  if (!state.answered) return "The updated connector did not answer on its control socket in time.";
-  return `The updated connector did not finish probing its agents in time (${state.unsettled.join(", ") || "unknown"}).`;
+  if (!state.answered) return "The updated connector stopped making progress before it answered on its control socket.";
+  return `The updated connector stopped making progress while probing its agents (${state.unsettled.join(", ") || "unknown"}).`;
 }
 
 /**
