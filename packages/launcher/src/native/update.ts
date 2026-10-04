@@ -1,10 +1,11 @@
 import { mkdir, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, parse, resolve } from "node:path";
-import { NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
+import { NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, writeSecretFile } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, ownedByAnotherConnector, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
+import { setupError, setupLine, setupLocale } from "../setup-locale.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
 import { moveRecordAndManifest, withRuntimeLocks } from "./install.js";
 
@@ -21,6 +22,7 @@ type NativeUpdateCheck =
 
 /** Read-only: which signed release the channel offers relative to the installed record. */
 export async function checkNativeUpdate(options: { root: string; deps?: NativeUpdateDeps }): Promise<NativeUpdateCheck> {
+  setupLocale();
   const platform = options.deps?.platform ?? nativePlatform();
   const roots = options.deps?.roots ?? EMBEDDED_RELEASE_ROOTS;
   const root = validRoot(options.root);
@@ -33,7 +35,7 @@ export async function checkNativeUpdate(options: { root: string; deps?: NativeUp
 /** The manifest the deps hold, else the one the release channel serves. */
 async function channelManifest(deps: NativeUpdateDeps | undefined): Promise<unknown> {
   if (deps?.manifest !== undefined && deps.manifest !== null) return deps.manifest;
-  return fetchNativeReleaseManifest(deps?.fetchFn ?? fetch).catch(() => { throw new RemoteInstanceError("temporarily_unavailable", "The native release channel could not be read; the installed release is unchanged."); });
+  return fetchNativeReleaseManifest(deps?.fetchFn ?? fetch).catch(() => { throw setupError("temporarily_unavailable", "updateChannelUnreadable"); });
 }
 
 export type NativeUpdateStage =
@@ -49,7 +51,7 @@ function installerLockForUpdate(root: string): ReturnType<typeof acquireNativeRo
   try { return acquireNativeRootLock(join(root, "installer")); }
   catch (error) {
     if (ownedByAnotherConnector(error)) {
-      throw new RemoteInstanceError("temporarily_unavailable", "Another update or install of this connector is still running (it may be downloading a release). Wait for it to finish, then run `konteks-remote status`.", { cause: error });
+      throw setupError("temporarily_unavailable", "updateBusy", {}, { cause: error });
     }
     throw error;
   }
@@ -62,6 +64,7 @@ function installerLockForUpdate(root: string): ReturnType<typeof acquireNativeRo
  * record still names the previous release until `commitNativeUpdate`.
  */
 export async function stageNativeUpdate(options: { root: string; output: Output; deps?: NativeUpdateDeps }): Promise<NativeUpdateStage> {
+  setupLocale();
   const platform = options.deps?.platform ?? nativePlatform();
   const root = validRoot(options.root);
   const deps = await frozenUpdateDeps(root, options.deps);
@@ -74,10 +77,10 @@ export async function stageNativeUpdate(options: { root: string; output: Output;
     const agents = current.agents.filter(agent => !isHostAgentId(agent));
     const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: agents });
     assertOfflineArtifacts(artifacts);
-    options.output.line(`Staging native release ${release.manifest.bundleVersion} (installed: ${current.bundleVersion})… Downloading, verifying and unpacking its signed packages can take a few minutes; leave this command running and return for the result.`);
+    setupLine(options.output, "updateStaging", { version: release.manifest.bundleVersion, current: current.bundleVersion });
     const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn: options.deps?.fetchFn ?? fetch });
     const { releaseId, directory } = await completeStagedRelease({ root, release, platform, agents, artifacts, staged, lock });
-    options.output.line(`Release ${release.manifest.bundleVersion} staged as ${releaseId}; the running release is unchanged until it is committed.`);
+    setupLine(options.output, "updateStaged", { version: release.manifest.bundleVersion, release: releaseId });
     return { status: "staged", current, release, releaseId, directory };
   } finally {
     lock.release();
@@ -95,7 +98,7 @@ async function frozenUpdateDeps(root: string, deps: NativeUpdateDeps | undefined
   const pinned = { ...deps, manifest };
   const check = await checkNativeUpdate({ root, deps: pinned });
   if (check.status !== "available" || check.release.manifest.bundleVersion !== target.bundleVersion || check.release.manifest.digest !== target.manifestDigest) {
-    throw new RemoteInstanceError("update_required", "The signed update target changed; the installed release is unchanged.");
+    throw setupError("update_required", "updateTargetChanged");
   }
   return { ...deps, manifest: check.release.manifest };
 }
@@ -104,7 +107,7 @@ type SelectedArtifact = ReturnType<typeof selectNativeArtifacts>[number];
 
 function assertOfflineArtifacts(artifacts: readonly SelectedArtifact[]): void {
   if (artifacts.some(artifact => artifact.kind === "connector" ? artifact.format !== "executable" : artifact.format !== "offline_agent_tgz")) {
-    throw new RemoteInstanceError("bundle_untrusted", "Native updates require a complete signed offline package with official login tooling.");
+    throw setupError("bundle_untrusted", "updateOfflineRequired");
   }
 }
 
@@ -144,6 +147,7 @@ async function completeStagedRelease(candidate: {
  * `restoreNativeRecord` can roll back without a download.
  */
 export async function commitNativeUpdate(options: { root: string; releaseId: string; output: Output; deps?: Pick<NativeUpdateDeps, "roots" | "platform"> }): Promise<NativeRuntimeRecord> {
+  setupLocale();
   const platform = options.deps?.platform ?? nativePlatform();
   const roots = options.deps?.roots ?? EMBEDDED_RELEASE_ROOTS;
   const root = validRoot(options.root);
@@ -154,7 +158,7 @@ export async function commitNativeUpdate(options: { root: string; releaseId: str
     const release = await stagedRelease(join(root, "releases", options.releaseId), roots, platform, current.record);
     const successor = NativeRuntimeRecordSchema.parse({ ...current.record, releaseId: options.releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest });
     await moveRecordAndManifest({ root, lock: installer, load: () => loadNativeInstallation(root, { roots, platform }), current: current.record, successor, manifest: release.manifest, corrupt: invalid });
-    options.output.line(`Runtime record moved to ${options.releaseId} (${successor.bundleVersion}); ${current.record.releaseId} is kept for rollback.`);
+    setupLine(options.output, "updateRecordMoved", { release: options.releaseId, version: successor.bundleVersion, previous: current.record.releaseId });
     return successor;
   });
 }
@@ -162,7 +166,7 @@ export async function commitNativeUpdate(options: { root: string; releaseId: str
 /** The staged release, strictly newer than the installed one and verified as an installable connector. */
 async function stagedRelease(directory: string, roots: readonly EmbeddedReleaseRoot[], platform: NativePlatform, current: NativeRuntimeRecord): Promise<VerifiedNativeRelease> {
   const release = verifyNativeRelease(JSON.parse(await readFile(join(directory, "manifest.json"), "utf8")), roots);
-  if (compareSemver(release.manifest.bundleVersion, current.bundleVersion) <= 0) throw new RemoteInstanceError("update_required", "Only a strictly newer signed release can be committed; stale or same-version releases are refused.");
+  if (compareSemver(release.manifest.bundleVersion, current.bundleVersion) <= 0) throw setupError("update_required", "updateNotNewer");
   await verifyInstalledNativeConnector(release, directory, platform);
   return release;
 }
@@ -173,4 +177,4 @@ function validRoot(value: string): string {
   if (root === parse(root).root || root === resolve(homedir())) throw invalid();
   return root;
 }
-function invalid() { return new RemoteInstanceError("install_state_corrupt", "Native update cannot be completed; the installed release, identity and credentials were preserved."); }
+function invalid() { return setupError("install_state_corrupt", "updateInvalid"); }

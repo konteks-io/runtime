@@ -4,6 +4,7 @@ import type { SupervisorControl } from "../control.js";
 import { isHostAgentId } from "@konteks/remote-release";
 import { AlreadyToldError, type Output } from "../output.js";
 import { confirm, promptLine, promptSecret } from "../prompt.js";
+import { outputLocale, setupError, setupLine, setupWords } from "../setup-locale.js";
 import { agentName } from "./agent-name.js";
 
 /**
@@ -135,8 +136,8 @@ export async function authStatus(context: ControlContext, agentId?: string): Pro
 export async function authLogin(context: ControlContext, agentId: string, organization: boolean, which: { provider?: string; method?: string; reuse?: boolean; project?: string; location?: string } = {}): Promise<void> {
   const prompts = loginPrompts(context);
   if (organization) {
-    const ok = await prompts.ask(`Attest that the ${agentId} account you are about to log in is owned by your organization and may serve colleagues' work?`);
-    if (!ok) throw new RemoteInstanceError("ownership_promotion_denied", "organization attestation declined; log in without --organization for a personal account");
+    const ok = await prompts.ask(setupWords(context.output, "organizationAttestation", { agent: agentId }));
+    if (!ok) throw setupError("ownership_promotion_denied", "organizationDeclined");
   }
   const relay = new LoginRelay(context, prompts, agentName(agentId), organization);
   try {
@@ -155,7 +156,7 @@ interface LoginPrompts {
 }
 
 function loginPrompts(context: ControlContext): LoginPrompts {
-  const input = context.input ? { input: context.input } : {};
+  const input = { ...(context.input ? { input: context.input } : {}), locale: outputLocale(context.output) };
   return {
     ask: context.confirm ?? ((question: string) => confirm(question, input)),
     secret: context.promptSecret ?? ((label: string) => promptSecret({ label, minLength: 1, ...input })),
@@ -185,7 +186,7 @@ class LoginRelay {
         this.lastLine = event.text;
         return;
       case "open_url":
-        this.context.output.line(`open this URL to sign in: ${event.url}${event.userCode ? `\nenter code: ${event.userCode}` : ""}`);
+        setupLine(this.context.output, "signInOpenUrl", { url: event.url, code: event.userCode ? setupWords(this.context.output, "signInEnterCode", { code: event.userCode }) : "" });
         return;
       case "prompt": return this.prompt(event);
       case "completed": return this.completed(event.readiness);
@@ -202,7 +203,7 @@ class LoginRelay {
    * over an open prompt.
    */
   private started(agentId: string): void {
-    if (!isHostAgentId(agentId) && this.promptsOpen === 0) this.context.output.line(`Starting ${agentName(agentId)}'s own sign-in. Follow its steps below.`);
+    if (!isHostAgentId(agentId) && this.promptsOpen === 0) setupLine(this.context.output, "signInStarting", { name: agentName(agentId) });
   }
 
   /** A choice (OpenCode's provider) is typed in the open; anything else, an API key included, with the hidden prompt, never echoed. */
@@ -216,9 +217,7 @@ class LoginRelay {
   }
 
   private completed(readiness: string): void {
-    this.context.output.line((readiness === "ready"
-      ? `${this.name} is ready${this.organization ? " for your organization" : ""}.`
-      : `${this.name} is signed in but not ready yet; konteks-remote doctor says why.`) + (this.inWindow ? " You can close this window." : ""));
+    this.context.output.line(setupWords(this.context.output, readiness === "ready" ? "signInReady" : "signInNotReady", { name: this.name, organization: this.organization ? setupWords(this.context.output, "signInOrganization") : "" }) + (this.inWindow ? setupWords(this.context.output, "closeWindow") : ""));
   }
 
   /**

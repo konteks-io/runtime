@@ -5,6 +5,7 @@ import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin
 import { nativePaths, nativePlatform } from "./service.js";
 import { createOutput, type Output } from "../output.js";
 import { setVerbose } from "../verbose.js";
+import { setupLocale } from "../setup-locale.js";
 
 /**
  * The agents a native runtime runs: Claude Code and Codex from signed
@@ -32,6 +33,7 @@ export interface NativeCliActions {
 
 /** One customer architecture: the native connector. No provider-key or cloud-agent fallback switch. */
 export function createNativeProgram(actions: NativeCliActions): Command {
+  const locale = setupLocale();
   const program = new Command("konteks-remote").description("Konteks on this computer: connect it, run its agents, keep it updated")
     .option("--root <path>", "private user-scoped installation root")
     .option("--json", "machine-readable output", false)
@@ -50,7 +52,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   });
   const context = (): NativeCommandContext => {
     const options = program.opts<{ root?: string; json: boolean }>();
-    return { root: options.root ?? nativePaths({ os: nativePlatform().os }).root, output: createOutput({ json: options.json }) };
+    return { root: options.root ?? nativePaths({ os: nativePlatform().os }).root, output: createOutput({ json: options.json, locale }) };
   };
   const id = (value: string): string => {
     if (!/^[A-Za-z0-9._-]{8,128}$/.test(value)) throw new InvalidArgumentError("activation id must be an opaque identifier; the code is prompted securely");

@@ -1,5 +1,6 @@
 import { win32 } from "node:path";
 import { RemoteInstanceError, runCommand, sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
+import { setupDuration, setupLine } from "../setup-locale.js";
 import { nativeConnectorFileNames } from "@konteks/remote-release";
 import { serviceRun, type NativeServiceDefinition, type NativeServiceExecute } from "./service.js";
 
@@ -343,16 +344,12 @@ class WindowsServiceExitWait {
 
   private async forceAfterGrace(): Promise<boolean> {
     if (this.forced || this.deps.now() - this.started < this.graceMs) return false;
-    this.output.line(`The connector did not stop within ${spokenWait(this.graceMs)}; ending its processes.`);
+    setupLine(this.output, "updateForceStop", { duration: setupDuration(this.output, this.graceMs) });
     await endWindowsServiceTask(this.definition, this.deps.execute);
     await this.owner.terminate();
     this.forced = true;
     return true;
   }
-}
-
-function spokenWait(ms: number): string {
-  return ms >= 120_000 ? `${Math.round(ms / 60_000)} min` : `${Math.round(ms / 1_000)} s`;
 }
 
 async function terminateWindowsServiceProcesses(processes: WindowsServiceProcess[]): Promise<void> {

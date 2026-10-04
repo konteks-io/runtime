@@ -6,6 +6,7 @@ import type { RetainedProcessOwner } from "@konteks/remote-common";
 import { AgentRuntime } from "../runtime.js";
 import { RunnerConfigSchema } from "../config.js";
 import type { IdentityProbe } from "../auth/identity.js";
+import { AgentScopeStore } from "../auth/scope-store.js";
 import type { BridgeProcess, SpawnBridgeOptions } from "../bridge/process.js";
 import { RequestError } from "@agentclientprotocol/sdk";
 
@@ -263,12 +264,38 @@ it("reads the identity again when a discovery fails for good, so readiness stops
   });
   await f.runtime.probe(false);
   expect(f.runtime.readiness().readiness).toBe("ready");
-  // Its sign-in went away outside Konteks (its home cleared): every session is refused.
-  signedIn = false;
-  refuse = true;
-  await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
-  await vi.waitFor(() => expect(f.runtime.readiness()).toMatchObject({ readiness: "not_configured", recoveryAction: "login_locally" }));
-
+  const refresh = vi.spyOn(f.runtime, "probe");
+  let releaseWrite!: () => void;
+  const writable = new Promise<void>(resolve => { releaseWrite = resolve; });
+  let writeFinished = false;
+  const originalWrite = AgentScopeStore.prototype.write;
+  const write = vi.spyOn(AgentScopeStore.prototype, "write").mockImplementation(async function (this: AgentScopeStore, state) {
+    await writable;
+    await originalWrite.call(this, state);
+    writeFinished = true;
+  });
+  try {
+    // Its sign-in went away outside Konteks (its home cleared): every session is refused.
+    signedIn = false;
+    refuse = true;
+    await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
+    await vi.waitFor(() => expect(f.runtime.readiness()).toMatchObject({ readiness: "not_configured", recoveryAction: "login_locally" }));
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledWith(false, false, { fresh: true });
+    // Readiness is visible before persistence settles; fixture teardown must join that exact probe.
+    expect(writeFinished).toBe(false);
+    expect(write).toHaveBeenCalledOnce();
+    releaseWrite();
+    await refresh.mock.results[0]!.value;
+    expect(writeFinished).toBe(true);
+  } finally {
+    releaseWrite();
+    try { await refresh.mock.results[0]?.value; }
+    finally {
+      write.mockRestore();
+      refresh.mockRestore();
+    }
+  }
 });
 
 it("re-reads the offered models once the discovery TTL has passed", async () => {

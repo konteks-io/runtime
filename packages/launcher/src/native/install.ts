@@ -9,6 +9,7 @@ import { acquireNativeRootLock, compareSemver, deleteNativeAntigravity, HOST_AGE
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
 import type { Output } from "../output.js";
+import { outputLocale, setupError, setupLine, setupLocale, setupText, type SetupLocale } from "../setup-locale.js";
 import { promptSecret } from "../prompt.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
 import { releaseStaged, writeStagingProgress } from "./enrollment-staging.js";
@@ -47,6 +48,7 @@ interface NativeAgentAddOptions {
 
 /** Native activation + immutable release layout. Service registration is a separate phase. */
 export async function installNative(options: NativeInstallOptions): Promise<NativeRuntimeRecord> {
+  setupLocale();
   const { roots, platform } = releaseContext(options.deps);
   const root = installRoot(options.root);
   // Validate endpoints/agent selection before any activation or executable download.
@@ -122,7 +124,7 @@ async function installNew(install: InstallContext, agents: string[]): Promise<Na
   const identity = await activate(install, release, fetchFn);
   // Unpacking takes about a minute; the person hears each step instead of
   // a silent terminal after the code.
-  options.output.line(bundled.length > 0 ? "Code accepted. Unpacking the agents on this computer; this takes about a minute." : "Code accepted. Setting up Konteks on this computer…");
+  setupLine(options.output, bundled.length > 0 ? "installUnpacking" : "installSettingUp");
   const total = bundled.filter(id => agents.includes(id)).length;
   let unpacked = 0;
   const releaseId = await stageAgents({
@@ -130,7 +132,7 @@ async function installNew(install: InstallContext, agents: string[]): Promise<Na
     beforeAgent: async agent => {
       if (!bundled.includes(agent)) return;
       unpacked += 1;
-      options.output.line(`Unpacking ${findAgentBridge(agent)?.displayName ?? agent} (${unpacked} of ${total})…`);
+      setupLine(options.output, "installUnpackAgent", { name: findAgentBridge(agent)?.displayName ?? agent, number: unpacked, total });
     },
     afterAgent: agent => agentFolders(root, agent),
   });
@@ -139,7 +141,7 @@ async function installNew(install: InstallContext, agents: string[]): Promise<Na
   install.lock.assertOwned();
   await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
   await loadNativeInstallation(root, { roots, platform });
-  options.output.line("Installed. Starting Konteks on this computer next.");
+  setupLine(options.output, "installComplete");
   return record;
 }
 
@@ -164,14 +166,14 @@ async function localAgentProfiles(agents: readonly string[], root: string, optio
  * usable native install. Raw npm archives never trigger registry resolution.
  */
 function assertOfflinePackages(artifacts: ReturnType<typeof selectNativeArtifacts>): void {
-  if (artifacts.some(artifact => artifact.kind === "connector" ? artifact.format !== "executable" : artifact.format !== "offline_agent_tgz")) throw new RemoteInstanceError("bundle_untrusted", "Native agents require a complete signed offline package with official login tooling.");
+  if (artifacts.some(artifact => artifact.kind === "connector" ? artifact.format !== "executable" : artifact.format !== "offline_agent_tgz")) throw setupError("bundle_untrusted", "offlineInstallRequired");
 }
 
 /** The one-time code exchanged for this machine's identity, bound to this exact release. */
 async function activate(install: InstallContext, release: ReturnType<typeof verifyNativeRelease>, fetchFn: typeof fetch) {
   const { options, root, roots, platform, draft } = install;
-  options.output.line("Connecting this computer to Konteks. Type the one-time code from the site.");
-  const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir: join(root, "supervisor"), coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode: options.deps?.readActivationCode ?? (() => promptSecret({ label: "One-time code", minLength: 8 })), fetchFn });
+  setupLine(options.output, "installConnecting");
+  const activated = await (options.deps?.activate ?? runNativeActivationExchange)({ dataDir: join(root, "supervisor"), coreUrl: draft.coreUrl, activationId: options.activationId, platform, release, roots, clock: new SystemClock(), readActivationCode: options.deps?.readActivationCode ?? (() => promptSecret({ label: "One-time code", labelKey: "oneTimeCode", locale: outputLocale(options.output), minLength: 8 })), fetchFn });
   install.lock.assertOwned();
   const identity = await new SupervisorStore(join(root, "supervisor")).identity();
   if (!identity || identity.instanceId !== activated.instanceId || activated.manifestDigest !== release.manifest.digest) throw invalid();
@@ -231,10 +233,7 @@ export async function chooseControlPort(preferred = CONTROL_SOCKET_DEFAULT_PORT)
     });
   const chosen = (await tryListen(preferred)) ?? (await tryListen(0));
   if (chosen === null)
-    throw new RemoteInstanceError(
-      "temporarily_unavailable",
-      "No local control port is available; the native connector was not changed.",
-    );
+    throw setupError("temporarily_unavailable", "noControlPort");
   return chosen;
 }
 
@@ -251,10 +250,7 @@ export async function reassignOccupiedNativeControlPort(options: {
 }): Promise<{ previousPort: number; controlPort: number } | null> {
   const root = installRoot(options.root);
   if (!(await options.serviceStopped()))
-    throw new RemoteInstanceError(
-      "temporarily_unavailable",
-      "This connector's service is still registered or running. Stop this installation's service before retrying start; its identity and local work are unchanged.",
-    );
+    throw setupError("temporarily_unavailable", "occupiedService");
   return withRuntimeLocks(root, async locks => {
     await assertStillStopped(options.serviceStopped);
     const load = releaseContext(options);
@@ -280,10 +276,7 @@ export async function reassignOccupiedNativeControlPort(options: {
 
 async function assertStillStopped(serviceStopped: () => Promise<boolean>): Promise<void> {
   if (await serviceStopped()) return;
-  throw new RemoteInstanceError(
-    "temporarily_unavailable",
-    "This connector's service began starting. Stop this installation's service before retrying start; its identity and local work are unchanged.",
-  );
+  throw setupError("temporarily_unavailable", "startingService");
 }
 
 type RootLock = ReturnType<typeof acquireNativeRootLock>;
@@ -425,7 +418,7 @@ export async function recordNativeEnrollment(options: {
  */
 async function enrollmentAgents(root: string, listed: readonly string[] | undefined): Promise<string[]> {
   const fetched = listed?.find(agent => hostAgentInstallAdapter(agent)?.fetch !== undefined);
-  if (fetched !== undefined) throw new RemoteInstanceError("agent_unavailable", `${findAgentBridge(fetched)?.displayName ?? fetched} is added after onboarding, once you agree to its download: konteks-remote agent add ${fetched}`);
+  if (fetched !== undefined) throw setupError("agent_unavailable", "agentAfterOnboarding", { name: findAgentBridge(fetched)?.displayName ?? fetched, agent: fetched });
   return listed && listed.length > 0 ? [...listed] : detectNativeAgents(root);
 }
 
@@ -589,7 +582,7 @@ export async function completeNativeEnrollment(root: string, identity: { instanc
 async function boundEnrollment(root: string, identity: { instanceId: string; workspaceId: string }, roots: readonly EmbeddedReleaseRoot[]) {
   const prepared = await readNativeEnrollment(root);
   if (!prepared.releaseId) {
-    throw new RemoteInstanceError("temporarily_unavailable", "The agent packages are still unpacking on this machine.");
+    throw setupError("temporarily_unavailable", "agentUnpacking");
   }
   const stored = await new SupervisorStore(join(root, "supervisor")).identity();
   if (!stored || stored.instanceId !== identity.instanceId || stored.workspaceId !== identity.workspaceId) throw invalid();
@@ -641,6 +634,7 @@ function needsLocating(agent: string): boolean {
  * is actually stopped before any installed authority changes.
  */
 export async function addNativeAgent(options: NativeAgentAddOptions): Promise<NativeRuntimeRecord> {
+  setupLocale();
   const load = releaseContext(options.deps);
   const root = installRoot(options.root);
   refuseRetiredAgents([options.agentId]);
@@ -654,7 +648,7 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
       // A fetched agent whose copy no longer verifies (or an update's new
       // copy just fetched) is recorded again from the verified folder.
       if (await fetchedAgentStale(root, current.record, options.agentId)) return await addHostAgent(root, current.record, options, load, lock);
-      options.output.line(`${options.agentId} is already installed; no files or identity were changed.`);
+      setupLine(options.output, "agentAlreadyInstalled", { agent: options.agentId });
       return current.record;
     }
     if (isHostAgentId(options.agentId)) return await addHostAgent(root, current.record, options, load, lock);
@@ -688,7 +682,7 @@ async function addBundledAgent(add: { root: string; options: NativeAgentAddOptio
     ...profiles,
   });
   await moveRecordAndManifest({ root, lock: add.lock, load: () => loadNativeInstallation(root, load), current, successor, manifest: release.manifest });
-  options.output.line(`${findAgentBridge(options.agentId)?.displayName ?? options.agentId} added; your other agents, sign-ins and work are unchanged.`);
+  setupLine(options.output, "agentAdded", { name: findAgentBridge(options.agentId)?.displayName ?? options.agentId });
   return successor;
 }
 
@@ -701,7 +695,7 @@ async function releaseForAgent(options: NativeAgentAddOptions, roots: readonly E
   const release = verifyNativeRelease(options.deps?.manifest ?? await fetchNativeManifest(fetchFn), roots);
   const sameRelease = release.manifest.digest === current.manifestDigest;
   if (!sameRelease && compareSemver(release.manifest.bundleVersion, current.bundleVersion) <= 0) {
-    throw new RemoteInstanceError("update_required", "Adding an agent requires a newer signed native release; stale or same-version manifests are refused.");
+    throw setupError("update_required", "agentRequiresNewRelease");
   }
   return release;
 }
@@ -728,20 +722,18 @@ async function addHostAgent(root: string, previous: NativeRuntimeRecord, options
   const listed = previous.agents.includes(options.agentId);
   const successor = NativeRuntimeRecordSchema.parse({ ...previous, agents: listed ? previous.agents : [...previous.agents, options.agentId], ...located });
   await commitRecord(root, lock, { successor, previous }, () => loadNativeInstallation(root, deps));
-  options.output.line(hostAgentAddedLine(host, options.agentId, located, listed));
+  options.output.line(hostAgentAddedLine(host, options.agentId, located, listed, outputLocale(options.output)));
   return successor;
 }
 
-function hostAgentAddedLine(host: HostAgentInstallAdapter, agentId: string, located: Partial<NativeRuntimeRecord>, listed: boolean): string {
+function hostAgentAddedLine(host: HostAgentInstallAdapter, agentId: string, located: Partial<NativeRuntimeRecord>, listed: boolean, locale: SetupLocale): string {
   const name = findAgentBridge(agentId)?.displayName ?? agentId;
   if (host.fetch === undefined) {
     const version = located.opencodeVersion;
-    return `${name}${version ? ` ${version}` : ""} added from this machine's own installation; no release was downloaded and nothing else changed. To sign it in here: konteks-remote auth login ${agentId}`;
+    return setupText("agentHostAdded", { name: `${name}${version ? ` ${version}` : ""}`, agent: agentId }, locale);
   }
   const named = `${name}${located.antigravityVersion ? ` ${located.antigravityVersion}` : ""}`;
-  return listed
-    ? `${named} downloaded from Google again and its signature checked; its sign-ins were kept.`
-    : `${named} added: downloaded from Google and its signature checked; nothing else changed. To sign it in here with a Gemini API key: konteks-remote auth login ${agentId} --api-key. With Gemini Enterprise: konteks-remote auth login ${agentId} --enterprise --project <project id>`;
+  return setupText(listed ? "agentGoogleRefetched" : "agentGoogleAdded", { name: named, agent: agentId }, locale);
 }
 
 /** A listed fetched agent whose recorded copy does not verify now while this release's copy does (fetched again, or an update's). */
@@ -845,7 +837,7 @@ function gitCandidates(): string[] {
   if (windowsGit) candidates.push(windowsGit);
   return candidates;
 }
-function invalid() { return new RemoteInstanceError("install_state_corrupt", "Native installation cannot be completed; existing identity and credentials were preserved."); }
+function invalid() { return setupError("install_state_corrupt", "installInvalid"); }
 /**
  * Retired agents (Pi, Cline) are refused on install with the one shared
  * sentence. A host agent that is not offered is refused too, whatever the
@@ -857,7 +849,7 @@ function refuseRetiredAgents(agents: readonly string[]): void {
   const gated = agents.find(agent => !nativeAgentOffered(agent));
   if (gated !== undefined) throw notOffered(gated);
 }
-function notOffered(agentId: string) { return new RemoteInstanceError("agent_unavailable", `${agentId} cannot be added on this computer yet.`); }
+function notOffered(agentId: string) { return setupError("agent_unavailable", "agentNotOffered", { agent: agentId }); }
 
 /**
  * Locate every host-installed agent in `agents`; the install-record fields
@@ -886,13 +878,14 @@ async function locateHostAgents(agents: readonly string[], root: string, consent
  * without asking.
  */
 export async function fetchHostAgent(host: HostAgentInstallAdapter, root: string, consent: FetchConsent | undefined, output?: Output): Promise<Partial<NativeRuntimeRecord>> {
+  setupLocale();
   if (host.fetch === undefined) throw notOffered(host.agentId);
   host.assertFetchable?.();
   const kept = await host.locate(undefined, { root }).catch(() => null);
   if (kept) return kept;
   const name = findAgentBridge(host.agentId)?.displayName ?? host.agentId;
-  if (!await fetchConsented(host, name, consent)) throw new RemoteInstanceError("agent_unavailable", `Nothing was downloaded: ${name} was not added.`);
-  output?.line(`Downloading ${name} from Google and checking Google's signature; this takes a minute or two.`);
+  if (!await fetchConsented(host, name, consent)) throw setupError("agent_unavailable", "agentDownloadDeclined", { name });
+  if (output) setupLine(output, "agentGoogleDownloading", { name });
   return host.fetch({ root, consent: true });
 }
 

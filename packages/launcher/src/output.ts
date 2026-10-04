@@ -1,4 +1,5 @@
 import { RemoteInstanceError, redactText, redactValue } from "@konteks/remote-common";
+import { setupFailureText, setupLocale, setupText, type SetupCopyKey, type SetupLocale } from "./setup-locale.js";
 
 /**
  * Stable, actionable, secret-redacted output. Every line the launcher prints
@@ -6,6 +7,7 @@ import { RemoteInstanceError, redactText, redactValue } from "@konteks/remote-co
  */
 export interface Output {
   json: boolean;
+  readonly setupLocale?: SetupLocale;
   line(text: string): void;
   table(rows: Array<[string, string]>): void;
   result(value: unknown): void;
@@ -19,11 +21,13 @@ export interface Output {
  */
 export class AlreadyToldError extends RemoteInstanceError {}
 
-export function createOutput(options: { json: boolean; stdout?: NodeJS.WritableStream; stderr?: NodeJS.WritableStream }): Output {
+export function createOutput(options: { json: boolean; stdout?: NodeJS.WritableStream; stderr?: NodeJS.WritableStream; locale?: SetupLocale }): Output {
+  const locale = options.locale ?? setupLocale();
   const stdout = options.stdout ?? process.stdout;
   const stderr = options.stderr ?? process.stderr;
   return {
     json: options.json,
+    setupLocale: locale,
     line: (text) => {
       if (!options.json) stdout.write(`${redactText(text)}\n`);
     },
@@ -37,15 +41,15 @@ export function createOutput(options: { json: boolean; stdout?: NodeJS.WritableS
     },
     error: (error) => {
       if (error instanceof RemoteInstanceError) {
-        const actions = error.recoveryActions.map((action) => describeAction(action)).filter((text) => text.length > 0);
+        const actions = error.recoveryActions.map((action) => describeAction(action, locale)).filter((text) => text.length > 0);
         if (options.json) stderr.write(`${JSON.stringify(redactValue({ error: error.toJSON() }))}\n`);
         else if (error instanceof AlreadyToldError) return;
-        else stderr.write(`${redactText(`error (${error.code}): ${error.message}`)}\n${actions.map((action) => `  → ${action}`).join("\n")}${actions.length > 0 ? "\n" : ""}`);
+        else stderr.write(`${redactText(setupText("error", { code: error.code, detail: setupFailureText(error, locale) }, locale))}\n${actions.map((action) => `  → ${action}`).join("\n")}${actions.length > 0 ? "\n" : ""}`);
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
       if (options.json) stderr.write(`${JSON.stringify({ error: { code: "internal", message: redactText(message) } })}\n`);
-      else stderr.write(`${redactText(`error: ${message}`)}\n`);
+      else stderr.write(`${redactText(setupText("unknownError", { detail: message }, locale))}\n`);
     },
   };
 }
@@ -53,21 +57,15 @@ export function createOutput(options: { json: boolean; stdout?: NodeJS.WritableS
 const AGENT_NAMES: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex", dsh: "DeepSeek Harness", opencode: "OpenCode 2", antigravity: "Google Antigravity" };
 
 /** What each recovery action asks the person to do. */
-const ACTION_WORDS: Readonly<Record<string, (agentId: string | undefined) => string>> = {
-  retry: () => "retry the command",
-  run_doctor: () => "run `konteks-remote doctor`",
-  login_agent: agentId => `run \`konteks-remote auth login ${agentId ?? "<agent>"}\``,
-  update: () => "run `konteks-remote update`",
-  free_disk: () => "free disk space and retry",
-  install_backend: installWords,
-  new_activation: () => "create a new activation in the Konteks App or MCP and rerun install",
-  contact_support: () => "run `konteks-remote doctor` and share the support bundle with Konteks support",
-  revoke_in_app: () => "revoke or remove this runtime from the Konteks App or MCP",
-  reselect_runtime: () => "select another runtime for the workload",
+const ACTION_WORDS: Readonly<Record<string, SetupCopyKey>> = {
+  retry: "actionRetry", run_doctor: "actionDoctor", login_agent: "actionLogin", update: "actionUpdate",
+  free_disk: "actionDisk", new_activation: "actionActivation", contact_support: "actionSupport",
+  revoke_in_app: "actionRevoke", reselect_runtime: "actionReselect",
 };
 
-export function describeAction(action: { kind: string; agentId?: string | undefined }): string {
-  return Object.hasOwn(ACTION_WORDS, action.kind) ? ACTION_WORDS[action.kind]!(action.agentId) : "";
+export function describeAction(action: { kind: string; agentId?: string | undefined }, locale: SetupLocale = "en"): string {
+  if (action.kind === "install_backend") return installWords(action.agentId, locale);
+  return Object.hasOwn(ACTION_WORDS, action.kind) ? setupText(ACTION_WORDS[action.kind]!, { agent: action.agentId ?? "<agent>" }, locale) : "";
 }
 
 /**
@@ -75,9 +73,9 @@ export function describeAction(action: { kind: string; agentId?: string | undefi
  * install the message asks for (the person's own DeepSeek Harness or
  * OpenCode; Google Antigravity is downloaded by the connector itself).
  */
-function installWords(agentId: string | undefined): string {
-  if (agentId === "antigravity") return "run `konteks-remote agent add antigravity`, which downloads Google's copy again after you say yes";
+function installWords(agentId: string | undefined, locale: SetupLocale): string {
+  if (agentId === "antigravity") return setupText("actionAntigravity", {}, locale);
   return agentId
-    ? `install a supported ${AGENT_NAMES[agentId] ?? agentId} as the message says, then run the command again`
-    : "install what the message names, then run the command again";
+    ? setupText("actionInstallAgent", { name: AGENT_NAMES[agentId] ?? agentId }, locale)
+    : setupText("actionInstall", {}, locale);
 }

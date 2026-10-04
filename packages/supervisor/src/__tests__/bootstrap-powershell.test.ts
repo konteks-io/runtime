@@ -9,9 +9,25 @@ import { describe, expect, it } from "vitest";
  * string ("v$BootstrapVersion: fetching…") made the whole script fail to load
  * on every Windows computer until 0.10.8. CI also parses it with pwsh.
  */
-const script = readFileSync(fileURLToPath(new URL("../../../../bootstrap/install.ps1", import.meta.url)), "utf8");
-const posix = readFileSync(fileURLToPath(new URL("../../../../bootstrap/install.sh", import.meta.url)), "utf8");
-const SCOPES = new Set(["env", "script", "global", "local", "private", "using", "variable", "function", "alias"]);
+const script = readFileSync(
+  fileURLToPath(new URL("../../../../bootstrap/install.ps1", import.meta.url)),
+  "utf8",
+);
+const posix = readFileSync(
+  fileURLToPath(new URL("../../../../bootstrap/install.sh", import.meta.url)),
+  "utf8",
+);
+const SCOPES = new Set([
+  "env",
+  "script",
+  "global",
+  "local",
+  "private",
+  "using",
+  "variable",
+  "function",
+  "alias",
+]);
 
 describe("bootstrap/install.ps1", () => {
   it("has no variable directly followed by a colon in a double-quoted string", () => {
@@ -19,7 +35,8 @@ describe("bootstrap/install.ps1", () => {
     for (const [index, line] of script.split("\n").entries()) {
       for (const quoted of line.match(/"(?:[^"`]|`.)*"/g) ?? []) {
         for (const match of quoted.matchAll(/\$([A-Za-z_][A-Za-z0-9_]*):/g)) {
-          if (!SCOPES.has(match[1]!.toLowerCase())) offenders.push(`line ${index + 1}: ${match[0]}`);
+          if (!SCOPES.has(match[1]!.toLowerCase()))
+            offenders.push(`line ${index + 1}: ${match[0]}`);
         }
       }
     }
@@ -38,14 +55,24 @@ describe("bootstrap/install.ps1", () => {
     const posixKey = posix.match(/^PINNED_RELEASE_PUBKEY="([^"]+)"$/m)?.[1];
     expect(windowsKey).toBeDefined();
     expect(windowsKey).toBe(posixKey);
-    const key = createPublicKey({ key: Buffer.from(windowsKey!, "base64"), format: "der", type: "spki" });
+    const key = createPublicKey({
+      key: Buffer.from(windowsKey!, "base64"),
+      format: "der",
+      type: "spki",
+    });
     expect(key.asymmetricKeyType).toBe("ed25519");
   });
 
   it("never takes the key from the release unless a digest names it", () => {
-    const fetchKey = script.indexOf("/release-signing.pub");
+    const fetchKey = script.indexOf(
+      'Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/release-signing.pub"',
+    );
     expect(fetchKey).toBeGreaterThan(script.indexOf("if ($env:KONTEKS_RELEASE_PUBKEY_SHA256) {"));
-    expect(script.indexOf("release signing key digest mismatch")).toBeGreaterThan(fetchKey);
+    expect(
+      script.indexOf(
+        "if ((Get-SetupSha256 $keyPath) -ne $env:KONTEKS_RELEASE_PUBKEY_SHA256.ToLowerInvariant()) {",
+      ),
+    ).toBeGreaterThan(fetchKey);
   });
 
   it("verifies the manifest signature before the checksum, and both before Authenticode or msiexec", () => {
@@ -54,11 +81,14 @@ describe("bootstrap/install.ps1", () => {
       expect(index, needle).toBeGreaterThan(-1);
       return index;
     };
-    const signature = at("Test-Ed25519Signature $releaseKey $sums $signature");
-    expect(at("the release manifest's signature is not valid; nothing was installed")).toBeGreaterThan(signature);
-    const checksum = at("package checksum mismatch; nothing was installed");
+    const signature = at(
+      "if ($null -eq $releaseKey -or -not (Test-Ed25519Signature $releaseKey $sums $signature)) {",
+    );
+    const checksum = at("$actual = Get-SetupSha256 $msiPath");
     expect(checksum).toBeGreaterThan(signature);
-    expect(at("Get-AuthenticodeSignature")).toBeGreaterThan(checksum);
+    const checksumGuard = at("if ($expected[0] -ne $actual) {");
+    expect(checksumGuard).toBeGreaterThan(checksum);
+    expect(at("Get-AuthenticodeSignature")).toBeGreaterThan(checksumGuard);
     expect(at("msiexec.exe")).toBeGreaterThan(at("Get-AuthenticodeSignature"));
   });
 
@@ -73,7 +103,12 @@ describe("bootstrap/install.ps1", () => {
   it("defines the verifier and returns before anything runs under -VerifyOnly", () => {
     const stop = script.indexOf("if ($VerifyOnly) { return }");
     expect(stop).toBeGreaterThan(script.indexOf("function Test-Ed25519Signature"));
-    for (const action of ["Invoke-WebRequest", "exit ", "Start-Process", "$ErrorActionPreference = 'Stop'"]) {
+    for (const action of [
+      "Invoke-WebRequest",
+      "exit ",
+      "Start-Process",
+      "$ErrorActionPreference = 'Stop'",
+    ]) {
       expect(script.indexOf(action), action).toBeGreaterThan(stop);
     }
   });
@@ -97,8 +132,12 @@ describe("bootstrap/install.ps1", () => {
   it("updates a connected computer's launcher with -Update: no activation, the MSI first, then update and start", () => {
     expect(script).toMatch(/^\s*\[switch\]\$Update,$/m);
     const refuseBoth = script.indexOf("if ($Update -and $ActivationId) {");
-    const runtimeRoot = script.indexOf("$RuntimeRoot = Join-Path ${env:USERPROFILE} 'AppData\\Local\\konteks-remote'");
-    const notInstalled = script.indexOf("if ($Update -and -not (Test-Path (Join-Path $RuntimeRoot 'native-runtime.json'))) {");
+    const runtimeRoot = script.indexOf(
+      "$RuntimeRoot = Join-Path ${env:USERPROFILE} 'AppData\\Local\\konteks-remote'",
+    );
+    const notInstalled = script.indexOf(
+      "if ($Update -and -not (Test-Path (Join-Path $RuntimeRoot 'native-runtime.json'))) {",
+    );
     const requireId = script.indexOf("if (-not $Update -and -not $ActivationId) {");
     expect(refuseBoth).toBeGreaterThan(script.indexOf("if ($VerifyOnly) { return }"));
     expect(runtimeRoot).toBeGreaterThan(refuseBoth);

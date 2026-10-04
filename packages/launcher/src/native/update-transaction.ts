@@ -9,6 +9,7 @@ import { isHostAgentId, nativeConnectorFileNames, resolveNativeConnectorExecutab
 import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, ownedByAnotherConnector, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
+import { setupDuration, setupError, setupLine, setupLocale, setupText, setupWords, type SetupLocale } from "../setup-locale.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
 import { CONNECTOR_LOG_FILE, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps, type NativeUpdateStage } from "./update.js";
@@ -121,10 +122,11 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
  * supervisor consults before launching another attempt.
  */
 export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps): Promise<NativeUpdateOutcome> {
+  setupLocale();
   const previous = await deps.readRecord(input.root);
   const staged = await stageOrRecordFailure(input, deps);
   if (staged.status === "current") {
-    input.output.line(`Installed release ${staged.bundleVersion} is current; nothing was changed.`);
+    setupLine(input.output, "updateCurrent", { version: staged.bundleVersion });
     const outcome: NativeUpdateOutcome = { state: "current", bundleVersion: staged.bundleVersion };
     input.output.result(outcome);
     return outcome;
@@ -152,7 +154,7 @@ async function readUpdateService(input: NativeUpdateInput, deps: NativeUpdateTra
 }
 
 function assertUpdateTaskState(status: number | null, owner: NativeServiceProcessOwner | null, deps: NativeUpdateTransactionDeps): void {
-  if (deps.serviceOwner && !owner && status !== 0 && status !== 1) throw new RemoteInstanceError("temporarily_unavailable", "Windows could not confirm this connector's task state; its installation was not changed.");
+  if (deps.serviceOwner && !owner && status !== 0 && status !== 1) throw setupError("temporarily_unavailable", "updateTaskUnconfirmed");
 }
 
 async function finishUpdateAttempt(root: string, deps: NativeUpdateTransactionDeps, attempt: NativeUpdateAttempt, outcome: NativeUpdateAttempt["outcome"], detail: string | null): Promise<void> {
@@ -226,14 +228,14 @@ class UpdateTransaction {
     const successor = await commitOnceReleased(input, update.staged.releaseId, deps);
     this.successor = successor;
     if (update.wasRunning) {
-      input.output.line(`Starting ${successor.bundleVersion} and checking it is healthy before keeping it (rolled back if it makes no progress for ${spoken(deps.healthDeadlineMs ?? 180_000)})…`);
+      setupLine(input.output, "updateStarting", { version: successor.bundleVersion, duration: setupDuration(input.output, deps.healthDeadlineMs ?? 180_000) });
       await deps.start(input);
       await healthGate(input, deps.control(input.root, successor), { previous: update.previous, successor, baseline }, deps, update.definition);
     }
     await this.finish("applied", null);
     await this.refreshLauncher(successor);
     const outcome: NativeUpdateOutcome = { state: "updated", from: update.previous.bundleVersion, to: successor.bundleVersion, releaseId: successor.releaseId, previousReleaseId: update.previous.releaseId, restarted: update.wasRunning };
-    input.output.line(`Native connector updated ${outcome.from} → ${outcome.to}; ${update.previous.releaseId} is kept for rollback.`);
+    setupLine(input.output, "updateComplete", { from: outcome.from, to: outcome.to, previous: update.previous.releaseId });
     input.output.result(outcome);
     return outcome;
   }
@@ -265,13 +267,13 @@ class UpdateTransaction {
   private async requestStop(): Promise<void> {
     if (this.update.owner) {
       await this.control.call({ op: "shutdown" }, z.unknown()).catch(() => {
-        this.input.output.line("The connector did not acknowledge shutdown; waiting for its owned processes to close before continuing…");
+        setupLine(this.input.output, "updateShutdownUnacknowledged");
       });
       return;
     }
     if (await this.deps.execute(this.update.definition.stop) !== 0) {
       await this.cancelDrain();
-      throw new RemoteInstanceError("temporarily_unavailable", "The native runtime drained but could not stop; its installation was not changed.");
+      throw setupError("temporarily_unavailable", "updateStopFailed");
     }
   }
 
@@ -305,7 +307,7 @@ class UpdateTransaction {
   private async refreshLauncher(successor: NativeRuntimeRecord): Promise<void> {
     if (!this.deps.refreshLauncher) return;
     await this.deps.refreshLauncher(this.input.root, successor).catch(error => {
-      this.input.output.line(`konteks-remote itself could not be refreshed to ${successor.bundleVersion} (${errorText(error)}); the connector is updated.`);
+      setupLine(this.input.output, "updateLauncherFailed", { version: successor.bundleVersion, detail: errorText(error) });
     });
   }
 
@@ -322,13 +324,13 @@ class UpdateTransaction {
   private async restartUnchanged(): Promise<void> {
     await restartUnchanged(this.input, this.update.definition, this.deps, this.update.previous, this.oldPid, this.update.owner).catch(async () => {
       await this.cancelDrain();
-      this.input.output.line("The unchanged connector could not be restarted; run `konteks-remote start`.");
+      setupLine(this.input.output, "updateUnchangedRestartFailed");
     });
   }
 
   private async rollBack(successor: NativeRuntimeRecord, detail: string): Promise<void> {
     const { input, deps, update } = this;
-    input.output.line(`Update to ${successor.bundleVersion} failed its health gate; rolling back to ${update.previous.releaseId}.`);
+    setupLine(input.output, "updateHealthFailed", { version: successor.bundleVersion, previous: update.previous.releaseId });
     let restored = false;
     try {
       await stopForRollback(input, update.definition, deps);
@@ -340,7 +342,7 @@ class UpdateTransaction {
       await this.finish("failed", `rollback failed after: ${detail}`);
       // Never leave this computer without its connector.
       if (update.wasRunning) await keepServiceRunning(input, update.definition, deps, restored ? update.previous : successor);
-      throw new RemoteInstanceError("temporarily_unavailable", "The updated connector did not pass its health gate and automatic rollback failed; identity, credentials and workspaces remain preserved.", { cause: rollbackError });
+      throw setupError("temporarily_unavailable", "updateRollbackFailed", {}, { cause: rollbackError });
     }
   }
 
@@ -349,9 +351,7 @@ class UpdateTransaction {
     const { input, deps, update } = this;
     await deps.start(input);
     const back = await answersAgain(input, deps.control(input.root, update.previous), update.previous, deps);
-    input.output.line(back
-      ? `Rolled back: ${update.previous.bundleVersion} is running and answering again. ${successor.bundleVersion} was not kept.`
-      : `Rolled back to ${update.previous.bundleVersion} and started it; it has not answered yet. Run \`konteks-remote status\` in a minute.`);
+    setupLine(input.output, back ? "updateRolledBack" : "updateRolledBackWaiting", { previous: update.previous.bundleVersion, version: successor.bundleVersion });
   }
 }
 
@@ -371,7 +371,7 @@ function closedProtocolRefusal(error: unknown): boolean {
  */
 function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null, pid: number | null, owner: NativeServiceProcessOwner | null = null): Promise<void> {
   if (owner) return waitForWindowsServiceExit(owner, definition, {
-    ...deps, waiting: progressLines(input, deps, "Stopping the connector: it closes its agent sessions and relay first, which usually takes under a minute…", "still stopping the connector"),
+    ...deps, waiting: progressLines(input, deps, setupWords(input.output, "updateStopping"), setupWords(input.output, "updateStillStopping")),
   }, input.output);
   return new ServiceExitWait(input, definition, deps, previousReceipt, pid).run();
 }
@@ -396,13 +396,13 @@ class ServiceExitWait {
     this.started = deps.now();
     this.graceMs = Math.min(deps.stopGraceMs ?? 30_000, this.stopMs);
     this.watched = pid !== null && deps.processAlive ? { pid, alive: deps.processAlive } : null;
-    this.progress = progressLines(input, deps, "Stopping the connector: it closes its agent sessions and relay first, which usually takes under a minute…", "still stopping the connector");
+    this.progress = progressLines(input, deps, setupWords(input.output, "updateStopping"), setupWords(input.output, "updateStillStopping"));
   }
 
   async run(): Promise<void> {
     for (;;) {
       if (await this.exited()) return;
-      if (this.deps.now() >= this.started + this.stopMs) throw new RemoteInstanceError("temporarily_unavailable", "The native runtime did not finish stopping in time; its installation was not changed.");
+      if (this.deps.now() >= this.started + this.stopMs) throw setupError("temporarily_unavailable", "updateStopTimedOut");
       if (await this.forcedAfterGrace()) continue;
       this.progress();
       await this.deps.sleep(cappedPoll(this.deps, 1_000));
@@ -419,7 +419,7 @@ class ServiceExitWait {
   private async forcedAfterGrace(): Promise<boolean> {
     const { watched, deps } = this;
     if (!watched || this.gone || this.forced || !deps.killProcessGroup || deps.now() - this.started < this.graceMs) return false;
-    this.input.output.line(`The connector did not stop within ${spoken(this.graceMs)}; ending its processes.`);
+    setupLine(this.input.output, "updateForceStop", { duration: setupDuration(this.input.output, this.graceMs) });
     await deps.killProcessGroup(watched.pid, this.input.root).catch(() => undefined);
     this.forced = true;
     return true;
@@ -451,17 +451,15 @@ function cappedPoll(deps: NativeUpdateTransactionDeps, cap: number): number {
 async function restartUnchanged(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previous: NativeRuntimeRecord, pid: number | null, owner: NativeServiceProcessOwner | null = null): Promise<void> {
   if (owner) await endOwnedForRestart(owner, definition, deps);
   await endLingeringService(input, definition, deps, pid);
-  input.output.line("The update did not go ahead; starting this computer's connector again on the release it had.");
+  setupLine(input.output, "updateAbortedRestart");
   try {
     await deps.start(input);
   } catch {
-    input.output.line("The connector could not be started again; run `konteks-remote start`.");
+    setupLine(input.output, "updateRestartFailed");
     return;
   }
   const back = await answersAgain(input, deps.control(input.root, previous), previous, deps);
-  input.output.line(back
-    ? `${previous.bundleVersion} is running and answering again; nothing was changed.`
-    : `${previous.bundleVersion} was started again but has not answered yet; run \`konteks-remote status\` in a minute.`);
+  setupLine(input.output, back ? "updateUnchangedRestored" : "updateUnchangedWaiting", { version: previous.bundleVersion });
 }
 
 async function endOwnedForRestart(owner: NativeServiceProcessOwner, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
@@ -518,12 +516,12 @@ async function stopManagedForRollback(input: NativeUpdateInput, definition: Nati
   const running = async () => !serviceIsStopped(await deps.execute(definition.status).catch(() => deps.serviceOwner ? null : 0), deps);
   const stopMs = deps.stopDeadlineMs ?? 90_000;
   const deadline = deps.now() + stopMs;
-  const progress = progressLines(input, deps, "Stopping the updated connector before restoring the previous release…", "still stopping the updated connector");
+  const progress = progressLines(input, deps, setupWords(input.output, "updateRollbackStopping"), setupWords(input.output, "updateRollbackStillStopping"));
   let forced = false;
   while (await running()) {
     if (deps.now() >= deadline) {
-      if (forced || !deps.forceStop) throw new RemoteInstanceError("temporarily_unavailable", "The updated connector did not stop, so the previous release could not be restored.");
-      input.output.line(`The updated connector did not stop within ${spoken(stopMs)}; ending its processes.`);
+      if (forced || !deps.forceStop) throw setupError("temporarily_unavailable", "updateRollbackCannotStop");
+      setupLine(input.output, "updateRollbackForceStop", { duration: setupDuration(input.output, stopMs) });
       await deps.forceStop(definition).catch(() => undefined);
       forced = true;
       continue;
@@ -538,16 +536,16 @@ async function keepServiceRunning(input: NativeUpdateInput, definition: NativeSe
   if (await deps.execute(definition.status).catch(() => null) === 0) return;
   try {
     await deps.start(input);
-    input.output.line(`Started ${record.bundleVersion} again so this computer stays connected; run \`konteks-remote status\` to check it.`);
+    setupLine(input.output, "updateRestarted", { version: record.bundleVersion });
   } catch {
-    input.output.line("The connector could not be started again; run `konteks-remote start`.");
+    setupLine(input.output, "updateRestartFailed");
   }
 }
 
 /** Whether the restored release answers on its control socket within the stop deadline. */
 async function answersAgain(input: NativeUpdateInput, control: UpdateControlClient, record: NativeRuntimeRecord, deps: NativeUpdateTransactionDeps): Promise<boolean> {
   const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
-  const progress = progressLines(input, deps, `Waiting for ${record.bundleVersion} to answer again…`, `still waiting for ${record.bundleVersion} to answer`);
+  const progress = progressLines(input, deps, setupWords(input.output, "updateWaitingAgain", { version: record.bundleVersion }), setupWords(input.output, "updateStillWaiting", { version: record.bundleVersion }));
   for (;;) {
     progress();
     const status = await control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 }).catch(() => null);
@@ -555,10 +553,6 @@ async function answersAgain(input: NativeUpdateInput, control: UpdateControlClie
     if (deps.now() >= deadline) return false;
     await deps.sleep(cappedPoll(deps, 3_000));
   }
-}
-
-function spoken(ms: number): string {
-  return ms >= 120_000 ? `${Math.round(ms / 60_000)} min` : `${Math.round(ms / 1_000)} s`;
 }
 
 /**
@@ -572,7 +566,7 @@ function progressLines(input: NativeUpdateInput, deps: NativeUpdateTransactionDe
   return () => {
     const tens = Math.floor((deps.now() - started) / 10_000);
     if (tens === said) return;
-    input.output.line(said < 0 ? first : `${again} (${tens * 10} s so far)…`);
+    input.output.line(said < 0 ? first : setupWords(input.output, "updateElapsed", { again, seconds: tens * 10 }));
     said = tens;
   };
 }
@@ -586,7 +580,7 @@ function restoreOnceReleased(input: NativeUpdateInput, expectedReleaseId: string
 }
 async function onceReleased<T>(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, operation: () => Promise<T>): Promise<T> {
   const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
-  const progress = progressLines(input, deps, "Waiting for the stopped connector to let go of its files…", "still waiting for the stopped connector to let go of its files");
+  const progress = progressLines(input, deps, setupWords(input.output, "updateWaitingFiles"), setupWords(input.output, "updateStillWaitingFiles"));
   for (;;) {
     try {
       return await operation();
@@ -608,9 +602,9 @@ async function drain(input: NativeUpdateInput, control: UpdateControlClient, dep
     if (state.activeAssignments === 0) return;
     if (deps.now() >= deadline) {
       await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
-      throw new RemoteInstanceError("active_work", "The update waited for active work past its deadline; the running release resumed accepting work and was not changed.");
+      throw setupError("active_work", "updateActiveTimedOut");
     }
-    input.output.line(`waiting for ${state.activeAssignments} active assignment(s) before updating…`);
+    setupLine(input.output, "updateWaitingAssignments", { number: state.activeAssignments });
     await deps.sleep(deps.pollMs ?? 5_000);
   }
 }
@@ -741,7 +735,7 @@ async function healthGate(input: NativeUpdateInput, control: UpdateControlClient
   clock.deadline = Math.max(clock.deadline, deps.now() + quietMs);
   await noIntroducedFailures(input, control, versions, clock);
   for (const agent of (await control.call({ op: "agents" }, AgentsSchema)).agents) {
-    if (agent.readiness === "reconnect_required") input.output.line(`agent ${agent.agentId} needs a fresh login after this update: run \`konteks-remote auth login ${agent.agentId}\`.`);
+    if (agent.readiness === "reconnect_required") setupLine(input.output, "updateAgentReconnect", { agent: agent.agentId });
   }
 }
 
@@ -766,7 +760,7 @@ interface ProbeState {
 
 async function agentsSettled(input: NativeUpdateInput, control: UpdateControlClient, successor: NativeRuntimeRecord, clock: GateClock): Promise<void> {
   const state: ProbeState = { answered: false, unsettled: [] };
-  const progress = progressLines(input, clock.deps, `Waiting for ${successor.bundleVersion} to answer…`, `still waiting for ${successor.bundleVersion} to answer`);
+  const progress = progressLines(input, clock.deps, setupWords(input.output, "updateWaiting", { version: successor.bundleVersion }), setupWords(input.output, "updateStillWaiting", { version: successor.bundleVersion }));
   for (;;) {
     progress();
     if (await probeSuccessor(control, successor, state)) return;
@@ -782,7 +776,7 @@ async function probeSuccessor(control: UpdateControlClient, successor: NativeRun
     state.answered = true;
     // The old process has already exited before the commit, so a different
     // version answering here is the wrong executable, not a transition.
-    if (status.version.bundle !== successor.bundleVersion) throw new RemoteInstanceError("update_required", `the service answering reports ${status.version.bundle}, not ${successor.bundleVersion}`);
+    if (status.version.bundle !== successor.bundleVersion) throw setupError("update_required", "updateWrongVersion", { actual: status.version.bundle, expected: successor.bundleVersion });
     const probed = await control.call({ op: "agents" }, AgentsSchema, { timeoutMs: 5_000 });
     state.unsettled = unsettledAgents(successor, probed.agents);
     return state.unsettled.length === 0;
@@ -809,9 +803,13 @@ function unsettledAgents(successor: NativeRuntimeRecord, probed: readonly { agen
  */
 async function giveUpIfHopeless(state: ProbeState, clock: GateClock): Promise<void> {
   const exits = state.answered ? null : await clock.deps.serviceExits?.(clock.definition).catch(() => null);
-  if (exits && exits.runs >= 3 && exits.lastExitCode) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector stopped as soon as it started, ${exits.runs} times (exit code ${exits.lastExitCode}).`);
+  if (exits && exits.runs >= 3 && exits.lastExitCode) throw setupError("temporarily_unavailable", "updateExited", { number: exits.runs, code: exits.lastExitCode });
   await extendOnProgress(clock);
-  if (clock.deps.now() >= clock.deadline) throw new RemoteInstanceError("temporarily_unavailable", probeTimeoutMessage(state));
+  if (clock.deps.now() >= clock.deadline) throw probeTimeoutFailure(state);
+}
+
+function probeTimeoutFailure(state: ProbeState): RemoteInstanceError {
+  return setupError("temporarily_unavailable", state.answered ? "updateAgentsStalled" : "updateNoAnswer", { agents: state.unsettled.join(", ") || "unknown" });
 }
 
 /**
@@ -826,11 +824,6 @@ async function extendOnProgress(clock: GateClock): Promise<void> {
   clock.progressMark = mark;
 }
 
-function probeTimeoutMessage(state: ProbeState): string {
-  if (!state.answered) return "The updated connector stopped making progress before it answered on its control socket.";
-  return `The updated connector stopped making progress while probing its agents (${state.unsettled.join(", ") || "unknown"}).`;
-}
-
 /**
  * Connectivity checks (relay, lease) settle seconds after start; a failure
  * counts against the update only if it is still there when the deadline passes.
@@ -840,8 +833,8 @@ async function noIntroducedFailures(input: NativeUpdateInput, control: UpdateCon
     const failing = await failingDoctorDetails(control);
     const introduced = [...failing.keys()].filter(id => introducedByUpdate(id, versions.baseline, versions.successor));
     if (introduced.length === 0) return reportNewChecks(input, failing, versions);
-    if (clock.deps.now() >= clock.deadline) throw new RemoteInstanceError("temporarily_unavailable", `The updated connector introduced doctor failure(s): ${describeChecks(introduced, failing)}.`);
-    input.output.line(`waiting for the updated connector to clear doctor failure(s): ${introduced.join(", ")}…`);
+    if (clock.deps.now() >= clock.deadline) throw setupError("temporarily_unavailable", "updateDoctorFailed", { detail: describeChecks(introduced, failing) });
+    setupLine(input.output, "updateDoctorWaiting", { checks: introduced.join(", ") });
     await clock.deps.sleep(clock.poll);
   }
 }
@@ -850,7 +843,7 @@ async function noIntroducedFailures(input: NativeUpdateInput, control: UpdateCon
 function reportNewChecks(input: NativeUpdateInput, failing: ReadonlyMap<string, string>, versions: GateVersions): void {
   const { baseline } = versions;
   const added = [...failing.keys()].filter(id => baseline !== null && !baseline.has(id));
-  if (added.length > 0) input.output.line(`${versions.successor.bundleVersion} reports a check ${versions.previous.bundleVersion} did not have: ${describeChecks(added, failing)}. It is not held against the update.`);
+  if (added.length > 0) setupLine(input.output, "updateAddedChecks", { version: versions.successor.bundleVersion, previous: versions.previous.bundleVersion, detail: describeChecks(added, failing) });
 }
 
 function describeChecks(ids: readonly string[], failing: ReadonlyMap<string, string>): string {
@@ -871,13 +864,13 @@ export function earlierFailure(attempts: readonly NativeUpdateAttempt[], manifes
  * When the installed release is one the connector updated itself to, the
  * person hears that, instead of a bare "current" after being offered it.
  */
-export function selfUpdateNote(attempts: readonly NativeUpdateAttempt[], bundleVersion: string): string | null {
+export function selfUpdateNote(attempts: readonly NativeUpdateAttempt[], bundleVersion: string, locale: SetupLocale = "en"): string | null {
   const last = [...attempts].reverse().find(attempt => attempt.bundleVersion === bundleVersion && attempt.outcome !== "in_progress");
-  return last && last.outcome === "applied" && last.reason === "unattended" ? `Konteks updated itself to ${bundleVersion} at ${last.finishedAt ?? last.startedAt}.` : null;
+  return last && last.outcome === "applied" && last.reason === "unattended" ? setupText("updateSelf", { version: bundleVersion, at: last.finishedAt ?? last.startedAt }, locale) : null;
 }
 
-export function earlierFailureNote(attempt: NativeUpdateAttempt): string {
+export function earlierFailureNote(attempt: NativeUpdateAttempt, locale: SetupLocale = "en"): string {
   const when = attempt.finishedAt ?? attempt.startedAt;
-  const how = attempt.outcome === "rolled_back" ? "failed its health check here and was rolled back" : "failed here";
-  return `${attempt.bundleVersion} already ${how} (${when}${attempt.detail ? `: ${attempt.detail}` : ""}). Installing it again installs the same release; it is usually better to wait for a newer one.`;
+  const how = setupText(attempt.outcome === "rolled_back" ? "updateEarlierRolledBack" : "updateEarlierFailed", {}, locale);
+  return setupText("updateEarlier", { version: attempt.bundleVersion, how, when, detail: attempt.detail ? `: ${attempt.detail}` : "" }, locale);
 }

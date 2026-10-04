@@ -15,6 +15,8 @@ process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
 const LAUNCHER_VERSION = process.env.KONTEKS_LAUNCHER_VERSION ?? "0.1.0";
 
 async function main(): Promise<void> {
+  const { setupLocale } = await import("./setup-locale.js");
+  setupLocale();
   // The Windows command the MSI installed runs the installed release's own
   // code: Program Files cannot be refreshed by the connector, so its
   // copy would otherwise run the first MSI's code forever.
@@ -49,4 +51,8 @@ async function main(): Promise<void> {
   );
 }
 
-void main();
+void main().catch(async (error: unknown) => {
+  const { createOutput } = await import("./output.js");
+  createOutput({ json: process.argv.includes("--json"), locale: process.env.KONTEKS_SETUP_LOCALE === "id" ? "id" : "en" }).error(error);
+  process.exitCode = 1;
+});
