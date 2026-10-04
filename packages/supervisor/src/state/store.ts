@@ -40,7 +40,7 @@ import type { RelayDurableState } from "../relay/channel-mux.js";
  * Nothing under this root is ever a checkpoint payload, agent stdio, a
  * provider key, or a capability token.
  */
-/** Said when a machine with an identity has lost its key (W1-L1). */
+/** Said when a machine with an identity has lost its key. */
 export const MACHINE_KEY_LOST =
   "This machine's Konteks key is missing, so it can no longer prove which runtime it is. Run `konteks-remote onboard` to connect it again; it will replace its old runtime.";
 
@@ -55,16 +55,16 @@ export const IdentitySchema = z
     exchangeNonce: z.string().min(1),
   })
   .strict();
-export type Identity = z.infer<typeof IdentitySchema>;
+type Identity = z.infer<typeof IdentitySchema>;
 
 const ActivationAttemptSchema = z.object({
   activationId: z.string().min(1), nonce: z.string().min(1),
   keyDigest: z.string().min(1), manifestDigest: z.string().min(1),
   platformDigest: z.string().min(1), createdAt: z.string().datetime(),
 }).strict();
-export type ActivationAttempt = z.infer<typeof ActivationAttemptSchema>;
+type ActivationAttempt = z.infer<typeof ActivationAttemptSchema>;
 
-export const ProvisioningSchema = z
+const ProvisioningSchema = z
   .object({
     provisioningCredential: z.string().min(1),
     provisioningCredentialExpiresAt: z.string(),
@@ -73,7 +73,7 @@ export const ProvisioningSchema = z
     lastRefreshAt: z.string().nullable(),
   })
   .strict();
-export type Provisioning = z.infer<typeof ProvisioningSchema>;
+type Provisioning = z.infer<typeof ProvisioningSchema>;
 
 export const LeaseRecordSchema = z
   .object({
@@ -113,7 +113,7 @@ export const DEFAULT_CONFIG: ConfigRecord["configuration"] = {
 const CursorsSchema = z.record(z.string(), z.object({ to_core: z.number().int().nonnegative(), to_runtime: z.number().int().nonnegative(),
   /** Highest to_core sequence ever allocated; absent in files written before it existed. */
   allocated: z.number().int().nonnegative().optional() }).strict());
-export type Cursors = z.infer<typeof CursorsSchema>;
+type Cursors = z.infer<typeof CursorsSchema>;
 
 const RelayDurableStateSchema = z.object({
   cursors: CursorsSchema,
@@ -130,12 +130,12 @@ export const ControlledExitReasonSchema = z.enum([
   "liveness_lost", "uncaught_exception", "unhandled_rejection", "startup_failed", "shutdown_step_failed", "other",
 ]);
 export type ControlledExitReason = z.infer<typeof ControlledExitReasonSchema>;
-export const LastExitSchema = z.object({
+const LastExitSchema = z.object({
   schemaVersion: z.literal(1),
   reason: ControlledExitReasonSchema,
   occurredAt: z.string().datetime(),
 }).strict();
-export type LastExit = z.infer<typeof LastExitSchema>;
+type LastExit = z.infer<typeof LastExitSchema>;
 
 /** Diagnostic progress only. The shutdown-complete receipt remains the sole
  * attestation that every native shutdown step finished. */
@@ -147,12 +147,16 @@ export const ShutdownProgressSchema = z.object({
 }).strict();
 export type ShutdownProgress = z.infer<typeof ShutdownProgressSchema>;
 
+function validEntryMetadata(entry: { bytes: number; enqueuedAt: number }): boolean {
+  return Number.isSafeInteger(entry.bytes) && entry.bytes >= 0 && Number.isSafeInteger(entry.enqueuedAt) && entry.enqueuedAt >= 0;
+}
+
 export class SupervisorStore {
   private heartbeatWrites: Promise<void> = Promise.resolve();
   /**
    * Serialized JSON of each buffered relay frame already validated here. A
    * buffered frame is never changed after it is sent, so it is validated and
-   * serialized once instead of on every relay-state write (WS2-157).
+   * serialized once instead of on every relay-state write.
    */
   private readonly relayFrameJson = new WeakMap<object, string>();
   constructor(readonly dataDir: string, private readonly mutate: StateMutation = unrestrictedStateMutation) {}
@@ -312,14 +316,7 @@ export class SupervisorStore {
   saveRelayState(value: RelayDurableState): Promise<void> {
     // Full validation of cursors, entry metadata and every frame not seen
     // before; a known frame reuses its checked JSON. Same file as before.
-    const unseen: RelayDurableState["outbound"] = {};
-    for (const [channelId, entries] of Object.entries(value.outbound)) {
-      unseen[channelId] = entries.filter(entry => !this.relayFrameJson.has(entry.frame));
-      for (const entry of entries) {
-        if (this.relayFrameJson.has(entry.frame) && !(Number.isSafeInteger(entry.bytes) && entry.bytes >= 0 &&
-            Number.isSafeInteger(entry.enqueuedAt) && entry.enqueuedAt >= 0)) throw new TypeError("relay outbound entry is invalid");
-      }
-    }
+    const unseen = this.unseenFrames(value.outbound);
     RelayDurableStateSchema.parse({ cursors: value.cursors, outbound: unseen });
     for (const entries of Object.values(unseen)) {
       for (const entry of entries) this.relayFrameJson.set(entry.frame, JSON.stringify(entry.frame));
@@ -328,6 +325,18 @@ export class SupervisorStore {
       .map(entry => `{"frame":${this.relayFrameJson.get(entry.frame)!},"bytes":${entry.bytes},"enqueuedAt":${entry.enqueuedAt}}`).join(",")}]`);
     const text = `{"cursors":${JSON.stringify(value.cursors)},"outbound":{${outbound.join(",")}}}\n`;
     return this.mutate(() => writeSecretFile(this.path("relay-state.json"), text));
+  }
+
+  /** Each channel's frames not checked before; a known frame's entry metadata is still checked. */
+  private unseenFrames(outbound: RelayDurableState["outbound"]): RelayDurableState["outbound"] {
+    const unseen: RelayDurableState["outbound"] = {};
+    for (const [channelId, entries] of Object.entries(outbound)) {
+      unseen[channelId] = entries.filter(entry => !this.relayFrameJson.has(entry.frame));
+      for (const entry of entries) {
+        if (this.relayFrameJson.has(entry.frame) && !validEntryMetadata(entry)) throw new TypeError("relay outbound entry is invalid");
+      }
+    }
+    return unseen;
   }
 
   async heartbeatSequence(): Promise<number> {

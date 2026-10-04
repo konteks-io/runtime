@@ -5,7 +5,7 @@ import { isAbsolute, posix, relative, win32 } from "node:path";
  * The real path of `<workingCopy>/AGENTS.md` when it is a regular file inside
  * the working copy; else null. A link that leaves the working copy (to
  * `~/.ssh/...`, say) never counts, so no agent is ever handed a file from
- * outside the repository as its instructions (OpenCode CP2, Antigravity A9).
+ * outside the repository as its instructions.
  */
 export async function instructionsInside(workingCopy: string): Promise<string | null> {
   try {

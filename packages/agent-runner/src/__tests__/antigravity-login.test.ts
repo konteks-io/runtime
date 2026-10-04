@@ -22,7 +22,7 @@ import { projectReadiness } from "../readiness.js";
 import { INITIAL_SCOPE_STATE } from "../auth/scope-store.js";
 
 /**
- * Google Antigravity's sign-ins (CP3) against a fake `antigravity-acp` that
+ * Google Antigravity's sign-ins against a fake `antigravity-acp` that
  * speaks ACP on stdio, prints the real server's sign-in lines on stderr and
  * records what it was started with (`fixtures/fake-antigravity.mjs`): the
  * Gemini API key typed hidden and relayed (never the server's), Gemini
@@ -96,7 +96,7 @@ async function fakeGoogle(): Promise<{ origin: string; seen: Array<{ url?: strin
   return { origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, seen };
 }
 
-describe("a Gemini API key (A7)", () => {
+describe("a Gemini API key", () => {
   it("is asked hidden, checked with Google, kept 0600 outside the agent's home, and never in an event or a log line", async () => {
     const t = await setup();
     const flow = t.login({ request: { method: "gemini-api-key" }, verifyKey: async key => (key === KEY ? "valid" : "rejected") });
@@ -205,7 +205,7 @@ describe("Gemini Enterprise (machine-browser sign-in over ACP)", () => {
       credentials: [{ providerId: "google", label: "Gemini Enterprise Plus", kind: "sign_in", method: "oauth-business", billing: "subscription", state: "ready" }] });
     expect(identity).not.toHaveProperty("providerAdminBlocked");
     // A session that saw the organisation drop the Konteks servers: signed in,
-    // but held back until MCP Servers is on (WS1-196).
+    // but held back until MCP Servers is on.
     antigravityStderrFailure("I0929 server.py:2900] Admin MCP control active: dropping 2 client-requested custom MCP server(s) for this session.", t.credentialDir);
     expect(await antigravityIdentity(t.credentialDir, CORE_7_1)).toMatchObject({ kind: "signal", providerAdminBlocked: true });
   });
@@ -259,7 +259,7 @@ describe("Gemini Enterprise (machine-browser sign-in over ACP)", () => {
   });
 });
 
-describe("which sign-in, and personal Google sign-in held back (A10)", () => {
+describe("which sign-in, and personal Google sign-in held back", () => {
   it("reads the request, refuses another agent's option, and never starts a personal Google sign-in while the switch is off", () => {
     expect(antigravityLoginChoice(undefined)).toBeNull();
     expect(antigravityLoginChoice({ method: "gemini-api-key" })).toBe("key");
@@ -301,7 +301,7 @@ describe("signing out (auth logout antigravity)", () => {
   });
 });
 
-describe("credentials and readiness per mix (CP3 prep)", () => {
+describe("credentials and readiness per mix", () => {
   const gcp = { project: PROJECT, location: "global" as const };
   it("lists what is held, the one in use first, billed by how Google bills it", () => {
     expect(antigravityCredentialViews({ record: null, key: false, enterpriseToken: false }, CORE_7_1)).toEqual([]);

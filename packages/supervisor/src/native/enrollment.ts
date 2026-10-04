@@ -19,7 +19,7 @@ import { StateMutationGate } from "../state/mutation-gate.js";
 import { acquireNativeRootLock } from "./root-lock.js";
 
 /**
- * The runtime's half of agent-first enrollment (onboarding-simplified OS5–OS9).
+ * The runtime's half of agent-first enrollment.
  *
  * This is the launcher's client, not the supervisor's: at enrollment time no
  * supervisor is running, there is no identity and no lease, and the process
@@ -35,7 +35,7 @@ import { acquireNativeRootLock } from "./root-lock.js";
 const CORE_AUDIENCE = "konteks:remote-instance";
 const BASE = "/api/remote-instances/internal/remote-instances/enrollment";
 
-export const ENROLLMENT_PATHS = Object.freeze({
+const ENROLLMENT_PATHS = Object.freeze({
   intents: `${BASE}/intents`,
   intent: (ref: string) => `${BASE}/intents/${encodeURIComponent(ref)}`,
   challenge: (ref: string) => `${BASE}/intents/${encodeURIComponent(ref)}/challenge`,
@@ -49,7 +49,7 @@ const IntentOpenedSchema = z
     intentRef: z.string().min(1),
     status: z.string().min(1),
     expiresAt: z.string().min(1),
-    /** Set when this key's runtime lost only the person's access: proving the address gives it back (W1-Z4). */
+    /** Set when this key's runtime lost only the person's access: proving the address gives it back. */
     restoresInstanceId: z.string().min(1).optional(),
   })
   .strict();
@@ -105,14 +105,14 @@ const AccessRestoredSchema = z
   })
   .strict();
 
-export type EnrollmentIntentOpened = z.infer<typeof IntentOpenedSchema>;
-export type EnrollmentAccessRestored = z.infer<typeof AccessRestoredSchema>;
-export type EnrollmentChallengeSent = z.infer<typeof ChallengeSentSchema>;
-export type EnrollmentVerified = z.infer<typeof VerifiedSchema>;
-export type EnrollmentBound = z.infer<typeof BoundSchema>;
-export type OwnerTokenGrant = z.infer<typeof OwnerTokenSchema>;
+type EnrollmentIntentOpened = z.infer<typeof IntentOpenedSchema>;
+type EnrollmentAccessRestored = z.infer<typeof AccessRestoredSchema>;
+type EnrollmentChallengeSent = z.infer<typeof ChallengeSentSchema>;
+type EnrollmentVerified = z.infer<typeof VerifiedSchema>;
+type EnrollmentBound = z.infer<typeof BoundSchema>;
+type OwnerTokenGrant = z.infer<typeof OwnerTokenSchema>;
 
-export interface NativeEnrollmentOptions {
+interface NativeEnrollmentOptions {
   dataDir: string;
   coreUrl: string;
   clock: Clock;
@@ -169,8 +169,7 @@ export class NativeEnrollment {
   }
 
   /**
-   * Bind, then persist what the activation exchange would have persisted
-   * (onboarding-simplified OS3, OS9).
+   * Bind, then persist what the activation exchange would have persisted.
    *
    * Core answers with the identity, the provisioning credential and the
    * signed bundle manifest. Before any of it is believed, the manifest is
@@ -191,7 +190,7 @@ export class NativeEnrollment {
         {
           email: input.email,
           ...(input.tenantId ? { tenantId: input.tenantId } : {}),
-          // The runtime this machine was before it lost its key (W1-L1).
+          // The runtime this machine was before it lost its key.
           ...(input.replacesInstanceId ? { replacesInstanceId: input.replacesInstanceId } : {}),
         },
         key,
@@ -200,48 +199,58 @@ export class NativeEnrollment {
         BoundSchema,
         // Binding a new address creates its workspace, which takes tens of
         // seconds; Core allows two minutes for it, so this waits longer still
-        // rather than give up on a bind that is about to succeed (WS1-014).
+        // rather than give up on a bind that is about to succeed.
         BIND_TIMEOUT_MS,
       );
       const release = verifyNativeRelease(bound.bundleManifest, this.options.roots ?? EMBEDDED_RELEASE_ROOTS, this.options.clock.now());
       if (release.manifest.digest !== input.expectedManifestDigest) {
         throw new RemoteInstanceError("bundle_untrusted", "The bound bundle differs from the independently verified release this machine staged.");
       }
-      const activationId = bound.activationId ?? `enrollment:${intentRef}`;
-      const exchangeNonce = randomUUID();
-      await store.saveIdentity({
-        instanceId: bound.identity.instanceId,
-        workspaceId: bound.identity.workspaceId,
-        activationId,
-        activatedAt: this.options.clock.nowIso(),
-        administrativeStatus: "provisioning",
-        exchangeNonce,
-      });
-      await store.saveProvisioning({
-        provisioningCredential: bound.provisioningCredential,
-        provisioningCredentialExpiresAt: bound.provisioningCredentialExpiresAt,
-        provisioningWindowExpiresAt: bound.provisioningWindowExpiresAt,
-        manifestDigest: release.manifest.digest,
-        lastRefreshAt: null,
-      });
-      await store.saveManifest(release.manifest, release.manifest.digest);
-      const journal = new SupervisorJournal(store.path("journal"), mutations.run);
-      await journal.load();
-      const keyDigest = jcsDigest(key.publicKeyJwk as never);
-      if (!journal.execution.enrollment()) {
-        await journal.execution.seedEnrollment({ enrollmentId: randomUUID(), activationId, keyDigest, createdAt: this.options.clock.nowIso() });
-      }
-      const seed = journal.execution.enrollment();
-      if (seed && !("instanceId" in seed)) {
-        await journal.execution.bindEnrollment({ ...seed, instanceId: bound.identity.instanceId, workspaceId: bound.identity.workspaceId, exchangeNonce });
-      }
+      await this.recordBound(bound, release, { intentRef, key, store, mutations });
       return bound;
     });
   }
 
+  /** Identity, provisioning state and manifest record, then the journal's enrollment lineage seeded and bound. */
+  private async recordBound(
+    bound: z.infer<typeof BoundSchema>,
+    release: ReturnType<typeof verifyNativeRelease>,
+    held: { intentRef: string; key: { publicKeyJwk: unknown }; store: SupervisorStore; mutations: StateMutationGate },
+  ): Promise<void> {
+    const { intentRef, key, store, mutations } = held;
+    const activationId = bound.activationId ?? `enrollment:${intentRef}`;
+    const exchangeNonce = randomUUID();
+    await store.saveIdentity({
+      instanceId: bound.identity.instanceId,
+      workspaceId: bound.identity.workspaceId,
+      activationId,
+      activatedAt: this.options.clock.nowIso(),
+      administrativeStatus: "provisioning",
+      exchangeNonce,
+    });
+    await store.saveProvisioning({
+      provisioningCredential: bound.provisioningCredential,
+      provisioningCredentialExpiresAt: bound.provisioningCredentialExpiresAt,
+      provisioningWindowExpiresAt: bound.provisioningWindowExpiresAt,
+      manifestDigest: release.manifest.digest,
+      lastRefreshAt: null,
+    });
+    await store.saveManifest(release.manifest, release.manifest.digest);
+    const journal = new SupervisorJournal(store.path("journal"), mutations.run);
+    await journal.load();
+    const keyDigest = jcsDigest(key.publicKeyJwk as never);
+    if (!journal.execution.enrollment()) {
+      await journal.execution.seedEnrollment({ enrollmentId: randomUUID(), activationId, keyDigest, createdAt: this.options.clock.nowIso() });
+    }
+    const seed = journal.execution.enrollment();
+    if (seed && !("instanceId" in seed)) {
+      await journal.execution.bindEnrollment({ ...seed, instanceId: bound.identity.instanceId, workspaceId: bound.identity.workspaceId, exchangeNonce });
+    }
+  }
+
   /**
    * Bind a reopened intent back to the runtime it names: the person proved
-   * their address again after revoking only this machine's access (W1-Z4).
+   * their address again after revoking only this machine's access.
    * Nothing on disk changes but the token the caller keeps, so this works
    * while the connector runs.
    */

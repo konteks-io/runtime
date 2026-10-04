@@ -1,4 +1,5 @@
 import {
+  allEqual,
   RemoteExecutionRevisionControlDeliveryRequestSchema,
   RemoteInstanceError,
   type RemoteExecutionRevisionControlDeliveryRequest,
@@ -10,7 +11,7 @@ import type {
 } from "../state/execution-revision-fence-inbox.js";
 
 /** The current relay socket ownership captured at control delivery time. */
-export interface CapturedExecutionRevisionControlConnection {
+interface CapturedExecutionRevisionControlConnection {
   instanceId: string;
   workspaceId: string;
   runnerIncarnation: string;
@@ -21,8 +22,8 @@ export interface CapturedExecutionRevisionControlConnection {
 }
 
 /**
- * Authenticated C02 intake. It makes a durable pre-fence record only; the
- * exact execution gate and C03 terminal convergence remain separate owners.
+ * Authenticated execution revision control intake. It makes a durable pre-fence record only; the
+ * exact execution gate and recovery-evidence terminal convergence remain separate owners.
  */
 export class ExecutionRevisionControlReceiver {
   private readonly coreToMonotonicOffset: number;
@@ -99,18 +100,17 @@ export class ExecutionRevisionControlReceiver {
     request: RemoteExecutionRevisionControlDeliveryRequest,
     scope: CapturedExecutionRevisionControlConnection,
   ): void {
-    if (
-      request.path.instanceId !== scope.instanceId ||
-      request.intent.instanceId !== scope.instanceId ||
-      request.intent.tenantId !== scope.workspaceId ||
-      request.nodeId !== scope.nodeId ||
-      request.connectionRef !== scope.connectionRef ||
-      request.connectionEpoch !== scope.connectionEpoch ||
-      request.intent.connectionRef !== scope.connectionRef ||
-      request.intent.connectionEpoch !== scope.connectionEpoch
-    ) {
-      throw this.unavailable();
-    }
+    const owned = allEqual([
+      [request.path.instanceId, scope.instanceId],
+      [request.intent.instanceId, scope.instanceId],
+      [request.intent.tenantId, scope.workspaceId],
+      [request.nodeId, scope.nodeId],
+      [request.connectionRef, scope.connectionRef],
+      [request.connectionEpoch, scope.connectionEpoch],
+      [request.intent.connectionRef, scope.connectionRef],
+      [request.intent.connectionEpoch, scope.connectionEpoch],
+    ]);
+    if (!owned) throw this.unavailable();
   }
 
   private unavailable(): RemoteInstanceError {

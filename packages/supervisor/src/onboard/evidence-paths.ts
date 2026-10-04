@@ -1,7 +1,7 @@
 import type { CatalogLearningEvidenceKind } from "@konteks/remote-common";
 
 /**
- * The conventional single-file reads a `grouping` pass may make (OB6 §2).
+ * The conventional single-file reads a `grouping` pass may make.
  *
  * The list is CLOSED and ordered. Closed, because the collector never reads a
  * file it cannot name in `refs` — a wildcard would let a run read whatever it
@@ -37,7 +37,7 @@ const STATIC_CANDIDATES: readonly EvidenceCandidate[] = [
 ];
 
 /**
- * CONTRACT-GAP: OB6 §2 names `*.csproj` among the manifest roots, but a
+ * CONTRACT-GAP: the onboarding contract names `*.csproj` among the manifest roots, but a
  * `grouping` pass has no file listing — it reads named paths and never clones,
  * so a glob cannot be resolved. The two conventional spellings derived from the
  * repository's own name are read instead; a solution laid out some other way is

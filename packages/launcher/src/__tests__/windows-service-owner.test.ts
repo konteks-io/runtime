@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { captureWindowsServiceOwner, windowsServiceTerminationScript, type WindowsServiceProcess } from "../native/windows-service-owner.js";
+import { captureWindowsServiceOwner, windowsServiceProcessQueryScript, windowsServiceTerminationScript, type WindowsServiceProcess } from "../native/windows-service-owner.js";
 
 const root = "C:\\Users\\Test User\\literal %PATH% & O'Brien\\remote";
 const executable = `${root}\\releases\\old\\konteks-connector.exe`;
@@ -11,7 +11,32 @@ const connector: WindowsServiceProcess = { pid: 42, parentPid: 41, startToken: "
   command: `"${executable}" serve --root "${root}"` };
 const child: WindowsServiceProcess = { pid: 43, parentPid: 42, startToken: "20000", executable: "C:\\node.exe", command: "node agent.js" };
 
+async function waitForFixtureChildPid(root: string): Promise<number> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const value = await readFile(join(root, "child.pid"), "utf8").catch(() => null);
+    if (value) return Number(value);
+    if (Date.now() >= deadline) throw new Error("fixture child did not start");
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+}
+
 describe("Windows connector service ownership", () => {
+  it.skipIf(process.platform !== "win32")("retains a same-root connector that replaces another PID between the Windows snapshots", async () => {
+    const literal = (value: string) => `'${value.replace(/'/g, "''")}'`;
+    const script = [
+      "$script:query=0",
+      "function Get-Process { param([int]$Id) [pscustomobject]@{Path='C:\\ordinary.exe';StartTime=[datetime]'2026-01-01T00:00:00Z'} }",
+      "function Get-CimInstance { param([string]$ClassName) $script:query++; if ($script:query -eq 1) { [pscustomobject]@{ProcessId=42;ParentProcessId=41;ExecutablePath='C:\\ordinary.exe';CommandLine='ordinary.exe';CreationDate=[datetime]'2026-01-01T00:00:00Z'} } else {",
+      `[pscustomobject]@{ProcessId=42;ParentProcessId=41;ExecutablePath=${literal(executable)};CommandLine=${literal(connector.command)};CreationDate=[datetime]'2026-01-02T00:00:00Z'} } }`,
+      windowsServiceProcessQueryScript(),
+    ].join("\n");
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")], { encoding: "utf8", windowsHide: true, timeout: 20_000 });
+    expect(result.status, result.stderr).toBe(0);
+    const processes = JSON.parse(result.stdout) as WindowsServiceProcess[];
+    expect(processes).toEqual([{ ...connector, startToken: "" }]);
+    await expect(captureWindowsServiceOwner(root, { read: async () => processes, terminate: vi.fn() })).rejects.toThrow(/creation identity/);
+  });
   it("pins the kernel process handle before checking creation identity and terminating", () => {
     const script = windowsServiceTerminationScript([connector]);
     expect(script.indexOf("$handle=$process.Handle")).toBeLessThan(script.indexOf("$process.StartTime"));
@@ -128,13 +153,7 @@ describe("Windows connector service ownership", () => {
     let childPid: number | null = null;
     try {
       await Promise.all([leader, sibling].map(child => new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); })));
-      const deadline = Date.now() + 10_000;
-      while (childPid === null) {
-        const value = await readFile(join(root, "child.pid"), "utf8").catch(() => null);
-        if (value) childPid = Number(value);
-        else if (Date.now() >= deadline) throw new Error("fixture child did not start");
-        else await new Promise(resolve => setTimeout(resolve, 100));
-      }
+      childPid = await waitForFixtureChildPid(root);
       const owner = await captureWindowsServiceOwner(root);
       expect(owner?.pid).toBe(leader.pid);
       leader.kill("SIGKILL"); // Reproduce a lost task/host while a child survives.

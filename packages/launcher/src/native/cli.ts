@@ -75,7 +75,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   };
   program.command("install").description("install the connector with a one-time code from Konteks, then start it")
     .option("--activation-id <id>", "non-secret activation id from App or MCP", id)
-    // Agent-first onboarding (onboarding-simplified OS3): no activation, no
+    // Agent-first onboarding: no activation, no
     // prompt, no TTY. The install stops short of an identity; `onboard` binds.
     .option("--enroll", "prepare this machine for `konteks-remote onboard` instead of consuming an activation", false)
     .option("--core-url <url>", "Core HTTPS endpoint", process.env.KONTEKS_CORE_URL ?? "https://api.konteks.io")
@@ -86,7 +86,7 @@ export function createNativeProgram(actions: NativeCliActions): Command {
       if (options.activationId && options.enroll) throw new InvalidArgumentError("an activation install and an enrollment install are different doors; choose one");
       await actions.install({ ...context(), ...options });
     });
-  // The conversation the person's own coding agent relays (OS2, OS16). One
+  // The conversation the person's own coding agent relays. One
   // step per invocation; the agent runs what the step says and nothing else.
   program.command("onboard").description("connect this machine to Konteks, one question at a time")
     .option("--answer <text>", "the person's answer to the question the previous step asked")
@@ -132,11 +132,8 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--enterprise", "Google Antigravity: sign in with Gemini Enterprise in the browser on this computer", false)
     .option("--project <id>", "Google Antigravity: the Google Cloud project that holds the Gemini Enterprise licence", project)
     .option("--location <location>", "Google Antigravity: the licence's location, global, us or eu (default global)", location)
-    .action(async (value: string, options: { organization: boolean; provider?: string; method?: string; reuse: boolean; apiKey: boolean; enterprise: boolean; project?: string; location?: string }) => {
-      if (value !== "antigravity" && (options.apiKey || options.enterprise || options.project || options.location)) throw new InvalidArgumentError("--api-key, --enterprise, --project and --location are for antigravity");
-      if (options.apiKey && (options.enterprise || options.project || options.location)) throw new InvalidArgumentError("a Gemini API key and Gemini Enterprise are different sign-ins; choose one");
-      if (options.location && !options.project) throw new InvalidArgumentError("--location goes with --project");
-      const method = options.apiKey ? "gemini-api-key" : options.enterprise || options.project ? "oauth-business" : options.method;
+    .action(async (value: string, options: LoginOptions) => {
+      const method = loginMethod(value, options);
       await actions.control({ ...context(), operation: "auth.login", agent: value, organization: options.organization,
         ...(options.provider ? { provider: options.provider } : {}), ...(method ? { method } : {}), ...(options.reuse ? { reuse: true } : {}),
         ...(options.project ? { project: options.project, location: options.location ?? "global" } : {}) });
@@ -145,16 +142,14 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     .option("--api-key", "Google Antigravity: forget only the Gemini API key", false)
     .option("--enterprise", "Google Antigravity: sign out of Gemini Enterprise only", false)
     .action(async (value: string, options: { provider?: string; apiKey: boolean; enterprise: boolean }) => {
-      if (value !== "antigravity" && (options.apiKey || options.enterprise)) throw new InvalidArgumentError("--api-key and --enterprise are for antigravity");
-      if (options.apiKey && options.enterprise) throw new InvalidArgumentError("to sign out of both, leave out --api-key and --enterprise");
-      const method = options.apiKey ? "gemini-api-key" : options.enterprise ? "oauth-business" : undefined;
+      const method = logoutMethod(value, options);
       await actions.control({ ...context(), operation: "auth.logout", agent: value, ...(options.provider ? { provider: options.provider } : {}), ...(method ? { method } : {}) });
     });
   program.command("update").description("install the newest connector release and restart; running work finishes first, and a failed start goes back")
     .option("--check", "report the available release without installing anything", false)
     .option("--unattended", "launched by the connector itself; recorded as such in the update ledger", false)
     .action(async (options: { check: boolean; unattended: boolean }) => actions.update({ ...context(), ...options }));
-  // ON16: managed-git key registration is a command on the trusted machine,
+  // Managed-git key registration is a command on the trusted machine,
   // because the private half must never leave it. The App shows this command.
   const git = program.command("git").description("this computer's key for Konteks-managed repositories");
   const key = git.command("key").description("the SSH key this computer uses for Konteks-managed repositories");
@@ -164,11 +159,38 @@ export function createNativeProgram(actions: NativeCliActions): Command {
   key.command("list").description("list the keys registered for this computer").action(async () => actions.control({ ...context(), operation: "git.key.list" }));
   key.command("remove").description("revoke one registered key").argument("<keyRef>", "key reference from `git key list`")
     .action(async (keyRef: string) => actions.control({ ...context(), operation: "git.key.remove", keyRef }));
-  // W1-L2: a person asks their agent to remove Konteks, in plain words; the
+  // A person asks their agent to remove Konteks, in plain words; the
   // description is what the agent finds in `--help`.
   program.command("uninstall").description("remove Konteks from this computer after running work finishes; your repositories and your agents' own sign-ins stay")
     .action(async () => actions.uninstall(context()));
   return program;
+}
+
+type LoginOptions = { organization: boolean; provider?: string; method?: string; reuse: boolean; apiKey: boolean; enterprise: boolean; project?: string; location?: string };
+
+/** The sign-in method `auth login` names: Google Antigravity's from its own options, otherwise `--method`. */
+function loginMethod(agent: string, options: LoginOptions): string | undefined {
+  assertAntigravityLoginOptions(agent, options);
+  if (options.apiKey) return "gemini-api-key";
+  return options.enterprise || options.project ? "oauth-business" : options.method;
+}
+
+function assertAntigravityLoginOptions(agent: string, options: LoginOptions): void {
+  const enterprise = enterpriseRequested(options);
+  if (agent !== "antigravity" && (options.apiKey || enterprise)) throw new InvalidArgumentError("--api-key, --enterprise, --project and --location are for antigravity");
+  if (options.apiKey && enterprise) throw new InvalidArgumentError("a Gemini API key and Gemini Enterprise are different sign-ins; choose one");
+  if (options.location && !options.project) throw new InvalidArgumentError("--location goes with --project");
+}
+
+function enterpriseRequested(options: LoginOptions): boolean {
+  return Boolean(options.enterprise || options.project || options.location);
+}
+
+function logoutMethod(agent: string, options: { apiKey: boolean; enterprise: boolean }): string | undefined {
+  if (agent !== "antigravity" && (options.apiKey || options.enterprise)) throw new InvalidArgumentError("--api-key and --enterprise are for antigravity");
+  if (options.apiKey && options.enterprise) throw new InvalidArgumentError("to sign out of both, leave out --api-key and --enterprise");
+  if (options.apiKey) return "gemini-api-key";
+  return options.enterprise ? "oauth-business" : undefined;
 }
 
 /** The bundle version of the release this root's runtime record points at, if one is installed. */

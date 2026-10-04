@@ -21,7 +21,7 @@ export interface PreparedSessionInputs {
 }
 
 /** Adapted from bb provider-bridge-acp's skill-root instruction construction. */
-export function organizationSkillInstructions(staged: StagedOrganizationSkills): string {
+function organizationSkillInstructions(staged: StagedOrganizationSkills): string {
   if (!staged.skills.length) return "";
   return [
     "Required organization skills are staged instruction folders. Read each selected SKILL.md before its applicable work, including the scripts/assets/references it requires. A missing or unreadable required file blocks the work; report that failure instead of silently omitting the skill.",
@@ -38,7 +38,7 @@ async function checkedDirectory(cwd: string): Promise<string> {
 }
 
 /**
- * A person's direct session (runtime-view R11, R13): its private session
+ * A person's direct session: its private session
  * folder and nothing else. No organization skill is staged and no instruction
  * is put in front of the person's text; before each prompt the folder is
  * checked to be the same one the session started in.

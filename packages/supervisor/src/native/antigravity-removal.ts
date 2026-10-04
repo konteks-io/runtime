@@ -5,7 +5,7 @@ import { removeNativeAntigravity } from "./antigravity-installation.js";
 import { nativeHostRunnerConfig, type NativeRuntimeRecord } from "./installation.js";
 
 /**
- * Removing Google Antigravity (antigravity-runtime-support A18), the parts
+ * Removing Google Antigravity, the parts
  * that are not the install record: `konteks-remote agent remove antigravity`
  * stops the service, signs out here, drops Antigravity from the record, then
  * deletes the files. Uninstalling the connector deletes both folders with the

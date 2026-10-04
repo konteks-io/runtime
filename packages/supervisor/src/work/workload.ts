@@ -1,6 +1,6 @@
 import type { BoundedJsonValue, RemoteWorkAssignment } from "@konteks/remote-common";
 
-/** The one Konteks-issued secret an agent may receive (D94), in ACP `mcpServers` shape. Never journaled. */
+/** The one Konteks-issued secret an agent may receive, in ACP `mcpServers` shape. Never journaled. */
 export interface PlatformMcpEntry {
   name: string;
   url: string;

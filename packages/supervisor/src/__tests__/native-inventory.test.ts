@@ -13,7 +13,7 @@ function fixture(executionPermitsReady?: () => boolean, cancellationDeliveryRead
   return { readiness, sample, inventory };
 }
 
-describe("native host inventory (A4 D133)", () => {
+describe("native host inventory", () => {
   it("discovers every signed installed runner without an agent-add registration step", async () => {
     const claude = { ...agent, agentId: "claude-code", displayName: "Claude Code", readiness: "not_configured" as const };
     const runners = new Map([
@@ -38,7 +38,7 @@ describe("native host inventory (A4 D133)", () => {
     f.readiness.mockResolvedValue({ agent: { ...agent, readiness: 'not_configured' }, utilization: { activeSessions: 0, activeTurns: 0 } });
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["core-contract-version-v1"]);
   });
-  it("offers a login from the site even while the agent is signed out, and Claude Code's only with a desktop (WS1-115)", async () => {
+  it("offers a login from the site even while the agent is signed out, and Claude Code's only with a desktop", async () => {
     let browser = true;
     const readiness = vi.fn(async () => ({ agent: { ...agent, readiness: "not_configured" as const }, utilization: { activeSessions: 0, activeTurns: 0 } }));
     const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0",
@@ -130,7 +130,7 @@ describe("native host inventory (A4 D133)", () => {
     expect(f.inventory.agents()[0]).toEqual(agent);
   });
 
-  it("adds Google Antigravity's download state to what it reports, never to readiness or capabilities (antigravity CP3 prep)", async () => {
+  it("adds Google Antigravity's download state to what it reports, never to readiness or capabilities", async () => {
     const readiness = vi.fn(async () => ({ agent, utilization: { activeSessions: 0, activeTurns: 0 } }));
     let decorate = async (agents: ConnectedAgentView[]) => withAntigravityDownload(agents, { state: "not_downloaded", sizeBytes: 111_725_488 });
     const inventory = new NativeInventoryCollector({ runners: new Map([["codex", { readiness }]]), sampler: { sample: async () => signals }, bundleVersion: "1.0.0",
@@ -147,7 +147,7 @@ describe("native host inventory (A4 D133)", () => {
     decorate = async () => { throw new Error("disk gone"); };
     expect((await inventory.collect()).agents).toEqual([agent]);
   });
-  it("always advertises that it reads Core's contract version: no agent, OpenCode, Google Antigravity (antigravity CP6)", async () => {
+  it("always advertises that it reads Core's contract version: no agent, OpenCode, Google Antigravity", async () => {
     const view = (agentId: string, readiness: ConnectedAgentView["readiness"]) => ({ ...agent, agentId, displayName: agentId, readiness });
     const collect = (runners: Array<[string, ConnectedAgentView]>, additionalCapabilities?: () => string[]) => new NativeInventoryCollector({
       runners: new Map(runners.map(([id, value]) => [id, { readiness: vi.fn(async () => ({ agent: value, utilization: { activeSessions: 0, activeTurns: 0 } })) }])),

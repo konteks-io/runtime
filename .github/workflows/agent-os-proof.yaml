@@ -1,5 +1,5 @@
 name: agent-os-proof
-# Every agent proven on every OS (opencode-runtime-support CP0-X): each job
+# Every agent proven on every OS: each job
 # installs one agent the way its own docs say on that OS, builds the runtime
 # and runs scripts/agent-os-proof.mjs, which drives the CONNECTOR's own code
 # (locators, spawn spec and private home, self-check, ACP initialize,

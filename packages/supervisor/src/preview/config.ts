@@ -33,13 +33,13 @@ export interface PreviewPlan {
 
 export type PreviewPlanResult = { ok: true; plan: PreviewPlan } | { ok: false; message: string; notes: string[] };
 
-export const PREVIEW_YAML = join(".konteks", "preview.yaml");
+const PREVIEW_YAML = join(".konteks", "preview.yaml");
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 /** The connector owns these; a repository file cannot override them. */
 const RESERVED_ENV = new Set(["PATH", "HOST", "PORT", "HOME", "USERPROFILE"]);
 const MAX_COMMAND = 2_000;
 
-export interface PlanReadDeps {
+interface PlanReadDeps {
   readText?: (path: string) => Promise<string | null>;
   exists?: (path: string) => Promise<boolean>;
   platform?: NodeJS.Platform;
@@ -49,42 +49,52 @@ export async function resolvePreviewPlan(cwd: string, deps: PlanReadDeps = {}): 
   const readText = deps.readText ?? (path => readFile(path, "utf8").catch(() => null));
   const exists = deps.exists ?? (path => access(path).then(() => true, () => false));
   const notes: string[] = [];
-  const raw = await readText(join(cwd, PREVIEW_YAML));
-  let declared: Partial<PreviewPlan> = {};
-  if (raw !== null) {
-    const parsed = parsePreviewYaml(raw);
-    if (!parsed.ok) notes.push(`.konteks/preview.yaml could not be read (${parsed.error}); the serve command was inferred instead.`);
-    else {
-      declared = parsed.plan;
-      notes.push(...parsed.notes);
-      if (declared.command) {
-        return { ok: true, plan: {
-          command: declared.command,
-          ...(declared.install ? { install: declared.install } : {}),
-          ...(declared.prepare ? { prepare: declared.prepare } : {}),
-          healthPath: declared.healthPath ?? "/",
-          env: declared.env ?? {},
-          ...(declared.readinessTimeoutMs ? { readinessTimeoutMs: declared.readinessTimeoutMs } : {}),
-          source: "preview_yaml",
-          explanation: "Using serve.command from .konteks/preview.yaml.",
-          notes,
-        } };
-      }
-      notes.push(".konteks/preview.yaml has no serve.command; the serve command was inferred.");
-    }
-  }
+  const declared = await declaredPlan(cwd, readText, notes);
+  if (declared.command) return { ok: true, plan: declaredOnly(declared.command, declared, notes) };
   const inferred = await inferPreviewPlan(cwd, { readText, exists, platform: deps.platform ?? process.platform });
   if (!inferred.ok) return { ok: false, message: inferred.message, notes };
-  // Declared install/prepare/healthPath/env still apply over an inferred command.
-  return { ok: true, plan: {
-    ...inferred.plan,
+  return { ok: true, plan: declaredOverInferred(inferred.plan, declared, notes) };
+}
+
+/** What `.konteks/preview.yaml` declares, with a note when it cannot be read or names no command. */
+async function declaredPlan(cwd: string, readText: (path: string) => Promise<string | null>, notes: string[]): Promise<Partial<PreviewPlan>> {
+  const raw = await readText(join(cwd, PREVIEW_YAML));
+  if (raw === null) return {};
+  const parsed = parsePreviewYaml(raw);
+  if (!parsed.ok) {
+    notes.push(`.konteks/preview.yaml could not be read (${parsed.error}); the serve command was inferred instead.`);
+    return {};
+  }
+  notes.push(...parsed.notes);
+  if (!parsed.plan.command) notes.push(".konteks/preview.yaml has no serve.command; the serve command was inferred.");
+  return parsed.plan;
+}
+
+function declaredOnly(command: string, declared: Partial<PreviewPlan>, notes: string[]): PreviewPlan {
+  return {
+    command,
+    ...(declared.install ? { install: declared.install } : {}),
+    ...(declared.prepare ? { prepare: declared.prepare } : {}),
+    healthPath: declared.healthPath ?? "/",
+    env: declared.env ?? {},
+    ...(declared.readinessTimeoutMs ? { readinessTimeoutMs: declared.readinessTimeoutMs } : {}),
+    source: "preview_yaml",
+    explanation: "Using serve.command from .konteks/preview.yaml.",
+    notes,
+  };
+}
+
+/** Declared install/prepare/healthPath/env still apply over an inferred command. */
+function declaredOverInferred(inferred: PreviewPlan, declared: Partial<PreviewPlan>, notes: string[]): PreviewPlan {
+  return {
+    ...inferred,
     ...(declared.install ? { install: declared.install } : {}),
     ...(declared.prepare ? { prepare: declared.prepare } : {}),
     ...(declared.healthPath ? { healthPath: declared.healthPath } : {}),
     env: declared.env ?? {},
     ...(declared.readinessTimeoutMs ? { readinessTimeoutMs: declared.readinessTimeoutMs } : {}),
-    notes: [...notes, ...inferred.plan.notes],
-  } };
+    notes: [...notes, ...inferred.notes],
+  };
 }
 
 type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
@@ -101,30 +111,7 @@ interface PackageJson { scripts?: Record<string, unknown>; packageManager?: unkn
  */
 export async function inferPreviewPlan(cwd: string, deps: Required<PlanReadDeps>): Promise<PreviewPlanResult> {
   const packageText = await deps.readText(join(cwd, "package.json"));
-  if (packageText !== null) {
-    let pkg: PackageJson;
-    try { pkg = JSON.parse(packageText) as PackageJson; } catch { return { ok: false, message: "package.json is not valid JSON, so the dev server command cannot be inferred. Fix it, or add serve.command to .konteks/preview.yaml.", notes: [] }; }
-    const scripts = pkg.scripts && typeof pkg.scripts === "object" ? pkg.scripts : {};
-    const script = (["dev", "start", "serve"] as const).find(name => typeof scripts[name] === "string" && (scripts[name] as string).trim().length > 0);
-    if (!script) {
-      return { ok: false, message: "package.json has no dev, start or serve script. Add one, or add serve.command to .konteks/preview.yaml.", notes: [] };
-    }
-    const { manager, evidence } = await detectPackageManager(cwd, pkg, deps);
-    const framework = frameworkFlags(scripts[script] as string);
-    const run = runScript(manager, script, framework?.flags);
-    const installed = await deps.exists(join(cwd, "node_modules")) || await deps.exists(join(cwd, ".pnp.cjs"));
-    const notes: string[] = [];
-    if (!framework) notes.push(`The "${script}" script is expected to read $PORT and $HOST; if it listens elsewhere, set serve.command in .konteks/preview.yaml.`);
-    return { ok: true, plan: {
-      command: run,
-      ...(installed ? {} : { install: `${manager} install` }),
-      healthPath: "/",
-      env: {},
-      source: "inferred",
-      explanation: `Inferred from package.json: the "${script}" script${framework ? ` (${framework.name})` : ""}, run with ${manager} (${evidence})${installed ? "" : "; dependencies are installed first because node_modules is missing"}.`,
-      notes,
-    } };
-  }
+  if (packageText !== null) return inferNodePlan(cwd, packageText, deps);
   if (await deps.exists(join(cwd, "manage.py"))) {
     const python = deps.platform === "win32" ? "python" : "python3";
     return { ok: true, plan: { command: `${python} manage.py runserver $HOST:$PORT --noreload`, healthPath: "/", env: {}, source: "inferred", explanation: "Inferred a Django project from manage.py.", notes: [] } };
@@ -135,12 +122,45 @@ export async function inferPreviewPlan(cwd: string, deps: Required<PlanReadDeps>
   }
   // A conversation's working folder carries the session's own files, never a
   // checkout of the project: there is nothing to run here, and a delivery's
-  // app is what the person's Open preview shows (09-29: asked to see the
-  // booking page, the ticket's agent answered it could not).
+  // app is what the person's Open preview shows.
   if (await deps.exists(join(cwd, ".assistant"))) {
     return { ok: false, message: CONVERSATION_HAS_NO_APP, notes: [] };
   }
   return { ok: false, message: "Could not tell how to serve this working copy (no package.json, manage.py or bin/rails). Add .konteks/preview.yaml with a serve.command that listens on $HOST:$PORT.", notes: [] };
+}
+
+const DEV_SCRIPTS = ["dev", "start", "serve"] as const;
+
+function parsedPackage(text: string): PackageJson | null {
+  try { return JSON.parse(text) as PackageJson; } catch { return null; }
+}
+
+async function inferNodePlan(cwd: string, packageText: string, deps: Required<PlanReadDeps>): Promise<PreviewPlanResult> {
+  const pkg = parsedPackage(packageText);
+  if (pkg === null) return { ok: false, message: "package.json is not valid JSON, so the dev server command cannot be inferred. Fix it, or add serve.command to .konteks/preview.yaml.", notes: [] };
+  const scripts = pkg.scripts && typeof pkg.scripts === "object" ? pkg.scripts : {};
+  const script = DEV_SCRIPTS.find(name => typeof scripts[name] === "string" && (scripts[name] as string).trim().length > 0);
+  if (!script) {
+    return { ok: false, message: "package.json has no dev, start or serve script. Add one, or add serve.command to .konteks/preview.yaml.", notes: [] };
+  }
+  const { manager, evidence } = await detectPackageManager(cwd, pkg, deps);
+  const framework = frameworkFlags(scripts[script] as string);
+  const installed = await deps.exists(join(cwd, "node_modules")) || await deps.exists(join(cwd, ".pnp.cjs"));
+  return { ok: true, plan: nodePlan({ script, manager, evidence, framework, installed }) };
+}
+
+function nodePlan(found: { script: string; manager: PackageManager; evidence: string; framework: { name: string; flags: string } | null; installed: boolean }): PreviewPlan {
+  const { script, manager, evidence, framework, installed } = found;
+  const notes = framework ? [] : [`The "${script}" script is expected to read $PORT and $HOST; if it listens elsewhere, set serve.command in .konteks/preview.yaml.`];
+  return {
+    command: runScript(manager, script, framework?.flags),
+    ...(installed ? {} : { install: `${manager} install` }),
+    healthPath: "/",
+    env: {},
+    source: "inferred",
+    explanation: `Inferred from package.json: the "${script}" script${framework ? ` (${framework.name})` : ""}, run with ${manager} (${evidence})${installed ? "" : "; dependencies are installed first because node_modules is missing"}.`,
+    notes,
+  };
 }
 
 /** What a conversation's agent is told when asked for a preview it cannot run itself. */
@@ -206,77 +226,122 @@ export function substitutePreviewVariables(command: string, values: { host: stri
  * are noted and ignored. Scalars may be plain, 'single' or "double" quoted.
  */
 export function parsePreviewYaml(text: string): { ok: true; plan: Partial<PreviewPlan>; notes: string[] } | { ok: false; error: string } {
-  const plan: Partial<PreviewPlan> = {};
-  const notes: string[] = [];
-  const env: Record<string, string> = {};
-  let section: "root" | "serve" | "env" | "skip" = "root";
-  let serveIndent = -1;
-  let envIndent = -1;
+  const reader = new PreviewYamlReader();
   const lines = text.split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]!;
-    if (/^\s*(#.*)?$/.test(line)) continue;
-    if (/^\s*-/.test(line)) {
-      if (section === "skip") continue;
-      return { ok: false, error: `line ${index + 1}: lists are not supported here` };
-    }
-    const match = /^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)\s*:(?:\s+(.*?))?\s*$/.exec(line);
-    if (!match) return { ok: false, error: `line ${index + 1}: expected "key: value"` };
+    const error = reader.read(lines[index]!);
+    if (error !== undefined) return { ok: false, error: `line ${index + 1}: ${error}` };
+  }
+  return { ok: true, ...reader.result() };
+}
+
+const KEY_LINE = /^(\s*)([A-Za-z_][A-Za-z0-9_.-]*)\s*:(?:\s+(.*?))?\s*$/;
+
+function blank(value: string | undefined): boolean {
+  return value === undefined || value === "";
+}
+
+/** Reads preview.yaml line by line; each method returns why a line cannot be read, if it cannot. */
+class PreviewYamlReader {
+  private readonly plan: Partial<PreviewPlan> = {};
+  private readonly notes: string[] = [];
+  private readonly env: Record<string, string> = {};
+  private section: "root" | "serve" | "env" | "skip" = "root";
+  private serveIndent = -1;
+  private envIndent = -1;
+
+  read(line: string): string | undefined {
+    if (/^\s*(#.*)?$/.test(line)) return undefined;
+    if (/^\s*-/.test(line)) return this.section === "skip" ? undefined : "lists are not supported here";
+    const match = KEY_LINE.exec(line);
+    if (!match) return 'expected "key: value"';
     const indent = match[1]!.length;
     const key = match[2]!;
     const rawValue = match[3] === undefined ? undefined : stripComment(match[3]);
-    if (indent === 0) {
-      section = "root";
-      if (key === "serve") {
-        if (rawValue !== undefined && rawValue !== "") return { ok: false, error: `line ${index + 1}: serve must be a mapping` };
-        section = "serve"; serveIndent = -1; continue;
-      }
-      if (key === "readinessTimeoutMs") {
-        const value = Number(scalar(rawValue ?? ""));
-        if (Number.isInteger(value) && value > 0) plan.readinessTimeoutMs = Math.min(value, 15 * 60_000);
-        continue;
-      }
-      notes.push(`.konteks/preview.yaml: "${key}" is not used by local previews and was ignored.`);
-      section = rawValue === undefined || rawValue === "" ? "skip" : "root";
-      continue;
+    if (indent === 0) return this.rootKey(key, rawValue);
+    return this.nestedKey(indent, key, rawValue);
+  }
+
+  result(): { plan: Partial<PreviewPlan>; notes: string[] } {
+    if (Object.keys(this.env).length > 0) this.plan.env = this.env;
+    return { plan: this.plan, notes: this.notes };
+  }
+
+  private rootKey(key: string, rawValue: string | undefined): string | undefined {
+    this.section = "root";
+    if (key === "serve") {
+      if (!blank(rawValue)) return "serve must be a mapping";
+      this.section = "serve"; this.serveIndent = -1;
+      return undefined;
     }
-    if (section === "skip" || section === "root") {
-      if (section === "root") return { ok: false, error: `line ${index + 1}: unexpected indentation` };
-      continue;
+    if (key === "readinessTimeoutMs") {
+      const value = Number(scalar(rawValue ?? ""));
+      if (Number.isInteger(value) && value > 0) this.plan.readinessTimeoutMs = Math.min(value, 15 * 60_000);
+      return undefined;
     }
-    if (section === "env" && indent > serveIndent && (envIndent === -1 || indent === envIndent)) {
-      envIndent = indent;
-      const value = scalar(rawValue ?? "");
-      if (!ENV_NAME.test(key) || RESERVED_ENV.has(key.toUpperCase())) notes.push(`.konteks/preview.yaml: serve.env.${key} is reserved or invalid and was ignored.`);
-      else if (Object.keys(env).length < 64 && Buffer.byteLength(value) <= 4_096) env[key] = value;
-      continue;
+    this.notes.push(`.konteks/preview.yaml: "${key}" is not used by local previews and was ignored.`);
+    this.section = blank(rawValue) ? "skip" : "root";
+    return undefined;
+  }
+
+  private nestedKey(indent: number, key: string, rawValue: string | undefined): string | undefined {
+    if (this.section === "root") return "unexpected indentation";
+    if (this.section === "skip") return undefined;
+    if (this.inEnv(indent)) {
+      this.envKey(indent, key, rawValue);
+      return undefined;
     }
-    if (serveIndent === -1) serveIndent = indent;
-    if (indent !== serveIndent) return { ok: false, error: `line ${index + 1}: inconsistent indentation under serve` };
-    section = "serve";
-    const value = rawValue === undefined ? "" : scalar(rawValue);
+    if (this.serveIndent === -1) this.serveIndent = indent;
+    if (indent !== this.serveIndent) return "inconsistent indentation under serve";
+    this.section = "serve";
+    return this.serveKey(key, rawValue === undefined ? "" : scalar(rawValue));
+  }
+
+  private inEnv(indent: number): boolean {
+    return this.section === "env" && indent > this.serveIndent && (this.envIndent === -1 || indent === this.envIndent);
+  }
+
+  private envKey(indent: number, key: string, rawValue: string | undefined): void {
+    this.envIndent = indent;
+    const value = scalar(rawValue ?? "");
+    if (!ENV_NAME.test(key) || RESERVED_ENV.has(key.toUpperCase())) this.notes.push(`.konteks/preview.yaml: serve.env.${key} is reserved or invalid and was ignored.`);
+    else if (Object.keys(this.env).length < 64 && Buffer.byteLength(value) <= 4_096) this.env[key] = value;
+  }
+
+  private serveKey(key: string, value: string): string | undefined {
     switch (key) {
       case "command": case "install": case "prepare":
-        if (value.length === 0 || value.length > MAX_COMMAND) return { ok: false, error: `line ${index + 1}: serve.${key} must be 1–${MAX_COMMAND} characters` };
-        plan[key] = value;
-        break;
+        return this.commandField(key, value);
       case "healthPath":
-        if (!value.startsWith("/") || value.startsWith("//") || value.length > 500) return { ok: false, error: `line ${index + 1}: serve.healthPath must be a path starting with /` };
-        plan.healthPath = value;
-        break;
+        return this.healthPath(value);
       case "port":
-        notes.push(".konteks/preview.yaml: serve.port is ignored; the connector assigns the port and passes it as $PORT.");
-        break;
+        this.notes.push(".konteks/preview.yaml: serve.port is ignored; the connector assigns the port and passes it as $PORT.");
+        return undefined;
       case "env":
-        if (value !== "") return { ok: false, error: `line ${index + 1}: serve.env must be a mapping` };
-        section = "env"; envIndent = -1;
-        break;
+        return this.envSection(value);
       default:
-        notes.push(`.konteks/preview.yaml: serve.${key} is not used by local previews and was ignored.`);
+        this.notes.push(`.konteks/preview.yaml: serve.${key} is not used by local previews and was ignored.`);
+        return undefined;
     }
   }
-  if (Object.keys(env).length > 0) plan.env = env;
-  return { ok: true, plan, notes };
+
+  private commandField(key: "command" | "install" | "prepare", value: string): string | undefined {
+    if (value.length === 0 || value.length > MAX_COMMAND) return `serve.${key} must be 1–${MAX_COMMAND} characters`;
+    this.plan[key] = value;
+    return undefined;
+  }
+
+  private healthPath(value: string): string | undefined {
+    if (!value.startsWith("/") || value.startsWith("//") || value.length > 500) return "serve.healthPath must be a path starting with /";
+    this.plan.healthPath = value;
+    return undefined;
+  }
+
+  private envSection(value: string): string | undefined {
+    if (value !== "") return "serve.env must be a mapping";
+    this.section = "env"; this.envIndent = -1;
+    return undefined;
+  }
 }
 
 function stripComment(value: string): string {

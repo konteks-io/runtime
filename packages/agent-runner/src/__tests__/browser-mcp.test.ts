@@ -62,7 +62,7 @@ describe("the QA browser MCP server", () => {
     expect(browserMcpServer(older as never, request)).toBeNull();
   });
 
-  it("is the connector's for DeepSeek Harness and OpenCode: the same server, run on the Node the connector resolved (O8)", () => {
+  it("is the connector's for DeepSeek Harness and OpenCode: the same server, run on the Node the connector resolved", () => {
     const shared = { version: "0.0.82", packageAgent: "claude-code" as const, nodeSource: "person" as const,
       node: "/usr/local/bin/node", launcher: "/pkg/claude/konteks/browser-mcp.js", entrypoint: "/pkg/claude/node_modules/@playwright/mcp/cli.js" };
     for (const agent of ["dsh", "opencode"] as const) {

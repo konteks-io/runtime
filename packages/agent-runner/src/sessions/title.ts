@@ -45,6 +45,10 @@ export function konteksCodingSessionTitle(label: KonteksSessionLabel | undefined
   const scope = [segment(label?.system, 60), segment(label?.kind, 32)].filter(Boolean);
   const title = clean(label?.title);
   if (scope.length === 0 && !title) return konteksSessionTitle(`Coding session ${ref}`);
+  return labelledTitle(scope, title, ref);
+}
+
+function labelledTitle(scope: readonly (string | undefined)[], title: string, ref: string): string {
   const prefix = scope.length ? `[konteks/${scope.join("/")}]` : "[konteks]";
   const room = MAX_TITLE - prefix.length - 1 - (ref ? ref.length + 1 : 0);
   const body = truncate(title || "Coding session", room);
@@ -52,12 +56,12 @@ export function konteksCodingSessionTitle(label: KonteksSessionLabel | undefined
 }
 
 /**
- * A person's direct session (D130): the agent titles it itself and Konteks
+ * A person's direct session: the agent titles it itself and Konteks
  * asks only for `[konteks] ` ahead of that title. The pinned Codex and Claude
  * Code bridges apply it; DeepSeek Harness, OpenCode and Antigravity have no
  * naming API over ACP and keep their own title.
  */
-export const KONTEKS_DIRECT_PREFIX = "[konteks]";
+const KONTEKS_DIRECT_PREFIX = "[konteks]";
 
 export function konteksAgentTitledMetadata(agentId?: string) {
   return {

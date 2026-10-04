@@ -117,7 +117,7 @@ it("passes an operation key identifier to the configured-origin trust cache", as
   expect(f.client.executionSigningKeys).toHaveBeenCalledWith(undefined, "rotated");
 });
 
-it("waits out Core's slow key endpoint during admission instead of refusing the prompt (D110)", async () => {
+it("waits out Core's slow key endpoint during admission instead of refusing the prompt", async () => {
   vi.useFakeTimers();
   const f = await fixture();
   const unavailable = new RemoteInstanceError("execution_authority_unavailable", "Core execution signing trust is unavailable.", { diagnostic: "temporarily_unavailable" });
@@ -151,7 +151,7 @@ it("dispatches delivery exactly once through dedicated consumption and check rou
   expect(f.journal.pendingRequests.get(operation.key)?.authorization?.claims).toMatchObject({ workloadKind: "harness_delivery" });
 });
 
-it("gives a renewal near or past the verified lease its whole I/O budget (D110)", async () => {
+it("gives a renewal near or past the verified lease its whole I/O budget", async () => {
   vi.useFakeTimers();
   const f = await fixture();
   const operation = await f.gate.admit(f.envelope);
@@ -187,7 +187,7 @@ it("renews early enough to recover from a 19 second busy-host pause without exte
   expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
 });
 
-it("adopts Core's fresh check that arrives after the old lease ran out, and keeps the agent running (D110)", async () => {
+it("adopts Core's fresh check that arrives after the old lease ran out, and keeps the agent running", async () => {
   vi.useFakeTimers();
   const f = await fixture();
   const operation = await f.gate.admit(f.envelope);
@@ -203,7 +203,7 @@ it("adopts Core's fresh check that arrives after the old lease ran out, and keep
   expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
 });
 
-it("keeps the agent running while renewals go unanswered past the lease, backing off, and stops it only when Core answers the execution is gone (D110)", async () => {
+it("keeps the agent running while renewals go unanswered past the lease, backing off, and stops it only when Core answers the execution is gone", async () => {
   vi.useFakeTimers();
   const f = await fixture();
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), child: vi.fn() };
@@ -227,7 +227,7 @@ it("keeps the agent running while renewals go unanswered past the lease, backing
   expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
 });
 
-it("keeps a delivery turn Core renewed running past its assignment's issued hour, adopting only the later lifetime (D115)", async () => {
+it("keeps a delivery turn Core renewed running past its assignment's issued hour, adopting only the later lifetime", async () => {
   vi.useFakeTimers();
   const f = await deliveryFixture();
   const persistUpdate = f.journal.assignments.update.bind(f.journal.assignments);
@@ -269,7 +269,7 @@ it("keeps a delivery turn Core renewed running past its assignment's issued hour
   await vi.waitFor(() => expect(f.onAuthorityLost).toHaveBeenCalledTimes(1));
 });
 
-it("still stops a renewed delivery turn when Core answers that it is gone (D115)", async () => {
+it("still stops a renewed delivery turn when Core answers that it is gone", async () => {
   vi.useFakeTimers();
   const f = await deliveryFixture();
   const operation = await f.gate.admit(f.envelope);
@@ -279,7 +279,7 @@ it("still stops a renewed delivery turn when Core answers that it is gone (D115)
   expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);
 });
 
-it("retries a genuine check lease that expired on its way from a slow Core instead of stopping the agent (D110)", async () => {
+it("retries a genuine check lease that expired on its way from a slow Core instead of stopping the agent", async () => {
   vi.useFakeTimers();
   const f = await fixture();
   const operation = await f.gate.admit(f.envelope);
@@ -298,7 +298,7 @@ it("retries a genuine check lease that expired on its way from a slow Core inste
   expect(() => f.gate.assertDispatchCurrent(operation.authority)).not.toThrow();
 });
 
-it("still stops at once on Core's durable revision fence while renewals are failing (D110)", async () => {
+it("still stops at once on Core's durable revision fence while renewals are failing", async () => {
   vi.useFakeTimers();
   const f = await fixture();
   const operation = await f.gate.admit(f.envelope);
@@ -469,7 +469,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.journal.pendingRequests.get("acp:received:request")?.authorization?.state).toBe("completed");
   });
 
-  // D112: the retry line carried no cause, so a Core refusal repeated 120+
+  // The retry line carried no cause, so a Core refusal repeated 120+
   // times looked like a transport stall from the connector log.
   it("names the refusal code when a durable delivery output hand-back is retried", async () => {
     const receipt = { version: 1 as const, acceptanceId: "acceptance", invocationRef: "invocation",
@@ -542,7 +542,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "completed" });
   });
 
-  it("admits a direct session prompt only with Core's permit, with nothing put in front of the person's text, and ends the assignment at end_turn (runtime-view R11, R16)", async () => {
+  it("admits a direct session prompt only with Core's permit, with nothing put in front of the person's text, and ends the assignment at end_turn", async () => {
     const direct: RemoteWorkAssignment = { ...assignment, kind: "direct", agentRoute: { agentId: "codex", requiredRole: "assistant" },
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
     const f = await sessionFixture(direct);
@@ -560,7 +560,7 @@ describe("native session dispatch uses genuine execution admission", () => {
     expect(f.send.mock.calls.map(call => call[0].body)).toContainEqual({ kind: "session_closed", assignmentId: "assignment", reason: "completed" });
   });
 
-  it("denies a second prompt on a busy session before dispatch and leaves the running turn alone (WS2-153)", async () => {
+  it("denies a second prompt on a busy session before dispatch and leaves the running turn alone", async () => {
     const f = await sessionFixture();
     const second = { kind: "acp" as const, method: "session/prompt" as const, id: "request-2", params: { sessionId: "acp", prompt: [{ type: "text" as const, text: "hello again" }] } };
     const claims = { ...f.claims, operationId: "operation-2", permitId: "permit-2", requestId: "request-2", payloadDigest: computeRemoteExecutionOperationDigest(second) };
@@ -863,7 +863,7 @@ describe("independent native live execution gate", () => {
     f.advance(31_000); f.clock.advance(-40_000); await vi.advanceTimersByTimeAsync(1000);
     // A backward wall-clock jump cannot manufacture time before the local
     // monotonic expiry; the old check is never extended. Only Core's fresh
-    // answer decides (D110), and here it says the execution is gone.
+    // answer decides, and here it says the execution is gone.
     expect(f.client.checkExecution).toHaveBeenCalledTimes(2);
     expect(() => f.gate.assertDispatchCurrent(operation.authority)).toThrow();
     expect(f.onAuthorityLost).toHaveBeenCalledTimes(1);

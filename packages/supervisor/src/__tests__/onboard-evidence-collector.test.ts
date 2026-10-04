@@ -200,7 +200,7 @@ describe("grouping depth", () => {
     // same credential five more times.
     expect(archiveFile).toHaveBeenCalledTimes(1);
     // The repository still has a row: an unreadable repository is a fact,
-    // and it says why and what a person does about it (W2-O3).
+    // and it says why and what a person does about it.
     expect(recorded.submitted[0]!.refs).toEqual([]);
     expect(recorded.submitted[0]).toMatchObject({ gap: { code: "credential_unavailable", remedy: "sign in to this provider" } });
   });

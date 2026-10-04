@@ -126,14 +126,14 @@ test("a failed reconciliation write remains an error with the tool still open", 
   assert.deepEqual([...openByTurn.get("turn")], ["read"]);
 });
 
-test("a Konteks thread turns the person's own configured MCP servers off and keeps its own (S0-2)", async () => {
+test("a Konteks thread turns the person's own configured MCP servers off and keeps its own", async () => {
   const { konteksCodexMcpServers } = await import("./codex-acp-live-user-patch.mjs");
   const existing = new Set(["atlassian", "personal_notes"]);
   assert.deepEqual(konteksCodexMcpServers(existing, ["konteks-1-a", "konteks-result"], []), {
     atlassian: { enabled: false },
     personal_notes: { enabled: false },
   });
-  // The CP2 seam: a server an integration binding admitted stays on.
+  // A server an integration binding admitted stays on.
   assert.deepEqual(konteksCodexMcpServers(existing, ["konteks-result"], ["atlassian"]), {
     personal_notes: { enabled: false },
   });
@@ -154,7 +154,7 @@ test("the reviewed bridge disables configured MCP servers on every thread start,
   assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v9");
 });
 
-test("an integration session admits only the bound personal server, read from its own session/new (CP2)", async () => {
+test("an integration session admits only the bound personal server, read from its own session/new", async () => {
   const { konteksAdmittedMcpServerNames } = await import("./codex-acp-live-user-patch.mjs");
   assert.deepEqual(konteksAdmittedMcpServerNames({ konteksIntegration: { version: 1, admittedMcpServerNames: ["atlassian"], accountConnectors: false } }), ["atlassian"]);
   // Nothing else admits anything: no meta, another version, a bad name, too many.

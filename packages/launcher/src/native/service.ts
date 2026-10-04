@@ -14,9 +14,11 @@ export interface NativePlatform {
   deploymentKind: "native_connector";
 }
 
+const HOST_OS: Partial<Record<NodeJS.Platform, HostOs>> = { darwin: "macos", win32: "windows", linux: "debian" };
+
 export function nativePlatform(platform: NodeJS.Platform = process.platform, arch: string = process.arch): NativePlatform {
   if (arch !== "x64" && arch !== "arm64") throw new Error(`unsupported native architecture ${arch}`);
-  const os = platform === "darwin" ? "macos" : platform === "win32" ? "windows" : platform === "linux" ? "debian" : null;
+  const os = HOST_OS[platform];
   if (!os) throw new Error(`unsupported native platform ${platform}`);
   return { os, architecture: arch === "x64" ? "amd64" : "arm64", containerBackend: "none", deploymentKind: "native_connector" };
 }
@@ -83,7 +85,7 @@ export interface NativeServiceDefinition {
  * A service manager reads a definition only when it loads it: launchd at
  * `bootstrap` (a KeepAlive respawn and `kickstart -k` reuse the loaded copy),
  * systemd at `daemon-reload`. Rewriting the file while the service runs
- * changes nothing until it is loaded again (RCA 2026-10-01: an updated
+ * changes nothing until it is loaded again (an updated
  * connector ran with stdout on /dev/null after the update, because the
  * install launcher had loaded a plist without the log file).
  */
@@ -109,13 +111,13 @@ const LAUNCHD_RELOAD_SCRIPT = [
 ].join("\n");
 
 /** Seconds launchd waits after SIGTERM before SIGKILL; above the connector's 15 s shutdown watchdog. */
-export const LAUNCHD_EXIT_TIMEOUT_SECONDS = 30;
+const LAUNCHD_EXIT_TIMEOUT_SECONDS = 30;
 
 /**
  * The bytes of a definition file, the one encoding every writer uses: Task
  * Scheduler reads UTF-16LE with a byte-order mark, the others UTF-8. A task
  * file in any other encoding is refused by `schtasks /Create` with "unable to
- * switch the encoding" (D129: 0.10.9 and older wrote UTF-8, and a failed
+ * switch the encoding" (0.10.9 and older wrote UTF-8, and a failed
  * refresh put a decoded copy back re-encoded under its old declaration).
  */
 export function encodeServiceDefinition(definition: Pick<NativeServiceDefinition, "contents" | "fileEncoding">): Buffer {
@@ -124,17 +126,11 @@ export function encodeServiceDefinition(definition: Pick<NativeServiceDefinition
     : Buffer.from(definition.contents, "utf8");
 }
 
-/** A definition file's text: UTF-16LE after its byte-order mark, UTF-8 otherwise. */
-export function decodeServiceDefinition(bytes: Uint8Array): string {
-  const buffer = Buffer.from(bytes);
-  return buffer[0] === 0xff && buffer[1] === 0xfe ? buffer.subarray(2).toString("utf16le") : buffer.toString("utf8");
-}
-
 /** How a service command ended, with what it printed, so a failure can say why. */
 export interface NativeServiceRun { code: number | null; stdout?: string; stderr?: string; error?: string; timedOut?: boolean }
 /** A service command runner: a bare exit code, or the whole outcome. */
 export type NativeServiceExecute = (command: NativeServiceCommand) => Promise<number | null | NativeServiceRun>;
-export type NativeServiceStep = "status" | "write" | "register" | "start" | "stop";
+type NativeServiceStep = "status" | "write" | "register" | "start" | "stop";
 
 export function serviceRun(value: number | null | NativeServiceRun): NativeServiceRun {
   return value !== null && typeof value === "object" ? value : { code: value };
@@ -143,20 +139,20 @@ export function serviceRun(value: number | null | NativeServiceRun): NativeServi
 const EXCERPT_LIMIT = 300;
 
 /** The service manager's own words, bounded: stderr first, stdout when stderr is empty. */
-export function serviceOutputExcerpt(run: NativeServiceRun): string {
+function serviceOutputExcerpt(run: NativeServiceRun): string {
   const text = (run.stderr?.trim() || run.stdout?.trim() || "").replace(/\s+/g, " ");
   return text.length > EXCERPT_LIMIT ? `${text.slice(0, EXCERPT_LIMIT - 1)}…` : text;
 }
 
 /** `schtasks.exe /Create`, `launchctl bootstrap`, `systemctl enable`: the command and its verb, never its paths. */
-export function serviceCommandName(command: NativeServiceCommand): string {
+function serviceCommandName(command: NativeServiceCommand): string {
   const verb = command.args.find(arg => /^\/?[A-Za-z][A-Za-z-]*$/.test(arg) && !arg.startsWith("-"));
   return verb ? `${command.command} ${verb}` : command.command;
 }
 
 /**
  * A service command that failed, or a definition file that could not be
- * written: which one, how it ended and what it printed (D129). The message
+ * written: which one, how it ended and what it printed. The message
  * never carries a secret: the commands are fixed and take only paths and the
  * task label.
  */
@@ -170,13 +166,16 @@ export class NativeServiceCommandError extends Error {
   ) {
     const excerpt = serviceOutputExcerpt(run);
     const name = command ? serviceCommandName(command) : `writing ${path ?? "the service definition"}`;
-    const ended = run.error ? `${command ? "could not be run" : "failed"}: ${run.error}`
-      : run.timedOut ? "did not finish in time"
-        : run.code === null ? "ended without an exit code" : `exited ${run.code}`;
-    super(`${name} ${ended}${excerpt && !run.error ? `: ${excerpt}` : ""}`);
+    super(`${name} ${serviceRunEnding(run, command !== null)}${excerpt && !run.error ? `: ${excerpt}` : ""}`);
     this.name = "NativeServiceCommandError";
     this.excerpt = excerpt;
   }
+}
+
+function serviceRunEnding(run: NativeServiceRun, ran: boolean): string {
+  if (run.error) return `${ran ? "could not be run" : "failed"}: ${run.error}`;
+  if (run.timedOut) return "did not finish in time";
+  return run.code === null ? "ended without an exit code" : `exited ${run.code}`;
 }
 
 /** A failed service step in plain words, with the one next step where it can be known. */
@@ -188,20 +187,45 @@ export function describeServiceFailure(os: HostOs, error: NativeServiceCommandEr
   return `${what} ${serviceNextStep(os, error, output)}`;
 }
 
+/** What a failed step means on each service manager; `status` is the fallback for any other step. */
+const SERVICE_STEP_WORDS: Readonly<Record<HostOs, Partial<Record<NativeServiceStep, string>> & { status: string }>> = {
+  windows: {
+    register: "Windows refused to create the Konteks task",
+    start: "Windows did not run the Konteks task",
+    stop: "Windows did not end the Konteks task",
+    status: "Windows could not say whether the Konteks task is running",
+  },
+  macos: {
+    register: "macOS did not load the Konteks launch agent",
+    start: "macOS did not load the Konteks launch agent",
+    stop: "macOS did not unload the Konteks launch agent",
+    status: "macOS could not say whether the Konteks launch agent is running",
+  },
+  debian: {
+    register: "systemd did not reload its user services",
+    start: "systemd did not start the Konteks user service",
+    stop: "systemd did not stop the Konteks user service",
+    status: "systemd could not say whether the Konteks user service is running",
+  },
+};
+
 function serviceStepWords(os: HostOs, step: NativeServiceStep): string {
-  if (os === "windows") return step === "register" ? "Windows refused to create the Konteks task" : step === "start" ? "Windows did not run the Konteks task" : step === "stop" ? "Windows did not end the Konteks task" : "Windows could not say whether the Konteks task is running";
-  if (os === "macos") return step === "start" || step === "register" ? "macOS did not load the Konteks launch agent" : step === "stop" ? "macOS did not unload the Konteks launch agent" : "macOS could not say whether the Konteks launch agent is running";
-  return step === "register" ? "systemd did not reload its user services" : step === "start" ? "systemd did not start the Konteks user service" : step === "stop" ? "systemd did not stop the Konteks user service" : "systemd could not say whether the Konteks user service is running";
+  const words = SERVICE_STEP_WORDS[os];
+  return words[step] ?? words.status;
 }
+
+/** What the service manager printed, read for the one next step it points to. */
+const SERVICE_REMEDIES: ReadonlyArray<{ os: HostOs; output: RegExp; next: string }> = [
+  { os: "windows", output: /access is denied/i, next: "Run konteks-remote start once from an administrator PowerShell (right-click PowerShell, Run as administrator); Konteks still runs as you." },
+  { os: "windows", output: /malformed|incorrectly formatted|out of range|switch the encoding/i, next: "This copy of konteks-remote wrote a task Windows does not accept; run konteks-remote update, then konteks-remote start. If it stays, send konteks-remote support to Konteks support." },
+  { os: "windows", output: /service is not available|not running|0x80041315/i, next: "Start the Task Scheduler service (services.msc), then run konteks-remote start again." },
+  { os: "macos", output: /Input\/output error|already loaded|service already/i, next: "Run konteks-remote stop, then konteks-remote start." },
+];
 
 function serviceNextStep(os: HostOs, error: NativeServiceCommandError, output: string): string {
   if (error.run.timedOut) return "Run konteks-remote start again; if it keeps timing out, restart the computer.";
-  if (os === "windows") {
-    if (/access is denied/i.test(output)) return "Run konteks-remote start once from an administrator PowerShell (right-click PowerShell, Run as administrator); Konteks still runs as you.";
-    if (/malformed|incorrectly formatted|out of range|switch the encoding/i.test(output)) return "This copy of konteks-remote wrote a task Windows does not accept; run konteks-remote update, then konteks-remote start. If it stays, send konteks-remote support to Konteks support.";
-    if (/service is not available|not running|0x80041315/i.test(output)) return "Start the Task Scheduler service (services.msc), then run konteks-remote start again.";
-  }
-  if (os === "macos" && /Input\/output error|already loaded|service already/i.test(output)) return "Run konteks-remote stop, then konteks-remote start.";
+  const remedy = SERVICE_REMEDIES.find(entry => entry.os === os && entry.output.test(output));
+  if (remedy) return remedy.next;
   if (error.step === "write") return "Check that this folder is yours and the disk has space, then run konteks-remote start again.";
   return "To see every step, run konteks-remote --verbose start.";
 }
@@ -238,54 +262,74 @@ export function nativeServiceDefinition(input: {
   const path = input.os === "windows" ? win32 : posix;
   const normalizedRoot = path.normalize(input.root);
   const label = `dev.konteks.remote.${createHash("sha256").update(input.os === "windows" ? normalizedRoot.toLowerCase() : normalizedRoot).digest("hex").slice(0, 12)}`;
-  const args = ["serve", "--root", normalizedRoot];
-  if (input.os === "macos") {
-    if (!Number.isSafeInteger(input.uid) || input.uid! < 1) throw new Error("a non-root user uid is required for the native launch agent");
-    const file = path.join(input.home, "Library", "LaunchAgents", `${label}.plist`);
-    const domain = `gui/${input.uid}`;
-    // launchd keeps nothing a service prints: without a file the connector's
-    // log, which doctor points to, did not exist (WS1-163). The connector
-    // keeps the file small itself (connector-log.ts).
-    // The home it was started from, as the service's own: launchd otherwise
-    // hands a service the login's home, so a connector installed for another
-    // home (a second person on this Mac, a stand-in laptop) read the wrong
-    // agents' sign-ins and installs (09-30).
-    const logFile = path.join(normalizedRoot, "logs", CONNECTOR_LOG_FILE);
-    // launchd SIGKILLs a booted-out job 5 s after SIGTERM by default (measured
-    // 2026-10-02, D113b): an idle connector was still stopping its agents, so
-    // it never wrote its shutdown receipt and its Codex app-server was left
-    // behind. 30 s covers the connector's own 15 s shutdown watchdog.
-    return {
-      label, path: file, requiresLinger: false,
-      contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>ExitTimeOut</key><integer>${LAUNCHD_EXIT_TIMEOUT_SECONDS}</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>${xml(logFile)}</string>\n<key>StandardErrorPath</key><string>${xml(logFile)}</string>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>${xml(input.home)}</string></dict>\n</dict></plist>\n`,
-      install: [],
-      start: { command: "launchctl", args: ["bootstrap", domain, file] },
-      stop: { command: "launchctl", args: ["bootout", `${domain}/${label}`] },
-      remove: [],
-      status: { command: "launchctl", args: ["print", `${domain}/${label}`] },
-      exits: { command: "launchctl", args: ["print", `${domain}/${label}`] },
-      inspect: { command: "launchctl", args: ["print", `${domain}/${label}`] },
-      expected: { program: input.executable, logFile },
-      reload: { kind: "detached", logFile, command: { command: "/bin/sh", args: ["-c", LAUNCHD_RELOAD_SCRIPT, "konteks-reload", `${domain}/${label}`, domain, file] } },
-    };
-  }
-  if (input.os === "debian") {
-    const unit = `${label}.service`;
-    return {
-      label, path: path.join(input.home, ".config", "systemd", "user", unit), requiresLinger: true,
-      contents: `[Unit]\nDescription=Konteks native agent connector\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=${[input.executable, ...args].map(systemdArg).join(" ")}\nEnvironment=${systemdArg(`HOME=${input.home}`)}\nRestart=always\nRestartSec=5\nTimeoutStopSec=45\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`,
-      install: [{ command: "systemctl", args: ["--user", "daemon-reload"] }],
-      start: { command: "systemctl", args: ["--user", "enable", "--now", unit] },
-      stop: { command: "systemctl", args: ["--user", "stop", unit] },
-      remove: [{ command: "systemctl", args: ["--user", "disable", "--now", unit] }],
-      status: { command: "systemctl", args: ["--user", "is-active", unit] },
-      exits: { command: "systemctl", args: ["--user", "show", unit, "-p", "NRestarts", "-p", "ExecMainStatus"] },
-      inspect: { command: "systemctl", args: ["--user", "show", unit, "-p", "MainPID", "-p", "NeedDaemonReload"] },
-      expected: { program: input.executable, logFile: null },
-      // `--no-block` only queues the restart, so this process can ask for its own.
-      reload: { kind: "inline", commands: [{ command: "systemctl", args: ["--user", "daemon-reload"] }, { command: "systemctl", args: ["--user", "--no-block", "restart", unit] }] },
-    };
-  }
+  return SERVICE_DEFINITIONS[input.os]({ input, path, normalizedRoot, label, args: ["serve", "--root", normalizedRoot] });
+}
+
+interface ServiceDefinitionInput {
+  input: { os: HostOs; home: string; root: string; executable: string; uid?: number | undefined; userId?: string };
+  path: typeof posix;
+  normalizedRoot: string;
+  label: string;
+  args: string[];
+}
+
+/** One definition per service manager: launchd, systemd's user manager, Task Scheduler. */
+const SERVICE_DEFINITIONS: Readonly<Record<HostOs, (spec: ServiceDefinitionInput) => NativeServiceDefinition>> = {
+  macos: launchAgentDefinition,
+  debian: systemdUserDefinition,
+  windows: scheduledTaskDefinition,
+};
+
+function launchAgentDefinition({ input, path, normalizedRoot, label, args }: ServiceDefinitionInput): NativeServiceDefinition {
+  if (!Number.isSafeInteger(input.uid) || input.uid! < 1) throw new Error("a non-root user uid is required for the native launch agent");
+  const file = path.join(input.home, "Library", "LaunchAgents", `${label}.plist`);
+  const domain = `gui/${input.uid}`;
+  // launchd keeps nothing a service prints: without a file the connector's
+  // log, which doctor points to, did not exist. The connector
+  // keeps the file small itself (connector-log.ts).
+  // The home it was started from, as the service's own: launchd otherwise
+  // hands a service the login's home, so a connector installed for another
+  // home (a second person on this Mac, a stand-in laptop) read the wrong
+  // agents' sign-ins and installs (09-30).
+  const logFile = path.join(normalizedRoot, "logs", CONNECTOR_LOG_FILE);
+  // launchd SIGKILLs a booted-out job 5 s after SIGTERM by default (measured):
+  // an idle connector was still stopping its agents, so
+  // it never wrote its shutdown receipt and its Codex app-server was left
+  // behind. 30 s covers the connector's own 15 s shutdown watchdog.
+  return {
+    label, path: file, requiresLinger: false,
+    contents: `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${label}</string>\n<key>ProgramArguments</key><array>${[input.executable, ...args].map(arg => `<string>${xml(arg)}</string>`).join("")}</array>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>ThrottleInterval</key><integer>5</integer>\n<key>ExitTimeOut</key><integer>${LAUNCHD_EXIT_TIMEOUT_SECONDS}</integer>\n<key>Umask</key><integer>63</integer>\n<key>StandardOutPath</key><string>${xml(logFile)}</string>\n<key>StandardErrorPath</key><string>${xml(logFile)}</string>\n<key>EnvironmentVariables</key><dict><key>HOME</key><string>${xml(input.home)}</string></dict>\n</dict></plist>\n`,
+    install: [],
+    start: { command: "launchctl", args: ["bootstrap", domain, file] },
+    stop: { command: "launchctl", args: ["bootout", `${domain}/${label}`] },
+    remove: [],
+    status: { command: "launchctl", args: ["print", `${domain}/${label}`] },
+    exits: { command: "launchctl", args: ["print", `${domain}/${label}`] },
+    inspect: { command: "launchctl", args: ["print", `${domain}/${label}`] },
+    expected: { program: input.executable, logFile },
+    reload: { kind: "detached", logFile, command: { command: "/bin/sh", args: ["-c", LAUNCHD_RELOAD_SCRIPT, "konteks-reload", `${domain}/${label}`, domain, file] } },
+  };
+}
+
+function systemdUserDefinition({ input, path, label, args }: ServiceDefinitionInput): NativeServiceDefinition {
+  const unit = `${label}.service`;
+  return {
+    label, path: path.join(input.home, ".config", "systemd", "user", unit), requiresLinger: true,
+    contents: `[Unit]\nDescription=Konteks native agent connector\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart=${[input.executable, ...args].map(systemdArg).join(" ")}\nEnvironment=${systemdArg(`HOME=${input.home}`)}\nRestart=always\nRestartSec=5\nTimeoutStopSec=45\nKillMode=control-group\nUMask=0077\n\n[Install]\nWantedBy=default.target\n`,
+    install: [{ command: "systemctl", args: ["--user", "daemon-reload"] }],
+    start: { command: "systemctl", args: ["--user", "enable", "--now", unit] },
+    stop: { command: "systemctl", args: ["--user", "stop", unit] },
+    remove: [{ command: "systemctl", args: ["--user", "disable", "--now", unit] }],
+    status: { command: "systemctl", args: ["--user", "is-active", unit] },
+    exits: { command: "systemctl", args: ["--user", "show", unit, "-p", "NRestarts", "-p", "ExecMainStatus"] },
+    inspect: { command: "systemctl", args: ["--user", "show", unit, "-p", "MainPID", "-p", "NeedDaemonReload"] },
+    expected: { program: input.executable, logFile: null },
+    // `--no-block` only queues the restart, so this process can ask for its own.
+    reload: { kind: "inline", commands: [{ command: "systemctl", args: ["--user", "daemon-reload"] }, { command: "systemctl", args: ["--user", "--no-block", "restart", unit] }] },
+  };
+}
+
+function scheduledTaskDefinition({ input, path, normalizedRoot, label }: ServiceDefinitionInput): NativeServiceDefinition {
   if (!input.userId || !/^S-1-\d+(?:-\d+)+$/.test(input.userId)) throw new Error("the current Windows user SID is required");
   const file = path.join(normalizedRoot, "service.xml");
   // Task Scheduler creates a visible console for a console executable even
@@ -318,14 +362,14 @@ export function nativeServiceDefinition(input: {
  * Task Scheduler's published schema types `RestartOnFailure/Count` as an
  * unsignedByte; 999, which its own dialog offers, is out of that range.
  */
-export const WINDOWS_TASK_RESTART_COUNT = 255;
+const WINDOWS_TASK_RESTART_COUNT = 255;
 /** The connector log's limit, as the supervisor keeps it on macOS and Linux (connector-log.ts). */
 const WINDOWS_LOG_MAX_BYTES = 20 * 1024 * 1024;
 
 /**
  * The hidden PowerShell host the Windows task runs. Task Scheduler keeps
  * nothing a task prints, so a connector that stopped as it started left no
- * trace (D129); like launchd's StandardOutPath, the connector's stdout and
+ * trace; like launchd's StandardOutPath, the connector's stdout and
  * stderr are appended to `<root>\logs\connector.log` from its very first
  * byte. Windows PowerShell's own redirection turns a native program's stderr
  * into error records (and, under `Stop`, ends the pipeline at the first
@@ -377,7 +421,6 @@ function windowsServiceHost(input: { executable: string; root: string; logFile: 
 function assertPath(value: string, os: HostOs): void {
   if (!(os === "windows" ? win32 : posix).isAbsolute(value)) throw new Error("native install paths must be absolute");
   // Reject control bytes deliberately; they can inject service-definition lines.
-  // eslint-disable-next-line no-control-regex
   if (/[\x00-\x1f\x7f]/.test(value)) throw new Error("control characters are not allowed in native install paths");
 }
 
@@ -424,19 +467,27 @@ export function parseServiceExits(os: HostOs, stdout: string): { runs: number; l
  * `MainPID` and `NeedDaemonReload`. Null where the output says neither.
  */
 export function parseLoadedService(os: HostOs, stdout: string, expected: { program: string; logFile: string | null }): { pid: number | null; current: boolean } | null {
-  if (os === "macos") {
-    if (!/^\S+ = \{$/m.test(stdout)) return null;
-    const pid = stdout.match(/^\s*pid = (\d+)$/m);
-    const program = stdout.match(/^\s*program = (.+)$/m)?.[1];
-    const out = stdout.match(/^\s*stdout path = (.+)$/m)?.[1];
-    const err = stdout.match(/^\s*stderr path = (.+)$/m)?.[1];
-    const logged = expected.logFile === null || (out === expected.logFile && err === expected.logFile);
-    return { pid: pid ? Number(pid[1]) : null, current: program === expected.program && logged };
-  }
-  if (os === "debian") {
-    const pid = stdout.match(/^MainPID=(\d+)$/m);
-    if (!pid) return null;
-    return { pid: Number(pid[1]) > 0 ? Number(pid[1]) : null, current: !/^NeedDaemonReload=yes$/m.test(stdout) };
-  }
-  return null;
+  if (os === "macos") return parseLaunchdService(stdout, expected);
+  return os === "debian" ? parseSystemdService(stdout) : null;
+}
+
+function parseLaunchdService(stdout: string, expected: { program: string; logFile: string | null }): { pid: number | null; current: boolean } | null {
+  if (!/^\S+ = \{$/m.test(stdout)) return null;
+  const pid = stdout.match(/^\s*pid = (\d+)$/m);
+  const program = stdout.match(/^\s*program = (.+)$/m)?.[1];
+  return { pid: pid ? Number(pid[1]) : null, current: program === expected.program && loggedTo(stdout, expected.logFile) };
+}
+
+/** Both of the job's output paths are the connector's log (always, when it keeps none). */
+function loggedTo(stdout: string, logFile: string | null): boolean {
+  if (logFile === null) return true;
+  const out = stdout.match(/^\s*stdout path = (.+)$/m)?.[1];
+  const err = stdout.match(/^\s*stderr path = (.+)$/m)?.[1];
+  return out === logFile && err === logFile;
+}
+
+function parseSystemdService(stdout: string): { pid: number | null; current: boolean } | null {
+  const pid = stdout.match(/^MainPID=(\d+)$/m);
+  if (!pid) return null;
+  return { pid: Number(pid[1]) > 0 ? Number(pid[1]) : null, current: !/^NeedDaemonReload=yes$/m.test(stdout) };
 }

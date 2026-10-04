@@ -12,7 +12,7 @@ import { extractLoginSignals, withoutTerminalEscapes } from "../auth/login-flow.
 import { writeDshApiKey } from "../auth/dsh-key.js";
 import { dshRuntimePaths } from "../bridge/dsh-profile.js";
 
-describe("identity signal normalization (D111)", () => {
+describe("identity signal normalization", () => {
   it("uses official Codex account identity rather than empty status stdout or shared login text", async () => {
     const dir = await mkdtemp(join(tmpdir(), "codex-identity-"));
     try {
@@ -114,7 +114,7 @@ describe("ConnectedAgentView projection", () => {
     expect("moneyObservable" in projectReadiness({ ...base, identity: "signal" })).toBe(false);
   });
 
-  it("a signed-in agent the provider's admin keeps Konteks tools out of is unavailable, contact the admin (WS1-196)", () => {
+  it("a signed-in agent the provider's admin keeps Konteks tools out of is unavailable, contact the admin", () => {
     const view = projectReadiness({ ...base, family: findAgentBridge("antigravity")!, providerAdminBlocked: true });
     expect(view.readiness).toBe("unavailable");
     expect(view.recoveryAction).toBe("contact_provider_admin");

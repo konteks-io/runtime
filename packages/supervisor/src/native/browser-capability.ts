@@ -4,7 +4,7 @@ import { packageBrowser, type RunnerBrowser, type RunnerConfig } from "@konteks/
 import { locatePersonNode, personNodeCandidates } from "./dsh-installation.js";
 
 /**
- * The QA browser as a connector capability (opencode-runtime-support O8).
+ * The QA browser as a connector capability.
  *
  * The browser (Playwright MCP, pinned by the release) is packaged inside the
  * Claude Code and Codex offline agent packages, with the connector's launcher.
@@ -28,13 +28,13 @@ import { locatePersonNode, personNodeCandidates } from "./dsh-installation.js";
 export const BROWSER_TOOL_CAPABILITY = "browser_tool";
 
 /** Playwright (the browser MCP server's engine) needs Node 20 or newer. */
-export const BROWSER_NODE_MINIMUM_MAJOR = 20;
+const BROWSER_NODE_MINIMUM_MAJOR = 20;
 
 export type ConnectorBrowserStatus =
   | { available: true; browser: RunnerBrowser }
   | { available: false; reason: "no_package" | "no_node"; message: string };
 
-export interface ConnectorBrowserDeps {
+interface ConnectorBrowserDeps {
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   /** `node --version` of a candidate (the person's Node only). */
@@ -77,14 +77,19 @@ export async function resolveConnectorBrowser(runners: readonly RunnerConfig[], 
   for (const candidate of packaged) {
     if (await executable(candidate.node)) return { available: true, browser: { ...source, node: candidate.node, nodeSource: "agent_package" } };
   }
+  const node = await personBrowserNode(runners, deps);
+  if (node === null) return { available: false, reason: "no_node", message: BROWSER_NO_NODE_MESSAGE };
+  return { available: true, browser: { ...source, node, nodeSource: "person" } };
+}
+
+/** The Node the person's DeepSeek Harness already runs on (Node 22.19+), then the usual places. */
+async function personBrowserNode(runners: readonly RunnerConfig[], deps: ConnectorBrowserDeps): Promise<string | null> {
   const env = deps.env ?? process.env;
   const platform = deps.platform ?? process.platform;
-  // The Node the person's DeepSeek Harness already runs on (Node 22.19+), then the usual places.
   const dshNode = runners.find(runner => runner.RUNNER_AGENT_ID === "dsh")?.RUNNER_NATIVE_DSH_NODE;
   const person = await locatePersonNode([...(dshNode ? [dshNode] : []), ...personNodeCandidates(env, platform)], browserNodeSupported, platform,
     deps.version ? { version: deps.version } : {});
-  if (person.node === null) return { available: false, reason: "no_node", message: BROWSER_NO_NODE_MESSAGE };
-  return { available: true, browser: { ...source, node: person.node, nodeSource: "person" } };
+  return person.node;
 }
 
 /**

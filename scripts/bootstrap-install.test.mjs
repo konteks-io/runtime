@@ -57,7 +57,16 @@ const windowsOnly = { skip: process.platform !== "win32" };
 const psLiteral = value => `'${value.replaceAll("'", "''")}'`;
 const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
 
-function runWindowsBootstrap({ msiCode = 0, cancelled = false, tampered = false, update = true, updateCode = 0, startCode = 0 } = {}) {
+function runWindowsBootstrap(options = {}) {
+  const { msiCode, cancelled, tampered, update, updateCode, startCode } = {
+    msiCode: 0,
+    cancelled: false,
+    tampered: false,
+    update: true,
+    updateCode: 0,
+    startCode: 0,
+    ...options,
+  };
   const fixture = mkdtempSync(join(root, "windows bootstrap "));
   const profile = join(fixture, "profile");
   const runtimeRoot = join(profile, "AppData", "Local", "konteks-remote");

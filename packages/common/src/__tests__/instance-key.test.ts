@@ -66,7 +66,7 @@ describe("instance key proofs", () => {
     expect(verifyBody(key.publicKey, { ...body, activeAssignments: 1 }, signature)).toBe(false);
   });
 
-  it("the supervisor RelayAck signature never covers the epoch (D115)", () => {
+  it("the supervisor RelayAck signature never covers the epoch", () => {
     const ack = {
       channelId: "control",
       dataDirection: "to_runtime" as const,
@@ -79,7 +79,7 @@ describe("instance key proofs", () => {
   });
 });
 
-describe("report payload digest (D125)", () => {
+describe("report payload digest", () => {
   it("ignores reportedAt and payloadDigest so a retry matches", () => {
     const a = reportPayloadDigest({
       assignmentId: "a",

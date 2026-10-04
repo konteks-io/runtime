@@ -12,11 +12,11 @@ process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
 }) as typeof process.emitWarning;
 
 /** The customer executable has one architecture: a native BYOA connector. */
-export const LAUNCHER_VERSION = process.env.KONTEKS_LAUNCHER_VERSION ?? "0.1.0";
+const LAUNCHER_VERSION = process.env.KONTEKS_LAUNCHER_VERSION ?? "0.1.0";
 
 async function main(): Promise<void> {
   // The Windows command the MSI installed runs the installed release's own
-  // code (D131): Program Files cannot be refreshed by the connector, so its
+  // code: Program Files cannot be refreshed by the connector, so its
   // copy would otherwise run the first MSI's code forever.
   if (process.platform === "win32") {
     const [{ delegateToInstalledRelease }, { nativePaths }] = await Promise.all([import("./native/launcher-delegate.js"), import("./native/service.js")]);

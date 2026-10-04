@@ -13,7 +13,7 @@ afterEach(async () => {
 });
 
 // A minimal ACP agent that, before answering `initialize`, calls the client
-// methods Konteks never offers (opencode-runtime-support CP4: OpenCode's ACP
+// methods Konteks never offers (OpenCode's ACP
 // writes edited files back through `fs/write_text_file` when a client offers
 // it) and records what it was answered.
 const AGENT = `
@@ -43,7 +43,7 @@ process.stdin.on("data", async chunk => {
 });
 `;
 
-// Every bridge answers the same way; Google Antigravity's included (antigravity-runtime-support CP4).
+// Every bridge answers the same way; Google Antigravity's included.
 it.each(["opencode", "antigravity"])("answers %s's fs and terminal calls with method not found and never acts on them", async agentId => {
   const root = await mkdtemp(join(tmpdir(), "bridge-client-")); roots.push(root);
   const script = join(root, "agent.cjs");

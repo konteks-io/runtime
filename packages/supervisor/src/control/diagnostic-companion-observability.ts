@@ -1,7 +1,7 @@
 import { createRuntimeAdmissionObservabilityContext } from "@konteks/remote-common";
 import type { DiagnosticCompanionInboxRecord } from "../state/diagnostic-companion-inbox.js";
 
-export interface ActiveDiagnosticCompanionOperation {
+interface ActiveDiagnosticCompanionOperation {
   assignmentId: string;
   attempt: number;
   claimId: string;
@@ -30,7 +30,7 @@ function coverageGapReason(
 }
 
 /**
- * Converts a retained C01 sidecar into an operational event only when its
+ * Converts a retained diagnostic companion into an operational event only when its
  * assignment identity can still be joined to the local active operation.
  * This is diagnostic-only: callers must never use its result for authority,
  * routing, idempotency, or delivery decisions.

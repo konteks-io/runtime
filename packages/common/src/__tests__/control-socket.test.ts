@@ -69,7 +69,7 @@ describe("loopback control socket", () => {
   it("survives a client that resets the connection mid-read and keeps serving", async () => {
     // A `status` probe that exits before reading its reply resets the socket.
     // readline re-emits the read error on its Interface; unhandled, that was
-    // an uncaught exception that killed the supervisor (live 2026-09-12).
+    // an uncaught exception that killed the supervisor.
     const server = await startControlSocketServer({ token, port: 0, handler: async () => ({ ok: true }) });
     servers.push(server);
     const uncaught: unknown[] = [];

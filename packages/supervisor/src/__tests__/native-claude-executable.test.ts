@@ -36,7 +36,7 @@ describe("native Claude Code executable discovery", () => {
     await expect(resolveNativeClaudeExecutable({ CLAUDE_CODE_EXECUTABLE: override }, join(root, "home"))).rejects.toMatchObject({ code: "prerequisite_missing" });
   });
 
-  it("finds the official Windows installer's claude.exe under the user's profile (D116)", async () => {
+  it("finds the official Windows installer's claude.exe under the user's profile", async () => {
     root = await realpath(await mkdtemp(join(tmpdir(), "claude-exe-")));
     const profile = join(root, "Users", "person");
     const installed = join(profile, ".local", "bin", "claude.exe");
@@ -45,7 +45,7 @@ describe("native Claude Code executable discovery", () => {
     await expect(resolveNativeClaudeExecutable({ PATH: join(root, "Windows", "System32") }, profile, "win32")).resolves.toBe(installed);
   });
 
-  it("names the platform's own official installer when Claude Code is missing (D116)", async () => {
+  it("names the platform's own official installer when Claude Code is missing", async () => {
     root = await realpath(await mkdtemp(join(tmpdir(), "claude-exe-")));
     const windows = resolveNativeClaudeExecutable({ PATH: "" }, join(root, "empty"), "win32");
     await expect(windows).rejects.toMatchObject({ code: "prerequisite_missing", message: expect.stringContaining("irm https://claude.ai/install.ps1 | iex") });
@@ -55,7 +55,7 @@ describe("native Claude Code executable discovery", () => {
     expect(claudeCodeInstaller("linux")).toEqual({ url: "https://claude.ai/install.sh", command: "curl -fsSL https://claude.ai/install.sh | bash" });
   });
 
-  it("finds npm's Windows install behind its claude.cmd shim, the package's own claude.exe (D116)", async () => {
+  it("finds npm's Windows install behind its claude.cmd shim, the package's own claude.exe", async () => {
     root = await realpath(await mkdtemp(join(tmpdir(), "claude-exe-")));
     const appData = join(root, "AppData", "Roaming");
     const npmBin = join(appData, "npm");

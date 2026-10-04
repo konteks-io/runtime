@@ -183,7 +183,7 @@ describe("Google Antigravity tool governance", () => {
       expect(governance.observe(done("ignored"), WC)).toEqual({ toolCallId: "ignored", title: "run_command", unaskedCommand: true });
     });
 
-    it("trips on a subagent's command, which never asks (CP0 B8)", () => {
+    it("trips on a subagent's command, which never asks", () => {
       const { governance } = governed();
       const conversation = "e1b92d65-1f8c-4c53-8885-e7cc4443b095";
       governance.observe(toolCall({ toolCallId: `${conversation}:1`, title: "git push origin HEAD:probe-push", kind: "execute", rawInput: { command_line: "git push origin HEAD:probe-push", working_dir: WC } }, "in_progress"), WC);
@@ -198,7 +198,7 @@ describe("Google Antigravity tool governance", () => {
       expect(governance.observe(toolCall(mcpCall("cd", "chrome-devtools", "navigate_page"), "in_progress"), WC)).toMatchObject({ toolCallId: "cd" });
     });
 
-    it("A21: a command with no request at all (Always proceed) trips and names the Enterprise setting on Gemini Enterprise", () => {
+    it("a command with no request at all (Always proceed) trips and names the Enterprise setting on Gemini Enterprise", () => {
       const { governance } = governed();
       governance.observe(toolCall(command("auto", "echo unasked"), "in_progress"), WC);
       const bypass = governance.observe(done("auto"), WC);

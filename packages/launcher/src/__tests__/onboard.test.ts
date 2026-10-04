@@ -2,15 +2,24 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { agentName, detectAgentFamilies, detectOpenCodeProblem, hostLabel, initiativeTitle, isNo, isYes, onboardFailureStep, runOnboard, runOnboardStep } from "../native/onboard.js";
+import { agentName } from "../native/agent-name.js";
+import { onboardFailureStep, runOnboard, runOnboardStep } from "../native/onboard.js";
+import { isNo, isYes } from "../native/onboard-answers.js";
+import { detectAgentFamilies, type OnboardStep } from "../native/onboard-session.js";
+import { hostLabel } from "../native/onboard-system.js";
+import { detectOpenCodeProblem, initiativeTitle } from "../native/onboard-closing.js";
 import { OPENCODE_MIN_BINARY_BYTES } from "@konteks/remote-supervisor";
 import { RemoteInstanceError } from "@konteks/remote-common";
 import { readOnboardState, writeOnboardState } from "../native/onboard-state.js";
 import { OWNER_ACCESS_REVOKED, writeOwnerToken } from "../native/owner-api.js";
 import { createOutput } from "../output.js";
 
+/** A closing step's remedies and summary, empty when it has none. */
+const remediesOf = (result: OnboardStep) => result.done?.remedies ?? [];
+const summaryOf = (result: OnboardStep) => result.done?.summary ?? "";
+
 /**
- * The conversation an agent relays (onboarding-simplified OS5–OS16).
+ * The conversation an agent relays.
  *
  * These drive the state machine the way the agent does: one invocation per
  * step, with the person's answer arriving as an argument on the next one.
@@ -22,7 +31,7 @@ describe("onboard", () => {
   let root: string;
   beforeEach(async () => {
     // Every machine these tests describe can still prove itself; the lost-key
-    // test (W1-L1) says otherwise for itself.
+    // test says otherwise for itself.
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
     vi.spyOn(SupervisorStore.prototype, "loadInstanceKey").mockResolvedValue({} as never);
     root = await mkdtemp(join(tmpdir(), "konteks-onboard-"));
@@ -67,7 +76,7 @@ describe("onboard", () => {
     vi.restoreAllMocks();
   });
 
-  it("requests first-machine work roles before promising Auto planning, engineering and review (WS1-144)", async () => {
+  it("requests first-machine work roles before promising Auto planning, engineering and review", async () => {
     await writeOnboardState(root, { step: "email" } as never);
     const { writeSecretFile } = await import("@konteks/remote-common");
     await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
@@ -108,7 +117,7 @@ describe("onboard", () => {
     });
   });
 
-  it("asks about the folder once the service answers, and waits for its first heartbeat only before agents run (WS1-116)", async () => {
+  it("asks about the folder once the service answers, and waits for its first heartbeat only before agents run", async () => {
     await writeOnboardState(root, { step: "inspect", instanceId: "instance-1", tenantId: "acme" } as never);
     const waits: Array<string | undefined> = [];
     const waitForReady = async (_root: string, until?: "ready" | "answering") => { waits.push(until); return { administrativeStatus: "provisioning", roles: [] }; };
@@ -136,7 +145,7 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ repositoryKind: "managed" });
   });
 
-  it("offers managed git, and says why, when the remote is a folder on this machine (W1-B1 pass 4)", async () => {
+  it("offers managed git, and says why, when the remote is a folder on this machine", async () => {
     await writeOnboardState(root, { step: "inspect" } as never);
     const result = await step({
       inspect: async () => ({
@@ -159,7 +168,7 @@ describe("onboard", () => {
     for (const url of ["/Users/me/remotes/recipe-box.git", "../recipe-box.git", "file:///srv/git/recipe-box.git", "C:\\git\\recipe-box.git"]) expect(remoteIsLocal(url), url).toBe(true);
   });
 
-  it("closes the conversation that just finished with its summary, not a revisit (pass 25)", async () => {
+  it("closes the conversation that just finished with its summary, not a revisit", async () => {
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
     vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "konteks-2" } as never);
     await writeOnboardState(root, {
@@ -176,7 +185,7 @@ describe("onboard", () => {
   });
 
   it("greets a new conversation on a finished machine instead of replaying the old summary", async () => {
-    // W1-A8: the person pastes the block into a new agent in the same folder.
+    // The person pastes the block into a new agent in the same folder.
     // The old closing summary came back as if setup had just happened, and the
     // new agent told the person to check what "they" had chosen.
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
@@ -251,12 +260,12 @@ describe("onboard", () => {
 
     const declined = await step(here, "no");
     expect(declined.note).toContain("Leaving the catalog");
-    // No System, so no first initiative to ask about: this conversation closes (pass 27).
+    // No System, so no first initiative to ask about: this conversation closes.
     expect(declined.note).toContain("run onboard here again");
     expect(await readOnboardState(root)).toMatchObject({ step: "done", closing: true });
   });
 
-  it("says every chained step's news, not only the last (pass 6)", async () => {
+  it("says every chained step's news, not only the last", async () => {
     await writeOnboardState(root, { step: "graft", repositoryPath: "/tmp/booking-site", repositoryName: "booking-site", systemId: "sys-1", systemExisting: true, instanceId: "instance-1" } as never);
     const fetchFn = vi.fn(async () => new Response(JSON.stringify({ initiatives: [{ id: "init_1", title: "Tables" }] }), { status: 200, headers: { "content-type": "application/json" } }));
     const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", deps: { waitForReady: readyService, fetchFn: fetchFn as never, families: async () => ["claude-code"], graft: { available: async () => true, wired: async () => true } as never } });
@@ -264,7 +273,7 @@ describe("onboard", () => {
     expect(result.note).toContain('booking-site already has an initiative, "Tables"');
   });
 
-  it("names the initiative a rejoined System already has instead of asking for a first one (WS1-090)", async () => {
+  it("names the initiative a rejoined System already has instead of asking for a first one", async () => {
     await writeOnboardState(root, { step: "first_task", systemExisting: true, systemId: "sys-existing", repositoryName: "hello-world", instanceId: "instance-1" } as never);
     const fetchFn = vi.fn(async () => new Response(JSON.stringify({ initiatives: [{ id: "init_1", title: "Turn this into a tiny page that greets visitors by the time of day" }] }), { status: 200, headers: { "content-type": "application/json" } }));
     const result = await step({ fetchFn: fetchFn as never });
@@ -277,7 +286,7 @@ describe("onboard", () => {
     expect((await step({ fetchFn: empty as never })).ask?.kind).toBe("text");
   });
 
-  it("says so when the folder was already the workspace's System, instead of failing (WS1-089)", async () => {
+  it("says so when the folder was already the workspace's System, instead of failing", async () => {
     await writeOnboardState(root, { step: "system", repositoryName: "hello-world", repositoryKind: "existing", repositoryPath: "/tmp/hello-world", remoteUrl: "https://github.com/octocat/Hello-World.git", defaultBranch: "master", instanceId: "instance-1" } as never);
     const fetchFn = vi.fn(async () => new Response(JSON.stringify({
       systemId: "sys-existing", existing: true, systemEntityRef: "system:default/konteks-2-hello-world", componentEntityRef: "component:default/octocat-hello-world",
@@ -321,7 +330,7 @@ describe("onboard", () => {
     });
   });
 
-  it("waits while Konteks is still setting up managed git, instead of asking to retry (WS1-048)", async () => {
+  it("waits while Konteks is still setting up managed git, instead of asking to retry", async () => {
     await writeOnboardState(root, {
       step: "system", repositoryName: "solo", repositoryKind: "managed", repositoryPath: "/tmp/solo", defaultBranch: "trunk", instanceId: "instance-1",
     } as never);
@@ -345,7 +354,7 @@ describe("onboard", () => {
     expect(failed.note).toBe("Konteks could not finish that step: Konteks is still setting up managed git for this workspace. It takes about a minute; nothing you answered was lost.");
   });
 
-  it("stops at the next step with why, once this machine's access was revoked, and offers to connect again (W1-X3, W1-Z4)", async () => {
+  it("stops at the next step with why, once this machine's access was revoked, and offers to connect again", async () => {
     await writeOnboardState(root, {
       step: "system",
       repositoryName: "solo",
@@ -366,12 +375,12 @@ describe("onboard", () => {
 
     const other = await step({ fetchFn: refusal({ error: { name: "AuthenticationError" } }) as never }, "yes").catch((e: unknown) => e);
     expect((other as Error).message).toBe("This machine's Konteks access was refused.");
-    // WS1-049: a refusal that says why keeps its words.
+    // A refusal that says why keeps its words.
     const named = await step({ fetchFn: refusal({ code: "access_denied", message: "The session proof was not accepted" }) as never }, "yes").catch((e: unknown) => e);
     expect((named as Error).message).toBe("Konteks refused that request: The session proof was not accepted.");
   });
 
-  it("hands the agent the next question with the note, instead of a bare run-again hop (WS1-032)", async () => {
+  it("hands the agent the next question with the note, instead of a bare run-again hop", async () => {
     await writeOnboardState(root, {
       step: "system", repositoryName: "solo", repositoryKind: "managed", repositoryPath: "/tmp/solo", repositoryNeedsInit: true, defaultBranch: "trunk", instanceId: "instance-1",
     } as never);
@@ -430,7 +439,7 @@ describe("onboard", () => {
     });
     expect(accepted.note).toContain("Pushed trunk");
     expect(accepted.note).toContain("branch tracks it"); expect(accepted.note.match(/Konteks managed git/g)).toHaveLength(1);
-    expect(await readOnboardState(root)).toMatchObject({ step: "graft" }); // Graft is offered next (W1-G1).
+    expect(await readOnboardState(root)).toMatchObject({ step: "graft" }); // Graft is offered next.
   });
 
   it("offers a plain project folder as the first System on managed git", async () => {
@@ -523,12 +532,12 @@ describe("onboard", () => {
     });
     expect(result.run).toEqual({ argv: ["konteks-remote", "onboard", "--json"] });
     expect(result.note).toContain("still starting");
-    // WS1-079: never "ask again in a moment", which read as an invitation to
+    // Never "ask again in a moment", which read as an invitation to
     // poll; the run already says what comes next.
     expect(result.note).not.toMatch(/ask again/i);
     expect(await readOnboardState(root)).toMatchObject({ step: "inspect", startWaits: 1 });
 
-    // WS1-036: the record exists before `start` is ever run, so "starting"
+    // The record exists before `start` is ever run, so "starting"
     // must not be said for ever. The second wait (each is over a minute)
     // hands out start again.
     const again = () => runOnboardStep({
@@ -557,10 +566,10 @@ describe("onboard", () => {
     const push = vi.fn(async () => ({ pushed: true, message: "Pushed main to Konteks managed git." }));
     const question = await step({ initialize, push: push as never });
     expect(question.ask?.question).toContain("It becomes a git repository on main; none of your files are added or changed");
-    expect(question.ask?.question).not.toContain("empty first commit"); // WS1-031: the repository usually has its own
+    expect(question.ask?.question).not.toContain("empty first commit"); // The repository usually has its own
     expect(question.ask?.question).toContain("none of your files are added");
     const joining = await step({ initialize, push: push as never }, "yes");
-    // Nothing of the person's is pushed from an empty folder (WS1-124).
+    // Nothing of the person's is pushed from an empty folder.
     expect(joining.note).toBe("Joining konteks-onboard-app to its Konteks repository. This usually takes a few seconds.");
     expect(initialize).not.toHaveBeenCalled();
     const pushed = await step({ initialize, push: push as never });
@@ -616,7 +625,7 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "push" });
   });
 
-  it("starts a stopped service instead of asking to retry the push, and keeps the person's yes (WS1-027)", async () => {
+  it("starts a stopped service instead of asking to retry the push, and keeps the person's yes", async () => {
     await writeOnboardState(root, {
       step: "pushing", repositoryName: "solo", repositoryPath: "/tmp/solo",
       managedRemoteUrl: "https://git.konteks.test/acme/solo", managedSshUrl: "ssh://git@git.konteks.test:2222/acme/solo.git", defaultBranch: "main",
@@ -693,7 +702,7 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
   });
 
-  it("waits when Core Auto has no eligible work route (WS1-144)", async () => {
+  it("waits when Core Auto has no eligible work route", async () => {
     await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
     const calls: Array<{ url: string; method: string }> = [];
     const fetchFn = vi.fn(async (url: string, init: RequestInit) => {
@@ -718,7 +727,7 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "initiative" });
   });
 
-  it("does not treat a profile without a ready default revision as first-machine setup (WS1-144)", async () => {
+  it("does not treat a profile without a ready default revision as first-machine setup", async () => {
     await writeOnboardState(root, { step: "agents", systemId: "sys-1", firstTask: "Book a table" } as never);
     const calls: string[] = [];
     const fetchFn = vi.fn(async (url: string) => {
@@ -786,7 +795,7 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "done", initiativeId: "init-7", initiativeUrl: "https://app.test/work/init-7" });
   });
 
-  it("closes once: no stale wait and no initiative said three times (pass 5)", async () => {
+  it("closes once: no stale wait and no initiative said three times", async () => {
     await writeOnboardState(root, { step: "agents", systemId: "sys-1", repositoryName: "recipe-box", firstTask: "Recipes", initiativeTitle: "Recipes", instanceId: "instance-1", tenantId: "acme" } as never);
     const fetchFn = vi.fn(async (url: string) => {
       const body = url.endsWith("/execution-profiles") ? { profiles: [{ id: "p1", isDefault: true, status: "active", currentReadyRevision: 1 }] }
@@ -833,14 +842,14 @@ describe("onboard", () => {
 
   it("names an initiative from the first sentence, at a title's length", () => {
     expect(initiativeTitle("Add a coupon code to checkout.")).toBe("Add a coupon code to checkout");
-    // WS1-083: a long sentence is cut where a phrase ends, not mid-phrase.
+    // A long sentence is cut where a phrase ends, not mid-phrase.
     expect(initiativeTitle("I want a very small booking site for my cafe where regulars can reserve the window table and get a reminder the day before.")).toBe(
       "I want a very small booking site for my cafe where regulars can reserve the window table",
     );
     expect(initiativeTitle("A simple site where people can book a table at my restaurant for a date and time, and I get an email for each booking.")).toBe(
       "A simple site where people can book a table at my restaurant for a date and time",
     );
-    // A sentence a title can hold stays whole: a cut at "date and party size" left "…for a date" (pass 8).
+    // A sentence a title can hold stays whole: a cut at "date and party size" left "…for a date".
     expect(initiativeTitle("A simple site where people book a table at my restaurant for a date and party size.")).toBe(
       "A simple site where people book a table at my restaurant for a date and party size",
     );
@@ -885,7 +894,7 @@ describe("onboard", () => {
     expect(gateway.ask).toBeUndefined();
   });
 
-  it("says Konteks could not be reached instead of a bare gateway status on any other step (pass 5)", async () => {
+  it("says Konteks could not be reached instead of a bare gateway status on any other step", async () => {
     await writeOnboardState(root, { step: "initiative", systemId: "sys-1" } as never);
     const failed = await onboardFailureStep({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test" }, new Error("HTTP 502"));
     expect(failed.note).toBe("Konteks could not be reached just now; it may be restarting. Nothing you answered was lost.");
@@ -905,7 +914,7 @@ describe("onboard", () => {
     expect(refused.done?.links.site).toBe("https://app.test");
   });
 
-  describe("a computer its owner connected from the site (W1-M4)", () => {
+  describe("a computer its owner connected from the site", () => {
     const connected = async () => {
       const { SupervisorStore } = await import("@konteks/remote-supervisor");
       vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
@@ -935,7 +944,7 @@ describe("onboard", () => {
     });
   });
 
-  describe("a machine whose access was revoked, when the person says yes (W1-Z4)", () => {
+  describe("a machine whose access was revoked, when the person says yes", () => {
     const enrolled = async () => {
       const { writeSecretFile } = await import("@konteks/remote-common");
       await writeSecretFile(join(root, "native-enrollment.json"), JSON.stringify({
@@ -1012,7 +1021,7 @@ describe("onboard", () => {
     });
   });
 
-  it("does not tell a revoked machine that nothing needs setting up, even mid-revisit (W1-Z4)", async () => {
+  it("does not tell a revoked machine that nothing needs setting up, even mid-revisit", async () => {
     await writeOnboardState(root, {
       step: "inspect", revisit: true, tenantId: "acme", systemEntityRef: "system:default/acme-solo",
       repositoryName: "solo", repositoryKind: "managed", repositoryPath: "/tmp/solo",
@@ -1025,7 +1034,7 @@ describe("onboard", () => {
     expect((error as Error).message).toBe(OWNER_ACCESS_REVOKED);
   });
 
-  it("rejoins a System whose branch Konteks already has without asking to push, and closes without claiming new work (WS1-112)", async () => {
+  it("rejoins a System whose branch Konteks already has without asking to push, and closes without claiming new work", async () => {
     await writeOnboardState(root, {
       step: "push", systemExisting: true, systemId: "sys-1", repositoryName: "solo", repositoryKind: "managed",
       repositoryOnManagedGit: true, repositoryUnpushed: 0, defaultBranch: "main", repositoryPath: "/tmp/solo",
@@ -1050,13 +1059,13 @@ describe("onboard", () => {
     expect(done.done?.summary).not.toContain("working on it here");
   });
 
-  it("asks about a folder already on Konteks managed git in words that say nothing is made twice (WS1-112)", async () => {
+  it("asks about a folder already on Konteks managed git in words that say nothing is made twice", async () => {
     await writeOnboardState(root, { step: "system", repositoryName: "solo", repositoryKind: "managed", repositoryOnManagedGit: true, repositoryPath: "/tmp/solo", defaultBranch: "main" } as never);
     const asked = await step({ inspect: async () => ({ path: "/tmp/solo", name: "solo", remoteUrl: null, remoteReachable: false, currentBranch: "main", defaultBranch: "main", onManagedGit: true }) });
     expect(asked.ask?.question).toBe("Use solo as your System here? It is already on Konteks managed git, so if your workspace has it, nothing is made twice.");
   });
 
-  it("keeps the person's address and Graft answer when a machine that lost its key connects again (W1-Z5, W1-G2)", async () => {
+  it("keeps the person's address and Graft answer when a machine that lost its key connects again", async () => {
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
     vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "acme" } as never);
     vi.spyOn(SupervisorStore.prototype, "loadInstanceKey").mockResolvedValue(null as never);
@@ -1069,14 +1078,14 @@ describe("onboard", () => {
     });
   });
 
-  it("leaves a revoked machine disconnected when the person says no (W1-Z4)", async () => {
+  it("leaves a revoked machine disconnected when the person says no", async () => {
     await writeOnboardState(root, { step: "reconnect", tenantId: "acme" } as never);
     const no = await step({}, "no");
     expect(no.done?.summary).toBe("This machine stays disconnected from Konteks.");
     expect(no.done?.links.site).toBe("https://app.test");
   });
 
-  it("reads a yes to 'Try that step again now?' as a retry, never as the step's own answer (pass 5)", async () => {
+  it("reads a yes to 'Try that step again now?' as a retry, never as the step's own answer", async () => {
     await writeOnboardState(root, { step: "first_task", systemId: "sys-1", retryAsked: true } as never);
     const fetchFn = vi.fn();
     const retried = await step({ fetchFn: fetchFn as never }, "yes");
@@ -1101,7 +1110,7 @@ describe("onboard", () => {
     expect((await readOnboardState(root))?.retryAsked).toBe(true);
   });
 
-  it("takes the one offered workspace a sentence names, and asks again when it names none or both (pass 5)", async () => {
+  it("takes the one offered workspace a sentence names, and asks again when it names none or both", async () => {
     const workspaces = [{ tenantId: "konteks-2", displayName: "konteks-2" }, { tenantId: "recipe-club", displayName: "Recipe Club" }];
     for (const [answer, tenantId] of [["konteks-2 again please", "konteks-2"], ["the Recipe Club one", "recipe-club"], ["recipe-club", "recipe-club"]] as const) {
       await writeOnboardState(root, { step: "workspace", decision: "choose", workspaces } as never);
@@ -1113,13 +1122,13 @@ describe("onboard", () => {
     expect((await step({}, "konteks-2 or Recipe Club?")).note).toBe("That is not one of the workspaces on offer.");
   });
 
-  it("asks what to build first in plain words, without billing terms (WS1-109)", async () => {
+  it("asks what to build first in plain words, without billing terms", async () => {
     await writeOnboardState(root, { step: "first_task", systemId: "sys-1" } as never);
     const ask = await step({});
     expect(ask.ask?.question).toBe("What do you want to build first? Your first planning turn is included.");
   });
 
-  it("tells an invited Viewer why no initiative is started, and asks nothing (WS1-131)", async () => {
+  it("tells an invited Viewer why no initiative is started, and asks nothing", async () => {
     await writeOnboardState(root, { step: "first_task", systemId: "sys-1", tenantId: "konteks-onboard", workspaces: [{ tenantId: "konteks-onboard", displayName: "Konteks-Onboard" }] } as never);
     const fetchFn = vi.fn(async (url: string) =>
       String(url).endsWith("/api/platform/permissions/check")
@@ -1172,7 +1181,7 @@ describe("onboard", () => {
     expect(result.done?.summary).toContain('Your first initiative is "Book a table"');
   });
 
-  it("names a workspace renamed on the site by its new name in the closing and the next conversation (WS1-108)", async () => {
+  it("names a workspace renamed on the site by its new name in the closing and the next conversation", async () => {
     await writeOnboardState(root, {
       step: "done", decision: "create", tenantId: "acme", ownerEmail: "ada@acme.test",
       systemId: "sys-1", systemEntityRef: "system:default/acme-solo", repositoryName: "solo", repositoryKind: "managed",
@@ -1191,14 +1200,14 @@ describe("onboard", () => {
     expect(greeting.note).toBe("This machine is already connected to Acme Kitchen as ada@acme.test; no sign-in is needed.");
   });
 
-  it("still closes, naming the id, when Core cannot say the workspace's name (WS1-108)", async () => {
+  it("still closes, naming the id, when Core cannot say the workspace's name", async () => {
     await writeOnboardState(root, { step: "done", decision: "create", tenantId: "acme" } as never);
     const down = vi.fn(async () => new Response("unavailable", { status: 503 }));
     const done = await step({ fetchFn: down as never });
     expect(done.done?.summary).toContain("This machine is connected to your workspace acme (you can rename it in Settings).");
   });
 
-  it("asks for the email without a note saying the machine is not connected (WS1-109)", async () => {
+  it("asks for the email without a note saying the machine is not connected", async () => {
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
     vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue(null as never);
     const first = await step({});
@@ -1206,13 +1215,13 @@ describe("onboard", () => {
     expect(first.ask?.question).toBe("What email address should this machine belong to?");
   });
 
-  it("names only the agents that are logged in as running work, and says how to log in the other (pass 28)", async () => {
+  it("names only the agents that are logged in as running work, and says how to log in the other", async () => {
     await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
     const result = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "login_required" }) });
     expect(result.done?.summary).toContain("Your Claude Code login will run Konteks work here.");
     expect(result.done?.summary).not.toContain("claude-code and codex");
     expect(result.done?.remedies).toContain("Codex needs you to sign in here: konteks-remote auth login codex");
-    // WS1-151: the summary names the agents that run work; a list of ids beside it read "Agents ready: claude-code".
+    // The summary names the agents that run work; a list of ids beside it read "Agents ready: claude-code".
     expect(result.done).not.toHaveProperty("agents");
     // A service still probing is not evidence of a missing login.
     const probing = await step({ families: async () => ["claude-code", "codex"], agentReadiness: async () => ({ "claude-code": "ready", codex: "probing" }) });
@@ -1228,42 +1237,42 @@ describe("onboard", () => {
     const without = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }) });
     expect(JSON.stringify(without.done)).not.toContain("DeepSeek");
   });
-  it("names OpenCode by name, asks for a sign-in only when it is here without one, and offers --reuse when the person has their own (opencode CP6)", async () => {
+  it("names OpenCode by name, asks for a sign-in only when it is here without one, and offers --reuse when the person has their own", async () => {
     await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
     const unsigned = await step({ families: async () => ["claude-code", "opencode"], agentReadiness: async () => ({ "claude-code": "ready", opencode: "not_configured" }) });
-    expect(unsigned.done?.remedies).toContain("OpenCode needs a subscription or an API key: konteks-remote auth login opencode");
-    expect(unsigned.done?.summary).toContain("Your Claude Code login will run Konteks work here.");
+    expect(remediesOf(unsigned)).toContain("OpenCode needs a subscription or an API key: konteks-remote auth login opencode");
+    expect(summaryOf(unsigned)).toContain("Your Claude Code login will run Konteks work here.");
     const reuse = await step({ families: async () => ["opencode"], agentReadiness: async () => ({ opencode: "not_configured" }), personalOpenCode: async () => true });
-    expect(reuse.done?.remedies).toContain("OpenCode needs a sign-in, starting from the providers your own OpenCode uses: konteks-remote auth login opencode --reuse");
+    expect(remediesOf(reuse)).toContain("OpenCode needs a sign-in, starting from the providers your own OpenCode uses: konteks-remote auth login opencode --reuse");
     const ready = await step({ families: async () => ["codex", "opencode"], agentReadiness: async () => ({ codex: "ready", opencode: "ready" }) });
-    expect(ready.done?.summary).toContain("Your Codex and OpenCode login will run Konteks work here.");
+    expect(summaryOf(ready)).toContain("Your Codex and OpenCode login will run Konteks work here.");
     // Installed after onboarding: the connector does not list it yet; listed but parked: doctor says why.
     const notAdded = await step({ families: async () => ["claude-code", "opencode"], agentReadiness: async () => ({ "claude-code": "ready" }), recordedAgents: async () => ["claude-code"] });
-    expect(notAdded.done?.remedies).toContain("OpenCode is on this computer but not added yet: konteks-remote agent add opencode");
-    expect(notAdded.done?.summary).toContain("Your Claude Code login will run Konteks work here.");
+    expect(remediesOf(notAdded)).toContain("OpenCode is on this computer but not added yet: konteks-remote agent add opencode");
+    expect(summaryOf(notAdded)).toContain("Your Claude Code login will run Konteks work here.");
     const parked = await step({ families: async () => ["claude-code", "opencode"], agentReadiness: async () => ({ "claude-code": "ready" }), recordedAgents: async () => ["claude-code", "opencode"] });
-    expect(parked.done?.remedies).toContain("OpenCode could not start here; to see why: konteks-remote doctor");
+    expect(remediesOf(parked)).toContain("OpenCode could not start here; to see why: konteks-remote doctor");
     // OpenCode 1 here: named, with OpenCode 2's install command.
     const v1 = "OpenCode 1 is not supported (found 1.18.33): install OpenCode 2 with `curl -fsSL https://opencode.ai/v2/install | bash`, then add it here: konteks-remote agent add opencode";
     const old = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }), openCodeProblem: async () => v1 });
-    expect(old.done?.remedies).toContain(v1);
-    // An unsupported DeepSeek Harness here: named too, with a supported one's install command (W1-D4).
+    expect(remediesOf(old)).toContain(v1);
+    // An unsupported DeepSeek Harness here: named too, with a supported one's install command.
     const dshOld = "DeepSeek Harness 0.1.3-alpha.2 is not a version Konteks supports (0.1.5-rc.3 up to, but not including, 0.1.8). Install it with `npm install -g @deepseek-ai/dsh@0.1.7-rc.2`, then add it here: konteks-remote agent add dsh";
     const oldDsh = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }), dshProblem: async () => dshOld });
-    expect(oldDsh.done?.remedies).toContain(dshOld);
+    expect(remediesOf(oldDsh)).toContain(dshOld);
     // Nobody with another agent and no OpenCode is told to install it.
     const without = await step({ families: async () => ["claude-code"], agentReadiness: async () => ({ "claude-code": "ready" }) });
     expect(JSON.stringify(without.done)).not.toContain("OpenCode");
     // With no agent at all, the no-agent line names it, with its install command.
     const none = await step({ families: async () => [], agentReadiness: async () => ({}) });
-    expect(none.done?.summary).toContain("No coding agent was found on this machine; install Claude Code, Codex, DeepSeek Harness or OpenCode, or add Google Antigravity, and run konteks-remote auth login.");
-    expect(none.done?.remedies).toContain("To run OpenCode work here: install it with `curl -fsSL https://opencode.ai/v2/install | bash`, then: konteks-remote agent add opencode");
-    // Claude Code or Codex not here: `agent add` installs or sets it up and signs it in; `auth login` has nothing to sign in (D116).
-    expect(none.done?.remedies).toContain("To also run Claude Code work here: konteks-remote agent add claude-code");
-    expect(none.done?.remedies).toContain("To also run Codex work here: konteks-remote agent add codex");
+    expect(summaryOf(none)).toContain("No coding agent was found on this machine; install Claude Code, Codex, DeepSeek Harness or OpenCode, or add Google Antigravity, and run konteks-remote auth login.");
+    expect(remediesOf(none)).toContain("To run OpenCode work here: install it with `curl -fsSL https://opencode.ai/v2/install | bash`, then: konteks-remote agent add opencode");
+    // Claude Code or Codex not here: `agent add` installs or sets it up and signs it in; `auth login` has nothing to sign in.
+    expect(remediesOf(none)).toContain("To also run Claude Code work here: konteks-remote agent add claude-code");
+    expect(remediesOf(none)).toContain("To also run Codex work here: konteks-remote agent add codex");
     expect(JSON.stringify(none.done)).not.toContain("konteks-remote auth login claude-code");
   });
-  it("offers Google Antigravity in one line only to a person with no agent, and names it once added: sign-in, or doctor (antigravity CP6)", async () => {
+  it("offers Google Antigravity in one line only to a person with no agent, and names it once added: sign-in, or doctor", async () => {
     await writeOnboardState(root, { step: "done", tenantId: "acme" } as never);
     const offer = "If you want Gemini: konteks-remote agent add antigravity downloads Google Antigravity from Google (about 110 MB) after you say yes, then: konteks-remote auth login antigravity";
     const none = await step({ families: async () => [], agentReadiness: async () => ({}), recordedAgents: async () => [] });
@@ -1284,7 +1293,7 @@ describe("onboard", () => {
     expect(await detectAgentFamilies()).not.toContain("antigravity");
     expect(agentName("antigravity")).toBe("Google Antigravity");
   });
-  it("finds a supported OpenCode 2 and names an OpenCode 1 with the install command (opencode CP6)", async () => {
+  it("finds a supported OpenCode 2 and names an OpenCode 1 with the install command", async () => {
     const dir = await mkdtemp(join(tmpdir(), "onboard-opencode-"));
     try {
       const install = async (name: string, version: string) => {
@@ -1377,7 +1386,7 @@ describe("onboard", () => {
     expect(result.run?.argv).toEqual(["konteks-remote", "onboard", "--json"]);
   });
 
-  it("tells the person the workspace is being made before the long bind starts, never chaining into it (WS1-076)", async () => {
+  it("tells the person the workspace is being made before the long bind starts, never chaining into it", async () => {
     await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "hello@konteks.io", emailMasked: "h••••@konteks.io" } as never);
     const verifyCode = vi.fn(async () => ({ decision: "create", proposedTenantId: "konteks" }));
     const bind = vi.fn(async () => { throw new Error("the bind must wait for the next invocation"); });
@@ -1392,7 +1401,7 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "start" });
   });
 
-  it("stops with Konteks's own words when it does not connect this machine's release, instead of asking the email again (WS1-077)", async () => {
+  it("stops with Konteks's own words when it does not connect this machine's release, instead of asking the email again", async () => {
     await writeOnboardState(root, { step: "email", email: "hello@konteks.io" } as never);
     const said = "This machine installed connector release 0.1.0-e2e, but Konteks connects release 0.4.1-e2e right now, so nothing was set up and no code was sent. Run the install command again to get the current release, then carry on";
     const result = await onboardFailureStep(
@@ -1408,7 +1417,7 @@ describe("onboard", () => {
     expect((state as { intentRef?: string }).intentRef).toBeUndefined();
   });
 
-  it("shows what a folder with files would commit, and what it leaves out, then commits exactly that and pushes (W1-B2)", async () => {
+  it("shows what a folder with files would commit, and what it leaves out, then commits exactly that and pushes", async () => {
     await writeOnboardState(root, {
       step: "push", repositoryPath: "/tmp/cafe", repositoryName: "cafe", repositoryNeedsInit: true, defaultBranch: "main",
       managedRemoteUrl: "https://git.konteks.test/acme/cafe", systemId: "sys-1", ownerEmail: "hello@konteks.io",
@@ -1431,7 +1440,7 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "graft" });
   });
 
-  describe("Graft (W1-G1..G3, WS1-081)", () => {
+  describe("Graft", () => {
     const plan = async () => ({ agents: ["claude", "agents"], adds: ["graft/", ".claude/", ".mcp.json", "AGENTS.md"], tracked: [] as string[], files: 3 });
     const graftDeps = (extra: Record<string, unknown> = {}) => ({
       families: async () => ["claude-code", "codex"],
@@ -1461,7 +1470,7 @@ describe("onboard", () => {
       const wire = vi.fn(async () => ({ added: [".claude/settings.json", ".mcp.json", "AGENTS.md", "graft/"], changedTracked: [] as string[], mappedFiles: 3 }));
       const yes = await step(graftDeps({ ensure, wire }), "yes");
       expect(yes.note).toContain("Setting up Graft: downloading it, then mapping table-booking.");
-      // WS1-145: first install can exceed a file-count estimate before the
+      // First install can exceed a file-count estimate before the
       // next reply; do not promise a hard upper bound for this synchronous step.
       expect(yes.note).not.toMatch(/under \d+ seconds/);
       expect(yes.note).toMatch(/come back|return later/i);
@@ -1482,7 +1491,7 @@ describe("onboard", () => {
       expect(wire).not.toHaveBeenCalled();
     });
 
-    it("adds nothing on a no, and never asks again for that folder (W1-G2)", async () => {
+    it("adds nothing on a no, and never asks again for that folder", async () => {
       await atGraft();
       const wire = vi.fn();
       const no = await step(graftDeps({ wire }), "no thanks");
@@ -1496,7 +1505,7 @@ describe("onboard", () => {
       expect(await readOnboardState(root)).toMatchObject({ step: "first_task" });
     });
 
-    it("does not offer Graft again in a folder it already wired (WS1-090)", async () => {
+    it("does not offer Graft again in a folder it already wired", async () => {
       await atGraft();
       const result = await step(graftDeps({ wired: async () => true }));
       expect(result.ask).toBeUndefined();
@@ -1520,7 +1529,7 @@ describe("onboard", () => {
     });
   });
 
-  it("connects a machine that lost its key again, as a replacement for the runtime it was (W1-L1)", async () => {
+  it("connects a machine that lost its key again, as a replacement for the runtime it was", async () => {
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
     await new SupervisorStore(join(root, "supervisor")).saveIdentity({
       instanceId: "instance-old", workspaceId: "acme", activationId: "act-1", activatedAt: new Date().toISOString(), administrativeStatus: "active", exchangeNonce: "n-1",
@@ -1552,7 +1561,7 @@ describe("onboard", () => {
     expect(bind).toHaveBeenCalledWith("intent-1", { email: "ada@acme.test", tenantId: "acme", replacesInstanceId: "instance-old", expectedManifestDigest: "digest-1" });
   });
 
-  it("greets a new conversation with the name of the workspace it joined (W1-E1)", async () => {
+  it("greets a new conversation with the name of the workspace it joined", async () => {
     const { SupervisorStore } = await import("@konteks/remote-supervisor");
     vi.spyOn(SupervisorStore.prototype, "identity").mockResolvedValue({ instanceId: "instance-1", workspaceId: "konteks-onboard" } as never);
     await writeOnboardState(root, {
@@ -1563,7 +1572,7 @@ describe("onboard", () => {
     expect(greeting.note).toContain("already connected to Konteks-Onboard as hello@konteks.io");
   });
 
-  it("names a workspace it joined by the name its owner gave it, and offers no rename (W1-E1)", async () => {
+  it("names a workspace it joined by the name its owner gave it, and offers no rename", async () => {
     await writeOnboardState(root, {
       step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "join",
       workspaces: [{ tenantId: "acme-kitchen", displayName: "Acme Kitchen" }], workspaceAnnounced: false,
@@ -1581,7 +1590,7 @@ describe("onboard", () => {
       workspaceCreated: false,
     }));
     const started = await step({ enrollment: { bind } as never, complete: vi.fn(async () => ({}) as never), staging: { status: async () => ({ state: "done" }), spawn: vi.fn() } });
-    // The join was already said; the step says it once (pass 5).
+    // The join was already said; the step says it once.
     expect(started.note).toContain("This machine is now Acme Kitchen's runtime; starting it next");
     expect(started.note).toContain("about a minute");
     expect(started.note).not.toContain("acme-kitchen");
@@ -1613,8 +1622,8 @@ describe("onboard", () => {
     expect(result.run?.argv).toEqual(["konteks-remote", "start"]);
     expect(result.note).toContain("Your workspace is ready: acme");
     expect(result.note).toContain("rename it in Settings");
-    // The start took 32 to 39 s on pass 6 with nothing said in between
-    // (WS1-124), so the note gives the person the wait to expect.
+    // The start takes 32 to 39 s with nothing said in between,
+    // so the note gives the person the wait to expect.
     expect(result.note).toContain("starting it next, which takes about a minute.");
     const state = await readOnboardState(root);
     expect(state).toMatchObject({ step: "inspect", instanceId: "instance-9", tenantId: "acme" });
@@ -1707,7 +1716,7 @@ describe("onboard", () => {
     expect((await readOnboardState(root))?.resendTo).toBeUndefined();
   });
 
-  it("after a full workspace, offers the other workspaces again without a new code (W1-E2, WS1-104)", async () => {
+  it("after a full workspace, offers the other workspaces again without a new code", async () => {
     const workspaces = [{ tenantId: "konteks-onboard", displayName: "Konteks-Onboard" }, { tenantId: "side-project", displayName: "Side Project" }];
     await writeOnboardState(root, { step: "start", intentRef: "intent-1", email: "ada@acme.test", decision: "choose", tenantId: "konteks-onboard", workspaces } as never);
     const { writeSecretFile, CoreResponseError } = await import("@konteks/remote-common");
@@ -1721,7 +1730,7 @@ describe("onboard", () => {
     // The address was proved a minute ago and Core still holds that proof.
     expect(result.step).toBe("workspace");
     expect(result.note).toContain("Konteks-Onboard has no room for this machine");
-    // W1-E5: a link that opens the page where runtimes are managed.
+    // A link that opens the page where runtimes are managed.
     expect(result.note).toContain("(https://app.test/customize/connected-runtimes)");
     expect(result.note).toContain("\"ada's Mac\" already holds it.");
     expect(result.note).toContain("Customize → Runtimes");
@@ -1740,9 +1749,9 @@ describe("onboard", () => {
       throw new CoreResponseError({ status: 402, code: "limit_exceeded", message: "This workspace's plan allows one connected runtime, and \"ada's Mac\" already holds it" });
     });
     const result = await step({ enrollment: { bind } as never });
-    // W1-A10: the refusal names the machine to revoke, and says how to move.
+    // The refusal names the machine to revoke, and says how to move.
     expect(result.done?.summary).toContain("\"ada's Mac\" already holds it.");
-    // W1-E5: runtimes moved to Customize on 09-21, and the link must open
+    // Runtimes moved to Customize on 09-21, and the link must open
     // that page; another slot comes from a larger plan.
     expect(result.done?.summary).toContain("revoke that runtime in Customize → Runtimes, then run onboard again here");
     expect(result.done?.summary).toContain("move the workspace to a plan with more runtimes in Settings → Plan");
@@ -1769,7 +1778,7 @@ describe("onboard", () => {
     expect(await readOnboardState(root)).toMatchObject({ step: "email", resendTo: "ada@acme.test" });
   });
 
-  it("says why a new code comes after the fifth wrong one, in the same reply as the new code (W1-Z2)", async () => {
+  it("says why a new code comes after the fifth wrong one, in the same reply as the new code", async () => {
     await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "ada@acme.test", emailMasked: "a••@acme.test", attemptsRemaining: 1 } as never);
     const { CoreResponseError } = await import("@konteks/remote-common");
     const enrollment = {
@@ -1784,14 +1793,14 @@ describe("onboard", () => {
     const result = await runOnboard({ root, output: output(), coreUrl: "https://core.test", siteUrl: "https://app.test", answer: "428913", deps: { waitForReady: readyService, enrollment: enrollment as never, fetchFn: (async () => { throw new Error("no fetch"); }) as never } });
     expect(result.note).toContain("after five wrong codes a code stops working, to keep your account safe.");
     expect(result.note).toContain("A new six-digit code is on its way."); expect(result.ask?.question).toContain("a••@acme.test");
-    // Said once, not once per chained step (pass 5).
+    // Said once, not once per chained step.
     expect(result.note!.split("after five wrong codes").length).toBe(2);
     expect(result.ask).toMatchObject({ kind: "code" });
     expect(enrollment.sendChallenge).toHaveBeenCalledWith("intent-2", "ada@acme.test");
     expect((await readOnboardState(root))?.resendReason).toBeUndefined();
   });
 
-  it("sends a new code when the person asks for one, and says when it is too soon (WS1-088)", async () => {
+  it("sends a new code when the person asks for one, and says when it is too soon", async () => {
     await writeOnboardState(root, { step: "code", intentRef: "intent-1", email: "ada@acme.test", emailMasked: "a••@acme.test", attemptsRemaining: 5 } as never);
     const { CoreResponseError } = await import("@konteks/remote-common");
     const sendChallenge = vi

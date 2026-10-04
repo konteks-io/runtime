@@ -1,5 +1,7 @@
 import { RemoteInstanceError, RuntimePermissionAnswerDeliveryRequestSchema, runtimePermissionAnswerMatches,
-  verifyRemoteExecutionOperationSignature, type RemoteAuthorizedOperation, type RemoteExecutionOperationPermitClaims } from "@konteks/remote-common";
+  verifyRemoteExecutionOperationSignature, type RemoteAuthorizedOperation, type RemoteExecutionOperationPermitClaims,
+  type RuntimePermissionAnswerDeliveryRequest } from "@konteks/remote-common";
+import { deliveryNotCurrent } from "./delivery-scope.js";
 import type { CoreSignatureVerifier } from "./core-signature.js";
 import type { CapturedCancellationConnection } from "./cancellation-receiver.js";
 import type { CoreClient } from "../core/client.js";
@@ -25,24 +27,31 @@ export class PermissionAnswerReceiver {
     if (!scope) throw denied();
     const assertConnection = () => {
       scope.assertCurrent();
-      const now = this.deps.now(), leaseDeadline = Date.parse(scope.leaseExpiresAt);
-      if (!Number.isSafeInteger(now) || !Number.isFinite(leaseDeadline) ||
-        request.intent.instanceId !== scope.instanceId || request.intent.tenantId !== scope.workspaceId ||
-        request.connectionEpoch !== scope.connectionEpoch || Date.parse(request.issuedAt) > now ||
-        Date.parse(request.expiresAt) <= now || Date.parse(request.expiresAt) > leaseDeadline) throw denied();
+      const now = this.deps.now();
+      if (!Number.isSafeInteger(now) || deliveryNotCurrent(request, scope, now, 0)) throw denied();
     };
     assertConnection();
     const keys = await this.deps.core.executionSigningKeys();
     assertConnection();
-    let claims: RemoteExecutionOperationPermitClaims;
-    try {
-      claims = verifyRemoteExecutionOperationSignature({ operation: request.intent.operation, trustedKeys: keys, nowSeconds: Math.floor(this.deps.now() / 1000) });
-      if (!runtimePermissionAnswerMatches(claims, request.intent, this.deps.coreProducer) ||
-        claims.runnerIncarnation !== scope.runnerIncarnation || Date.parse(request.expiresAt) > claims.exp * 1000) throw denied();
-    } catch { throw denied(); }
+    const claims = this.verifiedClaims(request, keys, scope, denied);
     const assertCurrent = () => { assertConnection(); if (claims.exp * 1000 <= this.deps.now()) throw denied(); };
     assertCurrent();
     await this.deps.deliver(request.intent.operation, claims, assertCurrent);
     assertCurrent();
+  }
+
+  /** The operation permit's claims, when they authorize exactly this answer on this connection's runner. */
+  private verifiedClaims(
+    request: RuntimePermissionAnswerDeliveryRequest,
+    keys: Awaited<ReturnType<CoreClient["executionSigningKeys"]>>,
+    scope: CapturedCancellationConnection,
+    denied: () => RemoteInstanceError,
+  ): RemoteExecutionOperationPermitClaims {
+    try {
+      const claims = verifyRemoteExecutionOperationSignature({ operation: request.intent.operation, trustedKeys: keys, nowSeconds: Math.floor(this.deps.now() / 1000) });
+      if (!runtimePermissionAnswerMatches(claims, request.intent, this.deps.coreProducer) ||
+        claims.runnerIncarnation !== scope.runnerIncarnation || Date.parse(request.expiresAt) > claims.exp * 1000) throw denied();
+      return claims;
+    } catch { throw denied(); }
   }
 }

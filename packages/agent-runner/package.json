@@ -30,7 +30,6 @@
     "@konteks/backstage-plugin-common": "file:../../../packages/packages/backstage-plugin-common",
     "@konteks/remote-common": "*",
     "@konteks/remote-release": "*",
-    "pino": "^9.5.0",
     "ws": "^8.18.0",
     "zod": "^4.0.0"
   },

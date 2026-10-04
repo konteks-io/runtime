@@ -1,8 +1,8 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, type Stats } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
   RemoteInstanceError,
   agentModelCapabilityMappingSigningBytes,
@@ -12,26 +12,27 @@ import {
 } from "@konteks/remote-common";
 import { EmbeddedReleaseRootSchema, HOST_AGENT_BRIDGES, installOfflineAgentPackage, reviewedNativeModelIdentities, NativeAgentPackageProfileSchema, OFFLINE_AGENT_LIMITS, signNativeReleaseManifest, verifyNativeRelease, type EmbeddedReleaseRoot, type NativeAgentPackageProfile } from "@konteks/remote-release";
 import type { RemoteSignedBundleManifest } from "@konteks/remote-common";
+import { insideE2EBoundary, plainLoopbackUrl } from "./boundary.js";
 
-export interface E2ESmokeReleaseOptions {
+interface E2ESmokeReleaseOptions {
   gate: string | undefined;
   directory: string;
   origin: string;
   platform: { os: "macos" | "debian"; architecture: "amd64" | "arm64" };
 }
 
-export interface E2ERealReleaseOptions extends Omit<E2ESmokeReleaseOptions, "gate"> {
+interface E2ERealReleaseOptions extends Omit<E2ESmokeReleaseOptions, "gate"> {
   realAgentGate: string | undefined;
   bundleVersion?: string;
   packagePath: string | readonly string[];
   profilePath: string | readonly string[];
 }
 
-export interface E2EAdditionalPlatformOptions extends E2ESmokeReleaseOptions {
+interface E2EAdditionalPlatformOptions extends E2ESmokeReleaseOptions {
   bundleVersion: string;
 }
 
-export interface E2ERealAdditionalPlatformOptions extends Omit<E2EAdditionalPlatformOptions, "platform"> {
+interface E2ERealAdditionalPlatformOptions extends Omit<E2EAdditionalPlatformOptions, "platform"> {
   realAgentGate: string | undefined;
   platform: { os: "windows"; architecture: "amd64" | "arm64" };
   connectorPath: string;
@@ -73,15 +74,7 @@ export async function prepareE2ESmokeRelease(options: E2ESmokeReleaseOptions) {
 export async function extendE2ESmokeRelease(options: E2EAdditionalPlatformOptions) {
   releaseBoundary(options);
   const origin = localOrigin(options.origin);
-  const roots = EmbeddedReleaseRootSchema.array().parse(JSON.parse(await readFile(join(options.directory, "release-roots.json"), "utf8")).roots);
-  const previous = verifyNativeRelease(JSON.parse(await readFile(join(options.directory, "native-manifest.json"), "utf8")), roots).manifest;
-  if (previous.nativeArtifacts?.some(artifact => artifact.os === options.platform.os && artifact.architecture === options.platform.architecture)
-    || previous.nativeArtifacts?.some(artifact => new URL(artifact.url).origin !== origin)
-    || options.bundleVersion === previous.bundleVersion) fail();
-  const privateKey = await e2eSigningKey(options.directory);
-  const root = roots.find(candidate => candidate.keyId === "e2e-local-native-release-1");
-  if (!root || createPublicKey(privateKey).export({ format: "jwk" }).x !== root.publicKeyJwk.x) fail();
-
+  const { previous, root, privateKey } = await extendableRelease(options, origin);
   const suffix = `${options.platform.os}-${options.platform.architecture}`;
   const connector = Buffer.from("KONTEKS_E2E_SOURCE_CONNECTOR_ONLY\n");
   const { archive, profileBytes } = fakeCodexArchive(options.platform);
@@ -94,34 +87,13 @@ export async function extendE2ESmokeRelease(options: E2EAdditionalPlatformOption
     id: `e2e-fake-codex-acp-${suffix}`, kind: "agent_bridge", format: "offline_agent_tgz", agentId: "codex", ...options.platform,
     url: `${origin}/__e2e/native/${agentName}`, digest: sha(archive), profileDigest: sha(profileBytes), sizeBytes: archive.length,
   };
-  const issuedAt = new Date(), expiresAt = new Date(issuedAt.getTime() + 370 * 24 * 60 * 60 * 1000);
-  const mappingBody = {
-    version: 1 as const, mappingId: `e2e-codex-${suffix}-model`, mappingRevision: 1,
-    bridgeProfileRef: agentArtifact.id, bridgeArtifactDigest: agentArtifact.digest,
-    configId: "model", optionType: "select" as const,
-    modelIdentities: [{ value: "e2e-model", canonicalProviderId: "e2e", canonicalModelId: "e2e-model" }],
-    issuedAt: issuedAt.toISOString(), expiresAt: expiresAt.toISOString(),
-  };
-  const mappingUnsigned = { ...mappingBody, mappingDigest: computeAgentModelCapabilityMappingDigest(mappingBody) };
-  const mappingPlaceholder: AgentModelCapabilityMapping = {
-    ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId: root.keyId, value: "AA" },
-  };
-  const mapping: AgentModelCapabilityMapping = {
-    ...mappingUnsigned,
-    signature: { algorithm: "Ed25519", keyId: root.keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(mappingPlaceholder), privateKey).toString("base64url") },
-  };
-  const { digest: _digest, signature: _signature, ...unsigned } = previous;
-  const manifest = signNativeReleaseManifest({
-    ...unsigned, bundleVersion: options.bundleVersion,
-    nativeArtifacts: [...(previous.nativeArtifacts ?? []), connectorArtifact, agentArtifact],
-    modelCapabilityMappings: [...(previous.modelCapabilityMappings ?? []), mapping],
-  }, { keyId: root.keyId, privateKey });
+  const manifest = extendedManifest(previous, options.bundleVersion, [connectorArtifact, agentArtifact],
+    signedMapping(bridgeMappingBody(`e2e-codex-${suffix}-model`, agentArtifact, [{ value: "e2e-model", canonicalProviderId: "e2e", canonicalModelId: "e2e-model" }]), root.keyId, privateKey), { keyId: root.keyId, privateKey });
   await writeFile(join(options.directory, connectorName), connector, { flag: "wx", mode: 0o700 });
   await writeFile(join(options.directory, agentName), archive, { flag: "wx", mode: 0o600 });
   const scratch = await mkdtemp(join(options.directory, ".manifest-"));
   try {
-    await writeFile(join(scratch, "native-manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
-    await rename(join(scratch, "native-manifest.json"), join(options.directory, "native-manifest.json"));
+    await replaceManifest(options.directory, scratch, manifest);
   } finally { await rm(scratch, { recursive: true, force: true }); }
   return { root, manifest, artifactFiles: { connector: join(options.directory, connectorName), agent: join(options.directory, agentName) } };
 }
@@ -131,80 +103,145 @@ export async function extendE2ERealRelease(options: E2ERealAdditionalPlatformOpt
   releaseBoundary(options);
   if (options.realAgentGate !== "1" || ![options.connectorPath, options.packagePath, options.profilePath].every(isAbsolute)) fail();
   const origin = localOrigin(options.origin);
-  const roots = EmbeddedReleaseRootSchema.array().parse(JSON.parse(await readFile(join(options.directory, "release-roots.json"), "utf8")).roots);
-  const previous = verifyNativeRelease(JSON.parse(await readFile(join(options.directory, "native-manifest.json"), "utf8")), roots).manifest;
-  if (previous.nativeArtifacts?.some(artifact => artifact.os === options.platform.os && artifact.architecture === options.platform.architecture)
-    || previous.nativeArtifacts?.some(artifact => new URL(artifact.url).origin !== origin)
-    || options.bundleVersion === previous.bundleVersion) fail();
-  const privateKey = await e2eSigningKey(options.directory);
-  const root = roots.find(candidate => candidate.keyId === "e2e-local-native-release-1");
-  if (!root || createPublicKey(privateKey).export({ format: "jwk" }).x !== root.publicKeyJwk.x) fail();
+  const { previous, root, privateKey } = await extendableRelease(options, origin);
   const suffix = `${options.platform.os}-${options.platform.architecture}`;
   const connectorName = `connector-${suffix}.exe`, agentName = `codex-${suffix}.tgz`;
   const validationRoot = await mkdtemp(join(options.directory, ".real-package-validation-"));
   try {
-    const [connectorInfo, packageInfo, profileInfo] = await Promise.all([
-      lstat(options.connectorPath).catch(fail),
-      lstat(options.packagePath).catch(fail),
-      lstat(options.profilePath).catch(fail),
-    ]);
-    if (!connectorInfo.isFile() || connectorInfo.nlink !== 1 || connectorInfo.size < 1
-      || !packageInfo.isFile() || packageInfo.nlink !== 1 || packageInfo.size < 1
-      || !profileInfo.isFile() || profileInfo.nlink !== 1 || profileInfo.size > OFFLINE_AGENT_LIMITS.profileBytes) fail();
-    const profileBytes = await readFile(options.profilePath);
-    const profile = (() => { try { return NativeAgentPackageProfileSchema.parse(JSON.parse(profileBytes.toString("utf8"))); } catch { return fail(); } })();
-    if (profile.agentId !== "codex" || profile.os !== options.platform.os || profile.architecture !== options.platform.architecture
-      || profile.bridge.entrypoint.endsWith("/fake-codex-acp")) fail();
-    const stagedConnector = join(validationRoot, connectorName), stagedArchive = join(validationRoot, agentName);
-    await Promise.all([copyFile(options.connectorPath, stagedConnector), copyFile(options.packagePath, stagedArchive)]);
-    await Promise.all([chmod(stagedConnector, 0o700), chmod(stagedArchive, 0o600)]);
-    const stagedConnectorInfo = await lstat(stagedConnector), stagedPackageInfo = await lstat(stagedArchive);
-    if (stagedConnectorInfo.size !== connectorInfo.size || stagedPackageInfo.size !== packageInfo.size) fail();
+    const staged = await stageRealWindowsPackage(options, validationRoot, connectorName, agentName);
     const connectorArtifact: RemoteNativeArtifact = {
       id: `e2e-real-connector-${suffix}`, kind: "connector", format: "executable", ...options.platform,
-      url: `${origin}/__e2e/native/${connectorName}`, digest: await shaFile(stagedConnector), sizeBytes: stagedConnectorInfo.size,
+      url: `${origin}/__e2e/native/${connectorName}`, digest: await shaFile(staged.connector), sizeBytes: staged.connectorSize,
     };
     const agentArtifact: RemoteNativeArtifact = {
       id: `e2e-real-codex-acp-${suffix}`, kind: "agent_bridge", format: "offline_agent_tgz", agentId: "codex", ...options.platform,
-      url: `${origin}/__e2e/native/${agentName}`, digest: await shaFile(stagedArchive), profileDigest: sha(profileBytes), sizeBytes: stagedPackageInfo.size,
+      url: `${origin}/__e2e/native/${agentName}`, digest: await shaFile(staged.archive), profileDigest: sha(staged.profileBytes), sizeBytes: staged.archiveSize,
     };
-    await installOfflineAgentPackage(stagedArchive, join(validationRoot, "installed-agent"), agentArtifact);
-    const issuedAt = new Date(), expiresAt = new Date(issuedAt.getTime() + 370 * 24 * 60 * 60 * 1000);
-    const mappingBody = {
-      version: 1 as const, mappingId: `e2e-codex-${suffix}-model`, mappingRevision: 1,
-      bridgeProfileRef: agentArtifact.id, bridgeArtifactDigest: agentArtifact.digest,
-      configId: "model", optionType: "select" as const,
-      modelIdentities: [{ value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" }],
-      issuedAt: issuedAt.toISOString(), expiresAt: expiresAt.toISOString(),
-    };
-    const mappingUnsigned = { ...mappingBody, mappingDigest: computeAgentModelCapabilityMappingDigest(mappingBody) };
-    const mappingPlaceholder: AgentModelCapabilityMapping = { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId: root.keyId, value: "AA" } };
-    const mapping: AgentModelCapabilityMapping = {
-      ...mappingUnsigned,
-      signature: { algorithm: "Ed25519", keyId: root.keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(mappingPlaceholder), privateKey).toString("base64url") },
-    };
-    const { digest: _digest, signature: _signature, ...unsigned } = previous;
-    const manifest = signNativeReleaseManifest({
-      ...unsigned, bundleVersion: options.bundleVersion,
-      nativeArtifacts: [...(previous.nativeArtifacts ?? []), connectorArtifact, agentArtifact],
-      modelCapabilityMappings: [...(previous.modelCapabilityMappings ?? []), mapping],
-    }, { keyId: root.keyId, privateKey });
+    await installOfflineAgentPackage(staged.archive, join(validationRoot, "installed-agent"), agentArtifact);
+    const manifest = extendedManifest(previous, options.bundleVersion, [connectorArtifact, agentArtifact],
+      signedMapping(bridgeMappingBody(`e2e-codex-${suffix}-model`, agentArtifact, [{ value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" }]), root.keyId, privateKey), { keyId: root.keyId, privateKey });
     const connectorDestination = join(options.directory, connectorName), agentDestination = join(options.directory, agentName);
-    if (await lstat(connectorDestination).then(() => true, () => false) || await lstat(agentDestination).then(() => true, () => false)) fail();
-    await rename(stagedConnector, connectorDestination);
-    await rename(stagedArchive, agentDestination);
-    await writeFile(join(validationRoot, "native-manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
-    await rename(join(validationRoot, "native-manifest.json"), join(options.directory, "native-manifest.json"));
+    if (await exists(connectorDestination) || await exists(agentDestination)) fail();
+    await rename(staged.connector, connectorDestination);
+    await rename(staged.archive, agentDestination);
+    await replaceManifest(options.directory, validationRoot, manifest);
     return { root, manifest, artifactFiles: { connector: connectorDestination, agent: agentDestination } };
   } finally { await rm(validationRoot, { recursive: true, force: true }); }
+}
+
+/** The local release, verified, with no artifact yet for this platform, and the local key it is signed with. */
+async function extendableRelease(options: { directory: string; platform: { os: string; architecture: string }; bundleVersion: string }, origin: string) {
+  const { roots, manifest: previous } = await currentRelease(options.directory);
+  if (previous.nativeArtifacts?.some(artifact => artifact.os === options.platform.os && artifact.architecture === options.platform.architecture)
+    || previous.nativeArtifacts?.some(artifact => new URL(artifact.url).origin !== origin)
+    || options.bundleVersion === previous.bundleVersion) fail();
+  return { previous, ...await localSigningRoot(options.directory, roots) };
+}
+
+async function currentRelease(directory: string): Promise<{ roots: EmbeddedReleaseRoot[]; manifest: RemoteSignedBundleManifest }> {
+  const roots = EmbeddedReleaseRootSchema.array().parse(JSON.parse(await readFile(join(directory, "release-roots.json"), "utf8")).roots);
+  return { roots, manifest: verifyNativeRelease(JSON.parse(await readFile(join(directory, "native-manifest.json"), "utf8")), roots).manifest };
+}
+
+/** The local release root and its private key, which must be the root's own. */
+async function localSigningRoot(directory: string, roots: readonly EmbeddedReleaseRoot[]): Promise<{ root: EmbeddedReleaseRoot; privateKey: KeyObject }> {
+  const privateKey = await e2eSigningKey(directory);
+  const root = roots.find(candidate => candidate.keyId === "e2e-local-native-release-1");
+  if (!root || createPublicKey(privateKey).export({ format: "jwk" }).x !== root.publicKeyJwk.x) fail();
+  return { root, privateKey };
+}
+
+/** Copies of the built connector and package (and the package's profile), each a single, non-empty regular file. */
+async function stageRealWindowsPackage(options: E2ERealAdditionalPlatformOptions, validationRoot: string, connectorName: string, agentName: string) {
+  const [connectorInfo, packageInfo, profileInfo] = await Promise.all([
+    lstat(options.connectorPath).catch(fail),
+    lstat(options.packagePath).catch(fail),
+    lstat(options.profilePath).catch(fail),
+  ]);
+  if (!nonEmptyFile(connectorInfo) || !nonEmptyFile(packageInfo) || !profileFile(profileInfo)) fail();
+  const profileBytes = await readFile(options.profilePath);
+  const profile = parsePackageProfile(profileBytes);
+  if (profile.agentId !== "codex" || !profileFor(profile, options.platform)) fail();
+  const connector = join(validationRoot, connectorName), archive = join(validationRoot, agentName);
+  await Promise.all([copyFile(options.connectorPath, connector), copyFile(options.packagePath, archive)]);
+  await Promise.all([chmod(connector, 0o700), chmod(archive, 0o600)]);
+  const stagedConnectorInfo = await lstat(connector), stagedPackageInfo = await lstat(archive);
+  if (stagedConnectorInfo.size !== connectorInfo.size || stagedPackageInfo.size !== packageInfo.size) fail();
+  return { connector, archive, profileBytes, connectorSize: stagedConnectorInfo.size, archiveSize: stagedPackageInfo.size };
+}
+
+function nonEmptyFile(info: Stats): boolean {
+  return info.isFile() && info.nlink === 1 && info.size >= 1;
+}
+
+function profileFile(info: Stats): boolean {
+  return info.isFile() && info.nlink === 1 && info.size <= OFFLINE_AGENT_LIMITS.profileBytes;
+}
+
+function parsePackageProfile(profileBytes: Buffer): NativeAgentPackageProfile {
+  try { return NativeAgentPackageProfileSchema.parse(JSON.parse(profileBytes.toString("utf8"))); } catch { return fail(); }
+}
+
+/** A real package for this platform, never the fake bridge. */
+function profileFor(profile: NativeAgentPackageProfile, platform: { os: string; architecture: string }): boolean {
+  return profile.os === platform.os && profile.architecture === platform.architecture && !profile.bridge.entrypoint.endsWith("/fake-codex-acp");
+}
+
+async function exists(path: string): Promise<boolean> {
+  return lstat(path).then(() => true, () => false);
+}
+
+/** The previous manifest with the new artifacts and mapping, re-signed at another version. */
+function extendedManifest(previous: RemoteSignedBundleManifest, bundleVersion: string, artifacts: RemoteNativeArtifact[], mapping: AgentModelCapabilityMapping, key: { keyId: string; privateKey: KeyObject }) {
+  const { digest: _digest, signature: _signature, ...unsigned } = previous;
+  return signNativeReleaseManifest({
+    ...unsigned, bundleVersion,
+    nativeArtifacts: [...(previous.nativeArtifacts ?? []), ...artifacts],
+    modelCapabilityMappings: [...(previous.modelCapabilityMappings ?? []), mapping],
+  }, key);
+}
+
+/** Written in `scratch`, then renamed over the served manifest. */
+async function replaceManifest(directory: string, scratch: string, manifest: RemoteSignedBundleManifest): Promise<void> {
+  await writeFile(join(scratch, "native-manifest.json"), JSON.stringify(manifest), { mode: 0o600 });
+  await rename(join(scratch, "native-manifest.json"), join(directory, "native-manifest.json"));
+}
+
+type MappingBody = Omit<AgentModelCapabilityMapping, "mappingDigest" | "signature">;
+
+/**
+ * The local stack may deliberately lengthen Core's seven-day default while
+ * exercising interrupted provisioning. Its checked-in development manifest
+ * uses a one-year envelope, so match that boundary plus preparation headroom;
+ * otherwise pairing fails closed before any release is installed.
+ */
+function mappingEnvelope(): { issuedAt: string; expiresAt: string } {
+  const issuedAt = new Date(), expiresAt = new Date(issuedAt.getTime() + 370 * 24 * 60 * 60 * 1000);
+  return { issuedAt: issuedAt.toISOString(), expiresAt: expiresAt.toISOString() };
+}
+
+function bridgeMappingBody(mappingId: string, artifact: RemoteNativeArtifact, modelIdentities: MappingBody["modelIdentities"], envelope = mappingEnvelope()): MappingBody {
+  return {
+    version: 1, mappingId, mappingRevision: 1,
+    bridgeProfileRef: artifact.id, bridgeArtifactDigest: artifact.digest,
+    configId: "model", optionType: "select",
+    modelIdentities,
+    ...envelope,
+  };
+}
+
+/** The mapping with its digest, signed by the local release key. */
+function signedMapping(body: MappingBody, keyId: string, privateKey: KeyObject): AgentModelCapabilityMapping {
+  const mappingUnsigned = { ...body, mappingDigest: computeAgentModelCapabilityMappingDigest(body) };
+  const mappingPlaceholder: AgentModelCapabilityMapping = { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: "AA" } };
+  return { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(mappingPlaceholder), privateKey).toString("base64url") } };
 }
 
 /** Prepare a signed local release from a separately built, complete Codex or Claude Code package. */
 export async function prepareE2ERealRelease(options: E2ERealReleaseOptions) {
   const packagePaths = typeof options.packagePath === "string" ? [options.packagePath] : [...options.packagePath];
   const profilePaths = typeof options.profilePath === "string" ? [options.profilePath] : [...options.profilePath];
-  if (options.realAgentGate !== "1" || packagePaths.length < 1 || packagePaths.length > 4 || packagePaths.length !== profilePaths.length
-    || packagePaths.some(path => !isAbsolute(path)) || profilePaths.some(path => !isAbsolute(path))) fail();
+  if (options.realAgentGate !== "1" || !realPackagePaths(packagePaths, profilePaths)) fail();
   releaseBoundary({ gate: options.realAgentGate, directory: options.directory });
   const origin = localOrigin(options.origin);
   await mkdir(options.directory, { recursive: true, mode: 0o700 });
@@ -215,28 +252,9 @@ export async function prepareE2ERealRelease(options: E2ERealReleaseOptions) {
   const artifactFiles: Record<string, string> = {};
   try {
     for (const [index, packagePath] of packagePaths.entries()) {
-      const profilePath = profilePaths[index]!;
-      const [packageInfo, profileInfo] = await Promise.all([lstat(packagePath).catch(fail), lstat(profilePath).catch(fail)]);
-      if (!packageInfo.isFile() || packageInfo.nlink !== 1 || packageInfo.size < 1 || !profileInfo.isFile() || profileInfo.nlink !== 1 || profileInfo.size > OFFLINE_AGENT_LIMITS.profileBytes) fail();
-      const profileBytes = await readFile(profilePath);
-      const profile = (() => { try { return NativeAgentPackageProfileSchema.parse(JSON.parse(profileBytes.toString("utf8"))); } catch { return fail(); } })();
-      if ((profile.agentId !== "codex" && profile.agentId !== "claude-code") || artifacts.some(artifact => artifact.agentId === profile.agentId)
-        || profile.os !== options.platform.os || profile.architecture !== options.platform.architecture || profile.bridge.entrypoint.endsWith("/fake-codex-acp")) fail();
-      const agentFile = `${profile.agentId}.tgz`;
-      const stagedArchive = join(validationRoot, agentFile);
-      await copyFile(packagePath, stagedArchive);
-      await chmod(stagedArchive, 0o600);
-      const stagedPackageInfo = await lstat(stagedArchive).catch(fail);
-      if (!stagedPackageInfo.isFile() || stagedPackageInfo.nlink !== 1 || stagedPackageInfo.size !== packageInfo.size) fail();
-      const artifact: RemoteNativeArtifact = {
-        id: `e2e-real-${profile.agentId}-acp`, kind: "agent_bridge", format: "offline_agent_tgz", agentId: profile.agentId, ...options.platform,
-        url: `${origin}/__e2e/native/${agentFile}`, digest: await shaFile(stagedArchive), profileDigest: sha(profileBytes), sizeBytes: stagedPackageInfo.size,
-      };
-      await installOfflineAgentPackage(stagedArchive, join(validationRoot, `agent-${profile.agentId}`), artifact);
-      const destination = join(options.directory, agentFile);
-      await rename(stagedArchive, destination);
+      const { artifact, destination } = await addRealPackage(options, origin, validationRoot, { packagePath, profilePath: profilePaths[index]! }, artifacts);
       artifacts.push(artifact);
-      artifactFiles[profile.agentId] = destination;
+      artifactFiles[artifact.agentId!] = destination;
     }
   }
   catch { return fail(); }
@@ -245,69 +263,50 @@ export async function prepareE2ERealRelease(options: E2ERealReleaseOptions) {
   return writeSignedRelease(options, origin, connector, artifacts, connectorPath, artifactFiles, options.bundleVersion);
 }
 
+/** One to four absolute package and profile paths, in pairs. */
+function realPackagePaths(packagePaths: readonly string[], profilePaths: readonly string[]): boolean {
+  return packagePaths.length >= 1 && packagePaths.length <= 4 && packagePaths.length === profilePaths.length
+    && packagePaths.every(path => isAbsolute(path)) && profilePaths.every(path => isAbsolute(path));
+}
+
+/** One real Codex or Claude Code package, verified by installing it, then moved beside the release. */
+async function addRealPackage(options: E2ERealReleaseOptions, origin: string, validationRoot: string, paths: { packagePath: string; profilePath: string }, added: readonly RemoteNativeArtifact[]) {
+  const [packageInfo, profileInfo] = await Promise.all([lstat(paths.packagePath).catch(fail), lstat(paths.profilePath).catch(fail)]);
+  if (!nonEmptyFile(packageInfo) || !profileFile(profileInfo)) fail();
+  const profileBytes = await readFile(paths.profilePath);
+  const profile = parsePackageProfile(profileBytes);
+  if (!realAgent(profile.agentId) || added.some(artifact => artifact.agentId === profile.agentId) || !profileFor(profile, options.platform)) fail();
+  const agentFile = `${profile.agentId}.tgz`;
+  const stagedArchive = join(validationRoot, agentFile);
+  await copyFile(paths.packagePath, stagedArchive);
+  await chmod(stagedArchive, 0o600);
+  const stagedPackageInfo = await lstat(stagedArchive).catch(fail);
+  if (!nonEmptyFile(stagedPackageInfo) || stagedPackageInfo.size !== packageInfo.size) fail();
+  const artifact: RemoteNativeArtifact = {
+    id: `e2e-real-${profile.agentId}-acp`, kind: "agent_bridge", format: "offline_agent_tgz", agentId: profile.agentId, ...options.platform,
+    url: `${origin}/__e2e/native/${agentFile}`, digest: await shaFile(stagedArchive), profileDigest: sha(profileBytes), sizeBytes: stagedPackageInfo.size,
+  };
+  await installOfflineAgentPackage(stagedArchive, join(validationRoot, `agent-${profile.agentId}`), artifact);
+  const destination = join(options.directory, agentFile);
+  await rename(stagedArchive, destination);
+  return { artifact, destination };
+}
+
+function realAgent(agentId: string): boolean {
+  return agentId === "codex" || agentId === "claude-code";
+}
+
 async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directory" | "platform">, origin: string, connector: Buffer, agentArtifacts: RemoteNativeArtifact[], connectorPath: string, agentFiles: Record<string, string>, bundleVersion = "0.1.0-e2e") {
   const connectorArtifact: RemoteNativeArtifact = { id: "e2e-source-connector", kind: "connector", format: "executable", ...options.platform, url: `${origin}/__e2e/native/connector`, digest: sha(connector), sizeBytes: connector.length };
   const privateKey = await e2eSigningKey(options.directory);
   const keyId = "e2e-local-native-release-1";
-  // The local stack may deliberately lengthen Core's seven-day default while
-  // exercising interrupted provisioning. Its checked-in development manifest
-  // uses a one-year envelope, so match that boundary plus preparation headroom;
-  // otherwise pairing fails closed before any release is installed.
-  const issuedAt = new Date(), expiresAt = new Date(issuedAt.getTime()+370*24*60*60*1000);
-  const mappingFor = (artifact: RemoteNativeArtifact): AgentModelCapabilityMapping => {
-    const mappingBody = {
-    version: 1 as const,
-    mappingId: `e2e-${artifact.agentId}-model`,
-    mappingRevision: 1,
-    bridgeProfileRef: artifact.id,
-    bridgeArtifactDigest: artifact.digest,
-    configId: "model",
-    optionType: "select" as const,
-    // Claude Code advertises short, moving selectors over ACP. Keep those
-    // transport values local to the bridge while giving Core the reviewed,
-    // canonical identities it needs for route and distinct-model authority.
-    modelIdentities: artifact.agentId === "claude-code" ? [
-      { value: "default", canonicalProviderId: "anthropic", canonicalModelId: "claude-opus-5[1m]" },
-      { value: "opus[1m]", canonicalProviderId: "anthropic", canonicalModelId: "claude-opus-5[1m]" },
-      { value: "claude-fable-5-1[1m]", canonicalProviderId: "anthropic", canonicalModelId: "claude-fable-5-1" },
-      { value: "sonnet", canonicalProviderId: "anthropic", canonicalModelId: "claude-sonnet-5" },
-      { value: "haiku", canonicalProviderId: "anthropic", canonicalModelId: "claude-haiku-4-5-20251001" },
-    ] : artifact.id.startsWith("e2e-fake-") ? [
-      { value: "e2e-model", canonicalProviderId: "e2e", canonicalModelId: "e2e-model" },
-    ] : [
-      { value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" },
-    ],
-    issuedAt: issuedAt.toISOString(),
-    expiresAt: expiresAt.toISOString(),
-  };
-    const mappingUnsigned = { ...mappingBody, mappingDigest: computeAgentModelCapabilityMappingDigest(mappingBody) };
-    const mappingPlaceholder: AgentModelCapabilityMapping = { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: "AA" } };
-    return { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(mappingPlaceholder), privateKey).toString("base64url") } };
-  };
-  // A host-installed agent (the person's own DeepSeek Harness) ships no
-  // artifact; its reviewed mapping names the agent and the versions this
-  // runtime supports, with the same canonical identities Core routes on. An
-  // agent with no reviewed identities (OpenCode) reports under its catalogue
-  // authority instead, as in a production release (release/src/native.ts).
-  const hostMappingFor = (family: (typeof HOST_AGENT_BRIDGES)[number]): AgentModelCapabilityMapping => {
-    const mappingBody = {
-      version: 1 as const,
-      mappingId: `e2e-${family.agentId}-model`,
-      mappingRevision: 1,
-      hostAgent: { agentId: family.agentId, versions: { ...family.hostInstall!.versions } },
-      configId: "model",
-      optionType: "select" as const,
-      modelIdentities: (reviewedNativeModelIdentities(family.agentId) ?? []).map(identity => ({ ...identity })),
-      issuedAt: issuedAt.toISOString(),
-      expiresAt: expiresAt.toISOString(),
-    };
-    const mappingUnsigned = { ...mappingBody, mappingDigest: computeAgentModelCapabilityMappingDigest(mappingBody) };
-    const mappingPlaceholder: AgentModelCapabilityMapping = { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: "AA" } };
-    return { ...mappingUnsigned, signature: { algorithm: "Ed25519", keyId, value: sign(null, agentModelCapabilityMappingSigningBytes(mappingPlaceholder), privateKey).toString("base64url") } };
-  };
-  const mappings = [...agentArtifacts.map(mappingFor), ...HOST_AGENT_BRIDGES.filter(family => family.hostInstall && reviewedNativeModelIdentities(family.agentId)).map(hostMappingFor)];
+  const envelope = mappingEnvelope();
+  const mappings = [
+    ...agentArtifacts.map(artifact => signedMapping(bridgeMappingBody(`e2e-${artifact.agentId}-model`, artifact, e2eModelIdentities(artifact), envelope), keyId, privateKey)),
+    ...HOST_AGENT_BRIDGES.filter(family => family.hostInstall && reviewedNativeModelIdentities(family.agentId)).map(family => signedMapping(hostMappingBody(family, envelope), keyId, privateKey)),
+  ];
   const manifest = signNativeReleaseManifest({
-    bundleVersion, protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [connectorArtifact, ...agentArtifacts], modelCapabilityMappings: mappings, expiresAt: expiresAt.toISOString(),
+    bundleVersion, protocol: { min: "1.0", max: "1.0" }, deploymentKind: "native_connector", components: ["agent_runner"], images: [], agentBridges: [], nativeArtifacts: [connectorArtifact, ...agentArtifacts], modelCapabilityMappings: mappings, expiresAt: envelope.expiresAt,
   }, { keyId, privateKey });
   const control = await localControlAuthority(options.directory);
   const root: EmbeddedReleaseRoot = EmbeddedReleaseRootSchema.parse({
@@ -319,23 +318,56 @@ async function writeSignedRelease(options: Pick<E2ESmokeReleaseOptions, "directo
   return { root, manifest, artifactFiles: { connector: connectorPath, agent: agentFiles[agentArtifacts[0]!.agentId!]!, agents: agentFiles } };
 }
 
+/**
+ * Claude Code advertises short, moving selectors over ACP. Keep those
+ * transport values local to the bridge while giving Core the reviewed,
+ * canonical identities it needs for route and distinct-model authority.
+ */
+function e2eModelIdentities(artifact: RemoteNativeArtifact): MappingBody["modelIdentities"] {
+  if (artifact.agentId === "claude-code") {
+    return [
+      { value: "default", canonicalProviderId: "anthropic", canonicalModelId: "claude-opus-5[1m]" },
+      { value: "opus[1m]", canonicalProviderId: "anthropic", canonicalModelId: "claude-opus-5[1m]" },
+      { value: "claude-fable-5-1[1m]", canonicalProviderId: "anthropic", canonicalModelId: "claude-fable-5-1" },
+      { value: "sonnet", canonicalProviderId: "anthropic", canonicalModelId: "claude-sonnet-5" },
+      { value: "haiku", canonicalProviderId: "anthropic", canonicalModelId: "claude-haiku-4-5-20251001" },
+    ];
+  }
+  return artifact.id.startsWith("e2e-fake-")
+    ? [{ value: "e2e-model", canonicalProviderId: "e2e", canonicalModelId: "e2e-model" }]
+    : [{ value: "gpt-5.6-sol", canonicalProviderId: "openai", canonicalModelId: "gpt-5.6-sol" }];
+}
+
+/**
+ * A host-installed agent (the person's own DeepSeek Harness) ships no
+ * artifact; its reviewed mapping names the agent and the versions this
+ * runtime supports, with the same canonical identities Core routes on. An
+ * agent with no reviewed identities (OpenCode) reports under its catalogue
+ * authority instead, as in a production release (release/src/native.ts).
+ */
+function hostMappingBody(family: (typeof HOST_AGENT_BRIDGES)[number], envelope: { issuedAt: string; expiresAt: string }): MappingBody {
+  return {
+    version: 1,
+    mappingId: `e2e-${family.agentId}-model`,
+    mappingRevision: 1,
+    hostAgent: { agentId: family.agentId, versions: { ...family.hostInstall!.versions } },
+    configId: "model",
+    optionType: "select",
+    modelIdentities: (reviewedNativeModelIdentities(family.agentId) ?? []).map(identity => ({ ...identity })),
+    ...envelope,
+  };
+}
+
 async function localControlAuthority(
   directory: string,
 ): Promise<{ keyId: string; publicKeyJwk: EmbeddedReleaseRoot["publicKeyJwk"] } | null> {
   const path = join(dirname(directory), "private", "native-control-public.json");
   const info = await lstat(path).catch((error) => {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")
-      return null;
+    if (isErrorCode(error, "ENOENT")) return null;
     throw error;
   });
   if (!info) return null;
-  if (
-    !info.isFile() ||
-    info.nlink !== 1 ||
-    info.size > 4096 ||
-    (process.platform !== "win32" && (info.mode & 0o077) !== 0)
-  )
-    fail();
+  if (!privateSmallFile(info)) fail();
   try {
     const key = EmbeddedReleaseRootSchema.parse(JSON.parse(await readFile(path, "utf8")));
     if (key.keyId !== "e2e-local-native-control-1" || key.coreControlKeys !== undefined) fail();
@@ -345,8 +377,17 @@ async function localControlAuthority(
   }
 }
 
+/** A single regular file of at most 4 KiB, readable by its owner only (where the OS has modes). */
+function privateSmallFile(info: Stats): boolean {
+  return info.isFile() && info.nlink === 1 && info.size <= 4096 && (process.platform === "win32" || (info.mode & 0o077) === 0);
+}
+
+function isErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
 /**
- * Re-sign the local release at another version (W1-L4), keeping its agent
+ * Re-sign the local release at another version, keeping its agent
  * packages and model mappings, and optionally replacing the connector with a
  * runnable one so the connector can run as a real OS service. The update path
  * — stage, drain, swap, health gate, roll back — only runs for a connector the
@@ -354,30 +395,16 @@ async function localControlAuthority(
  */
 export async function reissueE2ERelease(options: { directory: string; bundleVersion: string; connectorPath?: string; platform?: { os: "windows"; architecture: "amd64" | "arm64" } }) {
   const manifestPath = join(options.directory, "native-manifest.json");
-  const roots = EmbeddedReleaseRootSchema.array().parse(JSON.parse(await readFile(join(options.directory, "release-roots.json"), "utf8")).roots);
-  const current = verifyNativeRelease(JSON.parse(await readFile(manifestPath, "utf8")), roots).manifest;
+  const { roots, manifest: current } = await currentRelease(options.directory);
   if (options.bundleVersion === current.bundleVersion || options.platform && !options.connectorPath) fail();
   const { digest: _digest, signature: _signature, ...unsigned } = current;
-  const connectorName = options.platform ? `connector-${options.platform.os}-${options.platform.architecture}.exe` : "connector";
-  const target = current.nativeArtifacts?.find(artifact => artifact.kind === "connector" && new URL(artifact.url).pathname === `/__e2e/native/${connectorName}`);
-  if (options.connectorPath && !target) fail();
+  const { connectorName, target } = reissuedConnector(current, options);
   const scratch = await mkdtemp(join(options.directory, ".reissue-"));
   try {
-    let nativeArtifacts = current.nativeArtifacts;
-    if (options.connectorPath) {
-      if (!isAbsolute(options.connectorPath)) fail();
-      const info = await lstat(options.connectorPath).catch(fail);
-      if (!info.isFile() || info.nlink !== 1 || info.size < 1) fail();
-      const staged = join(scratch, connectorName);
-      await copyFile(options.connectorPath, staged);
-      await chmod(staged, 0o700);
-      const awaitDigest = await shaFile(staged);
-      nativeArtifacts = nativeArtifacts?.map(artifact => artifact.id === target!.id
-        ? { ...artifact, digest: awaitDigest, sizeBytes: info.size } : artifact);
-    }
-    const privateKey = await e2eSigningKey(options.directory);
-    const root = roots.find(candidate => candidate.keyId === "e2e-local-native-release-1");
-    if (!root || createPublicKey(privateKey).export({ format: "jwk" }).x !== root.publicKeyJwk.x) fail();
+    const nativeArtifacts = options.connectorPath
+      ? await withReplacedConnector(current.nativeArtifacts, target!, options.connectorPath, join(scratch, connectorName))
+      : current.nativeArtifacts;
+    const { root, privateKey } = await localSigningRoot(options.directory, roots);
     const manifest = signNativeReleaseManifest(
       { ...(unsigned as Omit<RemoteSignedBundleManifest, "digest" | "signature">), bundleVersion: options.bundleVersion, nativeArtifacts },
       { keyId: root.keyId, privateKey },
@@ -389,16 +416,33 @@ export async function reissueE2ERelease(options: { directory: string; bundleVers
   } finally { await rm(scratch, { recursive: true, force: true }); }
 }
 
+/** The connector artifact a runnable connector replaces (the platform's own, or the source one). */
+function reissuedConnector(current: RemoteSignedBundleManifest, options: { connectorPath?: string; platform?: { os: string; architecture: string } }) {
+  const connectorName = options.platform ? `connector-${options.platform.os}-${options.platform.architecture}.exe` : "connector";
+  const target = current.nativeArtifacts?.find(artifact => artifact.kind === "connector" && new URL(artifact.url).pathname === `/__e2e/native/${connectorName}`);
+  if (options.connectorPath && !target) fail();
+  return { connectorName, target };
+}
+
+/** The artifacts with `target` pointing at a staged copy of the runnable connector. */
+async function withReplacedConnector(artifacts: RemoteSignedBundleManifest["nativeArtifacts"], target: RemoteNativeArtifact, connectorPath: string, staged: string): Promise<RemoteSignedBundleManifest["nativeArtifacts"]> {
+  if (!isAbsolute(connectorPath)) fail();
+  const info = await lstat(connectorPath).catch(fail);
+  if (!nonEmptyFile(info)) fail();
+  await copyFile(connectorPath, staged);
+  await chmod(staged, 0o700);
+  const digest = await shaFile(staged);
+  return artifacts?.map(artifact => artifact.id === target.id ? { ...artifact, digest, sizeBytes: info.size } : artifact);
+}
+
 /** Stable private test authority lives outside the directory served by TLS. */
 async function e2eSigningKey(publicDirectory: string): Promise<KeyObject> {
   const path = join(dirname(publicDirectory), "private", "native-release-signing-key.pk8");
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   try {
-    const info = await lstat(path);
-    if (!info.isFile() || info.nlink !== 1 || info.size > 4096 || process.platform !== "win32" && (info.mode & 0o077) !== 0) fail();
-    return createPrivateKey({ key: await readFile(path), format: "der", type: "pkcs8" });
+    return await readSigningKey(path);
   } catch (error) {
-    if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") throw error;
+    if (!isErrorCode(error, "ENOENT")) throw error;
   }
   const generated = generateKeyPairSync("ed25519").privateKey;
   const bytes = generated.export({ format: "der", type: "pkcs8" });
@@ -407,21 +451,26 @@ async function e2eSigningKey(publicDirectory: string): Promise<KeyObject> {
     try { await file.writeFile(bytes); await file.sync(); } finally { await file.close(); }
     return generated;
   } catch (error) {
-    if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "EEXIST") throw error;
-    const info = await lstat(path);
-    if (!info.isFile() || info.nlink !== 1 || info.size > 4096 || process.platform !== "win32" && (info.mode & 0o077) !== 0) fail();
-    return createPrivateKey({ key: await readFile(path), format: "der", type: "pkcs8" });
+    // Another preparation wrote it first: use that one.
+    if (!isErrorCode(error, "EEXIST")) throw error;
+    return readSigningKey(path);
   }
 }
 
+async function readSigningKey(path: string): Promise<KeyObject> {
+  const info = await lstat(path);
+  if (!privateSmallFile(info)) fail();
+  return createPrivateKey({ key: await readFile(path), format: "der", type: "pkcs8" });
+}
+
 function releaseBoundary(options: Pick<E2ESmokeReleaseOptions, "gate" | "directory">): void {
-  if (options.gate !== "1" || !isAbsolute(options.directory) || normalize(options.directory).split(sep).slice(-2).join("/") !== ".runtime/native-cloud") fail();
+  if (!insideE2EBoundary(options.gate, options.directory)) fail();
 }
 
 function localOrigin(raw: string): string {
   try {
     const value = new URL(raw);
-    if (value.protocol === "https:" && value.port === "7443" && value.pathname === "/" && !value.search && !value.hash && !value.username && !value.password && ["127.0.0.1", "localhost", "[::1]"].includes(value.hostname)) return value.origin;
+    if (value.protocol === "https:" && value.port === "7443" && plainLoopbackUrl(value, "/")) return value.origin;
   } catch { /* closed below */ }
   return fail();
 }

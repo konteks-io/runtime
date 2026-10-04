@@ -1,5 +1,5 @@
 import { HeartbeatMessageSchema, REMOTE_INSTANCE_PROOF_AUDIENCE, RemoteInstanceError, signInstanceProof, type AgentModelOfferedValuesSnapshot, type Clock, type HeartbeatMessage, type SupportedAgentEntry, type ConnectorCommandsManifest, type HeartbeatResult, type InstanceKeyPair, type JsonValue, type Logger, createLogger } from "@konteks/remote-common";
-import type { InventorySource } from "../inventory/snapshot.js";
+import type { InventorySnapshot, InventorySource } from "../inventory/snapshot.js";
 import { computeUtilization, deriveAdvertisedRoles, type RoleBinding } from "../inventory/roles.js";
 import type { SupervisorStore } from "../state/store.js";
 import type { CoreClient } from "../core/client.js";
@@ -29,14 +29,14 @@ export interface HeartbeatOptions {
   activeAssignmentIds: () => string[];
   modelCapabilitySnapshots?: () => readonly AgentModelOfferedValuesSnapshot[];
   /**
-   * Every supported agent's real state on this computer (runtime-view R21),
+   * Every supported agent's real state on this computer,
    * from the agents just collected; undefined to leave the field out (an
    * older Core, or nothing detected yet). Never throws the heartbeat away.
    */
   supportedAgents?: (agents: HeartbeatMessage["agents"]) => readonly SupportedAgentEntry[] | undefined;
   /**
-   * The `konteks-remote` commands this installed release has (runtime-view
-   * R20); undefined to leave it out (an older Core, or no table). Sent on the
+   * The `konteks-remote` commands this installed release has;
+   * undefined to leave it out (an older Core, or no table). Sent on the
    * first heartbeat Core accepts from each runner incarnation and again only
    * when it changes: Core keeps the latest value it received.
    */
@@ -213,11 +213,7 @@ export class HeartbeatPublisher {
     const assertLease = this.options.captureLeaseFence?.() ?? (() => undefined);
     const instanceId = this.options.instanceId();
     const runnerIncarnation = this.options.runnerIncarnation();
-    const assertCurrent = () => {
-      assertLease();
-      if (this.stopped || (!pending && !this.running)) throw new RemoteInstanceError("temporarily_unavailable", "Heartbeat publisher is stopped.");
-      if (this.options.instanceId() !== instanceId || this.options.runnerIncarnation() !== runnerIncarnation) throw new RemoteInstanceError("recovery_required", "Heartbeat process identity changed.");
-    };
+    const assertCurrent = () => this.assertCurrent(assertLease, pending, instanceId, runnerIncarnation);
     assertCurrent();
     this.stage = "collect";
     const snapshot = await this.options.inventory.collect();
@@ -225,27 +221,9 @@ export class HeartbeatPublisher {
     this.options.onInventory?.(snapshot.agents);
     const roles = deriveAdvertisedRoles(this.options.roleBindings(), snapshot.agents, { gitVersion: snapshot.gitVersion });
     this.lastRoles = roles;
-    const requiredHealthy = snapshot.components.every((component) => component.healthStatus === "healthy" || component.healthStatus === "degraded");
-    const utilization = computeUtilization({
-      hostPressure: snapshot.hostPressure,
-      activeSessions: snapshot.activeSessions,
-      activeTurns: snapshot.activeTurns,
-      ...(this.options.softMaxConcurrent() === undefined ? {} : { softMaxConcurrent: this.options.softMaxConcurrent() as number }),
-      acceptingWork: !pending && this.options.acceptingWork() && requiredHealthy,
-    });
-    let supportedAgents: readonly SupportedAgentEntry[] | undefined;
-    try { supportedAgents = this.options.supportedAgents?.(snapshot.agents); } catch (error) {
-      this.logger.warn({ err: error }, "supported agents not reported on this heartbeat");
-    }
-    let connectorCommands: ConnectorCommandsManifest | undefined;
-    let connectorCommandsKey: string | null = null;
-    try {
-      const commands = this.options.connectorCommands?.();
-      const key = commands ? `${runnerIncarnation}\u0000${JSON.stringify(commands)}` : null;
-      if (commands && key !== this.sentConnectorCommands) { connectorCommands = commands; connectorCommandsKey = key; }
-    } catch (error) {
-      this.logger.warn({ err: error }, "connector commands not reported on this heartbeat");
-    }
+    const utilization = this.utilization(snapshot, pending);
+    const supportedAgents = this.supportedAgents(snapshot.agents);
+    const commands = this.unsentConnectorCommands(runnerIncarnation);
     this.stage = "sequence";
     const sequence = await this.options.store.allocateHeartbeatSequence();
     assertCurrent();
@@ -262,9 +240,7 @@ export class HeartbeatPublisher {
       activeAssignmentIds: this.options.activeAssignmentIds().slice(0, 256),
       configRevision: this.options.configRevision(),
       bundleVersion: this.options.bundleVersion,
-      ...(this.options.modelCapabilitySnapshots ? { modelCapabilitySnapshots: this.options.modelCapabilitySnapshots() } : {}),
-      ...(supportedAgents ? { supportedAgents } : {}),
-      ...(connectorCommands ? { connectorCommands } : {}),
+      ...this.optionalReports(supportedAgents, commands.manifest),
     });
     // The wire carries a top-level `signature` and no `proof` envelope, but the
     // bytes signed are the instance proof's: binding the audience, the
@@ -278,7 +254,7 @@ export class HeartbeatPublisher {
     this.stage = "request";
     const result = await this.options.core.heartbeat({ ...message, signature });
     // Core took them; later heartbeats of this incarnation leave them out until they change.
-    if (connectorCommandsKey !== null) this.sentConnectorCommands = connectorCommandsKey;
+    if (commands.key !== null) this.sentConnectorCommands = commands.key;
     // Preserve ordinary shutdown's no-adoption behavior; a pending refresh must
     // reject rather than let its caller infer that recovery connectivity is ready.
     if (!pending && !this.running) return message;
@@ -288,4 +264,49 @@ export class HeartbeatPublisher {
     assertCurrent();
     return message;
   }
-}
+
+  private assertCurrent(assertLease: () => void, pending: boolean, instanceId: string, runnerIncarnation: string): void {
+    assertLease();
+    if (this.stopped || (!pending && !this.running)) throw new RemoteInstanceError("temporarily_unavailable", "Heartbeat publisher is stopped.");
+    if (this.options.instanceId() !== instanceId || this.options.runnerIncarnation() !== runnerIncarnation) throw new RemoteInstanceError("recovery_required", "Heartbeat process identity changed.");
+  }
+
+  private utilization(snapshot: InventorySnapshot, pending: boolean): ReturnType<typeof computeUtilization> {
+    const requiredHealthy = snapshot.components.every((component) => component.healthStatus === "healthy" || component.healthStatus === "degraded");
+    return computeUtilization({
+      hostPressure: snapshot.hostPressure,
+      activeSessions: snapshot.activeSessions,
+      activeTurns: snapshot.activeTurns,
+      ...(this.options.softMaxConcurrent() === undefined ? {} : { softMaxConcurrent: this.options.softMaxConcurrent() as number }),
+      acceptingWork: !pending && this.options.acceptingWork() && requiredHealthy,
+    });
+  }
+
+  private supportedAgents(agents: InventorySnapshot["agents"]): readonly SupportedAgentEntry[] | undefined {
+    try {
+      return this.options.supportedAgents?.(agents);
+    } catch (error) {
+      this.logger.warn({ err: error }, "supported agents not reported on this heartbeat");
+      return undefined;
+    }
+  }
+
+  /** The connector commands when this incarnation has not sent them yet, with the key that records them as sent. */
+  private unsentConnectorCommands(runnerIncarnation: string): { manifest?: ConnectorCommandsManifest; key: string | null } {
+    try {
+      const commands = this.options.connectorCommands?.();
+      const key = commands ? `${runnerIncarnation}\u0000${JSON.stringify(commands)}` : null;
+      if (commands && key !== this.sentConnectorCommands) return { manifest: commands, key };
+    } catch (error) {
+      this.logger.warn({ err: error }, "connector commands not reported on this heartbeat");
+    }
+    return { key: null };
+  }
+
+  private optionalReports(supportedAgents: readonly SupportedAgentEntry[] | undefined, connectorCommands: ConnectorCommandsManifest | undefined): Record<string, unknown> {
+    return {
+      ...(this.options.modelCapabilitySnapshots ? { modelCapabilitySnapshots: this.options.modelCapabilitySnapshots() } : {}),
+      ...(supportedAgents ? { supportedAgents } : {}),
+      ...(connectorCommands ? { connectorCommands } : {}),
+    };
+  }}

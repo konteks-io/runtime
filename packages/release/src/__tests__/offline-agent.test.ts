@@ -34,7 +34,7 @@ describe("complete signed offline agent profile", () => {
     await writeFile(join(destination, "bridge/node_modules/example/package.json"), "modified");
     await expect(verifyOfflineAgentPackage(destination, fixture.artifact as never)).rejects.toThrow();
   });
-  it("hashes the package once per process and again only when its files change (WS2-156)", async () => {
+  it("hashes the package once per process and again only when its files change", async () => {
     forgetVerifiedOfflineAgentPackages();
     const fixture = offlineFixture();
     const root = await mkdtemp(join(tmpdir(), "offline-agent-")); folders.push(root);

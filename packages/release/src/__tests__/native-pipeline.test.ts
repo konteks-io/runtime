@@ -94,7 +94,7 @@ describe("native release pipeline", () => {
     expect(workflow).toContain("native-manifest.json");
     expect(workflow).toContain("sign-native");
     expect(workflow).toContain("gh release create");
-    // The connector commands the site lists for this release (runtime-view R20).
+    // The connector commands the site lists for this release.
     expect(workflow).toContain("release-assets.mjs commands --tag");
     expect(workflow).not.toMatch(/docker\/|docker-|buildx|compose|domain-images|runner-images|gateway/i);
   });

@@ -23,13 +23,13 @@ export const HOST_INHERITED_VARIABLES: readonly string[] = Object.freeze([
 ]);
 
 /** Windows system variables a native program needs to start and reach the network; none carries a credential. */
-export const WINDOWS_SYSTEM_VARIABLES: readonly string[] = Object.freeze(["SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT"]);
+const WINDOWS_SYSTEM_VARIABLES: readonly string[] = Object.freeze(["SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT"]);
 
 /** A name that looks like it carries a credential is never passed, whatever put it there. */
-export const CREDENTIAL_VARIABLE_NAME = /TOKEN|SECRET|PASSW(OR)?D|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|AUTH|SESSION|COOKIE/i;
+const CREDENTIAL_VARIABLE_NAME = /TOKEN|SECRET|PASSW(OR)?D|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|AUTH|SESSION|COOKIE/i;
 const CONTROL = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
-export interface AllowListEnvironmentOptions {
+interface AllowListEnvironmentOptions {
   /** The agent's name in refusals ("OpenCode", "Google Antigravity"). */
   agentName: string;
   /** Private-home variables (HOME, XDG_*, GEMINI_HOME …): each an absolute path the connector owns. */
@@ -55,36 +55,51 @@ export function allowListEnvironment(options: AllowListEnvironmentOptions): Node
   const inherited = options.inherited ?? process.env;
   const windows = platform === "win32";
   // The target platform's own rule (a Windows home is `C:\\…`), so a simulated platform checks like the real one.
-  const isAbsolute = (windows ? win32 : posix).isAbsolute;
-  const allowed = new Set([...HOST_INHERITED_VARIABLES, ...(windows ? WINDOWS_SYSTEM_VARIABLES : [])].map(name => (windows ? name.toUpperCase() : name)));
-  const env: NodeJS.ProcessEnv = {};
-  for (const [name, value] of Object.entries(inherited)) {
-    if (value === undefined || !allowed.has(windows ? name.toUpperCase() : name) || value.includes("\u0000")) continue;
-    env[name] = value;
-  }
+  const localPath = (value: string) => (windows ? win32 : posix).isAbsolute(value) && !CONTROL.test(value);
+  const env = allowListed(inherited, windows);
   // A shell for the agent's own shell tool: a path, only when absolute.
-  if (inherited.SHELL && isAbsolute(inherited.SHELL) && !CONTROL.test(inherited.SHELL)) env.SHELL = inherited.SHELL;
+  if (inherited.SHELL && localPath(inherited.SHELL)) env.SHELL = inherited.SHELL;
   const extraCa = env.NODE_EXTRA_CA_CERTS;
-  if (extraCa !== undefined && (!isAbsolute(extraCa) || CONTROL.test(extraCa))) throw new RemoteInstanceError("agent_unavailable", "Native additional CA certificate path must be absolute.");
-  const homes = [...Object.values(options.paths), ...(options.windowsProfile === undefined ? [] : [options.windowsProfile])];
-  for (const path of homes) {
-    if (!isAbsolute(path) || CONTROL.test(path)) throw new RemoteInstanceError("agent_unavailable", `The ${options.agentName} home must be an absolute local path.`);
-  }
-  for (const [name, path] of Object.entries(options.paths)) env[name] = path;
-  if (windows && options.windowsProfile !== undefined) {
-    env.USERPROFILE = options.windowsProfile;
-    env.APPDATA = win32.join(options.windowsProfile, "AppData", "Roaming");
-    env.LOCALAPPDATA = win32.join(options.windowsProfile, "AppData", "Local");
-  }
+  if (extraCa !== undefined && !localPath(extraCa)) throw new RemoteInstanceError("agent_unavailable", "Native additional CA certificate path must be absolute.");
+  setPrivateHome(env, options, localPath, windows);
   env.NO_COLOR = "1";
   env.TERM = "dumb";
+  setAgentSettings(env, options);
+  dropCredentialNames(env);
+  return env;
+}
+
+/** Last line of defence: the allow-list can never be widened into a credential. */
+function dropCredentialNames(env: NodeJS.ProcessEnv): void {
+  for (const name of Object.keys(env)) {
+    if (CREDENTIAL_VARIABLE_NAME.test(name)) delete env[name];
+  }
+}
+
+/** Only the allow-listed inherited variables (names compared case-insensitively on Windows), never one carrying a NUL. */
+function allowListed(inherited: NodeJS.ProcessEnv, windows: boolean): NodeJS.ProcessEnv {
+  const key = (name: string) => (windows ? name.toUpperCase() : name);
+  const allowed = new Set([...HOST_INHERITED_VARIABLES, ...(windows ? WINDOWS_SYSTEM_VARIABLES : [])].map(key));
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(inherited)) {
+    if (value !== undefined && allowed.has(key(name)) && !value.includes("\u0000")) env[name] = value;
+  }
+  return env;
+}
+
+function setPrivateHome(env: NodeJS.ProcessEnv, options: AllowListEnvironmentOptions, localPath: (value: string) => boolean, windows: boolean): void {
+  const homes = [...Object.values(options.paths), ...(options.windowsProfile === undefined ? [] : [options.windowsProfile])];
+  if (homes.some(path => !localPath(path))) throw new RemoteInstanceError("agent_unavailable", `The ${options.agentName} home must be an absolute local path.`);
+  for (const [name, path] of Object.entries(options.paths)) env[name] = path;
+  if (!windows || options.windowsProfile === undefined) return;
+  env.USERPROFILE = options.windowsProfile;
+  env.APPDATA = win32.join(options.windowsProfile, "AppData", "Roaming");
+  env.LOCALAPPDATA = win32.join(options.windowsProfile, "AppData", "Local");
+}
+
+function setAgentSettings(env: NodeJS.ProcessEnv, options: AllowListEnvironmentOptions): void {
   for (const [name, value] of Object.entries(options.settings ?? {})) {
     if (!options.settingName.test(name) || value.includes("\u0000")) throw new RemoteInstanceError("agent_unavailable", `not ${/^[aeiou]/i.test(options.agentName) ? "an" : "a"} ${options.agentName} setting: ${name}`);
     env[name] = value;
   }
-  // Last line of defence: the allow-list above can never be widened into a credential.
-  for (const name of Object.keys(env)) {
-    if (CREDENTIAL_VARIABLE_NAME.test(name)) delete env[name];
-  }
-  return env;
 }

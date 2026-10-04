@@ -5,7 +5,7 @@ import { RemoteInstanceError, createLogger, runCommand, sanitizeInheritedChildPr
 import type { ManagedGitBinding } from "./remotes.js";
 
 /**
- * Managed-git key registration on this machine (ON16, OB6 §4).
+ * Managed-git key registration on this machine.
  *
  * The runtime is already the trusted machine, so the key it uses for managed
  * git is generated HERE and registered by its public half alone. **The private
@@ -14,11 +14,11 @@ import type { ManagedGitBinding } from "./remotes.js";
  * shows the launcher command rather than a field to paste a key into.
  *
  * Removing the key revokes it in Core; so does removing the runtime, because
- * Core registers every key against this instance id (OB4 §1).
+ * Core registers every key against this instance id.
  */
 
 /** What the runtime keeps locally about a key it registered. */
-export const RegisteredGitKeySchema = z
+const RegisteredGitKeySchema = z
   .object({
     keyRef: z.string().min(1).max(200),
     title: z.string().min(1).max(256),
@@ -27,14 +27,14 @@ export const RegisteredGitKeySchema = z
      * The managed git host this key opens, where the registration named one.
      * Managed git registers a key for the person, not for one host, so the
      * answer may carry none; the repository's own SSH URL is then what a push
-     * uses (WS1-026), and the host-matching resolver simply has no binding.
+     * uses, and the host-matching resolver simply has no binding.
      */
     host: z.string().min(1).max(255).optional(),
     user: z.string().min(1).max(64).optional(),
     createdAt: z.string().min(1).max(64),
   })
   .strict();
-export type RegisteredGitKey = z.infer<typeof RegisteredGitKeySchema>;
+type RegisteredGitKey = z.infer<typeof RegisteredGitKeySchema>;
 
 const KeyFileSchema = z.object({ keys: z.array(RegisteredGitKeySchema).max(16) }).strict();
 
@@ -44,13 +44,13 @@ const KeyFileSchema = z.object({ keys: z.array(RegisteredGitKeySchema).max(16) }
  * `exactOptionalPropertyTypes` an absent optional and one set to `undefined`
  * are different types.
  */
-export interface GitKeyRegistrar {
+interface GitKeyRegistrar {
   register(input: { publicKey: string; title: string }): Promise<{ keyRef: string; fingerprint: string; host?: string | undefined; user?: string | undefined; createdAt?: string | undefined }>;
   list(): Promise<Array<{ keyRef: string; title: string; fingerprint: string; createdAt?: string | undefined; revokedAt?: string | undefined }>>;
   revoke(keyRef: string): Promise<void>;
 }
 
-export interface GitKeyStoreOptions {
+interface GitKeyStoreOptions {
   /** Private directory the key material lives in; 0700, never backed up. */
   directory: string;
   registrar: GitKeyRegistrar;

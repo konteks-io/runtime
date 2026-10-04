@@ -1,7 +1,26 @@
-import { RemoteInstanceError, jcsDigest, logicalAssignmentRequestDigest, type JsonValue, type RelayChannel } from "@konteks/remote-common";
+import { RemoteInstanceError, allEqual, jcsDigest, logicalAssignmentRequestDigest, type JsonValue, type RelayChannel } from "@konteks/remote-common";
 import type { ChannelMux } from "../relay/channel-mux.js";
 import type { RelayClient } from "../relay/relay-client.js";
 import type { ControlPlaneTransport, InboundHandler, OutboundMessage } from "./transport.js";
+
+type AssignmentFrame = NonNullable<OutboundMessage["assignmentFrame"]>;
+
+function requestKindOf(frame: AssignmentFrame): "pull" | "report" | "claim" {
+  if ("maxItems" in frame.body) return "pull";
+  return "reportId" in frame.body ? "report" : "claim";
+}
+
+/** The message carries exactly this retained frame: its channel, sequence, logical digest, kind and body. */
+function retainedFrameMatches(message: OutboundMessage, frame: AssignmentFrame): boolean {
+  const request = message.assignmentRequest!;
+  return message.channel === "assignment" && allEqual([
+    [message.channelId, frame.channelId],
+    [request.requestSequence, frame.seq],
+    [request.requestDigest, logicalAssignmentRequestDigest(frame)],
+    [request.requestKind, requestKindOf(frame)],
+    [jcsDigest(message.body as JsonValue), jcsDigest(frame.body as JsonValue)],
+  ]);
+}
 
 /** The relay as a ControlPlaneTransport: the mux frames, the client carries. */
 export class RelayTransport implements ControlPlaneTransport {
@@ -15,17 +34,20 @@ export class RelayTransport implements ControlPlaneTransport {
 
   send(message: OutboundMessage): void {
     if (message.assignmentRequest) {
-      const frame = message.assignmentFrame;
-      const requestKind = frame && "maxItems" in frame.body ? "pull" : frame && "reportId" in frame.body ? "report" : "claim";
-      if (!frame || message.channel !== "assignment" || message.channelId !== frame.channelId ||
-        message.assignmentRequest.requestSequence !== frame.seq || message.assignmentRequest.requestDigest !== logicalAssignmentRequestDigest(frame) ||
-        message.assignmentRequest.requestKind !== requestKind || jcsDigest(message.body as JsonValue) !== jcsDigest(frame.body as JsonValue)) {
-        throw new RemoteInstanceError("assignment_channel_invalid", "Allocated assignment relay carrier requires its exact retained frame and reference.");
-      }
-      this.mux.sendAssignment(frame); return;
+      this.sendAssignment(message);
+      return;
     }
     if (message.assignmentFrame) throw new RemoteInstanceError("assignment_channel_invalid", "An assignment frame has no retained request owner.");
     this.mux.send(message.channelId, message.channel, message.body, message.signature, message.sourceSequence);
+  }
+
+  /** An allocated assignment request goes out as its exact retained frame, never re-sequenced. */
+  private sendAssignment(message: OutboundMessage): void {
+    const frame = message.assignmentFrame;
+    if (!frame || !retainedFrameMatches(message, frame)) {
+      throw new RemoteInstanceError("assignment_channel_invalid", "Allocated assignment relay carrier requires its exact retained frame and reference.");
+    }
+    this.mux.sendAssignment(frame);
   }
 
   onInbound(handler: InboundHandler): void {
@@ -109,35 +131,39 @@ export class TransportManager {
 
   send(message: OutboundMessage): void {
     // Temporary explicit carrier composition, not protocol cutover: the legacy
-    // mux must never allocate a second sequence for a retained D143 frame.
-    if (message.assignmentRequest) {
-      if (message.channel !== "assignment") throw new RemoteInstanceError("assignment_channel_invalid", "Prepared assignment reference on another channel.");
-      if (this.relay?.available) this.relay.send(message);
-      else this.https.send(message);
-      return;
-    }
+    // mux must never allocate a second sequence for a retained frame.
+    if (message.assignmentRequest) return this.sendPreparedAssignment(message);
     if (message.assignmentFrame) throw new RemoteInstanceError("assignment_channel_invalid", "An assignment frame has no retained request owner.");
-    // The relay assignment channel admits only retained D143 frames. Explicit
+    // The relay assignment channel admits only retained frames. Explicit
     // protocol-1 composition uses Core's authenticated bare HTTPS endpoints;
     // a healthy socket does not make that incompatible envelope relayable.
     if (message.channel === "assignment") {
       this.https.send(message);
       return;
     }
-    // Session frames have one durable sequence/replay owner. Core has no
-    // native session HTTPS ingress; switching here stranded terminal results.
-    if (message.channel === "session") {
-      if (!this.relay) throw new RemoteInstanceError("protocol_incompatible", "Session delivery requires the configured relay.");
-      this.relay.send(message);
-      return;
-    }
-    // Preview is a relay-only stream with the same replay owner as a session;
-    // there is no HTTPS carrier for it, so without a relay it has nowhere to go.
+    if (message.channel === "session" || message.channel === "preview") return this.sendRelayOnly(message);
+    this.active.send(message);
+  }
+
+  private sendPreparedAssignment(message: OutboundMessage): void {
+    if (message.channel !== "assignment") throw new RemoteInstanceError("assignment_channel_invalid", "Prepared assignment reference on another channel.");
+    if (this.relay?.available) this.relay.send(message);
+    else this.https.send(message);
+  }
+
+  /**
+   * Session frames have one durable sequence/replay owner, and Core has no
+   * native session HTTPS ingress: switching to HTTPS stranded terminal
+   * results. Preview is a relay-only stream with the same replay owner; with
+   * no relay it has nowhere to go.
+   */
+  private sendRelayOnly(message: OutboundMessage): void {
     if (message.channel === "preview") {
       this.relay?.send(message);
       return;
     }
-    this.active.send(message);
+    if (!this.relay) throw new RemoteInstanceError("protocol_incompatible", "Session delivery requires the configured relay.");
+    this.relay.send(message);
   }
 
   resumeAfterRecovery(): void {

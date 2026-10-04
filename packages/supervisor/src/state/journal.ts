@@ -1,9 +1,9 @@
-import { open, readFile, rename, rm } from "node:fs/promises";
+import { open, readFile, rename, rm, type FileHandle } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { SchemaParser } from "@konteks/remote-common";
 import { join } from "node:path";
 import { z } from "zod";
-import { AssignmentReportSchema, canonicalize, isFsErrorWithCode, RemoteExecutionReadyResultSchema, RemoteReconciliationReceiptSnapshotSchema, ReportAckSchema,
+import { AssignmentReportSchema, allEqual, canonicalize, isFsErrorWithCode, RemoteExecutionReadyResultSchema, RemoteReconciliationReceiptSnapshotSchema, ReportAckSchema,
   RemoteExecutionAdmissionClaimsSchema, RemoteDeliveryAdmissionClaimsSchema, SessionToCoreMessageSchema, RemoteWorkKindSchema, RemoteRecoveryEvidenceSchema,
   remoteRecoveryEvidenceIdentityKey, type RemoteRecoveryEvidence } from "@konteks/remote-common";
 import { unrestrictedStateMutation, type StateMutation } from "./mutation-gate.js";
@@ -30,7 +30,7 @@ import {
  * stdio, or a payload. Append-only JSON lines with periodic compaction, so a
  * crash mid-write leaves at most one unparseable trailing line.
  */
-export const JournalEntrySchema = z
+const JournalEntryFieldsSchema = z
   .object({
     assignmentId: z.string().min(1),
     attempt: z.number().int().positive(),
@@ -51,33 +51,53 @@ export const JournalEntrySchema = z
     recoveryReason: z
       .enum(["instance_removed", "instance_revoked", "checkpoint_invalid", "resume_deadline_expired", "not_resumable", "assignment_conflict", "policy_denied", "limit_exceeded", "ownership_scope_lost", "agent_session_lost", "relay_replay_gap"])
       .optional(),
-    /** Report ordering state for this claim (D125). */
+    /** Report ordering state for this claim. */
     reports: z.object({ nextSequence: z.number().int().positive(), durableWatermark: z.number().int().nonnegative(), terminalSequence: z.number().int().positive().optional(), terminalControllerDirectiveId: z.string().min(1).max(256).optional(), terminalAck: ReportAckSchema.optional(), terminalResult: AssignmentReportSchema.shape.result }).strict(),
     evidenceUpload: z.enum(["structured_only", "selected_artifacts"]),
     expiresAt: z.string(),
     latestResumeAt: z.string(),
     updatedAt: z.string(),
   })
-  .strict()
-  .superRefine((entry, ctx) => {
-    if (entry.reports.terminalResult && (!entry.reports.terminalSequence || entry.reports.terminalResult.terminalResultHash !== entry.terminalResultHash)) {
-      ctx.addIssue({ code: "custom", path: ["reports", "terminalResult"], message: "Saved terminal result must match this terminal pointer" });
-    }
-    if ((entry.kind === "planning" && entry.reports.terminalSequence !== undefined) !== (entry.reports.terminalControllerDirectiveId !== undefined)) {
-      ctx.addIssue({ code: "custom", path: ["reports", "terminalControllerDirectiveId"], message: "Planning terminal reports require exactly one controller directive" });
-    }
-    const ack = entry.reports.terminalAck;
-    if (!ack) return;
-    if (ack.assignmentId !== entry.assignmentId || ack.attempt !== entry.attempt || ack.claimId !== entry.claimId ||
-      !entry.terminalResultHash || ack.terminalSequence !== entry.reports.terminalSequence || ack.terminalSequence !== ack.acknowledged.reportSequence ||
-      ack.durableWatermark < ack.acknowledged.reportSequence || entry.reports.durableWatermark < ack.durableWatermark ||
-      (ack.outcome !== "accepted" && ack.outcome !== "duplicate")) {
-      ctx.addIssue({ code: "custom", path: ["reports", "terminalAck"], message: "Terminal ACK must cover this exact claim and terminal sequence" });
-    }
-  });
+  .strict();
+type JournalEntryFields = z.infer<typeof JournalEntryFieldsSchema>;
+
+/** A saved terminal result belongs to the terminal report this entry points at. */
+function terminalResultMismatch(entry: JournalEntryFields): boolean {
+  const result = entry.reports.terminalResult;
+  if (!result) return false;
+  return !entry.reports.terminalSequence || result.terminalResultHash !== entry.terminalResultHash;
+}
+
+/** A planning claim's terminal report names exactly one controller directive; no other report names one. */
+function planningDirectiveMismatch(entry: JournalEntryFields): boolean {
+  return (entry.kind === "planning" && entry.reports.terminalSequence !== undefined) !== (entry.reports.terminalControllerDirectiveId !== undefined);
+}
+
+/** A saved terminal ACK covers this exact claim and terminal sequence. */
+function terminalAckMismatch(entry: JournalEntryFields): boolean {
+  const ack = entry.reports.terminalAck;
+  if (!ack) return false;
+  return !allEqual([
+    [ack.assignmentId, entry.assignmentId], [ack.attempt, entry.attempt], [ack.claimId, entry.claimId],
+    [ack.terminalSequence, entry.reports.terminalSequence], [ack.terminalSequence, ack.acknowledged.reportSequence],
+  ]) || !entry.terminalResultHash || ack.durableWatermark < ack.acknowledged.reportSequence || entry.reports.durableWatermark < ack.durableWatermark ||
+    (ack.outcome !== "accepted" && ack.outcome !== "duplicate");
+}
+
+export const JournalEntrySchema = JournalEntryFieldsSchema.superRefine((entry, ctx) => {
+  if (terminalResultMismatch(entry)) {
+    ctx.addIssue({ code: "custom", path: ["reports", "terminalResult"], message: "Saved terminal result must match this terminal pointer" });
+  }
+  if (planningDirectiveMismatch(entry)) {
+    ctx.addIssue({ code: "custom", path: ["reports", "terminalControllerDirectiveId"], message: "Planning terminal reports require exactly one controller directive" });
+  }
+  if (terminalAckMismatch(entry)) {
+    ctx.addIssue({ code: "custom", path: ["reports", "terminalAck"], message: "Terminal ACK must cover this exact claim and terminal sequence" });
+  }
+});
 export type JournalEntry = z.infer<typeof JournalEntrySchema>;
 
-const CurrentPendingRequestSchema = z
+const CurrentPendingRequestFieldsSchema = z
   .object({
     acpSessionRef: z.string().min(1),
     id: z.string().min(1),
@@ -95,41 +115,60 @@ const CurrentPendingRequestSchema = z
       completion: SessionToCoreMessageSchema.optional(),
     }).strict().optional(),
   })
-  .strict().superRefine((entry, ctx) => {
-    const authorization = entry.authorization;
-    if (!authorization) return;
-    const { claims, completion } = authorization;
-    const id = claims.requestId ?? `operation:${claims.operationId}`;
-    if (claims.acpSessionRef !== entry.acpSessionRef || claims.method !== entry.method || id !== entry.id ||
-      (claims.kind === "acp" ? "received" : "issued") !== entry.direction ||
-      (completion && (!["completed", "denied"].includes(authorization.state) ||
-        (authorization.state === "denied" && completion.kind !== "acp_error") || !("id" in completion) || completion.id !== entry.id ||
-        !("method" in completion) || completion.method !== entry.method || !["acp_result", "acp_error"].includes(completion.kind)))) {
-      ctx.addIssue({ code: "custom", message: "Operation admission and disposition must match the durable request" });
-    }
-  });
-/** Pre-D162 delivery admission evidence lacks the immutable repository, role,
+  .strict();
+type PendingRequestFields = z.infer<typeof CurrentPendingRequestFieldsSchema>;
+type PendingAuthorization = NonNullable<PendingRequestFields["authorization"]>;
+
+/** The admission names this request, and a recorded completion settles it as completed or denied. */
+function admissionMatches(entry: PendingRequestFields, authorization: PendingAuthorization): boolean {
+  const { claims, completion } = authorization;
+  const id = claims.requestId ?? `operation:${claims.operationId}`;
+  return allEqual([
+    [claims.acpSessionRef, entry.acpSessionRef], [claims.method, entry.method], [id, entry.id],
+    [claims.kind === "acp" ? "received" : "issued", entry.direction],
+  ]) && (!completion || completionMatches(entry, authorization.state, completion));
+}
+
+function completionMatches(entry: PendingRequestFields, state: PendingAuthorization["state"], completion: z.infer<typeof SessionToCoreMessageSchema>): boolean {
+  if (!["completed", "denied"].includes(state) || (state === "denied" && completion.kind !== "acp_error")) return false;
+  if (!["acp_result", "acp_error"].includes(completion.kind)) return false;
+  return "id" in completion && completion.id === entry.id && "method" in completion && completion.method === entry.method;
+}
+
+const CurrentPendingRequestSchema = CurrentPendingRequestFieldsSchema.superRefine((entry, ctx) => {
+  if (entry.authorization && !admissionMatches(entry, entry.authorization)) {
+    ctx.addIssue({ code: "custom", message: "Operation admission and disposition must match the durable request" });
+  }
+});
+
+function objectish(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+/** A harness delivery admission saved without the immutable repository, role, agent and model tuple. */
+function legacyDeliveryAdmission(candidate: unknown): boolean {
+  const claim = objectish(objectish(objectish(candidate)?.authorization)?.claims);
+  const delivery = objectish(claim?.deliveryIdentity);
+  if (claim?.workloadKind !== "harness_delivery" || !delivery) return false;
+  return !completeDeliveryTuple(delivery);
+}
+
+function completeDeliveryTuple(delivery: Record<string, unknown>): boolean {
+  return typeof delivery.repositoryId === "string" && typeof delivery.requiredRuntimeRole === "string" &&
+    typeof delivery.agentId === "string" && objectish(delivery.modelBinding) !== undefined;
+}
+
+/** Older delivery admission evidence lacks the immutable repository, role,
  * agent and model tuple. It may remain as transcript history, but stripping
  * its expired authorization makes it incapable of resuming or dispatching. */
 export const PendingRequestSchema = z.preprocess((candidate) => {
-  if (!candidate || typeof candidate !== "object") return candidate;
-  const entry = candidate as Record<string, unknown>;
-  const authorization = entry.authorization;
-  if (!authorization || typeof authorization !== "object") return candidate;
-  const claims = (authorization as Record<string, unknown>).claims;
-  if (!claims || typeof claims !== "object") return candidate;
-  const claim = claims as Record<string, unknown>;
-  const identity = claim.deliveryIdentity;
-  if (claim.workloadKind !== "harness_delivery" || !identity || typeof identity !== "object") return candidate;
-  const delivery = identity as Record<string, unknown>;
-  if (typeof delivery.repositoryId === "string" && typeof delivery.requiredRuntimeRole === "string" &&
-      typeof delivery.agentId === "string" && delivery.modelBinding && typeof delivery.modelBinding === "object") return candidate;
-  const { authorization: _legacyAuthority, ...displayOnly } = entry;
+  if (!legacyDeliveryAdmission(candidate)) return candidate;
+  const { authorization: _legacyAuthority, ...displayOnly } = candidate as Record<string, unknown>;
   return displayOnly;
 }, CurrentPendingRequestSchema);
 export type PendingRequest = z.infer<typeof PendingRequestSchema>;
 
-export const DecisionRecordSchema = z
+const DecisionRecordFieldsSchema = z
   .object({ manifestId: z.string().min(1), assignmentId: z.string().min(1), attempt: z.number().int(), action: z.string().min(1), recoveryEpoch: z.number().int().nonnegative(), journaledAt: z.string(), executedAt: z.string().nullable(),
     /** Hash only: recovery authorization bytes never enter the journal. Older records cannot prove exact replay. */
     decisionDigest: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional(),
@@ -138,28 +177,49 @@ export const DecisionRecordSchema = z
     /** Actual local disposition/evidence, frozen before receipt delivery. */
     result: RemoteReconciliationReceiptSnapshotSchema.shape.decisionResults.element.optional(),
   })
-  .strict().superRefine((record, ctx) => {
-    const absence = record.action === "cancel" && record.result?.disposition === "absent_local_cancelled" && record.absenceTombstoneDigest && !record.claimId;
-    if ((record.absenceTombstoneDigest && !absence) || (record.result?.disposition === "absent_local_cancelled" && !absence) || (record.result && ((!record.claimId && !absence) || !record.executedAt || record.result.assignmentId !== record.assignmentId || record.result.attempt !== record.attempt))) {
-      ctx.addIssue({ code: "custom", path: ["result"], message: "Decision result must match a durably applied identity" });
-    }
-  });
-export type DecisionRecord = z.infer<typeof DecisionRecordSchema>;
+  .strict();
+type DecisionRecordFields = z.infer<typeof DecisionRecordFieldsSchema>;
+
+/** A cancel of work this computer never had: a tombstone, no claim, and an absent-and-cancelled result. */
+function absenceRecord(record: DecisionRecordFields): boolean {
+  return record.action === "cancel" && record.result?.disposition === "absent_local_cancelled" && Boolean(record.absenceTombstoneDigest) && !record.claimId;
+}
+
+/** A result (or a tombstone) must match a durably applied identity. */
+function decisionInconsistent(record: DecisionRecordFields): boolean {
+  const absence = absenceRecord(record);
+  if (!absence && (record.absenceTombstoneDigest || record.result?.disposition === "absent_local_cancelled")) return true;
+  return resultInconsistent(record, absence);
+}
+
+/** A result needs its claim (or an absence tombstone), its execution time and the decision's own identity. */
+function resultInconsistent(record: DecisionRecordFields, absence: boolean): boolean {
+  const result = record.result;
+  if (!result) return false;
+  return (!record.claimId && !absence) || !record.executedAt || !allEqual([[result.assignmentId, record.assignmentId], [result.attempt, record.attempt]]);
+}
+
+const DecisionRecordSchema = DecisionRecordFieldsSchema.superRefine((record, ctx) => {
+  if (decisionInconsistent(record)) {
+    ctx.addIssue({ code: "custom", path: ["result"], message: "Decision result must match a durably applied identity" });
+  }
+});
+type DecisionRecord = z.infer<typeof DecisionRecordSchema>;
 
 /** First-seen manifest identity, never its renewable lease or decision authorization. */
-export const ReconciliationManifestRecordSchema = z.object({
+const ReconciliationManifestRecordSchema = z.object({
   manifestId: z.string().min(1), instanceId: z.string().min(1),
   manifestDigest: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
 }).strict();
-export type ReconciliationManifestRecord = z.infer<typeof ReconciliationManifestRecordSchema>;
+type ReconciliationManifestRecord = z.infer<typeof ReconciliationManifestRecordSchema>;
 
-export const EraseRecordSchema = z
+const EraseRecordSchema = z
   .object({ directiveId: z.string().min(1), scope: z.enum(["assignment_data", "all_konteks_data"]), status: z.enum(["pending", "completed", "partially_completed", "failed"]), receiptSent: z.boolean(), updatedAt: z.string() })
   .strict();
-export type EraseRecord = z.infer<typeof EraseRecordSchema>;
+type EraseRecord = z.infer<typeof EraseRecordSchema>;
 
 /**
- * An immutable C03 observation and its local delivery watermark. This is
+ * An immutable recovery observation and its local delivery watermark. This is
  * intentionally separate from terminal reports: accepting it cannot settle
  * work, assert quiescence, or release a workspace owner.
  */
@@ -167,7 +227,7 @@ export const RecoveryEvidenceRecordSchema = z.object({
   evidence: RemoteRecoveryEvidenceSchema,
   // `superseded`: Core can never accept these bytes (their process retired, or
   // Core already settled the claim) and says so. The record is kept for audit;
-  // it is simply no longer sent (WS2-159).
+  // it is simply no longer sent.
   delivery: z.enum(["pending", "accepted", "duplicate", "superseded"]),
   attempts: z.number().int().nonnegative(),
   lastAttemptAt: z.string().nullable(),
@@ -190,11 +250,11 @@ export const recoveryEvidenceRecordKey = (record: Pick<RecoveryEvidenceRecord, "
   remoteRecoveryEvidenceIdentityKey("evidence" in record ? record.evidence : record);
 
 /**
- * One consumed integration write grant (external-integration CP2): the gate
- * records it BEFORE it answers `allow_once`, so a nonce allows at most one
- * provider call even across a crash or a repeated assignment. Identifiers and
- * digests only, never arguments or credentials (N05: the attempt journal
- * survives restart without storing credentials).
+ * One consumed integration write grant: the gate records it BEFORE it
+ * answers `allow_once`, so a nonce allows at most one provider call even
+ * across a crash or a repeated assignment. Identifiers and digests only,
+ * never arguments or credentials (the attempt journal survives restart
+ * without storing credentials).
  */
 export const IntegrationWriteRecordSchema = z.object({
   nonce: z.string().min(1).max(256),
@@ -221,6 +281,38 @@ interface LogTable<T extends { [key: string]: unknown }> {
 const BatchEnvelopeSchema = z.object({ kind: z.literal("journal_batch"), schemaVersion: z.literal(1), entries: z.array(z.unknown()).min(1).max(64) }).strict();
 const MAX_BATCH_BYTES = 4 * 1024 * 1024;
 const COMPACTION_CHUNK_BYTES = 256 * 1024;
+
+/**
+ * One record per line, in bounded chunks: encoding memory stays bounded
+ * without one syscall per row. An individually larger validated record is
+ * written alone, never combined with a chunk.
+ */
+async function writeChunked(file: FileHandle, entries: Iterable<unknown>): Promise<void> {
+  let chunk: string[] = [];
+  let chunkBytes = 0;
+  for (const entry of entries) {
+    const line = `${JSON.stringify(entry)}\n`;
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    if (chunkBytes > 0 && chunkBytes + lineBytes > COMPACTION_CHUNK_BYTES) {
+      await file.writeFile(chunk.join("")); chunk = []; chunkBytes = 0;
+    }
+    if (lineBytes >= COMPACTION_CHUNK_BYTES) await file.writeFile(line);
+    else { chunk.push(line); chunkBytes += lineBytes; }
+  }
+  if (chunkBytes > 0) await file.writeFile(chunk.join(""));
+}
+
+function parsedRecord(line: string): unknown {
+  try {
+    return JSON.parse(line);
+  } catch {
+    throw new Error("Journal contains a corrupt complete record");
+  }
+}
+
+function journalBatch(parsed: unknown): boolean {
+  return parsed !== null && typeof parsed === "object" && "kind" in parsed && parsed.kind === "journal_batch";
+}
 
 /** A small append-only table with in-memory index and file compaction. */
 class AppendLog<T extends { [key: string]: unknown }> {
@@ -253,38 +345,50 @@ class AppendLog<T extends { [key: string]: unknown }> {
   private async loadInternal(): Promise<void> {
     if (this.writeUncertain) throw new Error("Journal write outcome requires recovery");
     if (this.loaded) return;
-    let raw = "";
-    try {
-      raw = await readFile(this.path, "utf8");
-    } catch (error) {
-      if (!isFsErrorWithCode(error, "ENOENT")) throw error;
+    const raw = await this.readJournal();
+    if (raw === null) {
       this.loaded = true;
       return;
     }
-    const restored = new Map<string, T>();
     const completeLength = raw.lastIndexOf("\n") + 1;
-    for (const line of raw.slice(0, completeLength).split("\n")) {
-      if (!line.trim()) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        throw new Error("Journal contains a corrupt complete record");
-      }
-      const entries = this.table.atomicBatches && parsed !== null && typeof parsed === "object" && "kind" in parsed && parsed.kind === "journal_batch"
-        ? this.parseBatch(parsed).entries : [this.table.schema.parse(parsed)];
-      // Validate the complete batch before exposing any of its keyed mutations.
-      for (const entry of entries) restored.set(this.table.key(entry), entry);
-    }
-    if (completeLength !== raw.length) {
-      const file = await open(this.path, "r+");
-      try { await file.truncate(Buffer.byteLength(raw.slice(0, completeLength))); await file.sync(); }
-      finally { await file.close(); }
-    }
+    const restored = this.restore(raw.slice(0, completeLength));
+    if (completeLength !== raw.length) await this.truncateTo(Buffer.byteLength(raw.slice(0, completeLength)));
     this.entries.clear();
     for (const [key, entry] of restored) this.entries.set(key, entry);
     this.committedRevision += 1;
     this.loaded = true;
+  }
+
+  /** The journal's text; null when there is no journal yet. */
+  private async readJournal(): Promise<string | null> {
+    try {
+      return await readFile(this.path, "utf8");
+    } catch (error) {
+      if (!isFsErrorWithCode(error, "ENOENT")) throw error;
+      return null;
+    }
+  }
+
+  /** Every complete record, by key; a corrupt complete record fails the load. */
+  private restore(complete: string): Map<string, T> {
+    const restored = new Map<string, T>();
+    for (const line of complete.split("\n")) {
+      if (!line.trim()) continue;
+      // Validate the complete batch before exposing any of its keyed mutations.
+      for (const entry of this.recordEntries(parsedRecord(line))) restored.set(this.table.key(entry), entry);
+    }
+    return restored;
+  }
+
+  private recordEntries(parsed: unknown): T[] {
+    return this.table.atomicBatches && journalBatch(parsed) ? this.parseBatch(parsed).entries : [this.table.schema.parse(parsed)];
+  }
+
+  /** Drops a torn final record left by a write that did not complete. */
+  private async truncateTo(bytes: number): Promise<void> {
+    const file = await open(this.path, "r+");
+    try { await file.truncate(bytes); await file.sync(); }
+    finally { await file.close(); }
   }
 
   all(): T[] {
@@ -411,20 +515,7 @@ class AppendLog<T extends { [key: string]: unknown }> {
     const file = await open(tmp, "wx", 0o600);
     let renamed = false;
     try {
-      // Bound encoding memory without one syscall per row. An individually
-      // larger validated record is written alone, never combined with a chunk.
-      let chunk: string[] = [];
-      let chunkBytes = 0;
-      for (const entry of entries.values()) {
-        const line = `${JSON.stringify(entry)}\n`;
-        const lineBytes = Buffer.byteLength(line, "utf8");
-        if (chunkBytes > 0 && chunkBytes + lineBytes > COMPACTION_CHUNK_BYTES) {
-          await file.writeFile(chunk.join("")); chunk = []; chunkBytes = 0;
-        }
-        if (lineBytes >= COMPACTION_CHUNK_BYTES) await file.writeFile(line);
-        else { chunk.push(line); chunkBytes += lineBytes; }
-      }
-      if (chunkBytes > 0) await file.writeFile(chunk.join(""));
+      await writeChunked(file, entries.values());
       await file.sync(); await file.close();
       await rename(tmp, this.path); renamed = true;
       await this.syncDirectory(); this.appends = 0;
@@ -455,18 +546,18 @@ export class SupervisorJournal {
   readonly decisions: AppendLog<DecisionRecord>;
   readonly manifests: AppendLog<ReconciliationManifestRecord>;
   readonly erase: AppendLog<EraseRecord>;
-  /** C03 local durable evidence. Never use this table as a terminal owner. */
+  /** Local durable recovery evidence. Never use this table as a terminal owner. */
   readonly recoveryEvidence: AppendLog<RecoveryEvidenceRecord>;
-  /** Consumed integration write nonces (external-integration CP2); never pruned with assignments. */
+  /** Consumed integration write nonces; never pruned with assignments. */
   readonly integrationWrites: AppendLog<IntegrationWriteRecord>;
   readonly planning: PlanningTerminalJournal;
   private readonly planningLog: AppendLog<PlanningTerminalRecord>;
   readonly cancellations: CancellationInbox;
   private readonly cancellationLog: AppendLog<CancellationInboxRecord>;
-  /** C02 pre-fence evidence; not a provider-stop or terminal result. */
+  /** Execution revision pre-fence evidence; not a provider-stop or terminal result. */
   readonly executionRevisionFences: ExecutionRevisionFenceInbox;
   private readonly executionRevisionFenceLog: AppendLog<ExecutionRevisionFenceInboxRecord>;
-  /** C01 diagnostic-only evidence; it never changes delivery or authority. */
+  /** Diagnostic-only companion evidence; it never changes delivery or authority. */
   readonly diagnosticCompanions: DiagnosticCompanionInbox;
   private readonly diagnosticCompanionLog: AppendLog<DiagnosticCompanionInboxRecord>;
 

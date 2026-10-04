@@ -2,8 +2,8 @@ import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { posix, win32 } from "node:path";
 
 /**
- * The Konteks overlay for DeepSeek Harness (`dsh --profile acp`), proven in
- * dsh-runtime-support CP0. `dsh` is the person's own installation (plan D9),
+ * The Konteks overlay for DeepSeek Harness (`dsh --profile acp`). `dsh` is
+ * the person's own installation,
  * so these files ship with the runtime and are written into the runtime-owned
  * directory before each spawn; the hook config needs an absolute path.
  *
@@ -21,7 +21,7 @@ import { posix, win32 } from "node:path";
  *
  * The hook fails open when it cannot run (dsh treats that as non-blocking), so
  * the hook command is a shell built-in printing a fixed decision, and the
- * supervisor keeps a tripwire for a gated call that never asked (plan CP3).
+ * supervisor keeps a tripwire for a gated call that never asked.
  */
 
 /** Tools that never change anything; every other tool asks first. */
@@ -49,9 +49,9 @@ const DISABLED_ROWS = [
 const ROWS_SINCE_0_1_7: ReadonlySet<string> = new Set(["deepseek-account", "llm-deepseek-account", "tool-plugin-manager"]);
 const ROWS_SINCE_0_1_7_VERSION = "0.1.7-rc.2";
 
-export const DSH_KONTEKS_MODEL = { provider: "deepseek-official", model: "deepseek-flash" } as const;
+const DSH_KONTEKS_MODEL = { provider: "deepseek-official", model: "deepseek-flash" } as const;
 
-export interface DshProfileRowExpectation {
+interface DshProfileRowExpectation {
   id: string;
   /** Expected module; checked only when set. */
   name?: string;

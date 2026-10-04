@@ -18,7 +18,9 @@ import {
   signBody,
   type AgentTurnUsageObservation,
   type ControlAck,
+  type ControlEmitter,
   type ControlHandler,
+  type ControlRequest,
   type ControlLoginEvent,
   type ConnectedAgentView,
   type ConnectorCommandsManifest,
@@ -70,14 +72,14 @@ import type { SessionPreviewAccess } from "./preview/mcp-server.js";
 import { provisioningCredentialIsExpired, refreshProvisioningCredential, submitReadiness } from "./provisioning/activation.js";
 import { Reconciliation } from "./reconnect/reconciliation.js";
 import { ChannelMux } from "./relay/channel-mux.js";
-import { RelayClient } from "./relay/relay-client.js";
+import { RelayClient, type RelayClientOptions } from "./relay/relay-client.js";
 import type { RunnerPort } from "./runner-port.js";
 import { NativeRunner, type NativeRunnerOptions } from "./native/runner.js";
 import { ModelCapabilitySnapshotProducer, antigravityOptionBilling, openCodeOptionBilling } from "./native/model-capability-snapshot.js";
 import { NativeInventoryCollector, machineHasDesktop } from "./native/inventory.js";
 import { windowsInstalledLauncher } from "./native/windows-launcher.js";
 import { antigravityRunnerCapabilities, openCodeRunnerCapabilities, siteLoginRelay } from "./native/site-login.js";
-import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerWatch } from "./native/on-computer.js";
+import { ON_COMPUTER_AGENTS, canOpenOnComputer, onComputerDone, onComputerScript, openOnComputer, planOnComputer, readOnComputerWatches, releaseLauncher, removeOnComputerWatch, standInTerminalEnv, writeOnComputerWatch, type OnComputerAgent, type OnComputerPlan, type OnComputerWatch } from "./native/on-computer.js";
 import { antigravityDownloadState, withAntigravityDownload } from "./native/antigravity-download.js";
 import { antigravityDiskBytes, antigravityPin } from "./native/antigravity-installation.js";
 import { BROWSER_TOOL_CAPABILITY, resolveConnectorBrowser, withConnectorBrowser, type ConnectorBrowserStatus } from "./native/browser-capability.js";
@@ -98,7 +100,8 @@ import { PermissionBroker } from "./session/permissions.js";
 import { EvaluatorPolicyResponder } from "./session/policy-responder.js";
 import { createWorkspaceToolPolicy } from "./session/workspace-tool-policy.js";
 import { ClaudeExecutableIdentity } from "./native/claude-executable-identity.js";
-import { SupervisorJournal } from "./state/journal.js";
+import { SupervisorJournal, type JournalEntry } from "./state/journal.js";
+import type { RuntimeRecoveryRecord } from "./state/runtime-recovery.js";
 import { DurableOutbox } from "./state/outbox.js";
 import { DEFAULT_CONFIG, MACHINE_KEY_LOST, SupervisorStore, type ConfigRecord, type ShutdownProgress } from "./state/store.js";
 import { buildSupportBundle } from "./support/bundle.js";
@@ -135,14 +138,14 @@ const LIVENESS_CHECK_MS = 30_000;
 const ON_COMPUTER_WATCH_MS = 30 * 60_000;
 /** How often the connector looks whether that step's agent reads ready. */
 const ON_COMPUTER_POLL_MS = 5_000;
-/** A turn's start or end is told to Core this soon, not at the next 30 s heartbeat (WS1-179). */
+/** A turn's start or end is told to Core this soon, not at the next 30 s heartbeat. */
 const TURN_ACTIVITY_HEARTBEAT_MS = 500;
 const LIVENESS_MIN_BUDGET_MS = 5 * 60_000;
 /**
  * How long Core may keep refusing this runtime's lapsed lease (Core answers,
  * the lease is gone) before the service restarts into its startup reconnect,
- * which proves the machine key and gets a fresh lease. Nothing renewed a lapsed
- * lease in a running process (RCA 2026-09-30: offline 13 h, then 6 h).
+ * which proves the machine key and gets a fresh lease. Nothing else renews a
+ * lapsed lease in a running process.
  */
 const LEASE_LAPSE_RESTART_MS = 2 * 60_000;
 /** How often a runtime Core refuses as too old re-reads the release channel. */
@@ -168,9 +171,9 @@ export interface SupervisorOptions {
     repositoryCacheRoot?: string;
     prepareRepositoryWorktree?: (cwd: string, agentId: string) => Promise<void | "unavailable" | "skipped" | "wired">;
     runtimeOptions?: NativeRunnerOptions["runtimeOptions"];
-    /** Host agents the installation lists but could not find or verify at load; left out and retried (opencode CP6). */
+    /** Host agents the installation lists but could not find or verify at load; left out and retried. */
     unavailableAgents?: NativeUnavailableAgent[];
-    /** The connector's QA browser (O8); resolved from the runners' packages and the person's Node when absent (tests pass it). */
+    /** The connector's QA browser; resolved from the runners' packages and the person's Node when absent (tests pass it). */
     browser?: ConnectorBrowserStatus;
     /** Test/embedding seam for the independently supervised shared Codex owner. */
     codexAppServerOptions?: Omit<NativeCodexAppServerOwnerOptions, "config">;
@@ -179,7 +182,7 @@ export interface SupervisorOptions {
     /**
      * This release and the update ledger: while an update is still checking
      * this release (its health gate), it takes no new work, so a rollback
-     * never stops it under a claim (D113b).
+     * never stops it under a claim.
      */
     updateProbation?: { releaseId: string; readLedger: () => Promise<NativeUpdateLedger>; pollMs?: number; staleAttemptMs?: number };
   };
@@ -209,11 +212,11 @@ export class Supervisor {
   private hostSettings = { openCodeFreeModels: false, coreAcceptsRouteBilling: false };
   /** The Core wire-contract version from the applied desired configuration (absent before one is applied). */
   private coreContractVersion: string | undefined;
-  /** Runs `integration` work (external-integration CP2); composed with the native runners. */
+  /** Runs `integration` work; composed with the native runners. */
   private integrationCarrier: IntegrationWorkCarrier | undefined;
   private roleBindings: RoleBinding[] = [];
   private draining = false;
-  /** An update is still checking this release; no new work until it keeps it (D113b). */
+  /** An update is still checking this release; no new work until it keeps it. */
   private onUpdateProbation = false;
   private probationTimer: NodeJS.Timeout | null = null;
   private drainReason: string | null = null;
@@ -221,16 +224,16 @@ export class Supervisor {
   private drainDeadline: string | null = null;
   private pendingRevocation = false;
   private lastSnapshot: InventorySnapshot | null = null;
-  /** This release's `konteks-remote` commands at its bundle version (runtime-view R20), built once; null when the table or version does not parse. */
+  /** This release's `konteks-remote` commands at its bundle version, built once; null when the table or version does not parse. */
   private connectorCommandsCache: { manifest: ConnectorCommandsManifest | null } | null = null;
   private connectorCommands(): ConnectorCommandsManifest | undefined {
     this.connectorCommandsCache ??= { manifest: connectorCommandsManifest(this.config.SUPERVISOR_BUNDLE_VERSION) };
     return this.connectorCommandsCache.manifest ?? undefined;
   }
-  /** The cached detection of supported agents the installation does not list (runtime-view R21). */
+  /** The cached detection of supported agents the installation does not list. */
   private notAddedAgents: NotAddedAgentsDetector | null = null;
   /**
-   * The machine's own git (OB6 §5). It is a field rather than a dependency
+   * The machine's own git. It is a field rather than a dependency
    * because every onboard lane — role advertisement, the evidence collector
    * and the relocation worker — must use the SAME access, or a runtime could
    * advertise a capability one path has and another does not.
@@ -267,7 +270,7 @@ export class Supervisor {
   readonly runners = new Map<string, RunnerPort>();
   private readonly nativeRunners: NativeRunner[] = [];
   private nativeCodexOwner: NativeCodexAppServerOwner | null = null;
-  /** The QA browser every agent's sessions get (O8), or why this connector has none. */
+  /** The QA browser every agent's sessions get, or why this connector has none. */
   private connectorBrowser: ConnectorBrowserStatus = { available: false, reason: "no_package", message: "" };
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
@@ -351,7 +354,32 @@ export class Supervisor {
   }
 
   private async startImpl(): Promise<void> {
-    if (!this.options.native) throw new RemoteInstanceError("protocol_incompatible", "Native supervisor composition requires explicit native dependencies.");
+    const native = this.options.native;
+    if (!native) throw new RemoteInstanceError("protocol_incompatible", "Native supervisor composition requires explicit native dependencies.");
+    await this.openNativeState();
+    const identity = await this.loadActivation(native);
+    await this.restoreStoredLease(identity.instanceId);
+    this.composeCoreDeliveries();
+    await this.composeLocalAgents(native, identity.instanceId);
+    this.composeInventory(native);
+    this.composeModelCapabilities();
+    await this.composeMux();
+    const verifier = new CoreSignatureVerifier(this.roots);
+    this.relay = this.config.SUPERVISOR_RELAY_URL ? this.createRelayClient(this.config.SUPERVISOR_RELAY_URL, verifier) : null;
+    this.composeTransport();
+    await this.composeControl(verifier);
+    this.composeWork(native, verifier);
+    this.composeRecovery(verifier);
+    this.composeHeartbeat();
+    await this.startLocalAgents(native);
+    this.lastSnapshot = await this.inventory.collect();
+    if (this.stopping) return;
+    await this.enterLifecycle();
+    this.startChannelTimers();
+  }
+
+  /** Take the state directory, sweep leftover previews and load the journals. */
+  private async openNativeState(): Promise<void> {
     this.nativeOwnership = acquireNativeRootLock(this.config.SUPERVISOR_DATA_DIR, { onLost: () => {
       this.logger.error("native state ownership lost; stopping without reacquisition");
       void this.stop().catch(() => this.logger.error("native ownership-loss shutdown failed"));
@@ -362,55 +390,74 @@ export class Supervisor {
     await this.journal.load();
     await this.outbox.load();
     await this.beginUpdateProbation();
-    // A native machine that has an identity but no key has lost the only
-    // proof of who it is. A fresh key would be refused by Core on every call
-    // while the process looked alive (W1-L1), so it stops and says so;
-    // `konteks-remote onboard` connects the machine again as a new runtime.
+  }
+
+  /**
+   * A native machine that has an identity but no key has lost the only proof
+   * of who it is. A fresh key would be refused by Core on every call while
+   * the process looked alive, so it stops and says so; `konteks-remote
+   * onboard` connects the machine again as a new runtime.
+   */
+  private async loadInstanceKey(): Promise<void> {
     const knownIdentity = await this.store.identity().catch(() => null);
     const existingKey = knownIdentity ? await this.store.loadInstanceKey() : null;
     if (knownIdentity && !existingKey) {
       throw new RemoteInstanceError("install_state_corrupt", MACHINE_KEY_LOST);
     }
     this.key = existingKey ?? await this.store.loadOrCreateInstanceKey();
-    this.roots = (this.options.native.trustedRoots ?? []).map(root => EmbeddedReleaseRootSchema.parse(root));
+  }
+
+  /** The stored activation, with its signed release verified against the installed one. */
+  private async loadActivation(native: NativeOptions): Promise<StoredIdentity> {
+    await this.loadInstanceKey();
+    this.roots = (native.trustedRoots ?? []).map(root => EmbeddedReleaseRootSchema.parse(root));
     const identity = await this.store.identity();
     const manifest = await this.store.manifest();
+    this.adoptIdentity(identity);
+    this.manifestDigest = manifest?.manifestDigest ?? "";
+    if (!identity || !manifest) throw new RemoteInstanceError("install_state_corrupt", "Native activation and release state are required before startup.");
+    await this.verifyInstalledRelease(native, manifest);
+    return identity;
+  }
+
+  private adoptIdentity(identity: StoredIdentity | null): void {
     this.instanceId = identity?.instanceId ?? null;
     this.workspaceId = identity?.workspaceId ?? null;
     this.administrativeStatus = identity?.administrativeStatus ?? "unknown";
-    this.manifestDigest = manifest?.manifestDigest ?? "";
-    if (!identity || !manifest) throw new RemoteInstanceError("install_state_corrupt", "Native activation and release state are required before startup.");
+  }
+
+  private async verifyInstalledRelease(native: NativeOptions, manifest: StoredManifest): Promise<void> {
     try {
       this.nativeRelease = verifyNativeRelease(JSON.parse(await readFile(this.config.SUPERVISOR_RELEASE_MANIFEST_FILE, "utf8")), this.roots, this.clock.now());
       const exchange = verifyNativeRelease(manifest.manifest, this.roots, this.clock.now());
       if (manifest.manifestDigest !== exchange.manifest.digest || this.nativeRelease.manifest.bundleVersion !== this.config.SUPERVISOR_BUNDLE_VERSION) throw new Error("release mismatch");
-      await verifyInstalledNativeBridges(this.nativeRelease, this.options.native!.runners, { os: this.config.SUPERVISOR_PLATFORM_OS, architecture: this.config.SUPERVISOR_PLATFORM_ARCH });
+      await verifyInstalledNativeBridges(this.nativeRelease, native.runners, { os: this.config.SUPERVISOR_PLATFORM_OS, architecture: this.config.SUPERVISOR_PLATFORM_ARCH });
       if (manifest.manifestDigest !== this.nativeRelease.manifest.digest) {
-        // D160 release evolution can be interrupted after the immutable
-        // successor and runtime record advance but before this projection.
-        // Only a strictly newer independently verified installed release may
-        // repair it; downgrade and same-version digest substitution refuse.
+        // Release evolution can be interrupted after the immutable successor
+        // and runtime record advance but before this projection. Only a
+        // strictly newer independently verified installed release may repair
+        // it; downgrade and same-version digest substitution refuse.
         if (compareSemver(this.nativeRelease.manifest.bundleVersion, exchange.manifest.bundleVersion) <= 0) throw new Error("release projection mismatch");
         await this.store.saveManifest(this.nativeRelease.manifest, this.nativeRelease.manifest.digest);
       }
       this.manifestDigest = this.nativeRelease.manifest.digest;
     } catch { throw new RemoteInstanceError("bundle_untrusted", "Native startup requires matching signed activation and installed release artifacts."); }
-    const storedLease = await this.store.lease();
-    if (storedLease) {
-      const claims = decodeStoredLeaseClaims(storedLease.lease, { instanceId: this.instanceId!, audience: LEASE_AUDIENCE });
-      if (claims.workspace_id !== this.workspaceId || storedLease.workspaceId !== this.workspaceId) throw new RemoteInstanceError("registration_mismatch", "lease workspace does not match the native activation");
-      const expected = leaseRecordFromClaims(storedLease.lease, claims);
-      if (storedLease.mode !== expected.mode
-        || Date.parse(storedLease.expiresAt) !== Date.parse(expected.expiresAt)
-        || Date.parse(storedLease.issuedAt) !== Date.parse(expected.issuedAt)
-        || (storedLease.drainDeadline === null ? null : Date.parse(storedLease.drainDeadline))
-          !== (expected.drainDeadline === null ? null : Date.parse(expected.drainDeadline))) {
-        throw new RemoteInstanceError("registration_mismatch", "stored lease metadata does not match its decoded claims");
-      }
-      this.lease.set(storedLease);
-      this.workspaceId = storedLease.workspaceId;
-    }
+  }
 
+  /** A stored lease is adopted only when it belongs to this workspace and its metadata matches its decoded claims. */
+  private async restoreStoredLease(instanceId: string): Promise<void> {
+    const storedLease = await this.store.lease();
+    if (!storedLease) return;
+    const claims = decodeStoredLeaseClaims(storedLease.lease, { instanceId, audience: LEASE_AUDIENCE });
+    if (claims.workspace_id !== this.workspaceId || storedLease.workspaceId !== this.workspaceId) throw new RemoteInstanceError("registration_mismatch", "lease workspace does not match the native activation");
+    if (!sameLeaseRecord(storedLease, leaseRecordFromClaims(storedLease.lease, claims))) {
+      throw new RemoteInstanceError("registration_mismatch", "stored lease metadata does not match its decoded claims");
+    }
+    this.lease.set(storedLease);
+    this.workspaceId = storedLease.workspaceId;
+  }
+
+  private composeCoreDeliveries(): void {
     this.core = new CoreClient({
       baseUrl: this.config.SUPERVISOR_CORE_URL,
       clock: this.clock,
@@ -423,31 +470,34 @@ export class Supervisor {
     this.observationDelivery.start();
     this.configurationAcks = new ConfigurationAckDelivery({ outbox: this.outbox, core: this.core, instanceId: () => this.instanceId ?? "", clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId) });
     this.executionRevisionFenceReceipts = new ExecutionRevisionFenceReceiptDelivery({ outbox: this.outbox, core: this.core, clock: this.clock, canSend: () => !this.stopping && Boolean(this.instanceId), logger: this.logger });
-    const sharedCodex = this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === "codex" && config.RUNNER_NATIVE_CODEX_SOCKET !== undefined);
+  }
+
+  private async composeLocalAgents(native: NativeOptions, instanceId: string): Promise<void> {
+    const sharedCodex = native.runners.find(config => config.RUNNER_AGENT_ID === "codex" && config.RUNNER_NATIVE_CODEX_SOCKET !== undefined);
     if (sharedCodex) this.nativeCodexOwner = new NativeCodexAppServerOwner({
-      ...this.options.native!.codexAppServerOptions,
+      ...native.codexAppServerOptions,
       config: sharedCodex,
       onRestartFailure: error => this.logger.warn({ err: error }, "shared Codex app-server restart failed; retrying"),
     });
-    // The QA browser is the connector's, not an agent package's (O8): every
+    // The QA browser is the connector's, not an agent package's: every
     // agent's sessions get it when an installed Claude Code or Codex package
     // carries it and some Node can run it.
-    this.connectorBrowser = this.options.native!.browser ?? await resolveConnectorBrowser(this.options.native!.runners);
+    this.connectorBrowser = native.browser ?? await resolveConnectorBrowser(native.runners);
     if (this.connectorBrowser.available) {
       this.logger.info({ event: "browser.connector_ready", packageAgent: this.connectorBrowser.browser.packageAgent, nodeSource: this.connectorBrowser.browser.nodeSource }, "the QA browser is available to every agent on this computer");
     } else {
       this.logger.warn({ event: "browser.connector_unavailable", reason: this.connectorBrowser.reason }, this.connectorBrowser.message);
     }
-    this.nativeRunnerInstanceId = identity!.instanceId;
-    for (const config of withConnectorBrowser(this.options.native!.runners, this.connectorBrowser)) {
+    this.nativeRunnerInstanceId = instanceId;
+    for (const config of withConnectorBrowser(native.runners, this.connectorBrowser)) {
       const runner = this.createNativeRunner(config);
       this.nativeRunners.push(runner);
       this.runners.set(runner.agentId, runner);
     }
-    // external-integration CP2: integration tasks (discovery, setup, gated
+    // Integration tasks (discovery, setup, gated
     // read/write/verify sessions) on this computer's Claude Code and Codex.
     this.integrationCarrier = composeIntegrationCarrier({
-      configs: this.options.native!.runners,
+      configs: native.runners,
       runners: () => this.runners,
       fetchWorkload: assignment => this.core.fetchWorkload(this.instanceId ?? "", assignment.id),
       instanceId: () => this.instanceId ?? "",
@@ -460,9 +510,12 @@ export class Supervisor {
     const recorded = this.recordedAgentIds();
     this.notAddedAgents = new NotAddedAgentsDetector({ agentIds: SUPPORTED_AGENT_IDS.filter(agentId => !recorded.has(agentId)) });
     void this.notAddedAgents.refreshIfDue().catch(() => undefined);
+  }
+
+  private composeInventory(native: NativeOptions): void {
     // The personal Claude Code executable a claude-code runner runs: its
-    // version and digest ride the capabilities (S0-5).
-    const claudeExecutable = this.options.native!.runners.find(runner => runner.RUNNER_AGENT_ID === "claude-code")?.RUNNER_NATIVE_CLAUDE_EXECUTABLE;
+    // version and digest ride the capabilities.
+    const claudeExecutable = native.runners.find(runner => runner.RUNNER_AGENT_ID === "claude-code")?.RUNNER_NATIVE_CLAUDE_EXECUTABLE;
     const claudeIdentity = claudeExecutable ? new ClaudeExecutableIdentity(claudeExecutable, { logger: this.logger }) : null;
     this.inventory = new NativeInventoryCollector({ runners: this.runners, sampler: new SignalSampler(this.config.SUPERVISOR_DATA_DIR), bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
       gitVersion: () => this.git.version(),
@@ -473,7 +526,7 @@ export class Supervisor {
         if (!this.work || !this.nativeOwnership || this.stopping) return false;
         try { this.nativeOwnership.assertOwned(); return true; } catch { return false; }
       },
-      // A site-started login needs a native install with a Codex runner (WS1-115).
+      // A site-started login needs a native install with a Codex runner.
       agentLoginReady: () => this.runners.has("codex") && !this.stopping && this.relay !== null && this.relay !== undefined,
       agentLoginBrowserReady: () => this.runners.has("claude-code") && !this.stopping && this.relay !== null && this.relay !== undefined && machineHasDesktop(),
       additionalCapabilities: () => [...this.openCodeCapabilities(), ...this.antigravityCapabilities(), ...this.onComputerCapabilities(), ...(this.browserToolReady() ? [BROWSER_TOOL_CAPABILITY] : []),
@@ -493,6 +546,9 @@ export class Supervisor {
         try { this.nativeOwnership.assertOwned(); return true; } catch { return false; }
       },
     });
+  }
+
+  private composeModelCapabilities(): void {
     this.modelCapabilities = new ModelCapabilitySnapshotProducer({
       clock: this.clock, instanceId: () => this.instanceId ?? "", runnerIncarnation: () => this.runnerIncarnation,
       manifestId: () => this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation)?.manifest?.manifestId ?? null,
@@ -508,12 +564,14 @@ export class Supervisor {
         if (!runner) throw new RemoteInstanceError("agent_unavailable", "Reviewed model mapping has no installed native runner.");
         return runner.discoverModelCapability(configId);
       },
-      // OpenCode's routes bill by provider and credential (O7, O11); only a
+      // OpenCode's routes bill by provider and credential; only a
       // 7.1.0 Core takes the field (the shape is strict and digested).
       optionBilling: (agentId, value, agent) => (!this.hostSettings.coreAcceptsRouteBilling ? undefined
         : agentId === "opencode" ? openCodeOptionBilling(agent, value) : agentId === "antigravity" ? antigravityOptionBilling(agent) : undefined),
     });
+  }
 
+  private async composeMux(): Promise<void> {
     this.mux = new ChannelMux({
       recoveryAuthority: () => this.recoveryAuthority(),
       clock: this.clock,
@@ -539,7 +597,7 @@ export class Supervisor {
           if (this.mux.connectionEpoch !== frame.connectionEpoch) throw new RemoteInstanceError("recovery_required", "Assignment reply socket epoch changed.");
         });
       },
-      // This callback selects the retained D143 carrier, even before a sender
+      // This callback selects the retained assignment carrier, even before a sender
       // has cursors. Keep its composition aligned with assignmentSender below.
       ...(String(REMOTE_INSTANCE_PROTOCOL_VERSION) === "2.0"
         ? { assignmentCursors: () => this.assignmentSender?.relayCursors() ?? null }
@@ -554,7 +612,7 @@ export class Supervisor {
     // A preview stream never outlives the process that served it, and Core
     // opens every preview grant counting from zero: counts kept from the last
     // process made the new one drop Core's first requests as duplicates and
-    // answer out of sequence after an update (W1-Z7). They start fresh.
+    // answer out of sequence after an update. They start fresh.
     const durableChannelOf = (channelId: string) => {
       const channel = channelOf(channelId);
       return channel === "preview" ? null : channel;
@@ -562,175 +620,177 @@ export class Supervisor {
     if (relayState) this.mux.restoreDurableState(relayState, durableChannelOf);
     else this.mux.restoreCursors(await this.store.cursors(), durableChannelOf);
     if (this.instanceId) this.openCoreChannels(this.instanceId);
+  }
 
-    const verifier = new CoreSignatureVerifier(this.roots);
-    this.relay = this.config.SUPERVISOR_RELAY_URL
-      ? new RelayClient({
-          relayUrl: this.config.SUPERVISOR_RELAY_URL,
-          instanceId: () => this.instanceId ?? "",
-          runnerIncarnation: () => this.runnerIncarnation,
-          appliedManifestId: () => this.recoveryAuthority() ? this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation)?.manifest?.manifestId ?? null : null,
-          lease: () => this.lease.current()?.lease ?? null,
-          key: () => this.key,
-          clock: this.clock,
-          mux: this.mux,
-          outboundHighWaterBytes: Math.max(64 * 1024, Math.floor(this.config.SUPERVISOR_REPLAY_BUFFER_BYTES / 2)),
-          outboundLowWaterBytes: Math.max(32 * 1024, Math.floor(this.config.SUPERVISOR_REPLAY_BUFFER_BYTES / 4)),
-          outboundMaxBytes: this.config.SUPERVISOR_REPLAY_BUFFER_BYTES,
-          onStateChange: (state) => {
-            if (state !== "connected") this.revisionFenceConnection = null;
-            this.transport.evaluate();
-          },
-          validateHandshake: result => this.validateRelayHandshake(result),
-          onConnected: result => this.onRelayConnected(result),
-          onAgentLogin: request => this.onAgentLogin(request, verifier),
-          onPermissionAnswer: async (request, connection) => {
-            const producer = this.config.SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER;
-            if (!producer) throw new RemoteInstanceError("recovery_required", "Core answer producer is not configured");
-            const lease = this.lease.current(), instanceId = this.instanceId, workspaceId = this.workspaceId;
-            const runnerIncarnation = this.runnerIncarnation, ownership = this.nativeOwnership;
-            const accepted = this.recoveryAuthority();
-            const receiver = new PermissionAnswerReceiver({
-              verifier, core: this.core, coreProducer: producer, now: () => this.clock.coreNow(),
-              deliver: (operation, claims, guard) => this.work.onPermissionAnswer(operation, claims, guard),
-              captureConnection: () => lease && instanceId && workspaceId && ownership && accepted ? {
-                instanceId, workspaceId, runnerIncarnation, connectionEpoch: connection.connectionEpoch, leaseExpiresAt: lease.expiresAt,
-                assertCurrent: () => {
-                  connection.assertCurrent();
-                  if (this.stopping || this.nativeOwnership !== ownership || this.lease.current() !== lease ||
-                    this.instanceId !== instanceId || this.workspaceId !== workspaceId || this.runnerIncarnation !== runnerIncarnation ||
-                    this.recoveryAuthority() !== accepted || !this.lease.canPullNewWork()) {
-                    throw new RemoteInstanceError("recovery_required", "Answer execution ownership is not current");
-                  }
-                  ownership.assertOwned();
-                },
-              } : null,
-            });
-            await receiver.receive(request);
-          },
-          onCancellation: async (request, connection) => {
-            const lease = this.lease.current();
-            const instanceId = this.instanceId;
-            const workspaceId = this.workspaceId;
-            const runnerIncarnation = this.runnerIncarnation;
-            const ownership = this.nativeOwnership;
-            const receiver = new CancellationReceiver({
-              core: this.core,
-              onPersisted: record => this.cancellationReplay?.notify(record),
-              verifier, inbox: this.journal.cancellations, claims: this.journal.execution,
-              now: () => this.clock.coreNow(),
-              captureConnection: () => lease && instanceId && workspaceId && ownership ? {
-                instanceId, workspaceId, runnerIncarnation, connectionEpoch: connection.connectionEpoch,
-                leaseExpiresAt: lease.expiresAt,
-                assertCurrent: () => {
-                  connection.assertCurrent();
-                  if (this.stopping || this.nativeOwnership !== ownership || this.lease.current() !== lease ||
-                      this.instanceId !== instanceId || this.workspaceId !== workspaceId ||
-                      this.runnerIncarnation !== runnerIncarnation) {
-                    throw new RemoteInstanceError("recovery_required", "Cancellation native ownership is not current");
-                  }
-                  ownership.assertOwned();
-                },
-              } : null,
-            });
-            await receiver.receive(request);
-          },
-          onDiagnosticCompanion: async (request, connection) => {
-            const lease = this.lease.current();
-            const instanceId = this.instanceId;
-            const workspaceId = this.workspaceId;
-            const runnerIncarnation = this.runnerIncarnation;
-            const ownership = this.nativeOwnership;
-            const receiver = new DiagnosticCompanionReceiver({
-              verifier,
-              inbox: this.journal.diagnosticCompanions,
-              now: () => this.clock.coreNow(),
-              onAccepted: record => {
-                const match = record.companion.match;
-                const active = this.journal.activeAssignments().find(entry =>
-                  entry.assignmentId === match.assignmentId && entry.attempt === match.attempt,
-                );
-                const retained = active ? this.journal.execution.start(match.assignmentId, match.attempt) : undefined;
-                const operation = active && retained && active.claimId === retained.admission.claimId
-                  ? {
-                      assignmentId: active.assignmentId,
-                      attempt: active.attempt,
-                      claimId: retained.admission.claimId,
-                      executionId: retained.admission.executionGeneration,
-                      runtimeIncarnationId: retained.admission.runnerIncarnation,
-                    }
-                  : null;
-                const observation = diagnosticCompanionOperationalObservation(record, operation);
-                if (observation.event === "runtime.diagnostic_companion.coverage_incomplete") {
-                  this.logger.warn(observation, "diagnostic companion coverage is incomplete");
-                } else {
-                  this.logger.info(observation, "diagnostic companion persisted for active operation");
-                }
-              },
-              captureConnection: () => lease && instanceId && workspaceId && ownership ? {
-                instanceId,
-                workspaceId,
-                runnerIncarnation,
-                nodeId: request.nodeId,
-                connectionRef: request.connectionRef,
-                connectionEpoch: connection.connectionEpoch,
-                assertCurrent: () => {
-                  connection.assertCurrent();
-                  if (this.stopping || this.nativeOwnership !== ownership ||
-                    this.lease.current() !== lease || this.instanceId !== instanceId ||
-                    this.workspaceId !== workspaceId ||
-                    this.runnerIncarnation !== runnerIncarnation) {
-                    throw new RemoteInstanceError("recovery_required", "Diagnostic companion ownership is not current");
-                  }
-                  ownership.assertOwned();
-                },
-              } : null,
-            });
-            await receiver.receive(request);
-          },
-          onExecutionRevisionControl: async (request, connection) => {
-            const lease = this.lease.current();
-            const instanceId = this.instanceId;
-            const workspaceId = this.workspaceId;
-            const runnerIncarnation = this.runnerIncarnation;
-            const ownership = this.nativeOwnership;
-            const accepted = this.recoveryAuthority();
-            const assertCurrent = () => {
-              connection.assertCurrent();
-              if (this.stopping || !lease || !instanceId || !workspaceId || !ownership ||
-                  this.nativeOwnership !== ownership || this.lease.current() !== lease ||
-                  this.instanceId !== instanceId || this.workspaceId !== workspaceId ||
-                  this.runnerIncarnation !== runnerIncarnation || this.recoveryAuthority() !== accepted) {
-                throw new RemoteInstanceError("recovery_required", "Revision-control native ownership is not current");
-              }
-              ownership.assertOwned();
-            };
-            const receiver = new ExecutionRevisionControlReceiver({
-              verifier,
-              inbox: this.journal.executionRevisionFences,
-              now: () => this.clock.coreNow(),
-              monotonicNow: () => performance.now(),
-              captureConnection: () => lease && instanceId && workspaceId && ownership && accepted ? {
-                instanceId,
-                workspaceId,
-                runnerIncarnation,
-                nodeId: request.nodeId,
-                connectionRef: request.connectionRef,
-                connectionEpoch: connection.connectionEpoch,
-                assertCurrent,
-              } : null,
-            });
-            await receiver.receive(request);
-            assertCurrent();
-            this.revisionFenceConnection = {
-              connectionRef: request.connectionRef,
-              connectionEpoch: connection.connectionEpoch,
-              assertCurrent,
-            };
-          },
-        })
+  private createRelayClient(relayUrl: string, verifier: CoreSignatureVerifier): RelayClient {
+    return new RelayClient({
+      relayUrl,
+      instanceId: () => this.instanceId ?? "",
+      runnerIncarnation: () => this.runnerIncarnation,
+      appliedManifestId: () => this.recoveryAuthority() ? this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation)?.manifest?.manifestId ?? null : null,
+      lease: () => this.lease.current()?.lease ?? null,
+      key: () => this.key,
+      clock: this.clock,
+      mux: this.mux,
+      outboundHighWaterBytes: Math.max(64 * 1024, Math.floor(this.config.SUPERVISOR_REPLAY_BUFFER_BYTES / 2)),
+      outboundLowWaterBytes: Math.max(32 * 1024, Math.floor(this.config.SUPERVISOR_REPLAY_BUFFER_BYTES / 4)),
+      outboundMaxBytes: this.config.SUPERVISOR_REPLAY_BUFFER_BYTES,
+      onStateChange: (state) => {
+        if (state !== "connected") this.revisionFenceConnection = null;
+        this.transport.evaluate();
+      },
+      validateHandshake: result => this.validateRelayHandshake(result),
+      onConnected: result => this.onRelayConnected(result),
+      onAgentLogin: request => this.onAgentLogin(request, verifier),
+      onPermissionAnswer: (request, connection) => this.receivePermissionAnswer(request, connection, verifier),
+      onCancellation: (request, connection) => this.receiveCancellation(request, connection, verifier),
+      onDiagnosticCompanion: (request, connection) => this.receiveDiagnosticCompanion(request, connection, verifier),
+      onExecutionRevisionControl: (request, connection) => this.receiveExecutionRevisionControl(request, connection, verifier),
+        });
+  }
+
+  private async receivePermissionAnswer(request: RelayRequestOf<"onPermissionAnswer">, connection: RelayConnectionOf<"onPermissionAnswer">, verifier: CoreSignatureVerifier): Promise<void> {
+    const producer = this.config.SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER;
+    if (!producer) throw new RemoteInstanceError("recovery_required", "Core answer producer is not configured");
+    const owner = this.captureOwner();
+    const accepted = this.recoveryAuthority();
+    const { lease, instanceId, workspaceId, runnerIncarnation, ownership } = owner;
+    const receiver = new PermissionAnswerReceiver({
+      verifier, core: this.core, coreProducer: producer, now: () => this.clock.coreNow(),
+      deliver: (operation, claims, guard) => this.work.onPermissionAnswer(operation, claims, guard),
+      captureConnection: () => lease && instanceId && workspaceId && ownership && accepted ? {
+        instanceId, workspaceId, runnerIncarnation, connectionEpoch: connection.connectionEpoch, leaseExpiresAt: lease.expiresAt,
+        assertCurrent: () => {
+          connection.assertCurrent();
+          if (!this.ownerUnchanged(owner) || this.recoveryAuthority() !== accepted || !this.lease.canPullNewWork()) {
+            throw new RemoteInstanceError("recovery_required", "Answer execution ownership is not current");
+          }
+          ownership.assertOwned();
+        },
+      } : null,
+    });
+    await receiver.receive(request);
+  }
+
+  private async receiveCancellation(request: RelayRequestOf<"onCancellation">, connection: RelayConnectionOf<"onCancellation">, verifier: CoreSignatureVerifier): Promise<void> {
+    const owner = this.captureOwner();
+    const { lease, instanceId, workspaceId, runnerIncarnation, ownership } = owner;
+    const receiver = new CancellationReceiver({
+      core: this.core,
+      onPersisted: record => this.cancellationReplay?.notify(record),
+      verifier, inbox: this.journal.cancellations, claims: this.journal.execution,
+      now: () => this.clock.coreNow(),
+      captureConnection: () => lease && instanceId && workspaceId && ownership ? {
+        instanceId, workspaceId, runnerIncarnation, connectionEpoch: connection.connectionEpoch,
+        leaseExpiresAt: lease.expiresAt,
+        assertCurrent: () => {
+          connection.assertCurrent();
+          if (!this.ownerUnchanged(owner)) throw new RemoteInstanceError("recovery_required", "Cancellation native ownership is not current");
+          ownership.assertOwned();
+        },
+      } : null,
+    });
+    await receiver.receive(request);
+  }
+
+  private async receiveDiagnosticCompanion(request: RelayRequestOf<"onDiagnosticCompanion">, connection: RelayConnectionOf<"onDiagnosticCompanion">, verifier: CoreSignatureVerifier): Promise<void> {
+    const owner = this.captureOwner();
+    const { lease, instanceId, workspaceId, runnerIncarnation, ownership } = owner;
+    const receiver = new DiagnosticCompanionReceiver({
+      verifier,
+      inbox: this.journal.diagnosticCompanions,
+      now: () => this.clock.coreNow(),
+      onAccepted: record => this.onDiagnosticCompanionAccepted(record),
+      captureConnection: () => lease && instanceId && workspaceId && ownership ? {
+        instanceId,
+        workspaceId,
+        runnerIncarnation,
+        nodeId: request.nodeId,
+        connectionRef: request.connectionRef,
+        connectionEpoch: connection.connectionEpoch,
+        assertCurrent: () => {
+          connection.assertCurrent();
+          if (!this.ownerUnchanged(owner)) throw new RemoteInstanceError("recovery_required", "Diagnostic companion ownership is not current");
+          ownership.assertOwned();
+        },
+      } : null,
+    });
+    await receiver.receive(request);
+  }
+
+  /** Log a persisted diagnostic companion against the active operation it matches, if any. */
+  private onDiagnosticCompanionAccepted(record: DiagnosticCompanionRecord): void {
+    const match = record.companion.match;
+    const active = this.journal.activeAssignments().find(entry =>
+      entry.assignmentId === match.assignmentId && entry.attempt === match.attempt,
+    );
+    const retained = active ? this.journal.execution.start(match.assignmentId, match.attempt) : undefined;
+    const operation = active && retained && active.claimId === retained.admission.claimId
+      ? {
+          assignmentId: active.assignmentId,
+          attempt: active.attempt,
+          claimId: retained.admission.claimId,
+          executionId: retained.admission.executionGeneration,
+          runtimeIncarnationId: retained.admission.runnerIncarnation,
+        }
       : null;
-    // The D143 cutover is decided by the protocol this build speaks, not by
+    const observation = diagnosticCompanionOperationalObservation(record, operation);
+    if (observation.event === "runtime.diagnostic_companion.coverage_incomplete") {
+      this.logger.warn(observation, "diagnostic companion coverage is incomplete");
+    } else {
+      this.logger.info(observation, "diagnostic companion persisted for active operation");
+    }
+  }
+
+  private async receiveExecutionRevisionControl(request: RelayRequestOf<"onExecutionRevisionControl">, connection: RelayConnectionOf<"onExecutionRevisionControl">, verifier: CoreSignatureVerifier): Promise<void> {
+    const owner = this.captureOwner();
+    const accepted = this.recoveryAuthority();
+    const { lease, instanceId, workspaceId, runnerIncarnation, ownership } = owner;
+    const assertCurrent = () => {
+      connection.assertCurrent();
+      if (!lease || !instanceId || !workspaceId || !ownership || !this.ownerUnchanged(owner) || this.recoveryAuthority() !== accepted) {
+        throw new RemoteInstanceError("recovery_required", "Revision-control native ownership is not current");
+      }
+      ownership.assertOwned();
+    };
+    const receiver = new ExecutionRevisionControlReceiver({
+      verifier,
+      inbox: this.journal.executionRevisionFences,
+      now: () => this.clock.coreNow(),
+      monotonicNow: () => performance.now(),
+      captureConnection: () => lease && instanceId && workspaceId && ownership && accepted ? {
+        instanceId,
+        workspaceId,
+        runnerIncarnation,
+        nodeId: request.nodeId,
+        connectionRef: request.connectionRef,
+        connectionEpoch: connection.connectionEpoch,
+        assertCurrent,
+      } : null,
+    });
+    await receiver.receive(request);
+    assertCurrent();
+    this.revisionFenceConnection = {
+      connectionRef: request.connectionRef,
+      connectionEpoch: connection.connectionEpoch,
+      assertCurrent,
+    };
+  }
+
+  /** The lease, identity, incarnation and state ownership a relayed request arrived under. */
+  private captureOwner(): CapturedOwner {
+    return { lease: this.lease.current(), instanceId: this.instanceId, workspaceId: this.workspaceId,
+      runnerIncarnation: this.runnerIncarnation, ownership: this.nativeOwnership };
+  }
+
+  /** Not stopping, and still the same state ownership, lease, identity and incarnation. */
+  private ownerUnchanged(owner: CapturedOwner): boolean {
+    return !this.stopping && this.nativeOwnership === owner.ownership && this.lease.current() === owner.lease &&
+      this.instanceId === owner.instanceId && this.workspaceId === owner.workspaceId && this.runnerIncarnation === owner.runnerIncarnation;
+  }
+
+  private composeTransport(): void {
+    // The retained-stream cutover is decided by the protocol this build speaks, not by
     // inspecting a reply: Core refuses the bare routes under 2.0, and a 1.0
     // build has no retained stream to send from. One constant, both halves.
     this.assignmentSender = String(REMOTE_INSTANCE_PROTOCOL_VERSION) === "2.0"
@@ -780,7 +840,9 @@ export class Supervisor {
       hasCapacity: channelId => this.mux.unackedBytes(channelId) < previewWindowBytes,
       logger: this.logger,
     });
+  }
 
+  private async composeControl(verifier: CoreSignatureVerifier): Promise<void> {
     this.control = new ControlHandlers({
       store: this.store,
       journal: this.journal,
@@ -812,7 +874,9 @@ export class Supervisor {
       sendAck: (ack) => this.sendControlAck(ack),
     });
     await this.control.load();
+  }
 
+  private composeWork(native: NativeOptions, verifier: CoreSignatureVerifier): void {
     this.broker = new PermissionBroker({ clock: this.clock, deadlineSeconds: () => this.configuration.permissionResponderDeadlineSeconds, onTimeout: async (request) => this.work.onPermissionTimeout(request) });
     this.work = new WorkOrchestrator({
       verifyCancellation: directive => verifier.verify(directive, directive.signature),
@@ -855,7 +919,7 @@ export class Supervisor {
         catch { return false; }
       },
       recoverPendingDeliveryOutput: createRetainedDeliveryOutputRecovery({
-        roots: this.options.native!.runners.map(config => config.RUNNER_WORKSPACE_DIR),
+        roots: native.runners.map(config => config.RUNNER_WORKSPACE_DIR),
         journal: this.journal,
         mutate: this.stateMutations.run,
         logger: this.logger,
@@ -886,7 +950,7 @@ export class Supervisor {
           const deadlineAtMs = Date.now() + Math.max(0, Date.parse(target.expiresAt) - this.clock.coreNow());
           return this.core.redeemCapabilityToken(this.instanceId ?? "", { assignmentId: target.id, attempt: target.attempt, mcpCapabilityTokenRef: target.agentRoute.mcpCapabilityTokenRef ?? "" }, deadlineAtMs);
         },
-        workspaceRoot: this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
+        workspaceRoot: native.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
         executionAuthority: {
           client: this.core,
           runnerIncarnation: this.runnerIncarnation,
@@ -909,17 +973,17 @@ export class Supervisor {
             this.nativeOwnership.assertOwned();
           },
         }),
-        prepareInputs: this.options.native!.prepareInputs ?? createNativeInputPreparer({
+        prepareInputs: native.prepareInputs ?? createNativeInputPreparer({
           logger: this.logger,
-          root: this.options.native!.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
+          root: native.runners.find(config => config.RUNNER_AGENT_ID === runner.agentId)!.RUNNER_WORKSPACE_DIR,
           clock: this.clock,
           mutate: this.stateMutations.run,
-          ...(this.options.native!.git ? { git: this.options.native!.git } : {}),
-          ...(this.options.native!.repositoryCacheRoot
-            ? { repositoryCacheRoot: this.options.native!.repositoryCacheRoot }
+          ...(native.git ? { git: native.git } : {}),
+          ...(native.repositoryCacheRoot
+            ? { repositoryCacheRoot: native.repositoryCacheRoot }
             : {}),
-          ...(this.options.native!.prepareRepositoryWorktree
-            ? { prepareRepositoryWorktree: this.options.native!.prepareRepositoryWorktree }
+          ...(native.prepareRepositoryWorktree
+            ? { prepareRepositoryWorktree: native.prepareRepositoryWorktree }
             : {}),
           client: () => new NativeInputClient({
             baseUrl: this.config.SUPERVISOR_CORE_URL, roots: this.roots, clock: this.clock,
@@ -929,18 +993,30 @@ export class Supervisor {
             baseUrl: this.config.SUPERVISOR_CORE_URL, clock: this.clock,
             credential: () => this.lease.mode() === "active" ? this.lease.current()?.lease ?? null : null,
           }),
-          claimId: target => {
-            if (this.stopping || !this.nativeOwnership || this.lease.mode() !== "active" || target.instanceId !== this.instanceId || target.workspaceId !== this.workspaceId) return null;
-            this.nativeOwnership.assertOwned();
-            const entry = this.journal.assignments.get(target.id + ":" + target.attempt);
-            if (!entry || entry.workspaceId !== target.workspaceId || entry.placementId !== target.placementId || entry.kind !== target.kind || entry.agentId !== target.agentRoute.agentId ||
-                !["claimed", "running", "checkpointed"].includes(entry.state) || Date.parse(entry.expiresAt) <= this.clock.coreNow()) return null;
-            return entry.claimId;
-          },
+          claimId: target => this.activeClaimId(target),
         }),
       }),
       onUsage: (observation) => this.sendUsageObservation(observation),
     });
+  }
+
+  /** The claim of an active, unexpired assignment this owned, active process holds for `target`; null otherwise. */
+  private activeClaimId(target: RemoteWorkAssignment): string | null {
+    const ownership = this.activeOwnershipFor(target);
+    if (!ownership) return null;
+    ownership.assertOwned();
+    const entry = this.journal.assignments.get(target.id + ":" + target.attempt);
+    if (!entry || !claimMatchesTarget(entry, target)) return null;
+    return Date.parse(entry.expiresAt) <= this.clock.coreNow() ? null : entry.claimId;
+  }
+
+  /** The state ownership of an active lease while not stopping, when `target` names this instance and workspace. */
+  private activeOwnershipFor(target: RemoteWorkAssignment): NonNullable<Supervisor["nativeOwnership"]> | null {
+    if (this.stopping || !this.nativeOwnership || this.lease.mode() !== "active") return null;
+    return target.instanceId === this.instanceId && target.workspaceId === this.workspaceId ? this.nativeOwnership : null;
+  }
+
+  private composeRecovery(verifier: CoreSignatureVerifier): void {
     this.cancellationReplay = new CancellationReplay({
       journal: this.journal,
       stopForRecovery: (assignmentId, attempt) => this.work.stopForRecovery(assignmentId, attempt),
@@ -1023,6 +1099,9 @@ export class Supervisor {
       withLeaseAcquisition: operation => this.withLeaseAcquisition(operation),
     });
 
+  }
+
+  private composeHeartbeat(): void {
     this.heartbeat = new HeartbeatPublisher({
       store: this.store,
       runnerIncarnation: () => this.runnerIncarnation,
@@ -1043,7 +1122,7 @@ export class Supervisor {
       activeAssignmentIds: () => this.work.activeAssignmentIds(),
       modelCapabilitySnapshots: () => this.modelCapabilities?.snapshots() ?? [],
       supportedAgents: agents => this.supportedAgents(agents),
-      // The commands this release carries (runtime-view R20), only to a Core that takes 7.1 fields.
+      // The commands this release carries, only to a Core that takes 7.1 fields.
       connectorCommands: () => (this.hostSettings.coreAcceptsRouteBilling ? this.connectorCommands() : undefined),
       configRevision: () => this.control.configRevision,
       bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
@@ -1052,7 +1131,9 @@ export class Supervisor {
       intervalSeconds: () => this.heartbeatIntervalSeconds ?? this.configuration.heartbeatIntervalSeconds,
       renewalDelayMs: () => this.lease.current() ? this.lease.nextRenewalDelayMs() : 5000,
     });
+  }
 
+  private async startLocalAgents(native: NativeOptions): Promise<void> {
     for (const runner of this.runners.values()) runner.startEvents();
     const agents = await startNativeAgents({
       codexOwner: this.nativeCodexOwner,
@@ -1062,25 +1143,30 @@ export class Supervisor {
         this.logger.error({ err: error, agentId }, "agent could not start; the runtime continues without it");
       },
     });
-    if (this.nativeCodexOwner && !agents.codexOwnerStarted) {
-      // Codex is left out rather than taking every other agent down with it:
-      // it is not advertised, so no work is placed on it. It is tried again
-      // in the background (WS1-018), so a passing failure does not leave it
-      // out until the service happens to restart.
-      this.parkedCodex = { owner: this.nativeCodexOwner, runners: this.nativeRunners.filter(candidate => candidate.agentId === "codex") };
-      this.scheduleCodexRetry();
-      this.nativeCodexOwner = null;
-      for (const runner of this.nativeRunners.filter(candidate => candidate.agentId === "codex")) this.runners.delete(runner.agentId);
-      for (let index = this.nativeRunners.length - 1; index >= 0; index -= 1) {
-        if (this.nativeRunners[index]!.agentId === "codex") this.nativeRunners.splice(index, 1);
-      }
-    }
+    if (this.nativeCodexOwner && !agents.codexOwnerStarted) this.parkFailedCodex(this.nativeCodexOwner);
     // Any other agent that could not start is left out the same way and
     // retried in the background, so one agent never takes the rest down.
     for (const runner of agents.failed) this.parkNativeRunner(runner);
-    for (const entry of this.options.native!.unavailableAgents ?? []) this.parkUnavailableHostAgent(entry);
-    this.lastSnapshot = await this.inventory.collect();
-    if (this.stopping) return;
+    for (const entry of native.unavailableAgents ?? []) this.parkUnavailableHostAgent(entry);
+  }
+
+  /**
+   * Codex is left out rather than taking every other agent down with it: it
+   * is not advertised, so no work is placed on it. It is tried again in the
+   * background, so a passing failure does not leave it out until the service
+   * happens to restart.
+   */
+  private parkFailedCodex(owner: NativeCodexAppServerOwner): void {
+    this.parkedCodex = { owner, runners: this.nativeRunners.filter(candidate => candidate.agentId === "codex") };
+    this.scheduleCodexRetry();
+    this.nativeCodexOwner = null;
+    for (const runner of this.nativeRunners.filter(candidate => candidate.agentId === "codex")) this.runners.delete(runner.agentId);
+    for (let index = this.nativeRunners.length - 1; index >= 0; index -= 1) {
+      if (this.nativeRunners[index]!.agentId === "codex") this.nativeRunners.splice(index, 1);
+    }
+  }
+
+  private async enterLifecycle(): Promise<void> {
     if (this.instanceId && this.administrativeStatus !== "provisioning") {
       await this.startActiveLoop();
     } else if (this.instanceId) {
@@ -1088,6 +1174,9 @@ export class Supervisor {
     } else {
       this.logger.warn("no instance identity yet; waiting for the launcher to run install");
     }
+  }
+
+  private startChannelTimers(): void {
     this.muxTimer = setInterval(() => this.mux.tick(), 1_000);
     this.muxTimer.unref();
     if (this.cancellationReplay) {
@@ -1116,7 +1205,7 @@ export class Supervisor {
   private parkUnavailableHostAgent(entry: NativeUnavailableAgent): void {
     this.agentStartFailures.set(entry.agentId, entry.error);
     this.logger.error({ err: entry.error, agentId: entry.agentId }, "agent could not be found or verified; the runtime continues without it");
-    // Google Antigravity's update (A17): its `relocate` fetches this release's
+    // Google Antigravity's update: its `relocate` fetches this release's
     // pin, checks it and switches to it, starting now rather than in a minute.
     this.nativeAgentRetry.park(entry.agentId, async () => {
       const [config] = withConnectorBrowser([await entry.relocate()], this.connectorBrowser);
@@ -1238,7 +1327,7 @@ export class Supervisor {
 
   /**
    * Core-bound channels are minted `<channel>:<instanceId>` so a relay
-   * handshake knows whose endpoint cursor to ask (CP9 integration note).
+   * handshake knows whose endpoint cursor to ask.
    */
   private openCoreChannels(instanceId: string): void {
     for (const channel of CORE_BOUND_CHANNELS) this.mux.openChannel(coreChannelId(channel, instanceId), channel);
@@ -1255,89 +1344,110 @@ export class Supervisor {
     if (this.provisioningLoopActive) return;
     this.provisioningLoopActive = true;
     this.provisioningCredential = provisioning.provisioningCredential;
-    const tick = async (): Promise<void> => {
-      const current = await this.store.provisioning();
-      if (!current) return void (this.provisioningLoopActive = false);
-      if (parseRfc3339(current.provisioningWindowExpiresAt) <= this.clock.coreNow()) {
-        this.provisioningLoopActive = false;
-        this.logger.error("provisioning window expired; a fresh activation is required");
-        return;
-      }
-      if (provisioningCredentialIsExpired(current, this.clock)) {
-        await refreshProvisioningCredential({ store: this.store, core: this.core, clock: this.clock, logger: this.logger }).catch((error: unknown) => this.logger.warn({ err: error }, "provisioning refresh failed"));
-        this.provisioningCredential = (await this.store.provisioning())?.provisioningCredential ?? null;
-      }
-      const snapshot = await this.inventory.collect();
-      this.lastSnapshot = snapshot;
-      const unhealthy = snapshot.components.filter((component) => component.healthStatus !== "healthy");
-      if (unhealthy.length > 0) {
-        // Provisioning waits for all four components. Silence here reads as a
-        // hung install, so name what is still missing on every attempt.
-        this.logger.info({ waitingFor: unhealthy.map((component) => `${component.kind}:${component.healthStatus}`) }, "provisioning is waiting for components to become healthy");
-        setTimeout(() => void tick(), 10_000).unref();
-        return;
-      }
-      try {
-        await this.refreshConfiguration();
-        const result = await submitReadiness({
-          store: this.store,
-          core: this.core,
-          clock: this.clock,
-          protocolVersion: String(REMOTE_INSTANCE_PROTOCOL_VERSION),
-          bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
-          components: snapshot.components.map((component) => ({ kind: component.kind, version: component.version, capabilities: component.capabilities, health: "healthy" as const })) as never,
-          logger: this.logger,
-        });
-        this.provisioningCredential = null;
-        this.administrativeStatus = "active";
-        this.provisioningLoopActive = false;
-        await this.adoptLease(result.lease);
-        await this.startActiveLoop();
-      } catch (error) {
-        this.logger.warn({ err: error }, "readiness not yet accepted; retrying");
-        // Core may have committed readiness and revoked the short credential
-        // before its response reached us. Recover through the existing signed
-        // owner/establishment/receipt protocol, never by reviving that bearer.
-        // Core refuses recovery for identities still provisioning or revoked.
-        await this.startActiveLoop();
-        if (this.activeLoopStarted) return;
-        setTimeout(() => void tick(), 15_000).unref();
-      }
-    };
-    await tick();
+    await this.provisioningTick();
+  }
+
+  private async provisioningTick(): Promise<void> {
+    const current = await this.store.provisioning();
+    if (!current) return void (this.provisioningLoopActive = false);
+    if (parseRfc3339(current.provisioningWindowExpiresAt) <= this.clock.coreNow()) {
+      this.provisioningLoopActive = false;
+      this.logger.error("provisioning window expired; a fresh activation is required");
+      return;
+    }
+    if (provisioningCredentialIsExpired(current, this.clock)) await this.refreshProvisioning();
+    const snapshot = await this.inventory.collect();
+    this.lastSnapshot = snapshot;
+    const unhealthy = snapshot.components.filter((component) => component.healthStatus !== "healthy");
+    if (unhealthy.length > 0) {
+      // Provisioning waits for all four components. Silence here reads as a
+      // hung install, so name what is still missing on every attempt.
+      this.logger.info({ waitingFor: unhealthy.map((component) => `${component.kind}:${component.healthStatus}`) }, "provisioning is waiting for components to become healthy");
+      setTimeout(() => void this.provisioningTick(), 10_000).unref();
+      return;
+    }
+    await this.submitProvisioningReadiness(snapshot);
+  }
+
+  private async refreshProvisioning(): Promise<void> {
+    await refreshProvisioningCredential({ store: this.store, core: this.core, clock: this.clock, logger: this.logger }).catch((error: unknown) => this.logger.warn({ err: error }, "provisioning refresh failed"));
+    this.provisioningCredential = (await this.store.provisioning())?.provisioningCredential ?? null;
+  }
+
+  private async submitProvisioningReadiness(snapshot: InventorySnapshot): Promise<void> {
+    try {
+      await this.refreshConfiguration();
+      const result = await submitReadiness({
+        store: this.store,
+        core: this.core,
+        clock: this.clock,
+        protocolVersion: String(REMOTE_INSTANCE_PROTOCOL_VERSION),
+        bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
+        components: snapshot.components.map((component) => ({ kind: component.kind, version: component.version, capabilities: component.capabilities, health: "healthy" as const })) as never,
+        logger: this.logger,
+      });
+      this.provisioningCredential = null;
+      this.administrativeStatus = "active";
+      this.provisioningLoopActive = false;
+      await this.adoptLease(result.lease);
+      await this.startActiveLoop();
+    } catch (error) {
+      this.logger.warn({ err: error }, "readiness not yet accepted; retrying");
+      // Core may have committed readiness and revoked the short credential
+      // before its response reached us. Recover through the existing signed
+      // owner/establishment/receipt protocol, never by reviving that bearer.
+      // Core refuses recovery for identities still provisioning or revoked.
+      await this.startActiveLoop();
+      if (this.activeLoopStarted) return;
+      setTimeout(() => void this.provisioningTick(), 15_000).unref();
+    }
   }
 
   private startActiveLoop(): Promise<void> {
     if (this.stopping || this.activeLoopStarted) return Promise.resolve();
     if (this.activeLoopStarting) return this.activeLoopStarting;
     this.startLivenessWatchdog();
-    if (this.recoveryRetryTimer) clearTimeout(this.recoveryRetryTimer);
+    stopTimeout(this.recoveryRetryTimer);
     this.recoveryRetryTimer = null;
-    const operation = this.startActiveLoopImpl().catch(error => {
-      // The logger keeps no stack, and every local-history refusal says the same
-      // sentence: name where it came from, or a stuck recovery is undiagnosable.
-      const at = error instanceof Error ? error.stack?.split("\n").slice(1, 6).map(line => line.trim().replace(/^at /, "")).join(" < ") : undefined;
-      this.logger.warn({ err: error, ...(at ? { at } : {}) }, "startup recovery remains pending");
-      const record = this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation);
-      const terminal = record && record.state !== "pending" && record.state !== "applied";
-      const denied = this.administrativeStatus === "revoked" || (error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch", "reconciliation_replay", "resume_deadline_expired"].includes(error.code));
-      // Core retired this process's recovery generation (or it expired, or
-      // another establishment won): this incarnation can never be accepted
-      // again, and retrying it is refused forever. A new process is a new
-      // incarnation that establishes through the ordinary path, so restart.
-      const retired = this.administrativeStatus !== "revoked" && !(error instanceof RemoteInstanceError && ["instance_revoked", "registration_mismatch"].includes(error.code)) &&
-        (terminal || (error instanceof RemoteInstanceError && ["reconciliation_replay", "resume_deadline_expired"].includes(error.code)));
-      this.reconnectRefusal = this.describeReconnectRefusal(error, retired);
-      // Below Core's minimum no start can succeed: only an update gets back in.
-      if (error instanceof RemoteInstanceError && error.code === "update_required") this.requestUpdateForRefusedBundle();
-      if (retired && !this.stopping && !this.activeLoopStarted) this.restartForRetiredProcess(error);
-      if (!this.stopping && !this.activeLoopStarted && !terminal && !denied && !this.recoveryRetryTimer) {
-        this.recoveryRetryTimer = setTimeout(() => { this.recoveryRetryTimer = null; void this.startActiveLoop(); }, 15_000);
-        this.recoveryRetryTimer.unref();
-      }
-    }).finally(() => { this.activeLoopStarting = null; });
+    const operation = this.startActiveLoopImpl().catch(error => this.onActiveLoopFailed(error))
+      .finally(() => { this.activeLoopStarting = null; });
     this.activeLoopStarting = operation;
     return operation;
+  }
+
+  private onActiveLoopFailed(error: unknown): void {
+    // The logger keeps no stack, and every local-history refusal says the same
+    // sentence: name where it came from, or a stuck recovery is undiagnosable.
+    this.logger.warn({ err: error, ...stackField(error) }, "startup recovery remains pending");
+    const terminal = recoveryEnded(this.journal.recovery.current(this.instanceId ?? "", this.runnerIncarnation));
+    const retired = this.retiredByCore(error, terminal);
+    this.reconnectRefusal = this.describeReconnectRefusal(error, retired);
+    // Below Core's minimum no start can succeed: only an update gets back in.
+    if (remoteErrorCodeIn(error, ["update_required"])) this.requestUpdateForRefusedBundle();
+    if (retired && !this.stopping && !this.activeLoopStarted) this.restartForRetiredProcess(error);
+    if (!terminal && !this.refusedForGood(error)) this.armRecoveryRetry();
+  }
+
+  /**
+   * Core retired this process's recovery generation (or it expired, or
+   * another establishment won): this incarnation can never be accepted
+   * again, and retrying it is refused forever. A new process is a new
+   * incarnation that establishes through the ordinary path, so restart.
+   */
+  private retiredByCore(error: unknown, terminal: boolean): boolean {
+    return this.administrativeStatus !== "revoked" && !remoteErrorCodeIn(error, REVOKED_CODES) &&
+      (terminal || remoteErrorCodeIn(error, RETIRED_CODES));
+  }
+
+  /** A revoked or retired runtime is never retried in place. */
+  private refusedForGood(error: unknown): boolean {
+    return this.administrativeStatus === "revoked" || remoteErrorCodeIn(error, [...REVOKED_CODES, ...RETIRED_CODES]);
+  }
+
+  private armRecoveryRetry(): void {
+    if (this.stopping || this.activeLoopStarted || this.recoveryRetryTimer) return;
+    this.recoveryRetryTimer = setTimeout(() => { this.recoveryRetryTimer = null; void this.startActiveLoop(); }, 15_000);
+    this.recoveryRetryTimer.unref();
   }
 
   /** Plain words for `doctor` when Core refused the startup reconnect; null for a passing failure. */
@@ -1388,35 +1498,40 @@ export class Supervisor {
   private startLivenessWatchdog(): void {
     if (this.livenessTimer) return;
     this.livenessWatchingSince = Date.now();
-    this.livenessTimer = setInterval(() => {
-      if (this.stopping || !this.livenessTimer) return;
-      if (this.leaseLapseNeedsRestart()) {
-        clearInterval(this.livenessTimer);
-        this.livenessTimer = null;
-        const detail = { reason: "lease_lapsed", leaseMode: this.lease.mode(), leaseExpiresAt: this.lease.current()?.expiresAt ?? null,
-          refusedForMs: Date.now() - (this.leaseRefusedSince ?? Date.now()), administrativeStatus: this.administrativeStatus };
-        this.logger.error(detail, "the lease lapsed and Core refuses it; restarting to reconnect with this machine's key");
-        this.options.onLivenessLost?.(detail);
-        return;
-      }
-      const budgetMs = Math.max(LIVENESS_MIN_BUDGET_MS, this.heartbeat.livenessBudgetMs());
-      const liveness = this.heartbeat.liveness();
-      const verdict = evaluateHeartbeatLiveness({ now: Date.now(), watchingSince: this.livenessWatchingSince ?? Date.now(), liveness, budgetMs });
-      if (verdict.state === "live") { this.livenessQuietWarned = false; return; }
-      const detail = { ...verdict, budgetMs, heartbeat: liveness, activeLoopStarted: this.activeLoopStarted, activeLoopStarting: this.activeLoopStarting !== null,
-        recoveryRetryArmed: this.recoveryRetryTimer !== null, leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus,
-        activeResources: process.getActiveResourcesInfo().slice(0, 32) };
-      if (verdict.state === "quiet") {
-        if (!this.livenessQuietWarned) this.logger.warn(detail, "no heartbeat attempted for a while; the supervisor may be stuck");
-        this.livenessQuietWarned = true;
-        return;
-      }
-      clearInterval(this.livenessTimer);
-      this.livenessTimer = null;
-      this.logger.error(detail, "supervisor liveness lost: no heartbeat attempted within the budget; asking the service to restart");
-      this.options.onLivenessLost?.(detail);
-    }, LIVENESS_CHECK_MS);
+    this.livenessTimer = setInterval(() => this.checkLiveness(), LIVENESS_CHECK_MS);
     this.livenessTimer.unref();
+  }
+
+  private checkLiveness(): void {
+    if (this.stopping || !this.livenessTimer) return;
+    if (this.leaseLapseNeedsRestart()) return this.restartForLapsedLease();
+    const budgetMs = Math.max(LIVENESS_MIN_BUDGET_MS, this.heartbeat.livenessBudgetMs());
+    const liveness = this.heartbeat.liveness();
+    const verdict = evaluateHeartbeatLiveness({ now: Date.now(), watchingSince: this.livenessWatchingSince ?? Date.now(), liveness, budgetMs });
+    if (verdict.state === "live") { this.livenessQuietWarned = false; return; }
+    const detail = { ...verdict, budgetMs, heartbeat: liveness, activeLoopStarted: this.activeLoopStarted, activeLoopStarting: this.activeLoopStarting !== null,
+      recoveryRetryArmed: this.recoveryRetryTimer !== null, leaseMode: this.lease.mode(), administrativeStatus: this.administrativeStatus,
+      activeResources: process.getActiveResourcesInfo().slice(0, 32) };
+    if (verdict.state === "quiet") return this.warnLivenessQuiet(detail);
+    stopInterval(this.livenessTimer);
+    this.livenessTimer = null;
+    this.logger.error(detail, "supervisor liveness lost: no heartbeat attempted within the budget; asking the service to restart");
+    this.options.onLivenessLost?.(detail);
+  }
+
+  /** Warn once per quiet stretch. */
+  private warnLivenessQuiet(detail: Record<string, unknown>): void {
+    if (!this.livenessQuietWarned) this.logger.warn(detail, "no heartbeat attempted for a while; the supervisor may be stuck");
+    this.livenessQuietWarned = true;
+  }
+
+  private restartForLapsedLease(): void {
+    stopInterval(this.livenessTimer);
+    this.livenessTimer = null;
+    const detail = { reason: "lease_lapsed", leaseMode: this.lease.mode(), leaseExpiresAt: this.lease.current()?.expiresAt ?? null,
+      refusedForMs: Date.now() - (this.leaseRefusedSince ?? Date.now()), administrativeStatus: this.administrativeStatus };
+    this.logger.error(detail, "the lease lapsed and Core refuses it; restarting to reconnect with this machine's key");
+    this.options.onLivenessLost?.(detail);
   }
 
   private async startActiveLoopImpl(): Promise<void> {
@@ -1431,24 +1546,37 @@ export class Supervisor {
       await this.heartbeat.settle();
     }
     this.requireRecoveryAuthority();
-    if (await this.store.provisioning()) {
-      this.requireRecoveryAuthority();
-      const identity = await this.store.identity();
-      this.requireRecoveryAuthority();
-      const status = this.administrativeStatus;
-      if (!identity || identity.instanceId !== this.instanceId || (status !== "active" && status !== "draining" && status !== "suspended")) {
-        throw new RemoteInstanceError("registration_mismatch", "Recovered provisioning identity is not authoritative.");
-      }
-      await this.store.saveIdentity({ ...identity, administrativeStatus: status });
-      this.requireRecoveryAuthority();
-      await this.store.clearProvisioning();
-      this.provisioningCredential = null;
-      this.provisioningLoopActive = false;
-    }
+    if (await this.store.provisioning()) await this.adoptRecoveredProvisioning();
     if (this.instanceId) this.openCoreChannels(this.instanceId);
     await this.refreshConfiguration();
     if (this.stopping) return;
     this.requireRecoveryAuthority();
+    await this.startOrdinaryLoops();
+    if (this.stopping) return;
+    this.requireRecoveryAuthority();
+    this.activeLoopStarted = true;
+    this.reconnectRefusal = null;
+    this.beginActiveWork();
+    await this.work.reports.flushAll();
+  }
+
+  /** Readiness was committed but its response lost: the recovered identity ends provisioning. */
+  private async adoptRecoveredProvisioning(): Promise<void> {
+    this.requireRecoveryAuthority();
+    const identity = await this.store.identity();
+    this.requireRecoveryAuthority();
+    const status = this.administrativeStatus;
+    if (!identity || identity.instanceId !== this.instanceId || !recoveredStatus(status)) {
+      throw new RemoteInstanceError("registration_mismatch", "Recovered provisioning identity is not authoritative.");
+    }
+    await this.store.saveIdentity({ ...identity, administrativeStatus: status });
+    this.requireRecoveryAuthority();
+    await this.store.clearProvisioning();
+    this.provisioningCredential = null;
+    this.provisioningLoopActive = false;
+  }
+
+  private async startOrdinaryLoops(): Promise<void> {
     if (!this.configurationTimer) {
       this.configurationTimer = setInterval(() => void this.refreshConfiguration(), 30_000);
       this.configurationTimer.unref();
@@ -1457,22 +1585,20 @@ export class Supervisor {
       await this.heartbeat.start();
       this.ordinaryHeartbeatStarted = true;
     }
-    if (this.stopping) return;
-    this.requireRecoveryAuthority();
-    this.activeLoopStarted = true;
-    this.reconnectRefusal = null;
+  }
+
+  private beginActiveWork(): void {
     void this.resumeOnComputerWatches().catch(error => this.logger.warn({ err: error }, "on-computer steps not resumed"));
     this.transport.start();
     this.planningDirectivePoller?.start();
     this.transport.resumeAfterRecovery();
     this.pullTimer = setInterval(() => this.work.pull(), 5_000);
     this.pullTimer.unref();
-    // bb: every 5 minutes release sessions idle for 30 minutes.
+    // Every 5 minutes, release sessions idle for 30 minutes.
     this.reaperTimer = setInterval(() => void this.work.reapIdleCompletedSessions(IDLE_SESSION_RELEASE_MS).catch(() => undefined), IDLE_SESSION_SWEEP_MS);
     this.reaperTimer.unref();
     this.previews.startIdleSweep();
     this.ensureUpdates()?.start();
-    await this.work.reports.flushAll();
   }
 
   /**
@@ -1489,7 +1615,7 @@ export class Supervisor {
         trustedRoots: this.options.native!.trustedRoots,
         logger: this.logger,
         canApply: () => this.stopping ? { ok: false, reason: "supervisor is stopping" } : this.draining && this.drainReason !== "update" ? { ok: false, reason: `draining (${this.drainReason ?? "unknown"})` } : { ok: true },
-        // Only a release Core accepts is installed unattended (WS1-093).
+        // Only a release Core accepts is installed unattended.
         acceptedRelease: async () => {
           if (!this.instanceId) throw new Error("no instance identity yet");
           return this.core.acceptedRelease(this.instanceId);
@@ -1526,11 +1652,22 @@ export class Supervisor {
 
   /** Local accepted-generation identity, not a substitute for Core authorization. */
   private recoveryAuthority(): string | null {
-    if (this.stopping || !this.nativeOwnership || !this.instanceId || !this.lease.isValid() || this.lease.mode() === "none" || !this.reconciliation?.isComplete) return null;
+    const instanceId = this.ownedRecoveryInstance();
+    if (!instanceId) return null;
+    const recovery = this.journal.recovery.current(instanceId, this.runnerIncarnation);
+    if (!appliedRecovery(recovery)) return null;
+    return JSON.stringify([instanceId, this.runnerIncarnation, this.leaseAuthorityEpoch, recovery.manifest.ownerRevision, recovery.manifest.manifestId, recovery.receipt.digest, recovery.acceptedAt]);
+  }
+
+  /** This process's instance while it owns its state under a usable lease after reconciliation; null otherwise. */
+  private ownedRecoveryInstance(): string | null {
+    if (this.stopping || !this.nativeOwnership || !this.instanceId || !this.leaseUsable() || !this.reconciliation?.isComplete) return null;
     try { this.nativeOwnership.assertOwned(); } catch { return null; }
-    const recovery = this.journal.recovery.current(this.instanceId, this.runnerIncarnation);
-    if (recovery?.state !== "applied" || !recovery.manifest || !recovery.receipt || !recovery.acceptedAt) return null;
-    return JSON.stringify([this.instanceId, this.runnerIncarnation, this.leaseAuthorityEpoch, recovery.manifest.ownerRevision, recovery.manifest.manifestId, recovery.receipt.digest, recovery.acceptedAt]);
+    return this.instanceId;
+  }
+
+  private leaseUsable(): boolean {
+    return this.lease.isValid() && this.lease.mode() !== "none";
   }
 
   private requireRecoveryAuthority(): void {
@@ -1612,8 +1749,7 @@ export class Supervisor {
   private async adoptHeartbeat(result: HeartbeatResult, assertCurrent: () => void): Promise<void> {
     if (this.stopping) return;
     const claims = decodeLeaseClaims(result.lease, { instanceId: this.instanceId ?? "", audience: LEASE_AUDIENCE });
-    if (result.instanceId !== this.instanceId || result.leaseMode !== claims.lease_mode || parseRfc3339(result.leaseExpiresAt) !== claims.exp * 1000 ||
-        (result.drainDeadline === undefined ? undefined : parseRfc3339(result.drainDeadline) / 1000) !== claims.drain_deadline) {
+    if (!heartbeatMatchesClaims(result, claims, this.instanceId)) {
       throw new RemoteInstanceError("registration_mismatch", "Heartbeat lease metadata does not match its claims.");
     }
     if (claims.exp * 1000 <= this.clock.coreNow()) throw new RemoteInstanceError("temporarily_unavailable", "Heartbeat returned an expired lease.");
@@ -1624,26 +1760,34 @@ export class Supervisor {
   private async onHeartbeatFailure(error: unknown): Promise<void> {
     if (this.stopping) return;
     const code = error instanceof RemoteInstanceError ? error.code : "temporarily_unavailable";
-    if (code === "instance_revoked" || code === "instance_suspended") {
-      this.logger.error({ code }, "heartbeat renewal denied; stopping new work");
-      this.administrativeStatus = code === "instance_revoked" ? "revoked" : "suspended";
-      this.leaseAuthorityEpoch++;
-      this.leaseRestorationAllowed = false;
-      if (code === "instance_revoked") this.heartbeat.stop();
-      this.lease.set(null);
-      if (!this.draining) { this.draining = true; this.drainReason = "lease_lost"; }
-      await this.mutateLease(() => this.store.clearLease());
-      // Cancellation is tracked, but never awaited inside lease acquisition:
-      // a stuck local tool cannot prevent suspended heartbeat retries. New
-      // work stays drained until both cleanup and fresh Core authority agree.
-      if (!this.leaseLossCleanup) {
-        this.leaseLossCleanupFailed = false;
-        void this.previews.stopAll("lease_lost");
-        this.leaseLossCleanup = Promise.resolve().then(() => this.work.drainSessions("lease_lost"))
-          .catch(() => { this.leaseLossCleanupFailed = true; this.logger.error("lease-loss session cleanup failed; work remains drained"); })
-          .finally(() => { this.leaseLossCleanup = null; this.restoreLeaseDrain(); });
-      }
-    }
+    if (code === "instance_revoked" || code === "instance_suspended") await this.loseLeaseAuthority(code);
+  }
+
+  /** Core revoked or suspended this runtime: stop new work, forget the lease and close its sessions. */
+  private async loseLeaseAuthority(code: "instance_revoked" | "instance_suspended"): Promise<void> {
+    this.logger.error({ code }, "heartbeat renewal denied; stopping new work");
+    this.administrativeStatus = code === "instance_revoked" ? "revoked" : "suspended";
+    this.leaseAuthorityEpoch++;
+    this.leaseRestorationAllowed = false;
+    if (code === "instance_revoked") this.heartbeat.stop();
+    this.lease.set(null);
+    if (!this.draining) { this.draining = true; this.drainReason = "lease_lost"; }
+    await this.mutateLease(() => this.store.clearLease());
+    this.startLeaseLossCleanup();
+  }
+
+  /**
+   * Cancellation is tracked, but never awaited inside lease acquisition:
+   * a stuck local tool cannot prevent suspended heartbeat retries. New
+   * work stays drained until both cleanup and fresh Core authority agree.
+   */
+  private startLeaseLossCleanup(): void {
+    if (this.leaseLossCleanup) return;
+    this.leaseLossCleanupFailed = false;
+    void this.previews.stopAll("lease_lost");
+    this.leaseLossCleanup = Promise.resolve().then(() => this.work.drainSessions("lease_lost"))
+      .catch(() => { this.leaseLossCleanupFailed = true; this.logger.error("lease-loss session cleanup failed; work remains drained"); })
+      .finally(() => { this.leaseLossCleanup = null; this.restoreLeaseDrain(); });
   }
 
   private restoreLeaseDrain(): void {
@@ -1659,26 +1803,10 @@ export class Supervisor {
   private async onInbound(message: InboundMessage): Promise<void> {
     if (this.stopping) throw new RemoteInstanceError("temporarily_unavailable", "supervisor is stopping before durable receipt");
     switch (message.channel) {
-      case "control": {
-        const body = message.body as { type?: string; manifestId?: string };
-        if (body.manifestId !== undefined) {
-          await this.reconciliation.apply(message.body);
-          return;
-        }
-        await this.control.handle(message.body);
-        return;
-      }
-      case "assignment": {
-        const terminal = PlanningControllerTerminalDirectiveSchema.safeParse(message.body);
-        if (terminal.success) {
-          const instanceId = this.instanceId ?? "", afterSequence = this.journal.planning.cursor(instanceId);
-          await this.journal.planning.storePulled(instanceId, afterSequence, { version: 1, directives: [terminal.data], highWater: terminal.data.directiveSequence });
-          await this.planningTerminal.accept(terminal.data);
-          return;
-        }
-        await this.work.onAssignmentMessage(message.body, message.assignmentRequest);
-        return;
-      }
+      case "control":
+        return this.onControlMessage(message.body);
+      case "assignment":
+        return this.onAssignmentChannelMessage(message);
       case "session":
         await this.work.onSessionMessage(message.channelId, message.body);
         return;
@@ -1689,6 +1817,27 @@ export class Supervisor {
     }
   }
 
+  /** A control frame naming a manifest is reconciliation; any other is a control directive. */
+  private async onControlMessage(body: unknown): Promise<void> {
+    if ((body as { manifestId?: string }).manifestId !== undefined) {
+      await this.reconciliation.apply(body);
+      return;
+    }
+    await this.control.handle(body);
+  }
+
+  /** A planning controller's terminal directive is stored and accepted; anything else is assignment work. */
+  private async onAssignmentChannelMessage(message: InboundMessage): Promise<void> {
+    const terminal = PlanningControllerTerminalDirectiveSchema.safeParse(message.body);
+    if (terminal.success) {
+      const instanceId = this.instanceId ?? "", afterSequence = this.journal.planning.cursor(instanceId);
+      await this.journal.planning.storePulled(instanceId, afterSequence, { version: 1, directives: [terminal.data], highWater: terminal.data.directiveSequence });
+      await this.planningTerminal.accept(terminal.data);
+      return;
+    }
+    await this.work.onAssignmentMessage(message.body, message.assignmentRequest);
+  }
+
   private async onChannelReset(channelId: string): Promise<void> {
     const channel = channelOf(channelId);
     if (channel === "session") await this.work.onChannelReset(channelId);
@@ -1697,27 +1846,30 @@ export class Supervisor {
   }
 
   private async onRunnerEvent(agentId: string, event: Parameters<WorkOrchestrator["onRunnerEvent"]>[0]): Promise<void> {
-    if (event.kind === "readiness_changed") {
-      this.inventory.updateAgent(event.agent);
-      if (this.lastSnapshot) this.lastSnapshot = { ...this.lastSnapshot, agents: this.inventory.agents() };
-      const agents = this.inventory.agents();
-      this.modelCapabilities?.invalidateForAgents(agents);
-      void this.modelCapabilities?.refresh(agents).catch(error => this.logger.warn({ err: error }, "native model capability discovery failed"));
-    }
-    if (event.kind === "login_event") {
-      const login = this.activeLogins.get(event.loginId);
-      if (login) {
-        const mapped = mapLoginEvent(event.loginId, event.event);
-        login.emit(mapped);
-        if (event.event.type === "completed" || event.event.type === "failed") {
-          if (event.event.type === "completed") this.modelCapabilities?.invalidateAgent(agentId);
-          this.activeLogins.delete(event.loginId);
-        }
-      }
-    }
+    if (event.kind === "readiness_changed") this.onAgentReadinessChanged(event.agent);
+    if (event.kind === "login_event") this.onLoginEvent(agentId, event);
     if (event.kind === "agent_scope_reset") { this.modelCapabilities?.invalidateAgent(agentId); this.logger.info({ agentId, previousScope: event.previousScope }, "agent_scope_reset"); }
     if (event.kind === "agent_scope_attested") this.modelCapabilities?.invalidateAgent(agentId);
     await this.work.onRunnerEvent(event);
+  }
+
+  private onAgentReadinessChanged(agent: Extract<SupervisorRunnerEvent, { kind: "readiness_changed" }>["agent"]): void {
+    this.inventory.updateAgent(agent);
+    if (this.lastSnapshot) this.lastSnapshot = { ...this.lastSnapshot, agents: this.inventory.agents() };
+    const agents = this.inventory.agents();
+    this.modelCapabilities?.invalidateForAgents(agents);
+    void this.modelCapabilities?.refresh(agents).catch(error => this.logger.warn({ err: error }, "native model capability discovery failed"));
+  }
+
+  /** Relay a runner's sign-in event to the login that asked for it; a completed or failed sign-in ends it. */
+  private onLoginEvent(agentId: string, event: Extract<SupervisorRunnerEvent, { kind: "login_event" }>): void {
+    const login = this.activeLogins.get(event.loginId);
+    if (!login) return;
+    login.emit(mapLoginEvent(event.loginId, event.event));
+    const type = event.event.type;
+    if (type !== "completed" && type !== "failed") return;
+    if (type === "completed") this.modelCapabilities?.invalidateAgent(agentId);
+    this.activeLogins.delete(event.loginId);
   }
 
   // ── Outbound facts ─────────────────────────────────────────────────────────
@@ -1727,8 +1879,7 @@ export class Supervisor {
       await this.configurationAcks.submit(ack);
       return;
     }
-    const key = `control:${"directiveId" in ack ? ack.directiveId : "rotationId" in ack ? ack.rotationId : `${ack.type}:${"revision" in ack ? ack.revision : ack.type === "version_ack" ? ack.bundleVersion : ack.acknowledgedAt}`}`;
-    await this.outbox.enqueue({ id: randomUUID(), channel: "control", key, group: "control", order: this.clock.now(), body: ack, createdAt: this.clock.nowIso() });
+    await this.outbox.enqueue({ id: randomUUID(), channel: "control", key: controlAckKey(ack), group: "control", order: this.clock.now(), body: ack, createdAt: this.clock.nowIso() });
     if (!this.stopping) {
       this.transport.send({ channel: "control", channelId: coreChannelId("control", this.instanceId ?? ""), body: ack, signature: "signature" in ack ? ack.signature : signBody(this.key, ack as unknown as { [key: string]: JsonValue }) });
     }
@@ -1830,7 +1981,7 @@ export class Supervisor {
    * The onboard lane, composed once. Everything it needs is local: the
    * machine's own git, a scratch directory, and the capability token the
    * orchestrator redeems per claim. No connector credential and no broker
-   * client appear here, and none may (invariant 3, A5).
+   * client appear here, and none may.
    */
   private onboardCarrier(): OnboardWorkCarrier {
     const scratch = new OnboardScratch(this.config.SUPERVISOR_ONBOARD_SCRATCH_ROOT);
@@ -1911,11 +2062,8 @@ export class Supervisor {
   private async startPreviewForViewer(sessionId: string): Promise<boolean> {
     const current = this.previews.status(sessionId);
     if (current.state === "starting") return true;
-    if (this.stopping || this.draining || this.lease.mode() !== "active") return false;
-    const cwd = this.previewWorktrees.get(sessionId);
-    if (cwd === undefined || !existsSync(cwd)) return false;
-    const last = this.previewViewerStarts.get(sessionId);
-    if (current.state === "failed" && last !== undefined && Date.now() - last < PREVIEW_VIEWER_RETRY_MS) return false;
+    const cwd = this.viewerPreviewWorktree(sessionId, current.state);
+    if (cwd === null) return false;
     this.previewViewerStarts.set(sessionId, Date.now());
     const started = await this.previews.start(sessionId, cwd, "viewer");
     if (started.state !== "starting" && started.state !== "running") {
@@ -1926,13 +2074,26 @@ export class Supervisor {
     return true;
   }
 
+  /** The session's worktree when a viewer may start its preview now; null while stopping, draining, without an active lease or a worktree, or soon after a viewer start failed. */
+  private viewerPreviewWorktree(sessionId: string, state: string): string | null {
+    if (this.stopping || this.draining || this.lease.mode() !== "active") return null;
+    const cwd = this.previewWorktrees.get(sessionId);
+    if (cwd === undefined || !existsSync(cwd)) return null;
+    return this.viewerRetryPending(sessionId, state) ? null : cwd;
+  }
+
+  private viewerRetryPending(sessionId: string, state: string): boolean {
+    const last = this.previewViewerStarts.get(sessionId);
+    return state === "failed" && last !== undefined && Date.now() - last < PREVIEW_VIEWER_RETRY_MS;
+  }
+
   private forgetPreviewWorktree(sessionId: string): void {
     this.previewWorktrees.delete(sessionId);
     this.previewViewerStarts.delete(sessionId);
   }
 
   /**
-   * Every agent's sessions get the QA browser (O8) while the connector has
+   * Every agent's sessions get the QA browser while the connector has
    * one and previews can run (a session is given the browser with its
    * preview); Core may then place QA on any of them.
    */
@@ -1950,9 +2111,7 @@ export class Supervisor {
       agents.push(agentId);
       version ??= offered;
     }
-    const browser = this.connectorBrowser;
-    return { version, agents: agents.sort(), chrome: chromeInstalled(),
-      ...(browser.available ? { packageAgent: browser.browser.packageAgent, nodeSource: browser.browser.nodeSource } : version === null && browser.message ? { unavailable: browser.message } : {}) };
+    return { version, agents: agents.sort(), chrome: chromeInstalled(), ...connectorBrowserFields(this.connectorBrowser, version) };
   }
 
   private previewCapable(): boolean {
@@ -1991,20 +2150,18 @@ export class Supervisor {
   // ── Status and control socket ─────────────────────────────────────────────
 
   status(): SupervisorStatus {
-    const relay = this.relay?.status();
-    const lease = this.lease.current();
     return {
       instanceId: this.instanceId,
       workspaceId: this.workspaceId,
       administrativeStatus: this.administrativeStatus,
-      connectivity: { transport: relay?.state === "connected" ? "relay" : this.transport?.available ? "https_fallback" : "offline", relayConnected: relay?.state === "connected", lastConnectedAt: relay?.lastConnectedAt ?? null, reconciliationComplete: this.reconciliation?.isComplete ?? false },
-      lease: { mode: this.lease.mode(), expiresAt: lease?.expiresAt ?? null, drainDeadline: lease?.drainDeadline ?? null },
-      version: { bundle: this.config.SUPERVISOR_BUNDLE_VERSION, protocol: String(REMOTE_INSTANCE_PROTOCOL_VERSION), manifestDigest: this.manifestDigest || null, updateAvailable: this.control?.versionPolicy?.updateAvailable ?? false, targetBundle: this.control?.versionPolicy?.targetBundle ?? null },
+      connectivity: this.connectivityStatus(),
+      lease: this.leaseStatus(),
+      version: this.versionStatus(),
       configRevision: this.control?.configRevision ?? 0,
       components: (this.lastSnapshot?.components ?? []).map((component) => ({ kind: component.kind, version: component.version, healthStatus: component.healthStatus, capabilities: component.capabilities, lastProbeAt: component.lastProbeAt })),
       roles: (this.heartbeat?.roles() ?? []) as SupervisorStatus["roles"],
       roleBindings: this.roleBindings,
-      utilization: { acceptingWork: !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork(), activeSessions: this.lastSnapshot?.activeSessions ?? 0, activeTurns: this.lastSnapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, this.lastSnapshot?.hostPressure ?? 0), ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) },
+      utilization: this.utilizationStatus(),
       pendingErase: this.journal.erase.all().filter((record) => !record.receiptSent).length,
       pendingRevocation: this.pendingRevocation,
       // Also read by launchers installed before 7.0.0, which require both fields.
@@ -2013,176 +2170,213 @@ export class Supervisor {
     };
   }
 
+  private connectivityStatus(): SupervisorStatus["connectivity"] {
+    const relay = this.relay?.status();
+    const relayConnected = relay?.state === "connected";
+    return { transport: this.transportState(relayConnected), relayConnected, lastConnectedAt: relay?.lastConnectedAt ?? null, reconciliationComplete: this.reconciliation?.isComplete ?? false };
+  }
+
+  private transportState(relayConnected: boolean): SupervisorStatus["connectivity"]["transport"] {
+    if (relayConnected) return "relay";
+    return this.transport?.available ? "https_fallback" : "offline";
+  }
+
+  private leaseStatus(): SupervisorStatus["lease"] {
+    const lease = this.lease.current();
+    return { mode: this.lease.mode(), expiresAt: lease?.expiresAt ?? null, drainDeadline: lease?.drainDeadline ?? null };
+  }
+
+  private versionStatus(): SupervisorStatus["version"] {
+    const policy = this.control?.versionPolicy;
+    return { bundle: this.config.SUPERVISOR_BUNDLE_VERSION, protocol: String(REMOTE_INSTANCE_PROTOCOL_VERSION), manifestDigest: this.manifestDigest || null,
+      updateAvailable: policy?.updateAvailable ?? false, targetBundle: policy?.targetBundle ?? null };
+  }
+
+  private utilizationStatus(): SupervisorStatus["utilization"] {
+    return { acceptingWork: !this.draining && !this.onUpdateProbation && this.lease.canPullNewWork(), ...snapshotLoad(this.lastSnapshot),
+      ...(this.configuration.softMaxConcurrent === undefined ? {} : { softMaxConcurrent: this.configuration.softMaxConcurrent }) };
+  }
+
   controlHandler(): ControlHandler {
-    return async (request, emit) => {
-      switch (request.op) {
-        case "status":
-          return this.status();
-        case "agents": {
-          const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
-          return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
+    const ops = this.controlOps();
+    return async (request, emit) => (ops[request.op] as (request: ControlRequest, emit: ControlEmitter) => unknown)(request, emit);
+  }
+
+  /** One handler per control-socket op. */
+  private controlOps(): ControlOps {
+    return {
+      status: () => this.status(),
+      agents: () => {
+        const agents = this.lastSnapshot?.agents ?? this.inventory.agents();
+        return { agents: [...agents, ...this.leftOutAgents(agents)], roles: this.heartbeat?.roles() ?? [], roleBindings: this.roleBindings };
+      },
+      "auth.status": request => ({ agents: (this.lastSnapshot?.agents ?? this.inventory.agents()).filter((agent) => request.agentId === undefined || agent.agentId === request.agentId) }),
+      "auth.login": (request, emit) => this.localLogin(request, emit),
+      "auth.input": async request => {
+        const login = this.activeLogins.get(request.loginId);
+        if (!login) throw new RemoteInstanceError("temporarily_unavailable", "no login in progress with that id");
+        await this.requireRunner(login.agentId).loginInput(request.loginId, request.text);
+        return {};
+      },
+      "auth.cancel": request => this.cancelLocalLogin(request.loginId),
+      "auth.logout": request => {
+        const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }) };
+        return Object.keys(which).length === 0 ? this.requireRunner(request.agentId).logout() : this.requireRunner(request.agentId).logout(which);
+      },
+      "git.key.add": request => this.addGitKey(request.title),
+      "git.key.list": async () => ({ keys: await this.gitKeys().list() }),
+      "git.key.remove": async request => {
+        const store = this.gitKeys();
+        await store.remove(request.keyRef);
+        this.managedGitBinding = await store.binding();
+        return { keyRef: request.keyRef, revoked: true };
+      },
+      drain: async request => ({ activeAssignments: await this.beginDrain(request.reason, null) }),
+      "drain.status": () => this.drainStatus(),
+      "codex.maintenance.preflight": async () => {
+        if (!this.draining || this.drainReason !== "update" || this.work.activeCount() !== 0 || this.stopping) {
+          throw new RemoteInstanceError("active_work", "The update drain has not settled for Codex maintenance.");
         }
-        case "auth.status":
-          return { agents: (this.lastSnapshot?.agents ?? this.inventory.agents()).filter((agent) => request.agentId === undefined || agent.agentId === request.agentId) };
-        case "auth.login": {
-          const runner = this.requireRunner(request.agentId);
-          const loginId = `login-${randomUUID()}`;
-          this.activeLogins.set(loginId, { agentId: request.agentId, emit: (event) => emit.event(event) });
-          emit.signal.addEventListener("abort", () => {
-            if (!this.activeLogins.delete(loginId)) return;
-            void runner.loginCancel(loginId).catch(error => this.logger.warn({ err: error }, "orphaned local login cancellation failed"));
-          }, { once: true });
-          // The person ran this on their own machine: their own login (WS1-115).
-          const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }),
-            ...(request.reuse === undefined ? {} : { reuse: request.reuse }),
-            // Gemini Enterprise's project and location, both or neither (the runner checks them again).
-            ...(request.project !== undefined && request.location !== undefined ? { gcp: AgentLoginGcpSchema.parse({ project: request.project, location: request.location }) } : {}) };
-          try {
-            if (Object.keys(which).length > 0) await runner.login(request.organization, loginId, true, which);
-            else await runner.login(request.organization, loginId, true);
-            if (emit.signal.aborted) {
-              await runner.loginCancel(loginId);
-              throw new RemoteInstanceError("temporarily_unavailable", "login caller disconnected");
-            }
-          } catch (error) {
-            this.activeLogins.delete(loginId);
-            throw error;
-          }
-          emit.event({ kind: "started", loginId, agentId: request.agentId });
-          return { loginId };
-        }
-        case "auth.input": {
-          const login = this.activeLogins.get(request.loginId);
-          if (!login) throw new RemoteInstanceError("temporarily_unavailable", "no login in progress with that id");
-          await this.requireRunner(login.agentId).loginInput(request.loginId, request.text);
-          return {};
-        }
-        case "auth.cancel": {
-          const login = this.activeLogins.get(request.loginId);
-          if (!login) return {};
-          this.activeLogins.delete(request.loginId);
-          await this.requireRunner(login.agentId).loginCancel(request.loginId);
-          login.emit({ kind: "failed", loginId: request.loginId, code: "login_cancelled", message: "login cancelled" });
-          return {};
-        }
-        case "auth.logout": {
-          const which = { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }) };
-          return Object.keys(which).length === 0 ? this.requireRunner(request.agentId).logout() : this.requireRunner(request.agentId).logout(which);
-        }
-        case "git.key.add": {
-          const store = this.gitKeys();
-          const key = await store.add(request.title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);
-          this.managedGitBinding = await store.binding();
-          // The reference, the fingerprint and the host; never the key.
-          // The key file's PATH lets the person's own git use the key for the
-          // repository onboarding pushes (WS1-021); the key itself never leaves.
-          return {
-            keyRef: key.keyRef, title: key.title, fingerprint: key.fingerprint, host: key.host,
-            sshConfig: sshConfigPath(this.config.SUPERVISOR_ONBOARD_GIT_KEY_DIR),
-            // The key file, wherever the person's push needs it: the binding
-            // exists only when the registration named a host (WS1-026).
-            identityFile: store.privateKeyPath,
-            user: this.managedGitBinding?.user ?? "git",
-          };
-        }
-        case "git.key.list":
-          return { keys: await this.gitKeys().list() };
-        case "git.key.remove": {
-          const store = this.gitKeys();
-          await store.remove(request.keyRef);
-          this.managedGitBinding = await store.binding();
-          return { keyRef: request.keyRef, revoked: true };
-        }
-        case "drain":
-          return { activeAssignments: await this.beginDrain(request.reason, null) };
-        case "drain.status":
-          return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
-        case "codex.maintenance.preflight": {
-          if (!this.draining || this.drainReason !== "update" || this.work.activeCount() !== 0 || this.stopping) {
-            throw new RemoteInstanceError("active_work", "The update drain has not settled for Codex maintenance.");
-          }
-          await this.nativeCodexOwner?.preflightMaintenance();
-          return { idle: true };
-        }
-        case "drain.cancel": {
-          // Only a locally requested drain is reversible; a Core directive with a
-          // deadline stays in force until Core lifts it.
-          if (this.draining && this.drainDeadline === null) {
-            this.draining = false;
-            this.drainReason = null;
-            if (this.administrativeStatus === "draining") this.administrativeStatus = "active";
-            this.logger.info("drain cancelled by the local operator");
-          }
-          return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
-        }
-        case "update.check":
-          return this.requireUpdates().check();
-        case "update.apply":
-          return this.requireUpdates().apply("operator");
-        case "update.status":
-          return this.requireUpdates().status();
-        case "update.channel": {
-          // Its own op, not a status field: launchers from older releases read
-          // `status` strictly and a user install never replaces its launcher.
-          const channel = this.updates ? this.updateChannelReport() : null;
-          return channel ? { host: channel.host, override: channel.override, lastCheckedAt: channel.lastCheckedAt, error: channel.lastError } : null;
-        }
-        case "release.accepted": {
-          if (!this.instanceId) return { bundleVersion: null };
-          const accepted = await this.core.acceptedRelease(this.instanceId);
-          return { bundleVersion: accepted?.bundleVersion ?? null };
-        }
-        case "preview.status":
-          return this.previewReport();
-        case "doctor":
-          return this.doctor();
-        case "logs":
-          return { lines: this.logLines.slice(-2_000) };
-        case "support.bundle": {
-          const doctor = await this.doctor();
-          return buildSupportBundle({
-            bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
-            protocolVersion: String(REMOTE_INSTANCE_PROTOCOL_VERSION),
-            instanceId: this.instanceId,
-            administrativeStatus: this.administrativeStatus,
-            doctor,
-            configurationKeys: flattenKeys(this.configuration),
-            counters: { relay: { ...this.mux.counters }, control: { ...this.control.counters }, work: { ...this.work.counters } },
-            recentLogLines: this.logLines,
-            generatedAt: this.clock.nowIso(),
-          }).document;
-        }
-        case "readiness.submit":
-          await this.continueProvisioning();
-          return this.status();
-        case "revoke.pending":
-          this.pendingRevocation = true;
-          return { pendingRevocation: true };
-        case "shutdown": {
-          // Answered first, then stopped, so the caller hears it was accepted.
-          setTimeout(() => {
-            if (this.options.onShutdownRequested) this.options.onShutdownRequested();
-            else void this.stop().catch(() => undefined);
-          }, 200).unref?.();
-          return { stopping: true };
-        }
-        case "instance.retire": {
-          if (!this.instanceId) throw new RemoteInstanceError("temporarily_unavailable", "This runtime is not activated, so there is nothing to remove from Konteks.");
-          const result = await this.core.retire(this.instanceId);
-          if (result.outcome !== "draining") {
-            // Removed from its workspace, a runtime has nothing left to do:
-            // it stops once this answer is sent, so uninstall never deletes a
-            // folder out from under a process still running in it.
-            this.administrativeStatus = "removed";
-            setTimeout(() => {
-              if (this.options.onRetired) this.options.onRetired();
-              else void this.stop().catch(() => undefined);
-            }, 500).unref?.();
-          }
-          return result;
-        }
-      }
+        await this.nativeCodexOwner?.preflightMaintenance();
+        return { idle: true };
+      },
+      "drain.cancel": () => this.cancelLocalDrain(),
+      "update.check": () => this.requireUpdates().check(),
+      "update.apply": () => this.requireUpdates().apply("operator"),
+      "update.status": () => this.requireUpdates().status(),
+      // Its own op, not a status field: launchers from older releases read
+      // `status` strictly and a user install never replaces its launcher.
+      "update.channel": () => {
+        const channel = this.updates ? this.updateChannelReport() : null;
+        return channel ? { host: channel.host, override: channel.override, lastCheckedAt: channel.lastCheckedAt, error: channel.lastError } : null;
+      },
+      "release.accepted": async () => {
+        if (!this.instanceId) return { bundleVersion: null };
+        const accepted = await this.core.acceptedRelease(this.instanceId);
+        return { bundleVersion: accepted?.bundleVersion ?? null };
+      },
+      "preview.status": () => this.previewReport(),
+      doctor: () => this.doctor(),
+      logs: () => ({ lines: this.logLines.slice(-2_000) }),
+      "support.bundle": () => this.supportBundle(),
+      "readiness.submit": async () => {
+        await this.continueProvisioning();
+        return this.status();
+      },
+      "revoke.pending": () => {
+        this.pendingRevocation = true;
+        return { pendingRevocation: true };
+      },
+      // Answered first, then stopped, so the caller hears it was accepted.
+      shutdown: () => {
+        setTimeout(() => {
+          if (this.options.onShutdownRequested) this.options.onShutdownRequested();
+          else void this.stop().catch(() => undefined);
+        }, 200).unref?.();
+        return { stopping: true };
+      },
+      "instance.retire": () => this.retireInstance(),
     };
+  }
+
+  /** The person ran this on their own machine: their own login. */
+  private async localLogin(request: ControlRequestOf<"auth.login">, emit: ControlEmitter): Promise<{ loginId: string }> {
+    const runner = this.requireRunner(request.agentId);
+    const loginId = `login-${randomUUID()}`;
+    this.activeLogins.set(loginId, { agentId: request.agentId, emit: (event) => emit.event(event) });
+    emit.signal.addEventListener("abort", () => {
+      if (!this.activeLogins.delete(loginId)) return;
+      void runner.loginCancel(loginId).catch(error => this.logger.warn({ err: error }, "orphaned local login cancellation failed"));
+    }, { once: true });
+    const which = localLoginSelection(request);
+    try {
+      if (Object.keys(which).length > 0) await runner.login(request.organization, loginId, true, which);
+      else await runner.login(request.organization, loginId, true);
+      if (emit.signal.aborted) {
+        await runner.loginCancel(loginId);
+        throw new RemoteInstanceError("temporarily_unavailable", "login caller disconnected");
+      }
+    } catch (error) {
+      this.activeLogins.delete(loginId);
+      throw error;
+    }
+    emit.event({ kind: "started", loginId, agentId: request.agentId });
+    return { loginId };
+  }
+
+  private async cancelLocalLogin(loginId: string): Promise<Record<string, never>> {
+    const login = this.activeLogins.get(loginId);
+    if (!login) return {};
+    this.activeLogins.delete(loginId);
+    await this.requireRunner(login.agentId).loginCancel(loginId);
+    login.emit({ kind: "failed", loginId, code: "login_cancelled", message: "login cancelled" });
+    return {};
+  }
+
+  /**
+   * The reference, the fingerprint and the host; never the key. The key
+   * file's path lets the person's own git use the key for the repository
+   * onboarding pushes; the key itself never leaves. The binding exists only
+   * when the registration named a host.
+   */
+  private async addGitKey(title: string | undefined) {
+    const store = this.gitKeys();
+    const key = await store.add(title ?? `konteks-remote ${this.instanceId ?? "runtime"}`);
+    this.managedGitBinding = await store.binding();
+    return {
+      keyRef: key.keyRef, title: key.title, fingerprint: key.fingerprint, host: key.host,
+      sshConfig: sshConfigPath(this.config.SUPERVISOR_ONBOARD_GIT_KEY_DIR),
+      identityFile: store.privateKeyPath,
+      user: this.managedGitBinding?.user ?? "git",
+    };
+  }
+
+  private drainStatus() {
+    return { draining: this.draining, reason: this.drainReason, activeAssignments: this.work.activeCount(), openSessions: this.work.openSessions() };
+  }
+
+  /** Only a locally requested drain is reversible; a Core directive with a deadline stays in force until Core lifts it. */
+  private cancelLocalDrain() {
+    if (this.draining && this.drainDeadline === null) {
+      this.draining = false;
+      this.drainReason = null;
+      if (this.administrativeStatus === "draining") this.administrativeStatus = "active";
+      this.logger.info("drain cancelled by the local operator");
+    }
+    return this.drainStatus();
+  }
+
+  private async supportBundle() {
+    const doctor = await this.doctor();
+    return buildSupportBundle({
+      bundleVersion: this.config.SUPERVISOR_BUNDLE_VERSION,
+      protocolVersion: String(REMOTE_INSTANCE_PROTOCOL_VERSION),
+      instanceId: this.instanceId,
+      administrativeStatus: this.administrativeStatus,
+      doctor,
+      configurationKeys: flattenKeys(this.configuration),
+      counters: { relay: { ...this.mux.counters }, control: { ...this.control.counters }, work: { ...this.work.counters } },
+      recentLogLines: this.logLines,
+      generatedAt: this.clock.nowIso(),
+    }).document;
+  }
+
+  /**
+   * Removed from its workspace, a runtime has nothing left to do: it stops
+   * once this answer is sent, so uninstall never deletes a folder out from
+   * under a process still running in it.
+   */
+  private async retireInstance() {
+    if (!this.instanceId) throw new RemoteInstanceError("temporarily_unavailable", "This runtime is not activated, so there is nothing to remove from Konteks.");
+    const result = await this.core.retire(this.instanceId);
+    if (result.outcome !== "draining") {
+      this.administrativeStatus = "removed";
+      setTimeout(() => {
+        if (this.options.onRetired) this.options.onRetired();
+        else void this.stop().catch(() => undefined);
+      }, 500).unref?.();
+    }
+    return result;
   }
 
   private requireUpdates(): NativeUpdateCoordinator {
@@ -2191,8 +2385,8 @@ export class Supervisor {
   }
 
   /**
-   * A login the person started from the site for an agent on this machine
-   * (WS1-115). Core signed it for this runtime; the runner runs the agent's
+   * A login the person started from the site for an agent on this machine.
+   * Core signed it for this runtime; the runner runs the agent's
    * official device login in the person's own profile, and only the provider
    * link and code go back to Core. A login that asks for typed input is
    * stopped: nothing the person types may cross Konteks.
@@ -2202,65 +2396,68 @@ export class Supervisor {
       throw new RemoteInstanceError("permission_denied", "Core agent login signatures are required");
     }
     const { intent } = request;
+    const instanceId = this.loginRuntime(intent);
+    if (isOnComputerLogin(intent)) return this.startOnComputer(instanceId, intent.loginId, intent.agentId as OnComputerAgent, intent.action);
+    const agentId = intent.agentId;
+    if (!isSiteLoginAgent(agentId)) return this.refuseLoginAgent(instanceId, intent);
+    const site = siteLoginSelection(intent);
+    const report = this.siteLoginReporter(instanceId, intent.loginId, site.loginOption);
+    if (intent.action === "cancel") return this.cancelSiteLogin(intent.loginId);
+    // A repeated delivery of a login already under way changes nothing.
+    if (this.activeLogins.has(intent.loginId)) return;
+    const runner = this.runners.get(agentId);
+    if (!runner || siteLoginRefused(agentId, site, runner)) {
+      await report({ loginId: intent.loginId, agentId, state: "failed", failure: "unavailable" });
+      return;
+    }
+    await this.startSiteLogin(intent.loginId, agentId, runner, site, report);
+  }
+
+  /** The runtime a signed login names: this one, or the login is refused. */
+  private loginRuntime(intent: AgentLoginIntent): string {
     const instanceId = this.instanceId;
     if (!instanceId || intent.instanceId !== instanceId || intent.tenantId !== this.workspaceId) {
       throw new RemoteInstanceError("recovery_required", "This agent login is for another runtime");
     }
-    if (intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId)) {
-      await this.startOnComputer(instanceId, intent.loginId, intent.agentId as OnComputerAgent, intent.action);
-      return;
-    }
-    if (intent.agentId !== "codex" && intent.agentId !== "claude-code" && intent.agentId !== "opencode" && intent.agentId !== "antigravity") {
-      if (intent.action !== "cancel") {
-        await this.core.reportAgentLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as Parameters<CoreClient["reportAgentLogin"]>[1])
-          .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
-      }
-      return;
-    }
-    // An OpenCode or Antigravity login names its sign-in option; every report
-    // echoes it. Another agent's option is never started (the runner offers
-    // only its own). Gemini Enterprise carries its Google Cloud project.
-    const optionAgent = intent.agentId === "opencode" || intent.agentId === "antigravity";
-    const requestedOption = optionAgent && intent.loginOption !== undefined ? AgentLoginOptionIdSchema.safeParse(intent.loginOption) : undefined;
-    const loginOption = requestedOption?.success ? requestedOption.data : undefined;
-    const gcp = intent.agentId === "antigravity" && loginOption === "gemini-enterprise" && intent.gcp !== undefined ? intent.gcp : undefined;
-    const report = (value: Parameters<CoreClient["reportAgentLogin"]>[1]) =>
-      this.core.reportAgentLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as Parameters<CoreClient["reportAgentLogin"]>[1])
-        .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
-    if (intent.action === "cancel") {
-      const login = this.activeLogins.get(intent.loginId);
-      if (login) {
-        this.activeLogins.delete(intent.loginId);
-        await this.requireRunner(login.agentId).loginCancel(intent.loginId).catch(() => undefined);
-      }
-      return;
-    }
-    // A repeated delivery of a login already under way changes nothing.
-    if (this.activeLogins.has(intent.loginId)) return;
-    const runner = this.runners.get(intent.agentId);
-    if (!runner) {
-      await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
-      return;
-    }
-    // A sign-in this machine does not offer (any more) is not started; nor a
-    // Gemini Enterprise sign-in without its project.
-    if ((requestedOption !== undefined && !requestedOption.success) || (loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(loginOption))
-        || (intent.agentId === "antigravity" && (loginOption === undefined || (loginOption === "gemini-enterprise" && gcp === undefined)))) {
-      await report({ loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" });
-      return;
-    }
-    const relay = siteLoginRelay({ loginId: intent.loginId, agentId: intent.agentId, ...(loginOption === undefined ? {} : { loginOption }),
+    return instanceId;
+  }
+
+  /** An agent this connector cannot sign in from the site: its start is reported unavailable. */
+  private async refuseLoginAgent(instanceId: string, intent: AgentLoginIntent): Promise<void> {
+    if (intent.action === "cancel") return;
+    await this.core.reportAgentLogin(instanceId, { loginId: intent.loginId, agentId: intent.agentId, state: "failed", failure: "unavailable" } as AgentLoginReport)
+      .catch(error => this.logger.warn({ err: error, loginId: intent.loginId }, "agent login report not delivered"));
+  }
+
+  /** Every report of a site sign-in echoes the sign-in option it named. */
+  private siteLoginReporter(instanceId: string, loginId: string, loginOption: SiteLoginSelection["loginOption"]) {
+    return (value: AgentLoginReport) =>
+      this.core.reportAgentLogin(instanceId, { ...value, ...(loginOption === undefined ? {} : { loginOption }) } as AgentLoginReport)
+        .catch(error => this.logger.warn({ err: error, loginId }, "agent login report not delivered"));
+  }
+
+  private async cancelSiteLogin(loginId: string): Promise<void> {
+    const login = this.activeLogins.get(loginId);
+    if (!login) return;
+    this.activeLogins.delete(loginId);
+    await this.requireRunner(login.agentId).loginCancel(loginId).catch(() => undefined);
+  }
+
+  private async startSiteLogin(loginId: string, agentId: SiteLoginAgent, runner: RunnerPort, site: SiteLoginSelection,
+    report: (value: AgentLoginReport) => Promise<unknown>): Promise<void> {
+    const { loginOption, gcp } = site;
+    const relay = siteLoginRelay({ loginId, agentId, ...(loginOption === undefined ? {} : { loginOption }),
       coreAcceptsNoLicense: this.hostSettings.coreAcceptsRouteBilling,
       report: value => { void report(value); },
-      cancel: () => { void runner.loginCancel(intent.loginId).catch(() => undefined); },
-      onFinished: () => { this.activeLogins.delete(intent.loginId); },
+      cancel: () => { void runner.loginCancel(loginId).catch(() => undefined); },
+      onFinished: () => { this.activeLogins.delete(loginId); },
       // Ready shows on the site now, not at the next heartbeat.
       onSucceeded: () => { if (this.activeLoopStarted) void this.heartbeat.publish().catch(error => this.logger.warn({ err: error }, "heartbeat after login failed")); },
     });
-    this.activeLogins.set(intent.loginId, { agentId: intent.agentId, emit: event => relay.emit(event) });
+    this.activeLogins.set(loginId, { agentId, emit: event => relay.emit(event) });
     try {
-      if (loginOption === undefined) await runner.login(false, intent.loginId, true);
-      else await runner.login(false, intent.loginId, true, { loginOption, ...(gcp ? { gcp } : {}) });
+      if (loginOption === undefined) await runner.login(false, loginId, true);
+      else await runner.login(false, loginId, true, { loginOption, ...(gcp ? { gcp } : {}) });
       relay.started();
     } catch (error) {
       const busy = error instanceof RemoteInstanceError && /already in progress/i.test(error.message);
@@ -2283,19 +2480,9 @@ export class Supervisor {
     const facts = this.onComputerFacts(agentId);
     if (!facts) { await report({ state: "failed", failure: "unavailable" }); return; }
     if (onComputerDone(facts.state)) { await report({ state: "succeeded" }); return; }
-    const plan = planOnComputer({ agentId, state: facts.state, ...(facts.installCommand ? { installCommand: facts.installCommand } : {}), ...(facts.windowsInstallCommand ? { windowsInstallCommand: facts.windowsInstallCommand } : {}) }, process.platform);
+    const plan = onComputerPlan(agentId, facts);
     if (!plan) { await report({ state: "failed", failure: "unavailable" }); return; }
-    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
-    // A stand-in laptop's window loads the stand-in's own terminal settings.
-    const prelude = process.env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" ? standInTerminalEnv(root) : undefined;
-    // This release's own launcher, never the install-day one in bin (it is not updated).
-    const launcher = releaseLauncher();
-    try {
-      const { file, opened } = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform, ...(prelude ? { prelude } : {}), ...(launcher ? { launcher } : {}) }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform, confined: prelude !== undefined });
-      this.logger.info({ event: opened ? "on_computer.opened" : "on_computer.left_for_tester", loginId, agentId, step: plan.step, file },
-        opened ? "site-started step brought to the front on this computer" : "site-started step left in the stand-in's folder; no window opened");
-    } catch (error) {
-      this.logger.warn({ err: error, loginId, agentId }, "site-started step could not be opened on this computer");
+    if (!await this.openOnComputerStep(loginId, agentId, plan)) {
       await report({ state: "failed", failure: "unavailable" });
       return;
     }
@@ -2305,6 +2492,24 @@ export class Supervisor {
     // still end (and say so on the site) in the connector that comes back.
     await writeOnComputerWatch(this.config.SUPERVISOR_DATA_DIR, watch).catch(error => this.logger.warn({ err: error, loginId }, "on-computer step not kept across a restart"));
     this.watchOnComputer(watch);
+  }
+
+  /** Bring the step's window to the front; false when it could not be opened. */
+  private async openOnComputerStep(loginId: string, agentId: OnComputerAgent, plan: OnComputerPlan): Promise<boolean> {
+    const root = dirname(this.config.SUPERVISOR_DATA_DIR);
+    // A stand-in laptop's window loads the stand-in's own terminal settings.
+    const prelude = process.env.KONTEKS_E2E_NATIVE_CONNECTOR === "1" ? standInTerminalEnv(root) : undefined;
+    // This release's own launcher, never the install-day one in bin (it is not updated).
+    const launcher = releaseLauncher();
+    try {
+      const { file, opened } = await openOnComputer({ loginId, script: onComputerScript(plan, { agentId, root, platform: process.platform, ...(prelude ? { prelude } : {}), ...(launcher ? { launcher } : {}) }), dataDir: this.config.SUPERVISOR_DATA_DIR, platform: process.platform, confined: prelude !== undefined });
+      this.logger.info({ event: opened ? "on_computer.opened" : "on_computer.left_for_tester", loginId, agentId, step: plan.step, file },
+        opened ? "site-started step brought to the front on this computer" : "site-started step left in the stand-in's folder; no window opened");
+      return true;
+    } catch (error) {
+      this.logger.warn({ err: error, loginId, agentId }, "site-started step could not be opened on this computer");
+      return false;
+    }
   }
 
   private onComputerReporter(instanceId: string, loginId: string, agentId: OnComputerAgent) {
@@ -2320,8 +2525,8 @@ export class Supervisor {
 
   /**
    * A turn started or ended: publish a heartbeat shortly (once for a burst), so
-   * the runtime's busy bar and counter move with the work. A short turn used
-   * to fall between two 30 s heartbeats and never showed at all (WS1-179).
+   * the runtime's busy bar and counter move with the work, and a short turn
+   * never falls between two 30 s heartbeats unseen.
    */
   private nudgeHeartbeat(): void {
     if (!this.activeLoopStarted || this.stopping || this.turnActivityTimer) return;
@@ -2378,13 +2583,13 @@ export class Supervisor {
 
   /**
    * Core's host-agent settings from an applied desired configuration: OpenCode
-   * Zen's free models (absent = off, O6) and whether Core takes 7.1 fields
+   * Zen's free models (absent = off) and whether Core takes 7.1 fields
    * (pay-per-use turns and route billing, an offered option's billing,
    * `hostAgentDownload`, a credential's and a site sign-in's `no_license`).
    * The latter is the Core wire-contract version Core signs into every
    * revision for a connector advertising `core-contract-version-v1`
    * (inventory.ts); no fallback on the free-models field, which no released
-   * Core ever sent (antigravity CP6). A change drops OpenCode's model
+   * Core ever sent. A change drops OpenCode's model
    * snapshots.
    */
   private applyHostSettings(configuration: ConfigRecord["configuration"]): void {
@@ -2401,9 +2606,8 @@ export class Supervisor {
 
   /**
    * The agents this installation lists that could not start, as unavailable,
-   * for `agents` and `doctor` (RCA 2026-10-01: a Codex left out at start was
-   * simply missing there, so the update health gate kept waiting for its
-   * probe until its deadline and blamed the probe). Only agents this release
+   * for `agents` and `doctor`, so the update health gate never waits for the
+   * probe of an agent left out at start. Only agents this release
    * bundles: the person's own host agents have their own doctor checks and
    * never hold an update back. Not in the heartbeat: Core hears of them
    * through `supportedAgents`.
@@ -2426,7 +2630,7 @@ export class Supervisor {
   }
 
   /**
-   * Every supported agent's real state on this computer (runtime-view R21),
+   * Every supported agent's real state on this computer,
    * only to a Core that takes 7.1 fields (the heartbeat is strict there). A
    * listed agent from its runner, or from why it is left out; the others
    * from the cached detection, re-run in the background on the agent retry
@@ -2438,15 +2642,19 @@ export class Supervisor {
     void detector.refreshIfDue().catch(() => undefined);
     if (!detector.detectedOnce()) return undefined;
     const added = new Map<string, AddedAgentFacts>();
-    for (const agentId of this.recordedAgentIds()) {
-      const live = this.nativeRunners.find(runner => runner.agentId === agentId && this.runners.get(agentId) === runner);
-      const view = live ? agents.find(agent => agent.agentId === agentId) : undefined;
-      const version = (live ?? this.parkedRunners.get(agentId) ?? this.gaveUpRunners.get(agentId))?.hostInstallation()?.version;
-      added.set(agentId, live && view
-        ? { view, signInLost: live.signInLost(), ...(version ? { version } : {}) }
-        : { failure: this.agentStartFailures.get(agentId), ...(version ? { version } : {}) });
-    }
+    for (const agentId of this.recordedAgentIds()) added.set(agentId, this.addedAgentFacts(agentId, agents));
     return projectSupportedAgents({ added, notAdded: detector.current() });
+  }
+
+  /** A listed agent from its live runner's view, or from why it is left out. */
+  private addedAgentFacts(agentId: string, agents: readonly ConnectedAgentView[]): AddedAgentFacts {
+    const live = this.liveNativeRunner(agentId);
+    const view = live ? agents.find(agent => agent.agentId === agentId) : undefined;
+    const version = this.runnerInstallation(agentId, live)?.version;
+    const versionField = version ? { version } : {};
+    return live && view
+      ? { view, signInLost: live.signInLost(), ...versionField }
+      : { failure: this.agentStartFailures.get(agentId), ...versionField };
   }
 
   /** What this connector advertises for OpenCode: the free-models switch, and the sign-ins the site may start here. */
@@ -2457,7 +2665,7 @@ export class Supervisor {
   }
 
   /**
-   * Google Antigravity's download state on its connected agent (CP3 prep),
+   * Google Antigravity's download state on its connected agent,
    * only to a Core that takes it (a 7.1.0 Core; the view is strict there).
    * While no runner of it can start (not downloaded, or its copy fails the
    * start checks) it is reported as an unavailable agent carrying that state,
@@ -2469,7 +2677,7 @@ export class Supervisor {
     const root = dirname(this.config.SUPERVISOR_DATA_DIR);
     const record = this.antigravityRecordFields();
     // Not added (the installation does not list it): the site's add card
-    // shows "Not added" with the one command (A20), or the download while
+    // shows "Not added" with the one command, or the download while
     // `agent add antigravity` fetches it in the launcher (the service keeps
     // running meanwhile). Nothing where Google publishes no copy for this
     // computer.
@@ -2485,17 +2693,12 @@ export class Supervisor {
   private antigravityRecordFields(): Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot"> | null {
     const native = this.options.native;
     if (!native) return null;
-    const runner = this.nativeRunners.find(candidate => candidate.agentId === "antigravity") ?? this.parkedRunners.get("antigravity") ?? this.gaveUpRunners.get("antigravity");
-    const live = runner?.hostInstallation();
+    const live = this.runnerInstallation("antigravity", this.nativeRunners.find(candidate => candidate.agentId === "antigravity"));
     if (live?.fetchedRoot !== undefined) return { antigravityVersion: live.version, antigravityRoot: live.fetchedRoot };
-    const unavailable = native.unavailableAgents?.find(entry => entry.agentId === "antigravity");
-    if (unavailable) return unavailable.fetched ?? {};
-    const config = native.runners.find(candidate => candidate.RUNNER_AGENT_ID === "antigravity");
-    if (config?.RUNNER_NATIVE_ANTIGRAVITY_ROOT !== undefined) return { antigravityVersion: config.RUNNER_BRIDGE_VERSION, antigravityRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT };
-    return null;
+    return listedAntigravityFields(native);
   }
 
-  /** What this connector advertises for Google Antigravity: its Gemini Enterprise sign-in from the site (CP3). */
+  /** What this connector advertises for Google Antigravity: its Gemini Enterprise sign-in from the site. */
   private antigravityCapabilities(): string[] {
     const runner = this.runners.get("antigravity");
     return antigravityRunnerCapabilities({ installed: runner !== undefined, relayReady: !this.stopping && this.relay !== null && this.relay !== undefined,
@@ -2512,20 +2715,29 @@ export class Supervisor {
     const snapshot = this.lastSnapshot ?? (await this.inventory.collect());
     const openCode = this.openCodeDoctor(snapshot.agents);
     const antigravity = await this.antigravityDoctor(snapshot.agents).catch(() => undefined);
-    return runDoctor({
+    const inputs = {
+      ...this.doctorState(snapshot),
+      ...(openCode ? { openCode } : {}),
+      ...(antigravity ? { antigravity } : {}),
+      ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
+    };
+    return runDoctor({ ...inputs, ...await this.doctorLauncher() });
+  }
+
+  private doctorState(snapshot: InventorySnapshot) {
+    return {
       now: () => this.clock.nowIso(),
       dataDir: this.config.SUPERVISOR_DATA_DIR,
       identity: { instanceId: this.instanceId, administrativeStatus: this.administrativeStatus },
       lease: { mode: this.lease.mode(), expiresAt: this.lease.current()?.expiresAt ?? null },
-      relay: this.relay?.status() ?? { state: "offline", lastError: "relay not configured", consecutiveFailures: 0 },
+      relay: this.relay?.status() ?? { state: "offline" as const, lastError: "relay not configured", consecutiveFailures: 0 },
       transport: this.transport.kind,
       reconciliationComplete: this.reconciliation.isComplete,
       ...(this.reconnectRefusal ? { reconciliationRefusal: this.reconnectRefusal } : {}),
       components: snapshot.components,
       agents: [...snapshot.agents, ...this.leftOutAgents(snapshot.agents)],
       // The snapshot may carry the site's "Not added" Google Antigravity view
-      // (only after a fresh collect, so a long-running release did not show
-      // it and a just-started one did): an update gate read it as a failure.
+      // (only after a fresh collect): an update gate must not read it as a failure.
       ...(this.options.native ? { listedAgents: [...this.recordedAgentIds()] } : {}),
       configRevision: this.control.configRevision,
       diskFreeBytes: snapshot.diskFreeBytes,
@@ -2534,13 +2746,20 @@ export class Supervisor {
       outboxDepth: this.outbox.depth,
       recoveryRequired: this.journal.recoveryRequired().length,
       coreSignatureConfigured: this.roots.some((root) => (root.coreControlKeys ?? []).length > 0),
-      preview: { advertised: this.previewCapable(), running: this.previews.health().running, lastFailureAt: this.previews.health().lastFailure?.at ?? null },
+      preview: this.previewDoctorReport(),
       browser: this.browserReport(),
-      ...(openCode ? { openCode } : {}),
-      ...(antigravity ? { antigravity } : {}),
-      ...(this.updates ? { updateChannel: this.updateChannelReport() } : {}),
-      ...(this.options.native && process.platform === "win32" ? { launcher: await windowsInstalledLauncher().catch(() => null) } : {}),
-    });
+    };
+  }
+
+  private previewDoctorReport() {
+    const health = this.previews.health();
+    return { advertised: this.previewCapable(), running: health.running, lastFailureAt: health.lastFailure?.at ?? null };
+  }
+
+  /** The Windows installed launcher, for a native connector on Windows only. */
+  private async doctorLauncher() {
+    if (!this.options.native || process.platform !== "win32") return {};
+    return { launcher: await windowsInstalledLauncher().catch(() => null) };
   }
 
   /** The unattended update's channel for `doctor`: host only, never the full URL. */
@@ -2560,59 +2779,83 @@ export class Supervisor {
 
   /** The Google Antigravity doctor line's facts, when this installation lists it (running, updating, retried or given up). */
   private async antigravityDoctor(agents: Array<{ agentId: string; credentials?: Array<{ label: string; state: string; method?: string | undefined; reason?: string | undefined }> | undefined }>): Promise<AntigravityDoctorInputs | undefined> {
-    const running = this.nativeRunners.find(runner => runner.agentId === "antigravity" && this.runners.get("antigravity") === runner);
-    const retrying = this.nativeAgentRetry.parked().includes("antigravity");
-    const gaveUp = this.gaveUpRunners.get("antigravity");
-    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has("antigravity")) return undefined;
+    const listed = this.listedAgentRunner("antigravity");
+    if (!listed) return undefined;
     const root = dirname(this.config.SUPERVISOR_DATA_DIR);
-    let pin: ReturnType<typeof antigravityPin> | null = null;
-    try { pin = antigravityPin(); } catch { pin = null; }
-    const installation = (running ?? this.parkedRunners.get("antigravity") ?? gaveUp)?.hostInstallation() ?? null;
-    const record = this.antigravityRecordFields();
-    const download = record === null ? undefined : (await antigravityDownloadState(root, record).catch(() => undefined))?.state;
+    const pin = currentAntigravityPin();
+    const download = await antigravityDownloadStateOf(root, this.antigravityRecordFields());
     const failure = this.agentStartFailures.get("antigravity");
-    const updating = retrying && this.options.native?.unavailableAgents?.some(entry => entry.agentId === "antigravity" && entry.updating === true) === true;
+    const updating = listed.retrying && this.antigravityUpdating();
     const observation = await readAntigravityAdminObservation(join(root, "credentials", "antigravity")).catch(() => null);
     return {
-      state: running ? "running" : retrying ? "retrying" : "given_up",
+      state: listed.state,
       pinnedVersion: pin?.version ?? null,
       ...(download === undefined ? {} : { download }),
-      selfCheck: installation?.selfCheck ?? "not_run",
-      failure: failure instanceof RemoteInstanceError ? failure.diagnostic : undefined,
+      selfCheck: selfCheckOf(listed.installation),
+      failure: startFailureDiagnostic(failure),
       updating,
-      credentials: (agents.find(agent => agent.agentId === "antigravity")?.credentials ?? [])
+      credentials: agentCredentials(agents, "antigravity")
         .map(credential => ({ label: credential.label, state: credential.state, method: credential.method, reason: credential.reason })),
-      quarantine: running?.quarantineReason() ?? null,
+      quarantine: quarantineOf(listed.running),
       mcpServersOffAt: observation?.mcpServersOffAt ?? null,
-      diskBytes: pin && (download === "ready" || download === "update_available") ? antigravityDiskBytes(pin) : null,
-      browser: running ? running.browserVersion() !== null : this.connectorBrowser.available,
+      diskBytes: downloadedAntigravityDiskBytes(pin, download),
+      browser: this.agentBrowser(listed.running),
     };
+  }
+
+  /** A retried Google Antigravity is updating when the installation marks its left-out copy so. */
+  private antigravityUpdating(): boolean {
+    return this.options.native?.unavailableAgents?.some(entry => entry.agentId === "antigravity" && entry.updating === true) === true;
+  }
+
+  /**
+   * A listed agent's runner for its doctor line: running, retried or given up,
+   * or none of those but a start failure; undefined when the installation does not list it.
+   */
+  private listedAgentRunner(agentId: string): ListedAgentRunner | undefined {
+    const running = this.liveNativeRunner(agentId);
+    const retrying = this.nativeAgentRetry.parked().includes(agentId);
+    const gaveUp = this.gaveUpRunners.get(agentId);
+    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has(agentId)) return undefined;
+    return { running, retrying, state: doctorRunnerState(running, retrying), installation: this.runnerInstallation(agentId, running) ?? null };
+  }
+
+  /** The runner serving this agent now. */
+  private liveNativeRunner(agentId: string): NativeRunner | undefined {
+    return this.nativeRunners.find(runner => runner.agentId === agentId && this.runners.get(agentId) === runner);
+  }
+
+  /** The installation of the given runner, else the agent's parked one, else its given-up one. */
+  private runnerInstallation(agentId: string, runner: NativeRunner | undefined): HostInstallation | null | undefined {
+    return (runner ?? this.parkedRunners.get(agentId) ?? this.gaveUpRunners.get(agentId))?.hostInstallation();
+  }
+
+  /** A running agent reports its own browser; otherwise the connector's. */
+  private agentBrowser(running: NativeRunner | undefined): boolean {
+    return running ? running.browserVersion() !== null : this.connectorBrowser.available;
   }
 
   /** The OpenCode doctor line's facts, when this installation lists OpenCode (running, retried or given up). */
   private openCodeDoctor(agents: Array<{ agentId: string; credentials?: Array<{ label: string; state: string }> | undefined }>): OpenCodeDoctorInputs | undefined {
-    const running = this.nativeRunners.find(runner => runner.agentId === "opencode" && this.runners.get("opencode") === runner);
-    const retrying = this.nativeAgentRetry.parked().includes("opencode");
-    const gaveUp = this.gaveUpRunners.get("opencode");
-    if (!running && !retrying && !gaveUp && !this.agentStartFailures.has("opencode")) return undefined;
-    const installation = (running ?? this.parkedRunners.get("opencode") ?? gaveUp)?.hostInstallation() ?? null;
-    const failure = this.agentStartFailures.get("opencode");
+    const listed = this.listedAgentRunner("opencode");
+    if (!listed) return undefined;
+    const { installation } = listed;
     return {
-      state: running ? "running" : retrying ? "retrying" : "given_up",
+      state: listed.state,
       version: installation?.version ?? null,
       installKind: installation?.executable ? openCodeInstallKind(installation.executable) : null,
-      selfCheck: installation?.selfCheck ?? "not_run",
-      failure: failure instanceof RemoteInstanceError ? failure.diagnostic : undefined,
-      credentials: (agents.find(agent => agent.agentId === "opencode")?.credentials ?? []).map(credential => ({ label: credential.label, state: credential.state })),
+      selfCheck: selfCheckOf(installation),
+      failure: startFailureDiagnostic(this.agentStartFailures.get("opencode")),
+      credentials: agentCredentials(agents, "opencode").map(credential => ({ label: credential.label, state: credential.state })),
       freeModels: this.hostSettings.openCodeFreeModels,
-      browser: running ? running.browserVersion() !== null : this.connectorBrowser.available,
+      browser: this.agentBrowser(listed.running),
     };
   }
 
   stop(): Promise<void> {
     this.leaseAuthorityEpoch++;
     this.stopping = true;
-    // Before anything that can outlast the daemon's exit watchdog (WS1-042).
+    // Before anything that can outlast the daemon's exit watchdog.
     this.nativeCodexOwner?.shutdownRequested();
     this.draining = true;
     this.heartbeat?.stop();
@@ -2629,93 +2872,127 @@ export class Supervisor {
   }
 
   private async stopImpl(): Promise<void> {
-    const note = async (phase: ShutdownProgress["phase"], state: ShutdownProgress["state"]): Promise<void> => {
-      // Diagnostics must never prevent cleanup or change the shutdown receipt.
-      if (!this.options.native) return;
-      await this.shutdownProgressStore.recordShutdownProgress(phase, state).catch((err: unknown) => {
-        this.logger.warn({ err }, "shutdown progress could not be recorded");
-      });
-    };
-    await note("supervisor_prelude", "entered");
-    // A stop that hung here (09-30 15:23) left no clue which wait held it:
-    // every wait that takes longer than a few seconds is named in the log.
-    const waitFor = async (step: string, pending: Promise<unknown> | null | undefined): Promise<void> => {
-      if (!pending) return;
-      const slow = setTimeout(() => this.logger.warn({ event: "shutdown.waiting", step }, "shutdown is still waiting"), 5_000);
-      slow.unref?.();
-      try { await pending; } finally { clearTimeout(slow); }
-    };
-    await waitFor("start", this.startPromise?.catch(() => undefined));
-    await waitFor("active_loop_start", this.activeLoopStarting);
-    if (this.pullTimer) clearInterval(this.pullTimer);
+    await this.noteShutdown("supervisor_prelude", "entered");
+    await this.stopLoopsForShutdown();
+    await this.noteShutdown("supervisor_prelude", "completed");
+    await this.drainForShutdown();
+    await this.noteShutdown("preview_close", "entered");
+    await this.previews.close();
+    await this.noteShutdown("preview_close", "completed");
+    this.previewChannel?.dispose();
+    const { runnerFailure, codexFailure } = await this.stopAgentsForShutdown();
+    for (const runner of this.runners.values()) runner.stopEvents();
+    this.transport?.stop();
+    await this.noteShutdown("state_close", "entered");
+    await this.stateMutations.close();
+    this.nativeOwnership?.release();
+    if (runnerFailure) throw runnerFailure.reason;
+    if (codexFailure) throw codexFailure.reason;
+  }
+
+  /** Diagnostics must never prevent cleanup or change the shutdown receipt. */
+  private async noteShutdown(phase: ShutdownProgress["phase"], state: ShutdownProgress["state"]): Promise<void> {
+    if (!this.options.native) return;
+    await this.shutdownProgressStore.recordShutdownProgress(phase, state).catch((err: unknown) => {
+      this.logger.warn({ err }, "shutdown progress could not be recorded");
+    });
+  }
+
+  /** Every shutdown wait that takes longer than a few seconds is named in the log, so a hung stop shows which wait holds it. */
+  private async waitForShutdownStep(step: string, pending: Promise<unknown> | null | undefined): Promise<void> {
+    if (!pending) return;
+    const slow = setTimeout(() => this.logger.warn({ event: "shutdown.waiting", step }, "shutdown is still waiting"), 5_000);
+    slow.unref?.();
+    try { await pending; } finally { clearTimeout(slow); }
+  }
+
+  /** Stop every timer and poller, and wait for what they already started. */
+  private async stopLoopsForShutdown(): Promise<void> {
+    await this.waitForShutdownStep("start", this.startPromise?.catch(() => undefined));
+    await this.waitForShutdownStep("active_loop_start", this.activeLoopStarting);
+    this.stopWorkTimers();
+    await this.waitForShutdownStep("cancellation_replay", this.cancellationReplay?.stop());
+    stopInterval(this.configurationTimer);
+    await this.settleControlLoops();
+    this.heartbeat?.stop();
+    await this.waitForShutdownStep("heartbeat", this.heartbeat?.settle());
+    await this.waitForShutdownStep("lease_acquisition", this.leaseAcquisition);
+    await this.waitForShutdownStep("lease_mutation", this.leaseMutation);
+    await this.waitForShutdownStep("lease_loss_cleanup", this.leaseLossCleanup);
+  }
+
+  private stopWorkTimers(): void {
+    stopInterval(this.pullTimer);
     for (const watch of this.onComputerWatches.values()) clearInterval(watch);
     this.onComputerWatches.clear();
-    if (this.turnActivityTimer) clearTimeout(this.turnActivityTimer);
+    stopTimeout(this.turnActivityTimer);
     this.turnActivityTimer = null;
-    if (this.reaperTimer) clearInterval(this.reaperTimer);
-    if (this.livenessTimer) clearInterval(this.livenessTimer);
+    stopInterval(this.reaperTimer);
+    stopInterval(this.livenessTimer);
     this.livenessTimer = null;
     this.updates?.stop();
-    if (this.muxTimer) clearInterval(this.muxTimer);
-    if (this.cancellationTimer) clearInterval(this.cancellationTimer);
-    await waitFor("cancellation_replay", this.cancellationReplay?.stop());
-    if (this.configurationTimer) clearInterval(this.configurationTimer);
-    await waitFor("configuration_refresh", this.configurationRefresh);
-    await waitFor("observation_delivery", this.observationDelivery?.stop());
-    await waitFor("configuration_acks", this.configurationAcks?.settle());
-    await waitFor("fence_receipts", this.executionRevisionFenceReceipts?.settle());
-    await waitFor("planning_directives", this.planningDirectivePoller?.stop());
-    this.heartbeat?.stop();
-    await waitFor("heartbeat", this.heartbeat?.settle());
-    await waitFor("lease_acquisition", this.leaseAcquisition);
-    await waitFor("lease_mutation", this.leaseMutation);
-    await waitFor("lease_loss_cleanup", this.leaseLossCleanup);
-    await note("supervisor_prelude", "completed");
-    await note("work_drain", "entered");
-    // stop() withdrew this process's recovery authority first, so a session
-    // whose close asserts it is refused ("Transport recovery generation is not
-    // currently accepted"). That must not abort the stop before the runners
-    // and the Codex owner below are stopped (D113: it orphaned Codex and no
-    // receipt was written); the session stays journaled for recovery.
+    stopInterval(this.muxTimer);
+    stopInterval(this.cancellationTimer);
+  }
+
+  private async settleControlLoops(): Promise<void> {
+    await this.waitForShutdownStep("configuration_refresh", this.configurationRefresh);
+    await this.waitForShutdownStep("observation_delivery", this.observationDelivery?.stop());
+    await this.waitForShutdownStep("configuration_acks", this.configurationAcks?.settle());
+    await this.waitForShutdownStep("fence_receipts", this.executionRevisionFenceReceipts?.settle());
+    await this.waitForShutdownStep("planning_directives", this.planningDirectivePoller?.stop());
+  }
+
+  /**
+   * stop() withdrew this process's recovery authority first, so a session
+   * whose close asserts it is refused ("Transport recovery generation is not
+   * currently accepted"). That must not abort the stop before the runners
+   * and the Codex owner are stopped, or Codex is orphaned and no receipt is
+   * written; the session stays journaled for recovery.
+   */
+  private async drainForShutdown(): Promise<void> {
+    await this.noteShutdown("work_drain", "entered");
     try {
       await this.work?.drainSessions("drain");
-      await note("work_drain", "completed");
+      await this.noteShutdown("work_drain", "completed");
     } catch (error) {
       this.logger.warn({ event: "shutdown.session_close_unconfirmed", code: error instanceof RemoteInstanceError ? error.code : "unexpected_error" },
         "an open session could not close during shutdown; stopping its agent anyway, the next start recovers it");
     }
-    await note("preview_close", "entered");
-    await this.previews.close();
-    await note("preview_close", "completed");
-    this.previewChannel?.dispose();
-    await note("runner_stop", "entered");
-    // Side by side: one after another, an idle connector's bridges took 5 s,
-    // and launchd's SIGKILL came before the Codex owner was reached (D113b).
-    // A runner that cannot stop does not keep the others, the Codex owner or
-    // the state from stopping; its failure is reported once all are done.
+  }
+
+  /**
+   * Runners stop side by side: one after another, an idle connector's bridges
+   * take 5 s and launchd's SIGKILL comes before the Codex owner is reached.
+   * A runner that cannot stop does not keep the others, the Codex owner or
+   * the state from stopping; its failure is reported once all are done.
+   */
+  private async stopAgentsForShutdown(): Promise<{ runnerFailure: PromiseRejectedResult | undefined; codexFailure: { reason: unknown } | null }> {
+    await this.noteShutdown("runner_stop", "entered");
     const runnerStops = await Promise.allSettled(this.nativeRunners.map(runner => runner.stop()));
     const runnerFailure = runnerStops.find((stop): stop is PromiseRejectedResult => stop.status === "rejected");
     const codexUnstopped = runnerStops.some((stop, index) => stop.status === "rejected" && this.nativeRunners[index]?.agentId === "codex");
-    if (!runnerFailure) await note("runner_stop", "completed");
-    await note("codex_owner_stop", "entered");
-    // The shared Codex app-server is stopped here only once every Codex runner
-    // stopped; otherwise the exit reaper armed by stop() ends it with the process.
-    let codexFailure: { reason: unknown } | null = null;
-    if (!codexUnstopped) await this.nativeCodexOwner?.stop().catch((reason: unknown) => { codexFailure = { reason }; });
-    if (!codexFailure && !codexUnstopped) await note("codex_owner_stop", "completed");
-    if (this.codexRetryTimer) clearTimeout(this.codexRetryTimer);
+    if (!runnerFailure) await this.noteShutdown("runner_stop", "completed");
+    const codexFailure = await this.stopCodexOwnerForShutdown(codexUnstopped);
+    stopTimeout(this.codexRetryTimer);
     this.codexRetryTimer = null;
     this.parkedCodex = null;
     this.nativeAgentRetry.stop();
     for (const runner of this.parkedRunners.values()) await runner.stop().catch(() => undefined);
     this.parkedRunners.clear();
-    for (const runner of this.runners.values()) runner.stopEvents();
-    this.transport?.stop();
-    await note("state_close", "entered");
-    await this.stateMutations.close();
-    this.nativeOwnership?.release();
-    if (runnerFailure) throw runnerFailure.reason;
-    if (codexFailure) throw (codexFailure as { reason: unknown }).reason;
+    return { runnerFailure, codexFailure };
+  }
+
+  /**
+   * The shared Codex app-server is stopped here only once every Codex runner
+   * stopped; otherwise the exit reaper armed by stop() ends it with the process.
+   */
+  private async stopCodexOwnerForShutdown(codexUnstopped: boolean): Promise<{ reason: unknown } | null> {
+    await this.noteShutdown("codex_owner_stop", "entered");
+    if (codexUnstopped) return null;
+    const failure = await stopCodexOwner(this.nativeCodexOwner);
+    if (!failure) await this.noteShutdown("codex_owner_stop", "completed");
+    return failure;
   }
 
   /**
@@ -2754,6 +3031,237 @@ export class Supervisor {
 
 const channelOf = channelOfId;
 
+type ControlRequestOf<Op extends ControlRequest["op"]> = Extract<ControlRequest, { op: Op }>;
+type ControlOps = { [Op in ControlRequest["op"]]: (request: ControlRequestOf<Op>, emit: ControlEmitter) => unknown };
+
+/** The provider, method, reuse and Gemini Enterprise project and location a local sign-in names; the runner checks them again. */
+function localLoginSelection(request: ControlRequestOf<"auth.login">) {
+  return { ...(request.provider === undefined ? {} : { provider: request.provider }), ...(request.method === undefined ? {} : { method: request.method }),
+    ...(request.reuse === undefined ? {} : { reuse: request.reuse }),
+    ...(request.project !== undefined && request.location !== undefined ? { gcp: AgentLoginGcpSchema.parse({ project: request.project, location: request.location }) } : {}) };
+}
+
+/** Sessions, turns and host pressure from the last inventory snapshot; zero before the first. */
+function snapshotLoad(snapshot: InventorySnapshot | null) {
+  return { activeSessions: snapshot?.activeSessions ?? 0, activeTurns: snapshot?.activeTurns ?? 0, utilizationRatio: Math.min(1, snapshot?.hostPressure ?? 0) };
+}
+
+/** The connector's QA browser package and Node, or why there is none when no agent offers one. */
+function connectorBrowserFields(browser: ConnectorBrowserStatus, version: string | null) {
+  if (browser.available) return { packageAgent: browser.browser.packageAgent, nodeSource: browser.browser.nodeSource };
+  return version === null && browser.message ? { unavailable: browser.message } : {};
+}
+
+type AgentLoginIntent = RuntimeAgentLoginDeliveryRequest["intent"];
+type AgentLoginReport = Parameters<CoreClient["reportAgentLogin"]>[1];
+type SiteLoginAgent = "codex" | "claude-code" | "opencode" | "antigravity";
+
+function isSiteLoginAgent(agentId: string): agentId is SiteLoginAgent {
+  return agentId === "codex" || agentId === "claude-code" || agentId === "opencode" || agentId === "antigravity";
+}
+
+function isOnComputerLogin(intent: AgentLoginIntent): boolean {
+  return intent.loginOption === ON_COMPUTER_LOGIN_OPTION && (ON_COMPUTER_AGENTS as readonly string[]).includes(intent.agentId);
+}
+
+type SiteLoginSelection = ReturnType<typeof siteLoginSelection>;
+
+/**
+ * An OpenCode or Antigravity login names its sign-in option; every report
+ * echoes it. Another agent's option is never started (the runner offers
+ * only its own). Gemini Enterprise carries its Google Cloud project.
+ */
+function siteLoginSelection(intent: AgentLoginIntent) {
+  const optionAgent = intent.agentId === "opencode" || intent.agentId === "antigravity";
+  const requestedOption = optionAgent && intent.loginOption !== undefined ? AgentLoginOptionIdSchema.safeParse(intent.loginOption) : undefined;
+  const loginOption = requestedOption?.success ? requestedOption.data : undefined;
+  return { requestedOption, loginOption, gcp: geminiEnterpriseProject(intent, loginOption) };
+}
+
+function geminiEnterpriseProject(intent: AgentLoginIntent, loginOption: string | undefined) {
+  return intent.agentId === "antigravity" && loginOption === "gemini-enterprise" && intent.gcp !== undefined ? intent.gcp : undefined;
+}
+
+/** A sign-in this machine does not offer (any more) is not started; nor a Gemini Enterprise sign-in without its project. */
+function siteLoginRefused(agentId: SiteLoginAgent, site: SiteLoginSelection, runner: RunnerPort): boolean {
+  return siteLoginOptionRefused(site, runner) || antigravityLoginIncomplete(agentId, site);
+}
+
+function siteLoginOptionRefused(site: SiteLoginSelection, runner: RunnerPort): boolean {
+  if (site.requestedOption !== undefined && !site.requestedOption.success) return true;
+  return site.loginOption !== undefined && !(runner.siteLoginOptions?.() ?? []).includes(site.loginOption);
+}
+
+function antigravityLoginIncomplete(agentId: SiteLoginAgent, site: SiteLoginSelection): boolean {
+  return agentId === "antigravity" && (site.loginOption === undefined || (site.loginOption === "gemini-enterprise" && site.gcp === undefined));
+}
+
+function onComputerPlan(agentId: OnComputerAgent, facts: { state: Parameters<typeof planOnComputer>[0]["state"]; installCommand?: string | undefined; windowsInstallCommand?: string | undefined }): OnComputerPlan | null {
+  return planOnComputer({ agentId, state: facts.state, ...(facts.installCommand ? { installCommand: facts.installCommand } : {}),
+    ...(facts.windowsInstallCommand ? { windowsInstallCommand: facts.windowsInstallCommand } : {}) }, process.platform);
+}
+
+type SupervisorRunnerEvent = Parameters<WorkOrchestrator["onRunnerEvent"]>[0];
+
+/** Statuses a recovered provisioning identity may hold once Core committed its readiness. */
+function recoveredStatus(status: string): status is "active" | "draining" | "suspended" {
+  return status === "active" || status === "draining" || status === "suspended";
+}
+/** Core refuses this runtime itself. */
+const REVOKED_CODES = ["instance_revoked", "registration_mismatch"] as const;
+/** Core refuses this process's recovery generation for good. */
+const RETIRED_CODES = ["reconciliation_replay", "resume_deadline_expired"] as const;
+
+function remoteErrorCodeIn(error: unknown, codes: readonly string[]): boolean {
+  return error instanceof RemoteInstanceError && codes.includes(error.code);
+}
+
+/** The first five call sites of an error's stack, innermost first, when it has one. */
+function stackField(error: unknown): { at?: string } {
+  const at = error instanceof Error ? error.stack?.split("\n").slice(1, 6).map(line => line.trim().replace(/^at /, "")).join(" < ") : undefined;
+  return at ? { at } : {};
+}
+
+/** A recovery record past pending and applied: this incarnation's recovery ended. */
+function recoveryEnded(record: RuntimeRecoveryRecord | undefined): boolean {
+  return record !== undefined && record.state !== "pending" && record.state !== "applied";
+}
+
+type AppliedRecovery = RuntimeRecoveryRecord & {
+  manifest: NonNullable<RuntimeRecoveryRecord["manifest"]>;
+  receipt: NonNullable<RuntimeRecoveryRecord["receipt"]>;
+  acceptedAt: NonNullable<RuntimeRecoveryRecord["acceptedAt"]>;
+};
+
+function appliedRecovery(recovery: RuntimeRecoveryRecord | undefined): recovery is AppliedRecovery {
+  return recovery?.state === "applied" && Boolean(recovery.manifest) && Boolean(recovery.receipt) && Boolean(recovery.acceptedAt);
+}
+
+function heartbeatDrainDeadline(result: HeartbeatResult): number | undefined {
+  return result.drainDeadline === undefined ? undefined : parseRfc3339(result.drainDeadline) / 1000;
+}
+
+/** The heartbeat's lease metadata matches the claims of the lease it carries. */
+function heartbeatMatchesClaims(result: HeartbeatResult, claims: ReturnType<typeof decodeLeaseClaims>, instanceId: string | null): boolean {
+  return result.instanceId === instanceId && result.leaseMode === claims.lease_mode &&
+    parseRfc3339(result.leaseExpiresAt) === claims.exp * 1000 && heartbeatDrainDeadline(result) === claims.drain_deadline;
+}
+
+/** One outbox key per directive, rotation or acknowledged version of a control ACK. */
+function controlAckKey(ack: ControlAck): string {
+  if ("directiveId" in ack) return `control:${ack.directiveId}`;
+  if ("rotationId" in ack) return `control:${ack.rotationId}`;
+  if ("revision" in ack) return `control:${ack.type}:${ack.revision}`;
+  return `control:${ack.type}:${ack.type === "version_ack" ? ack.bundleVersion : ack.acknowledgedAt}`;
+}
+
+type NativeOptions = NonNullable<SupervisorOptions["native"]>;
+type StoredIdentity = NonNullable<Awaited<ReturnType<SupervisorStore["identity"]>>>;
+type StoredManifest = NonNullable<Awaited<ReturnType<SupervisorStore["manifest"]>>>;
+type StoredLease = NonNullable<Awaited<ReturnType<SupervisorStore["lease"]>>>;
+type RelayHandler<Name extends keyof RelayClientOptions> = NonNullable<RelayClientOptions[Name]> extends (...args: infer Args) => unknown ? Args : never;
+type RelayRequestOf<Name extends keyof RelayClientOptions> = RelayHandler<Name>[0];
+type RelayConnectionOf<Name extends keyof RelayClientOptions> = RelayHandler<Name>[1];
+type DiagnosticCompanionRecord = Parameters<NonNullable<ConstructorParameters<typeof DiagnosticCompanionReceiver>[0]["onAccepted"]>>[0];
+
+interface CapturedOwner {
+  readonly lease: ReturnType<LeaseState["current"]>;
+  readonly instanceId: string | null;
+  readonly workspaceId: string | null;
+  readonly runnerIncarnation: string;
+  readonly ownership: Supervisor["nativeOwnership"];
+}
+
+function drainDeadlineMs(drainDeadline: string | null): number | null {
+  return drainDeadline === null ? null : Date.parse(drainDeadline);
+}
+
+/** The stored lease's metadata matches the record its decoded claims make. */
+function sameLeaseRecord(stored: StoredLease, expected: ReturnType<typeof leaseRecordFromClaims>): boolean {
+  return stored.mode === expected.mode &&
+    Date.parse(stored.expiresAt) === Date.parse(expected.expiresAt) &&
+    Date.parse(stored.issuedAt) === Date.parse(expected.issuedAt) &&
+    drainDeadlineMs(stored.drainDeadline) === drainDeadlineMs(expected.drainDeadline);
+}
+
+/** The journal entry is still the live claim of exactly this assignment's placement, kind and agent. */
+function claimMatchesTarget(entry: JournalEntry, target: RemoteWorkAssignment): boolean {
+  return entry.workspaceId === target.workspaceId && entry.placementId === target.placementId && entry.kind === target.kind &&
+    entry.agentId === target.agentRoute.agentId && ["claimed", "running", "checkpointed"].includes(entry.state);
+}
+
+function stopInterval(timer: NodeJS.Timeout | null): void {
+  if (timer) clearInterval(timer);
+}
+
+function stopTimeout(timer: NodeJS.Timeout | null): void {
+  if (timer) clearTimeout(timer);
+}
+
+/** Stop the shared Codex owner: its refusal, or null once stopped (or when there is none). */
+async function stopCodexOwner(owner: NativeCodexAppServerOwner | null): Promise<{ reason: unknown } | null> {
+  try {
+    await owner?.stop();
+    return null;
+  } catch (reason) {
+    return { reason };
+  }
+}
+
+type HostInstallation = NonNullable<ReturnType<NativeRunner["hostInstallation"]>>;
+
+interface ListedAgentRunner {
+  readonly running: NativeRunner | undefined;
+  readonly retrying: boolean;
+  readonly state: "running" | "retrying" | "given_up";
+  readonly installation: HostInstallation | null;
+}
+
+function doctorRunnerState(running: NativeRunner | undefined, retrying: boolean): ListedAgentRunner["state"] {
+  if (running) return "running";
+  return retrying ? "retrying" : "given_up";
+}
+
+function selfCheckOf(installation: HostInstallation | null): HostInstallation["selfCheck"] {
+  return installation?.selfCheck ?? "not_run";
+}
+
+function startFailureDiagnostic(failure: unknown) {
+  return failure instanceof RemoteInstanceError ? failure.diagnostic : undefined;
+}
+
+function agentCredentials<Credential>(agents: ReadonlyArray<{ agentId: string; credentials?: Credential[] | undefined }>, agentId: string): Credential[] {
+  return agents.find(agent => agent.agentId === agentId)?.credentials ?? [];
+}
+
+function quarantineOf(running: NativeRunner | undefined) {
+  return running?.quarantineReason() ?? null;
+}
+
+/** The copy the installation's load named: a left-out agent's fetched copy, else its runner configuration's; null when unlisted. */
+function listedAntigravityFields(native: NonNullable<SupervisorOptions["native"]>): Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot"> | null {
+  const unavailable = native.unavailableAgents?.find(entry => entry.agentId === "antigravity");
+  if (unavailable) return unavailable.fetched ?? {};
+  const config = native.runners.find(candidate => candidate.RUNNER_AGENT_ID === "antigravity");
+  if (config?.RUNNER_NATIVE_ANTIGRAVITY_ROOT === undefined) return null;
+  return { antigravityVersion: config.RUNNER_BRIDGE_VERSION, antigravityRoot: config.RUNNER_NATIVE_ANTIGRAVITY_ROOT };
+}
+
+/** The pinned Google Antigravity copy, or null when this build names none. */
+function currentAntigravityPin(): ReturnType<typeof antigravityPin> | null {
+  try { return antigravityPin(); } catch { return null; }
+}
+
+async function antigravityDownloadStateOf(root: string, record: Pick<NativeRuntimeRecord, "antigravityVersion" | "antigravityRoot"> | null) {
+  if (record === null) return undefined;
+  return (await antigravityDownloadState(root, record).catch(() => undefined))?.state;
+}
+
+/** Disk use is known once the pinned copy is downloaded. */
+function downloadedAntigravityDiskBytes(pin: ReturnType<typeof antigravityPin> | null, download: string | undefined): number | null {
+  return pin && (download === "ready" || download === "update_available") ? antigravityDiskBytes(pin) : null;
+}
+
 function flattenKeys(value: Record<string, unknown>, prefix = ""): string[] {
   const keys: string[] = [];
   for (const [key, entry] of Object.entries(value)) {
@@ -2764,17 +3272,22 @@ function flattenKeys(value: Record<string, unknown>, prefix = ""): string[] {
   return keys;
 }
 
-function mapLoginEvent(loginId: string, event: { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; visible?: true | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined; reason?: "no_license" | undefined }): ControlLoginEvent {
-  switch (event.type) {
-    case "display":
-      return { kind: "display", loginId, text: event.text ?? "" };
-    case "open_url":
-      return { kind: "open_url", loginId, url: event.url ?? "", ...(event.userCode ? { userCode: event.userCode } : {}) };
-    case "prompt":
-      return { kind: "prompt", loginId, label: event.label ?? "", secret: event.secret ?? true, ...(event.visible === true && event.secret === false ? { visible: true as const } : {}) };
-    case "completed":
-      return { kind: "completed", loginId, readiness: event.readiness ?? "unknown" };
-    default:
-      return { kind: "failed", loginId, code: event.code ?? "agent_auth_required", message: event.message ?? "login failed", ...(event.reason === "no_license" ? { reason: "no_license" as const } : {}) };
-  }
+interface RunnerLoginEvent { type: string; text?: string | undefined; url?: string | undefined; userCode?: string | undefined; label?: string | undefined; secret?: boolean | undefined; visible?: true | undefined; readiness?: string | undefined; code?: string | undefined; message?: string | undefined; reason?: "no_license" | undefined }
+
+const LOGIN_EVENTS = new Map<string, (loginId: string, event: RunnerLoginEvent) => ControlLoginEvent>([
+  ["display", (loginId, event) => ({ kind: "display", loginId, text: event.text ?? "" })],
+  ["open_url", (loginId, event) => ({ kind: "open_url", loginId, url: event.url ?? "", ...(event.userCode ? { userCode: event.userCode } : {}) })],
+  ["prompt", (loginId, event) => ({ kind: "prompt", loginId, label: event.label ?? "", secret: event.secret ?? true,
+    ...(event.visible === true && event.secret === false ? { visible: true as const } : {}) })],
+  ["completed", (loginId, event) => ({ kind: "completed", loginId, readiness: event.readiness ?? "unknown" })],
+]);
+
+/** Any other runner login event ends the sign-in as failed. */
+function failedLoginEvent(loginId: string, event: RunnerLoginEvent): ControlLoginEvent {
+  return { kind: "failed", loginId, code: event.code ?? "agent_auth_required", message: event.message ?? "login failed",
+    ...(event.reason === "no_license" ? { reason: "no_license" as const } : {}) };
+}
+
+function mapLoginEvent(loginId: string, event: RunnerLoginEvent): ControlLoginEvent {
+  return (LOGIN_EVENTS.get(event.type) ?? failedLoginEvent)(loginId, event);
 }

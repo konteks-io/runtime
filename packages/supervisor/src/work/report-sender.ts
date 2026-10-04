@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { terminalOperationDispositions } from '../state/operation-dispositions.js';
-import { AssignmentReportSchema, ReportAckSchema, createLogger, jcsDigest, reportPayloadDigest, type AssignmentReport, type AssignmentRequestReference, type Clock, type JsonValue, type Logger, type ReportAck } from "@konteks/remote-common";
+import { AssignmentReportSchema, ReportAckSchema, allEqual, createLogger, jcsDigest, reportPayloadDigest, type AssignmentReport, type AssignmentRequestReference, type Clock, type JsonValue, type Logger, type ReportAck } from "@konteks/remote-common";
 import type { SupervisorJournal } from "../state/journal.js";
 import type { DurableOutbox, OutboxItem } from "../state/outbox.js";
 import type { TransportManager } from "../transport/relay-transport.js";
@@ -8,7 +8,7 @@ import { coreChannelId } from "../relay/channel-ids.js";
 import type { AssignmentSender } from "./assignment-sender.js";
 
 /**
- * The sender side of the D125 report protocol. Per claim: mint a `reportId`,
+ * The sender side of the report protocol. Per claim: mint a `reportId`,
  * a strictly consecutive `reportSequence`, and a `payloadDigest`; journal the
  * report in the outbox BEFORE sending; send in order; resend unchanged until
  * `accepted`/`duplicate`; resend from `durableWatermark + 1` on
@@ -23,7 +23,7 @@ import type { AssignmentSender } from "./assignment-sender.js";
  * exponential backoff until it is durable. The claim frees itself instead of
  * halting until its deadline.
  */
-export interface ReportSenderOptions {
+interface ReportSenderOptions {
   journal: SupervisorJournal;
   outbox: DurableOutbox;
   transport: TransportManager;
@@ -48,10 +48,99 @@ const RESUBMIT_BASE_DELAY_MS = 500;
 const RESUBMIT_MAX_DELAY_MS = 30_000;
 const STOP_CONFIRMED_RESULT = { class: "interrupted" as const, reason: "not_resumable" as const };
 
-export type ReportDraft = Omit<AssignmentReport, "reportId" | "reportSequence" | "payloadDigest" | "reportedAt" | "assignmentId" | "attempt" | "claimId">;
+type ReportDraft = Omit<AssignmentReport, "reportId" | "reportSequence" | "payloadDigest" | "reportedAt" | "assignmentId" | "attempt" | "claimId">;
 
-export function reportGroup(assignmentId: string, attempt: number, claimId: string): string {
+function reportGroup(assignmentId: string, attempt: number, claimId: string): string {
   return `report:${assignmentId}:${attempt}:${claimId}`;
+}
+
+type JournalEntry = NonNullable<ReturnType<SupervisorJournal["assignments"]["get"]>>;
+type SubmitArgs = { assignmentId: string; attempt: number; claimId: string; draft: ReportDraft };
+
+/** One received ACK with the claim entry it settles. */
+interface AckContext {
+  ack: ReportAck;
+  entry: JournalEntry;
+  key: string;
+  group: string;
+  ackedKey: string;
+  reference: AssignmentRequestReference | undefined;
+}
+
+function digestOf(report: AssignmentReport | Omit<AssignmentReport, "payloadDigest" | "reportedAt">): string {
+  return reportPayloadDigest(report as unknown as { [key: string]: JsonValue });
+}
+
+function assertSubmittable(entry: JournalEntry, draft: ReportDraft, key: string): void {
+  if (entry.reports.terminalSequence !== undefined) throw new Error(`claim ${key} already has a terminal report`);
+  if (draft.terminal && ((entry.kind === "planning") !== (draft.controllerDirectiveId !== undefined))) throw new Error("Planning terminal authority must come from exactly one controller directive");
+  if (!draft.terminal && draft.controllerDirectiveId !== undefined) throw new Error("A progress report cannot carry a controller directive");
+  if (draft.operationDispositions !== undefined) throw new Error('Operation dispositions must come from the durable native journal');
+}
+
+/** The queued terminal report is exactly the one this claim's terminal pointer names, with its own payload digest. */
+function terminalReportMatches(report: AssignmentReport, expected: { assignmentId: string; attempt: number; claimId: string; itemId: string; sequence: number; terminalResultHash: string | undefined }): boolean {
+  return report.terminal && report.result !== undefined && allEqual([
+    [report.assignmentId, expected.assignmentId], [report.attempt, expected.attempt], [report.claimId, expected.claimId],
+    [report.reportId, expected.itemId], [report.reportSequence, expected.sequence],
+    [report.result.terminalResultHash, expected.terminalResultHash], [report.payloadDigest, digestOf(report)],
+  ]);
+}
+
+/** The ACK names this exact report and claim, and the report's payload digest is its own. */
+function reportMatchesAck(report: AssignmentReport | undefined, ack: ReportAck): boolean {
+  return report !== undefined && allEqual([
+    [report.reportId, ack.acknowledged.reportId], [report.reportSequence, ack.acknowledged.reportSequence],
+    [report.assignmentId, ack.assignmentId], [report.attempt, ack.attempt], [report.claimId, ack.claimId],
+    [report.payloadDigest, digestOf(report)],
+  ]);
+}
+
+/**
+ * Persist the original received terminal ACK before retiring its only report
+ * evidence. Retry after either crash window keeps this first ACK.
+ */
+function acceptedEntry(current: JournalEntry | undefined, ack: ReportAck, terminal: boolean, report: AssignmentReport | undefined, now: string): JournalEntry {
+  if (!current || current.claimId !== ack.claimId) throw new Error("Report ACK claim changed before commit");
+  return { ...current, ...(terminal ? { state: "completed" as const } : {}),
+    reports: { ...current.reports, durableWatermark: Math.max(current.reports.durableWatermark, ack.durableWatermark), ...(terminal ? { terminalAck: current.reports.terminalAck ?? ack, terminalResult: report?.result ?? current.reports.terminalResult } : {}) }, updatedAt: now };
+}
+
+/** The claim without its refused terminal report: the sequence it held is free again. */
+function withoutTerminal(current: JournalEntry, nextSequence: number, now: string): JournalEntry {
+  const { terminalSequence: _sequence, terminalResult: _result, ...reports } = current.reports;
+  const { terminalResultHash: _hash, ...rest } = current;
+  return { ...rest, reports: { ...reports, nextSequence }, updatedAt: now };
+}
+
+function stopConfirmed(result: AssignmentReport["result"]): boolean {
+  return result?.class === STOP_CONFIRMED_RESULT.class && result.reason === STOP_CONFIRMED_RESULT.reason;
+}
+
+/** A terminal report Core refused over an unresolved operation, which the claim may replace with a stop-confirmed one. */
+function replaceableTerminal(rejected: AssignmentReport, acknowledged: { reportId: string; reportSequence: number }): boolean {
+  return rejected.reportId === acknowledged.reportId && rejected.reportSequence === acknowledged.reportSequence &&
+    rejected.controllerDirectiveId === undefined && !stopConfirmed(rejected.result);
+}
+
+function stopConfirmedDraft(rejected: Pick<AssignmentReport, "usage" | "acpSessionRef">): ReportDraft {
+  return { terminal: true,
+    result: { ...STOP_CONFIRMED_RESULT, terminalResultHash: jcsDigest(STOP_CONFIRMED_RESULT) },
+    ...(rejected.usage ? { usage: rejected.usage } : {}),
+    ...(rejected.acpSessionRef ? { acpSessionRef: rejected.acpSessionRef } : {}) };
+}
+
+function errorCode(error: unknown): string {
+  return error instanceof Error && "code" in error ? String((error as { code: unknown }).code).slice(0, 64) : "unexpected_error";
+}
+
+function lastAttemptMs(item: OutboxItem): number {
+  return item.lastAttemptAt ? Date.parse(item.lastAttemptAt) : Number.NEGATIVE_INFINITY;
+}
+
+function recentlyAttempted(item: OutboxItem, now: number, retryIntervalMs: number): boolean {
+  const lastAttempt = lastAttemptMs(item);
+  return item.attempts > 0 && Number.isFinite(lastAttempt) && now - lastAttempt < retryIntervalMs;
 }
 
 export class ReportSender {
@@ -89,7 +178,11 @@ export class ReportSender {
     if (!entry || entry.claimId !== claimId || entry.reports.terminalControllerDirectiveId !== directiveId) return undefined;
     const queued = this.queuedTerminalReport(assignmentId, attempt, claimId);
     if (queued?.controllerDirectiveId === directiveId && queued.result) return { reportId: queued.reportId, result: queued.result };
-    const ack = this.acknowledgedTerminalReport(assignmentId, attempt, claimId), result = entry.reports.terminalResult;
+    return this.acknowledgedDirectiveReport(entry);
+  }
+
+  private acknowledgedDirectiveReport(entry: JournalEntry): { reportId: string; result: NonNullable<AssignmentReport["result"]> } | undefined {
+    const ack = this.acknowledgedTerminalReport(entry.assignmentId, entry.attempt, entry.claimId), result = entry.reports.terminalResult;
     return ack && result ? { reportId: ack.acknowledged.reportId, result } : undefined;
   }
 
@@ -98,27 +191,44 @@ export class ReportSender {
     const entry = this.options.journal.assignments.get(`${assignmentId}:${attempt}`);
     if (!entry || entry.claimId !== claimId || entry.reports.terminalSequence === undefined) return undefined;
     const sequence = entry.reports.terminalSequence;
-    const group = reportGroup(assignmentId, attempt, claimId);
-    const item = this.options.outbox.groupFrom(group, sequence).find(candidate => candidate.order === sequence && candidate.key === `${group}:${sequence}`);
-    if (!item || item.channel !== "assignment") return undefined;
+    const item = this.terminalItem(reportGroup(assignmentId, attempt, claimId), sequence);
+    if (!item) return undefined;
     const parsed = AssignmentReportSchema.safeParse(item.body);
     if (!parsed.success) return undefined;
-    const report = parsed.data;
-    return report.terminal && report.result !== undefined && report.assignmentId === assignmentId && report.attempt === attempt && report.claimId === claimId && report.reportId === item.id && report.reportSequence === sequence &&
-      report.result.terminalResultHash === entry.terminalResultHash && report.payloadDigest === reportPayloadDigest(report as unknown as { [key: string]: JsonValue }) ? report : undefined;
+    const expected = { assignmentId, attempt, claimId, itemId: item.id, sequence, terminalResultHash: entry.terminalResultHash };
+    return terminalReportMatches(parsed.data, expected) ? parsed.data : undefined;
+  }
+
+  private terminalItem(group: string, sequence: number): OutboxItem | undefined {
+    const item = this.options.outbox.groupFrom(group, sequence).find(candidate => candidate.order === sequence && candidate.key === `${group}:${sequence}`);
+    return item?.channel === "assignment" ? item : undefined;
   }
 
   /** Mint, journal, and send the next report for a claim. */
-  async submit(args: { assignmentId: string; attempt: number; claimId: string; draft: ReportDraft }): Promise<AssignmentReport> {
+  async submit(args: SubmitArgs): Promise<AssignmentReport> {
     const key = `${args.assignmentId}:${args.attempt}`;
     const entry = this.options.journal.assignments.get(key);
     if (!entry) throw new Error(`no journal entry for ${key}`);
-    if (entry.reports.terminalSequence !== undefined) throw new Error(`claim ${key} already has a terminal report`);
-    if (args.draft.terminal && ((entry.kind === "planning") !== (args.draft.controllerDirectiveId !== undefined))) throw new Error("Planning terminal authority must come from exactly one controller directive");
-    if (!args.draft.terminal && args.draft.controllerDirectiveId !== undefined) throw new Error("A progress report cannot carry a controller directive");
+    assertSubmittable(entry, args.draft, key);
     const reportSequence = entry.reports.nextSequence;
     const reportId = randomUUID();
-    if (args.draft.operationDispositions !== undefined) throw new Error('Operation dispositions must come from the durable native journal');
+    const report = await this.mintReport(entry, args, reportId, reportSequence);
+    await this.journalReport(entry, report, reportSequence);
+    const group = reportGroup(args.assignmentId, args.attempt, args.claimId);
+    await this.options.outbox.enqueue({
+      id: reportId,
+      channel: "assignment",
+      key: `${group}:${reportSequence}`,
+      group,
+      order: reportSequence,
+      body: report,
+      createdAt: report.reportedAt,
+    });
+    await this.flushGroup(group);
+    return report;
+  }
+
+  private async mintReport(entry: JournalEntry, args: SubmitArgs, reportId: string, reportSequence: number): Promise<AssignmentReport> {
     // Every native ACP-backed terminal must settle the operations admitted for
     // its claim. Delivery uses the same ACP operation journal as assistant
     // execution; omitting its dispositions leaves Core's execution open even
@@ -133,8 +243,11 @@ export class ReportSender {
     const base = { assignmentId: args.assignmentId, attempt: args.attempt, claimId: args.claimId, reportId, reportSequence, ...args.draft,
       ...(acpSessionRef ? { acpSessionRef } : {}),
       ...(dispositions.length ? { operationDispositions: dispositions } : {}) } as Omit<AssignmentReport, "payloadDigest" | "reportedAt">;
-    const payloadDigest = reportPayloadDigest(base as unknown as { [key: string]: JsonValue });
-    const report = AssignmentReportSchema.parse({ ...base, payloadDigest, reportedAt: this.options.clock.nowIso() });
+    return AssignmentReportSchema.parse({ ...base, payloadDigest: digestOf(base), reportedAt: this.options.clock.nowIso() });
+  }
+
+  /** The claim's next sequence (and terminal pointer) is journaled before the report is queued. */
+  private async journalReport(entry: JournalEntry, report: AssignmentReport, reportSequence: number): Promise<void> {
     await this.options.journal.assignments.put({
       ...entry,
       state: report.terminal ? "terminal_pending_report" : entry.state,
@@ -142,17 +255,6 @@ export class ReportSender {
       reports: { ...entry.reports, nextSequence: reportSequence + 1, ...(report.terminal ? { terminalSequence: reportSequence } : {}), ...(report.controllerDirectiveId ? { terminalControllerDirectiveId: report.controllerDirectiveId } : {}) },
       updatedAt: report.reportedAt,
     });
-    await this.options.outbox.enqueue({
-      id: reportId,
-      channel: "assignment",
-      key: `${reportGroup(args.assignmentId, args.attempt, args.claimId)}:${reportSequence}`,
-      group: reportGroup(args.assignmentId, args.attempt, args.claimId),
-      order: reportSequence,
-      body: report,
-      createdAt: report.reportedAt,
-    });
-    await this.flushGroup(reportGroup(args.assignmentId, args.attempt, args.claimId));
-    return report;
   }
 
   /** Send the head of a group (only one report of a claim is in flight at a time). */
@@ -182,28 +284,26 @@ export class ReportSender {
    */
   retryDue(retryIntervalMs = 5_000, maxItems = 4): Promise<void> {
     if (this.retryFlight) return this.retryFlight;
-    const flight = (async () => {
-      const now = this.options.clock.coreNow();
-      if (!Number.isSafeInteger(maxItems) || maxItems < 1) throw new Error("report_retry_budget_invalid");
-      const due = this.options.outbox.heads("assignment")
-        .filter(head => head.group.startsWith("report:"))
-        .sort((left, right) => {
-          const leftAt = left.lastAttemptAt ? Date.parse(left.lastAttemptAt) : Number.NEGATIVE_INFINITY;
-          const rightAt = right.lastAttemptAt ? Date.parse(right.lastAttemptAt) : Number.NEGATIVE_INFINITY;
-          return leftAt - rightAt;
-        });
-      let attempted = 0;
-      for (const head of due) {
-        const lastAttempt = head.lastAttemptAt ? Date.parse(head.lastAttemptAt) : Number.NEGATIVE_INFINITY;
-        if (head.attempts > 0 && Number.isFinite(lastAttempt) && now - lastAttempt < retryIntervalMs) continue;
-        if (attempted >= maxItems) break;
-        attempted += 1;
-        if (!await this.sendItem(head)) return;
-      }
-    })();
+    const flight = this.retryOldestHeads(retryIntervalMs, maxItems);
     this.retryFlight = flight;
     void flight.finally(() => { if (this.retryFlight === flight) this.retryFlight = null; }).catch(() => undefined);
     return flight;
+  }
+
+  /** Report heads, least recently attempted first, each at most once per interval and at most `maxItems` per call. */
+  private async retryOldestHeads(retryIntervalMs: number, maxItems: number): Promise<void> {
+    const now = this.options.clock.coreNow();
+    if (!Number.isSafeInteger(maxItems) || maxItems < 1) throw new Error("report_retry_budget_invalid");
+    const due = this.options.outbox.heads("assignment")
+      .filter(head => head.group.startsWith("report:"))
+      .sort((left, right) => lastAttemptMs(left) - lastAttemptMs(right));
+    let attempted = 0;
+    for (const head of due) {
+      if (recentlyAttempted(head, now, retryIntervalMs)) continue;
+      if (attempted >= maxItems) break;
+      attempted += 1;
+      if (!await this.sendItem(head)) return;
+    }
   }
 
   private async sendItem(item: OutboxItem, retryAfter?: AssignmentRequestReference): Promise<boolean> {
@@ -220,16 +320,20 @@ export class ReportSender {
     // immutable operation remains scheduled by Work's existing maintenance tick;
     // outbox absence never deletes a slot or proves it was unsent.
     if (!this.options.outbox.all("assignment").some(current => current.id === item.id && current.key === item.key)) return false;
+    this.dispatchItem(item, reference, assertOriginal);
+    return true;
+  }
+
+  private dispatchItem(item: OutboxItem, reference: AssignmentRequestReference | undefined, assertOriginal: () => void): void {
     if (reference && this.options.assignmentSender) {
       // Never let a newly prepared report overtake an older durable stream slot.
       this.options.assignmentSender.scheduleRetained(message => { assertOriginal(); this.options.transport.send(message); });
     } else {
       this.options.transport.send({ channel: "assignment", channelId: coreChannelId("assignment", this.options.instanceId()), body: item.body as AssignmentReport });
     }
-    return true;
   }
 
-  /** Apply a `ReportAck` verdict exactly as the D125 sender-side table prescribes. */
+  /** Apply a `ReportAck` verdict exactly as the sender-side table prescribes. */
   async onAck(candidate: ReportAck, reference?: AssignmentRequestReference): Promise<void> {
     const ack = ReportAckSchema.parse(candidate);
     const key = `${ack.assignmentId}:${ack.attempt}`;
@@ -239,78 +343,107 @@ export class ReportSender {
       return;
     }
     const group = reportGroup(ack.assignmentId, ack.attempt, ack.claimId);
-    const ackedKey = `${group}:${ack.acknowledged.reportSequence}`;
+    await this.ackOutcomes[ack.outcome]({ ack, entry, key, group, ackedKey: `${group}:${ack.acknowledged.reportSequence}`, reference });
+  }
+
+  /** Each `ReportAck` verdict, exactly as the sender-side table prescribes. */
+  private readonly ackOutcomes: Readonly<Record<ReportAck["outcome"], (context: AckContext) => Promise<void>>> = {
+    accepted: context => this.onAccepted(context),
+    duplicate: context => this.onAccepted(context),
+    sequence_gap: context => this.onSequenceGap(context),
+    out_of_order: context => this.onOutOfOrder(context),
+    terminal_winner_exists: context => this.onTerminalWinner(context),
+    operation_conflict: context => this.onOperationConflict(context),
+    payload_conflict: context => this.haltOnConflict(context),
+    report_id_reused: context => this.haltOnConflict(context),
+    claim_unknown: context => this.haltClaim(context),
+    schema_invalid: context => {
+      this.logger.error({ assignmentId: context.ack.assignmentId }, "Core rejected a report as schema_invalid; halting the claim");
+      return this.haltClaim(context);
+    },
+  };
+
+  private async onAccepted(context: AckContext): Promise<void> {
+    const { ack, key, group, ackedKey } = context;
+    if (ack.durableWatermark < ack.acknowledged.reportSequence) return;
+    const report = this.ackedReport(group, ack, ackedKey);
+    const terminal = this.acceptedTerminal(context.entry, ack, report);
+    if (terminal === null) return;
+    await this.options.journal.assignments.update(key, current => acceptedEntry(current, ack, terminal, report, this.options.clock.nowIso()));
+    await this.options.outbox.ackKey(ackedKey);
+    if (terminal) await this.options.onTerminalDurable(ack.assignmentId, ack.attempt);
+    else await this.flushGroup(group);
+  }
+
+  /** The queued report the ACK names, if it is still queued. */
+  private ackedReport(group: string, ack: ReportAck, ackedKey: string): AssignmentReport | undefined {
+    const item = this.options.outbox.groupFrom(group, ack.acknowledged.reportSequence).find(value => value.key === ackedKey && value.id === ack.acknowledged.reportId && value.order === ack.acknowledged.reportSequence && value.channel === "assignment");
+    const parsed = AssignmentReportSchema.safeParse(item?.body);
+    return parsed.success ? parsed.data : undefined;
+  }
+
+  /** Whether an accepted ACK settles the terminal report; null when it proves nothing this claim can record. */
+  private acceptedTerminal(entry: JournalEntry, ack: ReportAck, report: AssignmentReport | undefined): boolean | null {
+    const savedMatch = this.savedAckMatches(ack);
+    if (!savedMatch && !reportMatchesAck(report, ack)) return null;
+    const terminal = savedMatch || report?.terminal === true;
+    if (terminal && !this.terminalAckCurrent(ack, entry, savedMatch)) return null;
+    return terminal;
+  }
+
+  private savedAckMatches(ack: ReportAck): boolean {
+    const saved = this.acknowledgedTerminalReport(ack.assignmentId, ack.attempt, ack.claimId);
+    return saved?.acknowledged.reportId === ack.acknowledged.reportId && saved.acknowledged.reportSequence === ack.acknowledged.reportSequence;
+  }
+
+  /** A terminal ACK covers the claim's own terminal sequence, with the report (or its saved ACK) still held. */
+  private terminalAckCurrent(ack: ReportAck, entry: JournalEntry, savedMatch: boolean): boolean {
+    return ack.terminalSequence === ack.acknowledged.reportSequence && ack.terminalSequence === entry.reports.terminalSequence &&
+      (savedMatch || this.queuedTerminalReport(ack.assignmentId, ack.attempt, ack.claimId) !== undefined);
+  }
+
+  private async advanceWatermark({ ack, entry }: AckContext): Promise<void> {
     const watermark = Math.max(entry.reports.durableWatermark, ack.durableWatermark);
-    const advance = async (): Promise<void> => {
-      await this.options.journal.assignments.put({ ...entry, reports: { ...entry.reports, durableWatermark: watermark }, updatedAt: this.options.clock.nowIso() });
-    };
-    switch (ack.outcome) {
-      case "accepted":
-      case "duplicate": {
-        const item = this.options.outbox.groupFrom(group, ack.acknowledged.reportSequence).find(value => value.key === ackedKey && value.id === ack.acknowledged.reportId && value.order === ack.acknowledged.reportSequence && value.channel === "assignment");
-        const parsed = AssignmentReportSchema.safeParse(item?.body);
-        const report = parsed.success ? parsed.data : undefined;
-        const saved = this.acknowledgedTerminalReport(ack.assignmentId, ack.attempt, ack.claimId);
-        const savedMatch = saved?.acknowledged.reportId === ack.acknowledged.reportId && saved.acknowledged.reportSequence === ack.acknowledged.reportSequence;
-        if (ack.durableWatermark < ack.acknowledged.reportSequence) return;
-        if (!savedMatch && (!report || report.reportId !== ack.acknowledged.reportId || report.reportSequence !== ack.acknowledged.reportSequence ||
-          report.assignmentId !== ack.assignmentId || report.attempt !== ack.attempt || report.claimId !== ack.claimId ||
-          report.payloadDigest !== reportPayloadDigest(report as unknown as { [key: string]: JsonValue }))) return;
-        const terminal = savedMatch || report?.terminal === true;
-        if (terminal && (ack.terminalSequence !== ack.acknowledged.reportSequence || ack.terminalSequence !== entry.reports.terminalSequence ||
-          (!savedMatch && !this.queuedTerminalReport(ack.assignmentId, ack.attempt, ack.claimId)))) return;
-        // Persist the original received terminal ACK before retiring its only
-        // report evidence. Retry after either crash window keeps this first ACK.
-        await this.options.journal.assignments.update(key, current => {
-          if (!current || current.claimId !== ack.claimId) throw new Error("Report ACK claim changed before commit");
-          return { ...current, ...(terminal ? { state: "completed" as const } : {}),
-            reports: { ...current.reports, durableWatermark: Math.max(current.reports.durableWatermark, ack.durableWatermark), ...(terminal ? { terminalAck: current.reports.terminalAck ?? ack, terminalResult: report?.result ?? current.reports.terminalResult } : {}) }, updatedAt: this.options.clock.nowIso() };
-        });
-        await this.options.outbox.ackKey(ackedKey);
-        if (terminal) {
-          await this.options.onTerminalDurable(ack.assignmentId, ack.attempt);
-        } else {
-          await this.flushGroup(group);
-        }
-        return;
-      }
-      case "sequence_gap":
-        await advance();
-        for (const item of this.options.outbox.groupFrom(group, ack.durableWatermark + 1)) {
-          if (!await this.sendItem(item, item.id === ack.acknowledged.reportId ? reference : undefined)) return;
-        }
-        return;
-      case "out_of_order":
-        // The sequence is already occupied durably; this retry record is stale.
-        await this.options.outbox.ackKey(ackedKey);
-        await advance();
-        await this.flushGroup(group);
-        return;
-      case "terminal_winner_exists":
-        await this.options.outbox.removeGroup(group);
-        await this.options.journal.assignments.put({ ...entry, state: "completed", updatedAt: this.options.clock.nowIso() });
-        return;
-      case "operation_conflict":
-        if (await this.reopenForStopConfirmedTerminal(ack.assignmentId, ack.attempt, ack.claimId, ack.acknowledged)) return;
-        // Not a terminal we can settle as stop-confirmed: halt as before.
-        // falls through
-      case "payload_conflict":
-      case "report_id_reused":
-        this.logger.error({ assignmentId: ack.assignmentId, outcome: ack.outcome }, "report conflict: halting the claim into recovery_required(assignment_conflict)");
-        await this.options.outbox.removeGroup(group);
-        await this.options.journal.assignments.put({ ...entry, state: "recovery_required", recoveryReason: "assignment_conflict", updatedAt: this.options.clock.nowIso() });
-        await this.options.onConflict(ack.assignmentId, ack.attempt);
-        return;
-      case "claim_unknown":
-        await this.options.outbox.removeGroup(group);
-        await this.options.journal.assignments.put({ ...entry, state: "recovery_required", recoveryReason: "assignment_conflict", updatedAt: this.options.clock.nowIso() });
-        return;
-      case "schema_invalid":
-        this.logger.error({ assignmentId: ack.assignmentId }, "Core rejected a report as schema_invalid; halting the claim");
-        await this.options.outbox.removeGroup(group);
-        await this.options.journal.assignments.put({ ...entry, state: "recovery_required", recoveryReason: "assignment_conflict", updatedAt: this.options.clock.nowIso() });
-        return;
+    await this.options.journal.assignments.put({ ...entry, reports: { ...entry.reports, durableWatermark: watermark }, updatedAt: this.options.clock.nowIso() });
+  }
+
+  private async onSequenceGap(context: AckContext): Promise<void> {
+    const { ack, group, reference } = context;
+    await this.advanceWatermark(context);
+    for (const item of this.options.outbox.groupFrom(group, ack.durableWatermark + 1)) {
+      if (!await this.sendItem(item, item.id === ack.acknowledged.reportId ? reference : undefined)) return;
     }
+  }
+
+  /** The sequence is already occupied durably; this retry record is stale. */
+  private async onOutOfOrder(context: AckContext): Promise<void> {
+    await this.options.outbox.ackKey(context.ackedKey);
+    await this.advanceWatermark(context);
+    await this.flushGroup(context.group);
+  }
+
+  private async onTerminalWinner({ entry, group }: AckContext): Promise<void> {
+    await this.options.outbox.removeGroup(group);
+    await this.options.journal.assignments.put({ ...entry, state: "completed", updatedAt: this.options.clock.nowIso() });
+  }
+
+  /** Not a terminal that can be settled as stop-confirmed: halt as for a payload conflict. */
+  private async onOperationConflict(context: AckContext): Promise<void> {
+    const { ack } = context;
+    if (await this.reopenForStopConfirmedTerminal(ack.assignmentId, ack.attempt, ack.claimId, ack.acknowledged)) return;
+    await this.haltOnConflict(context);
+  }
+
+  private async haltOnConflict(context: AckContext): Promise<void> {
+    const { ack } = context;
+    this.logger.error({ assignmentId: ack.assignmentId, outcome: ack.outcome }, "report conflict: halting the claim into recovery_required(assignment_conflict)");
+    await this.haltClaim(context);
+    await this.options.onConflict(ack.assignmentId, ack.attempt);
+  }
+
+  private async haltClaim({ entry, group }: AckContext): Promise<void> {
+    await this.options.outbox.removeGroup(group);
+    await this.options.journal.assignments.put({ ...entry, state: "recovery_required", recoveryReason: "assignment_conflict", updatedAt: this.options.clock.nowIso() });
   }
 
   /**
@@ -320,29 +453,37 @@ export class ReportSender {
    * once per process its refused terminal is taken back and the claim reports
    * interrupted(not_resumable) once its session is stopped, with backoff. Core
    * stored nothing for an operation_conflict refusal; for a genuine integrity
-   * conflict it refuses again and the claim halts as before (WS2-153).
+   * conflict it refuses again and the claim halts as before.
    */
   async healHaltedConflicts(): Promise<void> {
     if (!this.options.confirmStopped || !this.options.canSend()) return;
     for (const entry of this.options.journal.assignments.all()) {
-      const key = `${entry.assignmentId}:${entry.attempt}`;
-      const terminalSequence = entry.reports.terminalSequence;
-      if (entry.state !== "recovery_required" || entry.recoveryReason !== "assignment_conflict" || entry.kind === "planning" ||
-        terminalSequence === undefined || entry.reports.durableWatermark >= terminalSequence ||
-        this.healed.has(key) || this.resubmits.has(key)) continue;
-      this.healed.add(key);
-      await this.options.outbox.removeGroup(reportGroup(entry.assignmentId, entry.attempt, entry.claimId));
-      await this.options.journal.assignments.update(key, current => {
-        if (!current || current.claimId !== entry.claimId || current.state !== "recovery_required") throw new Error("Halted claim changed before healing");
-        const { terminalSequence: _sequence, terminalResult: _result, ...reports } = current.reports;
-        const { terminalResultHash: _hash, ...rest } = current;
-        return { ...rest, reports: { ...reports, nextSequence: terminalSequence }, updatedAt: this.options.clock.nowIso() };
-      });
-      this.logger.warn({ assignmentId: entry.assignmentId, attempt: entry.attempt, reportSequence: terminalSequence },
-        "healing a claim halted over a refused terminal report; reporting interrupted once the session is stopped");
-      this.resubmitStopConfirmed(entry.assignmentId, entry.attempt, entry.claimId,
-        entry.acpSessionRef ? { acpSessionRef: entry.acpSessionRef } : {});
+      const terminalSequence = this.healableTerminal(entry);
+      if (terminalSequence !== null) await this.heal(entry, terminalSequence);
     }
+  }
+
+  /** The refused terminal sequence of a claim halted over it and not yet healed in this process; null otherwise. */
+  private healableTerminal(entry: JournalEntry): number | null {
+    const key = `${entry.assignmentId}:${entry.attempt}`;
+    const terminalSequence = entry.reports.terminalSequence;
+    const halted = entry.state === "recovery_required" && entry.recoveryReason === "assignment_conflict" && entry.kind !== "planning";
+    if (!halted || terminalSequence === undefined || entry.reports.durableWatermark >= terminalSequence) return null;
+    return this.healed.has(key) || this.resubmits.has(key) ? null : terminalSequence;
+  }
+
+  private async heal(entry: JournalEntry, terminalSequence: number): Promise<void> {
+    const key = `${entry.assignmentId}:${entry.attempt}`;
+    this.healed.add(key);
+    await this.options.outbox.removeGroup(reportGroup(entry.assignmentId, entry.attempt, entry.claimId));
+    await this.options.journal.assignments.update(key, current => {
+      if (!current || current.claimId !== entry.claimId || current.state !== "recovery_required") throw new Error("Halted claim changed before healing");
+      return withoutTerminal(current, terminalSequence, this.options.clock.nowIso());
+    });
+    this.logger.warn({ assignmentId: entry.assignmentId, attempt: entry.attempt, reportSequence: terminalSequence },
+      "healing a claim halted over a refused terminal report; reporting interrupted once the session is stopped");
+    this.resubmitStopConfirmed(entry.assignmentId, entry.attempt, entry.claimId,
+      entry.acpSessionRef ? { acpSessionRef: entry.acpSessionRef } : {});
   }
 
   /** In-flight stop-confirmed resubmissions (tests and shutdown observe them). */
@@ -360,17 +501,13 @@ export class ReportSender {
     acknowledged: { reportId: string; reportSequence: number }): Promise<boolean> {
     if (!this.options.confirmStopped) return false;
     const rejected = this.queuedTerminalReport(assignmentId, attempt, claimId);
-    if (!rejected || rejected.reportId !== acknowledged.reportId || rejected.reportSequence !== acknowledged.reportSequence ||
-      rejected.controllerDirectiveId !== undefined ||
-      (rejected.result?.class === STOP_CONFIRMED_RESULT.class && rejected.result.reason === STOP_CONFIRMED_RESULT.reason)) return false;
+    if (!rejected || !replaceableTerminal(rejected, acknowledged)) return false;
     const key = `${assignmentId}:${attempt}`;
     const group = reportGroup(assignmentId, attempt, claimId);
     await this.options.outbox.removeGroup(group);
     await this.options.journal.assignments.update(key, current => {
       if (!current || current.claimId !== claimId) throw new Error("Report conflict claim changed before reopening");
-      const { terminalSequence: _sequence, terminalResult: _result, ...reports } = current.reports;
-      const { terminalResultHash: _hash, ...rest } = current;
-      return { ...rest, reports: { ...reports, nextSequence: rejected.reportSequence }, updatedAt: this.options.clock.nowIso() };
+      return withoutTerminal(current, rejected.reportSequence, this.options.clock.nowIso());
     });
     this.logger.warn({ assignmentId, attempt, reportSequence: rejected.reportSequence, refusedClass: rejected.result?.class,
       outcome: "operation_conflict" }, "terminal report refused over an unresolved operation; reporting interrupted once the session is stopped");
@@ -383,28 +520,31 @@ export class ReportSender {
     const key = `${assignmentId}:${attempt}`;
     if (this.resubmits.has(key)) return;
     const sleep = this.options.sleep ?? ((ms: number) => new Promise<void>(resolve => { const timer = setTimeout(resolve, ms); timer.unref?.(); }));
-    const task = (async () => {
-      for (let failures = 0; ; failures += 1) {
-        const entry = this.options.journal.assignments.get(key);
-        // Someone else settled the claim (a restart's recovery, a cancel): done.
-        if (!entry || entry.claimId !== claimId || entry.reports.terminalSequence !== undefined) return;
-        try {
-          await this.options.confirmStopped!(assignmentId, attempt);
-          await this.submit({ assignmentId, attempt, claimId, draft: { terminal: true,
-            result: { ...STOP_CONFIRMED_RESULT, terminalResultHash: jcsDigest(STOP_CONFIRMED_RESULT) },
-            ...(rejected.usage ? { usage: rejected.usage } : {}),
-            ...(rejected.acpSessionRef ? { acpSessionRef: rejected.acpSessionRef } : {}) } });
-          return;
-        } catch (error) {
-          const delayMs = Math.min(RESUBMIT_MAX_DELAY_MS, RESUBMIT_BASE_DELAY_MS * 2 ** Math.min(failures, 16));
-          this.logger.warn({ assignmentId, attempt, failures: failures + 1, delayMs,
-            code: error instanceof Error && "code" in error ? String((error as { code: unknown }).code).slice(0, 64) : "unexpected_error" },
-          "stop-confirmed terminal report not yet submitted; retrying");
-          await sleep(delayMs);
-        }
-      }
-    })();
+    const task = this.resubmitUntilDurable({ assignmentId, attempt, claimId }, rejected, sleep);
     this.resubmits.set(key, task);
     void task.finally(() => { if (this.resubmits.get(key) === task) this.resubmits.delete(key); }).catch(() => undefined);
+  }
+
+  /** Once the session is stopped, submit the stop-confirmed terminal; retry with backoff until it is durable or the claim settled otherwise. */
+  private async resubmitUntilDurable(claim: { assignmentId: string; attempt: number; claimId: string }, rejected: Pick<AssignmentReport, "usage" | "acpSessionRef">, sleep: (ms: number) => Promise<void>): Promise<void> {
+    for (let failures = 0; ; failures += 1) {
+      // Someone else settled the claim (a restart's recovery, a cancel): done.
+      if (!this.awaitingStopConfirmed(claim)) return;
+      try {
+        await this.options.confirmStopped!(claim.assignmentId, claim.attempt);
+        await this.submit({ ...claim, draft: stopConfirmedDraft(rejected) });
+        return;
+      } catch (error) {
+        const delayMs = Math.min(RESUBMIT_MAX_DELAY_MS, RESUBMIT_BASE_DELAY_MS * 2 ** Math.min(failures, 16));
+        this.logger.warn({ assignmentId: claim.assignmentId, attempt: claim.attempt, failures: failures + 1, delayMs, code: errorCode(error) },
+          "stop-confirmed terminal report not yet submitted; retrying");
+        await sleep(delayMs);
+      }
+    }
+  }
+
+  private awaitingStopConfirmed(claim: { assignmentId: string; attempt: number; claimId: string }): boolean {
+    const entry = this.options.journal.assignments.get(`${claim.assignmentId}:${claim.attempt}`);
+    return entry !== undefined && entry.claimId === claim.claimId && entry.reports.terminalSequence === undefined;
   }
 }

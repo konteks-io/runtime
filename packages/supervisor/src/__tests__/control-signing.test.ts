@@ -42,7 +42,7 @@ describe.skipIf(coreSigning === null)("Core/connector detached control signature
     expect(() => new CoreSignatureVerifier([{ ...old.root, coreControlKeys: [old.root.coreControlKeys[0]!, { ...next.root.coreControlKeys[0]!, keyId: "control-1" }] }])).toThrow();
   });
 });
-describe.skipIf(coreSigning === null)("site-started agent login delivery (WS1-115)", () => {
+describe.skipIf(coreSigning === null)("site-started agent login delivery", () => {
   const unsigned = {
     type: "runtime_agent_login_delivery", method: "POST", path: { instanceId: "instance" }, nodeId: "node-1",
     connectionRef: "conn-1", connectionEpoch: 3, keyId: "control-1", nonce: "A".repeat(22),

@@ -3,6 +3,8 @@ import { verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-r
 import { compareSemver } from "../control/handlers.js";
 import type { NativeUpdateLedger } from "./update-ledger.js";
 
+type AvailableRelease = { bundleVersion: string; manifestDigest: string };
+
 export type NativeUpdateReason = "periodic" | "core_minimum" | "operator";
 
 export interface NativeUpdateCoordinatorOptions {
@@ -25,7 +27,7 @@ export interface NativeUpdateCoordinatorOptions {
   /** An `in_progress` attempt older than this is treated as abandoned. */
   staleAttemptMs?: number;
   /**
-   * The release Core accepts (WS1-093): installing any other one is refused
+   * The release Core accepts: installing any other one is refused
    * by Core and costs minutes offline and a rollback. Undefined when Core
    * could not be asked; null when this Core does not say.
    */
@@ -52,7 +54,7 @@ export class NativeUpdateCoordinator {
    * Core refused this bundle as below its minimum (a `version_policy` or a
    * refused reconnect). Such a runtime has no lease, so Core cannot be asked
    * which release it accepts; a strictly newer signed release is then the way
-   * back in (RCA 2026-09-30: 14 runtimes below a raised minimum never updated).
+   * back in, so a runtime below a raised minimum still updates.
    */
   private refusedAsTooOld: { minimumSupportedBundle: string | null } | null = null;
   /** The last channel read's failure only (never a launch failure), for `doctor`. */
@@ -151,25 +153,44 @@ export class NativeUpdateCoordinator {
     await this.check();
     const available = this.available;
     if (!available) return refuse(this.lastError ? `check failed: ${this.lastError}` : "no newer signed release");
-    if (this.inFlight) return refuse(`update to ${this.inFlight.bundleVersion} already launched`);
+    const refusal = await this.launchRefusal(reason, available);
+    if (refusal) return refuse(refusal);
+    return this.launch(reason, available);
+  }
+
+  /** Why the available release is not launched now: one already in flight, a veto, the ledger, backoff, or Core's accepted release. */
+  private async launchRefusal(reason: NativeUpdateReason, available: AvailableRelease): Promise<string | null> {
+    if (this.inFlight) return `update to ${this.inFlight.bundleVersion} already launched`;
     const veto = this.options.canApply();
-    if (!veto.ok) return refuse(veto.reason);
+    if (!veto.ok) return veto.reason;
     const ledger = await this.options.readLedger().catch((error: unknown) => { this.options.logger.warn({ err: error }, "native update ledger unreadable; refusing to launch"); return null; });
-    if (!ledger) return refuse("update ledger unreadable");
+    if (!ledger) return "update ledger unreadable";
     const backoff = this.backoffReason(ledger, available.manifestDigest);
-    if (backoff) return refuse(backoff);
-    if (this.options.acceptedRelease) {
-      const accepted = await this.options.acceptedRelease().catch((error: unknown) => {
-        this.options.logger.warn({ err: error }, "could not ask Konteks which release it accepts");
-        return undefined;
-      });
-      if (accepted === undefined && !this.mayUpdateWithoutAcceptedRelease(reason, available.bundleVersion)) return refuse("Konteks could not be asked which release it accepts; staying on this one");
-      if (accepted === undefined) this.options.logger.warn({ bundleVersion: available.bundleVersion, minimumSupportedBundle: this.refusedAsTooOld?.minimumSupportedBundle ?? null }, "Konteks refuses this release and cannot be asked which one it accepts; installing the newer signed release");
-      if (accepted === null) return refuse("this Konteks does not say which release it accepts; update by hand with `konteks-remote update`");
-      if (accepted !== undefined && accepted.bundleVersion !== available.bundleVersion) {
-        return refuse(`Konteks accepts ${accepted.bundleVersion}, not ${available.bundleVersion} yet; staying on this one until it does`);
-      }
-    }
+    if (backoff) return backoff;
+    return this.acceptedReleaseRefusal(reason, available);
+  }
+
+  private async acceptedReleaseRefusal(reason: NativeUpdateReason, available: AvailableRelease): Promise<string | null> {
+    if (!this.options.acceptedRelease) return null;
+    const accepted = await this.options.acceptedRelease().catch((error: unknown) => {
+      this.options.logger.warn({ err: error }, "could not ask Konteks which release it accepts");
+      return undefined;
+    });
+    if (accepted === undefined) return this.unansweredAcceptedRelease(reason, available);
+    if (accepted === null) return "this Konteks does not say which release it accepts; update by hand with `konteks-remote update`";
+    return accepted.bundleVersion !== available.bundleVersion
+      ? `Konteks accepts ${accepted.bundleVersion}, not ${available.bundleVersion} yet; staying on this one until it does`
+      : null;
+  }
+
+  /** Konteks could not be asked: stay, unless it refuses this release as too old. */
+  private unansweredAcceptedRelease(reason: NativeUpdateReason, available: AvailableRelease): string | null {
+    if (!this.mayUpdateWithoutAcceptedRelease(reason, available.bundleVersion)) return "Konteks could not be asked which release it accepts; staying on this one";
+    this.options.logger.warn({ bundleVersion: available.bundleVersion, minimumSupportedBundle: this.refusedAsTooOld?.minimumSupportedBundle ?? null }, "Konteks refuses this release and cannot be asked which one it accepts; installing the newer signed release");
+    return null;
+  }
+
+  private async launch(reason: NativeUpdateReason, available: AvailableRelease): Promise<NativeUpdateApply> {
     try {
       const launched = await this.options.launch({ ...available, reason });
       const inFlight = { startedAt: new Date(this.now()).toISOString(), bundleVersion: available.bundleVersion, manifestDigest: available.manifestDigest, reason, pid: launched.pid };
@@ -207,9 +228,17 @@ export class NativeUpdateCoordinator {
     const ledger = await this.options.readLedger().catch(() => null);
     const last = ledger?.attempts[ledger.attempts.length - 1];
     this.lastAttempt = last ? { bundleVersion: last.bundleVersion, manifestDigest: last.manifestDigest, outcome: last.outcome, startedAt: last.startedAt, finishedAt: last.finishedAt, detail: last.detail } : null;
-    // A launched transaction that reached a terminal ledger outcome without
-    // replacing this process (refused, failed before stop) is no longer in flight.
-    if (this.inFlight && last && last.manifestDigest === this.inFlight.manifestDigest && last.outcome !== "in_progress" && Date.parse(last.startedAt) >= Date.parse(this.inFlight.startedAt) - 60_000) this.inFlight = null;
-    else if (this.inFlight && this.now() - Date.parse(this.inFlight.startedAt) > (this.options.staleAttemptMs ?? DEFAULT_STALE_ATTEMPT_MS)) this.inFlight = null;
+    if (this.inFlightSettled(last)) this.inFlight = null;
   }
-}
+
+  /**
+   * A launched transaction that reached a terminal ledger outcome without
+   * replacing this process (refused, failed before stop), or one gone stale,
+   * is no longer in flight.
+   */
+  private inFlightSettled(last: NativeUpdateLedger["attempts"][number] | undefined): boolean {
+    const inFlight = this.inFlight;
+    if (!inFlight) return false;
+    if (last && last.manifestDigest === inFlight.manifestDigest && last.outcome !== "in_progress" && Date.parse(last.startedAt) >= Date.parse(inFlight.startedAt) - 60_000) return true;
+    return this.now() - Date.parse(inFlight.startedAt) > (this.options.staleAttemptMs ?? DEFAULT_STALE_ATTEMPT_MS);
+  }}

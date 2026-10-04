@@ -20,7 +20,7 @@ describe("the connector's own log (macOS keeps none)", () => {
     expect(await readFile(file, "utf8")).toBe("");
   });
 
-  it("leaves a Windows log alone, whose writer does not append (D129)", async () => {
+  it("leaves a Windows log alone, whose writer does not append", async () => {
     const dir = await mkdtemp(join(tmpdir(), "connector-log-")); dirs.push(dir);
     await mkdir(join(dir, "logs"));
     const file = join(dir, "logs", "connector.log");

@@ -1,12 +1,12 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { spawnEnrollmentStaging } from "../native/enrollment-staging.js";
-import { ensureGraft, planGraft, runGraft, writeGraftRecord } from "../native/graft.js";
+import { ensureGraft, planGraft, prepareDeliveryGraft, writeGraftRecord } from "../native/graft.js";
 
 const processes = vi.hoisted(() => {
   const capture = vi.fn();
@@ -28,6 +28,7 @@ beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), "konteks-background-setup-"));
 });
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const value of streams.splice(0)) value.destroy();
   await rm(directory, { recursive: true, force: true });
 });
@@ -42,15 +43,31 @@ describe("Windows background installation helpers", () => {
     expect({ windowsHide: options.windowsHide, detached: options.detached }).toEqual({ windowsHide: true, detached: true });
   });
 
-  it("builds the repository context graph without opening another console", async () => {
+  it("wires the repository context graph without opening another console", async () => {
+    const root = join(directory, "connector");
+    const repo = join(directory, "delivery");
+    const gitDir = join(repo, ".git");
+    await mkdir(gitDir, { recursive: true });
+    vi.stubEnv("HOME", join(directory, "home"));
+    processes.capture.mockImplementation(async (_command, args: string[]) => ({
+      stdout: args.includes("--absolute-git-dir") ? `${gitDir}\n` : "",
+      stderr: "",
+    }));
     processes.spawn.mockImplementation(() => {
       const child = Object.assign(new EventEmitter(), { stdout: stream(), stderr: stream(), kill: vi.fn() });
       queueMicrotask(() => { child.stdout.end("graph ready\n"); child.emit("close", 0); });
       return child;
     });
-    await expect(runGraft({ node: "node.exe", cli: "graft.mjs" }, ["build"], directory, 5_000)).resolves.toBe("graph ready\n");
-    const [command, args, options] = processes.spawn.mock.calls[0]!;
-    expect({ command, args, windowsHide: options.windowsHide, cwd: options.cwd, stdio: options.stdio }).toEqual({ command: "node.exe", args: ["graft.mjs", "build"], windowsHide: true, cwd: directory, stdio: ["ignore", "pipe", "pipe"] });
+    await expect(prepareDeliveryGraft(root, repo, "codex", {
+      available: async () => true,
+      ensure: async () => ({ node: "node.exe", cli: "graft.mjs" }),
+    })).resolves.toBe("wired");
+    expect(processes.spawn.mock.calls.map(([command, args, options]) => ({
+      command, args, windowsHide: options.windowsHide, cwd: options.cwd, stdio: options.stdio,
+    }))).toEqual([
+      { command: "node.exe", args: ["graft.mjs", "telemetry", "disable"], windowsHide: true, cwd: repo, stdio: ["ignore", "pipe", "pipe"] },
+      { command: "node.exe", args: ["graft.mjs", "init", repo, "--agents", "agents", "--no-global", "-y"], windowsHide: true, cwd: repo, stdio: ["ignore", "pipe", "pipe"] },
+    ]);
   });
 
   it("reads Git's repository inventory quietly while preparing Graft", async () => {

@@ -142,7 +142,7 @@ describe("native execution admission HTTPS proofs", () => {
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
-  it("serves the last confirmed keys while Core's key endpoint times out, backing off between refreshes (D110)", async () => {
+  it("serves the last confirmed keys while Core's key endpoint times out, backing off between refreshes", async () => {
     const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const key = { ...pair.publicKey.export({ format: "jwk" }), kid: "core", alg: "RS256", use: "sig" };
     const now = vi.spyOn(Date, "now").mockReturnValue(1_000);

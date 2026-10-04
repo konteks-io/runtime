@@ -1,8 +1,9 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import { createLogger, plainRecord, RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import type { CapabilityTokenIssue } from "../core/client.js";
+import { bearerMatches, readBounded, sendJson } from "../loopback-http.js";
 
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MIN_REFRESH_LEAD_MS = 30_000;
@@ -22,13 +23,13 @@ const FORWARDED_RESPONSE_HEADERS = new Set([
 ]);
 
 /** Core's tool that opens a cloud preview or a registered application in the session's browser. */
-export const ENVIRONMENT_OPEN_TOOL = "platform__quality-assurance__environment_open";
+const ENVIRONMENT_OPEN_TOOL = "platform__quality-assurance__environment_open";
 const MAX_OBSERVED_RESPONSE_BYTES = 1024 * 1024;
 /** No Core grant is trusted for longer than a day, whatever it says. */
 const MAX_GRANT_MS = 24 * 60 * 60 * 1000;
 
 /** The origins Core opened for this session's browser, as Core answered `environment_open`. */
-export interface BrowserAccessGrant {
+interface BrowserAccessGrant {
   kind: "cloud_preview" | "external";
   origins: Array<{ origin: string; expiresAt: string }>;
 }
@@ -36,7 +37,7 @@ export interface BrowserAccessGrant {
 /** Local transport continuity only. This credential never grants Core authority. */
 export interface McpLocalTransportIdentity { port: number; credential: string }
 
-export interface McpCapabilityFacadeOptions {
+interface McpCapabilityFacadeOptions {
   initial: CapabilityTokenIssue;
   renew: () => Promise<CapabilityTokenIssue>;
   localTransport?: McpLocalTransportIdentity;
@@ -56,7 +57,7 @@ export interface McpCapabilityFacadeOptions {
 }
 
 /**
- * Session-scoped loopback MCP facade (D165).
+ * Session-scoped loopback MCP facade.
  *
  * The ACP process receives only the random loopback credential. The upstream
  * bearer remains in this process, is renewed single-flight, and is never
@@ -141,12 +142,10 @@ export class McpCapabilityFacade {
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     response.setHeader("Cache-Control", "no-store");
-    if (this.closed) return this.fail(response, 503, "facade_closed");
-    if (!this.authorized(request.headers.authorization)) return this.fail(response, 401, "invalid_local_credential");
-    if (!this.active) return this.fail(response, 503, "assignment_not_active");
-    if (request.method !== "POST") {
-      response.setHeader("Allow", "POST");
-      return this.fail(response, 405, "method_not_allowed");
+    const refusal = this.refusal(request);
+    if (refusal) {
+      if (refusal.status === 405) response.setHeader("Allow", "POST");
+      return this.fail(response, refusal.status, refusal.code);
     }
     let body: Buffer;
     try {
@@ -155,28 +154,44 @@ export class McpCapabilityFacade {
       return this.fail(response, 413, "request_too_large");
     }
     try {
-      let upstream = await this.forward(request, body, false);
-      // Core's native MCP ingress authenticates before parsing or dispatching
-      // the body. Its 401 therefore proves that replay has no tool side effect.
-      if (upstream.response.status === 401) {
-        upstream.controller.abort();
-        this.activeRequests.delete(upstream.controller);
-        this.logger.warn({ event: "mcp_capability.auth_rejected", ...this.options.context, action: "refresh_and_replay" }, "upstream MCP capability was rejected before dispatch");
-        await this.refresh(true, "auth_rejection");
-        upstream = await this.forward(request, body, true);
-      }
-      const observed = this.options.onBrowserAccess ? environmentOpenRequestId(body) : undefined;
-      if (observed !== undefined) await this.writeObserved(upstream.response, upstream.controller, response, observed);
-      else await this.writeUpstream(upstream.response, upstream.controller, response);
+      await this.proxy(request, body, response);
     } catch (error) {
-      if (!response.headersSent) this.fail(response, 503, "upstream_unavailable");
-      else response.destroy();
-      this.logger.warn({
-        event: "mcp_capability.proxy_failed",
-        ...this.options.context,
-        code: error instanceof RemoteInstanceError ? error.code : "temporarily_unavailable",
-      }, "local MCP capability facade request failed");
+      this.proxyFailed(response, error);
     }
+  }
+
+  private refusal(request: IncomingMessage): { status: number; code: string } | null {
+    if (this.closed) return { status: 503, code: "facade_closed" };
+    if (!bearerMatches(request.headers.authorization, this.localCredential)) return { status: 401, code: "invalid_local_credential" };
+    if (!this.active) return { status: 503, code: "assignment_not_active" };
+    if (request.method !== "POST") return { status: 405, code: "method_not_allowed" };
+    return null;
+  }
+
+  private async proxy(request: IncomingMessage, body: Buffer, response: ServerResponse): Promise<void> {
+    let upstream = await this.forward(request, body, false);
+    // Core's native MCP ingress authenticates before parsing or dispatching
+    // the body. Its 401 therefore proves that replay has no tool side effect.
+    if (upstream.response.status === 401) {
+      upstream.controller.abort();
+      this.activeRequests.delete(upstream.controller);
+      this.logger.warn({ event: "mcp_capability.auth_rejected", ...this.options.context, action: "refresh_and_replay" }, "upstream MCP capability was rejected before dispatch");
+      await this.refresh(true, "auth_rejection");
+      upstream = await this.forward(request, body, true);
+    }
+    const observed = this.options.onBrowserAccess ? environmentOpenRequestId(body) : undefined;
+    if (observed !== undefined) await this.writeObserved(upstream.response, upstream.controller, response, observed);
+    else await this.writeUpstream(upstream.response, upstream.controller, response);
+  }
+
+  private proxyFailed(response: ServerResponse, error: unknown): void {
+    if (!response.headersSent) this.fail(response, 503, "upstream_unavailable");
+    else response.destroy();
+    this.logger.warn({
+      event: "mcp_capability.proxy_failed",
+      ...this.options.context,
+      code: error instanceof RemoteInstanceError ? error.code : "temporarily_unavailable",
+    }, "local MCP capability facade request failed");
   }
 
   private async forward(request: IncomingMessage, body: Buffer, refreshedAfterRejection: boolean) {
@@ -216,9 +231,7 @@ export class McpCapabilityFacade {
 
   private async writeUpstream(upstream: Response, controller: AbortController, response: ServerResponse): Promise<void> {
     response.statusCode = upstream.status;
-    for (const [name, value] of upstream.headers) {
-      if (FORWARDED_RESPONSE_HEADERS.has(name.toLowerCase())) response.setHeader(name, value);
-    }
+    copyResponseHeaders(upstream, response);
     try {
       if (!upstream.body) return void response.end();
       await new Promise<void>((resolve, reject) => {
@@ -241,37 +254,26 @@ export class McpCapabilityFacade {
    * nothing.
    */
   private async writeObserved(upstream: Response, controller: AbortController, response: ServerResponse, requestId: string | number): Promise<void> {
-    const contentType = upstream.headers.get("content-type") ?? "";
-    if (upstream.status !== 200 || !contentType.toLowerCase().includes("application/json") || !upstream.body) {
-      return this.writeUpstream(upstream, controller, response);
-    }
+    if (!observableAnswer(upstream)) return this.writeUpstream(upstream, controller, response);
     let text: string;
     try {
-      const reader = upstream.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let size = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        size += value.byteLength;
-        if (size > MAX_OBSERVED_RESPONSE_BYTES) { controller.abort(); throw new Error("response too large"); }
-        chunks.push(value);
-      }
-      text = Buffer.concat(chunks).toString("utf8");
+      text = await boundedText(upstream.body!, controller);
     } finally {
       this.activeRequests.delete(controller);
     }
+    this.readGrant(text, requestId);
+    response.statusCode = upstream.status;
+    copyResponseHeaders(upstream, response);
+    response.end(text);
+  }
+
+  private readGrant(text: string, requestId: string | number): void {
     try {
       const grant = browserAccessFrom(text, requestId, this.options.context.sessionId, this.now());
       if (grant) this.options.onBrowserAccess?.(grant);
     } catch {
       this.logger.warn({ event: "mcp_capability.browser_access_unreadable", ...this.options.context }, "environment_open answer could not be read; the browser gains nothing");
     }
-    response.statusCode = upstream.status;
-    for (const [name, value] of upstream.headers) {
-      if (FORWARDED_RESPONSE_HEADERS.has(name.toLowerCase())) response.setHeader(name, value);
-    }
-    response.end(text);
   }
 
   private refresh(force: boolean, reason: "request" | "timer" | "auth_rejection"): Promise<CapabilityTokenIssue> {
@@ -290,33 +292,43 @@ export class McpCapabilityFacade {
       this.logger.info({ event: "mcp_capability.refresh_recovered", ...this.options.context, reason, expiresAt: issue.expiresAt, durationMs: this.now() - startedAt }, "MCP capability refresh succeeded");
       this.scheduleRefresh(this.refreshDue() ? REFRESH_RETRY_DELAY_MS : undefined);
       return issue;
-    }).catch(async error => {
-      this.logger.warn({
-        event: "mcp_capability.refresh_exhausted",
-        ...this.options.context,
-        reason,
-        durationMs: this.now() - startedAt,
-        code: error instanceof RemoteInstanceError ? error.code : "temporarily_unavailable",
-      }, "MCP capability refresh exhausted its bounded retries");
-      if (!this.closed) {
-        this.refreshFailures++;
-        this.renewalDeadline ??= Math.min(Date.parse(this.issue.expiresAt), this.now() + 60_000);
-        const remaining = this.renewalDeadline - this.now();
-        const retryable = error instanceof RemoteInstanceError && (error.retryable || error.code === "temporarily_unavailable");
-        if (retryable && remaining > 0) {
-          const delay = Math.min(remaining, 30_000, REFRESH_RETRY_DELAY_MS * 2 ** Math.min(this.refreshFailures - 1, 3));
-          this.scheduleRefresh(Math.min(remaining, delay * (0.8 + Math.random() * 0.2)));
-        } else {
-          this.logger.warn({ event: "mcp_capability.owner_unavailable", ...this.options.context,
-            attempts: this.refreshFailures, reason: retryable ? "renewal_deadline" : "permanent_refusal" }, "MCP capability owner must stop");
-          await this.close();
-          try { await this.options.onUnavailable?.(); }
-          catch { this.logger.error({ event: "mcp_capability.owner_stop_failed", ...this.options.context }, "MCP capability owner stop failed"); }
-        }
-      }
-      throw error;
-    }).finally(() => { this.refreshTask = null; });
+    }).catch(error => this.refreshFailed(error, reason, startedAt))
+      .finally(() => { this.refreshTask = null; });
     return this.refreshTask;
+  }
+
+  private async refreshFailed(error: unknown, reason: "request" | "timer" | "auth_rejection", startedAt: number): Promise<never> {
+    this.logger.warn({
+      event: "mcp_capability.refresh_exhausted",
+      ...this.options.context,
+      reason,
+      durationMs: this.now() - startedAt,
+      code: error instanceof RemoteInstanceError ? error.code : "temporarily_unavailable",
+    }, "MCP capability refresh exhausted its bounded retries");
+    if (!this.closed) await this.afterRefreshFailure(error);
+    throw error;
+  }
+
+  /** Retry with backoff until the renewal deadline; a permanent refusal or a missed deadline stops the owner. */
+  private async afterRefreshFailure(error: unknown): Promise<void> {
+    this.refreshFailures++;
+    this.renewalDeadline ??= Math.min(Date.parse(this.issue.expiresAt), this.now() + 60_000);
+    const remaining = this.renewalDeadline - this.now();
+    const retryable = error instanceof RemoteInstanceError && (error.retryable || error.code === "temporarily_unavailable");
+    if (retryable && remaining > 0) {
+      const delay = Math.min(remaining, 30_000, REFRESH_RETRY_DELAY_MS * 2 ** Math.min(this.refreshFailures - 1, 3));
+      this.scheduleRefresh(Math.min(remaining, delay * (0.8 + Math.random() * 0.2)));
+      return;
+    }
+    await this.stopOwner(retryable ? "renewal_deadline" : "permanent_refusal");
+  }
+
+  private async stopOwner(reason: "renewal_deadline" | "permanent_refusal"): Promise<void> {
+    this.logger.warn({ event: "mcp_capability.owner_unavailable", ...this.options.context,
+      attempts: this.refreshFailures, reason }, "MCP capability owner must stop");
+    await this.close();
+    try { await this.options.onUnavailable?.(); }
+    catch { this.logger.error({ event: "mcp_capability.owner_stop_failed", ...this.options.context }, "MCP capability owner stop failed"); }
   }
 
   private refreshDue(): boolean {
@@ -342,28 +354,48 @@ export class McpCapabilityFacade {
     authorization(issue);
   }
 
-  private authorized(value: string | undefined): boolean {
-    if (!value?.startsWith("Bearer ")) return false;
-    const received = Buffer.from(value.slice(7));
-    const expected = Buffer.from(this.localCredential);
-    return received.length === expected.length && timingSafeEqual(received, expected);
-  }
-
   private fail(response: ServerResponse, status: number, code: string): void {
-    response.statusCode = status;
-    response.setHeader("Content-Type", "application/json");
-    response.end(JSON.stringify({ error: code }));
+    sendJson(response, status, { error: code });
   }
 }
 
 /** The JSON-RPC id of a single `tools/call` of `environment_open`, else undefined (batches and everything else pass through). */
-export function environmentOpenRequestId(body: Buffer): string | number | undefined {
-  let message: unknown;
-  try { message = JSON.parse(body.toString("utf8")); } catch { return undefined; }
-  if (!message || typeof message !== "object" || Array.isArray(message)) return undefined;
-  const { method, params, id } = message as { method?: unknown; params?: { name?: unknown }; id?: unknown };
-  if (method !== "tools/call" || params?.name !== ENVIRONMENT_OPEN_TOOL) return undefined;
-  return typeof id === "string" || typeof id === "number" ? id : undefined;
+function environmentOpenRequestId(body: Buffer): string | number | undefined {
+  const message = plainRecord(parsedJson(body.toString("utf8")));
+  if (!message) return undefined;
+  const params = message.params as { name?: unknown } | undefined;
+  if (message.method !== "tools/call" || params?.name !== ENVIRONMENT_OPEN_TOOL) return undefined;
+  return typeof message.id === "string" || typeof message.id === "number" ? message.id : undefined;
+}
+
+function parsedJson(text: string): unknown {
+  try { return JSON.parse(text); } catch { return undefined; }
+}
+
+/** A single JSON answer with a body: what the grant can be read from. */
+function observableAnswer(upstream: Response): boolean {
+  return upstream.status === 200 && (upstream.headers.get("content-type") ?? "").toLowerCase().includes("application/json") && upstream.body !== null;
+}
+
+/** The whole body, aborting the upstream request once it grows past the observed-answer limit. */
+async function boundedText(body: ReadableStream<Uint8Array>, controller: AbortController): Promise<string> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_OBSERVED_RESPONSE_BYTES) { controller.abort(); throw new Error("response too large"); }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function copyResponseHeaders(upstream: Response, response: ServerResponse): void {
+  for (const [name, value] of upstream.headers) {
+    if (FORWARDED_RESPONSE_HEADERS.has(name.toLowerCase())) response.setHeader(name, value);
+  }
 }
 
 /**
@@ -371,26 +403,62 @@ export function environmentOpenRequestId(body: Buffer): string | number | undefi
  * session: http(s) origins only, each with an expiry in the future (capped
  * at a day). Null when the answer grants nothing.
  */
-export function browserAccessFrom(text: string, requestId: string | number, sessionId: string, now: number): BrowserAccessGrant | null {
-  const message = JSON.parse(text) as { id?: unknown; result?: { structuredContent?: unknown } };
-  if (!message || message.id !== requestId) return null;
-  const content = message.result?.structuredContent as { target?: { kind?: unknown }; browserAccess?: { sessionId?: unknown; origins?: unknown } } | undefined;
+function browserAccessFrom(text: string, requestId: string | number, sessionId: string, now: number): BrowserAccessGrant | null {
+  const content = answerContent(JSON.parse(text), requestId);
+  const entries = sessionOrigins(content, sessionId);
+  const kind = grantKind(content?.target?.kind);
+  if (entries === null || kind === null) return null;
+  const origins = grantedOrigins(entries, kind, now);
+  return origins.length > 0 ? { kind, origins } : null;
+}
+
+type GrantContent = { target?: { kind?: unknown }; browserAccess?: { sessionId?: unknown; origins?: unknown } };
+type GrantEntry = { origin?: unknown; expiresAt?: unknown } | null | undefined;
+
+/** The structured answer to exactly this request. */
+function answerContent(message: unknown, requestId: string | number): GrantContent | undefined {
+  const answer = message as { id?: unknown; result?: { structuredContent?: unknown } } | null;
+  if (!answer || answer.id !== requestId) return undefined;
+  return answer.result?.structuredContent as GrantContent | undefined;
+}
+
+/** The origins granted, when the grant names this session. */
+function sessionOrigins(content: GrantContent | undefined, sessionId: string): unknown[] | null {
   const access = content?.browserAccess;
   if (!access || access.sessionId !== sessionId || !Array.isArray(access.origins)) return null;
-  const kind = content?.target?.kind === "preview" ? "cloud_preview" : content?.target?.kind === "external" ? "external" : null;
-  if (kind === null) return null;
+  return access.origins;
+}
+
+function grantKind(target: unknown): BrowserAccessGrant["kind"] | null {
+  if (target === "preview") return "cloud_preview";
+  return target === "external" ? "external" : null;
+}
+
+function grantedOrigins(entries: unknown[], kind: BrowserAccessGrant["kind"], now: number): BrowserAccessGrant["origins"] {
   const origins: BrowserAccessGrant["origins"] = [];
-  for (const entry of access.origins.slice(0, 16) as Array<{ origin?: unknown; expiresAt?: unknown }>) {
-    if (typeof entry?.origin !== "string" || typeof entry.expiresAt !== "string") continue;
-    let url: URL;
-    try { url = new URL(entry.origin); } catch { continue; }
-    if ((url.protocol !== "https:" && url.protocol !== "http:") || url.origin !== entry.origin) continue;
-    if (kind === "external" && url.protocol !== "https:") continue;
-    const expiresAt = Date.parse(entry.expiresAt);
-    if (!Number.isFinite(expiresAt) || expiresAt <= now) continue;
-    origins.push({ origin: url.origin, expiresAt: new Date(Math.min(expiresAt, now + MAX_GRANT_MS)).toISOString() });
+  for (const entry of entries.slice(0, 16) as GrantEntry[]) {
+    const origin = grantedOrigin(entry, kind, now);
+    if (origin) origins.push(origin);
   }
-  return origins.length > 0 ? { kind, origins } : null;
+  return origins;
+}
+
+/** An http(s) origin written exactly (https only for an external application), still unexpired; capped at a day. */
+function grantedOrigin(entry: GrantEntry, kind: BrowserAccessGrant["kind"], now: number): BrowserAccessGrant["origins"][number] | null {
+  if (typeof entry?.origin !== "string" || typeof entry.expiresAt !== "string") return null;
+  const url = parsedUrl(entry.origin);
+  if (!url || !allowedOrigin(url, entry.origin, kind)) return null;
+  const expiresAt = Date.parse(entry.expiresAt);
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) return null;
+  return { origin: url.origin, expiresAt: new Date(Math.min(expiresAt, now + MAX_GRANT_MS)).toISOString() };
+}
+
+function parsedUrl(value: string): URL | null {
+  try { return new URL(value); } catch { return null; }
+}
+
+function allowedOrigin(url: URL, origin: string, kind: BrowserAccessGrant["kind"]): boolean {
+  return (url.protocol === "https:" || url.protocol === "http:") && url.origin === origin && (kind !== "external" || url.protocol === "https:");
 }
 
 function refreshLead(remainingMs: number): number {
@@ -410,16 +478,4 @@ function forwardedHeaders(input: IncomingHttpHeaders): Headers {
     output.set(name, Array.isArray(value) ? value.join(", ") : value);
   }
   return output;
-}
-
-async function readBounded(request: IncomingMessage, limit: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const value of request) {
-    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-    size += chunk.length;
-    if (size > limit) throw new Error("request too large");
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
 }

@@ -2,7 +2,8 @@ import { createServer, request as httpRequest, type Server } from "node:http";
 import { connect, createServer as createTcpServer, type AddressInfo } from "node:net";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
-import { BROWSER_ORIGINS_PATH, NO_PREVIEW_MESSAGE, PreviewBrowserGateway } from "../preview/browser-gateway.js";
+import { BROWSER_ORIGINS_PATH } from "@konteks/remote-agent-runner";
+import { NO_PREVIEW_MESSAGE, PreviewBrowserGateway } from "../preview/browser-gateway.js";
 
 const servers: Array<{ close(): unknown }> = [];
 afterEach(() => { for (const server of servers.splice(0)) server.close(); });
@@ -86,7 +87,7 @@ describe("the QA browser's gateway", () => {
     expect(g.gw.counters.tunnels).toBe(1);
   });
 
-  it("survives a browser resetting a refused CONNECT or upgrade socket (found live in O8: Chrome resets them)", async () => {
+  it("survives a browser resetting a refused CONNECT or upgrade socket (Chrome resets them)", async () => {
     const g = await gateway(() => "http://127.0.0.1:43100");
     const handlers = g.gw as unknown as { onConnect(request: unknown, socket: PassThrough, head: Buffer): void; onUpgrade(request: unknown, socket: PassThrough, head: Buffer): void };
     for (const [name, request] of [["onConnect", { url: "accounts.google.com:443" }], ["onUpgrade", { url: "http://example.com/socket", rawHeaders: [], method: "GET" }]] as const) {

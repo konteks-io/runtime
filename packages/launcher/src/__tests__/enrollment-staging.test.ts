@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { enrollmentStagingStatus, writeStagingProgress } from "../native/enrollment-staging.js";
 
-/** The unpacking `onboard` waits on (WS1-012). */
+/** The unpacking `onboard` waits on. */
 describe("enrollment staging status", () => {
   let root: string;
   beforeEach(async () => {

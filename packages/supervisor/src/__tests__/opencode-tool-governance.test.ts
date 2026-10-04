@@ -3,8 +3,7 @@ import { describe, expect, it } from "vitest";
 import { parseKonteksCodeModeBlock } from "../session/opencode-code-mode.js";
 import { OpenCodeToolGovernance } from "../session/opencode-tool-governance.js";
 
-// Shapes as OpenCode 2.0.18 sends them (opencode-runtime-support CP0-v2,
-// CP0 part 2): the first `tool_call` is titled with OpenCode's tool name and
+// Shapes as OpenCode 2.0.18 sends them: the first `tool_call` is titled with OpenCode's tool name and
 // has no input yet, an update fills the input in, and the permission request
 // carries the input with the command or path as its title. The options are
 // always once / always / reject.
@@ -111,7 +110,7 @@ describe("OpenCode tool governance", () => {
     }
   });
 
-  it("admits the connector's QA browser through Code Mode only on a session given it, never its hidden tools (O8)", () => {
+  it("admits the connector's QA browser through Code Mode only on a session given it, never its hidden tools", () => {
     const browserContext = { cwd: WC, servers: new Set([...SERVERS, "konteks-browser"]), browserTools: true };
     const governance = new OpenCodeToolGovernance();
     const block = (id: string, source: string, ctx: { cwd: string; servers: ReadonlySet<string>; browserTools?: boolean }) => {

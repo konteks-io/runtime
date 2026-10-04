@@ -9,11 +9,10 @@ import { RunnerConfigSchema, antigravityRuntimePaths, type BridgeProcess, type S
 import { ANTIGRAVITY_AUTH_METHODS, antigravityInitializeDrift, checkAntigravityServer } from "../native/antigravity-self-check.js";
 
 /**
- * The Google Antigravity start check (CP2): one `initialize` of the fetched
+ * The Google Antigravity start check: one `initialize` of the fetched
  * server in the connector's private home proves it answers as the server
  * Konteks governs. The fixture is antigravity-acp 1.2.1's own answer
- * (agy-runtime-feasibility proof/transcripts/acp-init.jsonl; the same shape
- * came back live in CP2).
+ * (the shape a live `initialize` returns).
  */
 const pin = fetchedAgentPlatformPin("antigravity");
 const INITIALIZE = JSON.parse(await readFile(new URL("./fixtures/antigravity-1.2.1-initialize.json", import.meta.url), "utf8")) as InitializeResponse;

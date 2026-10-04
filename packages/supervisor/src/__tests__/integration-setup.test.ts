@@ -16,7 +16,7 @@ function runner(exits: Array<number | null>) {
   return { calls, setup: new OfficialSetupRunner({ codex: () => launch, run, timeoutMs: 1_000 }) };
 }
 
-describe("confirmed official setup (P08, D29)", () => {
+describe("confirmed official setup (P08)", () => {
   it("adds the pinned Atlassian server to Codex with the reviewed command, after checking it is not there", async () => {
     const { calls, setup } = runner([1, 0, 0]);
     const result = await setup.run(spec(), () => undefined);

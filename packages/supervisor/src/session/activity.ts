@@ -1,4 +1,4 @@
-import { isSecretKey, redactText } from "@konteks/remote-common";
+import { isSecretKey, plainRecord, redactText } from "@konteks/remote-common";
 import { ANTIGRAVITY_TOOL_KINDS, antigravityCallTool } from "./antigravity-tool-governance.js";
 import { DSH_TOOL_KINDS } from "./dsh-tool-governance.js";
 import { KONTEKS_CODE_MODE_SERVERS, parseKonteksCodeModeBlock } from "./opencode-code-mode.js";
@@ -12,7 +12,7 @@ const ACP_TOOL_KINDS = new Set([
 const PLATFORM_MCP_TOOL_NAME = /^mcp__[A-Za-z0-9_-]+?__(platform__[A-Za-z0-9_-]+)$/;
 
 /** The federated `platform__*` tool name behind a Claude `mcp__<server>__<tool>` label, if that is what it is. */
-export function platformMcpToolName(value: string | undefined): string | undefined {
+function platformMcpToolName(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   return PLATFORM_MCP_TOOL_NAME.exec(value.trim())?.[1];
 }
@@ -37,6 +37,8 @@ export function omitPrivateAcpToolPayload(value: unknown): unknown {
     key !== "rawInput" && key !== "rawOutput" && key !== "_meta"));
 }
 
+type ToolCanonicalizer = (candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined) => unknown;
+
 /**
  * Promote a bridge-specific tool identity into ACP's ordinary public fields
  * before `_meta` is discarded. The relay intentionally never persists private
@@ -48,38 +50,61 @@ export function canonicalizeAcpToolActivity(
   dialectId: string | undefined,
   prior?: CanonicalAcpToolIdentity,
 ): unknown {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
-  const candidate = value as Record<string, unknown>;
-  if (candidate.sessionUpdate !== "tool_call" && candidate.sessionUpdate !== "tool_call_update") {
-    return value;
-  }
-  if (dialectId === "dsh") return canonicalizeDshToolActivity(candidate, prior);
-  if (dialectId === "opencode") return canonicalizeOpenCodeToolActivity(candidate, prior);
-  if (dialectId === "antigravity") return canonicalizeAntigravityToolActivity(candidate, prior);
-  if (dialectId !== "claude-code") return value;
-  const meta = candidate._meta;
-  const rawTool = meta !== null && typeof meta === "object" && !Array.isArray(meta)
-    ? (meta as Record<string, unknown>)["claude.ai/tool"]
-    : undefined;
-  const tool = rawTool !== null && typeof rawTool === "object" && !Array.isArray(rawTool)
-    ? rawTool as Record<string, unknown>
-    : undefined;
-  const metaName = typeof tool?.name === "string" && tool.name.trim().length > 0
-    ? tool.name
-    : undefined;
-  const metaKind = typeof tool?.kind === "string" && ACP_TOOL_KINDS.has(tool.kind)
-    ? tool.kind
-    : undefined;
-  const currentName = typeof candidate.name === "string" && candidate.name.trim().length > 0
-    ? candidate.name
-    : undefined;
+  const candidate = plainRecord(value);
+  if (candidate?.sessionUpdate !== "tool_call" && candidate?.sessionUpdate !== "tool_call_update") return value;
+  const canonicalize = dialectId === undefined ? undefined : DIALECT_CANONICALIZERS.get(dialectId);
+  return canonicalize === undefined ? value : canonicalize(candidate, prior);
+}
+
+/** A tool identity while it is worked out: any part may still be unknown. */
+type ToolIdentity = { name: string | undefined; kind: string | undefined; title: string | undefined };
+
+function priorIdentity(prior: CanonicalAcpToolIdentity | undefined): ToolIdentity {
+  return { name: prior?.name, kind: prior?.kind, title: prior?.title };
+}
+
+function definedName(name: string | undefined): { name?: string } {
+  return name === undefined ? {} : { name };
+}
+
+/** The identified kind, filled in only where the call's own kind is generic (absent or `other`). */
+function filledKind(candidate: Record<string, unknown>, kind: string | undefined): { kind?: string } {
+  return kind !== undefined && (typeof candidate.kind !== "string" || candidate.kind === "other") ? { kind } : {};
+}
+
+function nonBlank(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function claudeCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+  const currentName = nonBlank(candidate.name);
   const currentTitle = typeof candidate.title === "string" ? candidate.title : undefined;
+  const meta = claudeMetaTool(candidate);
+  const identityName = claudeIdentityName(meta.name, prior, currentName, currentTitle);
+  if (identityName === undefined && prior === undefined) return candidate;
+  const name = currentName ?? identityName;
+  return {
+    ...candidate,
+    ...definedName(name),
+    ...filledKind(candidate, claudeIdentityKind(identityName, meta.kind, prior)),
+    ...placeholderTitle(currentTitle, prior?.title ?? name),
+  };
+}
+
+/** The tool Claude's bridge names in private `_meta`, before the relay drops it. */
+function claudeMetaTool(candidate: Record<string, unknown>): { name: string | undefined; kind: string | undefined } {
+  const tool = plainRecord(plainRecord(candidate._meta)?.["claude.ai/tool"]);
+  return {
+    name: nonBlank(tool?.name),
+    kind: typeof tool?.kind === "string" && ACP_TOOL_KINDS.has(tool.kind) ? tool.kind : undefined,
+  };
+}
+
+function claudeIdentityName(metaName: string | undefined, prior: CanonicalAcpToolIdentity | undefined, currentName: string | undefined, currentTitle: string | undefined): string | undefined {
   // Some claude-agent-acp releases already expose the safe ToolSearch label as
   // the public title but omit the private metadata entirely. Keep this a
   // closed, exact bridge quirk: arbitrary titles must never become tool names.
-  const knownPublicName = currentName === "ToolSearch" || currentTitle === "ToolSearch"
-    ? "ToolSearch"
-    : undefined;
+  const knownPublicName = currentName === "ToolSearch" || currentTitle === "ToolSearch" ? "ToolSearch" : undefined;
   // Claude names every MCP tool `mcp__<server>__<tool>` and the bridge echoes
   // that name as the call's title with the generic `other` kind. For the
   // platform facade the tool half is the federated `platform__*` name Core
@@ -88,25 +113,20 @@ export function canonicalizeAcpToolActivity(
   // the terminal ideation hand-off is never recognized. Only that closed
   // namespace is promoted — an arbitrary title still never becomes a name.
   const platformToolName = platformMcpToolName(currentName) ?? platformMcpToolName(currentTitle);
-  const identityName = metaName ?? prior?.name ?? knownPublicName ?? platformToolName;
-  if (identityName === undefined && prior === undefined) return value;
-  // Claude currently emits ToolSearch as ACP `other`; that one closed quirk is
-  // normalized here. Other tools keep their protocol kind, including Agent.
-  const identityKind = identityName === "ToolSearch" ? "search" : metaKind ?? prior?.kind;
+  return metaName ?? prior?.name ?? knownPublicName ?? platformToolName;
+}
 
-  const currentKind = typeof candidate.kind === "string" ? candidate.kind : undefined;
-  const name = currentName ?? identityName;
-  const titleFallback = prior?.title ?? name;
-  return {
-    ...candidate,
-    ...(name === undefined ? {} : { name }),
-    ...((currentKind === undefined || currentKind === "other") && identityKind !== undefined
-      ? { kind: identityKind }
-      : {}),
-    ...(titleFallback !== undefined && (currentTitle === undefined || TOOL_TITLE_PLACEHOLDER.test(currentTitle.trim()))
-      ? { title: titleFallback }
-      : {}),
-  };
+/**
+ * Claude currently emits ToolSearch as ACP `other`; that one closed quirk is
+ * normalized here. Other tools keep their protocol kind, including Agent.
+ */
+function claudeIdentityKind(identityName: string | undefined, metaKind: string | undefined, prior: CanonicalAcpToolIdentity | undefined): string | undefined {
+  return identityName === "ToolSearch" ? "search" : metaKind ?? prior?.kind;
+}
+
+/** The fallback title, only over a missing or placeholder one (`other`, `tool`, `unknown tool`). */
+function placeholderTitle(currentTitle: string | undefined, fallback: string | undefined): { title?: string } {
+  return fallback !== undefined && (currentTitle === undefined || TOOL_TITLE_PLACEHOLDER.test(currentTitle.trim())) ? { title: fallback } : {};
 }
 
 /**
@@ -115,21 +135,24 @@ export function canonicalizeAcpToolActivity(
  * promote the federated `platform__*` name behind an MCP title as for Claude.
  * An arbitrary title still never becomes a name.
  */
-function canonicalizeDshToolActivity(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+function dshCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
   const title = typeof candidate.title === "string" ? candidate.title : undefined;
   const name = platformMcpToolName(title) ?? prior?.name;
-  const kind = (title !== undefined ? DSH_TOOL_KINDS[title] : undefined) ?? prior?.kind;
-  const currentKind = typeof candidate.kind === "string" ? candidate.kind : undefined;
+  const kind = dshKind(title, prior);
   if (name === undefined && kind === undefined) return candidate;
   return {
     ...candidate,
-    ...(name !== undefined && typeof candidate.name !== "string" ? { name } : {}),
-    ...(kind !== undefined && (currentKind === undefined || currentKind === "other") ? { kind } : {}),
+    ...(typeof candidate.name !== "string" ? definedName(name) : {}),
+    ...filledKind(candidate, kind),
   };
 }
 
+function dshKind(title: string | undefined, prior: CanonicalAcpToolIdentity | undefined): string | undefined {
+  return (title !== undefined ? DSH_TOOL_KINDS[title] : undefined) ?? prior?.kind;
+}
+
 /** OpenCode's Code Mode, named so policy and people never read it as a shell command. */
-export const OPENCODE_CODE_MODE_NAME = "code_mode";
+const OPENCODE_CODE_MODE_NAME = "code_mode";
 
 /**
  * OpenCode 2 names its tool only in a call's first `tool_call` title (later
@@ -139,39 +162,40 @@ export const OPENCODE_CODE_MODE_NAME = "code_mode";
  * from its code with the same parser that approves it; any other block reads
  * "Code Mode". An arbitrary title still never becomes a name.
  */
-function canonicalizeOpenCodeToolActivity(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
-  const toolCallId = typeof candidate.toolCallId === "string" ? candidate.toolCallId : "";
-  let name = prior?.name;
-  let kind = prior?.kind;
-  let title = prior?.title;
-  if (candidate.sessionUpdate === "tool_call" && prior === undefined) {
-    const tool = openCodeToolName(toolCallId, candidate.title, candidate._meta);
-    if (tool !== undefined && Object.hasOwn(OPENCODE_TOOL_KINDS, tool)) {
-      name = tool === "execute" ? OPENCODE_CODE_MODE_NAME : tool;
-      kind = OPENCODE_TOOL_KINDS[tool];
-      if (tool === "execute") title = "Code Mode";
-    }
-  }
-  const code = (candidate.rawInput as { code?: unknown } | undefined)?.code;
-  if ((name === OPENCODE_CODE_MODE_NAME || kind === "other") && typeof code === "string") {
-    const block = parseKonteksCodeModeBlock(code, KONTEKS_CODE_MODE_SERVERS);
-    if (block.ok) {
-      const tools = [...new Set(block.calls.map(call => call.tool))];
-      name = tools[0];
-      title = tools.join(", ");
-      kind = "other";
-    }
-  }
-  if (name === undefined && kind === undefined) return candidate;
-  const currentKind = typeof candidate.kind === "string" ? candidate.kind : undefined;
-  const currentTitle = typeof candidate.title === "string" ? candidate.title.trim() : undefined;
+function openCodeCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+  const identity = codeModeIdentity(candidate, openCodeFirstIdentity(candidate, prior));
+  if (identity.name === undefined && identity.kind === undefined) return candidate;
   return {
     ...candidate,
-    ...(name !== undefined ? { name } : {}),
-    ...(kind !== undefined && (currentKind === undefined || currentKind === "other") ? { kind } : {}),
-    // Code Mode's own title is always `execute`; show what it runs instead.
-    ...(title !== undefined && (currentTitle === undefined || currentTitle === "execute" || kind === "other") ? { title } : {}),
+    ...definedName(identity.name),
+    ...filledKind(candidate, identity.kind),
+    ...openCodeTitle(candidate, identity),
   };
+}
+
+function openCodeFirstIdentity(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): ToolIdentity {
+  if (candidate.sessionUpdate !== "tool_call" || prior !== undefined) return priorIdentity(prior);
+  const toolCallId = typeof candidate.toolCallId === "string" ? candidate.toolCallId : "";
+  const tool = openCodeToolName(toolCallId, candidate.title, candidate._meta);
+  if (tool === undefined || !Object.hasOwn(OPENCODE_TOOL_KINDS, tool)) return priorIdentity(undefined);
+  if (tool === "execute") return { name: OPENCODE_CODE_MODE_NAME, kind: OPENCODE_TOOL_KINDS[tool], title: "Code Mode" };
+  return { name: tool, kind: OPENCODE_TOOL_KINDS[tool], title: undefined };
+}
+
+/** A Code Mode block that only calls Konteks tools, shown as those tools. */
+function codeModeIdentity(candidate: Record<string, unknown>, identity: ToolIdentity): ToolIdentity {
+  const code = (candidate.rawInput as { code?: unknown } | undefined)?.code;
+  if ((identity.name !== OPENCODE_CODE_MODE_NAME && identity.kind !== "other") || typeof code !== "string") return identity;
+  const block = parseKonteksCodeModeBlock(code, KONTEKS_CODE_MODE_SERVERS);
+  if (!block.ok) return identity;
+  const tools = [...new Set(block.calls.map(call => call.tool))];
+  return { name: tools[0], kind: "other", title: tools.join(", ") };
+}
+
+/** Code Mode's own title is always `execute`; show what it runs instead. */
+function openCodeTitle(candidate: Record<string, unknown>, { kind, title }: ToolIdentity): { title?: string } {
+  const currentTitle = typeof candidate.title === "string" ? candidate.title.trim() : undefined;
+  return title !== undefined && (currentTitle === undefined || currentTitle === "execute" || kind === "other") ? { title } : {};
 }
 
 /** Google Antigravity's own tools in plain words (the titles `Run <tool>?` and `Running <tool>` name them). */
@@ -191,40 +215,45 @@ const ANTIGRAVITY_TOOL_TITLE = /^(?:Run [a-z][a-z0-9_]*\?|Running [a-z][a-z0-9_]
  * question as such. A command keeps its own text as the title; an arbitrary
  * title never becomes a name.
  */
-function canonicalizeAntigravityToolActivity(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
-  let name = prior?.name;
-  let kind = prior?.kind;
-  let title = prior?.title;
-  if (candidate.sessionUpdate === "tool_call" && prior === undefined) {
-    const meta = candidate._meta !== null && typeof candidate._meta === "object" ? (candidate._meta as { mcp?: { server?: unknown; tool?: unknown } }).mcp : undefined;
-    if (typeof meta?.server === "string" && typeof meta.tool === "string" && meta.server.startsWith("konteks-")) {
-      name = meta.tool;
-      kind = "other";
-      title = meta.tool;
-    } else {
-      const tool = antigravityCallTool(candidate);
-      if (tool === "workspace_trust") {
-        name = tool;
-        kind = "other";
-        title = "Workspace trust question";
-      } else if (tool !== undefined && tool !== "mcp" && Object.hasOwn(ANTIGRAVITY_TOOL_KINDS, tool)) {
-        name = tool;
-        kind = ANTIGRAVITY_TOOL_KINDS[tool];
-        title = ANTIGRAVITY_PLAIN_TITLES[tool];
-      }
-    }
-  }
-  if (name === undefined && kind === undefined) return candidate;
-  const currentKind = typeof candidate.kind === "string" ? candidate.kind : undefined;
-  const currentTitle = typeof candidate.title === "string" ? candidate.title.trim() : undefined;
-  const replaceTitle = title !== undefined && (currentTitle === undefined || ANTIGRAVITY_TOOL_TITLE.test(currentTitle) || name === title || name === "workspace_trust" || kind === "other");
+function antigravityCanonicalizer(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): unknown {
+  const identity = antigravityFirstIdentity(candidate, prior);
+  if (identity.name === undefined && identity.kind === undefined) return candidate;
   return {
     ...candidate,
-    ...(name !== undefined ? { name } : {}),
-    ...(kind !== undefined && (currentKind === undefined || currentKind === "other") ? { kind } : {}),
-    ...(replaceTitle ? { title } : {}),
+    ...definedName(identity.name),
+    ...filledKind(candidate, identity.kind),
+    ...(antigravityReplacesTitle(candidate, identity) ? { title: identity.title } : {}),
   };
 }
+
+function antigravityFirstIdentity(candidate: Record<string, unknown>, prior: CanonicalAcpToolIdentity | undefined): ToolIdentity {
+  if (candidate.sessionUpdate !== "tool_call" || prior !== undefined) return priorIdentity(prior);
+  return konteksMcpIdentity(candidate) ?? antigravityToolIdentity(antigravityCallTool(candidate)) ?? priorIdentity(undefined);
+}
+
+function konteksMcpIdentity(candidate: Record<string, unknown>): ToolIdentity | undefined {
+  const meta = candidate._meta !== null && typeof candidate._meta === "object" ? (candidate._meta as { mcp?: { server?: unknown; tool?: unknown } }).mcp : undefined;
+  if (typeof meta?.server !== "string" || typeof meta.tool !== "string" || !meta.server.startsWith("konteks-")) return undefined;
+  return { name: meta.tool, kind: "other", title: meta.tool };
+}
+
+function antigravityToolIdentity(tool: string | undefined): ToolIdentity | undefined {
+  if (tool === "workspace_trust") return { name: tool, kind: "other", title: "Workspace trust question" };
+  if (tool === undefined || tool === "mcp" || !Object.hasOwn(ANTIGRAVITY_TOOL_KINDS, tool)) return undefined;
+  return { name: tool, kind: ANTIGRAVITY_TOOL_KINDS[tool], title: ANTIGRAVITY_PLAIN_TITLES[tool] };
+}
+
+function antigravityReplacesTitle(candidate: Record<string, unknown>, { name, kind, title }: ToolIdentity): boolean {
+  const currentTitle = typeof candidate.title === "string" ? candidate.title.trim() : undefined;
+  return title !== undefined && (currentTitle === undefined || ANTIGRAVITY_TOOL_TITLE.test(currentTitle) || name === title || name === "workspace_trust" || kind === "other");
+}
+
+const DIALECT_CANONICALIZERS: ReadonlyMap<string, ToolCanonicalizer> = new Map([
+  ["claude-code", claudeCanonicalizer],
+  ["dsh", dshCanonicalizer],
+  ["opencode", openCodeCanonicalizer],
+  ["antigravity", antigravityCanonicalizer],
+]);
 
 /**
  * Defense in depth after strict ACP parsing and before replay persistence.
@@ -236,6 +265,10 @@ export function redactActivity(value: unknown, workspaceRoot: string, options: A
   if (typeof value === "string") return publicText(value, workspaceRoot, options.startsAtBoundary ?? true, options.continuesPath ?? false);
   if (Array.isArray(value)) return value.map(item => redactActivity(item, workspaceRoot, options));
   if (value === null || typeof value !== "object") return value;
+  return redactedRecord(value, workspaceRoot, options);
+}
+
+function redactedRecord(value: object, workspaceRoot: string, options: ActivityTextOptions): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
     if (key === "rawInput" || key === "rawOutput" || key === "_meta") continue;
@@ -249,7 +282,7 @@ export function redactActivity(value: unknown, workspaceRoot: string, options: A
  * describe that chunk's text alone: applied to every string they turned the
  * message's own `kind`, `method` and `sessionUpdate` into `[local-path]`
  * whenever the previous chunk ended inside a path, so the relay contract
- * refused the chunk and every update after it in that word (D121).
+ * refused the chunk and every update after it in that word.
  */
 export function redactSessionMessage(message: unknown, workspaceRoot: string, chunk: ActivityTextOptions = {}): unknown {
   const redacted = redactActivity(message, workspaceRoot);
@@ -289,7 +322,7 @@ export function contractIssue(issues: ReadonlyArray<ContractIssue>): { issuePath
   return best === undefined ? undefined : { issuePath: best.path.map(segment).join("."), issueCode: best.code };
 }
 
-export interface ActivityTextOptions {
+interface ActivityTextOptions {
   /**
    * False for a streamed chunk that continues a word: its first character is
    * not the start of a token, so `default` + `/name` or `componen` + `t:x/y`
@@ -349,7 +382,7 @@ function publicText(value: string, workspaceRoot: string, startsAtBoundary: bool
     .replace(/\\\\[^\s"'<>`)\]}]+/g, "[local-path]")
     // A path starts with a path character after the slash, and `*` is never
     // part of one: `sudo ls /**` (a root slash and Markdown bold) is not a
-    // private path, and redacting it broke the bold (WS1-175).
+    // private path, and redacting it broke the bold.
     .replace(/(^|[\s"'=(])\/(?!\/)(?=[\w.~-])[^\s"'<>`)\]}*]+/g, "$1[local-path]");
   return startsAtBoundary ? out : out.slice(1);
 }

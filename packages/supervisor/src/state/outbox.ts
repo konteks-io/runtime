@@ -32,6 +32,26 @@ export type OutboxItem = z.infer<typeof OutboxItemSchema>;
 
 const MAX_OUTBOX_ITEMS = 10_000;
 
+const OutboxRecordSchema = z.discriminatedUnion("op", [
+  z.object({ op: z.literal("put"), item: OutboxItemSchema }).strict(),
+  z.object({ op: z.literal("ack"), id: z.string().min(1) }).strict(),
+  z.object({ op: z.literal("configuration_superseded"), id: z.string().min(1), receipt: DesiredConfigurationAckResultSchema }).strict(),
+]);
+
+function outboxRecord(line: string): z.infer<typeof OutboxRecordSchema> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch { throw new Error("outbox contains a corrupt complete record"); }
+  return OutboxRecordSchema.parse(parsed);
+}
+
+/** Core's supersession receipt names exactly this acknowledgement, and does not merely restate an applied one. */
+function supersedes(receipt: ReturnType<typeof DesiredConfigurationAckResultSchema.parse>, ack: ReturnType<typeof DesiredConfigurationAckSchema.parse>): boolean {
+  return receipt.status === "superseded" && receipt.instanceId === ack.instanceId && receipt.revision === ack.revision &&
+    receipt.requestDigest === jcsDigest(ack as unknown as JsonValue) && !(receipt.appliedRevision === ack.revision && ack.status === "applied");
+}
+
 export class DurableOutbox {
   private readonly items = new Map<string, OutboxItem>();
   private loaded = false;
@@ -54,23 +74,37 @@ export class DurableOutbox {
 
   private async loadInternal(): Promise<void> {
     if (this.loaded) return;
-    let raw = "";
-    try {
-      raw = await readFile(this.path, "utf8");
-    } catch (error) {
-      if (!isFsErrorWithCode(error, "ENOENT")) throw error;
+    const raw = await this.readJournal();
+    if (raw === null) {
       this.loaded = true;
       return;
     }
-    const restored = new Map<string, OutboxItem>();
     const completeLength = raw.lastIndexOf("\n") + 1;
-    for (const line of raw.slice(0, completeLength).split("\n")) {
+    const restored = this.replay(raw.slice(0, completeLength));
+    if (restored.size > MAX_OUTBOX_ITEMS) throw new Error("outbox exceeds its item bound");
+    // A write not terminated by a newline was never committed. Remove the
+    // torn tail before another append, otherwise two records become one.
+    if (completeLength !== raw.length) await this.truncateTo(Buffer.byteLength(raw.slice(0, completeLength)));
+    this.items.clear();
+    for (const [id, item] of restored) this.items.set(id, item);
+    this.loaded = true;
+  }
+
+  private async readJournal(): Promise<string | null> {
+    try {
+      return await readFile(this.path, "utf8");
+    } catch (error) {
+      if (!isFsErrorWithCode(error, "ENOENT")) throw error;
+      return null;
+    }
+  }
+
+  /** The items the complete records leave: puts, acknowledgements and configuration supersessions, in order. */
+  private replay(text: string): Map<string, OutboxItem> {
+    const restored = new Map<string, OutboxItem>();
+    for (const line of text.split("\n")) {
       if (!line.trim()) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch { throw new Error("outbox contains a corrupt complete record"); }
-      const record = z.discriminatedUnion("op", [z.object({ op: z.literal("put"), item: OutboxItemSchema }).strict(), z.object({ op: z.literal("ack"), id: z.string().min(1) }).strict(), z.object({ op: z.literal("configuration_superseded"), id: z.string().min(1), receipt: DesiredConfigurationAckResultSchema }).strict()]).parse(parsed);
+      const record = outboxRecord(line);
       if (record.op === "put") restored.set(record.item.id, record.item);
       else if (record.op === "configuration_superseded") {
         this.assertSupersession(restored.get(record.id), record.receipt);
@@ -78,17 +112,13 @@ export class DurableOutbox {
       }
       else restored.delete(record.id);
     }
-    if (restored.size > MAX_OUTBOX_ITEMS) throw new Error("outbox exceeds its item bound");
-    // A write not terminated by a newline was never committed. Remove the
-    // torn tail before another append, otherwise two records become one.
-    if (completeLength !== raw.length) {
-      const file = await open(this.path, "r+");
-      try { await file.truncate(Buffer.byteLength(raw.slice(0, completeLength))); await file.sync(); }
-      finally { await file.close(); }
-    }
-    this.items.clear();
-    for (const [id, item] of restored) this.items.set(id, item);
-    this.loaded = true;
+    return restored;
+  }
+
+  private async truncateTo(bytes: number): Promise<void> {
+    const file = await open(this.path, "r+");
+    try { await file.truncate(bytes); await file.sync(); }
+    finally { await file.close(); }
   }
 
   get depth(): number {
@@ -172,7 +202,7 @@ export class DurableOutbox {
 
   private assertSupersession(item: OutboxItem | undefined, receipt: ReturnType<typeof DesiredConfigurationAckResultSchema.parse>): void {
     const parsed = DesiredConfigurationAckSchema.safeParse(item?.body);
-    if (!item || item.channel !== "control" || !parsed.success || receipt.status !== "superseded" || receipt.instanceId !== parsed.data.instanceId || receipt.revision !== parsed.data.revision || receipt.requestDigest !== jcsDigest(parsed.data as unknown as JsonValue) || (receipt.appliedRevision === parsed.data.revision && parsed.data.status === "applied")) {
+    if (!item || item.channel !== "control" || !parsed.success || !supersedes(receipt, parsed.data)) {
       throw new Error("outbox configuration supersession receipt mismatch");
     }
   }

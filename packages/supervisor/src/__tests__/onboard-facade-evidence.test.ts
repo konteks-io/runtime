@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { McpOnboardFacade } from "../onboard/facade.js";
 
 /**
- * An unreadable repository's gap leaves the machine with its evidence (W2-O3),
+ * An unreadable repository's gap leaves the machine with its evidence,
  * checked and bounded, while the rest still passes the shared schema.
  */
 describe("McpOnboardFacade.evidenceSubmit", () => {

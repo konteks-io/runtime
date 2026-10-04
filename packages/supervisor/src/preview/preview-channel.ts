@@ -1,6 +1,6 @@
 import { PreviewToRuntimeChunkSchema, createLogger, type Logger, type PreviewToCoreChunk, type PreviewToRuntimeChunk, type RelayChannel } from "@konteks/remote-common";
 import type { OutboundMessage } from "../transport/transport.js";
-import { PreviewForwarder, type PreviewForwarderCounters, type PreviewForwarderOptions } from "./forwarder.js";
+import { PreviewForwarder, type PreviewForwarderOptions } from "./forwarder.js";
 
 /**
  * The supervisor's side of the governed `preview` relay channel.
@@ -12,7 +12,7 @@ import { PreviewForwarder, type PreviewForwarderCounters, type PreviewForwarderO
  * 503 too. Replay and acknowledgements are the mux's, exactly as for a
  * session channel.
  */
-export interface PreviewChannelDeps {
+interface PreviewChannelDeps {
   transport: { send(message: OutboundMessage): void; openChannel(channelId: string, channel: RelayChannel): void; closeChannel(channelId: string): void };
   lease: { canOpenChannel(channel: RelayChannel): boolean };
   previews: {
@@ -55,33 +55,36 @@ export class PreviewChannel {
   onToRuntime(channelId: string, body: unknown): void {
     const sessionId = sessionIdOf(channelId);
     const parsed = PreviewToRuntimeChunkSchema.safeParse(body);
-    const streamId = typeof (body as { streamId?: unknown } | null)?.streamId === "string" ? (body as { streamId: string }).streamId : null;
-    if (sessionId === null || !parsed.success) {
-      this.counters.malformed += 1;
-      if (sessionId !== null && streamId !== null && /^[A-Za-z0-9._:-]{1,256}$/.test(streamId)) this.reply(channelId, streamId, 400, "Malformed preview chunk.");
-      return;
-    }
+    if (sessionId === null || !parsed.success) return this.malformed(channelId, sessionId, body);
     const chunk = parsed.data;
-    if (this.disposed || !this.deps.lease.canOpenChannel("preview")) {
-      this.counters.refusedDraining += 1;
-      if (chunk.kind === "request") this.reply(channelId, chunk.streamId, 503, "This computer is not taking preview traffic right now (it is draining or disconnected).");
-      return;
-    }
-    // A viewer's first request for a session with nothing running: start it
-    // and say so, instead of "nothing is running". Only a request that is
-    // complete in one chunk (a page load, an asset, an upgrade): a multi-part
-    // body keeps going to the forwarder, which answers it plainly.
-    if (
-      chunk.kind === "request" &&
-      chunk.final &&
-      this.deps.previews.autoStart &&
-      this.deps.previews.originFor(sessionId) === null &&
-      !this.forwarders.get(channelId)?.hasStream(chunk.streamId)
-    ) {
+    if (this.disposed || !this.deps.lease.canOpenChannel("preview")) return this.refuseDraining(channelId, chunk);
+    if (this.startsSession(channelId, sessionId, chunk)) {
       void this.startForViewer(channelId, sessionId, chunk);
       return;
     }
     this.forwarderFor(channelId, sessionId).handle(chunk);
+  }
+
+  private malformed(channelId: string, sessionId: string | null, body: unknown): void {
+    this.counters.malformed += 1;
+    const streamId = typeof (body as { streamId?: unknown } | null)?.streamId === "string" ? (body as { streamId: string }).streamId : null;
+    if (sessionId !== null && streamId !== null && /^[A-Za-z0-9._:-]{1,256}$/.test(streamId)) this.reply(channelId, streamId, 400, "Malformed preview chunk.");
+  }
+
+  private refuseDraining(channelId: string, chunk: PreviewToRuntimeChunk): void {
+    this.counters.refusedDraining += 1;
+    if (chunk.kind === "request") this.reply(channelId, chunk.streamId, 503, "This computer is not taking preview traffic right now (it is draining or disconnected).");
+  }
+
+  /**
+   * A viewer's first request for a session with nothing running: start it
+   * and say so, instead of "nothing is running". Only a request that is
+   * complete in one chunk (a page load, an asset, an upgrade): a multi-part
+   * body keeps going to the forwarder, which answers it plainly.
+   */
+  private startsSession(channelId: string, sessionId: string, chunk: PreviewToRuntimeChunk): chunk is Extract<PreviewToRuntimeChunk, { kind: "request" }> {
+    return chunk.kind === "request" && chunk.final === true && this.deps.previews.autoStart !== undefined &&
+      this.deps.previews.originFor(sessionId) === null && !this.forwarders.get(channelId)?.hasStream(chunk.streamId);
   }
 
   private async startForViewer(channelId: string, sessionId: string, chunk: Extract<PreviewToRuntimeChunk, { kind: "request" }>): Promise<void> {
@@ -113,7 +116,7 @@ export class PreviewChannel {
       forwarder.dispose();
     }
     // Its counts go even when no viewer reached this process yet: a reset
-    // that left them kept the channel out of step with Core (W1-Z7).
+    // that left them kept the channel out of step with Core.
     this.deps.transport.closeChannel(channelId);
   }
 
@@ -126,14 +129,6 @@ export class PreviewChannel {
     let total = 0;
     for (const forwarder of this.forwarders.values()) total += forwarder.activeStreams;
     return total;
-  }
-
-  counterTotals(): PreviewForwarderCounters & { channels: number; malformed: number; refusedDraining: number; autoStarted: number } {
-    const totals: PreviewForwarderCounters = { streams: 0, rejectedPaths: 0, rejectedHeaders: 0, refusedNoPreview: 0, refusedStreamCap: 0, oversized: 0, idleClosed: 0, upstreamFailures: 0 };
-    for (const forwarder of this.forwarders.values()) {
-      for (const key of Object.keys(totals) as Array<keyof PreviewForwarderCounters>) totals[key] += forwarder.counters[key];
-    }
-    return { ...totals, channels: this.forwarders.size, ...this.counters };
   }
 
   dispose(): void {

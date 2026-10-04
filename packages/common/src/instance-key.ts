@@ -52,10 +52,6 @@ export function exportPrivateJwk(key: InstanceKeyPair): JsonWebKey {
   return key.privateKey.export({ format: "jwk" });
 }
 
-export function publicKeyFromJwk(jwk: JsonWebKey): KeyObject {
-  return createPublicKey({ key: jwk, format: "jwk" });
-}
-
 /** 16 CSPRNG bytes, base64url — the single canonical client nonce per request. */
 export function newNonce(): string {
   return randomBytes(16).toString("base64url");
@@ -64,20 +60,13 @@ export function newNonce(): string {
 /**
  * The instance-key request proof: `{ algorithm: 'ES256', nonce, signature }`.
  *
- * wire-contracts.md fixes WHAT the signature covers ("the normalized request
- * body, nonce, method, audience, and instance/activation ID") but the D125
- * `CanonicalProofInput` formula is specified only for the replica/relay/attach
- * profiles. This profile mirrors it exactly so CP3's verifier can reuse the
- * same reconstruction: JCS of a closed object whose `bodyDigest` is the JCS
- * digest of the body with every `PROOF_MEMBERS` entry removed.
+ * The signature covers the normalized request body, nonce, method, audience
+ * and instance or activation id, as the JCS of a closed object whose
+ * `bodyDigest` is the JCS digest of the body with every proof member removed
+ * (profile 'konteks-instance-proof-v1'). Core verifies the same bytes
+ * (core `plugins/remote-instance-backend/src/crypto/instanceProof.ts`).
  */
-// CONTRACT-GAP: the byte layout of the ES256 instance-key proof is not fixed
-// by wire-contracts.md; this profile ('konteks-instance-proof-v1') is the
-// closest faithful reading of D125. CP3 adopted it verbatim
-// (core/plugins/remote-instance-backend crypto/instanceProof.ts) with
-// audience 'konteks:remote-instance'; the gap now only asks CP1 to publish
-// the profile as the shared reference so neither side re-derives it.
-export interface InstanceProofInput {
+interface InstanceProofInput {
   v: "konteks-instance-proof-v1";
   method: string; // closed per endpoint: 'activation_exchange' | 'provisioning_refresh' | 'readiness' | 'reconnect' | 'relay_handshake' | 'lease_renew' | 'token_redeem'
   audience: string; // Core audience the endpoint names (e.g. 'konteks:remote-instance')
@@ -86,13 +75,13 @@ export interface InstanceProofInput {
   nonce: string;
 }
 
-export interface InstanceProof {
+interface InstanceProof {
   algorithm: "ES256";
   nonce: string;
   signature: string;
 }
 
-export function instanceProofBytes(input: InstanceProofInput): Uint8Array {
+function instanceProofBytes(input: InstanceProofInput): Uint8Array {
   return Buffer.from(canonicalize(input as unknown as JsonValue), "utf8");
 }
 
@@ -181,7 +170,7 @@ export function verifyBody(
 /**
  * The supervisor `RelayAck` signature covers `channelId`, `dataDirection`,
  * `cumulativeSeq`, and `issuedAt` — never the epoch, which the relay re-stamps
- * per hop (D115).
+ * per hop.
  */
 export function signRelayAck(
   key: Pick<InstanceKeyPair, "privateKey">,

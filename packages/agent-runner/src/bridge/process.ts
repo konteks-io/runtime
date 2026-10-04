@@ -27,8 +27,8 @@ import { instructionScopeObserver } from "./instruction-scope-observer.js";
 import type { BridgeSpawnSpec } from "./spec.js";
 
 /**
- * One pinned bridge process over stdio (D98: `initialize` happens here, once
- * per process, and is never relayed). Adapted from bb's
+ * One pinned bridge process over stdio (`initialize` happens here, once per
+ * process, and is never relayed). Adapted from bb's
  * `provider-bridge-acp/bridge/agent-connection.ts` process lifecycle, using
  * the official `@agentclientprotocol/sdk` connection instead of a hand-rolled
  * JSON-RPC loop. Bridge stdout is the protocol stream; stderr is kept as a
@@ -84,9 +84,45 @@ export interface SpawnBridgeOptions {
 
 export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgeProcess> {
   const logger = options.logger ?? createLogger({ name: `bridge-${options.spec.family.agentId}` });
-  let child: PipedChildProcess;
+  const child = spawnBridgeChild(options);
+  const stderr = stderrReader(options, logger, child);
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", stderr.onData);
+  const state = { exited: false };
+  child.once("exit", (code, signal) => {
+    state.exited = true;
+    logger.info({ code, signal }, "bridge exited");
+    options.handlers.onExit({ code, signal });
+  });
+  const retainedProcessOwner = await captureBridgeOwner(child, state);
+  const processOwner = bridgeStopOwner(child, state, retainedProcessOwner);
+  try { await options.onProcessOwner?.(processOwner); }
+  catch (error) { await processOwner.stop(); throw error; }
+  child.stdin.on("error", () => {
+    // The connection surfaces the failure through its own rejected requests.
+  });
+  const stream = ndJsonStream(
+    Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
+    Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
+  );
+  const connection = new ClientSideConnection(() => bridgeClient(options.handlers), stream);
+  const initializeResult = await initializeBridge(connection, options, child);
+  logger.info({ agentId: options.spec.family.agentId }, "bridge initialized");
+  return {
+    connection,
+    initializeResult,
+    get exited() {
+      return state.exited;
+    },
+    stderrTail: () => [...stderr.tail],
+    ...(stderr.failure ? { failure: stderr.failure } : {}),
+    stop: processOwner.stop,
+  };
+}
+
+function spawnBridgeChild(options: SpawnBridgeOptions): PipedChildProcess {
   try {
-    child = (options.spawnProcess ?? spawnPiped)({
+    return (options.spawnProcess ?? spawnPiped)({
       command: options.spec.command,
       args: options.spec.args,
       cwd: options.spec.cwd,
@@ -99,7 +135,16 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
       recoveryActions: [{ kind: "update" }, { kind: "run_doctor" }],
     });
   }
-  const stderrLines: string[] = [];
+}
+
+/**
+ * The bridge's stderr: a bounded tail for diagnostics, Claude Code's
+ * instruction-scope marker, each complete line for an observer, and the host
+ * adapter's reading of a line that means the agent cannot go on without the
+ * person (`failure` rejects with it, once).
+ */
+function stderrReader(options: SpawnBridgeOptions, logger: Logger, child: PipedChildProcess) {
+  const tail: string[] = [];
   const observeInstructionScope = instructionScopeObserver(scope => {
     logger.info({ event: "agent.instruction_scope", agentId: options.spec.family.agentId, bridgePid: child.pid, source: "bridge_report", ...scope }, "agent instruction scope applied");
   });
@@ -108,51 +153,57 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
   // Observed through races only; never an unhandled rejection of its own.
   void failure?.catch(() => undefined);
   let partial = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) => {
-    if (options.spec.family.agentId === "claude-code") observeInstructionScope(chunk);
+  const keepTail = (chunk: string) => {
     for (const line of chunk.split(/\r?\n/)) {
       if (!line) continue;
-      stderrLines.push(line.slice(0, 512));
-      if (stderrLines.length > STDERR_TAIL_MAX_LINES) stderrLines.shift();
+      tail.push(line.slice(0, 512));
+      if (tail.length > STDERR_TAIL_MAX_LINES) tail.shift();
     }
-    if (options.onStderrLine || (options.stderrFailure && failWith)) {
-      const lines = (partial + chunk).split(/\r?\n/);
-      partial = (lines.pop() ?? "").slice(-4_096);
-      for (const line of lines) {
-        if (line && options.onStderrLine) {
-          try { options.onStderrLine(line.slice(0, 4_096)); } catch { /* an observer never breaks the process */ }
-        }
-        if (!options.stderrFailure || !failWith) continue;
-        const refusal = line ? options.stderrFailure(line.slice(0, 4_096)) : null;
-        if (refusal && failWith) {
-          const fail: (error: RemoteInstanceError) => void = failWith;
-          failWith = null;
-          logger.warn({ agentId: options.spec.family.agentId, errorCode: refusal.code, diagnostic: refusal.diagnostic }, "the agent cannot go on without the person");
-          fail(refusal);
-          break;
-        }
-      }
-    }
-  });
-  let exited = false;
-  child.once("exit", (code, signal) => {
-    exited = true;
-    logger.info({ code, signal }, "bridge exited");
-    options.handlers.onExit({ code, signal });
-  });
-  let retainedProcessOwner: RetainedProcessOwner | undefined;
+  };
+
+  /** True once a line ended the agent's run. */
+  const observe = (line: string) => {
+    if (!line || !options.onStderrLine) return;
+    try { options.onStderrLine(line.slice(0, 4_096)); } catch { /* an observer never breaks the process */ }
+  };
+  const refusalOf = (line: string): RemoteInstanceError | null =>
+    line && failWith && options.stderrFailure ? options.stderrFailure(line.slice(0, 4_096)) : null;
+  const readLine = (line: string): boolean => {
+    observe(line);
+    const refusal = refusalOf(line);
+    if (!refusal || !failWith) return false;
+    const fail: (error: RemoteInstanceError) => void = failWith;
+    failWith = null;
+    logger.warn({ agentId: options.spec.family.agentId, errorCode: refusal.code, diagnostic: refusal.diagnostic }, "the agent cannot go on without the person");
+    fail(refusal);
+    return true;
+  };
+  const onData = (chunk: string) => {
+    if (options.spec.family.agentId === "claude-code") observeInstructionScope(chunk);
+    keepTail(chunk);
+    if (!options.onStderrLine && !(options.stderrFailure && failWith)) return;
+    const lines = (partial + chunk).split(/\r?\n/);
+    partial = (lines.pop() ?? "").slice(-4_096);
+    for (const line of lines) if (readLine(line)) break;
+  };
+  return { tail, failure, onData };
+}
+
+/**
+ * The durable stop handle of a just-spawned bridge (macOS, Linux, Windows).
+ * Identity capture can transiently miss a just-spawned process on a cold
+ * Windows PowerShell host. A fresh spawn is safe only after this exact
+ * candidate's leader exit and process-group absence are both observed.
+ * Otherwise retain the recovery-required refusal: retrying beside an
+ * unowned process would weaken the durable ownership fence.
+ */
+async function captureBridgeOwner(child: PipedChildProcess, state: { exited: boolean }): Promise<RetainedProcessOwner | undefined> {
+  if (!OWNED_PLATFORMS.has(process.platform) || child.pid === undefined) return undefined;
   try {
-    if ((process.platform === "darwin" || process.platform === "linux" || process.platform === "win32") && child.pid !== undefined) retainedProcessOwner = captureRetainedProcessOwner(child.pid);
+    return captureRetainedProcessOwner(child.pid);
   } catch (error) {
     await stopProcessGroupLeaderFirst({ child, timeoutMs: 2_000, killGraceMs: 1_000 });
-    // Identity capture can transiently miss a just-spawned process on a cold
-    // Windows PowerShell host. A fresh spawn is safe only after this exact
-    // candidate's leader exit and process-group absence are both observed.
-    // Otherwise retain the recovery-required refusal: retrying beside an
-    // unowned process would weaken the durable ownership fence.
-    const leaderExited = exited || child.exitCode !== null || child.signalCode !== null;
-    if (!leaderExited || isProcessGroupAlive(child)) throw error;
+    if (!leaderExited(child, state) || isProcessGroupAlive(child)) throw error;
     throw new RemoteInstanceError("agent_unavailable", "Bridge process identity capture was temporarily unavailable.", {
       cause: error,
       diagnostic: "bridge_process_identity_capture_failed",
@@ -160,15 +211,24 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
       recoveryActions: [{ kind: "run_doctor" }],
     });
   }
-  const processOwner: BridgeStopOwner = {
-    get exited() { return exited; },
+}
+
+const OWNED_PLATFORMS: ReadonlySet<NodeJS.Platform> = new Set(["darwin", "linux", "win32"]);
+
+function leaderExited(child: PipedChildProcess, state: { exited: boolean }): boolean {
+  return state.exited || child.exitCode !== null || child.signalCode !== null;
+}
+
+function bridgeStopOwner(child: PipedChildProcess, state: { exited: boolean }, retainedProcessOwner: RetainedProcessOwner | undefined): BridgeStopOwner {
+  return {
+    get exited() { return state.exited; },
     ...(retainedProcessOwner ? { retainedProcessOwner } : {}),
     stop: async () => {
       await stopProcessGroupLeaderFirst({ child, timeoutMs: 5_000, killGraceMs: 2_000 });
       // The bounded group helper may finish on its grace timeout. Require
       // actual leader-exit observation; this still does not prove tool/MCP
       // quiescence or authorize release of retained execution capacity.
-      if (!exited && child.exitCode === null && child.signalCode === null) {
+      if (!leaderExited(child, state)) {
         throw new RemoteInstanceError("recovery_required", "Bridge process exit remains unconfirmed.");
       }
       if (isProcessGroupAlive(child)) {
@@ -176,16 +236,13 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
       }
     },
   };
-  try { await options.onProcessOwner?.(processOwner); }
-  catch (error) { await processOwner.stop(); throw error; }
-  child.stdin.on("error", () => {
-    // The connection surfaces the failure through its own rejected requests.
-  });
+}
 
-  const client: Client = {
-    sessionUpdate: (params) => options.handlers.onSessionUpdate(params),
-    requestPermission: (params) => options.handlers.onRequestPermission(params),
-    createElicitation: (params) => options.handlers.onCreateElicitation(params),
+function bridgeClient(handlers: BridgeClientHandlers): Client {
+  return {
+    sessionUpdate: (params) => handlers.onSessionUpdate(params),
+    requestPermission: (params) => handlers.onRequestPermission(params),
+    createElicitation: (params) => handlers.onCreateElicitation(params),
     // No fs/terminal capabilities are offered: the agent operates inside its
     // working copy through its own tools, which Konteks governs, never through
     // the runner acting on its behalf. An agent that calls them anyway gets
@@ -199,12 +256,10 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
     waitForTerminalExit: async () => { throw RequestError.methodNotFound("terminal/wait_for_exit"); },
     killTerminal: async () => { throw RequestError.methodNotFound("terminal/kill"); },
   };
-  const stream = ndJsonStream(
-    Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
-    Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
-  );
-  const connection = new ClientSideConnection(() => client, stream);
+}
 
+/** ACP `initialize`, once, within its deadline and at the pinned protocol version; the process is stopped otherwise. */
+async function initializeBridge(connection: ClientSideConnection, options: SpawnBridgeOptions, child: PipedChildProcess): Promise<InitializeResponse> {
   const timeout = new Promise<never>((_resolve, reject) => {
     setTimeout(
       () => reject(new RemoteInstanceError("agent_unavailable", `bridge did not answer initialize within ${options.initializeTimeoutMs}ms`, { recoveryActions: [{ kind: "run_doctor" }] })),
@@ -232,28 +287,13 @@ export async function spawnBridge(options: SpawnBridgeOptions): Promise<BridgePr
       recoveryActions: [{ kind: "update" }],
     });
   }
-  logger.info({ agentId: options.spec.family.agentId }, "bridge initialized");
-  return {
-    connection,
-    initializeResult,
-    get exited() {
-      return exited;
-    },
-    stderrTail: () => [...stderrLines],
-    ...(failure ? { failure } : {}),
-    stop: processOwner.stop,
-  };
+  return initializeResult;
 }
 
 /**
- * Codex reports a sign-in it can no longer refresh as a JSON-RPC internal
- * error (-32603) whose data says "unauthorized"; read as "internal" it
- * surfaced as "the provider call failed" instead of "sign in again" (WS2-141).
- */
-/**
  * DeepSeek Harness reports a missing or unusable API key as a failed turn
  * (-32603) whose text names neither auth nor a status; these are its exact
- * llm-deepseek messages (dsh-runtime-support CP0 #7). A revoked key already
+ * llm-deepseek messages. A revoked key already
  * reads "Authentication Fails".
  */
 const DSH_KEY_MISSING = /llm-deepseek: (?:no API key for provider route|the API key resolved from \S+ contains characters no HTTP header can carry)/;
@@ -270,8 +310,8 @@ type BridgeErrorClass = ReturnType<typeof classifyBridgeError>;
 
 /**
  * OpenCode 2 fails a turn as JSON-RPC -32603 whose data names the failure:
- * `{ service: "session", errorName: "provider.<reason>" }` (CP0-v2: an empty
- * Zen balance was `provider.quota`, a model outside the account
+ * `{ service: "session", errorName: "provider.<reason>" }` (an empty Zen
+ * balance is `provider.quota`, a model outside the account
  * `provider.no-route`); a failed sign-in is ACP's auth-required error. The
  * provider's HTTP status is not forwarded, so 429 arrives as
  * `provider.rate-limit` and 5xx as `provider.internal`, `timeout` or
@@ -312,32 +352,48 @@ function openCodeProviderError(error: RequestError): BridgeErrorClass | null {
  * Enterprise settings could not be read (the session is blocked). Its own
  * text names paths and projects, so none of it reaches the person: fixed
  * plain lines only. A licensed account whose project has the Business AI
- * Code API switched off reads "no license" (CP0 part 2), so the licence line
+ * Code API switched off reads "no license", so the licence line
  * names that API and the command that turns it on.
  */
 export const ANTIGRAVITY_LICENCE_REASON = "Gemini Enterprise found no licence for this Google Cloud project. Turn on the Business AI Code API with `gcloud services enable businessaicode.googleapis.com --project <project id>`, then sign in again with `konteks-remote auth login antigravity`.";
-export const ANTIGRAVITY_ADMIN_SETTINGS_REASON = "Your organisation's Gemini Enterprise settings could not be checked. Sign in again or ask your Google Cloud admin.";
+const ANTIGRAVITY_ADMIN_SETTINGS_REASON = "Your organisation's Gemini Enterprise settings could not be checked. Sign in again or ask your Google Cloud admin.";
 const ANTIGRAVITY_SIGN_IN_AGAIN = "Google Antigravity needs to sign in again. Run `konteks-remote auth login antigravity`.";
+
+/** Every reason but `ge_license_failed`, which depends on its text. */
+const ANTIGRAVITY_REASONS: ReadonlyMap<string, string> = new Map([
+  ["admin_controls_permission_denied", ANTIGRAVITY_ADMIN_SETTINGS_REASON],
+  ["admin_controls_verification_failed", ANTIGRAVITY_ADMIN_SETTINGS_REASON],
+  ["ge_license_cancelled", "The Gemini Enterprise licence was not chosen. Sign in again with `konteks-remote auth login antigravity`."],
+  ["ge_license_superseded", "The Gemini Enterprise licence was not chosen. Sign in again with `konteks-remote auth login antigravity`."],
+  ["ge_auth_failed", ANTIGRAVITY_SIGN_IN_AGAIN],
+  ["onboarding_failed", ANTIGRAVITY_SIGN_IN_AGAIN],
+]);
 
 function antigravityError(error: RequestError): BridgeErrorClass | null {
   const data = error.data as { reason?: unknown } | null | undefined;
   const reason = data !== null && typeof data === "object" && typeof data.reason === "string" ? data.reason : undefined;
-  const text = error.message.slice(0, 2_048);
-  const auth = (message: string): BridgeErrorClass => ({ code: error.code, class: "agent_auth_required", message, retryable: false });
-  if (reason === "admin_controls_permission_denied" || reason === "admin_controls_verification_failed") return auth(ANTIGRAVITY_ADMIN_SETTINGS_REASON);
-  if (reason === "ge_license_failed") {
-    // No answer from Google at all, or a server error there: nothing was learned about the licence.
-    if (/failed to reach the backend|\(HTTP 5\d\d\)/i.test(text)) {
-      return { code: error.code, class: "provider_failure", message: "Google Antigravity could not reach Gemini Enterprise. Try again shortly.", retryable: true };
-    }
-    if (/setup incomplete/i.test(text)) return auth("Gemini Enterprise needs a Google Cloud project and location. Sign in again with `konteks-remote auth login antigravity`.");
-    return auth(ANTIGRAVITY_LICENCE_REASON);
-  }
-  if (reason === "ge_license_cancelled" || reason === "ge_license_superseded") return auth("The Gemini Enterprise licence was not chosen. Sign in again with `konteks-remote auth login antigravity`.");
-  if (reason === "ge_auth_failed" || reason === "onboarding_failed") return auth(ANTIGRAVITY_SIGN_IN_AGAIN);
-  return null;
+  if (reason === "ge_license_failed") return antigravityLicenceError(error);
+  const message = reason === undefined ? undefined : ANTIGRAVITY_REASONS.get(reason);
+  return message === undefined ? null : { code: error.code, class: "agent_auth_required", message, retryable: false };
 }
 
+function antigravityLicenceError(error: RequestError): BridgeErrorClass {
+  const text = error.message.slice(0, 2_048);
+  // No answer from Google at all, or a server error there: nothing was learned about the licence.
+  if (/failed to reach the backend|\(HTTP 5\d\d\)/i.test(text)) {
+    return { code: error.code, class: "provider_failure", message: "Google Antigravity could not reach Gemini Enterprise. Try again shortly.", retryable: true };
+  }
+  const message = /setup incomplete/i.test(text)
+    ? "Gemini Enterprise needs a Google Cloud project and location. Sign in again with `konteks-remote auth login antigravity`."
+    : ANTIGRAVITY_LICENCE_REASON;
+  return { code: error.code, class: "agent_auth_required", message, retryable: false };
+}
+
+/**
+ * Codex reports a sign-in it can no longer refresh as a JSON-RPC internal
+ * error (-32603) whose data says "unauthorized"; read as "internal" it would
+ * surface as "the provider call failed" instead of "sign in again".
+ */
 function signInLapsed(data: unknown): boolean {
   if (data === undefined || data === null) return false;
   let text: string;
@@ -352,24 +408,30 @@ export function classifyBridgeError(error: unknown): {
   message: string;
   retryable: boolean;
 } {
-  if (error instanceof RequestError) {
-    const openCode = openCodeProviderError(error) ?? antigravityError(error);
-    if (openCode) return openCode;
-    const message = error.message.slice(0, 1_024);
-    if (error.code === -32000 || /auth/i.test(message) || signInLapsed(error.data) || DSH_KEY_MISSING.test(message)) {
-      return { code: error.code, class: "agent_auth_required", message: "agent authentication required", retryable: false };
-    }
-    // dsh already retried these five times; a turn is not idempotent, so name
-    // the provider and let the person decide, never retry the whole turn.
-    if (DSH_PROVIDER_FAILURE.test(message)) return { code: error.code, class: "provider_failure", message, retryable: false };
-    if (error.code === -32602) return { code: error.code, class: "invalid_params", message, retryable: false };
-    if (error.code === -32601) return { code: error.code, class: "unknown_request", message, retryable: false };
-    if (error.code === -32603) return { code: error.code, class: "internal", message, retryable: false };
-    return { code: error.code, class: "provider_failure", message, retryable: true };
-  }
+  if (error instanceof RequestError) return openCodeProviderError(error) ?? antigravityError(error) ?? classifyRequestError(error);
   if (error instanceof RemoteInstanceError && error.code === "agent_auth_required") {
     return { code: -32000, class: "agent_auth_required", message: error.message, retryable: false };
   }
   const message = error instanceof Error ? error.message.slice(0, 1_024) : "bridge request failed";
   return { code: -32603, class: "internal", message, retryable: false };
+}
+
+/** JSON-RPC codes that are definite answers, never worth repeating. */
+const DEFINITE_REQUEST_CODES: ReadonlyMap<number, "invalid_params" | "unknown_request" | "internal"> = new Map([
+  [-32602, "invalid_params"], [-32601, "unknown_request"], [-32603, "internal"],
+]);
+
+function classifyRequestError(error: RequestError): BridgeErrorClass {
+  const message = error.message.slice(0, 1_024);
+  if (needsSignIn(error, message)) return { code: error.code, class: "agent_auth_required", message: "agent authentication required", retryable: false };
+  // dsh already retried these five times; a turn is not idempotent, so name
+  // the provider and let the person decide, never retry the whole turn.
+  if (DSH_PROVIDER_FAILURE.test(message)) return { code: error.code, class: "provider_failure", message, retryable: false };
+  const definite = DEFINITE_REQUEST_CODES.get(error.code);
+  if (definite) return { code: error.code, class: definite, message, retryable: false };
+  return { code: error.code, class: "provider_failure", message, retryable: true };
+}
+
+function needsSignIn(error: RequestError, message: string): boolean {
+  return error.code === -32000 || /auth/i.test(message) || signInLapsed(error.data) || DSH_KEY_MISSING.test(message);
 }

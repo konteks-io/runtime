@@ -15,9 +15,9 @@ export const SupervisorConfigSchema = z
     /** Empty means HTTPS-only. */
     SUPERVISOR_RELAY_URL: z.preprocess((value) => (value === "" ? undefined : value), z.string().url().optional()),
     SUPERVISOR_CONTROL_PORT: z.coerce.number().int().min(1).max(65_535).default(41800),
-    /** The onboard lane's scratch: `clones/` for deep reads and relocation mirrors, `archives/` for single-file tars (OB6 §2). */
+    /** The onboard lane's scratch: `clones/` for deep reads and relocation mirrors, `archives/` for single-file tars. */
     SUPERVISOR_ONBOARD_SCRATCH_ROOT: z.string().min(1).default("/data/onboard"),
-    /** Where this runtime's managed-git key lives. Private half, never backed up, never sent (ON16). */
+    /** Where this runtime's managed-git key lives. Private half, never backed up, never sent. */
     SUPERVISOR_ONBOARD_GIT_KEY_DIR: z.string().min(1).default("/data/git-keys"),
     /** Repositories in flight during an evidence pass; the host is somebody's laptop. */
     SUPERVISOR_ONBOARD_MAX_CONCURRENT: z.coerce.number().int().min(1).max(16).default(4),

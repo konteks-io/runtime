@@ -49,7 +49,7 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("auth.cancel"), loginId: z.string().min(1) }).strict(),
   // `method`: which of an agent's sign-ins to remove (Antigravity: its key or Gemini Enterprise).
   z.object({ op: z.literal("auth.logout"), agentId: agentIdSchema, provider: providerIdSchema.optional(), method: methodIdSchema.optional() }).strict(),
-  // Managed-git key registration (ON16). Nothing here carries key material:
+  // Managed-git key registration. Nothing here carries key material:
   // the private half is generated on the machine and never crosses this hop,
   // not even to be shown to the person who ran the command.
   z.object({ op: z.literal("git.key.add"), title: z.string().trim().min(1).max(256).optional() }).strict(),
@@ -69,9 +69,9 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   /** Ask the supervisor to launch the installer's transactional update in a separate process. */
   z.object({ op: z.literal("update.apply") }).strict(),
   z.object({ op: z.literal("update.status") }).strict(),
-  /** Where the unattended update reads releases (host only), an override, and the last read's failure (RCA 2026-09-30). */
+  /** Where the unattended update reads releases (host only), an override, and the last read's failure. */
   z.object({ op: z.literal("update.channel") }).strict(),
-  /** The release Konteks accepts for this machine, asked with this machine's lease (WS1-093). */
+  /** The release Konteks accepts for this machine, asked with this machine's lease. */
   z.object({ op: z.literal("release.accepted") }).strict(),
   z
     .object({ op: z.literal("logs"), sinceSeconds: z.number().int().min(1).max(86_400 * 7) })
@@ -79,9 +79,9 @@ export const ControlRequestSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("support.bundle") }).strict(),
   z.object({ op: z.literal("readiness.submit") }).strict(),
   z.object({ op: z.literal("revoke.pending") }).strict(),
-  /** Uninstall: ask Core to drain, revoke and tombstone this runtime (W1-L2). */
+  /** Uninstall: ask Core to drain, revoke and tombstone this runtime. */
   z.object({ op: z.literal("instance.retire") }).strict(),
-  /** Stop this connector however it runs: a foreground `serve` has no service to stop it (W1-D3). */
+  /** Stop this connector however it runs: a foreground `serve` has no service to stop it. */
   z.object({ op: z.literal("shutdown") }).strict(),
 ]);
 export type ControlRequest = z.infer<typeof ControlRequestSchema>;
@@ -146,7 +146,7 @@ const recoveryActionsSchema = z
   .array(z.object({ kind: z.string(), agentId: z.string().optional() }).strict())
   .max(8);
 
-export const ControlResponseSchema = z.discriminatedUnion("kind", [
+const ControlResponseSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("ok"), id: z.string(), result: z.unknown() }).strict(),
   z
     .object({
@@ -160,7 +160,7 @@ export const ControlResponseSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("event"), id: z.string(), event: ControlLoginEventSchema }).strict(),
   z.object({ kind: z.literal("done"), id: z.string() }).strict(),
 ]);
-export type ControlResponse = z.infer<typeof ControlResponseSchema>;
+type ControlResponse = z.infer<typeof ControlResponseSchema>;
 
 const AuthEnvelopeSchema = z.object({ auth: z.string().min(16).max(256) }).strict();
 const RequestEnvelopeSchema = z
@@ -175,7 +175,7 @@ export interface ControlEmitter {
 
 export type ControlHandler = (request: ControlRequest, emit: ControlEmitter) => Promise<unknown>;
 
-export interface ControlSocketServerOptions {
+interface ControlSocketServerOptions {
   token: string;
   port: number;
   handler: ControlHandler;
@@ -222,7 +222,7 @@ function handleConnection(socket: Socket, options: ControlSocketServerOptions): 
   // A client that resets mid-read (a `status` probe exiting early) surfaces as
   // an 'error' on the socket AND, independently, on the readline interface.
   // Unhandled, either one is an uncaught exception that takes the whole
-  // supervisor down — observed live 2026-09-12 (`read ECONNRESET` emitted on
+  // supervisor down (`read ECONNRESET` emitted on
   // the Interface). A peer's failure ends that connection, nothing else.
   socket.on("error", () => socket.destroy());
   lines.on("error", () => socket.destroy());
@@ -293,7 +293,7 @@ function handleConnection(socket: Socket, options: ControlSocketServerOptions): 
   socket.on("error", () => socket.destroy());
 }
 
-export interface ControlSocketClientOptions {
+interface ControlSocketClientOptions {
   token: string;
   port: number;
   timeoutMs?: number;
@@ -367,40 +367,47 @@ export function controlCall<T>(options: ControlSocketClientOptions, call: Contro
     // readline forwards input errors independently of the socket listener.
     // A stopped service must reject the call, not crash the launcher.
     lines.on("error", error => finish(() => reject(unavailable("cannot read the supervisor control socket", error))));
-    lines.on("line", (line) => {
-      const parsed = ControlResponseSchema.safeParse(safeJson(line));
-      // A request the server cannot parse is answered with id "unknown". Each
-      // call owns its connection and sends one request, so that error is ours.
-      if (!parsed.success || (parsed.data.id !== id && !(parsed.data.kind === "error" && parsed.data.id === "unknown"))) return;
-      const response = parsed.data;
-      if (response.kind === "event") {
-        call.onEvent?.(response.event);
-        if (response.event.kind === "completed" || response.event.kind === "failed") {
-          loginFinished = true;
+    const onResponse = (response: ControlResponse): void => {
+      switch (response.kind) {
+        case "event":
+          call.onEvent?.(response.event);
+          if (response.event.kind === "completed" || response.event.kind === "failed") {
+            loginFinished = true;
+            complete();
+          }
+          return;
+        case "ok":
+          result = response.result;
+          sawOk = true;
+          return;
+        case "error":
+          finish(() => reject(new RemoteInstanceError("temporarily_unavailable", `${response.code}: ${response.message}`, {
+            recoveryActions: response.recoveryActions as RecoveryAction[],
+          })));
+          return;
+        default:
+          sawDone = true;
           complete();
-        }
-        return;
       }
-      if (response.kind === "ok") {
-        result = response.result;
-        sawOk = true;
-        return;
-      }
-      if (response.kind === "error") {
-        finish(() =>
-          reject(
-            new RemoteInstanceError("temporarily_unavailable", `${response.code}: ${response.message}`, {
-              recoveryActions: response.recoveryActions as RecoveryAction[],
-            }),
-          ),
-        );
-        return;
-      }
-      sawDone = true;
-      complete();
+    };
+    lines.on("line", (line) => {
+      const response = ownResponse(line, id);
+      if (response) onResponse(response);
     });
     socket.once("close", () => finish(() => reject(unavailable("control socket closed early"))));
   });
+}
+
+/**
+ * The response on `line` when it answers this call. A request the server
+ * cannot parse is answered with id "unknown"; each call owns its connection
+ * and sends one request, so that error is ours.
+ */
+function ownResponse(line: string, id: string): ControlResponse | null {
+  const parsed = ControlResponseSchema.safeParse(safeJson(line));
+  if (!parsed.success) return null;
+  const unparsedRequest = parsed.data.kind === "error" && parsed.data.id === "unknown";
+  return parsed.data.id === id || unparsedRequest ? parsed.data : null;
 }
 
 function safeJson(line: string): unknown {

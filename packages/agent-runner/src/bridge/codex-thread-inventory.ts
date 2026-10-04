@@ -45,28 +45,39 @@ export async function codexLoadedThreadStatuses(socketPath: string): Promise<Map
   try {
     await request("initialize", { clientInfo: { name: "konteks_maintenance_inventory", version: "1" }, capabilities: { experimentalApi: true, requestAttestation: false } });
     stream.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
-    const ids = new Set<string>();
-    let cursor: string | null = null;
-    const seen = new Set<string>();
-    do {
-      const page = loadedPage.parse(await request("thread/loaded/list", { limit: 128, ...(cursor ? { cursor } : {}) }));
-      for (const threadId of page.data) ids.add(threadId);
-      if (ids.size > MAX_LOADED_THREADS || (page.nextCursor && seen.has(page.nextCursor))) throw new Error("Codex loaded-thread inventory exceeded its bound");
-      cursor = page.nextCursor;
-      if (cursor) seen.add(cursor);
-    } while (cursor);
-    const statuses = new Map<string, string>();
-    for (const threadId of ids) {
-      const result = threadRead.parse(await request("thread/read", { threadId, includeTurns: false }));
-      if (result.thread.id !== threadId) throw new Error("Codex loaded-thread inventory identity changed");
-      statuses.set(threadId, result.thread.status.type);
-    }
-    return statuses;
+    return await threadStatuses(request, await loadedThreadIds(request));
   } finally {
     clearTimeout(timeout);
     lines.close();
     stream.destroy();
   }
+}
+
+type InventoryRequest = (method: string, params: unknown) => Promise<unknown>;
+
+/** Every loaded thread, page by page; a repeated cursor or too many threads fails closed. */
+async function loadedThreadIds(request: InventoryRequest): Promise<Set<string>> {
+  const ids = new Set<string>();
+  let cursor: string | null = null;
+  const seen = new Set<string>();
+  do {
+    const page = loadedPage.parse(await request("thread/loaded/list", { limit: 128, ...(cursor ? { cursor } : {}) }));
+    for (const threadId of page.data) ids.add(threadId);
+    if (ids.size > MAX_LOADED_THREADS || (page.nextCursor && seen.has(page.nextCursor))) throw new Error("Codex loaded-thread inventory exceeded its bound");
+    cursor = page.nextCursor;
+    if (cursor) seen.add(cursor);
+  } while (cursor);
+  return ids;
+}
+
+async function threadStatuses(request: InventoryRequest, ids: Iterable<string>): Promise<Map<string, string>> {
+  const statuses = new Map<string, string>();
+  for (const threadId of ids) {
+    const result = threadRead.parse(await request("thread/read", { threadId, includeTurns: false }));
+    if (result.thread.id !== threadId) throw new Error("Codex loaded-thread inventory identity changed");
+    statuses.set(threadId, result.thread.status.type);
+  }
+  return statuses;
 }
 
 export async function assertCodexThreadsIdle(socketPath: string): Promise<void> {

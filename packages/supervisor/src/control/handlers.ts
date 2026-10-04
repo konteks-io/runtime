@@ -31,12 +31,12 @@ import type { SupervisorJournal } from "../state/journal.js";
 
 /**
  * The closed control protocol: desired configuration, version policy, key
- * rotation, erase, and drain. Every directive is a strict CP1 schema, must
+ * rotation, erase, and drain. Every directive is a strict shared schema, must
  * carry a verifying Core signature and a fresh (monotonic or unexpired)
  * revision/nonce, and is acknowledged with a signed body. There is no
  * arbitrary directive; anything else is dropped and counted.
  */
-export interface ControlDeps {
+interface ControlDeps {
   store: SupervisorStore;
   journal: SupervisorJournal;
   clock: Clock;
@@ -58,7 +58,7 @@ export interface ControlDeps {
   logger?: Logger;
 }
 
-export interface ControlCounters {
+interface ControlCounters {
   rejectedSignature: number;
   rejectedStale: number;
   rejectedUnknown: number;
@@ -135,30 +135,34 @@ export class ControlHandlers {
     if (envelope.instanceId !== this.deps.instanceId()) return void (this.counters.rejectedUnknown += 1);
     if (!this.verify(envelope as unknown as { [key: string]: JsonValue }, envelope.signature, "desired_configuration")) return;
     const ackBase = { type: "desired_configuration_ack" as const, instanceId: envelope.instanceId, revision: envelope.revision, digest: envelope.digest, acknowledgedAt: this.deps.clock.nowIso() };
-    const reject = async (reason: DesiredConfigurationAck["reason"]): Promise<void> => { await this.deps.sendAck(this.signed({ ...ackBase, status: "rejected", reason })); };
+    const verdict = await this.configurationVerdict(envelope);
+    if (verdict === "already_applied") return this.deps.sendAck(this.signed({ ...ackBase, status: "applied" }));
+    if (verdict !== "apply") return this.deps.sendAck(this.signed({ ...ackBase, status: "rejected", reason: verdict }));
     const configuration = envelope.configuration;
-    if (envelope.digest !== jcsDigest(configuration as unknown as JsonValue)) return reject("invalid_value");
-    if (parseRfc3339(envelope.expiresAt) <= this.deps.clock.coreNow()) {
-      this.counters.rejectedStale += 1;
-      return reject("unsupported_revision");
-    }
-    if (envelope.revision === this.appliedRevision) {
-      const stored = await this.deps.store.config();
-      if (stored?.digest === envelope.digest) {
-        await this.deps.sendAck(this.signed({ ...ackBase, status: "applied" }));
-        return;
-      }
-    }
-    if (envelope.revision <= this.appliedRevision) {
-      this.counters.rejectedStale += 1;
-      return reject("unsupported_revision");
-    }
-    if (configuration.softMaxConcurrent !== undefined && configuration.softMaxConcurrent > this.deps.localCapacity()) return reject("local_capacity_too_low");
-    if (configuration.heartbeatIntervalSeconds < 5 || configuration.permissionResponderDeadlineSeconds < 1) return reject("invalid_value");
     await this.deps.store.saveConfig({ revision: envelope.revision, digest: envelope.digest, configuration, acknowledgedAt: ackBase.acknowledgedAt });
     this.deps.onConfigurationApplied?.(configuration);
     this.appliedRevision = envelope.revision;
     await this.deps.sendAck(this.signed({ ...ackBase, status: "applied" }));
+  }
+
+  /** Whether a verified configuration is applied, was already applied, or is rejected and why. */
+  private async configurationVerdict(envelope: DesiredConfigurationEnvelope): Promise<"apply" | "already_applied" | NonNullable<DesiredConfigurationAck["reason"]>> {
+    if (envelope.digest !== jcsDigest(envelope.configuration as unknown as JsonValue)) return "invalid_value";
+    if (parseRfc3339(envelope.expiresAt) <= this.deps.clock.coreNow()) {
+      this.counters.rejectedStale += 1;
+      return "unsupported_revision";
+    }
+    if (envelope.revision === this.appliedRevision && (await this.deps.store.config())?.digest === envelope.digest) return "already_applied";
+    if (envelope.revision <= this.appliedRevision) {
+      this.counters.rejectedStale += 1;
+      return "unsupported_revision";
+    }
+    return this.fitsLocally(envelope.configuration);
+  }
+
+  private fitsLocally(configuration: DesiredConfigurationEnvelope["configuration"]): "apply" | "local_capacity_too_low" | "invalid_value" {
+    if (configuration.softMaxConcurrent !== undefined && configuration.softMaxConcurrent > this.deps.localCapacity()) return "local_capacity_too_low";
+    return configuration.heartbeatIntervalSeconds < 5 || configuration.permissionResponderDeadlineSeconds < 1 ? "invalid_value" : "apply";
   }
 
   async handleVersionPolicy(policy: VersionPolicy): Promise<void> {
@@ -220,34 +224,29 @@ export class ControlHandlers {
       return;
     }
     await this.deps.journal.erase.put({ directiveId: directive.directiveId, scope: directive.scope, status: "pending", receiptSent: false, updatedAt: this.deps.clock.nowIso() });
-    let status: EraseReceipt["status"] = "completed";
-    let failedAssignmentIds: string[] | undefined;
-    let reason: EraseReceipt["reason"] | undefined;
-    if (directive.scope === "assignment_data") {
-      const result = await this.deps.eraseAssignments(directive.assignmentIds ?? []);
-      if (result.failed.length > 0) {
-        status = result.failed.length === (directive.assignmentIds ?? []).length ? "failed" : "partially_completed";
-        failedAssignmentIds = result.failed;
-        reason = result.reason ?? "local_io_failure";
-      }
-    } else {
-      const result = await this.deps.eraseAll();
-      if (!result.ok) {
-        status = "failed";
-        reason = result.reason ?? "local_io_failure";
-      }
-    }
+    const outcome = await this.erase(directive);
     const receipt: Omit<EraseReceipt, "signature"> = {
       type: "erase_receipt",
       directiveId: directive.directiveId,
       instanceId: directive.instanceId,
-      status,
+      status: outcome.status,
       completedAt: this.deps.clock.nowIso(),
-      ...(failedAssignmentIds === undefined ? {} : { failedAssignmentIds }),
-      ...(reason === undefined ? {} : { reason }),
+      ...outcome.details,
     };
-    await this.deps.journal.erase.put({ directiveId: directive.directiveId, scope: directive.scope, status, receiptSent: true, updatedAt: receipt.completedAt });
+    await this.deps.journal.erase.put({ directiveId: directive.directiveId, scope: directive.scope, status: outcome.status, receiptSent: true, updatedAt: receipt.completedAt });
     await this.deps.sendAck(this.signed(receipt as unknown as { [key: string]: JsonValue }) as unknown as EraseReceipt);
+  }
+
+  private async erase(directive: EraseDirective): Promise<{ status: EraseReceipt["status"]; details: Pick<EraseReceipt, "failedAssignmentIds" | "reason"> }> {
+    if (directive.scope === "assignment_data") {
+      const requested = directive.assignmentIds ?? [];
+      const result = await this.deps.eraseAssignments(requested);
+      if (result.failed.length === 0) return { status: "completed", details: {} };
+      const status = result.failed.length === requested.length ? "failed" : "partially_completed";
+      return { status, details: { failedAssignmentIds: result.failed, reason: result.reason ?? "local_io_failure" } };
+    }
+    const result = await this.deps.eraseAll();
+    return result.ok ? { status: "completed", details: {} } : { status: "failed", details: { reason: result.reason ?? "local_io_failure" } };
   }
 
   async handleDrain(directive: DrainDirective): Promise<void> {

@@ -108,12 +108,7 @@ it.each(["fresh", "live"] as const)("binds a %s conversation bootstrap to the tr
       evidenceUpload: "structured_only", projectionCreatedAt: identity.openedAt, claimCreatedAt: identity.openedAt }, current);
     await journal.execution.reserveAllocation(identity, current);
   }
-  const listener = createServer();
-  await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
-  const address = listener.address();
-  if (!address || typeof address === "string") throw new Error("missing listener port");
-  const priorTransport = { port: address.port, credential: "p".repeat(43) };
-  await new Promise<void>(resolve => listener.close(() => resolve()));
+  const priorTransport = { port: await closedLoopbackPort(), credential: "p".repeat(43) };
   await journal.execution.open(previous, current, previous.openedAt);
   await journal.execution.bindReference(previous, "prior-ref", current);
   await journal.execution.bindMcpLocalTransport(previous, priorTransport, current);
@@ -165,18 +160,32 @@ it.each(["fresh", "live"] as const)("binds a %s conversation bootstrap to the tr
     await internal.startRelayedSession(assignment, entry, current);
     await internal.bootstrapping.get(`${successor.assignmentId}:1`);
     expect(createSession).toHaveBeenCalledOnce();
-    const transport = journal.execution.execution(successor)?.mcpLocalTransport;
-    expect(transport).toBeDefined();
-    if (mode === "live") {
-      expect(transport).toEqual(priorTransport);
-      expect(createSession.mock.calls[0]?.[0]).toMatchObject({ acpSessionRef: "prior-ref" });
-    } else {
-      expect(transport?.credential).not.toBe(priorTransport.credential);
-      expect(createSession.mock.calls[0]?.[0]).not.toHaveProperty("acpSessionRef");
-      expect(createSession.mock.calls[0]?.[0]).not.toHaveProperty("restoreAcpSessionRef");
-    }
+    expectBootstrapTransport(mode, journal.execution.execution(successor)?.mcpLocalTransport, priorTransport, createSession.mock.calls[0]?.[0]);
   } finally { await session?.close("cancelled"); }
 });
+
+/** A loopback port that was free a moment ago: a prior transport nothing listens on any more. */
+async function closedLoopbackPort(): Promise<number> {
+  const listener = createServer();
+  await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
+  const address = listener.address();
+  if (!address || typeof address === "string") throw new Error("missing listener port");
+  await new Promise<void>(resolve => listener.close(() => resolve()));
+  return address.port;
+}
+
+/** A live bootstrap reuses the prior transport and session; a fresh one gets its own. */
+function expectBootstrapTransport(mode: "fresh" | "live", transport: { port: number; credential: string } | undefined, priorTransport: { port: number; credential: string }, request: unknown): void {
+  expect(transport).toBeDefined();
+  if (mode === "live") {
+    expect(transport).toEqual(priorTransport);
+    expect(request).toMatchObject({ acpSessionRef: "prior-ref" });
+    return;
+  }
+  expect(transport?.credential).not.toBe(priorTransport.credential);
+  expect(request).not.toHaveProperty("acpSessionRef");
+  expect(request).not.toHaveProperty("restoreAcpSessionRef");
+}
 
 it("continues the reference a predecessor actually opened, not the stale one it asked for", async () => {
   // The prior turn asked to continue a session that was not live here and
@@ -220,8 +229,8 @@ it("keeps a previous turn's channel while its terminal report is still being jou
 it("supersedes a previous turn that is still live here when Core places a new turn for the conversation", async () => {
   // Core admits a new conversation turn only when the session has no queued
   // or claimed assignment, so a live local owner is a turn Core already
-  // cancelled — and the cancellation itself needs protocol 2.0. Live
-  // 2026-09-12: a hosted turn that failed before its prompt arrived left a
+  // cancelled — and the cancellation itself needs protocol 2.0. Live,
+  // a hosted turn that failed before its prompt arrived left a
   // zombie owner, and every later turn on the session was refused as
   // assignment_conflict until the connector restarted.
   const f = await fixture({ closed: false, terminal: false });
@@ -443,7 +452,7 @@ it("explains an unqualified stopped predecessor and preserves its fence", async 
   expect(f.runner.releaseSealedSession).not.toHaveBeenCalled();
 });
 
-// Production 2026-10-01 (TKT-1): after a connector update the QA session was
+// After a connector update the QA session was
 // restored for one re-check, which completed. The next re-check of the same
 // kept changes failed at activation with a ZodError on every try, the idle
 // reaper could not release the session either, and the review never started.

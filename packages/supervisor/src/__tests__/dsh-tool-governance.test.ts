@@ -2,7 +2,7 @@ import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 import { DshToolGovernance } from "../session/dsh-tool-governance.js";
 
-// Shapes as dsh 0.1.7-rc.2 sends them (dsh-runtime-support CP0 s4): every tool
+// Shapes as dsh 0.1.7-rc.2 sends them: every tool
 // call is `kind: other` titled with the dsh tool name, and its permission
 // request carries only the tool call id.
 const call = (toolCallId: string, title: string, rawInput: Record<string, unknown>) =>
@@ -61,7 +61,7 @@ describe("DeepSeek Harness tool governance", () => {
     for (const id of ["m2", "m3", "m6", "j1", "p1"]) expect(governance.decide(ask(id), CWD), id).toMatchObject({ kind: "deny" });
   });
 
-  it("allows the connector's QA browser on a session given it, never its hidden tools (O8)", () => {
+  it("allows the connector's QA browser on a session given it, never its hidden tools", () => {
     const governance = new DshToolGovernance();
     governance.observe(call("n1", "mcp__konteks-browser__browser_navigate", { url: "http://127.0.0.1:43100/" }));
     governance.observe(call("n2", "mcp__konteks-browser__browser_snapshot", {}));
