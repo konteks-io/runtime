@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
+import { NATIVE_UPDATE_TARGET_ENV, bundleManifestSigningBytes, computeBundleManifestDigest, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { buildReleaseFixture, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { acquireNativeRootLock, loadNativeInstallation, OPENCODE_MIN_BINARY_BYTES, readNativeUpdateLedger, SupervisorStore, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { installNative, readNativeRecord, restoreNativeRecord } from "../native/install.js";
@@ -61,6 +61,36 @@ async function fixture({ oldVersion = "1.0.0", nextVersion = "1.1.0", openCode =
 }
 
 describe("native update staging and commit", () => {
+  it("refuses a changed fixed target before acquiring the installer lock, downloading, or staging files", async () => {
+    const f = await fixture();
+    const before = await readdir(join(f.root, "releases"));
+    const lock = acquireNativeRootLock(join(f.root, "installer"));
+    f.fetchFn.mockClear();
+    vi.stubEnv(NATIVE_UPDATE_TARGET_ENV, JSON.stringify({ bundleVersion: "1.2.0", manifestDigest: f.manifest.digest }));
+    try {
+      await expect(stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, manifest: f.manifest } })).rejects.toMatchObject({ code: "update_required" });
+      expect(f.fetchFn).not.toHaveBeenCalled();
+      expect(await readdir(join(f.root, "releases"))).toEqual(before);
+      expect(await readNativeRecord(f.root)).toEqual(f.installed);
+    } finally { lock.release(); }
+  });
+
+  it("pins the verified channel bytes across the installer lock so a moving latest release cannot change the requested update", async () => {
+    const f = await fixture();
+    vi.stubEnv(NATIVE_UPDATE_TARGET_ENV, JSON.stringify({ bundleVersion: "1.1.0", manifestDigest: f.manifest.digest }));
+    let channelReads = 0;
+    const fetchFn = vi.fn(async (url: string) => {
+      if (String(url).endsWith("native-manifest.json")) {
+        channelReads += 1;
+        return new Response(JSON.stringify(channelReads === 1 ? f.manifest : f.oldManifest));
+      }
+      return f.fetchFn(url);
+    });
+    const staged = await stageNativeUpdate({ root: f.root, output: f.output, deps: { ...f.deps, fetchFn: fetchFn as never } });
+    expect(staged).toMatchObject({ status: "staged", release: { manifest: { bundleVersion: "1.1.0", digest: f.manifest.digest } } });
+    expect(channelReads).toBe(1);
+  });
+
   it("offers a newer signed rc build with the same release core", async () => {
     const f = await fixture({ oldVersion: "0.7.6-rc.1", nextVersion: "0.7.6-rc.2" });
     expect(await checkNativeUpdate({ root: f.root, deps: { ...f.deps, manifest: f.manifest } })).toMatchObject({

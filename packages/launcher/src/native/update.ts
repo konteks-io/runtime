@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, parse, resolve } from "node:path";
-import { RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
+import { NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, RemoteInstanceError, writeSecretFile } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, ownedByAnotherConnector, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
@@ -64,9 +64,10 @@ function installerLockForUpdate(root: string): ReturnType<typeof acquireNativeRo
 export async function stageNativeUpdate(options: { root: string; output: Output; deps?: NativeUpdateDeps }): Promise<NativeUpdateStage> {
   const platform = options.deps?.platform ?? nativePlatform();
   const root = validRoot(options.root);
+  const deps = await frozenUpdateDeps(root, options.deps);
   const lock = installerLockForUpdate(root);
   try {
-    const check = await checkNativeUpdate({ root, ...(options.deps ? { deps: options.deps } : {}) });
+    const check = await checkNativeUpdate({ root, ...(deps ? { deps } : {}) });
     if (check.status === "current") return check;
     const { current, release } = check;
     // The person's own DeepSeek Harness and OpenCode are not in any release; only bundled agents are restaged.
@@ -81,6 +82,22 @@ export async function stageNativeUpdate(options: { root: string; output: Output;
   } finally {
     lock.release();
   }
+}
+
+/** Verify the service's fixed target before taking a lock or staging any bytes.
+ * Reuse exactly these signed channel bytes after the lock; a moving channel
+ * cannot silently turn the person's request into a different release. */
+async function frozenUpdateDeps(root: string, deps: NativeUpdateDeps | undefined): Promise<NativeUpdateDeps | undefined> {
+  const serialized = process.env[NATIVE_UPDATE_TARGET_ENV];
+  if (serialized === undefined) return deps;
+  const target = NativeUpdateTargetSchema.parse(JSON.parse(serialized));
+  const manifest = await channelManifest(deps);
+  const pinned = { ...deps, manifest };
+  const check = await checkNativeUpdate({ root, deps: pinned });
+  if (check.status !== "available" || check.release.manifest.bundleVersion !== target.bundleVersion || check.release.manifest.digest !== target.manifestDigest) {
+    throw new RemoteInstanceError("update_required", "The signed update target changed; the installed release is unchanged.");
+  }
+  return { ...deps, manifest: check.release.manifest };
 }
 
 type SelectedArtifact = ReturnType<typeof selectNativeArtifacts>[number];

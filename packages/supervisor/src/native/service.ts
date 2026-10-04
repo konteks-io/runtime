@@ -82,7 +82,9 @@ function updateOptions(options: NativeServiceOptions, executable: string): NonNu
   if (options.update === false) return undefined;
   return {
     fetchManifest: () => fetchNativeReleaseManifest(),
-    launch: async () => launchNativeUpdater({ root: options.root, executable, os: options.platform.os }),
+    launch: async target => launchNativeUpdater({ root: options.root, executable, os: options.platform.os,
+      target: { bundleVersion: target.bundleVersion, manifestDigest: target.manifestDigest },
+      ...(target.assertCurrent ? { assertCurrent: target.assertCurrent } : {}) }),
     readLedger: () => readNativeUpdateLedger(options.root),
     ...(options.update ?? {}),
   };

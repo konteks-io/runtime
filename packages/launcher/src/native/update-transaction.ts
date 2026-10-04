@@ -4,7 +4,7 @@ import { createReadStream } from "node:fs";
 import { chmod, copyFile, readFile, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import { DoctorReportSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
+import { DoctorReportSchema, NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, RemoteInstanceError, SupervisorStatusSchema, type ControlRequest } from "@konteks/remote-common";
 import { isHostAgentId, nativeConnectorFileNames, resolveNativeConnectorExecutable } from "@konteks/remote-release";
 import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, ownedByAnotherConnector, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
@@ -173,9 +173,16 @@ async function stageOrRecordFailure(input: NativeUpdateInput, deps: NativeUpdate
     return await deps.stage({ root: input.root, output: input.output, ...(input.deps ? { deps: input.deps } : {}) });
   } catch (error) {
     const startedAt = new Date(deps.now()).toISOString();
-    await deps.recordAttempt(input.root, { id: `update-${randomUUID()}`, bundleVersion: "unknown", manifestDigest: "unknown", releaseId: null, reason: attemptReason(input), startedAt, finishedAt: startedAt, outcome: "failed", detail: errorText(error).slice(0, 1_024) }).catch(() => undefined);
+    await deps.recordAttempt(input.root, { id: `update-${randomUUID()}`, ...failedStageTarget(), releaseId: null, reason: attemptReason(input), startedAt, finishedAt: startedAt, outcome: "failed", detail: errorText(error).slice(0, 1_024) }).catch(() => undefined);
     throw error;
   }
+}
+
+/** The fixed local hand-off also identifies failures before staging succeeds,
+ * so the successor can report the outcome of the person's exact request. */
+function failedStageTarget(): { bundleVersion: string; manifestDigest: string } {
+  try { return NativeUpdateTargetSchema.parse(JSON.parse(process.env[NATIVE_UPDATE_TARGET_ENV] ?? "null")); }
+  catch { return { bundleVersion: "unknown", manifestDigest: "unknown" }; }
 }
 
 function errorText(error: unknown): string {
