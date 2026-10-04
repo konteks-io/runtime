@@ -274,10 +274,10 @@ describe.runIf(process.platform === "win32")("on a real Windows", () => {
   it("Windows PowerShell parses the task's host script", () => {
     const service = windows();
     const check = "$errors = $null; [System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(), [ref]$null, [ref]$errors) | Out-Null; if ($errors) { $errors | ForEach-Object { [Console]::Error.WriteLine($_.ToString()) }; exit 1 }";
-    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", check], { input: hostScript(service), encoding: "utf8" });
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", check], { input: hostScript(service), encoding: "utf8", timeout: 15_000 });
     expect(result.stderr).toBe("");
     expect(result.status).toBe(0);
-  });
+  }, 20_000);
 
   it("runs the connector with a path full of cmd and PowerShell metacharacters, appends its output to the log and forwards its exit code", async () => {
     const base = await mkdtemp(join(tmpdir(), "konteks host %PATH% & O'Brien ")); dirs.push(base);
