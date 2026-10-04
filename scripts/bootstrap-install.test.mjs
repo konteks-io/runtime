@@ -99,6 +99,15 @@ function fixtureLines(path) {
     : [];
 }
 
+function fixtureText(path) {
+  return existsSync(path) ? readFileSync(path, "utf8") : null;
+}
+
+function fixtureJson(path) {
+  const text = fixtureText(path);
+  return text === null ? null : JSON.parse(text.replace(/^\uFEFF/, ""));
+}
+
 const posixShell = process.env.KONTEKS_TEST_SH ?? "sh";
 const posixOnly = { skip: process.platform === "win32" && !process.env.KONTEKS_TEST_SH };
 const shellLiteral = (value) => `'${value.replaceAll("'", "'\\''")}'`;
@@ -376,6 +385,57 @@ function saveFixtureTranscript(scenario, output, status) {
   );
 }
 
+function windowsSecurityContext(mode, modulePath, discoveryPath) {
+  if (mode === "mock") return "$env:PSModulePath = Join-Path $PSHOME 'Modules'";
+  return `
+$env:PSModulePath = ${psLiteral(modulePath)}
+$signatureBefore = Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue
+$hashBefore = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+[IO.File]::WriteAllText(${psLiteral(discoveryPath)}, "signatureMissing=$($null -eq $signatureBefore);hashMissing=$($null -eq $hashBefore)")
+# Only fixture file/JSON operations need these native modules. Security remains absent.
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Management/Microsoft.PowerShell.Management.psd1') -ErrorAction Stop
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
+$PSModuleAutoLoadingPreference = 'None'
+`;
+}
+
+function windowsSecurityCommand(mode, unavailable, proof) {
+  if (mode === "native") return nativeSecurityImport(proof);
+  if (mode === "missing" || mode === "empty") {
+    const result =
+      mode === "empty"
+        ? "return [PSCustomObject]@{ ExportedCmdlets = @{} }"
+        : "throw 'Fixture host-native Security module is unavailable'";
+    return `
+function Import-Module {
+  param([string]$Name, [string]$Scope, [switch]$PassThru, [string]$ErrorAction)
+  $expected = Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1'
+  if ($Name -ne $expected -or $Scope -ne 'Local' -or -not $PassThru) { throw 'Fixture refused an unexpected module import' }
+  ${result}
+}
+`;
+  }
+  const result = unavailable
+    ? "throw [System.Management.Automation.CommandNotFoundException]::new('Get-AuthenticodeSignature is unavailable in this fixture')"
+    : "return @{ Status = 'NotSigned' }";
+  return `function Get-AuthenticodeSignature { param([string]$FilePath); ${result} }`;
+}
+
+function nativeSecurityImport({ path, harmlessPath, modulePath }) {
+  return `
+function Import-Module {
+  param([string]$Name, [string]$Scope, [switch]$PassThru, [string]$ErrorAction)
+  $expected = Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1'
+  if ($Name -ne $expected -or $Scope -ne 'Local' -or -not $PassThru) { throw 'Fixture refused an unexpected module import' }
+  $nativeModule = Microsoft.PowerShell.Core\\Import-Module @PSBoundParameters
+  $nativeCommand = $nativeModule.ExportedCmdlets['Get-AuthenticodeSignature']
+  $classification = & $nativeCommand -FilePath ${psLiteral(harmlessPath)}
+  @{ status = [string]$classification.Status; commandType = [string]$nativeCommand.CommandType; modulePath = $nativeCommand.Module.Path; nativeModulePath = (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1'); modulePathUnchanged = ($env:PSModulePath -ceq ${psLiteral(modulePath)}); edition = $PSVersionTable.PSEdition } | ConvertTo-Json | Set-Content -LiteralPath ${psLiteral(path)} -Encoding UTF8
+  return $nativeModule
+}
+`;
+}
+
 function runWindowsBootstrap(options = {}) {
   const {
     msiCode,
@@ -393,6 +453,7 @@ function runWindowsBootstrap(options = {}) {
     verifyOnly,
     hashUnavailable,
     authenticodeUnavailable,
+    securityContext,
   } = {
     msiCode: 0,
     cancelled: false,
@@ -409,6 +470,7 @@ function runWindowsBootstrap(options = {}) {
     verifyOnly: false,
     hashUnavailable: false,
     authenticodeUnavailable: false,
+    securityContext: "mock",
     ...options,
   };
   const fixture = mkdtempSync(join(root, "windows bootstrap "));
@@ -436,14 +498,29 @@ function runWindowsBootstrap(options = {}) {
   const effectsPath = join(fixture, "effect-calls.txt");
   const localesPath = join(fixture, "launcher-locales.txt");
   const msiCallPath = join(fixture, "msi-call.json");
+  const securityDiscoveryPath = join(fixture, "security-discovery.txt");
+  const securityProofPath = join(fixture, "security-proof.json");
+  const harmlessPath = join(fixture, "never-executed.ps1");
+  writeFileSync(harmlessPath, "# Harmless Authenticode classification fixture; never executed.\n");
+  const foreignModules = join(fixture, "incompatible modules");
+  for (const [name, cmdlet] of Object.entries({
+    "Microsoft.PowerShell.Security": "Get-AuthenticodeSignature",
+    "Microsoft.PowerShell.Utility": "Get-FileHash",
+  })) {
+    const directory = join(foreignModules, name);
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(
+      join(directory, `${name}.psd1`),
+      `@{ ModuleVersion='7.0.0'; PowerShellVersion='99.0'; CmdletsToExport=@('${cmdlet}') }\n`,
+    );
+  }
+  const discoveryModules = process.env.KONTEKS_TEST_FOREIGN_PSMODULEPATH ?? foreignModules;
   const harnessPath = join(fixture, "run.ps1");
   writeFileSync(
     harnessPath,
     `
-# A PowerShell 7 parent can give Windows PowerShell an incompatible module
-# search path. Use each test shell's own built-in modules before changing home.
-$env:PSModulePath = Join-Path $PSHOME 'Modules'
 $ErrorActionPreference = 'Stop'
+${windowsSecurityContext(securityContext, discoveryModules, securityDiscoveryPath)}
 $env:USERPROFILE = ${psLiteral(profile)}
 $env:ProgramFiles = ${psLiteral(join(fixture, "Program Files"))}
 $env:LOCALAPPDATA = ${psLiteral(join(profile, "AppData", "Local"))}
@@ -465,7 +542,7 @@ function New-Item {
   if ($${directoryFailed}) { throw 'Fixture temporary directory unavailable' }
   Microsoft.PowerShell.Management\\New-Item @PSBoundParameters
 }
-function Get-AuthenticodeSignature { param([string]$FilePath); ${authenticodeUnavailable ? "throw [System.Management.Automation.CommandNotFoundException]::new('Get-AuthenticodeSignature is unavailable in this fixture')" : "return @{ Status = 'NotSigned' }"} }
+${windowsSecurityCommand(securityContext, authenticodeUnavailable, { path: securityProofPath, harmlessPath, modulePath: discoveryModules })}
 ${hashUnavailable ? "function Get-FileHash { throw [System.Management.Automation.CommandNotFoundException]::new('Get-FileHash is not recognized in this fixture') }" : ""}
 function Start-Process {
   param([string]$FilePath, [string[]]$ArgumentList, [string]$Verb, [string]$WindowStyle, [switch]$Wait, [switch]$PassThru)
@@ -500,7 +577,6 @@ function konteks-remote {
   const output = `${result.stdout}${result.stderr}`.replaceAll("\r\n", "\n");
   const scenario = `msi-${msiCode}-cancel-${cancelled}-tampered-${tampered}-download-failed-${downloadFailed}-update-${update}-update-exit-${updateCode}-start-exit-${startCode}-${sha256(JSON.stringify(options)).slice(0, 8)}`;
   saveFixtureTranscript(scenario, output, result.status);
-  const json = (path) => JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
   return {
     status: result.status,
     output,
@@ -511,7 +587,9 @@ function konteks-remote {
     calls: fixtureLines(callsPath).map((line) => JSON.parse(line.replace(/^\uFEFF/, ""))),
     effects: fixtureLines(effectsPath),
     launcherLocales: fixtureLines(localesPath),
-    msiCall: existsSync(msiCallPath) ? json(msiCallPath) : null,
+    msiCall: fixtureJson(msiCallPath),
+    securityDiscovery: fixtureText(securityDiscoveryPath),
+    securityProof: fixtureJson(securityProofPath),
     runtimeRoot,
   };
 }
@@ -674,6 +752,99 @@ test("Windows bootstrap still rejects tampered MSI bytes without Get-FileHash", 
 });
 
 for (const locale of ["en", "id"]) {
+  test(
+    `Windows bootstrap recovers host-native Security discovery and refuses malformed package bytes in ${locale}`,
+    windowsOnly,
+    () => {
+      const result = runWindowsBootstrap({
+        locale,
+        securityContext: "native",
+        hashUnavailable: true,
+      });
+      assert.equal(result.securityDiscovery, "signatureMissing=True;hashMissing=True");
+      assert.equal(result.status, 1, result.output);
+      assert.match(result.output, /UnknownError/);
+      assert.match(
+        result.output,
+        locale === "id" ? /Pemasangan belum selesai/ : /Setup could not finish/,
+      );
+      assert.deepEqual(result.calls, []);
+      assert.equal(result.securityProof.status, "NotSigned");
+      assert.equal(result.securityProof.commandType, "Cmdlet");
+      assert.equal(
+        result.securityProof.modulePath.toLowerCase(),
+        result.securityProof.nativeModulePath.toLowerCase(),
+      );
+      assert.equal(result.securityProof.modulePathUnchanged, true);
+      assert.equal(result.msiCall, null);
+    },
+  );
+  test(
+    `Windows bootstrap refuses unavailable host-native Security in ${locale}`,
+    windowsOnly,
+    () => {
+      const result = runWindowsBootstrap({
+        locale,
+        securityContext: "missing",
+        hashUnavailable: true,
+      });
+      assert.equal(result.securityDiscovery, "signatureMissing=True;hashMissing=True");
+      assert.equal(result.status, 1, result.output);
+      assert.match(result.output, /Fixture host-native Security module is unavailable/);
+      assert.match(
+        result.output,
+        locale === "id" ? /Pemasangan belum selesai/ : /Setup could not finish/,
+      );
+      assert.equal(result.msiCall, null);
+      assert.deepEqual(result.calls, []);
+    },
+  );
+  test(
+    `Windows bootstrap rejects tampering before host-native Security recovery in ${locale}`,
+    windowsOnly,
+    () => {
+      const result = runWindowsBootstrap({
+        locale,
+        securityContext: "native",
+        hashUnavailable: true,
+        tampered: true,
+      });
+      assert.equal(result.securityDiscovery, "signatureMissing=True;hashMissing=True");
+      assert.equal(result.status, 1, result.output);
+      assert.match(
+        result.output,
+        locale === "id" ? /checksum paket tidak cocok/ : /package checksum mismatch/,
+      );
+      assert.equal(result.securityProof, null);
+      assert.equal(result.msiCall, null);
+      assert.deepEqual(result.calls, []);
+    },
+  );
+  test(
+    `Windows bootstrap refuses a host-native Security module without the required cmdlet in ${locale}`,
+    windowsOnly,
+    () => {
+      const result = runWindowsBootstrap({
+        locale,
+        securityContext: "empty",
+        hashUnavailable: true,
+      });
+      assert.equal(result.securityDiscovery, "signatureMissing=True;hashMissing=True");
+      assert.equal(result.status, 1, result.output);
+      assert.match(
+        result.output,
+        locale === "id"
+          ? /Windows tidak dapat memverifikasi tanda tangan Authenticode pemasang; tidak ada yang dipasang/
+          : /Windows cannot verify the installer Authenticode signature; nothing was installed/,
+      );
+      assert.match(
+        result.output,
+        locale === "id" ? /Pemasangan belum selesai/ : /Setup could not finish/,
+      );
+      assert.equal(result.msiCall, null);
+      assert.deepEqual(result.calls, []);
+    },
+  );
   test(
     `Windows bootstrap refuses an unavailable Authenticode check in ${locale}`,
     windowsOnly,
