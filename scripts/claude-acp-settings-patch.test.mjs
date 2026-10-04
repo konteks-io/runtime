@@ -22,16 +22,16 @@ test("reviewed bridge uses project settings in both SDK resolution and query", {
   assert.match(settings, /resolveSettings\(\{ cwd: this.cwd, settingSources: \["project"\] \}\)/);
   assert.doesNotMatch(settings, /path.join\(CLAUDE_CONFIG_DIR, "settings.json"\)/);
   const agent = load("acp-agent.js");
-  // CP2: an integration session (and only one, `_meta.konteksIntegration`)
+  // An integration session (and only one, `_meta.konteksIntegration`)
   // loads the account connectors, with no setting sources at all so no
   // repository .mcp.json server starts; every other session is as Stage 0.
   assert.match(agent, /\.\.\.userProvidedOptions,\s+settingSources: konteksAccountConnectors\(params\._meta\) \? \[\] : \["project"\],\s+strictMcpConfig: !konteksAccountConnectors\(params\._meta\),/);
-  // S0-1: only the MCP servers Konteks hands the session (the ACP request)
+  // Only the MCP servers Konteks hands the session (the ACP request)
   // load; the repository's .mcp.json is ignored. Flag settings switch the
   // repository's hooks off on new, loaded and resumed sessions alike.
   assert.match(agent, /settings = hardenClaudeSession\(await isolateClaudeInstructions\(settings, params.cwd, CLAUDE_CONFIG_DIR\), konteksAccountConnectors\(params\._meta\)\)/);
   assert.match(agent, /^import \{ hardenClaudeSession, isolateClaudeInstructions, konteksAccountConnectors \} from "\.\/konteks-instruction-scope\.mjs";/);
-  // S0-4: every permission request names its tool in a structured field the
+  // Every permission request names its tool in a structured field the
   // connector reads (never the display title), set where the bridge asks.
   assert.match(agent, /async requestPermissionFromClient\(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId\) \{\n        params = \{ \.\.\.params, toolCall: \{ \.\.\.params\.toolCall, _meta: \{ \.\.\.params\.toolCall\._meta, claudeCode: \{ \.\.\.params\.toolCall\._meta\?\.claudeCode, toolName \} \} \} \};/);
   assert.match(agent, /\[konteks\] instruction_scope version=4 settings=\$\{konteksAccountConnectors\(params\._meta\) \? "none" : "project"\} .* hooks=disabled repository_mcp=excluded account_connectors=\$\{konteksAccountConnectors\(params\._meta\) \? "integration" : "excluded"\}/);

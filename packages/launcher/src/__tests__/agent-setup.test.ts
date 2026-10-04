@@ -31,7 +31,7 @@ function setupDeps(overrides: Partial<AgentSetupDeps> = {}): AgentSetupDeps & { 
   };
 }
 
-describe("setting up a missing Claude Code or Codex (D116)", () => {
+describe("setting up a missing Claude Code or Codex", () => {
   it("asks once, then runs Anthropic's official Windows installer in the person's terminal", async () => {
     const { lines, output } = captured();
     const deps = setupDeps();
@@ -45,7 +45,7 @@ describe("setting up a missing Claude Code or Codex (D116)", () => {
     expect(args.at(-1)).toBe("irm https://claude.ai/install.ps1 | iex");
   });
 
-  it("on Windows without Git for Windows, asks once and installs it with winget before Claude Code (D116)", async () => {
+  it("on Windows without Git for Windows, asks once and installs it with winget before Claude Code", async () => {
     const { output } = captured();
     let git = false;
     const deps = setupDeps({ gitForWindows: () => git });
@@ -60,7 +60,7 @@ describe("setting up a missing Claude Code or Codex (D116)", () => {
     expect(deps.runs[1]![0]).toMatch(/powershell\.exe$/i);
   });
 
-  it("without winget, or on a no, gives the one download line and still installs Claude Code (D116)", async () => {
+  it("without winget, or on a no, gives the one download line and still installs Claude Code", async () => {
     const noWinget = captured();
     const deps = setupDeps({ gitForWindows: () => false });
     const run = deps.run;
@@ -77,7 +77,7 @@ describe("setting up a missing Claude Code or Codex (D116)", () => {
     expect(declined.lines.filter(line => line.includes("https://git-scm.com/download/win"))).toHaveLength(1);
   });
 
-  it("asks about Git only on Windows, and only when it is missing (D116)", async () => {
+  it("asks about Git only on Windows, and only when it is missing", async () => {
     const { output } = captured();
     const present = setupDeps();
     await setUpPersonalAgent("claude-code", output, present);
@@ -157,7 +157,7 @@ function closingDeps(sequence: Array<Record<string, AgentState> | null>, overrid
   return { deps, signedIn, questions };
 }
 
-describe("the install's closing summary (D116)", () => {
+describe("the install's closing summary", () => {
   it("with no agent, says so and gives the one command for each", async () => {
     const { lines, output } = captured();
     const c = closingDeps([{}]);
@@ -207,7 +207,7 @@ describe("the install's closing summary (D116)", () => {
     expect(lines).toEqual(["Checking which agents are ready…", "Ready to work here: Codex."]);
   });
 
-  it("names Git for Windows when Claude Code is here without it (D116)", async () => {
+  it("names Git for Windows when Claude Code is here without it", async () => {
     const { lines, output } = captured();
     const c = closingDeps([{ "claude-code": "failed" }], { gitForWindowsMissing: () => true });
     await closeAgentSetup({ agents: ["claude-code"], signInNow: [], missing: [], output }, c.deps);

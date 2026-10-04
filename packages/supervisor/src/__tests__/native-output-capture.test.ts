@@ -58,7 +58,7 @@ describe("native delivery output capture", () => {
     expect(result.files.entries.map(entry => entry.path)).toEqual(["kept.txt"]);
   });
 
-  it("emits bounded C01-correlated capture telemetry without output content or paths", async () => {
+  it("emits bounded diagnostic-correlated capture telemetry without output content or paths", async () => {
     await writeFile(join(dir, "secret-path.txt"), "payload-canary-secret\n");
     const { stdout } = await run("git", ["-C", dir, "rev-parse", "HEAD"]);
     const info = vi.fn();

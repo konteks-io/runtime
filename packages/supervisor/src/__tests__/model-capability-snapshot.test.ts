@@ -65,7 +65,7 @@ describe("authenticated model offered-values snapshot producer", () => {
     expect(kept).not.toHaveProperty("observedAgoMs");
   });
 
-  it("reports an agent the release signed nothing for under its catalogue authority, with names (System One §6a, KM6)", async () => {
+  it("reports an agent the release signed nothing for under its catalogue authority, with names", async () => {
     const codex = { ...ready, agentId: "codex", displayName: "Codex", authIdentityFingerprint: "identity-codex" };
     const discover = vi.fn(async (agentId: string, configId: string) => ({
       currentValue: agentId === "codex" ? "gpt-5.6-sol" : "sonnet",
@@ -113,7 +113,7 @@ describe("authenticated model offered-values snapshot producer", () => {
       offeredValues: [currentValue] })]);
   });
 
-  it("labels each offered OpenCode route with how it is billed here, only when asked to (a 7.1.0 Core, CP3)", async () => {
+  it("labels each offered OpenCode route with how it is billed here, only when asked to (a 7.1.0 Core)", async () => {
     const own = new FixedClock(Date.parse("2026-09-28T00:00:00Z"));
     const opencode = { ...ready, agentId: "opencode", displayName: "OpenCode", authIdentityFingerprint: "identity-oc",
       credentials: [{ providerId: "openai", label: "ChatGPT Plus or Pro", kind: "sign_in" as const, state: "ready" as const }, { providerId: "opencode", label: "OpenCode Console account", kind: "sign_in" as const, state: "ready" as const }] };

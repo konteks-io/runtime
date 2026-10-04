@@ -11,7 +11,7 @@ function relay(agentId: "codex" | "claude-code" | "opencode" | "antigravity", lo
   return { login, reports, cancel, onFinished, onSucceeded };
 }
 
-describe("a sign-in started from the site (WS1-115, OpenCode CP3)", () => {
+describe("a sign-in started from the site", () => {
   it("relays OpenCode's device link and code, echoing the option in every report", () => {
     const f = relay("opencode", "opencode-console");
     // A link on another host is never shown, whatever the agent printed.
@@ -74,7 +74,7 @@ describe("what a connector with OpenCode advertises", () => {
   });
 });
 
-describe("Google Antigravity's Gemini Enterprise sign-in from the site (antigravity CP3)", () => {
+describe("Google Antigravity's Gemini Enterprise sign-in from the site", () => {
   const GOOGLE = "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id=x.apps.googleusercontent.com&redirect_uri=http%3A%2F%2F127.0.0.1%3A50695%2F&scope=openid";
 
   it("finishes in the browser on this machine: awaiting at once, then Google's own page only, never the loopback licence picker", () => {

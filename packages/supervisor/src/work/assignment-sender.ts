@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import {
-  RemoteInstanceError,
+  RemoteInstanceError, allEqual,
   type AssignmentPull, type AssignmentReport,
   type AssignmentRequestOrigin, type AssignmentRequestReference, type AssignmentTransportReply,
   NativeAssignmentResultSchema, NativeAssignmentAckResultSchema, type Clock, type NativeAssignmentResult,
   AssignmentReplyFrameSchema, NativeCoreRequestAckSchema,
-  AssignmentReportSchema, ReportAckSchema, jcsDigest, logicalAssignmentResponseDigest, type AssignmentReplyFrame, type JsonValue, type RelayAck,
+  AssignmentReportSchema, ReportAckSchema, type ReportAck, jcsDigest, logicalAssignmentResponseDigest, type AssignmentReplyFrame, type JsonValue, type RelayAck,
 } from "@konteks/remote-common";
 import type { LocalAdmission } from "../state/local-admission.js";
 import type { CoreClient } from "../core/client.js";
@@ -13,7 +13,15 @@ import type { SupervisorJournal } from "../state/journal.js";
 import { allocationReference, type AssignmentRequestRecord, type AssignmentReplyRecordValue } from "../state/assignment-stream.js";
 import type { OutboundMessage } from "../transport/transport.js";
 
-export interface AssignmentSenderDeps {
+type Captured = ReturnType<AssignmentSender["capture"]>;
+type ApplyReply = (body: AssignmentTransportReply["body"]) => Promise<void>;
+
+/** The request was framed by this process generation (same runner and applied manifest). */
+function sameOrigin(request: AssignmentRequestRecord, origin: AssignmentRequestOrigin): boolean {
+  return request.frame.origin.runnerIncarnation === origin.runnerIncarnation && request.frame.origin.manifestId === origin.manifestId;
+}
+
+interface AssignmentSenderDeps {
   clock: Clock;
   journal: SupervisorJournal;
   core: Pick<CoreClient, "submitAssignment" | "acknowledgeAssignments">;
@@ -30,7 +38,7 @@ export interface AssignmentSenderDeps {
 }
 
 /**
- * The one durable logical sender for assignment operations (D143).
+ * The one durable logical sender for assignment operations.
  *
  * Every request's frame and sequence are frozen BEFORE the first send, so an
  * uncertain outcome replays the same bytes rather than allocating a second
@@ -180,30 +188,39 @@ export class AssignmentSender {
     await this.deps.journal.assignmentStream.retire(captured.scope, assertCurrent);
   }
 
-  private async deliverOperation(reference: AssignmentRequestReference, captured: ReturnType<AssignmentSender["capture"]>, apply: (body: AssignmentTransportReply["body"]) => Promise<void>): Promise<void> {
+  private async deliverOperation(reference: AssignmentRequestReference, captured: Captured, apply: ApplyReply): Promise<void> {
     const { scope, origin, assertCurrent } = captured;
     const operation = this.deps.journal.assignmentStream.operation(scope, reference);
     const request = this.deps.journal.assignmentStream.request(scope, reference.requestSequence);
-    if (!request || request.frame.origin.runnerIncarnation !== origin.runnerIncarnation || request.frame.origin.manifestId !== origin.manifestId) {
+    if (!request || !sameOrigin(request, origin)) {
       throw new RemoteInstanceError("recovery_required", "Retained operation requires qualified origin or effect recovery.");
     }
     if (operation.effect.state === "applied") return;
-    let receipt = this.deps.journal.assignmentStream.operationReply(scope, reference);
+    const read = () => this.deps.journal.assignmentStream.operationReply(scope, reference);
     const cleanupOnly = operation.effect.state === "applying";
-    if (cleanupOnly && (!receipt || !this.savedTerminalMatches(request, receipt))) {
-      throw new RemoteInstanceError("recovery_required", "Uncertain domain effect has no exact durable terminal ACK evidence.");
-    }
-    if (!receipt) {
-      await this.exchange(request, assertCurrent);
-      assertCurrent(); receipt = this.deps.journal.assignmentStream.operationReply(scope, reference);
-    }
-    if (!receipt) throw new RemoteInstanceError("recovery_required", "Operation reply was not durably accepted.");
+    if (cleanupOnly) this.assertTerminalEvidence(request, read(), "Uncertain domain effect has no exact durable terminal ACK evidence.");
+    const receipt = await this.replyOrExchange(request, read, assertCurrent, "Operation reply was not durably accepted.");
     if (!cleanupOnly && !await this.deps.journal.assignmentStream.beginOperationEffect(scope, reference, assertCurrent)) return;
     assertCurrent();
-    if (cleanupOnly && !this.savedTerminalMatches(request, receipt)) throw new RemoteInstanceError("recovery_required", "Saved terminal evidence changed before cleanup.");
+    if (cleanupOnly) this.assertTerminalEvidence(request, receipt, "Saved terminal evidence changed before cleanup.");
     await apply(receipt.frame.body.body);
     assertCurrent();
     await this.deps.journal.assignmentStream.finishOperationEffect(scope, reference, assertCurrent);
+  }
+
+  /** The durable reply to a retained request, exchanging the frozen frame with Core when none is stored yet. */
+  private async replyOrExchange<T>(request: AssignmentRequestRecord, read: () => T | undefined, assertCurrent: () => void, missing: string): Promise<T> {
+    const saved = read();
+    if (saved) return saved;
+    await this.exchange(request, assertCurrent);
+    assertCurrent();
+    const receipt = read();
+    if (!receipt) throw new RemoteInstanceError("recovery_required", missing);
+    return receipt;
+  }
+
+  private assertTerminalEvidence(request: AssignmentRequestRecord, receipt: AssignmentReplyRecordValue | undefined, message: string): void {
+    if (!receipt || !this.savedTerminalMatches(request, receipt)) throw new RemoteInstanceError("recovery_required", message);
   }
 
   /** Only the existing idempotent terminal-ACK cleanup may resume an applying effect. */
@@ -211,34 +228,41 @@ export class AssignmentSender {
     const report = AssignmentReportSchema.safeParse(request.frame.body);
     const ack = ReportAckSchema.safeParse(receipt.frame.body.body);
     if (!report.success || !report.data.terminal || !ack.success || (ack.data.outcome !== "accepted" && ack.data.outcome !== "duplicate")) return false;
-    const body = report.data, result = ack.data;
-    const entry = this.deps.journal.assignments.get(`${body.assignmentId}:${body.attempt}`);
-    const saved = entry?.reports.terminalAck;
-    return !!entry && entry.claimId === body.claimId && !!saved && result.assignmentId === body.assignmentId && result.attempt === body.attempt &&
-      result.claimId === body.claimId && result.acknowledged.reportId === body.reportId && result.acknowledged.reportSequence === body.reportSequence &&
-      result.terminalSequence === body.reportSequence && entry.reports.terminalSequence === body.reportSequence &&
-      jcsDigest(saved as JsonValue) === jcsDigest(result as JsonValue);
+    return this.terminalAckSaved(report.data, ack.data);
   }
 
-  private async deliverClaim(reference: AssignmentRequestReference, captured: ReturnType<AssignmentSender["capture"]>, apply: (body: AssignmentTransportReply["body"]) => Promise<void>): Promise<void> {
+  /** The saved terminal ACK is exactly this report's acknowledgement, on the claim that owns it. */
+  private terminalAckSaved(body: AssignmentReport, result: ReportAck): boolean {
+    const entry = this.deps.journal.assignments.get(`${body.assignmentId}:${body.attempt}`);
+    const saved = entry?.reports.terminalAck;
+    return !!entry && !!saved && allEqual([
+      [entry.claimId, body.claimId], [result.assignmentId, body.assignmentId], [result.attempt, body.attempt],
+      [result.claimId, body.claimId], [result.acknowledged.reportId, body.reportId], [result.acknowledged.reportSequence, body.reportSequence],
+      [result.terminalSequence, body.reportSequence], [entry.reports.terminalSequence, body.reportSequence],
+      [jcsDigest(saved as JsonValue), jcsDigest(result as JsonValue)],
+    ]);
+  }
+
+  private async deliverClaim(reference: AssignmentRequestReference, captured: Captured, apply: ApplyReply): Promise<void> {
     const { scope, origin } = captured;
     const request = this.deps.journal.assignmentStream.request(scope, reference.requestSequence);
-    if (!request?.admission || request.frame.origin.runnerIncarnation !== origin.runnerIncarnation || request.frame.origin.manifestId !== origin.manifestId) throw new RemoteInstanceError("recovery_required", "Claim requires its original admitted generation.");
-    const start = this.deps.journal.execution.start(request.admission.assignmentId, request.admission.attempt);
-    if (start?.claimEffect?.state === "applied") return;
-    if (start?.claimEffect?.state === "applying") throw new RemoteInstanceError("recovery_required", "Uncertain claim handoff requires recovery.");
+    if (!request?.admission || !sameOrigin(request, origin)) throw new RemoteInstanceError("recovery_required", "Claim requires its original admitted generation.");
+    if (this.claimApplied(request.admission)) return;
     const assertClaim = this.deps.captureClaimAuthority(request.admission);
     const assertCurrent = () => { captured.assertCurrent(); assertClaim(); };
     assertCurrent();
-    let receipt = this.deps.journal.assignmentStream.replyForRequest(scope, reference);
-    if (!receipt) {
-      await this.exchange(request, assertCurrent);
-      assertCurrent(); receipt = this.deps.journal.assignmentStream.replyForRequest(scope, reference);
-    }
-    if (!receipt) throw new RemoteInstanceError("recovery_required", "Claim reply was not durably accepted.");
+    const read = () => this.deps.journal.assignmentStream.replyForRequest(scope, reference);
+    const receipt = await this.replyOrExchange(request, read, assertCurrent, "Claim reply was not durably accepted.");
     if (!await this.deps.journal.assignmentStream.beginClaimEffect(scope, reference, assertCurrent)) return;
     assertCurrent(); await apply(receipt.frame.body.body); assertCurrent();
     await this.deps.journal.assignmentStream.finishClaimEffect(scope, reference, assertCurrent);
+  }
+
+  /** Whether the claim's handoff already applied; an uncertain one needs recovery. */
+  private claimApplied(admission: LocalAdmission): boolean {
+    const state = this.deps.journal.execution.start(admission.assignmentId, admission.attempt)?.claimEffect?.state;
+    if (state === "applying") throw new RemoteInstanceError("recovery_required", "Uncertain claim handoff requires recovery.");
+    return state === "applied";
   }
 
   /**

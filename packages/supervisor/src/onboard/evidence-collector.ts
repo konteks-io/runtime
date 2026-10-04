@@ -6,11 +6,11 @@ import { MAX_EVIDENCE_FILE_BYTES, type EvidenceReadPath, type RawFileApi } from 
 import type { GitAccess, GitGap, GitRemote, OnboardScratch } from "./git.js";
 
 /**
- * The evidence collector (OB6 §2). It reads a bounded, named set of files per
+ * The evidence collector. It reads a bounded, named set of files per
  * repository with the machine's own git, extracts facts locally, and submits
  * `DiscoveryEvidence` — refs, hashes, facts. It never submits a body, never
  * reads a file it cannot name in `refs`, and refuses a run whose bounds are
- * absent (ON30).
+ * absent.
  *
  * Two depths land here:
  *
@@ -26,7 +26,7 @@ export interface OnboardEvidenceCollectorDeps {
   rawFiles: Pick<RawFileApi, "read">;
   scratch: OnboardScratch;
   facade: OnboardFacade;
-  /** Managed git is the one place the runtime's own key is the credential (A10). */
+  /** Managed git is the one place the runtime's own key is the credential. */
   resolveRemote: (item: DiscoveryInventoryItem) => GitRemote;
   /** Default 4 repositories in flight, so a laptop stays usable. */
   concurrency?: number;
@@ -35,19 +35,19 @@ export interface OnboardEvidenceCollectorDeps {
   logger?: Logger;
 }
 
-export const DEFAULT_ONBOARD_CONCURRENCY = 4;
+const DEFAULT_ONBOARD_CONCURRENCY = 4;
 const DEFAULT_BATCH_SIZE = 8;
 
 /** What one repository's read produced, including what it could not read. */
-export interface RepositoryEvidence {
+interface RepositoryEvidence {
   submission: DiscoveryEvidenceSubmission;
-  /** Which path produced each ref (OB6 gotcha); diagnostics, never submitted. */
+  /** Which path produced each ref; diagnostics, never submitted. */
   readPaths: Record<string, EvidenceReadPath>;
   /** Ordinary evidence gaps, never exceptions: a side we could not read. */
   gaps: GitGap[];
 }
 
-export interface GroupingOutcome {
+interface GroupingOutcome {
   submitted: number;
   /** Canonical keys the machine's git could not read at all. */
   unreadable: Array<{ canonicalKey: string; gap: GitGap }>;
@@ -55,13 +55,13 @@ export interface GroupingOutcome {
 
 export interface EnrichmentScope {
   systemRef: string;
-  /** `min(remainingRunBudget, repositoriesOfSystem)`, computed by Core (gap R6). */
+  /** `min(remainingRunBudget, repositoriesOfSystem)`, computed by Core. */
   allowance: number;
   /** Only the accepted System's repositories, in the order Core authorised them. */
   canonicalKeys: string[];
 }
 
-export interface EnrichmentOutcome {
+interface EnrichmentOutcome {
   cloned: number;
   submitted: number;
   /** `budget_exhausted` when the allowance was 0: the assignment is done. */
@@ -98,23 +98,7 @@ export class OnboardEvidenceCollector {
       const outstanding = page.items.filter(item => !item.collected);
       for (const batch of chunk(outstanding, this.batchSize)) {
         assertCurrent();
-        const results = await mapWithConcurrency(batch, this.concurrency, item => this.readRepository(item, run.bounds));
-        const submissions: OnboardEvidenceSubmission[] = [];
-        for (const result of results) {
-          if (result.submission.refs.length === 0 && result.gaps.length > 0) {
-            // Nothing readable: the gap IS the evidence for this repository,
-            // and it travels with it so the person sees why and what to do.
-            const gap = result.gaps[0]!;
-            outcome.unreadable.push({ canonicalKey: result.submission.canonicalKey, gap });
-            submissions.push({ ...result.submission, gap });
-            continue;
-          }
-          submissions.push(result.submission);
-        }
-        if (submissions.length > 0) {
-          await this.deps.facade.evidenceSubmit(run.runRef, submissions);
-          outcome.submitted += submissions.length;
-        }
+        await this.submitGroupingBatch(run, batch, outcome);
       }
       cursor = page.nextCursor ?? undefined;
     } while (cursor);
@@ -124,8 +108,24 @@ export class OnboardEvidenceCollector {
     return outcome;
   }
 
+  private async submitGroupingBatch(run: OnboardRunView, batch: DiscoveryInventoryItem[], outcome: GroupingOutcome): Promise<void> {
+    const results = await mapWithConcurrency(batch, this.concurrency, item => this.readRepository(item, run.bounds));
+    const submissions: OnboardEvidenceSubmission[] = results.map(result => {
+      if (result.submission.refs.length > 0 || result.gaps.length === 0) return result.submission;
+      // Nothing readable: the gap IS the evidence for this repository, and
+      // it travels with it so the person sees why and what to do.
+      const gap = result.gaps[0]!;
+      outcome.unreadable.push({ canonicalKey: result.submission.canonicalKey, gap });
+      return { ...result.submission, gap };
+    });
+    if (submissions.length > 0) {
+      await this.deps.facade.evidenceSubmit(run.runRef, submissions);
+      outcome.submitted += submissions.length;
+    }
+  }
+
   /**
-   * `deep` enrichment for ONE accepted System (ON5, gap 4). Every clone is
+   * `deep` enrichment for ONE accepted System. Every clone is
    * announced to Core BEFORE it starts and reported `extracted` with its
    * submission, so Core's per-repository ledger is never behind what is on disk:
    * a clone that died before extraction is retried on the SAME budget instead of
@@ -139,14 +139,7 @@ export class OnboardEvidenceCollector {
       return { cloned: 0, submitted: 0, disposition: "budget_exhausted" };
     }
     const keys = scope.canonicalKeys.slice(0, Math.min(scope.allowance, run.bounds.maxRepositoriesDeep));
-    const byKey = new Map<string, DiscoveryInventoryItem>();
-    let cursor: string | undefined;
-    do {
-      const page = await this.deps.facade.inventoryList(run.runRef, cursor);
-      for (const item of page.items) if (keys.includes(item.canonicalKey)) byKey.set(item.canonicalKey, item);
-      cursor = page.nextCursor ?? undefined;
-    } while (cursor && byKey.size < keys.length);
-
+    const byKey = await this.inventoryByKey(run, keys);
     const outcome: EnrichmentOutcome = { cloned: 0, submitted: 0, disposition: "completed" };
     for (const batch of chunk(keys, this.concurrency)) {
       assertCurrent();
@@ -155,16 +148,30 @@ export class OnboardEvidenceCollector {
         if (!item) return null;
         return this.enrichOne(run, item, outcome, assertCurrent);
       });
-      const ready = submissions.filter((entry): entry is DiscoveryEvidenceSubmission => entry !== null);
-      if (ready.length > 0) {
-        await this.deps.facade.enrichmentSubmit(run.runRef, scope.systemRef, ready);
-        outcome.submitted += ready.length;
-        for (const submission of ready) {
-          await this.deps.facade.enrichmentProgress(run.runRef, { canonicalKey: submission.canonicalKey, state: "extracted" });
-        }
-      }
+      await this.submitEnrichment(run, scope, submissions.filter((entry): entry is DiscoveryEvidenceSubmission => entry !== null), outcome);
     }
     return outcome;
+  }
+
+  /** The inventory items for `keys`, paging only until all are found. */
+  private async inventoryByKey(run: OnboardRunView, keys: string[]): Promise<Map<string, DiscoveryInventoryItem>> {
+    const byKey = new Map<string, DiscoveryInventoryItem>();
+    let cursor: string | undefined;
+    do {
+      const page = await this.deps.facade.inventoryList(run.runRef, cursor);
+      for (const item of page.items) if (keys.includes(item.canonicalKey)) byKey.set(item.canonicalKey, item);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor && byKey.size < keys.length);
+    return byKey;
+  }
+
+  private async submitEnrichment(run: OnboardRunView, scope: EnrichmentScope, ready: DiscoveryEvidenceSubmission[], outcome: EnrichmentOutcome): Promise<void> {
+    if (ready.length === 0) return;
+    await this.deps.facade.enrichmentSubmit(run.runRef, scope.systemRef, ready);
+    outcome.submitted += ready.length;
+    for (const submission of ready) {
+      await this.deps.facade.enrichmentProgress(run.runRef, { canonicalKey: submission.canonicalKey, state: "extracted" });
+    }
   }
 
   private async enrichOne(
@@ -247,7 +254,7 @@ export class OnboardEvidenceCollector {
       refs.push(ref);
       readPaths[ref.ref] = via;
     }
-    // Which path produced each ref is a fact about the run (OB6 gotcha): a
+    // Which path produced each ref is a fact about the run: a
     // portfolio read entirely through `git archive` and one that fell back for
     // half its repositories are different things to have measured.
     this.logger.debug({
@@ -265,7 +272,7 @@ export class OnboardEvidenceCollector {
  * A ref names the file this fact came from and proves which bytes were read.
  * It is the ONLY thing about a file that leaves the machine besides the facts.
  */
-export function evidenceRef(item: Pick<DiscoveryInventoryItem, "canonicalKey" | "defaultBranch">, candidate: EvidenceCandidate, body: Buffer): CatalogLearningEvidence {
+function evidenceRef(item: Pick<DiscoveryInventoryItem, "canonicalKey" | "defaultBranch">, candidate: EvidenceCandidate, body: Buffer): CatalogLearningEvidence {
   return {
     ref: `${item.canonicalKey}@${item.defaultBranch}:${candidate.path}`,
     kind: candidate.kind,

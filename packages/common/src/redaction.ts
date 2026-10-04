@@ -18,7 +18,7 @@ const API_KEY_PATTERNS: RegExp[] = [
   /\bkxrp_[A-Za-z0-9_-]{4,}/g, // Konteks provisioning credential
 ];
 
-export const REDACTED = "[redacted]";
+const REDACTED = "[redacted]";
 
 export function isSecretKey(key: string): boolean {
   return SECRET_KEY_PATTERN.test(key);
@@ -47,20 +47,23 @@ type JsonLike = string | number | boolean | null | JsonLike[] | { [key: string]:
 export function redactValue(value: unknown, depth = 0): JsonLike {
   if (depth > 16) return REDACTED;
   if (value === null || value === undefined) return null;
-  if (typeof value === "string") return redactText(value);
-  if (typeof value === "number" || typeof value === "boolean") return value;
-  if (value instanceof Error) {
-    return { name: value.name, message: redactText(value.message) };
-  }
+  if (value instanceof Error) return { name: value.name, message: redactText(value.message) };
   if (Array.isArray(value)) return value.map((item) => redactValue(item, depth + 1));
-  if (typeof value === "object") {
-    const out: { [key: string]: JsonLike } = {};
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = isSecretKey(key) ? REDACTED : redactValue(entry, depth + 1);
-    }
-    return out;
+  if (typeof value === "object") return redactRecord(value as Record<string, unknown>, depth);
+  return redactScalar(value);
+}
+
+function redactScalar(value: unknown): JsonLike {
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  return redactText(typeof value === "string" ? value : String(value));
+}
+
+function redactRecord(value: Record<string, unknown>, depth: number): { [key: string]: JsonLike } {
+  const out: { [key: string]: JsonLike } = {};
+  for (const [key, entry] of Object.entries(value)) {
+    out[key] = isSecretKey(key) ? REDACTED : redactValue(entry, depth + 1);
   }
-  return redactText(String(value));
+  return out;
 }
 
 /**

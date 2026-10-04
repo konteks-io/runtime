@@ -21,7 +21,7 @@ function redactStream(chunks: string[], root = "/Users/me/work"): string {
 }
 
 describe("streamed activity redaction", () => {
-  it("applies a chunk's continuation only to its text, never to the message's own fields (D121)", () => {
+  it("applies a chunk's continuation only to its text, never to the message's own fields", () => {
     const message = { kind: "acp", method: "session/update", params: { sessionId: "acp-1",
       update: { sessionUpdate: "agent_message_chunk", messageId: "msg-1", content: { type: "text", text: "o/src/index.ts now" } } } };
     const chunk = { startsAtBoundary: false, continuesPath: true };
@@ -126,7 +126,7 @@ describe("streamed activity redaction", () => {
     expect(redactStream(["a https://example.test/x b"])).toBe("a https://example.test/x b");
   });
 
-  it("leaves a bare root slash and Markdown around it alone (WS1-175)", () => {
+  it("leaves a bare root slash and Markdown around it alone", () => {
     expect(redactStream(["**sudo ls /** — didn't run"])).toBe("**sudo ls /** — didn't run");
     expect(redactStream(["**sudo ls /", "** — didn't run"])).toBe("**sudo ls /** — didn't run");
     expect(redactStream(["run ls / now"])).toBe("run ls / now");

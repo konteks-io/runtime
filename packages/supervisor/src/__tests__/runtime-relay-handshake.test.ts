@@ -167,7 +167,7 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); }
   });
 
-  it("routes C02 revision control only to its current dedicated receiver", async () => {
+  it("routes execution revision control only to its current dedicated receiver", async () => {
     const onExecutionRevisionControl = vi.fn(async (_request, connection) => connection.assertCurrent());
     const f = fixture({ onExecutionRevisionControl } as never);
     const intent = {
@@ -247,7 +247,7 @@ describe("native runtime relay handshake validation boundary", () => {
     signature: "A".repeat(86),
   });
 
-  it("isolates C01 diagnostic sidecar failure from mux and work transport", async () => {
+  it("isolates a diagnostic companion failure from mux and work transport", async () => {
     const onDiagnosticCompanion = vi.fn(async () => { throw new Error("diagnostic journal unavailable"); });
     const f = fixture({ onDiagnosticCompanion } as never);
     try {
@@ -260,7 +260,7 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); }
   });
 
-  it("records an explicit C01 coverage gap when a legacy runtime lacks the diagnostic receiver", async () => {
+  it("records an explicit diagnostic coverage gap when a legacy runtime lacks the diagnostic receiver", async () => {
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const f = fixture({ logger: logger as never });
     try {
@@ -476,7 +476,7 @@ describe("native runtime relay handshake validation boundary", () => {
     } finally { f.client.stop(); vi.useRealTimers(); }
   });
 
-  it("logs who closed the relay socket and why (WS2-157)", async () => {
+  it("logs who closed the relay socket and why", async () => {
     const warn = vi.fn();
     const logger = { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn(), fatal: vi.fn(), trace: vi.fn(), child: vi.fn() } as never;
     const closed = () => warn.mock.calls.filter(call => (call[0] as { event?: string }).event === "relay.socket.closed").map(call => call[0]);

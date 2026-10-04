@@ -8,7 +8,7 @@ export const OWNER_ACCESS_REVOKED = "This machine's Konteks access was revoked i
 
 /**
  * The person's own credential, and the three calls the onboarding flow makes
- * with it (onboarding-simplified OS13, OS15, core chapter §5–§6).
+ * with it.
  *
  * It is a login for that person on this machine, so it is treated as one: a
  * secret file, never printed, never logged, refreshed rather than kept long,
@@ -26,11 +26,11 @@ const StoredTokenSchema = z
   })
   .strict();
 
-export type StoredOwnerToken = z.infer<typeof StoredTokenSchema>;
+type StoredOwnerToken = z.infer<typeof StoredTokenSchema>;
 
 const FILE = "owner-token.json";
 
-export function ownerTokenPath(supervisorData: string): string {
+function ownerTokenPath(supervisorData: string): string {
   return join(supervisorData, FILE);
 }
 
@@ -62,7 +62,7 @@ export async function writeOwnerToken(
 const FirstSystemSchema = z
   .object({
     systemId: z.string().min(1),
-    /** The workspace already had this System; this machine now works on it (WS1-089). */
+    /** The workspace already had this System; this machine now works on it. */
     existing: z.boolean().optional(),
     systemEntityRef: z.string().min(1),
     componentEntityRef: z.string().min(1),
@@ -78,7 +78,7 @@ const FirstSystemSchema = z
   })
   .strict();
 
-export type FirstSystemRegistered = z.infer<typeof FirstSystemSchema>;
+type FirstSystemRegistered = z.infer<typeof FirstSystemSchema>;
 
 export class OwnerApiClient {
   constructor(
@@ -105,7 +105,7 @@ export class OwnerApiClient {
   }
 
   /**
-   * Whether this workspace can already run work (W1-A6).
+   * Whether this workspace can already run work.
    *
    * A workspace made from a coding agent has never been through the setup the
    * site offers, so its first session needs a ready default revision. A
@@ -139,7 +139,7 @@ export class OwnerApiClient {
 
   /**
    * Whether this person may start planning work here: a Member or the owner
-   * can, a Viewer cannot (WS1-131). Undefined when Konteks cannot say, so a
+   * can, a Viewer cannot. Undefined when Konteks cannot say, so a
    * check that fails never stops someone who can.
    */
   async canStartWork(): Promise<boolean | undefined> {
@@ -150,7 +150,7 @@ export class OwnerApiClient {
   }
 
   /**
-   * The person's first initiative on that System (W1-A6).
+   * The person's first initiative on that System.
    *
    * Core's initiative setup creates the initiative and opens its planning
    * session under this same token, exactly as New initiative does on the site.
@@ -166,26 +166,20 @@ export class OwnerApiClient {
       title: input.title,
     })) as Record<string, unknown>;
     const initiative = (body.initiative ?? {}) as Record<string, unknown>;
-    const initiativeId = typeof initiative.id === "string" ? initiative.id : "";
+    const initiativeId = nonEmptyString(initiative.id);
     if (!initiativeId) {
       throw new RemoteInstanceError("temporarily_unavailable", "Konteks did not answer with an initiative.");
     }
-    const pmSessionId =
-      typeof body.pmSessionId === "string" && body.pmSessionId
-        ? body.pmSessionId
-        : typeof initiative.pmSessionId === "string" && initiative.pmSessionId
-          ? initiative.pmSessionId
-          : undefined;
+    const pmSessionId = nonEmptyString(body.pmSessionId) ?? nonEmptyString(initiative.pmSessionId);
     const failure = body.spawnFailure as { message?: unknown } | undefined;
     return {
       initiativeId,
       title: typeof initiative.title === "string" ? initiative.title : input.title,
       ...(pmSessionId ? { pmSessionId } : {}),
-      ...(failure && typeof failure.message === "string" ? { setupFailure: failure.message } : {}),
+      ...(typeof failure?.message === "string" ? { setupFailure: failure.message } : {}),
     };
   }
 
-  /** The initiatives a System already has, newest first as Konteks lists them (WS1-090). */
   /** The workspace's name as people see it on the site, or undefined when Core does not say. */
   async workspaceDisplayName(tenantId: string): Promise<string | undefined> {
     const body = await this.call("GET", "/api/platform/tenants");
@@ -196,31 +190,13 @@ export class OwnerApiClient {
     return typeof match?.displayName === "string" && match.displayName.trim() ? match.displayName.trim() : undefined;
   }
 
+  /** The initiatives a System already has, newest first as Konteks lists them. */
   async listInitiatives(systemId: string): Promise<Array<{ id: string; title: string }>> {
     const body = (await this.call("GET", `/api/collaboration/initiatives?systemId=${encodeURIComponent(systemId)}`)) as Record<string, unknown>;
     const list = Array.isArray(body.initiatives) ? (body.initiatives as Array<Record<string, unknown>>) : [];
     return list
       .filter(entry => typeof entry.id === "string" && entry.id)
       .map(entry => ({ id: entry.id as string, title: typeof entry.title === "string" ? entry.title : "" }));
-  }
-
-  /** A project-management session scoped to that System (OS13). */
-  async createProjectManagementSession(input: {
-    systemId: string;
-    instanceId: string;
-    title: string;
-  }): Promise<{ sessionId: string }> {
-    const body = (await this.call("POST", "/api/app/sessions", {
-      mode: "project_management",
-      title: input.title,
-      system_id: input.systemId,
-      runtimeTarget: { kind: "specific_instance", instanceId: input.instanceId },
-    })) as Record<string, unknown>;
-    const sessionId = String(body.id ?? body.session_id ?? "");
-    if (!sessionId) {
-      throw new RemoteInstanceError("temporarily_unavailable", "Konteks did not answer with a session.");
-    }
-    return { sessionId };
   }
 
   /** The person's first sentence becomes the session's first turn. */
@@ -233,10 +209,19 @@ export class OwnerApiClient {
   }
 
   private async call(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<unknown> {
+    const response = await this.send(method, path, body, headers);
+    if (response.status === 401 || response.status === 403) throw refusal(response.status, await jsonDetail(response));
+    if (response.status === 402) {
+      throw new RemoteInstanceError("limit_exceeded", "This workspace has no Story Points left for a first turn.");
+    }
+    if (!response.ok) throw failure(response.status, path, await jsonDetail(response));
+    return response.json().catch(() => ({}));
+  }
+
+  private async send(method: string, path: string, body: unknown, headers: Record<string, string>): Promise<Response> {
     const doFetch = this.options.fetchFn ?? fetch;
-    let response: Response;
     try {
-      response = await doFetch(`${this.options.coreUrl.replace(/\/+$/, "")}${path}`, {
+      return await doFetch(`${this.options.coreUrl.replace(/\/+$/, "")}${path}`, {
         method,
         headers: {
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
@@ -249,33 +234,34 @@ export class OwnerApiClient {
     } catch {
       throw new RemoteInstanceError("temporarily_unavailable", "Konteks could not be reached.");
     }
-    if (response.status === 401 || response.status === 403) {
-      // Core refuses a token revoked in Customize → Runtimes at its next use with the code
-      // a revoked refresh gets, so the person hears why rather than "refused".
-      const detail = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-      if (response.status === 401 && detail.code === "enrollment_invalid") {
-        throw new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED);
-      }
-      // Say what Konteks said (WS1-049): "access was refused" alone sent the
-      // person looking at this machine for a refusal that was about something
-      // else, such as a proof the Assistant would not accept.
-      const said = typeof detail.message === "string" && detail.message.trim() ? detail.message.trim().replace(/([^.!?])$/, "$1.") : "";
-      throw new RemoteInstanceError("permission_denied", said ? `Konteks refused that request: ${said}` : "This machine's Konteks access was refused.");
-    }
-    if (response.status === 402) {
-      throw new RemoteInstanceError("limit_exceeded", "This workspace has no Story Points left for a first turn.");
-    }
-    if (!response.ok) {
-      const detail = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-      if (response.status === 503 && path === "/api/app/execution-profiles/auto"
-        && (detail.error as { code?: unknown } | undefined)?.code === "native_execution_profile_unavailable") {
-        throw new RemoteInstanceError("role_not_advertised", "Konteks is still learning what this machine's agents can do.");
-      }
-      throw new RemoteInstanceError(
-        "temporarily_unavailable",
-        typeof detail.message === "string" ? detail.message : `Konteks answered ${response.status}.`,
-      );
-    }
-    return response.json().catch(() => ({}));
   }
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+async function jsonDetail(response: Response): Promise<Record<string, unknown>> {
+  return (await response.json().catch(() => ({}))) as Record<string, unknown>;
+}
+
+/**
+ * Core refuses a token revoked in Customize → Runtimes at its next use with
+ * the code a revoked refresh gets, so the person hears why rather than
+ * "refused". Otherwise say what Konteks said: "access was refused" alone sent
+ * the person looking at this machine for a refusal that was about something
+ * else, such as a proof the Assistant would not accept.
+ */
+function refusal(status: number, detail: Record<string, unknown>): RemoteInstanceError {
+  if (status === 401 && detail.code === "enrollment_invalid") return new RemoteInstanceError("permission_denied", OWNER_ACCESS_REVOKED);
+  const said = typeof detail.message === "string" && detail.message.trim() ? detail.message.trim().replace(/([^.!?])$/, "$1.") : "";
+  return new RemoteInstanceError("permission_denied", said ? `Konteks refused that request: ${said}` : "This machine's Konteks access was refused.");
+}
+
+function failure(status: number, path: string, detail: Record<string, unknown>): RemoteInstanceError {
+  if (status === 503 && path === "/api/app/execution-profiles/auto"
+    && (detail.error as { code?: unknown } | undefined)?.code === "native_execution_profile_unavailable") {
+    return new RemoteInstanceError("role_not_advertised", "Konteks is still learning what this machine's agents can do.");
+  }
+  return new RemoteInstanceError("temporarily_unavailable", typeof detail.message === "string" ? detail.message : `Konteks answered ${status}.`);
 }

@@ -44,7 +44,7 @@ async function absentFixture() {
   return { ...f, work };
 }
 
-it("D139 refuses actual ACP-only durable settlement without a terminal report or applied receipt", async () => {
+it("refuses actual ACP-only durable settlement without a terminal report or applied receipt", async () => {
   const f = await fixture([{ action: "report_interrupted", assignmentId: "a", attempt: 1, reason: "agent_session_lost" }]);
   await f.addClaim();
   const admission = { instanceId: "instance", workspaceId: "w", runnerIncarnation: "process", assignmentId: "a", attempt: 1, claimId: "claim", agentId: "codex", executionGeneration: "generation", openedAt: f.clock.nowIso() };

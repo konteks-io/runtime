@@ -8,6 +8,45 @@ export function admittedOperationKey(claims: Admission): string {
   return `${claims.acpSessionRef}:${claims.kind === "acp" ? "received" : "issued"}:${claims.requestId ?? `operation:${claims.operationId}`}`;
 }
 
+type Authorization = NonNullable<PendingRequest["authorization"]>;
+
+function canonical(value: unknown): string {
+  return canonicalize(value as JsonValue);
+}
+
+function assertSameAdmission(authorization: Authorization, claims: Admission, receipt: string): void {
+  if (canonical(authorization.claims) !== canonical(claims) || authorization.receipt !== receipt) throw conflict();
+}
+
+/** A repeated completion must be the one already stored. */
+function assertSameCompletion(stored: unknown, completion: SessionToCoreMessage | undefined): void {
+  if (completion && canonical(completion) !== canonical(stored)) throw conflict();
+}
+
+/** A delivery's answer to a permission request this journal holds open, as Core signed it. */
+function answersOpenRequest(current: PendingRequest | undefined, claims: Admission): boolean {
+  return current !== undefined && current.closedAt === null && current.method === claims.method &&
+    claims.sender.kind === "core_permission_answer" && current.requestDigest === claims.sender.requestDigest;
+}
+
+function assertAdmissible(current: PendingRequest | undefined, claims: Admission): void {
+  if (claims.kind === "acp") {
+    // A legacy pending request cannot prove it has not already dispatched.
+    if (current) throw new RemoteInstanceError("operation_interrupted", "Previous request has no durable admission evidence.");
+    return;
+  }
+  if (!answersOpenRequest(current, claims)) throw conflict();
+}
+
+function receivedRequest(claims: Admission, openedAt: string): PendingRequest {
+  return { acpSessionRef: claims.acpSessionRef, id: claims.requestId ?? `operation:${claims.operationId}`,
+    method: claims.method, direction: "received" as const, openedAt, closedAt: null,
+    deadlineAt: null, requestDigest: claims.payloadDigest };
+}
+
+/** What a begin does to an admitted operation in its current state. */
+type BeginStep = "keep" | "interrupt" | "begin";
+
 /** Extends the existing pending-request journal. No second transport cursor or
  * operation log: every admission/disposition is fsynced with its request row. */
 export class OperationAdmissionJournal {
@@ -23,17 +62,11 @@ export class OperationAdmissionJournal {
     await this.journal.pendingRequests.update(key, current => {
       assertCurrent();
       if (current?.authorization) {
-        if (canonicalize(current.authorization.claims as unknown as JsonValue) !== canonicalize(claims as unknown as JsonValue) || current.authorization.receipt !== receipt) throw conflict();
+        assertSameAdmission(current.authorization, claims, receipt);
         return current;
       }
-      if (claims.kind === "acp") {
-        // A legacy pending request cannot prove it has not already dispatched.
-        if (current) throw new RemoteInstanceError("operation_interrupted", "Previous request has no durable admission evidence.");
-      } else if (!current || current.closedAt !== null || current.method !== claims.method ||
-        claims.sender.kind !== "core_permission_answer" || current.requestDigest !== claims.sender.requestDigest) throw conflict();
-      return { ...(current ?? { acpSessionRef: claims.acpSessionRef, id: claims.requestId ?? `operation:${claims.operationId}`,
-        method: claims.method, direction: "received" as const, openedAt: this.clock.nowIso(), closedAt: null,
-        deadlineAt: null, requestDigest: claims.payloadDigest }), authorization: { claims, receipt, state: "admitted" } };
+      assertAdmissible(current, claims);
+      return { ...(current ?? receivedRequest(claims, this.clock.nowIso())), authorization: { claims, receipt, state: "admitted" } };
     });
     return this.journal.pendingRequests.get(key)!;
   }
@@ -52,29 +85,40 @@ export class OperationAdmissionJournal {
     await this.journal.pendingRequests.update(key, current => {
       assertCurrent();
       if (!current?.authorization) throw conflict();
-      const authorization = current.authorization;
-      if (authorization.state === "completed" || authorization.state === "denied") return current;
-      if (authorization.state === "dispatch_started" && this.active.has(key)) return current;
-      if (authorization.state === "dispatch_started" || authorization.state === "interrupted") {
+      const step = this.beginStep(key, current.authorization.state);
+      if (step === "keep") return current;
+      if (step === "interrupt") {
         interrupted = true;
-        return { ...current, authorization: { ...authorization, state: "interrupted" } };
+        return { ...current, authorization: { ...current.authorization, state: "interrupted" } };
       }
       begin = true;
-      return { ...current, authorization: { ...authorization, state: "dispatch_started" } };
+      return { ...current, authorization: { ...current.authorization, state: "dispatch_started" } };
     });
     if (interrupted) throw new RemoteInstanceError("operation_interrupted", "Prior dispatch outcome requires explicit recovery.");
     if (begin) this.active.add(key);
     return begin;
   }
 
+  /** A started dispatch this process began is settled once; a recovered one stays ambiguous. */
+  private beginStep(key: string, state: Authorization["state"]): BeginStep {
+    if (state === "completed" || state === "denied") return "keep";
+    if (state === "dispatch_started" && this.active.has(key)) return "keep";
+    if (state === "dispatch_started" || state === "interrupted") return "interrupt";
+    return "begin";
+  }
+
+  private assertDispatching(key: string, authorization: Authorization): void {
+    if (authorization.state !== "dispatch_started" || !this.active.has(key)) throw conflict();
+  }
+
   async complete(key: string, completion?: SessionToCoreMessage): Promise<void> {
     await this.journal.pendingRequests.update(key, current => {
       if (!current?.authorization) throw conflict();
       if (current.authorization.state === "completed") {
-        if (completion && canonicalize(completion as unknown as JsonValue) !== canonicalize((current.authorization.completion ?? null) as JsonValue)) throw conflict();
+        assertSameCompletion(current.authorization.completion ?? null, completion);
         return current;
       }
-      if (current.authorization.state !== "dispatch_started" || !this.active.has(key)) throw conflict();
+      this.assertDispatching(key, current.authorization);
       return { ...current, closedAt: this.clock.nowIso(), authorization: { ...current.authorization,
         state: "completed", ...(completion ? { completion } : {}) } };
     });
@@ -95,7 +139,7 @@ export class OperationAdmissionJournal {
     await this.journal.pendingRequests.update(key, current => {
       if (!current?.authorization) throw conflict();
       if (current.authorization.state === "denied") return current;
-      if (current.authorization.state !== "dispatch_started" || !this.active.has(key)) throw conflict();
+      this.assertDispatching(key, current.authorization);
       return { ...current, closedAt: current.closedAt ?? this.clock.nowIso(), authorization: { ...current.authorization,
         state: "denied", completion } };
     });
@@ -106,7 +150,7 @@ export class OperationAdmissionJournal {
     await this.journal.pendingRequests.update(key, current => {
       if (!current?.authorization || !["admitted", "denied"].includes(current.authorization.state)) throw conflict();
       if (current.authorization.completion) {
-        if (completion && canonicalize(completion as unknown as JsonValue) !== canonicalize(current.authorization.completion as unknown as JsonValue)) throw conflict();
+        assertSameCompletion(current.authorization.completion, completion);
         return current;
       }
       return { ...current, closedAt: current.closedAt ?? this.clock.nowIso(), authorization: { ...current.authorization,

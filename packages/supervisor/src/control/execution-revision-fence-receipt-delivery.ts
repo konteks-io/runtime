@@ -11,7 +11,7 @@ import type { CoreClient } from "../core/client.js";
 import type { DurableOutbox } from "../state/outbox.js";
 
 /**
- * Retains exact proof-bearing C02 receipt bytes before delivery. This is only
+ * Retains exact proof-bearing revision fence receipt bytes before delivery. This is only
  * proof of a local authority fence; it never reports provider stop, quiescence,
  * or a terminal controller state.
  */

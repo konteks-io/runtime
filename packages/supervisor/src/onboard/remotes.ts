@@ -1,7 +1,7 @@
 import type { GitRemote } from "./git.js";
 
 /**
- * Which credential reaches which repository (OB6 §5, A10).
+ * Which credential reaches which repository.
  *
  * There are exactly two answers and no third:
  *
@@ -35,7 +35,7 @@ export interface RepositoryLocation {
   repoName: string;
 }
 
-export type ManagedBindingSource = () => ManagedGitBinding | null;
+type ManagedBindingSource = () => ManagedGitBinding | null;
 
 export function createRemoteResolver(managed: ManagedBindingSource): (location: RepositoryLocation) => GitRemote {
   return location => resolveRemote(location, managed());

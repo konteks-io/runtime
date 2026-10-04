@@ -3,8 +3,9 @@ import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 
 // Build-time compatibility change only. Never mutate an installed signed artifact.
 // Reuse upstream's history conversion; do not reconstruct or read local files.
-// v9: v8 (integration admission, S0-2 server switch-off) combined with
-// main's v7 (a direct session's own title behind the [konteks] prefix).
+// It admits an integration task's own server, switches every other configured
+// MCP server off, and shows a direct session's own title behind the
+// [konteks] prefix.
 export const codexAcpLiveUserPatch = {
   id: "konteks-codex-acp-live-user-v9",
   package: "@agentclientprotocol/codex-acp",
@@ -43,12 +44,13 @@ export async function reconcileCodexToolTerminals(turn, openByTurn, emit) {
   }
 }
 
-// Stage 0 (S0-2): a Konteks thread runs only the MCP servers Konteks gave it.
+// A Konteks thread runs only the MCP servers Konteks gave it.
 // codex-acp keeps the person's configured servers (user and trusted project
 // layers) and adds the ACP ones; this turns each configured server off for
 // the thread (`mcp_servers.<name>.enabled = false`, deep-merged per thread;
 // measured against the pinned Codex 0.153.4: the server is never started).
-// `admittedNames` is the integration seam (CP2); nothing admits one yet.
+// `admittedNames` are the servers an integration task's binding admits
+// (`konteksAdmittedMcpServerNames`).
 export function konteksCodexMcpServers(existingNames, requestedNames, admittedNames) {
   const conflict = requestedNames.find((name) => existingNames.has(name));
   if (conflict !== undefined) {
@@ -60,7 +62,7 @@ export function konteksCodexMcpServers(existingNames, requestedNames, admittedNa
   );
 }
 
-// CP2 (external-integration): the one personal server an integration task's
+// The one personal server an integration task's
 // binding admits, read ONLY from that task's own session/new
 // (`_meta.konteksIntegration`, version 1, at most 8 bounded names). Any other
 // shape admits nothing; resume, load and fork never carry an admission.

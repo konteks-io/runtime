@@ -254,7 +254,7 @@ it("spawns a throwaway probe process only when nothing is resident", async () =>
   expect(f.owners[1]!.bridge.stop).toHaveBeenCalledOnce();
 });
 
-it("reads the identity again when a discovery fails for good, so readiness stops saying ready (WS1-216)", async () => {
+it("reads the identity again when a discovery fails for good, so readiness stops saying ready", async () => {
   let signedIn = true;
   let refuse = false;
   const f = await fixture({
@@ -271,7 +271,7 @@ it("reads the identity again when a discovery fails for good, so readiness stops
 
 });
 
-it("re-reads the offered models once the discovery TTL has passed (System One §6a, KM6)", async () => {
+it("re-reads the offered models once the discovery TTL has passed", async () => {
   let now = Date.parse("2026-09-27T00:00:00Z");
   const f = await fixture({ now: () => new Date(now), modelCapabilityTtlMs: 60_000 });
   await f.runtime.probe(false);

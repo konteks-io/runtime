@@ -10,7 +10,7 @@ const TraceCarrierSchema = ObservabilityContextV1Schema.pick({
   tracestate: true,
 });
 
-export interface RuntimeAdmissionObservabilityInput {
+interface RuntimeAdmissionObservabilityInput {
   runtimeIncarnationId: string;
   assignmentId: string;
   attempt: number;
@@ -28,6 +28,12 @@ function nextTraceId(newId: () => string): string {
   return newId().replaceAll("-", "");
 }
 
+/** The version, trace id and flags a W3C parent carries, or a fresh trace. */
+function traceParent(traceparent: string | undefined): { version: string; traceId: string; flags: string } {
+  const [version = "00", traceId = nextTraceId(randomUUID), , flags = "01"] = traceparent?.split("-") ?? [];
+  return { version, traceId, flags };
+}
+
 /**
  * Create validated, diagnostic-only causal context after an admission is durable.
  *
@@ -41,7 +47,7 @@ export function createRuntimeAdmissionObservabilityContext(
   newSpanId: () => string = () => nextTraceId(randomUUID).slice(0, 16),
 ): ObservabilityContextV1 {
   const trace = input.trace ? TraceCarrierSchema.parse(input.trace) : undefined;
-  const [version = "00", traceId = nextTraceId(randomUUID), _parentId, flags = "01"] = trace?.traceparent.split("-") ?? [];
+  const { version, traceId, flags } = traceParent(trace?.traceparent);
 
   return ObservabilityContextV1Schema.parse({
     schemaVersion: OBSERVABILITY_CONTRACT_VERSIONS.context,

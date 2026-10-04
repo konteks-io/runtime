@@ -1,3 +1,4 @@
+import type { z } from "zod";
 import { RemoteInstanceError, createLogger, jcsDigest, type AgentTurnUsageObservation, type BoundedJsonValue, type JsonValue, type Logger, type RemoteWorkAssignment } from "@konteks/remote-common";
 import type { RunnerEvent } from "@konteks/remote-agent-runner";
 import {
@@ -18,7 +19,7 @@ import type { IntegrationSetupRunner } from "./setup.js";
 import type { IntegrationWriteLedger } from "./tool-gate.js";
 
 /**
- * An `integration` assignment (external-integration-via-agent CP2): one
+ * An `integration` assignment: one
  * bounded integration task Core placed on the runtime that holds the
  * binding. It never takes the relayed-session path: the carrier fetches the
  * frozen task from Core's workload route and runs it here, model-free for
@@ -47,8 +48,8 @@ export function integrationTerminalResult(outcome: IntegrationWorkOutcome): { cl
   return { class: "succeeded", structuredOutput: outcome.structuredOutput, terminalResultHash: jcsDigest(outcome.structuredOutput as JsonValue) };
 }
 
-/** The agents an integration task can run on: the two with a certified permission gate (Stage 0). */
-export const INTEGRATION_AGENT_IDS: ReadonlySet<string> = new Set(["claude-code", "codex"]);
+/** The agents an integration task can run on: the two with a certified permission gate. */
+const INTEGRATION_AGENT_IDS: ReadonlySet<string> = new Set(["claude-code", "codex"]);
 
 /** `integration-task-v1` for the `agent_runner` component when a Claude Code or Codex runner is installed. */
 export function integrationTaskCapabilities(agentIds: Iterable<string>): string[] {
@@ -61,7 +62,7 @@ export function integrationFixturesEnabled(env: NodeJS.ProcessEnv = process.env)
   return env.KONTEKS_E2E_NATIVE_CONNECTOR === "1";
 }
 
-export interface IntegrationTaskCarrierDeps {
+interface IntegrationTaskCarrierDeps {
   /** Core's frozen task for the claimed assignment (the workload route, assignment authority). */
   fetchWorkload: (assignment: IntegrationWorkAssignment) => Promise<WorkloadDefinition>;
   discovery: IntegrationDiscovery;
@@ -80,7 +81,7 @@ export interface IntegrationTaskCarrierDeps {
 }
 
 /**
- * The integration lane (DESIGN §2). Fetches the frozen task through the
+ * The integration lane. Fetches the frozen task through the
  * workload route, refuses it unless it parses with the shared schema, its
  * digest equals the assignment source's `specDigest`, and it names this
  * assignment's task and agent; then runs it: discovery model-free, setup
@@ -88,6 +89,19 @@ export interface IntegrationTaskCarrierDeps {
  * A genuine task that cannot be done here ends in a result with a stable
  * error; a task that does not match its assignment fails the assignment.
  */
+/** The task the fetched workload carries, when it is exactly the one this assignment names. */
+function assignedTask(assignment: IntegrationWorkAssignment, workload: WorkloadDefinition): z.infer<typeof IntegrationWorkloadSchema> {
+  const invalid = (diagnostic: string) => new RemoteInstanceError("schema_invalid", "The integration task does not match its assignment.", { diagnostic });
+  if (workload.kind !== "integration" || workload.assignmentId !== assignment.id || workload.attempt !== assignment.attempt) throw invalid("integration_workload_mismatch");
+  const parsed = IntegrationWorkloadSchema.safeParse(workload.workload);
+  if (!parsed.success) throw invalid("integration_spec_invalid");
+  const task = parsed.data;
+  if (integrationWorkloadDigest(task) !== assignment.source.specDigest) throw invalid("integration_spec_digest_mismatch");
+  if (task.taskId !== assignment.source.taskId) throw invalid("integration_task_mismatch");
+  if (task.agentId !== assignment.agentRoute.agentId) throw invalid("integration_agent_mismatch");
+  return task;
+}
+
 export class IntegrationTaskCarrier implements IntegrationWorkCarrier {
   private readonly sessions = new Set<IntegrationSession>();
   private readonly logger: Logger;
@@ -99,14 +113,7 @@ export class IntegrationTaskCarrier implements IntegrationWorkCarrier {
   async execute(assignment: IntegrationWorkAssignment, assertCurrent: () => void): Promise<IntegrationWorkOutcome> {
     const workload = await this.deps.fetchWorkload(assignment);
     assertCurrent();
-    const invalid = (diagnostic: string) => new RemoteInstanceError("schema_invalid", "The integration task does not match its assignment.", { diagnostic });
-    if (workload.kind !== "integration" || workload.assignmentId !== assignment.id || workload.attempt !== assignment.attempt) throw invalid("integration_workload_mismatch");
-    const parsed = IntegrationWorkloadSchema.safeParse(workload.workload);
-    if (!parsed.success) throw invalid("integration_spec_invalid");
-    const task = parsed.data;
-    if (integrationWorkloadDigest(task) !== assignment.source.specDigest) throw invalid("integration_spec_digest_mismatch");
-    if (task.taskId !== assignment.source.taskId) throw invalid("integration_task_mismatch");
-    if (task.agentId !== assignment.agentRoute.agentId) throw invalid("integration_agent_mismatch");
+    const task = assignedTask(assignment, workload);
     if ("kind" in task) {
       const result = await this.deps.setup.run(task, assertCurrent);
       return { structuredOutput: IntegrationSetupResultSchema.parse(result) as BoundedJsonValue };
@@ -123,32 +130,34 @@ export class IntegrationTaskCarrier implements IntegrationWorkCarrier {
 
   private async runTask(assignment: IntegrationWorkAssignment, spec: IntegrationTaskSpec, assertCurrent: () => void): Promise<IntegrationTaskResult> {
     const base = { schemaVersion: 1 as const, taskId: spec.taskId, phase: spec.phase, toolCalls: [], observations: [] };
-    const failed = (error: IntegrationTaskError): IntegrationTaskResult => IntegrationTaskResultSchema.parse({ ...base, error: error.toResultError() });
     try {
       if (!INTEGRATION_AGENT_IDS.has(spec.agentId)) throw new IntegrationTaskError("operation_unsupported", { reason: "agent" });
       if (spec.phase === "discover") {
         const inventory = await this.deps.discovery.discover(spec.agentId);
         return IntegrationTaskResultSchema.parse({ ...base, inventory });
       }
-      const runner = this.deps.runners().get(spec.agentId);
-      if (!runner) throw new IntegrationTaskError("runtime_offline", { reason: "agent_runner" });
-      const session = new IntegrationSession(assignment, spec, {
-        runner,
-        instanceId: this.deps.instanceId(),
-        workspaceRoot: this.deps.workspaceRoot(spec.agentId),
-        writes: this.deps.writes,
-        e2eFixtures: this.deps.e2eFixtures,
-        ...(this.deps.now ? { now: this.deps.now } : {}),
-        ...(this.deps.onUsage ? { onUsage: this.deps.onUsage } : {}),
-        ...(this.deps.cancelGraceMs !== undefined ? { cancelGraceMs: this.deps.cancelGraceMs } : {}),
-        logger: this.logger,
-      });
+      const session = this.openSession(assignment, spec);
       this.sessions.add(session);
       try { return await session.run(assertCurrent); }
       finally { this.sessions.delete(session); }
     } catch (error) {
-      if (error instanceof IntegrationTaskError) return failed(error);
+      if (error instanceof IntegrationTaskError) return IntegrationTaskResultSchema.parse({ ...base, error: error.toResultError() });
       throw error;
     }
   }
-}
+
+  private openSession(assignment: IntegrationWorkAssignment, spec: IntegrationTaskSpec): IntegrationSession {
+    const runner = this.deps.runners().get(spec.agentId);
+    if (!runner) throw new IntegrationTaskError("runtime_offline", { reason: "agent_runner" });
+    return new IntegrationSession(assignment, spec, {
+      runner,
+      instanceId: this.deps.instanceId(),
+      workspaceRoot: this.deps.workspaceRoot(spec.agentId),
+      writes: this.deps.writes,
+      e2eFixtures: this.deps.e2eFixtures,
+      ...(this.deps.now ? { now: this.deps.now } : {}),
+      ...(this.deps.onUsage ? { onUsage: this.deps.onUsage } : {}),
+      ...(this.deps.cancelGraceMs !== undefined ? { cancelGraceMs: this.deps.cancelGraceMs } : {}),
+      logger: this.logger,
+    });
+  }}

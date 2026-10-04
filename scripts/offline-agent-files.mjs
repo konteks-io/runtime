@@ -7,7 +7,7 @@ import { join } from "node:path";
  * execute bit (Node reports none), so there a program is known by its
  * extension; without that a native entrypoint such as Claude Code's
  * `bin/claude.exe` was inventoried as data and the installer refused the
- * whole package (agent OS proof, CP0-X).
+ * whole package (agent OS proof).
  */
 const WINDOWS_PROGRAM = /\.(?:exe|com|cmd|bat)$/i;
 export async function inventoryOfflineFiles(root, paths, runtimeName, platform = process.platform) {
@@ -31,7 +31,7 @@ export async function inventoryOfflineFiles(root, paths, runtimeName, platform =
  * The files the shared Codex proxy needs beside it: its entry and every
  * relative module it imports, transitively. The package used to copy a fixed
  * list, so a new import (`codex-socket.js`) was left behind and the proxy
- * could not even load (RCA 2026-10-01, agent-os-proof run 36907602087).
+ * could not even load.
  * `sourceExtension` reads `.ts` sources for a `.js` import, for tests.
  */
 export function codexLocalProxyFiles(directory, { entry = "codex-local-proxy.js", sourceExtension = ".js" } = {}) {
@@ -52,7 +52,7 @@ export function codexLocalProxyFiles(directory, { entry = "codex-local-proxy.js"
 /**
  * What the build changes in an agent's package for one platform. The Codex
  * bridge patch carries Konteks's session naming, so every platform gets it
- * (D130: Windows shipped it unpatched and no thread read "[konteks]"); only
+ * (Windows shipped it unpatched and no thread read "[konteks]"); only
  * the shared app-server proxy is Unix-only.
  */
 export function offlineAgentPatches(agent, os) {

@@ -4,7 +4,7 @@ import { z } from "zod";
 import { isFsErrorWithCode, writeSecretFile, type OwnershipScope } from "@konteks/remote-common";
 
 /**
- * Per-agent ownership scope state (D101), kept inside the private credential
+ * Per-agent ownership scope state, kept inside the private credential
  * volume next to the login it describes. Holds only the opaque keyed
  * fingerprint — never an account identifier — and the scope the operator
  * attested. Any fingerprint change resets the scope to `personal`.
@@ -19,9 +19,9 @@ export const AgentScopeStateSchema = z
   .strict();
 export type AgentScopeState = z.infer<typeof AgentScopeStateSchema>;
 
-export const SCOPE_FILE_NAME = "agent-scope.json";
+const SCOPE_FILE_NAME = "agent-scope.json";
 
-export type ScopeTransition =
+type ScopeTransition =
   | { kind: "unchanged"; state: AgentScopeState }
   | { kind: "attested"; state: AgentScopeState }
   | { kind: "reset"; state: AgentScopeState; previousScope: OwnershipScope };
@@ -41,25 +41,25 @@ export function applyIdentityObservation(
   state: AgentScopeState,
   observation: { fingerprint: string | null; organizationAttested: boolean; at: string; isLogin: boolean },
 ): ScopeTransition {
-  const identityChanged =
-    observation.fingerprint !== null && state.authIdentityFingerprint !== null && observation.fingerprint !== state.authIdentityFingerprint;
-  const loggedOut = observation.fingerprint === null && state.authIdentityFingerprint !== null;
   let next: AgentScopeState = {
     ...state,
     authIdentityFingerprint: observation.fingerprint,
     ...(observation.isLogin ? { lastLoginAt: observation.at } : {}),
   };
-  let reset = false;
-  if (identityChanged || loggedOut) {
-    if (state.accountScope === "organization") reset = true;
-    next = { ...next, accountScope: "personal", scopeAttestedAt: null };
-  }
+  const lost = identityLost(state.authIdentityFingerprint, observation.fingerprint);
+  const reset = lost && state.accountScope === "organization";
+  if (lost) next = { ...next, accountScope: "personal", scopeAttestedAt: null };
   if (observation.organizationAttested && observation.fingerprint !== null) {
     next = { ...next, accountScope: "organization", scopeAttestedAt: observation.at };
     return { kind: "attested", state: next };
   }
   if (reset) return { kind: "reset", state: next, previousScope: "organization" };
   return { kind: "unchanged", state: next };
+}
+
+/** A known identity was replaced by another or signed out. */
+function identityLost(previous: string | null, observed: string | null): boolean {
+  return previous !== null && observed !== previous;
 }
 
 export class AgentScopeStore {

@@ -4,7 +4,7 @@ import { waitWhileStarting } from "../native/commands.js";
 
 const unavailable = () => new RemoteInstanceError("control_socket_unavailable", "cannot reach the supervisor control socket");
 
-describe("a command run while the connector is still starting (WS1-167)", () => {
+describe("a command run while the connector is still starting", () => {
   it("waits for it and says so once, then goes on", async () => {
     let now = 0;
     const call = vi.fn().mockRejectedValueOnce(unavailable()).mockRejectedValueOnce(unavailable()).mockResolvedValue({});

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FETCHED_AGENT_PINS, fetchedAgentFolderName, fetchedAgentPin, fetchedAgentPlatformKey, fetchedAgentPlatformPin } from "../fetched-agents.js";
-import { HOST_AGENT_BRIDGES, SUPPORTED_AGENT_BRIDGES, compareAgentVersions, findAgentBridge, hostAgentFamily, hostAgentVersionSupported, hostInstallCommand, isFetchedAgentId, isHostAgentId, type HostAgentFamily } from "../bridges.js";
+import { HOST_AGENT_BRIDGES, SUPPORTED_AGENT_BRIDGES, compareAgentVersions, findAgentBridge, hostAgentFamily, hostAgentVersionSupported, hostInstallCommand, isHostAgentId, type HostAgentFamily } from "../bridges.js";
 
 describe("host-installed agent families", () => {
   it("registers DeepSeek Harness as a host-installed family, outside the signed bundled matrix", () => {
@@ -67,22 +67,18 @@ describe("host-installed agent families", () => {
   it("names `agent add` as the install command of a fetched agent, whatever its record says", () => {
     const fetched = { ...hostAgentFamily("opencode"), agentId: "opencode", hostInstall: { ...hostAgentFamily("opencode").hostInstall, launch: "fetched" as const } } as HostAgentFamily;
     for (const platform of ["darwin", "linux", "win32"] as const) expect(hostInstallCommand(fetched, platform)).toBe("konteks-remote agent add opencode");
-    expect(isFetchedAgentId("opencode")).toBe(false);
-    expect(isFetchedAgentId("dsh")).toBe(false);
-    expect(isFetchedAgentId("codex")).toBe(false);
   });
 
-  it("registers Google Antigravity as a fetched host agent, never bundled, with Google's release pinned (A1, A3, A15)", () => {
+  it("registers Google Antigravity as a fetched host agent, never bundled, with Google's release pinned", () => {
     const antigravity = hostAgentFamily("antigravity");
     expect(antigravity).toMatchObject({ displayName: "Google Antigravity", package: "antigravity-acp", version: "1.2.1", command: [] });
     expect(antigravity.hostInstall).toMatchObject({ launch: "fetched", versions: { min: "1.2.1", belowCore: "1.3.0" } });
     expect(isHostAgentId("antigravity")).toBe(true);
-    expect(isFetchedAgentId("antigravity")).toBe(true);
     expect(SUPPORTED_AGENT_BRIDGES.some(bridge => bridge.agentId === "antigravity")).toBe(false);
     for (const platform of ["darwin", "linux", "win32"] as const) expect(hostInstallCommand(antigravity, platform)).toBe("konteks-remote agent add antigravity");
     for (const version of ["1.2.1", "1.2.12"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(true);
     for (const version of ["1.1.1", "1.3.0", "1.3.0-rc.1", "2.0.0"]) expect(hostAgentVersionSupported(antigravity, version), version).toBe(false);
-    // The pin: only macOS arm64 is proven (A11); the connector never follows the registry itself.
+    // The pin: only macOS arm64 is proven; the connector never follows the registry itself.
     expect(FETCHED_AGENT_PINS.map(pin => pin.agentId)).toEqual(["antigravity"]);
     const pin = fetchedAgentPin("antigravity")!;
     expect(pin).toMatchObject({ registryId: "antigravity-acp", version: "1.2.1", terms: "https://antigravity.google/terms" });

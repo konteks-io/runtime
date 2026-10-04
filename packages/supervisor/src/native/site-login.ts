@@ -30,13 +30,13 @@ export interface SiteLoginReport {
   failure?: Failure;
 }
 
-export interface SiteLoginRelayOptions {
+interface SiteLoginRelayOptions {
   loginId: string;
   agentId: Agent;
   /** OpenCode's or Antigravity's sign-in option; every report echoes it. */
   loginOption?: AgentLoginOptionId;
   /**
-   * Core takes `no_license` as a failure (a 7.1.0 Core, CP3 prep): a Gemini
+   * Core takes `no_license` as a failure (from Core 7.1.0): a Gemini
    * Enterprise sign-in that found no licence says so; otherwise it reads
    * `login_failed`.
    */
@@ -50,10 +50,10 @@ export interface SiteLoginRelayOptions {
 }
 
 /**
- * A login a person started from the site (WS1-115, OpenCode CP3): the agent's
+ * A login a person started from the site: the agent's
  * own device login runs on this machine and only the provider link and code
  * go back to Core. Claude Code, OpenCode's browser sign-ins (GitLab, Poe) and
- * Google Antigravity's Gemini Enterprise (antigravity CP3) finish in a
+ * Google Antigravity's Gemini Enterprise finish in a
  * browser this machine opens: nothing is shown but Google's page (never the
  * licence picker Antigravity serves on loopback).
  * A login that asks for typed input is stopped. Links must be on the agent's
@@ -77,35 +77,43 @@ export function siteLoginRelay(options: SiteLoginRelayOptions) {
     if (over || (!url && !browser)) return;
     report({ state: "awaiting_person", ...(url ? { verificationUrl: url } : {}), ...(code && !browser ? { userCode: code } : {}) });
   };
+  const onOpenUrl = (event: { url: string; userCode?: string | undefined }) => {
+    if (!agentLoginUrlAllowed(options.agentId, event.url, options.loginOption)) return;
+    url = event.url;
+    if (event.userCode && codeSchema.safeParse(event.userCode).success) code = event.userCode;
+    awaiting();
+  };
+  // Codex's code may come on its own line after the link (OpenCode's relay
+  // sends it with the link: its codes take several shapes).
+  const onDisplay = (text: string) => {
+    if (browser || options.agentId === "opencode") return;
+    const found = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/.exec(text)?.[1];
+    if (found && found !== code) {
+      code = found;
+      awaiting();
+    }
+  };
+  const onPrompt = () => {
+    // The browser's own callback completes a browser login.
+    if (browser) return;
+    options.cancel();
+    finish({ state: "failed", failure: "login_failed" });
+  };
+  const onFailed = (reason: string | undefined) => {
+    const noLicense = reason === "no_license" && options.coreAcceptsNoLicense === true
+      && options.agentId === "antigravity" && options.loginOption === "gemini-enterprise";
+    finish({ state: "failed", failure: noLicense ? "no_license" : "login_failed" });
+  };
   return {
     browser,
     emit(event: ControlLoginEvent): void {
-      if (event.kind === "open_url") {
-        if (!agentLoginUrlAllowed(options.agentId, event.url, options.loginOption)) return;
-        url = event.url;
-        if (event.userCode && codeSchema.safeParse(event.userCode).success) code = event.userCode;
-        awaiting();
-      } else if (event.kind === "display" && !browser && options.agentId !== "opencode") {
-        // Codex's code may come on its own line after the link (OpenCode's
-        // relay sends it with the link: its codes take several shapes).
-        const found = /\b([A-Z0-9]{4,5}-[A-Z0-9]{4,5})\b/.exec(event.text)?.[1];
-        if (found && found !== code) {
-          code = found;
-          awaiting();
-        }
-      } else if (event.kind === "prompt") {
-        // The browser's own callback completes a browser login.
-        if (browser) return;
-        options.cancel();
-        finish({ state: "failed", failure: "login_failed" });
-      } else if (event.kind === "completed") {
+      if (event.kind === "open_url") onOpenUrl(event);
+      else if (event.kind === "display") onDisplay(event.text);
+      else if (event.kind === "prompt") onPrompt();
+      else if (event.kind === "completed") {
         finish({ state: "succeeded" });
         options.onSucceeded?.();
-      } else if (event.kind === "failed") {
-        const noLicense = event.reason === "no_license" && options.coreAcceptsNoLicense === true
-          && options.agentId === "antigravity" && options.loginOption === "gemini-enterprise";
-        finish({ state: "failed", failure: noLicense ? "no_license" : "login_failed" });
-      }
+      } else if (event.kind === "failed") onFailed(event.reason);
     },
     /** The agent's login started: a browser login is awaiting the person at once. */
     started(): void {
@@ -118,8 +126,8 @@ export function siteLoginRelay(options: SiteLoginRelayOptions) {
 }
 
 /**
- * What a connector with OpenCode installed advertises on its `agent_runner`
- * (CP3): the free-models switch it reads from the desired configuration, and,
+ * What a connector with OpenCode installed advertises on its `agent_runner`:
+ * the free-models switch it reads from the desired configuration, and,
  * while the relay can carry a site-started login, `agent-login-opencode-v1`
  * with one capability per reviewed sign-in its OpenCode offers (a browser one
  * only where this machine can open a browser).
@@ -134,11 +142,11 @@ export function openCodeRunnerCapabilities(input: { installed: boolean; relayRea
 }
 
 /**
- * What a connector with Google Antigravity advertises on its `agent_runner`
- * (antigravity CP3): while the relay can carry a site-started login and this
+ * What a connector with Google Antigravity advertises on its `agent_runner`:
+ * while the relay can carry a site-started login and this
  * machine can open a browser, `agent-login-antigravity-v1` with one
  * capability per released sign-in (Gemini Enterprise; personal Google
- * sign-in is held back, A10). Nothing otherwise: whether Core takes 7.1
+ * sign-in is held back). Nothing otherwise: whether Core takes 7.1
  * fields is the generic `core-contract-version-v1` signal (inventory.ts).
  */
 export function antigravityRunnerCapabilities(input: { installed: boolean; relayReady: boolean; options: readonly AgentLoginOptionId[]; desktop: boolean }): string[] {

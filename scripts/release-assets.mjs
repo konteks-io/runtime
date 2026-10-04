@@ -10,8 +10,8 @@
  *   collect — release job: merge every platform's staging directory.
  *   commands — release job: `commands.json`, the konteks-remote commands a
  *             person runs on a connected computer for this release
- *             (packages/release/src/connector-commands.json plus the version; runtime-view
- *             R20). The site reads it from this release's assets, so the
+ *             (packages/release/src/connector-commands.json plus the version).
+ *             The site reads it from this release's assets, so the
  *             page never lists a command the installed connector lacks.
  *   verify  — release job: every manifest artifact is present with its exact bytes.
  *   notes   — release job: human-readable release notes from the manifest.
@@ -46,7 +46,7 @@ switch (command) {
       node("scripts/build-offline-agent.mjs", ["--agent", agent, "--os", args.os, "--architecture", args.architecture, "--approval", args.approval, "--out", join(out, name), "--profile", profile]);
       node("scripts/native-artifact-index.mjs", ["--file", join(out, name), "--profile", profile, "--id", `${agent}-${args.os}-${args.architecture}`, "--kind", "agent_bridge", "--format", "offline_agent_tgz", "--agent", agent, "--os", args.os, "--architecture", args.architecture, "--url", url(name), "--out", join(out, `${agent}-${args.os}-${args.architecture}.artifact.json`)]);
     }
-    // Graft rides next to the connector, listed in SHA256SUMS (W1-G1). It is
+    // Graft rides next to the connector, listed in SHA256SUMS. It is
     // a local tool Core never hands out, so it is not a manifest artifact.
     if (args.os !== "windows") node("scripts/build-offline-tool.mjs", ["--tool", "graft", "--out", join(out, `konteks-graft-${args.os}-${args.architecture}.tgz`)]);
     copyFileSync(args.package, join(out, basename(args.package)));
@@ -121,12 +121,32 @@ function checkCommands(commands) {
   if (!Array.isArray(commands) || commands.length === 0 || commands.length > 64) fail("connector commands must be 1 to 64 entries");
   const ids = new Set();
   for (const entry of commands) {
-    if (!entry || typeof entry.id !== "string" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(entry.id) || ids.has(entry.id)) fail(`connector command id ${JSON.stringify(entry?.id)} is invalid or repeated`);
+    if (!validCommandId(entry, ids)) fail(`connector command id ${JSON.stringify(entry?.id)} is invalid or repeated`);
     ids.add(entry.id);
-    if (typeof entry.command !== "string" || !entry.command.startsWith("konteks-remote") || entry.command.length > 512 || /[\u0000-\u001f\u007f]/.test(entry.command)) fail(`connector command ${entry.id} is not one konteks-remote line`);
-    if (typeof entry.description !== "string" || entry.description.length === 0 || entry.description.length > 200 || /[\u0000-\u001f\u007f]/.test(entry.description)) fail(`connector command ${entry.id} needs one plain line`);
-    if (!Array.isArray(entry.os) || entry.os.length === 0 || new Set(entry.os).size !== entry.os.length || entry.os.some(os => !["macos", "windows", "debian"].includes(os))) fail(`connector command ${entry.id} names unknown systems`);
+    const problem = commandProblem(entry);
+    if (problem) fail(`connector command ${entry.id} ${problem}`);
   }
+}
+
+function validCommandId(entry, ids) {
+  return Boolean(entry) && typeof entry.id === "string" && /^[a-z][a-z0-9_.-]{0,63}$/.test(entry.id) && !ids.has(entry.id);
+}
+
+/** What is wrong with one command's line, description or systems; null when nothing is. */
+function commandProblem(entry) {
+  if (!(plainLine(entry.command, 512) && entry.command.startsWith("konteks-remote"))) return "is not one konteks-remote line";
+  if (!(plainLine(entry.description, 200) && entry.description.length > 0)) return "needs one plain line";
+  if (!knownSystems(entry.os)) return "names unknown systems";
+  return null;
+}
+
+/** One line of at most `max` characters with no control characters. */
+function plainLine(value, max) {
+  return typeof value === "string" && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function knownSystems(os) {
+  return Array.isArray(os) && os.length > 0 && new Set(os).size === os.length && os.every(system => ["macos", "windows", "debian"].includes(system));
 }
 
 function walk(directory) { return readdirSync(directory).flatMap(name => { const path = join(directory, name); return statSync(path).isDirectory() ? walk(path) : [path]; }); }

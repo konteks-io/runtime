@@ -1,8 +1,9 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
+import { plainRecord } from "@konteks/remote-common";
 
 /**
- * Which tool a permission request asks for, read only from structured fields
- * (external-integration Stage 0, S0-4 / invariant N10). A request's `title` is
+ * Which tool a permission request asks for, read only from structured fields.
+ * A request's `title` is
  * display text: Claude Code's shell title is the model-written description,
  * and an MCP tool chooses its own display title, so a title never identifies
  * a tool and never grants anything.
@@ -19,9 +20,6 @@ export type PermissionToolIdentity =
   | { kind: "native"; tool: string }
   | { kind: "unidentified"; mcp: boolean };
 
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
 
 const MAX_NAME = 256;
 const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= MAX_NAME;
@@ -32,8 +30,24 @@ export function claudeMcpServerSegment(name: string): string {
 }
 
 /** Codex's MCP server key for an ACP server name (codex-acp `sanitizeMcpServerName`): whitespace becomes `_`. */
-export function codexMcpServerName(name: string): string {
+function codexMcpServerName(name: string): string {
   return name.replace(/\s/g, "_");
+}
+
+function toolCallUpdate(value: Record<string, unknown> | undefined): value is Record<string, unknown> & { toolCallId: string } {
+  return value !== undefined && (value.sessionUpdate === "tool_call" || value.sessionUpdate === "tool_call_update") && nonEmpty(value.toolCallId);
+}
+
+/**
+ * A `tool_call` Codex marked as an MCP call, with its server, tool and the
+ * call's own arguments, kept for an integration gate that must judge the
+ * exact arguments of a Codex approval (which names only the id).
+ */
+function announcedMcpCall(value: Record<string, unknown>): { server: string; tool: string; arguments?: unknown } | null {
+  if (value.sessionUpdate !== "tool_call" || plainRecord(value._meta)?.is_mcp_tool_call !== true) return null;
+  const raw = plainRecord(value.rawInput);
+  if (!raw || !nonEmpty(raw.server) || !nonEmpty(raw.tool)) return null;
+  return { server: raw.server, tool: raw.tool, ...("arguments" in raw ? { arguments: raw.arguments } : {}) };
 }
 
 /**
@@ -48,19 +62,16 @@ export class McpToolCallLedger {
   constructor(private readonly limit = 512) {}
 
   observe(update: unknown): void {
-    const value = record(update);
-    if (!value || (value.sessionUpdate !== "tool_call" && value.sessionUpdate !== "tool_call_update") || !nonEmpty(value.toolCallId)) return;
+    const value = plainRecord(update);
+    if (!toolCallUpdate(value)) return;
     if (value.status === "completed" || value.status === "failed") {
       this.calls.delete(value.toolCallId);
       return;
     }
-    if (value.sessionUpdate !== "tool_call" || record(value._meta)?.is_mcp_tool_call !== true) return;
-    const raw = record(value.rawInput);
-    if (!raw || !nonEmpty(raw.server) || !nonEmpty(raw.tool)) return;
+    const call = announcedMcpCall(value);
+    if (!call) return;
     this.calls.delete(value.toolCallId);
-    // The call's own arguments, kept for an integration gate that must judge
-    // the exact arguments of a Codex approval (which names only the id).
-    this.calls.set(value.toolCallId, { server: raw.server, tool: raw.tool, ...("arguments" in raw ? { arguments: raw.arguments } : {}) });
+    this.calls.set(value.toolCallId, call);
     while (this.calls.size > this.limit) this.calls.delete(this.calls.keys().next().value!);
   }
 
@@ -75,7 +86,7 @@ export class McpToolCallLedger {
   }
 }
 
-export interface PermissionIdentityInputs {
+interface PermissionIdentityInputs {
   /** The MCP servers this session gave its agent (their ACP names). */
   sessionServers?: ReadonlySet<string>;
   /** Codex's announced MCP calls (relayed-session observes every session update). */
@@ -96,23 +107,32 @@ function claudeMcpIdentity(name: string, servers: ReadonlySet<string> | undefine
 }
 
 export function permissionToolIdentity(request: RequestPermissionRequest, agentId: string, inputs: PermissionIdentityInputs = {}): PermissionToolIdentity {
-  const toolCall = record(request.toolCall) ?? {};
-  if (agentId === "claude-code") {
-    // The Stage 0 bridge names the tool here (claude-acp-settings-patch v3).
-    const toolName = record(record(toolCall._meta)?.claudeCode)?.toolName;
-    if (!nonEmpty(toolName)) return { kind: "unidentified", mcp: false };
-    return toolName.startsWith("mcp__") ? claudeMcpIdentity(toolName, inputs.sessionServers) : { kind: "native", tool: toolName };
-  }
-  if (agentId === "codex") {
-    // codex-acp marks an MCP tool approval; an MCP server's own elicitation
-    // carries its server name in rawInput. Both are MCP, never native.
-    if (record(request._meta)?.is_mcp_tool_approval === true || typeof record(toolCall.rawInput)?.serverName === "string") {
-      const call = nonEmpty(toolCall.toolCallId) ? inputs.ledger?.get(toolCall.toolCallId) : undefined;
-      if (!call) return { kind: "unidentified", mcp: true };
-      const server = [...(inputs.sessionServers ?? [])].find(name => codexMcpServerName(name) === call.server) ?? call.server;
-      return { kind: "mcp", server, tool: call.tool };
-    }
-    return nonEmpty(toolCall.kind) ? { kind: "native", tool: toolCall.kind } : { kind: "unidentified", mcp: false };
-  }
+  const toolCall = plainRecord(request.toolCall) ?? {};
+  if (agentId === "claude-code") return claudeIdentity(toolCall, inputs);
+  if (agentId === "codex") return codexIdentity(request, toolCall, inputs);
   return { kind: "unidentified", mcp: false };
+}
+
+/** The bridge names the tool in `_meta.claudeCode.toolName`. */
+function claudeIdentity(toolCall: Record<string, unknown>, inputs: PermissionIdentityInputs): PermissionToolIdentity {
+  const toolName = plainRecord(plainRecord(toolCall._meta)?.claudeCode)?.toolName;
+  if (!nonEmpty(toolName)) return { kind: "unidentified", mcp: false };
+  return toolName.startsWith("mcp__") ? claudeMcpIdentity(toolName, inputs.sessionServers) : { kind: "native", tool: toolName };
+}
+
+/**
+ * codex-acp marks an MCP tool approval; an MCP server's own elicitation
+ * carries its server name in rawInput. Both are MCP, never native.
+ */
+function codexIdentity(request: RequestPermissionRequest, toolCall: Record<string, unknown>, inputs: PermissionIdentityInputs): PermissionToolIdentity {
+  if (plainRecord(request._meta)?.is_mcp_tool_approval === true || typeof plainRecord(toolCall.rawInput)?.serverName === "string") return codexMcpIdentity(toolCall, inputs);
+  return nonEmpty(toolCall.kind) ? { kind: "native", tool: toolCall.kind } : { kind: "unidentified", mcp: false };
+}
+
+/** The announced call the approval names, under the session server it belongs to. */
+function codexMcpIdentity(toolCall: Record<string, unknown>, inputs: PermissionIdentityInputs): PermissionToolIdentity {
+  const call = nonEmpty(toolCall.toolCallId) ? inputs.ledger?.get(toolCall.toolCallId) : undefined;
+  if (!call) return { kind: "unidentified", mcp: true };
+  const server = [...(inputs.sessionServers ?? [])].find(name => codexMcpServerName(name) === call.server) ?? call.server;
+  return { kind: "mcp", server, tool: call.tool };
 }

@@ -15,14 +15,14 @@ export function jcsDigest(value: JsonValue): string {
 }
 
 /**
- * `payloadDigest` for an `AssignmentReport` (D125): the report with
+ * `payloadDigest` for an `AssignmentReport`: the report with
  * `reportedAt` and `payloadDigest` removed, canonicalized, hashed.
  */
 export function reportPayloadDigest(report: { [key: string]: JsonValue }): string {
   return jcsDigest(withoutMembers(report, ["reportedAt", "payloadDigest"]));
 }
 
-/** Keyed hash used for the opaque `authIdentityFingerprint` (D111). */
+/** Keyed hash used for the opaque `authIdentityFingerprint`. */
 export function keyedFingerprint(key: Uint8Array, identitySignal: string): string {
   const digest = createHmac("sha256", key).update(identitySignal).digest("base64url");
   // Wire snapshot identities must start with an alphanumeric character.

@@ -2,7 +2,7 @@ import { createServer } from "node:net";
 import { describe, expect, it } from "vitest";
 import { chooseControlPort } from "../native/install.js";
 
-/** A second connector on one machine must not inherit a taken port (WS1-020). */
+/** A second connector on one machine must not inherit a taken port. */
 describe("chooseControlPort", () => {
   it("keeps the preferred port when it is free and picks another when it is taken", async () => {
     const free = await chooseControlPort(0);

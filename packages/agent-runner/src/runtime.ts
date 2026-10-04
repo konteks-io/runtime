@@ -1,20 +1,20 @@
 import { mkdir, readFile } from "node:fs/promises";
 import type { InitializeResponse } from "@agentclientprotocol/sdk";
 import { join } from "node:path";
-import { RemoteInstanceError, createLogger, writeSecretFile, type AgentLoginOptionId, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
+import { RemoteInstanceError, createLogger, withoutUndefined, writeSecretFile, type AgentLoginOptionId, type ConnectedAgentCredential, type ConnectedAgentView, type Logger, type RetainedProcessOwner } from "@konteks/remote-common";
 import type { AgentBridgeFamily } from "@konteks/remote-release";
 import { fallbackLoginIdentity, probeIdentity, type IdentityProbe } from "./auth/identity.js";
-import { runLogout, startLoginFlow, type LoginFlow } from "./auth/login-flow.js";
+import { runLogout, startLoginFlow, type LoginFailureReason, type LoginFlow } from "./auth/login-flow.js";
 import { hostAgentRunnerAdapter } from "./host/registry.js";
 import { DEFAULT_HOST_AGENT_SETTINGS, type HostAgentRunnerAdapter, type HostAgentSettings, type HostLoginRequest, type HostSpawn, type HostWorkingCopyBinding } from "./host/host-agent.js";
 import { AgentScopeStore, applyIdentityObservation, type AgentScopeState } from "./auth/scope-store.js";
-import { classifyBridgeError, spawnBridge, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
+import { classifyBridgeError, spawnBridge, type BridgeClientHandlers, type BridgeProcess, type BridgeStopOwner, type SpawnBridgeOptions } from "./bridge/process.js";
 import { MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS, definiteModelDiscoveryFailure, discoverBridgeModelCapability, offerableModelCapability, type DiscoveredBridgeModelCapability } from "./bridge/model-capability.js";
 import { resolveBridgeSpawnSpec, verifyNativeRunnerPackage, type BridgeSpawnSpec } from "./bridge/spec.js";
 import type { RunnerConfig } from "./config.js";
 import { RunnerEventBus } from "./events.js";
 import { projectReadiness } from "./readiness.js";
-import { SessionManager, type SessionRefStore, type TurnUsageLabel } from "./sessions/manager.js";
+import { SessionManager, type SessionManagerOptions, type SessionRefStore, type TurnUsageLabel } from "./sessions/manager.js";
 import { AVAILABLE_COMMANDS_FILE, AvailableCommandsStore } from "./sessions/available-commands.js";
 import { turnUsageLabel } from "./sessions/usage-label.js";
 
@@ -45,14 +45,14 @@ export interface AgentRuntimeOptions {
 }
 
 /**
- * The offered models are re-read at least this often (System One §6a, KM6),
+ * The offered models are re-read at least this often ,
  * so a model the agent starts offering shows up without a restart. A sign-in
  * change re-reads at once: the account fingerprint is part of the cache key.
  */
-export const DEFAULT_MODEL_CAPABILITY_TTL_MS = 5 * 60_000;
+const DEFAULT_MODEL_CAPABILITY_TTL_MS = 5 * 60_000;
 
 /** A wedged agent process must not outlive the conversation it served. */
-export const DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS = 30 * 60_000;
+const DEFAULT_IDLE_EXECUTION_BRIDGE_TTL_MS = 30 * 60_000;
 
 // `finalized` separates the two questions this record answers. A key is kept
 // forever so a reference is never reused, but a finalized owner no longer
@@ -139,7 +139,7 @@ class FileSessionRefStore implements SessionRefStore {
  * escalation reaches Konteks's permission callback rather than Codex's own
  * auto-reviewer ("Approve for me", `agent`). It is applied before ready on
  * new, restored and live-continued sessions, and every other mode is refused,
- * including one a later codex-acp adds (external-integration Stage 0, S0-3).
+ * including one a later codex-acp adds (external-integration Stage 0).
  */
 export const CODEX_SESSION_GOVERNANCE = {
   defaultSessionConfig: { mode: "read-only" },
@@ -149,6 +149,103 @@ export const CODEX_SESSION_GOVERNANCE = {
     message: "Codex runs in Ask for approval mode on Konteks so workspace policy decides every sensitive action.",
   },
 } as const;
+
+/** Codex sessions are pinned to Ask for approval; a host agent refuses its own unsafe modes. */
+function sessionGovernance(agentId: string, host: HostAgentRunnerAdapter | null): Pick<SessionManagerOptions, "defaultSessionConfig" | "refusedModes"> {
+  if (agentId === "codex") return { defaultSessionConfig: CODEX_SESSION_GOVERNANCE.defaultSessionConfig, refusedModes: CODEX_SESSION_GOVERNANCE.refusedModes };
+  return host?.refusedSessionModes ? { refusedModes: host.refusedSessionModes } : {};
+}
+
+/** What a host agent's adapter adds to its sessions: refused commands, offered models, session checks and prompt preludes. */
+function hostSessionHooks(host: HostAgentRunnerAdapter, config: RunnerConfig, settings: () => HostAgentSettings): Partial<SessionManagerOptions> {
+  return {
+    ...(host.refusedPromptCommands ? { refusedPromptCommands: host.refusedPromptCommands } : {}),
+    ...(host.offersModel ? { modelAllowed: (value: string) => host.offersModel!(value, settings()) } : {}),
+    ...(host.sessionMeta ? { sessionMeta: host.sessionMeta } : {}),
+    ...(host.verifySession ? { verifySession: (response: { configOptions?: unknown; modes?: unknown }) => host.verifySession!(response) } : {}),
+    ...(host.promptPrelude ? { promptPrelude: (session: { cwd: string; sessionKey: string }) => host.promptPrelude!(config, session) } : {}),
+    ...(host.agentErrorText ? { agentErrorText: (text: string) => host.agentErrorText!(text) } : {}),
+    ...measuredTurns(host, settings),
+  };
+}
+
+/** A turn measured outside the agent is pay-per-use: only a Core that takes it gets it. */
+function measuredTurns(host: HostAgentRunnerAdapter, settings: () => HostAgentSettings): Partial<SessionManagerOptions> {
+  if (!host.measureTurn) return {};
+  return { measureTurn: (bridge: BridgeProcess) => {
+    const read = host.measureTurn!(bridge);
+    return read ? () => (settings().coreAcceptsRouteBilling ? read() : null) : null;
+  } };
+}
+
+function signalTokenUsage(result: IdentityProbe): boolean | undefined {
+  return result.kind === "signal" ? result.tokenUsageObservable : undefined;
+}
+
+/** The record holds `owner`'s exact live process. */
+function liveOwnerOf(record: ExecutionOwner, owner: RetainedProcessOwner): boolean {
+  const identity = record.durable?.retainedProcessOwner;
+  return identity !== undefined && !record.finalized && !record.durable!.exited && sameRetainedOwner(identity, owner);
+}
+
+/** A process that failed to start is worth a fresh one unless the failure was a definite refusal. */
+function startupRetryable(error: unknown): boolean {
+  return !(error instanceof RemoteInstanceError) || error.code === "agent_unavailable" || error.retryable;
+}
+
+function startupErrorFields(error: unknown): { errorClass: string; errorCode: string; diagnostic: string | undefined } {
+  return {
+    errorClass: classifyBridgeError(error).class,
+    errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_initialize_failed",
+    diagnostic: error instanceof RemoteInstanceError ? error.diagnostic : undefined,
+  };
+}
+
+/** Exponential backoff with jitter, at most 2 s, before a fresh process. */
+function freshProcessDelayMs(attempt: number, random: () => number): number {
+  const exponentialMs = 500 * (2 ** (attempt - 1));
+  return Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + (random() * 0.5)))));
+}
+
+function runtimeDefaults(options: AgentRuntimeOptions): { events: RunnerEventBus; logger: Logger; now: () => Date } {
+  return {
+    events: options.events ?? new RunnerEventBus(),
+    logger: options.logger ?? createLogger({ name: `runner-${options.config.RUNNER_AGENT_ID}` }),
+    now: options.now ?? (() => new Date()),
+  };
+}
+
+/** How every process of this agent is spawned: the runtime's own, or its adapter's around it (Antigravity's key relay). */
+function runtimeSpawn(host: HostAgentRunnerAdapter | null, options: AgentRuntimeOptions): HostSpawn {
+  const spawn = options.spawn ?? spawnBridge;
+  return host?.wrapSpawn ? host.wrapSpawn(options.config, spawn) : spawn;
+}
+
+function refusedCommandNames(host: HostAgentRunnerAdapter | null): readonly string[] {
+  return host?.refusedPromptCommands?.commands ?? [];
+}
+
+type SessionLifecycle = NonNullable<Parameters<SessionManager["create"]>[0]["lifecycle"]>;
+
+/**
+ * The attempt's lifecycle: a candidate's durable owner replaces the previous
+ * candidate's (or is recorded first), and is remembered for the next attempt.
+ */
+function bootstrapLifecycle(lifecycle: SessionLifecycle | undefined, owners: { durablePrevious: RetainedProcessOwner | undefined }, persisted: { candidate?: RetainedProcessOwner }): SessionLifecycle | undefined {
+  if (!lifecycle) return undefined;
+  return {
+    ...lifecycle,
+    recordProcessOwner: async (candidate: RetainedProcessOwner) => {
+      if (owners.durablePrevious) {
+        if (!lifecycle.replaceProcessOwner) throw new RemoteInstanceError("recovery_required", "Durable bootstrap process-owner replacement is unavailable.");
+        await lifecycle.replaceProcessOwner(owners.durablePrevious, candidate);
+      } else {
+        await lifecycle.recordProcessOwner(candidate);
+      }
+      persisted.candidate = candidate;
+    },
+  };
+}
 
 export class AgentRuntime {
   readonly events: RunnerEventBus;
@@ -199,45 +296,36 @@ export class AgentRuntime {
   private controlIdleTimer: NodeJS.Timeout | null = null;
   /** What the control process answered before it was stopped for being idle; readiness keeps reading it. */
   private parkedInitializeResult: InitializeResponse | null = null;
-  /** The slash commands this agent announced on this computer (runtime-view R19), kept across restarts. */
+  /** The slash commands this agent announced on this computer, kept across restarts. */
   private readonly availableCommands: AvailableCommandsStore;
 
   constructor(private readonly options: AgentRuntimeOptions) {
-    this.events = options.events ?? new RunnerEventBus();
-    this.logger = options.logger ?? createLogger({ name: `runner-${options.config.RUNNER_AGENT_ID}` });
-    this.now = options.now ?? (() => new Date());
+    const defaults = runtimeDefaults(options);
+    this.events = defaults.events;
+    this.logger = defaults.logger;
+    this.now = defaults.now;
     this.spec = resolveBridgeSpawnSpec(options.config);
     this.family = this.spec.family;
     this.host = hostAgentRunnerAdapter(this.family.agentId) ?? null;
     this.perWorkingCopy = this.host?.bindWorkingCopy !== undefined;
-    const spawn = options.spawn ?? spawnBridge;
-    this.spawnProcess = this.host?.wrapSpawn ? this.host.wrapSpawn(options.config, spawn) : spawn;
+    this.spawnProcess = runtimeSpawn(this.host, options);
     if (this.perWorkingCopy && !options.executionBridgeLimit) {
       // Its control process has no working copy, so it never runs a session.
       throw new RemoteInstanceError("agent_unavailable", `${this.family.displayName} runs every session in a process of its own working copy.`);
     }
     this.scopeStore = new AgentScopeStore(options.config.RUNNER_CREDENTIAL_DIR);
-    this.availableCommands = new AvailableCommandsStore(join(options.config.RUNNER_CREDENTIAL_DIR, AVAILABLE_COMMANDS_FILE),
-      this.host?.refusedPromptCommands?.commands ?? [], this.logger);
-    const codexGovernance = this.family.agentId === "codex" ? CODEX_SESSION_GOVERNANCE : null;
-    this.sessions = new SessionManager({
+    this.availableCommands = new AvailableCommandsStore(join(options.config.RUNNER_CREDENTIAL_DIR, AVAILABLE_COMMANDS_FILE), refusedCommandNames(this.host), this.logger);
+    this.sessions = new SessionManager(this.sessionManagerOptions());
+  }
+
+  private sessionManagerOptions(): SessionManagerOptions {
+    const { options } = this;
+    return {
       bridge: () => this.bridge,
-      ...(options.executionBridgeLimit ? { createBridge: (ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle, cwd) } : {}),
-      ...(options.executionBridgeLimit ? { replaceBridge: (ref: string, previous: BridgeProcess, bootstrapAttempt: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle, cwd) } : {}),
+      ...this.executionBridgeHooks(),
       ...(this.perWorkingCopy ? { beforePrompt: (bridge: BridgeProcess) => this.workingCopyBindings.get(bridge)?.beforePrompt() } : {}),
-      ...(codexGovernance ? { defaultSessionConfig: codexGovernance.defaultSessionConfig, refusedModes: codexGovernance.refusedModes }
-        : this.host?.refusedSessionModes ? { refusedModes: this.host.refusedSessionModes } : {}),
-      ...(this.host?.refusedPromptCommands ? { refusedPromptCommands: this.host.refusedPromptCommands } : {}),
-      ...(this.host?.offersModel ? { modelAllowed: (value: string) => this.host!.offersModel!(value, this.hostSettings) } : {}),
-      ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
-      ...(this.host?.verifySession ? { verifySession: (response: { configOptions?: unknown; modes?: unknown }) => this.host!.verifySession!(response) } : {}),
-      ...(this.host?.promptPrelude ? { promptPrelude: (session: { cwd: string; sessionKey: string }) => this.host!.promptPrelude!(options.config, session) } : {}),
-      ...(this.host?.agentErrorText ? { agentErrorText: (text: string) => this.host!.agentErrorText!(text) } : {}),
-      // A turn measured outside the agent is pay-per-use: only a Core that takes it gets it.
-      ...(this.host?.measureTurn ? { measureTurn: (bridge: BridgeProcess) => {
-        const read = this.host!.measureTurn!(bridge);
-        return read ? () => (this.hostSettings.coreAcceptsRouteBilling ? read() : null) : null;
-      } } : {}),
+      ...sessionGovernance(this.family.agentId, this.host),
+      ...(this.host ? hostSessionHooks(this.host, options.config, () => this.hostSettings) : {}),
       usageLabel: modelValue => this.usageLabel(modelValue),
       onAvailableCommands: update => this.availableCommands.learn(update, this.now()),
       events: this.events,
@@ -251,7 +339,16 @@ export class AgentRuntime {
         // A host agent's credentials may now say why (Antigravity: no licence found).
         if (this.host?.identity && !this.stopping) void this.probe(false).catch(() => undefined);
       },
-    });
+    };
+  }
+
+  /** With execution processes, every session gets one of its own (and a fresh one when bootstrap must retry). */
+  private executionBridgeHooks(): Pick<SessionManagerOptions, "createBridge" | "replaceBridge"> {
+    if (!this.options.executionBridgeLimit) return {};
+    return {
+      createBridge: (ref, lifecycle, cwd) => this.acquireBootstrapExecutionBridge(ref, 1, undefined, lifecycle, cwd),
+      replaceBridge: (ref, previous, bootstrapAttempt, lifecycle, cwd) => this.replaceBootstrapExecutionBridge(ref, previous, bootstrapAttempt, lifecycle, cwd),
+    };
   }
 
   async start(): Promise<void> {
@@ -287,14 +384,17 @@ export class AgentRuntime {
     const previous = this.hostSettings;
     this.hostSettings = Object.freeze({ ...settings });
     const freeModelsChanged = previous.openCodeFreeModels !== settings.openCodeFreeModels && this.host?.offersModel !== undefined;
-    // What a host agent's credentials say depends on what Core takes (Antigravity's no-licence reason).
-    const coreChanged = previous.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling && this.host?.identity !== undefined;
-    if (!freeModelsChanged && !coreChanged) return;
+    if (!freeModelsChanged && !this.coreBillingChanged(previous, settings)) return;
     if (freeModelsChanged) this.modelCapabilities.clear();
     if (this.connectionState !== "unavailable" && !this.stopping) await this.probe(false);
   }
 
-  /** How one turn's usage is labelled (O7): sessions/usage-label.ts. */
+  /** What a host agent's credentials say depends on what Core takes (Antigravity's no-licence reason). */
+  private coreBillingChanged(previous: HostAgentSettings, settings: HostAgentSettings): boolean {
+    return previous.coreAcceptsRouteBilling !== settings.coreAcceptsRouteBilling && this.host?.identity !== undefined;
+  }
+
+  /** How one turn's usage is labelled: sessions/usage-label.ts. */
   private usageLabel(modelValue: string | undefined): TurnUsageLabel | null {
     return turnUsageLabel({ agentId: this.family.agentId, modelValue, credentials: this.credentials, coreAcceptsRouteBilling: this.hostSettings.coreAcceptsRouteBilling });
   }
@@ -330,7 +430,7 @@ export class AgentRuntime {
     catch (error) { this.logger.warn({ agentId: this.family.agentId, errorCode: error instanceof RemoteInstanceError ? error.code : "sweep_failed" }, "processes the agent left behind could not all be stopped"); }
   }
 
-  /** Execution processes that may live at once: the supervisor's ceiling, and the agent's own when lower (Antigravity: two, A12). */
+  /** Execution processes that may live at once: the supervisor's ceiling, and the agent's own when lower (Antigravity: two). */
   private executionLimit(): number | undefined {
     const limit = this.options.executionBridgeLimit?.();
     const own = this.host?.processLimits?.executionProcesses;
@@ -357,9 +457,7 @@ export class AgentRuntime {
   private async queueForExecutionBridge(ref: string, until: number, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
     for (let logged = false; ; logged = true) {
       const limit = this.executionLimit();
-      if (this.stopping || this.authRequired || this.activeLogin !== null || this.executionBridges.has(ref) || typeof limit !== "number" || this.heldExecutionOwners() < limit) {
-        return this.reserveExecutionBridge(ref, lifecycle, cwd);
-      }
+      if (!this.waitsForCapacity(ref, limit)) return this.reserveExecutionBridge(ref, lifecycle, cwd);
       if (Date.now() >= until) {
         throw new RemoteInstanceError("temporarily_unavailable", `${this.family.displayName} is already running ${limit} sessions on this computer. Try again when one of them finishes.`, { diagnostic: "execution_processes_busy" });
       }
@@ -369,15 +467,35 @@ export class AgentRuntime {
     }
   }
 
-  private reserveExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+  /**
+   * Only a full ceiling waits; anything else (stopping, signed out, signing
+   * in, a reference already reserved, no ceiling) goes straight to the
+   * reservation, which reserves or refuses it.
+   */
+  private waitsForCapacity(ref: string, limit: number | undefined): boolean {
+    if (this.stopping || this.authRequired || this.activeLogin !== null || this.executionBridges.has(ref)) return false;
+    return typeof limit === "number" && this.heldExecutionOwners() >= limit;
+  }
+
+  /** Why no execution owner may be reserved for `ref` now, or null. */
+  private reservationRefusal(ref: string): RemoteInstanceError | null {
     const limit = this.executionLimit();
-    if (this.authRequired) return Promise.reject(new RemoteInstanceError("agent_auth_required", "Sign in to the selected local agent.", { recoveryActions: [{ kind: "login_agent", agentId: this.family.agentId }] }));
-    if (this.activeLogin !== null) return Promise.reject(new RemoteInstanceError("temporarily_unavailable", "The local agent is signing in."));
-    // Only unfinalized owners hold capacity; retained keys still refuse reuse.
-    const held = this.heldExecutionOwners();
-    if (this.stopping || typeof limit !== "number" || !Number.isSafeInteger(limit) || limit < 1 || held >= limit || this.executionBridges.has(ref)) {
-      return Promise.reject(new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization."));
+    if (this.authRequired) return new RemoteInstanceError("agent_auth_required", "Sign in to the selected local agent.", { recoveryActions: [{ kind: "login_agent", agentId: this.family.agentId }] });
+    if (this.activeLogin !== null) return new RemoteInstanceError("temporarily_unavailable", "The local agent is signing in.");
+    if (this.stopping || !this.capacityFree(limit) || this.executionBridges.has(ref)) {
+      return new RemoteInstanceError("recovery_required", "Native execution owner capacity is unavailable; retained owners require qualified finalization.");
     }
+    return null;
+  }
+
+  /** Only unfinalized owners hold capacity; retained keys still refuse reuse. */
+  private capacityFree(limit: number | undefined): boolean {
+    return typeof limit === "number" && Number.isSafeInteger(limit) && limit >= 1 && this.heldExecutionOwners() < limit;
+  }
+
+  private reserveExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
+    const refusal = this.reservationRefusal(ref);
+    if (refusal) return Promise.reject(refusal);
     const bridge = Promise.resolve().then(async () => {
       this.assertNotQuarantined();
       await this.prepareToSpawn(this.logger);
@@ -411,9 +529,7 @@ export class AgentRuntime {
 
   private async spawnExecutionBridge(ref: string, lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"], cwd?: string): Promise<BridgeProcess> {
     const record = this.executionBridges.get(ref)!;
-    let owner: BridgeProcess | null = null;
-    let exitedDuringStart = false;
-    let ownerPersistence: Promise<void> = Promise.resolve();
+    const start: { owner: BridgeProcess | null; exitedDuringStart: boolean; ownerPersistence: Promise<void> } = { owner: null, exitedDuringStart: false, ownerPersistence: Promise.resolve() };
     const { spec, binding } = await this.executionSpec(cwd);
     const candidate = await this.spawnProcess({
       spec, initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
@@ -421,43 +537,55 @@ export class AgentRuntime {
       onProcessOwner: process => {
         record.process = process;
         record.durable = process;
-        ownerPersistence = this.persistProcessOwner(process, lifecycle);
-        return ownerPersistence;
+        start.ownerPersistence = this.persistProcessOwner(process, lifecycle);
+        return start.ownerPersistence;
       },
-      ...(this.options.executionSpawnProcess ? { spawnProcess: this.options.executionSpawnProcess } : {}),
-      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.readStderrFailure(line) } : {}),
-      // Callback authority is the initialized process object, which a later
-      // reference reuses as-is: the session manager resolves every update,
-      // permission, elicitation and exit to the sessions bound to exactly it.
-      handlers: {
-        onSessionUpdate: params => this.sessions.onSessionUpdate(params, owner),
-        onRequestPermission: params => this.sessions.onRequestPermission(params, owner),
-        onCreateElicitation: params => this.sessions.onCreateElicitation(params, owner),
-        onExit: () => {
-          this.releaseWorkingCopy(binding);
-          if (!owner) { exitedDuringStart = true; return; }
-          this.sessions.closeAll("agent_exited", owner);
-          this.observeExecutionExit(owner);
-          // An execution exit does not reset control/login readiness, nor
-          // automatically respawn an uncertain execution generation.
-        },
-      },
+      ...this.executionSpawnHooks(),
+      handlers: this.executionHandlers(start, binding),
     }).catch((error: unknown) => {
       // A process that never started never exits: undo its preparation here.
       this.releaseWorkingCopy(binding);
       throw error;
     });
     if (binding) this.workingCopyBindings.set(candidate, binding);
-    await ownerPersistence;
-    owner = candidate;
+    await start.ownerPersistence;
+    start.owner = candidate;
     record.process = candidate;
     record.live = candidate;
     record.durable ??= candidate;
-    if (this.stopping || record.stopping || exitedDuringStart || candidate.exited) {
+    if (this.stopping || record.stopping || start.exitedDuringStart || candidate.exited) {
       await candidate.stop();
       throw new RemoteInstanceError("agent_unavailable", "Execution bridge exited during initialization.");
     }
     return candidate;
+  }
+
+  private executionSpawnHooks(): Pick<SpawnBridgeOptions, "spawnProcess" | "stderrFailure"> {
+    return {
+      ...(this.options.executionSpawnProcess ? { spawnProcess: this.options.executionSpawnProcess } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.readStderrFailure(line) } : {}),
+    };
+  }
+
+  /**
+   * Callback authority is the initialized process object, which a later
+   * reference reuses as-is: the session manager resolves every update,
+   * permission, elicitation and exit to the sessions bound to exactly it.
+   */
+  private executionHandlers(start: { owner: BridgeProcess | null; exitedDuringStart: boolean }, binding: HostWorkingCopyBinding | null): BridgeClientHandlers {
+    return {
+      onSessionUpdate: params => this.sessions.onSessionUpdate(params, start.owner),
+      onRequestPermission: params => this.sessions.onRequestPermission(params, start.owner),
+      onCreateElicitation: params => this.sessions.onCreateElicitation(params, start.owner),
+      onExit: () => {
+        this.releaseWorkingCopy(binding);
+        if (!start.owner) { start.exitedDuringStart = true; return; }
+        this.sessions.closeAll("agent_exited", start.owner);
+        this.observeExecutionExit(start.owner);
+        // An execution exit does not reset control/login readiness, nor
+        // automatically respawn an uncertain execution generation.
+      },
+    };
   }
 
   /**
@@ -483,105 +611,119 @@ export class AgentRuntime {
     ref: string,
     firstAttempt: number,
     previous: BridgeProcess | undefined,
-    lifecycle?: Parameters<SessionManager["create"]>[0]["lifecycle"],
+    lifecycle?: SessionLifecycle,
     cwd?: string,
   ): Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }> {
-    let durablePrevious: RetainedProcessOwner | undefined;
-    if (previous) {
-      const owner = this.executionBridges.get(ref);
-      if (!owner || owner.live !== previous || owner.stopping || owner.finalized || !previous.exited || this.sessions.sessionsBoundTo(previous) !== 0) {
-        throw new RemoteInstanceError("recovery_required", "Bootstrap bridge replacement did not match one confirmed-stopped pre-ready owner.", {
-          diagnostic: "bootstrap_bridge_replacement_invalid",
-        });
-      }
-      durablePrevious = owner.durable?.retainedProcessOwner;
-      if (!durablePrevious || !lifecycle?.replaceProcessOwner) {
-        throw new RemoteInstanceError("recovery_required", "Durable bootstrap process-owner replacement is unavailable.", {
-          diagnostic: "bootstrap_process_owner_replacement_unavailable",
-        });
-      }
-      owner.finalized = true;
-      this.executionBridges.delete(ref);
-    }
-
+    const owners: { durablePrevious: RetainedProcessOwner | undefined } = { durablePrevious: previous ? this.retireBootstrapOwner(ref, previous, lifecycle) : undefined };
     for (let bootstrapAttempt = firstAttempt; bootstrapAttempt <= 4; bootstrapAttempt += 1) {
-      let persistedCandidate: RetainedProcessOwner | undefined;
-      const attemptLifecycle = lifecycle ? {
-        ...lifecycle,
-        recordProcessOwner: async (candidate: RetainedProcessOwner) => {
-          if (durablePrevious) {
-            if (!lifecycle.replaceProcessOwner) throw new RemoteInstanceError("recovery_required", "Durable bootstrap process-owner replacement is unavailable.");
-            await lifecycle.replaceProcessOwner(durablePrevious, candidate);
-          } else {
-            await lifecycle.recordProcessOwner(candidate);
-          }
-          persistedCandidate = candidate;
-        },
-      } : undefined;
-      const initializeStartedAt = Date.now();
-      try {
-        const bridge = await this.createExecutionBridge(ref, attemptLifecycle, cwd);
-        this.logger.info({
-          agentId: this.family.agentId,
-          acpSessionRef: ref,
-          bootstrapAttempt,
-          bridgeInitializeDurationMs: Date.now() - initializeStartedAt,
-        }, bootstrapAttempt === 1 ? "bootstrap bridge initialized" : "fresh bootstrap bridge initialized");
-        return { bridge, bootstrapAttempt };
-      } catch (error) {
-        const failedOwner = this.executionBridges.get(ref);
-        // An explicit stop/recovery owns this reference now. Its settlement
-        // promise is already waiting for the captured spawn and exact process;
-        // bootstrap must neither stop it a second time nor replace its slot.
-        if (failedOwner?.stopping) throw error;
-        let stopConfirmed = failedOwner?.process === null || failedOwner === undefined;
-        if (failedOwner?.process) {
-          try {
-            await failedOwner.process.stop();
-            stopConfirmed = failedOwner.process.exited;
-            if (!stopConfirmed) throw new RemoteInstanceError("recovery_required", "Bootstrap candidate stop returned without observed process exit.", {
-              diagnostic: "bootstrap_initialize_stop_unconfirmed",
-            });
-          } catch (stopError) {
-            this.logger.error({ agentId: this.family.agentId, acpSessionRef: ref, bootstrapAttempt,
-              bridgeInitializeDurationMs: Date.now() - initializeStartedAt, stopConfirmed: false,
-              errorClass: classifyBridgeError(stopError).class,
-              errorCode: stopError instanceof RemoteInstanceError ? stopError.code : "bridge_stop_failed",
-              diagnostic: stopError instanceof RemoteInstanceError ? stopError.diagnostic : undefined },
-            "bootstrap bridge initialize failed and exact candidate stop is unconfirmed");
-            throw new RemoteInstanceError("recovery_required", "Bootstrap bridge initialization failed and its process stop is unconfirmed.", {
-              cause: stopError, diagnostic: "bootstrap_initialize_stop_unconfirmed",
-            });
-          }
-        }
-        if (persistedCandidate) durablePrevious = persistedCandidate;
-        if (failedOwner) failedOwner.finalized = true;
-        this.executionBridges.delete(ref);
-        const retryable = !(error instanceof RemoteInstanceError) || error.code === "agent_unavailable" || error.retryable;
-        const exhausted = !retryable || bootstrapAttempt === 4;
-        this.logger.warn({
-          agentId: this.family.agentId,
-          acpSessionRef: ref,
-          bootstrapAttempt,
-          maxBootstrapAttempts: 4,
-          bridgeInitializeDurationMs: Date.now() - initializeStartedAt,
-          stopConfirmed,
-          retryable,
-          exhausted,
-          errorClass: classifyBridgeError(error).class,
-          errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_initialize_failed",
-          diagnostic: error instanceof RemoteInstanceError ? error.diagnostic : undefined,
-        }, "bootstrap bridge initialization failed");
-        if (exhausted) throw error;
-        const exponentialMs = 500 * (2 ** (bootstrapAttempt - 1));
-        const delayMs = Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + ((this.options.retryRandom ?? Math.random)() * 0.5)))));
-        this.logger.warn({ agentId: this.family.agentId, acpSessionRef: ref, bootstrapAttempt,
-          nextBootstrapAttempt: bootstrapAttempt + 1, maxBootstrapAttempts: 4, delayMs, recovery: "fresh_bridge" },
-        "retrying bootstrap bridge initialization with exponential backoff");
-        await (this.options.retrySleep ?? (delay => new Promise(resolve => setTimeout(resolve, delay))))(delayMs);
-      }
+      const bridge = await this.bootstrapAttempt(ref, bootstrapAttempt, owners, lifecycle, cwd);
+      if (bridge) return { bridge, bootstrapAttempt };
+      await this.bootstrapPause(ref, bootstrapAttempt);
     }
     throw new RemoteInstanceError("agent_unavailable", "Bootstrap bridge retry budget exhausted.", { retryable: true });
+  }
+
+  /** The confirmed-stopped pre-ready owner a replacement takes over; its durable owner is what the next candidate replaces. */
+  private retireBootstrapOwner(ref: string, previous: BridgeProcess, lifecycle: SessionLifecycle | undefined): RetainedProcessOwner {
+    const owner = this.executionBridges.get(ref);
+    if (!owner || !this.stoppedPreReadyOwner(owner, previous)) {
+      throw new RemoteInstanceError("recovery_required", "Bootstrap bridge replacement did not match one confirmed-stopped pre-ready owner.", {
+        diagnostic: "bootstrap_bridge_replacement_invalid",
+      });
+    }
+    const durablePrevious = owner.durable?.retainedProcessOwner;
+    if (!durablePrevious || !lifecycle?.replaceProcessOwner) {
+      throw new RemoteInstanceError("recovery_required", "Durable bootstrap process-owner replacement is unavailable.", {
+        diagnostic: "bootstrap_process_owner_replacement_unavailable",
+      });
+    }
+    owner.finalized = true;
+    this.executionBridges.delete(ref);
+    return durablePrevious;
+  }
+
+  private stoppedPreReadyOwner(owner: ExecutionOwner, previous: BridgeProcess): boolean {
+    return owner.live === previous && !owner.stopping && !owner.finalized && previous.exited && this.sessions.sessionsBoundTo(previous) === 0;
+  }
+
+  /** The initialized candidate, or null when this attempt failed in a way worth a fresh one (its process already stopped). */
+  private async bootstrapAttempt(ref: string, bootstrapAttempt: number, owners: { durablePrevious: RetainedProcessOwner | undefined }, lifecycle: SessionLifecycle | undefined, cwd: string | undefined): Promise<BridgeProcess | null> {
+    const persisted: { candidate?: RetainedProcessOwner } = {};
+    const initializeStartedAt = Date.now();
+    try {
+      const bridge = await this.createExecutionBridge(ref, bootstrapLifecycle(lifecycle, owners, persisted), cwd);
+      this.logger.info({
+        agentId: this.family.agentId,
+        acpSessionRef: ref,
+        bootstrapAttempt,
+        bridgeInitializeDurationMs: Date.now() - initializeStartedAt,
+      }, bootstrapAttempt === 1 ? "bootstrap bridge initialized" : "fresh bootstrap bridge initialized");
+      return bridge;
+    } catch (error) {
+      const failedOwner = this.executionBridges.get(ref);
+      // An explicit stop/recovery owns this reference now. Its settlement
+      // promise is already waiting for the captured spawn and exact process;
+      // bootstrap must neither stop it a second time nor replace its slot.
+      if (failedOwner?.stopping) throw error;
+      const stopConfirmed = await this.stopFailedBootstrapCandidate(failedOwner, ref, bootstrapAttempt, initializeStartedAt);
+      if (persisted.candidate) owners.durablePrevious = persisted.candidate;
+      this.finalizeFailedBootstrap(ref, failedOwner);
+      const retryable = startupRetryable(error);
+      const exhausted = !retryable || bootstrapAttempt === 4;
+      this.logger.warn({
+        agentId: this.family.agentId,
+        acpSessionRef: ref,
+        bootstrapAttempt,
+        maxBootstrapAttempts: 4,
+        bridgeInitializeDurationMs: Date.now() - initializeStartedAt,
+        stopConfirmed,
+        retryable,
+        exhausted,
+        ...startupErrorFields(error),
+      }, "bootstrap bridge initialization failed");
+      if (exhausted) throw error;
+      return null;
+    }
+  }
+
+  private finalizeFailedBootstrap(ref: string, failedOwner: ExecutionOwner | undefined): void {
+    if (failedOwner) failedOwner.finalized = true;
+    this.executionBridges.delete(ref);
+  }
+
+  /** Whether the failed candidate is known stopped; an unconfirmed stop needs recovery. */
+  private async stopFailedBootstrapCandidate(failedOwner: ExecutionOwner | undefined, ref: string, bootstrapAttempt: number, initializeStartedAt: number): Promise<boolean> {
+    if (!failedOwner?.process) return failedOwner === undefined || failedOwner.process === null;
+    try {
+      await failedOwner.process.stop();
+      if (!failedOwner.process.exited) throw new RemoteInstanceError("recovery_required", "Bootstrap candidate stop returned without observed process exit.", {
+        diagnostic: "bootstrap_initialize_stop_unconfirmed",
+      });
+      return true;
+    } catch (stopError) {
+      this.logger.error({ agentId: this.family.agentId, acpSessionRef: ref, bootstrapAttempt,
+        bridgeInitializeDurationMs: Date.now() - initializeStartedAt, stopConfirmed: false,
+        errorClass: classifyBridgeError(stopError).class,
+        errorCode: stopError instanceof RemoteInstanceError ? stopError.code : "bridge_stop_failed",
+        diagnostic: stopError instanceof RemoteInstanceError ? stopError.diagnostic : undefined },
+      "bootstrap bridge initialize failed and exact candidate stop is unconfirmed");
+      throw new RemoteInstanceError("recovery_required", "Bootstrap bridge initialization failed and its process stop is unconfirmed.", {
+        cause: stopError, diagnostic: "bootstrap_initialize_stop_unconfirmed",
+      });
+    }
+  }
+
+  /** Exponential backoff with jitter before a fresh bootstrap bridge. */
+  private async bootstrapPause(ref: string, bootstrapAttempt: number): Promise<void> {
+    const delayMs = freshProcessDelayMs(bootstrapAttempt, this.options.retryRandom ?? Math.random);
+    this.logger.warn({ agentId: this.family.agentId, acpSessionRef: ref, bootstrapAttempt,
+      nextBootstrapAttempt: bootstrapAttempt + 1, maxBootstrapAttempts: 4, delayMs, recovery: "fresh_bridge" },
+    "retrying bootstrap bridge initialization with exponential backoff");
+    await this.retrySleep(delayMs);
+  }
+
+  private retrySleep(delayMs: number): Promise<void> {
+    return (this.options.retrySleep ?? (delay => new Promise(resolve => setTimeout(resolve, delay))))(delayMs);
   }
 
   /** Same durable owner record per reference whether the process is new or resident. */
@@ -771,8 +913,7 @@ export class AgentRuntime {
    */
   async yieldRetainedProcess(owner: RetainedProcessOwner): Promise<void> {
     for (const [ref, record] of this.executionBridges) {
-      const identity = record.durable?.retainedProcessOwner;
-      if (!identity || record.finalized || record.durable!.exited || !sameRetainedOwner(identity, owner)) continue;
+      if (!liveOwnerOf(record, owner)) continue;
       // Its own reference was already being stopped (a recovery stop whose
       // process stop did not finish on a loaded computer): nothing else owns
       // this process, so retry that exact stop rather than refuse for good.
@@ -793,23 +934,35 @@ export class AgentRuntime {
       authMode: this.options.config.RUNNER_AUTH_MODE,
       connectionState: this.connectionState,
       initializeResult: this.bridge?.initializeResult ?? this.parkedInitializeResult,
-      scope: this.authRequired ? { ...this.scope, authIdentityFingerprint: null, scopeAttestedAt: null } : this.scope,
-      identity: this.authRequired ? "logged_out" : this.identity,
-      ...(this.credentials === undefined ? {} : { credentials: this.authRequired ? this.credentials.map(credential => ({ ...credential, state: "needs_sign_in" as const })) : this.credentials }),
+      ...this.signInReadiness(),
       bridgeVersionCompatible: true,
-      ...(this.hostVersion() === undefined ? {} : { hostAgentVersion: this.hostVersion()! }),
-      ...(this.tokenUsageObservable === undefined ? {} : { tokenUsageObservable: this.tokenUsageObservable }),
+      ...withoutUndefined({ hostAgentVersion: this.hostVersion(), tokenUsageObservable: this.tokenUsageObservable }),
       ...(this.providerAdminBlocked && !this.authRequired ? { providerAdminBlocked: true } : {}),
-      // Only to a Core that takes 7.1 fields: an older Core's heartbeat is strict.
-      ...(this.hostSettings.coreAcceptsRouteBilling && this.availableCommands.current() ? { availableCommands: this.availableCommands.current()! } : {}),
+      ...this.readinessCommands(),
       lastProbeAt: this.lastProbeAt,
     });
   }
 
+  /** A lost sign-in reads as signed out: no identity, and every credential needing a sign-in. */
+  private signInReadiness(): Pick<Parameters<typeof projectReadiness>[0], "scope" | "identity" | "credentials"> {
+    if (!this.authRequired) return { scope: this.scope, identity: this.identity, ...withoutUndefined({ credentials: this.credentials }) };
+    return {
+      scope: { ...this.scope, authIdentityFingerprint: null, scopeAttestedAt: null },
+      identity: "logged_out",
+      ...(this.credentials === undefined ? {} : { credentials: this.credentials.map(credential => ({ ...credential, state: "needs_sign_in" as const })) }),
+    };
+  }
+
+  /** Only to a Core that takes 7.1 fields: an older Core's heartbeat is strict. */
+  private readinessCommands(): { availableCommands?: NonNullable<ReturnType<AvailableCommandsStore["current"]>> } {
+    const current = this.availableCommands.current();
+    return this.hostSettings.coreAcceptsRouteBilling && current ? { availableCommands: current } : {};
+  }
+
   /**
    * Whether this agent was signed in and the sign-in no longer works: a turn
-   * failed on it, or a credential it holds needs signing in again (runtime-view
-   * R21 `sign_in_expired`, as opposed to never signed in).
+   * failed on it, or a credential it holds needs signing in again (`sign_in_expired`,
+   * as opposed to never signed in).
    */
   signInLost(): boolean {
     return this.authRequired || (this.credentials?.some(credential => credential.state === "needs_sign_in") ?? false);
@@ -833,7 +986,7 @@ export class AgentRuntime {
   /**
    * A discovery that failed for good may mean the agent's sign-in went away
    * outside Konteks (its home cleared, a token revoked): read the identity
-   * again, so readiness stops saying ready while nothing can run (WS1-216).
+   * again, so readiness stops saying ready while nothing can run.
    */
   private afterDiscoveryFailure(error: unknown): void {
     if (this.stopping) return;
@@ -852,8 +1005,8 @@ export class AgentRuntime {
    * when that refresh fails for a transient reason (a deadline on a loaded
    * computer, an internal error). A sign-in failure, a definite refusal or a
    * malformed answer drops it; a sign-in or version change is a new key.
-   * Without that, one slow refresh left Core no offered models and every
-   * delivery placement failed (2026-10-02).
+   * Without that, one slow refresh would leave Core no offered models and every
+   * delivery placement would fail.
    */
   async discoverModelCapability(configId: string): Promise<DiscoveredBridgeModelCapability> {
     const view = this.readiness();
@@ -861,40 +1014,86 @@ export class AgentRuntime {
       throw new RemoteInstanceError("agent_auth_required", "Model capability discovery requires the current authenticated agent identity.");
     }
     const cacheKey = `${view.authIdentityFingerprint}\u0000${this.options.config.RUNNER_BRIDGE_VERSION}\u0000${configId}`;
-    const nowMs = this.now().getTime();
-    const ttlMs = this.options.modelCapabilityTtlMs ?? DEFAULT_MODEL_CAPABILITY_TTL_MS;
-    let entry = this.modelCapabilities.get(cacheKey);
-    if (!entry) {
-      // The control plane supplies a reviewed config id, but keep the cache
-      // bounded if that contract regresses. Oldest insertion is safe to evict.
-      if (this.modelCapabilities.size >= 16) {
-        const oldest = this.modelCapabilities.keys().next().value as string | undefined;
-        if (oldest) this.modelCapabilities.delete(oldest);
-      }
-      entry = { good: null, refresh: null };
-      this.modelCapabilities.set(cacheKey, entry);
-    }
-    let answer: { capability: DiscoveredBridgeModelCapability; at: number };
-    if (entry.good && nowMs - entry.good.at < ttlMs) {
-      this.logger.debug({ event: "model_capability.cache_hit", agentId: this.family.agentId, configId },
-        "reusing authenticated ACP model capability");
-      answer = entry.good;
-    } else if (entry.good) {
-      answer = entry.good;
-      if (!entry.refresh) {
-        this.logger.info({ event: "model_capability.revalidate", agentId: this.family.agentId, configId, ageMs: nowMs - answer.at },
-          "serving the last offered models while they are read again");
-        void this.refreshModelCapability(cacheKey, entry, configId).catch(() => undefined);
-      }
-    } else {
-      const capability = await (entry.refresh ?? this.refreshModelCapability(cacheKey, entry, configId));
-      answer = { capability, at: this.now().getTime() };
-    }
-    const offers = this.host?.offersModel;
-    const capability = structuredClone(answer.capability);
-    const offered = offers ? offerableModelCapability(capability, value => offers(value, this.hostSettings), this.family) : capability;
+    const entry = this.modelCapabilityEntry(cacheKey);
+    const answer = entry.good ? this.cachedModelCapability(cacheKey, entry, entry.good, configId)
+      : { capability: await (entry.refresh ?? this.refreshModelCapability(cacheKey, entry, configId)), at: this.now().getTime() };
+    const offered = this.offerable(structuredClone(answer.capability));
     const ageMs = Math.max(0, this.now().getTime() - answer.at);
     return ageMs > 0 ? { ...offered, observedAgoMs: ageMs } : offered;
+  }
+
+  /** What may be offered under the host agent's settings (OpenCode's free models); everything for other agents. */
+  private offerable(capability: DiscoveredBridgeModelCapability): DiscoveredBridgeModelCapability {
+    const host = this.host;
+    if (!host?.offersModel) return capability;
+    return offerableModelCapability(capability, value => host.offersModel!(value, this.hostSettings), this.family);
+  }
+
+  /**
+   * The cache entry for one sign-in, bridge version and config id. The
+   * control plane supplies a reviewed config id, but keep the cache bounded
+   * if that contract regresses. Oldest insertion is safe to evict.
+   */
+  private modelCapabilityEntry(cacheKey: string): ModelCapabilityEntry {
+    const known = this.modelCapabilities.get(cacheKey);
+    if (known) return known;
+    if (this.modelCapabilities.size >= 16) {
+      const oldest = this.modelCapabilities.keys().next().value as string | undefined;
+      if (oldest) this.modelCapabilities.delete(oldest);
+    }
+    const entry: ModelCapabilityEntry = { good: null, refresh: null };
+    this.modelCapabilities.set(cacheKey, entry);
+    return entry;
+  }
+
+  /** The last good answer: fresh within the TTL, else served while one shared refresh reads it again. */
+  private cachedModelCapability(cacheKey: string, entry: ModelCapabilityEntry, good: { capability: DiscoveredBridgeModelCapability; at: number }, configId: string): { capability: DiscoveredBridgeModelCapability; at: number } {
+    const nowMs = this.now().getTime();
+    if (nowMs - good.at < (this.options.modelCapabilityTtlMs ?? DEFAULT_MODEL_CAPABILITY_TTL_MS)) {
+      this.logger.debug({ event: "model_capability.cache_hit", agentId: this.family.agentId, configId },
+        "reusing authenticated ACP model capability");
+      return good;
+    }
+    if (!entry.refresh) {
+      this.logger.info({ event: "model_capability.revalidate", agentId: this.family.agentId, configId, ageMs: nowMs - good.at },
+        "serving the last offered models while they are read again");
+      void this.refreshModelCapability(cacheKey, entry, configId).catch(() => undefined);
+    }
+    return good;
+  }
+
+  private discoveryOptions(configId: string): Parameters<typeof discoverBridgeModelCapability>[0] {
+    return {
+      configId,
+      workspaceRoot: this.options.config.RUNNER_WORKSPACE_DIR,
+      spec: this.spec,
+      initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
+      // A background check, not a turn: never the 10 s session bootstrap deadline.
+      sessionTimeoutMs: Math.max(this.sessionBootstrapTimeoutMs(), MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS),
+      clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
+      logger: this.logger,
+      ...withoutUndefined({ retrySleep: this.options.retrySleep, retryRandom: this.options.retryRandom }),
+      spawn: this.spawnProcess,
+      ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
+      ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.readStderrFailure(line) } : {}),
+    };
+  }
+
+  /** The discovery on a checked-out idle resident bridge, parked again only when it succeeded there. */
+  private async discoverOnIdleBridge(discovery: Parameters<typeof discoverBridgeModelCapability>[0], idle: IdleExecutionBridge): Promise<DiscoveredBridgeModelCapability> {
+    let succeeded = false;
+    try {
+      const result = await discoverBridgeModelCapability({ ...discovery, bridge: idle.bridge });
+      succeeded = true;
+      return result;
+    } finally {
+      if (!succeeded || !this.parkIdle(idle.bridge, idle.durable)) {
+        await idle.bridge.stop().catch(error => this.logger.warn({
+          errorClass: classifyBridgeError(error).class,
+          errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_stop_failed",
+        }, "idle execution bridge could not be stopped after model capability discovery"));
+      }
+    }
   }
 
   /** One shared discovery for `entry`; settles the entry itself (see `discoverModelCapability`). */
@@ -907,39 +1106,12 @@ export class AgentRuntime {
     // would keep it open for good.
     const task = (async () => {
       await this.prepareToSpawn();
-      const discovery = {
-        configId,
-        workspaceRoot: this.options.config.RUNNER_WORKSPACE_DIR,
-        spec: this.spec,
-        initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
-        // A background check, not a turn: never the 10 s session bootstrap deadline.
-        sessionTimeoutMs: Math.max(this.sessionBootstrapTimeoutMs(), MODEL_DISCOVERY_MIN_SESSION_TIMEOUT_MS),
-        clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
-        logger: this.logger,
-        ...(this.options.retrySleep ? { retrySleep: this.options.retrySleep } : {}),
-        ...(this.options.retryRandom ? { retryRandom: this.options.retryRandom } : {}),
-        spawn: this.spawnProcess,
-        ...(this.host?.sessionMeta ? { sessionMeta: this.host.sessionMeta } : {}),
-        ...(this.host?.stderrFailure ? { stderrFailure: (line: string) => this.readStderrFailure(line) } : {}),
-      };
+      const discovery = this.discoveryOptions(configId);
       this.logger.info({ event: "model_capability.cache_miss", agentId: this.family.agentId, configId },
         "discovering authenticated ACP model capability once");
       const closes = this.idleExecutionBridge?.bridge.initializeResult.agentCapabilities?.sessionCapabilities?.close != null;
       const idle = closes ? this.takeIdleExecutionBridge() : null;
-      if (!idle) return discoverBridgeModelCapability(discovery);
-      let succeeded = false;
-      try {
-        const result = await discoverBridgeModelCapability({ ...discovery, bridge: idle.bridge });
-        succeeded = true;
-        return result;
-      } finally {
-        if (!succeeded || !this.parkIdle(idle.bridge, idle.durable)) {
-          await idle.bridge.stop().catch(error => this.logger.warn({
-            errorClass: classifyBridgeError(error).class,
-            errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_stop_failed",
-          }, "idle execution bridge could not be stopped after model capability discovery"));
-        }
-      }
+      return idle ? this.discoverOnIdleBridge(discovery, idle) : discoverBridgeModelCapability(discovery);
     })();
     entry.refresh = task;
     // Registered before any caller awaits `task`, so the entry is settled
@@ -963,17 +1135,16 @@ export class AgentRuntime {
     return task;
   }
 
-  /** (Re)spawns the bridge and performs the runner-local `initialize`. */
-  /**
-   * Take this agent out of service for the life of the process: stop every
-   * bridge, refuse new ones and read as unavailable. Used when DeepSeek
-   * Harness ran a gated tool without asking (dsh-tool-governance.ts).
-   */
   /** Why this agent was taken out of service (the tripwire's line), or null (doctor). */
   quarantineReason(): string | null {
     return this.quarantined;
   }
 
+  /**
+   * Take this agent out of service for the life of the process: stop every
+   * bridge, refuse new ones and read as unavailable. Used when a host agent
+   * ran a gated tool without asking (its tool governance tripwire).
+   */
   async quarantine(reason: string): Promise<void> {
     this.quarantined = reason;
     this.logger.error({ event: "agent.quarantined", agentId: this.family.agentId }, "agent taken out of service");
@@ -995,7 +1166,7 @@ export class AgentRuntime {
    * Before any bridge process starts: re-verify a bundled package, or let a
    * host-installed agent's adapter write the Konteks overlay or config it boots
    * from. Every dsh process reads those files at boot, so a changed copy heals
-   * on the next spawn instead of leaving it unguarded (CP3 live proof, phase 2).
+   * on the next spawn instead of leaving it unguarded.
    */
   private async prepareToSpawn(logger?: Pick<Logger, "info">): Promise<void> {
     await verifyNativeRunnerPackage(this.options.config, logger);
@@ -1053,6 +1224,7 @@ export class AgentRuntime {
     finally { if (this.bridgeStart === starting) this.bridgeStart = null; }
   }
 
+  /** (Re)spawns the control bridge and performs the runner-local `initialize`, with up to four fresh attempts. */
   private async startBridge(): Promise<void> {
     this.clearControlIdleStop();
     // A control process stopped for being idle comes back without the agent reading as unavailable meanwhile.
@@ -1062,83 +1234,99 @@ export class AgentRuntime {
       this.publishReadiness();
     }
     for (let attempt = 1; attempt <= 4; attempt += 1) {
-      // Callback authority belongs to this spawn, never whichever bridge
-      // happens to be current when a deferred callback arrives.
-      let owner: BridgeProcess | null = null;
-      let provisional: BridgeStopOwner | null = null;
-      let exitedDuringStart = false;
-      const initializeStartedAt = Date.now();
-      try {
-        await this.prepareToSpawn(this.logger);
-        if (this.stopping) return;
-        const candidate = await this.spawnProcess({
-          spec: this.spec,
-          initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
-          clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
-          logger: this.logger,
-          onProcessOwner: process => { provisional = process; },
-          handlers: {
-            onSessionUpdate: (params) => this.sessions.onSessionUpdate(params, owner),
-            onRequestPermission: (params) => this.sessions.onRequestPermission(params, owner),
-            onCreateElicitation: (params) => this.sessions.onCreateElicitation(params, owner),
-            onExit: (info) => {
-              if (!owner) { exitedDuringStart = true; return; }
-              this.sessions.closeAll("agent_exited", owner);
-              if (this.bridge !== owner) return;
-              this.connectionState = "exited";
-              this.events.publish({ kind: "bridge_exited", code: info.code, signal: info.signal });
-              this.publishReadiness();
-              if (!this.stopping) setTimeout(() => void this.ensureBridge().catch(() => undefined), 2_000).unref();
-            },
-          },
-        });
-        owner = candidate;
-        provisional ??= candidate;
-        if (this.stopping || exitedDuringStart || candidate.exited) {
-          if (this.stopping) { await candidate.stop(); return; }
-          throw new RemoteInstanceError("agent_unavailable", "Bridge exited during initialization.", { retryable: true });
-        }
-        this.bridge = candidate;
-        this.parkedInitializeResult = null;
-        this.connectionState = "ready";
-        this.logger.info({ agentId: this.family.agentId, attempt,
-          bridgeInitializeDurationMs: Date.now() - initializeStartedAt }, "runner control bridge initialized");
-        this.publishReadiness();
-        this.scheduleControlIdleStop();
-        return;
-      } catch (error) {
-        let stopConfirmed = provisional === null;
-        if (provisional) {
-          try { await provisional.stop(); stopConfirmed = true; }
-          catch (stopError) {
-            this.connectionState = "failed";
-            this.logger.error({ agentId: this.family.agentId, attempt, stopConfirmed: false,
-              errorClass: classifyBridgeError(stopError).class,
-              errorCode: stopError instanceof RemoteInstanceError ? stopError.code : "bridge_stop_failed" },
-            "runner control bridge startup stop is unconfirmed");
-            this.publishReadiness();
-            return;
-          }
-        }
-        const classified = classifyBridgeError(error);
-        const retryable = !(error instanceof RemoteInstanceError) || error.code === "agent_unavailable" || error.retryable;
-        const exhausted = !retryable || attempt === 4;
-        this.logger.warn({ agentId: this.family.agentId, attempt, maxAttempts: 4,
-          bridgeInitializeDurationMs: Date.now() - initializeStartedAt, stopConfirmed, retryable, exhausted,
-          errorClass: classified.class, errorCode: error instanceof RemoteInstanceError ? error.code : "bridge_initialize_failed",
-          diagnostic: error instanceof RemoteInstanceError ? error.diagnostic : undefined },
-        "runner control bridge startup attempt failed");
-        if (exhausted) break;
-        const exponentialMs = 500 * (2 ** (attempt - 1));
-        const delayMs = Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + ((this.options.retryRandom ?? Math.random)() * 0.5)))));
-        this.logger.warn({ agentId: this.family.agentId, attempt, nextAttempt: attempt + 1,
-          maxAttempts: 4, delayMs, recovery: "fresh_bridge" }, "retrying runner control bridge startup with exponential backoff");
-        await (this.options.retrySleep ?? (delay => new Promise(resolve => setTimeout(resolve, delay))))(delayMs);
-      }
+      const outcome = await this.controlBridgeAttempt(attempt);
+      if (outcome === "done") return;
+      if (outcome === "exhausted") break;
+      await this.retrySleep(this.controlRetryDelay(attempt));
     }
     this.parkedInitializeResult = null;
     this.connectionState = "failed";
     this.publishReadiness();
+  }
+
+  /** "done" (started, stopping, or failed with its stop unconfirmed), "retry" or "exhausted". */
+  private async controlBridgeAttempt(attempt: number): Promise<"done" | "retry" | "exhausted"> {
+    // Callback authority belongs to this spawn, never whichever bridge
+    // happens to be current when a deferred callback arrives.
+    const start: { owner: BridgeProcess | null; provisional: BridgeStopOwner | null; exitedDuringStart: boolean } = { owner: null, provisional: null, exitedDuringStart: false };
+    const initializeStartedAt = Date.now();
+    try {
+      await this.prepareToSpawn(this.logger);
+      if (this.stopping) return "done";
+      const candidate = await this.spawnProcess({
+        spec: this.spec,
+        initializeTimeoutMs: this.options.config.RUNNER_INITIALIZE_TIMEOUT_MS,
+        clientVersion: this.options.config.RUNNER_BRIDGE_VERSION,
+        logger: this.logger,
+        onProcessOwner: process => { start.provisional = process; },
+        handlers: this.controlHandlers(start),
+      });
+      start.owner = candidate;
+      start.provisional ??= candidate;
+      if (this.stopping) { await candidate.stop(); return "done"; }
+      if (start.exitedDuringStart || candidate.exited) throw new RemoteInstanceError("agent_unavailable", "Bridge exited during initialization.", { retryable: true });
+      this.adoptControlBridge(candidate, attempt, initializeStartedAt);
+      return "done";
+    } catch (error) {
+      return this.failedControlAttempt(error, start.provisional, attempt, initializeStartedAt);
+    }
+  }
+
+  private controlHandlers(start: { owner: BridgeProcess | null; exitedDuringStart: boolean }): BridgeClientHandlers {
+    return {
+      onSessionUpdate: (params) => this.sessions.onSessionUpdate(params, start.owner),
+      onRequestPermission: (params) => this.sessions.onRequestPermission(params, start.owner),
+      onCreateElicitation: (params) => this.sessions.onCreateElicitation(params, start.owner),
+      onExit: (info) => {
+        if (!start.owner) { start.exitedDuringStart = true; return; }
+        this.sessions.closeAll("agent_exited", start.owner);
+        if (this.bridge !== start.owner) return;
+        this.connectionState = "exited";
+        this.events.publish({ kind: "bridge_exited", code: info.code, signal: info.signal });
+        this.publishReadiness();
+        if (!this.stopping) setTimeout(() => void this.ensureBridge().catch(() => undefined), 2_000).unref();
+      },
+    };
+  }
+
+  private adoptControlBridge(candidate: BridgeProcess, attempt: number, initializeStartedAt: number): void {
+    this.bridge = candidate;
+    this.parkedInitializeResult = null;
+    this.connectionState = "ready";
+    this.logger.info({ agentId: this.family.agentId, attempt,
+      bridgeInitializeDurationMs: Date.now() - initializeStartedAt }, "runner control bridge initialized");
+    this.publishReadiness();
+    this.scheduleControlIdleStop();
+  }
+
+  /** Stops the failed candidate first; a stop that cannot be confirmed leaves the agent failed. */
+  private async failedControlAttempt(error: unknown, provisional: BridgeStopOwner | null, attempt: number, initializeStartedAt: number): Promise<"done" | "retry" | "exhausted"> {
+    if (provisional) {
+      try { await provisional.stop(); }
+      catch (stopError) {
+        this.connectionState = "failed";
+        this.logger.error({ agentId: this.family.agentId, attempt, stopConfirmed: false,
+          errorClass: classifyBridgeError(stopError).class,
+          errorCode: stopError instanceof RemoteInstanceError ? stopError.code : "bridge_stop_failed" },
+        "runner control bridge startup stop is unconfirmed");
+        this.publishReadiness();
+        return "done";
+      }
+    }
+    const retryable = startupRetryable(error);
+    const exhausted = !retryable || attempt === 4;
+    this.logger.warn({ agentId: this.family.agentId, attempt, maxAttempts: 4,
+      bridgeInitializeDurationMs: Date.now() - initializeStartedAt, stopConfirmed: true, retryable, exhausted,
+      ...startupErrorFields(error) },
+    "runner control bridge startup attempt failed");
+    return exhausted ? "exhausted" : "retry";
+  }
+
+  private controlRetryDelay(attempt: number): number {
+    const delayMs = freshProcessDelayMs(attempt, this.options.retryRandom ?? Math.random);
+    this.logger.warn({ agentId: this.family.agentId, attempt, nextAttempt: attempt + 1,
+      maxAttempts: 4, delayMs, recovery: "fresh_bridge" }, "retrying runner control bridge startup with exponential backoff");
+    return delayMs;
   }
 
   /**
@@ -1147,28 +1335,11 @@ export class AgentRuntime {
    * `--organization` attestation may be recorded.
    */
   async probe(isLogin: boolean, organizationAttested = false, options: { fresh?: boolean } = {}): Promise<ConnectedAgentView> {
-    let result: IdentityProbe;
-    try {
-      await this.prepareToSpawn();
-      // `fresh`: read the sign-in through a process of its own, not the shared
-      // Codex app-server, which keeps the sign-in it loaded at its start even
-      // after the files under it are gone (WS1-216).
-      const { RUNNER_NATIVE_CODEX_SOCKET: _shared, ...unshared } = this.options.config;
-      result = await (this.options.probe ?? probeIdentity)(options.fresh ? unshared : this.options.config, this.family, this.spec.env, {}, this.hostSettings);
-    } catch (error) {
-      this.logger.warn({ err: error }, "identity probe failed");
-      result = { kind: "logged_out" };
-    }
-    this.identity = result.kind;
-    if (result.kind !== "no_official_signal" && result.credentials !== undefined) this.credentials = result.credentials;
-    if (this.host?.identity) this.tokenUsageObservable = result.kind === "signal" ? result.tokenUsageObservable : undefined;
-    this.providerAdminBlocked = result.kind === "signal" && result.providerAdminBlocked === true;
-    if (isLogin && (result.kind === "signal" || result.kind === "no_official_signal")) this.authRequired = false;
+    const result = await this.readIdentity(options.fresh === true);
+    this.noteIdentity(result, isLogin);
     const at = this.now().toISOString();
     this.lastProbeAt = at;
-    const fingerprint =
-      result.kind === "signal" ? result.fingerprint : result.kind === "no_official_signal" ? (isLogin ? fallbackLoginIdentity() : this.scope.authIdentityFingerprint) : null;
-    const transition = applyIdentityObservation(this.scope, { fingerprint, organizationAttested, at, isLogin });
+    const transition = applyIdentityObservation(this.scope, { fingerprint: this.observedFingerprint(result, isLogin), organizationAttested, at, isLogin });
     this.scope = transition.state;
     await this.scopeStore.write(this.scope);
     if (transition.kind === "reset") {
@@ -1181,61 +1352,56 @@ export class AgentRuntime {
     return view;
   }
 
+  /**
+   * The official identity signal; a failed read is signed out. `fresh` reads
+   * the sign-in through a process of its own, not the shared Codex
+   * app-server, which keeps the sign-in it loaded at its start even after the
+   * files under it are gone.
+   */
+  private async readIdentity(fresh: boolean): Promise<IdentityProbe> {
+    try {
+      await this.prepareToSpawn();
+      const { RUNNER_NATIVE_CODEX_SOCKET: _shared, ...unshared } = this.options.config;
+      return await (this.options.probe ?? probeIdentity)(fresh ? unshared : this.options.config, this.family, this.spec.env, {}, this.hostSettings);
+    } catch (error) {
+      this.logger.warn({ err: error }, "identity probe failed");
+      return { kind: "logged_out" };
+    }
+  }
+
+  private noteIdentity(result: IdentityProbe, isLogin: boolean): void {
+    this.identity = result.kind;
+    if (result.kind !== "no_official_signal" && result.credentials !== undefined) this.credentials = result.credentials;
+    if (this.host?.identity) this.tokenUsageObservable = signalTokenUsage(result);
+    this.providerAdminBlocked = result.kind === "signal" && result.providerAdminBlocked === true;
+    if (isLogin && result.kind !== "logged_out") this.authRequired = false;
+  }
+
+  /** Without an official signal, a login is a new identity and anything else keeps the last one. */
+  private observedFingerprint(result: IdentityProbe, isLogin: boolean): string | null {
+    if (result.kind === "signal") return result.fingerprint;
+    if (result.kind !== "no_official_signal") return null;
+    return isLogin ? fallbackLoginIdentity() : this.scope.authIdentityFingerprint;
+  }
+
   /** Starts the official login flow; completion re-probes readiness and applies the attestation. */
   startLogin(args: { organization: boolean; loginId?: string; personal?: boolean; request?: HostLoginRequest }): LoginFlow {
     // The person asking for their own login on their own machine (the site's
     // Log in, or `konteks-remote auth login` they ran) is not Konteks changing
-    // their login behind their back (WS1-115).
+    // their login behind their back.
     if (!(args.personal && this.personalLogin())) this.assertConnectorOwnedAuthentication();
-    if (this.activeLogin) {
-      throw new RemoteInstanceError("temporarily_unavailable", "a login is already in progress for this agent");
-    }
-    if (this.options.afterSuccessfulLogin && this.sessions.activeSessions > 0) {
-      throw new RemoteInstanceError("temporarily_unavailable", "Finish or recover active Codex sessions before signing in again.");
-    }
+    this.assertLoginMayStart();
     const previousConnectionState = this.connectionState;
-    // A host-installed agent may own its sign-in (DeepSeek Harness has no
-    // login command: the runtime asks for the API key itself).
     const host = hostAgentRunnerAdapter(this.family.agentId);
-    const flow = host?.startLogin
-      ? host.startLogin({ config: this.options.config, events: this.events, logger: this.logger, spawn: this.options.spawn ?? spawnBridge,
-        ...(args.loginId === undefined ? {} : { loginId: args.loginId }), ...(args.request === undefined ? {} : { request: args.request }) })
-      : startLoginFlow({
-        config: this.options.config,
-        family: this.family,
-        env: this.spec.env,
-        events: this.events,
-        logger: this.logger,
-        ...(args.loginId === undefined ? {} : { loginId: args.loginId }),
-      });
+    const flow = this.loginFlow(host, args);
     this.activeLogin = flow;
     if (this.options.afterSuccessfulLogin) {
       this.connectionState = "starting";
       this.publishReadiness();
     }
     void flow.done.then(async ({ code, reason }) => {
-      if (code !== 0) {
-        this.activeLogin = null;
-        this.connectionState = previousConnectionState;
-        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: host?.loginFailedMessage ?? "official login tooling did not complete", ...(reason ? { reason } : {}) } });
-        await this.probe(false);
-        return;
-      }
-      // A bridge that caches auth at startup must observe the new login.
-      this.connectionState = "starting";
-      this.publishReadiness();
-      await this.stopExecutionForAuthChange();
-      await this.bridge?.stop();
-      this.bridge = null;
-      await this.options.afterSuccessfulLogin?.();
-      await this.ensureBridge();
-      const view = await this.probe(true, args.organization);
-      if (view.readiness === "ready") {
-        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "completed", readiness: view.readiness } });
-      } else {
-        this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: "official login returned without an authenticated local account; retry sign-in on this machine" } });
-      }
-      this.activeLogin = null;
+      if (code !== 0) return this.afterFailedLogin(flow.loginId, previousConnectionState, host?.loginFailedMessage, reason);
+      await this.afterSuccessfulLogin(flow.loginId, args.organization);
     }).catch(error => {
       this.activeLogin = null;
       this.connectionState = "failed";
@@ -1244,6 +1410,54 @@ export class AgentRuntime {
       this.events.publish({ kind: "login_event", loginId: flow.loginId, event: { type: "failed", code: "agent_auth_required", message: "the agent login completed, but its local authentication refresh failed" } });
     });
     return flow;
+  }
+
+  private assertLoginMayStart(): void {
+    if (this.activeLogin) {
+      throw new RemoteInstanceError("temporarily_unavailable", "a login is already in progress for this agent");
+    }
+    if (this.options.afterSuccessfulLogin && this.sessions.activeSessions > 0) {
+      throw new RemoteInstanceError("temporarily_unavailable", "Finish or recover active Codex sessions before signing in again.");
+    }
+  }
+
+  /**
+   * The official login tooling, or a host-installed agent's own sign-in
+   * (DeepSeek Harness has no login command: the runtime asks for the API key
+   * itself).
+   */
+  private loginFlow(host: HostAgentRunnerAdapter | undefined, args: { loginId?: string; request?: HostLoginRequest }): LoginFlow {
+    const loginId = withoutUndefined({ loginId: args.loginId });
+    if (host?.startLogin) {
+      return host.startLogin({ config: this.options.config, events: this.events, logger: this.logger, spawn: this.options.spawn ?? spawnBridge,
+        ...loginId, ...withoutUndefined({ request: args.request }) });
+    }
+    return startLoginFlow({ config: this.options.config, family: this.family, env: this.spec.env, events: this.events, logger: this.logger, ...loginId });
+  }
+
+  private async afterFailedLogin(loginId: string, previousConnectionState: ConnectedAgentView["connectionState"], message: string | undefined, reason: LoginFailureReason | undefined): Promise<void> {
+    this.activeLogin = null;
+    this.connectionState = previousConnectionState;
+    this.events.publish({ kind: "login_event", loginId, event: { type: "failed", code: "agent_auth_required", message: message ?? "official login tooling did not complete", ...(reason ? { reason } : {}) } });
+    await this.probe(false);
+  }
+
+  /** A bridge that caches auth at startup must observe the new login. */
+  private async afterSuccessfulLogin(loginId: string, organization: boolean): Promise<void> {
+    this.connectionState = "starting";
+    this.publishReadiness();
+    await this.stopExecutionForAuthChange();
+    await this.bridge?.stop();
+    this.bridge = null;
+    await this.options.afterSuccessfulLogin?.();
+    await this.ensureBridge();
+    const view = await this.probe(true, organization);
+    if (view.readiness === "ready") {
+      this.events.publish({ kind: "login_event", loginId, event: { type: "completed", readiness: view.readiness } });
+    } else {
+      this.events.publish({ kind: "login_event", loginId, event: { type: "failed", code: "agent_auth_required", message: "official login returned without an authenticated local account; retry sign-in on this machine" } });
+    }
+    this.activeLogin = null;
   }
 
   loginInput(loginId: string, text: string): boolean {

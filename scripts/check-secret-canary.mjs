@@ -39,13 +39,15 @@ function walk(dir) {
       continue;
     }
     const rel = relative(root, path);
-    if (ALLOWLIST.some((pattern) => pattern.test(rel))) continue;
-    if (entry === "package-lock.json") continue;
-    const text = readFileSync(path, "utf8");
-    for (const pattern of PATTERNS) {
-      const match = pattern.regex.exec(text);
-      if (match) hits.push(`${rel}: ${pattern.name} (${match[0].slice(0, 8)}…)`);
-    }
+    if (!ALLOWLIST.some((pattern) => pattern.test(rel)) && entry !== "package-lock.json") scan(path, rel);
+  }
+}
+
+function scan(path, rel) {
+  const text = readFileSync(path, "utf8");
+  for (const pattern of PATTERNS) {
+    const match = pattern.regex.exec(text);
+    if (match) hits.push(`${rel}: ${pattern.name} (${match[0].slice(0, 8)}…)`);
   }
 }
 walk(root);

@@ -2,16 +2,17 @@ import { randomUUID } from "node:crypto";
 import { assertRestrictedMode, deleteSecretFile, readSecretFileIfPresent, writeSecretFile, type Logger } from "@konteks/remote-common";
 import type { RunnerEventBus } from "../events.js";
 import type { LoginFlow } from "./login-flow.js";
+import { checkApiKey, type KeyVerdict } from "./key-check.js";
 
 /**
  * DeepSeek Harness has no login command: it reads `DEEPSEEK_API_KEY` from its
  * credential document (`$DSH_HOME/.credentials.yaml`, `refs`). The runtime
  * owns that document in its private DSH_HOME, so this module is its only
  * writer and reads back only what it wrote; it is not a vendor credential file
- * parsed behind the agent's back (D111). The key is never logged, never put in
+ * parsed behind the agent's back. The key is never logged, never put in
  * an event and never passed through the environment.
  */
-export const DSH_KEY_REF = "DEEPSEEK_API_KEY";
+const DSH_KEY_REF = "DEEPSEEK_API_KEY";
 const MODELS_URL = "https://api.deepseek.com/models";
 const KEY_SHAPE = /^[\x21-\x7e]{16,512}$/;
 
@@ -20,15 +21,20 @@ export async function readDshApiKey(credentialsFile: string): Promise<string | n
   if (document === null) return null;
   // dsh refuses a document other users can read; repair ours before relying on it.
   await assertRestrictedMode(credentialsFile);
-  const lines = document.split(/\r?\n/);
-  if (lines[0]?.trim() !== "version: 1" || !lines.includes("refs:")) return null;
-  const entry = lines.map(line => /^ {2}DEEPSEEK_API_KEY: (.+)$/.exec(line)?.[1]?.trim()).find(Boolean);
+  const entry = keyEntry(document.split(/\r?\n/));
   if (!entry) return null;
-  let key = entry;
-  if (entry.startsWith('"')) {
-    try { key = JSON.parse(entry) as string; } catch { return null; }
-  }
+  const key = entry.startsWith('"') ? quotedScalar(entry) : entry;
   return typeof key === "string" && KEY_SHAPE.test(key) ? key : null;
+}
+
+/** The `DEEPSEEK_API_KEY` value of a version 1 document with `refs:`, as written. */
+function keyEntry(lines: string[]): string | undefined {
+  if (lines[0]?.trim() !== "version: 1" || !lines.includes("refs:")) return undefined;
+  return lines.map(line => /^ {2}DEEPSEEK_API_KEY: (.+)$/.exec(line)?.[1]?.trim()).find(Boolean);
+}
+
+function quotedScalar(entry: string): unknown {
+  try { return JSON.parse(entry) as unknown; } catch { return null; }
 }
 
 export async function writeDshApiKey(credentialsFile: string, key: string): Promise<void> {
@@ -42,27 +48,16 @@ export async function removeDshApiKey(credentialsFile: string): Promise<void> {
 }
 
 /** Check a key against DeepSeek's model list: no tokens are spent. */
-export async function verifyDeepSeekApiKey(key: string, deps: { fetch?: typeof fetch; timeoutMs?: number } = {}): Promise<"valid" | "rejected" | "unreachable"> {
-  try {
-    const response = await (deps.fetch ?? fetch)(MODELS_URL, {
-      headers: { authorization: `Bearer ${key}`, accept: "application/json" },
-      signal: AbortSignal.timeout(deps.timeoutMs ?? 15_000),
-    });
-    await response.body?.cancel().catch(() => undefined);
-    if (response.ok) return "valid";
-    if (response.status === 401 || response.status === 403) return "rejected";
-    return "unreachable";
-  } catch {
-    return "unreachable";
-  }
+export function verifyDeepSeekApiKey(key: string, deps: { fetch?: typeof fetch; timeoutMs?: number } = {}): Promise<KeyVerdict> {
+  return checkApiKey(MODELS_URL, { authorization: `Bearer ${key}`, accept: "application/json" }, [401, 403], deps);
 }
 
-export interface DshKeyLoginOptions {
+interface DshKeyLoginOptions {
   credentialsFile: string;
   events: RunnerEventBus;
   loginId?: string;
   logger?: Pick<Logger, "info">;
-  verify?: (key: string) => Promise<"valid" | "rejected" | "unreachable">;
+  verify?: (key: string) => Promise<KeyVerdict>;
   maxAttempts?: number;
   timeoutMs?: number;
 }

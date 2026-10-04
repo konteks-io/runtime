@@ -1,4 +1,5 @@
 import {
+  allEqual,
   CoreResponseError,
   RemoteInstanceError,
   createLogger,
@@ -36,7 +37,8 @@ interface ActivationExchangeBase {
   roots: readonly EmbeddedReleaseRoot[];
   logger?: Logger;
 }
-export type ActivationExchangeArgs = ActivationExchangeBase & {
+
+type ActivationExchangeArgs = ActivationExchangeBase & {
   deploymentKind: "native_connector";
   platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64"; containerBackend: "none"; deploymentKind: "native_connector" };
   release: VerifiedNativeRelease;
@@ -52,7 +54,24 @@ export interface ActivationExchangeOutcome {
 export async function runActivationExchange(args: ActivationExchangeArgs): Promise<ActivationExchangeOutcome> {
   const logger = args.logger ?? createLogger({ name: "provisioning" });
   const existing = await args.store.identity();
-  if (existing && existing.activationId !== args.activationId) {
+  assertActivatable(existing, args.activationId);
+  const independent = verifyNativeRelease(args.release.manifest, args.roots, args.clock.now());
+  const attempt = await args.store.activationAttempt();
+  if (existing && !attempt) throw new RemoteInstanceError("registration_mismatch", "Existing identity requires an explicit native migration; it cannot be relabelled during activation.");
+  const binding: ActivationBinding = { activationId: args.activationId, keyDigest: jcsDigest(args.key.publicKeyJwk as unknown as JsonValue), platformDigest: jcsDigest(args.platform), manifestDigest: independent.manifest.digest };
+  const nonce = await activationNonce(args, existing, attempt, binding);
+  const resumed = await resumedProvisioning(args, existing, binding);
+  if (resumed) return resumed;
+  const result = await exchanged(args, nonce);
+  return recordExchange(args, result, nonce, logger);
+}
+
+type Identity = Awaited<ReturnType<SupervisorStore["identity"]>>;
+type ActivationAttempt = Awaited<ReturnType<SupervisorStore["activationAttempt"]>>;
+type ActivationBinding = { activationId: string; keyDigest: string; platformDigest: string; manifestDigest: string };
+
+function assertActivatable(existing: Identity, activationId: string): void {
+  if (existing && existing.activationId !== activationId) {
     throw new RemoteInstanceError("registration_mismatch", "this data root already holds an instance from a different activation; uninstall first", {
       recoveryActions: [{ kind: "revoke_in_app" }],
     });
@@ -60,42 +79,62 @@ export async function runActivationExchange(args: ActivationExchangeArgs): Promi
   if (existing && existing.administrativeStatus !== "provisioning") {
     throw new RemoteInstanceError("activation_consumed", "this runtime is already activated", { recoveryActions: [{ kind: "run_doctor" }] });
   }
-  // A retried exchange reuses this semantic nonce in its idempotency key.
-  // The transport proof nonce is regenerated for every HTTP attempt.
-  let nonce = existing?.exchangeNonce ?? newNonce();
-  const independent = verifyNativeRelease(args.release.manifest, args.roots, args.clock.now());
-  const attempt = await args.store.activationAttempt();
-  if (existing && !attempt) throw new RemoteInstanceError("registration_mismatch", "Existing identity requires an explicit native migration; it cannot be relabelled during activation.");
-  const binding = { activationId: args.activationId, keyDigest: jcsDigest(args.key.publicKeyJwk as unknown as JsonValue), platformDigest: jcsDigest(args.platform), manifestDigest: independent.manifest.digest };
+}
+
+/**
+ * A retried exchange reuses its semantic nonce in its idempotency key, and
+ * must match its original identity, platform and release; a first attempt
+ * is recorded before anything is sent. The transport proof nonce is
+ * regenerated for every HTTP attempt.
+ */
+async function activationNonce(args: ActivationExchangeArgs, existing: Identity, attempt: ActivationAttempt, binding: ActivationBinding): Promise<string> {
   if (attempt) {
-    if (attempt.activationId !== binding.activationId || attempt.keyDigest !== binding.keyDigest || attempt.platformDigest !== binding.platformDigest || attempt.manifestDigest !== binding.manifestDigest || (existing && existing.exchangeNonce !== attempt.nonce)) throw new RemoteInstanceError("registration_mismatch", "Activation retry does not match its original identity, platform and release.");
-    nonce = attempt.nonce;
-  } else {
-    await args.store.saveActivationAttempt({ ...binding, nonce, createdAt: args.clock.nowIso() });
+    const same = allEqual([
+      [attempt.activationId, binding.activationId],
+      [attempt.keyDigest, binding.keyDigest],
+      [attempt.platformDigest, binding.platformDigest],
+      [attempt.manifestDigest, binding.manifestDigest],
+    ]);
+    if (!same || (existing && existing.exchangeNonce !== attempt.nonce)) throw new RemoteInstanceError("registration_mismatch", "Activation retry does not match its original identity, platform and release.");
+    return attempt.nonce;
   }
+  const nonce = existing?.exchangeNonce ?? newNonce();
+  await args.store.saveActivationAttempt({ ...binding, nonce, createdAt: args.clock.nowIso() });
+  return nonce;
+}
+
+/** An exchange that already completed: its stored release must still verify, inside the provisioning window. */
+async function resumedProvisioning(args: ActivationExchangeArgs, existing: Identity, binding: ActivationBinding): Promise<ActivationExchangeOutcome | null> {
   const provisioning = await args.store.provisioning();
   const stored = await args.store.manifest();
-  if (existing && provisioning && stored) {
-    const verified = verifyNativeRelease(stored.manifest, args.roots, args.clock.now());
-    if (verified.manifest.digest !== binding.manifestDigest || stored.manifestDigest !== binding.manifestDigest || provisioning.manifestDigest !== binding.manifestDigest) throw new RemoteInstanceError("install_state_corrupt", "Stored native activation release is inconsistent.");
-    if (parseRfc3339(provisioning.provisioningWindowExpiresAt) <= args.clock.coreNow()) throw new RemoteInstanceError("provisioning_window_expired", "Native provisioning window expired; a fresh activation is required.");
-    return { instanceId: existing.instanceId, manifest: verified.manifest, manifestDigest: binding.manifestDigest, provisioningWindowExpiresAt: provisioning.provisioningWindowExpiresAt };
-  }
+  if (!existing || !provisioning || !stored) return null;
+  const verified = verifyNativeRelease(stored.manifest, args.roots, args.clock.now());
+  const consistent = allEqual([
+    [verified.manifest.digest, binding.manifestDigest],
+    [stored.manifestDigest, binding.manifestDigest],
+    [provisioning.manifestDigest, binding.manifestDigest],
+  ]);
+  if (!consistent) throw new RemoteInstanceError("install_state_corrupt", "Stored native activation release is inconsistent.");
+  if (parseRfc3339(provisioning.provisioningWindowExpiresAt) <= args.clock.coreNow()) throw new RemoteInstanceError("provisioning_window_expired", "Native provisioning window expired; a fresh activation is required.");
+  return { instanceId: existing.instanceId, manifest: verified.manifest, manifestDigest: binding.manifestDigest, provisioningWindowExpiresAt: provisioning.provisioningWindowExpiresAt };
+}
+
+async function exchanged(args: ActivationExchangeArgs, nonce: string) {
   const activationCode = await args.readActivationCode();
-  let result;
   try {
-    result = await args.core.activationExchange(
+    return await args.core.activationExchange(
       { activationId: args.activationId, activationCode, publicKeyJwk: args.key.publicKeyJwk, platform: args.platform },
       nonce,
     );
   } catch (error) {
-    if (error instanceof CoreResponseError) {
-      // The message says what to do next, so no second "create a new
-      // activation in the App or MCP" line follows it (W1-M3).
-      throw new RemoteInstanceError(error.code, activationFailureMessage(error.wireCode), { cause: error });
-    }
+    // The message says what to do next, so no second "create a new
+    // activation in the App or MCP" line follows it.
+    if (error instanceof CoreResponseError) throw new RemoteInstanceError(error.code, activationFailureMessage(error.wireCode), { cause: error });
     throw error;
   }
+}
+
+async function recordExchange(args: ActivationExchangeArgs, result: Awaited<ReturnType<typeof exchanged>>, nonce: string, logger: Logger): Promise<ActivationExchangeOutcome> {
   const exchange = verifyNativeRelease(result.bundleManifest, args.roots, args.clock.now());
   if (exchange.manifest.digest !== args.release.manifest.digest) throw new RemoteInstanceError("bundle_untrusted", "Native exchange differs from the independently verified release.");
   const manifestDigest = exchange.manifest.digest;
@@ -151,15 +190,7 @@ export async function refreshProvisioningCredential(args: { store: SupervisorSto
       recoveryActions: [{ kind: "new_activation" }, { kind: "revoke_in_app" }],
     });
   }
-  let result;
-  try {
-    result = await args.core.refreshProvisioningCredential({ instanceId: identity.instanceId, manifestDigest: provisioning.manifestDigest });
-  } catch (error) {
-    if (error instanceof CoreResponseError && error.code === "provisioning_window_expired") {
-      throw new RemoteInstanceError("provisioning_window_expired", "the provisioning window has expired; create a fresh activation", { recoveryActions: [{ kind: "new_activation" }], cause: error });
-    }
-    throw error;
-  }
+  const result = await refreshedCredential(args.core, identity.instanceId, provisioning.manifestDigest);
   if (result.bundleManifest) {
     assertSameBundle(stored.manifest, result.bundleManifest);
     await args.store.saveManifest(result.bundleManifest, stored.manifestDigest);
@@ -172,6 +203,17 @@ export async function refreshProvisioningCredential(args: { store: SupervisorSto
     lastRefreshAt: args.clock.nowIso(),
   });
   logger.info({ instanceId: identity.instanceId }, "provisioning credential refreshed under the same key");
+}
+
+async function refreshedCredential(core: CoreClient, instanceId: string, manifestDigest: string) {
+  try {
+    return await core.refreshProvisioningCredential({ instanceId, manifestDigest });
+  } catch (error) {
+    if (error instanceof CoreResponseError && error.code === "provisioning_window_expired") {
+      throw new RemoteInstanceError("provisioning_window_expired", "the provisioning window has expired; create a fresh activation", { recoveryActions: [{ kind: "new_activation" }], cause: error });
+    }
+    throw error;
+  }
 }
 
 export function provisioningCredentialIsExpired(provisioning: { provisioningCredentialExpiresAt: string }, clock: Clock, marginMs = 60_000): boolean {

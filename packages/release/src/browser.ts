@@ -2,7 +2,7 @@
  * The browser a QA or validator agent drives (native-only plan step 6): Microsoft's
  * Playwright MCP server, bundled into the Claude Code and Codex offline agent
  * packages at the version pinned here and in `release/native-agent-builds.json`
- * (`browser`). It is a connector capability (opencode-runtime-support O8):
+ * (`browser`). It is a connector capability:
  * every agent's sessions get it, run from whichever installed package carries
  * it, on that package's Node or else the person's own; it is never fetched
  * from a registry at runtime. The browser itself is not bundled: the installed Google

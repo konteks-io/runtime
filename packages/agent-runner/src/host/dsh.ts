@@ -60,7 +60,7 @@ export const dshRunnerAdapter: HostAgentRunnerAdapter = {
     return env;
   },
   // Every dsh process reads the overlay at boot, so a changed copy heals on
-  // the next spawn instead of leaving it unguarded (CP3 live proof, phase 2).
+  // the next spawn instead of leaving it unguarded.
   prepareToSpawn: async config => { await writeDshKonteksProfile(dshRuntimePaths(config.RUNNER_CREDENTIAL_DIR).konteksDir); },
   // dsh has no login command: the runtime asks for the API key itself, checks
   // it with DeepSeek and stores it in its dsh home.

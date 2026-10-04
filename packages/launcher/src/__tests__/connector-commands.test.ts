@@ -7,7 +7,7 @@ import { ConnectorCommandsManifestSchema, connectorCommandsFor } from "@konteks/
 import { createNativeProgram } from "../native/cli.js";
 
 /**
- * runtime-view R20: the connector commands a release ships (`commands.json`)
+ * The connector commands a release ships (`commands.json`)
  * never name a command, option or argument the launcher does not have, and
  * every command a person runs on the computer is listed.
  */
@@ -52,7 +52,7 @@ function leaves(command: Command, prefix: string[] = []): string[] {
   });
 }
 
-describe("connector commands shipped with the release (runtime-view R20)", () => {
+describe("connector commands shipped with the release", () => {
   it("is a manifest the site takes once the release names its version", () => {
     const manifest = ConnectorCommandsManifestSchema.parse({ version: "0.4.1", ...table });
     expect(manifest.commands.length).toBeGreaterThan(10);
@@ -72,7 +72,7 @@ describe("connector commands shipped with the release (runtime-view R20)", () =>
   });
 });
 
-describe("the commands the connector reports on its heartbeat (runtime-view R20)", () => {
+describe("the commands the connector reports on its heartbeat", () => {
   it("are this release's table at the installed bundle version, or nothing when they would not parse", async () => {
     const { connectorCommandsManifest, CONNECTOR_COMMANDS_TABLE } = await import("@konteks/remote-release");
     const manifest = connectorCommandsManifest("0.4.1");

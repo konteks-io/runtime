@@ -12,12 +12,12 @@ afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 const now = "2026-09-10T00:00:00.000Z";
 const conversation = { kind: "assistant_execution" as const, agentRoute: { requiredRole: "assistant" as const, agentId: "codex" },
   source: { kind: "conversation" as const, portability: "portable_before_claim" as const, sessionId: "session", turnRef: "turn" } };
-// A repository-role delivery turn (WS2-159): Core owns its cleanup.
+// A repository-role delivery turn: Core owns its cleanup.
 const delivery = { kind: "validation" as const, agentRoute: { requiredRole: "qa" as const, agentId: "codex" },
   source: { kind: "harness_delivery" as const, portability: "instance_bound" as const, ownerInstanceId: "instance",
     executionSessionId: "session", repositoryId: "https://git.example.com/acme/store",
     modelBinding: { canonicalProviderId: "openai", canonicalModelId: "model" }, turn: { invocationId: "qa-run", dispatchGeneration: 0 } } };
-// A direct session's turn (WS1-172): Core's cancel settles it the same way.
+// A direct session's turn: Core's cancel settles it the same way.
 const direct = { kind: "direct" as const, agentRoute: { requiredRole: "assistant" as const, agentId: "codex" },
   source: { kind: "direct_session" as const, portability: "instance_bound" as const, ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
 async function fixture(count = 1, work: typeof conversation | typeof delivery | typeof direct = conversation) {
@@ -51,7 +51,7 @@ async function fixture(count = 1, work: typeof conversation | typeof delivery | 
   return { journal, owner, stop, cancelDelivery, replay };
 }
 
-it("cancels a claimed, unprompted delivery turn through its signed cancel instead of a recovery fence (WS2-159)", async () => {
+it("cancels a claimed, unprompted delivery turn through its signed cancel instead of a recovery fence", async () => {
   const f = await fixture(1, delivery);
   f.replay.tick(); await f.replay.settle();
   expect(f.cancelDelivery).toHaveBeenCalledOnce();
@@ -65,7 +65,7 @@ it("cancels a claimed, unprompted delivery turn through its signed cancel instea
   expect(f.journal.cancellations.pending()).toHaveLength(1);
 });
 
-it("answers a direct session turn's signed cancel with its cancelled terminal, never a recovery fence (WS1-172)", async () => {
+it("answers a direct session turn's signed cancel with its cancelled terminal, never a recovery fence", async () => {
   const f = await fixture(1, direct);
   f.replay.tick(); await f.replay.settle();
   expect(f.cancelDelivery).toHaveBeenCalledOnce();

@@ -1,14 +1,15 @@
 import { execFile } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import { access, lstat, mkdtemp, open, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { RemoteInstanceError } from "@konteks/remote-common";
+import { absolutePathEntries, plainAbsolutePath, safelyOwned } from "./host-files.js";
 import { openCodeScratchEnvironment } from "@konteks/remote-agent-runner";
 import { hostAgentFamily, hostAgentVersionSupported, hostInstallCommand, type HostAgentFamily } from "@konteks/remote-release";
 
 /** The person's own installed OpenCode 2, as the runtime will launch it. */
-export interface NativeOpenCodeInstallation {
+interface NativeOpenCodeInstallation {
   /** Canonical path of the native executable (never a shim). */
   binary: string;
   version: string;
@@ -24,7 +25,7 @@ const CONTROL = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 /** npm packages whose `bin/opencode.exe` is OpenCode: 2.x, and 1.x (named so it can be refused by name). */
 const NPM_PACKAGES = ["@opencode/cli", "opencode-ai"] as const;
 
-export interface OpenCodeLocatorDeps {
+interface OpenCodeLocatorDeps {
   /** Runs `<binary> --version` (scrubbed environment, throwaway home); replaced only in tests. */
   versionOutput?: (binary: string) => Promise<string | null>;
 }
@@ -69,29 +70,21 @@ function unsafe(path: string, platform: NodeJS.Platform): Refusal {
  * refusal (unsupported version, then unsafe, then not found), each naming the
  * install command. Operator process configuration only; never from Core or ACP.
  */
-export async function resolveNativeOpenCodeInstallation(
+export function resolveNativeOpenCodeInstallation(
   env: NodeJS.ProcessEnv = process.env,
   operatorHome = homedir(),
   platform: NodeJS.Platform = process.platform,
   deps: OpenCodeLocatorDeps = {},
 ): Promise<NativeOpenCodeInstallation> {
-  const hostInstall = family().hostInstall;
-  const candidates: string[] = [];
+  return locateOpenCode(env, operatorHome, platform, deps);
+}
+
+async function locateOpenCode(env: NodeJS.ProcessEnv, operatorHome: string, platform: NodeJS.Platform, deps: OpenCodeLocatorDeps): Promise<NativeOpenCodeInstallation> {
   const override = env.OPENCODE_EXECUTABLE;
-  if (override !== undefined) {
-    if (!isAbsolute(override) || CONTROL.test(override)) {
-      throw refuse({ diagnostic: "opencode_not_found", message: "OPENCODE_EXECUTABLE must be an absolute path to the installed OpenCode 2 executable or its @opencode/cli package." });
-    }
-    candidates.push(override);
-  } else {
-    const windows = platform === "win32";
-    const extensions = windows ? [...(env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map(ext => ext.toLowerCase()), ".ps1", ""] : [""];
-    const directories = (env.PATH ?? "").split(windows ? ";" : ":").filter(directory => directory && isAbsolute(directory));
-    for (const name of hostInstall.pathNames ?? [hostInstall.bin]) {
-      for (const directory of directories) for (const extension of extensions) candidates.push(join(directory, `${name}${extension}`));
-    }
-    candidates.push(...fallbackCandidates(env, operatorHome, platform));
+  if (override !== undefined && !plainAbsolutePath(override)) {
+    throw refuse({ diagnostic: "opencode_not_found", message: "OPENCODE_EXECUTABLE must be an absolute path to the installed OpenCode 2 executable or its @opencode/cli package." });
   }
+  const candidates = override !== undefined ? [override] : [...pathCandidates(env, platform), ...fallbackCandidates(env, operatorHome, platform)];
   let best: Refusal = notFound(platform);
   for (const candidate of [...new Set(candidates)]) {
     for (const binary of await binariesFor(candidate, platform)) {
@@ -103,9 +96,19 @@ export async function resolveNativeOpenCodeInstallation(
   throw refuse(best);
 }
 
+/** Every PATH folder for each of OpenCode's names (`opencode2` first); on Windows each `PATHEXT` name. */
+function pathCandidates(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string[] {
+  const hostInstall = family().hostInstall;
+  const windows = platform === "win32";
+  const extensions = windows ? [...(env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean).map(ext => ext.toLowerCase()), ".ps1", ""] : [""];
+  const directories = absolutePathEntries(env.PATH, windows ? ";" : ":");
+  return (hostInstall.pathNames ?? [hostInstall.bin])
+    .flatMap(name => directories.flatMap(directory => extensions.map(extension => join(directory, `${name}${extension}`))));
+}
+
 /** Re-verify a recorded executable before every start (ownership, kind and version). */
 export async function verifyNativeOpenCodeBinary(binary: string, platform: NodeJS.Platform = process.platform, deps: OpenCodeLocatorDeps = {}): Promise<NativeOpenCodeInstallation> {
-  if (!isAbsolute(binary) || CONTROL.test(binary)) throw refuse(notFound(platform));
+  if (!plainAbsolutePath(binary)) throw refuse(notFound(platform));
   const outcome = await inspect(binary, platform, deps);
   if ("binary" in outcome) return outcome;
   throw refuse(outcome);
@@ -120,19 +123,36 @@ export async function locateNativeOpenCode(env: NodeJS.ProcessEnv = process.env)
 /** Documented install locations, after PATH. Root never inherits a user-writable per-user install. */
 function fallbackCandidates(env: NodeJS.ProcessEnv, operatorHome: string, platform: NodeJS.Platform): string[] {
   const perUser = process.getuid?.() !== 0;
-  const npmBinary = (prefix: string, windows: boolean) => windows ? join(prefix, "node_modules", "@opencode", "cli", "bin", "opencode.exe") : join(prefix, "lib", "node_modules", "@opencode", "cli", "bin", "opencode.exe");
-  const absolute = (path: string | undefined): path is string => Boolean(path && isAbsolute(path));
-  if (platform === "win32") {
-    const profile = absolute(env.USERPROFILE) ? env.USERPROFILE : operatorHome;
-    const scoop = absolute(env.SCOOP) ? env.SCOOP : join(profile, "scoop");
-    const choco = absolute(env.ChocolateyInstall) ? env.ChocolateyInstall : absolute(env.ProgramData) ? join(env.ProgramData, "chocolatey") : undefined;
-    return [
-      ...(perUser ? [join(profile, ".opencode", "bin", "opencode.exe")] : []),
-      ...[env.npm_config_prefix, absolute(env.APPDATA) ? join(env.APPDATA, "npm") : undefined].filter(absolute).map(prefix => npmBinary(prefix, true)),
-      ...(perUser ? ["opencode2.exe", "opencode.exe"].map(name => join(scoop, "shims", name)) : []),
-      ...(choco ? ["opencode2.exe", "opencode.exe"].map(name => join(choco, "bin", name)) : []),
-    ];
-  }
+  return platform === "win32" ? windowsFallbacks(env, operatorHome, perUser) : posixFallbacks(env, operatorHome, perUser);
+}
+
+function absolute(path: string | undefined): path is string {
+  return Boolean(path && isAbsolute(path));
+}
+
+function npmBinary(prefix: string, windows: boolean): string {
+  return windows ? join(prefix, "node_modules", "@opencode", "cli", "bin", "opencode.exe") : join(prefix, "lib", "node_modules", "@opencode", "cli", "bin", "opencode.exe");
+}
+
+function windowsFallbacks(env: NodeJS.ProcessEnv, operatorHome: string, perUser: boolean): string[] {
+  const profile = absolute(env.USERPROFILE) ? env.USERPROFILE : operatorHome;
+  const scoop = absolute(env.SCOOP) ? env.SCOOP : join(profile, "scoop");
+  const choco = chocolateyRoot(env);
+  const npmPrefixes = [env.npm_config_prefix, absolute(env.APPDATA) ? join(env.APPDATA, "npm") : undefined].filter(absolute);
+  return [
+    ...(perUser ? [join(profile, ".opencode", "bin", "opencode.exe")] : []),
+    ...npmPrefixes.map(prefix => npmBinary(prefix, true)),
+    ...(perUser ? ["opencode2.exe", "opencode.exe"].map(name => join(scoop, "shims", name)) : []),
+    ...(choco ? ["opencode2.exe", "opencode.exe"].map(name => join(choco, "bin", name)) : []),
+  ];
+}
+
+function chocolateyRoot(env: NodeJS.ProcessEnv): string | undefined {
+  if (absolute(env.ChocolateyInstall)) return env.ChocolateyInstall;
+  return absolute(env.ProgramData) ? join(env.ProgramData, "chocolatey") : undefined;
+}
+
+function posixFallbacks(env: NodeJS.ProcessEnv, operatorHome: string, perUser: boolean): string[] {
   const prefixes = [env.npm_config_prefix, ...(perUser ? [join(operatorHome, ".npm-global"), join(operatorHome, ".local")] : []), "/opt/homebrew", "/usr/local", "/usr"].filter(absolute);
   return [
     ...(perUser ? [join(operatorHome, ".opencode", "bin", "opencode")] : []),
@@ -144,17 +164,28 @@ function fallbackCandidates(env: NodeJS.ProcessEnv, operatorHome: string, platfo
 /** Executables a candidate may stand for, in trust order, found without running or parsing any script. */
 async function binariesFor(candidate: string, platform: NodeJS.Platform): Promise<string[]> {
   if (!(await lstat(candidate).then(() => true, () => false))) return [];
-  const windows = platform === "win32";
-  const executable = windows ? "opencode.exe" : "opencode";
-  const out: string[] = [];
+  const direct = await directTarget(candidate);
+  return direct.binaries ?? besideLayouts(candidate, direct.canonical, platform);
+}
+
+/** The candidate itself when it is the package folder or a native executable; otherwise only its real path, if readable. */
+async function directTarget(candidate: string): Promise<{ binaries: string[] | null; canonical: string | null }> {
   let canonical: string | null = null;
   try {
     canonical = await realpath(candidate);
     const info = await stat(canonical);
     // The @opencode/cli package folder itself (an override may name it).
-    if (info.isDirectory()) return [join(canonical, "bin", "opencode.exe")];
-    if (await nativeExecutable(canonical)) return [canonical];
+    if (info.isDirectory()) return { binaries: [join(canonical, "bin", "opencode.exe")], canonical };
+    if (await nativeExecutable(canonical)) return { binaries: [canonical], canonical };
   } catch { /* unreadable: try the layouts beside it */ }
+  return { binaries: null, canonical };
+}
+
+/** The executables a shim stands for, by the layout beside it. */
+async function besideLayouts(candidate: string, canonical: string | null, platform: NodeJS.Platform): Promise<string[]> {
+  const windows = platform === "win32";
+  const executable = windows ? "opencode.exe" : "opencode";
+  const out: string[] = [];
   const beside = dirname(candidate);
   // scoop: `<shims>/opencode.exe` + `opencode.shim` naming the real path.
   const shimTarget = await scoopShimTarget(join(beside, `${basename(candidate, extname(candidate))}.shim`));
@@ -206,26 +237,26 @@ async function nativeExecutable(path: string): Promise<boolean> {
   }
 }
 
-function safelyOwned(info: { uid: number; mode: number }): boolean {
-  const owner = info.uid === process.getuid?.() || info.uid === 0;
-  return owner && (info.mode & 0o022) === 0;
+async function inspect(candidate: string, platform: NodeJS.Platform, deps: OpenCodeLocatorDeps): Promise<NativeOpenCodeInstallation | Refusal> {
+  const binary = await realpath(candidate).catch(() => null);
+  if (binary === null || !(await nativeExecutable(binary))) return notFound(platform);
+  const posixOwnership = platform !== "win32" && process.platform !== "win32";
+  // Same rule as the Claude executable: user- or root-owned, not writable by others.
+  const refused = posixOwnership ? await ownershipRefusal(binary, platform) : null;
+  return refused ?? versionVerdict(binary, posixOwnership, platform, deps);
 }
 
-async function inspect(candidate: string, platform: NodeJS.Platform, deps: OpenCodeLocatorDeps): Promise<NativeOpenCodeInstallation | Refusal> {
-  let binary: string;
+async function ownershipRefusal(binary: string, platform: NodeJS.Platform): Promise<Refusal | null> {
+  if (!safelyOwned(await stat(binary))) return unsafe(binary, platform);
   try {
-    binary = await realpath(candidate);
+    await access(binary, constants.X_OK);
+    return null;
   } catch {
     return notFound(platform);
   }
-  if (!(await nativeExecutable(binary))) return notFound(platform);
-  const posixOwnership = platform !== "win32" && process.platform !== "win32";
-  // Same rule as the Claude executable: user- or root-owned, not writable by others.
-  if (posixOwnership) {
-    const info = await stat(binary);
-    if (!safelyOwned(info)) return unsafe(binary, platform);
-    try { await access(binary, constants.X_OK); } catch { return notFound(platform); }
-  }
+}
+
+async function versionVerdict(binary: string, posixOwnership: boolean, platform: NodeJS.Platform, deps: OpenCodeLocatorDeps): Promise<NativeOpenCodeInstallation | Refusal> {
   const packaged = await npmPackageVersion(binary, posixOwnership);
   if (packaged === "unsafe") return unsafe(binary, platform);
   const version = packaged ?? await cachedVersion(binary, deps);
@@ -239,19 +270,23 @@ async function inspect(candidate: string, platform: NodeJS.Platform, deps: OpenC
  */
 async function npmPackageVersion(binary: string, posixOwnership: boolean): Promise<string | "unsafe" | null> {
   if (basename(binary) !== "opencode.exe" || basename(dirname(binary)) !== "bin") return null;
-  const file = join(dirname(dirname(binary)), "package.json");
+  const found = await readNpmManifest(join(dirname(dirname(binary)), "package.json"));
+  if (!found) return null;
+  if (posixOwnership && !safelyOwned(found.info)) return "unsafe";
+  return found.version;
+}
+
+async function readNpmManifest(file: string): Promise<{ info: Stats; version: string } | null> {
   try {
     const info = await stat(file);
     if (!info.isFile() || info.size > 64 * 1024) return null;
     const manifest = JSON.parse(await readFile(file, "utf8")) as { name?: unknown; version?: unknown };
     if (!NPM_PACKAGES.includes(manifest.name as (typeof NPM_PACKAGES)[number]) || typeof manifest.version !== "string") return null;
-    if (posixOwnership && !safelyOwned(info)) return "unsafe";
-    return manifest.version;
+    return { info, version: manifest.version };
   } catch {
     return null;
   }
 }
-
 const versionCaches = new WeakMap<(binary: string) => Promise<string | null>, Map<string, Promise<string | null>>>();
 
 /** One `--version` per executable file (path, inode, size and modification time), per process. */
@@ -297,7 +332,7 @@ export async function openCodeVersionOutput(binary: string): Promise<string | nu
 }
 
 /** How the person installed the OpenCode the connector runs, in words for doctor (never the path). */
-export type OpenCodeInstallKind = "homepage installer" | "npm" | "Homebrew" | "scoop" | "Chocolatey" | "another location";
+type OpenCodeInstallKind = "homepage installer" | "npm" | "Homebrew" | "scoop" | "Chocolatey" | "another location";
 
 /** Read from the canonical executable path the locator returned (so a shim already points at its target). */
 export function openCodeInstallKind(binary: string): OpenCodeInstallKind {

@@ -40,11 +40,21 @@ interface WindowsProcessRecord {
   ExecutablePath: string | null;
 }
 
+type OwnerPlatform = RetainedProcessOwner["platform"];
+
+function isOwnerPlatform(platform: NodeJS.Platform): platform is OwnerPlatform {
+  return platform === "darwin" || platform === "linux" || platform === "win32";
+}
+
+function isBridgePid(pid: number): boolean {
+  return Number.isSafeInteger(pid) && pid > 1;
+}
+
 export function captureRetainedProcessOwner(pid: number, options: CaptureOptions = {}): RetainedProcessOwner {
   const platform = options.platform ?? process.platform;
-  if (platform !== "darwin" && platform !== "linux" && platform !== "win32") throw new RemoteInstanceError("recovery_required", `Durable execution-process rehydration is not available on ${platform}.`);
-  if (!Number.isSafeInteger(pid) || pid <= 1) throw invalidOwner("Bridge PID is invalid.");
-  const identity = (options.readIdentity ?? identityReader(platform))(pid);
+  if (!isOwnerPlatform(platform)) throw invalidOwner(`Durable execution-process rehydration is not available on ${platform}.`);
+  if (!isBridgePid(pid)) throw invalidOwner("Bridge PID is invalid.");
+  const identity = readerFor(options, platform)(pid);
   if (!identity) throw invalidOwner("Bridge process identity cannot be captured.");
   if (identity.pid !== pid || identity.processGroupId !== pid) throw invalidOwner("Bridge is not its exact process-group leader.");
   return { version: 1, platform, ...identity };
@@ -52,31 +62,61 @@ export function captureRetainedProcessOwner(pid: number, options: CaptureOptions
 
 export async function stopRetainedProcessOwner(owner: RetainedProcessOwner, options: StopOptions = {}): Promise<void> {
   const platform = options.platform ?? process.platform;
-  if ((platform !== "darwin" && platform !== "linux" && platform !== "win32") || owner.platform !== platform) throw invalidOwner(`Durable execution-process rehydration is not available on ${platform}.`);
-  const read = options.readIdentity ?? identityReader(platform);
+  if (!isOwnerPlatform(platform) || owner.platform !== platform) throw invalidOwner(`Durable execution-process rehydration is not available on ${platform}.`);
+  const read = readerFor(options, platform);
   if (platform === "win32") return stopWindowsProcessOwner(owner, read, options);
-  const observed = read(owner.pid);
-  const signal = options.signal ?? ((pid, value) => process.kill(pid, value));
-  const groupAlive = options.groupAlive ?? ((pgid) => {
-    try { process.kill(-pgid, 0); return true; }
-    catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-  });
-  const pause = options.pause ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  return stopPosixProcessOwner(owner, read, options);
+}
+
+const pauseFor = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+function processGroupAlive(pgid: number): boolean {
+  try { process.kill(-pgid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+
+function posixStopDeps(options: StopOptions) {
+  return {
+    signal: options.signal ?? ((pid: number, value: NodeJS.Signals) => process.kill(pid, value)),
+    groupAlive: options.groupAlive ?? processGroupAlive,
+    pause: options.pause ?? pauseFor,
+  };
+}
+
+/**
+ * Whether the retained leader is still the exact process to stop. An absent
+ * leader is not stop proof by itself (a descendant could have survived it),
+ * so it counts as stopped only when nothing it started survives; a reused
+ * identity is refused.
+ */
+function leaderToStop(owner: RetainedProcessOwner, observed: ProcessIdentity | null, survivors: () => boolean, kind: "group" | "tree"): boolean {
   if (!observed) {
-    // The leader is gone. That alone is not stop proof — a descendant could
-    // have survived it — so require the same evidence the stop wait accepts:
-    // the whole process group is absent. A reused PID is refused below.
-    if (groupAlive(owner.processGroupId)) throw invalidOwner("Retained bridge leader is absent while its process group survives; absence is not stop proof.");
-    return;
+    if (survivors()) throw invalidOwner(kind === "group"
+      ? "Retained bridge leader is absent while its process group survives; absence is not stop proof."
+      : "Retained bridge leader is absent while its process tree survives; absence is not stop proof.");
+    return false;
   }
-  if (!sameIdentity(owner, observed)) throw invalidOwner("Retained bridge identity changed; refusing to signal a reused process identity.");
+  if (!sameIdentity(owner, observed)) throw invalidOwner(kind === "group"
+    ? "Retained bridge identity changed; refusing to signal a reused process identity."
+    : "Retained bridge identity changed; refusing to terminate a reused process identity.");
+  return true;
+}
+
+async function stopPosixProcessOwner(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, options: StopOptions): Promise<void> {
+  const { signal, groupAlive, pause } = posixStopDeps(options);
+  const survivors = () => groupAlive(owner.processGroupId);
+  if (!leaderToStop(owner, read(owner.pid), survivors, "group")) return;
   signal(owner.pid, "SIGTERM");
-  if (await waitUntilStopped(owner, read, groupAlive, pause, options.termTimeoutMs ?? 5_000)) return;
+  if (await waitUntilStopped(owner, read, survivors, pause, options.termTimeoutMs ?? 5_000)) return;
   // The group signal is authorized only after the exact leader identity was
   // positively matched above. It does not rely on a PID file or root lock.
   try { signal(-owner.processGroupId, "SIGKILL"); } catch { /* verified below */ }
-  if (await waitUntilStopped(owner, read, groupAlive, pause, options.killTimeoutMs ?? 2_000)) return;
+  if (await waitUntilStopped(owner, read, survivors, pause, options.killTimeoutMs ?? 2_000)) return;
   throw invalidOwner("Retained bridge process-group exit remains unconfirmed.");
+}
+
+function readerFor(options: CaptureOptions, platform: OwnerPlatform): (pid: number) => ProcessIdentity | null {
+  return options.readIdentity ?? identityReader(platform);
 }
 
 function identityReader(platform: "darwin" | "linux" | "win32"): (pid: number) => ProcessIdentity | null {
@@ -101,17 +141,27 @@ export function readLinuxProcessIdentity(
   pid: number,
   readFile: (path: string) => Buffer | null = path => { try { return readFileSync(path); } catch { return null; } },
 ): ProcessIdentity | null {
-  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  if (!isBridgePid(pid)) return null;
   const statPath = `/proc/${pid}/stat`;
   const first = parseLinuxStat(readFile(statPath), pid);
   if (!first) return null;
   const command = readFile(`/proc/${pid}/cmdline`);
-  const bootId = readFile("/proc/sys/kernel/random/boot_id")?.toString("utf8").trim();
+  const bootId = readBootId(readFile);
   const second = parseLinuxStat(readFile(statPath), pid);
-  if (!command?.length || !bootId || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(bootId) ||
-      !second || first.processGroupId !== second.processGroupId || first.startTicks !== second.startTicks) return null;
+  if (!command?.length || !bootId || !sameLinuxStat(first, second)) return null;
   return { pid, processGroupId: first.processGroupId, startToken: `${bootId}:${first.startTicks}`,
     commandDigest: createHash("sha256").update(command).digest("base64url") };
+}
+
+function readBootId(readFile: (path: string) => Buffer | null): string | null {
+  const bootId = readFile("/proc/sys/kernel/random/boot_id")?.toString("utf8").trim();
+  return bootId && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(bootId) ? bootId : null;
+}
+
+type LinuxStat = { processGroupId: number; startTicks: string };
+
+function sameLinuxStat(first: LinuxStat, second: LinuxStat | null): boolean {
+  return second !== null && first.processGroupId === second.processGroupId && first.startTicks === second.startTicks;
 }
 
 /** Windows has no POSIX process groups. A detached bridge is fenced by the
@@ -122,14 +172,9 @@ export function readWindowsProcessIdentity(
   pid: number,
   query?: (pid: number) => WindowsProcessRecord | null,
 ): ProcessIdentity | null {
-  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  if (!isBridgePid(pid)) return null;
   const [first, second] = query ? [query(pid), query(pid)] : queryWindowsProcessPair(pid);
-  if (!first) return null;
-  if (!second || first.ProcessId !== pid || second.ProcessId !== pid ||
-      first.CreationDate !== second.CreationDate ||
-      (first.CommandLine && second.CommandLine && first.CommandLine !== second.CommandLine) ||
-      (first.ExecutablePath && second.ExecutablePath && first.ExecutablePath !== second.ExecutablePath)) return null;
-  if (!first.CreationDate.trim()) return null;
+  if (!first || !second || !sameWindowsProcess(pid, first, second) || !first.CreationDate.trim()) return null;
   // Windows may reveal Path/CommandLine only after the process has started.
   // Unlike POSIX it cannot replace a running process image with exec(), so PID
   // + kernel creation time is the stable authority. Optional process details
@@ -138,6 +183,16 @@ export function readWindowsProcessIdentity(
   const command = `${pid}\0${first.CreationDate}`;
   return { pid, processGroupId: pid, startToken: first.CreationDate,
     commandDigest: createHash("sha256").update(command).digest("base64url") };
+}
+
+/** Both reads name the same process: its PID and creation instant, and no conflicting optional detail. */
+function sameWindowsProcess(pid: number, first: WindowsProcessRecord, second: WindowsProcessRecord): boolean {
+  return first.ProcessId === pid && second.ProcessId === pid && first.CreationDate === second.CreationDate &&
+    !conflicting(first.CommandLine, second.CommandLine) && !conflicting(first.ExecutablePath, second.ExecutablePath);
+}
+
+function conflicting(first: string | null, second: string | null): boolean {
+  return Boolean(first && second && first !== second);
 }
 
 function queryWindowsProcessPair(pid: number): [WindowsProcessRecord | null, WindowsProcessRecord | null] {
@@ -161,20 +216,22 @@ function queryWindowsProcessPair(pid: number): [WindowsProcessRecord | null, Win
   } catch { return [null, null]; }
 }
 
+function windowsStopDeps(options: StopOptions) {
+  return {
+    treeAlive: options.treeAlive ?? windowsProcessTreeAlive,
+    terminate: options.terminateTree ?? terminateWindowsProcessTree,
+    pause: options.pause ?? pauseFor,
+  };
+}
+
 async function stopWindowsProcessOwner(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, options: StopOptions): Promise<void> {
-  const observed = read(owner.pid);
-  const treeAlive = options.treeAlive ?? windowsProcessTreeAlive;
-  if (!observed) {
-    if (treeAlive(owner.pid)) throw invalidOwner("Retained bridge leader is absent while its process tree survives; absence is not stop proof.");
-    return;
-  }
-  if (!sameIdentity(owner, observed)) throw invalidOwner("Retained bridge identity changed; refusing to terminate a reused process identity.");
-  const terminate = options.terminateTree ?? terminateWindowsProcessTree;
-  const pause = options.pause ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const { treeAlive, terminate, pause } = windowsStopDeps(options);
+  const survivors = () => treeAlive(owner.pid);
+  if (!leaderToStop(owner, read(owner.pid), survivors, "tree")) return;
   terminate(owner.pid, false);
-  if (await waitUntilWindowsTreeStopped(owner, read, treeAlive, pause, options.termTimeoutMs ?? 5_000)) return;
+  if (await waitUntilStopped(owner, read, survivors, pause, options.termTimeoutMs ?? 5_000)) return;
   terminate(owner.pid, true);
-  if (await waitUntilWindowsTreeStopped(owner, read, treeAlive, pause, options.killTimeoutMs ?? 2_000)) return;
+  if (await waitUntilStopped(owner, read, survivors, pause, options.killTimeoutMs ?? 2_000)) return;
   throw invalidOwner("Retained bridge process-tree exit remains unconfirmed.");
 }
 
@@ -193,39 +250,34 @@ function windowsProcessTreeAlive(pid: number): boolean {
   return result.status === 0;
 }
 
-async function waitUntilWindowsTreeStopped(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, treeAlive: (pid: number) => boolean, pause: (ms: number) => Promise<void>, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  do {
-    const current = read(owner.pid);
-    if (current && !sameIdentity(owner, current)) throw invalidOwner("Retained bridge identity changed while stopping.");
-    if (!current && !treeAlive(owner.pid)) return true;
-    await pause(Math.min(50, Math.max(0, deadline - Date.now())));
-  } while (Date.now() <= deadline);
-  return false;
+function parseLinuxStat(bytes: Buffer | null, pid: number): LinuxStat | null {
+  const fields = linuxStatFields(bytes, pid);
+  if (!fields || fields.length < 20 || fields[0] === "Z" || fields[0] === "X") return null;
+  const processGroupId = Number(fields[2]);
+  const startTicks = fields[19];
+  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 1 || !validStartTicks(startTicks)) return null;
+  return { processGroupId, startTicks };
 }
 
-function parseLinuxStat(bytes: Buffer | null, pid: number): { processGroupId: number; startTicks: string } | null {
+/** The fields after `comm`: state (field 3), ppid (4), pgrp (5), ... starttime (22). */
+function linuxStatFields(bytes: Buffer | null, pid: number): string[] | null {
   if (!bytes) return null;
   const stat = bytes.toString("utf8");
   if (!stat.startsWith(`${pid} (`)) return null;
   const end = stat.lastIndexOf(") ");
-  if (end < 0) return null;
-  // After comm: state (field 3), ppid (4), pgrp (5), ... starttime (22).
-  const fields = stat.slice(end + 2).trim().split(/\s+/);
-  const processGroupId = Number(fields[2]);
-  const startTicks = fields[19];
-  if (fields.length < 20 || fields[0] === "Z" || fields[0] === "X" ||
-      !Number.isSafeInteger(processGroupId) || processGroupId <= 1 ||
-      !startTicks || !/^\d+$/.test(startTicks) || BigInt(startTicks) === 0n) return null;
-  return { processGroupId, startTicks };
+  return end < 0 ? null : stat.slice(end + 2).trim().split(/\s+/);
 }
 
-async function waitUntilStopped(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, groupAlive: (pgid: number) => boolean, pause: (ms: number) => Promise<void>, timeoutMs: number): Promise<boolean> {
+function validStartTicks(value: string | undefined): value is string {
+  return value !== undefined && /^\d+$/.test(value) && BigInt(value) !== 0n;
+}
+
+async function waitUntilStopped(owner: RetainedProcessOwner, read: (pid: number) => ProcessIdentity | null, survivors: () => boolean, pause: (ms: number) => Promise<void>, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   do {
     const current = read(owner.pid);
     if (current && !sameIdentity(owner, current)) throw invalidOwner("Retained bridge identity changed while stopping.");
-    if (!current && !groupAlive(owner.processGroupId)) return true;
+    if (!current && !survivors()) return true;
     await pause(Math.min(50, Math.max(0, deadline - Date.now())));
   } while (Date.now() <= deadline);
   return false;

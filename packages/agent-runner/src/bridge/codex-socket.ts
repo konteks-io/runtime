@@ -2,7 +2,7 @@ import type { Stats } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export type CodexSocketEntry =
+type CodexSocketEntry =
   | { kind: "none" }
   /** A socket at the path, or reached through this user's link into a private directory of this user. */
   | { kind: "socket"; target: string; info: Pick<Stats, "mode" | "uid" | "dev" | "ino"> }
@@ -13,9 +13,8 @@ export type CodexSocketEntry =
 /**
  * What is at the shared socket path. Codex 0.159 and later bind the socket
  * under a private per-user directory of their own (`/tmp/codex-daemon-<uid>/`)
- * and leave a symlink at the `--listen unix://PATH` they were given (RCA
- * 2026-10-01: the connector looked for a socket at PATH itself, never saw one,
- * and Codex never started on 0.10.3). A link counts only when this user owns
+ * and leave a symlink at the `--listen unix://PATH` they were given. A link
+ * counts only when this user owns
  * it and its socket sits, owned by this user, in a directory only this user
  * can enter; anything else is foreign and never touched.
  */
@@ -24,11 +23,20 @@ export async function resolveCodexSocket(socketPath: string, entry?: Pick<Stats,
   if (!own) return { kind: "none" };
   if (own.isSocket()) return { kind: "socket", target: socketPath, info: own };
   if (!own.isSymbolicLink() || own.uid !== process.getuid?.()) return { kind: "foreign" };
+  return linkedSocket(socketPath);
+}
+
+/** This user's link: its socket, when it sits owned by this user in a directory only this user can enter. */
+async function linkedSocket(socketPath: string): Promise<CodexSocketEntry> {
   const target = await realpath(socketPath).catch(() => null);
   if (!target) return { kind: "dangling" };
   const [info, directory] = await Promise.all([lstat(target).catch(() => null), lstat(dirname(target)).catch(() => null)]);
-  if (!info?.isSocket() || info.uid !== process.getuid?.() || !directory?.isDirectory() || !privateOwner(directory)) return { kind: "foreign" };
+  if (!ownSocket(info) || !directory?.isDirectory() || !privateOwner(directory)) return { kind: "foreign" };
   return { kind: "socket", target, info };
+}
+
+function ownSocket(info: Stats | null): info is Stats {
+  return info !== null && info.isSocket() && info.uid === process.getuid?.();
 }
 
 function privateOwner(info: { mode: number; uid: number }): boolean {

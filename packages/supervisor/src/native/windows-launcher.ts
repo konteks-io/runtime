@@ -4,7 +4,7 @@ import { join } from "node:path";
 /**
  * The file only an MSI from 0.10.11 on installs next to `konteks-remote.exe`
  * (`packaging/windows/launcher.wxs`): that launcher runs the installed
- * release's own code (D131). An older MSI's runs its own code for every
+ * release's own code. An older MSI's runs its own code for every
  * command, and no connector update can replace it under Program Files.
  */
 export const WINDOWS_LAUNCHER_MARKER = "launcher.json";

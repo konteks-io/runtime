@@ -1,9 +1,10 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Ajv, type ErrorObject, type ValidateFunction } from "ajv";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { STRUCTURED_RESULT_MCP_SERVER_NAME, STRUCTURED_RESULT_TOOL_NAME } from "@konteks/agent-core";
-import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import { createLogger, plainRecord, RemoteInstanceError, type Logger } from "@konteks/remote-common";
+import { bearerMatches, negotiatedProtocolVersion, readJsonBody, sendJson } from "../loopback-http.js";
 
 /**
  * The session's result tool, `submit_result`, as a connector-local loopback
@@ -34,7 +35,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "
 /** A plan or verdict is kilobytes; the completion frame that carries it is bounded at 1 MiB. */
 const MAX_REQUEST_BYTES = 512 * 1024;
 /** How long `bind` waits for the agent to read the new tool list (Claude Code takes milliseconds). */
-export const DEFAULT_RELIST_WAIT_MS = 2_000;
+const DEFAULT_RELIST_WAIT_MS = 2_000;
 /** Let the agent take in the new list before the prompt that relies on it arrives. */
 const RELIST_SETTLE_MS = 100;
 const MAX_REPORTED_ERRORS = 20;
@@ -67,7 +68,7 @@ export function compileResultSchema(schema: Record<string, unknown>): ValidateFu
 }
 
 /** One line per problem, bounded, naming where it is: what the agent reads to correct its call. */
-export function describeSchemaErrors(errors: readonly ErrorObject[] | null | undefined, prefix = ""): string[] {
+function describeSchemaErrors(errors: readonly ErrorObject[] | null | undefined, prefix = ""): string[] {
   const lines = (errors ?? []).map((issue) => {
     const where = `${prefix}${issue.instancePath}` || "/";
     const extra = issue.keyword === "additionalProperties" && typeof issue.params.additionalProperty === "string"
@@ -113,6 +114,27 @@ interface BoundTurn {
 type JsonRpcId = string | number | null;
 interface JsonRpcRequest { jsonrpc?: unknown; id?: JsonRpcId; method?: unknown; params?: unknown }
 type ToolAnswer = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
+
+function toolAnswer(text: string, isError = false): ToolAnswer {
+  return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
+}
+
+function isStreamRequest(request: IncomingMessage): boolean {
+  return request.method === "GET" && String(request.headers.accept ?? "").includes("text/event-stream");
+}
+
+function validRequest(request: JsonRpcRequest): boolean {
+  return Boolean(request) && typeof request === "object" && typeof request.method === "string";
+}
+
+function initializeResult(params: unknown): Record<string, unknown> {
+  return {
+    protocolVersion: negotiatedProtocolVersion(params, SUPPORTED_PROTOCOL_VERSIONS),
+    capabilities: { tools: { listChanged: true } },
+    serverInfo: { name: STRUCTURED_RESULT_MCP_SERVER_NAME, title: "Konteks turn result", version: "1.0.0" },
+    instructions: `When a Konteks turn asks for a structured result, call ${STRUCTURED_RESULT_TOOL_NAME} once with it when you are finished. Do not call it otherwise.`,
+  };
+}
 
 export class StructuredResultToolServer {
   private readonly credential = randomBytes(32).toString("base64url");
@@ -220,39 +242,49 @@ export class StructuredResultToolServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     response.setHeader("Cache-Control", "no-store");
     if (this.closed) return this.fail(response, 503, "closed");
-    if (!this.authorized(request.headers.authorization)) return this.fail(response, 401, "invalid_local_credential");
-    if (request.method === "GET" && String(request.headers.accept ?? "").includes("text/event-stream")) return this.openStream(request, response);
+    if (!bearerMatches(request.headers.authorization, this.credential)) return this.fail(response, 401, "invalid_local_credential");
+    if (isStreamRequest(request)) return this.openStream(request, response);
     if (request.method !== "POST") {
       response.setHeader("Allow", "POST");
       return this.fail(response, 405, "method_not_allowed");
     }
-    let payload: unknown;
-    try {
-      payload = JSON.parse((await readBounded(request, MAX_REQUEST_BYTES)).toString("utf8"));
-    } catch {
-      return this.json(response, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error (or a result larger than 512 KiB)" } });
+    const payload = await readJsonBody(request, MAX_REQUEST_BYTES);
+    if (payload === null) {
+      return sendJson(response, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error (or a result larger than 512 KiB)" } });
     }
+    return this.answerRpc(response, payload.value);
+  }
+
+  /** A JSON-RPC message or batch; notifications get no answer, and a batch of only those gets 202. */
+  private answerRpc(response: ServerResponse, payload: unknown): void {
     const batch = Array.isArray(payload);
-    const requests = (batch ? payload : [payload]) as JsonRpcRequest[];
-    const answers: unknown[] = [];
-    let listed = false;
-    for (const item of requests) {
-      let answer: unknown | null;
-      try {
-        if ((item as JsonRpcRequest | null)?.method === "tools/list") listed = true;
-        answer = this.dispatch(item);
-      } catch {
-        answer = { jsonrpc: "2.0", id: (item as JsonRpcRequest | null)?.id ?? null, error: { code: -32603, message: "Internal error" } };
-      }
-      if (answer !== null) answers.push(answer);
-    }
+    const { answers, listed } = this.answerAll((batch ? payload : [payload]) as JsonRpcRequest[]);
     if (listed) response.once("finish", () => this.settleListWaiters());
     if (answers.length === 0) {
       response.statusCode = 202;
       return void response.end();
     }
     response.setHeader("Mcp-Session-Id", this.mcpSessionId);
-    return this.json(response, 200, batch ? answers : answers[0]);
+    return sendJson(response, 200, batch ? answers : answers[0]);
+  }
+
+  private answerAll(requests: JsonRpcRequest[]): { answers: unknown[]; listed: boolean } {
+    const answers: unknown[] = [];
+    let listed = false;
+    for (const item of requests) {
+      if ((item as JsonRpcRequest | null)?.method === "tools/list") listed = true;
+      const answer = this.safeDispatch(item);
+      if (answer !== null) answers.push(answer);
+    }
+    return { answers, listed };
+  }
+
+  private safeDispatch(item: JsonRpcRequest): unknown | null {
+    try {
+      return this.dispatch(item);
+    } catch {
+      return { jsonrpc: "2.0", id: (item as JsonRpcRequest | null)?.id ?? null, error: { code: -32603, message: "Internal error" } };
+    }
   }
 
   private settleListWaiters(): void {
@@ -272,91 +304,66 @@ export class StructuredResultToolServer {
   }
 
   private dispatch(request: JsonRpcRequest): unknown | null {
-    if (!request || typeof request !== "object" || typeof request.method !== "string") {
-      return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
-    }
+    if (!validRequest(request)) return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
     const id = request.id;
     if (id === undefined) return null;
     const reply = (result: unknown) => ({ jsonrpc: "2.0", id, result });
     switch (request.method) {
-      case "initialize": {
-        const asked = (request.params as { protocolVersion?: unknown } | undefined)?.protocolVersion;
-        return reply({
-          protocolVersion: typeof asked === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(asked) ? asked : SUPPORTED_PROTOCOL_VERSIONS[0],
-          capabilities: { tools: { listChanged: true } },
-          serverInfo: { name: STRUCTURED_RESULT_MCP_SERVER_NAME, title: "Konteks turn result", version: "1.0.0" },
-          instructions: `When a Konteks turn asks for a structured result, call ${STRUCTURED_RESULT_TOOL_NAME} once with it when you are finished. Do not call it otherwise.`,
-        });
-      }
+      case "initialize":
+        return reply(initializeResult(request.params));
       case "ping":
         return reply({});
       case "tools/list":
         return reply({ tools: this.tools() });
-      case "tools/call": {
-        const params = (request.params ?? {}) as { name?: unknown; arguments?: unknown };
-        return reply(this.call(typeof params.name === "string" ? params.name : "", params.arguments));
-      }
+      case "tools/call":
+        return reply(this.toolCall(request.params));
       default:
         return { jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } };
     }
   }
 
+  private toolCall(params: unknown): ToolAnswer {
+    const call = (params ?? {}) as { name?: unknown; arguments?: unknown };
+    return this.call(typeof call.name === "string" ? call.name : "", call.arguments);
+  }
+
   private call(name: string, args: unknown): ToolAnswer {
-    const answer = (text: string, isError = false): ToolAnswer => ({ content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) });
-    const log = (outcome: string, extra: Record<string, unknown> = {}) =>
-      this.logger.info({ event: "structured_result.call", outcome, ...extra, ...this.options.context }, "result tool called");
-    if (name !== STRUCTURED_RESULT_TOOL_NAME) return answer(`Unknown tool ${name}. This server has one tool, ${STRUCTURED_RESULT_TOOL_NAME}.`, true);
+    if (name !== STRUCTURED_RESULT_TOOL_NAME) return toolAnswer(`Unknown tool ${name}. This server has one tool, ${STRUCTURED_RESULT_TOOL_NAME}.`, true);
     const turn = this.turn;
     if (!turn) {
-      log("not_requested");
-      return answer(`No result is requested in this turn. Continue without calling ${STRUCTURED_RESULT_TOOL_NAME}.`, true);
+      this.logCall("not_requested");
+      return toolAnswer(`No result is requested in this turn. Continue without calling ${STRUCTURED_RESULT_TOOL_NAME}.`, true);
     }
     if (turn.accepted) {
-      log("already_recorded");
-      return answer(`Already recorded: your result for this turn was accepted. Do not call ${STRUCTURED_RESULT_TOOL_NAME} again; finish your turn.`);
+      this.logCall("already_recorded");
+      return toolAnswer(`Already recorded: your result for this turn was accepted. Do not call ${STRUCTURED_RESULT_TOOL_NAME} again; finish your turn.`);
     }
-    const input = args && typeof args === "object" && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+    return this.submit(turn, args);
+  }
+
+  private submit(turn: BoundTurn, args: unknown): ToolAnswer {
+    const input = plainRecord(args) ?? {};
     if (turn.wrapped && !("result" in input)) {
-      log("rejected", { problems: 1 });
-      return answer("Put your whole result in the `result` argument and call submit_result again.", true);
+      this.logCall("rejected", { problems: 1 });
+      return toolAnswer("Put your whole result in the `result` argument and call submit_result again.", true);
     }
     const value = turn.wrapped ? input.result : input;
     if (!turn.validate(value)) {
       const problems = describeSchemaErrors(turn.validate.errors, turn.wrapped ? "/result" : "");
-      log("rejected", { problems: problems.length });
-      return answer(["Not recorded: the result does not match the required schema. Fix these and call submit_result again with the whole result:", ...problems].join("\n"), true);
+      this.logCall("rejected", { problems: problems.length });
+      return toolAnswer(["Not recorded: the result does not match the required schema. Fix these and call submit_result again with the whole result:", ...problems].join("\n"), true);
     }
     turn.accepted = { value };
-    log("accepted");
-    return answer("Recorded. Your result for this turn is accepted; finish your turn now.");
+    this.logCall("accepted");
+    return toolAnswer("Recorded. Your result for this turn is accepted; finish your turn now.");
   }
 
-  private authorized(value: string | undefined): boolean {
-    if (!value?.startsWith("Bearer ")) return false;
-    const received = Buffer.from(value.slice(7));
-    const expected = Buffer.from(this.credential);
-    return received.length === expected.length && timingSafeEqual(received, expected);
-  }
-
-  private json(response: ServerResponse, status: number, body: unknown): void {
-    response.statusCode = status;
-    response.setHeader("Content-Type", "application/json");
-    response.end(JSON.stringify(body));
+  private logCall(outcome: string, extra: Record<string, unknown> = {}): void {
+    this.logger.info({ event: "structured_result.call", outcome, ...extra, ...this.options.context }, "result tool called");
   }
 
   private fail(response: ServerResponse, status: number, code: string): void {
-    this.json(response, status, { error: code });
+    sendJson(response, status, { error: code });
   }
 }
 
-async function readBounded(request: IncomingMessage, limit: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const value of request) {
-    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value as Uint8Array);
-    size += chunk.length;
-    if (size > limit) throw new Error("request too large");
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
-}

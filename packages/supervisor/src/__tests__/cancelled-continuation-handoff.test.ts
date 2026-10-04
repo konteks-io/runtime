@@ -9,7 +9,7 @@ import { DurableOutbox } from "../state/outbox.js";
 import { WorkOrchestrator } from "../work/orchestrator.js";
 import type { LocalAdmission } from "../state/local-admission.js";
 
-// Production 2026-10-01: every review turn of a task continues one QA delivery
+// Every review turn of a task continues one QA delivery
 // session. A continuation the person cancelled kept its journal record
 // `opened` (no stop, no settlement) while the review it continued was marked
 // `continued`, so every later review naming that completed review was refused

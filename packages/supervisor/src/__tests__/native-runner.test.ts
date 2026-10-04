@@ -42,7 +42,7 @@ function fixture(options: { loggedOut?: boolean; startGate?: Promise<void> } = {
   return { runner, port, input, config, connection, bridge, spawn, events, handlers: () => handlers };
 }
 
-describe("native in-process runner (A4)", () => {
+describe("native in-process runner", () => {
   it("names the provider session from Core's display label", async () => {
     const f = fixture(); await f.runner.start();
     const { acpSessionRef } = await f.runner.createSession({ ...f.input, sessionLabel: { system: "Todo List", kind: "initiative", title: "[v3] Stand up the todo list API" } });
@@ -134,7 +134,7 @@ describe("native in-process runner (A4)", () => {
     await f.runner.prompt(first.acpSessionRef, "p", { sessionId: first.acpSessionRef, prompt: [{ type: "text", text: "Complete this turn." }] });
     await f.runner.closeSession(first.acpSessionRef, { completed: true });
     await expect(f.runner.releaseSealedSession(first.acpSessionRef)).resolves.toEqual({ processRetained: true });
-    // The resident process does not keep the released session open (2026-10-02 leak).
+    // The resident process does not keep the released session open.
     expect(f.connection.closeSession).toHaveBeenCalledWith({ sessionId: "first-private" });
     expect(execution.stop).not.toHaveBeenCalled();
     const second = await f.runner.createSession(f.input, lifecycle);

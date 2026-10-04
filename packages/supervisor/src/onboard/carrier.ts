@@ -6,7 +6,7 @@ import { OnboardEvidenceCollector, type EnrichmentScope, type OnboardEvidenceCol
 import { RepositoryRelocationWorker, type RelocationWorkerDeps } from "./relocation-worker.js";
 
 /**
- * Where an onboard assignment goes (OB6 §2, §3).
+ * Where an onboard assignment goes.
  *
  * `onboarding` is the one work kind that carries two sources. A `conversation`
  * source is a session turn and takes the ordinary relayed ACP path, exactly as
@@ -26,14 +26,14 @@ export function isOnboardWorkAssignment(assignment: RemoteWorkAssignment): assig
 }
 
 /**
- * CONTRACT-GAP: OB2 §3b puts `enrichment: {systemRef, allowance}` "on the
- * assignment", but OB1's `discovery_run` source carries only `runRef` — a
+ * CONTRACT-GAP: the onboarding contract puts `enrichment: {systemRef,
+ * allowance}` "on the assignment", but the `discovery_run` source carries only `runRef` — a
  * source is the thing that survives re-placement, and an allowance is not. The
  * scope is read instead from Core's existing definition-of-claimed-work route
  * (`GET …/assignments/:id/workload`), which is where every other kind reads the
  * definition an assignment does not carry.
  */
-export const OnboardWorkloadSchema = z
+const OnboardWorkloadSchema = z
   .object({
     depth: z.enum(["inventory", "grouping", "deep"]).optional(),
     enrichment: z
@@ -45,9 +45,8 @@ export const OnboardWorkloadSchema = z
       .strict()
       .optional(),
   });
-export type OnboardWorkload = z.infer<typeof OnboardWorkloadSchema>;
 
-export interface OnboardCarrierDeps {
+interface OnboardCarrierDeps {
   /** Everything the collector needs except the facade, which is per-claim. */
   collector: Omit<OnboardEvidenceCollectorDeps, "facade">;
   relocation: Omit<RelocationWorkerDeps, "facade">;
@@ -61,7 +60,7 @@ export interface OnboardCarrierDeps {
 }
 
 /** What the orchestrator turns into a terminal report. */
-export interface OnboardWorkOutcome {
+interface OnboardWorkOutcome {
   structuredOutput: BoundedJsonValue;
 }
 
@@ -79,17 +78,22 @@ export class OnboardWorkCarrier {
     }
     const facade = (this.deps.createFacade ?? ((value: PlatformMcpEntry) => new McpOnboardFacade({ endpoint: value })))(entry);
     assertCurrent();
-    if (assignment.kind === "repository_relocation") {
-      const source = assignment.source;
-      if (source.kind !== "repository_relocation") {
-        throw new RemoteInstanceError("schema_invalid", "A relocation assignment carries the relocation source.", { diagnostic: "onboard_source_mismatch" });
-      }
-      const worker = new RepositoryRelocationWorker({ ...this.deps.relocation, facade });
-      const outcome = await worker.run(source.relocationRef, assertCurrent);
-      this.logger.info({ relocationRef: source.relocationRef, step: outcome.step, disposition: outcome.disposition }, "relocation step reported");
-      return { structuredOutput: { relocation: { step: outcome.step, disposition: outcome.disposition, ...(outcome.gap ? { gap: outcome.gap.code } : {}) } } };
-    }
+    if (assignment.kind === "repository_relocation") return this.relocate(assignment, facade, assertCurrent);
+    return this.collectEvidence(assignment, facade, assertCurrent);
+  }
 
+  private async relocate(assignment: OnboardWorkAssignment, facade: OnboardFacade, assertCurrent: () => void): Promise<OnboardWorkOutcome> {
+    const source = assignment.source;
+    if (source.kind !== "repository_relocation") {
+      throw new RemoteInstanceError("schema_invalid", "A relocation assignment carries the relocation source.", { diagnostic: "onboard_source_mismatch" });
+    }
+    const worker = new RepositoryRelocationWorker({ ...this.deps.relocation, facade });
+    const outcome = await worker.run(source.relocationRef, assertCurrent);
+    this.logger.info({ relocationRef: source.relocationRef, step: outcome.step, disposition: outcome.disposition }, "relocation step reported");
+    return { structuredOutput: { relocation: { step: outcome.step, disposition: outcome.disposition, ...(outcome.gap ? { gap: outcome.gap.code } : {}) } } };
+  }
+
+  private async collectEvidence(assignment: OnboardWorkAssignment, facade: OnboardFacade, assertCurrent: () => void): Promise<OnboardWorkOutcome> {
     const source = assignment.source;
     if (source.kind !== "discovery_run") {
       throw new RemoteInstanceError("schema_invalid", "An onboard evidence assignment carries the discovery-run source.", { diagnostic: "onboard_source_mismatch" });
@@ -103,7 +107,7 @@ export class OnboardWorkCarrier {
       return { structuredOutput: { enrichment: { ...outcome, systemRef: scope.systemRef } } };
     }
     if (run.depth === "inventory") {
-      // Inventory is Core's, through the connector (ON4). A runtime asked to
+      // Inventory is Core's, through the connector. A runtime asked to
       // collect at that depth has nothing to do and says so rather than
       // inventing a pass nobody authorised.
       return { structuredOutput: { grouping: { submitted: 0, unreadable: 0, skipped: "inventory_depth" } } };

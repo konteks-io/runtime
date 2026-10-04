@@ -311,7 +311,7 @@ describe("native authorized input composition", () => {
     expect(await readdir(prepared.cwd)).toEqual([]);
     await prepared.beforePrompt();
   });
-  it("gives a direct session its own empty private folder, stages no skill and puts nothing before the prompt (runtime-view R11, R13)", async () => {
+  it("gives a direct session its own empty private folder, stages no skill and puts nothing before the prompt", async () => {
     const f = await fixture({});
     const direct: RemoteWorkAssignment = { ...assignment, kind: "direct",
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
@@ -326,7 +326,7 @@ describe("native authorized input composition", () => {
     const again = await createNativeInputPreparer(f.options)({ ...direct, id: "assignment" });
     expect(again.cwd).toBe(prepared.cwd);
   });
-  it("keeps what the agent wrote in a direct session's folder when the next turn brings newer inputs (WS1-170)", async () => {
+  it("keeps what the agent wrote in a direct session's folder when the next turn brings newer inputs", async () => {
     const f = await fixture({ "README.md": "from Core" });
     const direct: RemoteWorkAssignment = { ...assignment, kind: "direct",
       source: { kind: "direct_session", portability: "instance_bound", ownerInstanceId: "instance", sessionId: "session", turnRef: "turn" } };
@@ -361,7 +361,7 @@ describe("native authorized input composition", () => {
     await expect(createNativeInputPreparer(f.options)(assignment)).rejects.toThrow();
     expect(await readFile(receipt, "utf8")).toBe("{}");
   });
-  it("wires repository tools alongside the rest of bootstrap, once per worktree, and logs every stage (WS2-156)", async () => {
+  it("wires repository tools alongside the rest of bootstrap, once per worktree, and logs every stage", async () => {
     const f = await fixture(),
       git = await testGitTool();
     // A real repository, served as the signed bundle Core sends.

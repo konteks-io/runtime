@@ -54,7 +54,7 @@ describe("request-specific Core transport deadline", () => {
     expect(JSON.stringify(error.mock.calls)).not.toContain("secret");
   });
 
-  it("names an unlisted local failure by its error classes, never its message (WS2-159)", async () => {
+  it("names an unlisted local failure by its error classes, never its message", async () => {
     const fetchFn = vi.fn(async () => { throw new TypeError("secret URL", { cause: Object.assign(new Error("secret host"), { name: "InvalidArgumentError", code: "UND_ERR_INVALID_ARG" }) }); });
     const error = vi.fn();
     const client = new JsonClient({ baseUrl: "https://core.example", fetchFn,
@@ -64,7 +64,7 @@ describe("request-specific Core transport deadline", () => {
     expect(JSON.stringify(error.mock.calls)).not.toContain("secret");
   });
 
-  it("refuses a header fetch cannot send once, as a local failure, never as transport (WS2-159)", async () => {
+  it("refuses a header fetch cannot send once, as a local failure, never as transport", async () => {
     const fetchFn = vi.fn();
     const error = vi.fn();
     const client = new JsonClient({ baseUrl: "https://core.example", fetchFn,

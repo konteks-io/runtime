@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-// CP5 brings OpenCode's recognition rule to packages 7.1.0; until the runtime
-// vendors it, stand in for it so the wiring (agent id, KM6 order) is proven.
+// Packages 7.1.0 brings OpenCode's recognition rule; until the runtime
+// vendors it, stand in for it so the wiring (agent id, offered order) is proven.
 vi.mock("@konteks/backstage-plugin-common/known-models", async importOriginal => {
   const actual = await importOriginal<typeof import("@konteks/backstage-plugin-common/known-models")>();
   return {
@@ -21,7 +21,7 @@ describe("OpenCode's model select", () => {
     expect(result.currentValue).toBe("opencode/model-40");
   });
 
-  it("above the wire bound keeps the known models first and the current one (KM6)", () => {
+  it("above the wire bound keeps the known models first and the current one", () => {
     const zen = Array.from({ length: 150 }, (_value, index) => ({ value: `opencode/zen-${index}`, name: `Zen ${index}` }));
     const anthropic = [{ value: "anthropic/claude-sonnet-4-5", name: "Claude Sonnet 4.5" }, { value: "anthropic/claude-opus-4-1", name: "Claude Opus 4.1" }];
     const result = exactSelect({ id: "model", name: "Model", type: "select", currentValue: "opencode/zen-149", options: [...zen, ...anthropic] } as never, "opencode");

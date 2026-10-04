@@ -56,7 +56,7 @@ test("a Codex proxy import that is missing fails the package build instead of th
 });
 
 test("every platform's Codex bridge carries Konteks's session naming; only the shared proxy is Unix-only", () => {
-  // D130: the Windows package shipped the bridge unpatched, so Codex named
+  // The Windows package shipped the bridge unpatched, so Codex named
   // every thread from its own title model and no session read "[konteks]".
   for (const os of ["macos", "linux", "windows"]) {
     assert.deepEqual(offlineAgentPatches("codex", os), { codexBridge: true, codexLocalProxy: os !== "windows", claudeFiles: [] });

@@ -60,8 +60,6 @@ SOFTWARE.
 The native continuation inspected bb at commit
 `dba32a469fd820ff6106715db0aaf6ed297d79a5`. Its product server, enrollment
 credentials, plugin UI, and provider-specific product policy are not imported.
-Further extraction candidates and deliberate security differences are tracked
-in `proof/BB-REUSE.md`.
 
 `shellular-org/*` repositories are AGPL-3.0-only and were consulted for
 design only (descriptor shape, ACP client structure, CLI flow); no source

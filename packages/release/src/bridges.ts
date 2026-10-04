@@ -3,10 +3,10 @@
  * come from the signed native manifest at install time; this table is the
  * static knowledge the runner needs about each bridge family: how to spawn it,
  * which official tooling owns login/logout, whether an official identity
- * signal exists (D111), and whether a documented file-backed host cache may be
+ * signal exists, and whether a documented file-backed host cache may be
  * copied once with consent.
  *
- * Versions are the CP0-pinned bridge releases. A bridge is never resolved from
+ * Versions are the pinned bridge releases. A bridge is never resolved from
  * a package registry at runtime: the signed offline agent package carries the
  * exact version.
  */
@@ -22,8 +22,6 @@ export interface AgentBridgeFamily {
     logout: readonly string[];
     /** Official identity signal; when absent every login counts as an identity change. */
     identitySignal?: readonly string[];
-    /** Documented file-backed cache eligible for a one-time consented copy. */
-    hostCacheImport?: { relativePath: string; documentedBy: string };
   };
   acpProtocol: { min: number; max: number };
   /**
@@ -82,10 +80,6 @@ export const SUPPORTED_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.free
       login: ["codex", "login", "--device-auth"],
       logout: ["codex", "logout"],
       identitySignal: ["codex", "login", "status"],
-      hostCacheImport: {
-        relativePath: ".codex/auth.json",
-        documentedBy: "https://github.com/openai/codex/blob/main/docs/authentication.md",
-      },
     },
     acpProtocol: { min: 1, max: 1 },
   },
@@ -115,15 +109,14 @@ export const HOST_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.freeze([
     },
   },
   {
-    // OpenCode 2, the line OpenCode's homepage installs (opencode-runtime-support
-    // O3). Its npm package only places a native binary; there is no Node entry.
-    // Offered since opencode-runtime-support CP6 (supervisor host-agents.ts).
+    // OpenCode 2, the line OpenCode's homepage installs. Its npm package only places a native binary; there is no Node entry.
+    // Offered as a host agent (supervisor host-agents.ts).
     agentId: "opencode",
     displayName: "OpenCode",
     package: "@opencode/cli",
     version: "2.0.18",
     command: ["acp"],
-    // Sign-in runs through OpenCode's own `auth login` in the private home (CP3).
+    // Sign-in runs through OpenCode's own `auth login` in the private home.
     tooling: { login: [], logout: [] },
     acpProtocol: { min: 1, max: 1 },
     hostInstall: {
@@ -137,24 +130,24 @@ export const HOST_AGENT_BRIDGES: readonly AgentBridgeFamily[] = Object.freeze([
     },
   },
   {
-    // Google's official Antigravity ACP server (antigravity-runtime-support
-    // A1), never the `agy` CLI. Nobody installs it: on the person's yes the
-    // connector fetches Google's zip pinned in fetched-agents.json (A2, A15)
-    // into its own folder and verifies it before every start (A16). Not
-    // offered until its security checkpoint (CP4) and sign-in (CP3).
+    // Google's official Antigravity ACP server, never
+    // the `agy` CLI. Nobody installs it: on the person's yes the
+    // connector fetches Google's zip pinned in fetched-agents.json
+    // into its own folder and verifies it before every start. Not
+    // offered until its security checkpoint and sign-in.
     agentId: "antigravity",
     displayName: "Google Antigravity",
     package: "antigravity-acp",
     version: "1.2.1",
     // The arguments come from the pin (the registry's `args`, per platform).
     command: [],
-    // Sign-in runs through ACP `authenticate` with a key or Gemini Enterprise (CP3).
+    // Sign-in runs through ACP `authenticate` with a key or Gemini Enterprise.
     tooling: { login: [], logout: [] },
     acpProtocol: { min: 1, max: 1 },
     hostInstall: {
       launch: "fetched",
       bin: "agy_acp_server",
-      // What the start self-check and the canary accept (A3); the connector
+      // What the start self-check and the canary accept; the connector
       // only ever runs the one version its release pins.
       versions: { min: "1.2.1", belowCore: "1.3.0" },
       installCommand: "konteks-remote agent add antigravity",
@@ -178,19 +171,34 @@ function parseVersion(version: string): { core: [number, number, number]; pre: s
 /** Semantic-version precedence (build metadata ignored); throws on anything else. */
 export function compareAgentVersions(left: string, right: string): number {
   const a = parseVersion(left), b = parseVersion(right);
-  for (let index = 0; index < 3; index += 1) if (a.core[index] !== b.core[index]) return a.core[index]! - b.core[index]!;
+  const core = compareCore(a.core, b.core);
+  if (core !== 0) return core;
+  // A release ranks above any of its prereleases.
   if (a.pre.length === 0 || b.pre.length === 0) return b.pre.length - a.pre.length;
-  for (let index = 0; index < Math.max(a.pre.length, b.pre.length); index += 1) {
-    const x = a.pre[index], y = b.pre[index];
+  return comparePrerelease(a.pre, b.pre);
+}
+
+function compareCore(a: readonly number[], b: readonly number[]): number {
+  for (let index = 0; index < 3; index += 1) if (a[index] !== b[index]) return a[index]! - b[index]!;
+  return 0;
+}
+
+function comparePrerelease(a: readonly string[], b: readonly string[]): number {
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const x = a[index], y = b[index];
     if (x === undefined) return -1;
     if (y === undefined) return 1;
-    if (x === y) continue;
-    const xNumeric = /^\d+$/.test(x), yNumeric = /^\d+$/.test(y);
-    if (xNumeric && yNumeric) return Number(x) - Number(y);
-    if (xNumeric !== yNumeric) return xNumeric ? -1 : 1;
-    return x < y ? -1 : 1;
+    if (x !== y) return comparePrereleaseIdentifier(x, y);
   }
   return 0;
+}
+
+/** Numeric identifiers compare as numbers and rank below alphanumeric ones, which compare as text. */
+function comparePrereleaseIdentifier(x: string, y: string): number {
+  const xNumeric = /^\d+$/.test(x), yNumeric = /^\d+$/.test(y);
+  if (xNumeric && yNumeric) return Number(x) - Number(y);
+  if (xNumeric !== yNumeric) return xNumeric ? -1 : 1;
+  return x < y ? -1 : 1;
 }
 
 /** A host-installed agent family, with its install facts guaranteed present. */
@@ -211,11 +219,6 @@ export function hostAgentFamily(agentId: string): HostAgentFamily {
 export function hostInstallCommand(family: HostAgentFamily, platform: NodeJS.Platform): string {
   if (family.hostInstall.launch === "fetched") return `konteks-remote agent add ${family.agentId}`;
   return platform === "win32" ? family.hostInstall.windowsInstallCommand ?? family.hostInstall.installCommand : family.hostInstall.installCommand;
-}
-
-/** Whether a host-installed agent is one the connector fetches itself (on the person's yes), not one the person installed. */
-export function isFetchedAgentId(agentId: string): boolean {
-  return findAgentBridge(agentId)?.hostInstall?.launch === "fetched";
 }
 
 /** Whether an agent family is used from the person's own installation (nothing of it in the release). */

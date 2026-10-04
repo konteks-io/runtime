@@ -1,9 +1,10 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createLogger, RemoteInstanceError, type Logger } from "@konteks/remote-common";
 import { BROWSER_MCP_SERVER_NAME } from "@konteks/remote-agent-runner";
-import type { PreviewStatus } from "./process-manager.js";
+import type { PreviewStarter, PreviewStatus } from "./process-manager.js";
 import { CONVERSATION_HAS_NO_APP, CONVERSATION_HAS_NO_APP_AGENT_NOTE } from "./config.js";
+import { bearerMatches, negotiatedProtocolVersion, readJsonBody, sendJson } from "../loopback-http.js";
 
 /**
  * The session's preview tools, as a connector-local loopback MCP server
@@ -39,20 +40,18 @@ export interface SessionPreviewAccess {
   browsersPath?: string;
 }
 
-/** Work kinds whose agent may run a preview: code that changes, is validated or is checked. */
+/**
+ * Work kinds whose agent may run a preview, and also gets a browser on it
+ * whenever the connector has one: code that changes, is validated or is
+ * checked. The validator checks the work in its UI; a QA-mode conversation is
+ * an `assistant_execution` turn whose agent exercises the preview and reports
+ * the run (`run_submit`); the executor and an ordinary chat can look at what
+ * they build. The browser reaches only the session's own preview, and it
+ * starts only when a tool is first used.
+ */
 export const PREVIEW_WORK_KINDS: ReadonlySet<string> = new Set(["delivery", "validation", "qa", "assistant_execution"]);
 
-/**
- * Work kinds whose agent also gets a browser on the preview (any agent while
- * the connector has the browser, O8): every kind that has a preview. The validator checks the work in its
- * UI; a QA-mode conversation is an `assistant_execution` turn whose agent
- * exercises the preview and reports the run (`run_submit`); the executor and
- * an ordinary chat can look at what they build. The browser reaches only the
- * session's own preview, and it starts only when a tool is first used.
- */
-export const BROWSER_WORK_KINDS: ReadonlySet<string> = PREVIEW_WORK_KINDS;
-
-export interface PreviewToolHost {
+interface PreviewToolHost {
   start(): Promise<PreviewStatus>;
   stop(): Promise<PreviewStatus>;
   status(): PreviewStatus;
@@ -60,7 +59,7 @@ export interface PreviewToolHost {
 
 const NO_ARGUMENTS = { type: "object", properties: {}, additionalProperties: false } as const;
 
-export const PREVIEW_TOOLS = [
+const PREVIEW_TOOLS = [
   {
     name: "preview_start",
     title: "Start the live preview",
@@ -86,6 +85,23 @@ export const PREVIEW_TOOLS = [
 
 type JsonRpcId = string | number | null;
 interface JsonRpcRequest { jsonrpc?: unknown; id?: JsonRpcId; method?: unknown; params?: unknown }
+type ToolAnswer = { content: Array<{ type: "text"; text: string }>; structuredContent?: PreviewStatus; isError?: boolean };
+
+const BROWSER_INSTRUCTIONS = `Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. Open the returned http://127.0.0.1 URL with the ${BROWSER_MCP_SERVER_NAME} tools (browser_navigate, browser_snapshot, browser_click, browser_type, browser_take_screenshot): that browser reaches only this preview, plus a cloud preview or registered application you open with the quality-assurance environment_open tool (browser_navigate to the signInUrl or url it returns).`;
+const PLAIN_INSTRUCTIONS = "Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. A browser on this computer can open the returned http://127.0.0.1 URL.";
+
+function validRequest(request: JsonRpcRequest): boolean {
+  return Boolean(request) && typeof request === "object" && typeof request.method === "string";
+}
+
+function toolName(params: unknown): string {
+  const name = (params as { name?: unknown } | undefined)?.name;
+  return typeof name === "string" ? name : "";
+}
+
+function textAnswer(text: string): ToolAnswer {
+  return { content: [{ type: "text", text }], isError: true };
+}
 
 export class PreviewMcpServer {
   private readonly credential = randomBytes(32).toString("base64url");
@@ -126,130 +142,124 @@ export class PreviewMcpServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     response.setHeader("Cache-Control", "no-store");
     if (this.closed) return this.fail(response, 503, "closed");
-    if (!this.authorized(request.headers.authorization)) return this.fail(response, 401, "invalid_local_credential");
+    if (!bearerMatches(request.headers.authorization, this.credential)) return this.fail(response, 401, "invalid_local_credential");
     if (request.method !== "POST") {
       response.setHeader("Allow", "POST");
       return this.fail(response, 405, "method_not_allowed");
     }
-    let payload: unknown;
-    try {
-      payload = JSON.parse((await readBounded(request, MAX_REQUEST_BYTES)).toString("utf8"));
-    } catch {
-      return this.json(response, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
-    }
-    const batch = Array.isArray(payload);
-    const requests = (batch ? payload : [payload]) as JsonRpcRequest[];
-    const answers: unknown[] = [];
-    for (const item of requests) {
-      let answer: unknown | null;
-      try {
-        answer = await this.dispatch(item);
-      } catch {
-        answer = { jsonrpc: "2.0", id: (item as JsonRpcRequest | null)?.id ?? null, error: { code: -32603, message: "Internal error" } };
-      }
-      if (answer !== null) answers.push(answer);
-    }
+    const payload = await readJsonBody(request, MAX_REQUEST_BYTES);
+    if (payload === null) return sendJson(response, 400, { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
+    const batch = Array.isArray(payload.value);
+    const answers = await this.answerAll((batch ? payload.value : [payload.value]) as JsonRpcRequest[]);
     if (answers.length === 0) {
       response.statusCode = 202;
       return void response.end();
     }
-    return this.json(response, 200, batch ? answers : answers[0]);
+    return sendJson(response, 200, batch ? answers : answers[0]);
+  }
+
+  private async answerAll(requests: JsonRpcRequest[]): Promise<unknown[]> {
+    const answers: unknown[] = [];
+    for (const item of requests) {
+      const answer = await this.safeDispatch(item);
+      if (answer !== null) answers.push(answer);
+    }
+    return answers;
+  }
+
+  private async safeDispatch(item: JsonRpcRequest): Promise<unknown | null> {
+    try {
+      return await this.dispatch(item);
+    } catch {
+      return { jsonrpc: "2.0", id: (item as JsonRpcRequest | null)?.id ?? null, error: { code: -32603, message: "Internal error" } };
+    }
   }
 
   private async dispatch(request: JsonRpcRequest): Promise<unknown | null> {
-    if (!request || typeof request !== "object" || typeof request.method !== "string") {
-      return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
-    }
+    if (!validRequest(request)) return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
     const id = request.id;
     // A notification (no id) never gets an answer.
     if (id === undefined) return null;
     const reply = (result: unknown) => ({ jsonrpc: "2.0", id, result });
     switch (request.method) {
-      case "initialize": {
-        const asked = (request.params as { protocolVersion?: unknown } | undefined)?.protocolVersion;
-        return reply({
-          protocolVersion: typeof asked === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(asked) ? asked : SUPPORTED_PROTOCOL_VERSIONS[0],
-          capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: PREVIEW_MCP_SERVER_NAME, title: "Konteks live preview", version: "1.0.0" },
-          instructions: this.options.browser
-            ? `Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. Open the returned http://127.0.0.1 URL with the ${BROWSER_MCP_SERVER_NAME} tools (browser_navigate, browser_snapshot, browser_click, browser_type, browser_take_screenshot): that browser reaches only this preview, plus a cloud preview or registered application you open with the quality-assurance environment_open tool (browser_navigate to the signInUrl or url it returns).`
-            : "Use preview_start to run this session's live preview (no arguments), preview_status to see its URL, command and logs, and preview_stop when done. A browser on this computer can open the returned http://127.0.0.1 URL.",
-        });
-      }
+      case "initialize":
+        return reply(this.initializeResult(request.params));
       case "ping":
         return reply({});
       case "tools/list":
         return reply({ tools: PREVIEW_TOOLS });
-      case "tools/call": {
-        const name = (request.params as { name?: unknown } | undefined)?.name;
-        return reply(await this.call(typeof name === "string" ? name : ""));
-      }
+      case "tools/call":
+        return reply(await this.call(toolName(request.params)));
       default:
         return { jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } };
     }
   }
 
-  private async call(name: string): Promise<{ content: Array<{ type: "text"; text: string }>; structuredContent?: PreviewStatus; isError?: boolean }> {
+  private initializeResult(params: unknown): Record<string, unknown> {
+    return {
+      protocolVersion: negotiatedProtocolVersion(params, SUPPORTED_PROTOCOL_VERSIONS),
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: PREVIEW_MCP_SERVER_NAME, title: "Konteks live preview", version: "1.0.0" },
+      instructions: this.options.browser ? BROWSER_INSTRUCTIONS : PLAIN_INSTRUCTIONS,
+    };
+  }
+
+  private async call(name: string): Promise<ToolAnswer> {
+    const run = this.tool(name);
+    if (run === null) return textAnswer(`Unknown tool ${name}. The preview tools are preview_start, preview_status and preview_stop.`);
     let status: PreviewStatus;
     try {
-      switch (name) {
-        case "preview_start": status = await this.host.start(); break;
-        case "preview_stop": status = await this.host.stop(); break;
-        case "preview_status": status = this.host.status(); break;
-        default: return { content: [{ type: "text", text: `Unknown tool ${name}. The preview tools are preview_start, preview_status and preview_stop.` }], isError: true };
-      }
+      status = await run();
     } catch (error) {
       this.logger.warn({ event: "preview.tool_failed", tool: name, ...this.options.context, code: error instanceof RemoteInstanceError ? error.code : "unexpected" }, "preview tool call failed");
-      return { content: [{ type: "text", text: `The preview tool failed: ${error instanceof Error ? error.message.slice(0, 300) : "unexpected error"}.` }], isError: true };
+      return textAnswer(`The preview tool failed: ${error instanceof Error ? error.message.slice(0, 300) : "unexpected error"}.`);
     }
     this.logger.info({ event: "preview.tool_called", tool: name, state: status.state, ...this.options.context }, "preview tool called");
     return { content: [{ type: "text", text: describeStatus(status, { browser: this.options.browser === true }) }], structuredContent: status, ...(name === "preview_start" && status.state === "failed" ? { isError: true } : {}) };
   }
 
-  private authorized(value: string | undefined): boolean {
-    if (!value?.startsWith("Bearer ")) return false;
-    const received = Buffer.from(value.slice(7));
-    const expected = Buffer.from(this.credential);
-    return received.length === expected.length && timingSafeEqual(received, expected);
-  }
-
-  private json(response: ServerResponse, status: number, body: unknown): void {
-    response.statusCode = status;
-    response.setHeader("Content-Type", "application/json");
-    response.end(JSON.stringify(body));
+  private tool(name: string): (() => Promise<PreviewStatus> | PreviewStatus) | null {
+    switch (name) {
+      case "preview_start": return () => this.host.start();
+      case "preview_stop": return () => this.host.stop();
+      case "preview_status": return () => this.host.status();
+      default: return null;
+    }
   }
 
   private fail(response: ServerResponse, status: number, code: string): void {
-    this.json(response, status, { error: code });
+    sendJson(response, status, { error: code });
   }
 }
 
 /** The plain-text answer an agent reads; the same facts are in structuredContent. */
 export function describeStatus(status: PreviewStatus, options: { browser?: boolean } = {}): string {
   const lines = [`Preview: ${status.state}${status.phase && status.state === "starting" ? ` (${status.phase})` : ""}`, status.message];
-  if (status.message === CONVERSATION_HAS_NO_APP) lines.push(CONVERSATION_HAS_NO_APP_AGENT_NOTE);
-  if (status.startedBy === "viewer") lines.push("Started by a viewer who opened the preview in Konteks.");
-  else if (status.startedBy === "agent") lines.push("Started by the agent (preview_start).");
-  if (status.url) lines.push(`Loopback URL (a browser on this computer): ${status.url}`);
-  if (status.url && options.browser) lines.push(`Open it with ${BROWSER_MCP_SERVER_NAME} browser_navigate; that browser reaches only this URL (and what environment_open opens).`);
-  if (status.command) lines.push(`Command: ${status.command}${status.explanation ? ` — ${status.explanation}` : ""}`);
-  if (status.install) lines.push(`Install step: ${status.install}`);
-  if (status.prepare) lines.push(`Prepare step: ${status.prepare}`);
-  for (const note of status.notes) lines.push(`Note: ${note}`);
-  if (status.state === "starting") lines.push("Still starting: call preview_status in a little while.");
-  if (status.state === "running" || status.state === "starting") lines.push(`Stops by itself after ${status.idleStopMinutes} minutes with no viewer and no agent activity.`);
+  for (const describe of STATUS_LINES) lines.push(...describe(status, options.browser === true));
   if (status.logTail.length > 0) lines.push("Recent log lines:", ...status.logTail.slice(-20).map(line => `  ${line}`));
   return lines.join("\n");
 }
 
-async function readBounded(request: IncomingMessage, limit: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const value of request) {
-    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value as Uint8Array);
-    size += chunk.length;
-    if (size > limit) throw new Error("request too large");
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
+type StatusLines = (status: PreviewStatus, browser: boolean) => string[];
+
+function lineIf(condition: unknown, line: () => string): string[] {
+  return condition ? [line()] : [];
 }
+
+const STARTED_BY: Readonly<Record<PreviewStarter, string>> = {
+  viewer: "Started by a viewer who opened the preview in Konteks.",
+  agent: "Started by the agent (preview_start).",
+};
+
+const STATUS_LINES: readonly StatusLines[] = [
+  status => lineIf(status.message === CONVERSATION_HAS_NO_APP, () => CONVERSATION_HAS_NO_APP_AGENT_NOTE),
+  status => (status.startedBy === null ? [] : [STARTED_BY[status.startedBy]]),
+  status => lineIf(status.url, () => `Loopback URL (a browser on this computer): ${status.url}`),
+  (status, browser) => lineIf(status.url && browser, () => `Open it with ${BROWSER_MCP_SERVER_NAME} browser_navigate; that browser reaches only this URL (and what environment_open opens).`),
+  status => lineIf(status.command, () => `Command: ${status.command}${status.explanation ? ` — ${status.explanation}` : ""}`),
+  status => lineIf(status.install, () => `Install step: ${status.install}`),
+  status => lineIf(status.prepare, () => `Prepare step: ${status.prepare}`),
+  status => status.notes.map(note => `Note: ${note}`),
+  status => lineIf(status.state === "starting", () => "Still starting: call preview_status in a little while."),
+  status => lineIf(status.state === "running" || status.state === "starting", () => `Stops by itself after ${status.idleStopMinutes} minutes with no viewer and no agent activity.`),
+];

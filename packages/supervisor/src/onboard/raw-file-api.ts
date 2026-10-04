@@ -2,7 +2,7 @@ import type { FetchFn } from "@konteks/remote-common";
 import { gitGap, gitOk, type GitAccess, type GitResult } from "./git.js";
 
 /**
- * The fallback single-file read (OB6 gotcha): `git archive --remote` is disabled
+ * The fallback single-file read: `git archive --remote` is disabled
  * on GitHub and on plenty of self-hosted installs, so a ref that the archive
  * path cannot produce is read through the provider's raw-file API instead —
  * still with **the machine's own credential**, obtained through `git credential
@@ -15,7 +15,7 @@ import { gitGap, gitOk, type GitAccess, type GitResult } from "./git.js";
 export const EVIDENCE_READ_PATHS = ["git_archive", "raw_file_api"] as const;
 export type EvidenceReadPath = (typeof EVIDENCE_READ_PATHS)[number];
 
-export interface RawFileRequest {
+interface RawFileRequest {
   provider: string;
   /** The repository's browse URL, as the inventory carries it. */
   url: string;
@@ -28,10 +28,22 @@ export interface RawFileRequest {
 /** Maximum bytes a single evidence read may pull; facts are small by design. */
 export const MAX_EVIDENCE_FILE_BYTES = 512 * 1024;
 
-export interface RawFileApiOptions {
+interface RawFileApiOptions {
   git: Pick<GitAccess, "credential">;
   fetchFn?: FetchFn;
   timeoutMs?: number;
+}
+
+async function fileBody(response: Response): Promise<GitResult<Buffer>> {
+  if (response.status === 401 || response.status === 403) {
+    return gitGap("credential_unavailable", "sign in to this provider with git on the machine running this Konteks runtime");
+  }
+  if (response.status === 404) return gitGap("not_found", "the repository does not carry this file at its default branch");
+  if (!response.ok) return gitGap("unavailable", "retry when this machine can reach the provider");
+  const body = Buffer.from(await response.arrayBuffer());
+  // Truncating rather than refusing keeps a huge lockfile from losing a
+  // repository its whole evidence row; the facts we extract sit at the top.
+  return gitOk(body.byteLength > MAX_EVIDENCE_FILE_BYTES ? body.subarray(0, MAX_EVIDENCE_FILE_BYTES) : body);
 }
 
 export class RawFileApi {
@@ -61,24 +73,15 @@ export class RawFileApi {
     } catch {
       return gitGap("unavailable", "retry when this machine can reach the provider");
     }
-    if (response.status === 401 || response.status === 403) {
-      return gitGap("credential_unavailable", "sign in to this provider with git on the machine running this Konteks runtime");
-    }
-    if (response.status === 404) return gitGap("not_found", "the repository does not carry this file at its default branch");
-    if (!response.ok) return gitGap("unavailable", "retry when this machine can reach the provider");
-    const body = Buffer.from(await response.arrayBuffer());
-    // Truncating rather than refusing keeps a huge lockfile from losing a
-    // repository its whole evidence row; the facts we extract sit at the top.
-    return gitOk(body.byteLength > MAX_EVIDENCE_FILE_BYTES ? body.subarray(0, MAX_EVIDENCE_FILE_BYTES) : body);
-  }
-}
+    return fileBody(response);
+  }}
 
 /**
  * Provider raw-file endpoints. Only the four providers the catalog's repository
  * vocabulary already names are built; anything else reports an evidence gap
  * rather than guessing a URL shape.
  */
-export function rawFileUrl(request: RawFileRequest): { url: string; accept?: string } | null {
+function rawFileUrl(request: RawFileRequest): { url: string; accept?: string } | null {
   const base = originOf(request.url);
   if (!base) return null;
   const owner = encodeURIComponent(request.repoOwner);

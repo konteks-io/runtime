@@ -19,8 +19,8 @@ import { INITIAL_SCOPE_STATE } from "../auth/scope-store.js";
 
 /**
  * Credential and Google variables an owner commonly has set; none may reach
- * any Antigravity process (A5). The server hands everything it gets to its
- * `run_command` tool (CP0 B14), and would sign in from `GEMINI_API_KEY`.
+ * any Antigravity process. The server hands everything it gets to its
+ * `run_command` tool, and would sign in from `GEMINI_API_KEY`.
  */
 const OWNER_SECRETS: Record<string, string> = {
   GITHUB_TOKEN: "ghp_owner_token_must_not_reach_antigravity", GH_TOKEN: "gho_owner", GITHUB_PAT: "github_pat_owner",
@@ -46,7 +46,7 @@ const config = (extra: Record<string, unknown> = {}) => RunnerConfigSchema.parse
 const DISTINCT = Object.values(OWNER_SECRETS).filter(value => value.length >= 8 && value !== "/Users/owner/.gemini");
 const FIXED = new Set([...HOST_INHERITED_VARIABLES, "HOME", "GEMINI_HOME", "AGY_ACP_FORCE_FILE_STORAGE", "NO_COLOR", "TERM", "SHELL"]);
 
-describe("Google Antigravity's environment is an allow-list (A5)", () => {
+describe("Google Antigravity's environment is an allow-list", () => {
   afterEach(() => { vi.unstubAllEnvs(); });
 
   it("gets a private HOME and GEMINI_HOME, forced file storage, and none of the owner's credential, Google or Antigravity variables", () => {
@@ -168,7 +168,7 @@ describe("the Antigravity runner adapter", () => {
     expect(antigravityRunnerAdapter.sessionBootstrapTimeoutMs).toBe(30_000);
   });
 
-  it("reports its pinned version, and no billing usage unless its identity says the key relay counts it (CP3)", () => {
+  it("reports its pinned version, and no billing usage unless its identity says the key relay counts it", () => {
     const view = projectReadiness({
       family: findAgentBridge("antigravity")!, authMode: "agent_local_subscription", connectionState: "ready", initializeResult: null,
       scope: INITIAL_SCOPE_STATE,
@@ -179,7 +179,7 @@ describe("the Antigravity runner adapter", () => {
   });
 });
 
-describe("Google Antigravity's private home (CP2)", () => {
+describe("Google Antigravity's private home", () => {
   const dirs: string[] = [];
   afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
   const credentials = async () => { const dir = await realpath(await mkdtemp(join(tmpdir(), "agy-home-"))); dirs.push(dir); return join(dir, "credentials"); };
@@ -203,10 +203,10 @@ describe("Google Antigravity's private home (CP2)", () => {
     expect(await readAntigravitySignIn(cred)).toBeNull();
     await writeFile(paths.signIn, JSON.stringify({ method: "gemini-api-key", token: "x" }));
     expect(await readAntigravitySignIn(cred)).toBeNull();
-    // CP3: the key in use keeps Enterprise's project for the next sign-in; settings name only the method.
+    // The key in use keeps Enterprise's project for the next sign-in; settings name only the method.
     expect(JSON.parse(renderAntigravitySettings({ method: "gemini-api-key", gcp: { project: "gemini-enterprise-qa-25d3", location: "global" }, tier: "gcp-ge-plus-tier" }))).toEqual({ auth: { type: "gemini-api-key" } });
     expect(renderAntigravitySettings({ method: "none", gcp: { project: "gemini-enterprise-qa-25d3", location: "global" } })).toBe("{}\n");
-    // Personal Google sign-in stays held back (A10): even a recorded one names no method.
+    // Personal Google sign-in stays held back: even a recorded one names no method.
     await writeFile(paths.signIn, JSON.stringify({ method: "oauth-personal" }));
     await prepareAntigravityHome(cred);
     expect(await readFile(paths.settingsFile, "utf8")).toBe("{}\n");
@@ -248,7 +248,7 @@ describe("Google Antigravity's private home (CP2)", () => {
   });
 });
 
-describe("the working copy's AGENTS.md for Google Antigravity (A9)", () => {
+describe("the working copy's AGENTS.md for Google Antigravity", () => {
   const dirs: string[] = [];
   afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
   async function setup() {
@@ -347,7 +347,7 @@ describe("what Google Antigravity reports, read for the person", () => {
   });
 });
 
-describe("the organisation's MCP Servers setting as a Gemini Enterprise session shows it (antigravity CP6)", () => {
+describe("the organisation's MCP Servers setting as a Gemini Enterprise session shows it", () => {
   it("records the servers dropped by the admin setting, never zero, clears on an allowlist that keeps ours, and never writes a secret", async () => {
     const credentialDir = await mkdtemp(join(tmpdir(), "agy-admin-"));
     try {
@@ -368,7 +368,7 @@ describe("the organisation's MCP Servers setting as a Gemini Enterprise session 
       expect(await readAntigravityAdminObservation(credentialDir)).toBeNull();
       // Read from every execution process's stderr, beside the licence lines:
       // dropped servers end the session at once as an access error, recorded
-      // before it returns so the identity read that follows sees it (WS1-196).
+      // before it returns so the identity read that follows sees it.
       expect(stderrFailure("I0929 server.py:2900] Admin MCP control active: dropping 4 client-requested custom MCP server(s) for this session.", credentialDir))
         .toMatchObject({ code: "agent_unavailable", diagnostic: "antigravity_mcp_servers_off", message: expect.stringContaining("MCP Servers is turned off") });
       expect(await readAntigravityAdminObservation(credentialDir)).not.toBeNull();

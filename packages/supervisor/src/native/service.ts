@@ -13,7 +13,7 @@ import { writeSecretFile } from "@konteks/remote-common";
 
 export const NATIVE_SHUTDOWN_RECEIPT_FILE = "shutdown-complete";
 
-export interface NativeServiceOptions extends NativeInstallationOptions {
+interface NativeServiceOptions extends NativeInstallationOptions {
   root: string;
   /** Test/embedding override; production defaults to the claim-bound native preparer. */
   prepareInputs?: NonNullable<SupervisorOptions["native"]>["prepareInputs"];
@@ -59,6 +59,35 @@ export function nativeShutdownSteps(
   ];
 }
 
+type NativeInstallation = Awaited<ReturnType<typeof loadNativeInstallation>>;
+
+function nativeSupervisorOptions(options: NativeServiceOptions, installation: NativeInstallation, executable: string): NonNullable<SupervisorOptions["native"]> {
+  const update = updateOptions(options, executable);
+  return {
+    trustedRoots: installation.roots, runners: installation.runners,
+    ...(installation.unavailableAgents.length > 0 ? { unavailableAgents: installation.unavailableAgents } : {}),
+    repositoryCacheRoot: join(options.root, "repositories"),
+    ...(update ? { update } : {}),
+    // An update still checking this release keeps it from taking work.
+    updateProbation: { releaseId: installation.record.releaseId, readLedger: () => readNativeUpdateLedger(options.root) },
+    ...(installation.record.git ? { git: installation.record.git } : {}),
+    ...(options.prepareInputs ? { prepareInputs: options.prepareInputs } : {}),
+    ...(options.prepareRepositoryWorktree ? { prepareRepositoryWorktree: options.prepareRepositoryWorktree } : {}),
+    ...(options.runtimeOptions ? { runtimeOptions: options.runtimeOptions } : {}),
+  };
+}
+
+/** Self-update through the release channel and the installed updater, unless disabled. */
+function updateOptions(options: NativeServiceOptions, executable: string): NonNullable<SupervisorOptions["native"]>["update"] | undefined {
+  if (options.update === false) return undefined;
+  return {
+    fetchManifest: () => fetchNativeReleaseManifest(),
+    launch: async () => launchNativeUpdater({ root: options.root, executable, os: options.platform.os }),
+    readLedger: () => readNativeUpdateLedger(options.root),
+    ...(options.update ?? {}),
+  };
+}
+
 /** Native service composition: local agents plus authenticated control, no domain services. */
 export function createNativeService(options: NativeServiceOptions): Daemon {
   let supervisor: Supervisor | undefined;
@@ -76,30 +105,13 @@ export function createNativeService(options: NativeServiceOptions): Daemon {
       const installation = await loadNativeInstallation(options.root, options);
       // The connector of the release now serving: `konteks-connector`, or `connector` in a release from before the rename.
       const executable = await resolveNativeConnectorExecutable(join(options.root, "releases", installation.record.releaseId), options.platform.os);
-      const update = options.update === false ? undefined : {
-        fetchManifest: () => fetchNativeReleaseManifest(),
-        launch: async () => launchNativeUpdater({ root: options.root, executable, os: options.platform.os }),
-        readLedger: () => readNativeUpdateLedger(options.root),
-        ...(options.update ?? {}),
-      };
       supervisor = new Supervisor(installation.config, {
         onLivenessLost: () => { void daemon.shutdown("liveness-lost", 1).catch(() => undefined); },
-        // Uninstalled (W1-L2): nothing is left for this process to do, and its
+        // Uninstalled: nothing is left for this process to do, and its
         // folder is about to be deleted — end it, whatever runs it.
         onRetired: () => { void daemon.shutdown("retired", 0).catch(() => undefined); },
         onShutdownRequested: () => { void daemon.shutdown("control", 0).catch(() => undefined); },
-        native: {
-          trustedRoots: installation.roots, runners: installation.runners,
-          ...(installation.unavailableAgents.length > 0 ? { unavailableAgents: installation.unavailableAgents } : {}),
-          repositoryCacheRoot: join(options.root, "repositories"),
-          ...(update ? { update } : {}),
-          // An update still checking this release keeps it from taking work (D113b).
-          updateProbation: { releaseId: installation.record.releaseId, readLedger: () => readNativeUpdateLedger(options.root) },
-          ...(installation.record.git ? { git: installation.record.git } : {}),
-          ...(options.prepareInputs ? { prepareInputs: options.prepareInputs } : {}),
-          ...(options.prepareRepositoryWorktree ? { prepareRepositoryWorktree: options.prepareRepositoryWorktree } : {}),
-          ...(options.runtimeOptions ? { runtimeOptions: options.runtimeOptions } : {}),
-        },
+        native: nativeSupervisorOptions(options, installation, executable),
       });
       if (installation.retiredAgents.length > 0) {
         supervisor.logger.warn({ retiredAgents: installation.retiredAgents }, "this installation still lists agents Konteks no longer runs; they are skipped (Claude Code, Codex, DeepSeek Harness and OpenCode 2 are supported)");

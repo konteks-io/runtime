@@ -3,10 +3,10 @@ import type { NativeRuntimeRecord } from "./installation.js";
 import { antigravityFetchUnderWay, antigravityPin, verifyNativeAntigravityFolder, verifyNativeAntigravityRecord, type AntigravityInstallDeps } from "./antigravity-installation.js";
 
 /**
- * What the site shows about Google Antigravity's download (antigravity CP3
- * prep: `hostAgentDownload` on the connected agent), from the connector's own
+ * What the site shows about Google Antigravity's download
+ * (`hostAgentDownload` on the connected agent), from the connector's own
  * fetch state. The runtime keeps no state enum of its own, so this reads it
- * off the checks every start runs (A16):
+ * off the checks every start runs:
  * - a fetch running in this process, or in the launcher's `agent add
  *   antigravity` (its staging download still growing) → `downloading`,
  *   bytes received of the pinned zip's size;
@@ -14,7 +14,7 @@ import { antigravityFetchUnderWay, antigravityPin, verifyNativeAntigravityFolder
  * - nothing recorded, or nothing fetched → `not_downloaded`, with the zip's
  *   size;
  * - the record names another version while this release's pin is already
- *   fetched and verifies (an update fetched, not switched to yet, A17) →
+ *   fetched and verifies (an update fetched, not switched to yet) →
  *   `update_available` with the pin's version;
  * - the kept copy does not match Google's release, or is a version this
  *   release does not run → `integrity_failed`.
@@ -27,21 +27,25 @@ export async function antigravityDownloadState(
 ): Promise<HostAgentDownload | undefined> {
   let pin: ReturnType<typeof antigravityPin>;
   try { pin = antigravityPin(deps); } catch { return undefined; }
-  const sizeBytes = pin.platform.archive.size;
   const running = await antigravityFetchUnderWay(root, deps);
   if (running) return HostAgentDownloadSchema.parse({ state: "downloading", sizeBytes: running.sizeBytes, receivedBytes: Math.min(running.receivedBytes, running.sizeBytes) });
   try {
     await verifyNativeAntigravityRecord(record ?? {}, root, deps);
     return { state: "ready" };
   } catch (error) {
-    const diagnostic = error instanceof RemoteInstanceError ? error.diagnostic : undefined;
-    if (diagnostic === "antigravity_unsupported_version") {
-      const fetched = await verifyNativeAntigravityFolder(root, deps).then(() => true, () => false);
-      return fetched ? HostAgentDownloadSchema.parse({ state: "update_available", availableVersion: pin.version }) : { state: "integrity_failed" };
-    }
-    if (diagnostic === "antigravity_unsafe_install") return { state: "integrity_failed" };
-    return { state: "not_downloaded", sizeBytes };
+    return unverifiedState(error, root, pin, deps);
   }
+}
+
+/** The state of a recorded copy that did not verify. */
+async function unverifiedState(error: unknown, root: string, pin: ReturnType<typeof antigravityPin>, deps: AntigravityInstallDeps): Promise<HostAgentDownload> {
+  const diagnostic = error instanceof RemoteInstanceError ? error.diagnostic : undefined;
+  if (diagnostic === "antigravity_unsupported_version") {
+    const fetched = await verifyNativeAntigravityFolder(root, deps).then(() => true, () => false);
+    return fetched ? HostAgentDownloadSchema.parse({ state: "update_available", availableVersion: pin.version }) : { state: "integrity_failed" };
+  }
+  if (diagnostic === "antigravity_unsafe_install") return { state: "integrity_failed" };
+  return { state: "not_downloaded", sizeBytes: pin.platform.archive.size };
 }
 
 /**

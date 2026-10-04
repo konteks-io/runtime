@@ -159,12 +159,25 @@ function splitPath(path) {
 function validatePaths(paths) {
   const folded = new Set(), files = new Set(paths.map(path => path.toLowerCase())), directories = new Set();
   for (const path of paths) {
-    // eslint-disable-next-line no-control-regex -- Archive paths must reject control characters.
-    if (Buffer.byteLength(path) > 240 || path.startsWith("/") || path.includes("\\") || /[\x00-\x1f\x7f]/.test(path)) throw new Error("offline package path is not portable");
-    const parts = path.split("/");
-    if (parts.some(part => !part || part === "." || part === ".." || /[. ]$/.test(part) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) throw new Error("offline package path is not portable");
+    if (!portablePath(path)) throw new Error("offline package path is not portable");
     const key = path.toLowerCase(); if (folded.has(key)) throw new Error("offline package contains a case collision"); folded.add(key);
+    const parts = path.split("/");
     for (let length = 1; length < parts.length; length++) directories.add(parts.slice(0, length).join("/").toLowerCase());
   }
   if ([...directories].some(directory => files.has(directory))) throw new Error("offline package contains a file/directory collision");
+}
+/** Bounded, relative, forward slashes only, no control characters, and no empty, dot, trailing-dot or Windows-reserved segment. */
+function portablePath(path) {
+  if (Buffer.byteLength(path) > 240 || path.startsWith("/") || path.includes("\\") || hasControlCharacter(path)) return false;
+  return !path.split("/").some(nonPortableSegment);
+}
+function nonPortableSegment(part) {
+  return !part || part === "." || part === ".." || /[. ]$/.test(part) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part);
+}
+function hasControlCharacter(text) {
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
 }

@@ -6,9 +6,10 @@ import { findAgentBridge } from "@konteks/remote-release";
 import { RunnerConfigSchema } from "../config.js";
 import { bridgeEnvironment, resolveBridgeSpawnSpec } from "../bridge/spec.js";
 import {
-  OPENCODE_INHERITED_VARIABLES, OPENCODE_KONTEKS_PERMISSIONS, bindOpenCodeWorkingCopy, openCodeEnvironment, openCodeKonteksSettings, openCodePermissionDecision,
+  OPENCODE_KONTEKS_PERMISSIONS, bindOpenCodeWorkingCopy, openCodeEnvironment, openCodeKonteksSettings, openCodePermissionDecision,
   openCodeRunnerAdapter, openCodeRuntimePaths, openCodeWorkingCopyConfig, openCodeWorkingCopyKey, renderOpenCodeKonteksConfig, syncOpenCodeInstructions,
 } from "../host/opencode.js";
+import { HOST_INHERITED_VARIABLES } from "../host/allow-list-environment.js";
 import { hostAgentRunnerAdapter } from "../host/registry.js";
 import { projectReadiness } from "../readiness.js";
 import { INITIAL_SCOPE_STATE } from "../auth/scope-store.js";
@@ -59,7 +60,7 @@ describe("OpenCode's environment is an allow-list", () => {
     for (const name of Object.keys(OWNER_SECRETS).filter(name => !(name in openCodeKonteksSettings()))) expect(spec.env[name], name).toBeUndefined();
     for (const value of Object.values(OWNER_SECRETS)) expect(JSON.stringify(spec.env)).not.toContain(value);
     // Nothing outside the allow-list, the private home, our settings and fixed switches is present.
-    const fixed = new Set([...OPENCODE_INHERITED_VARIABLES, ...Object.keys(openCodeKonteksSettings()), "HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "NO_COLOR", "TERM", "SHELL"]);
+    const fixed = new Set([...HOST_INHERITED_VARIABLES, ...Object.keys(openCodeKonteksSettings()), "HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "NO_COLOR", "TERM", "SHELL"]);
     expect(Object.keys(spec.env).filter(name => !fixed.has(name))).toEqual([]);
   });
 
@@ -113,7 +114,7 @@ describe("the OpenCode runner adapter", () => {
     // The control process (discovery, sign-in) never carries a working copy's instructions.
     await expect(lstat(join(paths.controlConfig, "opencode", "AGENTS.md"))).rejects.toThrow();
     await expect(openCodeRunnerAdapter.prepareToSpawn(config({ RUNNER_NATIVE_OPENCODE_BINARY: undefined }))).rejects.toMatchObject({ code: "agent_unavailable" });
-    // CP3: sign-in, sign-out and identity run OpenCode's own `auth` (opencode-login.test.ts); never without the located binary.
+    // Sign-in, sign-out and identity run OpenCode's own `auth` (opencode-login.test.ts); never without the located binary.
     const unlocated = config({ RUNNER_CREDENTIAL_DIR: join(root, "credentials"), RUNNER_NATIVE_OPENCODE_BINARY: undefined });
     expect(() => openCodeRunnerAdapter.startLogin!({ config: unlocated, events: {} as never, logger: { info: () => undefined, warn: () => undefined } })).toThrow(/installed OpenCode 2/);
     await expect(openCodeRunnerAdapter.logout!(unlocated)).rejects.toMatchObject({ code: "agent_unavailable" });

@@ -10,11 +10,11 @@ export type LeaseAcquisition = <T>(operation: () => Promise<T>) => Promise<T>;
  * authority and re-evaluates limits on every renew/assignment.
  */
 /** Canonical signed payload validation followed only by a local time projection. */
-export const LeaseClaimsSchema = RemoteInstanceLeaseClaimsSchema.transform(claims => {
+const LeaseClaimsSchema = RemoteInstanceLeaseClaimsSchema.transform(claims => {
   const { drain_deadline, ...rest } = claims;
   return { ...rest, ...(drain_deadline === undefined ? {} : { drain_deadline: parseRfc3339(drain_deadline) / 1000 }) };
 });
-export type LeaseClaims = ReturnType<typeof LeaseClaimsSchema.parse>;
+type LeaseClaims = ReturnType<typeof LeaseClaimsSchema.parse>;
 
 interface ExpectedLease { instanceId: string; audience: string }
 
@@ -38,13 +38,17 @@ function decode(lease: string, expected: ExpectedLease, stored: boolean): LeaseC
   const segments = lease.split(".");
   const payload = segments.length === 3 ? segments[1] : undefined;
   if (!payload) throw new RemoteInstanceError("temporarily_unavailable", "lease is not a compact JWS");
-  let claims: LeaseClaims;
+  const claims = parseLeaseClaims(payload, stored);
+  if (claims.sub !== expected.instanceId) throw new RemoteInstanceError("registration_mismatch", "lease subject is not this instance");
+  if (claims.aud !== expected.audience) throw new RemoteInstanceError("registration_mismatch", "lease audience mismatch");
+  return claims;
+}
+
+function parseLeaseClaims(payload: string, stored: boolean): LeaseClaims {
   let candidate: unknown;
   try {
     candidate = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    if (stored && candidate && typeof candidate === "object" && "drain_deadline" in candidate && typeof candidate.drain_deadline === "number" && Number.isSafeInteger(candidate.drain_deadline) && candidate.drain_deadline >= 0) {
-      claims = LeaseClaimsSchema.parse({ ...candidate, drain_deadline: new Date(candidate.drain_deadline * 1000).toISOString() });
-    } else claims = LeaseClaimsSchema.parse(candidate);
+    return LeaseClaimsSchema.parse(stored ? withIsoDrainDeadline(candidate) : candidate);
   } catch (error) {
     // The shared schema admits only the native topology. A lease for another
     // one (the retired appliance) is a registration mismatch, not a fault.
@@ -53,9 +57,15 @@ function decode(lease: string, expected: ExpectedLease, stored: boolean): LeaseC
     }
     throw new RemoteInstanceError("temporarily_unavailable", "lease claims do not parse", { cause: error });
   }
-  if (claims.sub !== expected.instanceId) throw new RemoteInstanceError("registration_mismatch", "lease subject is not this instance");
-  if (claims.aud !== expected.audience) throw new RemoteInstanceError("registration_mismatch", "lease audience mismatch");
-  return claims;
+}
+
+/** A stored lease keeps `drain_deadline` in epoch seconds; the claims carry it as an ISO time. */
+function withIsoDrainDeadline(candidate: unknown): unknown {
+  if (candidate && typeof candidate === "object" && "drain_deadline" in candidate && typeof candidate.drain_deadline === "number" &&
+    Number.isSafeInteger(candidate.drain_deadline) && candidate.drain_deadline >= 0) {
+    return { ...candidate, drain_deadline: new Date(candidate.drain_deadline * 1000).toISOString() };
+  }
+  return candidate;
 }
 
 export function leaseRecordFromClaims(lease: string, claims: LeaseClaims): LeaseRecord {
@@ -69,7 +79,7 @@ export function leaseRecordFromClaims(lease: string, claims: LeaseClaims): Lease
   };
 }
 
-/** Channels a drain-only lease may still open (A2 §5). */
+/** Channels a drain-only lease may still open. */
 const DRAIN_ONLY_CHANNELS: ReadonlySet<RelayChannel> = new Set(["control", "heartbeat", "assignment", "observation", "support"]);
 
 export class LeaseState {

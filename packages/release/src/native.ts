@@ -111,9 +111,7 @@ export function verifyNativeRelease(payload: unknown, roots: readonly EmbeddedRe
   const verdict = verifyBundleManifestTrust({ manifest, independentManifest: manifest, releaseRoots: keys, now: new Date(nowMs).toISOString(), supportedProtocol: { min: "1.0", max: "1.0" } });
   if (!verdict.trusted) throw new RemoteInstanceError("bundle_untrusted", `native release verification failed (${verdict.reason})`);
   for (const mapping of manifest.modelCapabilityMappings ?? []) {
-    const key = keys.get(mapping.signature.keyId);
-    if (!key || !ed25519Verify(key, agentModelCapabilityMappingSigningBytes(mapping), mapping.signature.value)
-      || parseRfc3339(mapping.expiresAt) <= nowMs || parseRfc3339(mapping.issuedAt) > nowMs + 5 * 60_000) {
+    if (!mappingTrusted(mapping, keys, nowMs)) {
       throw new RemoteInstanceError("bundle_untrusted", "native model capability mapping is not trusted by the accepted release root");
     }
   }
@@ -121,7 +119,14 @@ export function verifyNativeRelease(payload: unknown, roots: readonly EmbeddedRe
   return Object.freeze({ manifest, [verified]: true as const });
 }
 
-export interface VerifiedNativeModelCapabilityMapping {
+/** Signed by an accepted release root, unexpired, and issued no later than five minutes ahead of this clock. */
+function mappingTrusted(mapping: AgentModelCapabilityMapping, keys: ReadonlyMap<string, KeyObject>, nowMs: number): boolean {
+  const key = keys.get(mapping.signature.keyId);
+  return key !== undefined && ed25519Verify(key, agentModelCapabilityMappingSigningBytes(mapping), mapping.signature.value)
+    && parseRfc3339(mapping.expiresAt) > nowMs && parseRfc3339(mapping.issuedAt) <= nowMs + 5 * 60_000;
+}
+
+interface VerifiedNativeModelCapabilityMapping {
   agentId: string;
   mapping: AgentModelCapabilityMapping;
 }
@@ -132,26 +137,32 @@ export function selectNativeModelCapabilityMappings(
   target?: Pick<NativeArtifactTarget, "os" | "architecture">,
 ): VerifiedNativeModelCapabilityMapping[] {
   if (release[verified] !== true) throw new RemoteInstanceError("bundle_untrusted", "native release has not been verified");
-  return (release.manifest.modelCapabilityMappings ?? []).flatMap(mapping => {
-    if (mapping.hostAgent !== undefined) {
-      // A host-installed agent (the person's own DeepSeek Harness) has no
-      // artifact: the mapping holds only for the versions this runtime was
-      // built and tested against. A mapping for other versions is not ours.
-      const family = findAgentBridge(mapping.hostAgent.agentId);
-      const versions = family?.hostInstall?.versions;
-      return versions && versions.min === mapping.hostAgent.versions.min && versions.belowCore === mapping.hostAgent.versions.belowCore
-        ? [{ agentId: mapping.hostAgent.agentId, mapping }]
-        : [];
-    }
-    const artifact = release.manifest.nativeArtifacts?.find(candidate => candidate.kind === "agent_bridge"
-      && candidate.id === mapping.bridgeProfileRef && candidate.digest === mapping.bridgeArtifactDigest);
-    if (!artifact?.agentId) throw new RemoteInstanceError("bundle_untrusted", "native model mapping lost its exact bridge binding");
-    if (target && (artifact.os !== target.os || artifact.architecture !== target.architecture)) return [];
-    return [{ agentId: artifact.agentId, mapping }];
-  });
+  return (release.manifest.modelCapabilityMappings ?? []).flatMap(mapping => mapping.hostAgent !== undefined
+    ? hostAgentMapping(mapping, mapping.hostAgent)
+    : bridgeArtifactMapping(release, mapping, target));
 }
 
-export interface NativeArtifactTarget {
+/**
+ * A host-installed agent (the person's own DeepSeek Harness) has no artifact:
+ * the mapping holds only for the versions this runtime was built and tested
+ * against. A mapping for other versions is not ours.
+ */
+function hostAgentMapping(mapping: AgentModelCapabilityMapping, hostAgent: NonNullable<AgentModelCapabilityMapping["hostAgent"]>): VerifiedNativeModelCapabilityMapping[] {
+  const versions = findAgentBridge(hostAgent.agentId)?.hostInstall?.versions;
+  return versions && versions.min === hostAgent.versions.min && versions.belowCore === hostAgent.versions.belowCore
+    ? [{ agentId: hostAgent.agentId, mapping }]
+    : [];
+}
+
+function bridgeArtifactMapping(release: VerifiedNativeRelease, mapping: AgentModelCapabilityMapping, target: Pick<NativeArtifactTarget, "os" | "architecture"> | undefined): VerifiedNativeModelCapabilityMapping[] {
+  const artifact = release.manifest.nativeArtifacts?.find(candidate => candidate.kind === "agent_bridge"
+    && candidate.id === mapping.bridgeProfileRef && candidate.digest === mapping.bridgeArtifactDigest);
+  if (!artifact?.agentId) throw new RemoteInstanceError("bundle_untrusted", "native model mapping lost its exact bridge binding");
+  if (target && (artifact.os !== target.os || artifact.architecture !== target.architecture)) return [];
+  return [{ agentId: artifact.agentId, mapping }];
+}
+
+interface NativeArtifactTarget {
   os: "macos" | "windows" | "debian";
   architecture: "amd64" | "arm64";
   agentIds: readonly string[];
@@ -182,8 +193,8 @@ function freezeJson(value: object): void {
  * Konteks name first. `kind: "connector"` in the signed manifest is protocol
  * and is not a file name.
  */
-export const NATIVE_CONNECTOR_FILE = "konteks-connector";
-export const LEGACY_NATIVE_CONNECTOR_FILE = "connector";
+const NATIVE_CONNECTOR_FILE = "konteks-connector";
+const LEGACY_NATIVE_CONNECTOR_FILE = "connector";
 
 /**
  * While launchers from before the rename are still installed (a package's
@@ -193,7 +204,7 @@ export const LEGACY_NATIVE_CONNECTOR_FILE = "connector";
  * always runs the Konteks name. Drop the copy once no supported launcher
  * predates the rename.
  */
-export const STAGE_LEGACY_NATIVE_CONNECTOR_COPY = true;
+const STAGE_LEGACY_NATIVE_CONNECTOR_COPY = true;
 
 /** Both file names for an OS, the Konteks name first. */
 export function nativeConnectorFileNames(os: NativeArtifactTarget["os"]): [string, string] {
@@ -241,43 +252,60 @@ export async function stageNativeRelease(args: {
   const result = { directory, connector: "", bridges: {} as Record<string, string> };
   try {
     for (const [index, artifact] of artifacts.entries()) {
-      const extension = artifact.format !== "executable" ? ".tgz" : args.target.os === "windows" ? ".exe" : "";
-      // File names never come from untrusted URL paths or manifest identifiers.
-      const file = join(directory, `${index === 0 ? NATIVE_CONNECTOR_FILE : `bridge-${index}`}${extension}`);
-      // Release hosts redirect to an asset store; every byte is still pinned by
-      // the signed digest and size, so only the final scheme is constrained.
-      const response = await fetchFn(artifact.url, { redirect: "follow", credentials: "omit", signal: AbortSignal.timeout(300_000) });
-      if (!response.ok || !response.body || (response.url && !response.url.startsWith("https://"))) throw new Error("native artifact download failed");
-      const handle = await open(file, "wx", 0o600);
-      let size = 0;
-      const hash = createHash("sha256");
-      try {
-        for await (const chunk of response.body) {
-          size += chunk.byteLength;
-          if (size > artifact.sizeBytes) throw new Error("native artifact exceeds its signed size");
-          hash.update(chunk);
-          await handle.writeFile(chunk);
-        }
-        if (size !== artifact.sizeBytes || `sha256:${hash.digest("hex")}` !== artifact.digest) throw new Error("native artifact size or digest mismatch");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
+      const file = join(directory, stagedArtifactName(index, artifact, args.target.os));
+      await downloadArtifact(fetchFn, artifact, file);
       if (artifact.format === "executable") await chmod(file, 0o700);
-      if (artifact.kind === "connector" && artifact.format === "executable" && STAGE_LEGACY_NATIVE_CONNECTOR_COPY) {
-        // A copy, not a link: installed-executable verification refuses both.
-        const legacy = join(directory, nativeConnectorFileNames(args.target.os)[1]);
-        await copyFile(file, legacy, fsConstants.COPYFILE_EXCL);
-        await chmod(legacy, 0o700);
-      }
-      if (artifact.kind === "connector") result.connector = file;
-      else result.bridges[artifact.agentId!] = file;
+      if (artifact.kind === "connector") {
+        await stageLegacyConnectorCopy(artifact, file, join(directory, nativeConnectorFileNames(args.target.os)[1]));
+        result.connector = file;
+      } else result.bridges[artifact.agentId!] = file;
     }
     return result;
   } catch (error) {
     await rm(directory, { recursive: true, force: true });
     throw new RemoteInstanceError("bundle_untrusted", "native artifacts were not staged; the existing install was not changed", { cause: error });
   }
+}
+
+/** File names never come from untrusted URL paths or manifest identifiers. */
+function stagedArtifactName(index: number, artifact: RemoteNativeArtifact, os: NativeArtifactTarget["os"]): string {
+  const extension = artifact.format !== "executable" ? ".tgz" : os === "windows" ? ".exe" : "";
+  return `${index === 0 ? NATIVE_CONNECTOR_FILE : `bridge-${index}`}${extension}`;
+}
+
+/**
+ * Release hosts redirect to an asset store; every byte is still pinned by the
+ * signed digest and size, so only the final scheme is constrained.
+ */
+function downloadedOverHttps(response: Response): response is Response & { body: ReadableStream<Uint8Array> } {
+  return response.ok && response.body !== null && (!response.url || response.url.startsWith("https://"));
+}
+
+async function downloadArtifact(fetchFn: typeof fetch, artifact: RemoteNativeArtifact, file: string): Promise<void> {
+  const response = await fetchFn(artifact.url, { redirect: "follow", credentials: "omit", signal: AbortSignal.timeout(300_000) });
+  if (!downloadedOverHttps(response)) throw new Error("native artifact download failed");
+  const handle = await open(file, "wx", 0o600);
+  let size = 0;
+  const hash = createHash("sha256");
+  try {
+    for await (const chunk of response.body) {
+      size += chunk.byteLength;
+      if (size > artifact.sizeBytes) throw new Error("native artifact exceeds its signed size");
+      hash.update(chunk);
+      await handle.writeFile(chunk);
+    }
+    if (size !== artifact.sizeBytes || `sha256:${hash.digest("hex")}` !== artifact.digest) throw new Error("native artifact size or digest mismatch");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** A copy, not a link: installed-executable verification refuses both. */
+async function stageLegacyConnectorCopy(artifact: RemoteNativeArtifact, file: string, legacy: string): Promise<void> {
+  if (artifact.format !== "executable" || !STAGE_LEGACY_NATIVE_CONNECTOR_COPY) return;
+  await copyFile(file, legacy, fsConstants.COPYFILE_EXCL);
+  await chmod(legacy, 0o700);
 }
 
 /** Stable channel: the newest non-prerelease GitHub release of konteks-io/runtime. */
@@ -301,7 +329,7 @@ export function nativeManifestUrl(env: NodeJS.ProcessEnv = process.env): string 
  */
 export async function fetchNativeReleaseManifest(fetchFn: typeof fetch = fetch, url: string = nativeManifestUrl()): Promise<unknown> {
   const response = await fetchFn(url, { redirect: "follow", credentials: "omit", signal: AbortSignal.timeout(30_000) });
-  if (!response.ok || !response.body || (response.url && !response.url.startsWith("https://"))) throw new Error("native manifest download failed");
+  if (!downloadedOverHttps(response)) throw new Error("native manifest download failed");
   let size = 0;
   const chunks: Uint8Array[] = [];
   for await (const chunk of response.body) {

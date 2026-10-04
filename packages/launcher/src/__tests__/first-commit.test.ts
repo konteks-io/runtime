@@ -7,8 +7,7 @@ import { commitFirstFiles, initializeRepository, inspectRepository, planFirstCom
 
 /**
  * A folder with files but no git becomes a repository on managed git with
- * the person's files in it, and nothing they were told is left out (W1-B2,
- * WS1-084). A bare repository with Konteks's own first commit stands in for
+ * the person's files in it, and nothing they were told is left out. A bare repository with Konteks's own first commit stands in for
  * the managed one.
  */
 
@@ -56,7 +55,7 @@ describe("first commit of a folder with files", () => {
     ]);
   });
 
-  it("commits a folder with nothing to leave out without adding a .gitignore (W1-E1)", async () => {
+  it("commits a folder with nothing to leave out without adding a .gitignore", async () => {
     const notes = join(dir, "team-notes");
     await mkdir(notes, { recursive: true });
     await writeFile(join(notes, "README.md"), "# Team notes\n");
@@ -97,7 +96,7 @@ describe("first commit of a folder with files", () => {
     // What was left out is still there, and still not tracked.
     expect(await readFile(join(folder, ".env"), "utf8")).toContain("sk_test_fake");
     expect(git(folder, "status", "--porcelain")).toBe("");
-    // A later look at the folder knows it is on Konteks managed git (pass 6).
+    // A later look at the folder knows it is on Konteks managed git.
     expect(await inspectRepository(folder)).toMatchObject({ onManagedGit: true, remoteUrl: null, unpushedCommits: 0 });
   });
 });

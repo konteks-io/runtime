@@ -42,8 +42,8 @@ const TranscriptRecordSchema = z.object({
 
 export const PlanningTerminalRecordSchema = z.discriminatedUnion("kind", [CursorRecordSchema, DirectiveRecordSchema, TranscriptRecordSchema]);
 export type PlanningTerminalRecord = z.infer<typeof PlanningTerminalRecordSchema>;
-export type PlanningTranscriptState = z.infer<typeof TranscriptRecordSchema>;
-export type PlanningDirectiveRecord = z.infer<typeof DirectiveRecordSchema>;
+type PlanningTranscriptState = z.infer<typeof TranscriptRecordSchema>;
+type PlanningDirectiveRecord = z.infer<typeof DirectiveRecordSchema>;
 
 export function planningTerminalRecordKey(record: PlanningTerminalRecord): string {
   if (record.kind === "cursor") return JSON.stringify(["cursor", record.instanceId]);
@@ -68,6 +68,38 @@ const equal = (left: unknown, right: unknown): boolean => canonicalize(left as J
 function hex(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
 
 /** One fsync-owned planning transcript/directive/cursor domain. */
+/** The transcript after one more frame from its own execution, in order: session_ready first and only once. */
+function appended(existing: PlanningTerminalRecord | undefined, admission: LocalAdmission, message: SessionToCoreMessage): PlanningTranscriptState {
+  if (existing?.kind !== "execution" || !equal(existing.admission, admission)) throw new Error("Planning transcript has no exact execution owner");
+  const sourceSequence = existing.sourceSequence + 1;
+  if (!Number.isSafeInteger(sourceSequence)) throw new Error("Planning transcript sequence exhausted");
+  assertReadyOrder(existing.readySeen, message);
+  const terminal = (message.kind === "acp_result" || message.kind === "acp_error") && message.method === "session/prompt";
+  return {
+    ...existing,
+    sourceSequence,
+    frameCount: existing.frameCount + 1,
+    executionDigest: fold("konteks-planning-execution-frame-v1", existing.executionDigest, sourceSequence, message),
+    lastFrameDigest: hex(canonicalize(message as unknown as JsonValue)),
+    readySeen: true,
+    ...outputFold(existing, sourceSequence, message),
+    ...(terminal ? { turnCount: existing.turnCount + 1, finalRequestId: message.id } : {}),
+  };
+}
+
+function assertReadyOrder(readySeen: boolean, message: SessionToCoreMessage): void {
+  if (!readySeen && message.kind !== "session_ready") throw new Error("Planning transcript must begin with session_ready");
+  if (readySeen && message.kind === "session_ready") throw new Error("Planning transcript cannot contain a second session_ready");
+}
+
+function outputFold(existing: PlanningTranscriptState, sourceSequence: number, message: SessionToCoreMessage): Partial<PlanningTranscriptState> {
+  if (message.kind === "session_ready") return {};
+  return {
+    outputFrameCount: existing.outputFrameCount + 1,
+    outputDigest: fold("konteks-planning-output-frame-v1", existing.outputDigest, sourceSequence, message),
+  };
+}
+
 export class PlanningTerminalJournal {
   constructor(private readonly log: PlanningLog) {}
 
@@ -121,50 +153,35 @@ export class PlanningTerminalJournal {
     const key = JSON.stringify(["execution", admission.executionGeneration]);
     let committed!: PlanningTranscriptState;
     await this.log.update(key, existing => {
-      if (existing?.kind !== "execution" || !equal(existing.admission, admission)) throw new Error("Planning transcript has no exact execution owner");
-      const sourceSequence = existing.sourceSequence + 1;
-      if (!Number.isSafeInteger(sourceSequence)) throw new Error("Planning transcript sequence exhausted");
-      if (!existing.readySeen && message.kind !== "session_ready") throw new Error("Planning transcript must begin with session_ready");
-      if (existing.readySeen && message.kind === "session_ready") throw new Error("Planning transcript cannot contain a second session_ready");
-      const terminal = (message.kind === "acp_result" || message.kind === "acp_error") && message.method === "session/prompt";
-      const next: PlanningTranscriptState = {
-        ...existing,
-        sourceSequence,
-        frameCount: existing.frameCount + 1,
-        executionDigest: fold("konteks-planning-execution-frame-v1", existing.executionDigest, sourceSequence, message),
-        lastFrameDigest: hex(canonicalize(message as unknown as JsonValue)),
-        readySeen: true,
-        ...(message.kind === "session_ready" ? {} : {
-          outputFrameCount: existing.outputFrameCount + 1,
-          outputDigest: fold("konteks-planning-output-frame-v1", existing.outputDigest, sourceSequence, message),
-        }),
-        ...(terminal ? { turnCount: existing.turnCount + 1, finalRequestId: message.id } : {}),
-      };
-      committed = TranscriptRecordSchema.parse(next);
+      committed = TranscriptRecordSchema.parse(appended(existing, admission, message));
       return committed;
     });
     return structuredClone(committed);
+  }
+
+
+  /** The directive's row: the next sequence, inside the page's high-water, its identity and sequence never reused. */
+  private directiveRow(instanceId: string, directive: PlanningControllerTerminalDirective, expected: number, highWater: number): PlanningTerminalRecord {
+    if (directive.directiveSequence !== expected || directive.directiveSequence > highWater) throw new Error("Controller directive page has a gap");
+    const prior = this.directive(instanceId, directive.directiveId);
+    if (prior && !equal(prior.directive, directive)) throw new Error("Controller directive identity was reused");
+    this.assertSequenceUnused(instanceId, directive);
+    return prior ?? { kind: "directive", version: 1, instanceId, directiveId: directive.directiveId,
+      directiveSequence: directive.directiveSequence, directiveDigest: hex(canonicalize(directive as unknown as JsonValue)), directive, state: "stored" };
+  }
+
+  private assertSequenceUnused(instanceId: string, directive: PlanningControllerTerminalDirective): void {
+    const atSequence = this.log.all().find(row => row.kind === "directive" && row.instanceId === instanceId && row.directiveSequence === directive.directiveSequence);
+    if (atSequence?.kind === "directive" && atSequence.directiveId !== directive.directiveId) throw new Error("Controller directive sequence was reused");
   }
 
   async storePulled(instanceId: string, afterSequence: number, candidate: PlanningControllerDirectivePullResult): Promise<void> {
     const page = PlanningControllerDirectivePullResultSchema.parse(candidate);
     await this.log.batch(() => {
       if (this.cursor(instanceId) !== afterSequence) throw new Error("Controller directive cursor changed");
-      let expected = afterSequence + 1;
-      const rows: PlanningTerminalRecord[] = [];
-      for (const directive of page.directives) {
-        if (directive.directiveSequence !== expected || directive.directiveSequence > page.highWater) throw new Error("Controller directive page has a gap");
-        const prior = this.directive(instanceId, directive.directiveId);
-        if (prior && !equal(prior.directive, directive)) throw new Error("Controller directive identity was reused");
-        const atSequence = this.log.all().find(row => row.kind === "directive" && row.instanceId === instanceId && row.directiveSequence === directive.directiveSequence);
-        if (atSequence?.kind === "directive" && atSequence.directiveId !== directive.directiveId) throw new Error("Controller directive sequence was reused");
-        rows.push(prior ?? { kind: "directive", version: 1, instanceId, directiveId: directive.directiveId,
-          directiveSequence: directive.directiveSequence, directiveDigest: hex(canonicalize(directive as unknown as JsonValue)), directive, state: "stored" });
-        expected += 1;
-      }
+      const rows: PlanningTerminalRecord[] = page.directives.map((directive, index) => this.directiveRow(instanceId, directive, afterSequence + 1 + index, page.highWater));
       if (page.highWater < afterSequence || (page.directives.length === 0 && page.highWater > afterSequence)) throw new Error("Controller directive high-water is invalid");
-      const next = page.directives.at(-1)?.directiveSequence ?? afterSequence;
-      rows.push({ kind: "cursor", version: 1, instanceId, afterSequence: next });
+      rows.push({ kind: "cursor", version: 1, instanceId, afterSequence: page.directives.at(-1)?.directiveSequence ?? afterSequence });
       return rows;
     });
   }

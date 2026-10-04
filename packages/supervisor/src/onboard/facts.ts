@@ -2,7 +2,7 @@ import { DiscoveryEvidenceFactsSchema, type DiscoveryEvidenceFacts } from "@kont
 import type { EvidenceCandidate } from "./evidence-paths.js";
 
 /**
- * Fact extraction (OB6 §2, invariant 2: Konteks receives evidence, never code).
+ * Fact extraction: Konteks receives evidence, never code.
  *
  * Everything here runs on the customer's machine and returns only the small
  * closed shape `DiscoveryEvidenceFacts` names. No file body is kept, no line is
@@ -21,63 +21,72 @@ const MAX_DEPENDENCIES = 512;
 const MAX_WORKSPACES = 256;
 
 export function extractFacts(files: readonly ReadFile[]): DiscoveryEvidenceFacts {
-  const handles = new Set<string>();
-  const manifests: NonNullable<DiscoveryEvidenceFacts["manifests"]> = [];
-  const workspaces = new Set<string>();
-  const release: NonNullable<DiscoveryEvidenceFacts["release"]> = [];
-  let monorepo = false;
-  let descriptor: DiscoveryEvidenceFacts["descriptor"];
+  const draft = new FactsDraft();
+  for (const file of files) FAMILY_READERS[file.candidate.family](draft, file.candidate.path, file.body.toString("utf8"));
+  // Parse our own output: the schema is the boundary that keeps a body out.
+  return DiscoveryEvidenceFactsSchema.parse(draft.facts());
+}
 
-  for (const file of files) {
-    const text = file.body.toString("utf8");
-    switch (file.candidate.family) {
-      case "codeowners":
-        for (const handle of parseCodeowners(text)) if (handles.size < MAX_HANDLES) handles.add(handle);
-        break;
-      case "manifest": {
-        const manifest = parseManifest(file.candidate.path, text);
-        if (manifest) manifests.push(manifest);
-        if (file.candidate.path === "package.json") {
-          for (const pattern of packageJsonWorkspaces(text)) {
-            if (workspaces.size < MAX_WORKSPACES) workspaces.add(pattern);
-          }
-          if (workspaces.size > 0) monorepo = true;
-        }
-        break;
-      }
-      case "workspace": {
-        for (const pattern of workspacePatterns(file.candidate.path, text)) {
-          if (workspaces.size < MAX_WORKSPACES) workspaces.add(pattern);
-        }
-        monorepo = true;
-        break;
-      }
-      case "release":
-        release.push({ kind: releaseKind(file.candidate.path) });
-        break;
-      case "descriptor": {
-        const found = parseDescriptor(text);
-        if (found) descriptor = found;
-        break;
-      }
-    }
+type Manifest = NonNullable<DiscoveryEvidenceFacts["manifests"]>[number];
+
+/** The facts gathered so far from one repository's files. */
+class FactsDraft {
+  readonly handles = new Set<string>();
+  readonly manifests: Manifest[] = [];
+  readonly workspaces = new Set<string>();
+  readonly release: NonNullable<DiscoveryEvidenceFacts["release"]> = [];
+  monorepo = false;
+  descriptor: DiscoveryEvidenceFacts["descriptor"];
+
+  addWorkspaces(patterns: Iterable<string>): void {
+    for (const pattern of patterns) if (this.workspaces.size < MAX_WORKSPACES) this.workspaces.add(pattern);
   }
 
-  const facts: DiscoveryEvidenceFacts = {
-    ...(handles.size > 0 ? { codeowners: { handles: [...handles] } } : {}),
-    ...(manifests.length > 0 ? { manifests: manifests.slice(0, 64) } : {}),
-    ...(workspaces.size > 0 || monorepo ? { layout: { monorepo, ...(workspaces.size > 0 ? { workspaces: [...workspaces] } : {}) } } : {}),
-    ...(descriptor ? { descriptor } : {}),
-    ...(release.length > 0 ? { release: release.slice(0, 32) } : {}),
-  };
-  // Parse our own output: the schema is the boundary that keeps a body out.
-  return DiscoveryEvidenceFactsSchema.parse(facts);
+  facts(): DiscoveryEvidenceFacts {
+    return {
+      ...(this.handles.size > 0 ? { codeowners: { handles: [...this.handles] } } : {}),
+      ...(this.manifests.length > 0 ? { manifests: this.manifests.slice(0, 64) } : {}),
+      ...this.layout(),
+      ...(this.descriptor ? { descriptor: this.descriptor } : {}),
+      ...(this.release.length > 0 ? { release: this.release.slice(0, 32) } : {}),
+    };
+  }
+
+  private layout(): Pick<DiscoveryEvidenceFacts, "layout"> {
+    if (this.workspaces.size === 0 && !this.monorepo) return {};
+    return { layout: { monorepo: this.monorepo, ...(this.workspaces.size > 0 ? { workspaces: [...this.workspaces] } : {}) } };
+  }
 }
+
+/** What each family of evidence file adds to the draft. */
+const FAMILY_READERS: Record<ReadFile["candidate"]["family"], (draft: FactsDraft, path: string, text: string) => void> = {
+  codeowners: (draft, _path, text) => {
+    for (const handle of parseCodeowners(text)) if (draft.handles.size < MAX_HANDLES) draft.handles.add(handle);
+  },
+  manifest: (draft, path, text) => {
+    const manifest = parseManifest(path, text);
+    if (manifest) draft.manifests.push(manifest);
+    if (path !== "package.json") return;
+    draft.addWorkspaces(packageJsonWorkspaces(text));
+    if (draft.workspaces.size > 0) draft.monorepo = true;
+  },
+  workspace: (draft, path, text) => {
+    draft.addWorkspaces(workspacePatterns(path, text));
+    draft.monorepo = true;
+  },
+  release: (draft, path) => {
+    draft.release.push({ kind: releaseKind(path) });
+  },
+  descriptor: (draft, _path, text) => {
+    const found = parseDescriptor(text);
+    if (found) draft.descriptor = found;
+  },
+};
 
 /**
  * CODEOWNERS handles only. Patterns are deliberately dropped: a path pattern is
  * a fact about the repository's layout that nobody asked for, and the owner
- * mapping (ON9) works on handles.
+ * mapping works on handles.
  */
 export function parseCodeowners(text: string): string[] {
   const handles: string[] = [];
@@ -91,49 +100,52 @@ export function parseCodeowners(text: string): string[] {
   return handles;
 }
 
-function parseManifest(path: string, text: string): { kind: string; name?: string; dependencies?: string[] } | null {
-  switch (path) {
-    case "package.json": {
-      const json = safeJson(text);
-      if (!json) return null;
-      const name = typeof json.name === "string" ? json.name : undefined;
-      const dependencies = [...dependencyNames(json.dependencies), ...dependencyNames(json.devDependencies), ...dependencyNames(json.peerDependencies)];
-      return { kind: "npm", ...(name ? { name } : {}), ...(dependencies.length ? { dependencies: dependencies.slice(0, MAX_DEPENDENCIES) } : {}) };
-    }
-    case "pyproject.toml": {
-      const name = /^\s*name\s*=\s*["']([^"']{1,256})["']/m.exec(text)?.[1];
-      const dependencies = [...text.matchAll(/^\s*["']([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:[<>=!~[][^"']*)?["']\s*,?\s*$/gm)].map(match => match[1]!);
-      return { kind: "python", ...(name ? { name } : {}), ...(dependencies.length ? { dependencies: dependencies.slice(0, MAX_DEPENDENCIES) } : {}) };
-    }
-    case "go.mod": {
-      const name = /^module\s+(\S{1,256})/m.exec(text)?.[1];
-      const dependencies = [...text.matchAll(/^\s*(\S+)\s+v\d+\.\S+/gm)].map(match => match[1]!).filter(value => value !== "go" && value !== "toolchain");
-      return { kind: "go", ...(name ? { name } : {}), ...(dependencies.length ? { dependencies: dependencies.slice(0, MAX_DEPENDENCIES) } : {}) };
-    }
-    case "Cargo.toml": {
-      const name = /^\s*name\s*=\s*["']([^"']{1,256})["']/m.exec(text)?.[1];
-      const section = /\[dependencies\]([\s\S]*?)(?=\n\[|$)/.exec(text)?.[1] ?? "";
-      const dependencies = [...section.matchAll(/^\s*([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*=/gm)].map(match => match[1]!);
-      return { kind: "cargo", ...(name ? { name } : {}), ...(dependencies.length ? { dependencies: dependencies.slice(0, MAX_DEPENDENCIES) } : {}) };
-    }
-    case "pom.xml": {
-      const name = /<artifactId>([^<]{1,256})<\/artifactId>/.exec(text)?.[1];
-      const dependencies = [...text.matchAll(/<dependency>[\s\S]*?<artifactId>([^<]{1,256})<\/artifactId>/g)].map(match => match[1]!.trim());
-      return { kind: "maven", ...(name ? { name } : {}), ...(dependencies.length ? { dependencies: dependencies.slice(0, MAX_DEPENDENCIES) } : {}) };
-    }
-    default:
-      if (!path.endsWith(".csproj")) return null;
-      return {
-        kind: "dotnet",
-        name: path.split("/").pop()!.replace(/\.csproj$/, ""),
-        ...(() => {
-          const dependencies = [...text.matchAll(/<PackageReference\s+Include="([^"]{1,256})"/g)].map(match => match[1]!);
-          return dependencies.length ? { dependencies: dependencies.slice(0, MAX_DEPENDENCIES) } : {};
-        })(),
-      };
-  }
+function parseManifest(path: string, text: string): Manifest | null {
+  const parse = MANIFEST_PARSERS.get(path);
+  if (parse) return parse(text);
+  if (!path.endsWith(".csproj")) return null;
+  const dependencies = [...text.matchAll(/<PackageReference\s+Include="([^"]{1,256})"/g)].map(match => match[1]!);
+  return { kind: "dotnet", name: path.split("/").pop()!.replace(/\.csproj$/, ""), ...dependencyField(dependencies) };
 }
 
+function manifest(kind: string, name: string | undefined, dependencies: string[]): Manifest {
+  return { kind, ...(name ? { name } : {}), ...dependencyField(dependencies) };
+}
+
+function dependencyField(dependencies: string[]): { dependencies?: string[] } {
+  return dependencies.length ? { dependencies: dependencies.slice(0, MAX_DEPENDENCIES) } : {};
+}
+
+const NAME_LINE = /^\s*name\s*=\s*["']([^"']{1,256})["']/m;
+
+/** Each manifest file's kind, name and dependency names; null when it does not parse. */
+const MANIFEST_PARSERS = new Map<string, (text: string) => Manifest | null>([
+  ["package.json", text => {
+    const json = safeJson(text);
+    if (!json) return null;
+    const dependencies = [...dependencyNames(json.dependencies), ...dependencyNames(json.devDependencies), ...dependencyNames(json.peerDependencies)];
+    return manifest("npm", typeof json.name === "string" ? json.name : undefined, dependencies);
+  }],
+  ["pyproject.toml", text => manifest(
+    "python",
+    NAME_LINE.exec(text)?.[1],
+    [...text.matchAll(/^\s*["']([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?:[<>=!~[][^"']*)?["']\s*,?\s*$/gm)].map(match => match[1]!),
+  )],
+  ["go.mod", text => manifest(
+    "go",
+    /^module\s+(\S{1,256})/m.exec(text)?.[1],
+    [...text.matchAll(/^\s*(\S+)\s+v\d+\.\S+/gm)].map(match => match[1]!).filter(value => value !== "go" && value !== "toolchain"),
+  )],
+  ["Cargo.toml", text => {
+    const section = /\[dependencies\]([\s\S]*?)(?=\n\[|$)/.exec(text)?.[1] ?? "";
+    return manifest("cargo", NAME_LINE.exec(text)?.[1], [...section.matchAll(/^\s*([A-Za-z0-9][A-Za-z0-9._-]{0,127})\s*=/gm)].map(match => match[1]!));
+  }],
+  ["pom.xml", text => manifest(
+    "maven",
+    /<artifactId>([^<]{1,256})<\/artifactId>/.exec(text)?.[1],
+    [...text.matchAll(/<dependency>[\s\S]*?<artifactId>([^<]{1,256})<\/artifactId>/g)].map(match => match[1]!.trim()),
+  )],
+]);
 function packageJsonWorkspaces(text: string): string[] {
   const json = safeJson(text);
   if (!json) return [];

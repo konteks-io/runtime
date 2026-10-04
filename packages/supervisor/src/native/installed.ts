@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { lstat, open, type FileHandle } from "node:fs/promises";
 import { RemoteInstanceError, type RemoteNativeArtifact } from "@konteks/remote-common";
 import { isHostAgentId, presentNativeConnectorExecutables, selectNativeArtifacts, verifyOfflineAgentPackage, type VerifiedNativeRelease } from "@konteks/remote-release";
 import type { RunnerConfig } from "@konteks/remote-agent-runner";
 
 /** Verify the complete installed package before any native bridge is spawned. */
 export async function verifyInstalledNativeBridges(release: VerifiedNativeRelease, runners: readonly RunnerConfig[], platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" }): Promise<void> {
-  // No agent yet is a machine connected before any was set up (OS14, D116): nothing to verify.
+  // No agent yet is a machine connected before any was set up: nothing to verify.
   if (runners.length === 0) return;
   // Host-installed agents are verified against their local package at load,
   // and intentionally have no signed offline bridge artifact in the release.
@@ -41,23 +41,34 @@ export async function verifyInstalledNativeConnector(release: VerifiedNativeRele
 }
 
 async function verifyExecutable(path: string, artifact: RemoteNativeArtifact): Promise<void> {
+  try {
+    const info = await lstat(path);
+    if (!plainArtifactFile(info, artifact)) throw untrusted();
+    const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
-      const info = await lstat(path);
-      if (!info.isFile() || info.nlink !== 1 || info.size !== artifact.sizeBytes || (process.platform !== "win32" && ((info.mode & 0o022) !== 0 || (info.mode & 0o100) === 0))) throw untrusted();
-      const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-      try {
-        const opened = await handle.stat();
-        if (opened.ino !== info.ino || opened.dev !== info.dev || opened.size !== info.size) throw untrusted();
-        const hash = createHash("sha256");
-        let size = 0;
-        for await (const chunk of handle.createReadStream({ autoClose: false })) {
-          size += chunk.length;
-          if (size > artifact.sizeBytes) throw untrusted();
-          hash.update(chunk);
-        }
-        if (size !== artifact.sizeBytes || `sha256:${hash.digest("hex")}` !== artifact.digest) throw untrusted();
-      } finally { await handle.close(); }
-    } catch { throw untrusted(); }
+      await verifyOpenedContent(handle, info, artifact);
+    } finally { await handle.close(); }
+  } catch { throw untrusted(); }
+}
+
+/** One plain link of the artifact's size; outside Windows not group or world writable, and executable by its owner. */
+function plainArtifactFile(info: Stats, artifact: RemoteNativeArtifact): boolean {
+  if (!info.isFile() || info.nlink !== 1 || info.size !== artifact.sizeBytes) return false;
+  return process.platform === "win32" || ((info.mode & 0o022) === 0 && (info.mode & 0o100) !== 0);
+}
+
+/** The opened file is the one inspected, and its bytes are exactly the artifact's. */
+async function verifyOpenedContent(handle: FileHandle, info: Stats, artifact: RemoteNativeArtifact): Promise<void> {
+  const opened = await handle.stat();
+  if (opened.ino !== info.ino || opened.dev !== info.dev || opened.size !== info.size) throw untrusted();
+  const hash = createHash("sha256");
+  let size = 0;
+  for await (const chunk of handle.createReadStream({ autoClose: false })) {
+    size += chunk.length;
+    if (size > artifact.sizeBytes) throw untrusted();
+    hash.update(chunk);
+  }
+  if (size !== artifact.sizeBytes || `sha256:${hash.digest("hex")}` !== artifact.digest) throw untrusted();
 }
 
 function untrusted() { return new RemoteInstanceError("bundle_untrusted", "Installed native bridges do not match the signed executable release."); }

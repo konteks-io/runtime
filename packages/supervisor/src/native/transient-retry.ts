@@ -2,7 +2,7 @@ import type { Logger } from "@konteks/remote-common";
 
 /** One initial attempt followed by the required minimum of three retries. */
 export const NATIVE_TRANSIENT_MAX_ATTEMPTS = 4;
-export const NATIVE_TRANSIENT_BASE_DELAY_MS = 100;
+const NATIVE_TRANSIENT_BASE_DELAY_MS = 100;
 
 export type NativeTransientClassification = "transport" | "timeout" | "rate_limited" | "upstream" | "response_body" | "credential_rotated";
 

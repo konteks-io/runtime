@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join, parse, relative, resolve } from "node:path";
 import type { PolicyEvaluator, ToolPolicyContext, ToolPolicyEvaluation } from "@konteks/agent-core";
 
 /**
- * The native connector's tool policy (D87 step 1).
+ * The native connector's tool policy.
  *
  * Hosted runs answer every ACP permission request by policy: the deployment
  * bash blocklist, then a workspace-boundary check for file changes, and allow
@@ -20,7 +20,7 @@ import type { PolicyEvaluator, ToolPolicyContext, ToolPolicyEvaluation } from "@
 export const DEFAULT_BASH_BLOCKLIST: readonly string[] = [
   "nc ", "netcat", "ssh ", "telnet", "nslookup", "dig ", "sudo ", "su ", "mkfs", "dd if=", "/dev/",
   "rm -rf /", "chmod 777 /", "git commit", "git push", "git tag", "gh pr create",
-  // Windows elevation, sudo's counterpart (agent OS proof, CP0-X):
+  // Windows elevation, sudo's counterpart (agent OS proof):
   // `Start-Process … -Verb RunAs`, `-Verb:RunAs`, `runas /user:…`, gsudo.
   "runas", "verb:runas", "gsudo",
 ];
@@ -120,7 +120,7 @@ function bounded(path: string): string {
  * Describe a path outside the boundary without naming this computer's folders.
  *
  * An agent sometimes writes a repository path from the filesystem root
- * (`/src/app/x` for the working copy's `src/app/x`; T1, 2026-10-02). That path
+ * (`/src/app/x` for the working copy's `src/app/x`). That path
  * is still refused: an ACP permission answer can only allow or refuse the call,
  * never rewrite it (`updatedInput` has no ACP carrier), so allowing it would
  * let the agent write at the filesystem root, not in the working copy. It is
@@ -150,7 +150,7 @@ export function describeRefusedPath(rawPath: string, workspaceRoot: string, cwd:
 }
 
 /** The note the agent and Konteks see for a refused file change. */
-export function outsideWorkspaceMessage(outside: readonly RefusedPath[], pathCount: number, cwd: string): string {
+function outsideWorkspaceMessage(outside: readonly RefusedPath[], pathCount: number, cwd: string): string {
   const shown = outside.slice(0, MAX_SHOWN_PATHS).map(entry => entry.rootAnchored
     ? `\`${entry.path}\` starts at the filesystem root; inside the workspace it is \`${entry.suggestion}\``
     : `\`${entry.path}\` is outside it`);
@@ -164,19 +164,15 @@ export function outsideWorkspaceMessage(outside: readonly RefusedPath[], pathCou
 }
 
 function changedPaths(input: Record<string, unknown>): string[] {
-  const paths: string[] = [];
-  for (const key of PATH_KEYS) {
-    const value = input[key];
-    if (typeof value === "string" && value.trim()) paths.push(value);
-  }
-  const locations = input.locations;
-  if (Array.isArray(locations)) {
-    for (const location of locations) {
-      const path = (location as { path?: unknown } | null)?.path;
-      if (typeof path === "string" && path.trim()) paths.push(path);
-    }
-  }
-  return paths;
+  const named = PATH_KEYS.map(key => input[key]).filter(nonBlankString);
+  const locations = Array.isArray(input.locations)
+    ? input.locations.map(location => (location as { path?: unknown } | null)?.path).filter(nonBlankString)
+    : [];
+  return [...named, ...locations];
+}
+
+function nonBlankString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 export function createWorkspaceToolPolicy(options: { bashBlocklist?: readonly string[] } = {}): PolicyEvaluator {

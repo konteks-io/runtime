@@ -9,7 +9,7 @@ import { DurableOutbox } from "../state/outbox.js";
 import { WorkOrchestrator } from "../work/orchestrator.js";
 import type { LocalAdmission } from "../state/local-admission.js";
 
-// WS2-159: a session fenced after its execution lease could not renew must be
+// A session fenced after its execution lease could not renew must be
 // able to start again once its process is proven stopped and Core settled the
 // claim, even when Core can no longer accept the stop observation.
 
@@ -201,7 +201,7 @@ it("keeps a retired process's observation pending when Core refuses it for anoth
   await expect(f.internal.takeOverCompletedChannel(conversation(f.next), f.next, current)).rejects.toMatchObject({ code: "recovery_required" });
 });
 
-it("lets a later recovery stop an execution an earlier one already interrupted, without moving it back (WS1-166)", async () => {
+it("lets a later recovery stop an execution an earlier one already interrupted, without moving it back", async () => {
   const journal = new SupervisorJournal(dir); await journal.load();
   const stopped = admission("stopped");
   await admit(journal, stopped, conversation(stopped));

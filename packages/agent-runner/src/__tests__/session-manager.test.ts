@@ -50,7 +50,7 @@ async function nextEvent(bus: RunnerEventBus, kind: RunnerEvent["kind"]): Promis
   });
 }
 
-describe("session manager (D98 bootstrap)", () => {
+describe("session manager bootstrap", () => {
   it("applies the governed session baseline to create and live continuation", async () => {
     const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
     const events = new RunnerEventBus();
@@ -72,7 +72,7 @@ describe("session manager (D98 bootstrap)", () => {
       .rejects.toThrow("governed mode required");
   });
 
-  it("pins Codex to Ask for approval: every other mode, named today or added later, is refused (S0-3)", async () => {
+  it("pins Codex to Ask for approval: every other mode, named today or added later, is refused", async () => {
     // codex-acp 1.10.0 "read-only" = "Ask for approval": approvalPolicy
     // on-request, approvalsReviewer user, so Konteks's callback decides.
     expect(CODEX_SESSION_GOVERNANCE.defaultSessionConfig).toEqual({ mode: "read-only" });
@@ -117,7 +117,7 @@ describe("session manager (D98 bootstrap)", () => {
     expect(manager.activeSessions).toBe(1);
   });
 
-  it("closes and resumes a live session the agent will not resume while open, so the next prompt continues (WS1-168)", async () => {
+  it("closes and resumes a live session the agent will not resume while open, so the next prompt continues", async () => {
     let active = true;
     const resumeSession = vi.fn(async () => {
       if (active) throw RequestError.invalidParams(undefined, "session is already active: bridge-s1");
@@ -140,7 +140,7 @@ describe("session manager (D98 bootstrap)", () => {
     expect(resumeSession).toHaveBeenCalledTimes(2);
   });
 
-  it("refuses and cancels work the agent starts on its own after a turn, so the next turn still continues (WS2-130)", async () => {
+  it("refuses and cancels work the agent starts on its own after a turn, so the next turn still continues", async () => {
     const { bridge, calls } = fakeBridge({}, { agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } } });
     const events = new RunnerEventBus();
     const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore() });
@@ -483,7 +483,7 @@ describe("session manager (D98 bootstrap)", () => {
     expect((seen[1] as { params: { update: unknown } }).params.update).not.toHaveProperty("nativeObservation");
   });
 
-  it("attributes a Codex reply to the turn the connector opened, and only that turn (WS2-158)", async () => {
+  it("attributes a Codex reply to the turn the connector opened, and only that turn", async () => {
     const events = new RunnerEventBus(), seen: RunnerEvent[] = [];
     events.subscribe(event => seen.push(event));
     const { bridge } = fakeBridge();
@@ -736,7 +736,7 @@ describe("session manager (D98 bootstrap)", () => {
     expect(JSON.stringify(await usage)).not.toMatch(/"model"|amount|currency/);
   });
 
-  it("refuses a second prompt while one runs on the session, before it reaches the bridge (WS2-153)", async () => {
+  it("refuses a second prompt while one runs on the session, before it reaches the bridge", async () => {
     let finish!: (value: { stopReason: "end_turn" }) => void;
     const prompt = vi.fn(() => new Promise<{ stopReason: "end_turn" }>((resolve) => { finish = resolve; }));
     const { bridge } = fakeBridge({ prompt });
@@ -800,7 +800,7 @@ describe("session manager (D98 bootstrap)", () => {
   });
 });
 
-describe("integration sessions (external-integration CP2)", () => {
+describe("integration sessions", () => {
   it("tells the bridge which personal server or account connectors this one session admits", async () => {
     const { bridge, calls } = fakeBridge();
     const manager = new SessionManager({ bridge: () => bridge, events: new RunnerEventBus(), refStore: new InMemorySessionRefStore() });

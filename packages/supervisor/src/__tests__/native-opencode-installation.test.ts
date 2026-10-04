@@ -251,7 +251,7 @@ describe("the one OpenCode command detection runs", () => {
   });
 });
 
-describe("OpenCode for doctor and onboarding (CP6)", () => {
+describe("OpenCode for doctor and onboarding", () => {
   it("names how OpenCode was installed from its canonical executable, never the path", () => {
     expect(openCodeInstallKind("/Users/a/.nvm/versions/node/v22.23.2/lib/node_modules/@opencode/cli/bin/opencode.exe")).toBe("npm");
     expect(openCodeInstallKind("C:\\Users\\a\\AppData\\Roaming\\npm\\node_modules\\@opencode\\cli\\bin\\opencode.exe")).toBe("npm");

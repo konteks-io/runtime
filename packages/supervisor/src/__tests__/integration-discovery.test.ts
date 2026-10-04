@@ -23,7 +23,7 @@ const codexRaw = [
   "not an object",
 ];
 
-describe("integration discovery allowlist (D26, secret canaries)", () => {
+describe("integration discovery allowlist (secret canaries)", () => {
   it("keeps only server name, source kind, status, provider category and tool names from Codex", () => {
     const inventory = sanitizeCodexMcpStatus(codexRaw);
     expect(JSON.stringify(inventory)).not.toContain(CANARY);

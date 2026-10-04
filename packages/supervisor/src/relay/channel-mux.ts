@@ -23,7 +23,7 @@ import { ReplayBuffer } from "./replay-buffer.js";
 import { RecoveryAuthority } from "../transport/recovery-authority.js";
 
 /**
- * The typed channel mux (D99/D107/D114/D115/D117):
+ * The typed channel mux:
  *  - per `(channelId, to_core)` monotonic `seq` and a sender-owned replay buffer;
  *  - per `(channelId, to_runtime)` durable receive cursor with dedup;
  *  - explicit supervisor-signed `RelayAck`s at the configured cadence and
@@ -55,14 +55,14 @@ export interface MuxOptions {
   emit: (envelope: ToCoreRelayFrame | AssignmentRequestFrame | RelayAck) => boolean;
   /** Resolve only after durable acceptance, not completion of the agent turn. */
   onFrame: (frame: ToRuntimeRelayFrame) => void | Promise<void>;
-  /** D143 assignment receipts and request ACKs use the durable assignment journal. */
+  /** Assignment receipts and request ACKs use the durable assignment journal. */
   onAssignmentFrame?: (frame: AssignmentReplyFrame) => Promise<number>;
   onAssignmentRequestAck?: (ack: RelayAck) => Promise<void>;
-  /** D143 logical cursors replace generic mux counters in the relay handshake. */
+  /** Assignment logical cursors replace generic mux counters in the relay handshake. */
   assignmentCursors?: () => { channelId: string; to_core: number; to_runtime: number } | null;
   onStall: (channelId: string) => void;
   onReset: (channelId: string) => void;
-  /** Persist the durable receive cursor (the authoritative cursor for to_runtime, D107). */
+  /** Persist the durable receive cursor (the authoritative cursor for to_runtime). */
   persistCursors: (cursors: Record<string, { to_core: number; to_runtime: number; allocated?: number | undefined }>) => Promise<void>;
   /** Production durability boundary: allocation, replay bytes and cursors in one atomic write. */
   persistRelayState?: (state: RelayDurableState) => Promise<void>;
@@ -100,6 +100,41 @@ interface ChannelState {
   lastInboundAt: number;
 }
 
+type ReplayFrames = NonNullable<ReturnType<ChannelState["buffer"]["after"]>>;
+
+/** The whole unacknowledged history, contiguous to the last allocated sequence; null when any of it is gone. */
+function completeReplay(state: ChannelState): ReplayFrames | null {
+  const replay = state.buffer.after(state.ackedByEndpoint);
+  return replay !== null && !state.buffer.needsReset && replay.length === state.nextSeq - 1 - state.ackedByEndpoint ? replay : null;
+}
+
+/** Why a peer's resume cursor cannot be served from the retained replay; null when it can. */
+function resumeRefusal(cursor: { to_core: number }, state: ChannelState, replay: ReplayFrames | null): string | null {
+  if (cursor.to_core < state.ackedByEndpoint) return "resume_cursor_regressed";
+  if (cursor.to_core >= state.nextSeq) return "resume_cursor_ahead";
+  if (state.buffer.needsReset) return "replay_evicted";
+  if (replay === null) return "replay_unavailable";
+  return replay.length !== state.nextSeq - 1 - state.ackedByEndpoint ? "replay_incomplete" : null;
+}
+
+/**
+ * A session may have advanced through the HTTPS carrier before its first
+ * relay frame. Its durable source sequence is the authority; a pristine
+ * relay-local allocator may join that already-accepted prefix once.
+ */
+function allocateSequence(state: ChannelState, expectedSequence: number | undefined): number {
+  if (expectedSequence !== undefined && expectedSequence > state.nextSeq && state.nextSeq === 1 && state.ackedByEndpoint === 0) state.nextSeq = expectedSequence;
+  const seq = state.nextSeq;
+  if (expectedSequence !== undefined && expectedSequence !== seq) throw new RemoteInstanceError("recovery_required", "Durable logical source sequence differs from relay sequence");
+  state.nextSeq += 1;
+  return seq;
+}
+
+/** Unacknowledged sends past both the stall deadline and the liveness window, not already stalled. */
+function overdue(state: ChannelState, now: number, stallDeadlineMs: number): boolean {
+  return state.buffer.unackedCount > 0 && !state.stalled && now - state.lastAckAt > stallDeadlineMs && now - state.lastInboundAt > CHANNEL_LIVENESS_MS;
+}
+
 interface PendingSend {
   channelId: string;
   channel: RelayChannel;
@@ -109,7 +144,7 @@ interface PendingSend {
   generation: number;
 }
 
-export interface MuxCounters {
+interface MuxCounters {
   epochStale: number;
   invalidFrames: number;
   duplicates: number;
@@ -127,7 +162,7 @@ export class ChannelMux {
   private pending: Promise<void> = Promise.resolve();
   /**
    * Sent frames waiting for the durability write that has not started yet
-   * (group commit, WS2-157). Every frame queued while an earlier write runs
+   * (group commit). Every frame queued while an earlier write runs
    * joins this one batch; the batch closes when its own write starts.
    */
   private openSendBatch: PendingSend[] | null = null;
@@ -158,8 +193,7 @@ export class ChannelMux {
       // frame allocated before a restart but never acknowledged here may still
       // have reached the holder durably (its ACK was in flight); reusing that
       // sequence after the restart made the holder drop the new frame as an
-      // already-durable duplicate — a fresh session_ready vanished silently
-      // (live 2026-09-12). Sequence numbers are never handed out twice.
+      // already-durable duplicate — a fresh session_ready would vanish silently. Sequence numbers are never handed out twice.
       state.nextSeq = Math.max(state.nextSeq, cursor.to_core + 1, (cursor.allocated ?? 0) + 1);
       state.buffer.ackUpTo(cursor.to_core);
     }
@@ -195,14 +229,6 @@ export class ChannelMux {
     void this.serialize(() => this.persist(this.durableState())).catch(error => {
       this.logger.warn({ err: error, channelId }, "closed relay channel state could not be retired durably");
     });
-  }
-
-  hasChannel(channelId: string): boolean {
-    return this.channels.has(channelId);
-  }
-
-  channelIds(): string[] {
-    return [...this.channels.keys()];
   }
 
   private ensure(channelId: string, channel: RelayChannel): ChannelState {
@@ -241,7 +267,7 @@ export class ChannelMux {
     return out;
   }
 
-  /** Generic replay cursor persistence excludes D143's independently durable stream. */
+  /** Generic replay cursor persistence excludes the assignment's independently durable stream. */
   private genericCursors(): Record<string, { to_core: number; to_runtime: number; allocated: number }> {
     const out: Record<string, { to_core: number; to_runtime: number; allocated: number }> = {};
     for (const [channelId, state] of this.channels) {
@@ -272,65 +298,83 @@ export class ChannelMux {
     this.epoch = result.connectionEpoch;
     this.connected = true;
     this.lastSocketInboundAt = this.options.clock.now();
-    for (const channelId of result.reset) {
-      const state = this.channels.get(channelId);
-      if (!state) continue;
-      this.logReset(channelId, state, "peer_reset");
-      if (state.channel === "assignment" && this.options.assignmentCursors) {
-        this.counters.resets += 1; this.options.onReset(channelId); continue;
-      }
-      this.counters.resets += 1;
-      const replay = state.buffer.after(state.ackedByEndpoint);
-      const complete = replay !== null && !state.buffer.needsReset &&
-        replay.length === state.nextSeq - 1 - state.ackedByEndpoint;
-      if (!complete) {
-        // The sender no longer has a contiguous history to rebuild the peer.
-        // Retain every remaining byte and fence new sends; clearing while the
-        // allocation cursor advances manufactures an unrecoverable seq hole.
-        state.stalled = true;
-        this.options.onReset(channelId);
-        continue;
-      }
-      // A reset peer is rebuilt from the sender-owned durable replay. This is
-      // not an execution reset and does not discard or renumber any frame.
-      state.stalled = false;
-      state.lastAckAt = this.options.clock.now();
-      state.lastInboundAt = this.options.clock.now();
-      for (const entry of replay) {
-        if (this.recovery.permits(state.channel)) this.options.emit({ ...entry.frame, connectionEpoch: this.epoch });
-      }
-    }
+    for (const channelId of result.reset) this.peerReset(channelId);
     for (const [channelId, cursor] of Object.entries(result.resume)) {
-      const state = this.channels.get(channelId);
-      if (!state || result.reset.includes(channelId)) continue;
-      // Assignment replay comes only from the journal-owned sender. Handshake
-      // cursors are hints and cannot mutate or replace either durable counter.
-      if (state.channel === "assignment" && this.options.assignmentCursors) continue;
-      state.stalled = false;
-      state.lastAckAt = this.options.clock.now();
-      // D117: only a validated source-specific RelayAck frees replay. A peer
-      // resume hint cannot stand in for an ACK that we never received.
-      const replay = state.buffer.after(state.ackedByEndpoint);
-      if (cursor.to_core < state.ackedByEndpoint || cursor.to_core >= state.nextSeq || replay === null ||
-          state.buffer.needsReset || replay.length !== state.nextSeq - 1 - state.ackedByEndpoint) {
-        const reason = cursor.to_core < state.ackedByEndpoint ? "resume_cursor_regressed"
-          : cursor.to_core >= state.nextSeq ? "resume_cursor_ahead"
-          : state.buffer.needsReset ? "replay_evicted"
-          : replay === null ? "replay_unavailable" : "replay_incomplete";
-        this.logReset(channelId, state, reason, { peerToCore: cursor.to_core, peerToRuntime: cursor.to_runtime, replayCount: replay?.length ?? null });
-        // Preserve the remaining replay and its allocation. Recovery may use
-        // it as evidence; erasing it here would create a new sequence hole.
-        state.stalled = true;
-        this.counters.resets += 1;
-        this.options.onReset(channelId);
-        continue;
-      }
-      for (const entry of replay) {
-        if (this.recovery.permits(state.channel)) this.options.emit({ ...entry.frame, connectionEpoch: this.epoch });
-      }
+      if (!result.reset.includes(channelId)) this.resumeChannel(channelId, cursor);
     }
     // Take the snapshot when this write executes, after earlier receive commits.
     return this.serialize(() => this.persist(this.durableState()));
+  }
+
+  /** The peer lost this channel: rebuild it from the sender-owned replay, or fence it when that is incomplete. */
+  private peerReset(channelId: string): void {
+    const state = this.channels.get(channelId);
+    if (!state) return;
+    this.logReset(channelId, state, "peer_reset");
+    this.counters.resets += 1;
+    if (state.channel === "assignment" && this.options.assignmentCursors) {
+      this.options.onReset(channelId);
+      return;
+    }
+    const replay = completeReplay(state);
+    if (replay === null) {
+      // The sender no longer has a contiguous history to rebuild the peer.
+      // Retain every remaining byte and fence new sends; clearing while the
+      // allocation cursor advances manufactures an unrecoverable seq hole.
+      state.stalled = true;
+      this.options.onReset(channelId);
+      return;
+    }
+    // A reset peer is rebuilt from the sender-owned durable replay. This is
+    // not an execution reset and does not discard or renumber any frame.
+    state.stalled = false;
+    state.lastAckAt = this.options.clock.now();
+    state.lastInboundAt = this.options.clock.now();
+    this.emitPermitted(state, replay);
+  }
+
+  /**
+   * The peer resumes a channel at its cursor. Assignment replay comes only
+   * from the journal-owned sender: handshake cursors are hints and cannot
+   * mutate or replace either durable counter.
+   */
+  private resumeChannel(channelId: string, cursor: { to_core: number; to_runtime: number }): void {
+    const state = this.channels.get(channelId);
+    if (!state || (state.channel === "assignment" && this.options.assignmentCursors)) return;
+    state.stalled = false;
+    state.lastAckAt = this.options.clock.now();
+    // Only a validated source-specific RelayAck frees replay. A peer resume
+    // hint cannot stand in for an ACK that we never received.
+    const replay = state.buffer.after(state.ackedByEndpoint);
+    const refusal = resumeRefusal(cursor, state, replay);
+    if (refusal !== null || replay === null) return this.resumeRefused(channelId, state, refusal ?? "replay_unavailable", cursor, replay);
+    this.emitPermitted(state, replay);
+  }
+
+  /**
+   * Preserve the remaining replay and its allocation. Recovery may use it as
+   * evidence; erasing it here would create a new sequence hole.
+   */
+  private resumeRefused(channelId: string, state: ChannelState, reason: string, cursor: { to_core: number; to_runtime: number }, replay: ReplayFrames | null): void {
+    this.logReset(channelId, state, reason, { peerToCore: cursor.to_core, peerToRuntime: cursor.to_runtime, replayCount: replay?.length ?? null });
+    state.stalled = true;
+    this.counters.resets += 1;
+    this.options.onReset(channelId);
+  }
+
+  /** Re-emit retained frames on this epoch, each only while recovery permits the channel. */
+  private emitPermitted(state: ChannelState, replay: ReplayFrames): void {
+    for (const entry of replay) {
+      if (this.recovery.permits(state.channel)) this.options.emit({ ...entry.frame, connectionEpoch: this.epoch });
+    }
+  }
+
+  /** Re-emit retained frames on this epoch until recovery no longer permits the channel. */
+  private emitUntilRefused(state: ChannelState, replay: ReplayFrames): void {
+    for (const entry of replay) {
+      if (!this.recovery.permits(state.channel)) break;
+      this.options.emit({ ...entry.frame, connectionEpoch: this.epoch });
+    }
   }
 
   /**
@@ -345,21 +389,22 @@ export class ChannelMux {
     }
     const state = this.channels.get(request.channelId);
     if (!state || state.channel === "assignment" || !this.recovery.permits(state.channel)) return Promise.resolve();
+    this.replayFromAck(request.channelId, state);
+    return Promise.resolve();
+  }
+
+  private replayFromAck(channelId: string, state: ChannelState): void {
     const replay = state.buffer.after(state.ackedByEndpoint);
     if (!replay || state.buffer.needsReset) {
       state.stalled = true;
       this.counters.resets += 1;
-      this.options.onReset(request.channelId);
-      return Promise.resolve();
+      this.options.onReset(channelId);
+      return;
     }
     state.stalled = false;
     state.lastAckAt = this.options.clock.now();
     state.lastInboundAt = this.options.clock.now();
-    for (const entry of replay) {
-      if (!this.recovery.permits(state.channel)) break;
-      this.options.emit({ ...entry.frame, connectionEpoch: this.epoch });
-    }
-    return Promise.resolve();
+    this.emitUntilRefused(state, replay);
   }
 
   disconnected(): void {
@@ -377,10 +422,7 @@ export class ChannelMux {
       const replay = state.buffer.after(state.ackedByEndpoint);
       if (!replay || state.buffer.needsReset) continue;
       state.lastAckAt = this.options.clock.now();
-      for (const entry of replay) {
-        if (!this.recovery.permits(state.channel)) break;
-        this.options.emit({ ...entry.frame, connectionEpoch: this.epoch });
-      }
+      this.emitUntilRefused(state, replay);
     }
   }
 
@@ -393,13 +435,7 @@ export class ChannelMux {
     if (state.buffer.needsReset) {
       throw new RemoteInstanceError("recovery_required", "The channel replay history is incomplete.");
     }
-    // A session may have advanced through the HTTPS carrier before its first
-    // relay frame. Its durable source sequence is the authority; a pristine
-    // relay-local allocator may join that already-accepted prefix once.
-    if (expectedSequence !== undefined && expectedSequence > state.nextSeq && state.nextSeq === 1 && state.ackedByEndpoint === 0) state.nextSeq = expectedSequence;
-    const seq = state.nextSeq;
-    if (expectedSequence !== undefined && expectedSequence !== seq) throw new RemoteInstanceError("recovery_required", "Durable logical source sequence differs from relay sequence");
-    state.nextSeq += 1;
+    const seq = allocateSequence(state, expectedSequence);
     const frame = {
       channel,
       direction: "to_core",
@@ -410,6 +446,17 @@ export class ChannelMux {
       body,
       ...(signature === undefined ? {} : { signature }),
     } as ToCoreRelayFrame;
+    this.retain(channelId, state, seq, frame);
+    // Allocation and replay bytes become durable before the socket can observe
+    // them. A crash before this write emits nothing; a crash after it replays.
+    // A handshake that races this durability write owns replay on its new
+    // epoch; the original send continuation must not emit the same frame too.
+    this.commitSend({ channelId, channel, state, frame, seq, generation: this.generation });
+    return seq;
+  }
+
+  /** Buffers the frame for replay; a buffer that had to evict fences the channel for reset. */
+  private retain(channelId: string, state: ChannelState, seq: number, frame: ToCoreRelayFrame): void {
     const bytes = Buffer.byteLength(JSON.stringify(frame));
     // Idle time is not ACK wait time. Start the deadline only for a new
     // pending batch; later sends cannot keep an unacknowledged batch alive.
@@ -423,16 +470,10 @@ export class ChannelMux {
       state.stalled = true;
       this.options.onReset(channelId);
     }
-    // Allocation and replay bytes become durable before the socket can observe
-    // them. A crash before this write emits nothing; a crash after it replays.
-    // A handshake that races this durability write owns replay on its new
-    // epoch; the original send continuation must not emit the same frame too.
-    this.commitSend({ channelId, channel, state, frame, seq, generation: this.generation });
-    return seq;
   }
 
   /**
-   * Group commit (WS2-157): one durability write covers every frame sent
+   * Group commit: one durability write covers every frame sent
    * while the previous write ran, instead of one full relay-state write per
    * frame. Each frame is still emitted only after a write that contains it.
    */
@@ -450,25 +491,34 @@ export class ChannelMux {
       const startedAt = this.options.clock.now();
       await this.persist(this.durableState());
       const persistenceMs = Math.max(0, this.options.clock.now() - startedAt);
-      for (const { channelId, channel, state, frame, seq, generation } of batch) {
-        if (channel === "session" && (frame.body as { kind?: string }).kind === "session_ready") {
-          this.logger.info({ event: "relay.session_ready.persisted", channelId, seq, connectionEpoch: this.epoch,
-            connected: this.connected, stalled: state.stalled, recoveryPermitted: this.recovery.permits(channel),
-            generationChanged: this.generation !== generation, persistenceMs, batchFrames: batch.length },
-          "session readiness retained for endpoint delivery");
-        }
-        if (this.generation !== generation || this.channels.get(channelId) !== state ||
-            !state.buffer.holds(seq)) continue;
-        if (this.connected && !state.stalled && this.recovery.permits(channel)) this.options.emit({ ...frame, connectionEpoch: this.epoch });
+      for (const send of batch) {
+        this.logSessionReady(send, persistenceMs, batch.length);
+        if (this.emittable(send)) this.options.emit({ ...send.frame, connectionEpoch: this.epoch });
       }
-    }).catch(error => {
-      if (this.openSendBatch === batch) this.openSendBatch = null;
-      const stalled = new Set<string>();
-      for (const { channelId, seq } of batch) {
-        this.logger.warn({ err: error, channelId, seq }, "relay outbound durability failed; retaining the frame without emitting");
-        if (!stalled.has(channelId)) { stalled.add(channelId); this.options.onStall(channelId); }
-      }
-    });
+    }).catch(error => this.sendBatchFailed(batch, error));
+  }
+
+  /** A committed frame is emitted only on the generation it was sent in, while still retained and the channel is open. */
+  private emittable(send: PendingSend): boolean {
+    return this.generation === send.generation && this.channels.get(send.channelId) === send.state && send.state.buffer.holds(send.seq) &&
+      this.connected && !send.state.stalled && this.recovery.permits(send.channel);
+  }
+
+  private logSessionReady(send: PendingSend, persistenceMs: number, batchFrames: number): void {
+    if (send.channel !== "session" || (send.frame.body as { kind?: string }).kind !== "session_ready") return;
+    this.logger.info({ event: "relay.session_ready.persisted", channelId: send.channelId, seq: send.seq, connectionEpoch: this.epoch,
+      connected: this.connected, stalled: send.state.stalled, recoveryPermitted: this.recovery.permits(send.channel),
+      generationChanged: this.generation !== send.generation, persistenceMs, batchFrames },
+    "session readiness retained for endpoint delivery");
+  }
+
+  private sendBatchFailed(batch: PendingSend[], error: unknown): void {
+    if (this.openSendBatch === batch) this.openSendBatch = null;
+    const stalled = new Set<string>();
+    for (const { channelId, seq } of batch) {
+      this.logger.warn({ err: error, channelId, seq }, "relay outbound durability failed; retaining the frame without emitting");
+      if (!stalled.has(channelId)) { stalled.add(channelId); this.options.onStall(channelId); }
+    }
   }
 
   /** Emit the journal-owned assignment identity with only this socket's epoch added. */
@@ -483,58 +533,75 @@ export class ChannelMux {
   async receive(envelope: unknown): Promise<void> {
     const generation = this.generation;
     const ack = RelayAckSchema.safeParse(envelope);
-    if (ack.success && ack.data.connectionEpoch === this.epoch) this.lastSocketInboundAt = this.options.clock.now();
-    if (ack.success) {
-      if (this.options.onAssignmentRequestAck && ack.data.channelId.startsWith("assignment:") && ack.data.origin === "core" && ack.data.dataDirection === "to_core") {
-        const assertRecovery = this.recovery.capture("assignment");
-        return this.receiveAssignmentRequestAck(ack.data, generation, assertRecovery);
-      }
-      const state = this.channels.get(ack.data.channelId);
-      if (!state) return Promise.resolve();
-      if (ack.data.connectionEpoch === this.epoch) state.lastInboundAt = this.options.clock.now();
-      const highestSent = state.nextSeq - 1;
-      const assertRecovery = this.recovery.capture(state.channel);
-      return this.serialize(() => this.receiveAck(ack.data, state, generation, highestSent, assertRecovery));
-    }
+    if (ack.success) return this.receiveAckEnvelope(ack.data, generation);
     const assignment = AssignmentReplyFrameSchema.safeParse(envelope);
-    if (assignment.success) {
-      if (!this.connected || assignment.data.connectionEpoch !== this.epoch) {
-        this.counters.epochStale += 1;
-        return Promise.resolve();
-      }
-      const assertRecovery = this.recovery.capture("assignment");
-      const prior = this.receiveLanes.get(assignment.data.channelId) ?? Promise.resolve();
-      const result = prior.then(() => this.receiveAssignmentFrame(assignment.data, generation, assertRecovery));
-      this.receiveLanes.set(assignment.data.channelId, result.then(() => undefined, () => undefined));
-      return result;
-    }
+    if (assignment.success) return this.receiveAssignmentEnvelope(assignment.data, generation);
     const frame = ToRuntimeRelayFrameSchema.safeParse(envelope);
     if (!frame.success) {
       this.counters.invalidFrames += 1;
       this.logger.warn("dropped an envelope that matches no relay schema");
+      return;
+    }
+    return this.receiveFrameEnvelope(frame.data, generation);
+  }
+
+  private receiveAckEnvelope(ack: RelayAck, generation: number): Promise<void> {
+    if (ack.connectionEpoch === this.epoch) this.lastSocketInboundAt = this.options.clock.now();
+    if (this.assignmentRequestAck(ack)) return this.receiveAssignmentRequestAck(ack, generation, this.recovery.capture("assignment"));
+    const state = this.channels.get(ack.channelId);
+    if (!state) return Promise.resolve();
+    if (ack.connectionEpoch === this.epoch) state.lastInboundAt = this.options.clock.now();
+    const highestSent = state.nextSeq - 1;
+    const assertRecovery = this.recovery.capture(state.channel);
+    return this.serialize(() => this.receiveAck(ack, state, generation, highestSent, assertRecovery));
+  }
+
+  /** Core's ACK of a journal-owned assignment request, which only that owner may record. */
+  private assignmentRequestAck(ack: RelayAck): boolean {
+    return this.options.onAssignmentRequestAck !== undefined && ack.channelId.startsWith("assignment:") && ack.origin === "core" && ack.dataDirection === "to_core";
+  }
+
+  private receiveAssignmentEnvelope(frame: AssignmentReplyFrame, generation: number): Promise<void> {
+    if (!this.connected || frame.connectionEpoch !== this.epoch) {
+      this.counters.epochStale += 1;
       return Promise.resolve();
     }
-    if (frame.data.channel === "assignment" && this.options.onAssignmentFrame) {
+    const assertRecovery = this.recovery.capture("assignment");
+    return this.inLane(frame.channelId, () => this.receiveAssignmentFrame(frame, generation, assertRecovery));
+  }
+
+  private receiveFrameEnvelope(frame: ToRuntimeRelayFrame, generation: number): Promise<void> {
+    if (frame.channel === "assignment" && this.options.onAssignmentFrame) {
       throw new RemoteInstanceError("assignment_channel_invalid", "Bare assignment replies are disabled for the durable assignment carrier.");
     }
-    if (!this.connected || frame.data.connectionEpoch !== this.epoch) {
+    if (!this.connected || frame.connectionEpoch !== this.epoch) {
       this.counters.epochStale += 1;
       return Promise.resolve();
     }
     // Capture identity before queueing so close/reopen cannot adopt an old frame.
-    const assertRecovery = this.recovery.capture(frame.data.channel);
-    const state = this.ensure(frame.data.channelId, frame.data.channel);
+    const assertRecovery = this.recovery.capture(frame.channel);
+    const state = this.ensure(frame.channelId, frame.channel);
     // Receipt is liveness even while processing this frame takes a while.
     state.lastInboundAt = this.options.clock.now();
     this.lastSocketInboundAt = state.lastInboundAt;
-    const prior = this.receiveLanes.get(frame.data.channelId) ?? Promise.resolve();
-    const result = prior.then(() => this.receiveFrame(frame.data, state, generation, assertRecovery));
-    this.receiveLanes.set(frame.data.channelId, result.then(() => undefined, () => undefined));
+    return this.inLane(frame.channelId, () => this.receiveFrame(frame, state, generation, assertRecovery));
+  }
+
+  /** Frames of one channel are handled in arrival order; a failure does not block the lane. */
+  private inLane(channelId: string, work: () => Promise<void>): Promise<void> {
+    const prior = this.receiveLanes.get(channelId) ?? Promise.resolve();
+    const result = prior.then(work);
+    this.receiveLanes.set(channelId, result.then(() => undefined, () => undefined));
     return result;
   }
 
+  /** Still the connection (socket generation) this work was received on. */
+  private sameConnection(generation: number): boolean {
+    return this.connected && generation === this.generation;
+  }
+
   private async receiveAssignmentRequestAck(ack: RelayAck, generation: number, assertRecovery: () => void): Promise<void> {
-    if (!this.connected || generation !== this.generation || ack.connectionEpoch !== this.epoch) {
+    if (!this.sameConnection(generation) || ack.connectionEpoch !== this.epoch) {
       this.counters.epochStale += 1; return;
     }
     assertRecovery();
@@ -545,14 +612,14 @@ export class ChannelMux {
   }
 
   private async receiveAssignmentFrame(frame: AssignmentReplyFrame, generation: number, assertRecovery: () => void): Promise<void> {
-    if (!this.connected || generation !== this.generation || frame.connectionEpoch !== this.epoch) {
+    if (!this.sameConnection(generation) || frame.connectionEpoch !== this.epoch) {
       this.counters.epochStale += 1; return;
     }
     assertRecovery();
     if (!this.options.onAssignmentFrame) throw new Error("No durable assignment reply owner is attached.");
     const consumed = await this.options.onAssignmentFrame(frame);
     assertRecovery();
-    if (!this.connected || generation !== this.generation || !Number.isSafeInteger(consumed) || consumed < frame.seq) {
+    if (!this.sameConnection(generation) || !Number.isSafeInteger(consumed) || consumed < frame.seq) {
       throw new Error("Assignment reply was not durably consumed by the current owner.");
     }
     const issuedAt = this.options.clock.nowIso();
@@ -574,17 +641,20 @@ export class ChannelMux {
       this.counters.invalidFrames += 1;
       return;
     }
-    if (ack.cumulativeSeq > state.ackedByEndpoint) {
-      const cursors = this.genericCursors();
-      cursors[ack.channelId] = { to_core: ack.cumulativeSeq, to_runtime: state.receivedCursor, allocated: state.nextSeq - 1 };
-      await this.persist(this.durableState(cursors, { channelId: ack.channelId, cumulativeSeq: ack.cumulativeSeq }));
-      assertRecovery();
-      if (!this.current(ack.channelId, state, generation)) return;
-      state.ackedByEndpoint = ack.cumulativeSeq;
-      state.buffer.ackUpTo(ack.cumulativeSeq);
-      state.lastAckAt = this.options.clock.now();
-      state.stalled = false;
-    }
+    if (ack.cumulativeSeq > state.ackedByEndpoint) await this.advanceAck(ack, state, generation, assertRecovery);
+  }
+
+  /** The endpoint acknowledged more: persist the cursor first, then free the replay it covers. */
+  private async advanceAck(ack: RelayAck, state: ChannelState, generation: number, assertRecovery: () => void): Promise<void> {
+    const cursors = this.genericCursors();
+    cursors[ack.channelId] = { to_core: ack.cumulativeSeq, to_runtime: state.receivedCursor, allocated: state.nextSeq - 1 };
+    await this.persist(this.durableState(cursors, { channelId: ack.channelId, cumulativeSeq: ack.cumulativeSeq }));
+    assertRecovery();
+    if (!this.current(ack.channelId, state, generation)) return;
+    state.ackedByEndpoint = ack.cumulativeSeq;
+    state.buffer.ackUpTo(ack.cumulativeSeq);
+    state.lastAckAt = this.options.clock.now();
+    state.stalled = false;
   }
 
   private async receiveFrame(frame: ToRuntimeRelayFrame, state: ChannelState, generation: number, assertRecovery: () => void): Promise<void> {
@@ -678,32 +748,36 @@ export class ChannelMux {
     const now = this.options.clock.now();
     const intervalMs = this.options.ackIntervalSeconds * 1_000;
     const socketLive = now - this.lastSocketInboundAt <= CHANNEL_LIVENESS_MS;
-    for (const [channelId, state] of this.channels) {
-      if (!this.recovery.permits(state.channel)) continue;
-      if (state.receivedCursor > state.lastEmittedAckCursor) this.emitAck(channelId, state);
-      // Session and preview receivers attach independently from the runtime
-      // socket. Their absence is normal and D156 asks us to replay as soon as
-      // a holder binds; it is not evidence that the shared socket is dead.
-      // Rolling that socket only fences unrelated work and cannot make a
-      // detached holder appear. Buffer bounds still produce explicit reset if
-      // a later replay is no longer complete.
-      if (holderBound(state.channel)) continue;
-      const stallDeadlineMs = socketLive ? Math.max(this.stallDeadlineMs(state, intervalMs), STALL_BACKOFF_CEILING_MS) : this.stallDeadlineMs(state, intervalMs);
-      // A late acknowledgement from a peer that is still sending on this
-      // channel means busy, not dead (bb reconnects on a missed heartbeat,
-      // never on late acks). Re-handshake only after the liveness window.
-      if (state.buffer.unackedCount > 0 && !state.stalled && now - state.lastAckAt > stallDeadlineMs && now - state.lastInboundAt > CHANNEL_LIVENESS_MS) {
-        state.stalled = true;
-        state.stallStreak = state.ackedByEndpoint > state.stallCursor ? 1 : state.stallStreak + 1;
-        state.stallCursor = state.ackedByEndpoint;
-        this.counters.stalls += 1;
-        this.logger.warn({ event: "relay.channel.stalled", channelId, channel: state.channel, connectionEpoch: this.epoch,
-          nextSeq: state.nextSeq, ackedByEndpoint: state.ackedByEndpoint, receivedCursor: state.receivedCursor,
-          unackedCount: state.buffer.unackedCount, unackedBytes: state.buffer.unackedBytes,
-          ackWaitMs: now - state.lastAckAt, ackDeadlineMs: stallDeadlineMs, stallStreak: state.stallStreak }, "channel stalled: no ack within its stall deadline; re-handshaking");
-        this.options.onStall(channelId);
-      }
-    }
+    for (const [channelId, state] of this.channels) this.tickChannel(channelId, state, { now, intervalMs, socketLive });
+  }
+
+  private tickChannel(channelId: string, state: ChannelState, tick: { now: number; intervalMs: number; socketLive: boolean }): void {
+    if (!this.recovery.permits(state.channel)) return;
+    if (state.receivedCursor > state.lastEmittedAckCursor) this.emitAck(channelId, state);
+    // Session and preview receivers attach independently from the runtime
+    // socket. Their absence is normal and the relay replays as soon as a
+    // holder binds; it is not evidence that the shared socket is dead.
+    // Rolling that socket only fences unrelated work and cannot make a
+    // detached holder appear. Buffer bounds still produce explicit reset if
+    // a later replay is no longer complete.
+    if (holderBound(state.channel)) return;
+    const stallDeadlineMs = tick.socketLive ? Math.max(this.stallDeadlineMs(state, tick.intervalMs), STALL_BACKOFF_CEILING_MS) : this.stallDeadlineMs(state, tick.intervalMs);
+    // A late acknowledgement from a peer that is still sending on this
+    // channel means busy, not dead (bb reconnects on a missed heartbeat,
+    // never on late acks). Re-handshake only after the liveness window.
+    if (overdue(state, tick.now, stallDeadlineMs)) this.markStalled(channelId, state, tick.now, stallDeadlineMs);
+  }
+
+  private markStalled(channelId: string, state: ChannelState, now: number, stallDeadlineMs: number): void {
+    state.stalled = true;
+    state.stallStreak = state.ackedByEndpoint > state.stallCursor ? 1 : state.stallStreak + 1;
+    state.stallCursor = state.ackedByEndpoint;
+    this.counters.stalls += 1;
+    this.logger.warn({ event: "relay.channel.stalled", channelId, channel: state.channel, connectionEpoch: this.epoch,
+      nextSeq: state.nextSeq, ackedByEndpoint: state.ackedByEndpoint, receivedCursor: state.receivedCursor,
+      unackedCount: state.buffer.unackedCount, unackedBytes: state.buffer.unackedBytes,
+      ackWaitMs: now - state.lastAckAt, ackDeadlineMs: stallDeadlineMs, stallStreak: state.stallStreak }, "channel stalled: no ack within its stall deadline; re-handshaking");
+    this.options.onStall(channelId);
   }
 
   /**

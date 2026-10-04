@@ -12,7 +12,7 @@ export type OnComputerAgent = (typeof ON_COMPUTER_AGENTS)[number];
 const NAMES: Readonly<Record<OnComputerAgent, string>> = { dsh: "DeepSeek Harness", opencode: "OpenCode", antigravity: "Google Antigravity" };
 
 /** Where an agent stands here, as the supported-agents report says it. */
-export interface OnComputerAgentFacts {
+interface OnComputerAgentFacts {
   agentId: OnComputerAgent;
   state: string;
   installCommand?: string;
@@ -44,23 +44,21 @@ export function planOnComputer(agent: OnComputerAgentFacts, platform: NodeJS.Pla
   const siteSignIn = agent.agentId === "antigravity";
   const after = (commands: string[]): Pick<OnComputerPlan, "commands" | "until"> =>
     siteSignIn ? { commands, until: "added" } : { commands: [...commands, signIn], until: "ready" };
-  switch (agent.state) {
-    case "not_installed":
-    case "unsupported_version": {
-      const install = platform === "win32" ? agent.windowsInstallCommand ?? agent.installCommand : agent.installCommand;
-      // Google Antigravity is never installed by the person: Konteks adds it (downloads it from Google).
-      if (!install || install === add) return { step: "add", ...after([add]) };
-      return { step: "install", ...after([install, add]) };
-    }
-    case "installed_not_added":
-    case "not_added":
-      return { step: "add", ...after([add]) };
-    case "needs_sign_in":
-    case "sign_in_expired":
-      return siteSignIn ? null : { step: "sign_in", commands: [signIn], until: "ready" };
-    default:
-      return null;
-  }
+  if (INSTALL_STATES.has(agent.state)) return installPlan(agent, platform, add, after);
+  if (ADD_STATES.has(agent.state)) return { step: "add", ...after([add]) };
+  if (SIGN_IN_STATES.has(agent.state)) return siteSignIn ? null : { step: "sign_in", commands: [signIn], until: "ready" };
+  return null;
+}
+
+const INSTALL_STATES: ReadonlySet<string> = new Set(["not_installed", "unsupported_version"]);
+const ADD_STATES: ReadonlySet<string> = new Set(["installed_not_added", "not_added"]);
+const SIGN_IN_STATES: ReadonlySet<string> = new Set(["needs_sign_in", "sign_in_expired"]);
+
+function installPlan(agent: OnComputerAgentFacts, platform: NodeJS.Platform, add: string, after: (commands: string[]) => Pick<OnComputerPlan, "commands" | "until">): OnComputerPlan {
+  const install = platform === "win32" ? agent.windowsInstallCommand ?? agent.installCommand : agent.installCommand;
+  // Google Antigravity is never installed by the person: Konteks adds it (downloads it from Google).
+  if (!install || install === add) return { step: "add", ...after([add]) };
+  return { step: "install", ...after([install, add]) };
 }
 
 /**
@@ -130,7 +128,7 @@ export function onComputerScript(plan: OnComputerPlan, context: { agentId: OnCom
   ].join("\n");
 }
 
-export interface OnComputerOpenDeps {
+interface OnComputerOpenDeps {
   spawn?: (command: string, args: string[]) => void;
 }
 
@@ -155,31 +153,43 @@ export function standInTerminalEnv(root: string, exists: (file: string) => boole
  * plays the person at it. Returns the script's path.
  */
 export async function openOnComputer(input: { loginId: string; script: string; dataDir: string; platform: NodeJS.Platform; env?: NodeJS.ProcessEnv; confined?: boolean }, deps: OnComputerOpenDeps = {}): Promise<OnComputerOpened> {
-  const env = input.env ?? process.env;
-  // A stand-in laptop opens a real window only when the script loads the
-  // stand-in's own terminal settings (`confined`), so nothing it runs touches
-  // the real computer's home (09-29). With a spool (the controller's serve)
-  // or without those settings it leaves the script for the tester instead.
-  const standIn = env.KONTEKS_E2E_NATIVE_CONNECTOR === "1";
-  const spool = standIn && (env.KONTEKS_E2E_ON_COMPUTER_SPOOL || !input.confined) ? env.KONTEKS_E2E_ON_COMPUTER_SPOOL || join(input.dataDir, "on-computer") : undefined;
+  const spool = standInSpool(input);
   const directory = spool ?? join(input.dataDir, "on-computer");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const file = join(directory, `${input.loginId}.${input.platform === "win32" ? "ps1" : "command"}`);
   await writeFile(file, input.script, { mode: 0o700 });
   await chmod(file, 0o700);
   if (spool) return { file, opened: false };
-  const run = deps.spawn ?? ((command: string, args: string[]) => {
-    const child = spawn(command, args, { detached: true, stdio: "ignore" });
-    child.on("error", () => undefined);
-    child.unref();
-  });
-  if (input.platform === "darwin") run("open", ["-a", "Terminal", file]);
-  else if (input.platform === "win32") run("cmd.exe", ["/c", "start", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", file]);
-  else run("x-terminal-emulator", ["-e", "sh", file]);
+  openInTerminal(input.platform, file, deps.spawn ?? detachedSpawn);
   return { file, opened: true };
 }
 
-export interface OnComputerOpened {
+/**
+ * A stand-in laptop opens a real window only when the script loads the
+ * stand-in's own terminal settings (`confined`), so nothing it runs touches
+ * the real computer's home. With a spool (the controller's serve) or without
+ * those settings it leaves the script for the tester instead.
+ */
+function standInSpool(input: { dataDir: string; env?: NodeJS.ProcessEnv; confined?: boolean }): string | undefined {
+  const env = input.env ?? process.env;
+  const standIn = env.KONTEKS_E2E_NATIVE_CONNECTOR === "1";
+  if (!standIn || !(env.KONTEKS_E2E_ON_COMPUTER_SPOOL || !input.confined)) return undefined;
+  return env.KONTEKS_E2E_ON_COMPUTER_SPOOL || join(input.dataDir, "on-computer");
+}
+
+function openInTerminal(platform: NodeJS.Platform, file: string, run: (command: string, args: string[]) => void): void {
+  if (platform === "darwin") run("open", ["-a", "Terminal", file]);
+  else if (platform === "win32") run("cmd.exe", ["/c", "start", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", file]);
+  else run("x-terminal-emulator", ["-e", "sh", file]);
+}
+
+function detachedSpawn(command: string, args: string[]): void {
+  const child = spawn(command, args, { detached: true, stdio: "ignore" });
+  child.on("error", () => undefined);
+  child.unref();
+}
+
+interface OnComputerOpened {
   file: string;
   /** Whether a window came up; false when the script was only left for a stand-in's tester. */
   opened: boolean;
@@ -229,13 +239,17 @@ export async function readOnComputerWatches(dataDir: string): Promise<OnComputer
   for (const name of names.filter(entry => entry.endsWith(".watch.json"))) {
     try {
       const value = JSON.parse(await readFile(join(watchDir(dataDir), name), "utf8")) as Partial<OnComputerWatch>;
-      if (typeof value.instanceId === "string" && typeof value.loginId === "string" && (ON_COMPUTER_AGENTS as readonly string[]).includes(value.agentId as string)
-        && (value.until === "ready" || value.until === "added") && typeof value.deadline === "number") {
-        watches.push(value as OnComputerWatch);
+      if (wellFormedWatch(value)) {
+        watches.push(value);
         continue;
       }
     } catch { /* dropped below */ }
     await rm(join(watchDir(dataDir), name), { force: true });
   }
   return watches;
+}
+
+function wellFormedWatch(value: Partial<OnComputerWatch>): value is OnComputerWatch {
+  return typeof value.instanceId === "string" && typeof value.loginId === "string" && (ON_COMPUTER_AGENTS as readonly string[]).includes(value.agentId as string)
+    && (value.until === "ready" || value.until === "added") && typeof value.deadline === "number";
 }

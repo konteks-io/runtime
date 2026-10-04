@@ -3,7 +3,7 @@ import { open } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { sanitizeInheritedChildProcessEnv } from "@konteks/remote-common";
 
-export interface NativeUpdateLaunchOptions {
+interface NativeUpdateLaunchOptions {
   root: string;
   /** The installed connector executable of the release currently serving. */
   executable: string;
@@ -23,7 +23,7 @@ export interface NativeUpdateLaunchOptions {
 /** Network trust and channel settings the service itself was started with; the transaction needs the same ones. */
 const UPDATER_ENV_ALLOWLIST = ["NODE_EXTRA_CA_CERTS", "KONTEKS_RELEASE_MANIFEST_URL", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy"] as const;
 
-export interface NativeUpdateLaunch {
+interface NativeUpdateLaunch {
   pid: number | null;
   command: string;
   args: string[];
