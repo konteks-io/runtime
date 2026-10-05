@@ -105,9 +105,9 @@ jobs:
       - name: Build workspace packages
         run: npm run build
       - name: Verify Mac binary compatibility decisions and produced native metadata
-        run: node --test --test-concurrency=1 scripts/macos-artifact-compatibility.test.mjs
+        run: node --test --test-concurrency=1 scripts/macos-artifact-compatibility.test.mjs scripts/macos-codex-resource-owners.test.mjs scripts/macos-codex-resource-preparation.test.mjs scripts/macos-codex-resources.test.mjs scripts/macos-voice-resource-closure.test.mjs
       - name: Verify Mac resource inspection refusals on every native coordinate
-        run: node --test --test-concurrency=1 scripts/mac13-resource-probe/inspect-candidate.test.mjs scripts/mac13-resource-probe/probe.test.mjs
+        run: node --test --test-concurrency=1 scripts/mac13-resource-probe/inspect-candidate.test.mjs scripts/mac13-resource-probe/probe.test.mjs scripts/mac13-resource-probe/cpal-patch.test.mjs scripts/mac13-resource-probe/voice-helper-relocation.test.mjs scripts/mac13-resource-probe/pipeline.test.mjs
       - name: Verify reviewed Graft prebuild selection and native parser smoke boundaries
         run: node --test --test-concurrency=1 scripts/offline-graft-prebuilds.test.mjs
       - name: Verify POSIX setup language, signed downloads and recovery
@@ -128,8 +128,13 @@ jobs:
       - name: Verify organization Skill staging on Windows
         if: runner.os == 'Windows'
         run: npx vitest run --maxWorkers=1 packages/supervisor/src/__tests__/skill-staging.test.ts -t "retains digest-bound executable metadata on Windows instead of guessing it from stat"
+      - name: Set up pinned Mac resource build tools before packaging
+        timeout-minutes: 35
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/setup-macos-resources
       - name: Preflight the actual offline Mac agent and Graft packages before release
         id: macos-offline-preflight
+        timeout-minutes: 120
         if: runner.os == 'macOS'
         shell: bash
         env:
@@ -157,50 +162,6 @@ jobs:
             failed=1
           fi
           exit "$failed"
-      - name: Set up exact public Python for the Mac resource measurement
-        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
-        timeout-minutes: 5
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
-        with:
-          python-version: '3.12'
-      - name: Set up the pinned upstream Rust toolchain
-        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
-        timeout-minutes: 10
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
-      - name: Set up the pinned upstream Bazel launcher
-        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
-        timeout-minutes: 5
-        uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86
-        with:
-          bazelisk-version: 1.28.1
-      - name: Set up public autoconf for the pinned zsh source
-        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
-        timeout-minutes: 10
-        shell: bash
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-          HOMEBREW_NO_INSTALL_CLEANUP: '1'
-        run: |
-          set -euo pipefail
-          if ! command -v autoconf >/dev/null 2>&1; then
-            brew install autoconf
-          fi
-      - name: Measure exact Mac 13 resource build candidate; preserve shipping failure
-        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
-        timeout-minutes: 110
-        shell: bash
-        env:
-          MATRIX_OS: ${{ matrix.os }}
-        run: |
-          set -euo pipefail
-          case "$MATRIX_OS" in
-            macos-26) architecture=arm64 ;;
-            macos-15-intel) architecture=x64 ;;
-            *) echo 'Unsupported Mac resource probe coordinate'; exit 1 ;;
-          esac
-          node --max-old-space-size=512 scripts/mac13-resource-probe/probe.mjs \
-            --arch "$architecture" \
-            --output "$RUNNER_TEMP/mac13-resource-probe-evidence"
       - name: Bound the selected resource measurement diagnostics before upload
         id: mac13-resource-diagnostic-bounds
         if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')

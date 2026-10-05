@@ -3,7 +3,9 @@ import { constants, closeSync, openSync, writeSync } from 'node:fs';
 import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { inspect, sha256 } from './inspect-candidate.mjs';
+import { inspect, inventory, sha256 } from './inspect-candidate.mjs';
+import { assertStableCpalCompilerInput, prepareCpalAvailabilityCandidate, verifyCpalCompilerInput } from './cpal-patch.mjs';
+import { relocateVoiceHelper } from './voice-helper-relocation.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CODEX = Object.freeze({ url: 'https://github.com/openai/codex.git', tag: 'rust-v0.159.0',
@@ -224,7 +226,23 @@ for name,p in new.items():
 print(json.dumps({'externalGraphUnchanged':True,'workspacePackages':len(new)}))
 `;
 
+function voiceBuildOptions(context) {
+  return ['-c', 'opt', '--jobs=2', '--macos_minimum_os=13.0', '--remote_executor=', '--remote_cache=',
+    '--bes_backend=', '--experimental_remote_downloader=', '--disk_cache=',
+    `--repository_cache=${join(context.work, 'repository-cache')}`];
+}
+
+async function cpalCompilerInput(context, codex, startup) {
+  const outputBase = (await run(context, 'cpal-output-base', 'bazel', [...startup, 'info', 'output_base'], 120, { cwd: codex.directory })).trim();
+  const query = 'mnemonic("Rustc", inputs(".*src/host/coreaudio/macos/loopback[.]rs", deps(//codex-rs/voice-host:codex-voice-host)))';
+  const text = await run(context, 'cpal-effective-action', 'bazel', [...startup, 'aquery', ...voiceBuildOptions(context),
+    '--output=jsonproto', '--include_artifacts', '--include_param_files', query], 300, { cwd: codex.directory });
+  return verifyCpalCompilerInput({ text, outputBase, work: context.work, target: context.coordinate.target });
+}
+
 async function buildVoice(context, codex) {
+  context.stage = 'cpal-prepare';
+  const preparation = await prepareCpalAvailabilityCandidate(codex);
   const lock = join(codex.directory, 'codex-rs/Cargo.lock');
   const before = join(context.output, 'Cargo.lock.source');
   await copyFile(lock, before, constants.COPYFILE_EXCL);
@@ -235,11 +253,16 @@ async function buildVoice(context, codex) {
   const startup = ['--batch', '--nosystem_rc', '--nohome_rc', `--output_user_root=${join(context.work, 'bazel')}`];
   const bazel = (await run(context, 'tool-bazel', 'bazel', [...startup, 'version'], 300, { cwd: codex.directory })).trim();
   assert(/Build label: 9\.0\.0\b/.test(bazel), 'pinned Bazel 9.0.0 is required');
-  await run(context, 'voice-build', 'bazel', [...startup, 'build', '-c', 'opt', '--jobs=2', '--macos_minimum_os=13.0',
-    '--remote_executor=', '--remote_cache=', '--bes_backend=', '--experimental_remote_downloader=',
-    '--disk_cache=', `--repository_cache=${join(context.work, 'repository-cache')}`,
+  context.stage = 'cpal-input-before';
+  const compilerInputBefore = await cpalCompilerInput(context, codex, startup);
+  context.stage = 'voice-build';
+  await run(context, 'voice-build', 'bazel', [...startup, 'build', ...voiceBuildOptions(context),
     '//codex-rs/voice-host:codex-voice-host', '//third_party/voice:native_runtime'], 5400, { cwd: codex.directory });
-  return { bazel, sourceLockSha256: await sha256(before), refreshedLockSha256: await sha256(lock) };
+  context.stage = 'cpal-input-after';
+  const compilerInputAfter = await cpalCompilerInput(context, codex, startup);
+  assertStableCpalCompilerInput(compilerInputBefore, compilerInputAfter);
+  return { bazel, sourceLockSha256: await sha256(before), refreshedLockSha256: await sha256(lock),
+    cpalCandidate: { preparation, compilerInputBefore, compilerInputAfter, compilerInputStable: true } };
 }
 
 async function stageVoice(context, codex, candidate) {
@@ -258,7 +281,8 @@ async function stageVoice(context, codex, candidate) {
   const executable = join(voice, 'bin/codex-voice-host');
   await copyFile(join(codex.directory, 'bazel-bin/codex-rs/voice-host/codex-voice-host'), executable, constants.COPYFILE_EXCL);
   await chmod(executable, 0o755);
-  return executable;
+  const relocation = await relocateVoiceHelper(context, codex, executable, run, voiceBuildOptions(context));
+  return { executable, relocation };
 }
 
 async function developmentSignature(context, file) {
@@ -353,22 +377,105 @@ async function zshSmoke(context, directory) {
   return { outputMatched: true, execWrapperObserved: true, macOS13ExecutionProved: false };
 }
 
+function reportCandidateStage(context, stage) {
+  const labels = { 'zsh-build': 'Mac13 candidate: building patched zsh.',
+    'voice-build': 'Mac13 candidate: preparing and building voice helper.',
+    inspect: 'Mac13 candidate: inspecting native artifacts.', handshake: 'Mac13 candidate: checking helper protocol.' };
+  assert(Object.hasOwn(labels, stage), 'unknown candidate progress stage');
+  context.stage = stage;
+  console.log(labels[stage]);
+}
+
+async function candidateOutputs(built) {
+  const found = await inventory(built.candidate);
+  const entries = [];
+  for (const row of found.files) entries.push({ path: row.path.split('\\').join('/'), size: row.size, sha256: await sha256(row.file) });
+  const zsh = entries.find(row => row.path === 'zsh/zsh');
+  assert(zsh, 'fresh candidate zsh output is missing');
+  const members = entries.filter(row => row.path.startsWith('codex-resources/voice/'))
+    .map(row => ({ ...row, path: row.path.slice('codex-resources/voice/'.length) }));
+  assert(members.length > 0, 'fresh candidate voice outputs are missing');
+  return { zsh: { ...zsh, path: join(built.candidate, 'zsh/zsh') },
+    voice: { directory: join(built.candidate, 'codex-resources/voice'), members } };
+}
+
+async function voiceManifest(context, built) {
+  const file = join(built.candidate, 'codex-resources/voice/runtime.json');
+  const manifest = JSON.parse(await boundedText(file, 1024 ** 2));
+  assert(manifest.schemaVersion === 1 && manifest.target === context.coordinate.target, 'candidate voice manifest target changed');
+  assert(manifest.sourceCommit === CODEX.commit, 'candidate voice source commit changed');
+  return { schemaVersion: manifest.schemaVersion, target: manifest.target, sourceCommit: manifest.sourceCommit,
+    sourceManifestSha256: manifest.sourceManifestSha256, inventorySha256: manifest.inventorySha256, developmentOnly: manifest.developmentOnly,
+    distribution: manifest.distribution ?? null, sha256: await sha256(file) };
+}
+
+async function provenanceMember(context, source, destination, expectedSha256) {
+  assert(/^[a-f0-9]{64}$/.test(expectedSha256), 'candidate source provenance digest is missing');
+  const physical = childPath(context.work, await realpath(source));
+  const info = await lstat(physical);
+  assert(info.isFile() && !info.isSymbolicLink() && info.nlink === 1 && info.size <= 1024 ** 2, 'candidate source provenance member refused');
+  await copyFile(physical, destination, constants.COPYFILE_EXCL);
+  const sha = await sha256(destination, 1024 ** 2);
+  assert(sha === expectedSha256, 'candidate source provenance differs from its actual runtime manifest');
+  return { path: destination, size: info.size, sha256: sha };
+}
+
+async function preserveVoiceProvenance(context, codex, manifest) {
+  const directory = join(context.work, 'voice-source-provenance');
+  await mkdir(directory, { mode: 0o700 });
+  const sourceManifest = await provenanceMember(context, join(codex.directory, 'third_party/voice/sources.json'),
+    join(directory, 'sources.json'), manifest.sourceManifestSha256);
+  const original = join(codex.directory, `bazel-bin/third_party/voice/native_runtime_${context.coordinate.prefix}/konteks-source-inventory.json`);
+  const inventory = await provenanceMember(context, original, join(directory, 'binaries.json'), manifest.inventorySha256);
+  return { sourceManifest, inventory };
+}
+
+async function sealCandidateVoice(context, codex, built) {
+  const before = { manifest: await voiceManifest(context, built), outputs: await candidateOutputs(built) };
+  assert(before.manifest.developmentOnly === true, 'candidate voice was already sealed');
+  const source = join(codex.directory, 'third_party/voice/release_runtime.py');
+  const sourceSha256 = await sha256(source);
+  assert(sourceSha256 === '96aab48ce7156ecab5343b55836162956e84f5b43fdb34dde8f54766c154be40', 'candidate voice seal source changed');
+  context.stage = 'voice-seal';
+  await run(context, 'voice-seal', 'python3', ['third_party/voice/release_runtime.py', 'seal',
+    '--target', context.coordinate.target, '--output', before.outputs.voice.directory], 120,
+    { cwd: codex.directory, env: { PYTHONPATH: join(codex.directory, 'third_party/voice') } });
+  const manifest = await voiceManifest(context, built);
+  assert(manifest.developmentOnly === false && manifest.distribution === 'publicRelease', 'candidate voice seal did not produce the exact public layout');
+  const outputs = await candidateOutputs(built);
+  outputs.provenance = await preserveVoiceProvenance(context, codex, manifest);
+  return { outputs, seal: { sourceSha256, beforeManifest: before.manifest,
+    afterManifest: manifest, beforeVoiceMembers: before.outputs.voice.members, normalPinnedSealCompleted: true,
+    publisherTrustProved: false, shippingReplacementApproved: false } };
+}
+
+async function candidateNativeSignatures(context, built, inspection) {
+  const values = [];
+  for (const row of inspection.binaries) {
+    values.push({ path: row.path, result: await developmentSignature(context, join(built.candidate, row.path)) });
+  }
+  return values;
+}
+
 async function candidates(context, codex) {
   const candidate = join(context.work, 'candidate');
   await mkdir(candidate);
   const zsh = await checkout(context, 'zsh', ZSH);
   const zshOutput = join(candidate, 'zsh');
+  reportCandidateStage(context, 'zsh-build');
   await run(context, 'zsh-build', '/bin/bash', ['--noprofile', '--norc',
     join(HERE, 'build-patched-zsh.sh'), zsh.directory, codex.directory, zshOutput], 1200);
   const zshSignature = await developmentSignature(context, join(zshOutput, 'zsh'));
   const smoke = await zshSmoke(context, zshOutput);
+  reportCandidateStage(context, 'voice-build');
   const voiceBuild = await buildVoice(context, codex);
-  const helper = await stageVoice(context, codex, candidate);
+  const staged = await stageVoice(context, codex, candidate);
+  const helper = staged.executable;
   const signatures = { zsh: zshSignature,
     helper: await developmentSignature(context, helper) };
-  const buildCommit = (await run(context, 'helper-build-commit', helper, ['--build-commit'], 10, { env: GST })).trim();
-  assert(buildCommit === CODEX.commit, 'voice helper build commit mismatch');
-  return { candidate, helper, zsh, voiceBuild, signatures, smoke };
+  const voiceRelocation = { ...staged.relocation, signedHelper: {
+    size: (await lstat(helper)).size, sha256: await sha256(helper), signature: signatures.helper } };
+  return { candidate, helper, zsh, voiceBuild, voiceRelocation, signatures, smoke };
 }
 
 async function body(context) {
@@ -377,26 +484,46 @@ async function body(context) {
   const codex = await codexSource(context);
   context.stage = 'build';
   const built = await candidates(context, codex);
-  context.stage = 'inspect';
+  reportCandidateStage(context, 'inspect');
+  const initialInspection = await inspect(built.candidate, built.helper, context.coordinate.macho,
+    (label, executable, args) => run(context, label, executable, args));
+  captureNativeMeasurements(context, built, initialInspection, []);
+  const nativeSignatures = await candidateNativeSignatures(context, built, initialInspection);
   const inspection = await inspect(built.candidate, built.helper, context.coordinate.macho,
     (label, executable, args) => run(context, label, executable, args));
-  context.stage = 'handshake';
+  captureNativeMeasurements(context, built, inspection, nativeSignatures);
+  context.stage = 'candidate-loader-verification';
+  assert(inspection.privateImportsResolved, 'candidate loader closure unresolved');
+  assert(inspection.allMinimumsAtMost13, 'candidate native minimum exceeds macOS 13.0');
+  assert(inspection.selectedNewerAPIImportsAllWeak, 'candidate selected newer API imports are not weak');
+  context.stage = 'helper-build-commit';
+  const buildCommit = (await run(context, 'helper-build-commit', built.helper, ['--build-commit'], 10, { env: GST })).trim();
+  assert(buildCommit === CODEX.commit, 'voice helper build commit mismatch');
+  reportCandidateStage(context, 'handshake');
   const protocol = await handshake(context, built.helper);
+  const sealed = await sealCandidateVoice(context, codex, built);
   return { tools, codex: { ...CODEX }, zsh: { ...ZSH, tree: built.zsh.tree }, voiceBuild: built.voiceBuild,
-    signatures: built.signatures, zshSmoke: built.smoke, inspection, protocol, inspectedOnMacOS: tools.os,
-    buildAndProbeCompleted: true, candidateMeetsMeasuredFloor: inspection.allMinimumsAtMost13,
+    ...context.measurements, protocol, inspectedOnMacOS: tools.os,
+    outputs: sealed.outputs, voiceSeal: sealed.seal, buildAndProbeCompleted: true };
+}
+
+function captureNativeMeasurements(context, built, inspection, nativeSignatures) {
+  context.measurements = { voiceBuild: built.voiceBuild, voiceRelocation: built.voiceRelocation,
+    signatures: built.signatures, zshSmoke: built.smoke, inspection, nativeSignatures,
+    candidateMeetsMeasuredFloor: inspection.allMinimumsAtMost13,
     candidateLoaderClosureResolved: inspection.privateImportsResolved,
     selectedNewerAPIImportsAllWeak: inspection.selectedNewerAPIImportsAllWeak };
 }
 
-export async function main(argv = process.argv.slice(2)) {
-  const context = await contextFor(argumentsFor(argv));
+export async function buildMac13ResourceCandidate(input) {
+  assert(input && Object.keys(input).sort().join(',') === 'architecture,output', 'candidate builder requires only architecture and fresh output');
+  const context = await contextFor(argumentsFor(['--arch', input.architecture, '--output', input.output]));
   const startedAt = new Date().toISOString();
   let result;
   try {
     result = await body(context);
   } catch (error) {
-    result = { buildAndProbeCompleted: false, failedStage: context.stage, error: String(error.message).slice(0, 4096) };
+    result = { ...context.measurements, buildAndProbeCompleted: false, failedStage: context.stage, error: String(error.message).slice(0, 4096) };
   }
   const receipt = { schema: 1, startedAt, finishedAt: new Date().toISOString(), architecture: context.architecture,
     target: context.coordinate.target, minimumRequested: '13.0', candidateOnly: true,
@@ -407,10 +534,17 @@ export async function main(argv = process.argv.slice(2)) {
       aggregateLogBytes: MAX_LOG_BYTES, candidateBytes: 1024 ** 3, candidateFiles: 20_000,
       overallWallMilliseconds: WALL_MILLISECONDS }, ...result };
   await writeFile(join(context.output, 'receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-  console.log(JSON.stringify({ failedStage: result.failedStage ?? null, buildAndProbeCompleted: result.buildAndProbeCompleted,
+  return receipt;
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  const { architecture, output } = argumentsFor(argv);
+  const receipt = await buildMac13ResourceCandidate({ architecture, output });
+  console.log(JSON.stringify({ failedStage: receipt.failedStage ?? null, buildAndProbeCompleted: receipt.buildAndProbeCompleted,
     acceptancePassed: false, macOS13ExecutionProved: false }));
-  const measured = result.candidateMeetsMeasuredFloor && result.candidateLoaderClosureResolved && result.selectedNewerAPIImportsAllWeak;
-  if (!result.buildAndProbeCompleted || !measured) process.exitCode = 1;
+  const measured = receipt.candidateMeetsMeasuredFloor && receipt.candidateLoaderClosureResolved && receipt.selectedNewerAPIImportsAllWeak;
+  if (!receipt.buildAndProbeCompleted || !measured) process.exitCode = 1;
+  return receipt;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

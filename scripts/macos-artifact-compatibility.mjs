@@ -2,6 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, posix, relative } from 'node:path';
+import { assertMacVoiceResourceDependencies, assertMacVoiceResourceInspections, createMacVoiceResourceClosures, macVoiceResourceContext } from './macos-voice-resource-closure.mjs';
 
 const architectures = new Map([['arm64', 'arm64'], ['amd64', 'x86_64']]);
 const thinMagic = new Set(['feedface', 'cefaedfe', 'feedfacf', 'cffaedfe']);
@@ -17,6 +18,10 @@ export function macOsArtifactOptions(architecture) {
 }
 
 export function assertMacOsMetadata(metadata, options) {
+  assertMetadata(metadata, options, null);
+}
+
+function assertMetadata(metadata, options, voiceContext) {
   const expected = expectedArchitecture(options.architecture);
   if (metadata.architectures.trim() !== expected) throw new Error(`Mach-O expected thin ${expected}, found ${metadata.architectures.trim() || '(missing)'}`);
   const commands = loadCommands(metadata.loadCommands);
@@ -26,6 +31,7 @@ export function assertMacOsMetadata(metadata, options) {
   for (const version of versions) {
     if (versionNumber(version) > maximum) throw new Error(`Mach-O minimum OS exceeds advertised ${options.minimumOS}: ${version}`);
   }
+  if (voiceContext) return assertMacVoiceResourceDependencies(voiceContext, commands);
   for (const command of commands) assertDependencies(command);
 }
 
@@ -89,16 +95,20 @@ function assertSystemPath(path) {
 }
 
 export function assertMacOsArtifact(path, options) {
+  inspectArtifact(path, options, null);
+}
+
+function inspectArtifact(path, options, voiceContext) {
   if (process.platform !== 'darwin') throw new Error('Produced Mach-O inspection requires a macOS build host');
   const magic = artifactMagic(path);
   if (fatMagic.has(magic)) throw new Error(`Mach-O expected thin ${expectedArchitecture(options.architecture)}: ${path}`);
   if (!thinMagic.has(magic)) throw new Error(`Not a Mach-O artifact: ${path}`);
   const invocation = { encoding: 'utf8', timeout: 15_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true };
   try {
-    assertMacOsMetadata({
+    assertMetadata({
       architectures: execFileSync('/usr/bin/lipo', ['-archs', path], invocation),
       loadCommands: execFileSync('/usr/bin/otool', ['-l', path], invocation),
-    }, options);
+    }, options, voiceContext);
   } catch (cause) {
     throw new Error(`Mach-O compatibility refused ${JSON.stringify(path)}: ${cause.message}`, { cause });
   }
@@ -119,9 +129,11 @@ export function assertMacOsArtifactTree(directory, options) {
   if (process.platform !== 'darwin') throw new Error('Produced Mach-O inspection requires a macOS build host');
   const root = realpathSync(directory);
   if (!statSync(root).isDirectory()) throw new Error('Mach-O artifact tree must be a directory');
-  const state = { root, options, visited: 0, inspected: 0 };
+  const closures = createMacVoiceResourceClosures(root, options.resourceClosures, options.architecture);
+  const state = { root, options, closures, visited: 0, inspected: 0 };
   inspectDirectory(root, state, 0);
   if (state.inspected === 0) throw new Error('No Mach-O artifacts in native package');
+  assertMacVoiceResourceInspections(closures);
   return state.inspected;
 }
 
@@ -140,7 +152,7 @@ function inspectEntry(path, state, depth) {
   if (!info.isFile()) throw new Error(`Unsupported native package entry: ${path}`);
   const magic = artifactMagic(path);
   if (!thinMagic.has(magic) && !fatMagic.has(magic)) return;
-  assertMacOsArtifact(path, state.options);
+  inspectArtifact(path, state.options, macVoiceResourceContext(state.closures, path));
   state.inspected++;
 }
 

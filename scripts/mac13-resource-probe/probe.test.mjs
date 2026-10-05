@@ -7,6 +7,7 @@ import test from 'node:test';
 
 const source = readFileSync(new URL('./probe.mjs', import.meta.url), 'utf8');
 const workflow = readFileSync(new URL('../../.github/workflows/ci.yaml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+const setup = readFileSync(new URL('../../.github/actions/setup-macos-resources/action.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const gate = "runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')";
 
 function functionSource(start, end) {
@@ -26,8 +27,10 @@ function mainFixture(body) {
   const writes = [];
   const output = [];
   const process = { argv: [], exitCode: 0 };
-  const text = functionSource('export async function main(', 'if (process.argv[1] && import.meta.url');
-  const main = runInNewContext(`${text}; main`, { contextFor: async () => context, argumentsFor: value => value, body,
+  const text = functionSource('export async function buildMac13ResourceCandidate(', 'if (process.argv[1] && import.meta.url').replace(/^export /gm, '');
+  const main = runInNewContext(`${text}; main`, { contextFor: async () => context,
+    argumentsFor: () => ({ architecture: context.architecture, output: context.output }), body,
+    assert: (value, message) => assert.ok(value, message),
     Date, String, JSON, CODEX: { commit: 'synthetic-source-pin' }, ZSH: { commit: 'synthetic-zsh-pin' },
     MAX_COMMAND_BYTES: 4 * 1024 ** 2, MAX_LOG_BYTES: 16 * 1024 ** 2, WALL_MILLISECONDS: 105 * 60 * 1000,
     writeFile: async (file, bytes, options) => writes.push({ file, value: JSON.parse(bytes), options }),
@@ -77,6 +80,20 @@ test('existing owned build failure remains failed even when diagnostic evidence 
   assert.equal(f.writes[0].value.notarizationUsed, false);
 });
 
+test('actual shared builder preserves measured native refusal facts without claiming completion', async () => {
+  const f = mainFixture(async context => {
+    context.stage = 'candidate-loader-verification';
+    context.measurements = { inspection: { privateImportsResolved: false }, candidateLoaderClosureResolved: false };
+    throw Error('candidate loader closure unresolved');
+  });
+  await f.main([]);
+  assert.equal(f.process.exitCode, 1);
+  assert.deepEqual(f.writes[0].value.inspection, { privateImportsResolved: false });
+  assert.equal(f.writes[0].value.candidateLoaderClosureResolved, false);
+  assert.equal(f.writes[0].value.buildAndProbeCompleted, false);
+  assert.equal(f.writes[0].value.acceptancePassed, false);
+});
+
 test('pre-output admission refusal prints a fixed reason without raw exception/path data', async () => {
   const beginning = source.indexOf('if (process.argv[1] && import.meta.url');
   assert.ok(beginning > 0);
@@ -100,28 +117,31 @@ function step(name) {
   return workflow.slice(begin, end < 0 ? undefined : end);
 }
 
-test('finite conditional official autoconf provisioning uses both no-update/no-cleanup controls', () => {
-  const value = step('Set up public autoconf for the pinned zsh source');
-  assert.ok(value.includes(`if: ${gate}`));
-  assert.match(value, /timeout-minutes: 10\n/);
-  assert.match(value, /HOMEBREW_NO_AUTO_UPDATE: '1'/);
-  assert.match(value, /HOMEBREW_NO_INSTALL_CLEANUP: '1'/);
-  assert.match(value, /if ! command -v autoconf >\/dev\/null 2>&1; then\s+brew install autoconf\s+fi/);
-  assert.equal((value.match(/brew install/g) ?? []).length, 1);
-  assert.equal(value.includes('continue-on-error'), false);
+test('finite shared Mac prerequisites keep official conditional autoconf provisioning', () => {
+  const value = step('Set up pinned Mac resource build tools before packaging');
+  assert.ok(value.includes("if: runner.os == 'macOS'"));
+  assert.match(value, /timeout-minutes: 35\n/);
+  assert.ok(value.includes('uses: ./.github/actions/setup-macos-resources'));
+  assert.match(setup, /HOMEBREW_NO_AUTO_UPDATE: '1'/);
+  assert.match(setup, /HOMEBREW_NO_INSTALL_CLEANUP: '1'/);
+  assert.match(setup, /if ! command -v autoconf >\/dev\/null 2>&1; then\s+brew install autoconf\s+fi/);
+  assert.equal((setup.match(/brew install/g) ?? []).length, 1);
+  assert.equal(setup.includes('continue-on-error'), false);
 });
 
-test('measurement enters Node instead of silently stopping at an outer autoconf check', () => {
-  const value = step('Measure exact Mac 13 resource build candidate; preserve shipping failure');
-  assert.ok(value.includes(`if: ${gate}`));
-  assert.match(value, /timeout-minutes: 110/);
+test('packaging enters the real builder once with no post-preflight resource compilation', () => {
+  const value = step('Preflight the actual offline Mac agent and Graft packages before release');
+  assert.ok(value.includes("if: runner.os == 'macOS'"));
+  assert.match(value, /timeout-minutes: 120/);
   assert.equal(value.includes('command -v autoconf'), false);
-  assert.ok(value.includes('node --max-old-space-size=512 scripts/mac13-resource-probe/probe.mjs'));
+  assert.ok(value.includes('node scripts/build-offline-agent.mjs'));
+  const following = workflow.slice(workflow.indexOf(value) + value.length);
+  assert.equal(/node[^\n]*scripts\/mac13-resource-probe\/probe\.mjs/.test(following), false);
 });
 
 test('one native runner retains both inspector and diagnostics failures on every coordinate', () => {
   const value = step('Verify Mac resource inspection refusals on every native coordinate');
-  assert.match(value, /run: node --test --test-concurrency=1 scripts\/mac13-resource-probe\/inspect-candidate\.test\.mjs scripts\/mac13-resource-probe\/probe\.test\.mjs\n/);
+  assert.match(value, /run: node --test --test-concurrency=1 scripts\/mac13-resource-probe\/inspect-candidate\.test\.mjs scripts\/mac13-resource-probe\/probe\.test\.mjs scripts\/mac13-resource-probe\/cpal-patch\.test\.mjs scripts\/mac13-resource-probe\/voice-helper-relocation\.test\.mjs scripts\/mac13-resource-probe\/pipeline\.test\.mjs\n/);
   assert.equal(value.includes('npm run'), false);
 });
 

@@ -1,0 +1,177 @@
+--- a/src/host/coreaudio/macos/loopback.rs
++++ b/src/host/coreaudio/macos/loopback.rs
+@@ -1,22 +1,21 @@
+ //! Manages loopback recording (recording system audio output)
+ 
+ use std::{
++    ffi::{c_char, c_int, c_void, CStr},
+-    ffi::{c_void, CStr},
+     mem::MaybeUninit,
+     ptr::NonNull,
++    sync::{atomic::{AtomicU32, Ordering}, OnceLock},
+-    sync::atomic::{AtomicU32, Ordering},
+ };
+ 
+ static AGGREGATE_INSTANCE_COUNTER: AtomicU32 = AtomicU32::new(0);
+ 
++use objc2::{msg_send, rc::{Allocated, Retained}, runtime::AnyClass, sel, AnyThread};
+-use objc2::{rc::Retained, AnyThread};
+ use objc2_core_audio::{
+     kAudioAggregateDeviceNameKey, kAudioAggregateDeviceTapAutoStartKey,
+     kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceUID,
+     kAudioEndPointDeviceIsPrivateKey, kAudioObjectPropertyElementMain,
+     kAudioObjectPropertyScopeGlobal, kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
++    AudioHardwareCreateAggregateDevice, AudioHardwareDestroyAggregateDevice,
+-    AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
+-    AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
+     AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress, CATapDescription,
+     CATapMuteBehavior,
+ };
+@@ -31,6 +30,90 @@
+ use crate::{host::coreaudio::check_os_status, Error, ErrorKind};
+ type CFStringRef = *mut std::os::raw::c_void;
+ 
++// The optional functions are resolved only on the loopback path, never by dyld
++// as mandatory imports. A successful load retains one framework reference for
++// this process's lifetime, so every created tap's destroy pointer stays valid.
++type CreateProcessTap = unsafe extern "C-unwind" fn(
++    Option<&CATapDescription>,
++    *mut AudioObjectID,
++) -> i32;
++type DestroyProcessTap = unsafe extern "C-unwind" fn(AudioObjectID) -> i32;
++
++struct ProcessTapApi {
++    create: CreateProcessTap,
++    destroy: DestroyProcessTap,
++}
++
++static PROCESS_TAP_API: OnceLock<Option<ProcessTapApi>> = OnceLock::new();
++
++unsafe extern "C" {
++    fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
++    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
++    fn dlclose(handle: *mut c_void) -> c_int;
++}
++
++fn process_tap_unavailable() -> Error {
++    Error::with_message(
++        ErrorKind::UnsupportedOperation,
++        "CoreAudio process taps are unavailable on this system",
++    )
++}
++
++fn process_tap_api() -> Result<&'static ProcessTapApi, Error> {
++    if !objc2::available!(macos = 14.2) {
++        return Err(process_tap_unavailable());
++    }
++    PROCESS_TAP_API
++        .get_or_init(load_process_tap_api)
++        .as_ref()
++        .ok_or_else(process_tap_unavailable)
++}
++
++fn load_process_tap_api() -> Option<ProcessTapApi> {
++    // Darwin RTLD_LAZY (1) | RTLD_LOCAL (4); no user path or global search.
++    let handle = unsafe {
++        dlopen(
++            c"/System/Library/Frameworks/CoreAudio.framework/CoreAudio".as_ptr(),
++            1 | 4,
++        )
++    };
++    if handle.is_null() {
++        return None;
++    }
++    let create = unsafe { dlsym(handle, c"AudioHardwareCreateProcessTap".as_ptr()) };
++    let destroy = unsafe { dlsym(handle, c"AudioHardwareDestroyProcessTap".as_ptr()) };
++    if create.is_null() || destroy.is_null() {
++        // No tap was created, so this failed reference can be released.
++        unsafe { dlclose(handle) };
++        return None;
++    }
++    // SAFETY: The two fixed symbols in the system framework have the exact
++    // signatures declared in objc2-core-audio 0.3.2. Only Apple 64-bit targets
++    // compile this module. Retaining handle keeps both functions loaded.
++    Some(ProcessTapApi {
++        create: unsafe { std::mem::transmute::<*mut c_void, CreateProcessTap>(create) },
++        destroy: unsafe { std::mem::transmute::<*mut c_void, DestroyProcessTap>(destroy) },
++    })
++}
++
++fn process_tap_class() -> Result<&'static AnyClass, Error> {
++    let class = AnyClass::get(c"CATapDescription").ok_or_else(process_tap_unavailable)?;
++    class.class_method(sel!(alloc)).ok_or_else(process_tap_unavailable)?;
++    for selector in [
++        sel!(initWithProcesses:andDeviceUID:withStream:),
++        sel!(setMuteBehavior:),
++        sel!(setName:),
++        sel!(setPrivate:),
++        sel!(setExclusive:),
++        sel!(UUID),
++    ] {
++        class.instance_method(selector).ok_or_else(process_tap_unavailable)?;
++    }
++    let uuid_class = AnyClass::get(c"NSUUID").ok_or_else(process_tap_unavailable)?;
++    uuid_class.instance_method(sel!(UUIDString)).ok_or_else(process_tap_unavailable)?;
++    Ok(class)
++}
++
+ impl Device {
+     fn uid(&self) -> Result<Retained<NSString>, Error> {
+         let mut cfstring: CFStringRef = std::ptr::null_mut();
+@@ -84,6 +167,9 @@
+     /// Create a [`LoopbackDevice`] that records the sound
+     /// output of `device`.
+     pub fn from_device(device: &Device) -> Result<Self, Error> {
++        // Refuse missing APIs/classes/selectors before allocation or audio effects.
++        let tap_api = process_tap_api()?;
++        let tap_class = process_tap_class()?;
+         // 1 - Create tap
+ 
+         let pid = std::process::id();
+@@ -92,9 +178,11 @@
+         // Empty list of processes as we want to record all processes
+         let processes = NSArray::new();
+         let device_uid = device.uid()?;
++        // Allocate the checked dynamic class; do not use CATapDescription::class().
++        let allocated: Allocated<CATapDescription> = unsafe { msg_send![tap_class, alloc] };
+         let tap_desc = unsafe {
+             CATapDescription::initWithProcesses_andDeviceUID_withStream(
++                allocated,
+-                CATapDescription::alloc(),
+                 &processes,
+                 device_uid.as_ref(),
+                 0,
+@@ -112,7 +200,7 @@
+         let mut tap_obj_id: MaybeUninit<AudioObjectID> = MaybeUninit::uninit();
+         let tap_obj_id = unsafe {
+             let status =
++                (tap_api.create)(Some(tap_desc.as_ref()), tap_obj_id.as_mut_ptr());
+-                AudioHardwareCreateProcessTap(Some(tap_desc.as_ref()), tap_obj_id.as_mut_ptr());
+             check_os_status(status)?;
+             tap_obj_id.assume_init()
+         };
+@@ -131,7 +219,11 @@
+                 NonNull::from(&mut aggregate_device_id),
+             )
+         };
++        if let Err(error) = check_os_status(status) {
++            // Preserve the aggregate failure while releasing the created tap.
++            unsafe { (tap_api.destroy)(tap_obj_id) };
++            return Err(error);
++        }
+-        check_os_status(status)?;
+ 
+         Ok(Self {
+             tap_id: tap_obj_id,
+@@ -146,7 +238,10 @@
+             // We don't check status to avoid panic during `drop`
+             let _status =
+                 AudioHardwareDestroyAggregateDevice(self.aggregate_device.audio_device_id);
++            // A tap created by from_device has this same process-lifetime pair.
++            if let Some(Some(tap_api)) = PROCESS_TAP_API.get() {
++                let _status = (tap_api.destroy)(self.tap_id);
++            }
+-            let _status = AudioHardwareDestroyProcessTap(self.tap_id);
+         }
+     }
+ }

@@ -112,6 +112,18 @@ test('mocked Intel metadata and the legacy macOS minimum command are accepted ex
   assert.equal(result.allMinimumsAtMost13, true);
 }));
 
+test('actual inspector resolves a unique contained thin Mach-O through only that binary rpath', () => fixture(async root => {
+  const executable = await file(root);
+  const library = await file(root, 'lib/libSynthetic.dylib');
+  const rpath = '      cmd LC_RPATH\n  cmdsize 48\n     path @loader_path/../lib (offset 12)';
+  const rows = new Map([[executable, { load: loadCommands(buildMinimum(), rpath,
+    loader('LC_LOAD_DYLIB', '@rpath/libSynthetic.dylib')) }]]);
+  const result = await inspect(root, executable, 'arm64', commandFixture(rows));
+  assert.equal(result.privateImportsResolved, true, 'actual inspector currently leaves every @rpath import unresolved');
+  assert.equal(result.binaries.find(row => row.path === relative(root, executable)).imports[0].path, relative(root, library));
+  assert.equal(result.symbolAvailabilityFullyClassified, false);
+}));
+
 for (const architecture of ['x86_64', 'arm64 x86_64']) {
   test(`mocked lipo architecture ${architecture} refuses the requested arm64 coordinate`, () => fixture(async root => {
     const executable = await file(root);
@@ -183,7 +195,7 @@ test('mocked private loader closure resolves only regular members of the candida
   assert.equal(privateLibrary.imports[0].path, relative(root, nested));
 }));
 
-for (const path of ['@rpath/libUnknown.dylib', '@loader_path/../../outside.dylib', '/opt/homebrew/lib/libUnknown.dylib']) {
+for (const path of ['@loader_path/../../outside.dylib', '/opt/homebrew/lib/libUnknown.dylib']) {
   test(`mocked private import ${path} never becomes a resolved candidate member`, () => fixture(async root => {
     const executable = await file(root);
     const result = await inspect(root, executable, 'arm64', commandFixture(new Map([[executable, { load: loadCommands(buildMinimum(), loader('LC_LOAD_DYLIB', path)) }]])));
@@ -195,10 +207,82 @@ for (const path of ['@rpath/libUnknown.dylib', '@loader_path/../../outside.dylib
 
 test('an explicitly relative rpath remains reported rather than counted as a resolved imported file', () => fixture(async root => {
   const executable = await file(root);
+  await mkdir(join(root, 'lib'));
   const result = await inspect(root, executable, 'arm64', commandFixture(new Map([[executable, { load: loadCommands(buildMinimum(), loader('LC_RPATH', '@loader_path/../lib')) }]])));
   assert.deepEqual(result.binaries[0].rpaths, ['@loader_path/../lib']);
   assert.deepEqual(result.binaries[0].imports, []);
   assert.equal(result.symbolAvailabilityFullyClassified, false);
+}));
+
+for (const path of ['/usr/lib', '@loader_path/../../outside', '@loader_path/../lib/./', '@unknown/../lib']) {
+  test(`candidate rpath ${path} refuses inherited, escaped or unknown search directories`, () => fixture(async root => {
+    const executable = await file(root);
+    const rows = new Map([[executable, { load: loadCommands(buildMinimum(), loader('LC_RPATH', path)) }]]);
+    await assert.rejects(inspect(root, executable, 'arm64', commandFixture(rows)), /rpath (?:escapes|is not normalized)/);
+  }));
+}
+
+for (const [name, bytes, error] of [
+  ['non-native', Buffer.from('synthetic non-native'), /not thin Mach-O/],
+  ['fat native', Buffer.from('cafebabe', 'hex'), /fat Mach-O/],
+]) {
+  test(`candidate @rpath refuses a ${name} member`, () => fixture(async root => {
+    const executable = await file(root);
+    await file(root, 'lib/libSynthetic.dylib', bytes);
+    const rpath = '      cmd LC_RPATH\n     path @loader_path/../lib (offset 12)';
+    const rows = new Map([[executable, { load: loadCommands(buildMinimum(), rpath, loader('LC_LOAD_DYLIB', '@rpath/libSynthetic.dylib')) }]]);
+    await assert.rejects(inspect(root, executable, 'arm64', commandFixture(rows)), error);
+  }));
+}
+
+test('candidate @rpath refuses missing, ambiguous and non-basename members', () => fixture(async root => {
+  const executable = await file(root);
+  await file(root, 'lib/libSynthetic.dylib');
+  await file(root, 'other/libSynthetic.dylib');
+  const rpath = path => `      cmd LC_RPATH\n     path ${path} (offset 12)`;
+  for (const [paths, name, error] of [
+    [['@loader_path/../lib'], '@rpath/libUnknown.dylib', /unresolved or ambiguous/],
+    [['@loader_path/../lib', '@loader_path/../other'], '@rpath/libSynthetic.dylib', /unresolved or ambiguous/],
+    [['@loader_path/../lib'], '@rpath/../lib/libSynthetic.dylib', /normalized library basename/],
+  ]) {
+    const rows = new Map([[executable, { load: loadCommands(buildMinimum(), ...paths.map(rpath), loader('LC_LOAD_DYLIB', name)) }]]);
+    await assert.rejects(inspect(root, executable, 'arm64', commandFixture(rows)), error);
+  }
+}));
+
+test('direct private imports cannot promote a non-native regular file to a measured native dependency', () => fixture(async root => {
+  const executable = await file(root);
+  await file(root, 'lib/not-native.dylib', Buffer.from('synthetic non-native bytes\n'));
+  const rows = new Map([[executable, { load: loadCommands(buildMinimum(), loader('LC_LOAD_DYLIB', '@loader_path/../lib/not-native.dylib')) }]]);
+  await assert.rejects(inspect(root, executable, 'arm64', commandFixture(rows)), /not thin Mach-O/);
+}));
+
+test('direct private imports refuse unnormalized path suffixes', () => fixture(async root => {
+  const executable = await file(root);
+  await file(root, 'lib/libSynthetic.dylib');
+  const rows = new Map([[executable, { load: loadCommands(buildMinimum(), loader('LC_LOAD_DYLIB', '@loader_path/../lib/./libSynthetic.dylib')) }]]);
+  await assert.rejects(inspect(root, executable, 'arm64', commandFixture(rows)), /private path is not normalized/);
+}));
+
+test('unknown dependency load commands refuse rather than being omitted from native measurements', () => fixture(async root => {
+  const executable = await file(root);
+  const rows = new Map([[executable, { load: loadCommands(buildMinimum(), loader('LC_LOAD_UNKNOWN_DYLIB', '/opt/local/unreviewed.dylib')) }]]);
+  await assert.rejects(inspect(root, executable, 'arm64', commandFixture(rows)), /unknown candidate dependency/);
+}));
+
+test('native inspection never attributes old metadata to a same-size replacement during a tool await', () => fixture(async root => {
+  const executable = await file(root);
+  const command = commandFixture();
+  const changingCommand = async (...args) => {
+    const result = await command(...args);
+    if (args[0] === 'nm-undefined') {
+      const bytes = Buffer.from(THIN);
+      bytes[bytes.length - 1] ^= 1;
+      await writeFile(executable, bytes);
+    }
+    return result;
+  };
+  await assert.rejects(inspect(root, executable, 'arm64', changingCommand), /changed during native metadata/);
 }));
 
 test('a candidate directory cannot satisfy a private dylib import', () => fixture(async root => {

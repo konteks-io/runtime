@@ -101,7 +101,11 @@ function minimum(blocks) {
 function loaderEntry(block) {
   assert(!/\bcmd (?:LC_PREBOUND_DYLIB|LC_DYLD_ENVIRONMENT)\b/.test(block), 'unsupported candidate loader command');
   const kind = block.match(/\bcmd (LC_(?:LOAD|LOAD_WEAK|REEXPORT|LOAD_UPWARD|LAZY_LOAD)_DYLIB|LC_LOAD_DYLINKER|LC_RPATH)\b/)?.[1];
-  if (!kind) return [];
+  if (!kind) {
+    const command = block.match(/\bcmd (LC_[A-Z0-9_]+)\b/)?.[1] ?? '';
+    assert(!/^LC_LOAD_|_DYLIB$/.test(command) || command === 'LC_ID_DYLIB', 'unknown candidate dependency load command');
+    return [];
+  }
   const name = block.match(/\n\s+(?:name|path) ([^\r\n]+) \(offset [0-9]+\)/)?.[1];
   assert(typeof name === 'string' && name.length <= 4096, 'invalid loader path');
   return [{ kind, name }];
@@ -115,18 +119,64 @@ function knownAPIImports(output) {
 }
 
 function loaderPath(value, file, executable) {
-  if (value.startsWith('@loader_path/')) return resolve(dirname(file), value.slice(13));
-  if (value.startsWith('@executable_path/')) return resolve(dirname(executable), value.slice(17));
-  return null;
+  const token = value.split('/')[0];
+  const bases = new Map([['@loader_path', dirname(file)], ['@executable_path', dirname(executable)]]);
+  const base = bases.get(token);
+  if (!base) return null;
+  const suffix = value.slice(token.length + 1);
+  assert(!value.includes('\\') && !posix.isAbsolute(suffix) && posix.normalize(suffix) === suffix, 'candidate private path is not normalized');
+  return resolve(base, suffix);
 }
 
-async function resolveImport(root, file, executable, entry) {
+async function nativeMember(root, path, files) {
+  const info = await member(root, path);
+  assert(info.isFile(), 'private import is not a regular candidate file');
+  assert(files.some(row => row.file === path), 'private import is outside the complete candidate inventory');
+  assert(info.nlink === 1 && await realpath(path) === path, 'candidate private member is not physically regular');
+  assert(await macho(path), 'candidate private member is not thin Mach-O');
+  return relative(root, path);
+}
+
+async function resolveImport(root, file, executable, entry, files) {
   if (systemImport(entry.name)) return { ...entry, resolution: 'system' };
   const path = loaderPath(entry.name, file, executable);
   if (!path || !contained(root, path)) return { ...entry, resolution: 'unresolved_private' };
-  const info = await member(root, path);
-  assert(info.isFile(), 'private import is not a regular candidate file');
-  return { ...entry, resolution: 'candidate', path: relative(root, path) };
+  return { ...entry, resolution: 'candidate', path: await nativeMember(root, path, files) };
+}
+
+async function rpathDirectories(root, file, executable, entries) {
+  const paths = entries.filter(entry => entry.kind === 'LC_RPATH');
+  assert(paths.length <= 16, 'candidate rpath count exceeds cap');
+  const result = [];
+  for (const entry of paths) {
+    const suffix = entry.name.slice(entry.name.indexOf('/') + 1);
+    assert(!entry.name.includes('\\') && posix.normalize(suffix) === suffix, 'candidate rpath is not normalized');
+    const path = loaderPath(entry.name, file, executable);
+    assert(path && (path === root || contained(root, path)), 'candidate rpath escapes its closure');
+    const info = await lstat(path);
+    assert(info.isDirectory() && !info.isSymbolicLink() && await realpath(path) === path, 'candidate rpath directory is not physical');
+    assert(!result.includes(path), 'candidate rpath directory is repeated');
+    result.push(path);
+  }
+  return result;
+}
+
+async function rpathImport(root, entry, directories, files) {
+  assert(/^@rpath\/[A-Za-z0-9_+.-]+\.dylib$/.test(entry.name), 'candidate rpath import is not a normalized library basename');
+  const matches = directories.flatMap(directory => files.filter(row => row.file === join(directory, entry.name.slice(7))));
+  assert(matches.length === 1, 'candidate rpath import is unresolved or ambiguous');
+  return { ...entry, resolution: 'candidate', path: await nativeMember(root, matches[0].file, files) };
+}
+
+async function binaryImports(root, row, executable, entries, files) {
+  const directories = await rpathDirectories(root, row.file, executable, entries);
+  const imports = [];
+  for (const entry of entries.filter(value => value.kind !== 'LC_RPATH')) {
+    imports.push(entry.name.startsWith('@rpath/')
+      ? await rpathImport(root, entry, directories, files)
+      : await resolveImport(root, row.file, executable, entry, files));
+  }
+  return imports;
 }
 
 function systemImport(name) {
@@ -139,11 +189,20 @@ function atMost13(value) {
   return major < 13 || (major === 13 && minor === 0 && patch === 0);
 }
 
+async function nativeFingerprint(root, row) {
+  const info = await member(root, row.file);
+  assert(info.isFile() && info.nlink === 1 && info.size === row.size && await realpath(row.file) === row.file,
+    'candidate changed during native metadata measurement');
+  return JSON.stringify({ size: info.size, dev: info.dev, ino: info.ino,
+    mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs, sha256: await sha256(row.file) });
+}
+
 export async function inspect(root, executable, architecture, command) {
   const found = await inventory(root);
   const binaries = [];
   for (const row of found.files) {
     if (!await macho(row.file)) continue;
+    const before = await nativeFingerprint(root, row);
     const arch = (await command('lipo', '/usr/bin/lipo', ['-archs', row.file])).trim();
     assert(arch === architecture, 'candidate architecture mismatch');
     const load = await command('otool-load', '/usr/bin/otool', ['-l', row.file]);
@@ -152,11 +211,9 @@ export async function inspect(root, executable, architecture, command) {
     const blocks = commandBlocks(load);
     const minimumOS = minimum(blocks);
     const entries = blocks.flatMap(loaderEntry);
-    const imports = [];
-    for (const entry of entries.filter((value) => value.kind !== 'LC_RPATH')) {
-      imports.push(await resolveImport(root, row.file, executable, entry));
-    }
-    binaries.push({ path: row.path, size: row.size, sha256: await sha256(row.file), architecture: arch,
+    const imports = await binaryImports(root, row, executable, entries, found.files);
+    assert(await nativeFingerprint(root, row) === before, 'candidate changed during native metadata measurement');
+    binaries.push({ path: row.path, size: row.size, sha256: JSON.parse(before).sha256, architecture: arch,
       minimumOS, minimumAtMost13: atMost13(minimumOS), imports,
       rpaths: entries.filter((value) => value.kind === 'LC_RPATH').map((value) => value.name),
       selectedNewerAPIImports: knownAPIImports(symbols) });

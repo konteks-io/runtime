@@ -5,3 +5,15 @@ scripts/fixtures/node-gyp-build-4.8.4/LICENSE -text
 scripts/fixtures/tree-sitter-0.22.4/index.js -text whitespace=-blank-at-eol
 scripts/fixtures/tree-sitter-0.22.4/package.json -text
 scripts/fixtures/tree-sitter-0.22.4/LICENSE -text
+# Source-bound CPAL measurement inputs retain exact authenticated LF bytes.
+scripts/fixtures/cpal-0.18.2-availability/process-tap.patch -text whitespace=-blank-at-eol
+scripts/fixtures/cpal-0.18.2-availability/loopback.candidate.rs -text
+scripts/fixtures/cpal-0.18.2-availability/loopback.upstream.rs -text
+scripts/fixtures/cpal-0.18.2-availability/LICENSE -text
+scripts/fixtures/cpal-0.18.2-availability/MODULE.bazel -text
+scripts/fixtures/cpal-0.18.2-availability/Cargo.lock -text
+scripts/fixtures/cpal-0.18.2-availability/Cargo.toml -text
+scripts/fixtures/cpal-0.18.2-availability/patches.BUILD.bazel -text
+scripts/fixtures/cpal-0.18.2-availability/prepare_built_runtime.py -text
+scripts/fixtures/cpal-0.18.2-availability/voice.BUILD.bazel -text
+scripts/fixtures/cpal-0.18.2-availability/voice.native_link.bzl -text
