@@ -94,10 +94,14 @@ export function assertMacOsArtifact(path, options) {
   if (fatMagic.has(magic)) throw new Error(`Mach-O expected thin ${expectedArchitecture(options.architecture)}: ${path}`);
   if (!thinMagic.has(magic)) throw new Error(`Not a Mach-O artifact: ${path}`);
   const invocation = { encoding: 'utf8', timeout: 15_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true };
-  assertMacOsMetadata({
-    architectures: execFileSync('/usr/bin/lipo', ['-archs', path], invocation),
-    loadCommands: execFileSync('/usr/bin/otool', ['-l', path], invocation),
-  }, options);
+  try {
+    assertMacOsMetadata({
+      architectures: execFileSync('/usr/bin/lipo', ['-archs', path], invocation),
+      loadCommands: execFileSync('/usr/bin/otool', ['-l', path], invocation),
+    }, options);
+  } catch (cause) {
+    throw new Error(`Mach-O compatibility refused ${JSON.stringify(path)}: ${cause.message}`, { cause });
+  }
 }
 
 function artifactMagic(path) {

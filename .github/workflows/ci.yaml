@@ -123,3 +123,31 @@ jobs:
       - name: Verify organization Skill staging on Windows
         if: runner.os == 'Windows'
         run: npx vitest run --maxWorkers=1 packages/supervisor/src/__tests__/skill-staging.test.ts -t "retains digest-bound executable metadata on Windows instead of guessing it from stat"
+      - name: Preflight the actual offline Mac agent and Graft packages before release
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          REDISTRIBUTION_APPROVAL_REF: ${{ vars.KONTEKS_AGENT_REDISTRIBUTION_APPROVAL_REF }}
+        run: |
+          set -euo pipefail
+          test -n "$REDISTRIBUTION_APPROVAL_REF" || { echo "KONTEKS_AGENT_REDISTRIBUTION_APPROVAL_REF variable is required"; exit 1; }
+          case "$MATRIX_OS" in
+            macos-26) architecture=arm64 ;;
+            macos-15-intel) architecture=amd64 ;;
+            *) echo "Unsupported Mac package preflight coordinate: $MATRIX_OS"; exit 1 ;;
+          esac
+          output="$RUNNER_TEMP/konteks-offline-compatibility"
+          mkdir -p "$output"
+          failed=0
+          for agent in claude-code codex; do
+            echo "Inspecting the complete $agent package for macos/$architecture"
+            if ! node scripts/build-offline-agent.mjs --agent "$agent" --os macos --architecture "$architecture" --approval "$REDISTRIBUTION_APPROVAL_REF" --out "$output/$agent-macos-$architecture.tgz" --profile "$output/$agent-macos-$architecture.profile.json"; then
+              failed=1
+            fi
+          done
+          echo "Inspecting the complete Graft package for macos/$architecture"
+          if ! node scripts/build-offline-tool.mjs --tool graft --architecture "$architecture" --out "$output/konteks-graft-macos-$architecture.tgz"; then
+            failed=1
+          fi
+          exit "$failed"
