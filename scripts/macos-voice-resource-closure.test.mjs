@@ -44,16 +44,26 @@ function seed(root, architecture) {
   const manifest = { schemaVersion: 1, developmentOnly: false, distribution: 'publicRelease', target, sourceCommit, sourceManifestSha256: sourceManifest.sha256, inventorySha256: inventory.sha256, libraries, plugins };
   const manifestRecord = write(root, `${voice}/runtime.json`, Buffer.from(JSON.stringify(manifest) + '\n'));
   const closure = { kind: 'codex-voice-0.159.0', root: voice, target, sourceCommit, sourceManifest, inventory, manifest: { ...manifestRecord, path: 'runtime.json' }, nativeMembers };
-  return { root, voice, closure, architecture, commands: new Map(), versions: new Map(), architectures: new Map(), calls: [] };
+  return { root, voice, closure, architecture, commands: new Map(), versions: new Map(), architectures: new Map(), metadataMembers: new Set(members), calls: [] };
 }
 
-function fixture(run, architecture = 'arm64') {
-  const root = fs.mkdtempSync(path.join(tmpdir(), 'konteks-voice-closure-'));
-  try { return run(seed(root, architecture)); }
+function fixture(run, architecture = 'arm64', useAlias = false) {
+  const temporaryDirectory = fs.realpathSync(tmpdir());
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(temporaryDirectory, 'konteks-voice-closure-')));
+  try { return run(seed(fs.realpathSync(useAlias ? aliasedTreeRoot(root) : root), architecture)); }
   finally {
-    assert.equal(path.dirname(path.resolve(root)), path.resolve(tmpdir()));
+    assert.equal(path.dirname(root), temporaryDirectory);
     fs.rmSync(root, { recursive: true, force: true });
   }
+}
+
+function aliasedTreeRoot(parent) {
+  const physical = path.join(parent, 'physical');
+  const alias = path.join(parent, 'alias');
+  fs.mkdirSync(physical);
+  fs.symlinkSync(physical, alias, 'junction');
+  assert.notEqual(path.resolve(alias), fs.realpathSync(alias));
+  return alias;
 }
 
 function inspect(state, closures = [state.closure]) {
@@ -75,7 +85,8 @@ function assertProductionRefusal(run, expected) {
 }
 
 function toolMetadata(state, executable, args) {
-  const name = path.relative(path.join(state.root, state.voice), args[1]).split(path.sep).join('/');
+  const name = path.relative(path.join(state.root, state.voice), fs.realpathSync(args[1])).split(path.sep).join('/');
+  assert.ok(state.metadataMembers.has(name), `unexpected native fixture row: ${name}`);
   state.calls.push({ executable, name });
   if (executable === '/usr/bin/lipo') return state.architectures.get(name) ?? (state.architecture === 'arm64' ? 'arm64' : 'x86_64');
   assert.equal(executable, '/usr/bin/otool');
@@ -110,6 +121,7 @@ for (const [name, member, commands] of privateImports) {
     state.commands.set(member, commands);
     assert.equal(inspect(state), members.length);
     assert.equal(state.calls.filter(call => call.executable === '/usr/bin/otool').length, members.length);
+    assert.ok(state.calls.some(call => call.executable === '/usr/bin/otool' && call.name === member));
   }));
 }
 
@@ -126,6 +138,25 @@ test('a verified closure cannot waive an individual native macOS floor', () => f
 test('a verified closure cannot waive an individual native architecture', () => fixture(state => {
   state.architectures.set('lib/libglib-2.0.0.dylib', 'x86_64');
   assertProductionRefusal(() => inspect(state), /expected thin/);
+}));
+
+const aliasedMetadataRefusals = [
+  ['minimum OS', state => state.versions.set('lib/libglib-2.0.0.dylib', '14.0'), /minimum OS exceeds/],
+  ['architecture', state => state.architectures.set('lib/libglib-2.0.0.dylib', 'x86_64'), /expected thin/],
+  ['private import', state => state.commands.set('lib/libgio-2.0.0.dylib', dependency('@loader_path/unknown.dylib')), /undeclared|closure/],
+];
+
+for (const [name, mutate, expected] of aliasedMetadataRefusals) {
+  test(`canonical tree inspection preserves ${name} refusal through a temporary path alias`, () => fixture(state => {
+    mutate(state);
+    assertProductionRefusal(() => inspect(state), expected);
+  }, 'arm64', true));
+}
+
+test('native metadata fixture refuses unregistered tool paths instead of safe defaults', () => fixture(state => {
+  const file = path.join(state.root, 'unregistered.dylib');
+  fs.writeFileSync(file, Buffer.from('cffaedfe00000000', 'hex'));
+  assert.throws(() => toolMetadata(state, '/usr/bin/lipo', ['-archs', file]), /unexpected native fixture row/);
 }));
 
 test('all nonclosure native artifacts retain system-only imports', () => fixture(state => {
@@ -169,6 +200,7 @@ test('verified voice tree refuses undeclared native members', () => fixture(stat
 
 function addLibrary(state, name, bytes) {
   const member = { ...write(state.root, `${state.voice}/${name}`, bytes), path: name };
+  state.metadataMembers.add(name);
   state.closure.nativeMembers.push(member);
   reviseManifest(state, manifest => {
     manifest.libraries.push({ path: name, sourcePath: `synthetic-prefix/${name}`, sourceSha256: member.sha256, sha256: member.sha256, imports: ['/usr/lib/libSystem.B.dylib'] });
@@ -199,6 +231,7 @@ test('verified voice tree refuses a linked member ancestor before native tools',
 test('a sibling voice-backup path never receives closure permission', () => fixture(state => {
   const backup = `${state.voice}-backup/backup.dylib`;
   write(state.root, backup, Buffer.from('cffaedfe00000000', 'hex'));
+  state.metadataMembers.add('../voice-backup/backup.dylib');
   state.commands.set('../voice-backup/backup.dylib', dependency('@loader_path/libglib-2.0.0.dylib'));
   assertProductionRefusal(() => inspect(state), /non-system dependency/);
 }));

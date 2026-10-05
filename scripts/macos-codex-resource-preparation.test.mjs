@@ -51,7 +51,8 @@ function owner(directory, version, cpu, triple) {
 }
 
 function fixture(t, architecture = 'arm64') {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'konteks-resource-preparation-fixture-')));
+  // Match the production promise resolver, including Windows short-path aliases.
+  const directory = realpathSync.native(mkdtempSync(join(tmpdir(), 'konteks-resource-preparation-fixture-')));
   const root = join(directory, 'package'), runner = join(directory, 'runner');
   mkdirSync(root); mkdirSync(runner);
   const cpu = architecture === 'arm64' ? 'arm64' : 'x64';
