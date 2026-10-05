@@ -1,7 +1,7 @@
 import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema,
   RuntimeUpdateLocalBeginRequestSchema,
   RuntimeUpdateLocalBeginResultSchema,
-  allEqual,
+  allEqual, withoutUndefined,
   directModelSelectionsEqual, createLogger, type Logger, type RuntimeUpdateReport,
   type RuntimeUpdateLocalBeginRequest,
   type RuntimeUpdateLocalBeginResult,
@@ -409,8 +409,12 @@ export class CoreClient {
 
   async registerExecutionReady(instanceId: string, request: Omit<RemoteExecutionReadyRequest, "proof">, deadlineAtMs?: number,
   ): Promise<RemoteExecutionReadyResult> {
+    const body = z.record(z.string(), BoundedJsonValueSchema).parse(withoutUndefined({
+      ...request,
+      modelSelection: request.modelSelection === undefined ? undefined : withoutUndefined(request.modelSelection),
+    }));
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionReady(instanceId),
-      bodyFactory: () => RemoteExecutionReadyRequestSchema.parse({ ...request, proof: this.proof("execution_ready", instanceId, request) }), schema: RemoteExecutionReadyResultSchema,
+      bodyFactory: () => RemoteExecutionReadyRequestSchema.parse({ ...body, proof: this.proof("execution_ready", instanceId, body) }), schema: RemoteExecutionReadyResultSchema,
       idempotencyKey: `execution-ready:${request.assignmentId}:${request.attempt}:${request.claimId}:${request.recoveryEpoch}`,
       operationPolicy: "admissionPreparation",
       ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });

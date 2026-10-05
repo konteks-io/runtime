@@ -607,15 +607,22 @@ for (const update of [true, false]) {
           update ? [["update"], ["start"]] : [["install", "--activation-id", "activation-test-id"]],
         );
         assert.deepEqual(result.launcherLocales, update ? [locale, locale] : [locale]);
+        assert.match(
+          result.output,
+          locale === "en" ? /^\nKONTEKS\nRuntime setup\n/ : /^\nKONTEKS\nPemasangan runtime\n/,
+        );
+        assert.equal(result.output.match(/^KONTEKS$/gm)?.length, 1);
         if (locale === "en") {
-          assert.match(result.output, /\n\n1 of [34] - Download and verify\n/);
+          assert.match(
+            result.output,
+            /\n\n1 of [34] - Download and verify\n  Downloading and verifying\n/,
+          );
           assert.match(result.output, /\n\nSetup complete\n/);
           return;
         }
-        assert.match(result.output, /^\nPemasangan runtime Konteks\n/);
         assert.match(
           result.output,
-          /\n\n1 dari [34] - Unduh dan verifikasi\n  Mengambil manifes rilis bertanda tangan/,
+          /\n\n1 dari [34] - Unduh dan verifikasi\n  Mengunduh dan memverifikasi\n/,
         );
         assert.match(
           result.output,
