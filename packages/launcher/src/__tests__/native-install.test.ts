@@ -456,6 +456,24 @@ describe("native install composition", () => {
     await expect(loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).resolves.toMatchObject({ record: { agents: ["claude-code"], releaseId: before.releaseId }, runners: [{ RUNNER_AGENT_ID: "claude-code" }] });
     expect(await readFile(join(f.root, "credentials", "claude-code", "keep"), "utf8")).toBe("credential-owned-by-agent");
   });
+  it.runIf(process.platform !== "win32")("adds Claude beside host agents without asking the signed release for host packages", async () => {
+    const f = await fixture();
+    const dsh = await personDsh(f.root);
+    const opencode = await personOpenCode(f.root);
+    const claude = join(f.root, "operator-claude");
+    await writeFile(claude, "claude-not-executed", { mode: 0o700 });
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", claude);
+    const before = await installNative({ ...f.options, agents: ["codex", "dsh", "opencode"] } as never);
+    const identity = await readFile(join(f.root, "supervisor", "identity.json"), "utf8");
+    await writeFile(join(f.root, "credentials", "dsh", "keep"), "private-provider-state");
+    const added = await addNativeAgent({ root: f.root, agentId: "claude-code", output: f.options.output, deps: { roots: f.trust, platform: f.platform, manifest: f.manifest, fetchFn: f.fetchFn } });
+    expect(added).toMatchObject({ instanceId: before.instanceId, workspaceId: before.workspaceId, agents: ["codex", "dsh", "opencode", "claude-code"], dshRoot: dsh.pkg, dshNode: dsh.node, opencodeBinary: opencode.binary });
+    expect(await readFile(join(f.root, "supervisor", "identity.json"), "utf8")).toBe(identity);
+    expect(await readFile(join(f.root, "credentials", "dsh", "keep"), "utf8")).toBe("private-provider-state");
+    expect(await readdir(join(f.root, "releases", added.releaseId, "agents"))).toEqual(["claude-code", "codex"]);
+    expect((await loadNativeInstallation(f.root, { roots: f.trust, platform: f.platform })).runners.map(runner => runner.RUNNER_AGENT_ID)).toEqual(added.agents);
+    expect(f.activate).toHaveBeenCalledTimes(1);
+  });
   it("refuses stale or untrusted release evolution without changing the installed record", async () => {
     const f = await fixture();
     const claude = join(f.root, "operator-claude");

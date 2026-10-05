@@ -563,16 +563,17 @@ export async function addNativeAgent(options: NativeAgentAddOptions): Promise<Na
       throw new RemoteInstanceError("update_required", "Adding an agent requires a newer signed native release; stale or same-version manifests are refused.");
     }
     const agents = [...current.record.agents, options.agentId];
+    const bundled = agents.filter(agent => !isHostAgentId(agent));
     const codexHome = options.agentId === "codex" ? await resolveNativeCodexHome() : current.record.codexHome;
     const claudeExecutable = options.agentId === "claude-code" ? await resolveNativeClaudeExecutable() : current.record.claudeExecutable;
-    const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: agents });
+    const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: bundled });
     if (artifacts.some(artifact => artifact.kind === "connector" ? artifact.format !== "executable" : artifact.format !== "offline_agent_tgz")) {
       throw new RemoteInstanceError("bundle_untrusted", "Native agents require a complete signed offline package with official login tooling.");
     }
-    const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn });
+    const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: bundled }, releasesDir: join(root, "releases"), fetchFn });
     await privateDirectory(join(staged.directory, "agents"));
     try {
-      for (const agent of agents) {
+      for (const agent of bundled) {
         const artifact = artifacts.find(candidate => candidate.agentId === agent)!;
         await installOfflineAgentPackage(staged.bridges[agent]!, join(staged.directory, "agents", agent), artifact);
       }
