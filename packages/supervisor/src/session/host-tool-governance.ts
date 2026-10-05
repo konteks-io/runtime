@@ -47,6 +47,9 @@ export interface HostToolGovernance {
    * with it.
    */
   answered?(toolCallId: string, allowed: boolean): void;
+  /** Peek before observe consumes a terminal call. Only a freshly authorized,
+   * allow-once native Skill load may be attributed by the usage emitter. */
+  completedManagedSkill?(update: unknown): { toolCallId: string; directoryId: string } | undefined;
   /**
    * The quarantine line for this bypass given the credential the agent runs
    * on (its sign-in method, when the connector reports one); absent: always

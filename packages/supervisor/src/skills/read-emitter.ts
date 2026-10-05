@@ -1,4 +1,4 @@
-import { AgentSkillReadObservationSchema, jcsDigest, type AgentSkillReadObservation,
+import { AgentSkillReadObservationSchema, jcsDigest, sha256Hex, type AgentSkillReadObservation,
   type RemoteExecutionAuthorityView, type RemoteDeliveryExecutionAuthorityView } from '@konteks/remote-common';
 import { SkillReadTracker, type ManagedSkillReadTarget, type CompletedSkillRead } from './read-tracker.js';
 
@@ -17,6 +17,16 @@ export class SkillReadEmitter {
     authority: () => Authority | null; coreNow: () => number;
     verifyRead?: (read: CompletedSkillRead) => Promise<boolean>;
     submit: (event: AgentSkillReadObservation) => Promise<void> }) {}
+
+  /** Internal governance callback, never a raw provider claim: the caller has
+   * correlated an allow-once native Skill load with its completed operation. */
+  async observeManagedSkillCompletion(completion: { toolCallId: string; directoryId: string }): Promise<void> {
+    if (!this.options.verifyRead) return;
+    const targets = this.options.targets.filter(target => `konteks-${sha256Hex(target.skillId)}` === completion.directoryId);
+    if (targets.length === 0 || targets.some(target => target.skillId !== targets[0]!.skillId || target.version !== targets[0]!.version)) return;
+    await this.observe({ sessionUpdate: 'tool_call', kind: 'read', toolCallId: completion.toolCallId,
+      status: 'completed', locations: [{ path: targets[0]!.skillFile }] });
+  }
 
   async observe(update: unknown): Promise<void> {
     const authority = this.options.authority();

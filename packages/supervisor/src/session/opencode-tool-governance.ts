@@ -145,10 +145,28 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
   private readonly approved = new Map<string, string[]>();
   /** Code Mode blocks Konteks refused. */
   private readonly refused = new Set<string>();
+  private readonly managedSkills = new Map<string, { directoryId: string; allowed: boolean }>();
 
   constructor(private readonly limit = 512) {}
 
   size(): number { return this.calls.size; }
+
+  answered(toolCallId: string, allowed: boolean): void {
+    const skill = this.managedSkills.get(toolCallId);
+    if (skill) skill.allowed = allowed;
+  }
+
+  completedManagedSkill(update: unknown): { toolCallId: string; directoryId: string } | undefined {
+    const value = record(update);
+    if (value.sessionUpdate !== "tool_call_update" || value.status !== "completed" || typeof value.toolCallId !== "string") return;
+    const skill = this.managedSkills.get(value.toolCallId);
+    const call = this.calls.get(value.toolCallId);
+    if (!skill?.allowed || call?.tool !== "skill" || (value.kind !== undefined && value.kind !== "other")) return;
+    const raw = record(value.rawInput);
+    if (raw.id !== undefined && raw.id !== skill.directoryId) return;
+    if (call.rawInput.id !== undefined && call.rawInput.id !== skill.directoryId) return;
+    return { toolCallId: value.toolCallId, directoryId: skill.directoryId };
+  }
 
   observe(update: unknown, cwd: string): HostToolBypass | null {
     const value = record(update);
@@ -227,8 +245,10 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     };
 
     if (tool === "skill") {
+      this.managedSkills.delete(toolCallId);
       const id = same("id");
       if (!id || !context.managedSkillIds?.has(id)) return { kind: "deny", reason: "the Skill is not authorized for this session" };
+      this.managedSkills.set(toolCallId, { directoryId: id, allowed: false });
       return { kind: "allow" };
     }
 
@@ -287,6 +307,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
 
   private forget(toolCallId: string): void {
     this.calls.delete(toolCallId);
+    this.managedSkills.delete(toolCallId);
     this.asked.delete(toolCallId);
     this.approved.delete(toolCallId);
     this.refused.delete(toolCallId);

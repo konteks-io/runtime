@@ -994,8 +994,13 @@ export class RelayedSession {
         if (this.previewSessionId !== null) this.deps.preview?.touch(this.previewSessionId);
         this.observeStructuredText((event.params as { update?: unknown } | null)?.update);
         this.mcpCalls?.observe((event.params as { update?: unknown } | null)?.update);
-        await this.skillReads?.observe((event.params as { update?: unknown } | null)?.update);
-        const bypass = this.toolGovernance?.observe((event.params as { update?: unknown } | null)?.update, this.sessionCwd()) ?? null;
+        const update = (event.params as { update?: unknown } | null)?.update;
+        const completedSkill = this.toolGovernance?.completedManagedSkill?.(update);
+        const bypass = this.toolGovernance?.observe(update, this.sessionCwd()) ?? null;
+        if (!bypass) {
+          if (completedSkill) await this.skillReads?.observeManagedSkillCompletion(completedSkill);
+          await this.skillReads?.observe(update);
+        }
         await this.sendToCore({ kind: "acp", method: "session/update", params: event.params as never });
         if (bypass) await this.onToolGovernanceBypass(bypass);
         return;

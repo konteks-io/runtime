@@ -58,6 +58,27 @@ describe("OpenCode tool governance", () => {
     expect(governance.observe(done("skill-unasked"), WC)).toMatchObject({ title: "skill" });
   });
 
+  it("attributes only an allowed completed native Skill call, with no replay or changed ID", () => {
+    const { governance } = governed();
+    const id = "konteks-authorized";
+    const prepare = (toolCallId: string) => {
+      governance.observe(call(toolCallId, "skill"), WC);
+      governance.observe(input(toolCallId, { id }), WC);
+      expect(governance.decide(ask(toolCallId, "other", "skill", { id }), { ...context, managedSkillIds: new Set([id]) })).toEqual({ kind: "allow" });
+    };
+    prepare("native-ok");
+    expect(governance.completedManagedSkill(done("native-ok"))).toBeUndefined();
+    governance.answered("native-ok", true);
+    expect(governance.completedManagedSkill(done("native-ok"))).toEqual({ toolCallId: "native-ok", directoryId: id });
+    expect(governance.completedManagedSkill(done("native-ok", "failed"))).toBeUndefined();
+    expect(governance.completedManagedSkill({ ...done("native-ok"), rawInput: { id: "personal" } })).toBeUndefined();
+    governance.observe(done("native-ok"), WC);
+    expect(governance.completedManagedSkill(done("native-ok"))).toBeUndefined();
+    prepare("native-denied"); governance.answered("native-denied", false);
+    expect(governance.completedManagedSkill(done("native-denied"))).toBeUndefined();
+    expect(governance.completedManagedSkill(done("unasked"))).toBeUndefined();
+  });
+
   it("judges a shell request by the command its call reported, and refuses a folder outside the working copy", () => {
     const { governance, shell } = governed();
     expect(shell("s1", "git push origin main")).toEqual({ kind: "evaluate", request: expect.objectContaining({

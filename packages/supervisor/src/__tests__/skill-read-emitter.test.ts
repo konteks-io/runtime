@@ -1,4 +1,5 @@
 import { expect, it, vi } from 'vitest';
+import { sha256Hex } from '@konteks/remote-common';
 import type { RemoteExecutionAuthorityView, AgentSkillReadObservation } from '@konteks/remote-common';
 import { SkillReadEmitter } from '../skills/read-emitter.js';
 
@@ -48,4 +49,39 @@ it('rechecks original execution ownership after asynchronous file verification',
  const f = fixture(verify);
  await f.emitter.observe(read);
  expect(f.submit).not.toHaveBeenCalled();
+});
+
+it('attributes a governance-approved native Skill completion through the same verified fenced emitter', async () => {
+ const f = fixture();
+ const completion = { toolCallId: 'native-skill', directoryId: 'konteks-' + sha256Hex(capabilityId) };
+ await f.emitter.observeManagedSkillCompletion(completion);
+ await f.emitter.observeManagedSkillCompletion(completion);
+ expect(f.submit).toHaveBeenCalledTimes(1);
+ expect(f.submit.mock.calls[0]![0]).toMatchObject({ capabilityId, version: '1.0.1', toolCallId: 'native-skill', kind: 'skill_read_completed' });
+});
+it('never attributes unknown or completion-time unverified native Skills', async () => {
+ const f = fixture();
+ await f.emitter.observeManagedSkillCompletion({ toolCallId: 'unknown', directoryId: 'personal' });
+ expect(f.submit).not.toHaveBeenCalled();
+ const denied = fixture(vi.fn(async () => false));
+ await denied.emitter.observeManagedSkillCompletion({ toolCallId: 'unverified', directoryId: 'konteks-' + sha256Hex(capabilityId) });
+ expect(denied.submit).not.toHaveBeenCalled();
+});
+
+it('never assigns a native Skill completion without current ownership or after verification loses its execution', async () => {
+ const completion = { toolCallId: 'native-owned', directoryId: 'konteks-' + sha256Hex(capabilityId) };
+ const missing = fixture(); missing.current.mockReturnValue(null);
+ await missing.emitter.observeManagedSkillCompletion(completion);
+ expect(missing.submit).not.toHaveBeenCalled();
+ const verify = vi.fn(async () => { changed.current.mockReturnValue({ ...authority, executionId: 'new' }); return true; });
+ const changed = fixture(verify);
+ await changed.emitter.observeManagedSkillCompletion(completion);
+ expect(changed.submit).not.toHaveBeenCalled();
+});
+it('requires completion-time verification for native Skill attribution', async () => {
+ const submit = vi.fn(async (_event: AgentSkillReadObservation) => undefined);
+ const emitter = new SkillReadEmitter({ targets: [{ skillId: capabilityId, version: '1.0.1', skillFile: '/verified/SKILL.md' }],
+ cwd: '/verified', authority: () => authority, coreNow: () => Date.now(), submit });
+ await emitter.observeManagedSkillCompletion({ toolCallId: 'unverified', directoryId: 'konteks-' + sha256Hex(capabilityId) });
+ expect(submit).not.toHaveBeenCalled();
 });
