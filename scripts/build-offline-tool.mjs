@@ -14,11 +14,16 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
+import { assertMacOsArtifactTree, macOsArtifactOptions } from "./macos-artifact-compatibility.mjs";
 
 const shell = process.platform === "win32";
 const npm = shell ? "npm.cmd" : "npm";
 const args = Object.fromEntries(process.argv.slice(2).map((value, index, all) => value.startsWith("--") ? [value.slice(2), all[index + 1]] : []).filter(pair => pair.length === 2));
-if (!args.tool || !args.out) throw new Error("usage: build-offline-tool.mjs --tool graft --out dist/release/konteks-graft-<os>-<architecture>.tgz");
+if (!args.tool || !args.out) throw new Error("usage: build-offline-tool.mjs --tool graft --architecture arm64|amd64 --out dist/release/konteks-graft-<os>-<architecture>.tgz");
+const macOptions = process.platform === "darwin" ? macOsArtifactOptions(args.architecture) : null;
+// Only this native grammar build receives a deployment target; inspect the
+// produced bytes too because prebuilt addons and build scripts can override it.
+const buildEnvironment = macOptions ? { ...process.env, MACOSX_DEPLOYMENT_TARGET: macOptions.minimumOS.replace(/^\d+$/, "$&.0") } : process.env;
 const config = JSON.parse(readFileSync(args.config ?? "release/native-agent-builds.json", "utf8"));
 const tool = config.tools?.[args.tool];
 if (!tool) throw new Error(`tool ${args.tool} is not approved for the release`);
@@ -30,11 +35,12 @@ try {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   // Install scripts run on purpose: some grammars ship no prebuilt binary and
   // are compiled here, once, instead of on the person's laptop.
-  execFileSync(npm, ["install", "--no-audit", "--no-fund", "--no-package-lock", "--omit=dev", "--prefix", root, `${tool.package}@${tool.version}`], { stdio: "inherit", shell });
+  execFileSync(npm, ["install", "--no-audit", "--no-fund", "--no-package-lock", "--omit=dev", "--prefix", root, `${tool.package}@${tool.version}`], { stdio: "inherit", shell, env: buildEnvironment });
   const cli = join(root, "node_modules", ...tool.package.split("/"), ...tool.entrypoint.split("/"));
   if (!existsSync(cli)) throw new Error(`${tool.package} has no ${tool.entrypoint}`);
   // The package must run with nothing but this Node: no network, no home.
   execFileSync(process.execPath, [cli, "--version"], { stdio: "inherit", env: { PATH: "/usr/bin:/bin", HOME: work, DO_NOT_TRACK: "1" } });
+  if (macOptions) assertMacOsArtifactTree(root, macOptions);
   execFileSync("tar", ["-czf", args.out, "-C", root, "node_modules"], { stdio: "inherit" });
   console.log(`built ${args.out} (${tool.package}@${tool.version})`);
 } finally {

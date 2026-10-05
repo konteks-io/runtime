@@ -87,7 +87,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm, windows-2022]
+        os: [macos-26, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -103,6 +103,8 @@ jobs:
         run: npm ci --ignore-scripts --legacy-peer-deps
       - name: Build workspace packages
         run: npm run build
+      - name: Verify Mac binary compatibility decisions and produced native metadata
+        run: node --test --test-concurrency=1 scripts/macos-artifact-compatibility.test.mjs
       - name: Verify POSIX setup language, signed downloads and recovery
         if: runner.os != 'Windows'
         run: node --test --test-name-pattern="POSIX bootstrap" scripts/bootstrap-install.test.mjs
@@ -112,7 +114,7 @@ jobs:
       - name: Verify foreground setup and update language on each native OS
         run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/setup-locale.test.ts packages/launcher/src/__tests__/foreground-progress.test.ts packages/launcher/src/__tests__/native-install.test.ts packages/launcher/src/__tests__/agent-setup.test.ts packages/launcher/src/__tests__/prompt-output.test.ts packages/launcher/src/__tests__/prompt-interruption.test.ts
       - name: Verify native service, updates and background process ownership
-        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-stop-completion.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/native-update-progress.test.ts packages/launcher/src/__tests__/native-agent-add.test.ts packages/launcher/src/__tests__/windows-service-owner.test.ts packages/launcher/src/__tests__/windows-background-setup.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/supervisor/src/__tests__/native-update-coordinator.test.ts packages/supervisor/src/__tests__/runtime-update.test.ts packages/supervisor/src/__tests__/runtime-update-capability.test.ts packages/supervisor/src/__tests__/runtime-relay-handshake.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts packages/supervisor/src/__tests__/windows-background-probes.test.ts packages/agent-runner/src/__tests__/windows-background-spawn.test.ts
+        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-stop-completion.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/native-update-progress.test.ts packages/launcher/src/__tests__/native-agent-add.test.ts packages/launcher/src/__tests__/windows-service-owner.test.ts packages/launcher/src/__tests__/windows-background-setup.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/supervisor/src/__tests__/native-update-coordinator.test.ts packages/supervisor/src/__tests__/runtime-update.test.ts packages/supervisor/src/__tests__/runtime-update-ownership.test.ts packages/supervisor/src/__tests__/runtime-update-capability.test.ts packages/supervisor/src/__tests__/runtime-relay-handshake.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts packages/supervisor/src/__tests__/windows-background-probes.test.ts packages/agent-runner/src/__tests__/windows-background-spawn.test.ts
       - name: Verify current Codex tooling, model choice and fresh readiness on each native OS
         run: npx vitest run --maxWorkers=1 packages/agent-runner/src/__tests__/bridge-spec.test.ts packages/agent-runner/src/__tests__/model-capability-discovery.test.ts packages/agent-runner/src/__tests__/session-model-selection.test.ts packages/supervisor/src/__tests__/session.test.ts packages/supervisor/src/__tests__/native-execution-ready.test.ts packages/supervisor/src/__tests__/heartbeat.test.ts packages/supervisor/src/__tests__/native-inventory.test.ts packages/supervisor/src/__tests__/native-supervisor.test.ts
       - name: Verify signed Windows local release

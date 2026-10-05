@@ -20,6 +20,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { assertMacOsArtifact, macOsArtifactOptions } from "./macos-artifact-compatibility.mjs";
 
 const [command, ...rest] = process.argv.slice(2);
 const args = Object.fromEntries(rest.map((value, index, all) => (value.startsWith("--") ? [value.slice(2), all[index + 1]] : [])).filter(pair => pair.length === 2));
@@ -38,6 +39,7 @@ switch (command) {
     if (!/^https:\/\//.test(base)) fail("base-url must be https");
     const url = name => `${base}/${args.tag}/${name}`;
     const connectorName = `konteks-remote-${args.os}-${args.architecture}${args.os === "windows" ? ".exe" : ""}`;
+    if (args.os === "macos") assertMacOsArtifact(args.executable, macOsArtifactOptions(args.architecture));
     copyFileSync(args.executable, join(out, connectorName));
     node("scripts/native-artifact-index.mjs", ["--file", join(out, connectorName), "--id", `konteks-remote-${args.os}-${args.architecture}`, "--kind", "connector", "--format", "executable", "--os", args.os, "--architecture", args.architecture, "--url", url(connectorName), "--out", join(out, `konteks-remote-${args.os}-${args.architecture}.artifact.json`)]);
     for (const agent of AGENTS) {
@@ -48,7 +50,7 @@ switch (command) {
     }
     // Graft rides next to the connector, listed in SHA256SUMS. It is
     // a local tool Core never hands out, so it is not a manifest artifact.
-    if (args.os !== "windows") node("scripts/build-offline-tool.mjs", ["--tool", "graft", "--out", join(out, `konteks-graft-${args.os}-${args.architecture}.tgz`)]);
+    if (args.os !== "windows") node("scripts/build-offline-tool.mjs", ["--tool", "graft", "--architecture", args.architecture, "--out", join(out, `konteks-graft-${args.os}-${args.architecture}.tgz`)]);
     copyFileSync(args.package, join(out, basename(args.package)));
     if (existsSync(`${args.package}.asc`)) copyFileSync(`${args.package}.asc`, join(out, `${basename(args.package)}.asc`));
     console.log(`staged ${readdirSync(out).length} release assets for ${args.os}/${args.architecture} in ${out}`);

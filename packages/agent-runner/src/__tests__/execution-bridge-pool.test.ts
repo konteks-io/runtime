@@ -396,16 +396,43 @@ it("drops the last offered models when a refresh says the agent needs signing in
   const f = await fixture({ now: () => new Date(now), modelCapabilityTtlMs: 60_000, newSessionFails: () => fail });
   await f.runtime.probe(false);
   await f.runtime.discoverModelCapability("model");
-  now += 90_000;
-  fail = new RequestError(-32000, "Authentication required");
-  await f.runtime.discoverModelCapability("model");
-  await vi.waitFor(() => expect(f.owners[2]?.bridge.stop).toHaveBeenCalled());
-  // Nothing is kept now: the next read is a discovery of its own, and it fails.
-  await vi.waitFor(async () => {
-    const spawned = f.spawn.mock.calls.length;
-    await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
-    expect(f.spawn.mock.calls.length).toBe(spawned + 1);
+  const refresh = vi.spyOn(f.runtime, "probe");
+  let releaseWrite!: () => void;
+  const writable = new Promise<void>(resolve => { releaseWrite = resolve; });
+  let finishedWrites = 0;
+  const originalWrite = AgentScopeStore.prototype.write;
+  const write = vi.spyOn(AgentScopeStore.prototype, "write").mockImplementation(async function (this: AgentScopeStore, state) {
+    await writable;
+    await originalWrite.call(this, state);
+    finishedWrites += 1;
   });
+  try {
+    now += 90_000;
+    fail = new RequestError(-32000, "Authentication required");
+    await f.runtime.discoverModelCapability("model");
+    await vi.waitFor(() => expect(f.owners[2]?.bridge.stop).toHaveBeenCalled());
+    // Nothing is kept now: the next read is a discovery of its own, and it fails.
+    await vi.waitFor(async () => {
+      const spawned = f.spawn.mock.calls.length;
+      await expect(f.runtime.discoverModelCapability("model")).rejects.toThrow();
+      expect(f.spawn.mock.calls.length).toBe(spawned + 1);
+    });
+    expect(refresh.mock.calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of refresh.mock.calls) expect(call).toEqual([false, false, { fresh: true }]);
+    await vi.waitFor(() => expect(write).toHaveBeenCalledTimes(refresh.mock.calls.length));
+    // Auth and model changes are visible before persistence; join every induced probe before teardown.
+    expect(finishedWrites).toBe(0);
+    releaseWrite();
+    await Promise.all(refresh.mock.results.map(result => result.value));
+    expect(finishedWrites).toBe(refresh.mock.calls.length);
+  } finally {
+    releaseWrite();
+    try { await Promise.allSettled(refresh.mock.results.map(result => result.value)); }
+    finally {
+      write.mockRestore();
+      refresh.mockRestore();
+    }
+  }
 });
 
 it("refuses a restart-only retained stop for an identity live under a current owner and yields an idle one", async () => {
