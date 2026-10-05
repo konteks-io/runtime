@@ -7,7 +7,7 @@ import { konteksPrefixedName } from "./konteks-session-prefix.mjs";
 // MCP server off, and shows a direct session's own title behind the
 // [konteks] prefix.
 export const codexAcpLiveUserPatch = {
-  id: "konteks-codex-acp-live-user-v9",
+  id: "konteks-codex-acp-live-user-v11",
   package: "@agentclientprotocol/codex-acp",
   version: "1.10.0",
   upstreamSha256: "4602784c5896fbf05a7d89b09655bacc768d0bf281e0d03a10333ff81da45268",
@@ -89,6 +89,24 @@ export function patchCodexAcpLiveUsers(source, version) {
       throw new Error("Codex ACP compatibility anchor is not unique");
     source = source.replace(before, after);
   };
+  replaceOnce(
+    "    currentValue: currentBaseModelId,\n    options\n  };\n}\nfunction createReasoningEffortConfigOption",
+    `    currentValue: currentBaseModelId,
+    options,
+    _meta: { konteksModelOffer: {
+      source: "codex-model-list.v1",
+      offeredValues: availableModels.map(model => model.id),
+      defaultValue: availableModels.filter(model => model.isDefault === true).length === 1 ?
+        availableModels.find(model => model.isDefault === true).id : null
+    } }
+  };
+}
+function createReasoningEffortConfigOption`,
+  );
+  replaceOnce(
+    '    codex = process.platform === "win32" ? spawn(`"${codexPath}" app-server`, { shell: true, env: spawnEnv }) : spawn(codexPath, ["app-server"], { env: spawnEnv });',
+    '    codex = process.platform === "win32" ? spawn(`"${codexPath}" app-server`, { shell: true, env: spawnEnv, windowsHide: true }) : spawn(codexPath, ["app-server"], { env: spawnEnv });',
+  );
   replaceOnce(
     "var CodexEventHandler = class _CodexEventHandler {",
     `${missingCodexToolTerminals.toString()}\n${reconcileCodexToolTerminals.toString()}\n${konteksCodexMcpServers.toString()}\n${konteksAdmittedMcpServerNames.toString()}\n${konteksPrefixedName.toString()}\nvar CodexEventHandler = class _CodexEventHandler {`,

@@ -6,6 +6,7 @@ import { classifyBridgeError, spawnBridge, type BridgeProcess, type SpawnBridgeO
 import type { BridgeSpawnSpec } from "./spec.js";
 import { konteksSessionMetadata } from "../sessions/title.js";
 import { orderKnownFirst, recogniseNativeModel } from "@konteks/backstage-plugin-common/known-models";
+import { readModelOffer, type ModelOffer } from "./model-offer.js";
 
 interface DiscoverBridgeModelCapabilityOptions {
   configId: string;
@@ -87,7 +88,9 @@ export function definiteModelDiscoveryFailure(error: unknown): boolean {
 const DEFINITE_BRIDGE_ERRORS: ReadonlySet<string> = new Set(["agent_auth_required", "invalid_params", "unknown_request", "malformed_response"]);
 
 function refusedOrSignedOut(error: unknown): boolean {
-  return error instanceof RemoteInstanceError && (error.code === "agent_auth_required" || error.diagnostic === MODEL_DISCOVERY_REFUSED);
+  return (
+    error instanceof RemoteInstanceError && (error.code === "agent_auth_required" || error.diagnostic === MODEL_DISCOVERY_REFUSED)
+  );
 }
 
 /**
@@ -172,7 +175,8 @@ interface AttemptState {
 }
 
 /** The capability, or null when the attempt failed in a way worth another one (it already stopped its process). */
-async function discoveryAttempt(run: DiscoveryRun, attempt: number): Promise<DiscoveredBridgeModelCapability | null> {
+async function discoveryAttempt(run: DiscoveryRun, attempt: number,
+): Promise<DiscoveredBridgeModelCapability | null> {
   const { options } = run;
   const timeoutMs = discoverySessionTimeoutMs(run.baseTimeoutMs, attempt);
   // Only the first attempt uses the lent bridge; a retry always gets a fresh process.
@@ -180,7 +184,7 @@ async function discoveryAttempt(run: DiscoveryRun, attempt: number): Promise<Dis
   const state: AttemptState = { bridge: lent, spawned: null, bridgeAcquired: lent !== null, sessionCreated: false, stopped: false };
   const deadline = sessionDeadline(timeoutMs);
   try {
-    const bridge = state.bridge ?? await spawnDiscoveryBridge(run, state);
+    const bridge = state.bridge ?? (await spawnDiscoveryBridge(run, state));
     const created = await Promise.race([
       bridge.connection.newSession({ cwd: run.cwd, mcpServers: [], _meta: { ...konteksSessionMetadata("Model capability check", run.agentId), ...options.sessionMeta } }),
       deadline.start(),
@@ -270,10 +274,13 @@ async function failedAttempt(run: DiscoveryRun, state: AttemptState, error: unkn
 }
 
 /** Retried only before a session exists: a bridge that never came up, or a transient answer. */
-function attemptRetryable(state: AttemptState, error: unknown, classifiedRetryable: boolean): boolean {
+function attemptRetryable(state: AttemptState, error: unknown, classifiedRetryable: boolean,
+): boolean {
   if (state.sessionCreated) return false;
   if (!state.bridgeAcquired || classifiedRetryable) return true;
-  return error instanceof RemoteInstanceError && (error.retryable || error.code === "agent_unavailable");
+  return (
+    error instanceof RemoteInstanceError && (error.retryable || error.code === "agent_unavailable")
+  );
 }
 
 /** Whether the attempt's process is known to be stopped; an unconfirmed stop needs recovery. */
@@ -297,8 +304,9 @@ async function stopAfterFailure(run: DiscoveryRun, state: AttemptState, retryabl
 
 /** Exponential backoff with jitter before a fresh bridge tries again. */
 async function retryPause(run: DiscoveryRun, attempt: number): Promise<void> {
-  const exponentialMs = 500 * (2 ** (attempt - 1));
-  const delayMs = Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + (run.random() * 0.5)))));
+  const exponentialMs = 500 * 2 ** (attempt - 1);
+  const delayMs = Math.min(2_000, Math.max(1, Math.round(exponentialMs * (0.75 + run.random() * 0.5))),
+  );
   run.logger.warn({ agentId: run.agentId, attempt, nextAttempt: attempt + 1, maxAttempts: DISCOVERY_ATTEMPTS, delayMs,
     recovery: "fresh_bridge" }, "retrying model capability discovery with exponential backoff");
   await run.sleep(delayMs);
@@ -345,8 +353,9 @@ function label(text: unknown): string | undefined {
 }
 
 function validValue(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 256
-    && ![...value].some(char => isControl(char.charCodeAt(0)));
+  return (
+    typeof value === "string" && value.length > 0 && value.length <= 256
+    && ![...value].some(char => isControl(char.charCodeAt(0))));
 }
 
 /**
@@ -355,34 +364,64 @@ function validValue(value: unknown): value is string {
  * recognised, so a DeepSeek Harness fronting many providers still reports
  * what Konteks can price; the current value is always kept.
  */
-export function exactSelect(option: Extract<SessionConfigOption, { type: "select" }>, agentId: string): DiscoveredBridgeModelCapability {
-  if (!validValue(option.currentValue)) throw unavailable();
+function discoveryModelOffer(
+  option: Extract<SessionConfigOption, { type: "select" }>, agentId: string,
+): ModelOffer | null {
+  const requireRaw = agentId === "codex" && option.id === "model";
+  if (!requireRaw && option._meta?.konteksModelOffer === undefined) return null;
+  const authority = readModelOffer(option, requireRaw);
+  if (authority.currentValue === null) throw unavailable();
+  return authority;
+}
+
+function valueOffered(authority: ModelOffer | null, value: string): boolean {
+  return authority === null || authority.values.has(value);
+}
+
+function discoveredOption(
+  entry: SessionConfigSelectOption,
+  group: { group: string; name: string } | undefined,
+): DiscoveredModelOption {
+  const name = label(entry.name);
+  const groupId = group ? label(group.group) : undefined;
+  const groupName = group ? label(group.name) : undefined;
+  return { value: entry.value, ...(name ? { name } : {}), ...(groupId ? { group: groupId } : {}), ...(groupName ? { groupName } : {}) };
+}
+
+function boundedOptions(
+  all: DiscoveredModelOption[],
+  currentValue: string,
+  agentId: string,
+): DiscoveredModelOption[] {
+  if (all.length <= MAX_OFFERED_MODEL_VALUES) return all;
+  const ranked = orderKnownFirst(all.map(entry => ({ entry, status: recogniseNativeModel(agentId, entry.value).status })));
+  const current = ranked.find((item) => item.entry.value === currentValue)!;
+  const kept = new Set([current, ...ranked.filter(item => item !== current).slice(0, MAX_OFFERED_MODEL_VALUES - 1)]
+      .map(item => item.entry));
+  // Keep the agent's own order among what is kept.
+  return all.filter(entry => kept.has(entry));
+}
+
+export function exactSelect(option: Extract<SessionConfigOption, { type: "select" }>, agentId: string,
+): DiscoveredBridgeModelCapability {
+  const authority = discoveryModelOffer(option, agentId);
+  const currentValue = authority?.currentValue ?? option.currentValue;
+  if (!validValue(currentValue)) throw unavailable();
   const seen = new Set<string>();
   const all: DiscoveredModelOption[] = [];
   const add = (entry: SessionConfigSelectOption, group?: { group: string; name: string }) => {
-    if (!validValue(entry.value) || seen.has(entry.value)) return;
+    if (!validValue(entry.value) || seen.has(entry.value) || !valueOffered(authority, entry.value)) return;
     seen.add(entry.value);
-    const name = label(entry.name);
-    const groupId = group ? label(group.group) : undefined;
-    const groupName = group ? label(group.name) : undefined;
-    all.push({ value: entry.value, ...(name ? { name } : {}), ...(groupId ? { group: groupId } : {}), ...(groupName ? { groupName } : {}) });
+    all.push(discoveredOption(entry, group));
   };
   for (const entry of option.options) {
     if ("value" in entry) add(entry);
     else for (const nested of entry.options) add(nested, { group: entry.group, name: entry.name });
   }
-  if (!seen.has(option.currentValue)) throw unavailable();
-  let offered = all;
-  if (all.length > MAX_OFFERED_MODEL_VALUES) {
-    const ranked = orderKnownFirst(all.map(entry => ({ entry, status: recogniseNativeModel(agentId, entry.value).status })));
-    const current = ranked.find(item => item.entry.value === option.currentValue)!;
-    const kept = new Set([current, ...ranked.filter(item => item !== current).slice(0, MAX_OFFERED_MODEL_VALUES - 1)]
-      .map(item => item.entry));
-    // Keep the agent's own order among what is kept.
-    offered = all.filter(entry => kept.has(entry));
-  }
+  if (!seen.has(currentValue)) throw unavailable();
+  const offered = boundedOptions(all, currentValue, agentId);
   return {
-    currentValue: option.currentValue,
+    currentValue,
     offeredValues: offered.map(entry => entry.value),
     offeredOptions: offered,
   };

@@ -25,6 +25,73 @@ function fixture(options: unknown) {
 }
 
 describe("supervisor-only ACP model capability discovery", () => {
+  it("advertises only Codex raw model-list offers and uses its explicit default instead of an injected current value", () => {
+    const result = exactSelect(
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        currentValue: "gpt-6.1-sol",
+        options: [
+          { value: "gpt-6.1-sol", name: "Injected current" },
+          { value: "actual-default", name: "Actual default" },
+        ],
+        _meta: {
+          konteksModelOffer: {
+            source: "codex-model-list.v1",
+            offeredValues: ["actual-default"],
+            defaultValue: "actual-default",
+          },
+        },
+      },
+      "codex",
+    );
+    expect(result).toEqual({
+      currentValue: "actual-default",
+      offeredValues: ["actual-default"],
+      offeredOptions: [{ value: "actual-default", name: "Actual default" }],
+    });
+  });
+
+  it.each([
+    undefined,
+    { source: "codex-model-list.v1", offeredValues: ["actual-default"], defaultValue: null },
+    { source: "untrusted", offeredValues: ["actual-default"], defaultValue: "actual-default" },
+    {
+      source: "codex-model-list.v1",
+      offeredValues: ["not-an-option"],
+      defaultValue: "not-an-option",
+    },
+    {
+      source: "codex-model-list.v1",
+      offeredValues: ["actual-default", "actual-default"],
+      defaultValue: "actual-default",
+    },
+    {
+      source: "codex-model-list.v1",
+      offeredValues: ["actual-default"],
+      defaultValue: "injected",
+      extra: true,
+    },
+  ])("refuses missing or unproven Codex model-list provenance (%j)", (marker) => {
+    expect(() =>
+      exactSelect(
+        {
+          id: "model",
+          name: "Model",
+          type: "select",
+          currentValue: "injected",
+          options: [
+            { value: "injected", name: "Injected current" },
+            { value: "actual-default", name: "Actual default" },
+          ],
+          _meta: { konteksModelOffer: marker },
+        },
+        "codex",
+      ),
+    ).toThrow();
+  });
+
   it("uses one dedicated bridge, an empty private cwd and no MCP, then removes all temporary state", async () => {
     const root = await mkdtemp(join(tmpdir(), "model-discovery-test-")); roots.push(root);
     const f = fixture(exactModel);

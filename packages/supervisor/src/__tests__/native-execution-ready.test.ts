@@ -20,10 +20,94 @@ async function fixture() {
   await journal.assignments.put(entry);
   const registerExecutionReady = vi.fn(async () => ready);
   const assertActive = vi.fn();
-  const register = createNativeReadyRegistrar({ clock, journal, client: { registerExecutionReady }, instanceId: "instance", workspaceId: "tenant", runnerIncarnation: "process", assertActive });
+  const register = createNativeReadyRegistrar({ clock, journal, client: { registerExecutionReady }, instanceId: "instance", workspaceId: "tenant", runnerIncarnation: "process", assertActive,
+    directModelSelectionSupported: () => true,
+  });
   return { journal, entry, register, registerExecutionReady, assertActive };
 }
 describe("native authoritative execution readiness", () => {
+  const modelSelection = {
+    configId: "model",
+    requestedValue: "requested-model",
+    effectiveValue: "actual-default",
+    resolution: "default_if_unoffered" as const,
+  };
+  const direct = {
+    ...work,
+    kind: "direct",
+    requiredCapabilities: ["direct-model-fallback.v1"],
+    agentRoute: { ...work.agentRoute, sessionConfig: { model: "requested-model" } },
+    source: {
+      kind: "direct_session",
+      portability: "instance_bound",
+      ownerInstanceId: "instance",
+      sessionId: "session",
+      turnRef: "turn",
+      modelSelectionPolicy: {
+        kind: "same_agent_default_if_unoffered",
+        configId: "model",
+        requestedValue: "requested-model",
+      },
+    },
+  } as RemoteWorkAssignment;
+  it("journals the exact Core-accepted effective model before readiness and survives restart", async () => {
+    const f = await fixture();
+    await f.journal.assignments.put({ ...f.entry, kind: "direct" });
+    f.registerExecutionReady.mockResolvedValue({ ...ready, modelSelection } as typeof ready);
+    await expect(f.register(direct, binding, "acp", modelSelection)).resolves.toEqual({
+      ...ready,
+      modelSelection,
+    });
+    expect(f.registerExecutionReady).toHaveBeenCalledWith(
+      "instance",
+      expect.objectContaining({ modelSelection }),
+      expect.any(Number),
+    );
+    const reopened = new SupervisorJournal(root);
+    await reopened.load();
+    expect(reopened.assignments.get("assignment:1")?.executionReady).toMatchObject({
+      modelSelection,
+    });
+  });
+  it.each([
+    undefined,
+    { ...modelSelection, effectiveValue: "different-default" },
+    { ...modelSelection, requestedValue: "other" },
+  ])(
+    "refuses a missing or changed Core model receipt before journaling ready (%j)",
+    async (received) => {
+      const f = await fixture();
+      await f.journal.assignments.put({ ...f.entry, kind: "direct" });
+      f.registerExecutionReady.mockResolvedValue({
+        ...ready,
+        ...(received ? { modelSelection: received } : {}),
+      } as typeof ready);
+      await expect(f.register(direct, binding, "acp", modelSelection)).rejects.toThrow();
+      expect(f.journal.assignments.get("assignment:1")?.executionReady).toBeUndefined();
+    },
+  );
+  it("will not replace an accepted effective-model pin after a crash or recovery epoch", async () => {
+    const f = await fixture();
+    await f.journal.assignments.put({
+      ...f.entry,
+      kind: "direct",
+      executionReady: { ...ready, modelSelection },
+    } as typeof f.entry);
+    f.registerExecutionReady.mockResolvedValue({
+      ...ready,
+      modelSelection: { ...modelSelection, effectiveValue: "different-default" },
+    } as typeof ready);
+    await expect(
+      f.register(direct, binding, "acp", {
+        ...modelSelection,
+        effectiveValue: "different-default",
+      }),
+    ).rejects.toThrow();
+    expect(f.registerExecutionReady).not.toHaveBeenCalled();
+    expect(f.journal.assignments.get("assignment:1")?.executionReady).toMatchObject({
+      modelSelection,
+    });
+  });
   it("uses only the local accepted claim and persists Core's exact receipt before returning", async () => {
     const f = await fixture();
     await expect(f.register(work, binding, "acp")).resolves.toEqual(ready);

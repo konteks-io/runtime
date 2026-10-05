@@ -177,13 +177,90 @@ if ($VerifyOnly) { return }
 # --- end of the verifier -------------------------------------------------------
 
 function Write-SetupDetail([string]$Text) {
-  foreach ($line in ($Text -split "`r?`n")) { Write-Host "  $line" }
+  if ($script:SetupProgress) { $script:SetupProgress.Pause() }
+  try { foreach ($line in ($Text -split "`r?`n")) { Write-Host "  $line" } }
+  finally { if ($script:SetupProgress) { $script:SetupProgress.Resume() } }
 }
 
 function Write-SetupStage([string]$Title, [string[]]$Details) {
+  Stop-SetupProgress
   Write-Host ''
   Write-Host $Title
   foreach ($detail in $Details) { Write-SetupDetail $detail }
+}
+
+function Write-SetupDiagnostic([string]$Text) {
+  if ($env:KONTEKS_REMOTE_VERBOSE -match '^(?i:1|true|yes|on)$') { Write-SetupDetail $Text }
+}
+
+function Write-SetupIdentity([string]$Title) {
+  if ($env:KONTEKS_SETUP_HEADER_SHOWN -ceq '1') { return }
+  Write-Host "`nKONTEKS"
+  Write-Host $Title
+  Write-Host ''
+  $env:KONTEKS_SETUP_HEADER_SHOWN = '1'
+}
+
+# No extra PowerShell process or terminal: a bounded foreground row on this console.
+function Initialize-SetupProgress {
+  if ('KonteksSetupProgress' -as [type]) { return }
+  Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading;
+public sealed class KonteksSetupProgress : IDisposable {
+  readonly object gate = new object();
+  readonly TextWriter writer;
+  readonly string label;
+  readonly int maxWidth;
+  readonly DateTime started = DateTime.UtcNow;
+  readonly Timer timer;
+  int frame, width, paused;
+  bool disposed;
+  public KonteksSetupProgress(TextWriter writer, string label, int columns) {
+    this.writer = writer; this.label = label; maxWidth = Math.Max(1, columns - 1);
+    timer = new Timer(Draw, null, Timeout.Infinite, 160);
+    timer.Change(0, 160);
+  }
+  void Clear() {
+    if (width == 0) return;
+    try { writer.Write("\r" + new string(' ', width) + "\r"); writer.Flush(); }
+    catch (IOException) { }
+    catch (ObjectDisposedException) { }
+    finally { width = 0; }
+  }
+  void Draw(object state) {
+    try { lock (gate) {
+      if (disposed || paused > 0) return;
+      int seconds = (int)(DateTime.UtcNow - started).TotalSeconds;
+      string row = "|/-\\"[frame++ % 4] + " " + label + (seconds >= 3 ? " (" + seconds + "s)" : "");
+      if (row.Length > maxWidth) row = row.Substring(0, maxWidth);
+      writer.Write("\r" + row + new string(' ', Math.Max(0, width - row.Length))); writer.Flush(); width = row.Length;
+    } } catch (IOException) { Dispose(); }
+    catch (ObjectDisposedException) { Dispose(); }
+  }
+  public void Pause() { lock (gate) { paused++; Clear(); } }
+  public void Resume() { lock (gate) { if (paused > 0) paused--; } }
+  public void Dispose() {
+    lock (gate) { if (disposed) return; disposed = true; timer.Dispose(); Clear(); }
+  }
+}
+'@ -ErrorAction Stop
+}
+
+function Start-SetupProgress([string]$Label) {
+  Stop-SetupProgress
+  if ([Console]::IsOutputRedirected) { Write-SetupDetail $Label; return }
+  try {
+    Initialize-SetupProgress
+    $columns = 80
+    try { $columns = [Console]::BufferWidth } catch { }
+    $script:SetupProgress = New-Object KonteksSetupProgress -ArgumentList ([Console]::Out), $Label, $columns
+  } catch { Write-SetupDetail $Label }
+}
+
+function Stop-SetupProgress {
+  if ($script:SetupProgress) { $script:SetupProgress.Dispose(); $script:SetupProgress = $null }
 }
 
 # Presentation is confined to this setup process and its launcher children.
@@ -196,10 +273,9 @@ if (@('en', 'id') -cnotcontains $SetupLocale) {
 }
 $env:KONTEKS_SETUP_LOCALE = $SetupLocale
 $SetupIndonesian = @{
-  'Konteks runtime setup' = 'Pemasangan runtime Konteks'
-  "Updating this computer's existing Konteks connection." = 'Memperbarui koneksi Konteks yang sudah ada pada komputer ini.'
-  'Connecting this computer to Konteks.' = 'Menghubungkan komputer ini ke Konteks.'
-  'Keep this window open until setup finishes.' = 'Biarkan jendela ini terbuka sampai pemasangan selesai.'
+  'Runtime setup' = 'Pemasangan runtime'
+  'Downloading and verifying' = 'Mengunduh dan memverifikasi'
+  'Installing the Konteks command' = 'Memasang perintah Konteks'
   'Setup needs an activation' = 'Pemasangan memerlukan aktivasi'
   'The user-local install is not available on Windows yet.' = 'Pemasangan khusus pengguna belum tersedia pada Windows.'
   'Return to Konteks -> Customize -> Runtimes and connect this computer.' = 'Kembali ke Konteks -> Sesuaikan -> Runtimes dan hubungkan komputer ini.'
@@ -234,8 +310,6 @@ $SetupIndonesian = @{
   'Verified the Windows installer and signed release manifest.' = 'Pemasang Windows dan manifes rilis bertanda tangan sudah diverifikasi.'
   'Install the Konteks command' = 'Pasang perintah Konteks'
   'Approve the Windows elevation prompt if it appears.' = 'Setujui permintaan izin Windows jika muncul.'
-  'Installation can take a minute.' = 'Pemasangan dapat memerlukan satu menit.'
-  'Keep this setup window open.' = 'Biarkan jendela pemasangan ini terbuka.'
   'Open the downloaded setup file again and approve the prompt to continue.' = 'Buka kembali berkas pemasangan yang diunduh dan setujui permintaan izin untuk melanjutkan.'
   'The installation was cancelled at the Windows elevation prompt.' = 'Pemasangan dibatalkan pada permintaan izin Windows.'
   'Open the downloaded setup file again to retry.' = 'Buka kembali berkas pemasangan yang diunduh untuk mencoba ulang.'
@@ -263,7 +337,6 @@ $SetupIndonesian = @{
   'Return to Konteks and download a fresh setup file if a retry is needed.' = 'Kembali ke Konteks dan unduh berkas pemasangan baru jika perlu mencoba ulang.'
   'Update the connected runtime' = 'Perbarui runtime yang terhubung'
   'Updating the connected runtime...' = 'Memperbarui runtime yang terhubung...'
-  'Downloading and checking the release can take a few minutes.' = 'Mengunduh dan memeriksa rilis dapat memerlukan beberapa menit.'
   'Start and reconnect' = 'Mulai dan hubungkan kembali'
   'Starting the runtime...' = 'Memulai runtime...'
   'Connect this computer' = 'Hubungkan komputer ini'
@@ -302,10 +375,9 @@ function Get-SetupSha256([string]$Path) {
   }
 }
 
-$setupAction = if ($Update) { Get-SetupText "Updating this computer's existing Konteks connection." } else { Get-SetupText 'Connecting this computer to Konteks.' }
 $stageCount = if ($Update) { 4 } else { 3 }
 $restartNotice = $null
-Write-SetupStage (Get-SetupText 'Konteks runtime setup') @($setupAction, (Get-SetupText 'Keep this window open until setup finishes.'))
+Write-SetupIdentity (Get-SetupText 'Runtime setup')
 
 if ($User -or $Enroll) {
   Write-SetupStage (Get-SetupText 'Setup needs an activation') @(
@@ -360,7 +432,9 @@ try {
   if ([Enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') { $protocols = $protocols -bor [Net.SecurityProtocolType]'Tls13' }
   [Net.ServicePointManager]::SecurityProtocol = $protocols
   $activeStage = 'Download and verify'
-  Write-SetupStage (Get-SetupText '{0} of {1} - {2}' @(1, $stageCount, (Get-SetupText $activeStage))) @((Get-SetupText 'Fetching the signed release manifest...'))
+  Write-SetupStage (Get-SetupText '{0} of {1} - {2}' @(1, $stageCount, (Get-SetupText $activeStage))) @()
+  Write-SetupDiagnostic (Get-SetupText 'Fetching the signed release manifest...')
+  Start-SetupProgress (Get-SetupText 'Downloading and verifying')
   $sumsPath = Join-Path $work 'SHA256SUMS'
   $sigPath = Join-Path $work 'SHA256SUMS.sig'
   Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/SHA256SUMS" -OutFile $sumsPath
@@ -386,7 +460,7 @@ try {
   $expected = @([Text.Encoding]::UTF8.GetString($sums) -split "`r?`n" | Where-Object { $_ -match "^[0-9a-fA-F]{64}\s+\*?$([regex]::Escape($msi))$" } | ForEach-Object { ($_ -split '\s+')[0].ToLowerInvariant() })
   if ($expected.Count -ne 1) { throw (Get-SetupText 'the release manifest lists no single {0}; nothing was installed' @($msi)) }
   $msiPath = Join-Path $work $msi
-  Write-SetupDetail (Get-SetupText 'Downloading the Windows installer...')
+  Write-SetupDiagnostic (Get-SetupText 'Downloading the Windows installer...')
   Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$msi" -OutFile $msiPath
   $actual = Get-SetupSha256 $msiPath
   if ($expected[0] -ne $actual) { throw (Get-SetupText 'package checksum mismatch; nothing was installed') }
@@ -412,7 +486,7 @@ try {
     if ($ExpectedThumbprint -and $authenticode.SignerCertificate.Thumbprint -ne $ExpectedThumbprint) { throw (Get-SetupText 'package signer thumbprint mismatch; nothing was installed') }
   }
 
-  Write-SetupDetail (Get-SetupText 'Verified the Windows installer and signed release manifest.')
+  Write-SetupDiagnostic (Get-SetupText 'Verified the Windows installer and signed release manifest.')
   $activeStage = 'Install the Konteks command'
   # Windows Installer does not create the log's directory. Keep diagnostics
   # outside the temporary download folder so a failed install is inspectable.
@@ -420,10 +494,9 @@ try {
   New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
   $installerLog = Join-Path $logDirectory ("installer-" + [Guid]::NewGuid().ToString('n') + '.log')
   Write-SetupStage (Get-SetupText '{0} of {1} - {2}' @(2, $stageCount, (Get-SetupText $activeStage))) @(
-    (Get-SetupText 'Approve the Windows elevation prompt if it appears.'),
-    (Get-SetupText 'Installation can take a minute.'),
-    (Get-SetupText 'Keep this setup window open.')
+    (Get-SetupText 'Approve the Windows elevation prompt if it appears.')
   )
+  Start-SetupProgress (Get-SetupText 'Installing the Konteks command')
   try {
     $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', "`"$msiPath`"", '/qn', '/norestart', '/L*v', "`"$installerLog`"") -Verb RunAs -Wait -PassThru
   } catch {
@@ -471,6 +544,7 @@ try {
   # PowerShell ErrorRecord burying the actions. finally still removes downloads.
   exit 1
 } finally {
+  Stop-SetupProgress
   Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }
 
@@ -486,8 +560,7 @@ try {
     $activeStage = 'Update the connected runtime'
     $failedStage = $activeStage
     Write-SetupStage (Get-SetupText '{0} of {1} - {2}' @(3, 4, (Get-SetupText $activeStage))) @(
-      (Get-SetupText 'Updating the connected runtime...'),
-      (Get-SetupText 'Downloading and checking the release can take a few minutes.')
+      (Get-SetupText 'Updating the connected runtime...')
     )
     & $launcher update
     $code = $LASTEXITCODE

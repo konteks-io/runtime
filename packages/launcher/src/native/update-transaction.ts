@@ -9,11 +9,17 @@ import { isHostAgentId, nativeConnectorFileNames, resolveNativeConnectorExecutab
 import { NATIVE_SHUTDOWN_RECEIPT_FILE, assertLegacyCodexOwnerIdle, ownedByAnotherConnector, recordNativeUpdateAttempt, type NativeRuntimeRecord, type NativeUpdateAttempt } from "@konteks/remote-supervisor";
 import { SupervisorControl } from "../control.js";
 import type { NativeCommandContext } from "./cli.js";
-import { setupDuration, setupError, setupLine, setupLocale, setupText, setupWords, type SetupLocale } from "../setup-locale.js";
+import {
+  setupDetail,
+  setupDuration, setupError, setupLine, setupLocale,
+  setupProgress,
+  setupText, setupWords, type SetupLocale,
+} from "../setup-locale.js";
 import { readNativeRecord, restoreNativeRecord } from "./install.js";
 import { CONNECTOR_LOG_FILE, type NativeServiceCommand, type NativeServiceDefinition } from "./service.js";
 import { commitNativeUpdate, stageNativeUpdate, type NativeUpdateDeps, type NativeUpdateStage } from "./update.js";
 import { captureWindowsServiceOwner, endWindowsServiceTask, waitForWindowsServiceExit, type NativeServiceProcessOwner } from "./windows-service-owner.js";
+import { beginNativeUpdateProgress, type NativeUpdateProgressHandle } from "./update-progress.js";
 
 interface UpdateControlClient {
   call<T>(request: ControlRequest, schema: { parse(value: unknown): T }, options?: { timeoutMs?: number }): Promise<T>;
@@ -30,6 +36,12 @@ export interface NativeUpdateTransactionDeps {
   commit: (options: { root: string; releaseId: string; output: NativeCommandContext["output"] }) => Promise<NativeRuntimeRecord>;
   restore: (root: string, expectedReleaseId: string, previous: NativeRuntimeRecord) => Promise<void>;
   recordAttempt: (root: string, attempt: NativeUpdateAttempt) => Promise<unknown>;
+  /** Only a verified stage and a running enrolled service may announce execution to Core. */
+  beginProgress?: (input: {
+    root: string;
+    previous: NativeRuntimeRecord;
+    attempt: NativeUpdateAttempt;
+  }) => Promise<NativeUpdateProgressHandle | null>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   /** A fresh receipt is written only after this connector's shutdown steps succeed. */
@@ -97,6 +109,7 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
     commit: commitNativeUpdate,
     restore: restoreNativeRecord,
     recordAttempt: recordNativeUpdateAttempt,
+    beginProgress: beginNativeUpdateProgress,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     now: Date.now,
     startupProgress: async root => {
@@ -121,7 +134,8 @@ export function productionUpdateDeps(input: { serviceDefinition: NativeUpdateTra
  * here, so rollback needs no network. Outcomes land in the durable ledger the
  * supervisor consults before launching another attempt.
  */
-export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps): Promise<NativeUpdateOutcome> {
+export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps,
+): Promise<NativeUpdateOutcome> {
   setupLocale();
   const previous = await deps.readRecord(input.root);
   const staged = await stageOrRecordFailure(input, deps);
@@ -137,14 +151,42 @@ export async function runNativeUpdate(input: NativeUpdateInput, deps: NativeUpda
   };
   await deps.recordAttempt(input.root, attempt);
   const service = await readUpdateService(input, deps, attempt);
-  return new UpdateTransaction(input, deps, { previous, staged, attempt, ...service }).run();
+  const progress = service.wasRunning
+    ? await admittedProgress(input, deps, previous, attempt)
+    : null;
+  try {
+    const outcome = await new UpdateTransaction(input, deps, { previous, staged, attempt, ...service }).run();
+    await progress?.finish("succeeded").catch(() => undefined);
+    return outcome;
+  } catch (error) {
+    await progress?.finish("failed").catch(() => undefined);
+    throw error;
+  }
 }
 
-async function readUpdateService(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, attempt: NativeUpdateAttempt): Promise<{ definition: NativeServiceDefinition; wasRunning: boolean; owner: NativeServiceProcessOwner | null }> {
+async function admittedProgress(
+  input: NativeUpdateInput,
+  deps: NativeUpdateTransactionDeps,
+  previous: NativeRuntimeRecord,
+  attempt: NativeUpdateAttempt,
+): Promise<NativeUpdateProgressHandle | null> {
+  if (!deps.beginProgress) return null;
+  try {
+    const progress = await deps.beginProgress({ root: input.root, previous, attempt });
+    if (!progress) setupLine(input.output, "updateAppProgressUnavailable");
+    return progress;
+  } catch {
+    setupLine(input.output, "updateAppProgressUnavailable");
+    return null;
+  }
+}
+
+async function readUpdateService(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, attempt: NativeUpdateAttempt,
+): Promise<{ definition: NativeServiceDefinition; wasRunning: boolean; owner: NativeServiceProcessOwner | null }> {
   try {
     const definition = await deps.serviceDefinition(input.root);
     const status = await deps.execute(definition.status);
-    const owner = await deps.serviceOwner?.(input.root) ?? null;
+    const owner = (await deps.serviceOwner?.(input.root)) ?? null;
     assertUpdateTaskState(status, owner, deps);
     return { definition, wasRunning: status === 0 || owner !== null, owner };
   } catch (error) {
@@ -216,6 +258,8 @@ class UpdateTransaction {
     } catch (error) {
       await this.recover(errorText(error));
       throw error;
+    } finally {
+      this.input.output.finishProgress?.();
     }
   }
 
@@ -225,17 +269,23 @@ class UpdateTransaction {
     // could not be read, and then only the successor's own agents can count.
     const baseline = update.wasRunning ? await doctorStatuses(this.control).catch(() => null) : null;
     if (update.wasRunning) await this.stopPrevious();
+    setupProgress(input.output, "phaseInstall");
     const successor = await commitOnceReleased(input, update.staged.releaseId, deps);
     this.successor = successor;
     if (update.wasRunning) {
-      setupLine(input.output, "updateStarting", { version: successor.bundleVersion, duration: setupDuration(input.output, deps.healthDeadlineMs ?? 180_000) });
+      setupDetail(input.output, "updateStarting", { version: successor.bundleVersion, duration: setupDuration(input.output, deps.healthDeadlineMs ?? 180_000) });
+      setupProgress(input.output, "phaseStart");
       await deps.start(input);
+      setupProgress(input.output, "phaseHealth");
       await healthGate(input, deps.control(input.root, successor), { previous: update.previous, successor, baseline }, deps, update.definition);
     }
     await this.finish("applied", null);
     await this.refreshLauncher(successor);
     const outcome: NativeUpdateOutcome = { state: "updated", from: update.previous.bundleVersion, to: successor.bundleVersion, releaseId: successor.releaseId, previousReleaseId: update.previous.releaseId, restarted: update.wasRunning };
-    setupLine(input.output, "updateComplete", { from: outcome.from, to: outcome.to, previous: update.previous.releaseId });
+    setupDetail(input.output, "updateComplete", { from: outcome.from, to: outcome.to, previous: update.previous.releaseId });
+    setupLine(input.output, update.wasRunning ? "updateFinished" : "updateInstalled", {
+      version: outcome.to,
+    });
     input.output.result(outcome);
     return outcome;
   }
@@ -252,8 +302,8 @@ class UpdateTransaction {
     await drain(input, this.control, deps);
     if (update.previous.agents.includes("codex")) await this.codexPreflight();
     await this.captureStartedOwner();
-    const previousReceipt = await deps.readStopReceipt?.(input.root) ?? null;
-    this.oldPid = await deps.servicePid?.(update.definition).catch(() => null) ?? null;
+    const previousReceipt = (await deps.readStopReceipt?.(input.root)) ?? null;
+    this.oldPid = (await deps.servicePid?.(update.definition).catch(() => null)) ?? null;
     await this.requestStop();
     this.stopped = true;
     await waitForServiceExit(input, update.definition, deps, previousReceipt, this.oldPid, update.owner);
@@ -261,7 +311,7 @@ class UpdateTransaction {
 
   private async captureStartedOwner(): Promise<void> {
     if (this.update.owner !== null) return;
-    this.update.owner = await this.deps.serviceOwner?.(this.input.root) ?? null;
+    this.update.owner = (await this.deps.serviceOwner?.(this.input.root)) ?? null;
   }
 
   private async requestStop(): Promise<void> {
@@ -271,7 +321,7 @@ class UpdateTransaction {
       });
       return;
     }
-    if (await this.deps.execute(this.update.definition.stop) !== 0) {
+    if ((await this.deps.execute(this.update.definition.stop)) !== 0) {
       await this.cancelDrain();
       throw setupError("temporarily_unavailable", "updateStopFailed");
     }
@@ -357,8 +407,10 @@ class UpdateTransaction {
 
 /** An older connector refuses an op its closed control protocol does not have. */
 function closedProtocolRefusal(error: unknown): boolean {
-  return error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" &&
-    error.message === "control_request_invalid: request does not match the closed control protocol";
+  return (
+    error instanceof RemoteInstanceError && error.code === "temporarily_unavailable" &&
+    error.message === "control_request_invalid: request does not match the closed control protocol"
+  );
 }
 
 /**
@@ -369,10 +421,14 @@ function closedProtocolRefusal(error: unknown): boolean {
  * no lock, and the next start recovers what it journaled. One that outlives
  * the grace has its processes ended.
  */
-function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null, pid: number | null, owner: NativeServiceProcessOwner | null = null): Promise<void> {
+function waitForServiceExit(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, previousReceipt: string | null, pid: number | null, owner: NativeServiceProcessOwner | null = null,
+): Promise<void> {
   if (owner) return waitForWindowsServiceExit(owner, definition, {
-    ...deps, waiting: progressLines(input, deps, setupWords(input.output, "updateStopping"), setupWords(input.output, "updateStillStopping")),
-  }, input.output);
+    ...deps, waiting: progressLines(input, deps, setupWords(input.output, "updateStopping"), setupWords(input.output, "updateStillStopping"),
+          "phaseStop",
+        ),
+  }, input.output,
+    );
   return new ServiceExitWait(input, definition, deps, previousReceipt, pid).run();
 }
 
@@ -396,7 +452,9 @@ class ServiceExitWait {
     this.started = deps.now();
     this.graceMs = Math.min(deps.stopGraceMs ?? 30_000, this.stopMs);
     this.watched = pid !== null && deps.processAlive ? { pid, alive: deps.processAlive } : null;
-    this.progress = progressLines(input, deps, setupWords(input.output, "updateStopping"), setupWords(input.output, "updateStillStopping"));
+    this.progress = progressLines(input, deps, setupWords(input.output, "updateStopping"), setupWords(input.output, "updateStillStopping"),
+      "phaseStop",
+    );
   }
 
   async run(): Promise<void> {
@@ -412,7 +470,10 @@ class ServiceExitWait {
   private async exited(): Promise<boolean> {
     const status = await this.deps.execute(this.definition.status);
     this.gone = this.watched !== null && !this.watched.alive(this.watched.pid);
-    return serviceIsStopped(status, this.deps) && await stopConfirmed(this.input, this.deps, this.gone, this.previousReceipt);
+    return (
+      serviceIsStopped(status, this.deps) &&
+      (await stopConfirmed(this.input, this.deps, this.gone, this.previousReceipt))
+    );
   }
 
   /** One that outlives the grace has its processes ended, once. */
@@ -462,18 +523,20 @@ async function restartUnchanged(input: NativeUpdateInput, definition: NativeServ
   setupLine(input.output, back ? "updateUnchangedRestored" : "updateUnchangedWaiting", { version: previous.bundleVersion });
 }
 
-async function endOwnedForRestart(owner: NativeServiceProcessOwner, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
-  if (!await owner.alive()) return;
+async function endOwnedForRestart(owner: NativeServiceProcessOwner, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps,
+): Promise<void> {
+  if (!(await owner.alive())) return;
   await endWindowsServiceTask(definition, deps.execute);
   await owner.terminate();
 }
 
-async function endLingeringService(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, pid: number | null): Promise<void> {
-  const running = async () => await deps.execute(definition.status).catch(() => 0) === 0;
-  if (!await running()) return;
+async function endLingeringService(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, pid: number | null,
+): Promise<void> {
+  const running = async () => (await deps.execute(definition.status).catch(() => 0)) === 0;
+  if (!(await running())) return;
   if (pid !== null && deps.killProcessGroup) await deps.killProcessGroup(pid, input.root).catch(() => undefined);
   else await deps.forceStop?.(definition).catch(() => undefined);
-  for (let poll = 0; poll < 10 && await running(); poll += 1) await deps.sleep(cappedPoll(deps, 1_000));
+  for (let poll = 0; poll < 10 && (await running()); poll += 1) await deps.sleep(cappedPoll(deps, 1_000));
 }
 
 function processAlive(pid: number): boolean {
@@ -499,8 +562,9 @@ async function endProcessGroup(pid: number, root: string): Promise<void> {
  * keeps this computer connected; a successor whose shutdown fails writes no
  * receipt. A stop that does not finish ends the service's process group.
  */
-async function stopForRollback(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
-  const owner = await deps.serviceOwner?.(input.root) ?? null;
+async function stopForRollback(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps,
+): Promise<void> {
+  const owner = (await deps.serviceOwner?.(input.root)) ?? null;
   if (owner) return stopOwnedForRollback(input, definition, deps, owner);
   await stopManagedForRollback(input, definition, deps);
 }
@@ -511,12 +575,16 @@ async function stopOwnedForRollback(input: NativeUpdateInput, definition: Native
   await waitForServiceExit(input, definition, deps, null, owner.pid, owner);
 }
 
-async function stopManagedForRollback(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps): Promise<void> {
+async function stopManagedForRollback(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps,
+): Promise<void> {
   await deps.execute(definition.stop).catch(() => null);
-  const running = async () => !serviceIsStopped(await deps.execute(definition.status).catch(() => deps.serviceOwner ? null : 0), deps);
+  const running = async () => !serviceIsStopped(await deps.execute(definition.status).catch(() => (deps.serviceOwner ? null : 0)), deps,
+    );
   const stopMs = deps.stopDeadlineMs ?? 90_000;
   const deadline = deps.now() + stopMs;
-  const progress = progressLines(input, deps, setupWords(input.output, "updateRollbackStopping"), setupWords(input.output, "updateRollbackStillStopping"));
+  const progress = progressLines(input, deps, setupWords(input.output, "updateRollbackStopping"), setupWords(input.output, "updateRollbackStillStopping"),
+    "phaseStop",
+  );
   let forced = false;
   while (await running()) {
     if (deps.now() >= deadline) {
@@ -532,8 +600,9 @@ async function stopManagedForRollback(input: NativeUpdateInput, definition: Nati
 }
 
 /** Last resort after a failed rollback: whatever release the record names runs, rather than none. */
-async function keepServiceRunning(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, record: NativeRuntimeRecord): Promise<void> {
-  if (await deps.execute(definition.status).catch(() => null) === 0) return;
+async function keepServiceRunning(input: NativeUpdateInput, definition: NativeServiceDefinition, deps: NativeUpdateTransactionDeps, record: NativeRuntimeRecord,
+): Promise<void> {
+  if ((await deps.execute(definition.status).catch(() => null)) === 0) return;
   try {
     await deps.start(input);
     setupLine(input.output, "updateRestarted", { version: record.bundleVersion });
@@ -556,11 +625,16 @@ async function answersAgain(input: NativeUpdateInput, control: UpdateControlClie
 }
 
 /**
- * A wait the person watches: say once what is happening and roughly how long
- * it takes, then only every ten seconds how long it has been, so a normal wait
- * never reads as a loop.
+ * An interactive foreground row follows the wait; other outputs retain the
+ * first explanation and a bounded elapsed line every ten seconds.
  */
-function progressLines(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, first: string, again: string): () => void {
+function progressLines(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, first: string, again: string,
+  phase: "phaseStop" | "phaseInstall" | "phaseHealth" = "phaseHealth",
+): () => void {
+  if (input.output.progress) {
+    setupProgress(input.output, phase);
+    return () => { /* already gone */ };
+  }
   const started = deps.now();
   let said = -1;
   return () => {
@@ -578,9 +652,12 @@ function commitOnceReleased(input: NativeUpdateInput, releaseId: string, deps: N
 function restoreOnceReleased(input: NativeUpdateInput, expectedReleaseId: string, previous: NativeRuntimeRecord, deps: NativeUpdateTransactionDeps): Promise<void> {
   return onceReleased(input, deps, () => deps.restore(input.root, expectedReleaseId, previous));
 }
-async function onceReleased<T>(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, operation: () => Promise<T>): Promise<T> {
+async function onceReleased<T>(input: NativeUpdateInput, deps: NativeUpdateTransactionDeps, operation: () => Promise<T>,
+): Promise<T> {
   const deadline = deps.now() + (deps.stopDeadlineMs ?? 90_000);
-  const progress = progressLines(input, deps, setupWords(input.output, "updateWaitingFiles"), setupWords(input.output, "updateStillWaitingFiles"));
+  const progress = progressLines(input, deps, setupWords(input.output, "updateWaitingFiles"), setupWords(input.output, "updateStillWaitingFiles"),
+    "phaseInstall",
+  );
   for (;;) {
     try {
       return await operation();
@@ -592,7 +669,9 @@ async function onceReleased<T>(input: NativeUpdateInput, deps: NativeUpdateTrans
   }
 }
 
-async function drain(input: NativeUpdateInput, control: UpdateControlClient, deps: NativeUpdateTransactionDeps): Promise<void> {
+async function drain(input: NativeUpdateInput, control: UpdateControlClient, deps: NativeUpdateTransactionDeps,
+): Promise<void> {
+  setupProgress(input.output, "phaseDrain");
   await control.call({ op: "drain", reason: "update" }, z.unknown());
   const deadline = deps.now() + (deps.drainDeadlineMs ?? 15 * 60_000);
   for (;;) {
@@ -604,7 +683,7 @@ async function drain(input: NativeUpdateInput, control: UpdateControlClient, dep
       await control.call({ op: "drain.cancel" }, z.unknown()).catch(() => undefined);
       throw setupError("active_work", "updateActiveTimedOut");
     }
-    setupLine(input.output, "updateWaitingAssignments", { number: state.activeAssignments });
+    setupDetail(input.output, "updateWaitingAssignments", { number: state.activeAssignments });
     await deps.sleep(deps.pollMs ?? 5_000);
   }
 }
@@ -628,11 +707,14 @@ async function failingDoctorDetails(control: UpdateControlClient): Promise<Map<s
  * informational (an agent check for an agent this computer never added),
  * except the check of an agent the successor itself must run.
  */
-function introducedByUpdate(id: string, baseline: ReadonlyMap<string, string> | null, successor: NativeRuntimeRecord): boolean {
+function introducedByUpdate(id: string, baseline: ReadonlyMap<string, string> | null, successor: NativeRuntimeRecord,
+): boolean {
   const before = baseline?.get(id);
   if (before !== undefined) return before !== "fail";
   const agentId = id.startsWith("agent-") ? id.slice("agent-".length) : null;
-  return agentId !== null && (successor.agents as readonly string[]).includes(agentId) && !isHostAgentId(agentId);
+  return (
+    agentId !== null && (successor.agents as readonly string[]).includes(agentId) && !isHostAgentId(agentId)
+  );
 }
 
 /**
@@ -642,10 +724,11 @@ function introducedByUpdate(id: string, baseline: ReadonlyMap<string, string> | 
  * replaced without elevation, and it runs the installed release's own
  * executable instead (`launcher-delegate.ts`).
  */
-export async function refreshInstalledLauncher(root: string, record: NativeRuntimeRecord): Promise<boolean> {
+export async function refreshInstalledLauncher(root: string, record: NativeRuntimeRecord,
+): Promise<boolean> {
   if (process.platform === "win32") return false;
   const target = join(root, "bin", "konteks-remote");
-  if (!await stat(target).then(info => info.isFile(), () => false)) return false;
+  if (!(await stat(target).then(info => info.isFile(), () => false))) return false;
   const source = await resolveNativeConnectorExecutable(join(root, "releases", record.releaseId), process.platform === "darwin" ? "macos" : "debian");
   if (await sameContents(source, target)) return false;
   const staged = `${target}.update-${process.pid}`;
@@ -692,13 +775,14 @@ interface KeepLauncherCurrentDeps {
  * update is still checking this release, and leaves it alone unless this
  * process is the release the record names.
  */
-export async function keepLauncherCurrent(root: string, deps: KeepLauncherCurrentDeps): Promise<"refreshed" | "current" | "skipped"> {
+export async function keepLauncherCurrent(root: string, deps: KeepLauncherCurrentDeps,
+): Promise<"refreshed" | "current" | "skipped"> {
   if (!(nativeConnectorFileNames(hostOs()) as string[]).includes(basename(deps.execPath))) return "skipped";
   for (;;) {
     const record = await deps.readRecord(root);
     if (resolve(dirname(deps.execPath)) !== resolve(root, "releases", record.releaseId)) return "skipped";
     const ledger = await deps.readLedger(root).catch(() => ({ attempts: [] }));
-    if (!stillChecking(ledger.attempts, record, deps)) return await deps.refresh(root, record) ? "refreshed" : "current";
+    if (!stillChecking(ledger.attempts, record, deps)) return (await deps.refresh(root, record)) ? "refreshed" : "current";
     await deps.sleep(deps.pollMs ?? 5_000);
   }
 }
@@ -818,7 +902,7 @@ function probeTimeoutFailure(state: ProbeState): RemoteInstanceError {
  * three minutes. Only a successor that stops making progress is rolled back.
  */
 async function extendOnProgress(clock: GateClock): Promise<void> {
-  const mark = await clock.deps.startupProgress?.(clock.root).catch(() => null) ?? null;
+  const mark = (await clock.deps.startupProgress?.(clock.root).catch(() => null)) ?? null;
   if (mark === null) return;
   if (clock.progressMark !== undefined && mark !== clock.progressMark) clock.deadline = clock.deps.now() + clock.quietMs;
   clock.progressMark = mark;

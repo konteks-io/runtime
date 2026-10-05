@@ -31,11 +31,19 @@ describe("native host inventory", () => {
   it('advertises delivery separately and removes it when ownership or local-agent readiness is lost', async () => {
     let owned = true;
     const f = fixture(() => true, undefined, () => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(['agent:codex', 'execution-permits-v1', 'delivery-execution-permits-v1', 'delivery-turn-renewal-v1', 'session-label-v1', 'core-contract-version-v1']);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual([
+      "agent:codex",
+      "execution-permits-v1",
+      "direct-model-fallback.v1",
+      'delivery-execution-permits-v1',
+      'delivery-turn-renewal-v1',
+      "session-label-v1",
+      "core-contract-version-v1",
+    ]);
     owned = false;
     expect((await f.inventory.collect()).components[0]?.capabilities).not.toContain('delivery-execution-permits-v1');
     owned = true;
-    f.readiness.mockResolvedValue({ agent: { ...agent, readiness: 'not_configured' }, utilization: { activeSessions: 0, activeTurns: 0 } });
+    f.readiness.mockResolvedValue({ agent: { ...agent, readiness: "not_configured" }, utilization: { activeSessions: 0, activeTurns: 0 } });
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["core-contract-version-v1"]);
   });
   it("offers a login from the site even while the agent is signed out, and Claude Code's only with a desktop", async () => {
@@ -73,7 +81,9 @@ describe("native host inventory", () => {
   it("advertises permit admission only while a live owner and ready agent exist", async () => {
     let owned = true;
     const f = fixture(() => owned);
-    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "execution-permits-v1", "session-label-v1", "core-contract-version-v1"]);
+    expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "execution-permits-v1", "direct-model-fallback.v1",
+      "session-label-v1", "core-contract-version-v1",
+    ]);
     owned = false;
     expect((await f.inventory.collect()).components[0]?.capabilities).toEqual(["agent:codex", "session-label-v1", "core-contract-version-v1"]);
     owned = true;

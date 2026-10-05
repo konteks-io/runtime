@@ -20,6 +20,11 @@ import type { RunnerEventBus } from "../events.js";
 import type { HostPromptPrelude, HostPromptSession, HostTurnError } from "../host/host-agent.js";
 import { konteksAgentTitledMetadata, konteksCodingSessionTitle, konteksSessionMetadata, type KonteksSessionLabel } from "./title.js";
 import type { MeasuredTurn } from "./usage-label.js";
+import {
+  assertConfirmedDirectModelSelection,
+  prepareDirectModelSelection,
+} from "./model-selection.js";
+import type { DirectModelSelection, DirectModelSelectionPolicy } from "@konteks/remote-common";
 
 /**
  * ACP sessions inside this runner. The supervisor creates them as a
@@ -46,6 +51,8 @@ interface CreateSessionArgs {
   mcpServers: McpServer[];
   /** ACP session-config selections from the assignment (`agentRoute.sessionConfig`). */
   sessionConfig?: Record<string, string>;
+  modelSelectionPolicy?: DirectModelSelectionPolicy;
+  modelSelection?: DirectModelSelection;
   /** Opaque ref from a prior turn on this runtime; loaded/resumed only when the bridge proves it. */
   acpSessionRef?: string;
   /** Restart recovery whose durable context was staged outside the provider transcript. */
@@ -86,6 +93,7 @@ export interface CreatedSession {
   acpSessionRef: string;
   resumed: boolean;
   capabilities: { forkSession: boolean; sessionResume: boolean };
+  modelSelection?: DirectModelSelection;
 }
 
 interface SessionRecord {
@@ -134,6 +142,8 @@ const REFUSED_MODEL_MESSAGE = "That model is not available to this agent here. O
 type AcpNativeObservation = z.infer<typeof AcpNativeObservationSchema>;
 
 export interface SessionManagerOptions {
+  /** The signed bridge's raw-list marker, required rather than trusting an injected current menu value. */
+  requireRawModelOffer?: true;
   bridge: () => BridgeProcess | null;
   /** Native execution allocator; called only after the durable ref reservation. */
   createBridge?: (acpSessionRef: string, lifecycle?: CreateSessionArgs["lifecycle"], cwd?: string) => Promise<{ bridge: BridgeProcess; bootstrapAttempt: number }>;
@@ -216,9 +226,10 @@ function modelValues(configOptions: unknown): string[] {
   if (!Array.isArray(configOptions)) return [];
   const option = configOptions.find((entry: unknown) => (entry as { id?: unknown })?.id === "model" && (entry as { type?: unknown }).type === "select") as { options?: unknown } | undefined;
   if (!Array.isArray(option?.options)) return [];
-  return (option.options as unknown[]).flatMap(entry => {
+  return (option.options as unknown[]).flatMap((entry) => {
     const group = entry as { options?: unknown; value?: unknown };
-    const values = Array.isArray(group.options) ? group.options as Array<{ value?: unknown }> : [group];
+    const values = Array.isArray(group.options) ? (group.options as Array<{ value?: unknown }>)
+      : [group];
     return values.map(value => value.value).filter((value): value is string => typeof value === "string");
   });
 }
@@ -230,7 +241,9 @@ export interface SessionRefStore {
 
 /** A JSON-RPC "invalid params" refusal from the agent (ACP RequestError -32602). */
 function isInvalidParams(error: unknown): boolean {
-  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === -32602;
+  return (
+    typeof error === "object" && error !== null && (error as { code?: unknown }).code === -32602
+  );
 }
 
 export class InMemorySessionRefStore implements SessionRefStore {
@@ -476,9 +489,11 @@ export class SessionManager {
   }
 
   /** Exponential backoff with jitter, never past the readiness deadline. */
-  private async bootstrapBackoff(args: CreateSessionArgs, bootstrapAttempt: number, remainingMs: number): Promise<void> {
-    const exponentialMs = 500 * (2 ** (bootstrapAttempt - 1));
-    const delayMs = Math.min(remainingMs, 2_000, Math.max(1, Math.round(exponentialMs * (0.75 + (this.bootstrapRetryRandom() * 0.5)))));
+  private async bootstrapBackoff(args: CreateSessionArgs, bootstrapAttempt: number, remainingMs: number,
+  ): Promise<void> {
+    const exponentialMs = 500 * 2 ** (bootstrapAttempt - 1);
+    const delayMs = Math.min(remainingMs, 2_000, Math.max(1, Math.round(exponentialMs * (0.75 + this.bootstrapRetryRandom() * 0.5))),
+    );
     this.logger.warn({ ...contextLog(args), bootstrapAttempt, nextBootstrapAttempt: bootstrapAttempt + 1, maxBootstrapAttempts: 4, delayMs, recovery: "fresh_bridge" },
       "retrying ACP session bootstrap with exponential backoff");
     await this.bootstrapRetrySleep(delayMs);
@@ -494,7 +509,8 @@ export class SessionManager {
     if (reservedBridgeId !== null) this.creatingBridgeIds.delete(reservedBridgeId);
   }
 
-  private async createImpl(args: CreateSessionArgs, acpSessionRef: string, reserveBridgeId: (id: string) => void, bridge: BridgeProcess, loadFromRef: string | undefined, bootstrapAttempt: number): Promise<CreatedSession> {
+  private async createImpl(args: CreateSessionArgs, acpSessionRef: string, reserveBridgeId: (id: string) => void, bridge: BridgeProcess, loadFromRef: string | undefined, bootstrapAttempt: number,
+  ): Promise<CreatedSession> {
     if (bridge.exited) throw new RemoteInstanceError("agent_unavailable", "Creating bridge has exited.");
     const capabilities = capabilitiesOf(bridge);
     // The Claude SDK persists its deferred-tool registry in the provider
@@ -516,8 +532,10 @@ export class SessionManager {
       try { this.options.verifySession(opened.response); }
       catch (error) { throw fenceRecord(record, error); }
     }
-    await this.applySessionConfig(args, record, opened.response.configOptions, opened.resumed, bootstrapAttempt);
-    return { acpSessionRef, resumed: opened.resumed, capabilities };
+    const modelSelection = await this.applySessionConfig(args, record, opened.response.configOptions, opened.resumed, bootstrapAttempt);
+    return { acpSessionRef, resumed: opened.resumed, capabilities,
+      ...(modelSelection ? { modelSelection } : {}),
+    };
   }
 
   /** The prior provider session, resumed (or loaded) with this assignment's tools: identity is kept, tool authority is not. */
@@ -602,9 +620,11 @@ export class SessionManager {
    * admitted requirement, never a best-effort hint. Do not publish ready
    * until the bridge explicitly echoes each selected value.
    */
-  private async applySessionConfig(args: CreateSessionArgs, record: SessionRecord, configOptions: unknown, resumed: boolean, bootstrapAttempt: number): Promise<void> {
+  private async applySessionConfig(args: CreateSessionArgs, record: SessionRecord, configOptions: unknown, resumed: boolean, bootstrapAttempt: number,
+  ): Promise<DirectModelSelection | undefined> {
     const confirmed = new Map<string, string>();
     const sessionConfig = { ...(args.sessionConfig ?? {}) };
+    const modelSelection = this.directModelConfig(args, record, sessionConfig, configOptions);
     const model = this.substituteModel(args, record, sessionConfig, configOptions);
     if (model !== undefined) sessionConfig.model = model;
     for (const [configId, value] of Object.entries(sessionConfig)) {
@@ -619,11 +639,38 @@ export class SessionManager {
         // ACP returns the full configuration. Later selections must not reset
         // an earlier requirement (for example, changing effort resets model).
         assertSelections(result.configOptions, confirmed);
+        assertConfirmedDirectModelSelection(
+          modelSelection,
+          result.configOptions,
+          confirmed,
+          this.options.requireRawModelOffer === true,
+        );
       } catch (error) {
         throw this.unconfirmedConfig(error, args, record, resumed);
       }
       this.requireBridge(record);
       args.lifecycle?.assertCurrent();
+    }
+    return modelSelection;
+  }
+
+  private directModelConfig(
+    args: CreateSessionArgs,
+    record: SessionRecord,
+    config: Record<string, string>,
+    options: unknown,
+  ): DirectModelSelection | undefined {
+    try {
+      const selection = prepareDirectModelSelection(
+        args,
+        options,
+        this.options.requireRawModelOffer === true,
+      );
+      if (selection) config[selection.configId] = selection.effectiveValue;
+      this.assertAdmittedModes(config);
+      return selection;
+    } catch (error) {
+      throw fenceRecord(record, error);
     }
   }
 
@@ -763,13 +810,32 @@ export class SessionManager {
     record.assertCurrent?.();
     try {
       const refreshed = await this.refreshLiveAuthority(bridge, record, args);
-      this.options.verifySession?.(refreshed ?? {});
-      record.assertCurrent?.();
-      await confirmLiveConfig(bridge, record, args.sessionConfig ?? {});
-      return { acpSessionRef: ref, resumed: true, capabilities: capabilitiesOf(bridge) };
+      const modelSelection = await this.confirmContinuation(args, record, refreshed);
+      return { acpSessionRef: ref, resumed: true, capabilities: capabilitiesOf(bridge),
+        ...(modelSelection ? { modelSelection } : {}),
+      };
     } catch (error) {
       throw fenceRecord(record, error);
     }
+  }
+
+  private async confirmContinuation(
+    args: CreateSessionArgs,
+    record: SessionRecord,
+    refreshed: BootstrapResponse | null | undefined,
+  ): Promise<DirectModelSelection | undefined> {
+    this.options.verifySession?.(refreshed ?? {});
+      record.assertCurrent?.();
+    const config = { ...(args.sessionConfig ?? {}) };
+    const modelSelection = this.directModelConfig(args, record, config, refreshed?.configOptions);
+    await confirmLiveConfig(
+      record.bridge,
+      record,
+      config,
+      modelSelection,
+      this.options.requireRawModelOffer === true,
+    );
+      return modelSelection;
   }
 
   /** The idle sealed session of the same instance and agent that a live continuation adopts. */
@@ -854,7 +920,7 @@ export class SessionManager {
   closeAll(reason: "agent_exited" | "closed", bridge?: BridgeProcess): void {
     for (const ref of [...this.sessions.keys()]) {
       const record = this.sessions.get(ref);
-      if (!record || bridge && record.bridge !== bridge) continue;
+      if (!record || (bridge && record.bridge !== bridge)) continue;
       for (const pending of record.pendingClientRequests.values()) pending.reject(new Error(reason));
       if (record.recoveryStopping || this.creatingRefs.has(ref)) { record.operationFailed = true; continue; }
       this.sessions.delete(ref);
@@ -1072,7 +1138,8 @@ export class SessionManager {
   private refusesMode(modeId: unknown): boolean {
     const refused = this.options.refusedModes;
     if (typeof modeId !== "string" || !refused) return false;
-    return refused.modeIds.includes(modeId) || (refused.allowedModeIds !== undefined && !refused.allowedModeIds.includes(modeId));
+    return (
+      refused.modeIds.includes(modeId) || (refused.allowedModeIds !== undefined && !refused.allowedModeIds.includes(modeId)));
   }
 
   /** One immutable policy baseline for every provider-session entry path. */
@@ -1099,7 +1166,9 @@ export class SessionManager {
   }
 
   private refusesModel(value: unknown): boolean {
-    return typeof value === "string" && this.options.modelAllowed !== undefined && !this.options.modelAllowed(value);
+    return (
+      typeof value === "string" && this.options.modelAllowed !== undefined && !this.options.modelAllowed(value)
+    );
   }
 
   /** Refuse a mode change before it reaches the agent; answered like the agent's own invalid-params error. */
@@ -1210,10 +1279,11 @@ export class SessionManager {
    * dropped, so a Codex QA could never return a verdict. A turn the
    * connector did not open stays unclassified.
    */
-  private attributeNativeTurn(record: SessionRecord, sessionUpdate: string, observation: AcpNativeObservation): AcpNativeObservation {
+  private attributeNativeTurn(record: SessionRecord, sessionUpdate: string, observation: AcpNativeObservation,
+  ): AcpNativeObservation {
     if (sessionUpdate === "user_message_chunk") {
       if (observation.origin === "connector") {
-        const turns = record.connectorTurns ??= new Set();
+        const turns = (record.connectorTurns ??= new Set());
         turns.add(observation.turnId);
         if (turns.size > MAX_CONNECTOR_TURNS) turns.delete(turns.values().next().value!);
       }
@@ -1373,7 +1443,9 @@ function remainingReadinessMs(args: CreateSessionArgs, now: Date): number {
 }
 
 function isRetryableBootstrapDeadline(error: unknown): boolean {
-  return error instanceof RemoteInstanceError && error.retryable && error.diagnostic?.startsWith("acp_") === true && error.diagnostic.endsWith("_deadline");
+  return (
+    error instanceof RemoteInstanceError && error.retryable && error.diagnostic?.startsWith("acp_") === true && error.diagnostic.endsWith("_deadline")
+  );
 }
 
 function contextLog(args: CreateSessionArgs): { assignmentId: string; attempt: number; agentId: string } {
@@ -1398,23 +1470,38 @@ function assertSelections(configOptions: ReadonlyArray<{ id: string; type: strin
 }
 
 /** Each admitted selection, set and echoed back one at a time on the live session. */
-async function confirmLiveConfig(bridge: BridgeProcess, record: SessionRecord, sessionConfig: Readonly<Record<string, string>>): Promise<void> {
+async function confirmLiveConfig(bridge: BridgeProcess, record: SessionRecord, sessionConfig: Readonly<Record<string, string>>,
+  modelSelection: DirectModelSelection | undefined,
+  requireRaw: boolean,
+): Promise<void> {
+  const confirmed = new Map<string, string>();
   for (const [configId, value] of Object.entries(sessionConfig)) {
     const result = await bridge.connection.setSessionConfigOption({ sessionId: record.bridgeSessionId, configId, value });
-    assertSelections(result.configOptions, new Map([[configId, value]]));
+    confirmed.set(configId, value);
+    assertSelections(result.configOptions, confirmed);
+    assertConfirmedDirectModelSelection(
+      modelSelection,
+      result.configOptions,
+      confirmed,
+      requireRaw,
+    );
     record.assertCurrent?.();
   }
 }
 
 /** No failed, running or outstanding work on the record, and its bridge still lives. */
 function settledOn(record: SessionRecord, bridge: BridgeProcess): boolean {
-  return !record.operationFailed && record.activeTurns === 0 && record.operations.size === 0 && !bridge.exited;
+  return (
+    !record.operationFailed && record.activeTurns === 0 && record.operations.size === 0 && !bridge.exited
+  );
 }
 
 /** A sealed completion with no turn, operation or pending request, not fenced. */
 function idleSealed(record: SessionRecord): boolean {
-  return record.continuationSealed && !record.recoveryStopping && !record.operationFailed && record.activeTurns === 0 &&
-    record.operations.size === 0 && record.pendingClientRequests.size === 0;
+  return (
+    record.continuationSealed && !record.recoveryStopping && !record.operationFailed && record.activeTurns === 0 &&
+    record.operations.size === 0 && record.pendingClientRequests.size === 0
+  );
 }
 
 function sameAgent(a: CreateSessionArgs["context"], b: CreateSessionArgs["context"]): boolean {

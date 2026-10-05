@@ -151,8 +151,9 @@ test("the reviewed bridge disables configured MCP servers on every thread start,
   assert.match(source, /async createSessionConfig\(projectPath, additionalDirectories, mcpServers, admittedMcpServerNames = \[\]\) \{/);
   assert.match(source, /const disabledMcpServers = konteksCodexMcpServers\(existingMcpServerNames, requestedServers\.map\(\(mcp\) => mcp\.name\), admittedMcpServerNames\.map\(sanitizeMcpServerName\)\);/);
   assert.doesNotMatch(source, /shouldDeduplicateMcpConflicts\(\)\) \{\n      const existingNames/);
-  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v9");
-});
+  assert.equal(codexAcpLiveUserPatch.id, "konteks-codex-acp-live-user-v11");
+},
+);
 
 test("an integration session admits only the bound personal server, read from its own session/new", async () => {
   const { konteksAdmittedMcpServerNames } = await import("./codex-acp-live-user-patch.mjs");
@@ -191,6 +192,132 @@ test("a direct session keeps the agent's own title behind one [konteks] prefix",
 
 // Build qualification supplies the pristine upstream dist directory.
 const fixture = process.env.CODEX_ACP_FIXTURE_DIR;
+function codexModelOption() {
+  const original = readFileSync(join(fixture, "index.js"), "utf8");
+  const patched = patchCodexAcpLiveUsers(original, codexAcpLiveUserPatch.version).source;
+  const start = patched.indexOf(
+    "function createModelConfigOption(availableModels, currentBaseModelId) {",
+  );
+  const end = patched.indexOf("\nfunction createReasoningEffortConfigOption(", start);
+  assert.ok(start >= 0 && end > start, "the reviewed Codex model option section moved");
+  return new Function(
+    "MODEL_CONFIG_ID",
+    `${patched.slice(start, end)}\nreturn createModelConfigOption;`,
+  )("model");
+}
+
+test(
+  "Codex model provenance excludes the injected unsupported current value and identifies only its explicit default",
+  { skip: !fixture },
+  () => {
+    const create = codexModelOption();
+    const option = create(
+      [{ id: "supported-default", displayName: "Supported", isDefault: true }],
+      "gpt-6.1-sol",
+    );
+    // Upstream personal configuration semantics remain unchanged.
+    assert.equal(option.currentValue, "gpt-6.1-sol");
+    assert.deepEqual(
+      option.options.map((entry) => entry.value),
+      ["gpt-6.1-sol", "supported-default"],
+    );
+    assert.deepEqual(option._meta?.konteksModelOffer, {
+      source: "codex-model-list.v1",
+      offeredValues: ["supported-default"],
+      defaultValue: "supported-default",
+    });
+  },
+);
+
+test(
+  "Codex model provenance retains exact ACP values and never guesses an ambiguous or absent default",
+  { skip: !fixture },
+  () => {
+    const create = codexModelOption();
+    const models = [
+      { id: "supported/variant", displayName: "Variant", isDefault: true },
+      { id: "other", isDefault: true },
+    ];
+    const option = create(models, "supported/variant");
+    assert.deepEqual(option._meta?.konteksModelOffer, {
+      source: "codex-model-list.v1",
+      offeredValues: ["supported/variant", "other"],
+      defaultValue: null,
+    });
+    assert.equal(
+      create([{ id: "listed", isDefault: false }], "listed")._meta?.konteksModelOffer.defaultValue,
+      null,
+    );
+    assert.equal(create([], "unlisted")._meta?.konteksModelOffer.defaultValue, null);
+  },
+);
+
+function backgroundCodexSpawner(platform) {
+  const original = readFileSync(join(fixture, "index.js"), "utf8");
+  const patched = patchCodexAcpLiveUsers(original, codexAcpLiveUserPatch.version).source;
+  const start = patched.indexOf("function startCodexConnection(codexPath, env) {");
+  const end = patched.indexOf("\nfunction attachLogs(proc)", start);
+  assert.ok(start >= 0 && end > start, "the background Codex connection section moved");
+  const connection = { listen() {}, dispose() {} };
+  const calls = [];
+  const spawn = (...args) => {
+    calls.push(args);
+    return { stdout: {}, stdin: {}, on() {} };
+  };
+  // Substitute import.meta only to evaluate this reviewed function with inert boundaries.
+  const source = patched.slice(start, end)
+    .replace("createRequire(import.meta.url)", "createRequire('file:///fixture.js')");
+  const startConnection = new Function(
+    "process",
+    "spawn",
+    "attachLogs",
+    "createJSONRPCReader",
+    "createJSONRPCWriter",
+    "rpc",
+    "createRequire",
+    `${source}\nreturn startCodexConnection;`,
+  )(
+    { platform, execPath: "fixture-node", env: {} },
+    spawn,
+    () => {},
+    () => ({}),
+    () => ({}),
+    { createMessageConnection: () => connection },
+    () => ({ resolve: () => "fixture-bundled-codex" }),
+  );
+  return { startConnection, calls, patched };
+}
+
+test(
+  "a Windows background Codex app-server hides its console while sign-in stays interactive",
+  { skip: !fixture },
+  () => {
+    const { startConnection, calls, patched } = backgroundCodexSpawner("win32");
+    const env = { CODEX_HOME: "fixture-personal-home" };
+    startConnection("C:\\signed package\\codex.exe", env);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], '"C:\\signed package\\codex.exe" app-server');
+    assert.deepEqual(calls[0][1], { shell: true, env, windowsHide: true });
+    const cli = patched.slice(
+      patched.indexOf("function spawnCodexCli("),
+      patched.indexOf("// src/index.ts"),
+    );
+    assert.ok(cli.includes('stdio: "inherit"'));
+    assert.doesNotMatch(cli, /windowsHide/);
+  },
+);
+
+test(
+  "the background connection preserves Unix app-server arguments and environment",
+  { skip: !fixture },
+  () => {
+    const { startConnection, calls } = backgroundCodexSpawner("linux");
+    const env = { CODEX_HOME: "fixture-personal-home" };
+    startConnection("/signed package/codex", env);
+    assert.deepEqual(calls, [["/signed package/codex", ["app-server"], { env }]]);
+  },
+);
+
 function titleGenerator() {
   const patched = patchCodexAcpLiveUsers(readFileSync(join(fixture, "index.js"), "utf8"), codexAcpLiveUserPatch.version).source;
   const start = patched.indexOf("// src/TitleGenerator.ts");

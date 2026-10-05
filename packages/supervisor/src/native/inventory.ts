@@ -1,6 +1,9 @@
 import { z } from "zod";
 import { DELIVERY_TURN_RENEWAL_CAPABILITY } from "./delivery-turn-renewal.js";
-import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY, REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView } from "@konteks/remote-common";
+import { ConnectedAgentViewSchema, REMOTE_CORE_CONTRACT_CAPABILITY,
+  REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY,
+  REMOTE_AGENT_LOGIN_BROWSER_CAPABILITY, REMOTE_AGENT_LOGIN_CAPABILITY, REMOTE_CANCELLATION_DELIVERY_CAPABILITY, REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DELIVERY_PERMITS_CAPABILITY, REMOTE_PREVIEW_CAPABILITY, REMOTE_SESSION_LABEL_CAPABILITY, type ConnectedAgentView,
+} from "@konteks/remote-common";
 import { hostPressureRatio, UtilizationSignalsSchema, type SignalSampler } from "@konteks/remote-sysmon";
 import type { InventorySnapshot } from "../inventory/snapshot.js";
 import type { RunnerPort } from "../runner-port.js";
@@ -168,7 +171,7 @@ export class NativeInventoryCollector {
   /** Signed execution and delivery permits, only while some agent is ready to use them. */
   private permitCapabilities(anyReady: boolean): string[] {
     const permits: string[] = [];
-    if (anyReady && this.options.executionPermitsReady?.()) permits.push(REMOTE_EXECUTION_PERMITS_CAPABILITY);
+    if (anyReady && this.options.executionPermitsReady?.()) permits.push(REMOTE_EXECUTION_PERMITS_CAPABILITY, REMOTE_DIRECT_MODEL_FALLBACK_CAPABILITY);
     if (anyReady && this.options.deliveryExecutionPermitsReady?.()) permits.push(REMOTE_DELIVERY_PERMITS_CAPABILITY, DELIVERY_TURN_RENEWAL_CAPABILITY);
     return permits;
   }

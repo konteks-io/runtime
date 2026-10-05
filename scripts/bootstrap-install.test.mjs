@@ -283,8 +283,8 @@ for (const locale of ["en", "id"]) {
       assert.match(
         result.output,
         locale === "id"
-          ? /\n1 dari 3 - Unduh dan verifikasi\n  konteks-remote bootstrap v1: Mengambil manifes checksum bertanda tangan\n/
-          : /\n1 of 3 - Download and verify\n  konteks-remote bootstrap v1: fetching the signed checksum manifest\n/,
+          ? /\n1 dari 3 - Unduh dan verifikasi\n  Unduh dan verifikasi\n/
+          : /\n1 of 3 - Download and verify\n  Download and verify\n/,
       );
       assert.match(
         result.output,
@@ -922,14 +922,14 @@ test("Windows bootstrap shows the stages of an update", windowsOnly, () => {
   const result = runWindowsBootstrap();
   assert.equal(result.status, 0, result.output);
   assert.deepEqual(result.calls, [["update"], ["start"]], result.output);
-  assert.match(result.output, /downloading the Windows installer/i);
-  assert.match(result.output, /verified the Windows installer/i);
+  assert.match(result.output, /Downloading and verifying/);
+  assert.doesNotMatch(result.output, /Fetching the signed release manifest|Downloading the Windows installer|Verified the Windows installer|Installation can take a minute/,
+  );
   assert.match(result.output, /updating the connected runtime/i);
   assert.match(result.output, /starting the runtime/i);
   assert.match(
     result.output,
-    /\n\n1 of 4 - Download and verify\n  Fetching the signed release manifest/,
-  );
+    /\n\n1 of 4 - Download and verify\n  Downloading and verifying/);
   assert.match(
     result.output,
     /\n\n2 of 4 - Install the Konteks command\n  Approve the Windows elevation prompt/,
