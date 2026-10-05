@@ -14,6 +14,7 @@ import {
   REMOTE_AGENT_LOGIN_ON_COMPUTER_CAPABILITY,
   REMOTE_RUNTIME_UPDATE_CAPABILITY,
   REMOTE_DIRECT_MODEL_FALLBACK_MIN_CORE_CONTRACT_VERSION,
+  allEqual,
   SystemClock,
   createLogger,
   parseRfc3339,
@@ -813,26 +814,45 @@ export class Supervisor {
     const claims = decodeLeaseClaims(owner.lease.lease, { instanceId: owner.instanceId, audience: LEASE_AUDIENCE });
     return { instanceId: owner.instanceId, tenantId: owner.workspaceId, leaseId: claims.jti,
       runnerIncarnation: owner.runnerIncarnation, connectionEpoch: connection.connectionEpoch, leaseExpiresAt: owner.lease.expiresAt,
-      assertCurrent: () => this.assertRuntimeUpdateOwner(owner, accepted, connection) };
+      assertCurrent: () => this.assertRuntimeUpdateOwner(owner, accepted, claims, connection) };
   }
 
-  private assertRuntimeUpdateOwner(owner: CapturedOwner, accepted: string, connection: RelayConnectionOf<"onRuntimeUpdate">): void {
+  private assertRuntimeUpdateOwner(owner: CapturedOwner, accepted: string, claims: ReturnType<typeof decodeLeaseClaims>, connection: RelayConnectionOf<"onRuntimeUpdate">): void {
     connection.assertCurrent();
-    this.assertRuntimeUpdateAuthority(owner, accepted);
+    if (claims.lease_mode !== "active" || claims.administrative_status !== "active") {
+      throw new RemoteInstanceError("recovery_required", "Runtime update admission requires an active owner.");
+    }
+    this.assertRuntimeUpdateAuthority(owner, accepted, claims);
   }
 
-  private assertRuntimeUpdateAuthority(owner: CapturedOwner, accepted: string): void {
-    if (!this.ownerUnchanged(owner) || !this.leaseUsable() || this.recoveryAuthority() !== accepted) {
+  private assertRuntimeUpdateAuthority(owner: CapturedOwner, accepted: string, claims: ReturnType<typeof decodeLeaseClaims>): void {
+    if (!this.runtimeUpdateOwnerUnchanged(owner) || !this.runtimeUpdateLeaseUnchanged(owner, claims) || this.recoveryAuthority() !== accepted) {
       throw new RemoteInstanceError("recovery_required", "Runtime update ownership is no longer current.");
     }
     owner.ownership?.assertOwned();
   }
 
+  /** Update admission may span normal heartbeats; its process and root may not change. */
+  private runtimeUpdateOwnerUnchanged(owner: CapturedOwner): boolean {
+    return !this.stopping && owner.ownership !== null && this.nativeOwnership === owner.ownership &&
+      this.instanceId === owner.instanceId && this.workspaceId === owner.workspaceId && this.runnerIncarnation === owner.runnerIncarnation;
+  }
+
+  /** Only a usable renewal of the captured policy can retain update/report ownership. */
+  private runtimeUpdateLeaseUnchanged(owner: CapturedOwner, captured: ReturnType<typeof decodeLeaseClaims>): boolean {
+    const current = this.lease.current();
+    if (!current || !owner.instanceId || !this.leaseUsable()) return false;
+    const claims = decodeLeaseClaims(current.lease, { instanceId: owner.instanceId, audience: LEASE_AUDIENCE });
+    if (!sameLeaseRecord(current, leaseRecordFromClaims(current.lease, claims)) || current.workspaceId !== owner.workspaceId) return false;
+    return sameRuntimeUpdateLeasePolicy(captured, claims);
+  }
+
   private captureRuntimeUpdateReportOwner(): () => void {
     const owner = this.captureOwner();
     const accepted = this.recoveryAuthority();
-    if (!accepted) throw new RemoteInstanceError("recovery_required", "Runtime update reporting ownership is unavailable.");
-    const assertCurrent = () => this.assertRuntimeUpdateAuthority(owner, accepted);
+    if (!accepted || !owner.lease || !owner.instanceId) throw new RemoteInstanceError("recovery_required", "Runtime update reporting ownership is unavailable.");
+    const claims = decodeLeaseClaims(owner.lease.lease, { instanceId: owner.instanceId, audience: LEASE_AUDIENCE });
+    const assertCurrent = () => this.assertRuntimeUpdateAuthority(owner, accepted, claims);
     assertCurrent();
     return assertCurrent;
   }
@@ -3294,6 +3314,18 @@ function sameLeaseRecord(stored: StoredLease, expected: ReturnType<typeof leaseR
     Date.parse(stored.issuedAt) === Date.parse(expected.issuedAt) &&
     drainDeadlineMs(stored.drainDeadline) === drainDeadlineMs(expected.drainDeadline)
   );
+}
+
+/** A new token/expiry alone does not change a captured managed update's policy. */
+function sameRuntimeUpdateLeasePolicy(captured: ReturnType<typeof decodeLeaseClaims>, current: ReturnType<typeof decodeLeaseClaims>): boolean {
+  return current.iat >= captured.iat &&
+    allEqual([
+      [captured.sub, current.sub], [captured.workspace_id, current.workspace_id],
+      [captured.protocol, current.protocol], [captured.bundle_version, current.bundle_version],
+      [captured.ownership_scope, current.ownership_scope], [captured.administrative_status, current.administrative_status],
+      [captured.lease_mode, current.lease_mode],
+      [captured.drain_deadline, current.drain_deadline],
+    ]);
 }
 
 /** The journal entry is still the live claim of exactly this assignment's placement, kind and agent. */
