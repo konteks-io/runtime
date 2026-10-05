@@ -87,7 +87,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm, windows-2022]
+        os: [macos-26, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -103,6 +103,8 @@ jobs:
         run: npm ci --ignore-scripts --legacy-peer-deps
       - name: Build workspace packages
         run: npm run build
+      - name: Verify Mac binary compatibility decisions and produced native metadata
+        run: node --test --test-concurrency=1 scripts/macos-artifact-compatibility.test.mjs
       - name: Verify POSIX setup language, signed downloads and recovery
         if: runner.os != 'Windows'
         run: node --test --test-name-pattern="POSIX bootstrap" scripts/bootstrap-install.test.mjs

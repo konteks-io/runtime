@@ -21,8 +21,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-15, os: macos, architecture: arm64, node_arch: arm64, package: konteks-remote-arm64.pkg, executable: konteks-remote }
-          - { runner: macos-15, os: macos, architecture: amd64, node_arch: x64, package: konteks-remote-amd64.pkg, executable: konteks-remote }
+          - { runner: macos-26, os: macos, architecture: arm64, node_arch: arm64, package: konteks-remote-arm64.pkg, executable: konteks-remote }
+          - { runner: macos-15-intel, os: macos, architecture: amd64, node_arch: x64, package: konteks-remote-amd64.pkg, executable: konteks-remote }
           - { runner: windows-2022, os: windows, architecture: amd64, node_arch: x64, package: konteks-remote-x64.msi, executable: konteks-remote.exe }
           - { runner: ubuntu-24.04, os: debian, architecture: amd64, node_arch: x64, package: konteks-remote_amd64.deb, executable: konteks-remote }
           - { runner: ubuntu-24.04-arm, os: debian, architecture: arm64, node_arch: arm64, package: konteks-remote_arm64.deb, executable: konteks-remote }
@@ -55,7 +55,7 @@ jobs:
         run: |
           test -n "$KONTEKS_RELEASE_ROOTS_JSON" || { echo "KONTEKS_RELEASE_ROOTS_JSON variable is required: a connector without embedded roots verifies nothing"; exit 1; }
           node -e 'const value = JSON.parse(process.env.KONTEKS_RELEASE_ROOTS_JSON); if (!Array.isArray(value.roots) || !value.roots.some(root => Array.isArray(root.coreControlKeys) && root.coreControlKeys.length > 0)) { throw new Error("KONTEKS_RELEASE_ROOTS_JSON must certify at least one Core control key; otherwise every production directive is rejected") }'
-          node scripts/build-launcher.mjs --os "${{ matrix.os }}" --out "dist/${{ matrix.package }}"
+          node scripts/build-launcher.mjs --os "${{ matrix.os }}" --architecture "${{ matrix.architecture }}" --out "dist/${{ matrix.package }}"
           node scripts/sign-launcher.mjs --os "${{ matrix.os }}" --architecture "${{ matrix.architecture }}" --artifact "dist/${{ matrix.package }}"
       - name: Build complete offline agent packages and describe every artifact
         shell: bash
