@@ -1222,7 +1222,7 @@ export class RelayedSession {
       this.governedPermissions.set(requestId, { toolCallId: params.toolCall.toolCallId, options: params.options });
       // A host agent's request is judged by the call it names, or refused.
       const managedSkillIds = new Set<string>();
-      const skillId = (params.toolCall.rawInput as { name?: unknown } | undefined)?.name;
+      const skillId = (params.toolCall.rawInput as { id?: unknown } | undefined)?.id;
       if (this.assignment.agentRoute.agentId === "opencode" && typeof skillId === "string" && /^konteks-[a-f0-9]{64}$/.test(skillId)) {
         try {
           if (await this.preparedInputs?.authorizeManagedSkill?.(skillId)) managedSkillIds.add(skillId);

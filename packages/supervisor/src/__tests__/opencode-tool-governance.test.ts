@@ -43,13 +43,16 @@ describe("OpenCode tool governance", () => {
     const id = "konteks-authorized";
     const invoke = (callId: string, seen: string, requested = seen, authorized = new Set([id])) => {
       governance.observe(call(callId, "skill"), WC);
-      governance.observe(input(callId, { name: seen }), WC);
-      return governance.decide(ask(callId, "other", "skill", { name: requested }), { ...context, managedSkillIds: authorized });
+      governance.observe(input(callId, { id: seen }), WC);
+      return governance.decide(ask(callId, "other", "skill", { id: requested }), { ...context, managedSkillIds: authorized });
     };
     expect(invoke("skill-ok", id)).toEqual({ kind: "allow" });
     expect(invoke("skill-other", "personal-skill")).toMatchObject({ kind: "deny" });
     expect(invoke("skill-mismatch", id, "personal-skill")).toMatchObject({ kind: "deny" });
     expect(invoke("skill-stale", id, id, new Set())).toMatchObject({ kind: "deny" });
+    governance.observe(call("skill-name-only", "skill"), WC);
+    governance.observe(input("skill-name-only", { name: id }), WC);
+    expect(governance.decide(ask("skill-name-only", "other", "skill", { name: id }), { ...context, managedSkillIds: new Set([id]) })).toMatchObject({ kind: "deny" });
     expect(governance.observe(done("skill-ok"), WC)).toBeNull();
     governance.observe(call("skill-unasked", "skill"), WC);
     expect(governance.observe(done("skill-unasked"), WC)).toMatchObject({ title: "skill" });

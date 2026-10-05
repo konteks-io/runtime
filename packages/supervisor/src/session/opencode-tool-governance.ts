@@ -227,7 +227,7 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
     };
 
     if (tool === "skill") {
-      const id = same("name");
+      const id = same("id");
       if (!id || !context.managedSkillIds?.has(id)) return { kind: "deny", reason: "the Skill is not authorized for this session" };
       return { kind: "allow" };
     }
