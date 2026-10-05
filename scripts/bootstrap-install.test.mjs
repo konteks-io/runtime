@@ -232,9 +232,14 @@ for (const os of ["Linux", "Darwin"]) {
         ]);
         assert.match(
           result.output,
+          locale === "en" ? /^\nKONTEKS\nRuntime setup\n/ : /^\nKONTEKS\nPemasangan runtime\n/,
+        );
+        assert.equal(result.output.match(/^KONTEKS$/gm)?.length, 1);
+        assert.match(
+          result.output,
           locale === "id"
-            ? /Mengambil manifes checksum bertanda tangan/
-            : /fetching the signed checksum manifest/,
+            ? /\n1 dari 3 - Unduh dan verifikasi\n  Unduh dan verifikasi\n/
+            : /\n1 of 3 - Download and verify\n  Download and verify\n/,
         );
         assert.match(
           result.output,
@@ -242,7 +247,7 @@ for (const os of ["Linux", "Darwin"]) {
             ? /Menghubungkan komputer ini ke Konteks/
             : /Connecting this computer to Konteks/,
         );
-        assert.match(result.output, locale === "id" ? /Pemasangan selesai/ : /Setup complete/);
+        assert.match(result.output, locale === "id" ? /\nPemasangan selesai\n/ : /\nSetup complete\n/);
         assert.deepEqual(result.temporary, []);
       },
     );
@@ -283,8 +288,8 @@ for (const locale of ["en", "id"]) {
       assert.match(
         result.output,
         locale === "id"
-          ? /\n1 dari 3 - Unduh dan verifikasi\n  konteks-remote bootstrap v1: Mengambil manifes checksum bertanda tangan\n/
-          : /\n1 of 3 - Download and verify\n  konteks-remote bootstrap v1: fetching the signed checksum manifest\n/,
+          ? /\n1 dari 3 - Unduh dan verifikasi\n  Unduh dan verifikasi\n/
+          : /\n1 of 3 - Download and verify\n  Download and verify\n/,
       );
       assert.match(
         result.output,
@@ -607,15 +612,22 @@ for (const update of [true, false]) {
           update ? [["update"], ["start"]] : [["install", "--activation-id", "activation-test-id"]],
         );
         assert.deepEqual(result.launcherLocales, update ? [locale, locale] : [locale]);
+        assert.match(
+          result.output,
+          locale === "en" ? /^\nKONTEKS\nRuntime setup\n/ : /^\nKONTEKS\nPemasangan runtime\n/,
+        );
+        assert.equal(result.output.match(/^KONTEKS$/gm)?.length, 1);
         if (locale === "en") {
-          assert.match(result.output, /\n\n1 of [34] - Download and verify\n/);
+          assert.match(
+            result.output,
+            /\n\n1 of [34] - Download and verify\n  Downloading and verifying\n/,
+          );
           assert.match(result.output, /\n\nSetup complete\n/);
           return;
         }
-        assert.match(result.output, /^\nPemasangan runtime Konteks\n/);
         assert.match(
           result.output,
-          /\n\n1 dari [34] - Unduh dan verifikasi\n  Mengambil manifes rilis bertanda tangan/,
+          /\n\n1 dari [34] - Unduh dan verifikasi\n  Mengunduh dan memverifikasi\n/,
         );
         assert.match(
           result.output,
@@ -922,14 +934,14 @@ test("Windows bootstrap shows the stages of an update", windowsOnly, () => {
   const result = runWindowsBootstrap();
   assert.equal(result.status, 0, result.output);
   assert.deepEqual(result.calls, [["update"], ["start"]], result.output);
-  assert.match(result.output, /downloading the Windows installer/i);
-  assert.match(result.output, /verified the Windows installer/i);
+  assert.match(result.output, /Downloading and verifying/);
+  assert.doesNotMatch(result.output, /Fetching the signed release manifest|Downloading the Windows installer|Verified the Windows installer|Installation can take a minute/,
+  );
   assert.match(result.output, /updating the connected runtime/i);
   assert.match(result.output, /starting the runtime/i);
   assert.match(
     result.output,
-    /\n\n1 of 4 - Download and verify\n  Fetching the signed release manifest/,
-  );
+    /\n\n1 of 4 - Download and verify\n  Downloading and verifying/);
   assert.match(
     result.output,
     /\n\n2 of 4 - Install the Konteks command\n  Approve the Windows elevation prompt/,

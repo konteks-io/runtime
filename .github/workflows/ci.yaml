@@ -23,6 +23,16 @@ jobs:
           npm install --package-lock-only --ignore-scripts --legacy-peer-deps --no-audit --no-fund
       - name: Install (shared contracts are vendored under vendor/)
         run: npm ci --ignore-scripts --legacy-peer-deps
+      - name: Verify the Codex patch against the reviewed upstream source
+        shell: bash
+        env:
+          CODEX_ACP_FIXTURE_DIR: ${{ runner.temp }}/codex-acp-pristine/package/dist
+        run: |
+          curl -fSL --proto '=https' --tlsv1.2 --max-time 120 -o "$RUNNER_TEMP/codex-acp-1.10.0.tgz" 'https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-1.10.0.tgz'
+          echo "9dffb525b728d0579a8b19d48322281ecad7eea7ba1640fa2f8de1199346352c  $RUNNER_TEMP/codex-acp-1.10.0.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/codex-acp-pristine"
+          tar -xzf "$RUNNER_TEMP/codex-acp-1.10.0.tgz" -C "$RUNNER_TEMP/codex-acp-pristine"
+          node --test scripts/codex-acp-live-user-patch.test.mjs
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
@@ -63,6 +73,14 @@ jobs:
         env:
           KONTEKS_TEST_POWERSHELL: pwsh.exe
         run: node --test --test-name-pattern="Windows bootstrap" scripts/bootstrap-install.test.mjs
+      - name: Setup identity and animated progress in Windows PowerShell 5.1
+        shell: powershell
+        run: node --test scripts/bootstrap-progress.test.mjs
+      - name: The same foreground progress in PowerShell 7
+        shell: pwsh
+        env:
+          KONTEKS_TEST_POWERSHELL: pwsh.exe
+        run: node --test scripts/bootstrap-progress.test.mjs
 
   windows-native:
     name: native runtime on ${{ matrix.os }}
@@ -88,10 +106,15 @@ jobs:
       - name: Verify POSIX setup language, signed downloads and recovery
         if: runner.os != 'Windows'
         run: node --test --test-name-pattern="POSIX bootstrap" scripts/bootstrap-install.test.mjs
+      - name: Verify POSIX setup identity and animated progress
+        if: runner.os != 'Windows'
+        run: node --test scripts/bootstrap-progress.test.mjs
       - name: Verify foreground setup and update language on each native OS
-        run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/setup-locale.test.ts packages/launcher/src/__tests__/native-install.test.ts packages/launcher/src/__tests__/agent-setup.test.ts packages/launcher/src/__tests__/prompt-output.test.ts packages/launcher/src/__tests__/prompt-interruption.test.ts
+        run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/setup-locale.test.ts packages/launcher/src/__tests__/foreground-progress.test.ts packages/launcher/src/__tests__/native-install.test.ts packages/launcher/src/__tests__/agent-setup.test.ts packages/launcher/src/__tests__/prompt-output.test.ts packages/launcher/src/__tests__/prompt-interruption.test.ts
       - name: Verify native service, updates and background process ownership
-        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-stop-completion.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/native-agent-add.test.ts packages/launcher/src/__tests__/windows-service-owner.test.ts packages/launcher/src/__tests__/windows-background-setup.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/supervisor/src/__tests__/native-update-coordinator.test.ts packages/supervisor/src/__tests__/runtime-update.test.ts packages/supervisor/src/__tests__/runtime-update-capability.test.ts packages/supervisor/src/__tests__/runtime-relay-handshake.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts packages/supervisor/src/__tests__/windows-background-probes.test.ts packages/agent-runner/src/__tests__/windows-background-spawn.test.ts
+        run: npx vitest run --maxWorkers=1 packages/common/src/__tests__/process-spawn.test.ts packages/common/src/__tests__/retained-process-owner.test.ts packages/common/src/__tests__/secret-file.test.ts packages/launcher/src/__tests__/native-service.test.ts packages/launcher/src/__tests__/native-service-refresh.test.ts packages/launcher/src/__tests__/native-service-diagnostics.test.ts packages/launcher/src/__tests__/native-stop-completion.test.ts packages/launcher/src/__tests__/native-update.test.ts packages/launcher/src/__tests__/native-update-progress.test.ts packages/launcher/src/__tests__/native-agent-add.test.ts packages/launcher/src/__tests__/windows-service-owner.test.ts packages/launcher/src/__tests__/windows-background-setup.test.ts packages/launcher/src/__tests__/launcher-delegate.test.ts packages/supervisor/src/__tests__/native-update-coordinator.test.ts packages/supervisor/src/__tests__/runtime-update.test.ts packages/supervisor/src/__tests__/runtime-update-capability.test.ts packages/supervisor/src/__tests__/runtime-relay-handshake.test.ts packages/supervisor/src/__tests__/windows-launcher.test.ts packages/supervisor/src/__tests__/windows-background-probes.test.ts packages/agent-runner/src/__tests__/windows-background-spawn.test.ts
+      - name: Verify current Codex tooling, model choice and fresh readiness on each native OS
+        run: npx vitest run --maxWorkers=1 packages/agent-runner/src/__tests__/bridge-spec.test.ts packages/agent-runner/src/__tests__/model-capability-discovery.test.ts packages/agent-runner/src/__tests__/session-model-selection.test.ts packages/supervisor/src/__tests__/session.test.ts packages/supervisor/src/__tests__/native-execution-ready.test.ts packages/supervisor/src/__tests__/heartbeat.test.ts packages/supervisor/src/__tests__/native-inventory.test.ts packages/supervisor/src/__tests__/native-supervisor.test.ts
       - name: Verify signed Windows local release
         if: runner.os == 'Windows'
         run: npx vitest run --maxWorkers=1 packages/launcher/src/__tests__/e2e-smoke-release.test.ts -t "adds a real Windows connector and Codex package to the signed local release"

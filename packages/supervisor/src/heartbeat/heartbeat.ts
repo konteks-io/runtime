@@ -24,7 +24,8 @@ export interface HeartbeatOptions {
   withLeaseAcquisition?: LeaseAcquisition;
   onFailure: (error: unknown) => Promise<void>;
   inventory: InventorySource;
-  onInventory?: (agents: HeartbeatMessage["agents"]) => void;
+  /** The current owned collection, shared with local status before this heartbeat sends. */
+  onInventory?: (snapshot: InventorySnapshot) => void;
   roleBindings: () => RoleBinding[];
   activeAssignmentIds: () => string[];
   modelCapabilitySnapshots?: () => readonly AgentModelOfferedValuesSnapshot[];
@@ -129,7 +130,8 @@ export class HeartbeatPublisher {
   }
 
   private settleDeadlineMs(): number {
-    return this.options.settleDeadlineMs ?? Math.min(MAX_SETTLE_DEADLINE_MS, Math.max(MIN_SETTLE_DEADLINE_MS, 2 * this.options.intervalSeconds() * 1000));
+    return (
+      this.options.settleDeadlineMs ?? Math.min(MAX_SETTLE_DEADLINE_MS, Math.max(MIN_SETTLE_DEADLINE_MS, 2 * this.options.intervalSeconds() * 1000)));
   }
 
   private schedule(): void {
@@ -218,7 +220,7 @@ export class HeartbeatPublisher {
     this.stage = "collect";
     const snapshot = await this.options.inventory.collect();
     assertCurrent();
-    this.options.onInventory?.(snapshot.agents);
+    this.options.onInventory?.(snapshot);
     const roles = deriveAdvertisedRoles(this.options.roleBindings(), snapshot.agents, { gitVersion: snapshot.gitVersion });
     this.lastRoles = roles;
     const utilization = this.utilization(snapshot, pending);

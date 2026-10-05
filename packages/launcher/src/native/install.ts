@@ -9,7 +9,13 @@ import { acquireNativeRootLock, compareSemver, deleteNativeAntigravity, HOST_AGE
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
 import type { Output } from "../output.js";
-import { outputLocale, setupError, setupLine, setupLocale, setupText, type SetupLocale } from "../setup-locale.js";
+import { outputLocale,
+  setupDetail,
+  setupError, setupLine, setupLocale,
+  setupProgress,
+  setupText,
+  withSetupProgress, type SetupLocale,
+} from "../setup-locale.js";
 import { promptSecret } from "../prompt.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
 import { releaseStaged, writeStagingProgress } from "./enrollment-staging.js";
@@ -96,9 +102,12 @@ async function reinstallExisting(install: InstallContext, explicitAgents: string
 }
 
 /** The same activation and endpoints, and the same agents when they were listed. */
-function sameInstall(install: InstallContext, record: NativeRuntimeRecord, activationId: string | undefined, explicitAgents: string[] | null): boolean {
+function sameInstall(install: InstallContext, record: NativeRuntimeRecord, activationId: string | undefined, explicitAgents: string[] | null,
+): boolean {
   if (activationId !== install.options.activationId || record.coreUrl !== install.draft.coreUrl || record.relayUrl !== install.draft.relayUrl) return false;
-  return explicitAgents === null || JSON.stringify(record.agents) === JSON.stringify(explicitAgents);
+  return (
+    explicitAgents === null || JSON.stringify(record.agents) === JSON.stringify(explicitAgents)
+  );
 }
 
 /** A record from before the Codex profile was recorded binds the one its runner already uses. */
@@ -116,7 +125,8 @@ async function installNew(install: InstallContext, agents: string[]): Promise<Na
   const profiles = await localAgentProfiles(agents, root, options);
   const bundled = agents.filter(agent => !isHostAgentId(agent));
   const fetchFn = fetchOf(options.deps);
-  const release = verifyNativeRelease(options.deps?.manifest ?? await fetchNativeManifest(fetchFn), roots);
+  const release = verifyNativeRelease(options.deps?.manifest ?? (await fetchNativeManifest(fetchFn)), roots,
+  );
   assertOfflinePackages(selectNativeArtifacts(release, { ...platform, agentIds: bundled }));
   // The native enrollment owner exclusively creates supervisor; precreating
   // it would erase the distinction between new enrollment and legacy history.
@@ -124,18 +134,20 @@ async function installNew(install: InstallContext, agents: string[]): Promise<Na
   const identity = await activate(install, release, fetchFn);
   // Unpacking takes about a minute; the person hears each step instead of
   // a silent terminal after the code.
-  setupLine(options.output, bundled.length > 0 ? "installUnpacking" : "installSettingUp");
+  setupDetail(options.output, bundled.length > 0 ? "installUnpacking" : "installSettingUp");
   const total = bundled.filter(id => agents.includes(id)).length;
   let unpacked = 0;
-  const releaseId = await stageAgents({
+  const releaseId = await withSetupProgress(options.output, "phaseDownload", () =>
+    stageAgents({
     root, release, platform, agents, bundled, fetchFn,
-    beforeAgent: async agent => {
+    beforeAgent: async (agent) => {
       if (!bundled.includes(agent)) return;
       unpacked += 1;
-      setupLine(options.output, "installUnpackAgent", { name: findAgentBridge(agent)?.displayName ?? agent, number: unpacked, total });
+        setupProgress(options.output, "installUnpackAgent", { name: findAgentBridge(agent)?.displayName ?? agent, number: unpacked, total });
     },
     afterAgent: agent => agentFolders(root, agent),
-  });
+  }),
+  );
   const git = options.deps?.git === undefined ? await discoverGit() : options.deps.git;
   const record = NativeRuntimeRecordSchema.parse({ ...draft, agents, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...profiles, ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
   install.lock.assertOwned();
@@ -199,7 +211,8 @@ async function detectNativeAgents(root: string): Promise<string[]> {
   if (await resolveNativeCodexHome().then(() => true).catch(() => false)) detected.push("codex");
   for (const host of HOST_AGENT_INSTALL_ADAPTERS) {
     if (host.fetch !== undefined) continue;
-    if (host.offered && await host.locate(undefined, { root }).then(() => true).catch(() => false)) detected.push(host.agentId);
+    if (host.offered &&
+      (await host.locate(undefined, { root }).then(() => true).catch(() => false))) detected.push(host.agentId);
   }
   return detected;
 }
@@ -388,7 +401,7 @@ export async function recordNativeEnrollment(options: {
       return { agents: prepared.agents, bundleVersion: prepared.bundleVersion, staged: await releaseStaged(root, prepared.releaseId) };
     }
     const detected = await enrollmentAgents(root, options.agents);
-    const payload = options.deps?.manifest ?? await fetchNativeManifest(fetchOf(options.deps));
+    const payload = options.deps?.manifest ?? (await fetchNativeManifest(fetchOf(options.deps)));
     const release = verifyNativeRelease(payload, roots);
     assertOfflinePackages(selectNativeArtifacts(release, { ...platform, agentIds: detected.filter(agent => !isHostAgentId(agent)) }));
     for (const dir of ["releases", "credentials", "workspaces", "logs", "supervisor"]) await privateDirectory(join(root, dir));
@@ -403,8 +416,10 @@ export async function recordNativeEnrollment(options: {
       agents: detected,
       bundleVersion: release.manifest.bundleVersion,
       manifestDigest: release.manifest.digest,
-      controlPort: options.controlPort ?? await chooseControlPort(),
-    })));
+      controlPort: options.controlPort ?? (await chooseControlPort()),
+    }),
+      ),
+    );
     return { agents: detected, bundleVersion: release.manifest.bundleVersion, staged: false };
   } finally { lock.release(); }
 }
@@ -435,7 +450,7 @@ export async function stageNativeEnrollment(options: {
   const lock = await lockInstaller(root);
   try {
     const prepared = await readNativeEnrollment(root);
-    if (prepared.releaseId && await releaseStaged(root, prepared.releaseId)) {
+    if (prepared.releaseId && (await releaseStaged(root, prepared.releaseId))) {
       await writeStagingProgress(root, { state: "done", done: prepared.agents.length, total: prepared.agents.length });
       return { agents: prepared.agents, bundleVersion: prepared.bundleVersion, releaseId: prepared.releaseId };
     }
@@ -622,7 +637,9 @@ async function locatedHostAgent(root: string, agent: string): Promise<Partial<Na
 
 /** Codex, Claude Code and host-installed agents are kept only when found. */
 function needsLocating(agent: string): boolean {
-  return agent === "codex" || agent === "claude-code" || hostAgentInstallAdapter(agent) !== undefined;
+  return (
+    agent === "codex" || agent === "claude-code" || hostAgentInstallAdapter(agent) !== undefined
+  );
 }
 
 /**
@@ -691,8 +708,10 @@ async function addBundledAgent(add: { root: string; options: NativeAgentAddOptio
  * computer connected before Claude Code or Codex was here); any other release
  * must be newer. Stale or same-version substitutes are refused.
  */
-async function releaseForAgent(options: NativeAgentAddOptions, roots: readonly EmbeddedReleaseRoot[], current: NativeRuntimeRecord, fetchFn: typeof fetch) {
-  const release = verifyNativeRelease(options.deps?.manifest ?? await fetchNativeManifest(fetchFn), roots);
+async function releaseForAgent(options: NativeAgentAddOptions, roots: readonly EmbeddedReleaseRoot[], current: NativeRuntimeRecord, fetchFn: typeof fetch,
+) {
+  const release = verifyNativeRelease(options.deps?.manifest ?? (await fetchNativeManifest(fetchFn)), roots,
+  );
   const sameRelease = release.manifest.digest === current.manifestDigest;
   if (!sameRelease && compareSemver(release.manifest.bundleVersion, current.bundleVersion) <= 0) {
     throw setupError("update_required", "agentRequiresNewRelease");
@@ -877,14 +896,15 @@ async function locateHostAgents(agents: readonly string[], root: string, consent
  * connector's own folder, checked. A copy that already verifies is kept
  * without asking.
  */
-export async function fetchHostAgent(host: HostAgentInstallAdapter, root: string, consent: FetchConsent | undefined, output?: Output): Promise<Partial<NativeRuntimeRecord>> {
+export async function fetchHostAgent(host: HostAgentInstallAdapter, root: string, consent: FetchConsent | undefined, output?: Output,
+): Promise<Partial<NativeRuntimeRecord>> {
   setupLocale();
   if (host.fetch === undefined) throw notOffered(host.agentId);
   host.assertFetchable?.();
   const kept = await host.locate(undefined, { root }).catch(() => null);
   if (kept) return kept;
   const name = findAgentBridge(host.agentId)?.displayName ?? host.agentId;
-  if (!await fetchConsented(host, name, consent)) throw setupError("agent_unavailable", "agentDownloadDeclined", { name });
+  if (!(await fetchConsented(host, name, consent))) throw setupError("agent_unavailable", "agentDownloadDeclined", { name });
   if (output) setupLine(output, "agentGoogleDownloading", { name });
   return host.fetch({ root, consent: true });
 }

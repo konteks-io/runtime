@@ -7,6 +7,23 @@ type ErrorValues = Values | ((locale: SetupLocale) => Values);
 
 /** Foreground setup copy only. Technical values and provider output are never translated. */
 const COPY = {
+  foregroundInstall: ["Runtime setup", "Pemasangan runtime"],
+  foregroundUpdate: ["Runtime update", "Pembaruan runtime"],
+  phaseDownload: ["Downloading and verifying", "Mengunduh dan memverifikasi"],
+  phaseInstall: ["Setting up this computer", "Menyiapkan komputer ini"],
+  phaseStart: ["Starting runtime", "Memulai runtime"],
+  phaseHealth: ["Checking runtime and agents", "Memeriksa runtime dan agen"],
+  phaseStop: ["Stopping runtime", "Menghentikan runtime"],
+  phaseDrain: ["Waiting for current work", "Menunggu pekerjaan yang berjalan"],
+  updateFinished: ["Updated to {version}.", "Diperbarui ke {version}."],
+  updateInstalled: [
+    "Installed {version}. Start with: konteks-remote start",
+    "Versi {version} terpasang. Mulai dengan: konteks-remote start",
+  ],
+  updateAppProgressUnavailable: [
+    "Progress is unavailable in the app. Setup continues here.",
+    "Kemajuan belum tersedia di aplikasi. Pemasangan dilanjutkan di sini.",
+  ],
   error: ["error ({code}): {detail}", "Kesalahan ({code}): {detail}"],
   unknownError: ["error: {detail}", "Kesalahan: {detail}"],
   hiddenInput: ["{label} (input hidden): ", "{label} (input disembunyikan): "],
@@ -71,7 +88,8 @@ const COPY = {
   organizationAttestation: ["Attest that the {agent} account you are about to log in is owned by your organization and may serve colleagues' work?", "Nyatakan bahwa akun {agent} yang akan Anda gunakan untuk masuk dimiliki organisasi Anda dan boleh melayani pekerjaan rekan kerja?"],
   organizationDeclined: ["organization attestation declined; log in without --organization for a personal account", "pernyataan kepemilikan organisasi ditolak; masuk tanpa --organization untuk akun pribadi"],
   serviceAlreadyRunning: ["Konteks is already running on this computer; konteks-remote status shows how it is doing.", "Konteks sudah berjalan di komputer ini; konteks-remote status menunjukkan kondisinya."],
-  serviceStarting: ["Konteks is starting on this computer and is ready for work within a minute; konteks-remote status shows how it is doing.", "Konteks sedang dimulai di komputer ini dan siap bekerja dalam satu menit; konteks-remote status menunjukkan kondisinya."],
+  serviceStarting: ["Konteks is starting on this computer; konteks-remote status shows when it is connected.", "Konteks sedang dimulai di komputer ini; konteks-remote status menunjukkan saat komputer terhubung.",
+  ],
   serviceStillStarting: ["Konteks is still starting on this computer; waiting for it…", "Konteks masih dimulai di komputer ini; menunggu…"],
   serviceLinger: ["This Linux user service needs user lingering to remain available after logout. Configure it explicitly if required.", "Layanan pengguna Linux ini memerlukan user lingering agar tetap tersedia setelah keluar. Atur secara eksplisit jika diperlukan."],
   servicePortMoved: ["Another program uses port {previous}, so Konteks uses port {current} on this computer instead.", "Program lain menggunakan port {previous}, sehingga Konteks menggunakan port {current} di komputer ini."],
@@ -214,11 +232,13 @@ export function setupLocale(env: NodeJS.ProcessEnv = process.env): SetupLocale {
 }
 
 export function outputLocale(output: Partial<Pick<Output, "json" | "setupLocale">>): SetupLocale {
-  return output.json ? "en" : output.setupLocale ?? setupLocale();
+  return output.json ? "en" : (output.setupLocale ?? setupLocale());
 }
 
-export function setupText(key: SetupCopyKey, values: Values = {}, locale: SetupLocale = setupLocale()): string {
-  return COPY[key][locale === "id" ? 1 : 0].replace(/\{([A-Za-z]+)\}/g, (token: string, name: string) => values[name] === undefined ? token : String(values[name]));
+export function setupText(key: SetupCopyKey, values: Values = {}, locale: SetupLocale = setupLocale(),
+): string {
+  return COPY[key][locale === "id" ? 1 : 0].replace(/\{([A-Za-z]+)\}/g, (token: string, name: string) => (values[name] === undefined ? token : String(values[name])),
+  );
 }
 
 export function setupWords(output: Partial<Pick<Output, "json" | "setupLocale">>, key: SetupCopyKey, values: Values = {}): string {
@@ -227,6 +247,36 @@ export function setupWords(output: Partial<Pick<Output, "json" | "setupLocale">>
 
 export function setupLine(output: Pick<Output, "line"> & Partial<Pick<Output, "json" | "setupLocale">>, key: SetupCopyKey, values: Values = {}): void {
   output.line(setupWords(output, key, values));
+}
+
+/** A real foreground phase; simple injected outputs retain their normal line. */
+export function setupProgress(output: Output, key: SetupCopyKey, values: Values = {}): () => void {
+  const text = setupWords(output, key, values);
+  if (output.progress) return output.progress(text);
+  output.line(text);
+  return () => {};
+}
+
+/** Stop the row on completion or refusal, even when the action throws. */
+export async function withSetupProgress<T>(
+  output: Output,
+  key: SetupCopyKey,
+  action: () => Promise<T>,
+): Promise<T> {
+  const stop = setupProgress(output, key);
+  try {
+    return await action();
+  } finally {
+    stop();
+    output.finishProgress?.();
+  }
+}
+
+/** Release identifiers remain available with --verbose and in structured results. */
+export function setupDetail(output: Output, key: SetupCopyKey, values: Values = {}): void {
+  const text = setupWords(output, key, values);
+  if (output.detail) output.detail(text);
+  else output.line(text);
 }
 
 export function setupDuration(output: Pick<Output, "line"> & Partial<Pick<Output, "json" | "setupLocale">>, ms: number): string {

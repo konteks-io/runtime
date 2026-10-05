@@ -10,7 +10,11 @@ import { confirm } from "../prompt.js";
 import { SupervisorControl } from "../control.js";
 import { agentName } from "./agent-name.js";
 import { readNativeRecord } from "./install.js";
-import { outputLocale, setupError, setupLine, setupLocale, setupText, setupWords, type SetupLocale } from "../setup-locale.js";
+import { outputLocale, setupError, setupLine, setupLocale, setupText, setupWords,
+  withSetupProgress,
+  type SetupLocale,
+} from "../setup-locale.js";
+import { pauseSetupProgress } from "../foreground-progress.js";
 
 /**
  * Claude Code and Codex run from the person's own installation and sign-in
@@ -52,10 +56,17 @@ function productionAgentSetupDeps(output: Pick<Output, "json" | "setupLocale">):
   return {
     interactive: () => process.stdin.isTTY === true && !output.json,
     ask: question => confirm(question, { locale: outputLocale(output) }),
-    run: (command, args) => new Promise(resolveRun => {
-      const child = spawn(command, [...args], { stdio: "inherit", env: sanitizeInheritedChildProcessEnv({ env: process.env }) });
-      child.once("error", () => resolveRun(null));
-      child.once("exit", code => resolveRun(code));
+    run: (command, args) => new Promise((resolveRun) => {
+        const resume = pauseSetupProgress();
+        const child = spawn(command, [...args], { stdio: "inherit", env: sanitizeInheritedChildProcessEnv({ env: process.env }) });
+      child.once("error", () => {
+          resume();
+          resolveRun(null);
+        });
+      child.once("exit", (code) => {
+          resume();
+          resolveRun(code);
+        });
     }),
     platform: process.platform,
     found: agentId => (agentId === "claude-code" ? resolveNativeClaudeExecutable() : resolveNativeCodexHome()).then(() => true, () => false),
@@ -75,7 +86,7 @@ function productionAgentSetupDeps(output: Pick<Output, "json" | "setupLocale">):
  */
 async function offerGitForWindows(output: Output, deps: AgentSetupDeps): Promise<void> {
   const hint = gitHint(outputLocale(output));
-  if (!await deps.ask(setupWords(output, "gitOffer"))) {
+  if (!(await deps.ask(setupWords(output, "gitOffer")))) {
     output.line(hint);
     return;
   }
@@ -107,10 +118,10 @@ export async function setUpPersonalAgent(agentId: PersonalAgentId, output: Outpu
 
 /** Codex comes with Konteks: set up is its private folder, then found. */
 async function setUpCodex(output: Output, deps: AgentSetupDeps): Promise<boolean> {
-  if (!await deps.ask(setupWords(output, "codexOffer"))) return false;
+  if (!(await deps.ask(setupWords(output, "codexOffer")))) return false;
   const home = deps.codexHome();
   if (home) await mkdir(home, { recursive: true, mode: 0o700 }).catch(() => undefined);
-  if (home && await deps.found("codex")) return true;
+  if (home && (await deps.found("codex"))) return true;
   setupLine(output, "codexSetupFailed");
   return false;
 }
@@ -119,7 +130,7 @@ async function setUpCodex(output: Output, deps: AgentSetupDeps): Promise<boolean
 async function installClaudeCode(output: Output, deps: AgentSetupDeps): Promise<boolean> {
   const later = "konteks-remote agent add claude-code";
   const installer = claudeCodeInstaller(deps.platform);
-  if (!await deps.ask(setupWords(output, "claudeOffer", { url: installer.url }))) return false;
+  if (!(await deps.ask(setupWords(output, "claudeOffer", { url: installer.url })))) return false;
   if (deps.platform === "win32" && !deps.gitForWindows()) await offerGitForWindows(output, deps);
   setupLine(output, "claudeInstalling");
   const [command, args] = installerCommand(deps.platform);
@@ -216,7 +227,7 @@ export async function closeAgentSetup(
   const closing = new AgentClosing(input, deps);
   for (const agent of input.signInNow) if (input.agents.includes(agent)) await closing.signIn(agent);
   let states = await closing.settle();
-  if (deps.interactive() && await closing.offerSignIns(states)) states = await closing.settle();
+  if (deps.interactive() && (await closing.offerSignIns(states))) states = await closing.settle();
   closing.summarize(states);
 }
 
@@ -233,11 +244,23 @@ class AgentClosing {
   /** A skipped or failed sign-in leaves the command in the summary. */
   async signIn(agent: string): Promise<void> {
     this.attempted.add(agent);
-    await this.deps.signIn(agent).catch(() => undefined);
+    const resume = pauseSetupProgress();
+    try {
+      await this.deps.signIn(agent).catch(() => undefined);
+    } finally {
+      resume();
+    }
   }
 
   /** Every agent's state once none is still starting, or what is known at the deadline. */
   async settle(): Promise<Record<string, AgentState>> {
+    if (this.input.agents.length === 0) return {};
+    return this.input.output.progress
+      ? withSetupProgress(this.input.output, "phaseHealth", () => this.waitForAgents())
+      : this.waitForAgents();
+  }
+
+  private async waitForAgents(): Promise<Record<string, AgentState>> {
     if (this.input.agents.length === 0) return {};
     const deadline = this.deps.now() + (this.deps.waitMs ?? 90_000);
     for (;;) {
@@ -250,7 +273,7 @@ class AgentClosing {
   }
 
   private sayChecking(): void {
-    if (this.said) return;
+    if (this.said || this.input.output.progress) return;
     setupLine(this.input.output, "agentsChecking");
     this.said = true;
   }
@@ -264,7 +287,7 @@ class AgentClosing {
     let asked = false;
     for (const agent of this.input.agents) {
       if (states[agent] !== "needs_sign_in" || this.attempted.has(agent)) continue;
-      if (!await this.deps.ask(setupWords(this.input.output, "agentSignInOffer", { name: agentName(agent) }))) { this.attempted.add(agent); continue; }
+      if (!(await this.deps.ask(setupWords(this.input.output, "agentSignInOffer", { name: agentName(agent) })))) { this.attempted.add(agent); continue; }
       asked = true;
       await this.signIn(agent);
     }

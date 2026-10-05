@@ -17,7 +17,12 @@ import { spawnEnrollmentStaging } from "./enrollment-staging.js";
 import { onboardCoreUrl, onboardFailureStep, runOnboard } from "./onboard.js";
 import type { OnboardStep } from "./onboard-session.js";
 import { describeServiceFailure, encodeServiceDefinition, nativePlatform, nativeServiceDefinition, NativeServiceCommandError, parseLoadedService, parseServiceExits, serviceRun, startNativeServiceDefinition, type HostOs, type NativeServiceCommand, type NativeServiceDefinition, type NativeServiceExecute, type NativeServiceRun } from "./service.js";
-import { outputLocale, setupError, setupFailureText, setupLine, setupLocale, setupText, setupWords, type SetupLocale } from "../setup-locale.js";
+import { outputLocale,
+  setupDetail,
+  setupError, setupFailureText, setupLine, setupLocale, setupText, setupWords,
+  withSetupProgress,
+  type SetupLocale,
+} from "../setup-locale.js";
 import { clearServiceStartFailure, connectorLogFile, connectorLogTail, localServiceReport, readServiceStartFailure, recordServiceStartFailure } from "./service-report.js";
 import { verbose, verboseCommand } from "../verbose.js";
 import { checkNativeUpdate } from "./update.js";
@@ -267,9 +272,9 @@ function productionOwnServiceDefinitionDeps(root: string): OwnServiceDefinitionD
     write: writeSecretFile,
     os: nativePlatform().os,
     pid: process.pid,
-    inspect: async command => {
+    inspect: async (command) => {
       const result = await runServiceCommand(command, 10_000).catch(() => null);
-      return result?.code === 0 ? result.stdout ?? "" : null;
+      return result?.code === 0 ? (result.stdout ?? "") : null;
     },
     execute: executeDetailed,
     detach: detachServiceCommand,
@@ -320,7 +325,7 @@ export async function waitWhileStarting(
       await input.control.call({ op: "status" }, SupervisorStatusSchema, { timeoutMs: 5_000 });
       return;
     } catch (error) {
-      if (!await stillStarting(error, deps, deadline)) return;
+      if (!(await stillStarting(error, deps, deadline))) return;
       if (!said) setupLine(input.output, "serviceStillStarting");
       said = true;
       await deps.sleep(2_000);
@@ -329,9 +334,10 @@ export async function waitWhileStarting(
 }
 
 /** The control socket is not open yet, the service runs, and the wait is not over. */
-async function stillStarting(error: unknown, deps: { running: () => Promise<boolean>; now: () => number }, deadline: number): Promise<boolean> {
+async function stillStarting(error: unknown, deps: { running: () => Promise<boolean>; now: () => number }, deadline: number,
+): Promise<boolean> {
   if (!(error instanceof RemoteInstanceError) || error.code !== "control_socket_unavailable") return false;
-  return deps.now() < deadline && await deps.running();
+  return deps.now() < deadline && (await deps.running());
 }
 
 type UpdateCheck = Awaited<ReturnType<typeof checkNativeUpdate>>;
@@ -407,7 +413,7 @@ type ControlInput = Parameters<NativeCliActions["control"]>[0];
 type ControlOperation = (context: ControlContext, input: ControlInput) => Promise<void>;
 
 async function serviceRunning(root: string): Promise<boolean> {
-  return await execute((await serviceDefinition(root)).status) === 0;
+  return (await execute((await serviceDefinition(root)).status)) === 0;
 }
 
 function controlSocketUnavailable(error: unknown): boolean {
@@ -419,7 +425,7 @@ async function statusOrStopped(context: ControlContext, input: ControlInput): Pr
   try {
     return await status(context);
   } catch (error) {
-    if (!controlSocketUnavailable(error) || await serviceRunning(input.root)) throw error;
+    if (!controlSocketUnavailable(error) || (await serviceRunning(input.root))) throw error;
     setupLine(input.output, "serviceStoppedStatus");
   }
 }
@@ -494,10 +500,11 @@ async function shutdownNativeConnector(root: string): Promise<void> {
 /** launchctl bootout acknowledges deregistration before asynchronous owned
  * process cleanup has necessarily finished. A new private receipt is written
  * only after every daemon shutdown step succeeds. */
-export async function stopNativeConnector(input: NativeCommandContext, deps: NativeStopDeps = productionNativeStopDeps): Promise<void> {
+export async function stopNativeConnector(input: NativeCommandContext, deps: NativeStopDeps = productionNativeStopDeps,
+): Promise<void> {
   setupLocale();
   const definition = await deps.definition(input.root);
-  const owner = await deps.serviceOwner?.(input.root) ?? null;
+  const owner = (await deps.serviceOwner?.(input.root)) ?? null;
   if (owner) return stopOwnedNativeConnector(input, definition, deps, owner);
   const stoppedCodes = stoppedExitCodes(deps.platform.os);
   assertRunningBeforeStop(await deps.execute(definition.status), stoppedCodes);
@@ -531,9 +538,10 @@ async function requestOwnedShutdown(input: NativeCommandContext, definition: Nat
   });
 }
 
-async function waitForStopReceipt(root: string, definition: NativeServiceDefinition, deps: NativeStopDeps, before: { previousReceipt: string | null; stoppedCodes: readonly number[] }): Promise<void> {
+async function waitForStopReceipt(root: string, definition: NativeServiceDefinition, deps: NativeStopDeps, before: { previousReceipt: string | null; stoppedCodes: readonly number[] },
+): Promise<void> {
   const deadline = deps.now() + (deps.deadlineMs ?? 30_000);
-  while (!await stopConfirmed(root, definition, deps, before)) {
+  while (!(await stopConfirmed(root, definition, deps, before))) {
     if (deps.now() >= deadline) throw setupError("temporarily_unavailable", "serviceStoppedAgentsClosing");
     await deps.sleep(deps.pollMs ?? 250);
   }
@@ -556,10 +564,13 @@ function assertRunningBeforeStop(status: number | null, stoppedCodes: readonly n
 }
 
 /** A new shutdown receipt and a stopped service. */
-async function stopConfirmed(root: string, definition: NativeServiceDefinition, deps: NativeStopDeps, before: { previousReceipt: string | null; stoppedCodes: readonly number[] }): Promise<boolean> {
+async function stopConfirmed(root: string, definition: NativeServiceDefinition, deps: NativeStopDeps, before: { previousReceipt: string | null; stoppedCodes: readonly number[] },
+): Promise<boolean> {
   const receipt = await deps.readReceipt(root);
   const status = await deps.execute(definition.status);
-  return receipt !== null && receipt !== before.previousReceipt && status !== null && before.stoppedCodes.includes(status);
+  return (
+    receipt !== null && receipt !== before.previousReceipt && status !== null && before.stoppedCodes.includes(status)
+  );
 }
 /** The real start path with narrow hooks for collision and stopped-service tests. */
 export async function startNativeConnector(
@@ -594,9 +605,10 @@ export async function startNativeConnector(
   await moveOffOccupiedPort(input, { roots, platform }, serviceState);
   verbose(`registering and starting ${definition.label} from ${definition.path}`);
   const started = await startNativeServiceDefinition(definition, {
-    execute: command => command === definition.status ? serviceState().then(state => state === "running" ? 0 : stoppedCodes[0]!) : executeService(command),
+    execute: (command) => command === definition.status ? serviceState().then((state) => (state === "running" ? 0 : stoppedCodes[0]!)) : executeService(command),
     write: writeSecretFile,
-  }).catch((error: unknown) => startFailed(input.root, locale => startFailureDetail(error, platform.os, locale), error));
+  }).catch((error: unknown) => startFailed(input.root, locale => startFailureDetail(error, platform.os, locale), error),
+  );
   if (started === "already_running") {
     setupLine(input.output, "serviceAlreadyRunning");
     return;
@@ -608,7 +620,7 @@ export async function startNativeConnector(
   // finishes unpacking and opens its control port about a minute later. Saying
   // only "started" invited a second and third `start` against a service that
   // was already coming up.
-  setupLine(input.output, "serviceStarting");
+  setupDetail(input.output, "serviceStarting");
 }
 
 async function moveOffOccupiedPort(input: NativeCommandContext, release: { roots: readonly EmbeddedReleaseRoot[]; platform: ReturnType<typeof nativePlatform> }, serviceState: () => Promise<"running" | "stopped">): Promise<void> {
@@ -630,14 +642,15 @@ function startDefaults(deps: { roots?: readonly EmbeddedReleaseRoot[]; platform?
 }
 
 /** Running or stopped as the service manager says; anything else cannot prove this root is safe to rewrite. */
-async function readServiceState(executeService: NativeServiceExecute, definition: NativeServiceDefinition, stoppedCodes: readonly number[], owner?: () => Promise<NativeServiceProcessOwner | null>): Promise<"running" | "stopped"> {
+async function readServiceState(executeService: NativeServiceExecute, definition: NativeServiceDefinition, stoppedCodes: readonly number[], owner?: () => Promise<NativeServiceProcessOwner | null>,
+): Promise<"running" | "stopped"> {
   let code: number | null;
   try { code = serviceRun(await executeService(definition.status)).code; }
   catch { code = null; }
   const stopped = code !== null && stoppedCodes.includes(code);
   logServiceState(code, stopped);
   if (code === 0) return "running";
-  if (owner && await owner()) return "running";
+  if (owner && (await owner())) return "running";
   if (stopped) return "stopped";
   throw setupError("temporarily_unavailable", "serviceUnconfirmedStopped");
 }
@@ -756,7 +769,8 @@ const productionAgentAddDeps: NativeAgentAddDeps = {
  * while the service keeps running: a no, or a failed download, changes
  * nothing and stops nothing.
  */
-export async function runNativeAgentAdd(input: NativeCommandContext & { agent: string; yes?: boolean }, deps: NativeAgentAddDeps = productionAgentAddDeps): Promise<void> {
+export async function runNativeAgentAdd(input: NativeCommandContext & { agent: string; yes?: boolean }, deps: NativeAgentAddDeps = productionAgentAddDeps,
+): Promise<void> {
   setupLocale();
   const previous = await deps.readRecord(input.root);
   const host = hostAgentInstallAdapter(input.agent);
@@ -768,15 +782,16 @@ export async function runNativeAgentAdd(input: NativeCommandContext & { agent: s
   const setUp = await prepareAgent(input, deps, host, listed);
   const cycle = new ServiceCycle(deps, await deps.serviceDefinition(input.root));
   const wasRunning = await agentServiceRunning(input.root, deps, cycle);
-  const foreground = !wasRunning && await runsInTerminal(deps, input.root, previous);
+  const foreground = !wasRunning && (await runsInTerminal(deps, input.root, previous));
   cycle.resetStopDeadline();
   if (wasRunning || foreground) await stopForAgentAdd(input, deps, cycle, previous, foreground);
   await new AgentAddition(input, deps, cycle, previous, { wasRunning, foreground, setUp }).run();
 }
 
-async function agentServiceRunning(root: string, deps: NativeAgentAddDeps, cycle: ServiceCycle): Promise<boolean> {
+async function agentServiceRunning(root: string, deps: NativeAgentAddDeps, cycle: ServiceCycle,
+): Promise<boolean> {
   if (await cycle.running(setupError("temporarily_unavailable", "agentStateUnconfirmed"))) return true;
-  return (await deps.serviceOwner?.(root) ?? null) !== null;
+  return ((await deps.serviceOwner?.(root)) ?? null) !== null;
 }
 
 /**
@@ -802,10 +817,13 @@ async function alreadyInstalled(root: string, previous: NativeRuntimeRecord, hos
  * version checked, Claude Code or Codex offered and set up. Whether the
  * agent was set up now.
  */
-async function prepareAgent(input: NativeCommandContext & { agent: string; yes?: boolean }, deps: NativeAgentAddDeps, host: HostAgentInstallAdapter | undefined, listed: boolean): Promise<boolean> {
+async function prepareAgent(input: NativeCommandContext & { agent: string; yes?: boolean }, deps: NativeAgentAddDeps, host: HostAgentInstallAdapter | undefined, listed: boolean,
+): Promise<boolean> {
   if (host) await fetchOrLocate(input, deps, host);
   if (listed || !isPersonalAgent(input.agent)) return false;
-  return await (deps.ensurePersonal ?? ensurePersonalAgent)(input.agent, input.output) === "set_up";
+  return (
+    (await (deps.ensurePersonal ?? ensurePersonalAgent)(input.agent, input.output)) === "set_up"
+  );
 }
 
 /** A fetched agent asked about and downloaded; a host agent's own install found and its version checked. */
@@ -902,7 +920,7 @@ class AgentAddition {
   }
 
   private async assertStillStopped(): Promise<void> {
-    if (this.state.wasRunning && !await this.cycle.stopped()) throw setupError("temporarily_unavailable", "agentStartedAgain");
+    if (this.state.wasRunning && !(await this.cycle.stopped())) throw setupError("temporarily_unavailable", "agentStartedAgain");
   }
 
   private async closeSetup(): Promise<void> {
@@ -930,14 +948,14 @@ class AgentAddition {
     if (usesWindowsStop(this.deps)) return this.stopNewWindowsService();
     const { cycle, deps } = this;
     const code = await deps.execute(cycle.definition.status);
-    if (code === 0 && await deps.execute(cycle.definition.stop) !== 0) throw setupError("temporarily_unavailable", "agentRollbackCannotStop");
+    if (code === 0 && (await deps.execute(cycle.definition.stop)) !== 0) throw setupError("temporarily_unavailable", "agentRollbackCannotStop");
     if (code !== 0 && !cycle.stoppedCode(code)) throw setupError("temporarily_unavailable", "agentRollbackUnconfirmed");
     await cycle.awaitStopped(setupError("temporarily_unavailable", "agentRollbackStopTimedOut"));
   }
 
   private async stopNewWindowsService(): Promise<void> {
     const code = await this.deps.execute(this.cycle.definition.status);
-    if (code !== 1 || await this.deps.serviceOwner?.(this.input.root)) await this.deps.stop!(this.input);
+    if (code !== 1 || (await this.deps.serviceOwner?.(this.input.root))) await this.deps.stop!(this.input);
     this.cycle.resetStopDeadline();
   }
 }
@@ -1000,14 +1018,15 @@ class ServiceCycle {
     }
   }
 
-  async stop(couldNotStop: string | RemoteInstanceError, didNotFinish: string | RemoteInstanceError): Promise<void> {
-    if (await this.deps.execute(this.definition.stop) !== 0) throw cycleFailure("temporarily_unavailable", couldNotStop);
+  async stop(couldNotStop: string | RemoteInstanceError, didNotFinish: string | RemoteInstanceError,
+  ): Promise<void> {
+    if ((await this.deps.execute(this.definition.stop)) !== 0) throw cycleFailure("temporarily_unavailable", couldNotStop);
     await this.awaitStopped(didNotFinish);
   }
 
   async awaitStopped(didNotFinish: string | RemoteInstanceError): Promise<void> {
     this.resetStopDeadline();
-    while (!await this.stopped()) {
+    while (!(await this.stopped())) {
       if (this.deps.now() >= this.stopDeadline) throw cycleFailure("temporarily_unavailable", didNotFinish);
       await this.wait();
     }
@@ -1056,10 +1075,11 @@ interface NativeAgentRemoveDeps {
  * the record, deletes its downloads and its private home, and starts the
  * service again if it was running. Only a fetched agent is removed this way.
  */
-export async function runNativeAgentRemove(input: NativeCommandContext & { agent: string; yes?: boolean }, deps: NativeAgentRemoveDeps): Promise<void> {
+export async function runNativeAgentRemove(input: NativeCommandContext & { agent: string; yes?: boolean }, deps: NativeAgentRemoveDeps,
+): Promise<void> {
   const name = removableAgentName(input.agent);
   const previous = await deps.readRecord(input.root);
-  if (!await removalConfirmed(input, deps, name, previous)) return;
+  if (!(await removalConfirmed(input, deps, name, previous))) return;
   const cycle = new ServiceCycle(deps, await deps.serviceDefinition(input.root));
   const wasRunning = await cycle.running("The service manager cannot confirm this installation's service state. Inspect only this installation's service before removing an agent; identity and local work are unchanged.");
   cycle.resetStopDeadline();
@@ -1112,7 +1132,7 @@ async function confirmOnTerminal(question: string): Promise<boolean> {
 }
 
 export const nativeCliActions: NativeCliActions = {
-  install: async input => {
+  install: async (input) => {
     if (input.enroll) {
       // The enrollment install stops short of an identity, because there is no
       // Workspace to have one in yet. It verifies
@@ -1147,7 +1167,7 @@ export const nativeCliActions: NativeCliActions = {
     const setUp: string[] = [];
     const setupAgent = async (agent: "claude-code" | "codex") => { const done = await setUpPersonalAgent(agent, input.output); if (done) setUp.push(agent); return done; };
     const record = await installNative({ ...input, activationId: input.activationId!, deps: { consent, ...(input.agents === undefined ? { setupAgent } : {}) } });
-    await startNativeConnector(input);
+    await withSetupProgress(input.output, "phaseStart", () => startNativeConnector(input));
     // Sign in what was just set up, then say plainly what is ready and the one command for the rest.
     await closeAgentSetup(
       { agents: record.agents, signInNow: setUp, missing: input.agents === undefined ? PERSONAL_AGENTS.filter(agent => !record.agents.includes(agent)) : [], output: input.output },
@@ -1205,9 +1225,9 @@ export const nativeCliActions: NativeCliActions = {
     await service.waitUntilStopped();
   },
   start: startNativeConnector,
-  update: async input => {
+  update: async (input) => {
     if (input.check) return reportUpdateCheck(input);
-    if (!input.unattended && await notAcceptedByKonteks(input)) return;
+    if (!input.unattended && (await notAcceptedByKonteks(input))) return;
     await runNativeUpdate({ root: input.root, output: input.output, unattended: input.unattended }, productionUpdateDeps({ serviceDefinition, execute, start: startNativeConnector, serviceExits, forceStop: forceStopService, servicePid }));
   },
   uninstall: async input => {

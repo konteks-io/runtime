@@ -29,7 +29,14 @@ afterEach(async () => {
 
 const retainedOwner = (pid: number): RetainedProcessOwner =>
   ({ version: 1, platform: "darwin", pid, processGroupId: pid, startToken: `start-${pid}`, commandDigest: "A".repeat(43) });
-const modelOptions = [{ id: "model", name: "Model", category: "model", type: "select", currentValue: "sonnet", options: [{ value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }] }];
+const modelOption = {
+  id: "model", name: "Model", category: "model", type: "select", currentValue: "sonnet",
+  options: [{ value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }],
+  _meta: { konteksModelOffer: {
+    source: "codex-model-list.v1", offeredValues: ["sonnet", "opus"], defaultValue: "sonnet",
+  } },
+};
+const modelOptions = [modelOption];
 
 async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Date; modelCapabilityTtlMs?: number; probe?: () => Promise<IdentityProbe>;
   newSessionFails?: () => boolean | Error; closeSession?: () => Promise<object> } = {}) {
@@ -56,7 +63,7 @@ async function fixture(options: { limit?: number; ttlMs?: number; now?: () => Da
         closeSession: vi.fn(options.closeSession ?? (async () => ({}))),
         setSessionConfigOption: vi.fn(async ({ configId, value }: { configId: string; value: string }) => {
           selectedConfig.set(configId, value);
-          return { configOptions: [...selectedConfig].map(([id, currentValue]) => ({
+          return { configOptions: [...selectedConfig].map(([id, currentValue]) => id === modelOption.id ? { ...modelOption, currentValue } : ({
             id, name: id, type: "select" as const, currentValue,
             options: [{ value: currentValue, name: currentValue }],
           })) };

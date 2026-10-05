@@ -49,6 +49,8 @@ setup_text() {
 Setup could not finish|Pemasangan belum selesai
 Setup needs attention|Pemasangan perlu perhatian
 Setup complete|Pemasangan selesai
+Runtime setup|Pemasangan runtime
+Download and verify|Unduh dan verifikasi
 Review the technical message above before retrying.|Baca pesan teknis di atas sebelum mencoba ulang.
 Return to Konteks and copy a fresh setup command before trying again.|Kembali ke Konteks dan salin perintah pemasangan baru sebelum mencoba ulang.
 Return to Konteks -> Customize -> Runtimes.|Kembali ke Konteks -> Sesuaikan -> Runtimes.
@@ -96,9 +98,64 @@ SETUP_COPY
   printf "$setup_format\n" "$@"
 }
 
-setup_stage() { printf '\n'; setup_text "$@"; }
+setup_identity() {
+  if [ "${KONTEKS_SETUP_HEADER_SHOWN-}" = 1 ]; then return; fi
+  printf '\nKONTEKS\n'; setup_text 'Runtime setup'; printf '\n'
+  KONTEKS_SETUP_HEADER_SHOWN=1; export KONTEKS_SETUP_HEADER_SHOWN
+}
+
+setup_interactive() { [ -t 1 ]; }
+setup_spinner_pid=''
+setup_row_width=''
+setup_label_width=''
+setup_columns_valid() {
+  case "$1" in ''|0*|*[!0-9]*|????*) return 1 ;; esac
+  [ "$1" -ge 3 ] && [ "$1" -le 512 ]
+}
+setup_progress_width() {
+  if [ -n "$setup_row_width" ]; then return; fi
+  setup_columns="${COLUMNS-}"
+  if ! setup_columns_valid "$setup_columns"; then
+    setup_size="$(stty size 2>/dev/null </dev/tty || :)"
+    setup_columns="${setup_size##* }"
+  fi
+  if ! setup_columns_valid "$setup_columns"; then setup_columns=80; fi
+  # Resolve once, leave the final column unused, and spawn no width tools per frame.
+  setup_row_width=$((setup_columns - 1))
+  setup_label_width=$((setup_row_width - 2))
+}
+setup_progress_stop() {
+  if [ -z "$setup_spinner_pid" ]; then return; fi
+  kill "$setup_spinner_pid" 2>/dev/null || :
+  wait "$setup_spinner_pid" 2>/dev/null || :
+  setup_spinner_pid=''
+  printf '\r%*s\r' "$setup_row_width" ''
+}
+setup_progress_start() {
+  setup_progress_stop
+  setup_label="$(setup_text "$@")"
+  if ! setup_interactive; then printf '  %s\n' "$setup_label"; return; fi
+  setup_progress_width
+  (
+    while :; do
+      for setup_frame in '|' '/' '-' '\'; do
+        printf '\r%s %.*s' "$setup_frame" "$setup_label_width" "$setup_label"
+        sleep 0.2
+      done
+    done
+  ) &
+  setup_spinner_pid=$!
+}
+
+setup_stage() { setup_progress_stop; printf '\n'; setup_text "$@"; }
 setup_detail() {
+  setup_was_spinning="$setup_spinner_pid"
+  setup_progress_stop
   setup_text "$@" | while IFS= read -r setup_line; do printf '  %s\n' "$setup_line"; done
+  if [ -n "$setup_was_spinning" ]; then setup_progress_start "$setup_label"; fi
+}
+setup_diagnostic() {
+  case "${KONTEKS_REMOTE_VERBOSE-}" in 1|true|yes|on) setup_detail "$@" ;; esac
 }
 setup_fail() {
   setup_exit="$1"; shift
@@ -109,11 +166,13 @@ setup_fail() {
 }
 
 setup_run() {
+  setup_progress_stop
   if "$@"; then return 0; else setup_exit="$?"; fi
   setup_fail "$setup_exit" 'Review the technical message above before retrying.'
 }
 
 setup_connect() {
+  setup_progress_stop
   if [ "$enroll" -eq 1 ]; then
     setup_stage '3 of 3 - Enroll this computer'
     setup_detail 'Enrolling this computer with Konteks...'
@@ -189,16 +248,22 @@ case "$arch" in
 esac
 
 workdir="$(mktemp -d)"
-trap 'rm -rf "$workdir"' EXIT INT TERM
+trap 'setup_progress_stop; rm -rf "$workdir"' 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
 umask 077
 
 fetch() {
-  if curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1"; then return 0; else setup_exit="$?"; fi
+  if curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1" 2>"$workdir/download-error"; then return 0; else setup_exit="$?"; fi
+  setup_progress_stop
+  cat "$workdir/download-error" >&2
   setup_fail "$setup_exit" 'error: could not download %s' "${1##*/}"
 }
 
+setup_identity
 setup_stage '1 of 3 - Download and verify'
-setup_detail 'konteks-remote bootstrap v%s: fetching the signed checksum manifest' "$BOOTSTRAP_VERSION"
+setup_diagnostic 'konteks-remote bootstrap v%s: fetching the signed checksum manifest' "$BOOTSTRAP_VERSION"
+setup_progress_start 'Download and verify'
 fetch "${RELEASE_BASE}/SHA256SUMS" "$workdir/SHA256SUMS"
 fetch "${RELEASE_BASE}/SHA256SUMS.sig" "$workdir/SHA256SUMS.sig"
 

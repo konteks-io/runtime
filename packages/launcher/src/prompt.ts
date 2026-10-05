@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
 import { affirmative, setupError, setupLocale, setupText, type SetupLocale } from "./setup-locale.js";
+import { pauseSetupProgress } from "./foreground-progress.js";
 
 /**
  * The secure no-echo prompt. The activation code and an agent's API key are read
@@ -34,6 +35,7 @@ export async function promptSecret(options: SecretPromptOptions): Promise<string
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stderr;
   assertInteractive(input, options);
+  const resume = pauseSetupProgress(output);
   const muted = new Writable({ write: (_chunk, _encoding, callback) => callback() });
   const rl = createInterface({ input, output: muted, terminal: true });
   output.write(setupText("hiddenInput", { label: promptLabel(options, locale) }, locale));
@@ -49,6 +51,7 @@ export async function promptSecret(options: SecretPromptOptions): Promise<string
   } finally {
     rl.close();
     output.write("\n");
+    resume();
   }
   const trimmed = value.trim();
   if (trimmed.length < (options.minLength ?? 8) || trimmed.length > (options.maxLength ?? 4_096)) {
@@ -58,10 +61,12 @@ export async function promptSecret(options: SecretPromptOptions): Promise<string
 }
 
 /** One line typed in the open (a choice from a list, never a secret). */
-export async function promptLine(label: string, options: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream; locale?: SetupLocale } = {}): Promise<string> {
+export async function promptLine(label: string, options: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream; locale?: SetupLocale } = {},
+): Promise<string> {
   setupLocale();
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stderr;
+  const resume = pauseSetupProgress(output);
   const rl = createInterface({ input, output, terminal: false });
   try {
     return await new Promise<string>((resolve, reject) => {
@@ -71,14 +76,17 @@ export async function promptLine(label: string, options: { input?: NodeJS.Readab
     });
   } finally {
     rl.close();
+    resume();
   }
 }
 
 /** A plain yes/no confirmation for privileged or destructive steps. Never defaults to yes. */
-export async function confirm(question: string, options: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream; locale?: SetupLocale } = {}): Promise<boolean> {
+export async function confirm(question: string, options: { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream; locale?: SetupLocale } = {},
+): Promise<boolean> {
   const locale = options.locale ?? setupLocale();
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stderr;
+  const resume = pauseSetupProgress(output);
   const rl = createInterface({ input, output, terminal: false });
   try {
     const answer = await new Promise<string>(resolve => {
@@ -88,5 +96,6 @@ export async function confirm(question: string, options: { input?: NodeJS.Readab
     return affirmative(answer, locale);
   } finally {
     rl.close();
+    resume();
   }
 }

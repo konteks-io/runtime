@@ -2,7 +2,11 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { PromptRequest } from "@agentclientprotocol/sdk";
 import { AgentRuntime, RunnerConfigSchema, SessionContextSchema, browserMcpServer, runnerBrowserVersion, verifyNativeRunnerPackage, type AgentRuntimeOptions, type RunnerConfig, type RunnerEvent } from "@konteks/remote-agent-runner";
-import { AgentLoginGcpSchema, AgentLoginOptionIdSchema, RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, withoutUndefined, type RetainedProcessOwner } from "@konteks/remote-common";
+import { AgentLoginGcpSchema, AgentLoginOptionIdSchema,
+  DirectModelSelectionPolicySchema,
+  DirectModelSelectionSchema,
+  RemoteInstanceError, RemoteSessionLabelSchema, SessionToRuntimeMessageSchema, stopRetainedProcessOwner, withoutUndefined, type RetainedProcessOwner,
+} from "@konteks/remote-common";
 import type { RunnerHostSettings, RunnerLoginRequest, RunnerPort, RunnerSessionInput, RunnerSessionLifecycle } from "../runner-port.js";
 import type { checkDshKonteksProfile } from "./dsh-profile-check.js";
 import type { checkOpenCodeKonteksConfig } from "./opencode-self-check.js";
@@ -26,6 +30,8 @@ const inputSchema = z.object({
     headers: z.array(z.object({ name: z.string(), value: z.string() }).strict()).max(32),
   }).strict()).max(8),
   sessionConfig: z.record(z.string(), z.string()).optional(),
+    modelSelectionPolicy: DirectModelSelectionPolicySchema.optional(),
+    modelSelection: DirectModelSelectionSchema.optional(),
   acpSessionRef: z.string().min(1).max(256).optional(),
   restoreAcpSessionRef: z.string().min(1).max(256).optional(),
   freshProviderSessionOnRestore: z.boolean().optional(),
@@ -42,7 +48,12 @@ const inputSchema = z.object({
     admittedMcpServerNames: z.array(z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/)).max(8),
     accountConnectors: z.boolean(),
   }).strict().optional(),
-}).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined);
+}).strict().refine(value => value.acpSessionRef === undefined || value.restoreAcpSessionRef === undefined)
+  .refine(
+    (value) =>
+      value.integration === undefined ||
+      (value.modelSelectionPolicy === undefined && value.modelSelection === undefined),
+  );
 
 export interface NativeRunnerOptions {
   instanceId: string;
@@ -227,8 +238,13 @@ export class NativeRunner implements RunnerPort {
     return this.runtime.sessions.create(args);
   }
 
-  private sessionArgs(data: z.infer<typeof inputSchema>, lifecycle: RunnerSessionLifecycle | undefined) {
-    const { context, readinessDeadlineAt, cwd, sessionConfig, acpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser, integration } = data;
+  private sessionArgs(data: z.infer<typeof inputSchema>, lifecycle: RunnerSessionLifecycle | undefined,
+  ) {
+    const { context, readinessDeadlineAt, cwd, sessionConfig,
+      modelSelectionPolicy,
+      modelSelection,
+      acpSessionRef, freshProviderSessionOnRestore, sessionLabel, agentTitled, browser, integration,
+    } = data;
     // The session's browser is a stdio MCP server the agent launches (its own
     // package's, or the connector's for an agent without one); composed here,
     // where the paths are known.
@@ -236,7 +252,11 @@ export class NativeRunner implements RunnerPort {
     const mcpServers = browserServer === null ? data.mcpServers : [...data.mcpServers, browserServer];
     return {
       context, readinessDeadlineAt, cwd, mcpServers,
-      ...withoutUndefined({ sessionConfig, acpSessionRef, freshProviderSessionOnRestore, sessionLabel }),
+      ...withoutUndefined({ sessionConfig,
+        modelSelectionPolicy,
+        modelSelection,
+        acpSessionRef, freshProviderSessionOnRestore, sessionLabel,
+      }),
       ...(agentTitled ? { agentTitled } : {}),
       ...withoutUndefined({ integration }),
       lifecycle: this.sessionLifecycle(lifecycle),

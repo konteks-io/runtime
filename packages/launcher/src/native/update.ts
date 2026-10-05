@@ -5,7 +5,7 @@ import { NATIVE_UPDATE_TARGET_ENV, NativeUpdateTargetSchema, writeSecretFile } f
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot, type VerifiedNativeRelease } from "@konteks/remote-release";
 import { acquireNativeRootLock, compareSemver, loadNativeInstallation, NativeRuntimeRecordSchema, ownedByAnotherConnector, verifyInstalledNativeConnector, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import type { Output } from "../output.js";
-import { setupError, setupLine, setupLocale } from "../setup-locale.js";
+import { setupDetail, setupError, setupLocale, setupProgress } from "../setup-locale.js";
 import { nativePlatform, type NativePlatform } from "./service.js";
 import { moveRecordAndManifest, withRuntimeLocks } from "./install.js";
 
@@ -77,11 +77,16 @@ export async function stageNativeUpdate(options: { root: string; output: Output;
     const agents = current.agents.filter(agent => !isHostAgentId(agent));
     const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: agents });
     assertOfflineArtifacts(artifacts);
-    setupLine(options.output, "updateStaging", { version: release.manifest.bundleVersion, current: current.bundleVersion });
-    const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn: options.deps?.fetchFn ?? fetch });
+    setupDetail(options.output, "updateStaging", { version: release.manifest.bundleVersion, current: current.bundleVersion });
+    const stopProgress = setupProgress(options.output, "phaseDownload");
+    try {
+      const staged = await stageNativeRelease({ release, target: { ...platform, agentIds: agents }, releasesDir: join(root, "releases"), fetchFn: options.deps?.fetchFn ?? fetch });
     const { releaseId, directory } = await completeStagedRelease({ root, release, platform, agents, artifacts, staged, lock });
-    setupLine(options.output, "updateStaged", { version: release.manifest.bundleVersion, release: releaseId });
+      setupDetail(options.output, "updateStaged", { version: release.manifest.bundleVersion, release: releaseId });
     return { status: "staged", current, release, releaseId, directory };
+    } finally {
+      stopProgress();
+    }
   } finally {
     lock.release();
   }
@@ -158,7 +163,7 @@ export async function commitNativeUpdate(options: { root: string; releaseId: str
     const release = await stagedRelease(join(root, "releases", options.releaseId), roots, platform, current.record);
     const successor = NativeRuntimeRecordSchema.parse({ ...current.record, releaseId: options.releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest });
     await moveRecordAndManifest({ root, lock: installer, load: () => loadNativeInstallation(root, { roots, platform }), current: current.record, successor, manifest: release.manifest, corrupt: invalid });
-    setupLine(options.output, "updateRecordMoved", { release: options.releaseId, version: successor.bundleVersion, previous: current.record.releaseId });
+    setupDetail(options.output, "updateRecordMoved", { release: options.releaseId, version: successor.bundleVersion, previous: current.record.releaseId });
     return successor;
   });
 }

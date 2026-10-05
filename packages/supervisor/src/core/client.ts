@@ -1,4 +1,11 @@
-import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema, allEqual, createLogger, type Logger, type RuntimeUpdateReport } from "@konteks/remote-common";
+import { AgentTurnUsageObservationSchema, RuntimeAgentLoginReportSchema, RuntimeUpdateReportSchema,
+  RuntimeUpdateLocalBeginRequestSchema,
+  RuntimeUpdateLocalBeginResultSchema,
+  allEqual, withoutUndefined,
+  directModelSelectionsEqual, createLogger, type Logger, type RuntimeUpdateReport,
+  type RuntimeUpdateLocalBeginRequest,
+  type RuntimeUpdateLocalBeginResult,
+} from "@konteks/remote-common";
 
 import { z } from "zod";
 import { createHash, createPublicKey, type KeyObject } from "node:crypto";
@@ -156,6 +163,7 @@ const CORE_PATHS = Object.freeze({
   // A coding agent login the person started from the site.
   agentLoginReport: (instanceId: string) => instancePath(instanceId, "agent-logins/report"),
   runtimeUpdateReport: (instanceId: string) => instancePath(instanceId, "runtime-updates/report"),
+  runtimeUpdateLocal: (instanceId: string) => instancePath(instanceId, "runtime-updates/local"),
   acceptedRelease: (instanceId: string) => instancePath(instanceId, "accepted-release"),
   // Uninstall: the runtime removes itself, lease-authenticated like the rest.
   retire: (instanceId: string) => instancePath(instanceId, "retire"),
@@ -325,7 +333,9 @@ function errorFields(error: unknown): { code: string; diagnostic?: string } {
 }
 
 function configurationAck(ack: unknown): boolean {
-  return typeof ack === "object" && ack !== null && "type" in ack && ack.type === "desired_configuration_ack";
+  return (
+    typeof ack === "object" && ack !== null && "type" in ack && ack.type === "desired_configuration_ack"
+  );
 }
 
 function supersededAck<T extends { requestDigest: string; appliedRevision?: number | null }>(receipt: T, request: ReturnType<typeof DesiredConfigurationAckSchema.parse>): T {
@@ -397,9 +407,14 @@ export class CoreClient {
       idempotencyKey: `readiness:${request.instanceId}:${jcsDigest(request as unknown as JsonValue)}` });
   }
 
-  async registerExecutionReady(instanceId: string, request: Omit<RemoteExecutionReadyRequest, "proof">, deadlineAtMs?: number): Promise<RemoteExecutionReadyResult> {
+  async registerExecutionReady(instanceId: string, request: Omit<RemoteExecutionReadyRequest, "proof">, deadlineAtMs?: number,
+  ): Promise<RemoteExecutionReadyResult> {
+    const body = z.record(z.string(), BoundedJsonValueSchema).parse(withoutUndefined({
+      ...request,
+      modelSelection: request.modelSelection === undefined ? undefined : withoutUndefined(request.modelSelection),
+    }));
     const result = await this.http.request({ method: "POST", path: CORE_PATHS.executionReady(instanceId),
-      bodyFactory: () => RemoteExecutionReadyRequestSchema.parse({ ...request, proof: this.proof("execution_ready", instanceId, request) }), schema: RemoteExecutionReadyResultSchema,
+      bodyFactory: () => RemoteExecutionReadyRequestSchema.parse({ ...body, proof: this.proof("execution_ready", instanceId, body) }), schema: RemoteExecutionReadyResultSchema,
       idempotencyKey: `execution-ready:${request.assignmentId}:${request.attempt}:${request.claimId}:${request.recoveryEpoch}`,
       operationPolicy: "admissionPreparation",
       ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }) });
@@ -407,7 +422,9 @@ export class CoreClient {
       [result.instanceId, instanceId], [result.assignmentId, request.assignmentId], [result.attempt, request.attempt], [result.claimId, request.claimId],
       [result.recoveryEpoch, request.recoveryEpoch], [result.runnerIncarnation, request.runnerIncarnation], [result.agentId, request.agentId],
       [result.acpSessionRef, request.acpSessionRef],
-    ])) {
+    ]) ||
+      !directModelSelectionsEqual(result.modelSelection, request.modelSelection)
+    ) {
       throw new RemoteInstanceError("registration_mismatch", "Execution readiness response does not match the local claim.");
     }
     return result;
@@ -554,8 +571,12 @@ export class CoreClient {
     }
   }
 
-  async fetchDesiredConfiguration(instanceId: string): Promise<DesiredConfigurationEnvelope> {
-    const result = await this.http.request({ method: "GET", path: CORE_PATHS.desiredConfiguration(instanceId), schema: DesiredConfigurationEnvelopeSchema });
+  async fetchDesiredConfiguration(instanceId: string,
+    options: { deadlineAtMs?: number } = {},
+  ): Promise<DesiredConfigurationEnvelope> {
+    const result = await this.http.request({ method: "GET", path: CORE_PATHS.desiredConfiguration(instanceId), schema: DesiredConfigurationEnvelopeSchema,
+      ...options,
+    });
     if (result.instanceId !== instanceId) throw new RemoteInstanceError("registration_mismatch", "Configuration response belongs to another instance.");
     return result;
   }
@@ -855,12 +876,43 @@ export class CoreClient {
     });
   }
 
-  async reportRuntimeUpdate(instanceId: string, report: RuntimeUpdateReport): Promise<{ accepted: boolean }> {
+  /** Trusted local staging admits execution with an attempt identity, never a command. */
+  async beginLocalRuntimeUpdate(
+    instanceId: string,
+    request: RuntimeUpdateLocalBeginRequest,
+    options: { deadlineAtMs?: number } = {},
+  ): Promise<RuntimeUpdateLocalBeginResult> {
+    const body = RuntimeUpdateLocalBeginRequestSchema.parse(request);
+    const result = await this.http.request({
+      method: "POST",
+      path: CORE_PATHS.runtimeUpdateLocal(instanceId),
+      body,
+      schema: RuntimeUpdateLocalBeginResultSchema,
+      idempotencyKey: `runtime-update-local:${body.attemptId}`,
+      ...options,
+    });
+    if (
+      result.update.instanceId !== instanceId ||
+      result.update.targetBundle !== body.targetBundle ||
+      result.update.manifestDigest !== body.manifestDigest
+    ) {
+      throw new RemoteInstanceError(
+        "registration_mismatch",
+        "Local update response belongs to another attempt target.",
+      );
+    }
+    return result;
+  }
+
+  async reportRuntimeUpdate(instanceId: string, report: RuntimeUpdateReport,
+    options: { deadlineAtMs?: number } = {},
+  ): Promise<{ accepted: boolean }> {
     const body = RuntimeUpdateReportSchema.parse(report);
     return this.http.request({
       method: "POST", path: CORE_PATHS.runtimeUpdateReport(instanceId), body,
       schema: z.object({ accepted: z.boolean() }).strict(),
       idempotencyKey: `runtime-update:${body.updateId}:${body.state}`,
+      ...options,
     });
   }
 

@@ -1,4 +1,8 @@
-import type { AgentLoginGcp, AgentLoginOptionId, ConnectedAgentView, RemoteSessionLabel, RetainedProcessOwner } from "@konteks/remote-common";
+import type { AgentLoginGcp, AgentLoginOptionId, ConnectedAgentView,
+  DirectModelSelection,
+  DirectModelSelectionPolicy,
+  RemoteSessionLabel, RetainedProcessOwner,
+} from "@konteks/remote-common";
 
 /** Which sign-in to start or remove, for an agent with several (OpenCode, Antigravity). */
 export interface RunnerLoginRequest {
@@ -23,6 +27,8 @@ export interface RunnerSessionInput {
   cwd: string;
   mcpServers: Array<{ type: "http" | "sse"; name: string; url: string; headers: Array<{ name: string; value: string }> }>;
   sessionConfig?: Record<string, string>;
+  modelSelectionPolicy?: DirectModelSelectionPolicy;
+  modelSelection?: DirectModelSelection;
   /** Exact live predecessor owned in this process. */
   acpSessionRef?: string;
   /** Durable prior ref whose provider session must be loaded under a new local ref. */
@@ -52,6 +58,7 @@ export interface RunnerSessionCreated {
   acpSessionRef: string;
   resumed: boolean;
   capabilities: { forkSession: boolean; sessionResume: boolean };
+  modelSelection?: DirectModelSelection;
 }
 
 /** In-process native ownership only; never serialized onto ACP or HTTP. */
