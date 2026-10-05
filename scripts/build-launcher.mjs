@@ -20,6 +20,17 @@ if (!os || !out) {
   console.error("usage: build-launcher.mjs --os macos|windows|debian --out dist/<artifact>");
   process.exit(2);
 }
+// SEA copies process.execPath below; changing the output name cannot change
+// that executable's platform. Build each target on its matching native host.
+const targetPlatforms = { macos: "darwin", windows: "win32", debian: "linux" };
+if (!Object.hasOwn(targetPlatforms, os)) {
+  console.error(`unsupported launcher target: ${os}`);
+  process.exit(2);
+}
+if (targetPlatforms[os] !== process.platform) {
+  console.error(`launcher target must match the build host: ${os} requires ${targetPlatforms[os]}, found ${process.platform}`);
+  process.exit(2);
+}
 const roots = process.env.KONTEKS_RELEASE_ROOTS_JSON;
 if (!roots) {
   console.error("KONTEKS_RELEASE_ROOTS_JSON must be set: a launcher without embedded roots verifies nothing and must not be shipped");
