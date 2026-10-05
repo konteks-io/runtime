@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 import { assertMacOsArtifactTree, macOsArtifactOptions } from "./macos-artifact-compatibility.mjs";
+import { graftParserSmokeSource, pruneGraftPrebuilds } from "./offline-graft-prebuilds.mjs";
 
 const shell = process.platform === "win32";
 const npm = shell ? "npm.cmd" : "npm";
@@ -38,8 +39,15 @@ try {
   execFileSync(npm, ["install", "--no-audit", "--no-fund", "--no-package-lock", "--omit=dev", "--prefix", root, `${tool.package}@${tool.version}`], { stdio: "inherit", shell, env: buildEnvironment });
   const cli = join(root, "node_modules", ...tool.package.split("/"), ...tool.entrypoint.split("/"));
   if (!existsSync(cli)) throw new Error(`${tool.package} has no ${tool.entrypoint}`);
+  if (macOptions) {
+    const nodeArch = args.architecture === "amd64" ? "x64" : args.architecture;
+    if (process.arch !== nodeArch) throw new Error("Graft target does not match the native build host");
+    const selection = pruneGraftPrebuilds(root, { platform: process.platform, architecture: args.architecture });
+    console.log(`Graft native prebuild selection: ${JSON.stringify(selection)}`);
+  }
   // The package must run with nothing but this Node: no network, no home.
   execFileSync(process.execPath, [cli, "--version"], { stdio: "inherit", env: { PATH: "/usr/bin:/bin", HOME: work, DO_NOT_TRACK: "1" } });
+  if (macOptions) execFileSync(process.execPath, ["--max-old-space-size=128", "--input-type=commonjs", "--eval", graftParserSmokeSource(), root], { stdio: "inherit", timeout: 30_000, env: { PATH: "/usr/bin:/bin", HOME: work, DO_NOT_TRACK: "1" } });
   if (macOptions) assertMacOsArtifactTree(root, macOptions);
   execFileSync("tar", ["-czf", args.out, "-C", root, "node_modules"], { stdio: "inherit" });
   console.log(`built ${args.out} (${tool.package}@${tool.version})`);
