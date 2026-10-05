@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const loaderVersion = "4.8.4";
 const loaderSha256 = "134f0585f7c665db89f332a379158c6f113274422e42aaf54e0aa9d5ac37f577";
+const treeSitterRootSha256 = "830fa91de08c3c8348e7f8614ec41b20147f7f4a7491ed944d4a68e15ce89716";
 const nodeArchitectures = new Map([["amd64", "x64"], ["arm64", "arm64"]]);
 const indexWrapper = `const runtimeRequire = typeof __webpack_require__ === 'function' ? __non_webpack_require__ : require // eslint-disable-line
 if (typeof runtimeRequire.addon === 'function') { // if the platform supports native resolving prefer that
@@ -97,7 +98,7 @@ function planConsumer(path, modules, name, state) {
   const metadata = packageMetadata(state.root, join(path, "package.json"));
   if (typeof metadata.dependencies?.["node-gyp-build"] !== "string") throw new Error(`Unreviewed native loader consumer: ${metadata.name}`);
   const entry = createRequire(join(dirname(modules), "konteks-resolution.cjs")).resolve(name);
-  assertConsumerEntry(state.root, path, entry);
+  assertConsumerEntry(state.root, path, entry, metadata);
   assertLoader(state.root, entry);
   const prebuilds = join(path, "prebuilds");
   const tuples = tuplePlans(state, prebuilds);
@@ -105,19 +106,42 @@ function planConsumer(path, modules, name, state) {
   return { package: metadata.name, version: metadata.version, path: relative(state.root, path).split(sep).join("/"), loaderVersion, loaderSha256, ...tuples };
 }
 
-function assertConsumerEntry(root, packageRoot, entry) {
-  const source = readSource(root, entry).toString("utf8").replaceAll("\r\n", "\n");
+function assertConsumerEntry(root, packageRoot, entry, metadata) {
+  const bytes = readSource(root, entry);
+  if (metadata.name.length > 214 || metadata.version.length > 128) throw new Error("Native consumer identity exceeds context bound");
+  try {
+    assertConsumerSource(packageRoot, entry, bytes, metadata);
+  } catch (cause) {
+    const scoped = consumerEntryContext(root, entry);
+    throw new Error(`${cause.message}: ${metadata.name}@${metadata.version}, entry ${JSON.stringify(scoped)}`, { cause });
+  }
+}
+
+function consumerEntryContext(root, entry) {
+  const scoped = scopedRelative(root, entry).split(sep).join("/");
+  return Buffer.byteLength(scoped, "utf8") <= 4_096 ? scoped : "<staging-relative entry omitted: exceeds 4096 UTF-8 bytes>";
+}
+
+function assertConsumerSource(packageRoot, entry, bytes, metadata) {
+  const source = bytes.toString("utf8").replaceAll("\r\n", "\n");
   if (/\b(?:function\s+(?:require|__dirname|root)\s*\(|(?:const|let|var)\s+(?:require|__dirname)\b)/.test(source)) throw new Error("Native consumer shadows the reviewed loader context");
   const calls = [...source.matchAll(/require\(['"]node-gyp-build['"]\)\(([^)]+)\)/g)];
   if (calls.length !== 1) throw new Error("Unreviewed native loader call syntax");
-  if (calls[0][1] === "__dirname") return assertRootEntry(packageRoot, entry, source);
+  if (calls[0][1] === "__dirname") return assertRootEntry(packageRoot, entry, source, bytes, metadata);
   if (calls[0][1] === "root") return assertGrammarEntry(packageRoot, entry, source);
   throw new Error("Native loader argument does not identify its prebuild root");
 }
 
-function assertRootEntry(packageRoot, entry, source) {
+function assertRootEntry(packageRoot, entry, source, bytes, metadata) {
   const header = /^const binding = require\(['"]node-gyp-build['"]\)\(__dirname\);\n/;
-  if (dirname(entry) !== packageRoot || !header.test(source)) throw new Error("Unreviewed native root entry");
+  if (dirname(entry) !== packageRoot) throw new Error("Unreviewed native root entry");
+  if (header.test(source) || reviewedTreeSitterRoot(packageRoot, entry, bytes, metadata)) return;
+  throw new Error("Unreviewed native root entry");
+}
+
+function reviewedTreeSitterRoot(packageRoot, entry, bytes, metadata) {
+  return metadata.name === "tree-sitter" && metadata.version === "0.22.4" &&
+    entry === join(packageRoot, "index.js") && createHash("sha256").update(bytes).digest("hex") === treeSitterRootSha256;
 }
 
 function assertGrammarEntry(packageRoot, entry, source) {

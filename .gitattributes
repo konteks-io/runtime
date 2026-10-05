@@ -1,0 +1,7 @@
+# Authenticated upstream fixtures retain their exact published bytes.
+scripts/fixtures/node-gyp-build-4.8.4/node-gyp-build.js -text
+scripts/fixtures/node-gyp-build-4.8.4/LICENSE -text
+# This unmodified upstream source includes trailing spaces bound by its SHA-256.
+scripts/fixtures/tree-sitter-0.22.4/index.js -text whitespace=-blank-at-eol
+scripts/fixtures/tree-sitter-0.22.4/package.json -text
+scripts/fixtures/tree-sitter-0.22.4/LICENSE -text

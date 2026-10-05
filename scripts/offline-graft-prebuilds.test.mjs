@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -165,6 +166,37 @@ function fixtureFileSystem(root) {
   };
 }
 
+function authenticatedFixtureCheckout(name, fixture = "node-gyp-build-4.8.4") {
+  const directory = mkdtempSync(join(tmpdir(), "graft-authenticated-checkout-"));
+  try {
+    const source = join(directory, "source");
+    const checkout = join(directory, "checkout");
+    mkdirSync(source);
+    mkdirSync(checkout);
+    const config = join(directory, "empty-git-config");
+    writeFileSync(config, "", { flag: "wx" });
+    const options = { cwd: source, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: config, GIT_ATTR_NOSYSTEM: "1" }, timeout: 15_000, windowsHide: true, stdio: "pipe" };
+    const file = `scripts/fixtures/${fixture}/${name}`;
+    write(source, file, readFileSync(join(scriptDirectory, "fixtures", fixture, name)));
+    const attributes = join(dirname(scriptDirectory), ".gitattributes");
+    if (existsSync(attributes)) write(source, ".gitattributes", readFileSync(attributes));
+    execFileSync("git", ["init", "--quiet"], options);
+    execFileSync("git", ["-c", "core.autocrlf=false", "add", "--", "."], options);
+    execFileSync("git", ["-c", "core.autocrlf=true", "checkout-index", "--all", `--prefix=${checkout}${nodePath.sep}`], options);
+    return readFileSync(join(checkout, file));
+  } finally {
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+for (const name of ["node-gyp-build.js", "LICENSE"]) {
+  test(`Graft authenticated fixture checkout preserves exact ${name} bytes with autocrlf`, () => {
+    const expected = readFileSync(join(scriptDirectory, "fixtures", "node-gyp-build-4.8.4", name));
+    assert.deepEqual(authenticatedFixtureCheckout(name), expected);
+  });
+}
+
 test("Graft selector fixture is the independently verified node-gyp-build4.8.4 source", () => {
   assert.equal(loaderSource.length, 6_078);
   assert.equal(createHash("sha256").update(loaderSource).digest("hex"), "134f0585f7c665db89f332a379158c6f113274422e42aaf54e0aa9d5ac37f577");
@@ -306,4 +338,120 @@ function smokeDependency(name, exports, expected) {
     assert.equal(entry, expected);
     return name => { assert.ok(exports.has(name)); return exports.get(name); };
   } };
+}
+
+const reviewedRootDirectory = join(scriptDirectory, "fixtures", "tree-sitter-0.22.4");
+const reviewedRootSource = readFileSync(join(reviewedRootDirectory, "index.js"));
+const reviewedRootManifest = readFileSync(join(reviewedRootDirectory, "package.json"));
+
+function seedReviewedRoot(root) {
+  write(root, `${parserPath}/package.json`, reviewedRootManifest);
+  write(root, `${parserPath}/index.js`, reviewedRootSource);
+}
+
+test("Graft reviewed tree-sitter 0.22.4 fixture has the authenticated raw source and package identity", () => {
+  assert.equal(reviewedRootSource.length, 26_448);
+  assert.equal(createHash("sha256").update(reviewedRootSource).digest("hex"), "830fa91de08c3c8348e7f8614ec41b20147f7f4a7491ed944d4a68e15ce89716");
+  assert.equal(createHash("sha256").update(reviewedRootManifest).digest("hex"), "ae7daa24f7b4bc68d2f57b0c017ffbb127dac1ec3b8d3d827bbb194b87821984");
+  assert.equal(JSON.parse(reviewedRootManifest.toString("utf8")).license, "MIT");
+  const license = readFileSync(join(reviewedRootDirectory, "LICENSE"));
+  assert.equal(createHash("sha256").update(license).digest("hex"), "d39420a108609f487bece31800015cccabdb531fee4d543d66595459b3812d9a");
+  assert.match(license.toString("utf8"), /Copyright \(c\) 2014 maxbrunsfeld/);
+});
+
+for (const name of ["index.js", "package.json", "LICENSE"]) {
+  test(`Graft reviewed tree-sitter 0.22.4 checkout preserves authenticated ${name} bytes`, () => {
+    assert.deepEqual(authenticatedFixtureCheckout(name, "tree-sitter-0.22.4"), readFileSync(join(reviewedRootDirectory, name)));
+  });
+}
+
+for (const coordinate of coordinates) {
+  test(`Graft reviewed tree-sitter 0.22.4 preserves the actual loader choice on ${coordinate.platform}/${coordinate.nodeArch}`, () => parserFixture(root => {
+    seedReviewedRoot(root);
+    const parser = join(root, parserPath);
+    const selected = reviewedLoader(coordinate, root, true).resolve(parser);
+    const selectedBytes = readFileSync(selected);
+    const compiled = reviewedLoader(coordinate, root, false).resolve(parser);
+    const compiledBytes = readFileSync(compiled);
+    const [provenance] = helperExports.pruneGraftPrebuilds(root, coordinate);
+    assert.equal(reviewedLoader(coordinate, root, true).resolve(parser), selected);
+    assert.deepEqual(readFileSync(selected), selectedBytes);
+    assert.equal(reviewedLoader(coordinate, root, false).resolve(parser), compiled);
+    assert.deepEqual(readFileSync(compiled), compiledBytes);
+    assert.deepEqual(provenance.retained, [`${coordinate.platform}-${coordinate.nodeArch}`]);
+    assert.equal(provenance.version, "0.22.4");
+    assert.equal(provenance.loaderVersion, "4.8.4");
+  }));
+}
+
+const reviewedRootRefusals = [
+  ["different identity", root => editReviewedManifest(root, { name: "not-tree-sitter" }), /root entry/],
+  ["different version", root => editReviewedManifest(root, { version: "0.22.5" }), /root entry/],
+  ["changed source bytes", root => write(root, `${parserPath}/index.js`, Buffer.concat([reviewedRootSource, Buffer.from("\n// changed\n")])), /root entry/],
+  ["normalized instead of raw source", root => write(root, `${parserPath}/index.js`, reviewedRootSource.toString("utf8").replaceAll("\n", "\r\n")), /root entry/],
+  ["different physical entry", root => { editReviewedManifest(root, { main: "different.js" }); write(root, `${parserPath}/different.js`, reviewedRootSource); }, /root entry/],
+  ["extra loader call", root => write(root, `${parserPath}/index.js`, Buffer.concat([reviewedRootSource, Buffer.from("\nrequire('node-gyp-build')(__dirname);\n")])), /loader call syntax/],
+  ["shadowed loader", root => write(root, `${parserPath}/index.js`, Buffer.concat([reviewedRootSource, Buffer.from("\nfunction require() {}\n")])), /shadows/],
+  ["tampered pinned loader", root => write(root, "node_modules/node-gyp-build/node-gyp-build.js", Buffer.concat([loaderSource, Buffer.from("\n// changed\n")])), /source review/],
+];
+
+function editReviewedManifest(root, change) {
+  const manifest = JSON.parse(reviewedRootManifest.toString("utf8"));
+  write(root, `${parserPath}/package.json`, JSON.stringify({ ...manifest, ...change }));
+}
+
+for (const [name, mutate, expected] of reviewedRootRefusals) {
+  test(`Graft reviewed tree-sitter 0.22.4 refuses ${name} before removal`, () => parserFixture(root => {
+    seedReviewedRoot(root);
+    mutate(root);
+    const before = inventory(root);
+    assert.throws(() => helperExports.pruneGraftPrebuilds(root, coordinates[0]), expected);
+    assert.deepEqual(inventory(root), before);
+  }));
+}
+
+test("Graft reviewed tree-sitter 0.22.4 refusal includes bounded consumer context and the original cause", () => parserFixture(root => {
+  seedReviewedRoot(root);
+  write(root, `${parserPath}/index.js`, Buffer.concat([reviewedRootSource, Buffer.from("\n// changed\n")]));
+  const before = inventory(root);
+  assert.throws(() => helperExports.pruneGraftPrebuilds(root, coordinates[0]), error => {
+    assert.match(error.message, /tree-sitter@0\.22\.4/);
+    assert.ok(error.message.includes(JSON.stringify(`${parserPath}/index.js`)));
+    assert.ok(!error.message.includes(root));
+    assert.ok(error.cause instanceof Error);
+    assert.match(error.cause.message, /Unreviewed native root entry/);
+    return true;
+  });
+  assert.deepEqual(inventory(root), before);
+  assertBoundedConsumerContext();
+}));
+
+function assertBoundedConsumerContext() {
+  const source = readFileSync(helper, "utf8").match(/function consumerEntryContext\(root, entry\) \{[^]*?\n\}/)?.[0];
+  assert.ok(source, "production rejection context must have an explicit byte bound");
+  const context = scoped => runInNewContext(`${source}\nconsumerEntryContext('root', 'entry');`, { scopedRelative: () => scoped, sep: "/", Buffer }, { timeout: 1_000 });
+  assert.equal(context("x".repeat(4_096)), "x".repeat(4_096));
+  assert.equal(context("x".repeat(4_097)), "<staging-relative entry omitted: exceeds 4096 UTF-8 bytes>");
+  assert.equal(context("é".repeat(2_049)), "<staging-relative entry omitted: exceeds 4096 UTF-8 bytes>");
+}
+
+test("Graft reviewed tree-sitter 0.22.4 actual source uses the package-root Node22 loader branch", () => {
+  assert.match(process.versions.node, /^22\./);
+  const module = { exports: {} };
+  const root = join(tmpdir(), "owned-tree-sitter-root");
+  const calls = [];
+  const binding = stubTreeSitterBinding();
+  const require = name => {
+    calls.push(name);
+    if (name === "util") return { inspect: { custom: Symbol.for("nodejs.util.inspect.custom") } };
+    assert.equal(name, "node-gyp-build", "Node22 must not load the Bun-only native path");
+    return directory => { assert.equal(directory, root); return binding; };
+  };
+  runInNewContext(reviewedRootSource.toString("utf8"), { module, require, __dirname: root, process: { versions: process.versions } }, { timeout: 1_000 });
+  assert.deepEqual(calls, ["node-gyp-build", "util"]);
+  assert.equal(module.exports, binding.Parser);
+});
+
+function stubTreeSitterBinding() {
+  return { Query: class {}, Parser: class {}, Tree: class {}, TreeCursor: class {}, LookaheadIterator: class {}, NodeMethods: {}, pointTransferArray: [] };
 }
