@@ -52,7 +52,7 @@ export const OPENCODE_TOOL_KINDS: Readonly<Record<string, string>> = Object.free
   grep: "search", glob: "search", list: "search",
   webfetch: "fetch", websearch: "fetch",
   subagent: "think", task: "think", todowrite: "think", todoread: "think",
-  execute: "other",
+  execute: "other", skill: "other",
 });
 
 const SHELL = new Set(["shell", "bash"]);
@@ -225,6 +225,12 @@ export class OpenCodeToolGovernance implements HostToolGovernance {
       if (a !== undefined && b !== undefined && a !== b) return null;
       return a ?? b;
     };
+
+    if (tool === "skill") {
+      const id = same("name");
+      if (!id || !context.managedSkillIds?.has(id)) return { kind: "deny", reason: "the Skill is not authorized for this session" };
+      return { kind: "allow" };
+    }
 
     if (SHELL.has(tool)) {
       const command = same("command");

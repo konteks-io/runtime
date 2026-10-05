@@ -38,6 +38,23 @@ function governed() {
 }
 
 describe("OpenCode tool governance", () => {
+  it("allows only the exact Skill ID authorized for this session", () => {
+    const { governance } = governed();
+    const id = "konteks-authorized";
+    const invoke = (callId: string, seen: string, requested = seen, authorized = new Set([id])) => {
+      governance.observe(call(callId, "skill"), WC);
+      governance.observe(input(callId, { name: seen }), WC);
+      return governance.decide(ask(callId, "other", "skill", { name: requested }), { ...context, managedSkillIds: authorized });
+    };
+    expect(invoke("skill-ok", id)).toEqual({ kind: "allow" });
+    expect(invoke("skill-other", "personal-skill")).toMatchObject({ kind: "deny" });
+    expect(invoke("skill-mismatch", id, "personal-skill")).toMatchObject({ kind: "deny" });
+    expect(invoke("skill-stale", id, id, new Set())).toMatchObject({ kind: "deny" });
+    expect(governance.observe(done("skill-ok"), WC)).toBeNull();
+    governance.observe(call("skill-unasked", "skill"), WC);
+    expect(governance.observe(done("skill-unasked"), WC)).toMatchObject({ title: "skill" });
+  });
+
   it("judges a shell request by the command its call reported, and refuses a folder outside the working copy", () => {
     const { governance, shell } = governed();
     expect(shell("s1", "git push origin main")).toEqual({ kind: "evaluate", request: expect.objectContaining({

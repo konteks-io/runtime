@@ -1,3 +1,4 @@
+import { machineSkillPermissionAuthorizer } from "./native/skill-permission.js";
 import { SkillRefreshScheduler } from "./skills/refresh-scheduler.js";
 import { machineSkillReadTracking, type PreparedSessionInputs } from "./skills/session-inputs.js";
 import { publicSkillStatus } from "./skills/public-status.js";
@@ -283,7 +284,7 @@ export class Supervisor {
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private stopping = false;
-  private machineSkillReads: { workspaceId: string; instanceId: string; inputs: Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead"> } | undefined;
+  private machineSkillReads: { workspaceId: string; instanceId: string; inputs: Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead" | "authorizeManagedSkill"> } | undefined;
   private skillSync: SkillSyncCoordinator<MachineSkillInventory> | undefined;
   private skillRefreshScheduler: SkillRefreshScheduler | undefined;
   private skillSyncClient: NativeSkillSyncClient | undefined;
@@ -1601,7 +1602,14 @@ export class Supervisor {
         return refreshMachineSkills({ client, homes: currentHomes, scratchRoot: join(this.config.SUPERVISOR_DATA_DIR, "machine-skills"),
           owner: { workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" }, now: () => this.clock.coreNow(),
           onVerified: (staged, profiles, owner) => {
-            this.machineSkillReads = { ...owner, inputs: machineSkillReadTracking(staged, profiles, owner) };
+            const inputs = machineSkillReadTracking(staged, profiles, owner);
+            inputs.authorizeManagedSkill = machineSkillPermissionAuthorizer({ staged, owner, client, verify: inputs.verifyManagedSkillRead!,
+              assertOwned: () => {
+                if (this.stopping || !this.nativeOwnership || this.lease.mode() !== "active" ||
+                    this.workspaceId !== owner.workspaceId || this.instanceId !== owner.instanceId) throw new Error("Skill authority is unavailable");
+                this.nativeOwnership.assertOwned();
+              } });
+            this.machineSkillReads = { ...owner, inputs };
           } }, signal);
       }), () => this.clock.coreNow(), {
         ...(this.historicalSkillSync ? { initialSuccess: this.historicalSkillSync } : {}),

@@ -42,7 +42,7 @@ interface NativeInputPreparerOptions {
   root: string;
   /** Operator-owned native discovery homes, resolved locally at installation. */
   agentSkillHomes?: readonly string[];
-  directSkillReads?: (assignment: RemoteWorkAssignment) => Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead">;
+  directSkillReads?: (assignment: RemoteWorkAssignment) => Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead" | "authorizeManagedSkill">;
   clock: Clock;
   client: () => NativeInputClient;
   /** Current locally accepted claim; returning null denies preparation/continuation. */

@@ -1221,7 +1221,17 @@ export class RelayedSession {
       params = { ...params, options: params.options.filter(option => option.kind !== "allow_always") };
       this.governedPermissions.set(requestId, { toolCallId: params.toolCall.toolCallId, options: params.options });
       // A host agent's request is judged by the call it names, or refused.
-      const verdict = this.toolGovernance.decide(params, { cwd: this.sessionCwd(), servers: this.sessionServers, browserTools: this.browserGateway !== null });
+      const managedSkillIds = new Set<string>();
+      const skillId = (params.toolCall.rawInput as { name?: unknown } | undefined)?.name;
+      if (this.assignment.agentRoute.agentId === "opencode" && typeof skillId === "string" && /^konteks-[a-f0-9]{64}$/.test(skillId)) {
+        try {
+          if (await this.preparedInputs?.authorizeManagedSkill?.(skillId)) managedSkillIds.add(skillId);
+        } catch { /* An unavailable owner never grants a cached Skill permission. */ }
+        if (this.closed) return;
+        this.deps.assertExecutionOwned?.();
+      }
+      const verdict = this.toolGovernance.decide(params, { cwd: this.sessionCwd(), servers: this.sessionServers,
+        managedSkillIds, browserTools: this.browserGateway !== null });
       if (verdict.kind !== "evaluate") {
         if (this.closed) return;
         this.deps.assertExecutionOwned?.();

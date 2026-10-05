@@ -13,6 +13,8 @@ export interface PreparedSessionInputs {
   /** Verified immutable file identities; instruction injection is not usage. */
   managedSkillReadTargets?: readonly ManagedSkillReadTarget[];
   verifyManagedSkillRead?: (read: CompletedSkillRead) => Promise<boolean>;
+  /** Fresh authority for a managed native Skill tool; telemetry alone never grants access. */
+  authorizeManagedSkill?: (id: string) => Promise<boolean>;
   beforePrompt: () => Promise<void>;
   /** Delivery-only terminal barrier. Public ACP completion waits for its durable cloud receipt. */
   acceptDeliveryOutput?: (authority: { claimId: string; invocationRef: string; completion: SessionToCoreMessage }) => Promise<RemoteDeliveryAcceptanceReceipt>;
@@ -50,7 +52,7 @@ async function checkedDirectory(cwd: string): Promise<string> {
  */
 export async function prepareDirectSessionInputs(options: { cwd: string; binding: RemoteTransferBinding;
   /** Caller supplies a freshly verified machine inventory, never an agent path. */
-  skillReads?: Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead">;
+  skillReads?: Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead" | "authorizeManagedSkill">;
 }): Promise<PreparedSessionInputs> {
   try {
     const cwd = await checkedDirectory(options.cwd);
@@ -58,6 +60,7 @@ export async function prepareDirectSessionInputs(options: { cwd: string; binding
       binding: { ...options.binding }, cwd, skillInstructions: "",
       ...(options.skillReads?.managedSkillReadTargets ? { managedSkillReadTargets: options.skillReads.managedSkillReadTargets.map(target => ({ ...target })) } : {}),
       ...(options.skillReads?.verifyManagedSkillRead ? { verifyManagedSkillRead: options.skillReads.verifyManagedSkillRead } : {}),
+      ...(options.skillReads?.authorizeManagedSkill ? { authorizeManagedSkill: options.skillReads.authorizeManagedSkill } : {}),
       beforePrompt: async () => {
         try { if (await checkedDirectory(options.cwd) !== cwd) throw new Error("source moved"); }
         catch { throw new RemoteInstanceError("capability_unavailable", "Required local session inputs are unavailable."); }
@@ -99,6 +102,17 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
       managedSkillReadTargets: staged.skills.flatMap(skill => [skill.skillFile,
         ...[...homes].map(home => join(home, "skills", `konteks-${sha256Hex(skill.skillId)}`, "SKILL.md"))]
         .map(skillFile => ({ skillId: skill.skillId, version: skill.version, skillFile }))),
+      authorizeManagedSkill: async id => {
+        const skill = staged.skills.find(item => `konteks-${sha256Hex(item.skillId)}` === id);
+        if (!skill || !options.authorizeHomeSync) return false;
+        try {
+          await verifyRetainedSkillTree(skill, skill.directory);
+          for (const home of homes) if (!await verifyAgentHomeSkillRead({ home, owner: { workspaceId: snapshot.authority.binding.workspaceId,
+            instanceId: snapshot.authority.binding.instanceId }, skill })) return false;
+          await options.authorizeHomeSync();
+          return true;
+        } catch { return false; }
+      },
       verifyManagedSkillRead: async read => {
         const skill = staged.skills.find(item => item.skillId === read.capabilityId && item.version === read.version);
         if (!skill) return false;
@@ -124,7 +138,7 @@ export async function prepareOrganizationSkillSession(options: StageOrganization
 
 /** Machine-sync snapshot used only for read telemetry, never prompt instructions. */
 export function machineSkillReadTracking(staged: StagedOrganizationSkills, homes: readonly string[],
-  owner: { workspaceId: string; instanceId: string }): Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead"> {
+  owner: { workspaceId: string; instanceId: string }): Pick<PreparedSessionInputs, "managedSkillReadTargets" | "verifyManagedSkillRead" | "authorizeManagedSkill"> {
   const snapshot = structuredClone(staged), profiles = [...homes], binding = { ...owner };
   const targets = snapshot.skills.flatMap(skill => profiles.map(home => ({ skillId: skill.skillId, version: skill.version,
     skillFile: join(home, "skills", `konteks-${sha256Hex(skill.skillId)}`, "SKILL.md") })));

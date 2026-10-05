@@ -65,10 +65,14 @@ it("prepares direct-session native Skill tracking without injecting instructions
  const binding = { workspaceId: "org", sessionId: "s", assignmentId: "a", instanceId: "i", attempt: 1 };
  const target = { skillId: "review", version: "1", skillFile: join(root, "SKILL.md") };
  const verify = async () => true;
+ const authorize = async (id: string) => id === "konteks-probe";
  const prepared = await prepareDirectSessionInputs({ cwd: root, binding,
-   skillReads: { managedSkillReadTargets: [target], verifyManagedSkillRead: verify } });
+   skillReads: { managedSkillReadTargets: [target], verifyManagedSkillRead: verify, authorizeManagedSkill: authorize } });
  expect(prepared.skillInstructions).toBe("");
  expect(prepared.managedSkillReadTargets).toEqual([target]);
  expect(prepared.verifyManagedSkillRead).toBe(verify);
+ expect(prepared.authorizeManagedSkill).toBe(authorize);
+ expect(await prepared.authorizeManagedSkill!("konteks-probe")).toBe(true);
+ expect(await prepared.authorizeManagedSkill!("unknown")).toBe(false);
  await prepared.beforePrompt();
 });

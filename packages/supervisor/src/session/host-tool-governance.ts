@@ -21,6 +21,8 @@ export type HostPermissionDecision =
 export interface HostPermissionContext {
   /** The session's working copy. */
   cwd: string;
+  /** Exact managed Skill IDs admitted and freshly authorized by this session. */
+  managedSkillIds?: ReadonlySet<string>;
   /** The session's own MCP servers (Code Mode namespaces an OpenCode block may call). */
   servers: ReadonlySet<string>;
   /** The session was given the QA browser. */
