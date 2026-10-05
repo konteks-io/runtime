@@ -232,9 +232,14 @@ for (const os of ["Linux", "Darwin"]) {
         ]);
         assert.match(
           result.output,
+          locale === "en" ? /^\nKONTEKS\nRuntime setup\n/ : /^\nKONTEKS\nPemasangan runtime\n/,
+        );
+        assert.equal(result.output.match(/^KONTEKS$/gm)?.length, 1);
+        assert.match(
+          result.output,
           locale === "id"
-            ? /Mengambil manifes checksum bertanda tangan/
-            : /fetching the signed checksum manifest/,
+            ? /\n1 dari 3 - Unduh dan verifikasi\n  Unduh dan verifikasi\n/
+            : /\n1 of 3 - Download and verify\n  Download and verify\n/,
         );
         assert.match(
           result.output,
@@ -242,7 +247,7 @@ for (const os of ["Linux", "Darwin"]) {
             ? /Menghubungkan komputer ini ke Konteks/
             : /Connecting this computer to Konteks/,
         );
-        assert.match(result.output, locale === "id" ? /Pemasangan selesai/ : /Setup complete/);
+        assert.match(result.output, locale === "id" ? /\nPemasangan selesai\n/ : /\nSetup complete\n/);
         assert.deepEqual(result.temporary, []);
       },
     );
