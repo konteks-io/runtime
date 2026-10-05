@@ -107,7 +107,7 @@ jobs:
       - name: Verify Mac binary compatibility decisions and produced native metadata
         run: node --test --test-concurrency=1 scripts/macos-artifact-compatibility.test.mjs
       - name: Verify Mac resource inspection refusals on every native coordinate
-        run: npm run test:mac13-resource-probe
+        run: node --test --test-concurrency=1 scripts/mac13-resource-probe/inspect-candidate.test.mjs scripts/mac13-resource-probe/probe.test.mjs
       - name: Verify reviewed Graft prebuild selection and native parser smoke boundaries
         run: node --test --test-concurrency=1 scripts/offline-graft-prebuilds.test.mjs
       - name: Verify POSIX setup language, signed downloads and recovery
@@ -173,6 +173,18 @@ jobs:
         uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86
         with:
           bazelisk-version: 1.28.1
+      - name: Set up public autoconf for the pinned zsh source
+        if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
+        timeout-minutes: 10
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          set -euo pipefail
+          if ! command -v autoconf >/dev/null 2>&1; then
+            brew install autoconf
+          fi
       - name: Measure exact Mac 13 resource build candidate; preserve shipping failure
         if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure')
         timeout-minutes: 110
@@ -181,7 +193,6 @@ jobs:
           MATRIX_OS: ${{ matrix.os }}
         run: |
           set -euo pipefail
-          command -v autoconf
           case "$MATRIX_OS" in
             macos-26) architecture=arm64 ;;
             macos-15-intel) architecture=x64 ;;
@@ -201,28 +212,38 @@ jobs:
           import { lstat, readdir, realpath, appendFile } from 'node:fs/promises';
           import { join, resolve } from 'node:path';
           const root = join(await realpath(process.env.RUNNER_TEMP), 'mac13-resource-probe-evidence');
-          const rootInfo = await lstat(root);
-          if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || await realpath(root) !== resolve(root)) throw Error('invalid diagnostic root');
-          const logs = join(root, 'logs');
-          const logInfo = await lstat(logs);
-          if (!logInfo.isDirectory() || logInfo.isSymbolicLink()) throw Error('invalid diagnostic logs');
-          const names = await readdir(logs);
-          if (names.length > 1024) throw Error('diagnostic file cap');
-          let total = 0;
-          for (const name of names) {
-            if (!/^[0-9]{3,}-[a-z0-9-]+\.log$/.test(name)) throw Error('unexpected diagnostic name');
-            const info = await lstat(join(logs, name));
-            if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 ** 2) throw Error('diagnostic member cap');
-            total += info.size;
-          }
-          if (total > 16 * 1024 ** 2) throw Error('aggregate diagnostic cap');
+          let rootInfo = null;
           try {
-            const receipt = await lstat(join(root, 'receipt.json'));
-            if (!receipt.isFile() || receipt.isSymbolicLink() || receipt.size > 8 * 1024 ** 2) throw Error('receipt cap');
+            rootInfo = await lstat(root);
           } catch (error) {
             if (error.code !== 'ENOENT') throw error;
           }
-          await appendFile(process.env.GITHUB_OUTPUT, 'ready=true\n');
+          if (rootInfo === null) {
+            await appendFile(process.env.GITHUB_OUTPUT, 'ready=false\n');
+            console.log('No owned Mac resource measurement evidence was created.');
+          } else {
+            if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || await realpath(root) !== resolve(root)) throw Error('invalid diagnostic root');
+            const logs = join(root, 'logs');
+            const logInfo = await lstat(logs);
+            if (!logInfo.isDirectory() || logInfo.isSymbolicLink()) throw Error('invalid diagnostic logs');
+            const names = await readdir(logs);
+            if (names.length > 1024) throw Error('diagnostic file cap');
+            let total = 0;
+            for (const name of names) {
+              if (!/^[0-9]{3,}-[a-z0-9-]+\.log$/.test(name)) throw Error('unexpected diagnostic name');
+              const info = await lstat(join(logs, name));
+              if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 ** 2) throw Error('diagnostic member cap');
+              total += info.size;
+            }
+            if (total > 16 * 1024 ** 2) throw Error('aggregate diagnostic cap');
+            try {
+              const receipt = await lstat(join(root, 'receipt.json'));
+              if (!receipt.isFile() || receipt.isSymbolicLink() || receipt.size > 8 * 1024 ** 2) throw Error('receipt cap');
+            } catch (error) {
+              if (error.code !== 'ENOENT') throw error;
+            }
+            await appendFile(process.env.GITHUB_OUTPUT, 'ready=true\n');
+          }
           NODE
       - name: Retain bounded Mac resource measurements only
         if: runner.os == 'macOS' && !cancelled() && (steps.macos-offline-preflight.outcome == 'success' || steps.macos-offline-preflight.outcome == 'failure') && steps.mac13-resource-diagnostic-bounds.outputs.ready == 'true'

@@ -407,12 +407,12 @@ export async function main(argv = process.argv.slice(2)) {
       aggregateLogBytes: MAX_LOG_BYTES, candidateBytes: 1024 ** 3, candidateFiles: 20_000,
       overallWallMilliseconds: WALL_MILLISECONDS }, ...result };
   await writeFile(join(context.output, 'receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-  console.log(JSON.stringify({ output: context.output, buildAndProbeCompleted: result.buildAndProbeCompleted,
+  console.log(JSON.stringify({ failedStage: result.failedStage ?? null, buildAndProbeCompleted: result.buildAndProbeCompleted,
     acceptancePassed: false, macOS13ExecutionProved: false }));
   const measured = result.candidateMeetsMeasuredFloor && result.candidateLoaderClosureResolved && result.selectedNewerAPIImportsAllWeak;
   if (!result.buildAndProbeCompleted || !measured) process.exitCode = 1;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch((error) => { console.error(`Mac13 candidate probe refused: ${String(error.message).slice(0, 512)}`); process.exitCode = 1; });
+  main().catch(() => { console.error('Mac13 candidate probe refused before evidence admission.'); process.exitCode = 1; });
 }
