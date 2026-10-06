@@ -1582,7 +1582,7 @@ export class RelayedSession {
   }
 
   private permissionContext(): Parameters<PolicyResponder["evaluatePermission"]>[1] {
-    return { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, workspaceRoot: this.policyRoot(),
+    return { assignmentId: this.assignment.id, agentId: this.assignment.agentRoute.agentId, operations: this.assignment.kind === "operations", workspaceRoot: this.policyRoot(),
       cwd: this.sessionCwd(), browserTools: this.browserGateway !== null, sessionServers: this.sessionServers, ...(this.mcpCalls ? { ledger: this.mcpCalls } : {}),
       admittedMcpTools: this.deps.admittedMcpTools?.(this.assignment) ?? [] };
   }

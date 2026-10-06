@@ -34,6 +34,21 @@ describe("native workspace tool policy", () => {
       .resolves.toEqual({ kind: "allow", optionId: "allow" });
   });
 
+  it("requires an explicit allow-once decision for Ops execute/edit while preserving denials and reads", async () => {
+    const ops = { ...context, operations: true };
+    await expect(responder.evaluatePermission(request({ kind: "execute", rawInput: { command: "node --test tests/main.test.js" } }), ops))
+      .resolves.toEqual({ kind: "defer", allowOnceOnly: true });
+    await expect(responder.evaluatePermission(request({ kind: "edit", rawInput: { file_path: join(root, "src", "a.ts") } }), ops))
+      .resolves.toEqual({ kind: "defer", allowOnceOnly: true });
+    await expect(responder.evaluatePermission(request({ kind: "execute", rawInput: { command: "git push origin main" } }), ops))
+      .resolves.toMatchObject({ kind: "deny" });
+    await expect(responder.evaluatePermission(request({ kind: "read", rawInput: { file_path: join(root, "src", "a.ts") } }), ops))
+      .resolves.toEqual({ kind: "allow", optionId: "allow" });
+    await expect(new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => false)
+      .evaluatePermission(request({ kind: "execute", rawInput: { command: "node --test tests/main.test.js" } }), ops))
+      .resolves.toEqual({ kind: "deny", optionId: "reject" });
+  });
+
   it("allows the QA browser's tools only on a session given the browser, and never the unsafe ones", async () => {
     const browser = { ...context, browserTools: true };
     // Identity is the bridge's structured tool name, never the title.

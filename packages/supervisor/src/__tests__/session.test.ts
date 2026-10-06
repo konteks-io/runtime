@@ -757,9 +757,9 @@ describe("relayed session", () => {
   describe("DeepSeek Harness tool governance", () => {
     const dshWork: RemoteWorkAssignment = { ...assignment, agentRoute: { ...assignment.agentRoute, agentId: "dsh" } };
     const options = [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }, { optionId: "reject-once", name: "Reject", kind: "reject_once" }];
-    async function dshSession() {
+    async function dshSession(work = dshWork) {
       const quarantine = vi.fn(async () => undefined);
-      const f = await build({ policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) }, dshWork);
+      const f = await build({ policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => true) }, work);
       (f.runner as unknown as { quarantine: typeof quarantine }).quarantine = quarantine;
       await f.session.bootstrap();
       const toolCall = (toolCallId: string, title: string, rawInput: Record<string, unknown>) =>
@@ -771,6 +771,16 @@ describe("relayed session", () => {
       const answer = (requestId: string) => (vi.mocked(f.runner.answer).mock.calls.find(call => call[1] === requestId)?.[2] as { outcome: { optionId?: string } } | undefined)?.outcome.optionId;
       return { ...f, quarantine, toolCall, finished, ask, answer };
     }
+
+    it("surfaces an Ops shell call instead of answering it by local workspace policy", async () => {
+      const f = await dshSession({ ...dshWork, kind: "operations", agentRoute: { ...dshWork.agentRoute, requiredRole: "ops" } });
+      try {
+        await f.toolCall("ops-test", "bash", { command: "node --test tests/main.test.js", sandbox_permissions: "workspace-write" });
+        await f.ask("ops-permission", "ops-test");
+        expect(f.runner.answer).not.toHaveBeenCalled();
+        expect(f.sent.at(-1)?.body).toMatchObject({ kind: "acp", method: "session/request_permission", id: "ops-permission" });
+      } finally { await f.session.close("cancelled"); }
+    });
 
     it("judges the real command and path behind each dsh request with the native policy", async () => {
       const f = await dshSession();
