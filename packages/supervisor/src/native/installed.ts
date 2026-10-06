@@ -2,28 +2,15 @@ import { createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import { RemoteInstanceError, type RemoteNativeArtifact } from "@konteks/remote-common";
-import { isHostAgentId, presentNativeConnectorExecutables, selectNativeArtifacts, verifyOfflineAgentPackage, type VerifiedNativeRelease } from "@konteks/remote-release";
+import { presentNativeConnectorExecutables, selectNativeArtifacts, type VerifiedNativeRelease } from "@konteks/remote-release";
 import type { RunnerConfig } from "@konteks/remote-agent-runner";
+import { NativeBridgeVerification } from "./bridge-verification.js";
 
 /** Verify the complete installed package before any native bridge is spawned. */
 export async function verifyInstalledNativeBridges(release: VerifiedNativeRelease, runners: readonly RunnerConfig[], platform: { os: "macos" | "windows" | "debian"; architecture: "amd64" | "arm64" }): Promise<void> {
-  // No agent yet is a machine connected before any was set up: nothing to verify.
-  if (runners.length === 0) return;
-  // Host-installed agents are verified against their local package at load,
-  // and intentionally have no signed offline bridge artifact in the release.
-  const bundled = runners.filter(runner => !isHostAgentId(runner.RUNNER_AGENT_ID));
-  if (bundled.length === 0) return;
-  const artifacts = selectNativeArtifacts(release, { ...platform, agentIds: bundled.map(runner => runner.RUNNER_AGENT_ID) });
-  for (const runner of bundled) {
-    const artifact = artifacts.find(candidate => candidate.agentId === runner.RUNNER_AGENT_ID);
-    if (artifact?.format === "offline_agent_tgz") {
-      const profile = await verifyOfflineAgentPackage(runner.RUNNER_BRIDGE_PREFIX, artifact);
-      if (JSON.stringify(profile) !== JSON.stringify(runner.RUNNER_NATIVE_PACKAGE_PROFILE) || JSON.stringify(artifact) !== JSON.stringify(runner.RUNNER_NATIVE_PACKAGE_ARTIFACT)) throw untrusted();
-      continue;
-    }
-    // A historical bridge-only executable cannot establish official auth tooling.
-    throw untrusted();
-  }
+  const verification = new NativeBridgeVerification();
+  await verification.verifyRunners(release, runners, platform);
+  await verification.complete();
 }
 
 /**
