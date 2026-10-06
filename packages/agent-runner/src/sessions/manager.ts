@@ -171,6 +171,8 @@ export interface SessionManagerOptions {
    * mode). Callers may repeat the same value, but refusedModes prevents them
    * from selecting a mode outside that boundary. */
   defaultSessionConfig?: Readonly<Record<string, string>>;
+  /** This adapter ignores new authority while loaded; close only the sealed owned predecessor before reopening. */
+  closeBeforeLiveRefresh?: boolean;
   /**
    * Session modes this agent must never enter (OpenCode's `plan`): refused on
    * `set_mode`, on `set_config_option` for `mode` and in an admitted session
@@ -853,9 +855,27 @@ export class SessionManager {
   private async refreshLiveAuthority(bridge: BridgeProcess, record: SessionRecord, args: CreateSessionArgs): Promise<BootstrapResponse | null | undefined> {
     const caps = bridge.initializeResult.agentCapabilities;
     const request = () => ({ sessionId: record.bridgeSessionId, cwd: args.cwd, mcpServers: args.mcpServers, ...this.reopenMeta(args) });
+    if (this.options.closeBeforeLiveRefresh) await this.closeForLiveRefresh(bridge, record);
     if (caps?.sessionCapabilities?.resume != null) return this.resumeLive(bridge, record, () => bridge.connection.resumeSession(request()), caps.sessionCapabilities.close != null);
     if (caps?.loadSession === true) return bridge.connection.loadSession(request());
     throw new RemoteInstanceError("recovery_required", "Agent cannot refresh a live session's authority.", { diagnostic: "agent_cannot_refresh_authority" });
+  }
+
+  /** Only continueLive's transferred, idle sealed owner reaches this close. */
+  private async closeForLiveRefresh(bridge: BridgeProcess, record: SessionRecord): Promise<void> {
+    const caps = bridge.initializeResult.agentCapabilities;
+    if (caps?.sessionCapabilities?.close == null || (caps.sessionCapabilities.resume == null && caps.loadSession !== true)) {
+      throw new RemoteInstanceError("recovery_required", "Agent cannot safely refresh the settled session's authority.", { diagnostic: "agent_cannot_refresh_authority" });
+    }
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const deadline = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new RemoteInstanceError("recovery_required", "Session authority refresh close timed out.")), RELEASE_CLOSE_DEADLINE_MS);
+        timer.unref();
+      });
+      await Promise.race([bridge.connection.closeSession({ sessionId: record.bridgeSessionId }), deadline]);
+      record.assertCurrent?.();
+    } finally { if (timer) clearTimeout(timer); }
   }
 
   /**

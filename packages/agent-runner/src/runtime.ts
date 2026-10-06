@@ -144,6 +144,7 @@ class FileSessionRefStore implements SessionRefStore {
  * including one a later codex-acp adds (external-integration Stage 0).
  */
 export const CODEX_SESSION_GOVERNANCE = {
+  closeBeforeLiveRefresh: true,
   defaultSessionConfig: { mode: "read-only" },
   refusedModes: {
     modeIds: ["agent", "agent-full-access"],
@@ -154,8 +155,8 @@ export const CODEX_SESSION_GOVERNANCE = {
 
 /** Codex sessions are pinned to Ask for approval; a host agent refuses its own unsafe modes. */
 function sessionGovernance(agentId: string, host: HostAgentRunnerAdapter | null,
-): Pick<SessionManagerOptions, "defaultSessionConfig" | "refusedModes" | "requireRawModelOffer"> {
-  if (agentId === "codex") return { defaultSessionConfig: CODEX_SESSION_GOVERNANCE.defaultSessionConfig, refusedModes: CODEX_SESSION_GOVERNANCE.refusedModes,
+): Pick<SessionManagerOptions, "defaultSessionConfig" | "refusedModes" | "requireRawModelOffer" | "closeBeforeLiveRefresh"> {
+  if (agentId === "codex") return { closeBeforeLiveRefresh: CODEX_SESSION_GOVERNANCE.closeBeforeLiveRefresh, defaultSessionConfig: CODEX_SESSION_GOVERNANCE.defaultSessionConfig, refusedModes: CODEX_SESSION_GOVERNANCE.refusedModes,
       requireRawModelOffer: true,
     };
   return host?.refusedSessionModes ? { refusedModes: host.refusedSessionModes } : {};

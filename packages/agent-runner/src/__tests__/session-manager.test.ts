@@ -117,6 +117,50 @@ describe("session manager bootstrap", () => {
     expect(manager.activeSessions).toBe(1);
   });
 
+  it.each(["ready", "unsupported", "refused"] as const)("refreshes sealed Codex authority with a confirmed close before resume (%s)", async outcome => {
+    const order: string[] = [];
+    let loaded = true;
+    let freshAuthority = false;
+    const closeSession = vi.fn(async () => {
+      order.push("close");
+      if (outcome === "refused") throw new Error("close refused");
+      loaded = false;
+      return {};
+    });
+    const resumeSession = vi.fn(async () => {
+      order.push("resume");
+      // The real app-server accepts this RPC but ignores changed MCP configuration while loaded.
+      freshAuthority = !loaded;
+      return {};
+    });
+    const { bridge, calls } = fakeBridge({ closeSession, resumeSession }, { agentCapabilities: {
+      sessionCapabilities: { resume: {}, ...(outcome === "unsupported" ? {} : { close: {} }) },
+    } });
+    const events = new RunnerEventBus();
+    const manager = new SessionManager({ bridge: () => bridge, events, refStore: new InMemorySessionRefStore(), ...CODEX_SESSION_GOVERNANCE });
+    const first = await manager.create({ context, cwd: "/w", mcpServers: [] });
+    const completed = nextEvent(events, "prompt_result");
+    manager.prompt(first.acpSessionRef, "p1", { prompt: [] });
+    await completed;
+    await manager.sealCompletedTurn(first.acpSessionRef);
+    const mcpServers = [{ type: "http" as const, name: "platform", url: "http://localhost/current", headers: [] }];
+    const continuation = manager.continueLive({ context: { ...context, assignmentId: "asg-2" }, cwd: "/w", mcpServers, acpSessionRef: first.acpSessionRef,
+      lifecycle: { beforeCreate: async () => { order.push("transfer"); }, recordProcessOwner: async () => undefined, assertCurrent: () => undefined } });
+    if (outcome === "ready") {
+      await expect(continuation).resolves.toMatchObject({ acpSessionRef: first.acpSessionRef, resumed: true });
+      expect(order).toEqual(["transfer", "close", "resume"]);
+      expect(freshAuthority).toBe(true);
+      expect(resumeSession).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "bridge-s1", mcpServers }));
+    } else {
+      await expect(continuation).rejects.toThrow();
+      expect(resumeSession).not.toHaveBeenCalled();
+      expect(closeSession).toHaveBeenCalledTimes(outcome === "unsupported" ? 0 : 1);
+    }
+    expect(calls.newSession).toHaveLength(1);
+    expect(calls.cancel).toBeUndefined();
+    expect(bridge.stop).not.toHaveBeenCalled();
+  });
+
   it("closes and resumes a live session the agent will not resume while open, so the next prompt continues", async () => {
     let active = true;
     const resumeSession = vi.fn(async () => {
