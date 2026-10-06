@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { basename, delimiter, join, parse, resolve } from "node:path";
 import { CONTROL_SOCKET_DEFAULT_PORT, findGitForWindows, RemoteInstanceError, SystemClock, writeSecretFile, type RemoteSignedBundleManifest } from "@konteks/remote-common";
 import { EMBEDDED_RELEASE_ROOTS, fetchNativeReleaseManifest, findAgentBridge, installOfflineAgentPackage, isHostAgentId, selectNativeArtifacts, stageNativeRelease, verifyNativeRelease, type EmbeddedReleaseRoot } from "@konteks/remote-release";
-import { acquireNativeRootLock, compareSemver, deleteNativeAntigravity, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, signOutNativeAntigravity, type HostAgentInstallAdapter, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
+import { acquireNativeRootLock, nativeSkillHomeBinding, compareSemver, deleteNativeAntigravity, HOST_AGENT_INSTALL_ADAPTERS, hostAgentInstallAdapter, loadNativeInstallation, signOutNativeAntigravity, type HostAgentInstallAdapter, nativeAgentOffered, NativeRuntimeRecordSchema, parseNativeRuntimeRecord, resolveNativeClaudeExecutable, resolveNativeCodexHome, runNativeActivationExchange, SupervisorStore, verifyNativeGitTool, type NativeRuntimeRecord } from "@konteks/remote-supervisor";
 import { isRetiredAgentId, retiredAgentMessage } from "@konteks/backstage-plugin-common";
 import { z } from "zod";
 import type { Output } from "../output.js";
@@ -50,6 +50,43 @@ interface NativeAgentAddOptions {
     manifest?: unknown;
     fetchFn?: typeof fetch;
   };
+}
+
+function skillConfigurationContext(deps: Parameters<typeof configureNativeSkillHomes>[0]["deps"] = {}) {
+  return { env: deps.env ?? process.env, operatorHome: deps.operatorHome ?? homedir(), roots: deps.roots ?? EMBEDDED_RELEASE_ROOTS, platform: deps.platform ?? nativePlatform() };
+}
+async function explicitSkillCodexHome(stored: NativeRuntimeRecord, env: NodeJS.ProcessEnv, operatorHome: string): Promise<string | undefined> {
+  if (!stored.agents.includes("codex") || env.CODEX_HOME === undefined) return undefined;
+  return resolveNativeCodexHome(env, operatorHome);
+}
+function skillProfileEnvironment(env: NodeJS.ProcessEnv, record: NativeRuntimeRecord): NodeJS.ProcessEnv {
+  return { ...env, ...(env.CLAUDE_CONFIG_DIR === undefined && record.claudeConfigDir ? { CLAUDE_CONFIG_DIR: record.claudeConfigDir } : {}) };
+}
+
+export async function configureNativeSkillHomes(options: { root: string; deps?: {
+  roots?: readonly EmbeddedReleaseRoot[]; platform?: NativePlatform;
+  env?: NodeJS.ProcessEnv; operatorHome?: string;
+} }): Promise<NativeRuntimeRecord> {
+  const root = resolve(options.root);
+  if (root === parse(root).root || root === resolve(homedir())) throw invalid();
+  await privateDirectory(root);
+  await privateDirectory(join(root, "installer"));
+  const lock = acquireNativeRootLock(join(root, "installer"));
+  let runtimeLock: ReturnType<typeof acquireNativeRootLock> | undefined;
+  try {
+    runtimeLock = acquireNativeRootLock(join(root, "supervisor"));
+    const { env, operatorHome, roots, platform } = skillConfigurationContext(options.deps);
+    const stored = await readNativeRecord(root);
+    const localCodexHome = await explicitSkillCodexHome(stored, env, operatorHome);
+    const loaded = await loadNativeInstallation(root, { roots,
+      platform, ...(localCodexHome ? { localCodexHome } : {}) });
+    const codexHome = loaded.runners.find(runner => runner.RUNNER_AGENT_ID === "codex")?.RUNNER_NATIVE_CODEX_HOME;
+    const binding = nativeSkillHomeBinding(codexHome, skillProfileEnvironment(env, loaded.record), operatorHome);
+    const record = NativeRuntimeRecordSchema.parse({ ...loaded.record, ...binding, ...(codexHome ? { codexHome } : {}) });
+    lock.assertOwned(); runtimeLock.assertOwned();
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
+    return record;
+  } finally { runtimeLock?.release(); lock.release(); }
 }
 
 /** Native activation + immutable release layout. Service registration is a separate phase. */
@@ -149,7 +186,7 @@ async function installNew(install: InstallContext, agents: string[]): Promise<Na
   }),
   );
   const git = options.deps?.git === undefined ? await discoverGit() : options.deps.git;
-  const record = NativeRuntimeRecordSchema.parse({ ...draft, agents, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...profiles, ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
+  const record = NativeRuntimeRecordSchema.parse({ ...draft, ...nativeSkillHomeBinding(profiles.codexHome), agents, instanceId: identity.instanceId, workspaceId: identity.workspaceId, releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest, ...profiles, ...(git ? { git: await verifyNativeGitTool(git) } : {}) });
   install.lock.assertOwned();
   await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify(record));
   await loadNativeInstallation(root, { roots, platform });
@@ -579,7 +616,7 @@ export async function completeNativeEnrollment(root: string, identity: { instanc
     const { prepared, release } = await boundEnrollment(root, identity, load.roots);
     const found = await enrolledAgentsFound(root, prepared.agents);
     const git = deps.git === undefined ? await discoverGit() : deps.git;
-    const record = NativeRuntimeRecordSchema.parse({
+    const record = NativeRuntimeRecordSchema.parse({ ...nativeSkillHomeBinding(found.fields.codexHome),
       schemaVersion: 1, deploymentKind: "native_connector",
       instanceId: identity.instanceId, workspaceId: identity.workspaceId,
       releaseId: prepared.releaseId, bundleVersion: release.manifest.bundleVersion, manifestDigest: release.manifest.digest,

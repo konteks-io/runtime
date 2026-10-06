@@ -24,6 +24,7 @@ export interface NativeCliActions {
   stageEnrollment(input: NativeCommandContext): Promise<void>;
   addAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
   removeAgent(input: NativeCommandContext & { agent: NativeAgentId; yes?: boolean }): Promise<void>;
+  configureSkills(input: NativeCommandContext): Promise<void>;
   serve(input: NativeCommandContext): Promise<void>;
   start(input: NativeCommandContext): Promise<void>;
   stop(input: NativeCommandContext): Promise<void>;
@@ -124,6 +125,9 @@ export function createNativeProgram(actions: NativeCliActions): Command {
     support: "collect a support bundle to share with Konteks support",
   } as const;
   for (const operation of ["status", "agents", "doctor", "support"] as const) program.command(operation).description(CONTROL_HELP[operation]).action(async () => actions.control({ ...context(), operation }));
+  const skills = program.command("skills").description("shared Skills in your local coding agent profiles");
+  skills.command("configure").description("bind local Codex and Claude Skill folders for this installation; requires the connector to be stopped")
+    .action(async () => actions.configureSkills(context()));
   // Read-only. Whether this computer serves previews is switched per machine
   // in Konteks (Customize → Runtimes), never here.
   const preview = program.command("preview").description("live previews of sessions' work, served from this computer");

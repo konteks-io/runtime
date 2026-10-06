@@ -13,6 +13,40 @@ This repository (`konteks-io/runtime`) is the only source for the connector.
 The older `remote-instance` repository keeps architecture and proof history
 only; do not build or deploy from it.
 
+## Shared Skills in local agents
+
+New installations bind native Skill discovery to `~/.codex`, the operator's
+custom `CODEX_HOME` when present, `~/.agents` for current Codex discovery,
+and `~/.claude`. An explicit `CLAUDE_CONFIG_DIR` adds that profile too, so a
+Claude DeepSeek profile can discover the same workspace Skills. These local
+paths are installer metadata, never paths received from the cloud.
+
+When a native session prepares its inputs, the connector stages the complete
+Core-authorized active workspace catalog and publishes `konteks-<skill-id-hash>`
+links below each profile's `skills` directory. Each profile retains its own
+verified, content-addressed copy outside the agent's discovery directory, so
+the links survive removal of the connector staging cache and old versions are
+not discovered as additional Skills. The copies include scripts, assets and
+references and preserve executable modes. Windows uses directory
+junctions. A later authorized catalog updates these links and removes managed
+links for Skills that are no longer active; personal directories remain intact.
+Home delivery is session-triggered: it is not a background connection-time
+refresh, and local agent sessions may need a restart to discover changes.
+
+Each profile's hidden `.konteks-skill-sync` receipt binds the managed links to one
+workspace and machine. Another binding, a personal-folder collision, a replaced
+link or a linked profile/Skills root stops publication. A write-ahead receipt
+recovers interrupted updates under a process-owned filesystem lock. Original
+Skill caches remain immutable and session prompts revalidate their authority.
+Retained trees are verified before reuse; edited trees are preserved and
+refused. Inactive links are removed; retained historical bytes are not erased.
+Older installations without `agentSkillHomes` keep their existing behavior
+until their local profile binding is explicitly configured. With the connector
+stopped through its normal lifecycle, run `konteks-remote skills configure`
+(set `CLAUDE_CONFIG_DIR` for a custom Claude profile), then start it normally.
+This command records local paths without reactivation or transferring credentials.
+
+
 ## How it fits
 
 - **Konteks Core** (HTTPS): enrollment, leases, heartbeats, work assignments,

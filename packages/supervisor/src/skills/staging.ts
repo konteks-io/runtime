@@ -39,7 +39,8 @@ export interface StageOrganizationSkillsOptions {
 export interface StagedOrganizationSkills {
   root: string;
   catalogDigest: string;
-  skills: Array<{ skillId: string; version: string; name: string; description: string; directory: string; skillFile: string }>;
+  skills: Array<{ skillId: string; version: string; name: string; description: string; directory: string; skillFile: string;
+    treeDigest: string; fileModes: Record<string, 384 | 448> }>;
 }
 
 const unavailable = () => new RemoteInstanceError("capability_unavailable", "Required organization skills could not be staged safely.");
@@ -137,12 +138,13 @@ async function readTree(root: string, modes: Record<string, 384 | 448>): Promise
   return { format: "konteks-file-tree-v1", entries: reader.entries, treeDigest: computeRemoteFileTreeDigest(reader.entries) };
 }
 
-function result(root: string, catalog: RemoteSkillCatalog): StagedOrganizationSkills {
+function result(root: string, catalog: RemoteSkillCatalog, modes: Record<string, Record<string, 384 | 448>>): StagedOrganizationSkills {
   return {
     root, catalogDigest: catalog.catalogDigest,
     skills: catalog.skills.map(skill => {
       const directory = join(root, skill.name);
-      return { skillId: skill.skillId, version: skill.version, name: skill.name, description: skill.description, directory, skillFile: join(directory, "SKILL.md") };
+      return { skillId: skill.skillId, version: skill.version, name: skill.name, description: skill.description, directory, skillFile: join(directory, "SKILL.md"),
+        treeDigest: skill.transfer.treeDigest, fileModes: { ...modes[skill.name] } };
     }),
   };
 }
@@ -153,7 +155,7 @@ async function current(options: StageOrganizationSkillsOptions, catalog: RemoteS
   if (!Number.isFinite(now) || catalog.skills.some(s => Date.parse(s.transfer.expiresAt) <= now)) throw unavailable();
 }
 
-async function verifyCatalog(root: string, catalog: RemoteSkillCatalog, now: number): Promise<void> {
+async function verifyCatalog(root: string, catalog: RemoteSkillCatalog, now: number): Promise<Record<string, Record<string, 384 | 448>>> {
   privateNode(await lstat(root), true);
   const actual = (await readdir(root)).sort();
   const expected = [".catalog.json", ...catalog.skills.map(s => s.name)].sort();
@@ -169,6 +171,32 @@ async function verifyCatalog(root: string, catalog: RemoteSkillCatalog, now: num
     if (!tree.entries.some(e => e.path === "SKILL.md")) throw unavailable();
     if (!validateRemoteTransfer(skill.transfer, tree, { binding: catalog.binding, manifestDigest: computeRemoteTransferManifestDigest(skill.transfer), now }).valid) throw unavailable();
   }
+  return parsed.data.modes;
+}
+
+/** Retain verified full trees under the operator's agent profile. The caller
+ * owns and locks the destination parent. Existing content is verified and
+ * never overwritten, including a user edit to a previously retained tree. */
+export async function retainStagedSkill(skill: StagedOrganizationSkills["skills"][number], parent: string): Promise<string> {
+  const verify = async (root: string) => {
+    const tree = RemoteFileTreeSchema.parse(await readTree(root, skill.fileModes));
+    if (tree.treeDigest !== skill.treeDigest || !tree.entries.some(e => e.path === "SKILL.md")) throw unavailable();
+    return tree;
+  };
+  const tree = await verify(skill.directory);
+  const destination = join(parent, `tree-${sha256Hex(skill.treeDigest)}`);
+  try { await lstat(destination); await verify(destination); return destination; }
+  catch (error) { if (!isFsErrorWithCode(error, "ENOENT")) throw error; }
+  let temporary: string | undefined;
+  try {
+    temporary = await mkdtemp(join(parent, ".stage-")); await chmod(temporary, 0o700);
+    for (const entry of tree.entries) await writePrivate(join(temporary, ...entry.path.split("/")), Buffer.from(entry.contentBase64, "base64"), entry.mode);
+    await verify(temporary);
+    await rename(temporary, destination); temporary = undefined;
+    await verify(destination);
+    return destination;
+  } catch { throw unavailable(); }
+  finally { if (temporary) await rm(temporary, { recursive: true, force: true }).catch(() => undefined); }
 }
 
 export async function stageOrganizationSkills(options: StageOrganizationSkillsOptions): Promise<StagedOrganizationSkills> {
@@ -202,7 +230,7 @@ async function stagedAlready(destination: string): Promise<boolean> {
 }
 
 async function reuseStaged(destination: string, catalog: RemoteSkillCatalog, options: StageOrganizationSkillsOptions): Promise<StagedOrganizationSkills> {
-  try { await verifyCatalog(destination, catalog, options.now()); await current(options, catalog); return result(destination, catalog); }
+  try { const modes = await verifyCatalog(destination, catalog, options.now()); await current(options, catalog); return result(destination, catalog, modes); }
   catch { throw unavailable(); }
 }
 
@@ -217,7 +245,8 @@ async function stageFresh(scratch: string, destination: string, authorized: Auth
     await current(options, catalog);
     if (await publishStaged(temporary, destination, catalog, options)) temporary = undefined;
     await current(options, catalog);
-    return result(destination, catalog);
+    const retainedModes = await verifyCatalog(destination, catalog, options.now());
+    return result(destination, catalog, retainedModes);
   } catch { throw unavailable(); }
   finally {
     // Only the exact mkdtemp child created by this call is eligible for cleanup.

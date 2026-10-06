@@ -56,6 +56,9 @@ describe("connector commands shipped with the release", () => {
   it("is a manifest the site takes once the release names its version", () => {
     const manifest = ConnectorCommandsManifestSchema.parse({ version: "0.4.1", ...table });
     expect(manifest.commands.length).toBeGreaterThan(10);
+    for (const os of ["macos", "windows", "debian"] as const) {
+      expect(connectorCommandsFor(manifest, os).find(command => command.id === "skills.configure")?.command).toBe("konteks-remote skills configure");
+    }
     expect(connectorCommandsFor(manifest, "windows").map(command => command.id)).not.toContain("agent.remove");
     expect(connectorCommandsFor(manifest, "macos").map(command => command.id)).toContain("agent.remove");
     // Plain lines: no em dash, one line each.

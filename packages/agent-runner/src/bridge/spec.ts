@@ -96,6 +96,7 @@ function usePersonalClaude(config: RunnerConfig, family: AgentBridgeFamily, prof
   }
   const operator = userInfo();
   env.CLAUDE_CODE_EXECUTABLE = executable;
+  useClaudeConfigDirectory(config, env);
   env.HOME = operator.homedir;
   env.USER = operator.username;
   env.LOGNAME = operator.username;
@@ -237,4 +238,11 @@ export async function verifyNativeRunnerPackage(config: RunnerConfig, logger?: P
   if (profile.agentId !== config.RUNNER_AGENT_ID || JSON.stringify(profile) !== JSON.stringify(config.RUNNER_NATIVE_PACKAGE_PROFILE)) throw new RemoteInstanceError("bundle_untrusted", "native package profile changed");
   logger?.info({ event: "native.bootstrap.stage", stage: "package_verify", agentId: config.RUNNER_AGENT_ID,
     mode: cached ? "cached" : "full", durationMs: Date.now() - startedAt }, "agent package verified");
+}
+
+function useClaudeConfigDirectory(config: RunnerConfig, env: NodeJS.ProcessEnv): void {
+  if (config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR !== undefined) {
+    if (!localAbsolutePath(config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR)) throw new RemoteInstanceError("agent_unavailable", "A personal Claude profile requires an absolute locally bound config directory.");
+    env.CLAUDE_CONFIG_DIR = config.RUNNER_NATIVE_CLAUDE_CONFIG_DIR;
+  }
 }

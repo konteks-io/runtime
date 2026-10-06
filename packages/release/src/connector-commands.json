@@ -11,6 +11,7 @@
     { "id": "auth.logout", "command": "konteks-remote auth logout <agent>", "description": "Signs an agent out on this computer.", "os": ["macos", "windows", "debian"] },
     { "id": "agent.add", "command": "konteks-remote agent add <agent>", "description": "Adds an agent to this computer's connector: claude-code, codex, dsh, opencode or antigravity.", "os": ["macos", "windows", "debian"] },
     { "id": "agent.remove", "command": "konteks-remote agent remove antigravity", "description": "Removes Google Antigravity from this computer, with its download and its sign-ins here.", "os": ["macos"] },
+    { "id": "skills.configure", "command": "konteks-remote skills configure", "description": "Binds shared Skills to your local agent profiles. Stop the connector first, then start it normally.", "os": ["macos", "windows", "debian"] },
     { "id": "preview.status", "command": "konteks-remote preview status", "description": "Lists this computer's session previews and why any of them stopped. Turn previews on or off in Konteks.", "os": ["macos", "windows", "debian"] },
     { "id": "start", "command": "konteks-remote start", "description": "Starts the connector's background service.", "os": ["macos", "windows", "debian"] },
     { "id": "stop", "command": "konteks-remote stop", "description": "Stops the connector's background service. This computer and its work are kept.", "os": ["macos", "windows", "debian"] },
