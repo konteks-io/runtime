@@ -56,6 +56,11 @@ QA browser, structured results, updates and doctor/support.
   when Core answers (fenced, denied, revision fence), never on a timeout;
   renewals retry with backoff. `CoreClient.executionSigningKeys` serves the
   last confirmed key set for a bounded time, never an unknown key id.
+- **Owner refresh.** `NativeEnrollment` signs `issuedAt` Unix seconds from
+  `clock.coreNow()` with the instance-key body. Core and Common require that
+  field within a ±300s window; release the matched cohort before enforcing it.
+  Other enrollment bodies and the running connector's root-lock handoff keep
+  their existing contracts.
 - **Self-recovery.** A lapsed lease is never renewed in-process: the liveness
   watchdog asks the service manager to restart (`leaseLapseNeedsRestart`).
   A runtime below Core's minimum may install a strictly newer signed release
