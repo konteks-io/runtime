@@ -1,3 +1,4 @@
+import { isConversationWorkKind } from "@konteks/backstage-plugin-common";
 import type { KeyObject } from "node:crypto";
 import {
   RemoteAuthorizedOperationSchema, RemoteExecutionAuthorityViewSchema, RemoteInstanceError,
@@ -683,7 +684,7 @@ function conversationSourceMatches(claims: RemoteExecutionAuthorityView, assignm
 
 /** An Assistant turn's conversation, or a person's direct session prompt. */
 function conversationSource(assignment: RemoteWorkAssignment) {
-  if (assignment.kind === "assistant_execution" && assignment.source.kind === "conversation") return assignment.source;
+  if (isConversationWorkKind(assignment.kind) && assignment.source.kind === "conversation") return assignment.source;
   if (assignment.kind === "direct" && assignment.source.kind === "direct_session") return assignment.source;
   return null;
 }

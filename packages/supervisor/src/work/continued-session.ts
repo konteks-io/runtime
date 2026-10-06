@@ -1,3 +1,4 @@
+import { isConversationWorkKind } from "@konteks/backstage-plugin-common";
 import { isDirectWorkKind, type RemoteWorkAssignment } from "@konteks/remote-common";
 
 /**
@@ -36,5 +37,5 @@ export function isDirectAssignment(assignment: Pick<RemoteWorkAssignment, "kind"
  * direct session prompt, or a native delivery turn.
  */
 export function isNativeTurn(assignment: Pick<RemoteWorkAssignment, "kind" | "source">): boolean {
-  return assignment.kind === "assistant_execution" || isDirectWorkKind(assignment.kind) || assignment.source.kind === "harness_delivery";
+  return (isConversationWorkKind(assignment.kind) && assignment.source.kind === "conversation") || isDirectWorkKind(assignment.kind) || assignment.source.kind === "harness_delivery";
 }

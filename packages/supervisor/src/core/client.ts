@@ -216,7 +216,7 @@ export interface CapabilityTokenIssue {
   mcpServer: { name: string; url: string; headers: Array<{ name: string; value: string }> };
   expiresAt: string;
 }
-const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "qa", "assistant_execution", "onboarding", "repository_relocation", "integration"]), workload: BoundedJsonValueSchema }).strict();
+const WorkloadReadSchema = z.object({ assignmentId: z.string().min(1), attempt: z.number().int().positive(), kind: z.enum(["delivery", "validation", "qa", "assistant_execution", "operations", "onboarding", "repository_relocation", "integration"]), workload: BoundedJsonValueSchema }).strict();
 type WorkloadRead = z.infer<typeof WorkloadReadSchema>;
 
 /**
