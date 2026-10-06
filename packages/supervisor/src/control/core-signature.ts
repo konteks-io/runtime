@@ -1,3 +1,4 @@
+import { LocalSkillExportIntentSchema, localSkillExportSigningBytes } from '@konteks/backstage-plugin-common/remote-instance-internal';
 import { RuntimeSkillSyncEnvelopeSchema, RuntimeSkillSyncRequestSchema, runtimeSkillSyncSigningBytes, runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import type { KeyObject } from "node:crypto";
 import { PlanningControllerTerminalDirectiveSchema, RemoteControlSigningKeySchema, planningControllerTerminalDirectiveSigningBytes, remoteControlSigningBytes, ed25519PublicKeyFromJwk, ed25519Verify, type JsonValue, type PlanningControllerTerminalDirective } from "@konteks/remote-common";
@@ -140,6 +141,15 @@ export class CoreSignatureVerifier {
     try {
       const bytes = runtimeSkillSyncRequestSigningBytes(parsed.data);
       for (const key of this.keys.values()) if (ed25519Verify(key, bytes, signature)) return true;
+    } catch { return false; }
+    return false;
+  }
+
+  verifyLocalSkillExport(value: unknown): boolean {
+    const parsed = LocalSkillExportIntentSchema.safeParse(value);
+    if (!parsed.success || !this.configured || !/^[A-Za-z0-9_-]{86}$/.test(parsed.data.signature) || Buffer.from(parsed.data.signature, "base64url").toString("base64url") !== parsed.data.signature) return false;
+    try {
+      for (const key of this.keys.values()) if (ed25519Verify(key, localSkillExportSigningBytes(parsed.data), parsed.data.signature)) return true;
     } catch { return false; }
     return false;
   }

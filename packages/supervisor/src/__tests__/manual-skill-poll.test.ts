@@ -7,6 +7,7 @@ function fixture() {
     store: { pendingSkillReceipt: vi.fn(async () => persisted), savePendingSkillReceipt: vi.fn(async (_owner, result) => { persisted = result; }) },
     stopping: false, options: { native: {} }, nativeOwnership: {}, lease: { mode: () => "active" },
     reconciliation: { isComplete: true }, skillPollBusy: false, skillPollAbort: new AbortController(),
+    clock: { coreNow: vi.fn(() => 1_000) }, lastAutomaticSkillRefresh: 0, triggerSkillRefresh: vi.fn(),
     machineSkillSyncClient: () => client, logger: { warn: vi.fn() },
     admitManualSkillSync: vi.fn(async (_request, sync) => { await sync(); return "executed"; }),
     syncOrganizationSkills: vi.fn(async () => ({})),
@@ -52,4 +53,17 @@ it("clears a definitively refused result so later requests are not blocked", asy
   expect(supervisor.logger.warn).toHaveBeenCalledWith({ event: "skills.manual_sync_result_refused" }, expect.any(String));
   await supervisor.pollSkillSyncRequest();
   expect(client.pendingRequest).toHaveBeenCalledTimes(1);
+});
+
+it("refreshes organization discovery periodically even without a manual request", async () => {
+  const { client, supervisor } = fixture();
+  client.pendingRequest.mockResolvedValue(null);
+  supervisor.clock.coreNow.mockReturnValue(61_000);
+  await supervisor.pollSkillSyncRequest();
+  expect(supervisor.triggerSkillRefresh).toHaveBeenCalledTimes(1);
+  await supervisor.pollSkillSyncRequest();
+  expect(supervisor.triggerSkillRefresh).toHaveBeenCalledTimes(1);
+  supervisor.clock.coreNow.mockReturnValue(121_000);
+  await supervisor.pollSkillSyncRequest();
+  expect(supervisor.triggerSkillRefresh).toHaveBeenCalledTimes(2);
 });

@@ -1,7 +1,7 @@
 import { expect, it } from "vitest";
 import { sign } from "node:crypto";
 import { generateEd25519 } from "@konteks/remote-common";
-import { computeRuntimeSkillSyncCatalogDigest, runtimeSkillSyncSigningBytes, runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
+import { localSkillExportSigningBytes, computeRuntimeSkillSyncCatalogDigest, runtimeSkillSyncSigningBytes, runtimeSkillSyncRequestSigningBytes } from "@konteks/backstage-plugin-common/remote-instance-internal";
 import { CoreSignatureVerifier } from "../control/core-signature.js";
 it("verifies only the dedicated machine Skill domain under release-certified Core keys", () => {
   const key = generateEd25519();
@@ -28,5 +28,17 @@ it("verifies manual requests independently from catalog and ordinary control sig
   }
   expect(new CoreSignatureVerifier([]).verifyRuntimeSkillSyncRequest(request)).toBe(false);
   expect(verifier.verifyRuntimeSkillSync(request)).toBe(false);
+  expect(verifier.verify(request, signature)).toBe(false);
+});
+
+it("binds personal Skill exports to the exact runtime, tenant, selection and signature domain", () => {
+  const key = generateEd25519();
+  const root = { keyId: "release", publicKeyJwk: generateEd25519().publicJwk, coreControlKeys: [{ keyId: "core", publicKeyJwk: key.publicJwk }] };
+  const body = { type: "runtime_skill_export", workspaceId: "tenant-a", instanceId: "machine-a", requestId: "export-a", localId: "a".repeat(64), treeDigest: `sha256:${"b".repeat(64)}`, issuedAt: "2026-10-03T00:00:00Z", expiresAt: "2026-10-03T00:01:00Z" };
+  const signature = sign(null, localSkillExportSigningBytes(body), key.privateKey).toString("base64url");
+  const request = { ...body, signature }, verifier = new CoreSignatureVerifier([root]);
+  expect(verifier.verifyLocalSkillExport(request)).toBe(true);
+  for (const changed of [{ workspaceId: "tenant-b" }, { instanceId: "machine-b" }, { localId: "c".repeat(64) }, { treeDigest: `sha256:${"d".repeat(64)}` }, { signature: signature + "=" }]) expect(verifier.verifyLocalSkillExport({ ...request, ...changed })).toBe(false);
+  expect(new CoreSignatureVerifier([]).verifyLocalSkillExport(request)).toBe(false);
   expect(verifier.verify(request, signature)).toBe(false);
 });

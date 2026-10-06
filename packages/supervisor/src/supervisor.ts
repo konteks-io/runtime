@@ -1,3 +1,4 @@
+import { discoverLocalSkills, exportLocalSkill } from './skills/local-skills.js';
 import { machineSkillPermissionAuthorizer } from "./native/skill-permission.js";
 import { SkillRefreshScheduler } from "./skills/refresh-scheduler.js";
 import { machineSkillReadTracking, type PreparedSessionInputs } from "./skills/session-inputs.js";
@@ -289,6 +290,7 @@ export class Supervisor {
   private skillRefreshScheduler: SkillRefreshScheduler | undefined;
   private skillSyncClient: NativeSkillSyncClient | undefined;
   private skillPollBusy = false;
+  private lastAutomaticSkillRefresh = 0;
   private readonly skillPollAbort = new AbortController();
   private pendingSkillReceipt: { requestId: string; state: "succeeded" | "failed" } | undefined;
   private historicalSkillSync: SkillSyncSuccess | undefined;
@@ -1557,6 +1559,20 @@ export class Supervisor {
     try {
       const client = this.machineSkillSyncClient(), signal = this.skillPollAbort.signal;
       const owner = { workspaceId: this.workspaceId ?? "", instanceId: this.instanceId ?? "" };
+      try {
+        const homes = machineSkillHomes(this.options.native.runners);
+        await client.reportLocalInventory({ observedAt: new Date(this.clock.coreNow()).toISOString(), skills: await discoverLocalSkills(homes) }, signal);
+        const exportRequest = await client.pendingLocalExport(signal);
+        if (exportRequest) {
+          this.nativeOwnership.assertOwned(); client.assertLocalExport(exportRequest);
+          let tree = null;
+          try { tree = await exportLocalSkill(homes, exportRequest); } catch { /* Changed or unsafe trees are refused without exposing local errors. */ }
+          this.nativeOwnership.assertOwned(); client.assertLocalExport(exportRequest);
+          await client.reportLocalExport(exportRequest, tree, signal);
+        }
+      } catch {
+        this.logger.warn({ event: "skills.local_inventory_unavailable" }, "Personal Skill inventory could not be delivered");
+      }
       this.pendingSkillReceipt = await this.store.pendingSkillReceipt(owner) ?? undefined;
       if (this.pendingSkillReceipt) {
         const accepted = await client.receipt(this.pendingSkillReceipt, signal);
@@ -1586,7 +1602,12 @@ export class Supervisor {
       }
     } catch {
       if (!this.stopping) this.logger.warn({ event: "skills.manual_sync_unavailable" }, "Manual Skill synchronization could not be delivered");
-    } finally { this.skillPollBusy = false; }
+    } finally {
+      this.skillPollBusy = false;
+      if (!this.stopping && this.clock.coreNow() - this.lastAutomaticSkillRefresh >= 60_000) {
+        this.lastAutomaticSkillRefresh = this.clock.coreNow(); this.triggerSkillRefresh();
+      }
+    }
   }
 
   private async syncOrganizationSkills(): Promise<MachineSkillInventory> {
