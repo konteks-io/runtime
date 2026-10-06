@@ -453,3 +453,16 @@ shutdown. Telemetry configuration never grants or replaces execution authority.
 For controller-owned local E2E, set `KONTEKS_E2E_NATIVE_OTLP_TRACES_ENDPOINT` in
 the ignored controller `.env`; it applies only to the native connector process.
 Agent rules: see AGENTS.md (map and guardrails).
+
+### Native permission-answer producer pin
+
+Permission-answer rollout requires the same explicit dedicated producer in
+Core (`remoteInstance.permissionAnswerProducer`), Relay
+(`RELAY_CORE_PERMISSION_ANSWER_PRODUCER`), and the native installation's
+private operator-owned `native-runtime.json` (`corePermissionAnswerProducer`).
+The native pin is optional and has no default. An environment variable cannot
+provide or replace it. Coordinate the pin while native work is drained, preserve
+all existing installation identity, manifest and key fields, and restart through
+the installation's normal service controller. An absent pin keeps answers closed.
+The pin does not replace Core signature/permit verification, current connection
+and execution authority, exact tool-call binding or assignee approval.

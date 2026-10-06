@@ -62,6 +62,18 @@ describe("preview tuning from the service environment", () => {
 });
 
 describe("closed native runtime installation", () => {
+  it("pins the optional answer producer in private installation metadata, never ambient environment", async () => {
+    const f = await fixture();
+    const env = { SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER: "untrusted-ambient" };
+    expect((await loadNativeInstallation(root, { ...f.options, env })).config.SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER).toBeUndefined();
+    await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, corePermissionAnswerProducer: "core-answer" }));
+    const pinned = await loadNativeInstallation(root, { ...f.options, env });
+    expect(pinned.config.SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER).toBe("core-answer");
+    expect(pinned.record.manifestDigest).toBe(f.record.manifestDigest);
+    for (const producer of ["", "x".repeat(257)]) {
+      expect(NativeRuntimeRecordSchema.safeParse({ ...f.record, corePermissionAnswerProducer: producer }).success).toBe(false);
+    }
+  });
   it("loads only the digest-matching installer-selected Git executable", async () => {
     const f = await fixture(), git = await testGitTool();
     await writeSecretFile(join(root, "native-runtime.json"), JSON.stringify({ ...f.record, git }));

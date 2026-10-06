@@ -40,6 +40,8 @@ export const NativeRuntimeRecordSchema = z.object({
   manifestDigest: z.string().min(1).max(128), bundleVersion: z.string().min(1).max(128),
   coreUrl: endpoint("https:"), relayUrl: endpoint("wss:"),
   controlPort: z.number().int().min(1).max(65_535),
+  /** Operator-pinned dedicated Core answer identity. Absent keeps permission answers closed; environment cannot override it. */
+  corePermissionAnswerProducer: z.string().min(1).max(256).regex(/^\S+$/).optional(),
   // Zero agents is a machine enrolled from an agent door with nothing
   // detectable yet; it advertises no roles until one is added.
   agents: z.array(z.enum(NATIVE_AGENT_IDS)).max(NATIVE_AGENT_IDS.length)
@@ -292,6 +294,7 @@ function supervisorConfig(record: NativeRuntimeRecord, dataDir: string, releaseD
     SUPERVISOR_DEPLOYMENT_KIND: "native_connector", SUPERVISOR_DATA_DIR: dataDir,
     SUPERVISOR_CORE_URL: record.coreUrl, SUPERVISOR_RELAY_URL: record.relayUrl,
     SUPERVISOR_CONTROL_PORT: record.controlPort, SUPERVISOR_BUNDLE_VERSION: record.bundleVersion,
+    ...(record.corePermissionAnswerProducer ? { SUPERVISOR_CORE_PERMISSION_ANSWER_PRODUCER: record.corePermissionAnswerProducer } : {}),
     SUPERVISOR_PLATFORM_OS: options.platform.os, SUPERVISOR_PLATFORM_ARCH: options.platform.architecture,
     SUPERVISOR_RELEASE_MANIFEST_FILE: join(releaseDir, "manifest.json"),
     // The managed-git key lives in this runtime's private data, not at the
