@@ -27,24 +27,25 @@ function fixtureContext() {
     stage: 'build', coordinate: { target: 'aarch64-apple-darwin', prefix: 'macos_aarch64' } };
 }
 
-function buildVoiceFixture() {
+function buildVoiceFixture(voiceBuildOptions = () => []) {
   const calls = [];
+  const commands = [];
   const context = fixtureContext();
   const codex = { directory: resolve('synthetic-codex-source'), head: commit };
   const input = { actionKey: 'synthetic-cpal-action', loopbackSha256: 'synthetic-candidate-hash' };
   const sandbox = {
     join, constants: { COPYFILE_EXCL: 1 }, LOCK_CHECK: 'synthetic-lock-comparison',
     copyFile: async () => undefined, sha256: async () => 'synthetic-lock-hash',
-    run: async (_, label) => { calls.push(label); return label === 'tool-bazel' ? 'Build label: 9.0.0' : ''; },
+    run: async (_, label, executable, args) => { calls.push(label); commands.push({ label, executable, args }); return label === 'tool-bazel' ? 'Build label: 9.0.0' : ''; },
     assert: (value, message) => assert.ok(value, message),
     prepareCpalAvailabilityCandidate: async () => { calls.push('cpal-prepare'); return { candidateOnly: true }; },
-    voiceBuildOptions: () => [],
+    voiceBuildOptions,
     cpalCompilerInput: async () => { calls.push('cpal-compiler-input'); return input; },
     assertStableCpalCompilerInput: () => calls.push('cpal-input-stable'),
   };
   const source = productionFunction('async function buildVoice(context, codex)', '\nasync function stageVoice(');
   const build = runInNewContext(`${source}; buildVoice`, sandbox, { timeout: 1_000 });
-  return { calls, context, codex, build };
+  return { calls, commands, context, codex, build };
 }
 
 test('candidate CPAL preparation precedes the actual cargo and Bazel build path', async () => {
@@ -317,6 +318,36 @@ test('materialized linked repository refuses before compiler-input hash authorit
   await copyFile(new URL('Cargo.toml', fixtures), join(moved, 'Cargo.toml'));
   await assert.rejects(verifyCpalCompilerInput({ ...input, text: JSON.stringify(graph) }), /source path is linked/);
 }));
+
+function actualVoiceBuildOptions() {
+  const source = productionFunction('function voiceBuildOptions(context)', '\nasync function cpalCompilerInput(');
+  return runInNewContext(`${source}; voiceBuildOptions`, { join }, { timeout: 1_000 });
+}
+
+test('actual CPAL query disables fetched repository directory sharing', async () => {
+  const calls = [];
+  const context = fixtureContext();
+  const source = productionFunction('async function cpalCompilerInput(', '\nasync function buildVoice(');
+  const query = runInNewContext(`${source}; cpalCompilerInput`, { join,
+    voiceBuildOptions: actualVoiceBuildOptions(),
+    run: async (_, label, executable, args) => { calls.push({ label, executable, args }); return label === 'cpal-output-base' ? join(context.work, 'bazel/output') : '{}'; },
+    verifyCpalCompilerInput: async input => input,
+  }, { timeout: 1_000 });
+  await query(context, { directory: 'synthetic-owned-checkout' }, []);
+  const args = calls.find(call => call.label === 'cpal-effective-action').args;
+  assert.equal(args.filter(value => value.startsWith('--repo_contents_cache=')).length, 1);
+  assert.ok(args.includes('--repo_contents_cache='));
+  assert.ok(args.includes(`--repository_cache=${join(context.work, 'repository-cache')}`));
+});
+
+test('actual voice build disables fetched repository directory sharing', async () => {
+  const fixture = buildVoiceFixture(actualVoiceBuildOptions());
+  await fixture.build(fixture.context, fixture.codex);
+  const args = fixture.commands.find(command => command.label === 'voice-build').args;
+  assert.equal(args.filter(value => value.startsWith('--repo_contents_cache=')).length, 1);
+  assert.ok(args.includes('--repo_contents_cache='));
+  assert.ok(args.includes(`--repository_cache=${join(fixture.context.work, 'repository-cache')}`));
+});
 
 test('actual compiler-query seam has finite bounds and shares the build configuration', async () => {
   const calls = [];

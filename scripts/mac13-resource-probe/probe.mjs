@@ -228,7 +228,7 @@ print(json.dumps({'externalGraphUnchanged':True,'workspacePackages':len(new)}))
 
 function voiceBuildOptions(context) {
   return ['-c', 'opt', '--jobs=2', '--macos_minimum_os=13.0', '--remote_executor=', '--remote_cache=',
-    '--bes_backend=', '--experimental_remote_downloader=', '--disk_cache=',
+    '--bes_backend=', '--experimental_remote_downloader=', '--disk_cache=', '--repo_contents_cache=',
     `--repository_cache=${join(context.work, 'repository-cache')}`];
 }
 
