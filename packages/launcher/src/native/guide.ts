@@ -32,7 +32,7 @@ export function nativeGuide(man = false): string {
     ["SKILLS", [
       "Organization sessions receive the authorized Skill selection from Konteks. Local discovery folders are managed separately from your personal Skills.",
       "Older installations can bind Codex and Claude discovery folders with: stop, skills configure, then start. This binds local paths; it does not by itself fetch a new organization catalog.",
-      "Configured native profiles refresh when the runtime first becomes ready, after active relay or HTTPS reconciliation, and automatically about once a minute while connected. Promote a personal Skill from On this computer in Konteks to share its selected file snapshot with your organization. Run konteks-remote skills sync for a manual refresh; skills status shows inventory and the last successful sync for this installation, including across connector restarts. Restart an already-running agent session if it does not discover new Skills."
+      "Configured native profiles refresh when the runtime first becomes ready, after active relay or HTTPS reconciliation, and automatically about once a minute while connected. Promote a personal runtime Skill from Runtime Skills under On this computer in Konteks to share its selected file snapshot with your organization. Run konteks-remote skills sync for a manual refresh; skills status shows inventory and the last successful sync for this installation, including across connector restarts. Restart an already-running agent session if it does not discover new Skills."
     ]],
     ["REMOVAL", [
       "Run konteks-remote uninstall. It drains running work before unregistering the background service and removing the installation. Your repositories and your agents' own sign-ins stay.",
