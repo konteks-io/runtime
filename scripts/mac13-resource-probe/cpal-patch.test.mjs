@@ -9,7 +9,6 @@ import { runInNewContext } from 'node:vm';
 import test from 'node:test';
 import { assertStableCpalCompilerInput, prepareCpalAvailabilityCandidate, verifyCpalCompilerInput } from './cpal-patch.mjs';
 import { sha256 } from './inspect-candidate.mjs';
-import { actionIndex, actionPath } from './bazel-actions.mjs';
 
 const probe = readFileSync(new URL('./probe.mjs', import.meta.url), 'utf8');
 const commit = '687a119f0fcaace47e1f1abcc77cec6c813fd6da';
@@ -351,19 +350,8 @@ function libraryAndBuildScriptGraph(target) {
   return graph;
 }
 
-/** A synthetic Bazel output-filter boundary, not a native query execution. */
-function selectedCompilerGraph(query, graph) {
-  const match = /^outputs\("([^"]+)", /.exec(query);
-  if (!match) return graph;
-  const output = new RegExp(match[1]);
-  assert.ok(output.test('bazel-out/coordinate/bin/external/crates+cpal-0.18.2/libcpal-6231125.rlib'));
-  assert.equal(output.test('bazel-out/coordinate/bin/external/crates+cpal-0.18.2/_bs_target_'), false);
-  const artifacts = actionIndex(graph.artifacts), fragments = actionIndex(graph.pathFragments);
-  return { ...graph, actions: graph.actions.filter(action => action.outputIds.some(id => output.test(actionPath(fragments, artifacts.get(id).pathFragmentId)))) };
-}
-
 for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin']) {
-  test(`actual ${target} CPAL query separates the library from its transitive build script`, () => ownedFixture(async root => {
+  test(`observed empty filtered ${target} query preserves source-bound production selection`, () => ownedFixture(async root => {
     const graph = libraryAndBuildScriptGraph(target);
     const input = await compilerFixture(root, graph);
     const context = { work: root, coordinate: { target } };
@@ -374,7 +362,30 @@ for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin']) {
         assert.equal(executable, 'bazel');
         if (label === 'cpal-output-base') return input.outputBase;
         assert.equal(label, 'cpal-effective-action');
-        return JSON.stringify(selectedCompilerGraph(args.at(-1), graph));
+        // Actual ARM CI emitted {} for outputs(...); the observed source query emitted all three actions.
+        return args.at(-1).startsWith('outputs(') ? '{}' : JSON.stringify(graph);
+      },
+    }, { timeout: 1_000 });
+    const result = await query(context, { directory: root }, []);
+    assert.equal(result.actionKey, graph.actions[0].actionKey);
+    assert.equal(result.configuration.isTool, false);
+    assert.equal(result.target, target);
+    assert.equal(result.loopbackSha256, '981f569aeca0a715f4f403fcbd315dd31f50cdd303f4aa789c56ff878e3041ba');
+  }));
+
+  test(`actual ${target} CPAL source query selects production library from three transitive actions`, () => ownedFixture(async root => {
+    const graph = libraryAndBuildScriptGraph(target);
+    const input = await compilerFixture(root, graph);
+    const context = { work: root, coordinate: { target } };
+    const source = productionFunction('async function cpalCompilerInput(', '\nasync function buildVoice(');
+    const query = runInNewContext(`${source}; cpalCompilerInput`, {
+      join, verifyCpalCompilerInput, voiceBuildOptions: () => [],
+      run: async (_, label, executable, args) => {
+        assert.equal(executable, 'bazel');
+        if (label === 'cpal-output-base') return input.outputBase;
+        assert.equal(label, 'cpal-effective-action');
+        assert.equal(args.at(-1), 'mnemonic("Rustc", inputs(".*src/host/coreaudio/macos/loopback[.]rs", deps(//codex-rs/voice-host:codex-voice-host)))');
+        return JSON.stringify(graph);
       },
     }, { timeout: 1_000 });
     const result = await query(context, { directory: root }, []);
