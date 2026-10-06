@@ -105,6 +105,7 @@ export interface RelayedSessionDeps {
    * requestDigest an answer permit echoes, and the deadline. Absent only in
    * legacy local tests; a production session always registers.
    */
+  exactPermissionBindingSupported?: () => boolean;
   registerDeferral?: (body: DeferredPermissionBody) => Promise<PendingPermissionView>;
   instanceId: string;
   /** Redeems/renews one logical `mcpCapabilityTokenRef`; bearer stays in memory. */
@@ -1616,10 +1617,16 @@ export class RelayedSession {
   private async deferPermission(ref: string, requestId: string, request: RequestPermissionRequest, decision: Extract<PolicyDecision, { kind: "defer" }>): Promise<void> {
     if (!this.assignment.policy.humanDeferralAllowed) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
     const asked = decision.allowOnceOnly ? { ...request, options: request.options.filter(option => option.kind !== "allow_always") } : request;
-    const sanitized = sanitizePermissionRequest(asked);
+    const sanitized = this.sanitizedDeferredPermission(asked);
     const pending = await this.deferToHuman(ref, requestId, "session/request_permission", sanitized);
     if (!pending) return void (await this.answerPermission(ref, requestId, cancelledPermission()));
     await this.sendToCore({ kind: "acp", method: "session/request_permission", id: requestId, params: { sessionId: ref, toolCall: { toolCallId: asked.toolCall.toolCallId, title: sanitized.params.title, ...(sanitized.params.toolKind ? { kind: sanitized.params.toolKind } : {}) }, options: sanitized.params.options } as never });
+  }
+
+  private sanitizedDeferredPermission(request: RequestPermissionRequest): SanitizedPermission {
+    const context = this.deps.exactPermissionBindingSupported?.()
+      ? { cwd: this.sessionCwd(), observedInput: this.toolGovernance?.bindingInput?.(request.toolCall.toolCallId) } : undefined;
+    return sanitizePermissionRequest(request, context);
   }
 
   /** Put the policy's note on a refused tool call (an ACP `tool_call_update` carrying only content). */

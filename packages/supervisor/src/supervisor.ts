@@ -1024,6 +1024,7 @@ export class Supervisor {
         preview: this.sessionPreviewAccess(),
         policy: new EvaluatorPolicyResponder(createWorkspaceToolPolicy(), () => this.configuration.humanDeferralAllowed && assignment.policy.humanDeferralAllowed),
         broker: this.broker,
+        exactPermissionBindingSupported: () => coreContractAtLeast(this.coreContractVersion, "7.5"),
         registerDeferral: (body) => this.core.deferPermission(this.instanceId ?? "", body),
         instanceId: this.instanceId ?? "",
         redeemCapabilityToken: async (target) => {

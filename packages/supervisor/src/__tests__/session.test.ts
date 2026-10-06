@@ -1855,7 +1855,7 @@ describe("relayed session", () => {
     expect(runner.answer).toHaveBeenCalledTimes(1);
   });
 
-  it("registers a deferral with Core before surfacing it and journals Core's digest and earlier deadline", async () => {
+  it.each([false, true])("registers before surfacing and journals Core digest (exact binding: %s)", async exactBinding => {
     const order: string[] = [];
     const registered = vi.fn(async (body: DeferredPermissionBody) => {
       order.push("register");
@@ -1863,7 +1863,7 @@ describe("relayed session", () => {
         raisedAt: clock.nowIso(), deadlineAt: new Date(clock.now() + 30_000).toISOString(),
         permission: (body as Extract<DeferredPermissionBody, { kind: "permission" }>).permission } as unknown as PendingPermissionView;
     });
-    const { session, sent, journal } = await build({ registerDeferral: registered });
+    const { session, sent, journal } = await build({ registerDeferral: registered, exactPermissionBindingSupported: () => exactBinding });
     await session.bootstrap();
     const before = sent.length;
     const send = sent.push.bind(sent);
@@ -1872,6 +1872,9 @@ describe("relayed session", () => {
     expect(order).toEqual(["register", "frame"]);
     expect(registered).toHaveBeenCalledWith(expect.objectContaining({ kind: "permission", sessionId: "s", assignmentId: "asg", attempt: 1, agentId: "codex", requestId: "perm-1" }));
     expect(JSON.stringify(registered.mock.calls[0]?.[0])).not.toContain("rawInput");
+    const wire = registered.mock.calls[0]?.[0];
+    if (wire?.kind !== "permission") throw new Error("permission not registered");
+    expect(Boolean(wire.permission.toolCallBinding)).toBe(exactBinding);
     expect(sent.slice(before).map(message => (message.body as { method?: string }).method)).toEqual(["session/request_permission"]);
     expect(journal.pendingRequests.get("acp-1:issued:perm-1")).toMatchObject({ requestDigest: "c".repeat(43), deadlineAt: new Date(clock.now() + 30_000).toISOString() });
   });

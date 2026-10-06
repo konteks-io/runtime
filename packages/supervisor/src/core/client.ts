@@ -261,7 +261,7 @@ const GitKeyListResultSchema = z.object({
 
 /** Core's `DeferredPermission` (Core's `PendingPermissionService`): what the supervisor posts for a component-raised deferral. */
 export type DeferredPermissionBody =
-  | { kind: "permission"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; permission: { title: string; toolKind?: string; options: Array<{ optionId: string; name: string; kind: string }> } }
+  | { kind: "permission"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; permission: { title: string; toolKind?: string; toolCallBinding?: Extract<PendingPermissionView, { kind: "permission" }>["permission"]["toolCallBinding"]; options: Array<{ optionId: string; name: string; kind: string }> } }
   | { kind: "elicitation"; sessionId: string; assignmentId: string; attempt: number; agentId: string; requestId: string; elicitation: { message: string; requestedSchema: BoundedJsonValue; isSignIn: boolean } };
 
 interface CoreClientOptions {

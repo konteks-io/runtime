@@ -97,6 +97,12 @@ export class DshToolGovernance {
 
   size(): number { return this.calls.size; }
 
+  /** Original bridge-observed bytes for content binding, never the policy/display projection. */
+  bindingInput(toolCallId: string): unknown {
+    const call = this.calls.get(toolCallId);
+    return call ? structuredClone({ toolName: call.title, rawInput: call.rawInput }) : undefined;
+  }
+
   /** Record a session update; returns the call that ran without asking, if any. */
   observe(update: unknown): { toolCallId: string; title: string } | null {
     if (update === null || typeof update !== "object") return null;
