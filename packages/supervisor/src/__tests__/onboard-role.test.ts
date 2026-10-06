@@ -46,14 +46,14 @@ describe("the onboard role is the machine's git", () => {
     expect(agentSatisfiesRole(unavailable, "onboard", { gitVersion: "2.45.2" })).toBe(false);
   });
 
-  it("does not disturb the roles that came before it", () => {
+  it("keeps existing ready-agent roles and includes the composed Ops carrier", () => {
     const all = [
       { role: "planner" as const, agentPreference: ["codex"] },
       { role: "generator" as const, agentPreference: ["codex"] },
       { role: "qa" as const, agentPreference: ["codex"] },
       { role: "ops" as const, agentPreference: ["codex"] },
     ];
-    expect(deriveAdvertisedRoles(all, [ready], { gitVersion: null })).toEqual(["planner", "generator", "qa"]);
+    expect(deriveAdvertisedRoles(all, [ready], { gitVersion: null })).toEqual(["planner", "generator", "qa", "ops"]);
   });
 });
 
@@ -108,4 +108,14 @@ describe("ref digests", () => {
     const after = [{ ref: "refs/heads/main", sha: "b".repeat(40) }];
     expect(refDigest(before)).not.toBe(refDigest(after));
   });
+});
+
+it("advertises configured Ops only for a ready bound agent and never substitutes another", () => {
+  const ops = [{ role: "ops" as const, agentPreference: ["dsh"] }];
+  const dsh = { ...ready, agentId: "dsh" };
+  expect(deriveAdvertisedRoles(ops, [dsh], {})).toEqual(["ops"]);
+  expect(placedAgentReady([dsh], "dsh", "ops", {})).toBe(true);
+  expect(deriveAdvertisedRoles(ops, [ready], {})).toEqual([]);
+  expect(deriveAdvertisedRoles(ops, [{ ...dsh, readiness: "reconnect_required" }], {})).toEqual([]);
+  expect(deriveAdvertisedRoles([{ role: "assistant", agentPreference: ["dsh"] }], [dsh], {})).toEqual(["assistant"]);
 });
